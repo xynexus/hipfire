@@ -574,26 +574,37 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
 
         let weights = gemma4::load_weights(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
 
-        // Gemma 4 needs two KV caches: sliding (head_dim=256, 16 heads, 1024
-        // window capacity) and full (head_dim=512, 4 heads, full max_seq).
-        // Layer count for each: partitioned by config.layer_types.
+        // Gemma 4 needs two KV caches: sliding (head_dim=256, 16 heads) and
+        // full (head_dim=512, 4 heads). Layer count for each is partitioned by
+        // config.layer_types.
+        //
+        // Sizing notes:
+        //   • Sliding cache stores ALL positions written (write kernel addresses
+        //     absolute `pos * bytes_per_pos`). The sliding_window parameter
+        //     gates only the *read* side via attention's window_size uniform —
+        //     it does NOT make writes modular. So we allocate at max_seq to
+        //     avoid past-end writes at pos >= sliding_window.
+        //   • Full cache must use FP32 for correctness on this model: the
+        //     quantized flash kernels (asym3/asym4/asym2/q8) all iterate 32
+        //     threads × N dims where N∈{4,8} — i.e. ≤256 covered dims. Gemma 4
+        //     full layers have head_dim=512, so the quantized kernels would
+        //     silently truncate every head. Plain attention_f32 + FP32 KV
+        //     processes arbitrary head_dim correctly and (since full layers
+        //     never use sliding-window) doesn't need the window_size uniform.
+        //     This is why the kv_mode choice is honored on sliding but forced
+        //     to FP32 on full.
         let n_sliding = config.layer_types.iter().filter(|&&t| t == gemma4::LayerType::Sliding).count();
         let n_full = config.layer_types.iter().filter(|&&t| t == gemma4::LayerType::Full).count();
-        // For sliding layers we cap storage at the window size: no token outside
-        // [pos-1024+1, pos] is ever read, so allocating more is waste.
-        let sliding_cap = config.sliding_window.min(max_seq);
         let kv_sliding = match kv_mode.as_str() {
-            "q8" => llama::KvCache::new_gpu_q8(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap),
-            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap),
-            "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap),
-            _ => llama::KvCache::new_gpu_asym3(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap),
+            "q8" => llama::KvCache::new_gpu_q8(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, max_seq),
+            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, max_seq),
+            "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, max_seq),
+            _ => llama::KvCache::new_gpu_asym3(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, max_seq),
         }.map_err(|e| format!("{e}"))?;
-        let kv_full = match kv_mode.as_str() {
-            "q8" => llama::KvCache::new_gpu_q8(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq),
-            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq),
-            "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq),
-            _ => llama::KvCache::new_gpu_asym3(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq),
-        }.map_err(|e| format!("{e}"))?;
+        // Full-attn layers always use FP32 KV (see above). kv_mode is advisory
+        // only for the sliding side on Gemma 4.
+        let kv_full = llama::KvCache::new_gpu(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq)
+            .map_err(|e| format!("{e}"))?;
 
         let scratch = gemma4::Gemma4Scratch::new(gpu, &config, 128).map_err(|e| format!("{e}"))?;
         // One-time init of the ones-filled v_norm buffer used by full-attn layers.
@@ -641,11 +652,17 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(s) = m.q35_scratch { s.free_gpu(gpu); }
     if let Some(kv) = m.llama_kv { kv.free_gpu(gpu); }
     if let Some(s) = m.llama_scratch { s.free_gpu(gpu); }
+    // Gemma 4 allocations: scratch, two KV caches, weights.
+    if let Some(s) = m.g4_scratch { s.free_gpu(gpu); }
+    if let Some(kv) = m.g4_kv_sliding { kv.free_gpu(gpu); }
+    if let Some(kv) = m.g4_kv_full { kv.free_gpu(gpu); }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
     if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
     if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.g4_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.g4_vision_weights { w.free_gpu(gpu); }
     gpu.drain_pool();
 }
 
