@@ -15,7 +15,7 @@
 //!   • Embed scale: sqrt(hidden_size) multiplied onto every embedding row lookup.
 
 use crate::hfq::HfqFile;
-use crate::llama::{self, weight_gemv, WeightTensor, EmbeddingFormat};
+use crate::llama::{self, f16_to_f32, weight_gemv, WeightTensor, EmbeddingFormat};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -285,11 +285,276 @@ impl Gemma4Weights {
     }
 }
 
-/// Stub: real loader lands in Phase 5 (quantizer produces HFQ → this consumes).
-pub fn load_weights(_hfq: &HfqFile, _config: &Gemma4Config, _gpu: &mut Gpu)
+// ─── Loading helpers ───────────────────────────────────────────────────
+
+/// Decode a shape-[n] F16 or F32 tensor from HFQ into an F32 host Vec.
+fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> HipResult<Vec<f32>> {
+    let (info, data) = hfq.tensor_data(name).ok_or_else(|| {
+        hip_bridge::HipError::new(0, &format!("tensor not found: {name}"))
+    })?;
+    let n: usize = info.shape.iter().map(|&s| s as usize).product();
+    if n != expected_n {
+        return Err(hip_bridge::HipError::new(
+            0, &format!("shape mismatch for {name}: expected {expected_n}, got {n}"),
+        ));
+    }
+    let f32_data = match info.quant_type {
+        1 => data.chunks_exact(2)
+                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                 .collect(),
+        2 => data.chunks_exact(4)
+                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                 .collect(),
+        qt => return Err(hip_bridge::HipError::new(
+            0, &format!("expected F16/F32 for {name}, got qt={qt}"),
+        )),
+    };
+    Ok(f32_data)
+}
+
+/// Load a Gemma 4 RMSNorm weight — `x * weight` form, NO +1 shift.
+///
+/// Distinct from qwen35::load_norm_weight which shifts by +1 for HF Gemma
+/// 2/3-style `x * (1 + weight)`. Gemma 4 uses plain `x * weight` with weights
+/// initialized to 1.0 (see modeling_gemma4.py::Gemma4RMSNorm line 157).
+fn load_gemma4_norm(hfq: &HfqFile, gpu: &mut Gpu, name: &str, dim: usize)
+    -> HipResult<GpuTensor>
+{
+    let f32_data = load_f32_vec(hfq, name, dim)?;
+    gpu.upload_f32(&f32_data, &[dim])
+}
+
+/// Load a 256-element head-dim Q/K RMSNorm weight. Same semantics as
+/// `load_gemma4_norm` but scoped to the attention head_dim (256 on sliding,
+/// 512 on full).
+fn load_gemma4_head_norm(hfq: &HfqFile, gpu: &mut Gpu, name: &str, head_dim: usize)
+    -> HipResult<GpuTensor>
+{
+    load_gemma4_norm(hfq, gpu, name, head_dim)
+}
+
+/// Load the per-layer `layer_scalar` — shape-[1] BF16/F16 tensor — returning
+/// both a GPU-resident [1]-tensor (for potential batched use) and its host-side
+/// f32 value (used by the decode path to call `scale_f32(x, cpu_scalar)`).
+fn load_layer_scalar(hfq: &HfqFile, gpu: &mut Gpu, name: &str)
+    -> HipResult<(GpuTensor, f32)>
+{
+    let data = load_f32_vec(hfq, name, 1)?;
+    let host_val = data[0];
+    let gpu_tensor = gpu.upload_f32(&data, &[1])?;
+    Ok((gpu_tensor, host_val))
+}
+
+/// Load a quantized projection weight. Mirrors qwen35::load_weight_tensor_raw
+/// but uses the Gemma 4 tensor-name convention (`model.language_model.<name>`).
+fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize)
+    -> HipResult<WeightTensor>
+{
+    let (info, data) = hfq.tensor_data(name).ok_or_else(|| {
+        hip_bridge::HipError::new(0, &format!("tensor not found: {name}"))
+    })?;
+    let dtype = match info.quant_type {
+        1 => {
+            // F16 → upload as f32
+            let f32_data: Vec<f32> = data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            return Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 });
+        }
+        3  => DType::Q8_0,
+        4  => DType::Q4K,
+        6  => DType::HFQ4G256,
+        7  => DType::HFQ4G128,
+        8  => DType::HFQ6G256,
+        9  => DType::HFQ2G256,
+        10 => DType::HFQ2G128,
+        11 => DType::HFQ3G256,
+        12 => DType::HFQ3G128,
+        13 => DType::MQ4G256,
+        14 => DType::MQ8G256,
+        15 => DType::MQ6G256,
+        qt => return Err(hip_bridge::HipError::new(
+            0, &format!("unsupported quant_type {qt} for {name}"),
+        )),
+    };
+    let buf = gpu.upload_raw(data, &[data.len()])?;
+    Ok(WeightTensor { buf, gpu_dtype: dtype, m, k, row_stride: 0 })
+}
+
+/// Load Gemma 4 text model weights from an HFQ file.
+///
+/// Design notes:
+///   - `lm_head` aliases the `embed_tokens` GPU bytes (tied weights). We upload
+///     the embed data once and create a second WeightTensor whose DeviceBuffer
+///     points at the same allocation via `buf.alias()`. `Gemma4Weights::free_gpu`
+///     skips freeing the LM head to avoid a double-free.
+///   - Vision tensors are skipped here — Phase 7 `gemma4_vision::load_weights`
+///     picks those up from the same HFQ file in a separate pass.
+///   - The `v_norm_ones_full` ones-filled scratch buffer is populated here so
+///     the forward pass never has to manage one-time init state.
+pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
     -> HipResult<Gemma4Weights>
 {
-    Err(hip_bridge::HipError::new(0, "gemma4::load_weights not implemented (Phase 5)"))
+    eprintln!("gemma4: loading embed_tokens...");
+    let embed_name = "model.language_model.embed_tokens.weight";
+    let (embed_info, embed_data) = hfq.tensor_data(embed_name).ok_or_else(|| {
+        hip_bridge::HipError::new(0, "embed_tokens not found in HFQ")
+    })?;
+    let (embed_tokens, embd_format) = match embed_info.quant_type {
+        3 => {
+            eprintln!("  (Q8_0 / Q8F16, {} MB)", embed_data.len() / 1_000_000);
+            (gpu.upload_raw(embed_data, &[embed_data.len()])?, EmbeddingFormat::Q8_0)
+        }
+        6 => {
+            eprintln!("  (HFQ4-G256, {} MB)", embed_data.len() / 1_000_000);
+            (gpu.upload_raw(embed_data, &[embed_data.len()])?, EmbeddingFormat::HFQ4G256)
+        }
+        7 => {
+            eprintln!("  (HFQ4-G128, {} MB)", embed_data.len() / 1_000_000);
+            (gpu.upload_raw(embed_data, &[embed_data.len()])?, EmbeddingFormat::HFQ4G128)
+        }
+        1 => {
+            eprintln!("  (F16 → F32)");
+            let f32_data: Vec<f32> = embed_data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            (gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
+        }
+        qt => return Err(hip_bridge::HipError::new(
+            0, &format!("unsupported embed quant_type {qt}"),
+        )),
+    };
+
+    // Tied LM head: WeightTensor whose buffer aliases the embed allocation.
+    // free_gpu skips freeing this — embed_tokens owns the bytes.
+    let lm_head = {
+        let alias_buf = unsafe { embed_tokens.buf.alias() };
+        let dtype = match embd_format {
+            EmbeddingFormat::Q8_0    => DType::Q8_0,
+            EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
+            EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
+            EmbeddingFormat::F32     => DType::F32,
+            EmbeddingFormat::Q4K     => DType::Q4K,
+        };
+        let alias_tensor = GpuTensor {
+            buf: alias_buf,
+            shape: embed_tokens.shape.clone(),
+            dtype,
+        };
+        WeightTensor { buf: alias_tensor, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
+    };
+
+    eprintln!("gemma4: loading final norm...");
+    let final_norm = load_gemma4_norm(hfq, gpu, "model.language_model.norm.weight", config.dim)?;
+
+    eprintln!("gemma4: loading {} layers...", config.n_layers);
+    let mut layers = Vec::with_capacity(config.n_layers);
+    for i in 0..config.n_layers {
+        let p = format!("model.language_model.layers.{i}");
+        match config.layer_types[i] {
+            LayerType::Sliding => {
+                let hd = config.sliding_head_dim;
+                let kv_dim = config.sliding_n_kv_heads * hd;
+                let q_dim = config.n_heads * hd;
+                let (layer_scalar, layer_scalar_host) =
+                    load_layer_scalar(hfq, gpu, &format!("{p}.layer_scalar"))?;
+                layers.push(LayerWeights::Sliding(SlidingLayerWeights {
+                    input_layernorm: load_gemma4_norm(hfq, gpu,
+                        &format!("{p}.input_layernorm.weight"), config.dim)?,
+                    post_attention_layernorm: load_gemma4_norm(hfq, gpu,
+                        &format!("{p}.post_attention_layernorm.weight"), config.dim)?,
+                    pre_feedforward_layernorm: load_gemma4_norm(hfq, gpu,
+                        &format!("{p}.pre_feedforward_layernorm.weight"), config.dim)?,
+                    post_feedforward_layernorm: load_gemma4_norm(hfq, gpu,
+                        &format!("{p}.post_feedforward_layernorm.weight"), config.dim)?,
+                    layer_scalar,
+                    layer_scalar_host,
+                    q_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.self_attn.q_proj.weight"), q_dim, config.dim)?,
+                    k_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
+                    v_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
+                    o_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.self_attn.o_proj.weight"), config.dim, q_dim)?,
+                    q_norm: load_gemma4_head_norm(hfq, gpu,
+                        &format!("{p}.self_attn.q_norm.weight"), hd)?,
+                    k_norm: load_gemma4_head_norm(hfq, gpu,
+                        &format!("{p}.self_attn.k_norm.weight"), hd)?,
+                    gate_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+                    up_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+                    down_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                }));
+            }
+            LayerType::Full => {
+                let hd = config.full_head_dim;
+                let kv_dim = config.full_n_kv_heads * hd;
+                let q_dim = config.n_heads * hd;
+                let (layer_scalar, layer_scalar_host) =
+                    load_layer_scalar(hfq, gpu, &format!("{p}.layer_scalar"))?;
+                layers.push(LayerWeights::Full(FullLayerWeights {
+                    input_layernorm: load_gemma4_norm(hfq, gpu,
+                        &format!("{p}.input_layernorm.weight"), config.dim)?,
+                    post_attention_layernorm: load_gemma4_norm(hfq, gpu,
+                        &format!("{p}.post_attention_layernorm.weight"), config.dim)?,
+                    pre_feedforward_layernorm: load_gemma4_norm(hfq, gpu,
+                        &format!("{p}.pre_feedforward_layernorm.weight"), config.dim)?,
+                    post_feedforward_layernorm: load_gemma4_norm(hfq, gpu,
+                        &format!("{p}.post_feedforward_layernorm.weight"), config.dim)?,
+                    layer_scalar,
+                    layer_scalar_host,
+                    q_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.self_attn.q_proj.weight"), q_dim, config.dim)?,
+                    k_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
+                    // no v_proj on full layers — V reuses k_proj's pre-norm output.
+                    o_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.self_attn.o_proj.weight"), config.dim, q_dim)?,
+                    q_norm: load_gemma4_head_norm(hfq, gpu,
+                        &format!("{p}.self_attn.q_norm.weight"), hd)?,
+                    k_norm: load_gemma4_head_norm(hfq, gpu,
+                        &format!("{p}.self_attn.k_norm.weight"), hd)?,
+                    // no v_norm weight — v_norm is no-scale (ones buffer passed at decode time).
+                    gate_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+                    up_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+                    down_proj: load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                }));
+            }
+        }
+    }
+    eprintln!("gemma4: loaded all {} layers", config.n_layers);
+
+    Ok(Gemma4Weights {
+        embed_tokens,
+        embd_format,
+        lm_head,
+        final_norm,
+        layers,
+    })
+}
+
+/// One-time init for the scratch buffers that must hold a constant value
+/// across forward passes (notably the ones-filled `v_norm_ones_full`).
+/// Call once after `Gemma4Scratch::new` before the first forward pass.
+pub fn init_scratch_constants(gpu: &mut Gpu, scratch: &Gemma4Scratch, full_head_dim: usize)
+    -> HipResult<()>
+{
+    let ones: Vec<f32> = vec![1.0; full_head_dim];
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(ones.as_ptr() as *const u8, ones.len() * 4)
+    };
+    gpu.hip.memcpy_htod(&scratch.v_norm_ones_full.buf, bytes)?;
+    Ok(())
 }
 
 // ─── Scratch ────────────────────────────────────────────────────────────

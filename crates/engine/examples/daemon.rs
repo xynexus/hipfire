@@ -596,6 +596,9 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
         }.map_err(|e| format!("{e}"))?;
 
         let scratch = gemma4::Gemma4Scratch::new(gpu, &config, 128).map_err(|e| format!("{e}"))?;
+        // One-time init of the ones-filled v_norm buffer used by full-attn layers.
+        gemma4::init_scratch_constants(gpu, &scratch, config.full_head_dim)
+            .map_err(|e| format!("{e}"))?;
 
         Ok(LoadedModel {
             arch_id: hfq.arch_id,

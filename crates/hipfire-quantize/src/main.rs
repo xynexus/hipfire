@@ -1015,8 +1015,16 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 
 /// Determine which tensors to quantize (weight matrices) vs keep as F16 (norms, embeddings)
 fn should_quantize(name: &str) -> bool {
-    // Vision encoder weights stay FP16 (only 456M params, run once per image)
-    if name.starts_with("model.visual.") || name.starts_with("visual.") {
+    // Vision/audio encoder weights stay FP16 when included (small, run once per image).
+    // Covers Qwen (model.visual.*), Gemma 4 (model.vision_tower.*, model.embed_vision.*),
+    // and the audio side (model.audio_tower.*, model.embed_audio.*) for E-series configs.
+    if name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+        || name.starts_with("model.vision_tower.")
+        || name.starts_with("model.embed_vision.")
+        || name.starts_with("model.audio_tower.")
+        || name.starts_with("model.embed_audio.")
+    {
         return false;
     }
     if name.contains("norm") || name.contains("bias") {
@@ -1253,8 +1261,15 @@ fn main() {
     let include_vision = std::env::args().any(|a| a == "--include-vision");
     let mut skipped_params = 0u64;
     for (name, file_idx) in &all_tensors {
-        // Skip MTP head; optionally include vision encoder for VL inference
-        let is_vision = name.starts_with("model.visual.") || name.starts_with("visual.");
+        // Skip MTP head; optionally include vision encoder for VL inference.
+        // Gemma 4 uses `model.vision_tower.*` and `model.embed_vision.*`;
+        // Qwen uses `model.visual.*`. Same flag gates all three families.
+        let is_vision = name.starts_with("model.visual.")
+            || name.starts_with("visual.")
+            || name.starts_with("model.vision_tower.")
+            || name.starts_with("model.embed_vision.")
+            || name.starts_with("model.audio_tower.")
+            || name.starts_with("model.embed_audio.");
         if is_vision && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
