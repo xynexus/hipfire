@@ -34,7 +34,11 @@ __global__ void attention_flash_asym3_tile(
     int max_seq,
     float scale_attn,
     int tile_size,
-    int max_tiles
+    int max_tiles,
+    // Sliding-window lookback (Gemma 4). 0 = no window / full causal.
+    // When > 0, only positions t in [seq_len - window_size, seq_len - 1]
+    // contribute; tokens older than that get a -inf score (exp(x-max)=0).
+    int window_size
 ) {
     const int seq_len = pos_buf[0] + 1;
     const int h = blockIdx.x;
@@ -44,6 +48,18 @@ __global__ void attention_flash_asym3_tile(
     const int tile_end = min(tile_start + tile_size, seq_len);
     if (tile_start >= seq_len) return;
     const int tile_len = tile_end - tile_start;
+    // Sliding-window lower bound. When window_size == 0 we set t_lo = 0
+    // so the per-position guard is effectively disabled.
+    const int t_lo = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    // If the entire tile is older than the window, emit zero partials
+    // so the reduce stage sees no contribution from this tile.
+    if (window_size > 0 && tile_end <= t_lo) {
+        float* p = partials + (h * max_tiles + tile_id) * (2 + head_dim);
+        if (threadIdx.x == 0) { p[0] = -1e30f; p[1] = 0.0f; }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) p[2 + threadIdx.x * 8 + i] = 0.0f;
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
@@ -79,24 +95,32 @@ __global__ void attention_flash_asym3_tile(
     // Phase A: Q·K (3-bit K)
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
-        const unsigned char* base = kb + 4 + tid * 3;
-        unsigned int packed = (unsigned int)base[0]
-                            | ((unsigned int)base[1] << 8)
-                            | ((unsigned int)base[2] << 16);
-        float partial = mq0 * (cnorm * TURBO_C3_256[ packed        & 7])
-                      + mq1 * (cnorm * TURBO_C3_256[(packed >> 3)  & 7])
-                      + mq2 * (cnorm * TURBO_C3_256[(packed >> 6)  & 7])
-                      + mq3 * (cnorm * TURBO_C3_256[(packed >> 9)  & 7])
-                      + mq4 * (cnorm * TURBO_C3_256[(packed >> 12) & 7])
-                      + mq5 * (cnorm * TURBO_C3_256[(packed >> 15) & 7])
-                      + mq6 * (cnorm * TURBO_C3_256[(packed >> 18) & 7])
-                      + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        const bool out_of_window = (window_size > 0) && (t < t_lo);
+        float partial = 0.0f;
+        if (!out_of_window) {
+            const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+            float cnorm = *(const float*)kb;
+            const unsigned char* base = kb + 4 + tid * 3;
+            unsigned int packed = (unsigned int)base[0]
+                                | ((unsigned int)base[1] << 8)
+                                | ((unsigned int)base[2] << 16);
+            partial = mq0 * (cnorm * TURBO_C3_256[ packed        & 7])
+                    + mq1 * (cnorm * TURBO_C3_256[(packed >> 3)  & 7])
+                    + mq2 * (cnorm * TURBO_C3_256[(packed >> 6)  & 7])
+                    + mq3 * (cnorm * TURBO_C3_256[(packed >> 9)  & 7])
+                    + mq4 * (cnorm * TURBO_C3_256[(packed >> 12) & 7])
+                    + mq5 * (cnorm * TURBO_C3_256[(packed >> 15) & 7])
+                    + mq6 * (cnorm * TURBO_C3_256[(packed >> 18) & 7])
+                    + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        }
+        // All 32 threads participate in the reduce regardless of the
+        // window predicate — skipping shfl_xor in a lane would diverge
+        // the warp. For out-of-window lanes, partial==0 so the reduce
+        // still yields 0, and we write -inf below so exp()→0 downstream.
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0)
-            scores[t_local] = partial * scale_attn;
+            scores[t_local] = out_of_window ? -1e30f : (partial * scale_attn);
     }
     __syncthreads();
 

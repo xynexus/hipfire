@@ -24,7 +24,11 @@ __global__ void attention_flash_asym3_tile_batched(
     float scale_attn,
     int tile_size,
     int max_tiles,
-    int batch_offset
+    int batch_offset,
+    // Sliding-window lookback (Gemma 4). 0 = full causal. Per-batch t_lo
+    // is derived from each token's own position — Q at position p can only
+    // attend to K/V at positions in [p - window_size + 1, p].
+    int window_size
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -38,6 +42,15 @@ __global__ void attention_flash_asym3_tile_batched(
     if (tile_start >= seq_len) return;
     const int tile_end = min(tile_start + tile_size, seq_len);
     const int tile_len = tile_end - tile_start;
+    const int t_lo = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    if (window_size > 0 && tile_end <= t_lo) {
+        float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                            + tile_id * (2 + head_dim);
+        if (tid == 0) { p[0] = -1e30f; p[1] = 0.0f; }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) p[2 + tid * 8 + i] = 0.0f;
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
@@ -85,24 +98,29 @@ __global__ void attention_flash_asym3_tile_batched(
     // Phase A: Q·K
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
-        const unsigned char* base = kb + 4 + tid * 3;
-        unsigned int packed = (unsigned int)base[0]
-                            | ((unsigned int)base[1] << 8)
-                            | ((unsigned int)base[2] << 16);
-        float partial = mq0 * (cnorm * TURBO_C3_256[ packed        & 7])
-                      + mq1 * (cnorm * TURBO_C3_256[(packed >> 3)  & 7])
-                      + mq2 * (cnorm * TURBO_C3_256[(packed >> 6)  & 7])
-                      + mq3 * (cnorm * TURBO_C3_256[(packed >> 9)  & 7])
-                      + mq4 * (cnorm * TURBO_C3_256[(packed >> 12) & 7])
-                      + mq5 * (cnorm * TURBO_C3_256[(packed >> 15) & 7])
-                      + mq6 * (cnorm * TURBO_C3_256[(packed >> 18) & 7])
-                      + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        const bool out_of_window = (window_size > 0) && (t < t_lo);
+        float partial = 0.0f;
+        if (!out_of_window) {
+            const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+            float cnorm = *(const float*)kb;
+            const unsigned char* base = kb + 4 + tid * 3;
+            unsigned int packed = (unsigned int)base[0]
+                                | ((unsigned int)base[1] << 8)
+                                | ((unsigned int)base[2] << 16);
+            partial = mq0 * (cnorm * TURBO_C3_256[ packed        & 7])
+                    + mq1 * (cnorm * TURBO_C3_256[(packed >> 3)  & 7])
+                    + mq2 * (cnorm * TURBO_C3_256[(packed >> 6)  & 7])
+                    + mq3 * (cnorm * TURBO_C3_256[(packed >> 9)  & 7])
+                    + mq4 * (cnorm * TURBO_C3_256[(packed >> 12) & 7])
+                    + mq5 * (cnorm * TURBO_C3_256[(packed >> 15) & 7])
+                    + mq6 * (cnorm * TURBO_C3_256[(packed >> 18) & 7])
+                    + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        }
+        // Warp-reduce with all 32 lanes in lockstep.
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0)
-            scores[t_local] = partial * scale_attn;
+            scores[t_local] = out_of_window ? -1e30f : (partial * scale_attn);
     }
     __syncthreads();
 
