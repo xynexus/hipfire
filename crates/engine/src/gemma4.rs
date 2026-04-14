@@ -670,6 +670,33 @@ impl Gemma4Scratch {
             v_norm_ones_full,
         })
     }
+
+    /// Release every GPU allocation owned by this scratch. Mirrors the
+    /// Qwen35Scratch / LlamaScratch pattern so `unload_model` in the daemon
+    /// can reclaim VRAM on idle eviction.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.x);
+        let _ = gpu.free_tensor(self.residual);
+        let _ = gpu.free_tensor(self.tmp);
+        // pos_buf is a DeviceBuffer, not a GpuTensor; rely on Drop.
+        let _ = gpu.free_tensor(self.q);
+        let _ = gpu.free_tensor(self.k);
+        let _ = gpu.free_tensor(self.v);
+        let _ = gpu.free_tensor(self.attn_out);
+        let _ = gpu.free_tensor(self.gate_ffn);
+        let _ = gpu.free_tensor(self.up_ffn);
+        let _ = gpu.free_tensor(self.ffn_hidden);
+        let _ = gpu.free_tensor(self.ffn_out);
+        let _ = gpu.free_tensor(self.logits);
+        let _ = gpu.free_tensor(self.sample_buf);
+        let _ = gpu.free_tensor(self.repeat_buf);
+        let _ = gpu.free_tensor(self.flash_partials);
+        let _ = gpu.free_tensor(self.sliding_cos);
+        let _ = gpu.free_tensor(self.sliding_sin);
+        let _ = gpu.free_tensor(self.full_cos);
+        let _ = gpu.free_tensor(self.full_sin);
+        let _ = gpu.free_tensor(self.v_norm_ones_full);
+    }
 }
 
 // ─── Forward pass ───────────────────────────────────────────────────────
@@ -974,62 +1001,30 @@ fn full_layer_decode(
     gpu.rope_partial_halved_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
         n_heads, n_kv, head_dim, n_rot_pairs, config.full_rope_theta)?;
 
-    // KV cache write + flash attention with window_size=0 (full causal).
-    if kv_cache.quant_asym3 {
-        let ct = kv_cache.givens_cos.as_ref().unwrap();
-        let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym3_fused(
-            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        gpu.attention_flash_asym3(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            &scratch.flash_partials,
-            0u32,
-        )?;
-    } else if kv_cache.quant_asym4 {
-        let ct = kv_cache.givens_cos.as_ref().unwrap();
-        let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym4_fused(
-            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        gpu.attention_flash_asym4(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            &scratch.flash_partials,
-            0u32,
-        )?;
-    } else if kv_cache.quant_asym2 {
-        let ct = kv_cache.givens_cos.as_ref().unwrap();
-        let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym2_fused(
-            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        gpu.attention_flash_asym2(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            &scratch.flash_partials,
-            0u32,
-        )?;
-    } else if kv_cache.quant_q8 {
-        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim)?;
-        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim)?;
-        gpu.attention_flash_q8_0(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            &scratch.flash_partials,
-            0u32,
-        )?;
-    } else {
+    // KV cache write + attention. Full-attn layers REQUIRE the FP32 KV path:
+    // the quantized flash kernels (asym3/asym4/asym2/q8) all hard-code a
+    // `32 threads × N dims` layout where N∈{4,8}, covering at most 256 dims.
+    // Gemma 4's global_head_dim=512 would silently truncate every head.
+    // Plain attention_f32 processes arbitrary head_dim correctly, and full
+    // layers never need sliding-window (window_size guard lives in the flash
+    // kernels only). daemon.rs forces this cache to FP32 at load time.
+    if kv_cache.quantized {
         return Err(hip_bridge::HipError::new(
             0,
-            "gemma4 full-attn layer requires a quantized KV cache (asym2/asym3/asym4/q8)",
+            "gemma4 full-attn layer requires FP32 KV cache (quantized flash kernels \
+             truncate head_dim>256); allocate via KvCache::new_gpu",
         ));
     }
+    let kv_dim = n_kv * head_dim;
+    gpu.kv_cache_write(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
+    gpu.kv_cache_write(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+    // attention_f32 bakes in scale=1/sqrt(head_dim); our pre-scale of Q by
+    // sqrt(head_dim) above cancels it, giving the Gemma 4 scale=1.0 semantics.
+    gpu.attention_f32(
+        &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+        &scratch.attn_out, &scratch.pos_buf, pos + 1,
+        n_heads, n_kv, head_dim, kv_cache.max_seq,
+    )?;
 
     // o_proj → tmp.
     weight_gemv(gpu, &lw.o_proj, &scratch.attn_out, &scratch.tmp)?;

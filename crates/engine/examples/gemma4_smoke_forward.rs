@@ -57,20 +57,20 @@ fn main() {
 
     let kv_seq = std::env::var("HIPFIRE_SMOKE_KV_SEQ")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(256usize);
-    let sliding_cap = config.sliding_window.min(kv_seq);
     let kv_mode = std::env::var("HIPFIRE_SMOKE_KV").unwrap_or_else(|_| "asym3".to_string());
-    eprintln!("KV cache mode: {kv_mode} (sliding cap {} / full {})", sliding_cap, kv_seq);
+    // Sliding cache must hold every written position (write kernel addresses
+    // absolute pos); sliding_window only gates the *read* side. Full KV is
+    // forced to FP32 because the quantized flash kernels truncate head_dim>256.
+    eprintln!("KV cache: sliding={kv_mode} @ {kv_seq} / full=fp32 @ {kv_seq}");
 
-    let mut new_kv = |nl: usize, kvh: usize, hd: usize, seq: usize, gpu: &mut rdna_compute::Gpu| -> KvCache {
-        match kv_mode.as_str() {
-            "asym4" => KvCache::new_gpu_asym4(gpu, nl, kvh, hd, seq).expect("kv alloc"),
-            "asym2" => KvCache::new_gpu_asym2(gpu, nl, kvh, hd, seq).expect("kv alloc"),
-            "q8"    => KvCache::new_gpu_q8(gpu, nl, kvh, hd, seq).expect("kv alloc"),
-            _       => KvCache::new_gpu_asym3(gpu, nl, kvh, hd, seq).expect("kv alloc"),
-        }
-    };
-    let mut kv_sliding = new_kv(n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap, &mut gpu);
-    let mut kv_full    = new_kv(n_full,    config.full_n_kv_heads,    config.full_head_dim,    kv_seq, &mut gpu);
+    let mut kv_sliding = match kv_mode.as_str() {
+        "asym4" => KvCache::new_gpu_asym4(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
+        "asym2" => KvCache::new_gpu_asym2(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
+        "q8"    => KvCache::new_gpu_q8(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
+        _       => KvCache::new_gpu_asym3(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
+    }.expect("kv sliding alloc");
+    let mut kv_full = KvCache::new_gpu(&mut gpu, n_full, config.full_n_kv_heads, config.full_head_dim, kv_seq)
+        .expect("kv full alloc");
 
     let scratch = Gemma4Scratch::new(&mut gpu, &config, 64).expect("scratch alloc");
     gemma4::init_scratch_constants(&mut gpu, &scratch, config.full_head_dim)
