@@ -18,6 +18,7 @@ pub mod triattn;
 #[cfg(feature = "deltanet")]
 pub mod cask;
 pub mod gemma4;
+#[cfg(feature = "deltanet")]
 pub mod gemma4_vision;
 pub mod image;
 pub mod tokenizer;
