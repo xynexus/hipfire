@@ -182,6 +182,9 @@ pub struct SlidingLayerWeights {
     pub pre_feedforward_layernorm: GpuTensor, // [dim]
     pub post_feedforward_layernorm: GpuTensor,// [dim]
     pub layer_scalar: GpuTensor,              // [1]
+    /// Host-side mirror of layer_scalar. Populated at load time so decode can
+    /// call `gpu.scale_f32(x, layer_scalar_host)` without a D2H round-trip.
+    pub layer_scalar_host: f32,
 
     // Attention (sliding — head_dim=256)
     pub q_proj: WeightTensor,   // [n_heads * 256, dim]
@@ -210,6 +213,8 @@ pub struct FullLayerWeights {
     pub pre_feedforward_layernorm: GpuTensor,
     pub post_feedforward_layernorm: GpuTensor,
     pub layer_scalar: GpuTensor,
+    /// Host-side mirror of layer_scalar. See SlidingLayerWeights for rationale.
+    pub layer_scalar_host: f32,
 
     // Attention (full — head_dim=512, K=V)
     pub q_proj: WeightTensor,   // [n_heads * 512, dim]
@@ -475,45 +480,168 @@ pub fn forward_scratch(
 
 /// Single sliding-window attention layer.
 ///
-/// Order matches HF modeling_gemma4.py:
+/// Order matches HF modeling_gemma4.py::Gemma4TextDecoderLayer +
+/// Gemma4TextAttention (sliding branch):
 ///   residual = x
 ///   x = input_layernorm(x)              — RMSNorm (sandwich pre-attn)
-///   q = q_proj(x); q_normed = q_norm(q) — RMSNorm over head_dim, no weight on v
-///   k = k_proj(x); k_normed = k_norm(k)
-///   v = v_proj(x)                        — no v_norm weight on sliding either
-///   apply RoPE(q, k) with theta=10000, full head_dim=256
+///   q = q_proj(x); q = q_norm(q)        — RMSNorm over head_dim=256
+///   k = k_proj(x); k = k_norm(k)
+///   v = v_proj(x)                        — sliding has its own v_proj
+///   RoPE(q, k) with rotate_half, theta=10000, full head_dim=256
 ///   write K, V to KV cache at position `pos`
-///   attn = flash_attention(q, K_cache, V_cache, window_size=1024)
+///   attn = flash_attention(q, K, V, window_size=1024, scale=1.0 effective)
 ///   x = o_proj(attn)
 ///   x = post_attention_layernorm(x)     — RMSNorm (sandwich post-attn)
-///   x = residual + x                     — residual
+///   x = residual + x
 ///   residual = x
 ///   x = pre_feedforward_layernorm(x)    — RMSNorm (sandwich pre-FFN)
 ///   gate = gate_proj(x); up = up_proj(x)
-///   ffn_hidden = gelu_tanh(gate) * up    — SwiGLU with gelu_pytorch_tanh
-///   x = down_proj(ffn_hidden)
+///   ffn = gelu_pytorch_tanh(gate) * up  — SwiGLU
+///   x = down_proj(ffn)
 ///   x = post_feedforward_layernorm(x)   — RMSNorm (sandwich post-FFN)
-///   x = residual + x                     — residual
-///   x = x * layer_scalar[0]              — learned per-layer scalar
+///   x = residual + x
+///   x = x * layer_scalar                — learned per-layer scalar
+///
+/// Gemma 4 attention uses `scaling=1.0` in HF (see modeling_gemma4.py line 1143).
+/// Our flash kernels bake in `scale = 1/sqrt(head_dim)`; we compensate by
+/// pre-scaling Q by sqrt(head_dim) so the effective scale is 1.0.
 fn sliding_layer_decode(
-    _gpu: &mut Gpu,
-    _config: &Gemma4Config,
-    _lw: &SlidingLayerWeights,
-    _pos: usize,
-    _kv_cache: &mut llama::KvCache,
-    _kv_layer_idx: usize,
-    _scratch: &Gemma4Scratch,
+    gpu: &mut Gpu,
+    config: &Gemma4Config,
+    lw: &SlidingLayerWeights,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    kv_layer_idx: usize,
+    scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
-    // TODO Phase 3b: implement body. Uses existing kernels:
-    //   rmsnorm_f32, rmsnorm_batched, weight_gemv (MQ4 dispatch),
-    //   rope_f32 or rope_batched_f32 (full 256-dim rotation),
-    //   kv_cache_write_asym3_fused / q8_0 (format-specific),
-    //   attention_flash_asym3 with window_size=1024 (or matching format),
-    //   gelu_tanh_f32, mul_f32, scale_f32 (layer_scalar), add_inplace_f32.
-    Err(hip_bridge::HipError::new(
-        0,
-        "gemma4::sliding_layer_decode not implemented (Phase 3b)",
-    ))
+    let dim = config.dim;
+    let head_dim = config.sliding_head_dim;
+    let n_heads = config.n_heads;
+    let n_kv = config.sliding_n_kv_heads;
+    let dim_bytes = dim * 4;
+
+    // residual = x
+    gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+
+    // tmp = input_layernorm(x)
+    gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
+
+    // Q/K/V projections: q[n_heads*head_dim], k/v[n_kv*head_dim].
+    weight_gemv(gpu, &lw.q_proj, &scratch.tmp, &scratch.q)?;
+    weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
+    weight_gemv(gpu, &lw.v_proj, &scratch.tmp, &scratch.v)?;
+
+    // q_norm + k_norm across head_dim (in-place).
+    gpu.rmsnorm_batched(&scratch.q, &lw.q_norm, &scratch.q, n_heads, head_dim, config.norm_eps)?;
+    gpu.rmsnorm_batched(&scratch.k, &lw.k_norm, &scratch.k, n_kv, head_dim, config.norm_eps)?;
+
+    // Pre-scale Q by sqrt(head_dim) so the flash-attn kernel's internal
+    // 1/sqrt(head_dim) cancels, leaving the effective Gemma 4 scale of 1.0.
+    // Only the first n_heads*head_dim elements of scratch.q are live.
+    gpu.scale_f32(&scratch.q, (head_dim as f32).sqrt())?;
+
+    // Full rotate_half RoPE, theta=10000, head_dim=256 (all dims rotate).
+    gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
+        n_heads, n_kv, head_dim, config.sliding_rope_theta)?;
+
+    // KV cache write + flash attention with window_size=1024.
+    // Branch on cache quant mode, same as qwen35::run_fa_layer_body.
+    if kv_cache.quant_asym3 {
+        let ct = kv_cache.givens_cos.as_ref().unwrap();
+        let st = kv_cache.givens_sin.as_ref().unwrap();
+        gpu.kv_cache_write_asym3_fused(
+            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        gpu.attention_flash_asym3(
+            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+            &scratch.flash_partials,
+            config.sliding_window as u32,
+        )?;
+    } else if kv_cache.quant_asym4 {
+        let ct = kv_cache.givens_cos.as_ref().unwrap();
+        let st = kv_cache.givens_sin.as_ref().unwrap();
+        gpu.kv_cache_write_asym4_fused(
+            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        gpu.attention_flash_asym4(
+            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+            &scratch.flash_partials,
+            config.sliding_window as u32,
+        )?;
+    } else if kv_cache.quant_asym2 {
+        let ct = kv_cache.givens_cos.as_ref().unwrap();
+        let st = kv_cache.givens_sin.as_ref().unwrap();
+        gpu.kv_cache_write_asym2_fused(
+            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        gpu.attention_flash_asym2(
+            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+            &scratch.flash_partials,
+            config.sliding_window as u32,
+        )?;
+    } else if kv_cache.quant_q8 {
+        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim)?;
+        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim)?;
+        gpu.attention_flash_q8_0(
+            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.attn_out, &scratch.pos_buf, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+            &scratch.flash_partials,
+            config.sliding_window as u32,
+        )?;
+    } else {
+        // Plain FP32 KV path (kvf16 / kvfp32).
+        let kv_dim = n_kv * head_dim;
+        gpu.kv_cache_write(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+        // No sliding-window support in the plain attention_f32 kernel; this
+        // path is used only for debugging (mostly Qwen3.5 kvf16 mode).
+        return Err(hip_bridge::HipError::new(
+            0,
+            "gemma4 requires a quantized KV cache (asym2/asym3/asym4/q8); kvf16 lacks sliding-window support",
+        ));
+    }
+
+    // o_proj → tmp (reuse tmp, overwriting input_layernorm output).
+    weight_gemv(gpu, &lw.o_proj, &scratch.attn_out, &scratch.tmp)?;
+
+    // Sandwich post-attn norm (in-place on tmp).
+    gpu.rmsnorm_f32(&scratch.tmp, &lw.post_attention_layernorm, &scratch.tmp, config.norm_eps)?;
+
+    // x = residual + tmp. (Reset x first since earlier ops mutated it.)
+    gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
+
+    // residual = x (for the FFN residual stream).
+    gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+
+    // Pre-FFN norm.
+    gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+
+    // SwiGLU(gelu_pytorch_tanh): gate_proj, up_proj, gelu_tanh(gate) * up → down_proj.
+    weight_gemv(gpu, &lw.gate_proj, &scratch.tmp, &scratch.gate_ffn)?;
+    weight_gemv(gpu, &lw.up_proj, &scratch.tmp, &scratch.up_ffn)?;
+    gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, config.hidden_dim)?;
+    gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
+    weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
+
+    // Sandwich post-FFN norm.
+    gpu.rmsnorm_f32(&scratch.ffn_out, &lw.post_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+
+    // x = residual + tmp (again, reset x from saved residual).
+    gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
+
+    // Learned per-layer scalar multiplier.
+    gpu.scale_f32(&scratch.x, lw.layer_scalar_host)?;
+
+    Ok(())
 }
 
 /// Single full (global) attention layer with K=V weight sharing.
@@ -521,34 +649,157 @@ fn sliding_layer_decode(
 /// Key differences from sliding:
 ///   • head_dim = 512 (global_head_dim), 4 KV heads (vs sliding's 256 / 16).
 ///   • V is the *pre*-k_norm output of k_proj — CRITICAL ordering (line 1214
-///     of modeling_gemma4.py). Get this wrong and V is silently mangled.
+///     of modeling_gemma4.py). In Python:
+///         key_states = k_proj(x)
+///         value_states = v_proj(x) if v_proj else key_states   # bound BEFORE norm
+///         key_states   = k_norm(key_states)                    # rebind, value_states holds pre-norm
+///         value_states = v_norm(value_states)
+///     Our translation: write k_proj output into `scratch.k`, memcpy into
+///     `scratch.v`, then apply k_norm in-place on scratch.k.
 ///   • v_norm is `no_scale=true` RMSNorm — divide only, no learned gain.
-///     We pass `scratch.v_norm_ones_full` as the "weight" to the existing
-///     rmsnorm kernel to preserve no-scale semantics.
+///     We call the existing `rmsnorm_batched` with the ones-filled
+///     `scratch.v_norm_ones_full` as the weight vector.
 ///   • RoPE is partial_rotary_factor=0.25 proportional:
-///     first 64 dims rotate with cos/sin from inv_freq[0..64];
-///     dims 64..256 are NoPE (pass-through);
-///     the rotate_half partner at 256..319 sees sin=0, cos=1 (no-op).
-///     Net effect implemented via rope_partial_interleaved_f32(n_rot=64).
+///     pairs (i, i+head_dim/2) for i in [0, 64) rotate with theta=1e6;
+///     pairs [64, 256) are NoPE (identity). See `rope_partial_halved_f32`.
 ///   • No sliding window (window_size=0 = full causal).
+///   • Attention scale = 1.0 (same as sliding — Gemma 4 sets
+///     `self.scaling = 1.0`; we compensate by pre-scaling Q by sqrt(head_dim)).
 fn full_layer_decode(
-    _gpu: &mut Gpu,
-    _config: &Gemma4Config,
-    _lw: &FullLayerWeights,
-    _pos: usize,
-    _kv_cache: &mut llama::KvCache,
-    _kv_layer_idx: usize,
-    _scratch: &Gemma4Scratch,
+    gpu: &mut Gpu,
+    config: &Gemma4Config,
+    lw: &FullLayerWeights,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    kv_layer_idx: usize,
+    scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
-    // TODO Phase 3b: implement body. Same kernel set as sliding layer minus:
-    //   • no v_proj — v_src buffer borrows bytes from post-k_proj output
-    //     BEFORE k_norm is applied. Clone k_raw → v_raw before k_norm.
-    //   • rope_partial_interleaved_f32 with n_rot=64, head_dim=512.
-    //   • attention kernel called with window_size=0.
-    Err(hip_bridge::HipError::new(
-        0,
-        "gemma4::full_layer_decode not implemented (Phase 3b)",
-    ))
+    let dim = config.dim;
+    let head_dim = config.full_head_dim;
+    let n_heads = config.n_heads;
+    let n_kv = config.full_n_kv_heads;
+    let dim_bytes = dim * 4;
+    let kv_bytes = n_kv * head_dim * 4;
+
+    // residual = x
+    gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+
+    // tmp = input_layernorm(x)
+    gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
+
+    // Q + K projections. V is derived from K's pre-norm output below.
+    weight_gemv(gpu, &lw.q_proj, &scratch.tmp, &scratch.q)?;
+    weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
+
+    // CRITICAL: capture pre-k_norm bytes as V before applying k_norm.
+    gpu.hip.memcpy_dtod(&scratch.v.buf, &scratch.k.buf, kv_bytes)?;
+
+    // q_norm, k_norm, and no-scale v_norm (all head_dim = 512).
+    gpu.rmsnorm_batched(&scratch.q, &lw.q_norm, &scratch.q, n_heads, head_dim, config.norm_eps)?;
+    gpu.rmsnorm_batched(&scratch.k, &lw.k_norm, &scratch.k, n_kv, head_dim, config.norm_eps)?;
+    gpu.rmsnorm_batched(&scratch.v, &scratch.v_norm_ones_full, &scratch.v,
+        n_kv, head_dim, config.norm_eps)?;
+
+    // Pre-scale Q by sqrt(head_dim=512) so the flash kernel's 1/sqrt(head_dim)
+    // cancels (Gemma 4 attention scaling is 1.0).
+    gpu.scale_f32(&scratch.q, (head_dim as f32).sqrt())?;
+
+    // Proportional RoPE: rotate_half of the first 64 pairs of every 512-dim head.
+    let n_rot_pairs = ((head_dim as f32) * config.full_partial_rotary_factor * 0.5) as usize;
+    gpu.rope_partial_halved_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
+        n_heads, n_kv, head_dim, n_rot_pairs, config.full_rope_theta)?;
+
+    // KV cache write + flash attention with window_size=0 (full causal).
+    if kv_cache.quant_asym3 {
+        let ct = kv_cache.givens_cos.as_ref().unwrap();
+        let st = kv_cache.givens_sin.as_ref().unwrap();
+        gpu.kv_cache_write_asym3_fused(
+            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        gpu.attention_flash_asym3(
+            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+            &scratch.flash_partials,
+            0u32,
+        )?;
+    } else if kv_cache.quant_asym4 {
+        let ct = kv_cache.givens_cos.as_ref().unwrap();
+        let st = kv_cache.givens_sin.as_ref().unwrap();
+        gpu.kv_cache_write_asym4_fused(
+            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        gpu.attention_flash_asym4(
+            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+            &scratch.flash_partials,
+            0u32,
+        )?;
+    } else if kv_cache.quant_asym2 {
+        let ct = kv_cache.givens_cos.as_ref().unwrap();
+        let st = kv_cache.givens_sin.as_ref().unwrap();
+        gpu.kv_cache_write_asym2_fused(
+            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        gpu.attention_flash_asym2(
+            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+            &scratch.flash_partials,
+            0u32,
+        )?;
+    } else if kv_cache.quant_q8 {
+        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim)?;
+        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim)?;
+        gpu.attention_flash_q8_0(
+            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.attn_out, &scratch.pos_buf, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+            &scratch.flash_partials,
+            0u32,
+        )?;
+    } else {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "gemma4 full-attn layer requires a quantized KV cache (asym2/asym3/asym4/q8)",
+        ));
+    }
+
+    // o_proj → tmp.
+    weight_gemv(gpu, &lw.o_proj, &scratch.attn_out, &scratch.tmp)?;
+
+    // Sandwich post-attn norm.
+    gpu.rmsnorm_f32(&scratch.tmp, &lw.post_attention_layernorm, &scratch.tmp, config.norm_eps)?;
+
+    // x = residual + tmp.
+    gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
+
+    // Save new residual.
+    gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+
+    // Pre-FFN norm.
+    gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+
+    // SwiGLU with gelu_pytorch_tanh activation.
+    weight_gemv(gpu, &lw.gate_proj, &scratch.tmp, &scratch.gate_ffn)?;
+    weight_gemv(gpu, &lw.up_proj, &scratch.tmp, &scratch.up_ffn)?;
+    gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, config.hidden_dim)?;
+    gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
+    weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
+
+    // Sandwich post-FFN norm.
+    gpu.rmsnorm_f32(&scratch.ffn_out, &lw.post_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+
+    // x = residual + tmp.
+    gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
+
+    // Learned per-layer scalar multiplier.
+    gpu.scale_f32(&scratch.x, lw.layer_scalar_host)?;
+
+    Ok(())
 }
 
 /// Batched prefill. Phase 4.
