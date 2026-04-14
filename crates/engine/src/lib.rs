@@ -17,5 +17,7 @@ pub mod ddtree;
 pub mod triattn;
 #[cfg(feature = "deltanet")]
 pub mod cask;
+pub mod gemma4;
+pub mod gemma4_vision;
 pub mod image;
 pub mod tokenizer;

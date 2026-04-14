@@ -28,6 +28,8 @@ use engine::speculative::{
     self, DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
 use engine::triattn::{EvictionCtx, TriAttnCenters};
+use engine::gemma4;
+use engine::gemma4_vision;
 use hip_bridge::HipResult;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -224,9 +226,20 @@ struct LoadedModel {
     llama_weights: Option<llama::LlamaWeights>,
     llama_scratch: Option<llama::ForwardScratch>,
     llama_kv: Option<llama::KvCache>,
-    // Vision state (VL models only)
+    // Vision state (Qwen3.5-VL models only)
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
+    // Gemma 4 state (arch_id=7)
+    g4_config: Option<gemma4::Gemma4Config>,
+    g4_weights: Option<gemma4::Gemma4Weights>,
+    g4_scratch: Option<gemma4::Gemma4Scratch>,
+    /// Gemma 4 uses two KV caches because sliding layers (head_dim=256) and
+    /// full layers (head_dim=512) have different shapes. Dispatched by
+    /// `config.layer_types[layer]`.
+    g4_kv_sliding: Option<llama::KvCache>,
+    g4_kv_full: Option<llama::KvCache>,
+    g4_vision_config: Option<gemma4_vision::Gemma4VisionConfig>,
+    g4_vision_weights: Option<gemma4_vision::Gemma4VisionWeights>,
     // Shared
     tokenizer: Option<engine::tokenizer::Tokenizer>,
     // Multi-turn conversation state
@@ -469,10 +482,13 @@ fn main() {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
+                            7 => "gemma4",
                             _ => "qwen3",
                         };
-                        let vl = m.vision_config.is_some();
+                        let vl = m.vision_config.is_some() || m.g4_vision_config.is_some();
                         let (dim, layers, vocab) = if let Some(ref c) = m.q35_config {
+                            (c.dim, c.n_layers, c.vocab_size)
+                        } else if let Some(ref c) = m.g4_config {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.llama_config {
                             (c.dim, c.n_layers, c.vocab_size)
@@ -608,6 +624,7 @@ fn main() {
                 let model_arch = model.as_ref().map(|m| match m.arch_id {
                     5 => "qwen3_5",
                     6 => "qwen3_5_moe",
+                    7 => "gemma4",
                     _ => "qwen3",
                 }).unwrap_or("none");
                 // Count pre-compiled kernels
@@ -682,6 +699,17 @@ fn main() {
                     let kv = m.kv_cache.as_mut().unwrap();
                     let dn = m.dn_state.as_mut().unwrap();
                     qwen35::forward_prefill_batch(&mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None, None, None).is_ok()
+                } else if m.arch_id == 7 {
+                    let config = m.g4_config.as_ref().unwrap();
+                    let weights = m.g4_weights.as_ref().unwrap();
+                    let scratch = m.g4_scratch.as_ref().unwrap();
+                    let kv_sliding = m.g4_kv_sliding.as_mut().unwrap();
+                    let mut kv_full = m.g4_kv_full.take().unwrap();
+                    let ok = gemma4::forward_prefill_batch(
+                        &mut gpu, weights, config, &synthetic, 0, kv_sliding, &mut kv_full, scratch,
+                    ).is_ok();
+                    m.g4_kv_full = Some(kv_full);
+                    ok
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -1025,6 +1053,76 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: Some(kv), dn_state: Some(dn),
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             vision_config, vision_weights,
+            g4_config: None, g4_weights: None, g4_scratch: None,
+            g4_kv_sliding: None, g4_kv_full: None,
+            g4_vision_config: None, g4_vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, conversation_tokens: Vec::new(),
+        })
+    } else if hfq.arch_id == 7 {
+        // Gemma 4 (gemma-4-31B dense + vision tower).
+        //
+        // Phase 1 scaffolding: config parse works; weight load returns
+        // "not implemented" until Phase 3. The daemon surfaces that error to
+        // the caller so `hipfire list -r` / `hipfire diag` can still inspect
+        // the HFQ without crashing.
+        let config = gemma4::config_from_hfq(&hfq).ok_or("failed to read Gemma 4 config")?;
+        eprintln!(
+            "  Gemma 4: {} layers ({} sliding / {} full), dim={}, n_heads={}, vocab={}",
+            config.n_layers,
+            config.layer_types.iter().filter(|&&t| t == gemma4::LayerType::Sliding).count(),
+            config.layer_types.iter().filter(|&&t| t == gemma4::LayerType::Full).count(),
+            config.dim, config.n_heads, config.vocab_size,
+        );
+
+        let vision_config = gemma4_vision::vision_config_from_hfq(&hfq);
+        let has_vision_tensors = hfq.tensor_data("model.vision_tower.patch_embedder.input_proj.weight").is_some();
+        let (g4_vision_config, g4_vision_weights) = if let Some(vc) = vision_config {
+            if has_vision_tensors {
+                let vw = gemma4_vision::load_vision_weights(&hfq, &vc, gpu).map_err(|e| format!("{e}"))?;
+                eprintln!("  VL: vision tower ({} layers, hidden={})", vc.num_layers, vc.hidden_size);
+                (Some(vc), Some(vw))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        let weights = gemma4::load_weights(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
+
+        // Gemma 4 needs two KV caches: sliding (head_dim=256, 16 heads, 1024
+        // window capacity) and full (head_dim=512, 4 heads, full max_seq).
+        // Layer count for each: partitioned by config.layer_types.
+        let n_sliding = config.layer_types.iter().filter(|&&t| t == gemma4::LayerType::Sliding).count();
+        let n_full = config.layer_types.iter().filter(|&&t| t == gemma4::LayerType::Full).count();
+        // For sliding layers we cap storage at the window size: no token outside
+        // [pos-1024+1, pos] is ever read, so allocating more is waste.
+        let sliding_cap = config.sliding_window.min(max_seq);
+        let kv_sliding = match kv_mode.as_str() {
+            "q8" => llama::KvCache::new_gpu_q8(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap),
+            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap),
+            "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap),
+            _ => llama::KvCache::new_gpu_asym3(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap),
+        }.map_err(|e| format!("{e}"))?;
+        let kv_full = match kv_mode.as_str() {
+            "q8" => llama::KvCache::new_gpu_q8(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq),
+            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq),
+            "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq),
+            _ => llama::KvCache::new_gpu_asym3(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq),
+        }.map_err(|e| format!("{e}"))?;
+
+        let scratch = gemma4::Gemma4Scratch::new(gpu, &config, 128).map_err(|e| format!("{e}"))?;
+
+        Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            vision_config: None, vision_weights: None,
+            g4_config: Some(config), g4_weights: Some(weights), g4_scratch: Some(scratch),
+            g4_kv_sliding: Some(kv_sliding), g4_kv_full: Some(kv_full),
+            g4_vision_config, g4_vision_weights,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
             conversation_tokens: Vec::new(),
@@ -1045,6 +1143,9 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
             vision_config: None, vision_weights: None,
+            g4_config: None, g4_weights: None, g4_scratch: None,
+            g4_kv_sliding: None, g4_kv_full: None,
+            g4_vision_config: None, g4_vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
@@ -1761,6 +1862,22 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens);
         // Silence unused-variable warnings for the params we didn't need.
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text);
+        return;
+    }
+
+    // Gemma 4 generate path lands in Phase 3. Early-exit with a clear error so
+    // `hipfire run gemma-4:31b ...` surfaces the TODO cleanly instead of
+    // panicking inside an Option::unwrap() on a q35_* field that Gemma 4 never
+    // populates.
+    if m.arch_id == 7 {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"Gemma 4 generate not yet implemented (arch_id=7 is scaffolded; forward pass lands in Phase 3)"}}"#,
+            id
+        );
+        let _ = stdout.flush();
+        let _ = (prompt, system_prompt, temp, top_p, max_tokens, repeat_penalty,
+                 repeat_window, budget_alert_at_tok, budget_alert_text, max_think_tokens, gpu);
         return;
     }
 
