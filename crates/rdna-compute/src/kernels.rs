@@ -585,7 +585,6 @@ pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str = include_str!("../../../ke
 /// `n_rot_pairs..head_dim/2` as NoPE. Matches HF `apply_rotary_pos_emb` with
 /// `_compute_proportional_rope_parameters`. Distinct from
 /// `rope_partial_interleaved` which pairs (2i, 2i+1).
-#[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_HALVED_SRC: &str = include_str!("../../../kernels/src/rope_partial_halved.hip");
 
 
@@ -634,7 +633,7 @@ pub const ALPHA_GATE_SRC: &str = include_str!("../../../kernels/src/alpha_gate.h
 
 
 /// Scale vector by constant: x[i] *= scale. Eliminates 48µs CPU roundtrip.
-#[cfg(feature = "deltanet")]
+/// Used by DeltaNet epilogues and Gemma 4 (embed scale + layer_scalar).
 pub const SCALE_F32_SRC: &str = include_str!("../../../kernels/src/scale_f32.hip");
 
 

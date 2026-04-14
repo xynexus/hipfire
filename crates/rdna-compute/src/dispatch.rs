@@ -6816,7 +6816,8 @@ impl Gpu {
     /// Used by Gemma 4 full-attention layers with partial_rotary_factor=0.25
     /// (head_dim=512, n_rot_pairs=64). Matches HF `apply_rotary_pos_emb` +
     /// `_compute_proportional_rope_parameters`.
-    #[cfg(feature = "deltanet")]
+    ///
+    /// Not DeltaNet-specific — Gemma 4 is standard hybrid attention.
     pub fn rope_partial_halved_f32(
         &mut self, q: &GpuTensor, k: &GpuTensor, pos_buf: &hip_bridge::DeviceBuffer,
         n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot_pairs: usize, freq_base: f32,
@@ -7683,7 +7684,7 @@ impl Gpu {
     }
 
     /// Scale vector by constant: x[i] *= scale. Replaces 48µs CPU roundtrip.
-    #[cfg(feature = "deltanet")]
+    /// Not DeltaNet-specific — used by Gemma 4 embed scaling + layer_scalar.
     pub fn scale_f32(&mut self, x: &GpuTensor, scale: f32) -> HipResult<()> {
         self.ensure_kernel("scale_f32", kernels::SCALE_F32_SRC, "scale_f32")?;
         let func = &self.functions["scale_f32"];
