@@ -1184,6 +1184,10 @@ fn main() {
         // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
         // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
         "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
+        // Gemma 4 (gemma-4-31B dense and siblings): hybrid sliding/full attention,
+        // SwiGLU w/ gelu_tanh, sandwich RMSNorm, learned per-layer scalar, final
+        // logit softcap, tied LM head, 262k vocab, multimodal (vision tower).
+        "gemma4" | "gemma" => 7,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
     eprintln!("Architecture: {arch_str} (id={arch_id})");
