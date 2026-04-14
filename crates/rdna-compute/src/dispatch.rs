@@ -6811,6 +6811,46 @@ impl Gpu {
         result
     }
 
+    /// Partial rotate_half RoPE — pairs (i, i+head_dim/2) for the first
+    /// `n_rot_pairs` pairs rotate; remaining pairs are untouched (NoPE).
+    /// Used by Gemma 4 full-attention layers with partial_rotary_factor=0.25
+    /// (head_dim=512, n_rot_pairs=64). Matches HF `apply_rotary_pos_emb` +
+    /// `_compute_proportional_rope_parameters`.
+    #[cfg(feature = "deltanet")]
+    pub fn rope_partial_halved_f32(
+        &mut self, q: &GpuTensor, k: &GpuTensor, pos_buf: &hip_bridge::DeviceBuffer,
+        n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot_pairs: usize, freq_base: f32,
+    ) -> HipResult<()> {
+        self.ensure_kernel("rope_partial_halved", kernels::ROPE_PARTIAL_HALVED_SRC, "rope_partial_halved_f32")?;
+        let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let nhq = n_heads_q as i32; let nhk = n_heads_k as i32;
+        let hd = head_dim as i32; let nrp = n_rot_pairs as i32; let fb = freq_base;
+        let n_pairs = n_rot_pairs as u32;
+        let block = 32u32.min(n_pairs.max(1));
+        let grid = [(n_pairs + block - 1) / block, 1, 1];
+        let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_halved_f32", bytes);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void, &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
+            &nrp as *const _ as *mut c_void, &fb as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "rope_partial_halved_f32", grid, [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);
+                b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd); b.push_i32(nrp);
+                b.push_f32(fb);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Batched partial-interleaved RoPE. Each batch row reads its absolute
     /// position from positions[b] and rotates the first n_rot dims of every
     /// Q and K head. Q/K are [batch_size × n_heads × head_dim] row-major.

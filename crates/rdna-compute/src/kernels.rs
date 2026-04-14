@@ -580,6 +580,14 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str = include_str!("../../../kernels/sr
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str = include_str!("../../../kernels/src/rope_partial_interleaved_batched.hip");
 
+/// Partial rotate_half RoPE (Gemma 4 proportional variant): rotate only the
+/// first `n_rot_pairs` pairs (i, i+head_dim/2), leave pairs
+/// `n_rot_pairs..head_dim/2` as NoPE. Matches HF `apply_rotary_pos_emb` with
+/// `_compute_proportional_rope_parameters`. Distinct from
+/// `rope_partial_interleaved` which pairs (2i, 2i+1).
+#[cfg(feature = "deltanet")]
+pub const ROPE_PARTIAL_HALVED_SRC: &str = include_str!("../../../kernels/src/rope_partial_halved.hip");
+
 
 /// 1D causal depthwise convolution (kernel_size=4) with persistent ring buffer state.
 /// For decode: one token at a time. conv_state: [n_channels × 3] ring buffer.
