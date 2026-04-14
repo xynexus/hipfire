@@ -9202,6 +9202,9 @@ impl Gpu {
         out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
+        // Sliding-window lookback. 0 = full causal (existing behavior).
+        // Gemma 4 sliding layers pass 1024.
+        window_size: u32,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         // Graph-safe: use max_tiles so the grid is position-independent.
@@ -9227,6 +9230,7 @@ impl Gpu {
             let nh = n_heads as i32; let nkv = n_kv_heads as i32;
             let hd = head_dim as i32; let ms = max_seq as i32;
             let sc = scale; let ts = TILE_SIZE as i32;
+            let ws = window_size as i32;
             let grid = [n_heads as u32, launch_tiles as u32, 1];
             let shared = ((TILE_SIZE + head_dim) * 4) as u32;
             let mut params: Vec<*mut c_void> = vec![
@@ -9236,6 +9240,7 @@ impl Gpu {
                 &nkv as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
                 &ms as *const _ as *mut c_void, &sc as *const _ as *mut c_void,
                 &ts as *const _ as *mut c_void,
+                &ws as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 "attention_flash_q8_0_tile", grid, [32, 1, 1], shared, &mut params,
@@ -9245,6 +9250,7 @@ impl Gpu {
                     b.push_ptr(p_ptr); b.push_ptr(pos_ptr);
                     b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
                     b.push_f32(sc); b.push_i32(ts);
+                    b.push_i32(ws);
                     b
                 },
             )?;
@@ -9455,6 +9461,8 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        // 0 = full causal; >0 = sliding window (Gemma 4 sliding layers).
+        window_size: u32,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
@@ -9498,6 +9506,7 @@ impl Gpu {
                 let sc = scale; let ts = TILE_SIZE as i32;
                 let mt = max_tiles as i32; let bo = offset as i32;
                 let bs = block_start as i32; let bc = block_cols as i32;
+                let ws = window_size as i32;
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -9517,6 +9526,7 @@ impl Gpu {
                     &bo as *const _ as *mut c_void,
                     &bs as *const _ as *mut c_void,
                     &bc as *const _ as *mut c_void,
+                    &ws as *const _ as *mut c_void,
                 ];
                 self.launch_maybe_blob(
                     tile_func_name,
@@ -9531,7 +9541,7 @@ impl Gpu {
                         b.push_ptr(ct_ptr); b.push_ptr(st_ptr); b.push_ptr(bias_ptr);
                         b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
                         b.push_f32(sc); b.push_i32(ts); b.push_i32(mt); b.push_i32(bo);
-                        b.push_i32(bs); b.push_i32(bc);
+                        b.push_i32(bs); b.push_i32(bc); b.push_i32(ws);
                         b
                     },
                 )?;
@@ -9623,11 +9633,13 @@ impl Gpu {
         n_heads: usize, n_kv_heads: usize, head_dim: usize,
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
+        // 0 = full causal; >0 = sliding window (Gemma 4 sliding layers).
+        window_size: u32,
     ) -> HipResult<()> {
         self.attention_flash_asym4_batched_masked(
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0,
+            None, 0, 0, window_size,
         )
     }
 
@@ -9646,6 +9658,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        window_size: u32,
     ) -> HipResult<()> {
         self.launch_asym_flash_batched(
             "attention_flash_asym4_tile_batched",
@@ -9653,7 +9666,7 @@ impl Gpu {
             "attention_flash_asym4_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols,
+            tree_bias, block_start, block_cols, window_size,
         )
     }
 
@@ -9666,6 +9679,8 @@ impl Gpu {
         n_heads: usize, n_kv_heads: usize, head_dim: usize,
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
+        // 0 = full causal; >0 = sliding window (Gemma 4 sliding layers).
+        window_size: u32,
     ) -> HipResult<()> {
         self.launch_asym_flash_batched(
             "attention_flash_asym2_tile_batched",
@@ -9673,7 +9688,7 @@ impl Gpu {
             "attention_flash_asym2_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0,
+            None, 0, 0, window_size,
         )
     }
 
@@ -9742,11 +9757,15 @@ impl Gpu {
         n_heads: usize, n_kv_heads: usize, head_dim: usize,
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
+        // Sliding-window lookback per Q position. 0 = full causal (existing
+        // Qwen3.5 behavior). Per-batch bound is derived inside the kernel
+        // from positions[global_bid]. Gemma 4 sliding layers pass 1024.
+        window_size: u32,
     ) -> HipResult<()> {
         self.attention_flash_asym3_batched_masked(
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0,
+            None, 0, 0, window_size,
         )
     }
 
@@ -9764,6 +9783,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        window_size: u32,
     ) -> HipResult<()> {
         self.launch_asym_flash_batched(
             "attention_flash_asym3_tile_batched",
@@ -9771,7 +9791,7 @@ impl Gpu {
             "attention_flash_asym3_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols,
+            tree_bias, block_start, block_cols, window_size,
         )
     }
 
@@ -9783,6 +9803,11 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
+        // Sliding-window lookback. 0 = no window / full causal (existing
+        // behavior, byte-exact). Any positive value limits attention to the
+        // most recent `window_size` positions; older tokens get -inf scores.
+        // Gemma 4 sliding layers pass 1024; every other caller passes 0.
+        window_size: u32,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
@@ -9808,6 +9833,7 @@ impl Gpu {
             let mut hd = head_dim as i32; let mut ms = max_seq as i32;
             let mut sc = scale; let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut ws = window_size as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -9823,6 +9849,7 @@ impl Gpu {
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut ws as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(
@@ -9918,6 +9945,8 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
+        // 0 = full causal; >0 = sliding window (Gemma 4 sliding layers).
+        window_size: u32,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
@@ -10013,6 +10042,8 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
+        // 0 = full causal; >0 = sliding window (Gemma 4 sliding layers).
+        window_size: u32,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
@@ -10038,6 +10069,7 @@ impl Gpu {
             let mut hd = head_dim as i32; let mut ms = max_seq as i32;
             let mut sc = scale; let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut ws = window_size as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -10053,6 +10085,7 @@ impl Gpu {
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut ws as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(
@@ -12419,6 +12452,23 @@ impl Gpu {
             &mut xp as *mut _ as *mut c_void,
             &mut op as *mut _ as *mut c_void,
             &mut ni as *mut _ as *mut c_void,
+        ];
+        let blocks = ((n + 255) / 256) as u32;
+        unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Final-logit soft-capping in-place (Gemma 4): x = tanh(x/cap)*cap.
+    /// Applied to the LM-head output vector (e.g. 262144 floats) before sampling.
+    pub fn logit_softcap_f32(&mut self, x: &GpuTensor, n: usize, cap: f32) -> HipResult<()> {
+        self.ensure_kernel("logit_softcap_f32", kernels::LOGIT_SOFTCAP_SRC, "logit_softcap_f32")?;
+        let func = &self.functions["logit_softcap_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut cp = cap;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
         ];
         let blocks = ((n + 255) / 256) as u32;
         unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }

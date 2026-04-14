@@ -33,7 +33,8 @@ __global__ void attention_flash_q8_0_tile(
     int head_dim,
     int max_seq,
     float scale_attn,
-    int tile_size
+    int tile_size,
+    int window_size  // 0 = full causal; >0 = sliding window (Gemma 4)
 ) {
     const int seq_len = pos_buf[0] + 1;
     const int h = blockIdx.x;
@@ -43,6 +44,18 @@ __global__ void attention_flash_q8_0_tile(
     const int tile_end = min(tile_start + tile_size, seq_len);
     if (tile_start >= seq_len) return;
     const int tile_len = tile_end - tile_start;
+    const int t_lo = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    if (window_size > 0 && tile_end <= t_lo) {
+        const int n_tiles = (seq_len + tile_size - 1) / tile_size;
+        float* p = partials + (h * n_tiles + tile_id) * (2 + head_dim);
+        if (threadIdx.x == 0) { p[0] = -1e30f; p[1] = 0.0f; }
+        const int d = threadIdx.x * 4;
+        p[2 + d + 0] = 0.0f;
+        p[2 + d + 1] = 0.0f;
+        p[2 + d + 2] = 0.0f;
+        p[2 + d + 3] = 0.0f;
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
@@ -82,16 +95,20 @@ __global__ void attention_flash_q8_0_tile(
 
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * row_stride + k_blk_off;
-        float ks = (float)*((const _Float16*)kb);
-        float partial = qb_thread[0] * (ks * (float)((signed char)kb[2 + k_off + 0]))
-                      + qb_thread[1] * (ks * (float)((signed char)kb[2 + k_off + 1]))
-                      + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2]))
-                      + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3]));
+        const bool out_of_window = (window_size > 0) && (t < t_lo);
+        float partial = 0.0f;
+        if (!out_of_window) {
+            const unsigned char* kb = k_cache + (size_t)t * row_stride + k_blk_off;
+            float ks = (float)*((const _Float16*)kb);
+            partial = qb_thread[0] * (ks * (float)((signed char)kb[2 + k_off + 0]))
+                    + qb_thread[1] * (ks * (float)((signed char)kb[2 + k_off + 1]))
+                    + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2]))
+                    + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3]));
+        }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0)
-            scores[t_local] = partial * scale_attn;
+            scores[t_local] = out_of_window ? -1e30f : (partial * scale_attn);
     }
     __syncthreads();
 

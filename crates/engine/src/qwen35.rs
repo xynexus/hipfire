@@ -3897,6 +3897,7 @@ fn forward_prefill_chunk(
                         config.n_heads, config.n_kv_heads, config.head_dim,
                         kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                         tree_bias, block_start, block_cols,
+                        0, // window_size: 0 = full causal (Qwen3.5)
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -3907,6 +3908,7 @@ fn forward_prefill_chunk(
                         config.n_heads, config.n_kv_heads, config.head_dim,
                         kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                         tree_bias, block_start, block_cols,
+                        0, // window_size: 0 = full causal (Qwen3.5)
                     )?;
                 } else if kv_cache.quant_asym2 {
                     assert!(
@@ -3920,6 +3922,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
                         kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                        0, // window_size: 0 = full causal (Qwen3.5)
                     )?;
                 } else if max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
@@ -3943,6 +3946,7 @@ fn forward_prefill_chunk(
                             &out_b, &pos_buf_tmp, seq_len_b,
                             config.n_heads, config.n_kv_heads, config.head_dim,
                             kv_cache.physical_cap, &s.flash_partials,
+                            0, // window_size: 0 = full causal (Qwen3.5)
                         )?;
                     }
                     let _ = gpu.hip.free(pos_buf_tmp);
@@ -4608,6 +4612,7 @@ fn run_fa_layer_body(
             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
             config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
             &s.flash_partials,
+            0, // window_size: 0 = full causal (Qwen3.5)
         )?;
     } else if kv_cache.quant_asym3 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -4620,6 +4625,7 @@ fn run_fa_layer_body(
             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
             config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
             &s.flash_partials,
+            0, // window_size: 0 = full causal (Qwen3.5 has no sliding)
         )?;
     } else if kv_cache.quant_asym2 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -4632,6 +4638,7 @@ fn run_fa_layer_body(
             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
             config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
             &s.flash_partials,
+            0, // window_size: 0 = full causal (Qwen3.5)
         )?;
     } else if kv_cache.quant_q8 {
         gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
@@ -4995,6 +5002,7 @@ fn forward_scratch_layers(
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                         config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
+                        0, // window_size: 0 = full causal (Qwen3.5)
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -5007,6 +5015,7 @@ fn forward_scratch_layers(
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                         config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
+                        0, // window_size: 0 = full causal (Qwen3.5)
                     )?;
                 } else if kv_cache.quant_asym2 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -5019,6 +5028,7 @@ fn forward_scratch_layers(
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                         config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
+                        0, // window_size: 0 = full causal (Qwen3.5)
                     )?;
                 } else if kv_cache.quant_q8 {
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
@@ -5039,6 +5049,7 @@ fn forward_scratch_layers(
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
                             config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                             &s.flash_partials,
+                            0, // window_size: 0 = full causal (Qwen3.5)
                         )?;
                     } else {
                         gpu.attention_q8_0_kv(
@@ -5286,6 +5297,7 @@ fn forward_scratch_layers(
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                         config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
+                        0, // window_size: 0 = full causal (Qwen3.5)
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -5298,6 +5310,7 @@ fn forward_scratch_layers(
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                         config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
+                        0, // window_size: 0 = full causal (Qwen3.5)
                     )?;
                 } else if kv_cache.quant_asym2 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -5310,6 +5323,7 @@ fn forward_scratch_layers(
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                         config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
+                        0, // window_size: 0 = full causal (Qwen3.5)
                     )?;
                 } else if kv_cache.quant_q8 {
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
@@ -5324,6 +5338,7 @@ fn forward_scratch_layers(
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
                             config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                             &s.flash_partials,
+                            0, // window_size: 0 = full causal (Qwen3.5)
                         )?;
                     } else {
                         gpu.attention_q8_0_kv(
