@@ -1676,14 +1676,14 @@ fn forward_from_x_gpu(
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.attention_q8_0_kv(
                         &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 } else {
                     gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
                     gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
                     gpu.attention_f32(
                         &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 }
 
@@ -1855,14 +1855,14 @@ fn forward_from_x_gpu(
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.attention_q8_0_kv(
                         &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 } else {
                     gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
                     gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
                     gpu.attention_f32(
                         &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 }
 
@@ -3297,7 +3297,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                         tree_bias, block_start, block_cols,
                     )?;
                 } else if kv_cache.quant_asym3 {
@@ -3307,7 +3307,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                         tree_bias, block_start, block_cols,
                     )?;
                 } else if kv_cache.quant_asym2 {
@@ -3321,7 +3321,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                     )?;
                 } else if max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
@@ -3344,7 +3344,7 @@ fn forward_prefill_chunk(
                             &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &out_b, &pos_buf_tmp, seq_len_b,
                             config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.max_seq, &s.flash_partials,
+                            kv_cache.physical_cap, &s.flash_partials,
                         )?;
                     }
                     let _ = gpu.hip.free(pos_buf_tmp);
@@ -3354,7 +3354,7 @@ fn forward_prefill_chunk(
                         &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n,
+                        kv_cache.physical_cap, max_ctx_len, n,
                         tree_bias, block_start, block_cols,
                     )?;
                 }
@@ -3716,7 +3716,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                         tree_bias, block_start, block_cols,
                     )?;
                 } else if kv_cache.quant_asym3 {
@@ -3726,7 +3726,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                         tree_bias, block_start, block_cols,
                     )?;
                 } else if kv_cache.quant_asym2 {
@@ -3740,7 +3740,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                     )?;
                 } else if max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
@@ -3762,7 +3762,7 @@ fn forward_prefill_chunk(
                             &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &out_b, &pos_buf_tmp, seq_len_b,
                             config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.max_seq, &s.flash_partials,
+                            kv_cache.physical_cap, &s.flash_partials,
                         )?;
                     }
                     let _ = gpu.hip.free(pos_buf_tmp);
@@ -3772,7 +3772,7 @@ fn forward_prefill_chunk(
                         &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n,
+                        kv_cache.physical_cap, max_ctx_len, n,
                         tree_bias, block_start, block_cols,
                     )?;
                 }
@@ -3913,7 +3913,7 @@ fn run_fa_layer_body(
         gpu.attention_flash_asym4(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
             &s.flash_partials,
         )?;
     } else if kv_cache.quant_asym3 {
@@ -3925,7 +3925,7 @@ fn run_fa_layer_body(
         gpu.attention_flash_asym3(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
             &s.flash_partials,
         )?;
     } else if kv_cache.quant_asym2 {
@@ -3937,7 +3937,7 @@ fn run_fa_layer_body(
         gpu.attention_flash_asym2(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
             &s.flash_partials,
         )?;
     } else if kv_cache.quant_q8 {
@@ -3946,7 +3946,7 @@ fn run_fa_layer_body(
         gpu.attention_q8_0_kv(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
         )?;
     } else {
         gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
@@ -3954,7 +3954,7 @@ fn run_fa_layer_body(
         gpu.attention_f32(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
         )?;
     }
 
@@ -4286,7 +4286,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym4(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym3 {
@@ -4298,7 +4298,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym3(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym2 {
@@ -4310,7 +4310,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym2(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_q8 {
@@ -4330,14 +4330,14 @@ fn forward_scratch_layers(
                         gpu.attention_flash_q8_0(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                             &s.flash_partials,
                         )?;
                     } else {
                         gpu.attention_q8_0_kv(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         )?;
                     }
                 } else {
@@ -4346,7 +4346,7 @@ fn forward_scratch_layers(
                     gpu.attention_f32(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 }
 
@@ -4566,7 +4566,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym4(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym3 {
@@ -4578,7 +4578,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym3(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym2 {
@@ -4590,7 +4590,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym2(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_q8 {
@@ -4604,14 +4604,14 @@ fn forward_scratch_layers(
                         gpu.attention_flash_q8_0(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                             &s.flash_partials,
                         )?;
                     } else {
                         gpu.attention_q8_0_kv(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         )?;
                     }
                 } else {
@@ -4620,7 +4620,7 @@ fn forward_scratch_layers(
                     gpu.attention_f32(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 }
 

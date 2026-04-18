@@ -194,7 +194,7 @@ fn profile_token(
         let t = Instant::now();
         gpu.attention_f32(
             &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
         ).unwrap();
         lt.attention_us = sync_us(gpu, t);
 
