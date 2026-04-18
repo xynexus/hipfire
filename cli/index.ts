@@ -2302,6 +2302,50 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "serve: seconds idle before unloading model (frees VRAM; 0 = never unload)",
       range: [0, 86400], step: 30,
     },
+    experimental_budget_alert: {
+      label: "experimental_budget_alert",
+      desc: "show a one-line warning on startup when an experimental feature is enabled",
+      options: ["true", "false"],
+    },
+    dflash_adaptive_b: {
+      label: "dflash_adaptive_b",
+      desc: "DFlash draft length picker adapts B per-block based on acceptance history",
+      options: ["true", "false"],
+    },
+    dflash_mode: {
+      label: "dflash_mode",
+      desc: "DFlash speculative decoding: on = always, off = disable, auto = arch+model aware",
+      options: ["auto", "on", "off"],
+    },
+    cask_sidecar: {
+      label: "cask_sidecar",
+      desc: "path to CASK sidecar .bin (empty = disabled; enables KV cache pruning)",
+    },
+    cask: {
+      label: "cask",
+      desc: "enable CASK KV eviction when a sidecar is loaded",
+      options: ["true", "false"],
+    },
+    cask_budget: {
+      label: "cask_budget",
+      desc: "CASK keep budget (tokens retained per layer under eviction)",
+      range: [64, 65536], step: 64,
+    },
+    cask_beta: {
+      label: "cask_beta",
+      desc: "CASK recent-window bias — tokens newer than this are always kept",
+      range: [0, 65536], step: 64,
+    },
+    cask_core_frac: {
+      label: "cask_core_frac",
+      desc: "CASK core-aware m-folding fraction (0 = disabled, 1 = full)",
+      range: [0, 1], step: 0.05, decimals: 2,
+    },
+    cask_fold_m: {
+      label: "cask_fold_m",
+      desc: "CASK m-fold factor (1 = no folding, 2+ = fold m heads into one)",
+      range: [1, 16], step: 1,
+    },
   };
 
   let selected = 0;
@@ -2359,7 +2403,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     let idx = m.options.indexOf(cur);
     if (idx < 0) idx = 0;
     const next = m.options[(idx + dir + m.options.length) % m.options.length];
-    setValue(k, next);
+    // Booleans live as true/false in config but render as "true"/"false" in meta.
+    // Convert back so validateConfigValue + saveConfig see the right type.
+    const defaultVal = CONFIG_DEFAULTS[k];
+    const finalVal = typeof defaultVal === "boolean" ? next === "true" : next;
+    setValue(k, finalVal);
   };
 
   const nudge = (k: keyof HipfireConfig, dir: number) => {
@@ -2376,7 +2424,13 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const commitEdit = () => {
     const k = keys[selected];
     const defaultVal = CONFIG_DEFAULTS[k];
-    const parsed = typeof defaultVal === "number" ? Number(editBuffer) : editBuffer;
+    let parsed: any;
+    if (typeof defaultVal === "number") parsed = Number(editBuffer);
+    else if (typeof defaultVal === "boolean") {
+      if (editBuffer === "true") parsed = true;
+      else if (editBuffer === "false") parsed = false;
+      else parsed = editBuffer; // will fail validation, user sees red flash
+    } else parsed = editBuffer;
     if (editBuffer.length > 0 && validateConfigValue(k as string, parsed as any)) {
       const m = meta[k];
       const finalVal = typeof parsed === "number" && m.decimals !== undefined
