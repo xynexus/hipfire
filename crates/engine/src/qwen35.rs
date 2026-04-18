@@ -2023,51 +2023,69 @@ impl Qwen35Scratch {
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
 
+        // NOTE: all persistent scratch buffers are allocated with `gpu.zeros()`
+        // rather than `gpu.alloc_tensor()`. The pool gives us dirty VRAM
+        // (hipMalloc does not zero, and freed buffers aren't scrubbed on
+        // return to the free-list). If any kernel in the forward pass reads
+        // a scratch cell before writing it — even transiently, e.g. a tail
+        // element outside the "used" range of a ragged reduction — the dirty
+        // bytes bleed into the logits and cause per-daemon nondeterminism
+        // (different dirty pattern per process → different argmax at temp=0).
+        // Zero-init adds a one-shot memset at model load, not per-token.
         Ok(Self {
-            x: gpu.alloc_tensor(&[dim], DType::F32)?,
-            tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
+            x: gpu.zeros(&[dim], DType::F32)?,
+            tmp: gpu.zeros(&[dim], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,
 
-            dn_qkv: gpu.alloc_tensor(&[qkv_dim], DType::F32)?,
-            dn_z: gpu.alloc_tensor(&[v_dim], DType::F32)?,
-            dn_alpha: gpu.alloc_tensor(&[config.linear_num_value_heads], DType::F32)?,
-            dn_beta: gpu.alloc_tensor(&[config.linear_num_value_heads], DType::F32)?,
-            dn_conv_out: gpu.alloc_tensor(&[qkv_dim], DType::F32)?,
-            dn_q: gpu.alloc_tensor(&[v_dim], DType::F32)?,
-            dn_k: gpu.alloc_tensor(&[v_dim], DType::F32)?,
-            dn_v: gpu.alloc_tensor(&[v_dim], DType::F32)?,
-            dn_q_raw: gpu.alloc_tensor(&[k_dim], DType::F32)?,
-            dn_k_raw: gpu.alloc_tensor(&[k_dim], DType::F32)?,
-            dn_attn_out: gpu.alloc_tensor(&[v_dim], DType::F32)?,
-            dn_normed: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_qkv: gpu.zeros(&[qkv_dim], DType::F32)?,
+            dn_z: gpu.zeros(&[v_dim], DType::F32)?,
+            dn_alpha: gpu.zeros(&[config.linear_num_value_heads], DType::F32)?,
+            dn_beta: gpu.zeros(&[config.linear_num_value_heads], DType::F32)?,
+            dn_conv_out: gpu.zeros(&[qkv_dim], DType::F32)?,
+            dn_q: gpu.zeros(&[v_dim], DType::F32)?,
+            dn_k: gpu.zeros(&[v_dim], DType::F32)?,
+            dn_v: gpu.zeros(&[v_dim], DType::F32)?,
+            dn_q_raw: gpu.zeros(&[k_dim], DType::F32)?,
+            dn_k_raw: gpu.zeros(&[k_dim], DType::F32)?,
+            dn_attn_out: gpu.zeros(&[v_dim], DType::F32)?,
+            dn_normed: gpu.zeros(&[v_dim], DType::F32)?,
 
-            fa_q_full: gpu.alloc_tensor(&[q_dim * 2], DType::F32)?,
-            fa_q: gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            fa_gate: gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            fa_k: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            fa_v: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            fa_attn_out: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            fa_q_full: gpu.zeros(&[q_dim * 2], DType::F32)?,
+            fa_q: gpu.zeros(&[q_dim], DType::F32)?,
+            fa_gate: gpu.zeros(&[q_dim], DType::F32)?,
+            fa_k: gpu.zeros(&[kv_dim], DType::F32)?,
+            fa_v: gpu.zeros(&[kv_dim], DType::F32)?,
+            fa_attn_out: gpu.zeros(&[q_dim], DType::F32)?,
 
-            o: gpu.alloc_tensor(&[dim], DType::F32)?,
-            gate_ffn: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
-            up: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
-            ffn_hidden: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
-            ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
+            o: gpu.zeros(&[dim], DType::F32)?,
+            gate_ffn: gpu.zeros(&[config.hidden_dim], DType::F32)?,
+            up: gpu.zeros(&[config.hidden_dim], DType::F32)?,
+            ffn_hidden: gpu.zeros(&[config.hidden_dim], DType::F32)?,
+            ffn_out: gpu.zeros(&[dim], DType::F32)?,
 
-            logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
-            sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
-            repeat_buf: gpu.alloc_tensor(&[repeat_window], DType::F32)?,
-            x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
+            logits: gpu.zeros(&[config.vocab_size], DType::F32)?,
+            sample_buf: gpu.zeros(&[2], DType::F32)?,
+            repeat_buf: gpu.zeros(&[repeat_window], DType::F32)?,
+            x_rot: gpu.zeros(&[dim.max(config.hidden_dim)], DType::F32)?,
 
             // Flash attention partials: enough for max_seq with tile_size=128.
             // n_heads * max_tiles * (2 + head_dim) floats.
+            // MUST be zero-initialized: the tile→reduce flash path only writes
+            // the tiles actually covered by the current (pos, kv_len), but the
+            // reduce kernel reads every tile slot for the head; any dirty
+            // tail bleeds into the softmax.
             flash_partials: {
                 let tile_size = 128usize;
                 let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-                // Sized for batched flash prefill: 64 positions × per-position partials.
-                // Reused across layers (not per-call allocated). ~33MB for 9B at 32K.
-                let batch_mult = 64usize;
-                gpu.alloc_tensor(&[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)], DType::F32)?
+                // MUST match MAX_BATCH in forward_prefill_batch_with_pbs. Commit
+                // 43501f7 raised MAX_BATCH 64→256 without resizing this scratch,
+                // so batched flash kernels write past the end on chunks >64
+                // tokens and corrupt adjacent pooled VRAM allocations. The
+                // corruption layout varies per daemon process (pool reuse order
+                // depends on alloc sequence), which shows up as nondeterministic
+                // greedy decode at temp=0. Keep these two in sync.
+                let batch_mult = 256usize;
+                gpu.zeros(&[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)], DType::F32)?
             },
             // Flash attention tri-state for the Q8 path. Asym modes always
             // flash regardless.
@@ -2105,22 +2123,24 @@ impl Qwen35Scratch {
                 let smi = config.shared_expert_intermediate_size;
                 let max_inter = mi.max(smi);
                 let k = config.num_experts_per_tok;
-                s.moe_router_logits = Some(gpu.alloc_tensor(&[n_exp], DType::F32)?);
-                s.moe_scalar_buf    = Some(gpu.alloc_tensor(&[1], DType::F32)?);
-                s.moe_x_rot         = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
-                s.moe_gate_up_buf   = Some(gpu.alloc_tensor(&[2 * max_inter], DType::F32)?);
-                s.moe_gate_buf      = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
-                s.moe_up_buf        = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
-                s.moe_ffn_hidden    = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
-                s.moe_ffn_out       = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
-                s.moe_gate_batch    = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
-                s.moe_up_batch      = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
-                s.moe_rot_batch     = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                // Zero-init to avoid per-daemon nondeterminism from dirty VRAM
+                // — see main struct init comment.
+                s.moe_router_logits = Some(gpu.zeros(&[n_exp], DType::F32)?);
+                s.moe_scalar_buf    = Some(gpu.zeros(&[1], DType::F32)?);
+                s.moe_x_rot         = Some(gpu.zeros(&[hidden], DType::F32)?);
+                s.moe_gate_up_buf   = Some(gpu.zeros(&[2 * max_inter], DType::F32)?);
+                s.moe_gate_buf      = Some(gpu.zeros(&[max_inter], DType::F32)?);
+                s.moe_up_buf        = Some(gpu.zeros(&[max_inter], DType::F32)?);
+                s.moe_ffn_hidden    = Some(gpu.zeros(&[max_inter], DType::F32)?);
+                s.moe_ffn_out       = Some(gpu.zeros(&[hidden], DType::F32)?);
+                s.moe_gate_batch    = Some(gpu.zeros(&[k * mi], DType::F32)?);
+                s.moe_up_batch      = Some(gpu.zeros(&[k * mi], DType::F32)?);
+                s.moe_rot_batch     = Some(gpu.zeros(&[k * mi], DType::F32)?);
                 // i32 topk_indices stored in an F32 tensor (same byte width).
                 // The kernel that writes it casts the buffer to int*, and the
                 // indexed MoE GEMV kernels read it as int*.
-                s.moe_topk_indices  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
-                s.moe_topk_weights  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
+                s.moe_topk_indices  = Some(gpu.zeros(&[k], DType::F32)?);
+                s.moe_topk_weights  = Some(gpu.zeros(&[k], DType::F32)?);
                 // Pre-warm MQ FWHT sign tables (otherwise the lazy init in
                 // ensure_mq_signs fires during the first moe_ffn_decode and
                 // blows up hipGraph capture with a hipMalloc-in-capture
@@ -2318,65 +2338,69 @@ impl PrefillBatchScratch {
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
 
+        // Zero-initialized for the same reason as Qwen35Scratch: dirty VRAM
+        // across daemon restarts produces non-deterministic logits at temp=0
+        // whenever a prefill kernel reads a ragged tail slot before writing
+        // it. One-shot memset at model load, no per-token cost.
         Ok(Self {
             max_batch,
-            x_batch:           gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
-            x_rot_batch:       gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
-            dn_qkv_batch:      gpu.alloc_tensor(&[max_batch * qkv_dim], DType::F32)?,
-            dn_z_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            dn_alpha_batch:    gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
-            dn_beta_batch:     gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
-            dn_q_raw_batch:    gpu.alloc_tensor(&[max_batch * k_dim],   DType::F32)?,
-            dn_k_raw_batch:    gpu.alloc_tensor(&[max_batch * k_dim],   DType::F32)?,
-            dn_v_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            dn_q_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            dn_k_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            dn_attn_out_batch: gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            dn_normed_batch:   gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            gate_ffn_batch:    gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            up_batch:          gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            ffn_hidden_batch:  gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            dn_normed_rot_batch: gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            x_batch:           gpu.zeros(&[max_batch * dim], DType::F32)?,
+            x_rot_batch:       gpu.zeros(&[max_batch * dim], DType::F32)?,
+            dn_qkv_batch:      gpu.zeros(&[max_batch * qkv_dim], DType::F32)?,
+            dn_z_batch:        gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
+            dn_alpha_batch:    gpu.zeros(&[max_batch * n_v_heads], DType::F32)?,
+            dn_beta_batch:     gpu.zeros(&[max_batch * n_v_heads], DType::F32)?,
+            dn_q_raw_batch:    gpu.zeros(&[max_batch * k_dim],   DType::F32)?,
+            dn_k_raw_batch:    gpu.zeros(&[max_batch * k_dim],   DType::F32)?,
+            dn_v_batch:        gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
+            dn_q_batch:        gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
+            dn_k_batch:        gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
+            dn_attn_out_batch: gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
+            dn_normed_batch:   gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
+            gate_ffn_batch:    gpu.zeros(&[max_batch * hidden_dim], DType::F32)?,
+            up_batch:          gpu.zeros(&[max_batch * hidden_dim], DType::F32)?,
+            ffn_hidden_batch:  gpu.zeros(&[max_batch * hidden_dim], DType::F32)?,
+            dn_normed_rot_batch: gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
             // F32 dtype = 4 bytes/element, same layout as i32. The rope /
             // attention / kv_write kernels cast the pointer to `const int*`,
             // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
-            positions:         gpu.alloc_tensor(&[max_batch], DType::F32)?,
-            fa_q_full_batch:   gpu.alloc_tensor(&[max_batch * q_dim * 2], DType::F32)?,
-            fa_q_batch:        gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            fa_gate_batch:     gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            fa_k_batch:        gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
-            fa_v_batch:        gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
-            fa_attn_out_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            fa_attn_out_rot_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
+            positions:         gpu.zeros(&[max_batch], DType::F32)?,
+            fa_q_full_batch:   gpu.zeros(&[max_batch * q_dim * 2], DType::F32)?,
+            fa_q_batch:        gpu.zeros(&[max_batch * q_dim], DType::F32)?,
+            fa_gate_batch:     gpu.zeros(&[max_batch * q_dim], DType::F32)?,
+            fa_k_batch:        gpu.zeros(&[max_batch * kv_dim], DType::F32)?,
+            fa_v_batch:        gpu.zeros(&[max_batch * kv_dim], DType::F32)?,
+            fa_attn_out_batch: gpu.zeros(&[max_batch * q_dim], DType::F32)?,
+            fa_attn_out_rot_batch: gpu.zeros(&[max_batch * q_dim], DType::F32)?,
             moe_router_logits_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts], DType::F32)?)
+                Some(gpu.zeros(&[max_batch * config.num_experts], DType::F32)?)
             } else { None },
             moe_shared_scalar_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch], DType::F32)?)
+                Some(gpu.zeros(&[max_batch], DType::F32)?)
             } else { None },
             moe_shared_gate_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
+                Some(gpu.zeros(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
             } else { None },
             moe_shared_up_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
+                Some(gpu.zeros(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
             } else { None },
             moe_shared_rot_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
+                Some(gpu.zeros(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
             } else { None },
             moe_topk_indices_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok], DType::F32)?)
+                Some(gpu.zeros(&[max_batch * config.num_experts_per_tok], DType::F32)?)
             } else { None },
             moe_topk_weights_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok], DType::F32)?)
+                Some(gpu.zeros(&[max_batch * config.num_experts_per_tok], DType::F32)?)
             } else { None },
             moe_gate_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
+                Some(gpu.zeros(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
             } else { None },
             moe_up_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
+                Some(gpu.zeros(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
             } else { None },
             moe_rot_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
+                Some(gpu.zeros(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
             } else { None },
         })
     }
@@ -4299,6 +4323,7 @@ fn forward_scratch_layers(
                     gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+
                 gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
                 if kv_cache.compact_offset > 0 {
