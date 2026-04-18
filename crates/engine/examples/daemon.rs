@@ -17,18 +17,72 @@
 //!   → {"type":"unload"}
 //!   ← {"type":"unloaded"}
 
+use engine::cask::CaskCtx;
 use engine::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use engine::hfq::HfqFile;
 use engine::llama;
 use engine::qwen35;
-use engine::qwen35::DeltaNetState;
+use engine::qwen35::{DeltaNetState, LayerType};
 use engine::qwen35_vl;
 use engine::speculative::{
     self, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
+use engine::triattn::{EvictionCtx, TriAttnCenters};
+use hip_bridge::HipResult;
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
+
+/// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
+enum Eviction {
+    Plain(EvictionCtx),
+    Cask(CaskCtx),
+}
+
+impl Eviction {
+    fn maybe_evict(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        kv: &mut llama::KvCache,
+        physical: usize,
+    ) -> HipResult<Option<usize>> {
+        match self {
+            Eviction::Plain(c) => c.maybe_evict(gpu, kv, physical),
+            Eviction::Cask(c) => c.maybe_evict(gpu, kv, physical),
+        }
+    }
+    fn budget(&self) -> usize {
+        match self {
+            Eviction::Plain(c) => c.budget,
+            Eviction::Cask(c) => c.base.budget,
+        }
+    }
+    fn beta(&self) -> usize {
+        match self {
+            Eviction::Plain(c) => c.beta,
+            Eviction::Cask(c) => c.base.beta,
+        }
+    }
+    fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+        match self {
+            Eviction::Plain(c) => c.free_gpu(gpu),
+            Eviction::Cask(c) => c.free_gpu(gpu),
+        }
+    }
+}
+
+/// CASK/TriAttention params forwarded by the CLI at load time. Zero-initialized
+/// CaskConfig{sidecar: None, ..} means no eviction — matches 0.1.7-alpha behavior.
+#[derive(Default)]
+struct CaskConfig {
+    sidecar: Option<String>,
+    /// true = CASK m-folding; false = plain TriAttention drop-eviction.
+    cask_m_folding: bool,
+    budget: usize,
+    beta: usize,
+    core_frac: f32,
+    fold_m: usize,
+}
 
 /// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid via flock(2).
 /// Ensures only one hipfire daemon runs at a time; a second instance exits
@@ -126,8 +180,24 @@ struct LoadedModel {
     // Shared
     tokenizer: Option<engine::tokenizer::Tokenizer>,
     // Multi-turn conversation state
-    seq_pos: usize,              // current position in KV cache / DeltaNet state
-    max_seq: usize,              // KV cache capacity
+    //
+    // `seq_pos` is the *physical* write position in the KV cache (the value
+    // passed to `forward_scratch(..., pos, ...)`). With no eviction, physical
+    // == absolute, so seq_pos simply grows. Under eviction, seq_pos is bounded
+    // to `physical_cap`; absolute position = seq_pos + kv.compact_offset.
+    seq_pos: usize,
+    /// Advertised context window — client-facing capacity, the upper bound on
+    /// absolute conversation length. Without eviction this equals
+    /// `physical_cap` (the buffer size); under eviction it can be much larger.
+    max_seq: usize,
+    /// Physical KV buffer capacity, in slots. Allocators size per-layer K/V
+    /// for this many tokens. Under eviction, budget+beta <= physical_cap;
+    /// without eviction, physical_cap == max_seq.
+    physical_cap: usize,
+    /// When Some(_), the daemon calls `maybe_evict` after every prefill-chunk
+    /// and every decode-forward so the physical cache stays bounded by
+    /// `physical_cap` even when `max_seq` advertises a much larger window.
+    eviction: Option<Eviction>,
     conversation_tokens: Vec<u32>, // full token history for repeat penalty
     // Target model file path — cached so the DFlash fast path can reopen the
     // HfqFile mmap to construct a transient ModelSlot without reloading
@@ -253,21 +323,36 @@ fn main() {
                 let _adaptive_b = msg.get("params").and_then(|p| p.get("dflash_adaptive_b"))
                     .and_then(|v| v.as_bool()).unwrap_or(true);
 
-                // 0.1.7-alpha: TriAttention / CASK eviction protocol fields.
-                // Currently accepted but not wired through the daemon generate
-                // path — the serve-time eviction integration lands in 0.1.7
-                // stable. Logged on accept so users can see their config was
-                // received even when the backend doesn't honor it yet.
+                // 0.1.7: TriAttention / CASK eviction protocol fields. When
+                // `cask_sidecar` is set, `load_model` sizes the KV cache to a
+                // *physical_cap* (budget+beta+safety, clamped to max_seq) instead
+                // of the full max_seq, and wires an `Eviction` policy that the
+                // generate loop calls after every prefill-chunk / decode-forward.
+                // That decouples advertised context length from VRAM footprint —
+                // a 128K max_seq can run in ~1K-slot physical buffer when the
+                // operator opts in.
                 let cask_sidecar = msg.get("params").and_then(|p| p.get("cask_sidecar"))
                     .and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
-                if cask_sidecar.is_some() {
-                    eprintln!(
-                        "[hipfire-daemon] cask_sidecar accepted (pending 0.1.7 stable wire-up): {}",
-                        cask_sidecar.as_deref().unwrap_or(""),
-                    );
-                }
+                let cask_enabled = msg.get("params").and_then(|p| p.get("cask"))
+                    .and_then(|v| v.as_bool()).unwrap_or(false);
+                let cask_budget = msg.get("params").and_then(|p| p.get("cask_budget"))
+                    .and_then(|v| v.as_u64()).unwrap_or(512) as usize;
+                let cask_beta = msg.get("params").and_then(|p| p.get("cask_beta"))
+                    .and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+                let cask_core_frac = msg.get("params").and_then(|p| p.get("cask_core_frac"))
+                    .and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+                let cask_fold_m = msg.get("params").and_then(|p| p.get("cask_fold_m"))
+                    .and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+                let cask = CaskConfig {
+                    sidecar: cask_sidecar,
+                    cask_m_folding: cask_enabled,
+                    budget: cask_budget,
+                    beta: cask_beta,
+                    core_frac: cask_core_frac,
+                    fold_m: cask_fold_m,
+                };
 
-                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &mut gpu) {
+                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -342,7 +427,9 @@ fn main() {
             }
 
             "reset" => {
-                // Reset conversation state without unloading the model
+                // Reset conversation state without unloading the model.
+                // Under eviction, also zero the compact_offset so absolute
+                // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
@@ -358,6 +445,8 @@ fn main() {
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                     }
+                    if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
+                    if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = 0; }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -419,12 +508,14 @@ fn main() {
                     }
                 };
                 let n = msg.get("tokens").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
-                // Guard max_seq — reserve 32 slots of headroom so a subsequent
-                // generate request against the loaded model still has room.
-                if n + 32 > m.max_seq {
+                // Guard physical_cap — reserve 32 slots of headroom so a subsequent
+                // generate request against the loaded model still has room. We guard
+                // on the *physical* buffer (not the advertised max_seq) because this
+                // bench intentionally bypasses eviction to measure raw prefill.
+                if n + 32 > m.physical_cap {
                     let _ = writeln!(stdout,
-                        r#"{{"type":"error","message":"bench_prefill tokens={} exceeds loaded max_seq={}"}}"#,
-                        n, m.max_seq);
+                        r#"{{"type":"error","message":"bench_prefill tokens={} exceeds loaded physical_cap={}"}}"#,
+                        n, m.physical_cap);
                     let _ = stdout.flush();
                     continue;
                 }
@@ -524,7 +615,7 @@ fn main() {
     }
 }
 
-fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, cask: &CaskConfig, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     // Per-load kv_mode (sent in load message params) overrides the env var.
     // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
     // since layer-count compounding of asym3 noise flips argmax at decision
@@ -536,6 +627,24 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
+
+    // Derive physical_cap. With eviction (cask.sidecar set), the physical
+    // buffer only needs to hold budget+beta+safety slots; max_seq is the
+    // advertised window the client targets. Without eviction, the two are
+    // identical (prior behavior).
+    //
+    // The `HIPFIRE_KV_PHYSICAL_CAP` env var is an explicit operator override —
+    // useful for ablations or reproducing dflash_spec_demo settings.
+    let physical_cap = if cask.sidecar.is_some() {
+        let env_override = std::env::var("HIPFIRE_KV_PHYSICAL_CAP").ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        let safety = 256usize;
+        let floor = cask.budget + cask.beta + 4;
+        let derived = cask.budget + cask.beta + safety;
+        env_override.unwrap_or(derived).clamp(floor, max_seq)
+    } else {
+        max_seq
+    };
 
     if hfq.arch_id == 5 || hfq.arch_id == 6 {
         // Qwen3.5 DeltaNet (arch=5 dense, arch=6 MoE/A3B)
@@ -566,27 +675,70 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         //   q8    — K+V both Q8_0. 3.76× (reference quality).
         //
         // Legacy "turbo{2,3,4}" aliases map to asym{2,3,4} for backward compat.
+        //
+        // All allocators go through the `_capped` entry points with
+        // physical_cap derived above. Without eviction, physical_cap==max_seq
+        // and these match the back-compat wrappers byte-for-byte.
         let kv = match kv_mode.as_str() {
             "q8" => {
                 eprintln!("  KV cache: Q8");
-                llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
             "asym4" | "turbo4" => {
-                llama::KvCache::new_gpu_asym4(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym4_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
             "asym2" | "turbo2" => {
-                llama::KvCache::new_gpu_asym2(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym2_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
             "asym3" | "turbo3" | "turbo" | "auto" | "" => {
-                llama::KvCache::new_gpu_asym3(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
             other => {
                 eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-                llama::KvCache::new_gpu_asym3(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
         };
         let dn = DeltaNetState::new(gpu, &config).map_err(|e| format!("{e}"))?;
-        let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 128).map_err(|e| format!("{e}"))?;
+        // Flash partials size with physical_cap (bounds the max_tiles the
+        // flash kernel must address). When physical_cap == max_seq this is
+        // identical to sizing-by-max_seq; under eviction it's much smaller.
+        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &config, 128, physical_cap).map_err(|e| format!("{e}"))?;
+
+        // Build eviction policy if the operator supplied a sidecar. Qwen3 (arch_id < 5)
+        // lacks the FA/LA hybrid wiring TriAttention needs, so sidecars only take
+        // effect on arch_id 5/6 — see the cask.rs docs for why CASK targets full-
+        // attention layers only.
+        let eviction = if let Some(ref sidecar_path) = cask.sidecar {
+            let centers = TriAttnCenters::load(Path::new(sidecar_path))
+                .map_err(|e| format!("load cask sidecar {}: {e}", sidecar_path))?;
+            let fa_layer_ids: Vec<usize> = config.layer_types.iter().enumerate()
+                .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
+                .collect();
+            if fa_layer_ids.is_empty() {
+                eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
+                None
+            } else {
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                let base = EvictionCtx::new(
+                    gpu, &centers, fa_layer_ids, cask.budget, cask.beta,
+                    config.n_heads, config.n_kv_heads, config.head_dim,
+                    n_rot, config.rope_theta, physical_cap,
+                ).map_err(|e| format!("build EvictionCtx: {e}"))?;
+                if cask.cask_m_folding {
+                    eprintln!(
+                        "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
+                        cask.core_frac, cask.fold_m, cask.budget, cask.beta, physical_cap,
+                    );
+                    Some(Eviction::Cask(CaskCtx::new(base, cask.core_frac, cask.fold_m)))
+                } else {
+                    eprintln!(
+                        "  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
+                        cask.budget, cask.beta, physical_cap,
+                    );
+                    Some(Eviction::Plain(base))
+                }
+            }
+        } else { None };
         // Optional DFlash draft: load the draft model's weights + a fresh set
         // of per-cycle scratch buffers (hidden ring, verify scratch, GdnTape,
         // DeltaNetSnapshot) sized for the target's max_seq. If the draft file
@@ -616,12 +768,14 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, conversation_tokens: Vec::new(),
+            seq_pos: 0, max_seq, physical_cap, eviction,
+            conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash,
         })
     } else {
-        // Qwen3 / LLaMA
+        // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
+        // the FA/LA hybrid wiring from arch_id 5/6). physical_cap == max_seq.
         let config = engine::hfq::config_from_hfq(&hfq).ok_or("failed to read LLaMA config")?;
         let weights = engine::hfq::load_weights_hfq(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
         eprintln!("  KV cache: Q8");
@@ -634,7 +788,8 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, conversation_tokens: Vec::new(),
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
         })
@@ -651,6 +806,8 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         df.draft_weights.free_gpu(gpu);
         df.draft_scratch.free_gpu(gpu);
     }
+    // Free eviction context (centers + scratch tensors) if active.
+    if let Some(ev) = m.eviction { ev.free_gpu(gpu); }
     // Free KV cache + DeltaNet state + scratch first (small fraction of VRAM).
     if let Some(kv) = m.kv_cache { kv.free_gpu(gpu); }
     if let Some(dn) = m.dn_state { dn.free_gpu(gpu); }
@@ -999,13 +1156,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         return;
     }
 
-    // Auto-reset on multi-turn rollover. The estimate here is intentionally
-    // rough (ignores system prompt, which is only prepended on seq_pos==0);
-    // undercounting only means we reset slightly later, and the EXACT
-    // post-build guard below is the hard guarantee against KV overrun.
+    // Auto-reset on multi-turn rollover. When eviction is active (operator
+    // enabled cask_sidecar at load), the physical buffer is bounded by
+    // budget+beta+safety regardless of conversation length, so reset never
+    // needs to fire — eviction reclaims slots after each token. When eviction
+    // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!("[daemon] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
@@ -1015,6 +1173,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
             for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
         }
+        if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
+        if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = 0; }
     }
 
     let im_start = tokenizer.encode("<|im_start|>");
@@ -1051,20 +1211,32 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     new_tokens.extend_from_slice(&asst_tok);
     new_tokens.extend_from_slice(&nl);
 
-    // EXACT KV-budget guard. `new_tokens.len()` is the precise prefill cost
-    // (including system prompt on seq_pos==0 and all ChatML framing tokens);
-    // plus max_tokens for generation, plus nl.len() reserved for the ChatML
-    // trailer we run through forward AFTER an im_end termination (see the
-    // `for &t in &nl` loops below — they increment seq_pos and call
-    // forward_scratch at the new position). Without reserving those slots,
-    // a request that exactly fills max_seq and terminates naturally on
-    // im_end silently writes past the KV buffer.
+    // KV-budget guard. Without eviction the physical buffer is the hard cap;
+    // we must fit prefill + generation + trailer in one allocation. With
+    // eviction, physical is bounded by physical_cap regardless of total tokens
+    // — the chunked prefill below calls maybe_evict between chunks, and the
+    // decode loop evicts after every token. The only ceiling under eviction is
+    // the advertised context window (max_seq) — refuse requests that would
+    // overflow it in absolute position terms (current absolute + new).
     let trailer = nl.len();
-    if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.max_seq {
+    let absolute_pos = m.seq_pos
+        + m.kv_cache.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
+        + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0);
+    if m.eviction.is_none() {
+        if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
+                id, m.seq_pos, new_tokens.len(), max_tokens, trailer, m.physical_cap
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    } else if absolute_pos + new_tokens.len() + max_tokens + trailer > m.max_seq {
         let _ = writeln!(
             stdout,
-            r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > max_seq={} — reload model with a larger max_seq"}}"#,
-            id, m.seq_pos, new_tokens.len(), max_tokens, trailer, m.max_seq
+            r#"{{"type":"error","id":"{}","message":"request exceeds advertised context window: absolute={} + prefill={} + max_tokens={} + trailer={} > max_seq={}"}}"#,
+            id, absolute_pos, new_tokens.len(), max_tokens, trailer, m.max_seq
         );
         let _ = stdout.flush();
         return;
@@ -1096,11 +1268,36 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // which the first token is actually ready to stream. Placing the
         // mark earlier captures CPU-dispatch time, which under-reports
         // prefill by a large factor (prefill_tok_s ~5–10× too optimistic).
-        qwen35::forward_prefill_batch(
-            gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
-            None, None, None, None,
-        ).unwrap();
-        m.seq_pos += new_tokens.len();
+        //
+        // Under eviction: chunk prefill to the (budget+beta) eviction window
+        // and call `maybe_evict` between chunks so physical never exceeds
+        // physical_cap. Chunk size caps out at physical capacity available —
+        // when physical is at post-evict `budget`, a full `beta`-sized chunk
+        // can run before the next eviction fires.
+        if let Some(ref ev) = m.eviction {
+            let window = ev.budget() + ev.beta();
+            let mut remaining: &[u32] = &new_tokens;
+            while !remaining.is_empty() {
+                let space = window.saturating_sub(m.seq_pos).max(1);
+                let chunk_len = remaining.len().min(space);
+                let (chunk, rest) = remaining.split_at(chunk_len);
+                qwen35::forward_prefill_batch(
+                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch,
+                    None, None, None, None,
+                ).unwrap();
+                m.seq_pos += chunk_len;
+                if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                    m.seq_pos = new_phys;
+                }
+                remaining = rest;
+            }
+        } else {
+            qwen35::forward_prefill_batch(
+                gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
+                None, None, None, None,
+            ).unwrap();
+            m.seq_pos += new_tokens.len();
+        }
         m.conversation_tokens.extend_from_slice(&new_tokens);
 
         // ngram scope for the repeat penalty: ONLY generated tokens (never the
@@ -1171,8 +1368,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             // forward_scratch used to leave a hole at the im_end/eos
             // position — the next turn then attended over zero-init K/V
             // at that slot.
-            let pos = m.seq_pos + generated - 1;
-            qwen35::forward_scratch(gpu, weights, config, next_token, pos, kv, dn, scratch).unwrap();
+            //
+            // Under eviction, m.seq_pos is the *physical* write slot; we
+            // advance and call maybe_evict immediately so the next write
+            // never overruns physical_cap. compact_offset bookkeeping on
+            // the cache itself keeps RoPE phase correct across evictions.
+            qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
+            m.seq_pos += 1;
+            if let Some(ref ev) = m.eviction {
+                if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                    m.seq_pos = new_phys;
+                }
+            }
 
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
@@ -1224,13 +1431,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 let nudge_tokens = tokenizer.encode(budget_alert_text);
                 let budget_left = max_tokens.saturating_sub(generated);
                 let nudge_len = nudge_tokens.len().min(budget_left);
-                // KV headroom check — don't run past max_seq. If we don't have
-                // room for the clipped nudge, skip entirely rather than emit a
-                // partial nudge that poisons the trajectory. Trailer reservation
-                // matches the post-loop ChatML `\n` write so we don't slide past
-                // the KV budget guard established at the top of `generate`.
-                let need_kv = m.seq_pos + generated + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
-                if nudge_len > 0 && need_kv <= m.max_seq {
+                // KV headroom check — don't run past physical_cap. If we don't
+                // have room for the clipped nudge, skip entirely rather than
+                // emit a partial nudge that poisons the trajectory. Under
+                // eviction the physical check is trivially satisfied (budget
+                // always holds post-evict), but we still respect the check for
+                // the non-eviction path.
+                let need_kv = m.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+                if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
                     for &tok in &nudge_tokens[..nudge_len] {
                         m.conversation_tokens.push(tok);
                         streamed_tokens.push(tok);
@@ -1247,8 +1455,13 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                             let _ = stdout.flush();
                             emitted_bytes += vl2;
                         }
-                        let pos2 = m.seq_pos + generated;
-                        qwen35::forward_scratch(gpu, weights, config, tok, pos2, kv, dn, scratch).unwrap();
+                        qwen35::forward_scratch(gpu, weights, config, tok, m.seq_pos, kv, dn, scratch).unwrap();
+                        m.seq_pos += 1;
+                        if let Some(ref ev) = m.eviction {
+                            if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                                m.seq_pos = new_phys;
+                            }
+                        }
                         generated += 1;
                     }
                 } else if nudge_len < nudge_tokens.len() {
@@ -1280,7 +1493,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             next_token = tok;
             rng_state = rng;
         }
-        m.seq_pos += generated;
+        // m.seq_pos is already the "next physical write slot" — advanced
+        // per-token in the decode loop above, and evicted back down to
+        // `budget` whenever maybe_evict fired. No post-loop fix-up needed.
 
         // ChatML requires \n after <|im_end|>. Run it through forward so KV cache
         // and DeltaNet state stay in sync with seq_pos.
@@ -1288,6 +1503,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             for &t in &nl {
                 qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
                 m.seq_pos += 1;
+                if let Some(ref ev) = m.eviction {
+                    if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                        m.seq_pos = new_phys;
+                    }
+                }
                 m.conversation_tokens.push(t);
             }
         }
@@ -1408,7 +1628,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let n_patches = (IMAGE_SIZE / vision_config.patch_size) * (IMAGE_SIZE / vision_config.patch_size);
     let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
     let prompt_est = tokenizer.encode(prompt).len() + n_visual_tokens + 20; // text + vision + ChatML overhead
-    if m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!("[daemon/vl] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
@@ -1418,6 +1638,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
             for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
             for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
         }
+        if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
     }
     let config = m.q35_config.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
@@ -1482,14 +1703,22 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     prompt_tokens.extend_from_slice(&asst_tok);
     prompt_tokens.extend_from_slice(&nl);
 
-    // EXACT KV-budget guard — same contract as `generate` (reserves nl.len()
-    // for the ChatML trailer written post-generation on im_end termination).
+    // KV-budget guard — physical_cap without eviction, absolute window with.
+    // Mirrors the textual generate() contract; reserves trailer slots so
+    // natural im_end termination can still write the ChatML \n.
     let trailer = nl.len();
-    if m.seq_pos + prompt_tokens.len() + max_tokens + trailer > m.max_seq {
+    let absolute_pos_vl = m.seq_pos + kv.compact_offset;
+    let over_budget = if m.eviction.is_none() {
+        m.seq_pos + prompt_tokens.len() + max_tokens + trailer > m.physical_cap
+    } else {
+        absolute_pos_vl + prompt_tokens.len() + max_tokens + trailer > m.max_seq
+    };
+    if over_budget {
         let _ = writeln!(
             stdout,
-            r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > max_seq={} — reload model with a larger max_seq"}}"#,
-            id, m.seq_pos, prompt_tokens.len(), max_tokens, trailer, m.max_seq
+            r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq"}}"#,
+            id, m.seq_pos, prompt_tokens.len(), max_tokens, trailer,
+            if m.eviction.is_none() { m.physical_cap } else { m.max_seq },
         );
         let _ = stdout.flush();
         return;
@@ -1499,21 +1728,27 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let prefill_tokens = prompt_tokens.len();
     let t0 = Instant::now();
 
-    // Prefill with vision token embedding for IMAGE_PAD positions
+    // Prefill with vision token embedding for IMAGE_PAD positions.
+    // VL prefill is already per-token (forward_scratch_embed isn't batched),
+    // so we advance m.seq_pos in-loop and call maybe_evict after every write.
     let mut visual_idx = 0usize;
-    for (i, &token) in prompt_tokens.iter().enumerate() {
-        let pos = m.seq_pos + i;
+    for &token in prompt_tokens.iter() {
         if token == IMAGE_PAD_ID && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
-            qwen35::forward_scratch_embed(gpu, weights, config, emb, pos, kv, dn, scratch)
+            qwen35::forward_scratch_embed(gpu, weights, config, emb, m.seq_pos, kv, dn, scratch)
                 .expect("forward_scratch_embed failed");
             visual_idx += 1;
         } else {
-            qwen35::forward_scratch(gpu, weights, config, token, pos, kv, dn, scratch)
+            qwen35::forward_scratch(gpu, weights, config, token, m.seq_pos, kv, dn, scratch)
                 .expect("forward_scratch failed");
         }
+        m.seq_pos += 1;
+        if let Some(ref ev) = m.eviction {
+            if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                m.seq_pos = new_phys;
+            }
+        }
     }
-    m.seq_pos += prompt_tokens.len();
     m.conversation_tokens.extend_from_slice(&prompt_tokens);
 
     // Generate
@@ -1532,20 +1767,29 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         if next_token == config.eos_token { break; }
         if im_end_token == Some(next_token) { break; }
 
-        let pos = m.seq_pos + generated - 1;
-        qwen35::forward_scratch(gpu, weights, config, next_token, pos, kv, dn, scratch).unwrap();
+        qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
+        m.seq_pos += 1;
+        if let Some(ref ev) = m.eviction {
+            if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                m.seq_pos = new_phys;
+            }
+        }
         logits = gpu.download_f32(&scratch.logits).unwrap();
         llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
         llama::apply_repeat_penalty(&mut logits, &m.conversation_tokens, repeat_window, repeat_penalty);
         next_token = llama::sample_top_p(&logits, temp, top_p);
     }
-    m.seq_pos += generated;
 
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
     if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
         for &t in &nl {
             qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
             m.seq_pos += 1;
+            if let Some(ref ev) = m.eviction {
+                if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                    m.seq_pos = new_phys;
+                }
+            }
             m.conversation_tokens.push(t);
         }
     }

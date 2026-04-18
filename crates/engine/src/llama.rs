@@ -2164,7 +2164,7 @@ impl KvCache {
             k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
         Ok(Self {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
-            max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
             quant_asym4: true, quant_asym3: false, quant_asym2: false,
             boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),
@@ -2274,7 +2274,7 @@ impl KvCache {
             k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
         Ok(Self {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
-            max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
             quant_asym4: false, quant_asym3: false, quant_asym2: true,
             boundary_layers: 0, givens_cos: Some(ct), givens_sin: Some(st),

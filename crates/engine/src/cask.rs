@@ -58,6 +58,11 @@ impl CaskCtx {
         self.base.eviction_count.get()
     }
 
+    /// Release all GPU buffers held by the underlying EvictionCtx.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.base.free_gpu(gpu);
+    }
+
     /// Same trigger + return convention as `EvictionCtx::maybe_evict`.
     /// Falls back to plain TriAttention for non-Q8 modes in v1.
     pub fn maybe_evict(

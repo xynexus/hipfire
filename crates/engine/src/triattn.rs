@@ -698,6 +698,16 @@ impl EvictionCtx {
         self.eviction_count.set(self.eviction_count.get() + 1);
         Ok(Some(self.budget))
     }
+
+    /// Release all GPU buffers held by the context. Consumed by value;
+    /// the daemon calls this on unload to return VRAM.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.centers_dev);
+        let _ = gpu.free_tensor(self.scores_buf);
+        let _ = gpu.free_tensor(self.k_compact);
+        let _ = gpu.free_tensor(self.v_compact);
+        let _ = gpu.free_tensor(self.retain_dev);
+    }
 }
 
 // ─── Pearson correlation helper ──────────────────────────────────────────
