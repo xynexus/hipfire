@@ -146,8 +146,13 @@ echo "[chain-runner] skip_until='${SKIP_UNTIL:-<none>}'"
 run_if_pending 9b_scratch_25k           job_9b_scratch_25k           || exit 1
 run_if_pending 9b_scratch_convert       job_9b_scratch_convert       || exit 1
 run_if_pending 9b_sidecar_cal           job_9b_sidecar_cal           || exit 1
-run_if_pending 4b_scratch_25k           job_4b_scratch_25k           || exit 1
-run_if_pending 4b_scratch_convert       job_4b_scratch_convert       || exit 1
-run_if_pending 4b_sidecar_cal           job_4b_sidecar_cal           || exit 1
+
+# PAUSE POINT 2026-04-19: user wants to test 9B draft+sidecar before running
+# 4B. If testing validates the pipeline, the plan is to spin up an 8× cluster
+# for Qwen3.6-A3B and others — making a 1× 4B scratch run redundant.
+# Uncomment the 4B block below only if 9B test fails and we want a 4B fallback.
+# run_if_pending 4b_scratch_25k           job_4b_scratch_25k           || exit 1
+# run_if_pending 4b_scratch_convert       job_4b_scratch_convert       || exit 1
+# run_if_pending 4b_sidecar_cal           job_4b_sidecar_cal           || exit 1
 
 echo "[chain-runner] ALL JOBS DONE at $(date -Is)"
