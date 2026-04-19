@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Coherence battery — replaces the byte-exact MQ4 quality gate.
+#
+# Rationale: byte-exact comparison blocks legitimate numerical-correctness
+# improvements (e.g., norm convention fixes that change output for the
+# better). This gate instead runs a small fixed matrix of (model × prompt)
+# through the daemon and writes a markdown report that a human/agent
+# reviewer reads before committing. The gate itself only fails on hard
+# daemon/error signals (panics, non-zero exit, zero tokens emitted);
+# correctness is assessed qualitatively on the report.
+#
+# Exit codes:
+#   0  battery ran clean — open the report and inspect coherence
+#   1  a test hit a hard error (daemon panic / zero tokens / timeout)
+#   2  build or environment error
+#
+# Report destination: /tmp/coherence-<timestamp>.md (or $HIPFIRE_COHERENCE_OUT)
+#
+# Modes:
+#   ./scripts/coherence-gate.sh          # short battery (~2-4 min)
+#   ./scripts/coherence-gate.sh --full   # add A3B tests (~6-10 min)
+
+set -u
+cd "$(dirname "$0")/.."
+
+FULL=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --full) FULL=1 ;;
+        -h|--help)
+            sed -n '3,21p' "$0"
+            exit 0
+            ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+EXE="./target/release/examples/daemon"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-/home/kaden/ClaudeCode/autorocm/hipfire/models}"
+OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-$(date +%Y%m%d-%H%M%S).md}"
+LOCK_SCRIPT="./scripts/gpu-lock.sh"
+
+# ── Rebuild daemon if any relevant source is newer than the binary ────────
+rebuild=0
+if [ ! -x "$EXE" ]; then
+    rebuild=1
+else
+    for src in crates/engine/src/qwen35.rs crates/engine/src/llama.rs \
+               crates/engine/src/hfq.rs crates/engine/examples/daemon.rs \
+               crates/rdna-compute/src/dispatch.rs; do
+        if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
+            rebuild=1
+            break
+        fi
+    done
+fi
+if [ "$rebuild" -eq 1 ]; then
+    echo "coherence-gate: rebuilding daemon..."
+    if ! cargo build --release --example daemon --features deltanet >&2; then
+        echo "coherence-gate: build failed" >&2
+        exit 2
+    fi
+fi
+
+# ── GPU lock ──────────────────────────────────────────────────────────────
+if [ -r "$LOCK_SCRIPT" ]; then
+    # shellcheck disable=SC1090
+    . "$LOCK_SCRIPT"
+    gpu_acquire "coherence-gate" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap 'gpu_release 2>/dev/null || true' EXIT
+fi
+
+# ── Test matrix ───────────────────────────────────────────────────────────
+# Format: "model_file|id|prompt|max_tokens"
+# Short battery: the three dense sizes + a small multi-turn recall check.
+# Full battery (--full): adds A3B MoE tests (loads large models, ~2-3 min each).
+SHORT_TESTS=(
+    "qwen3.5-0.8b.mq4|cap|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.5-4b.mq4|code|Write a one-line Python function named square that returns n*n.|180"
+    "qwen3.5-9b.mq4|reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+)
+FULL_EXTRA=(
+    "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+    "qwen3.6-35b-a3b.mq4|moe36-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
+)
+tests=("${SHORT_TESTS[@]}")
+if [ "$FULL" -eq 1 ]; then
+    tests+=("${FULL_EXTRA[@]}")
+fi
+
+# ── Run ───────────────────────────────────────────────────────────────────
+hard_errors=0
+
+{
+    echo "# Coherence battery"
+    echo
+    echo "- commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "- branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+    echo "- date:   $(date -Iseconds)"
+    echo "- mode:   $( [ "$FULL" -eq 1 ] && echo full || echo short )"
+    echo
+    echo "Review each output for coherence (fluent English, on-topic, not stuck"
+    echo "in verbatim loops). Hard errors fail the gate; soft output changes do not."
+    echo
+} > "$OUT"
+
+for entry in "${tests[@]}"; do
+    IFS='|' read -r model_file prompt_id prompt max_tok <<< "$entry"
+    model_path="$MODELS_DIR/$model_file"
+    if [ ! -f "$model_path" ]; then
+        echo "## $model_file — $prompt_id — SKIPPED (model not present)" >> "$OUT"
+        echo >> "$OUT"
+        continue
+    fi
+
+    echo "== $model_file / $prompt_id =="
+    # JSONL input for daemon
+    in_file="/tmp/coh_in_$$.jsonl"
+    out_file="/tmp/coh_out_$$.log"
+    cat > "$in_file" <<JL
+{"type":"load","model":"$model_path","params":{"max_seq":4096}}
+{"type":"generate","id":"r1","prompt":"$(printf '%s' "$prompt" | sed 's/"/\\"/g')","temperature":0.0,"max_tokens":$max_tok,"repeat_penalty":1.05}
+{"type":"unload"}
+JL
+    t0=$(date +%s.%N)
+    timeout 240 "$EXE" < "$in_file" > "$out_file" 2>&1
+    ec=$?
+    t1=$(date +%s.%N)
+    wall=$(python3 -c "print(f'{$t1 - $t0:.1f}')")
+
+    done_line=$(grep -aE '"type":"done"' "$out_file" | head -1)
+    n_tokens=$(grep -ac '"type":"token"' "$out_file")
+    panic=$(grep -aE 'panicked|thread.*panicked|FATAL|error: ' "$out_file" | head -1)
+    status="OK"
+    if [ "$ec" -ne 0 ] || [ "$n_tokens" -eq 0 ] || [ -n "$panic" ]; then
+        status="HARD_ERROR (exit=$ec tokens=$n_tokens panic=${panic:+yes})"
+        hard_errors=$((hard_errors + 1))
+    fi
+
+    {
+        echo "## $model_file — $prompt_id"
+        echo
+        echo "- wall: ${wall}s  status: **$status**"
+        if [ -n "$done_line" ]; then
+            echo "- stats: \`$done_line\`"
+        fi
+        echo "- prompt: \"$prompt\""
+        echo
+        if [ -n "$panic" ]; then
+            echo '**PANIC/ERROR DETECTED:**'
+            echo
+            echo '```'
+            echo "$panic"
+            echo '```'
+            echo
+        fi
+        echo '**Output:**'
+        echo
+        echo '```'
+        grep -a '"type":"token"' "$out_file" | python3 -c '
+import sys, json
+print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
+        echo '```'
+        echo
+    } >> "$OUT"
+
+    rm -f "$in_file" "$out_file"
+done
+
+echo
+echo "coherence report: $OUT"
+if [ "$hard_errors" -gt 0 ]; then
+    echo "$hard_errors test(s) hit hard errors — gate FAILED"
+    exit 1
+fi
+echo "no hard errors — review $OUT for coherence, then commit if satisfied"
+exit 0

@@ -346,6 +346,12 @@ pub const GEMM_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4
 // CDNA3 wave64-native batched HFQ4-G256 GEMM (overwrite). 2 rows per block.
 pub const GEMM_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_wave64.hip");
 
+/// One-shot dequantize HFQ4-G256 matrix → FP16 row-major. Used when the
+/// downstream prefill GEMM path uses rocBLAS MFMA kernels (CDNA3 only —
+/// the FP16 shadow is 4× the MQ4 size, so the engine only allocates it on
+/// large-VRAM GPUs). Launch grid = (M, K/256, 1), block = (128, 1, 1).
+pub const HFQ4G256_DEQUANTIZE_TO_F16_SRC: &str = include_str!("../../../kernels/src/hfq4g256_dequantize_to_f16.hip");
+
 
 /// Fused QKV Q4_K: three GEMVs in one kernel launch.
 /// Grid = (q_m + k_m + v_m) blocks. Each block determines which matrix by blockIdx range.

@@ -454,6 +454,23 @@ fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -
     gpu.upload_f32(&f32_data, shape)
 }
 
+/// Load norm weight without the +1.0 offset — for standard RMSNorm tensors
+/// (e.g., the final `model.language_model.norm.weight` stored as raw scale,
+/// mean ~1.6 on Qwen3.5-MoE A3B). Applying +1.0 would over-amplify by ~60%.
+fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+    let full_name = format!("model.language_model.{name}");
+    let (info, data) = hfq.tensor_data(&full_name)
+        .or_else(|| hfq.tensor_data(name))
+        .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
+    let f32_data: Vec<f32> = match info.quant_type {
+        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
+    };
+    gpu.upload_f32(&f32_data, shape)
+}
+
+
 /// Load weight tensor from raw bytes + quant_type (no name lookup needed).
 fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: usize) -> HipResult<WeightTensor> {
     match quant_type {
@@ -810,7 +827,19 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
     };
 
     eprintln!("  loading output_norm...");
-    let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
+    // Final output norm: on Qwen3.5/3.6-MoE (A3B, arch_id=6) this tensor is
+    // stored as a raw RMSNorm scale (mean ~+1.6), NOT as deviation-from-0 like
+    // the per-block norms. Applying `w += 1.0` (via `load_norm_weight`) would
+    // over-amplify the pre-lm_head hidden state by ~60%, which on 3.6 MQ4 tips
+    // the model into infinite `<think>` spirals on reasoning prompts (3.5 MQ4
+    // tolerates it but is still subtly wrong). Dense Qwen3.5 0.8B/4B/9B use
+    // the deviation-from-0 convention and require `+=1.0` — they keep their
+    // byte-exact quality-gate baselines unchanged. Gate on num_experts > 0.
+    let output_norm = if config.num_experts > 0 {
+        load_norm_weight_raw(hfq, gpu, "norm.weight", &[config.dim])?
+    } else {
+        load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?
+    };
 
     // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens
     let lm_head_info = hfq.tensor_data("lm_head.weight")
@@ -1676,14 +1705,14 @@ fn forward_from_x_gpu(
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.attention_q8_0_kv(
                         &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 } else {
                     gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
                     gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
                     gpu.attention_f32(
                         &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 }
 
@@ -1855,14 +1884,14 @@ fn forward_from_x_gpu(
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.attention_q8_0_kv(
                         &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 } else {
                     gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
                     gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
                     gpu.attention_f32(
                         &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 }
 
@@ -2153,8 +2182,23 @@ pub fn forward_scratch(
     // reordering between capture and replay in one of the flash-attn or
     // GDN state-update kernels that compounds over many replays.
     // Until that's isolated, MoE always takes the direct path.
+    // HIPFIRE_GRAPH_MOE=1 (diagnostic-only): bypass the MoE guard. Required
+    // to reproduce task #100. Under-graph A3B does NOT corrupt at step 1 —
+    // it accumulates numerical drift and diverges from direct at step ~6
+    // with q8 KV or step ~114 with asym3 KV on the Count-from-1-to-20
+    // prompt. Migrating `kv_cache_write_q8_0` to the blob launch path (it
+    // was the only remaining non-blob kernel in the MoE hot path) did not
+    // resolve the drift — the root cause is elsewhere, likely DeltaNet
+    // state accumulating tiny bit-level differences across replays via a
+    // numerical-reordering path (atomics or wavefront-scheduling dependent
+    // reductions inside gated_delta_net_*). Reproducer for next dig:
+    //   HIPFIRE_GRAPH=1 HIPFIRE_GRAPH_MOE=1 HIPFIRE_SMOKE_KV=q8 \
+    //   HIPFIRE_SMOKE_MODE=chat HIPFIRE_SMOKE_STEPS=200 \
+    //   HIPFIRE_SMOKE_PROMPT="Count from one to twenty in English." \
+    //   ./target/release/examples/a3b_smoke_forward <a3b.mq4>
+    let allow_moe = std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1");
     let use_graph = std::env::var("HIPFIRE_GRAPH").ok().as_deref() == Some("1")
-        && config.num_experts == 0;
+        && (config.num_experts == 0 || allow_moe);
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
@@ -3282,7 +3326,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                         tree_bias, block_start, block_cols,
                     )?;
                 } else if kv_cache.quant_asym3 {
@@ -3292,7 +3336,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                         tree_bias, block_start, block_cols,
                     )?;
                 } else if kv_cache.quant_asym2 {
@@ -3306,7 +3350,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                     )?;
                 } else if max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
@@ -3329,7 +3373,7 @@ fn forward_prefill_chunk(
                             &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &out_b, &pos_buf_tmp, seq_len_b,
                             config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.max_seq, &s.flash_partials,
+                            kv_cache.physical_cap, &s.flash_partials,
                         )?;
                     }
                     let _ = gpu.hip.free(pos_buf_tmp);
@@ -3339,7 +3383,7 @@ fn forward_prefill_chunk(
                         &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n,
+                        kv_cache.physical_cap, max_ctx_len, n,
                         tree_bias, block_start, block_cols,
                     )?;
                 }
@@ -3701,7 +3745,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                         tree_bias, block_start, block_cols,
                     )?;
                 } else if kv_cache.quant_asym3 {
@@ -3711,7 +3755,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                         tree_bias, block_start, block_cols,
                     )?;
                 } else if kv_cache.quant_asym2 {
@@ -3725,7 +3769,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
                     )?;
                 } else if max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
@@ -3747,7 +3791,7 @@ fn forward_prefill_chunk(
                             &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &out_b, &pos_buf_tmp, seq_len_b,
                             config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.max_seq, &s.flash_partials,
+                            kv_cache.physical_cap, &s.flash_partials,
                         )?;
                     }
                     let _ = gpu.hip.free(pos_buf_tmp);
@@ -3757,7 +3801,7 @@ fn forward_prefill_chunk(
                         &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.max_seq, max_ctx_len, n,
+                        kv_cache.physical_cap, max_ctx_len, n,
                         tree_bias, block_start, block_cols,
                     )?;
                 }
@@ -3898,7 +3942,7 @@ fn run_fa_layer_body(
         gpu.attention_flash_asym4(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
             &s.flash_partials,
         )?;
     } else if kv_cache.quant_asym3 {
@@ -3910,7 +3954,7 @@ fn run_fa_layer_body(
         gpu.attention_flash_asym3(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
             &s.flash_partials,
         )?;
     } else if kv_cache.quant_asym2 {
@@ -3922,7 +3966,7 @@ fn run_fa_layer_body(
         gpu.attention_flash_asym2(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
             &s.flash_partials,
         )?;
     } else if kv_cache.quant_q8 {
@@ -3931,7 +3975,7 @@ fn run_fa_layer_body(
         gpu.attention_q8_0_kv(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
         )?;
     } else {
         gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
@@ -3939,7 +3983,7 @@ fn run_fa_layer_body(
         gpu.attention_f32(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
         )?;
     }
 
@@ -4271,7 +4315,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym4(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym3 {
@@ -4283,7 +4327,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym3(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym2 {
@@ -4295,7 +4339,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym2(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_q8 {
@@ -4315,14 +4359,14 @@ fn forward_scratch_layers(
                         gpu.attention_flash_q8_0(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                             &s.flash_partials,
                         )?;
                     } else {
                         gpu.attention_q8_0_kv(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         )?;
                     }
                 } else {
@@ -4331,7 +4375,7 @@ fn forward_scratch_layers(
                     gpu.attention_f32(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 }
 
@@ -4551,7 +4595,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym4(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym3 {
@@ -4563,7 +4607,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym3(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym2 {
@@ -4575,7 +4619,7 @@ fn forward_scratch_layers(
                     gpu.attention_flash_asym2(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_q8 {
@@ -4589,14 +4633,14 @@ fn forward_scratch_layers(
                         gpu.attention_flash_q8_0(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                             &s.flash_partials,
                         )?;
                     } else {
                         gpu.attention_q8_0_kv(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         )?;
                     }
                 } else {
@@ -4605,7 +4649,7 @@ fn forward_scratch_layers(
                     gpu.attention_f32(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                     )?;
                 }
 

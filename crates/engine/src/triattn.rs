@@ -567,6 +567,11 @@ impl EvictionCtx {
         rope_theta: f32,
         max_seq: usize,
     ) -> HipResult<Self> {
+        // The eviction trigger is `current_physical >= budget + beta`, where
+        // `current_physical` is bounded by `KvCache::physical_cap`. Historically
+        // physical_cap == max_seq so the two were interchangeable; now that
+        // eviction-aware allocators decouple them, the meaningful invariant is
+        // the physical cap (checked at maybe_evict time against the supplied kv).
         assert!(max_seq >= budget + beta, "max_seq < budget+beta; eviction can never fire");
         let n_bands = head_dim / 2;
         let centers_per_layer = n_heads * n_bands * 3;
@@ -692,6 +697,16 @@ impl EvictionCtx {
         kv.compact_offset += current_physical - self.budget;
         self.eviction_count.set(self.eviction_count.get() + 1);
         Ok(Some(self.budget))
+    }
+
+    /// Release all GPU buffers held by the context. Consumed by value;
+    /// the daemon calls this on unload to return VRAM.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.centers_dev);
+        let _ = gpu.free_tensor(self.scores_buf);
+        let _ = gpu.free_tensor(self.k_compact);
+        let _ = gpu.free_tensor(self.v_compact);
+        let _ = gpu.free_tensor(self.retain_dev);
     }
 }
 

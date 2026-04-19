@@ -4,11 +4,13 @@
 mod ffi;
 mod error;
 mod kernarg;
+mod rocblas;
 
 pub use error::{HipError, HipResult};
 pub use ffi::{Event, Function, Graph, GraphExec, HipRuntime, Module, Stream};
 pub use ffi::launch_counters;
 pub use kernarg::KernargBlob;
+pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]
