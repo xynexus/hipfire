@@ -11,15 +11,15 @@
 #   bash stage_models.sh [--dir /root/models] [--no-mq6]
 #
 # Models staged by default (covering tonight's hermes-cal sweep):
-#   - Qwen3.5-4B       → mq4, mq6  (small)
-#   - Qwen3.5-9B       → mq4, mq6
-#   - Qwen3.5-27B      → mq4, mq6
-#   - Qwen3.5-35B-A3B  → mq4  (MoE, no mq6 currently)
-#   - Qwen3.6-35B-A3B  → mq4  (MoE)
-#
-# Carnice is not on the public Qwen org — left to user to scp or pull
-# from schuttdev/hipfire-carnice-* (already MQ4-quantized, no HF
-# safetensors path). Same for local-only finetunes.
+#   - Qwen/Qwen3.5-4B            → mq4, mq6
+#   - Qwen/Qwen3.5-9B            → mq4, mq6
+#   - Qwen/Qwen3.5-27B           → mq4, mq6
+#   - Qwen/Qwen3.5-35B-A3B       → mq4 only  (MoE experts hard-coded
+#                                              to MQ4 in quantizer — MQ6
+#                                              support is a TODO)
+#   - Qwen/Qwen3.6-35B-A3B       → mq4 only  (same MoE limitation)
+#   - kai-os/Carnice-9b          → mq4, mq6  (Hermes tool-use fine-tune)
+#   - kai-os/Carnice-27b         → mq4, mq6
 
 set -uo pipefail
 
@@ -56,12 +56,17 @@ MATRIX=(
     "Qwen/Qwen3.5-27B:qwen3.5-27b:mq4"
     "Qwen/Qwen3.5-35B-A3B:qwen3.5-35b-a3b:mq4"
     "Qwen/Qwen3.6-35B-A3B:qwen3.6-35b-a3b:mq4"
+    # Hermes-tuned carnice (kai-os publishes the full safetensors)
+    "kai-os/Carnice-9b:carnice-9b:mq4"
+    "kai-os/Carnice-27b:carnice-27b:mq4"
 )
 if [ "$INCLUDE_MQ6" -eq 1 ]; then
     MATRIX+=(
         "Qwen/Qwen3.5-4B:qwen3.5-4b:mq6"
         "Qwen/Qwen3.5-9B:qwen3.5-9b:mq6"
         "Qwen/Qwen3.5-27B:qwen3.5-27b:mq6"
+        "kai-os/Carnice-9b:carnice-9b:mq6"
+        "kai-os/Carnice-27b:carnice-27b:mq6"
     )
 fi
 

@@ -198,11 +198,14 @@ log "GPUs visible: $N_GPUS"
 if [ "$FETCH_CORPUS" -eq 1 ]; then
     # shellcheck disable=SC1091
     [ -f "$VENV_DIR/bin/activate" ] && source "$VENV_DIR/bin/activate"
-    log "fetching lambda/hermes-agent-reasoning-traces corpus..."
-    if [ -x "$REPO_DIR/scripts/fetch_hermes_corpus.sh" ]; then
-        "$REPO_DIR/scripts/fetch_hermes_corpus.sh" /root/hermes_corpus.txt
+    log "fetching blended calibration corpus (agentic + reasoning + chat)..."
+    if [ -x "$REPO_DIR/scripts/fetch_calibration_corpus.sh" ]; then
+        "$REPO_DIR/scripts/fetch_calibration_corpus.sh" /root/calibration_corpus.txt --recipe blended
+    elif [ -x "$REPO_DIR/scripts/fetch_hermes_corpus.sh" ]; then
+        log "  new fetch_calibration_corpus.sh not present, falling back to hermes-only"
+        "$REPO_DIR/scripts/fetch_hermes_corpus.sh" /root/calibration_corpus.txt
     else
-        log "  fetch_hermes_corpus.sh not found in repo; skipping (repo may be older)"
+        log "  no fetch script in repo; skipping"
     fi
 fi
 
@@ -216,19 +219,21 @@ if [ "$SKIP_BUILD" -eq 0 ] && [ -d "$REPO_DIR" ]; then
 fi
 log ""
 log "Next steps:"
-log "  1. rsync your models to /root/models/ (or pull via hipfire CLI)"
-log "  2. Fetch a calibration corpus (if not done via --fetch-corpus):"
-log "       bash $REPO_DIR/scripts/fetch_hermes_corpus.sh /root/hermes_corpus.txt"
+log "  1. Stage models — pull safetensors + quantize to mq4/mq6:"
+log "       bash $REPO_DIR/scripts/stage_models.sh"
+log "  2. Fetch calibration corpus (if not done via --fetch-corpus):"
+log "       bash $REPO_DIR/scripts/fetch_calibration_corpus.sh \\"
+log "            /root/calibration_corpus.txt --recipe blended"
 if [ "$N_GPUS" -gt 1 ]; then
 log "  3. Parallel calibrate across all $N_GPUS GPUs:"
 log "       bash $REPO_DIR/scripts/calibrate_multigpu.sh \\"
-log "            --models /root/models/qwen3.5-9b.mq4,/root/models/qwen3.5-27b.mq4 \\"
-log "            --corpus /root/hermes_corpus.txt"
+log "            --models \$(ls /root/models/*.mq[46] | tr '\\n' ',') \\"
+log "            --corpus /root/calibration_corpus.txt"
 else
 log "  3. Single-GPU calibration:"
 log "       $REPO_DIR/target/release/examples/triattn_validate \\"
 log "            /root/models/qwen3.5-9b.mq4 \\"
-log "            --corpus /root/hermes_corpus.txt --max-tokens 1000000 \\"
+log "            --corpus /root/calibration_corpus.txt --max-tokens 1000000 \\"
 log "            --sidecar /root/models/qwen3.5-9b.mq4.triattn.bin"
 fi
 log "────────────────────────────────────────────────────"
