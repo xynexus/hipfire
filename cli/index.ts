@@ -401,9 +401,10 @@ const REGISTRY: Record<string, ModelEntry> = {
   // the existing A3B (arch_id=6) code path; weights differ (coding/agentic
   // fine-tune) but architecture (256 experts top-8, hybrid DeltaNet+FA,
   // head_dim=256 with partial_rotary=0.25, shared expert) is identical.
-  // Local-only until a pre-quantized HF repo exists; use `hipfire quantize
-  // Qwen/Qwen3.6-35B-A3B --format mq4` to produce the file.
-  "qwen3.6:35b-a3b":  { repo: "", file: "qwen3.6-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active (coding/agent) — LOCAL ONLY, quantize Qwen/Qwen3.6-35B-A3B" },
+  // Pre-quant at schuttdev/hipfire-qwen3.6-35b-a3b; includes an Aureth-
+  // corpus Hermes sidecar (qwen3.6-35b-a3b.mq4.hermes.triattn.bin) for
+  // cask_sidecar-based KV eviction — download separately via `hf download`.
+  "qwen3.6:35b-a3b":  { repo: hfRepo("qwen3.6","35b-a3b"), file: "qwen3.6-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active (coding/agent)" },
 
   // Qwen3.5 MQ6 — 6-bit rotated, higher quality / larger file (~1.47× MQ4)
   "qwen3.5:0.8b-mq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq6",   size_gb: 0.67, min_vram_gb: 2,  desc: "MQ6, higher quality" },
