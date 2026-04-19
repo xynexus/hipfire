@@ -343,9 +343,24 @@ fn main() {
                     .and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
                 let cask_fold_m = msg.get("params").and_then(|p| p.get("cask_fold_m"))
                     .and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+                // Known-broken combo guard: CASK m-folding + DFlash spec decode
+                // degenerates into single-token loops after the first eviction
+                // (the m-folded synthetic K/V rows are off the draft's trained
+                // hidden-state distribution). Until that's fixed at the library
+                // level, downgrade m-folding to plain TriAttention drop-eviction
+                // when a draft is attached. User's context window + eviction
+                // cadence still work; just the fold step is skipped.
+                let cask_m_folding_effective = if cask_enabled && draft_path.is_some() {
+                    eprintln!(
+                        "[hipfire-daemon] cask:true + draft: both set — downgrading to plain TriAttention drop-eviction (CASK m-fold + DFlash is a known-broken combo; see feedback_cask_mfold_dflash_broken.md)",
+                    );
+                    false
+                } else {
+                    cask_enabled
+                };
                 let cask = CaskConfig {
                     sidecar: cask_sidecar,
-                    cask_m_folding: cask_enabled,
+                    cask_m_folding: cask_m_folding_effective,
                     budget: cask_budget,
                     beta: cask_beta,
                     core_frac: cask_core_frac,
@@ -745,7 +760,12 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // is missing or arch-mismatched, we log and continue without DFlash
         // (temp==0 requests will fall back to AR sampling).
         let dflash = if let Some(dp) = draft_path {
-            match load_dflash_state(dp, max_seq, &config, &dn, gpu) {
+            // DFlash state (hidden_rb + target_hidden_host) sizes linearly with
+            // the ctx_capacity argument. Pass `physical_cap` instead of
+            // `max_seq` so eviction's smaller buffer caps VRAM: a 128K-advertised
+            // model with physical_cap=896 allocates an 896-slot ring, not 128K.
+            // Without eviction, physical_cap == max_seq so the behavior matches.
+            match load_dflash_state(dp, physical_cap, &config, &dn, gpu) {
                 Ok(state) => {
                     eprintln!(
                         "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
