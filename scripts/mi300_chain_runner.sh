@@ -115,10 +115,12 @@ job_4b_scratch_convert() {
 
 sidecar_cal() {
     local tgt=$1 sc_out=$2
+    # triattn_validate takes the model as a POSITIONAL arg, not --model.
+    # Output filename is controlled via --sidecar.
     /root/hipfire/target/release/examples/triattn_validate \
-        --model "$tgt" \
+        "$tgt" \
+        --sidecar "$sc_out" \
         --corpus "$CORPUS" \
-        --out "$sc_out" \
         --max-tokens 1000000 \
         --chunk-len 1024
 }
