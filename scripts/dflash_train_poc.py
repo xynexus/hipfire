@@ -174,7 +174,9 @@ def tau_probe(draft, target, tokenizer, prompt: str, max_new: int, device):
             dtype=torch.long, device=device,
         )
         position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
-        pkv_t = DynamicCache()
+        # Qwen3.5 target has hybrid linear_attention/full_attention layers;
+        # DynamicCache must be config-aware so has_previous_state works.
+        pkv_t = DynamicCache(config=target.config)
         pkv_d = DynamicCache()
         out = target(
             input_ids,
