@@ -53,3 +53,6 @@ __pycache__/
 cli/CLAUDE.md
 .pr_body_0_1_7_alpha.md
 .bench_0_1_7_alpha/
+
+# Training artifacts (draft ckpts, converted hfq, prompt files, logs)
+.dflash-runs/
