@@ -23,17 +23,21 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
+// __restrict__ stripped: hipcc/clang (ROCm 7.2) miscompile on gfx1100 —
+// leaving restrict on pointer params of batched-path kernels produces
+// deterministic-wrong output at LA layer 0 and nondeterministic output
+// at layers ≥ 1 in prefill (diagnosed via prefill_state_diff harness).
 __launch_bounds__(32, 2)
 extern "C" __global__ void gemm_qkvza_hfq4g256_wmma(
-    const char*    __restrict__ A_qkv,
-    const char*    __restrict__ A_z,
-    const char*    __restrict__ A_beta,
-    const char*    __restrict__ A_alpha,
-    const _Float16* __restrict__ X,         // [N x K], FP16
-    float*         __restrict__ Y_qkv,      // [N x qkv_m]
-    float*         __restrict__ Y_z,        // [N x z_m]
-    float*         __restrict__ Y_beta,     // [N x beta_m]
-    float*         __restrict__ Y_alpha,    // [N x alpha_m]
+    const char*    A_qkv,
+    const char*    A_z,
+    const char*    A_beta,
+    const char*    A_alpha,
+    const _Float16* X,         // [N x K], FP16
+    float*         Y_qkv,      // [N x qkv_m]
+    float*         Y_z,        // [N x z_m]
+    float*         Y_beta,     // [N x beta_m]
+    float*         Y_alpha,    // [N x alpha_m]
     int qkv_m, int z_m, int beta_m, int alpha_m,
     int K, int N
 ) {

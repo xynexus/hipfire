@@ -1211,10 +1211,23 @@ impl Gpu {
         result
     }
 
-    /// Batched `fused_rmsnorm_rotate_mq`. Grid.x is the batch dim — processes
-    /// N tokens' [N × K] x into [N × K] x_rot in a single launch. Byte-exact
-    /// against calling `fused_rmsnorm_rotate_mq` N times on separate x/x_rot
-    /// buffers. Weight/signs are shared across the batch.
+    /// Batched `fused_rmsnorm_rotate_mq`. Processes N tokens' [N × K] x into
+    /// [N × K] x_rot. Implemented as N single-row launches rather than one
+    /// multi-block launch: on ROCm 7.2 / gfx1100, the
+    /// `multi-block grid + large dynamic LDS + __launch_bounds__(256, 1)`
+    /// combination triggers a compiler/scheduler pathology that
+    /// *non-deterministically* produces blobs where only block 0 of the grid
+    /// actually executes — rows 1..N-1 of x_rot silently get zeros.
+    ///
+    /// Reproduced by repeatedly `rm`-ing the cached hsaco and recompiling:
+    /// identical source yields md5-different blobs, some correct and some
+    /// broken (rows 1..N-1 all zero). Compiler is not deterministic here, so
+    /// we can't rely on a "good" compile sticking.
+    ///
+    /// Single-row launches (grid = [1, 1, 1]) are always safe since they
+    /// never trigger the multi-block pathology. The per-launch overhead on
+    /// typical prefill sizes (N ≤ 16) is negligible vs the bandwidth of the
+    /// kernel itself.
     pub fn fused_rmsnorm_rotate_mq_batched(
         &mut self,
         x: &GpuTensor,
@@ -1233,43 +1246,60 @@ impl Gpu {
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
-        let mut xp = x.buf.as_ptr();
-        let mut wp = weight.buf.as_ptr();
-        let mut xrp = x_rot.buf.as_ptr();
-        let mut s1 = s1_ptr;
-        let mut s2 = s2_ptr;
-        let mut kv = k as i32;
-        let mut eps_v = eps;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void,
-            &mut s1 as *mut _ as *mut c_void,
-            &mut s2 as *mut _ as *mut c_void,
-            &mut xrp as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-            &mut eps_v as *mut _ as *mut c_void,
-        ];
         let block_size = 256u32;
         let shared_mem = ((k + 256) * 4) as u32;
-        let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
-        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_rmsnorm_mq_rotate_batched", bytes);
-        let result = self.launch_maybe_blob(
-            "fused_rmsnorm_mq_rotate",
-            [batch_size as u32, 1, 1],
-            [block_size, 1, 1],
-            shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp); b.push_ptr(wp);
-                b.push_ptr(s1); b.push_ptr(s2);
-                b.push_ptr(xrp);
-                b.push_i32(kv); b.push_f32(eps_v);
-                b
-            },
+        let bytes_per_row = k * 4 * 3 + 2 * 256 * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            "fused_rmsnorm_mq_rotate_batched",
+            bytes_per_row * batch_size,
         );
+
+        let x_base = x.buf.as_ptr() as usize;
+        let xr_base = x_rot.buf.as_ptr() as usize;
+        let row_bytes = k * 4;
+
+        for row in 0..batch_size {
+            let mut xp = (x_base + row * row_bytes) as *const std::ffi::c_void;
+            let mut wp = weight.buf.as_ptr();
+            let mut xrp = (xr_base + row * row_bytes) as *const std::ffi::c_void;
+            let mut s1 = s1_ptr;
+            let mut s2 = s2_ptr;
+            let mut kv = k as i32;
+            let mut eps_v = eps;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut wp as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut eps_v as *mut _ as *mut c_void,
+            ];
+            let result = self.launch_maybe_blob(
+                "fused_rmsnorm_mq_rotate",
+                [1, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(xp); b.push_ptr(wp);
+                    b.push_ptr(s1); b.push_ptr(s2);
+                    b.push_ptr(xrp);
+                    b.push_i32(kv); b.push_f32(eps_v);
+                    b
+                },
+            );
+            if result.is_err() {
+                if let Some(t) = timer { t.finish(&self.hip); }
+                return result;
+            }
+        }
+
         if let Some(t) = timer { t.finish(&self.hip); }
-        result
+        Ok(())
     }
 
     /// Fused SwiGLU + FWHT rotation. Reads gate/up, computes
@@ -8790,7 +8820,19 @@ impl Gpu {
         result
     }
 
-    /// Batched `fused_qk_l2_norm_scale_f32`. Grid.y is the batch dim.
+    /// Batched `fused_qk_l2_norm_scale_f32`.
+    ///
+    /// Originally dispatched as a single launch with grid = `[n_heads, batch_size, 1]`
+    /// and the kernel using `blockIdx.y` for the batch offset. That pattern is
+    /// affected by the ROCm 7.2 / gfx1100 non-deterministic compilation pathology
+    /// — see `fused_rmsnorm_rotate_mq_batched` for the long-form write-up.
+    /// Rows 1..N-1 intermittently don't execute, leaving q/k for those rows
+    /// identical to the conv1d output (unnormalized, unscaled), which silently
+    /// corrupts LA attention for batched prefill.
+    ///
+    /// Workaround: dispatch N single-row launches with grid = `[n_heads, 1, 1]`
+    /// and pre-offset q/k pointers. Q and K are laid out `[N × (n_heads*head_dim)]`
+    /// row-major, so row `r` starts at `r * n_heads * head_dim * 4` bytes.
     #[cfg(feature = "deltanet")]
     pub fn fused_qk_l2_norm_scale_f32_batched(
         &mut self,
@@ -8807,38 +8849,50 @@ impl Gpu {
             kernels::FUSED_QK_L2_NORM_SCALE_SRC,
             "fused_qk_l2_norm_scale_f32",
         )?;
-        let mut qp = q.buf.as_ptr();
-        let mut kp = k.buf.as_ptr();
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut qs = q_scale;
-        let mut ep = eps;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut qs as *mut _ as *mut c_void,
-            &mut ep as *mut _ as *mut c_void,
-        ];
         let bytes = crate::profile::elementwise1_bytes(n_heads * head_dim) * 2 * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qk_l2_norm_scale_f32_batched", bytes);
-        let result = self.launch_maybe_blob(
-            "fused_qk_l2_norm_scale_f32",
-            [n_heads as u32, batch_size as u32, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp); b.push_ptr(kp);
-                b.push_i32(nh); b.push_i32(hd);
-                b.push_f32(qs); b.push_f32(ep);
-                b
-            },
-        );
+
+        let q_base = q.buf.as_ptr() as usize;
+        let k_base = k.buf.as_ptr() as usize;
+        let row_bytes = n_heads * head_dim * 4;
+
+        for row in 0..batch_size {
+            let mut qp = (q_base + row * row_bytes) as *const std::ffi::c_void;
+            let mut kp = (k_base + row * row_bytes) as *const std::ffi::c_void;
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut qs = q_scale;
+            let mut ep = eps;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut qs as *mut _ as *mut c_void,
+                &mut ep as *mut _ as *mut c_void,
+            ];
+            let result = self.launch_maybe_blob(
+                "fused_qk_l2_norm_scale_f32",
+                [n_heads as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp); b.push_ptr(kp);
+                    b.push_i32(nh); b.push_i32(hd);
+                    b.push_f32(qs); b.push_f32(ep);
+                    b
+                },
+            );
+            if result.is_err() {
+                if let Some(t) = timer { t.finish(&self.hip); }
+                return result;
+            }
+        }
+
         if let Some(t) = timer { t.finish(&self.hip); }
-        result
+        Ok(())
     }
 
     /// 1D causal conv (kernel_size=4) for decode. Updates ring buffer state.
@@ -9056,55 +9110,88 @@ impl Gpu {
 
         let n_tiles = (128 / 4) as u32;
 
-        let mut qp = q_batch.buf.as_ptr();
-        let mut kp = k_batch.buf.as_ptr();
-        let mut vp = v_batch.buf.as_ptr();
-        let mut gp = gate_batch.buf.as_ptr();
-        let mut bp = beta_batch.buf.as_ptr();
-        let mut sp = s_q8.buf.as_ptr();
-        let mut scp = s_scales.buf.as_ptr();
-        let mut op = output_batch.buf.as_ptr();
-        let mut nt = n_tokens as i32;
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut gp as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut scp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-        ];
+        // N separate launches, each with n_tokens=1, matching the decode
+        // path byte-exact.
+        //
+        // History: commit 18ffaf0 changed this to a single launch with
+        // n_tokens=N and moved the per-token loop INTO the kernel,
+        // claiming "strictly higher quality" by deferring Q8 requant to
+        // the end of the whole batch. The claim is wrong for Qwen3.5-9B:
+        // empirically, batched prefill produced garbage output (Chinese
+        // token spam instead of "Paris" for "The capital of France is")
+        // while per-token + decode produced correct output. Diagnosed via
+        // the prefill_state_diff harness — DN state at layer 0 was
+        // deterministically different from the per-token reference.
+        //
+        // The per-token stochastic-rounding trajectory is load-bearing:
+        // each token sees the Q8-rounded state from the previous token,
+        // not the raw FP32. Collapsing N rounds into 1 changes the
+        // recurrence semantically, not just numerically. Batched decode
+        // must match decode byte-exactly to keep greedy output
+        // reproducible between prefill and streaming.
+        //
+        // Cost: N extra launches per LA layer per forward. On 9B MQ4 this
+        // is ~16 layers × N-token launches. Correctness over throughput.
+        let stride_qkv_bytes = n_heads * head_dim * 4;
+        let stride_ab_bytes = n_heads * 4;
 
-        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let q_base = q_batch.buf.as_ptr() as *mut u8;
+        let k_base = k_batch.buf.as_ptr() as *mut u8;
+        let v_base = v_batch.buf.as_ptr() as *mut u8;
+        let g_base = gate_batch.buf.as_ptr() as *mut u8;
+        let b_base = beta_batch.buf.as_ptr() as *mut u8;
+        let o_base = output_batch.buf.as_ptr() as *mut u8;
+        let s_ptr_raw = s_q8.buf.as_ptr();
+        let sc_ptr_raw = s_scales.buf.as_ptr();
+
+        let bytes = crate::profile::gated_delta_net_q8_bytes(1, n_heads, head_dim) * n_tokens;
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8_batch_seq", bytes);
-        // Single launch — the kernel loops over n_tokens internally,
-        // keeping state in F32 LDS across all tokens. Q8 quantization
-        // happens once at the end instead of per-token, reducing noise
-        // accumulation. Not byte-exact with N×1 decode calls but
-        // strictly higher quality.
-        let result = self.launch_maybe_blob(
-            "gated_delta_net_q8",
-            [n_heads as u32, n_tiles, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
-                b.push_ptr(gp); b.push_ptr(bp);
-                b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
-                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
-                b
-            },
-        );
+
+        for i in 0..n_tokens {
+            let off_qkv = i * stride_qkv_bytes;
+            let off_ab = i * stride_ab_bytes;
+            let mut qp = unsafe { q_base.add(off_qkv) as *mut c_void };
+            let mut kp = unsafe { k_base.add(off_qkv) as *mut c_void };
+            let mut vp = unsafe { v_base.add(off_qkv) as *mut c_void };
+            let mut gp = unsafe { g_base.add(off_ab) as *mut c_void };
+            let mut bp = unsafe { b_base.add(off_ab) as *mut c_void };
+            let mut op = unsafe { o_base.add(off_qkv) as *mut c_void };
+            let mut sp = s_ptr_raw;
+            let mut scp = sc_ptr_raw;
+            let mut nt = 1i32;
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut scp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_q8",
+                [n_heads as u32, n_tiles, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                    b.push_ptr(gp); b.push_ptr(bp);
+                    b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
+                    b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                    b
+                },
+            )?;
+        }
         if let Some(t) = timer { t.finish(&self.hip); }
-        result
+        Ok(())
     }
 
     /// GDN recurrence with Q4-quantized S state.
@@ -9311,6 +9398,15 @@ impl Gpu {
     /// (identical state trajectory to calling the single-token variant N
     /// times). `input` / `q_out` / `k_out` / `v_out` are all [N × stride]
     /// row-major.
+    ///
+    /// Implemented as N single-token launches rather than one N-token launch:
+    /// on ROCm 7.2 / gfx1100 the kernel's internal `for (t=0; t<n_tokens; t++)`
+    /// loop is miscompiled such that only iteration t=0 has visible side
+    /// effects — tokens 1..N-1 see zeros in q/k/v_out. Reproduces
+    /// deterministically against prefill_state_diff regardless of
+    /// `__restrict__` stripping or recompile. Single-token launches avoid the
+    /// miscompiled loop entirely, at the cost of N-1 extra kernel launches
+    /// (negligible for N ≤ 16 prefill chunks).
     #[cfg(feature = "deltanet")]
     pub fn conv1d_silu_split_f32_n(
         &mut self,
@@ -9329,43 +9425,59 @@ impl Gpu {
             kernels::CONV1D_SILU_SPLIT_SRC,
             "conv1d_silu_split_f32",
         )?;
-        let qp = q_out.buf.as_ptr();
-        let kp = k_out.buf.as_ptr();
-        let vp = v_out.buf.as_ptr();
-        let ip = input.buf.as_ptr();
-        let wp = weight.buf.as_ptr();
-        let sp = state.buf.as_ptr();
-        let kd = k_dim as i32;
-        let vd = v_dim as i32;
-        let nt = n_tokens as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &kd as *const _ as *mut c_void,
-            &vd as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-        ];
         let n_channels = 2 * k_dim + v_dim;
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
         let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32_n", bytes);
-        let result = self.launch_maybe_blob(
-            "conv1d_silu_split_f32", [grid, 1, 1], [block, 1, 1], 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
-                b.push_ptr(ip); b.push_ptr(wp); b.push_ptr(sp);
-                b.push_i32(kd); b.push_i32(vd); b.push_i32(nt);
-                b
-            },
-        );
+
+        let q_base = q_out.buf.as_ptr() as usize;
+        let k_base = k_out.buf.as_ptr() as usize;
+        let v_base = v_out.buf.as_ptr() as usize;
+        let i_base = input.buf.as_ptr() as usize;
+        let q_row = k_dim * 4;
+        let k_row = k_dim * 4;
+        let v_row = v_dim * 4;
+        let i_row = n_channels * 4;
+
+        for t in 0..n_tokens {
+            let qp = (q_base + t * q_row) as *const std::ffi::c_void;
+            let kp = (k_base + t * k_row) as *const std::ffi::c_void;
+            let vp = (v_base + t * v_row) as *const std::ffi::c_void;
+            let ip = (i_base + t * i_row) as *const std::ffi::c_void;
+            let wp = weight.buf.as_ptr();
+            let sp = state.buf.as_ptr();
+            let kd = k_dim as i32;
+            let vd = v_dim as i32;
+            let nt = 1i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &qp as *const _ as *mut c_void,
+                &kp as *const _ as *mut c_void,
+                &vp as *const _ as *mut c_void,
+                &ip as *const _ as *mut c_void,
+                &wp as *const _ as *mut c_void,
+                &sp as *const _ as *mut c_void,
+                &kd as *const _ as *mut c_void,
+                &vd as *const _ as *mut c_void,
+                &nt as *const _ as *mut c_void,
+            ];
+            let result = self.launch_maybe_blob(
+                "conv1d_silu_split_f32", [grid, 1, 1], [block, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                    b.push_ptr(ip); b.push_ptr(wp); b.push_ptr(sp);
+                    b.push_i32(kd); b.push_i32(vd); b.push_i32(nt);
+                    b
+                },
+            );
+            if result.is_err() {
+                if let Some(t) = timer { t.finish(&self.hip); }
+                return result;
+            }
+        }
         if let Some(t) = timer { t.finish(&self.hip); }
-        result
+        Ok(())
     }
 
     /// Compute cross-entropy loss for a single token on GPU.
