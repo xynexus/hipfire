@@ -76,7 +76,10 @@ def spec_generate_capped(draft, target, tokenizer, input_ids, max_new, max_cycle
         (1, max_length + B), draft.mask_token_id, dtype=torch.long, device=device,
     )
     position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
-    pkv_t = DynamicCache()
+    # Qwen3.5 target has linear_attention layers — DynamicCache must be
+    # initialized WITH the target's config so it creates the hybrid cache
+    # layout. Plain DynamicCache() errors on has_previous_state().
+    pkv_t = DynamicCache(config=target.config)
     pkv_d = DynamicCache()
 
     out = target(
