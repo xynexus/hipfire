@@ -106,7 +106,107 @@ def parse_args() -> argparse.Namespace:
                    help="Exponential decay rate for per-position loss weighting (paper eq. 4). <=0 disables weighting.")
     p.add_argument("--grad-ckpt-target", action="store_true",
                    help="Enable gradient checkpointing on the frozen target (doesn't affect correctness; saves VRAM on 27B/35B targets).")
+    # Training-time τ probe (Hermes 2026-04-19). Every N steps, take a fixed
+    # held-out prompt and run a tiny spec_generate on the current draft. Logs
+    # τ alongside loss. If loss drops but τ stays flat → training objective is
+    # wrong, don't burn more compute. Would have caught the 4B run's τ=0.09
+    # in minutes instead of 5000 steps.
+    p.add_argument("--tau-probe-every", type=int, default=0,
+                   help="Run a small spec_generate τ-probe every N steps (0=disable). Adds ~5s per probe on MI300X.")
+    p.add_argument("--tau-probe-prompt", default=None,
+                   help="Path to a text file with the fixed held-out prompt. If omitted, uses an in-script default.")
+    p.add_argument("--tau-probe-max-new", type=int, default=64,
+                   help="max_new_tokens for probe (small for speed; τ converges fast).")
     return p.parse_args()
+
+
+DEFAULT_TAU_PROBE_PROMPT = (
+    "You are an AI assistant. Call the `get_weather` tool to find today's "
+    "weather in Tokyo, then summarize the result in two sentences."
+)
+
+
+@torch.inference_mode()
+def tau_probe(draft, target, tokenizer, prompt: str, max_new: int, device):
+    """Run spec_generate on a fixed prompt and return τ = avg accept length.
+
+    Keep this cheap: small max_new, one prompt. Not a full benchmark — a
+    REGRESSION SIGNAL. τ ≈ 0 across steps = training isn't learning speculation.
+    """
+    draft.eval()
+    # ChatML-wrap to match the corpus's token distribution (corpus is ChatML'd).
+    im_start = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+    im_end = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    user = tokenizer.encode("user", add_special_tokens=False)
+    asst = tokenizer.encode("assistant", add_special_tokens=False)
+    nl = tokenizer.encode("\n", add_special_tokens=False)
+    body = tokenizer.encode(prompt, add_special_tokens=False)
+    input_ids = im_start + user + nl + body + im_end + nl + im_start + asst + nl
+    input_ids = torch.tensor([input_ids], dtype=torch.long, device=device)
+    stop_ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
+    # spec_generate is side-effect-free wrt past_key_values (fresh caches each call).
+    before_train = draft.training
+    try:
+        # Patch spec_generate to also return acceptance_lengths via a hack:
+        # we re-run the decode logic inline to capture τ cheaply.
+        from dflash.model import extract_context_feature, sample
+        from transformers import DynamicCache
+
+        num_input = input_ids.shape[1]
+        block_size = draft.block_size
+        max_length = num_input + max_new
+        output_ids = torch.full(
+            (1, max_length + block_size), draft.mask_token_id,
+            dtype=torch.long, device=device,
+        )
+        position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
+        pkv_t = DynamicCache()
+        pkv_d = DynamicCache()
+        out = target(
+            input_ids,
+            position_ids=position_ids[:, :num_input],
+            past_key_values=pkv_t, use_cache=True,
+            logits_to_keep=1, output_hidden_states=True,
+        )
+        output_ids[:, :num_input] = input_ids
+        output_ids[:, num_input:num_input + 1] = sample(out.logits, 0.0)
+        target_hidden = extract_context_feature(out.hidden_states, draft.target_layer_ids)
+
+        accept_lengths = []
+        start = num_input
+        while start < max_length:
+            block_out = output_ids[:, start:start + block_size].clone()
+            block_pos = position_ids[:, start:start + block_size]
+            noise_emb = target.model.embed_tokens(block_out)
+            dh = draft(
+                target_hidden=target_hidden,
+                noise_embedding=noise_emb,
+                position_ids=position_ids[:, pkv_d.get_seq_length():start + block_size],
+                past_key_values=pkv_d, use_cache=True,
+            )
+            draft_logits = target.lm_head(dh[:, -block_size + 1:, :])
+            pkv_d.crop(start)
+            block_out[:, 1:] = sample(draft_logits, 0.0)
+            out = target(
+                block_out, position_ids=block_pos,
+                past_key_values=pkv_t, use_cache=True,
+                output_hidden_states=True,
+            )
+            post = sample(out.logits, 0.0)
+            accept = (block_out[:, 1:] == post[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+            output_ids[:, start:start + accept + 1] = block_out[:, :accept + 1]
+            output_ids[:, start + accept + 1] = post[:, accept]
+            start += accept + 1
+            pkv_t.crop(start)
+            target_hidden = extract_context_feature(out.hidden_states, draft.target_layer_ids)[:, :accept + 1, :]
+            accept_lengths.append(accept + 1)
+            if stop_ids and any(s in output_ids[:, num_input:] for s in stop_ids):
+                break
+        tau = sum(accept_lengths) / max(1, len(accept_lengths))
+        return tau, len(accept_lengths)
+    finally:
+        if before_train:
+            draft.train()
 
 
 def read_corpus_tokens(corpus_path: str, tokenizer) -> list[int]:
@@ -142,17 +242,80 @@ def sample_batch(
 
 
 def build_draft_config(target_config, draft_layers: int, block_size: int, mask_token_id: int):
-    """Clone a DFlash draft config from the target config — same hidden/heads, fewer layers."""
-    import copy
+    """Build a flat Qwen3Config for the DFlash draft.
 
-    cfg = copy.deepcopy(target_config)
-    cfg.num_hidden_layers = draft_layers
-    # Required by the DFlashDraftModel __init__.
-    cfg.num_target_layers = target_config.num_hidden_layers
+    Qwen/Qwen3.5-* returns a composite `Qwen3_5Config` with text_config +
+    vision_config sub-fields. DFlashDraftModel declares `config_class =
+    Qwen3Config` and indexes flat attributes (hidden_size, num_attention_heads,
+    layer_types[layer_idx], etc.). Cloning the composite is fragile — some
+    attributes delegate cleanly, others don't. Construct a fresh flat config
+    from explicit values pulled from text_config (composite) or the target
+    config directly (flat). This eliminates Hypothesis D ambiguity.
+    """
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+
+    # Composite configs (Qwen3.5 VL-style) put per-layer arch under text_config.
+    src = getattr(target_config, "text_config", None) or target_config
+
+    def g(attr, default=None):
+        return getattr(src, attr, getattr(target_config, attr, default))
+
+    target_num_layers = g("num_hidden_layers")
+
+    # rope_parameters: transformers 5.x consolidated rope_theta/rope_scaling
+    # into a single `rope_parameters` dict. Be robust to both shapes.
+    rope_params = g("rope_parameters", None)
+    if rope_params is None:
+        rope_theta = g("rope_theta", 1e7)
+        rope_params = {"rope_type": "default", "rope_theta": rope_theta}
+    else:
+        # Drop MoE-only or VL-only rope keys that confuse Qwen3Config ("default"
+        # rope_type doesn't accept mrope_section/mrope_interleaved).
+        rope_params = {k: v for k, v in rope_params.items()
+                       if k not in ("mrope_section", "mrope_interleaved")}
+
+    # Copy every flat field Qwen3Config supports, plus DFlash-specific ones.
+    cfg = Qwen3Config(
+        vocab_size=g("vocab_size"),
+        hidden_size=g("hidden_size"),
+        intermediate_size=g("intermediate_size"),
+        num_hidden_layers=draft_layers,              # ← 5 for draft, not target's
+        num_attention_heads=g("num_attention_heads"),
+        num_key_value_heads=g("num_key_value_heads"),
+        hidden_act=g("hidden_act", "silu"),
+        max_position_embeddings=g("max_position_embeddings", 32768),
+        initializer_range=g("initializer_range", 0.02),
+        rms_norm_eps=g("rms_norm_eps", 1e-6),
+        use_cache=g("use_cache", True),
+        tie_word_embeddings=g("tie_word_embeddings", False),
+        rope_parameters=rope_params,
+        attention_bias=g("attention_bias", False),
+        attention_dropout=g("attention_dropout", 0.0),
+        sliding_window=g("sliding_window", 4096) or 4096,
+        max_window_layers=g("max_window_layers", draft_layers),
+        head_dim=g("head_dim", None),
+    )
+
+    # Force ALL layers to full_attention (matches z-lab's reference draft at
+    # https://huggingface.co/z-lab/Qwen3.5-4B-DFlash/blob/main/config.json).
+    # Qwen3DFlashAttention only differentiates "sliding_attention" from
+    # everything else; Qwen3.5 targets have per-layer "linear_attention"
+    # entries (for target's DeltaNet layers) that are meaningless for the
+    # draft since Qwen3DFlashAttention computes dense attention regardless.
+    # Setting all to "full_attention" makes our draft layer_types match
+    # z-lab's so side-by-side ckpt inspection is apples-to-apples.
+    cfg.layer_types = ["full_attention"] * draft_layers
+    assert cfg.num_hidden_layers == len(cfg.layer_types), (
+        f"num_hidden_layers={cfg.num_hidden_layers} but layer_types has "
+        f"{len(cfg.layer_types)} entries; save_pretrained will reject this."
+    )
+
+    # DFlash-specific attrs (unrecognized by Qwen3Config, carried along anyway).
+    cfg.num_target_layers = target_num_layers
     cfg.block_size = block_size
     cfg.dflash_config = {
         "mask_token_id": mask_token_id,
-        "target_layer_ids": build_target_layer_ids(target_config.num_hidden_layers, draft_layers),
+        "target_layer_ids": build_target_layer_ids(target_num_layers, draft_layers),
     }
     return cfg
 
@@ -425,8 +588,30 @@ def main() -> int:
                 flush=True,
             )
 
+        # τ probe — cheap regression signal. Runs BEFORE the checkpoint save
+        # so the log shows τ at that checkpoint step.
+        if args.tau_probe_every > 0 and step > 0 and step % args.tau_probe_every == 0:
+            probe_prompt = (
+                Path(args.tau_probe_prompt).read_text().strip()
+                if args.tau_probe_prompt else DEFAULT_TAU_PROBE_PROMPT
+            )
+            try:
+                tau, n_cycles = tau_probe(
+                    draft, target, tokenizer, probe_prompt,
+                    args.tau_probe_max_new, device,
+                )
+                print(f"[probe] step={step} τ={tau:.3f} cycles={n_cycles}", flush=True)
+            except Exception as e:
+                print(f"[probe] step={step} FAILED: {e}", flush=True)
+
         if step > 0 and step % args.ckpt_every == 0:
-            ckpt_path = out_dir / f"draft_step{step}.safetensors"
+            # Intermediate checkpoints go in a subdir — `dflash_convert --input
+            # <out_dir>` globs ALL safetensors at the root, and would try to
+            # load every intermediate ckpt as the final draft. Keeping only
+            # model.safetensors at root avoids that footgun.
+            ckpt_dir = out_dir / "checkpoints_intermediate"
+            ckpt_dir.mkdir(exist_ok=True)
+            ckpt_path = ckpt_dir / f"draft_step{step}.safetensors"
             save_file(draft.state_dict(), str(ckpt_path))
             meta = {
                 "step": step,
@@ -437,7 +622,7 @@ def main() -> int:
                 "mask_token_id": mask_token_id,
                 "target_layer_ids": draft_cfg.dflash_config["target_layer_ids"],
             }
-            (out_dir / f"draft_step{step}.json").write_text(json.dumps(meta, indent=2))
+            (ckpt_dir / f"draft_step{step}.json").write_text(json.dumps(meta, indent=2))
             print(f"[ckpt]   wrote {ckpt_path}", flush=True)
 
     # Save final checkpoint as a **HF-compatible repo** so that:
@@ -462,7 +647,9 @@ def main() -> int:
     cfg_path = final_dir / "config.json"
     hf_cfg = json.loads(cfg_path.read_text())
     hf_cfg["architectures"] = ["DFlashDraftModel"]
-    hf_cfg["num_target_layers"] = target.config.num_hidden_layers
+    # target.config may be composite (Qwen3_5Config) → use text_config if present
+    _tgt_src = getattr(target.config, "text_config", None) or target.config
+    hf_cfg["num_target_layers"] = _tgt_src.num_hidden_layers
     hf_cfg["block_size"] = args.block_size
     hf_cfg["dflash_config"] = {
         "mask_token_id": mask_token_id,

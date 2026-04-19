@@ -181,22 +181,103 @@ Kept on MI300X at `/root/dflash_4b_agentic/`:
 
 **Priority 1 (before ANY other DFlash work):** debug the training bug.
 
-Order I'd try:
-1. **Train K=1 variant** (single anchor per example, no multi-block concat).
-   Strip the dense mask code entirely — just one masked block at a random
-   position per example. If this also gives τ=0.1, the bug is not multi-
-   anchor specific. If τ > 3, multi-anchor mask is the root cause. 30 min,
-   $1.
-2. **Inspect z-lab's draft weight distributions vs ours**. Look at e.g.
-   `q_proj.weight.std()` per layer for both. If ours is wildly off (too
-   small, too big), training isn't exploring the loss landscape — could
-   be LR or init issue.
-3. **Sanity-train for 100 steps at γ=10** on the SAME data. If γ=3 is
-   starving mid-block positions, γ=10 should show meaningfully different
-   loss curves even early.
-4. **Wait for z-lab to release training code.** Their README promises it
-   "soon". If we debug first and they publish later, we've learned
-   something. If they publish first, we save a lot of time.
+### Update 2026-04-19 (Hermes review round)
+
+A Hermes-agent second-opinion round produced concrete diagnostic scripts now
+committed to `scripts/dflash_diag_*.py` and a thorough reassessment of the
+hypotheses:
+
+**Hypothesis A (mask) — REFUTED by `scripts/dflash_diag_mask.py`.** The mask
+is paper-faithful. Reference inference (`.dflash-reference/dflash/model.py:347`)
+uses `attention_mask=None` and `is_causal=False` → fully bidirectional within
+block. Training's bidirectional-within-block is the correct match. (Hermes
+initially suggested causal-within-block as an A/B, but reading the reference
+shows this would BREAK alignment.)
+
+**Hypothesis D (composite config) — REFUTED AND IRRELEVANT.** `AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-4B")` returns a model with `config` of type `Qwen3_5TextConfig` (flat), NOT composite `Qwen3_5Config`. The
+composite variant (which has no top-level hidden_size/num_hidden_layers attrs)
+only appears from `AutoConfig.from_pretrained`. So the old `build_draft_config`
+did clone a flat config — the post-mortem's "fragile delegation" framing was
+wrong.
+
+That said, `build_draft_config` has been rewritten to build a FRESH flat
+`Qwen3Config` from text_config-scoped attribute reads. This eliminates the
+Qwen3_5TextConfig vs Qwen3Config subclass question, and fixes the original
+save_pretrained crash (truncates `layer_types` to draft_layers, asserts the
+invariant). Side effects:
+  - All draft layers now forced to `"full_attention"` to match z-lab's config.
+  - Rope params routed through new-schema `rope_parameters` dict (transformers 5.x).
+  - `save_pretrained` verified end-to-end on Qwen3.5-0.8B test.
+
+**Hypothesis B (KV distribution) — mathematically implausible.** Careful trace
+through reference spec_generate shows that at cycle 2+, past_kv holds ONLY
+cropped target_hidden K/V (noise is dropped each cycle via `pkv_d.crop(start)`).
+Effective k_cat at cycle N = [all accepted target ctx] + [current block noise].
+Training's K-concat mask with `j < a_k` + within-block bidirectional
+EXACTLY replicates this per-block. Distributions match. Not the bug.
+
+**NEW FINDING — rope_parameters partial_rotary_factor=0.25 on Qwen3.5 target.**
+Qwen3.5 uses partial rotary (only 25% of head_dim rotated). Our draft inherits
+this; z-lab's draft config sets no partial_rotary_factor (full rotary). For
+head_dim=256, our draft leaves 192 of 256 dims WITHOUT positional encoding
+through RoPE. z-lab's draft (head_dim=128, full rotary) rotates all 128.
+Whether this tanks τ is unproven but it's a significant architectural difference.
+
+**NEW DIAGNOSTIC — `scripts/dflash_diag_zlab_loss.py`.** Loads z-lab's
+baseline weights, runs through OUR forward (our mask, our loss, our data).
+If their known-good weights produce low loss on our task → our
+forward/mask/loss are CORRECT, pointing at training dynamics / init /
+partial-rotary as the bug. If high loss → our forward has a bug.
+
+**NEW DIAGNOSTIC — `scripts/dflash_diag_iter1_tau.py`.** Caps decode cycles
+at 1. Measures τ for just iter 1 vs aggregate. If τ_iter1 much larger than
+τ_aggregate, Hypothesis B reactivates.
+
+**NEW TRAINING-TIME τ PROBE — `--tau-probe-every N` flag.** Hermes's
+highest-value suggestion. Every N steps, small spec_generate run on a fixed
+held-out prompt. Prints τ alongside loss. Would have caught the 4B run's
+τ=0.09 in <100 steps instead of 5000. Next training run MUST enable this.
+
+### Revised order to try (replaces original list)
+
+1. **Run the diagnostic scripts on MI300X:**
+   ```bash
+   # Hypothesis A (already run LOCALLY on CPU — confirmed PASS)
+   python3 scripts/dflash_diag_mask.py
+
+   # Hermes cheap #1: z-lab weights through our forward
+   python3 scripts/dflash_diag_zlab_loss.py \
+       --target-repo Qwen/Qwen3.5-4B \
+       --zlab-draft-repo z-lab/Qwen3.5-4B-DFlash \
+       --corpus /root/calibration_corpus.txt --num-batches 5
+
+   # Hermes cheap #2: iter-1 τ of our failed draft
+   python3 scripts/dflash_diag_iter1_tau.py \
+       --target-repo Qwen/Qwen3.5-4B \
+       --draft-dir /root/dflash_4b_agentic --max-cycles 1
+   python3 scripts/dflash_diag_iter1_tau.py \
+       --target-repo Qwen/Qwen3.5-4B \
+       --draft-dir /root/dflash_4b_agentic --max-cycles 50  # aggregate
+   ```
+
+2. **Retrain 4B from scratch with the patched script + τ probe enabled:**
+   ```bash
+   python3 scripts/dflash_train_poc.py \
+       --target-repo Qwen/Qwen3.5-4B \
+       --corpus /root/calibration_corpus.txt \
+       --seq-len 4096 --batch-size 1 --masked-blocks-per-seq 4 \
+       --steps 5000 --ckpt-every 1000 \
+       --tau-probe-every 200 \
+       --out /root/dflash_4b_agentic_v2
+   ```
+   If τ probe is still flat at step 500, KILL the run — don't waste compute.
+
+3. **If v2 still fails: force full rotary in the draft** (add a
+   `--full-rotary` flag that overrides rope_parameters to drop
+   `partial_rotary_factor`). Matches z-lab's architectural convention.
+
+4. **If still failing after 1-3: wait for z-lab to release training code.**
+   Their README promises "soon". Their code shortcuts everything.
 
 **Priority 2:** once we have a working draft-training pipeline, THEN
 return to sidecar work (which is currently in decent shape — generic
