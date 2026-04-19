@@ -139,12 +139,35 @@ def main():
         p.requires_grad_(False)
 
     print(f"[draft] loading from {args.draft_dir}...")
-    draft_cfg = AutoConfig.from_pretrained(args.draft_dir, trust_remote_code=True)
+    # Skip AutoConfig (stale auto_map with "module.submodule.Class" triples
+    # chokes transformers 5.x's class_reference.split parser). Load the
+    # config.json manually into a fresh Qwen3Config — DFlashDraftModel's
+    # config_class is Qwen3Config anyway.
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+    import json as _json
+    cfg_dict = _json.loads((Path(args.draft_dir) / "config.json").read_text())
+    dflash_cfg = cfg_dict.pop("dflash_config", {"mask_token_id": 248070, "target_layer_ids": []})
+    block_size = cfg_dict.pop("block_size", 16)
+    num_target_layers = cfg_dict.pop("num_target_layers", 32)
+    # Strip attrs Qwen3Config doesn't understand
+    for k in ("auto_map", "architectures", "dflash_config", "id2label", "label2id",
+              "problem_type", "num_target_layers", "block_size"):
+        cfg_dict.pop(k, None)
+    draft_cfg = Qwen3Config(**{k: v for k, v in cfg_dict.items() if k not in ("transformers_version",)})
+    draft_cfg.dflash_config = dflash_cfg
+    draft_cfg.block_size = block_size
+    draft_cfg.num_target_layers = num_target_layers
+    # Guard DFlashDraftModel's layer_types access — force all full_attention
+    draft_cfg.layer_types = ["full_attention"] * draft_cfg.num_hidden_layers
     draft = DFlashDraftModel(draft_cfg).to(device=device, dtype=dtype)
-    sf = next(Path(args.draft_dir).glob("*.safetensors"))
+    sf = next(p for p in Path(args.draft_dir).glob("*.safetensors"))
     sd = load_file(str(sf))
     missing, unexpected = draft.load_state_dict(sd, strict=False)
     print(f"[draft]   missing={len(missing)} unexpected={len(unexpected)}")
+    if missing[:3]:
+        print(f"[draft]   missing keys (first 3): {missing[:3]}")
+    if unexpected[:3]:
+        print(f"[draft]   unexpected keys (first 3): {unexpected[:3]}")
     draft.eval()
 
     # Build prompt
