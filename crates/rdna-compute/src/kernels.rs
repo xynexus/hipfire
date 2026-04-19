@@ -186,10 +186,11 @@ pub const GEMM_HFQ4G256_RESIDUAL_FP16_SRC: &str = include_str!("../../../kernels
 
 // WMMA variant: gfx1100+ only. Uses __builtin_amdgcn_wmma_f32_16x16x16_f16_w32
 // for 16×16 tiled matrix multiply. Same FP16 X input, FP32 Y output.
-pub const GEMM_HFQ4G256_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.hip");
-pub const GEMM_HFQ4G256_RESIDUAL_WMMA2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma2.hip");
+// K2 (2× K-tile unroll with FP32 dequant) is the live variant; earlier
+// _wmma / _wmma2 / _wmma_k4 siblings used the wrong RDNA3 output mapping
+// (row = row_start + (tid & 15) instead of row = row_start + 2*j + (tid >> 4))
+// and were removed to avoid a copy-paste regression.
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_k2.hip");
-pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K4_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_k4.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
