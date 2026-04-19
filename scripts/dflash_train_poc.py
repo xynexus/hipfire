@@ -376,17 +376,61 @@ def main() -> int:
             (out_dir / f"draft_step{step}.json").write_text(json.dumps(meta, indent=2))
             print(f"[ckpt]   wrote {ckpt_path}", flush=True)
 
-    final = out_dir / "draft_final.safetensors"
-    save_file(draft.state_dict(), str(final))
-    (out_dir / "draft_final.json").write_text(json.dumps({
+    # Save final checkpoint as a **HF-compatible repo** so that:
+    #   - crates/hipfire-quantize/bin/dflash_convert (our safetensors → .hfq
+    #     conversion path) can read it directly via `--input <dir>`.
+    #   - The same directory is uploadable to HuggingFace unchanged
+    #     (goal for research publication).
+    #
+    # HF-compatible layout expected by dflash_convert (see bin/dflash_convert.rs:466+):
+    #   config.json       — Qwen3Config + { dflash_config, num_target_layers,
+    #                       block_size, architectures: ["DFlashDraftModel"] }
+    #   *.safetensors     — draft state dict (filename flexible; any file is picked up)
+    #
+    # Approach: use PreTrainedModel.save_pretrained which writes both; then
+    # patch config.json to add the DFlash-specific fields the standard
+    # serializer drops.
+    final_dir = out_dir  # save final in-place at out root
+    draft.save_pretrained(str(final_dir), safe_serialization=True)
+
+    # save_pretrained drops attrs we stashed on draft_cfg that Qwen3Config
+    # doesn't know about. Patch them back in.
+    cfg_path = final_dir / "config.json"
+    hf_cfg = json.loads(cfg_path.read_text())
+    hf_cfg["architectures"] = ["DFlashDraftModel"]
+    hf_cfg["num_target_layers"] = target.config.num_hidden_layers
+    hf_cfg["block_size"] = args.block_size
+    hf_cfg["dflash_config"] = {
+        "mask_token_id": mask_token_id,
+        "target_layer_ids": draft_cfg.dflash_config["target_layer_ids"],
+    }
+    # auto_map hint so HF Auto* classes can find the reference model.py
+    # (published .dflash-reference lives under `dflash` python namespace).
+    hf_cfg["auto_map"] = {
+        "AutoConfig": "dflash.model.Qwen3Config",
+        "AutoModel": "dflash.model.DFlashDraftModel",
+    }
+    cfg_path.write_text(json.dumps(hf_cfg, indent=2))
+
+    # Training-provenance metadata (not HF-standard; helpful for reproducibility).
+    (final_dir / "training_meta.json").write_text(json.dumps({
         "steps": args.steps,
         "loss_ema": loss_ema,
         "target_repo": args.target_repo,
         "draft_layers": args.draft_layers,
         "block_size": args.block_size,
+        "seq_len": args.seq_len,
+        "masked_blocks_per_seq": args.masked_blocks_per_seq,
+        "loss_gamma": args.loss_gamma,
         "mask_token_id": mask_token_id,
+        "corpus": args.corpus,
+        "lr_peak": args.lr,
+        "batch_size": args.batch_size,
     }, indent=2))
-    print(f"[done] final ckpt at {final}", flush=True)
+    print(f"[done] final HF-format draft at {final_dir}", flush=True)
+    print(f"[done] convert to .hfq with:", flush=True)
+    print(f"       target/release/dflash_convert --input {final_dir} "
+          f"--output {final_dir}.hfq --mq4", flush=True)
     return 0
 
 
