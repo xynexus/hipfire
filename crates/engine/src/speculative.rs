@@ -3272,19 +3272,27 @@ pub fn seed_target_hidden_from_prompt(
 ) -> HipResult<()> {
     // Reset target state to avoid double-prefill of the same context.
     target.reset_state(gpu);
-    for (i, &tok) in prompt_tokens.iter().enumerate() {
-        qwen35::forward_scratch_with_hidden(
-            gpu,
-            &target.weights,
-            &target.config,
-            tok,
-            i,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            hidden_rb,
-        )?;
-    }
+    // Fast path: one batched prefill populates hidden_rb + KV + dn_state in a
+    // single forward, instead of N per-token forwards. On 9B MQ4 with a
+    // 6.2k-token prompt this drops prompt ingest from ~51s (121 tok/s) to
+    // a few seconds, which is the primary cost of an agent's first turn.
+    // `forward_prefill_batch` itself falls back to per-token internally if
+    // the KV quant mode / batch size aren't on the fast path, so the call
+    // is always safe — the effective cadence just varies.
+    qwen35::forward_prefill_batch(
+        gpu,
+        &target.weights,
+        &target.config,
+        prompt_tokens,
+        0,
+        &mut target.kv_cache,
+        &mut target.dn_state,
+        &target.scratch,
+        Some(hidden_rb),
+        None,
+        None,
+        None,
+    )?;
     // Gather the just-written rows from the ring buffer.
     let block = download_hidden_block(gpu, hidden_rb, prompt_tokens.len())?;
     target_hidden_host.extend_from_slice(&block);

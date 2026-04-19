@@ -504,7 +504,7 @@ fn main() {
     // stay byte-identical to the old contiguous-range behaviour.
     draft_scratch.target_hidden_abs_positions =
         (0..prompt_tokens.len() as i32).collect();
-    eprintln!("prefill (per-token) in {:.2}s", t2.elapsed().as_secs_f64());
+    eprintln!("prefill in {:.2}s", t2.elapsed().as_secs_f64());
 
     // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
     // The policy evicts target.kv_cache between spec_step cycles.
