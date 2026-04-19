@@ -982,14 +982,34 @@ fn generate_dflash(
 
     let t0 = Instant::now();
     let ctx_capacity = df.ctx_capacity;
-    if prompt_tokens.len() + max_tokens + df.block_size > ctx_capacity {
+    // Capacity checks. With eviction enabled the advertised context window is
+    // effectively unbounded (eviction fires between spec cycles), but the
+    // *prompt* must still fit in one physical_cap span because
+    // seed_target_hidden_from_prompt writes it per-token without chunking.
+    let eff_prompt_cap = if m.eviction.is_some() { m.physical_cap } else { ctx_capacity };
+    if prompt_tokens.len() + df.block_size > eff_prompt_cap {
         let _ = writeln!(
             stdout,
-            r#"{{"type":"error","id":"{}","message":"prompt+max_tokens exceeds ctx_capacity {}"}}"#,
+            r#"{{"type":"error","id":"{}","message":"prompt+block_size exceeds {} {} (eviction {})"}}"#,
+            id,
+            if m.eviction.is_some() { "physical_cap" } else { "ctx_capacity" },
+            eff_prompt_cap,
+            if m.eviction.is_some() { "on" } else { "off" },
+        );
+        let _ = stdout.flush();
+        m.q35_weights = Some(target.weights);
+        m.kv_cache = Some(target.kv_cache);
+        m.dn_state = Some(target.dn_state);
+        m.q35_scratch = Some(target.scratch);
+        return;
+    }
+    if m.eviction.is_none() && prompt_tokens.len() + max_tokens + df.block_size > ctx_capacity {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt+max_tokens exceeds ctx_capacity {} (enable cask_sidecar for long decode)"}}"#,
             id, ctx_capacity,
         );
         let _ = stdout.flush();
-        // Put state back before returning so subsequent requests don't panic.
         m.q35_weights = Some(target.weights);
         m.kv_cache = Some(target.kv_cache);
         m.dn_state = Some(target.dn_state);
@@ -1053,6 +1073,21 @@ fn generate_dflash(
     let mut stats = SpecStats::new(df.block_size);
     let mut generated = 0usize;
 
+    // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
+    // If the prompt already filled past budget+beta, compact once before
+    // entering the spec loop so the first spec_step writes at physical slot
+    // `budget`. compact_offset is maintained on target.kv_cache; subsequent
+    // forwards inside spec_step_dflash read it for RoPE phase automatically.
+    if let Some(ref ev) = m.eviction {
+        if let Some(new_phys) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
+            eprintln!(
+                "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
+                position, new_phys, target.kv_cache.compact_offset,
+            );
+            position = new_phys;
+        }
+    }
+
     // Emit the first token immediately so TTFT is the prefill time.
     streamed_tokens.push(first_token);
     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
@@ -1114,6 +1149,14 @@ fn generate_dflash(
         }
         position += step.accepted + 1;
         seed_token = step.bonus_token;
+        // Per-cycle eviction (FlashCASK). Fires whenever current physical
+        // has grown to budget+β since the last compaction. No-op when
+        // physical < budget+β, so non-firing cycles pay only the check cost.
+        if let Some(ref ev) = m.eviction {
+            if let Some(new_phys) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
+                position = new_phys;
+            }
+        }
         if hit_eos { break; }
     }
 
