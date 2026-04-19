@@ -13,6 +13,11 @@
 #      accelerate, numpy).
 #   6. Optionally clones/updates hipfire to /root/hipfire and builds the
 #      release binaries under the `deltanet` feature.
+#   7. Detects the number of visible GPUs and echoes the recommended
+#      parallel-calibration launcher command.
+#   8. Bakes HIPFIRE_ROCBLAS_OFF=1 + ROCm PATH into /root/.bashrc so every
+#      subsequent shell has the right environment for MQ4 inference
+#      (rocBLAS path is broken under physical_cap eviction on gfx942).
 #
 # What it does NOT do:
 #   - Transfer models or calibration corpora (multi-GB, pick per job).
@@ -23,23 +28,29 @@
 #   ssh <host> 'bash /root/amd_quickdeploy.sh'            # default targets
 #   ssh <host> 'bash /root/amd_quickdeploy.sh --skip-build'
 #   ssh <host> 'bash /root/amd_quickdeploy.sh --repo=git@github.com:user/hipfire.git'
+#   ssh <host> 'bash /root/amd_quickdeploy.sh --branch=dflash'
+#   ssh <host> 'bash /root/amd_quickdeploy.sh --fetch-corpus'  # pull hermes corpus too
 
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-}"      # git URL — if empty, assumes repo already present
+REPO_URL="${REPO_URL:-https://github.com/Kaden-Schutt/hipfire.git}"
 REPO_DIR="${REPO_DIR:-/root/hipfire}"
+REPO_BRANCH="${REPO_BRANCH:-dflash}"
 VENV_DIR="${VENV_DIR:-/root/pytorch_env}"
 SKIP_BUILD=0
 SKIP_HF=0
 SKIP_TORCH=0
+FETCH_CORPUS=0
 
 for arg in "$@"; do
     case "$arg" in
-        --skip-build)  SKIP_BUILD=1 ;;
-        --skip-hf)     SKIP_HF=1 ;;
-        --skip-torch)  SKIP_TORCH=1 ;;
-        --repo=*)      REPO_URL="${arg#--repo=}" ;;
-        --help|-h)     sed -n '2,24p' "$0"; exit 0 ;;
+        --skip-build)   SKIP_BUILD=1 ;;
+        --skip-hf)      SKIP_HF=1 ;;
+        --skip-torch)   SKIP_TORCH=1 ;;
+        --repo=*)       REPO_URL="${arg#--repo=}" ;;
+        --branch=*)     REPO_BRANCH="${arg#--branch=}" ;;
+        --fetch-corpus) FETCH_CORPUS=1 ;;
+        --help|-h)      sed -n '2,35p' "$0"; exit 0 ;;
         *) echo "unknown flag: $arg" >&2; exit 2 ;;
     esac
 done
@@ -142,15 +153,12 @@ fi
 
 # ── 6. hipfire build ──────────────────────────────────────────────────
 if [ "$SKIP_BUILD" -eq 0 ]; then
-    if [ -n "$REPO_URL" ] && [ ! -d "$REPO_DIR/.git" ]; then
-        log "cloning $REPO_URL → $REPO_DIR"
-        git clone "$REPO_URL" "$REPO_DIR"
-    elif [ -d "$REPO_DIR/.git" ]; then
-        log "hipfire repo present at $REPO_DIR"
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        log "cloning $REPO_URL ($REPO_BRANCH) → $REPO_DIR"
+        git clone --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR"
     else
-        log "no REPO_URL given and $REPO_DIR has no .git — skipping build"
-        log "either pass --repo=… or rsync the repo in manually, then re-run"
-        exit 0
+        log "hipfire repo present at $REPO_DIR — fetching + resetting to origin/$REPO_BRANCH"
+        (cd "$REPO_DIR" && git fetch origin "$REPO_BRANCH" && git reset --hard "origin/$REPO_BRANCH")
     fi
     cd "$REPO_DIR"
 
@@ -165,19 +173,62 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     log "build done — key binaries under $REPO_DIR/target/release/examples/"
 fi
 
+# ── 7. Environment defaults (baked into shell rc) ─────────────────────
+# HIPFIRE_ROCBLAS_OFF=1 is required on gfx942 under physical_cap eviction
+# until the rocBLAS stride bug is fixed (task #25). Cheap to set
+# globally — it only affects the rocBLAS MFMA path.
+log "baking env defaults into /root/.bashrc (HIPFIRE_ROCBLAS_OFF=1, ROCm PATH)"
+BASHRC=/root/.bashrc
+grep -q "HIPFIRE_ROCBLAS_OFF" "$BASHRC" 2>/dev/null || cat >> "$BASHRC" <<'BRC'
+# hipfire deploy defaults
+export HIPFIRE_ROCBLAS_OFF=1
+export PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/root/.cargo/bin:$PATH
+export HIP_PATH=/opt/rocm
+export ROCM_PATH=/opt/rocm
+BRC
+
+# ── 8. GPU count + parallel calibration hint ───────────────────────────
+N_GPUS=$(/opt/rocm/bin/rocminfo 2>/dev/null | grep -c "Agent " || echo 1)
+# rocminfo counts the CPU as an agent too; subtract 1
+N_GPUS=$((N_GPUS - 1))
+[ "$N_GPUS" -lt 1 ] && N_GPUS=1
+log "GPUs visible: $N_GPUS"
+
+# ── 9. Optional: fetch hermes calibration corpus ──────────────────────
+if [ "$FETCH_CORPUS" -eq 1 ]; then
+    # shellcheck disable=SC1091
+    [ -f "$VENV_DIR/bin/activate" ] && source "$VENV_DIR/bin/activate"
+    log "fetching lambda/hermes-agent-reasoning-traces corpus..."
+    if [ -x "$REPO_DIR/scripts/fetch_hermes_corpus.sh" ]; then
+        "$REPO_DIR/scripts/fetch_hermes_corpus.sh" /root/hermes_corpus.txt
+    else
+        log "  fetch_hermes_corpus.sh not found in repo; skipping (repo may be older)"
+    fi
+fi
+
 log "────────────────────────────────────────────────────"
 log "QUICKDEPLOY COMPLETE"
 log "ROCm:    $ROCM_VERSION"
-log "GPU:     $GPU_NAME"
+log "GPU:     $GPU_NAME  ×$N_GPUS"
 log "venv:    $VENV_DIR (activate with: source $VENV_DIR/bin/activate)"
 if [ "$SKIP_BUILD" -eq 0 ] && [ -d "$REPO_DIR" ]; then
-    log "hipfire: $REPO_DIR"
+    log "hipfire: $REPO_DIR ($(cd "$REPO_DIR" && git log -1 --format=%h))"
 fi
 log ""
-log "Next steps (machine-specific):"
-log "  - rsync your models and calibration corpora to this box."
-log "  - For sidecar cals:"
-log "      ./target/release/examples/triattn_validate <model.mq4> \\"
-log "        --corpus <wikitext_calib.txt> --max-tokens 1000000 \\"
-log "        --sidecar <model.mq4.triattn.bin>"
+log "Next steps:"
+log "  1. rsync your models to /root/models/ (or pull via hipfire CLI)"
+log "  2. Fetch a calibration corpus (if not done via --fetch-corpus):"
+log "       bash $REPO_DIR/scripts/fetch_hermes_corpus.sh /root/hermes_corpus.txt"
+if [ "$N_GPUS" -gt 1 ]; then
+log "  3. Parallel calibrate across all $N_GPUS GPUs:"
+log "       bash $REPO_DIR/scripts/calibrate_multigpu.sh \\"
+log "            --models /root/models/qwen3.5-9b.mq4,/root/models/qwen3.5-27b.mq4 \\"
+log "            --corpus /root/hermes_corpus.txt"
+else
+log "  3. Single-GPU calibration:"
+log "       $REPO_DIR/target/release/examples/triattn_validate \\"
+log "            /root/models/qwen3.5-9b.mq4 \\"
+log "            --corpus /root/hermes_corpus.txt --max-tokens 1000000 \\"
+log "            --sidecar /root/models/qwen3.5-9b.mq4.triattn.bin"
+fi
 log "────────────────────────────────────────────────────"
