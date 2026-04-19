@@ -279,6 +279,84 @@ held-out prompt. Prints τ alongside loss. Would have caught the 4B run's
 4. **If still failing after 1-3: wait for z-lab to release training code.**
    Their README promises "soon". Their code shortcuts everything.
 
+## Update 2026-04-19 (afternoon — five-run investigation complete)
+
+Five training runs fired, combined with deep diagnostics. Key findings:
+
+### Run matrix (all Qwen3.5-4B target, zlab-arch match except #1)
+
+| # | config | result (Rust-side τ on 3 prompts) |
+|---|---|---|
+| 1 | original (16/256 partial rotary), LR 3e-4 | τ=0.09 (actually broken) |
+| 2 | zlab-arch scratch, LR 3e-4 | killed at step 1300 on false τ-probe signal — loss trajectory was fine |
+| 3 | zlab-arch scratch, LR 5e-5 | killed at step 500 on false τ-probe signal — loss was dropping smoothly |
+| 4 | zlab-arch **warm-start** z-lab, LR 1e-5, 2000 steps | byte-identical to z-lab — LR too small |
+| 5 | zlab-arch warm-start z-lab, LR 1e-4, 2000 steps | loss 2.99→1.0 but τ **regressed** monotonically |
+
+### THE cache-bug false-negative
+
+Our Python τ-probe (both inline in training and stand-alone
+`scripts/dflash_diag_iter1_tau.py`) gave τ=1.000 on EVERY ckpt including
+z-lab's proven-working weights. Root cause isolated in
+`scripts/dflash_cache_test.py`: transformers 5.5.4's
+`DynamicCache(config=target.config)` for Qwen3.5 hybrid-attention
+target returns wrong logits at cycle-2+ of spec_generate. Plain
+`DynamicCache()` crashes at `has_previous_state`. No Python cache class
+in transformers 5.5.4 handles Qwen3.5 hybrid for manual spec loops —
+only `target.generate()` internal path works.
+
+Implication: **all τ-probe readings during training runs 2, 3, 4, 5 were
+false negatives.** Runs 2 and 3 may have been fine; we killed them
+prematurely. Runs 4 and 5 were evaluated end-to-end on Rust engine
+instead, which uses its own hybrid cache (correct).
+
+### The real blocker: loss ≠ τ on generation tasks
+
+Run 5 (LR=1e-4 warm-start) produced the cleanest data: loss went
+2.99→1.0 (EMA), but on all 3 eval prompts τ regressed monotonically as
+training progressed:
+
+| prompt | z-lab τ | ft500 | ft1000 | ft1500 |
+|---|---|---|---|---|
+| simple chat (weather) | 1.148 | 1.071 | 1.000 | 1.000 |
+| tool-call (mongolia search) | 3.130 | 3.130 | 3.130 | 3.130 |
+| full Hermes system+user (26KB) | **1.423** | 1.423 | 1.333 | **1.250** |
+
+Even on the FULL HERMES TEMPLATE (exact training distribution) τ
+regressed 12%. Training successfully minimizes per-position CE but the
+draft over-indexes on structural tokens (`<|im_end|>`, `<|im_start|>`,
+`\n`, tool-call boilerplate) that are abundant in agentic corpus but
+don't help predict the novel-content tokens target actually produces
+during assistant generation. Per-position CE loss is a poor proxy for
+deployment τ on generation tasks.
+
+### Decision
+
+Ship **z-lab's Qwen3.5-4B-DFlash as the 4B draft** for the hipfire
+release. Domain-specialization on agentic is an open research problem
+that requires either:
+- Data curation to dilute structural token density
+- Different loss (direct τ optimization, or weighted by token novelty)
+- Much more data so the draft can learn BOTH structure and content
+- z-lab's unreleased training recipe
+
+None of these are a one-night fix. For user-visible 4B draft
+performance, z-lab is already at τ≈3.1 on tool-call prompts.
+
+### What's salvageable
+
+- `scripts/dflash_train_poc.py` with `--match-zlab-arch` flag is
+  production-ready for from-scratch training when we get a better data
+  recipe. Its infrastructure (sparse mask, KV injection, multi-anchor)
+  is correctness-verified by `dflash_diag_zlab_loss.py` (z-lab weights
+  produce loss=1.81 through our forward — ±0.1 of zlab's reported
+  baseline).
+- `scripts/dflash_cache_test.py` documents the transformers-5.5.4 bug.
+  When upstream fixes it (or we find the right cache class), the Python
+  τ-probe becomes usable and training can have proper early-stopping.
+- Warm-start pattern (`--resume`) works cleanly; any future experiment
+  can start from z-lab's weights for zero-risk debugging.
+
 **Priority 2:** once we have a working draft-training pipeline, THEN
 return to sidecar work (which is currently in decent shape — generic
 mirror-evict fix shipped, agentic calibration validated end-to-end).
