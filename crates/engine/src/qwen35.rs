@@ -3090,7 +3090,13 @@ fn forward_prefill_chunk(
                         layer.wqkv.k, n,
                     )?;
                 } else {
-                    gpu.gemm_qkvza_hfq4g256(
+                    // NOTE: `gemm_qkvza_hfq4g256` (the batched 4-way kernel) diverges from
+                    // `fused_qkvza_hfq4g256` on real Qwen weights for row 0 even when inputs
+                    // are byte-identical, producing incoherent greedy output. Until the
+                    // divergence is root-caused, use `gemm_qkvza_hfq4g256_per_row`, which
+                    // runs N × fused_qkvza_hfq4g256 (same kernel as the per-token path) so
+                    // the batched path is guaranteed byte-exact with the per-token path.
+                    gpu.gemm_qkvza_hfq4g256_per_row(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
                         &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
@@ -3349,6 +3355,23 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
+                if trace {
+                    for r in 0..n {
+                        let h = la_hash_gpu_range(gpu, &pbs.x_rot_batch, r * dim * 4, dim * 4);
+                        eprintln!("[LA_TRACE][B] L0 r{r} post_ffn_norm x_rot      : {:016x}", h);
+                    }
+                    for r in 0..n {
+                        let h_g = la_hash_gpu_range(gpu, &pbs.gate_ffn_batch, r * hidden_dim * 4, hidden_dim * 4);
+                        let h_u = la_hash_gpu_range(gpu, &pbs.up_batch,       r * hidden_dim * 4, hidden_dim * 4);
+                        eprintln!("[LA_TRACE][B] L0 r{r} post_gate_up gate        : {:016x}", h_g);
+                        eprintln!("[LA_TRACE][B] L0 r{r} post_gate_up up          : {:016x}", h_u);
+                    }
+                    for r in 0..n {
+                        let h = la_hash_gpu_range(gpu, &pbs.ffn_hidden_batch, r * hidden_dim * 4, hidden_dim * 4);
+                        eprintln!("[LA_TRACE][B] L0 r{r} post_silu_mul hidden     : {:016x}", h);
+                    }
+                }
+
                 // Batched w_down + residual.
                 if w_down_is_6bit {
                     gpu.gemm_hfq6g256_residual(
@@ -3360,6 +3383,13 @@ fn forward_prefill_chunk(
                         &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
                         layer.w_down.m, layer.w_down.k, n,
                     )?;
+                }
+
+                if trace {
+                    for r in 0..n {
+                        let h = la_hash_gpu_range(gpu, &pbs.x_batch, r * dim * 4, dim * 4);
+                        eprintln!("[LA_TRACE][B] L0 r{r} post_wdown_resid x       : {:016x}", h);
+                    }
                 }
 
                 // Post-layer hidden extract for the DFlash draft path.
@@ -3721,7 +3751,13 @@ fn forward_prefill_chunk(
                         layer.wqkv.k, n,
                     )?;
                 } else {
-                    gpu.gemm_qkvza_hfq4g256(
+                    // NOTE: `gemm_qkvza_hfq4g256` (the batched 4-way kernel) diverges from
+                    // `fused_qkvza_hfq4g256` on real Qwen weights for row 0 even when inputs
+                    // are byte-identical, producing incoherent greedy output. Until the
+                    // divergence is root-caused, use `gemm_qkvza_hfq4g256_per_row`, which
+                    // runs N × fused_qkvza_hfq4g256 (same kernel as the per-token path) so
+                    // the batched path is guaranteed byte-exact with the per-token path.
+                    gpu.gemm_qkvza_hfq4g256_per_row(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
                         &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
@@ -4513,12 +4549,23 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                     weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 }
+                if trace {
+                    let h_g = la_hash_gpu_range(gpu, &s.gate_ffn, 0, config.hidden_dim * 4);
+                    let h_u = la_hash_gpu_range(gpu, &s.up, 0, config.hidden_dim * 4);
+                    eprintln!("[LA_TRACE][P] L0 p{pos} post_gate_up gate        : {:016x}", h_g);
+                    eprintln!("[LA_TRACE][P] L0 p{pos} post_gate_up up          : {:016x}", h_u);
+                }
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
                 weight_gemv_swiglu_residual(
                     gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
                 )?;
+
+                if trace {
+                    let h = la_hash_gpu_range(gpu, &s.x, 0, dim * 4);
+                    eprintln!("[LA_TRACE][P] L0 p{pos} post_wdown_resid x       : {:016x}", h);
+                }
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
