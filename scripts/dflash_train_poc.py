@@ -124,6 +124,13 @@ def parse_args() -> argparse.Namespace:
     # partial_rotary_factor from the draft's rope_parameters.
     p.add_argument("--full-rotary", action="store_true",
                    help="Force full (100%) rotary in the draft, matching z-lab's convention.")
+    # Macro flag: replicate z-lab's Qwen3.5-4B-DFlash draft architecture exactly
+    # (32 heads × 128 head_dim, no partial rotary, rope_theta=1e7, tied embeds).
+    # z-lab's arch produced loss=1.8 on our training task per diag_zlab_loss;
+    # ours (16/256 + partial rotary inherited from Qwen3.5) has NO evidence
+    # of trainability. Use this to minimize unknowns.
+    p.add_argument("--match-zlab-arch", action="store_true",
+                   help="Override draft arch to match z-lab's Qwen3.5-4B-DFlash (32/128/full-rotary/tied-emb/rope_theta=1e7).")
     return p.parse_args()
 
 
@@ -249,7 +256,7 @@ def sample_batch(
 
 
 def build_draft_config(target_config, draft_layers: int, block_size: int, mask_token_id: int,
-                       full_rotary: bool = False):
+                       full_rotary: bool = False, match_zlab_arch: bool = False):
     """Build a flat Qwen3Config for the DFlash draft.
 
     Qwen/Qwen3.5-* returns a composite `Qwen3_5Config` with text_config +
@@ -281,29 +288,50 @@ def build_draft_config(target_config, draft_layers: int, block_size: int, mask_t
         # rope_type doesn't accept mrope_section/mrope_interleaved).
         rope_params = {k: v for k, v in rope_params.items()
                        if k not in ("mrope_section", "mrope_interleaved")}
-    if full_rotary:
+    if full_rotary or match_zlab_arch:
         rope_params.pop("partial_rotary_factor", None)
+    if match_zlab_arch:
+        # Override rope_theta to z-lab's 1e7 if the target's was different.
+        rope_params["rope_theta"] = 1e7
+
+    # match_zlab_arch overrides: 32 heads, 8 KV heads, head_dim=128, tied
+    # embeddings, intermediate_size=9728. Keeps hidden_size from target (the
+    # fc layer needs len(target_layer_ids) * target.hidden_size → draft.hidden_size
+    # match — z-lab's 2560 matches Qwen3.5-4B target's 2560).
+    attn_overrides = {}
+    if match_zlab_arch:
+        attn_overrides.update(
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            intermediate_size=9728,
+            tie_word_embeddings=True,
+        )
 
     # Copy every flat field Qwen3Config supports, plus DFlash-specific ones.
+    # attn_overrides (from --match-zlab-arch) wins over target-inherited attrs.
+    def ov(attr, default=None):
+        return attn_overrides.get(attr, g(attr, default))
+
     cfg = Qwen3Config(
         vocab_size=g("vocab_size"),
         hidden_size=g("hidden_size"),
-        intermediate_size=g("intermediate_size"),
+        intermediate_size=ov("intermediate_size"),
         num_hidden_layers=draft_layers,              # ← 5 for draft, not target's
-        num_attention_heads=g("num_attention_heads"),
-        num_key_value_heads=g("num_key_value_heads"),
+        num_attention_heads=ov("num_attention_heads"),
+        num_key_value_heads=ov("num_key_value_heads"),
         hidden_act=g("hidden_act", "silu"),
         max_position_embeddings=g("max_position_embeddings", 32768),
         initializer_range=g("initializer_range", 0.02),
         rms_norm_eps=g("rms_norm_eps", 1e-6),
         use_cache=g("use_cache", True),
-        tie_word_embeddings=g("tie_word_embeddings", False),
+        tie_word_embeddings=ov("tie_word_embeddings", False),
         rope_parameters=rope_params,
         attention_bias=g("attention_bias", False),
         attention_dropout=g("attention_dropout", 0.0),
         sliding_window=g("sliding_window", 4096) or 4096,
         max_window_layers=g("max_window_layers", draft_layers),
-        head_dim=g("head_dim", None),
+        head_dim=ov("head_dim"),
     )
 
     # Force ALL layers to full_attention (matches z-lab's reference draft at
@@ -371,6 +399,7 @@ def main() -> int:
     draft_cfg = build_draft_config(
         target.config, args.draft_layers, args.block_size, mask_token_id,
         full_rotary=args.full_rotary,
+        match_zlab_arch=args.match_zlab_arch,
     )
     draft = DFlashDraftModel(draft_cfg).to(device=device, dtype=dtype)
     if args.resume:
