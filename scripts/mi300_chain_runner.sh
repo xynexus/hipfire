@@ -68,43 +68,46 @@ run_if_pending() {
 
 # ── job definitions ──────────────────────────────────────────────────
 
-job_4b_scratch_50k() {
-    PYTHONUNBUFFERED=1 "$PY" -u scripts/dflash_train_poc.py \
-        --target-repo Qwen/Qwen3.5-4B \
-        --corpus "$CORPUS" \
-        --seq-len 4096 --batch-size 1 --masked-blocks-per-seq 4 \
-        --steps 50000 --ckpt-every 2500 --log-every 250 \
-        --lr 5e-5 --warmup 500 \
-        --loss-gamma 3.0 \
-        --match-zlab-arch \
-        --out /root/dflash_4b_scratch_50k
-}
-
-job_4b_scratch_convert() {
-    # Convert final safetensors → .hfq (caller pulls + sidecars locally).
-    ./target/release/dflash_convert \
-        --input /root/dflash_4b_scratch_50k \
-        --output /root/dflash_4b_scratch_50k.hfq \
-        --mq4
-}
-
-job_9b_scratch_50k() {
+job_9b_scratch_25k() {
+    # 9B target is ~2.4× 4B compute → ~0.7 step/s → 25k steps ≈ 10hr.
+    # Grad ckpt on target to fit 9B bf16 + 5-layer draft + activations.
     PYTHONUNBUFFERED=1 "$PY" -u scripts/dflash_train_poc.py \
         --target-repo Qwen/Qwen3.5-9B \
         --corpus "$CORPUS" \
         --seq-len 4096 --batch-size 1 --masked-blocks-per-seq 4 \
-        --steps 50000 --ckpt-every 2500 --log-every 250 \
+        --steps 25000 --ckpt-every 2500 --log-every 250 \
         --lr 5e-5 --warmup 500 \
         --loss-gamma 3.0 \
         --match-zlab-arch \
         --grad-ckpt-target \
-        --out /root/dflash_9b_scratch_50k
+        --out /root/dflash_9b_scratch_25k
 }
 
 job_9b_scratch_convert() {
     ./target/release/dflash_convert \
-        --input /root/dflash_9b_scratch_50k \
-        --output /root/dflash_9b_scratch_50k.hfq \
+        --input /root/dflash_9b_scratch_25k \
+        --output /root/dflash_9b_scratch_25k.hfq \
+        --mq4
+}
+
+job_4b_scratch_25k() {
+    # 4B is faster (~1.7 step/s) so 25k steps ≈ 4hr. Keep steps parity with 9B
+    # to avoid biased comparison.
+    PYTHONUNBUFFERED=1 "$PY" -u scripts/dflash_train_poc.py \
+        --target-repo Qwen/Qwen3.5-4B \
+        --corpus "$CORPUS" \
+        --seq-len 4096 --batch-size 1 --masked-blocks-per-seq 4 \
+        --steps 25000 --ckpt-every 2500 --log-every 250 \
+        --lr 5e-5 --warmup 500 \
+        --loss-gamma 3.0 \
+        --match-zlab-arch \
+        --out /root/dflash_4b_scratch_25k
+}
+
+job_4b_scratch_convert() {
+    ./target/release/dflash_convert \
+        --input /root/dflash_4b_scratch_25k \
+        --output /root/dflash_4b_scratch_25k.hfq \
         --mq4
 }
 
@@ -140,11 +143,11 @@ job_9b_sidecar_cal() {
 echo "[chain-runner] starting chain at $(date -Is)"
 echo "[chain-runner] skip_until='${SKIP_UNTIL:-<none>}'"
 
-run_if_pending 4b_scratch_50k           job_4b_scratch_50k           || exit 1
-run_if_pending 4b_scratch_convert       job_4b_scratch_convert       || exit 1
-run_if_pending 4b_sidecar_cal           job_4b_sidecar_cal           || exit 1
-run_if_pending 9b_scratch_50k           job_9b_scratch_50k           || exit 1
+run_if_pending 9b_scratch_25k           job_9b_scratch_25k           || exit 1
 run_if_pending 9b_scratch_convert       job_9b_scratch_convert       || exit 1
 run_if_pending 9b_sidecar_cal           job_9b_sidecar_cal           || exit 1
+run_if_pending 4b_scratch_25k           job_4b_scratch_25k           || exit 1
+run_if_pending 4b_scratch_convert       job_4b_scratch_convert       || exit 1
+run_if_pending 4b_sidecar_cal           job_4b_sidecar_cal           || exit 1
 
 echo "[chain-runner] ALL JOBS DONE at $(date -Is)"
