@@ -395,6 +395,10 @@ const REGISTRY: Record<string, ModelEntry> = {
   // `hipfire run` still works once the file is in MODELS_DIR (auto-pull
   // sees the local copy and skips the download).
   "qwen3.5:35b-a3b":  { repo: "", file: "qwen3.5-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active, 115 tok/s — LOCAL ONLY (no HF repo yet)" },
+  // Qwen3.6-MoE (A3B) refresh — same arch_id=6 / layers / hidden / head_dim as
+  // 3.5 A3B, weights refreshed upstream (partial_rotary_factor explicit @ 0.25,
+  // matches 3.5 default — no engine changes needed). Local-only until upload.
+  "qwen3.6:35b-a3b":  { repo: "", file: "qwen3.6-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active refresh, 148 tok/s — LOCAL ONLY" },
 
   // Qwen3.5 MQ6 — 6-bit rotated, higher quality / larger file (~1.47× MQ4)
   "qwen3.5:0.8b-mq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq6",   size_gb: 0.67, min_vram_gb: 2,  desc: "MQ6, higher quality" },
@@ -426,6 +430,8 @@ const ALIASES: Record<string, string> = {
   "qwen3.5:latest": "qwen3.5:9b",
   "qwen3.5:small": "qwen3.5:0.8b",
   "qwen3.5:large": "qwen3.5:27b",
+  "qwen3.6": "qwen3.6:35b-a3b",
+  "qwen3.6:a3b": "qwen3.6:35b-a3b",
   "qwen3": "qwen3:8b",
   "carnice": "carnice:9b",
   "qwopus": "qwopus:9b",
