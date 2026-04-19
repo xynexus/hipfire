@@ -2132,92 +2132,32 @@ impl Gpu {
                 return r1.and(r2).and(r3).and(r4);
             }
         }
-        // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12") {
-                return self.gemm_qkvza_hfq4g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
-            }
-            // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
-            // Excludes gfx1010 (Navi 10, 5700 XT) and gfx1013 (Van Gogh/BC-250 APU).
-            if has_dot2_f32_f16(&self.arch) {
-                return self.gemm_qkvza_hfq4g256_dot2(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
-            }
-            // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
-            return self.gemm_qkvza_hfq4g256_fp16(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
+        // Verified-correct batched fast path: WMMA on gfx11/gfx12 with
+        // HIPFIRE_FP16=1 (default). The FP32-dequant-at-WMMA-boundary fix
+        // landed with this PR and parity-verified against `_per_row` via
+        // greedy_dump on Qwen3.5-9B (coherent output, +28% pp128).
+        if batch_size > 1
+            && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
+            && (self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12"))
+        {
+            return self.gemm_qkvza_hfq4g256_wmma(
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            );
         }
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
-            self.ensure_kernel(
-                "gemm_qkvza_hfq4g256_wave64",
-                kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC,
-                "gemm_qkvza_hfq4g256_wave64",
-            )?;
-            ("gemm_qkvza_hfq4g256_wave64", [64, 1, 1], 2)
-        } else {
-            self.ensure_kernel(
-                "gemm_qkvza_hfq4g256",
-                kernels::GEMM_QKVZA_HFQ4G256_SRC,
-                "gemm_qkvza_hfq4g256",
-            )?;
-            ("gemm_qkvza_hfq4g256", [32, 1, 1], 1)
-        };
-        let func = &self.functions[func_name];
 
-        let mut aq = a_qkv.buf.as_ptr();
-        let mut az = a_z.buf.as_ptr();
-        let mut ab = a_beta.buf.as_ptr();
-        let mut aa = a_alpha.buf.as_ptr();
-        let mut xp = x.buf.as_ptr();
-        let mut yq = y_qkv.buf.as_ptr();
-        let mut yz = y_z.buf.as_ptr();
-        let mut yb = y_beta.buf.as_ptr();
-        let mut ya = y_alpha.buf.as_ptr();
-        let mut q_m = qkv_m as i32;
-        let mut z_m_val = z_m as i32;
-        let mut b_m = beta_m as i32;
-        let mut a_m = alpha_m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = batch_size as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut aq as *mut _ as *mut c_void,
-            &mut az as *mut _ as *mut c_void,
-            &mut ab as *mut _ as *mut c_void,
-            &mut aa as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yq as *mut _ as *mut c_void,
-            &mut yz as *mut _ as *mut c_void,
-            &mut yb as *mut _ as *mut c_void,
-            &mut ya as *mut _ as *mut c_void,
-            &mut q_m as *mut _ as *mut c_void,
-            &mut z_m_val as *mut _ as *mut c_void,
-            &mut b_m as *mut _ as *mut c_void,
-            &mut a_m as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-        ];
-
-        let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
-        let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
-        let grid_x = (total_m + grid_div - 1) / grid_div;
-
-        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(z_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_x, batch_tiles as u32, 1],
-                block,
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
-        if let Some(t) = timer { t.finish(&self.hip); }
-        result
+        // Every other path — dot2 (gfx1011/1012/1030-1032), fp16-packed
+        // (gfx1010/1013), the scalar-batched `gemm_qkvza_hfq4g256[_wave64]`
+        // kernel, and HIPFIRE_FP16=0 on any arch — shares the row-0
+        // divergence against the per-token reference tracked in #30. Route
+        // through `_per_row` (N × fused_qkvza_hfq4g256) until each path is
+        // individually root-caused and verified. This preserves correctness
+        // across RDNA1/2, gfx1030–1032, CDNA3 (when rocBLAS is unavailable),
+        // and the HIPFIRE_FP16=0 opt-out.
+        self.gemm_qkvza_hfq4g256_per_row(
+            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha,
+            qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+        )
     }
 
     /// FP16-packed batched 4-way fused HFQ4-G256 GEMM (qkv + z + beta + alpha).
