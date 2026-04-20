@@ -182,6 +182,17 @@ hipfire/
 run a single forward pass on the 5700 XT, get correct output tokens.
 Performance doesn't matter yet — correctness first.
 
+## Perf benchmarking (kernel perf changes)
+
+Before claiming any kernel-level tok/s win: read
+`docs/methodology/perf-benchmarking.md`. Within-session A/B is noisy on
+gfx1100 (±10–15 % drift from DPM/thermal state); verify across a fresh
+process with `scripts/probe_commits.sh $(git rev-parse HEAD~1) HEAD` and
+confirm speed-gate passes before committing. The doc also keeps a
+negative-result log of attempts that looked like wins in one-shell A/B
+but measured as no-op or regression on fresh probe — check it before
+starting a new kernel experiment.
+
 ## MQ4 Quality Gate (mandatory)
 
 Any change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
