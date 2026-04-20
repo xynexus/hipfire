@@ -226,19 +226,32 @@ impl TriAttnCalibState {
 
     /// Feed one pre-RoPE Q sample: `q` is [n_heads × head_dim] interleaved
     /// (band f = complex pair (q[2f], q[2f+1]) per head).
+    ///
+    /// Heads are independent — the accumulator slice for (layer, head) is
+    /// written by exactly one thread at a time. We parallelize across heads
+    /// via rayon::par_chunks_mut so the inner band loop runs in parallel.
+    /// Measured on MI300X EPYC host: 99%+ of sidecar cal wall time was CPU
+    /// accumulation in the serial version. Per-head parallelism scales with
+    /// core count up to n_heads (typically 16 for Qwen3.5).
     pub fn add_sample(&mut self, layer: usize, q: &[f32]) {
+        use rayon::prelude::*;
         let n_bands = self.head_dim / 2;
-        assert_eq!(q.len(), self.n_heads * self.head_dim,
-            "sample length {} != n_heads * head_dim = {}", q.len(), self.n_heads * self.head_dim);
-        for h in 0..self.n_heads {
-            let base = h * self.head_dim;
-            for f in 0..n_bands {
-                let re = q[base + 2 * f];
-                let im = q[base + 2 * f + 1];
-                let idx = layer * self.n_heads * n_bands + h * n_bands + f;
-                self.accs[idx].add(re, im);
-            }
-        }
+        let head_dim = self.head_dim;
+        let n_heads = self.n_heads;
+        assert_eq!(q.len(), n_heads * head_dim,
+            "sample length {} != n_heads * head_dim = {}", q.len(), n_heads * head_dim);
+        let base_idx = layer * n_heads * n_bands;
+        self.accs[base_idx..base_idx + n_heads * n_bands]
+            .par_chunks_mut(n_bands)
+            .enumerate()
+            .for_each(|(h, head_accs)| {
+                let q_base = h * head_dim;
+                for f in 0..n_bands {
+                    let re = q[q_base + 2 * f];
+                    let im = q[q_base + 2 * f + 1];
+                    head_accs[f].add(re, im);
+                }
+            });
     }
 
     /// Feed a batch of samples at once. `q_batch` is [batch × n_heads × head_dim].
