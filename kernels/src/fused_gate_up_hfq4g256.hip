@@ -58,10 +58,13 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
         float sc3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3));
         float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
 
-        unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
-        unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
-        unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
-        unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
+        // Nontemporal: weight packs are read exactly once per GEMV. Bypassing
+        // L2/MALL allocation keeps cache available for KV / activations instead
+        // of being polluted by one-shot weight reads.
+        unsigned int pk0 = __builtin_nontemporal_load((const unsigned int*)(gp0 + 8 + boff));
+        unsigned int pk1 = __builtin_nontemporal_load((const unsigned int*)(gp1 + 8 + boff));
+        unsigned int pk2 = __builtin_nontemporal_load((const unsigned int*)(gp2 + 8 + boff));
+        unsigned int pk3 = __builtin_nontemporal_load((const unsigned int*)(gp3 + 8 + boff));
 
         int base = g * 256 + tid * 8;
 
@@ -99,7 +102,7 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
         const char* gp = row_ptr + g * 136;
         float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
         float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        unsigned int pk = __builtin_nontemporal_load((const unsigned int*)(gp + 8 + boff));
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc0);
     }
@@ -108,7 +111,7 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
         const char* gp = row_ptr + g * 136;
         float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
         float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        unsigned int pk = __builtin_nontemporal_load((const unsigned int*)(gp + 8 + boff));
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc1);
     }
@@ -117,7 +120,7 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
         const char* gp = row_ptr + g * 136;
         float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
         float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        unsigned int pk = __builtin_nontemporal_load((const unsigned int*)(gp + 8 + boff));
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc2);
     }
