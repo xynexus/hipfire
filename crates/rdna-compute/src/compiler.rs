@@ -204,6 +204,32 @@ impl KernelCompiler {
         Ok(&self.compiled[name])
     }
 
+    /// Extract per-kernel hipcc flags from magic comments in the source.
+    /// The marker must be the dominant content of a comment line — i.e. a
+    /// line whose non-whitespace starts with `//` followed (possibly after
+    /// more whitespace) by `HIPFIRE_COMPILER_FLAGS:`. Flags after the colon
+    /// are split on whitespace and appended to the hipcc invocation.
+    /// Lines that merely *mention* the tag in prose (e.g. in a docstring
+    /// explaining how to use it) are ignored, so we don't accidentally turn
+    /// documentation into command-line arguments.
+    fn per_kernel_flags(source: &str) -> Vec<String> {
+        const TAG: &str = "HIPFIRE_COMPILER_FLAGS:";
+        let mut out = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            let after_slashes = match trimmed.strip_prefix("//") {
+                Some(rest) => rest.trim_start(),
+                None => continue,
+            };
+            if let Some(rest) = after_slashes.strip_prefix(TAG) {
+                for tok in rest.split_whitespace() {
+                    out.push(tok.to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
     fn hipcc_compile(arch: &str, src_path: &Path, obj_path: &Path, name: &str, source: &str) -> HipResult<()> {
         std::fs::write(src_path, source).map_err(|e| {
@@ -215,6 +241,7 @@ impl KernelCompiler {
         // one-off experiments like `-mcumode` vs `-mno-cumode` on RDNA1
         // without having to rebuild every call site.
         let extra = std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default();
+        let per_kernel = Self::per_kernel_flags(source);
         let mut args: Vec<String> = vec![
             "--genco".into(),
             format!("--offload-arch={arch}"),
@@ -236,6 +263,12 @@ impl KernelCompiler {
         }
         for flag in extra.split_whitespace() {
             args.push(flag.to_string());
+        }
+        for flag in &per_kernel {
+            args.push(flag.clone());
+        }
+        if !per_kernel.is_empty() {
+            eprintln!("  {name}: per-kernel flags: {}", per_kernel.join(" "));
         }
         args.push("-o".into());
         args.push(obj_path.to_str().unwrap().into());
