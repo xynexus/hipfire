@@ -3247,16 +3247,26 @@ fn forward_prefill_chunk(
                 )?;
 
                 if crate::triattn::tap_enabled() {
-                    let n_q = config.n_heads * config.head_dim;
-                    let n_k = config.n_kv_heads * config.head_dim;
-                    let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
-                    let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
-                    for b in 0..n {
-                        crate::triattn::record_prerope_qk(
-                            layer_idx,
-                            &q_cpu[b * n_q..(b + 1) * n_q],
-                            Some(&k_cpu[b * n_k..(b + 1) * n_k]),
-                        );
+                    // Try GPU path first: dispatches a reduce kernel on the
+                    // device-resident Q tensor, zero PCIe transfer. Only
+                    // succeeds when install_tap_gpu() was used. Falls through
+                    // to CPU path otherwise.
+                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                        gpu, layer_idx, &pbs.fa_q_batch.buf,
+                        n, config.n_heads, config.head_dim,
+                    )?;
+                    if !gpu_handled {
+                        let n_q = config.n_heads * config.head_dim;
+                        let n_k = config.n_kv_heads * config.head_dim;
+                        let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
+                        let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
+                        for b in 0..n {
+                            crate::triattn::record_prerope_qk(
+                                layer_idx,
+                                &q_cpu[b * n_q..(b + 1) * n_q],
+                                Some(&k_cpu[b * n_k..(b + 1) * n_k]),
+                            );
+                        }
                     }
                 }
 
@@ -3680,16 +3690,22 @@ fn forward_prefill_chunk(
                     n * config.n_kv_heads, config.head_dim, config.norm_eps,
                 )?;
                 if crate::triattn::tap_enabled() {
-                    let n_q = config.n_heads * config.head_dim;
-                    let n_k = config.n_kv_heads * config.head_dim;
-                    let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
-                    let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
-                    for b in 0..n {
-                        crate::triattn::record_prerope_qk(
-                            layer_idx,
-                            &q_cpu[b * n_q..(b + 1) * n_q],
-                            Some(&k_cpu[b * n_k..(b + 1) * n_k]),
-                        );
+                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                        gpu, layer_idx, &pbs.fa_q_batch.buf,
+                        n, config.n_heads, config.head_dim,
+                    )?;
+                    if !gpu_handled {
+                        let n_q = config.n_heads * config.head_dim;
+                        let n_k = config.n_kv_heads * config.head_dim;
+                        let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
+                        let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
+                        for b in 0..n {
+                            crate::triattn::record_prerope_qk(
+                                layer_idx,
+                                &q_cpu[b * n_q..(b + 1) * n_q],
+                                Some(&k_cpu[b * n_k..(b + 1) * n_k]),
+                            );
+                        }
                     }
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;

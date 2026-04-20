@@ -5597,6 +5597,73 @@ impl Gpu {
 
     /// Batched RMSNorm: normalize `batch` vectors of length `n` independently.
     /// x and out can be the same buffer (in-place). Weight is [n], applied per vector.
+    /// TriAttention sidecar calibration: accumulate band statistics for one
+    /// chunk's Q tensor (batched across all tokens in the chunk).
+    ///
+    /// q_batch: [n_tokens, n_heads, head_dim] f32 pre-RoPE Q (already on GPU).
+    /// accs_sum_re/im/abs: [n_layers * n_heads * n_bands] f64 accumulators.
+    /// accs_count: [n_layers * n_heads * n_bands] u64 sample counters.
+    /// All accs_* buffers persist across calls; the kernel ADDS into them.
+    ///
+    /// Grid = [n_heads, n_bands, 1]. Block = [64, 1, 1]. Zero cross-block
+    /// contention since each (layer, head, band) is written by exactly one
+    /// block at a time (called sequentially per layer per chunk).
+    pub fn triattn_accumulate(
+        &mut self,
+        q_batch: &DeviceBuffer,
+        accs_sum_re: &DeviceBuffer,
+        accs_sum_im: &DeviceBuffer,
+        accs_sum_abs: &DeviceBuffer,
+        accs_count: &DeviceBuffer,
+        n_tokens: usize, n_heads: usize, head_dim: usize,
+        layer_idx: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "triattn_accumulate",
+            kernels::TRIATTN_ACCUMULATE_SRC,
+            "triattn_accumulate_f32",
+        )?;
+
+        let n_bands = head_dim / 2;
+
+        let mut q_ptr = q_batch.as_ptr();
+        let mut sre_ptr = accs_sum_re.as_ptr();
+        let mut sim_ptr = accs_sum_im.as_ptr();
+        let mut sab_ptr = accs_sum_abs.as_ptr();
+        let mut cnt_ptr = accs_count.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut li = layer_idx as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut sre_ptr as *mut _ as *mut c_void,
+            &mut sim_ptr as *mut _ as *mut c_void,
+            &mut sab_ptr as *mut _ as *mut c_void,
+            &mut cnt_ptr as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "triattn_accumulate_f32",
+            [n_heads as u32, n_bands as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr); b.push_ptr(sre_ptr); b.push_ptr(sim_ptr);
+                b.push_ptr(sab_ptr); b.push_ptr(cnt_ptr);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(li);
+                b
+            },
+        )
+    }
+
     pub fn rmsnorm_batched(
         &mut self,
         x: &GpuTensor, weight: &GpuTensor, out: &GpuTensor,

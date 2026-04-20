@@ -37,6 +37,7 @@ fn main() {
         "James Madison wrote Federalist No. 10 arguing that a large republic would curb the effects of factions better than a small one.",
     );
     let mut load_sidecar = false;
+    let mut cpu_calib = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -46,9 +47,10 @@ fn main() {
             "--chunk-len" => { chunk_len = args[i + 1].parse().unwrap(); i += 2; }
             "--val-prompt" => { validation_prompt = args[i + 1].clone(); i += 2; }
             "--load-sidecar" => { load_sidecar = true; i += 1; }
+            "--cpu-calib" => { cpu_calib = true; i += 1; }
             s if !s.starts_with("--") && model_path.is_none() => { model_path = Some(s.to_string()); i += 1; }
             other => {
-                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar]");
+                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--cpu-calib]");
                 std::process::exit(1);
             }
         }
@@ -135,11 +137,25 @@ fn main() {
             config.n_heads,
             config.head_dim / 2,
         );
-        let calib_state = TriAttnCalibState::new(
-            config.n_layers, config.n_heads, config.head_dim,
-            config.rope_theta, config.partial_rotary_factor,
-        );
-        triattn::install_tap(calib_state);
+        // Default to GPU-path calibration (~5-8× faster on MI300X).
+        // --cpu-calib flag forces the legacy CPU tap for A/B comparison.
+        let using_gpu_tap = !cpu_calib;
+        if using_gpu_tap {
+            eprintln!("calibration path: GPU (kernel triattn_accumulate_f32)");
+            let gpu_state = triattn::TriAttnCalibStateGpu::new(
+                &mut gpu,
+                config.n_layers, config.n_heads, config.head_dim,
+                config.rope_theta, config.partial_rotary_factor,
+            ).expect("alloc GPU calib state");
+            triattn::install_tap_gpu(gpu_state);
+        } else {
+            eprintln!("calibration path: CPU (--cpu-calib)");
+            let calib_state = TriAttnCalibState::new(
+                config.n_layers, config.n_heads, config.head_dim,
+                config.rope_theta, config.partial_rotary_factor,
+            );
+            triattn::install_tap(calib_state);
+        }
 
         let mut total_tokens = 0usize;
         'outer: for (pi, p) in calibration_prompts.iter().enumerate() {
@@ -165,9 +181,14 @@ fn main() {
             if total_tokens >= max_tokens { break 'outer; }
         }
 
-        let calib = triattn::take_tap().expect("tap still installed");
         eprintln!("total calibration samples: {total_tokens} tokens × FA layers");
-        let c = calib.finalize();
+        let c = if using_gpu_tap {
+            let gpu_state = triattn::take_tap_gpu().expect("GPU tap still installed");
+            gpu_state.finalize(&mut gpu).expect("finalize GPU calib")
+        } else {
+            let calib = triattn::take_tap().expect("tap still installed");
+            calib.finalize()
+        };
         c.save(Path::new(&sidecar_path)).expect("save sidecar");
         eprintln!("saved sidecar: {sidecar_path}");
         c

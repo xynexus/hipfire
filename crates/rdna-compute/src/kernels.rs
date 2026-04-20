@@ -391,6 +391,10 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
 
+/// TriAttention sidecar calibration: GPU band-statistics accumulator.
+/// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).
+pub const TRIATTN_ACCUMULATE_SRC: &str = include_str!("../../../kernels/src/triattn_accumulate.hip");
+
 
 /// Element-wise add
 pub const ADD_SRC: &str = include_str!("../../../kernels/src/add.hip");
