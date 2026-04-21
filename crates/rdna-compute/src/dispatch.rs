@@ -4180,20 +4180,28 @@ impl Gpu {
         if std::env::var("HIPFIRE_MW16").map_or(false, |v| v == "1") {
             return self.gemm_mw16_residual_wmma_via_dequant(a_raw, x, y, m, k, batch_size);
         }
-        // ksplit is the default on gfx1100 — splits the K-loop across 4 blocks
-        // with atomicAdd reduce, ~4×-ing the grid to fix WMMA grid-starvation
-        // on small-M / large-K GEMMs (wo_residual in particular). Measured
-        // +13 % tok/s on 27B DFlash, +2 % on 9B, -1 % on 4B (all within
-        // coherence-gate pass).
+        // Shape-aware default: ksplit only pays for itself when the un-split
+        // grid is CU-starved (target wo_residual at M=5120 → 320 blocks,
+        // ~3.3/CU on gfx1100 — ksplit 4×'s it to 13/CU). For draft-FFN shapes
+        // (M=17408, K=5120, B=16) the un-split grid is already 1088 blocks
+        // (~11/CU) and the atomicAdd reduce is pure overhead. k2 removes the
+        // split + atomics and runs deterministically.
         //
-        // HIPFIRE_WO_WMMA_VARIANT=ksplit|k2|k4|wmma|wmma2 overrides.
-        //   ksplit — K-split + atomicAdd (default)
-        //   k2     — 2× K-tile pipeline (previous default; byte-exact accum order)
+        // Threshold picked at M=8192: covers M∈{5120,6144} (target wo) on the
+        // ksplit side and M∈{17408} (draft gate/up/down) on the k2 side. lm_head
+        // (M=vocab) is always way above threshold → k2.
+        //
+        // HIPFIRE_WO_WMMA_VARIANT=ksplit|k2|k4|wmma|wmma2 overrides the auto
+        // selection (applies to every call, both target and draft).
+        //   ksplit — K-split + atomicAdd (non-deterministic accum order)
+        //   k2     — 2× K-tile pipeline (byte-exact accum order)
         //   k4     — 4× K-tile pipeline (output-mapping bug, τ=0 on dflash — debug only)
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
-        let variant = std::env::var("HIPFIRE_WO_WMMA_VARIANT").unwrap_or_default();
-        let (kernel_name, kernel_src, block_size, row_step, k_splits) = match variant.as_str() {
+        let auto_variant = if m >= 8192 { "k2" } else { "ksplit" };
+        let variant_override = std::env::var("HIPFIRE_WO_WMMA_VARIANT").ok();
+        let variant = variant_override.as_deref().unwrap_or(auto_variant);
+        let (kernel_name, kernel_src, block_size, row_step, k_splits) = match variant {
             "k2"     => ("gemm_hfq4g256_residual_wmma_k2",
                          kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC, 32u32, 16usize, 1u32),
             "k4"     => ("gemm_hfq4g256_residual_wmma_k4",
