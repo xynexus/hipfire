@@ -729,6 +729,29 @@ pub fn draft_forward(
         )?;
     }
 
+    // HIPFIRE_DRAFT_SUBPHASE=1: per-layer-section timing inside draft_forward.
+    // Diagnostic only — device_synchronize at each boundary makes this 2-3×
+    // slower than a production run. Printed once per forward.
+    //
+    // First measurement (2026-04-21, 27B HumanEval, B=16, steady-state):
+    //   attn_gemm: 7.4 ms  (wq + wk/v_noise + wk/v_ctx)
+    //   concat:    0.4 ms  (K/V cache concat D2Ds)
+    //   attn_krn:  0.6 ms  (attention_dflash_f32)
+    //   ffn_gemm:  56 ms   (wo + w_gate + w_up + w_down + silu_mul + adds)
+    //
+    // 87 % of draft_forward lives in the FFN GEMM block. w_gate/w_up/w_down
+    // at M=17408/K=5120 should be ~0.5 ms/layer BW-bound but is ~11 ms/layer
+    // observed. Next lever: route draft's w_gate/w_up through the fused
+    // gemm_gate_up_hfq4g256_wmma kernel (measured 73 µs/call on the same
+    // shape in target; vs ksplit's 288 µs/call on a different shape). Or
+    // find the real cause of the ksplit slowdown on draft shapes.
+    let dbg = std::env::var("HIPFIRE_DRAFT_SUBPHASE").ok().as_deref() == Some("1");
+    let mut us_attn_gemm: u128 = 0;
+    let mut us_attn_kernel: u128 = 0;
+    let mut us_ffn_gemm: u128 = 0;
+    let mut us_concat: u128 = 0;
+    if dbg { gpu.hip.device_synchronize()?; }
+
     // ── 2. Per-layer decoder ─────────────────────────────────────────────
     for li in 0..cfg.n_layers {
         let layer = &weights.layers[li];
@@ -745,6 +768,11 @@ pub fn draft_forward(
             h,
             eps,
         )?;
+
+        let t0 = if dbg {
+            gpu.hip.device_synchronize()?;
+            Some(std::time::Instant::now())
+        } else { None };
 
         // Q/K/V projections — dispatched on each weight's dtype.
         // Q and K/V noise (over the B block positions) must be computed
@@ -782,6 +810,14 @@ pub fn draft_forward(
             // Per-head RMSNorm on K delta rows only. batch = delta × n_kv_heads.
             gpu.rmsnorm_batched(&k_slot, &layer.k_norm, &k_slot, delta * cfg.n_kv_heads, hd, eps)?;
         }
+
+        if let Some(t) = t0 {
+            gpu.hip.device_synchronize()?;
+            us_attn_gemm += t.elapsed().as_micros();
+        }
+        let t1 = if dbg {
+            Some(std::time::Instant::now())
+        } else { None };
 
         // Concat K = [K_ctx_cached | K_noise] → k_cat [L + B, kv_dim].
         // The cached K prefix is already post-k_norm (applied incrementally
@@ -832,6 +868,14 @@ pub fn draft_forward(
             tot,
         )?;
 
+        if let Some(t) = t1 {
+            gpu.hip.device_synchronize()?;
+            us_concat += t.elapsed().as_micros();
+        }
+        let t2 = if dbg {
+            Some(std::time::Instant::now())
+        } else { None };
+
         // Attention: Q [B, n_heads, hd] × K [tot, n_kv_heads, hd]^T → scores
         // (with GQA expansion) → softmax → @V.
         gpu.attention_dflash_f32(
@@ -845,6 +889,11 @@ pub fn draft_forward(
             cfg.n_kv_heads,
             hd,
         )?;
+        if let Some(t) = t2 {
+            gpu.hip.device_synchronize()?;
+            us_attn_kernel += t.elapsed().as_micros();
+        }
+        let t3 = if dbg { Some(std::time::Instant::now()) } else { None };
 
         // attn_proj = attn_out @ wo^T → [B, hidden]
         gemm_dispatch(gpu, &scratch.attn_out, &layer.wo, &scratch.attn_proj, b, scratch.mq_x_rot.as_ref())?;
@@ -870,6 +919,19 @@ pub fn draft_forward(
 
         // x = residual_ffn + x
         gpu.add_f32(&scratch.residual_ffn, &scratch.x, &scratch.x)?;
+
+        if let Some(t) = t3 {
+            gpu.hip.device_synchronize()?;
+            us_ffn_gemm += t.elapsed().as_micros();
+        }
+    }
+
+    if dbg {
+        gpu.hip.device_synchronize()?;
+        eprintln!(
+            "[draft-sub] attn_gemm={}µs concat={}µs attn_kernel={}µs ffn_gemm={}µs (B={} L={})",
+            us_attn_gemm, us_concat, us_attn_kernel, us_ffn_gemm, b, l,
+        );
     }
 
     // ── 3. Final norm ────────────────────────────────────────────────────

@@ -2075,10 +2075,15 @@ pub fn spec_step_dflash(
         );
     }
 
-    // HIPFIRE_SPEC_PHASES=1: per-cycle host-side phase breakdown. Answers the
-    // question "of the ~35 ms 'other' per cycle, which phase owns it?"
-    // Costs ~5 Instant::now() calls (~150 ns total), printed only when enabled.
+    // HIPFIRE_SPEC_PHASES=1: per-cycle phase breakdown. Inserts a
+    // device_synchronize at each phase boundary so the wall-clock reflects
+    // ACTUAL GPU completion (not CPU enqueue of async work). Perf-heavy —
+    // use only for diagnostics. When disabled, zero cost beyond a handful
+    // of Instant::now() calls.
     let phase_on = std::env::var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1");
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
     let t_spec_start = std::time::Instant::now();
     let mut t_phase = t_spec_start;
 
@@ -2343,6 +2348,9 @@ pub fn spec_step_dflash(
         block[i] = drafted[i];
     }
 
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
     let t_draft_end = std::time::Instant::now();
 
     // ── 5b. N-gram override (DFlash path only) ───────────────────────────
@@ -2410,6 +2418,9 @@ pub fn spec_step_dflash(
         gdn_tape_opt = None;
     }
 
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
     let t_verify_start = std::time::Instant::now();
     let verify_out = verify_dflash_block(
         gpu, target, &block, position, hidden_rb,
@@ -2418,6 +2429,9 @@ pub fn spec_step_dflash(
         verify_scratch,
     )?;
 
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
     let t_verify_end = std::time::Instant::now();
 
     // ── 7. Acceptance ──────────────────────────────────────────────────
@@ -2541,6 +2555,9 @@ pub fn spec_step_dflash(
     let committed_count = committed.len();
     debug_assert_eq!(committed_count, accept_len + 2);
 
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
     let t_accept_end = std::time::Instant::now();
 
     // ── 9. Append accepted target hidden rows to target_hidden_host ─────
@@ -2616,6 +2633,11 @@ pub fn spec_step_dflash(
         }
     }
 
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_scatter_end = std::time::Instant::now();
+
     // ── 10. Rewind DeltaNet + replay committed tokens ────────────────────
     // After verify, target state reflects B forwards. We need it to reflect
     // `committed_count - 1 = accept_len + 1` forwards (the seed + accepted
@@ -2623,6 +2645,11 @@ pub fn spec_step_dflash(
     // block[0] of the next iter. This keeps the invariant that before each
     // verify, target state is at position `start` (= pre-verify position).
     target_snap.restore_to(&mut target.dn_state, gpu)?;
+
+    if phase_on {
+        gpu.hip.device_synchronize()?;
+    }
+    let t_restore_end = std::time::Instant::now();
     // Tape-replay path (0.1.7 perf): if a GdnTape was captured during verify,
     // replay the GatedDeltaNet recurrence for (accept+1) steps using the
     // recorded (q, k, v, α, β) tuples — no full-target re-run needed. The
@@ -2658,20 +2685,25 @@ pub fn spec_step_dflash(
     // `position + accept_len + 1`) as part of that iter's block[0] forward.
 
     if phase_on {
+        gpu.hip.device_synchronize()?;
         let t_end = std::time::Instant::now();
-        let us_draft  = t_draft_end.duration_since(t_spec_start).as_micros();
-        let us_ngram  = t_verify_start.duration_since(t_draft_end).as_micros();
-        let us_verify = t_verify_end.duration_since(t_verify_start).as_micros();
-        let us_accept = t_accept_end.duration_since(t_verify_end).as_micros();
-        let us_rewind = t_end.duration_since(t_accept_end).as_micros();
-        let us_total  = t_end.duration_since(t_spec_start).as_micros();
+        let us_draft   = t_draft_end.duration_since(t_spec_start).as_micros();
+        let us_ngram   = t_verify_start.duration_since(t_draft_end).as_micros();
+        let us_verify  = t_verify_end.duration_since(t_verify_start).as_micros();
+        let us_accept  = t_accept_end.duration_since(t_verify_end).as_micros();
+        let us_scatter = t_scatter_end.duration_since(t_accept_end).as_micros();
+        let us_restore = t_restore_end.duration_since(t_scatter_end).as_micros();
+        let us_replay  = t_end.duration_since(t_restore_end).as_micros();
+        let us_total   = t_end.duration_since(t_spec_start).as_micros();
         eprintln!(
-            "[phase] B={} draft={}µs ngram={}µs verify={}µs accept={}µs rewind+scatter={}µs | total={}µs",
-            b, us_draft, us_ngram, us_verify, us_accept, us_rewind, us_total,
+            "[phase] B={} accept={} draft={}µs ngram={}µs verify={}µs \
+             cmpr={}µs scatter={}µs restore={}µs replay={}µs | total={}µs",
+            b, accept_len, us_draft, us_ngram, us_verify, us_accept,
+            us_scatter, us_restore, us_replay, us_total,
         );
     }
-    // Mute the timer variables when disabled so the compiler doesn't warn.
-    let _ = (t_phase, t_draft_end, t_verify_start, t_verify_end, t_accept_end);
+    let _ = (t_phase, t_draft_end, t_verify_start, t_verify_end,
+             t_accept_end, t_scatter_end, t_restore_end);
 
     Ok(SpecStepResult {
         accepted: accept_len,
