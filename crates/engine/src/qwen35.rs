@@ -2281,6 +2281,10 @@ pub struct PrefillBatchScratch {
     // Uploaded once at the start of each chunk and reused by rope + kv_write
     // + attention kernels.
     pub positions: GpuTensor,
+    // Token-ids buffer feeding the batched embedding kernel. [max_batch] i32
+    // stored as F32 (same dtype-cosmetic pattern as `positions`). Uploaded
+    // once per batched forward and read by `embedding_lookup_hfq4g256_batched`.
+    pub tokens: GpuTensor,
     // QKV projection outputs
     pub fa_q_full_batch: GpuTensor,  // [N × n_heads × head_dim × 2] (Q + gate interleaved)
     pub fa_q_batch: GpuTensor,       // [N × n_heads × head_dim]
@@ -2341,6 +2345,7 @@ impl PrefillBatchScratch {
             // attention / kv_write kernels cast the pointer to `const int*`,
             // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
             positions:         gpu.alloc_tensor(&[max_batch], DType::F32)?,
+            tokens:            gpu.alloc_tensor(&[max_batch], DType::F32)?,
             fa_q_full_batch:   gpu.alloc_tensor(&[max_batch * q_dim * 2], DType::F32)?,
             fa_q_batch:        gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
             fa_gate_batch:     gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
@@ -2391,7 +2396,7 @@ impl PrefillBatchScratch {
             self.dn_attn_out_batch, self.dn_normed_batch,
             self.gate_ffn_batch, self.up_batch, self.ffn_hidden_batch,
             self.dn_normed_rot_batch,
-            self.positions,
+            self.positions, self.tokens,
             self.fa_q_full_batch, self.fa_q_batch, self.fa_gate_batch,
             self.fa_k_batch, self.fa_v_batch, self.fa_attn_out_batch,
             self.fa_attn_out_rot_batch,
@@ -2885,16 +2890,35 @@ fn forward_prefill_chunk(
     let hd = config.linear_key_head_dim;
     let dim_row_bytes = dim * 4;
 
-    // ── 1. Embed each token into s.x, then copy into pbs.x_batch row ──────
-    for (i, &tok) in tokens.iter().enumerate() {
-        match weights.embd_format {
-            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &s.x, tok, dim)?,
-            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?,
-            EmbeddingFormat::Q8_0     => gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?,
-            EmbeddingFormat::F32      => gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?,
-            _ => panic!("unsupported embedding format"),
+    // ── 1. Embed tokens into pbs.x_batch ─────────────────────────────────
+    //
+    // Fast path for HFQ4G256 (all MQ4-quantized Qwen3.5 models + friends):
+    // upload token ids to a device buffer and dispatch one batched kernel
+    // that dequantizes N rows directly into `pbs.x_batch`. This collapses
+    // 2N launches (N embed + N memcpy_dtod_at) into 1 upload + 1 launch
+    // AND is hipGraph-captureable — the kernel reads token ids from a
+    // device pointer instead of taking them as a baked-in scalar arg.
+    //
+    // Other formats fall back to the per-token loop (kept for correctness
+    // breadth; the MQ4-quantized hot path doesn't hit them).
+    if matches!(weights.embd_format, EmbeddingFormat::HFQ4G256) {
+        let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let tokens_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
+        };
+        gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+        gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+    } else {
+        for (i, &tok) in tokens.iter().enumerate() {
+            match weights.embd_format {
+                EmbeddingFormat::HFQ4G256 => unreachable!(),
+                EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?,
+                EmbeddingFormat::Q8_0     => gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?,
+                EmbeddingFormat::F32      => gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?,
+                _ => panic!("unsupported embedding format"),
+            }
+            gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
         }
-        gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
     }
 
     // ── 1b. Upload positions array ────────────────────────────────────────

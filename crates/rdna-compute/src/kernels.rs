@@ -795,6 +795,11 @@ pub const EMBEDDING_Q4K_SRC: &str = include_str!("../../../kernels/src/embedding
 /// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 elements.
 pub const EMBEDDING_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/embedding_hfq4g256.hip");
 
+/// Batched HFQ4-G256 embedding: dequantize N rows in one launch. Reads token ids
+/// from a device buffer so the launch is hipGraph-captureable — update the buffer
+/// between replays, replay the same graph. Writes into row-major `[N × dim]`.
+pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str = include_str!("../../../kernels/src/embedding_hfq4g256_batched.hip");
+
 
 /// HFQ4-G128 embedding lookup: dequantize one row from HFQ4-G128 table to F32.
 pub const EMBEDDING_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/embedding_hfq4g128.hip");

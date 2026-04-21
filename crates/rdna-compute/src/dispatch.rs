@@ -905,6 +905,51 @@ impl Gpu {
         result
     }
 
+    /// Batched HFQ4-G256 embedding lookup. Dequantizes N rows in a single
+    /// launch, reading token ids from a device buffer. hipGraph-capture-safe:
+    /// callers update `token_ids` between replays and replay the same graph.
+    ///
+    /// `output` shape: `[n × dim]` row-major. `token_ids` shape: `[n]` i32.
+    pub fn embedding_lookup_hfq4g256_batched(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_ids: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "embedding_hfq4g256_batched",
+            kernels::EMBEDDING_HFQ4G256_BATCHED_SRC,
+            "embedding_hfq4g256_batched",
+        )?;
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tidp = token_ids.buf.as_ptr();
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tidp as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "embedding_hfq4g256_batched",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp); b.push_ptr(op); b.push_ptr(tidp); b.push_i32(d);
+                b
+            },
+        )
+    }
+
     /// HFQ4-G128 embedding lookup: dequantize one row on GPU, output F32.
     pub fn embedding_lookup_hfq4g128(
         &mut self,
@@ -9878,6 +9923,7 @@ impl Gpu {
         specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));
         specs.push(("embedding_hfq4g256", kernels::EMBEDDING_HFQ4G256_SRC.to_string()));
         specs.push(("embedding_hfq4g128", kernels::EMBEDDING_HFQ4G128_SRC.to_string()));
+        specs.push(("embedding_hfq4g256_batched", kernels::EMBEDDING_HFQ4G256_BATCHED_SRC.to_string()));
 
         // DeltaNet kernels
         specs.push(("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC.to_string()));
