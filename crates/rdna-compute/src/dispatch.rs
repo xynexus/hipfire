@@ -155,6 +155,12 @@ pub struct Gpu {
     /// Kernarg blobs are stored in `capture_blobs` and must stay alive until the
     /// captured graph is destroyed.
     pub capture_mode: bool,
+    /// Diagnostic: when true, `launch_maybe_blob` takes the blob path even when
+    /// `capture_mode=false`. Isolates "blob-vs-kernelParams path" bugs without
+    /// the rest of the graph-capture machinery (stream capture, staging, etc).
+    /// Set via `HIPFIRE_BLOB_FORCE=1` at init. Blobs accumulate unbounded in
+    /// `capture_blobs` while set — only intended for short diagnostic runs.
+    pub force_blob_path: bool,
     /// Heap-stored kernarg blobs for the current capture session. The blob
     /// pointers are baked into the graph at capture time — do NOT clear this
     /// vec until after `graph_exec_destroy`.
@@ -280,6 +286,7 @@ impl Gpu {
             fp16_x_scratch_bytes: 0,
             fp16_x_source_ptr: std::ptr::null_mut(),
             capture_mode: false,
+            force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             capture_blobs: Vec::new(),
             graph_exec: None,
             captured_graph: None,
@@ -288,6 +295,9 @@ impl Gpu {
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
         }).map(|mut gpu| {
+            if gpu.force_blob_path {
+                eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
+            }
             // Auto-init rocBLAS on CDNA3 so the batched-prefill MFMA path is
             // available out of the box. No-op on consumer arches.
             gpu.try_init_rocblas();
@@ -512,7 +522,7 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
-        if self.capture_mode {
+        if self.capture_mode || self.force_blob_path {
             let mut blob = blob_builder();
             // Pad tail to 16-byte alignment — some kernel struct layouts that
             // HIP's loader expects have an implicit final pad to the struct's

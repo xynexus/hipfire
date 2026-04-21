@@ -1602,8 +1602,17 @@ fn verify_dflash_block_inner(
             if r.is_ok() {
                 gpu.end_graph_capture()?;
                 gpu.graph_verify_n = Some(b);
+                // Under `hipStreamBeginCapture`, kernels + memcpys on the
+                // captured stream are RECORDED, not executed. final_hidden
+                // and hidden_rb staging are left stale. Launching the graph
+                // once here makes this cycle's forward actually run so lm_head
+                // reads fresh data. DN state double-advance (if any future
+                // HIP version does execute during capture) is washed out by
+                // target_snap.restore_to after verify returns. KV cache
+                // double-write writes the same data to the same positions.
+                gpu.graph_launch()?;
                 eprintln!(
-                    "[verify-graph] captured for B={} with {} blobs",
+                    "[verify-graph] captured for B={} with {} blobs (executed via relaunch)",
                     b, gpu.capture_blobs.len(),
                 );
             } else {
