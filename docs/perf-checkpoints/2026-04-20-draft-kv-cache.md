@@ -161,3 +161,32 @@ realistic next levers:
 hipGraph (original plan) is still worth trying for launch overhead
 elimination, but at 2.3 ms/cycle of launch API time, the upside is
 smaller than originally estimated.
+
+## Update — fusion attempt (2026-04-20 eve v2)
+
+Tried wiring the target's existing `gemm_qkv_hfq4g256` (3 weights → 3
+outputs) and `gemm_gate_up_hfq4g256` (2 → 2) kernels into the draft's
+per-layer QKV and FFN-gate/up projections. Expectation: ~10-15 kernel
+launches saved per cycle on a 5-layer draft.
+
+Outcome:
+
+- **27B draft is F32** (not MQ4 despite the `.mq4` filename) — fusion
+  dispatch fell through to the F32 "separate GEMM" fallback, so the
+  fused kernel never ran there. 27B numbers matched baseline because
+  it was running the baseline code path.
+- **9B draft is MQ4G256** — fusion dispatch fired the fused kernel,
+  and output was garbage (τ=0 across all cycles). Tried purging the
+  JIT/install kernel caches AND swapping the kernel variant (non-WMMA
+  vs WMMA); same breakage both ways.
+- **Upside is tiny anyway** — 5-layer drafts × ~3 launches saved per
+  layer × ~30 µs = ~0.5 ms per cycle. Not worth deep-debugging the
+  MQ4-compatibility issue for that.
+
+Reverted. No code shipped.
+
+**What we learned:** a `.mq4`-named file can contain F32 weights; always
+runtime-check `gpu_dtype` when writing dtype-sensitive code. And the
+`gemm_qkv_hfq4g256` kernel family works on HFQ4 weights but has an
+untested MQ4 compatibility gap we'd need to resolve before any kernel
+fusion in the draft.
