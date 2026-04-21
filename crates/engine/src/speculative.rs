@@ -1530,7 +1530,12 @@ fn verify_dflash_block_inner(
     // no tree_verify (its attn_bias+positions are per-cycle), pbs is Some.
     // `gdn_tape` is safe because verify is single-chunk → tape_offset=0 always
     // → captured node's dst offset is correct across cycles.
-    let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() == Some("1")
+    //
+    // Default-on for eligible models (2026-04-21 smoke on 27B MQ4 Qwen3.5
+    // showed +14 % tok/s 25.6→29.2, wall-per-cycle 89→80 ms via coalescing
+    // verify kernels into one graph replay and saving ~1.3 ms of per-cycle
+    // launch overhead). Opt out with HIPFIRE_VERIFY_GRAPH=0.
+    let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
         && tree_verify.is_none()
         && matches!(
             target.weights.embd_format,
