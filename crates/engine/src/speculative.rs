@@ -934,56 +934,44 @@ impl HiddenStateRingBuffer {
     /// ring wrap, then advance the head by `n`. Must be called AFTER the
     /// forward (outside any captured region) — uses the current `head` to
     /// compute destination offsets, which would be baked wrong in a replayed
-    /// graph. When `gpu.active_stream` is Some, copies are async on that
-    /// stream so they're ordered after the graph_launch; otherwise sync.
+    /// graph.
+    ///
+    /// When `gpu.active_stream` is Some, we first sync the stream (so the
+    /// captured forward's staging writes are complete) then use sync D2D
+    /// for the scatter. This matches the existing sync-memcpy semantics the
+    /// rest of the engine relies on for ordering with null-stream consumers
+    /// (e.g. the draft forward's D2H of hidden rows after this commit).
     pub fn commit_staging_to_ring(&mut self, gpu: &mut Gpu, n: usize) -> HipResult<()> {
         let row_bytes = self.hidden_dim * 4;
         let head = self.head;
         let max_pos = self.max_positions;
-        let use_async = gpu.active_stream.is_some();
+
+        // If running under an explicit stream (graph capture path), wait
+        // for the captured writes to complete before the scatter so we
+        // don't read uninitialized staging.
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.stream_synchronize(stream)?;
+        }
 
         for ei in 0..self.layer_bufs.len() {
             if head + n <= max_pos {
-                if use_async {
-                    let stream = gpu.active_stream.as_ref().unwrap();
-                    gpu.hip.memcpy_dtod_async_at(
-                        &self.layer_bufs[ei].buf, head * row_bytes,
-                        &self.staging_bufs[ei].buf, 0,
-                        n * row_bytes, stream,
-                    )?;
-                } else {
-                    gpu.hip.memcpy_dtod_at(
-                        &self.layer_bufs[ei].buf, head * row_bytes,
-                        &self.staging_bufs[ei].buf, 0,
-                        n * row_bytes,
-                    )?;
-                }
+                gpu.hip.memcpy_dtod_at(
+                    &self.layer_bufs[ei].buf, head * row_bytes,
+                    &self.staging_bufs[ei].buf, 0,
+                    n * row_bytes,
+                )?;
             } else {
                 let first = max_pos - head;
-                if use_async {
-                    let stream = gpu.active_stream.as_ref().unwrap();
-                    gpu.hip.memcpy_dtod_async_at(
-                        &self.layer_bufs[ei].buf, head * row_bytes,
-                        &self.staging_bufs[ei].buf, 0,
-                        first * row_bytes, stream,
-                    )?;
-                    gpu.hip.memcpy_dtod_async_at(
-                        &self.layer_bufs[ei].buf, 0,
-                        &self.staging_bufs[ei].buf, first * row_bytes,
-                        (n - first) * row_bytes, stream,
-                    )?;
-                } else {
-                    gpu.hip.memcpy_dtod_at(
-                        &self.layer_bufs[ei].buf, head * row_bytes,
-                        &self.staging_bufs[ei].buf, 0,
-                        first * row_bytes,
-                    )?;
-                    gpu.hip.memcpy_dtod_at(
-                        &self.layer_bufs[ei].buf, 0,
-                        &self.staging_bufs[ei].buf, first * row_bytes,
-                        (n - first) * row_bytes,
-                    )?;
-                }
+                gpu.hip.memcpy_dtod_at(
+                    &self.layer_bufs[ei].buf, head * row_bytes,
+                    &self.staging_bufs[ei].buf, 0,
+                    first * row_bytes,
+                )?;
+                gpu.hip.memcpy_dtod_at(
+                    &self.layer_bufs[ei].buf, 0,
+                    &self.staging_bufs[ei].buf, first * row_bytes,
+                    (n - first) * row_bytes,
+                )?;
             }
         }
         self.head = (head + n) % max_pos;
@@ -1529,21 +1517,130 @@ fn verify_dflash_block_inner(
     // the actual current `b` (≤ max_n) so downstream kernels see the right
     // shapes. sub_offset returns a non-owning view; do NOT free these.
     let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
-    let batch_result = qwen35::forward_prefill_batch_with_pbs(
-        gpu,
-        &target.weights,
-        &target.config,
-        draft_tokens,
-        start_pos,
-        &mut target.kv_cache,
-        &mut target.dn_state,
-        &target.scratch,
-        Some(hidden_rb),
-        Some(&final_hidden),
-        gdn_tape,
-        tree_verify,
-        verify_scratch.prefill_batch.as_ref(),
-    );
+
+    // Graph-capture path eligibility. The captured forward bakes in:
+    //   - N (the batch size) — via kernel grid dims
+    //   - kernel selection + layer-type branches (dispatched once at capture)
+    //   - weight/bias/buffer pointers (stable across cycles)
+    // Per-cycle inputs (tokens, positions, kv_cache contents, dn_state contents,
+    // hidden_rb staging dest) are read from device buffers whose *contents*
+    // change between replays — the captured graph reads the current bytes.
+    //
+    // Eligibility is narrow: HFQ4G256 embedding (uploads via pbs.tokens),
+    // no tree_verify (its attn_bias+positions are per-cycle), pbs is Some.
+    // `gdn_tape` is safe because verify is single-chunk → tape_offset=0 always
+    // → captured node's dst offset is correct across cycles.
+    let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() == Some("1")
+        && tree_verify.is_none()
+        && matches!(
+            target.weights.embd_format,
+            crate::llama::EmbeddingFormat::HFQ4G256 | crate::llama::EmbeddingFormat::Q8_0,
+        )
+        && verify_scratch.prefill_batch.is_some();
+
+    let batch_result = if verify_graph_ok {
+        let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
+        debug_assert!(b <= pbs.max_batch);
+        // Pre-capture: pre-upload inputs and ensure a stream exists. memcpy_htod
+        // runs on the host/null-stream side and is NOT captured.
+        qwen35::upload_prefill_batch_inputs(gpu, pbs, draft_tokens, start_pos)?;
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create()?);
+        }
+        if gpu.graph_exec.is_some() && gpu.graph_verify_n == Some(b) {
+            // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
+            // kv_cache contents that were freshly updated above + upstream.
+            gpu.graph_launch()?;
+            Ok(())
+        } else if gpu.graph_verify_warmup == 0 {
+            // Warmup cycle: run direct so kernel JIT and any lazy scratch
+            // allocations (e.g., MQ signs/x_rot/x_q8, FP16 shadow) happen
+            // outside any captured region. Capturing a JIT + scratch-malloc
+            // hits "hipMalloc not permitted under stream capture" the first
+            // time any kernel is compiled inline.
+            gpu.graph_verify_warmup = 1;
+            let r = qwen35::forward_prefill_batch_single_chunk_captured(
+                gpu,
+                &target.weights,
+                &target.config,
+                draft_tokens,
+                start_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                pbs,
+                Some(hidden_rb),
+                Some(&final_hidden),
+                gdn_tape,
+                None,
+            );
+            if r.is_ok() {
+                eprintln!("[verify-graph] warmup cycle complete — capture next cycle");
+            }
+            r
+        } else {
+            // Capture path (second call, or B changed mid-run).
+            if gpu.graph_exec.is_some() {
+                gpu.graph_destroy();
+            }
+            gpu.begin_graph_capture()?;
+            let r = qwen35::forward_prefill_batch_single_chunk_captured(
+                gpu,
+                &target.weights,
+                &target.config,
+                draft_tokens,
+                start_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                pbs,
+                Some(hidden_rb),
+                Some(&final_hidden),
+                gdn_tape,
+                None, // tree_verify is already None per eligibility
+            );
+            if r.is_ok() {
+                gpu.end_graph_capture()?;
+                gpu.graph_verify_n = Some(b);
+                eprintln!(
+                    "[verify-graph] captured for B={} with {} blobs",
+                    b, gpu.capture_blobs.len(),
+                );
+            } else {
+                // If capture failed, destroy any partial state so we fall
+                // back to the direct path next cycle cleanly.
+                let _ = gpu.hip.stream_end_capture(gpu.active_stream.as_ref().unwrap());
+                gpu.capture_mode = false;
+                gpu.capture_blobs.clear();
+            }
+            r
+        }
+    } else {
+        qwen35::forward_prefill_batch_with_pbs(
+            gpu,
+            &target.weights,
+            &target.config,
+            draft_tokens,
+            start_pos,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            Some(hidden_rb),
+            Some(&final_hidden),
+            gdn_tape,
+            tree_verify,
+            verify_scratch.prefill_batch.as_ref(),
+        )
+    };
+
+    // Commit hidden_rb staging to the ring (outside any captured region).
+    // The captured forward wrote to staging[0..b*h]; this scatter places
+    // those rows at the current head and advances head by b. Under the
+    // graph path we manually drive this because the non-graph chunk loop
+    // (forward_prefill_batch_with_pbs) that usually calls it was bypassed.
+    if verify_graph_ok && batch_result.is_ok() {
+        hidden_rb.commit_staging_to_ring(gpu, b)?;
+    }
     // Tree mode at topk>1 REQUIRES this sync. Without it τ degrades badly
     // (e.g. budget=60 topk=8 drops 7.0 → 3.3; 9B asym3 2026-04-14). topk=1
     // is fine without the sync (byte-exact with baseline DFlash either way).

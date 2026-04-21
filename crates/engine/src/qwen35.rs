@@ -2461,6 +2461,71 @@ impl PrefillBatchScratch {
 /// on prompt seeding of long prompts).
 pub const PREFILL_MAX_BATCH: usize = 256;
 
+/// Host-side helper: upload token ids and positions to a `PrefillBatchScratch`
+/// via sync `memcpy_htod`. Call this BEFORE entering a hipGraph capture to
+/// pre-populate `pbs.tokens` and `pbs.positions`, then pass `pre_uploaded:
+/// true` (or use `forward_prefill_chunk_captured_safe`) so the forward
+/// does not issue any additional uploads inside the captured region.
+pub fn upload_prefill_batch_inputs(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    tokens: &[u32],
+    start_pos: usize,
+) -> HipResult<()> {
+    let n = tokens.len();
+    let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+    let tokens_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+    let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+    let positions_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    Ok(())
+}
+
+/// Capture-friendly entry point that runs the batched forward against a
+/// SINGLE chunk (`tokens.len() <= pbs.max_batch`), skipping the internal
+/// token/position upload and assuming the caller has already populated
+/// `pbs.tokens` / `pbs.positions` via `upload_prefill_batch_inputs`.
+///
+/// This exists so `hipStreamBeginCapture` can wrap the forward without
+/// the per-call `memcpy_htod` sync operations (which would either error
+/// under capture or bake stale host data into the captured graph nodes).
+///
+/// Callers still must handle `hidden_rb.commit_staging_to_ring(gpu, n)`
+/// AFTER the forward returns (outside any captured region) to scatter
+/// staging writes to the ring at the current head.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_single_chunk_captured(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+) -> HipResult<()> {
+    let n = tokens.len();
+    debug_assert!(n > 0 && n <= pbs.max_batch,
+        "single_chunk_captured: n={} but pbs.max_batch={}", n, pbs.max_batch);
+    forward_prefill_chunk(
+        gpu, weights, config, tokens, start_pos,
+        kv_cache, dn_state, scratch, pbs, hidden_rb,
+        per_token_hidden_out.map(|t| (t, 0)),
+        gdn_tape, 0, tree_verify,
+        true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
+    )
+}
+
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -2689,6 +2754,7 @@ pub fn forward_prefill_batch_with_pbs(
                 gpu, weights, config, chunk, start_pos + chunk_start,
                 kv_cache, dn_state, scratch, pbs, hidden_rb.as_deref(),
                 pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
+                false, // pre_uploaded: default path uploads inside
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -2892,6 +2958,7 @@ fn forward_prefill_chunk(
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tape_offset: usize,
     tree_verify: Option<TreeVerifyCtx<'_>>,
+    pre_uploaded: bool,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -2916,13 +2983,23 @@ fn forward_prefill_chunk(
     //
     // Other formats fall back to the per-token loop (kept for correctness
     // breadth; the MQ4-quantized hot path doesn't hit them).
-    if matches!(weights.embd_format, EmbeddingFormat::HFQ4G256) {
-        let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let tokens_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
-        };
-        gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
-        gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+    if matches!(weights.embd_format, EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0) {
+        if !pre_uploaded {
+            let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            let tokens_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
+            };
+            gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+        }
+        match weights.embd_format {
+            EmbeddingFormat::HFQ4G256 => {
+                gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+            }
+            EmbeddingFormat::Q8_0 => {
+                gpu.embedding_lookup_q8_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+            }
+            _ => unreachable!(),
+        }
     } else {
         for (i, &tok) in tokens.iter().enumerate() {
             match weights.embd_format {
@@ -2955,11 +3032,13 @@ fn forward_prefill_chunk(
     // or a scatter-kernel for commit. `ctx.positions` is accepted for API
     // compatibility but ignored — the DdNode depths it carries are only
     // used by `linearize_tree` to build the attn_bias mask.
-    let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
-    let positions_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
-    };
-    gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    if !pre_uploaded {
+        let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+        let positions_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
+        };
+        gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    }
 
     // Decide whether the FA layers can take the batched path. Requires
     // (a) all FA weights to be MQ4G256 or HFQ4G256 (the batched gemm_qkv
@@ -2986,7 +3065,18 @@ fn forward_prefill_chunk(
                 is_batchable_la(l.wo.gpu_dtype),
             _ => true, // LA layers don't gate this check
         });
-    let max_ctx_len = start_pos + n;
+    // Under hipGraph capture, scalar kernargs get BAKED into the kernarg blob
+    // at capture time. `max_ctx_len = start_pos + n` grows per cycle, so the
+    // captured value would be stale on replay — the attention kernel would
+    // allocate too-small LDS for `scores[]` and over-read. Bake the physical
+    // cap instead (LDS sized for the worst case). The kernel still iterates
+    // over the actual `positions[b] + 1` per-row seq_len from a device buffer,
+    // so correctness is preserved; only the LDS allocation is over-provisioned.
+    let max_ctx_len = if gpu.capture_mode {
+        kv_cache.physical_cap
+    } else {
+        start_pos + n
+    };
 
     // ── 2. Per-layer loop ────────────────────────────────────────────────
     let mut delta_layer_idx = 0usize;
@@ -3056,15 +3146,15 @@ fn forward_prefill_chunk(
                     let off_a = tape_offset * alpha_row_bytes;
                     let copy_qkv = n * qkv_row_bytes;
                     let copy_a = n * alpha_row_bytes;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.qkv_bufs[delta_layer_idx].buf, off_qkv,
                         &pbs.dn_qkv_batch.buf, 0, copy_qkv,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.alpha_bufs[delta_layer_idx].buf, off_a,
                         &pbs.dn_alpha_batch.buf, 0, copy_a,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.beta_bufs[delta_layer_idx].buf, off_a,
                         &pbs.dn_beta_batch.buf, 0, copy_a,
                     )?;
@@ -3098,8 +3188,8 @@ fn forward_prefill_chunk(
                     )?;
                 } else {
                     // n_key_heads == n_v_heads → k_dim == v_dim, memcpy the whole block.
-                    gpu.hip.memcpy_dtod(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
-                    gpu.hip.memcpy_dtod(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
                 }
 
                 // Gated Delta Net — N sequential calls with offset pointers.
@@ -3605,15 +3695,15 @@ fn forward_prefill_chunk(
                     let off_a = tape_offset * alpha_row_bytes;
                     let copy_qkv = n * qkv_row_bytes;
                     let copy_a = n * alpha_row_bytes;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.qkv_bufs[delta_layer_idx].buf, off_qkv,
                         &pbs.dn_qkv_batch.buf, 0, copy_qkv,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.alpha_bufs[delta_layer_idx].buf, off_a,
                         &pbs.dn_alpha_batch.buf, 0, copy_a,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.beta_bufs[delta_layer_idx].buf, off_a,
                         &pbs.dn_beta_batch.buf, 0, copy_a,
                     )?;
@@ -3637,8 +3727,8 @@ fn forward_prefill_chunk(
                         config.linear_num_key_heads, ratio, hd, n,
                     )?;
                 } else {
-                    gpu.hip.memcpy_dtod(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
-                    gpu.hip.memcpy_dtod(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
                 }
                 gpu.gated_delta_net_q8_batch_seq(
                     &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,

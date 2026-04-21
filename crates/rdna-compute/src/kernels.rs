@@ -800,6 +800,11 @@ pub const EMBEDDING_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/embe
 /// between replays, replay the same graph. Writes into row-major `[N × dim]`.
 pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str = include_str!("../../../kernels/src/embedding_hfq4g256_batched.hip");
 
+/// Batched Q8_0 embedding: same hipGraph-captureable pattern as the HFQ4-G256
+/// variant. 27B MQ4 targets ship with Q8_0-quantized embedding tables, so the
+/// verify hot path needs this variant to enable graph capture on that model.
+pub const EMBEDDING_Q8_BATCHED_SRC: &str = include_str!("../../../kernels/src/embedding_q8_batched.hip");
+
 
 /// HFQ4-G128 embedding lookup: dequantize one row from HFQ4-G128 table to F32.
 pub const EMBEDDING_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/embedding_hfq4g128.hip");

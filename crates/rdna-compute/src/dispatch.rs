@@ -163,6 +163,17 @@ pub struct Gpu {
     pub graph_exec: Option<hip_bridge::GraphExec>,
     /// The raw captured graph (kept alive for potential update operations).
     captured_graph: Option<hip_bridge::Graph>,
+    /// When the captured graph belongs to a verify-forward, this is the batch
+    /// size it was captured for. `None` means no verify graph captured (the
+    /// graph slot may hold the AR forward graph instead, or be unused).
+    /// Used to invalidate + re-capture when the DFlash budget changes mid-run.
+    pub graph_verify_n: Option<usize>,
+    /// Counter of verify forward calls seen since the last graph invalidate.
+    /// We run the first call direct (no capture) to let kernel JIT and any
+    /// lazy scratch allocations settle — then capture on the second call.
+    /// Capturing the first call itself hits "hipMalloc not permitted during
+    /// stream capture" the first time a kernel is JITted inside capture.
+    pub graph_verify_warmup: u32,
 
     // ── rocBLAS (CDNA3 MFMA-accelerated GEMM) ─────────────────────────────
     /// Optional rocBLAS handle. `None` on non-CDNA3 archs or when
@@ -272,6 +283,8 @@ impl Gpu {
             capture_blobs: Vec::new(),
             graph_exec: None,
             captured_graph: None,
+            graph_verify_n: None,
+            graph_verify_warmup: 0,
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
         }).map(|mut gpu| {
@@ -452,6 +465,39 @@ impl Gpu {
             let _ = self.hip.graph_destroy(graph);
         }
         self.capture_blobs.clear();
+        self.graph_verify_n = None;
+        self.graph_verify_warmup = 0;
+    }
+
+    /// D→D copy with offsets that picks async (on the active stream) when
+    /// a stream is set and sync otherwise. Captured graphs require async on
+    /// the captured stream — sync `hipMemcpy` errors with "would make the
+    /// legacy stream depend on a capturing blocking stream" under capture
+    /// mode Global. Use this helper whenever the copy might live inside
+    /// a captured region.
+    pub fn memcpy_dtod_at_auto(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        dst_offset: usize,
+        src: &hip_bridge::DeviceBuffer,
+        src_offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        if let Some(stream) = self.active_stream.as_ref() {
+            self.hip.memcpy_dtod_async_at(dst, dst_offset, src, src_offset, size, stream)
+        } else {
+            self.hip.memcpy_dtod_at(dst, dst_offset, src, src_offset, size)
+        }
+    }
+
+    /// D→D copy (whole buffer) that picks async on the active stream when set.
+    pub fn memcpy_dtod_auto(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        src: &hip_bridge::DeviceBuffer,
+        size: usize,
+    ) -> HipResult<()> {
+        self.memcpy_dtod_at_auto(dst, 0, src, 0, size)
     }
 
     /// Helper: launch a kernel using the blob path during graph capture,
@@ -467,7 +513,13 @@ impl Gpu {
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         if self.capture_mode {
-            let blob = blob_builder();
+            let mut blob = blob_builder();
+            // Pad tail to 16-byte alignment — some kernel struct layouts that
+            // HIP's loader expects have an implicit final pad to the struct's
+            // alignment. gfx1100 typically doesn't care, but under graph
+            // capture on ROCm 7.x the loader is stricter and unpadded tails
+            // have been observed to cause silent argument corruption.
+            blob.pad_to(16);
             self.capture_blobs.push(blob.into_vec());
             // Re-borrow fields separately to avoid conflicting borrows on self
             let buf = self.capture_blobs.last_mut().unwrap();
@@ -903,6 +955,48 @@ impl Gpu {
         };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
+    }
+
+    /// Batched Q8_0 embedding lookup. Same hipGraph-captureable pattern as
+    /// the HFQ4G256 variant. `output` shape: `[n × dim]` row-major.
+    pub fn embedding_lookup_q8_batched(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_ids: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "embedding_q8_batched",
+            kernels::EMBEDDING_Q8_BATCHED_SRC,
+            "embedding_q8_batched",
+        )?;
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tidp = token_ids.buf.as_ptr();
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tidp as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "embedding_q8_batched",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp); b.push_ptr(op); b.push_ptr(tidp); b.push_i32(d);
+                b
+            },
+        )
     }
 
     /// Batched HFQ4-G256 embedding lookup. Dequantizes N rows in a single
@@ -9924,6 +10018,7 @@ impl Gpu {
         specs.push(("embedding_hfq4g256", kernels::EMBEDDING_HFQ4G256_SRC.to_string()));
         specs.push(("embedding_hfq4g128", kernels::EMBEDDING_HFQ4G128_SRC.to_string()));
         specs.push(("embedding_hfq4g256_batched", kernels::EMBEDDING_HFQ4G256_BATCHED_SRC.to_string()));
+        specs.push(("embedding_q8_batched", kernels::EMBEDDING_Q8_BATCHED_SRC.to_string()));
 
         // DeltaNet kernels
         specs.push(("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC.to_string()));
