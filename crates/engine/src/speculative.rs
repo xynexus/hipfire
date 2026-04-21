@@ -3369,5 +3369,9 @@ pub fn apply_eviction_retain_to_draft(
     gpu.hip.memcpy_htod(&draft_scratch.target_hidden.buf, compacted_bytes)?;
     draft_scratch.target_hidden_abs_positions = new_abs;
     draft_scratch.uploaded_target_hidden_rows = budget;
+    // The per-layer k_ctx/v_ctx projection cache is indexed by the
+    // pre-eviction row layout. After compaction it's stale — rebuild on
+    // the next draft_forward. One slow cycle per eviction is fine.
+    draft_scratch.invalidate_draft_ctx_cache();
     Ok(())
 }

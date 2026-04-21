@@ -339,6 +339,37 @@ pub struct DflashScratch {
     /// every eviction mirror. Empty on the ctx_slice=Some path (caller
     /// manages positions explicitly for that diagnostic mode).
     pub target_hidden_abs_positions: Vec<i32>,
+
+    /// Per-layer cache of `k_ctx` and `v_ctx` (post-GEMM-of-target_hidden_proj,
+    /// K additionally post-RMSNorm-via-k_norm, both pre-RoPE). Filled
+    /// incrementally as draft_forward sees new target_hidden rows.
+    ///
+    /// The win: without this cache, each `draft_forward` call re-ran 2
+    /// big GEMMs per layer over ALL L context rows, even though only the
+    /// tail (accept+1 new rows) had changed since the previous cycle. On
+    /// 27B at L=512, that cost ~230 ms/cycle. With the cache, only the
+    /// delta rows are recomputed and appended — ~5 ms/cycle for typical
+    /// τ ≈ 5.
+    ///
+    /// Lucebox calls the same structure a "rolling target_feat ring" in
+    /// its DFlash-on-ggml writeup; this is our equivalent.
+    ///
+    /// Shapes: each entry is `[max_ctx, kv_dim]` f32.
+    pub k_ctx_cached: Vec<GpuTensor>,
+    pub v_ctx_cached: Vec<GpuTensor>,
+
+    /// Number of rows valid in `target_hidden_proj`, `k_ctx_cached[*]`, and
+    /// `v_ctx_cached[*]`. Rows `[0..draft_ctx_cached_rows)` have finished
+    /// all of (a) fc + hidden_norm projection into target_hidden_proj,
+    /// (b) per-layer wk/wv GEMMs, (c) per-layer k_norm. They are still
+    /// pre-RoPE — RoPE applies to the full concatenated k_cat each cycle
+    /// (cheap; memory-bound on tiny kv_dim tensors).
+    ///
+    /// Reset to 0 on `reset_upload_tracking` (new prompt) and on
+    /// eviction via `invalidate_draft_ctx_cache`. Next cycle after a
+    /// reset rebuilds the full prefix in one shot — same cost as a
+    /// pre-cache cycle, but amortized thereafter.
+    pub draft_ctx_cached_rows: usize,
 }
 
 impl DflashScratch {
@@ -381,6 +412,17 @@ impl DflashScratch {
             None
         };
 
+        // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K, pre-rope).
+        // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
+        // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
+        // = 128 MB. Trivial vs 24 GB VRAM.
+        let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        for _ in 0..cfg.n_layers {
+            k_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+            v_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+        }
+
         Ok(DflashScratch {
             max_block_size: b,
             max_ctx_len: l,
@@ -412,16 +454,33 @@ impl DflashScratch {
             mq_x_rot,
             uploaded_target_hidden_rows: 0,
             target_hidden_abs_positions: Vec::new(),
+            k_ctx_cached,
+            v_ctx_cached,
+            draft_ctx_cached_rows: 0,
         })
     }
 
     /// Reset the incremental-upload tracker for target_hidden. Call this
     /// at the start of a new prompt / session — otherwise stale tracker
     /// state from a prior prompt would cause the next draft_forward to
-    /// skip required rows.
+    /// skip required rows. Also clears the draft-ctx projection cache so
+    /// the first draft_forward after reset does a full rebuild.
     pub fn reset_upload_tracking(&mut self) {
         self.uploaded_target_hidden_rows = 0;
         self.target_hidden_abs_positions.clear();
+        self.draft_ctx_cached_rows = 0;
+    }
+
+    /// Invalidate the per-layer k_ctx/v_ctx projection cache. Called from
+    /// `apply_eviction_retain_to_draft` (in speculative.rs) when CASK
+    /// evicts positions — the cached rows no longer correspond to the
+    /// right absolute positions, so the simplest correct thing is to
+    /// rebuild on the next cycle. A finer mirror (applying retain_mask
+    /// to the cache) could preserve the cache across eviction but adds
+    /// complexity; the rebuild cost is bounded by one slow cycle per
+    /// eviction which is rare relative to total cycles.
+    pub fn invalidate_draft_ctx_cache(&mut self) {
+        self.draft_ctx_cached_rows = 0;
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -445,6 +504,12 @@ impl DflashScratch {
         let _ = gpu.free_tensor(self.v_cat);
         let _ = gpu.free_tensor(self.positions_q);
         let _ = gpu.free_tensor(self.positions_k);
+        for t in self.k_ctx_cached {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.v_ctx_cached {
+            let _ = gpu.free_tensor(t);
+        }
         if let Some(t) = self.mq_x_rot {
             let _ = gpu.free_tensor(t);
         }
@@ -621,25 +686,48 @@ pub fn draft_forward(
     upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
 
     // ── 1. target_hidden_proj = hidden_norm(fc @ target_hidden) ──────────
+    // Incremental-projection fast path (2026-04-20): only compute the
+    // delta rows [cached..L) that haven't been projected yet. Rows
+    // [0..cached) were projected and cached by a previous draft_forward
+    // call and are still valid. After this block, rows [0..L) of
+    // target_hidden_proj are usable by the per-layer K/V step below.
+    //
+    // `draft_ctx_cached_rows` is the scratch-owned invariant: how many
+    // prefix rows have been computed end-to-end (fc + hidden_norm +
+    // per-layer wk + k_norm + per-layer wv). It resets to 0 at new
+    // prompts (reset_upload_tracking) and on eviction
+    // (invalidate_draft_ctx_cache).
+    //
+    // Full-rebuild cases: delta == L (first cycle after reset), or
+    // delta > L somehow (shouldn't happen — this would be a bug). Those
+    // go through the same code path with delta == L, same cost as before.
+    //
     // Dispatch on fc weight dtype: F32 → gemm_f32_batched (legacy),
     // MQ4 → FWHT-rotate target_hidden then gemm_hfq4g256.
-    gemm_dispatch(
-        gpu,
-        &scratch.target_hidden,         // x [L, ne*h]
-        &weights.fc,                    // w [hidden, ne*h]
-        &scratch.target_hidden_proj,    // y [L, hidden]
-        l,
-        scratch.mq_x_rot.as_ref(),
-    )?;
-    // RMSNorm across each L-row of size hidden with hidden_norm weight.
-    gpu.rmsnorm_batched(
-        &scratch.target_hidden_proj,
-        &weights.hidden_norm,
-        &scratch.target_hidden_proj,
-        l,
-        h,
-        eps,
-    )?;
+    let cached_rows = scratch.draft_ctx_cached_rows;
+    let delta = l.saturating_sub(cached_rows);
+    if delta > 0 {
+        let src_offset_elems = cached_rows * ne * h;
+        let dst_offset_elems = cached_rows * h;
+        let th_slice = scratch.target_hidden.sub_offset(src_offset_elems, delta * ne * h);
+        let thp_slice = scratch.target_hidden_proj.sub_offset(dst_offset_elems, delta * h);
+        gemm_dispatch(
+            gpu,
+            &th_slice,
+            &weights.fc,
+            &thp_slice,
+            delta,
+            scratch.mq_x_rot.as_ref(),
+        )?;
+        gpu.rmsnorm_batched(
+            &thp_slice,
+            &weights.hidden_norm,
+            &thp_slice,
+            delta,
+            h,
+            eps,
+        )?;
+    }
 
     // ── 2. Per-layer decoder ─────────────────────────────────────────────
     for li in 0..cfg.n_layers {
@@ -659,29 +747,63 @@ pub fn draft_forward(
         )?;
 
         // Q/K/V projections — dispatched on each weight's dtype.
+        // Q and K/V noise (over the B block positions) must be computed
+        // every cycle. K_ctx and V_ctx (over the L context positions)
+        // are *incrementally* cached — see the per-layer block below.
         gemm_dispatch(gpu, &scratch.x_norm, &layer.wq, &scratch.q,       b, scratch.mq_x_rot.as_ref())?;
         gemm_dispatch(gpu, &scratch.x_norm, &layer.wk, &scratch.k_noise, b, scratch.mq_x_rot.as_ref())?;
         gemm_dispatch(gpu, &scratch.x_norm, &layer.wv, &scratch.v_noise, b, scratch.mq_x_rot.as_ref())?;
 
         // K_ctx / V_ctx — same wk/wv weights but projected over the L
-        // accepted-context rows of target_hidden_proj.
-        gemm_dispatch(gpu, &scratch.target_hidden_proj, &layer.wk, &scratch.k_ctx, l, scratch.mq_x_rot.as_ref())?;
-        gemm_dispatch(gpu, &scratch.target_hidden_proj, &layer.wv, &scratch.v_ctx, l, scratch.mq_x_rot.as_ref())?;
+        // accepted-context rows of target_hidden_proj. INCREMENTAL PATH:
+        // only rows [cached_rows..L) need projection; rows [0..cached_rows)
+        // were projected in a prior call and stored in the per-layer
+        // k_ctx_cached / v_ctx_cached buffers (post-k_norm for K).
+        //
+        // If delta > 0, run wk/wv on the delta slice of target_hidden_proj
+        // and write into the tail of the per-layer cache. Then run k_norm
+        // on those same delta rows (per-head) in-place on the cache.
+        //
+        // For correctness note: the per-head K RMSNorm is row-local
+        // (normalizes each kv_head row of size hd independently), so
+        // applying it to delta rows of the cache is exactly equivalent
+        // to applying it to the full k_cat post-concat. V has no
+        // draft-level norm so v_ctx_cached stores raw GEMM output.
+        let k_cache_layer = &scratch.k_ctx_cached[li];
+        let v_cache_layer = &scratch.v_ctx_cached[li];
+        if delta > 0 {
+            let src_offset_elems = cached_rows * h;
+            let dst_offset_elems = cached_rows * kvd;
+            let thp_slice = scratch.target_hidden_proj.sub_offset(src_offset_elems, delta * h);
+            let k_slot = k_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
+            let v_slot = v_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
+            gemm_dispatch(gpu, &thp_slice, &layer.wk, &k_slot, delta, scratch.mq_x_rot.as_ref())?;
+            gemm_dispatch(gpu, &thp_slice, &layer.wv, &v_slot, delta, scratch.mq_x_rot.as_ref())?;
+            // Per-head RMSNorm on K delta rows only. batch = delta × n_kv_heads.
+            gpu.rmsnorm_batched(&k_slot, &layer.k_norm, &k_slot, delta * cfg.n_kv_heads, hd, eps)?;
+        }
 
-        // Concat K = [K_ctx | K_noise] → [L + B, kv_dim]
-        //         V = [V_ctx | V_noise] → [L + B, kv_dim]
+        // Concat K = [K_ctx_cached | K_noise] → k_cat [L + B, kv_dim].
+        // The cached K prefix is already post-k_norm (applied incrementally
+        // above); the noise tail still needs k_norm applied below.
         let ctx_bytes   = (l * kvd) * 4;
         let noise_bytes = (b * kvd) * 4;
-        gpu.hip.memcpy_dtod_at(&scratch.k_cat.buf, 0,          &scratch.k_ctx.buf,   0, ctx_bytes)?;
+        gpu.hip.memcpy_dtod_at(&scratch.k_cat.buf, 0,          &k_cache_layer.buf,   0, ctx_bytes)?;
         gpu.hip.memcpy_dtod_at(&scratch.k_cat.buf, ctx_bytes,  &scratch.k_noise.buf, 0, noise_bytes)?;
-        gpu.hip.memcpy_dtod_at(&scratch.v_cat.buf, 0,          &scratch.v_ctx.buf,   0, ctx_bytes)?;
+        gpu.hip.memcpy_dtod_at(&scratch.v_cat.buf, 0,          &v_cache_layer.buf,   0, ctx_bytes)?;
         gpu.hip.memcpy_dtod_at(&scratch.v_cat.buf, ctx_bytes,  &scratch.v_noise.buf, 0, noise_bytes)?;
 
         // Per-head RMSNorm on Q: each of B*n_heads rows, size head_dim,
         // weight [head_dim].
-        gpu.rmsnorm_batched(&scratch.q,    &layer.q_norm, &scratch.q,    b * cfg.n_heads,   hd, eps)?;
-        // Per-head RMSNorm on K_cat: each of (L+B)*n_kv_heads rows.
-        gpu.rmsnorm_batched(&scratch.k_cat, &layer.k_norm, &scratch.k_cat, tot * cfg.n_kv_heads, hd, eps)?;
+        gpu.rmsnorm_batched(&scratch.q, &layer.q_norm, &scratch.q, b * cfg.n_heads, hd, eps)?;
+        // Per-head RMSNorm on the NOISE tail of K_cat only — the cached
+        // prefix was already normed when it was inserted into the layer's
+        // k_ctx_cached. batch = B × n_kv_heads, applied to the last B rows
+        // of k_cat.
+        {
+            let noise_slot = scratch.k_cat.sub_offset(l * kvd, b * kvd);
+            gpu.rmsnorm_batched(&noise_slot, &layer.k_norm, &noise_slot, b * cfg.n_kv_heads, hd, eps)?;
+        }
 
         // RoPE. rope_batched_f32 expects q and k at the SAME batch size,
         // rotating at per-row positions. We call it twice with a zero
@@ -752,6 +874,12 @@ pub fn draft_forward(
 
     // ── 3. Final norm ────────────────────────────────────────────────────
     gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, b, h, eps)?;
+
+    // ── 4. Advance the draft-ctx projection cache pointer ────────────────
+    // All rows [0..l) of target_hidden_proj and every layer's
+    // k_ctx_cached / v_ctx_cached now contain finalized per-layer
+    // projections. Next call's delta starts from here.
+    scratch.draft_ctx_cached_rows = l;
 
     Ok(())
 }
