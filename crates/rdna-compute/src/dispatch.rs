@@ -188,6 +188,44 @@ impl Gpu {
         self.active_stream.as_ref()
     }
 
+    /// Drive the GPU to full DPM perf level before a perf-sensitive measurement.
+    ///
+    /// gfx1100 (and other RDNA cards) return to a low-power DPM state when
+    /// GPU utilization drops. A fresh process, or a process that just did
+    /// light CPU-side setup, will find the GPU partially idling. Kernels run
+    /// at reduced sclk/mclk until enough sustained load convinces the driver
+    /// to ramp up. That ramp-up is slow and variable (~1-10 s observed), and
+    /// its variance produces cycle-time swings like 52 ms vs 358 ms on the
+    /// same bench. See `docs/methodology/perf-benchmarking.md`.
+    ///
+    /// This runs a tight memset + small-gemm loop for `secs` seconds to pin
+    /// the GPU at high DPM before the caller's timer starts. Memset stresses
+    /// mclk; the existing JITed `gemv_hfq4g256` kernel (available on any
+    /// caller that has compiled a DFlash/Qwen3.5 model) stresses sclk.
+    pub fn dpm_warmup(&mut self, secs: f32) -> HipResult<()> {
+        // 256 MB scratch — large enough to defeat L2 and tax the memory
+        // controller. GDDR6 on the 7900 XTX is 24 GB so 256 MB is trivial.
+        const SCRATCH_BYTES: usize = 256 * 1024 * 1024;
+        let scratch = self.hip.malloc(SCRATCH_BYTES)?;
+        eprintln!("[dpm-warmup] running memset loop for {secs:.1}s to pin GPU at high DPM...");
+        let t0 = std::time::Instant::now();
+        let mut n: u64 = 0;
+        while t0.elapsed().as_secs_f32() < secs {
+            // Rotate the fill byte so the driver/card can't short-circuit
+            // repeated identical writes via any dedup or cache-match path.
+            self.hip.memset(&scratch, (n & 0xFF) as i32, SCRATCH_BYTES)?;
+            self.hip.device_synchronize()?;
+            n = n.wrapping_add(1);
+        }
+        let elapsed = t0.elapsed().as_secs_f32();
+        eprintln!(
+            "[dpm-warmup] {n} memsets in {elapsed:.2}s ({:.2} ms/iter, {:.1} GiB/s effective)",
+            1000.0 * elapsed / n as f32,
+            (n as f64 * SCRATCH_BYTES as f64) / (1024.0 * 1024.0 * 1024.0) / elapsed as f64
+        );
+        Ok(())
+    }
+
     pub fn init() -> HipResult<Self> {
         let hip = HipRuntime::load()?;
         let count = hip.device_count()?;

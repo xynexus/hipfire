@@ -744,6 +744,19 @@ fn main() {
     let mut per_cycle_wall_us: Vec<u64> = Vec::new();
     let mut per_cycle_api_us: Vec<(u64, u64, u64, u64, u64)> = Vec::new(); // launch, h2d, d2h, d2d, memset
 
+    // HIPFIRE_DPM_WARMUP_SECS: run a memset loop on a 256 MB scratch before
+    // the decode timer starts, to pin the GPU at high DPM. See dispatch.rs
+    // `dpm_warmup` for rationale — between-process DPM variance has been
+    // observed at 7× wall-clock (52 ms vs 358 ms/cycle on the same bench),
+    // which is orders of magnitude more than the ±10-15% noise band our
+    // methodology doc calls out. Default 0 (disabled) for backward compat.
+    if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
+        let secs: f32 = secs_str.parse().unwrap_or(0.0);
+        if secs > 0.0 {
+            gpu.dpm_warmup(secs).expect("dpm warmup");
+        }
+    }
+
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
         if position + draft_cfg.block_size >= ctx_capacity {

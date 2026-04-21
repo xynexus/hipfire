@@ -168,6 +168,15 @@ fn main() {
     let warmup_ms = t_warmup.elapsed().as_secs_f64() * 1000.0;
     eprintln!("  total: {warmup_ms:.1}ms  avg: {:.2}ms/tok", warmup_ms / warmup_len as f64);
 
+    // HIPFIRE_DPM_WARMUP_SECS: optional DPM-stabilization pass before the
+    // timed decode. See crates/rdna-compute/src/dispatch.rs `dpm_warmup`.
+    if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
+        let secs: f32 = secs_str.parse().unwrap_or(0.0);
+        if secs > 0.0 {
+            gpu.dpm_warmup(secs).expect("dpm warmup");
+        }
+    }
+
     // === GEN BENCHMARK ===
     eprintln!("\n=== gen ({gen_len} tokens — timed) ===");
     let mut per_token_ms: Vec<f64> = Vec::with_capacity(gen_len);

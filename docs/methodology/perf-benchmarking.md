@@ -23,6 +23,14 @@ other due to:
 **Rule:** Any `tok/s` delta under ~5 % measured within one shell session
 is noise. Do not claim a win on it.
 
+**DPM pinning via `HIPFIRE_DPM_WARMUP_SECS=N`:** Both `bench_qwen35_mq4`
+and `dflash_spec_demo` accept this env var. It runs a 256 MB memset loop
+for `N` seconds before the decode timer starts, which pins the card at
+high DPM (effective ~770 GiB/s during warmup, verified with
+`rocm-smi --showclocks`). Use 10 s for most runs. If bench-to-bench
+variance is still >5 % with warmup, the noise source is elsewhere
+(thermal, kernel cache, etc.) — don't ship until you understand it.
+
 ## 2. The speed-gate is the source of truth
 
 `./scripts/speed-gate.sh` runs `bench_qwen35_mq4` on the 4 MQ4 sizes with
