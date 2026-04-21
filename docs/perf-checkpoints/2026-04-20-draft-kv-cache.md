@@ -162,6 +162,41 @@ hipGraph (original plan) is still worth trying for launch overhead
 elimination, but at 2.3 ms/cycle of launch API time, the upside is
 smaller than originally estimated.
 
+## Update — 2026-04-21: true post-KV-cache baseline is higher than doc'd
+
+Re-benched 27B long with and without the batched HFQ4G256 embedding
+kernel (commit `8e1ad2b`) at 2026-04-21 using the same DPM warmup:
+
+| Commit         | run 1 | run 2 | run 3 | cycles | committed | accepted | τ     |
+|----------------|-------|-------|-------|--------|-----------|----------|-------|
+| c1dc66c (pre)  | 42.83 | 42.72 |   -   |   21   |   140     |    98    | 4.667 |
+| 8e1ad2b (post) | 42.95 | 42.92 | 42.87 |   21   |   140     |    98    | 4.667 |
+
+Two things land:
+
+1. **Batched embedding is perf-neutral.** The ~0.5 ms/cycle saving we
+   expected was in the noise floor. No harm, no foul — the kernel is
+   still needed for hipGraph capture (it reads token ids from a device
+   buffer instead of taking them as a scalar kernel arg). Byte-exact
+   output: same cycles/committed/accepted/τ across both builds.
+
+2. **The doc'd 36.9 tok/s baseline was low by ~15%.** Re-running
+   c1dc66c (the same code the 36.9 measurement was taken against)
+   under the same DPM warmup gives 42.83 tok/s — so the true
+   "post-draft-KV-cache" baseline is **~43 tok/s**, not 36.9. The low
+   reading was a DPM-state artifact: the memset-loop warmup pins the
+   GPU at ~767 GiB/s effective bandwidth now, but apparently the
+   original measurement got an earlier/slower DPM state. Variance
+   within a DPM-warmed run is under 0.5 %.
+
+Revised gap to Lucebox's 3.43× AR on 27B (~155 tok/s target at the
+45.2 tok/s AR this repo has): we're at **0.95× AR** (43/45.2), not
+0.82×. Still short, but the budget for hitting 3.1× is cycle ≤ 40 ms
+(from the current 125 ms), which is ≥ 3× compression — achievable
+only via the launch-overhead-elimination levers (hipGraph,
+multi-stream) plus any remaining kernel-time cuts. Bare fusion /
+persist-write will not close it.
+
 ## Update — fusion attempt (2026-04-20 eve v2)
 
 Tried wiring the target's existing `gemm_qkv_hfq4g256` (3 weights → 3

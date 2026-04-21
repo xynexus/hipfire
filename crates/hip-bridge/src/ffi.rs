@@ -705,6 +705,33 @@ impl HipRuntime {
         self.check(code, "hipMemcpyAsync D2H")
     }
 
+    /// Async D→D copy with optional offsets on both sides. Ordered on
+    /// `stream` and capturable by hipStreamBeginCapture — use this in
+    /// place of sync `memcpy_dtod_at` wherever the copy needs to live
+    /// inside a hipGraph.
+    pub fn memcpy_dtod_async_at(
+        &self,
+        dst: &DeviceBuffer,
+        dst_offset: usize,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        size: usize,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert!(dst_offset + size <= dst.size);
+        assert!(src_offset + size <= src.size);
+        let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
+        let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                dst_ptr, src_ptr, size,
+                MemcpyKind::DeviceToDevice as c_uint,
+                stream.0,
+            )
+        };
+        self.check(code, "hipMemcpyAsync D2D offset")
+    }
+
     // ── Graph capture & replay ──────────────────────────────────
 
     /// Begin capturing all operations on `stream` into a graph.
