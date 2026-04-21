@@ -190,6 +190,7 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma2.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_k2.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K4_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_k4.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");

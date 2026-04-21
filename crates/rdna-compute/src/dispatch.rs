@@ -4001,9 +4001,31 @@ impl Gpu {
         if std::env::var("HIPFIRE_MW16").map_or(false, |v| v == "1") {
             return self.gemm_mw16_residual_wmma_via_dequant(a_raw, x, y, m, k, batch_size);
         }
-        // K2: 2× K-tile unroll with vmcnt(2) pipelining (optimal for 4-bit dequant)
-        let (kernel_name, kernel_src, block_size, row_step) =
-            ("gemm_hfq4g256_residual_wmma_k2", kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC, 32u32, 16usize);
+        // ksplit is the default on gfx1100 — splits the K-loop across 4 blocks
+        // with atomicAdd reduce, ~4×-ing the grid to fix WMMA grid-starvation
+        // on small-M / large-K GEMMs (wo_residual in particular). Measured
+        // +13 % tok/s on 27B DFlash, +2 % on 9B, -1 % on 4B (all within
+        // coherence-gate pass).
+        //
+        // HIPFIRE_WO_WMMA_VARIANT=ksplit|k2|k4|wmma|wmma2 overrides.
+        //   ksplit — K-split + atomicAdd (default)
+        //   k2     — 2× K-tile pipeline (previous default; byte-exact accum order)
+        //   k4     — 4× K-tile pipeline (output-mapping bug, τ=0 on dflash — debug only)
+        //   wmma   — base WMMA         (output-mapping bug — debug only)
+        //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
+        let variant = std::env::var("HIPFIRE_WO_WMMA_VARIANT").unwrap_or_default();
+        let (kernel_name, kernel_src, block_size, row_step, k_splits) = match variant.as_str() {
+            "k2"     => ("gemm_hfq4g256_residual_wmma_k2",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC, 32u32, 16usize, 1u32),
+            "k4"     => ("gemm_hfq4g256_residual_wmma_k4",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K4_SRC, 32u32, 16usize, 1u32),
+            "wmma"   => ("gemm_hfq4g256_residual_wmma",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_SRC, 32u32, 16usize, 1u32),
+            "wmma2"  => ("gemm_hfq4g256_residual_wmma2",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA2_SRC, 64u32, 32usize, 1u32),
+            _        => ("gemm_hfq4g256_residual_wmma_ksplit",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC, 32u32, 16usize, 4u32),
+        };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -4032,7 +4054,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
-            [row_tiles as u32, batch_tiles as u32, 1],
+            [row_tiles as u32, batch_tiles as u32, k_splits],
             [block_size, 1, 1],
             0,
             &mut params,
