@@ -104,3 +104,60 @@ total         374 ms           125 ms   ← 3.00×
 Goal is 27B long → ≥ 140 tok/s = 3.1× AR (approximate Lucebox claim of
 3.43× on the 3090). Current 36.9 tok/s = 0.82× AR; budget for hitting
 3.1× is cycle ≤ 36 ms for 5.55 committed-per-cycle.
+
+## Update — investigation findings (2026-04-20 eve)
+
+**Hypothesis tested and rejected: reducing D2H sync count.**
+
+We profiled the post-cache 27B long cycle and saw 95% of cycle wall
+time was spent in `hipMemcpy D2H`:
+```
+wall=117,741 µs | launch=2,276 µs | dtoh=112,496 µs
+kernel execution time (profile): 58 ms/cycle
+```
+
+So we built a GPU-side acceptance kernel (`accept_scan`) that runs
+on-GPU instead of downloading verify argmax to CPU, bringing the
+per-cycle D2H count from 2 to ~1 (the draft argmax still has to come
+back for the `drafted` CPU vec used by spec_step reporting).
+
+A/B measured (HIPFIRE_GPU_ACCEPT=1 vs unset):
+
+| Config    | CPU accept | GPU accept | Δ        |
+|-----------|-----------|------------|----------|
+| 9B short  | 188.2     | 186.8      | -0.7% (noise) |
+| 9B long   | 112.2     | 112.3      | flat     |
+| 27B short | 47.4      | 47.3       | -0.2% (noise) |
+| 27B long  | 36.9      | 36.8       | -0.2% (noise) |
+
+Acceptance was byte-exact (cycles/τ/accepted matched across CPU/GPU
+paths on all configs) — so the kernel works. But **total wall time
+didn't change.**
+
+**What we learned:** on a serial-dependency workload (draft → verify →
+accept), combining two dtohs into one doesn't help because each dtoh
+was already mostly waiting for the same critical path of kernels. The
+95% dtoh figure wasn't synchronization overhead to eliminate — it was
+the GPU kernel execution time *expressed as the CPU's view of waiting
+on the queue to drain*.
+
+The code was reverted (correct but zero-benefit) on 2026-04-20. Kernel
+source preserved in commit history for reference.
+
+## Revised understanding of the next lever
+
+Kernel execution time IS the bottleneck, not sync structure. The
+realistic next levers:
+
+- **Reduce total GPU kernel time** via fusion (fewer larger kernels
+  per layer) or faster individual kernels.
+- **Multi-stream concurrency** — run independent GPU work in parallel.
+  E.g., post-verify tape replay could start while draft_forward of the
+  next cycle is already queued. Requires careful stream/event plumbing.
+- **Reduce draft model cost specifically** — draft FA attention at L=512
+  is a chunk of the 72 ms draft+lmhead phase. A smaller draft or more
+  efficient draft attention could move the needle.
+
+hipGraph (original plan) is still worth trying for launch overhead
+elimination, but at 2.3 ms/cycle of launch API time, the upside is
+smaller than originally estimated.
