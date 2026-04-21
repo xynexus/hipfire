@@ -474,7 +474,69 @@ impl GdnTape {
     /// both `dn_state.s_matrices`/`s_scales` AND `dn_state.conv_states` by
     /// exactly `n_steps` single-token updates. Caller must have restored the
     /// DN snapshot to the pre-verify point before calling this.
+    ///
+    /// Graph-capture path (OPT-IN with HIPFIRE_REPLAY_GRAPH=1): per distinct
+    /// n_steps, the first call runs direct as a warmup, the second captures a
+    /// hipGraph, and subsequent calls replay the graph. Eligibility:
+    /// gpu.active_stream must be Some (so a verify-graph path that already
+    /// created one has run first in this cycle).
+    ///
+    /// MEASURED NULL RESULT (2026-04-21, 27B HumanEval @ accept≈10):
+    /// 77.27 → 77.41 tok/s (+0.18 %, noise). τ and mean_committed byte-exact
+    /// across A/B. Replay's ~192 kernel launches per cycle add ~0.3 ms of
+    /// dispatch API time out of a 130 ms cycle — graphing them saves that
+    /// 0.3 ms but cycle cost lives in GDN kernel execution time (scales
+    /// linearly with n_steps). Kept as opt-in infrastructure for future
+    /// launch-overhead-dominated workloads (smaller models, finer kernels).
     pub fn replay_gdn(
+        &self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &mut qwen35::DeltaNetState,
+        n_steps: usize,
+    ) -> HipResult<()> {
+        let graph_enabled =
+            std::env::var("HIPFIRE_REPLAY_GRAPH").ok().as_deref() == Some("1");
+        let can_graph = graph_enabled && gpu.active_stream.is_some();
+
+        if can_graph && gpu.replay_has_graph(n_steps) {
+            return gpu.replay_graph_launch(n_steps);
+        }
+
+        if can_graph && gpu.replay_needs_warmup(n_steps) {
+            self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps)?;
+            gpu.replay_mark_warmup_done(n_steps);
+            return Ok(());
+        }
+
+        if can_graph {
+            gpu.begin_replay_graph_capture(n_steps)?;
+            let r = self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps);
+            if r.is_ok() {
+                gpu.end_replay_graph_capture()?;
+                // Same pattern as verify_graph: hipStreamBeginCapture records
+                // without executing, so launch once here to apply this cycle's
+                // state updates.
+                gpu.replay_graph_launch(n_steps)?;
+                return Ok(());
+            } else {
+                let _ = gpu.hip.stream_end_capture(
+                    gpu.active_stream.as_ref().unwrap(),
+                );
+                gpu.capture_mode = false;
+                gpu.capture_blobs.clear();
+                return r;
+            }
+        }
+
+        self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps)
+    }
+
+    /// Direct kernel path — the original `replay_gdn` body, retained as a
+    /// helper so both the graph-warmup first call and the non-graph fallback
+    /// share one implementation.
+    fn replay_gdn_inner(
         &self,
         gpu: &mut Gpu,
         weights: &qwen35::Qwen35Weights,

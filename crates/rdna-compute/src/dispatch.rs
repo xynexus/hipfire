@@ -204,6 +204,17 @@ pub struct Gpu {
     /// end_verify_graph_capture). None outside that window.
     verify_capturing_b: Option<usize>,
 
+    /// Per-n_steps cache of captured tape-replay graphs (DeltaNetTape::replay_gdn).
+    /// Keyed by n_steps = accept_len + 1 (per-cycle accepted count). On 27B
+    /// HumanEval, replay scales linearly with accept — e.g. accept=10 runs
+    /// 48 LA layers × 4 kernels = ~192 launches. Graphing collapses those
+    /// into one replay. Same shape as verify_graph_cache: graph + exec + blobs.
+    pub replay_graph_cache: HashMap<usize, (hip_bridge::Graph, hip_bridge::GraphExec, Vec<Vec<u8>>)>,
+    /// n_steps values that have completed their once-per-n_steps JIT/scratch warmup.
+    pub replay_warmed_up: HashSet<usize>,
+    /// n_steps being captured right now. None outside the capture window.
+    replay_capturing_n: Option<usize>,
+
     // ── rocBLAS (CDNA3 MFMA-accelerated GEMM) ─────────────────────────────
     /// Optional rocBLAS handle. `None` on non-CDNA3 archs or when
     /// librocblas.so fails to load. Engine code should always gate on
@@ -318,6 +329,9 @@ impl Gpu {
             verify_graph_cache: HashMap::new(),
             verify_warmed_up: HashSet::new(),
             verify_capturing_b: None,
+            replay_graph_cache: HashMap::new(),
+            replay_warmed_up: HashSet::new(),
+            replay_capturing_n: None,
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
         }).map(|mut gpu| {
@@ -577,6 +591,71 @@ impl Gpu {
         }
         self.verify_warmed_up.clear();
         self.verify_capturing_b = None;
+    }
+
+    // ── Replay-graph cache (tape replay after verify) ────────────────────
+    // Same pattern as verify graph, keyed by n_steps instead of B. Captured
+    // once per distinct accept_len + 1 seen in a run; reused across cycles.
+    // On 27B HumanEval where n_steps hovers around 8-11, this caches 3-4
+    // graphs. Per-cycle savings target: 1-3 ms of launch overhead over
+    // ~192 kernel dispatches per replay.
+
+    pub fn replay_has_graph(&self, n_steps: usize) -> bool {
+        self.replay_graph_cache.contains_key(&n_steps)
+    }
+
+    pub fn replay_needs_warmup(&self, n_steps: usize) -> bool {
+        !self.replay_warmed_up.contains(&n_steps)
+    }
+
+    pub fn replay_mark_warmup_done(&mut self, n_steps: usize) {
+        self.replay_warmed_up.insert(n_steps);
+    }
+
+    pub fn begin_replay_graph_capture(&mut self, n_steps: usize) -> HipResult<()> {
+        debug_assert!(self.replay_capturing_n.is_none(),
+            "begin_replay_graph_capture: already capturing for n_steps={:?}",
+            self.replay_capturing_n);
+        debug_assert!(!self.capture_mode,
+            "begin_replay_graph_capture: capture_mode already set");
+        self.capture_blobs.clear();
+        self.replay_capturing_n = Some(n_steps);
+        self.capture_mode = true;
+        let stream = self.active_stream.as_ref()
+            .expect("replay graph capture requires an explicit stream");
+        self.hip.stream_begin_capture(stream, 0)
+    }
+
+    pub fn end_replay_graph_capture(&mut self) -> HipResult<()> {
+        let n_steps = self.replay_capturing_n.take()
+            .expect("end_replay_graph_capture without matching begin");
+        self.capture_mode = false;
+        let stream = self.active_stream.as_ref().unwrap();
+        let graph = self.hip.stream_end_capture(stream)?;
+        let exec = self.hip.graph_instantiate(&graph)?;
+        let blobs = std::mem::take(&mut self.capture_blobs);
+        self.replay_graph_cache.insert(n_steps, (graph, exec, blobs));
+        Ok(())
+    }
+
+    pub fn replay_graph_launch(&self, n_steps: usize) -> HipResult<()> {
+        let entry = self.replay_graph_cache.get(&n_steps)
+            .unwrap_or_else(|| panic!("no captured replay graph for n_steps={}", n_steps));
+        let stream = self.active_stream.as_ref().unwrap();
+        self.hip.graph_launch(&entry.1, stream)
+    }
+
+    pub fn replay_graph_count(&self) -> usize {
+        self.replay_graph_cache.len()
+    }
+
+    pub fn replay_graph_destroy_all(&mut self) {
+        for (_, (graph, exec, _blobs)) in self.replay_graph_cache.drain() {
+            let _ = self.hip.graph_exec_destroy(exec);
+            let _ = self.hip.graph_destroy(graph);
+        }
+        self.replay_warmed_up.clear();
+        self.replay_capturing_n = None;
     }
 
     /// D→D copy with offsets that picks async (on the active stream) when
