@@ -183,14 +183,27 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
         .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
     match info.quant_type {
         1 => {
-            // F16 on disk → F32 on GPU (legacy upload path).
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
-            let buf = gpu.upload_f32(&f32_data, &[m * k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+            // F16 on disk. Default: upload as F16 (no lift) and dispatch through
+            // the mw16 WMMA kernel — 3-5× faster draft at B=16 on gfx1100 than
+            // the F32 lift path (which bypassed WMMA entirely via the naive
+            // gemm_f32_batched kernel at ~100 GB/s / 10 % peak).
+            //
+            // HIPFIRE_DRAFT_F16=0 falls back to the legacy F16→F32 lift for
+            // A/B comparison.
+            let use_f16 = std::env::var("HIPFIRE_DRAFT_F16").ok().as_deref() != Some("0");
+            if use_f16 {
+                assert_eq!(data.len(), m * k * 2, "dflash {name} F16 byte-size mismatch");
+                let buf = gpu.upload_raw(data, &[m * k])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0 })
+            } else {
+                let f32_data: Vec<f32> = data
+                    .chunks_exact(2)
+                    .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
+                let buf = gpu.upload_f32(&f32_data, &[m * k])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+            }
         }
         2 => {
             let f32_data: Vec<f32> = data
@@ -543,8 +556,18 @@ fn gemm_dispatch(
     // on the same matmuls without touching AR-greedy numerics (AR on
     // Qwen3.5 doesn't call `gpu.gemm_hfq4g256` directly — it uses the
     // fused qkvza / gate_up / residual WMMA variants instead).
-    match w.gpu_dtype {
+    // HIPFIRE_DRAFT_GEMM_DUMP=1: per-call (dtype, M, K, B, us, GB/s) dump for
+    // draft GEMM triage. Cached via OnceLock so the fast path pays a single
+    // atomic load per call rather than an env lookup.
+    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let dump = *DUMP.get_or_init(|| {
+        std::env::var("HIPFIRE_DRAFT_GEMM_DUMP").ok().as_deref() == Some("1")
+    });
+    if dump { gpu.hip.device_synchronize()?; }
+    let t0 = if dump { Some(std::time::Instant::now()) } else { None };
+    let result = match w.gpu_dtype {
         DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
+        DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
             let scratch = mq_x_rot.expect("MQ4 dispatch requires mq_x_rot scratch");
@@ -554,7 +577,22 @@ fn gemm_dispatch(
             gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &rot_view, y, w.m, w.k, batch)
         }
         other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
+    };
+    if let Some(t) = t0 {
+        gpu.hip.device_synchronize()?;
+        let us = t.elapsed().as_micros();
+        let weight_bytes = match w.gpu_dtype {
+            DType::F32 => w.m * w.k * 4,
+            DType::F16 => w.m * w.k * 2,
+            // HFQ4/MQ4: 136B per group of 256
+            _ => w.m * (w.k / 256).max(1) * 136,
+        };
+        let bytes = weight_bytes + batch * w.k * 4 + batch * w.m * 4 * 2;
+        let gbs = (bytes as f64) / (us.max(1) as f64) / 1000.0;
+        eprintln!("[draft-gemm] dtype={:?} M={} K={} B={} us={} bytes={}KB GB/s={:.1}",
+            w.gpu_dtype, w.m, w.k, batch, us, bytes / 1024, gbs);
     }
+    result
 }
 
 /// Upload f32 slice into a GPU tensor (bytes via memcpy_htod).

@@ -4231,6 +4231,16 @@ impl Gpu {
             + batch_size * k * 2
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        // HIPFIRE_GEMM_DUMP=1: per-call shape+wall-clock dump of this kernel.
+        // Synchronously times only the ksplit kernel launch (not memset / convert).
+        // Measures actual GPU execution time via device_synchronize pre+post —
+        // costs latency vs async pipelining but gives shape-accurate µs.
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            std::env::var("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1")
+        });
+        if dump { self.hip.device_synchronize()?; }
+        let dump_start = if dump { Some(std::time::Instant::now()) } else { None };
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles as u32, batch_tiles as u32, k_splits],
@@ -4245,6 +4255,13 @@ impl Gpu {
             },
         );
         if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = dump_start {
+            self.hip.device_synchronize()?;
+            let us = t.elapsed().as_micros();
+            let gbs = (bytes as f64) / (us.max(1) as f64) / 1000.0; // MB/ms == GB/s
+            eprintln!("[gemm-dump] {} M={} K={} B={} bytes={}KB us={} GB/s={:.1}",
+                kernel_name, m, k, batch_size, bytes / 1024, us, gbs);
+        }
         result
     }
 
@@ -4401,6 +4418,72 @@ impl Gpu {
                 b
             },
         );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// FP16-weight lm_head fast path for DFlash drafts that ship F16 (not
+    /// quantized) weights. Routes through `gemm_mw16_residual_wmma` with the
+    /// usual memset-then-atomicAdd residual pattern.
+    ///
+    /// Shape requirements: K must be a multiple of 32 (mw16 processes 32 K
+    /// elements per WMMA iteration). All 27B/9B draft shapes satisfy this
+    /// (hidden=5120, intermediate=17408, q_dim=4096, kv_dim=1024, fc-K=25600).
+    ///
+    /// Non-gfx11 falls through to `gemm_f32_batched` — same semantics but
+    /// weight is read as F16 bytes, so the caller must have uploaded it that
+    /// way. (Currently only gfx11 is expected to hit this path; other archs
+    /// should use MQ4/HFQ4 drafts.)
+    pub fn gemm_f16_batched_lmhead(
+        &mut self,
+        w_f16: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if !self.arch.starts_with("gfx11") {
+            // No mw16 WMMA on non-RDNA3 — fall back to the scalar F32 GEMM.
+            // This is slow but correct; non-gfx11 isn't the intended target.
+            return self.gemm_f32_batched(x, w_f16, y, batch_size, k, m);
+        }
+        self.ensure_kernel(
+            "gemm_mw16_residual_wmma",
+            kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
+            "gemm_mw16_residual_wmma",
+        )?;
+        // Pre-zero Y (residual WMMA does y += acc) and force FP16-X reconversion
+        // (the draft reuses the same scratch pointer every cycle with new data).
+        self.fp16_x_source_ptr = std::ptr::null_mut();
+        self.hip.memset(&y.buf, 0, batch_size * m * 4)?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let func = &self.functions["gemm_mw16_residual_wmma"];
+        let mut wp = w_f16.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let rows = ((m + 15) / 16) as u32;
+        let batches = ((batch_size + 15) / 16) as u32;
+        // Bytes: FP16 weight + FP16 x + FP32 y (read+write).
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_mw16_residual_wmma", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func, [rows, batches, 1], [32, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
