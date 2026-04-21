@@ -910,6 +910,13 @@ pub fn draft_forward(
         // gate = x_norm @ w_gate^T; up = x_norm @ w_up^T
         gemm_dispatch(gpu, &scratch.x_norm, &layer.w_gate, &scratch.gate, b, scratch.mq_x_rot.as_ref())?;
         gemm_dispatch(gpu, &scratch.x_norm, &layer.w_up,   &scratch.up,   b, scratch.mq_x_rot.as_ref())?;
+        // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
+        // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
+        // on 27B HumanEval (median 76.47 fused vs 76.74 baseline; ±7 % run-to-
+        // run variance from ksplit's non-deterministic atomicAdd dominates).
+        // Kept per-weight dispatch for clarity. The real draft perf lever is
+        // the ~56 ms of ffn_gemm per cycle (see HIPFIRE_DRAFT_SUBPHASE=1);
+        // fusion alone doesn't move that number — kernel engineering does.
 
         // SiLU(gate) * up → gate_up
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
