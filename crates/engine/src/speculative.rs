@@ -1547,18 +1547,18 @@ fn verify_dflash_block_inner(
         if gpu.active_stream.is_none() {
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
-        if gpu.graph_exec.is_some() && gpu.graph_verify_n == Some(b) {
+        if gpu.verify_has_graph(b) {
             // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
             // kv_cache contents that were freshly updated above + upstream.
-            gpu.graph_launch()?;
+            gpu.verify_graph_launch(b)?;
             Ok(())
-        } else if gpu.graph_verify_warmup == 0 {
-            // Warmup cycle: run direct so kernel JIT and any lazy scratch
+        } else if gpu.verify_needs_warmup(b) {
+            // Warmup for this b: run direct so kernel JIT and any lazy scratch
             // allocations (e.g., MQ signs/x_rot/x_q8, FP16 shadow) happen
             // outside any captured region. Capturing a JIT + scratch-malloc
             // hits "hipMalloc not permitted under stream capture" the first
-            // time any kernel is compiled inline.
-            gpu.graph_verify_warmup = 1;
+            // time any kernel is compiled inline. One warmup per distinct b.
+            gpu.verify_mark_warmup_done(b);
             let r = qwen35::forward_prefill_batch_single_chunk_captured(
                 gpu,
                 &target.weights,
@@ -1575,15 +1575,12 @@ fn verify_dflash_block_inner(
                 None,
             );
             if r.is_ok() {
-                eprintln!("[verify-graph] warmup cycle complete — capture next cycle");
+                eprintln!("[verify-graph] warmup for B={} complete — capture next cycle at this B", b);
             }
             r
         } else {
-            // Capture path (second call, or B changed mid-run).
-            if gpu.graph_exec.is_some() {
-                gpu.graph_destroy();
-            }
-            gpu.begin_graph_capture()?;
+            // Capture path: first call at this B after warmup.
+            gpu.begin_verify_graph_capture(b)?;
             let r = qwen35::forward_prefill_batch_single_chunk_captured(
                 gpu,
                 &target.weights,
@@ -1600,8 +1597,8 @@ fn verify_dflash_block_inner(
                 None, // tree_verify is already None per eligibility
             );
             if r.is_ok() {
-                gpu.end_graph_capture()?;
-                gpu.graph_verify_n = Some(b);
+                let blob_count = gpu.capture_blobs.len();
+                gpu.end_verify_graph_capture()?;
                 // Under `hipStreamBeginCapture`, kernels + memcpys on the
                 // captured stream are RECORDED, not executed. final_hidden
                 // and hidden_rb staging are left stale. Launching the graph
@@ -1610,13 +1607,13 @@ fn verify_dflash_block_inner(
                 // HIP version does execute during capture) is washed out by
                 // target_snap.restore_to after verify returns. KV cache
                 // double-write writes the same data to the same positions.
-                gpu.graph_launch()?;
+                gpu.verify_graph_launch(b)?;
                 eprintln!(
-                    "[verify-graph] captured for B={} with {} blobs (executed via relaunch)",
-                    b, gpu.capture_blobs.len(),
+                    "[verify-graph] captured for B={} with {} blobs (cache size: {})",
+                    b, blob_count, gpu.verify_graph_count(),
                 );
             } else {
-                // If capture failed, destroy any partial state so we fall
+                // If capture failed, tear down the partial capture so we fall
                 // back to the direct path next cycle cleanly.
                 let _ = gpu.hip.stream_end_capture(gpu.active_stream.as_ref().unwrap());
                 gpu.capture_mode = false;

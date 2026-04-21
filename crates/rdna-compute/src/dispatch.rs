@@ -4,7 +4,7 @@
 use crate::compiler::KernelCompiler;
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -173,13 +173,36 @@ pub struct Gpu {
     /// size it was captured for. `None` means no verify graph captured (the
     /// graph slot may hold the AR forward graph instead, or be unused).
     /// Used to invalidate + re-capture when the DFlash budget changes mid-run.
+    ///
+    /// DEPRECATED for verify: the verify path now uses `verify_graph_cache`
+    /// keyed by B, keeping separate graphs live for each B value PLD may
+    /// oscillate through. This field stays for any legacy single-slot usage.
     pub graph_verify_n: Option<usize>,
     /// Counter of verify forward calls seen since the last graph invalidate.
     /// We run the first call direct (no capture) to let kernel JIT and any
     /// lazy scratch allocations settle — then capture on the second call.
     /// Capturing the first call itself hits "hipMalloc not permitted during
     /// stream capture" the first time a kernel is JITted inside capture.
+    ///
+    /// DEPRECATED for verify: replaced by `verify_warmed_up` (per-B set).
     pub graph_verify_warmup: u32,
+
+    /// Per-B cache of captured verify-forward graphs. Each entry owns its
+    /// graph + exec + the kernarg blobs that graph captured pointers into.
+    /// Blobs must stay alive for the life of the graph — they're baked into
+    /// the graph nodes by hipStreamEndCapture.
+    ///
+    /// Keyed by `b` (draft block size). DFlash's PLD intermittently shortens
+    /// b from 16 → 8 on short self-match spines; caching graphs per-B avoids
+    /// graph_destroy + re-capture every oscillation, which was wiping out the
+    /// hipGraph replay gain entirely.
+    pub verify_graph_cache: HashMap<usize, (hip_bridge::Graph, hip_bridge::GraphExec, Vec<Vec<u8>>)>,
+    /// Set of B values that have completed the once-per-B JIT/scratch warmup.
+    /// Capture can safely begin only after warmup — see graph_verify_warmup doc.
+    pub verify_warmed_up: HashSet<usize>,
+    /// B being captured right now (between begin_verify_graph_capture and
+    /// end_verify_graph_capture). None outside that window.
+    verify_capturing_b: Option<usize>,
 
     // ── rocBLAS (CDNA3 MFMA-accelerated GEMM) ─────────────────────────────
     /// Optional rocBLAS handle. `None` on non-CDNA3 archs or when
@@ -292,6 +315,9 @@ impl Gpu {
             captured_graph: None,
             graph_verify_n: None,
             graph_verify_warmup: 0,
+            verify_graph_cache: HashMap::new(),
+            verify_warmed_up: HashSet::new(),
+            verify_capturing_b: None,
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
         }).map(|mut gpu| {
@@ -477,6 +503,80 @@ impl Gpu {
         self.capture_blobs.clear();
         self.graph_verify_n = None;
         self.graph_verify_warmup = 0;
+    }
+
+    // ── Per-B verify-forward graph cache ─────────────────────────────────
+    //
+    // DFlash's PLD intermittently changes b (e.g. 16 → 8 on short self-match
+    // spines). With the old single-slot graph API, every b transition triggered
+    // `graph_destroy` + warmup + re-capture, wiping out the hipGraph replay
+    // gain. These methods cache one graph per distinct b value so oscillation
+    // becomes free.
+
+    pub fn verify_has_graph(&self, b: usize) -> bool {
+        self.verify_graph_cache.contains_key(&b)
+    }
+
+    pub fn verify_needs_warmup(&self, b: usize) -> bool {
+        !self.verify_warmed_up.contains(&b)
+    }
+
+    pub fn verify_mark_warmup_done(&mut self, b: usize) {
+        self.verify_warmed_up.insert(b);
+    }
+
+    /// Begin capturing a verify-forward graph for batch size `b`. Subsequent
+    /// launch_maybe_blob calls will push their kernargs into `capture_blobs`,
+    /// which is drained into the per-B cache entry on end_verify_graph_capture.
+    pub fn begin_verify_graph_capture(&mut self, b: usize) -> HipResult<()> {
+        debug_assert!(self.verify_capturing_b.is_none(),
+            "begin_verify_graph_capture: already capturing for b={:?}",
+            self.verify_capturing_b);
+        debug_assert!(!self.capture_mode,
+            "begin_verify_graph_capture: capture_mode already set");
+        self.capture_blobs.clear();
+        self.verify_capturing_b = Some(b);
+        self.capture_mode = true;
+        let stream = self.active_stream.as_ref()
+            .expect("verify graph capture requires an explicit stream");
+        self.hip.stream_begin_capture(stream, 0) // hipStreamCaptureModeGlobal
+    }
+
+    /// End capture, instantiate, stash into the per-B cache (taking ownership
+    /// of the current capture_blobs).
+    pub fn end_verify_graph_capture(&mut self) -> HipResult<()> {
+        let b = self.verify_capturing_b.take()
+            .expect("end_verify_graph_capture without matching begin");
+        self.capture_mode = false;
+        let stream = self.active_stream.as_ref().unwrap();
+        let graph = self.hip.stream_end_capture(stream)?;
+        let exec = self.hip.graph_instantiate(&graph)?;
+        let blobs = std::mem::take(&mut self.capture_blobs);
+        self.verify_graph_cache.insert(b, (graph, exec, blobs));
+        Ok(())
+    }
+
+    /// Replay the cached verify graph for batch size `b`.
+    pub fn verify_graph_launch(&self, b: usize) -> HipResult<()> {
+        let entry = self.verify_graph_cache.get(&b)
+            .unwrap_or_else(|| panic!("no captured verify graph for b={}", b));
+        let stream = self.active_stream.as_ref().unwrap();
+        self.hip.graph_launch(&entry.1, stream)
+    }
+
+    /// How many captured verify graphs are in the cache (for debug logs).
+    pub fn verify_graph_count(&self) -> usize {
+        self.verify_graph_cache.len()
+    }
+
+    /// Destroy all cached verify graphs and their blobs.
+    pub fn verify_graph_destroy_all(&mut self) {
+        for (_, (graph, exec, _blobs)) in self.verify_graph_cache.drain() {
+            let _ = self.hip.graph_exec_destroy(exec);
+            let _ = self.hip.graph_destroy(graph);
+        }
+        self.verify_warmed_up.clear();
+        self.verify_capturing_b = None;
     }
 
     /// D→D copy with offsets that picks async (on the active stream) when
