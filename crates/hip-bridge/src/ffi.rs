@@ -149,6 +149,7 @@ pub struct HipRuntime {
     fn_event_synchronize: unsafe extern "C" fn(HipEvent) -> u32,
     fn_event_elapsed_time: unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32,
     fn_event_destroy: unsafe extern "C" fn(HipEvent) -> u32,
+    fn_stream_wait_event: unsafe extern "C" fn(HipStream, HipEvent, c_uint) -> u32,
 
     // Error
     fn_get_error_string: unsafe extern "C" fn(u32) -> *const i8,
@@ -256,6 +257,7 @@ impl HipRuntime {
                 fn_event_synchronize: load_fn!(lib, "hipEventSynchronize", unsafe extern "C" fn(HipEvent) -> u32),
                 fn_event_elapsed_time: load_fn!(lib, "hipEventElapsedTime", unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32),
                 fn_event_destroy: load_fn!(lib, "hipEventDestroy", unsafe extern "C" fn(HipEvent) -> u32),
+                fn_stream_wait_event: load_fn!(lib, "hipStreamWaitEvent", unsafe extern "C" fn(HipStream, HipEvent, c_uint) -> u32),
                 fn_get_error_string: load_fn!(lib, "hipGetErrorString", unsafe extern "C" fn(u32) -> *const i8),
                 fn_get_last_error: load_fn!(lib, "hipGetLastError", unsafe extern "C" fn() -> u32),
                 fn_stream_begin_capture: load_fn!(lib, "hipStreamBeginCapture", unsafe extern "C" fn(HipStream, c_uint) -> u32),
@@ -720,6 +722,11 @@ impl HipRuntime {
         let code = unsafe { (self.fn_event_destroy)(event.0) };
         std::mem::forget(event);
         self.check(code, "hipEventDestroy")
+    }
+
+    pub fn stream_wait_event(&self, stream: &Stream, event: &Event) -> HipResult<()> {
+        let code = unsafe { (self.fn_stream_wait_event)(stream.0, event.0, 0) };
+        self.check(code, "hipStreamWaitEvent")
     }
 
     // ── Error query ─────────────────────────────────────────────
