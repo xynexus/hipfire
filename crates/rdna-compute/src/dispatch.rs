@@ -4191,10 +4191,15 @@ impl Gpu {
         // ksplit side and M∈{17408} (draft gate/up/down) on the k2 side. lm_head
         // (M=vocab) is always way above threshold → k2.
         //
-        // HIPFIRE_WO_WMMA_VARIANT=ksplit|k2|k4|wmma|wmma2 overrides the auto
-        // selection (applies to every call, both target and draft).
+        // HIPFIRE_WO_WMMA_VARIANT=ksplit|k2|k2x32|k4|wmma|wmma2 overrides the
+        // auto selection (applies to every call, both target and draft).
         //   ksplit — K-split + atomicAdd (non-deterministic accum order)
         //   k2     — 2× K-tile pipeline (byte-exact accum order)
+        //   k2x32  — 32-row block with shared X fragment per K-tile; measured
+        //            46% slower than k2 at M=248320 on 7900 XTX (1564µs → 2287µs,
+        //            450→310 GB/s). Likely register pressure / occupancy loss
+        //            from the doubled accumulator + 4× dequant path. Kept opt-in
+        //            for future revisit (needs LDS-staged B share + reg budget).
         //   k4     — 4× K-tile pipeline (output-mapping bug, τ=0 on dflash — debug only)
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
@@ -4204,6 +4209,8 @@ impl Gpu {
         let (kernel_name, kernel_src, block_size, row_step, k_splits) = match variant {
             "k2"     => ("gemm_hfq4g256_residual_wmma_k2",
                          kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC, 32u32, 16usize, 1u32),
+            "k2x32"  => ("gemm_hfq4g256_residual_wmma_k2x32",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2X32_SRC, 32u32, 32usize, 1u32),
             "k4"     => ("gemm_hfq4g256_residual_wmma_k4",
                          kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K4_SRC, 32u32, 16usize, 1u32),
             "wmma"   => ("gemm_hfq4g256_residual_wmma",
