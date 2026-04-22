@@ -173,14 +173,32 @@ impl ModelSlot {
     /// Reset the DeltaNet recurrent state and zero the KV write head.
     /// Does NOT shrink the KV allocation — callers track `seq_pos` separately.
     pub fn reset_state(&mut self, gpu: &mut Gpu) {
-        for s in &self.dn_state.s_matrices {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &self.dn_state.s_scales {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &self.dn_state.conv_states {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        // Use stream-ordered memset when an active_stream is set (hot path
+        // inside spec_step_dflash) to avoid null-stream host stalls. ~48
+        // memsets/cycle on 27B when draft rollback triggers a reset.
+        match gpu.active_stream.as_ref() {
+            Some(stream) => {
+                for s in &self.dn_state.s_matrices {
+                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                }
+                for s in &self.dn_state.s_scales {
+                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                }
+                for s in &self.dn_state.conv_states {
+                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                }
+            }
+            None => {
+                for s in &self.dn_state.s_matrices {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for s in &self.dn_state.s_scales {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for s in &self.dn_state.conv_states {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+            }
         }
     }
 }
@@ -2060,6 +2078,14 @@ pub fn spec_step_dflash(
     let ne = draft_cfg.num_extract();
     let vocab = target.config.vocab_size;
     let mask_token = draft_cfg.mask_token_id;
+
+    // Ensure active_stream is set before any draft/verify work so memset_async
+    // and stream-ordered launches have a non-null stream to ride on. Without
+    // this, the lm_head pre-zero memsets in dispatch.rs:4475/4545 fall through
+    // to the sync hipMemset path (~46 hot calls/cycle on 27B).
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
 
     assert!(b >= 2, "dflash block size must be ≥ 2");
     // `target_hidden_host` is only authoritative on the ctx_slice=Some path,

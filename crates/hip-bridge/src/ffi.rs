@@ -492,8 +492,10 @@ impl HipRuntime {
         self.check(code, "hipMemcpy D2D")
     }
 
+    #[track_caller]
     pub fn memset(&self, buf: &DeviceBuffer, value: i32, size: usize) -> HipResult<()> {
         assert!(size <= buf.size);
+        let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
         let code = unsafe { (self.fn_memset)(buf.ptr, value, size) };
         let elapsed = t.elapsed().as_nanos() as u64;
@@ -503,13 +505,14 @@ impl HipRuntime {
             std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1")
         });
         if dump {
-            eprintln!("memset bytes={} us={}", size, elapsed / 1000);
+            eprintln!("memset bytes={} us={} at {}:{}", size, elapsed / 1000, loc.file(), loc.line());
         }
         self.check(code, "hipMemset")
     }
 
     /// Async memset on a specific stream — does NOT block the host.
     /// Caller must ensure stream-ordering downstream work syncs correctly.
+    #[track_caller]
     pub fn memset_async(
         &self,
         buf: &DeviceBuffer,
@@ -518,6 +521,7 @@ impl HipRuntime {
         stream: &Stream,
     ) -> HipResult<()> {
         assert!(size <= buf.size);
+        let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
         let code = unsafe { (self.fn_memset_async)(buf.ptr, value, size, stream.0) };
         let elapsed = t.elapsed().as_nanos() as u64;
@@ -527,7 +531,7 @@ impl HipRuntime {
             std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1")
         });
         if dump {
-            eprintln!("memset_async bytes={} us={}", size, elapsed / 1000);
+            eprintln!("memset_async bytes={} us={} at {}:{}", size, elapsed / 1000, loc.file(), loc.line());
         }
         self.check(code, "hipMemsetAsync")
     }

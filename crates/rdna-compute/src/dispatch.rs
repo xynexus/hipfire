@@ -968,7 +968,10 @@ impl Gpu {
 
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         let tensor = self.alloc_tensor(shape, dtype)?;
-        self.hip.memset(&tensor.buf, 0, tensor.byte_size())?;
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?,
+            None => self.hip.memset(&tensor.buf, 0, tensor.byte_size())?,
+        }
         Ok(tensor)
     }
 
