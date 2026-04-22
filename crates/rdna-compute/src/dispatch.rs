@@ -4471,7 +4471,10 @@ impl Gpu {
         // Pre-zero Y (residual WMMA does y += acc) and force FP16-X reconversion
         // (the draft reuses the same scratch pointer every cycle with new data).
         self.fp16_x_source_ptr = std::ptr::null_mut();
-        self.hip.memset(&y.buf, 0, batch_size * m * 4)?;
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+        }
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let func = &self.functions["gemm_mw16_residual_wmma"];
@@ -4538,7 +4541,10 @@ impl Gpu {
             && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
-            self.hip.memset(&y.buf, 0, batch_size * m * 4)?;
+            match self.active_stream.as_ref() {
+                Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+            }
             return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
         self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)

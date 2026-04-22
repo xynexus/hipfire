@@ -117,6 +117,7 @@ pub struct HipRuntime {
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
+    fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
 
     // Streams
     fn_stream_create: unsafe extern "C" fn(*mut HipStream) -> u32,
@@ -242,6 +243,7 @@ impl HipRuntime {
                 fn_memcpy: load_fn!(lib, "hipMemcpy", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32),
                 fn_memcpy_async: load_fn!(lib, "hipMemcpyAsync", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32),
                 fn_memset: load_fn!(lib, "hipMemset", unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32),
+                fn_memset_async: load_fn!(lib, "hipMemsetAsync", unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32),
                 fn_stream_create: load_fn!(lib, "hipStreamCreate", unsafe extern "C" fn(*mut HipStream) -> u32),
                 fn_stream_synchronize: load_fn!(lib, "hipStreamSynchronize", unsafe extern "C" fn(HipStream) -> u32),
                 fn_stream_destroy: load_fn!(lib, "hipStreamDestroy", unsafe extern "C" fn(HipStream) -> u32),
@@ -504,6 +506,30 @@ impl HipRuntime {
             eprintln!("memset bytes={} us={}", size, elapsed / 1000);
         }
         self.check(code, "hipMemset")
+    }
+
+    /// Async memset on a specific stream — does NOT block the host.
+    /// Caller must ensure stream-ordering downstream work syncs correctly.
+    pub fn memset_async(
+        &self,
+        buf: &DeviceBuffer,
+        value: i32,
+        size: usize,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert!(size <= buf.size);
+        let t = std::time::Instant::now();
+        let code = unsafe { (self.fn_memset_async)(buf.ptr, value, size, stream.0) };
+        let elapsed = t.elapsed().as_nanos() as u64;
+        crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1")
+        });
+        if dump {
+            eprintln!("memset_async bytes={} us={}", size, elapsed / 1000);
+        }
+        self.check(code, "hipMemsetAsync")
     }
 
     // ── Streams ─────────────────────────────────────────────────
