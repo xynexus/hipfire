@@ -743,7 +743,8 @@ fn main() {
     // hip-bridge launch_counters around each cycle.
     let host_timing = std::env::var("HIPFIRE_HOST_TIMING").ok().as_deref() == Some("1");
     let mut per_cycle_wall_us: Vec<u64> = Vec::new();
-    let mut per_cycle_api_us: Vec<(u64, u64, u64, u64, u64)> = Vec::new(); // launch, h2d, d2h, d2d, memset
+    let mut per_cycle_api_us: Vec<(u64, u64, u64, u64, u64, u64, u64, u64, u64)> = Vec::new();
+    // columns: launch, h2d, d2h, d2d, memset, stream_sync, event_sync, device_sync, graph_launch
 
     // HIPFIRE_DPM_WARMUP_SECS: run a memset loop on a 256 MB scratch before
     // the decode timer starts, to pin the GPU at high DPM. See dispatch.rs
@@ -765,7 +766,18 @@ fn main() {
             break;
         }
         // Per-cycle host timing snapshot (before the step).
-        let (wall_start, l_start, htod_start, dtoh_start, dtod_start, memset_start) = if host_timing {
+        let (
+            wall_start,
+            l_start,
+            htod_start,
+            dtoh_start,
+            dtod_start,
+            memset_start,
+            ssync_start,
+            esync_start,
+            dsync_start,
+            glaunch_start,
+        ) = if host_timing {
             use hip_bridge::launch_counters as lc;
             (
                 Instant::now(),
@@ -774,9 +786,13 @@ fn main() {
                 lc::memcpy_dtoh::time_ns(),
                 lc::memcpy_dtod::time_ns(),
                 lc::memset::time_ns(),
+                lc::stream_sync::time_ns(),
+                lc::event_sync::time_ns(),
+                lc::device_sync::time_ns(),
+                lc::graph_launch::time_ns(),
             )
         } else {
-            (Instant::now(), 0, 0, 0, 0, 0)
+            (Instant::now(), 0, 0, 0, 0, 0, 0, 0, 0, 0)
         };
         if do_profile && stats.cycles == 1 && !profile_armed {
             // First cycle was the JIT warm-up. Arm profiling now and drain
@@ -994,8 +1010,15 @@ fn main() {
             let dtoh_us = (lc::memcpy_dtoh::time_ns() - dtoh_start) / 1000;
             let dtod_us = (lc::memcpy_dtod::time_ns() - dtod_start) / 1000;
             let memset_us = (lc::memset::time_ns() - memset_start) / 1000;
+            let ssync_us = (lc::stream_sync::time_ns() - ssync_start) / 1000;
+            let esync_us = (lc::event_sync::time_ns() - esync_start) / 1000;
+            let dsync_us = (lc::device_sync::time_ns() - dsync_start) / 1000;
+            let glaunch_us = (lc::graph_launch::time_ns() - glaunch_start) / 1000;
             per_cycle_wall_us.push(wall_us);
-            per_cycle_api_us.push((launch_us, htod_us, dtoh_us, dtod_us, memset_us));
+            per_cycle_api_us.push((
+                launch_us, htod_us, dtoh_us, dtod_us, memset_us,
+                ssync_us, esync_us, dsync_us, glaunch_us,
+            ));
         }
 
         // Rolling τ.
@@ -1096,7 +1119,7 @@ fn main() {
         // Skip first 2 cycles (JIT warm-up), summarize the rest as mean / median.
         let skip = 2.min(per_cycle_wall_us.len().saturating_sub(1));
         let wall: Vec<u64> = per_cycle_wall_us.iter().skip(skip).copied().collect();
-        let api: Vec<(u64, u64, u64, u64, u64)> =
+        let api: Vec<(u64, u64, u64, u64, u64, u64, u64, u64, u64)> =
             per_cycle_api_us.iter().skip(skip).copied().collect();
         let n = wall.len().max(1);
         let mean_wall = wall.iter().sum::<u64>() / n as u64;
@@ -1105,11 +1128,33 @@ fn main() {
         let mean_dtoh = api.iter().map(|x| x.2).sum::<u64>() / n as u64;
         let mean_dtod = api.iter().map(|x| x.3).sum::<u64>() / n as u64;
         let mean_memset = api.iter().map(|x| x.4).sum::<u64>() / n as u64;
-        let tracked = mean_launch + mean_htod + mean_dtoh + mean_dtod + mean_memset;
+        let mean_ssync = api.iter().map(|x| x.5).sum::<u64>() / n as u64;
+        let mean_esync = api.iter().map(|x| x.6).sum::<u64>() / n as u64;
+        let mean_dsync = api.iter().map(|x| x.7).sum::<u64>() / n as u64;
+        let mean_glaunch = api.iter().map(|x| x.8).sum::<u64>() / n as u64;
+        let tracked = mean_launch + mean_htod + mean_dtoh + mean_dtod + mean_memset
+            + mean_ssync + mean_esync + mean_dsync + mean_glaunch;
         let untracked = mean_wall.saturating_sub(tracked);
+        // Cumulative counts — post-run totals divided by elapsed cycles give
+        // mean per-cycle API call counts. Helpful for isolating which op is
+        // the hot path (few-but-fat vs many-but-thin).
+        use hip_bridge::launch_counters as lc;
+        let total_cycles = per_cycle_wall_us.len() as u64;
+        let n_launch = lc::launch_kernel::count() / total_cycles.max(1);
+        let n_htod = lc::memcpy_htod::count() / total_cycles.max(1);
+        let n_dtoh = lc::memcpy_dtoh::count() / total_cycles.max(1);
+        let n_dtod = lc::memcpy_dtod::count() / total_cycles.max(1);
+        let n_memset = lc::memset::count() / total_cycles.max(1);
+        let n_ssync = lc::stream_sync::count() / total_cycles.max(1);
+        let n_glaunch = lc::graph_launch::count() / total_cycles.max(1);
+        let b_dtoh = lc::memcpy_dtoh::bytes() / total_cycles.max(1);
+        let b_memset = lc::memset::bytes() / total_cycles.max(1);
         eprintln!(
-            "host timing (mean over {} cycles, µs): wall={} | launch={} htod={} dtoh={} dtod={} memset={} → other={}",
-            n, mean_wall, mean_launch, mean_htod, mean_dtoh, mean_dtod, mean_memset, untracked,
+            "host timing (mean over {} cycles, µs): wall={}\n  launch={} (n={}) h2d={} (n={}) d2h={} (n={}, {}KB) d2d={} (n={}) memset={} (n={}, {}MB) glaunch={} (n={})\n  ssync={} (n={}) esync={} dsync={} → other={}",
+            n, mean_wall,
+            mean_launch, n_launch, mean_htod, n_htod, mean_dtoh, n_dtoh, b_dtoh / 1024,
+            mean_dtod, n_dtod, mean_memset, n_memset, b_memset / (1024*1024), mean_glaunch, n_glaunch,
+            mean_ssync, n_ssync, mean_esync, mean_dsync, untracked,
         );
     }
     eprintln!("DFlash tokens: {:?}", emitted);

@@ -20,17 +20,26 @@ pub mod launch_counters {
                 thread_local! {
                     pub(super) static TIME_NS: Cell<u64> = const { Cell::new(0) };
                     pub(super) static COUNT: Cell<u64> = const { Cell::new(0) };
+                    pub(super) static BYTES: Cell<u64> = const { Cell::new(0) };
                 }
                 #[inline]
                 pub fn record(ns: u64) {
                     TIME_NS.with(|c| c.set(c.get() + ns));
                     COUNT.with(|c| c.set(c.get() + 1));
                 }
+                #[inline]
+                pub fn record_bytes(ns: u64, bytes: u64) {
+                    TIME_NS.with(|c| c.set(c.get() + ns));
+                    COUNT.with(|c| c.set(c.get() + 1));
+                    BYTES.with(|c| c.set(c.get() + bytes));
+                }
                 pub fn time_ns() -> u64 { TIME_NS.with(|c| c.get()) }
                 pub fn count() -> u64 { COUNT.with(|c| c.get()) }
+                pub fn bytes() -> u64 { BYTES.with(|c| c.get()) }
                 pub fn reset() {
                     TIME_NS.with(|c| c.set(0));
                     COUNT.with(|c| c.set(0));
+                    BYTES.with(|c| c.set(0));
                 }
             }
         };
@@ -58,6 +67,10 @@ pub mod launch_counters {
         memcpy_dtoh::reset();
         memset::reset();
         ensure_kernel_lookup::reset();
+        stream_sync::reset();
+        event_sync::reset();
+        device_sync::reset();
+        graph_launch::reset();
     }
 
     pub fn time_ns() -> u64 { TIME_NS.with(|c| c.get()) }
@@ -70,6 +83,10 @@ pub mod launch_counters {
     counter!(memcpy_dtoh);
     counter!(memset);
     counter!(ensure_kernel_lookup);
+    counter!(stream_sync);
+    counter!(event_sync);
+    counter!(device_sync);
+    counter!(graph_launch);
 }
 
 // Opaque HIP handles (pointers to internal structs)
@@ -418,7 +435,9 @@ impl HipRuntime {
                 MemcpyKind::DeviceToHost as c_uint,
             )
         };
-        crate::ffi::launch_counters::memcpy_dtoh::record(t.elapsed().as_nanos() as u64);
+        crate::ffi::launch_counters::memcpy_dtoh::record_bytes(
+            t.elapsed().as_nanos() as u64, dst.len() as u64,
+        );
         self.check(code, "hipMemcpy D2H")
     }
 
@@ -445,7 +464,9 @@ impl HipRuntime {
                 MemcpyKind::DeviceToHost as c_uint,
             )
         };
-        crate::ffi::launch_counters::memcpy_dtoh::record(t.elapsed().as_nanos() as u64);
+        crate::ffi::launch_counters::memcpy_dtoh::record_bytes(
+            t.elapsed().as_nanos() as u64, dst.len() as u64,
+        );
         self.check(code, "hipMemcpy D2H at offset")
     }
 
@@ -473,7 +494,15 @@ impl HipRuntime {
         assert!(size <= buf.size);
         let t = std::time::Instant::now();
         let code = unsafe { (self.fn_memset)(buf.ptr, value, size) };
-        crate::ffi::launch_counters::memset::record(t.elapsed().as_nanos() as u64);
+        let elapsed = t.elapsed().as_nanos() as u64;
+        crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1")
+        });
+        if dump {
+            eprintln!("memset bytes={} us={}", size, elapsed / 1000);
+        }
         self.check(code, "hipMemset")
     }
 
@@ -487,7 +516,9 @@ impl HipRuntime {
     }
 
     pub fn stream_synchronize(&self, stream: &Stream) -> HipResult<()> {
+        let t = std::time::Instant::now();
         let code = unsafe { (self.fn_stream_synchronize)(stream.0) };
+        crate::ffi::launch_counters::stream_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipStreamSynchronize")
     }
 
@@ -642,7 +673,9 @@ impl HipRuntime {
     }
 
     pub fn event_synchronize(&self, event: &Event) -> HipResult<()> {
+        let t = std::time::Instant::now();
         let code = unsafe { (self.fn_event_synchronize)(event.0) };
+        crate::ffi::launch_counters::event_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipEventSynchronize")
     }
 
@@ -761,7 +794,9 @@ impl HipRuntime {
 
     /// Launch an executable graph on `stream`.
     pub fn graph_launch(&self, exec: &GraphExec, stream: &Stream) -> HipResult<()> {
+        let t = std::time::Instant::now();
         let code = unsafe { (self.fn_graph_launch)(exec.0, stream.0) };
+        crate::ffi::launch_counters::graph_launch::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipGraphLaunch")
     }
 
@@ -787,7 +822,9 @@ impl HipRuntime {
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {
+        let t = std::time::Instant::now();
         let code = unsafe { (self.fn_device_synchronize)() };
+        crate::ffi::launch_counters::device_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipDeviceSynchronize")
     }
 
