@@ -56,3 +56,7 @@ cli/CLAUDE.md
 
 # Training artifacts (draft ckpts, converted hfq, prompt files, logs)
 .dflash-runs/
+artifacts/
+.gm-stop-verified
+.codeinsight
+findings/
