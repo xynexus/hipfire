@@ -4553,6 +4553,30 @@ impl Gpu {
         self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
     }
 
+    pub fn gemm_hfq6g256_batched_lmhead(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let wmma_eligible = batch_size > 1
+            && self.arch.starts_with("gfx11")
+            && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
+            && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+        }
+        if wmma_eligible {
+            self.fp16_x_source_ptr = std::ptr::null_mut();
+            return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
+        }
+        self.gemm_hfq6g256_residual(a_raw, x, y, m, k, batch_size)
+    }
+
     // ========================================================================
     // HFQ6-G256 GEMM variants (residual, fused)
     // ========================================================================

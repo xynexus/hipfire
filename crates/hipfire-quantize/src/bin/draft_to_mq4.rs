@@ -84,6 +84,40 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
+fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 200;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 63.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+        for i in (0..256).step_by(4) {
+            let q0 = ((group[i] - min_val) * inv_scale + 0.5) as u8;
+            let q1 = ((group[i + 1] - min_val) * inv_scale + 0.5) as u8;
+            let q2 = ((group[i + 2] - min_val) * inv_scale + 0.5) as u8;
+            let q3 = ((group[i + 3] - min_val) * inv_scale + 0.5) as u8;
+            let byte_off = 8 + (i / 4) * 3;
+            output[out_off + byte_off]     = q0.min(63) | (q1.min(63) << 6);
+            output[out_off + byte_off + 1] = (q1.min(63) >> 2) | (q2.min(63) << 4);
+            output[out_off + byte_off + 2] = (q2.min(63) >> 4) | (q3.min(63) << 2);
+        }
+    }
+    output
+}
+
 struct HfqInTensor {
     name: String,
     quant_type: u8,
@@ -181,16 +215,22 @@ fn write_hfq(path: &Path, arch: u32, metadata_json: &str, tensors: &[HfqInTensor
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: draft_to_mq4 <input.hfq> <output.mq4>");
+    if args.len() != 4 {
+        eprintln!("usage: draft_to_mq4 <mq4|mq6> <input.hfq> <output>");
         std::process::exit(2);
     }
-    let inp = Path::new(&args[1]);
-    let outp = Path::new(&args[2]);
+    let fmt = args[1].as_str();
+    let inp = Path::new(&args[2]);
+    let outp = Path::new(&args[3]);
+    let (out_qt, label) = match fmt {
+        "mq4" => (13u8, "MQ4"),
+        "mq6" => (15u8, "MQ6"),
+        other => { eprintln!("unknown format '{other}'; expected mq4 or mq6"); std::process::exit(2); }
+    };
 
     eprintln!("reading {}...", inp.display());
     let (arch, meta, mut tensors) = read_hfq(inp);
-    eprintln!("  arch_id={arch}  tensors={}", tensors.len());
+    eprintln!("  arch_id={arch}  tensors={}  target_format={label}", tensors.len());
 
     let signs1 = gen_fwht_signs(42, 256);
     let signs2 = gen_fwht_signs(1042, 256);
@@ -198,11 +238,7 @@ fn main() {
     let mut converted = 0usize;
     let mut skipped = 0usize;
     for t in &mut tensors {
-        if t.quant_type != 1 {
-            skipped += 1;
-            continue;
-        }
-        if t.shape.len() != 2 {
+        if t.quant_type != 1 || t.shape.len() != 2 {
             skipped += 1;
             continue;
         }
@@ -220,12 +256,16 @@ fn main() {
             let bits = u16::from_le_bytes([c[0], c[1]]);
             f32_data.push(f16_to_f32(bits));
         }
-        let mq4 = quantize_mq4g256(&f32_data, &signs1, &signs2);
-        eprintln!("  MQ4 {}: F16 {} MiB -> MQ4 {} MiB  ({}x{})",
-            t.name, t.data.len()/(1024*1024), mq4.len()/(1024*1024), m, k);
-        t.quant_type = 13;
+        let qdata = match fmt {
+            "mq4" => quantize_mq4g256(&f32_data, &signs1, &signs2),
+            "mq6" => quantize_mq6g256(&f32_data, &signs1, &signs2),
+            _ => unreachable!(),
+        };
+        eprintln!("  {label} {}: F16 {} MiB -> {label} {} MiB  ({}x{})",
+            t.name, t.data.len()/(1024*1024), qdata.len()/(1024*1024), m, k);
+        t.quant_type = out_qt;
         t.group_size = 256;
-        t.data = mq4;
+        t.data = qdata;
         converted += 1;
     }
     eprintln!("converted {converted} tensors, skipped {skipped}");
