@@ -193,6 +193,16 @@ negative-result log of attempts that looked like wins in one-shell A/B
 but measured as no-op or regression on fresh probe — check it before
 starting a new kernel experiment.
 
+**Diagnosing memset pressure:** run with `HIPFIRE_MEMSET_DUMP=1` — the
+gpu layer's memset helper is `#[track_caller]` and prints `file:line`
+per call. Grep the dump by source location, not by byte size. Note:
+the `memset_async` helper is **gated by `active_stream` being `Some`**;
+when the caller leaves `active_stream = None`, it silently falls
+through to sync `hipMemset`. If you add new gated async memsets,
+verify the caller actually sets a stream (fix pattern: create
+`gpu.active_stream` at the top of the caller — see da2753e for
+`spec_step_dflash`).
+
 ## MQ4 Quality Gate (mandatory)
 
 Any change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,

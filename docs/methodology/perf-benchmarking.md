@@ -104,6 +104,7 @@ is where it was tried and reverted, so you can `git show` the kernel code.
 | `__builtin_nontemporal_load` on HFQ4-G256 weight reads | +2 % (session A/B) | **−13 %** (fresh probe) | `0532579` → reverted in `34eb024` | Defeats default load-path wave coalescing. Don't try this on weight-streaming kernels. |
 | block=64 "wave64" variant for `gemv_hfq4g256_residual` | +6.5 % | **no-op** | (discarded; see wave64 investigation branch before the revert) | The +6.5 % was an artifact of the nontemporal regression on the wave32 baseline. Once baseline is clean, block=64 and wave32 tie. |
 | true wave64 compile (`-mwavefrontsize64` via `HIPFIRE_COMPILER_FLAGS` marker) | +4 % | **slightly worse than block=64** | (discarded) | RDNA3 wave64 doubles per-wave VGPR budget and halves occupancy without compensating throughput. |
+| LA-preamble fusion: `fused_qk_l2_norm_scale + repeat_interleave → fused_qk_l2_norm_scale_repeat` | +2–4 % (fewer launches) | **neutral / slightly worse** (−2 % tok/s avg, within noise) | (discarded 2026-04-22) | 27B DFlash Fibonacci-continuation @ B=16: baseline avg 127.0 tok/s τ=6.24 vs fused 124.4 tok/s τ=6.00 (3-run each). Save ≈1 launch/LA-layer but cycle is kernel-compute-bound (ssync ≈ 38.6/55 ms); trimming 9 µs × a few launches is noise. τ itself is non-deterministic run-to-run (range 5.85–6.73), which dominates signal on short benches. |
 
 Before starting a new kernel-level perf experiment, check this list. If
 it's been tried and failed, don't rediscover unless you have a specific
