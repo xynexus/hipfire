@@ -748,6 +748,18 @@ pub const CONV1D_SILU_SRC: &str = include_str!("../../../kernels/src/conv1d_silu
 #[cfg(feature = "deltanet")]
 pub const CONV1D_SILU_SPLIT_SRC: &str = include_str!("../../../kernels/src/conv1d_silu_split.hip");
 
+/// Tree-aware variant of conv1d_silu_split. Each in-block token walks its
+/// ancestor chain via parent_indices[] for the 3-tap causal window, falling
+/// back to pre-block conv_state when the chain exits the block. Leaves
+/// conv_state unchanged — caller runs linear conv1d on the accepted spine
+/// post-acceptance to advance state.
+///
+/// Ported from SGLang's `causal_conv1d_update` HAS_EAGLE_TREE_CUSTOM_ATTN_MASK
+/// branch, simplified to take a precomputed parent_indices[] (our tree layout
+/// is materialized host-side by ddtree::linearize_tree).
+#[cfg(feature = "deltanet")]
+pub const CONV1D_SILU_SPLIT_TREE_SRC: &str = include_str!("../../../kernels/src/conv1d_silu_split_tree.hip");
+
 
 /// GPU-side KV cache write using pos from a GPU buffer.
 /// Copies kv_dim floats from src to dst at offset pos_buf[0] * kv_dim.
