@@ -2319,6 +2319,20 @@ pub struct PrefillBatchScratch {
     pub moe_gate_batch:          Option<GpuTensor>,   // [N × k_top × mi]
     pub moe_up_batch:            Option<GpuTensor>,   // [N × k_top × mi]
     pub moe_rot_batch:           Option<GpuTensor>,   // [N × k_top × mi]
+
+    // ── Tree-aware LA scratch (Phase 3b of Task #101) ──
+    // Per-token S-state tape consumed by gated_delta_net_q8_tree kernel
+    // when TreeVerifyCtx.parent_indices is Some. Reused across LA layers
+    // since LA dispatch is serial per-cycle. Only allocated when the model
+    // has LA layers (linear_num_value_heads > 0). Call sites that pass
+    // parent_indices must ensure these tensors exist.
+    //
+    // s_tape_q8:     [max_batch × n_v_heads × head_dim × head_dim] Raw/i8
+    // s_tape_scales: [max_batch × n_v_heads × head_dim] f32
+    //
+    // At max_batch=22, n_v_heads=16, head_dim=128 → 5.77 MB + 180 KB total.
+    pub dn_s_tape_q8:     Option<GpuTensor>,
+    pub dn_s_tape_scales: Option<GpuTensor>,
 }
 
 impl PrefillBatchScratch {
@@ -2393,6 +2407,13 @@ impl PrefillBatchScratch {
             moe_rot_batch: if config.num_experts > 0 {
                 Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
             } else { None },
+            dn_s_tape_q8: if config.linear_num_value_heads > 0 {
+                let bytes = max_batch * config.linear_num_value_heads * config.linear_value_head_dim * config.linear_value_head_dim;
+                Some(gpu.alloc_tensor(&[bytes], DType::Raw)?)
+            } else { None },
+            dn_s_tape_scales: if config.linear_num_value_heads > 0 {
+                Some(gpu.alloc_tensor(&[max_batch * config.linear_num_value_heads * config.linear_value_head_dim], DType::F32)?)
+            } else { None },
         })
     }
 
@@ -2418,6 +2439,7 @@ impl PrefillBatchScratch {
             self.moe_shared_gate_batch, self.moe_shared_up_batch, self.moe_shared_rot_batch,
             self.moe_topk_indices_batch, self.moe_topk_weights_batch,
             self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch,
+            self.dn_s_tape_q8, self.dn_s_tape_scales,
         ] {
             if let Some(t) = t { let _ = gpu.free_tensor(t); }
         }
@@ -3170,14 +3192,30 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
-                // Conv1d + SiLU + Q/K/V split, advancing state N steps.
-                // State advance is byte-identical to N single-token calls.
-                gpu.conv1d_silu_split_f32_n(
-                    &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
-                    &pbs.dn_qkv_batch, &layer.conv_weight,
-                    &dn_state.conv_states[delta_layer_idx],
-                    k_dim, v_dim, n,
-                )?;
+                // Tree-aware dispatch gate: when the caller provides
+                // parent_indices (Phase 3b+ of Task #101), swap the linear
+                // conv1d + GDN for tree-walking variants that eliminate
+                // sibling-subtree state cross-contamination. The tree
+                // kernels are READ-ONLY on dn_state (don't advance it) —
+                // caller runs linear replay on the accepted spine
+                // post-acceptance to commit the trajectory.
+                let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
+                if let Some(parents) = tree_parents {
+                    gpu.conv1d_silu_split_tree_f32_n(
+                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        parents,
+                        k_dim, v_dim, n,
+                    )?;
+                } else {
+                    gpu.conv1d_silu_split_f32_n(
+                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        k_dim, v_dim, n,
+                    )?;
+                }
 
                 // Batched L2-norm(Q) + L2-norm(K) + scale(Q).
                 gpu.fused_qk_l2_norm_scale_f32_batched(
@@ -3202,17 +3240,33 @@ fn forward_prefill_chunk(
                     gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
                 }
 
-                // Gated Delta Net — N sequential calls with offset pointers.
-                // Byte-exact with decode because each call rounds S_q8 after
-                // its single-token update.
-                gpu.gated_delta_net_q8_batch_seq(
-                    &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
-                    &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
-                    &dn_state.s_matrices[delta_layer_idx],
-                    &dn_state.s_scales[delta_layer_idx],
-                    &pbs.dn_attn_out_batch,
-                    n, n_v_heads, config.linear_value_head_dim,
-                )?;
+                // Gated Delta Net — tree variant reads per-token S from
+                // s_tape[parent] (or pre-block s_q8_init at root); linear
+                // variant advances dn_state.s_matrices in place.
+                if let Some(parents) = tree_parents {
+                    let tape_q8 = pbs.dn_s_tape_q8.as_ref()
+                        .expect("tree-aware LA requires dn_s_tape_q8 scratch (check PrefillBatchScratch::new)");
+                    let tape_sc = pbs.dn_s_tape_scales.as_ref()
+                        .expect("tree-aware LA requires dn_s_tape_scales scratch (check PrefillBatchScratch::new)");
+                    gpu.gated_delta_net_q8_tree_batch_seq(
+                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx],
+                        tape_q8, tape_sc, parents,
+                        &pbs.dn_attn_out_batch,
+                        n, n_v_heads, config.linear_value_head_dim,
+                    )?;
+                } else {
+                    gpu.gated_delta_net_q8_batch_seq(
+                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx],
+                        &pbs.dn_attn_out_batch,
+                        n, n_v_heads, config.linear_value_head_dim,
+                    )?;
+                }
 
                 // Batched gated output norm.
                 gpu.gated_norm_f32_batched(
@@ -3718,12 +3772,24 @@ fn forward_prefill_chunk(
                         &pbs.dn_beta_batch.buf, 0, copy_a,
                     )?;
                 }
-                gpu.conv1d_silu_split_f32_n(
-                    &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
-                    &pbs.dn_qkv_batch, &layer.conv_weight,
-                    &dn_state.conv_states[delta_layer_idx],
-                    k_dim, v_dim, n,
-                )?;
+                // Same tree-aware dispatch gate as dense LA branch above.
+                let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
+                if let Some(parents) = tree_parents {
+                    gpu.conv1d_silu_split_tree_f32_n(
+                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        parents,
+                        k_dim, v_dim, n,
+                    )?;
+                } else {
+                    gpu.conv1d_silu_split_f32_n(
+                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        k_dim, v_dim, n,
+                    )?;
+                }
                 gpu.fused_qk_l2_norm_scale_f32_batched(
                     &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
                     config.linear_num_key_heads, hd,
@@ -3740,14 +3806,30 @@ fn forward_prefill_chunk(
                     gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
                     gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
                 }
-                gpu.gated_delta_net_q8_batch_seq(
-                    &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
-                    &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
-                    &dn_state.s_matrices[delta_layer_idx],
-                    &dn_state.s_scales[delta_layer_idx],
-                    &pbs.dn_attn_out_batch,
-                    n, n_v_heads, config.linear_value_head_dim,
-                )?;
+                if let Some(parents) = tree_parents {
+                    let tape_q8 = pbs.dn_s_tape_q8.as_ref()
+                        .expect("tree-aware LA requires dn_s_tape_q8 scratch");
+                    let tape_sc = pbs.dn_s_tape_scales.as_ref()
+                        .expect("tree-aware LA requires dn_s_tape_scales scratch");
+                    gpu.gated_delta_net_q8_tree_batch_seq(
+                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx],
+                        tape_q8, tape_sc, parents,
+                        &pbs.dn_attn_out_batch,
+                        n, n_v_heads, config.linear_value_head_dim,
+                    )?;
+                } else {
+                    gpu.gated_delta_net_q8_batch_seq(
+                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx],
+                        &pbs.dn_attn_out_batch,
+                        n, n_v_heads, config.linear_value_head_dim,
+                    )?;
+                }
                 gpu.gated_norm_f32_batched(
                     &pbs.dn_attn_out_batch, &pbs.dn_z_batch, &layer.norm_weight,
                     &pbs.dn_normed_batch,
