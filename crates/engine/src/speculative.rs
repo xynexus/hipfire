@@ -3592,9 +3592,30 @@ pub fn spec_step_ddtree_batched(
     // at same depth otherwise race and the LAST write wins regardless of
     // which sibling was committed).
     let force_slow = std::env::var("HIPFIRE_DDTREE_FORCE_SLOW").ok().as_deref() == Some("1");
-    let fast_tape_ok = !force_slow
-        && accepted_node_indices.iter().enumerate()
-            .all(|(i, &ni)| ni == i);
+    let spine_accept = accepted_node_indices.iter().enumerate()
+        .all(|(i, &ni)| ni == i);
+    let fast_tape_ok = !force_slow && spine_accept;
+    // Per-cycle fast/slow accounting. HIPFIRE_DDTREE_TAPE_DUMP=1 emits a
+    // per-cycle line to stderr; useful to quantify how often the slow-path
+    // 2nd verify fires at a given topk / workload. Aggregate stats are
+    // printed by dflash_spec_demo at end-of-generation via this thread-local.
+    thread_local! {
+        static DDTREE_FAST_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static DDTREE_SLOW_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    if fast_tape_ok {
+        DDTREE_FAST_COUNT.with(|c| c.set(c.get() + 1));
+    } else if !force_slow {
+        DDTREE_SLOW_COUNT.with(|c| c.set(c.get() + 1));
+    }
+    if std::env::var("HIPFIRE_DDTREE_TAPE_DUMP").ok().as_deref() == Some("1") {
+        let fast = DDTREE_FAST_COUNT.with(|c| c.get());
+        let slow = DDTREE_SLOW_COUNT.with(|c| c.get());
+        eprintln!(
+            "[ddtree-tape] cycle: fast_tape_ok={} accept_len={} spine_accept={} tree_la={} (cumulative fast={}/slow={})",
+            fast_tape_ok, accept_len, spine_accept, use_tree_la, fast, slow,
+        );
+    }
     let hidden_rows_written;
     if fast_tape_ok {
         // Tape already captured in tree verify. Restore + replay directly.
