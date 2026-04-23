@@ -47,6 +47,44 @@ Fibonacci-continuation prompt, HEAD `5cd6117`:
 comparisons where you need to compare raw-prompt outputs without
 template noise. Never for perf.
 
+**Prompt SHAPE dictates τ — not just the template flag.** On the same
+27B weights / same commit / same hardware / same chatml wrap, the
+*content genre* of the prompt swings τ by ~3×:
+
+| Prompt style                                                | tok/s | τ    |
+|-------------------------------------------------------------|-------|------|
+| Instruct "Explain why this is O(2^n)..."                    | 66    | 2.34 |
+| Prose continuation (Fibonacci numbers + prose context)      | 71    | 2.71 |
+| Pure code continuation (`def fib` / `def fib_memo` stubs)   | 168   | 8.18 |
+
+Measured 2026-04-23, 27B DFlash gfx1100 at `9ab691d`. The canonical
+"162 tok/s / τ=7.7" baseline is a **pure code continuation** — starts
+inside a `def`, no "explain" suffix, nothing pushing toward natural
+language. User rule: *"if the model will output language (not code)
+it will tank tau."*
+
+**Why:** draft-target acceptance tracks token-distribution predictability.
+Code tokens are syntactically constrained (`def` → name → `(` → args →
+`):` → `\n    ` → ...) so the HFQ4 draft agrees with target far more
+often than on high-entropy prose. τ ceiling is prompt-bound; no engine
+change compensates.
+
+**Rules:**
+- When quoting DFlash τ for release notes / regression gates / commits,
+  specify the prompt genre (code-cont / prose / instruct) alongside τ.
+  "162 tok/s τ=7.7" alone is meaningless without "on code-cont prompt".
+- A/B regression benches must hold the prompt genre constant. Mixing
+  prose baseline with code-cont candidate produces a fake 2-3× delta.
+- When supposed regression shows τ drop 7-8 → 2-3, FIRST check the
+  prompt genre. Bench scripts reading a path that now points to prose
+  / a missing file / an "explain this" variant are the likely cause —
+  not hardware, not code. (This bit once in 2026-04-23 as an imaginary
+  firmware/DPM regression.)
+- Canonical 27B code-cont prompt: Python function stubs with no
+  natural-language preamble.
+- Do NOT interpret a prose-prompt τ of 2-3 as a bug. That is the
+  prose ceiling.
+
 ## 2. The speed-gate is the source of truth
 
 `./scripts/speed-gate.sh` runs `bench_qwen35_mq4` on the 4 MQ4 sizes with
