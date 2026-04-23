@@ -3512,6 +3512,11 @@ pub fn spec_step_ddtree_batched(
     let ctx = qwen35::TreeVerifyCtx {
         positions: &verify_positions,
         attn_bias: &attn_bias_view,
+        // Phase 3b follow-up wires this via linearize_tree_with_parents +
+        // PrefillBatchScratch::dn_s_tape_{q8,scales} to activate the
+        // tree-aware LA kernels. None keeps the current linear-path
+        // behavior (slow-path 2nd verify still needed).
+        parent_indices: None,
     };
     let t_pre_verify = t_all.elapsed();
     let verify_out = verify_dflash_block_tree(

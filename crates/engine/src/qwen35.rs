@@ -35,15 +35,25 @@ pub enum LayerType {
 /// `forward_prefill_batch` returns an error if tree mode is requested but
 /// any FA layer would take the fallback path.
 ///
-/// GDN (LinearAttention) layers use the existing linear-replay state
-/// advance in tree mode — correct at topk=1 (byte-exact with DFlash), an
-/// approximation at topk>1 (sibling subtrees cross-contaminate recurrent
-/// state). A per-branch state-forking kernel would eliminate the
-/// approximation but is a separate kernel project.
+/// GDN (LinearAttention) layers: if `parent_indices` is `Some`, the
+/// DeltaNet branch dispatches the tree-aware kernels
+/// (`conv1d_silu_split_tree_f32_n` + `gated_delta_net_q8_tree_batch_seq`)
+/// which walk per-token ancestor chains via `parent_indices` instead of
+/// the linear-sequence predecessor. This eliminates sibling-subtree
+/// cross-contamination of recurrent state at topk>1. If `parent_indices`
+/// is `None`, LA layers fall back to the linear path (byte-exact with
+/// DFlash at topk=1; approximation at topk>1 — used by pre-Phase-3
+/// callers that haven't been rewritten).
 #[derive(Clone, Copy)]
 pub struct TreeVerifyCtx<'a> {
     pub positions: &'a [i32],
     pub attn_bias: &'a GpuTensor,
+    /// `[N]` i32 — for each linearized slot, the slot index of its parent
+    /// in the same linearization (or -1 for the root / seed). Produced by
+    /// `crate::ddtree::linearize_tree_with_parents`. When `Some`, LA layers
+    /// use tree-aware kernels that read parent state from the per-layer
+    /// s_tape scratch in `PrefillBatchScratch`.
+    pub parent_indices: Option<&'a GpuTensor>,
 }
 
 #[derive(Debug, Clone)]
