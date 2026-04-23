@@ -733,6 +733,11 @@ pub fn dflash_extract_layer_ids(num_target_layers: usize, num_extract: usize) ->
 pub struct DdtreeScratch {
     pub max_n: usize,
     pub attn_bias: GpuTensor,
+    /// Per-slot parent index consumed by tree-aware LA kernels when
+    /// `HIPFIRE_DDTREE_TREE_LA=1`. `[max_n]` i32, uploaded fresh each
+    /// cycle via `memcpy_htod` before calling `verify_dflash_block_tree`.
+    /// Allocated as Raw bytes (4 × max_n) since there's no i32 DType.
+    pub parent_indices: GpuTensor,
 }
 
 impl DdtreeScratch {
@@ -743,11 +748,16 @@ impl DdtreeScratch {
             &[max_n * max_n],
             rdna_compute::DType::F32,
         )?;
-        Ok(Self { max_n, attn_bias })
+        let parent_indices = gpu.alloc_tensor(
+            &[max_n * 4],
+            rdna_compute::DType::Raw,
+        )?;
+        Ok(Self { max_n, attn_bias, parent_indices })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.attn_bias);
+        let _ = gpu.free_tensor(self.parent_indices);
     }
 }
 
@@ -3461,11 +3471,12 @@ pub fn spec_step_ddtree_batched(
         });
     }
 
-    // ── 4. Linearize the tree into (tokens, positions, mask_host) ────────
-    let (verify_tokens, verify_positions, mask_host) =
-        crate::ddtree::linearize_tree(&tree, seed_token, position as u32);
+    // ── 4. Linearize the tree into (tokens, positions, mask_host, parents) ─
+    let (verify_tokens, verify_positions, mask_host, parent_host) =
+        crate::ddtree::linearize_tree_with_parents(&tree, seed_token, position as u32);
     let big_n = verify_tokens.len();
     debug_assert_eq!(big_n, 1 + tree.num_nodes());
+    debug_assert_eq!(parent_host.len(), big_n);
 
     // ── 5. Upload mask to GPU into the persistent bias scratch ───────────
     //
@@ -3483,6 +3494,21 @@ pub fn spec_step_ddtree_batched(
             std::slice::from_raw_parts(mask_host.as_ptr() as *const u8, mask_host.len() * 4)
         };
         gpu.hip.memcpy_htod(&scratch.attn_bias.buf, mask_bytes)?;
+    }
+
+    // ── 5b. Upload parent_indices for tree-aware LA kernels (opt-in) ─────
+    //
+    // Gated on HIPFIRE_DDTREE_TREE_LA=1 during correctness bring-up. When
+    // off, linear LA kernels run (existing behavior) and the slow-path 2nd
+    // verify handles sibling pollution. When on, tree-aware LA kernels
+    // read parent_indices from scratch and fast-tape should always match
+    // since topology is correct per-token.
+    let use_tree_la = std::env::var("HIPFIRE_DDTREE_TREE_LA").ok().as_deref() == Some("1");
+    if use_tree_la {
+        let parent_bytes = unsafe {
+            std::slice::from_raw_parts(parent_host.as_ptr() as *const u8, parent_host.len() * 4)
+        };
+        gpu.hip.memcpy_htod(&scratch.parent_indices.buf, parent_bytes)?;
     }
 
     // ── 6. Snapshot pre-seed target state ─────────────────────────────────
@@ -3509,14 +3535,13 @@ pub fn spec_step_ddtree_batched(
     // `tree_bias[row × block_cols + col]`, so a view is equivalent and keeps
     // the assert semantics meaningful.
     let attn_bias_view = scratch.attn_bias.sub_offset(0, big_n * big_n);
+    // Parent-indices sub-view sized to big_n (one i32 per slot; stored as
+    // 4 × big_n raw bytes). Only populated when HIPFIRE_DDTREE_TREE_LA=1.
+    let parent_view = scratch.parent_indices.sub_offset(0, big_n * 4);
     let ctx = qwen35::TreeVerifyCtx {
         positions: &verify_positions,
         attn_bias: &attn_bias_view,
-        // Phase 3b follow-up wires this via linearize_tree_with_parents +
-        // PrefillBatchScratch::dn_s_tape_{q8,scales} to activate the
-        // tree-aware LA kernels. None keeps the current linear-path
-        // behavior (slow-path 2nd verify still needed).
-        parent_indices: None,
+        parent_indices: if use_tree_la { Some(&parent_view) } else { None },
     };
     let t_pre_verify = t_all.elapsed();
     let verify_out = verify_dflash_block_tree(
