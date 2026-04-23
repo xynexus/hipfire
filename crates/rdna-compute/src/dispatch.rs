@@ -9669,6 +9669,102 @@ impl Gpu {
         result
     }
 
+    /// Tree-aware variant of `gated_delta_net_q8_batch_seq`. Per-token
+    /// S-tile persist-write so sibling tokens read the parent's post-update
+    /// state via `s_tape_q8[parent_indices[t]]`. `parent_indices[t] < 0`
+    /// means "read pre-block initial state from `s_q8_init`".
+    ///
+    /// Does NOT advance persistent `s_q8_init` / `s_scales_init` (those
+    /// are the pre-block snapshot, read-only). Caller runs linear replay
+    /// on the accepted spine post-acceptance to commit the trajectory.
+    ///
+    /// Tape layout (caller responsibility):
+    /// - `s_tape_q8`:     `[n_tokens × n_heads × HD × HD]` i8 (scratch)
+    /// - `s_tape_scales`: `[n_tokens × n_heads × HD]` f32 (scratch)
+    /// - `parent_indices`: `[n_tokens]` i32 (host materialized by
+    ///   `ddtree::linearize_tree`; spine topology is [-1, 0, 1, 2, ...])
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_q8_tree_batch_seq(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8_init: &GpuTensor,
+        s_scales_init: &GpuTensor,
+        s_tape_q8: &GpuTensor,
+        s_tape_scales: &GpuTensor,
+        parent_indices: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gated_delta_net_q8_tree",
+            kernels::GATED_DELTA_NET_Q8_TREE_SRC,
+            "gated_delta_net_q8_tree",
+        )?;
+
+        let n_tiles = (128 / 4) as u32;
+
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sip = s_q8_init.buf.as_ptr();
+        let mut scip = s_scales_init.buf.as_ptr();
+        let mut stp = s_tape_q8.buf.as_ptr();
+        let mut stsp = s_tape_scales.buf.as_ptr();
+        let mut pp = parent_indices.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp   as *mut _ as *mut c_void,
+            &mut kp   as *mut _ as *mut c_void,
+            &mut vp   as *mut _ as *mut c_void,
+            &mut gp   as *mut _ as *mut c_void,
+            &mut bp   as *mut _ as *mut c_void,
+            &mut sip  as *mut _ as *mut c_void,
+            &mut scip as *mut _ as *mut c_void,
+            &mut stp  as *mut _ as *mut c_void,
+            &mut stsp as *mut _ as *mut c_void,
+            &mut pp   as *mut _ as *mut c_void,
+            &mut op   as *mut _ as *mut c_void,
+            &mut nt   as *mut _ as *mut c_void,
+            &mut nh   as *mut _ as *mut c_void,
+            &mut hd   as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "deltanet", "gated_delta_net_q8_tree_batch_seq", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_q8_tree",
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(gp); b.push_ptr(bp);
+                b.push_ptr(sip); b.push_ptr(scip);
+                b.push_ptr(stp); b.push_ptr(stsp);
+                b.push_ptr(pp); b.push_ptr(op);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// GDN recurrence with Q4-quantized S state.
     #[cfg(feature = "deltanet")]
     pub fn gated_delta_net_q4(
@@ -10278,6 +10374,7 @@ impl Gpu {
             ("fused_sigmoid_alpha_gate", kernels::FUSED_SIGMOID_ALPHA_GATE_SRC.to_string()),
             ("conv1d_silu_split",        kernels::CONV1D_SILU_SPLIT_SRC.to_string()),
             ("conv1d_silu_split_tree",   kernels::CONV1D_SILU_SPLIT_TREE_SRC.to_string()),
+            ("gated_delta_net_q8_tree",  kernels::GATED_DELTA_NET_Q8_TREE_SRC.to_string()),
             ("sigmoid_mul",              kernels::SIGMOID_MUL_SRC.to_string()),
             ("topk_logits",              kernels::TOPK_LOGITS_SRC.to_string()),
             ("scale_f32",                kernels::SCALE_F32_SRC.to_string()),
@@ -10491,6 +10588,7 @@ impl Gpu {
                 "fused_sigmoid_alpha_gate" => vec!["fused_sigmoid_alpha_gate_f32"],
                 "conv1d_silu_split" => vec!["conv1d_silu_split_f32"],
                 "conv1d_silu_split_tree" => vec!["conv1d_silu_split_tree_f32"],
+                "gated_delta_net_q8_tree" => vec!["gated_delta_net_q8_tree"],
                 "sigmoid_mul" => vec!["sigmoid_mul_f32"],
                 "topk_logits"  => vec!["topk_logits_f32"],
                 "scale_f32" => vec!["scale_f32"],

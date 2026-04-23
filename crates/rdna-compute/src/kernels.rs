@@ -717,6 +717,18 @@ pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_d
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_Q8_SRC: &str = include_str!("../../../kernels/src/gated_delta_net_q8.hip");
 
+/// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
+/// to a caller-owned tape buffer, so sibling tokens read the parent's
+/// post-update state rather than the previous sibling's. Required for
+/// correctness when processing a DDTree-linearized token block.
+///
+/// s_q8_init / s_scales_init are the pre-block snapshot (READ-ONLY). The
+/// kernel never advances persistent dn_state.s_matrices — caller runs
+/// linear replay on the accepted spine post-acceptance to commit the
+/// trajectory (same pattern as conv1d_silu_split_tree).
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_Q8_TREE_SRC: &str = include_str!("../../../kernels/src/gated_delta_net_q8_tree.hip");
+
 
 /// GDN recurrence with Q4-quantized S state in VRAM.
 /// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
