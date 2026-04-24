@@ -817,6 +817,13 @@ pub struct DdtreeScratch {
     /// buffer for qkv/alpha/beta bufs. Sized to the widest tape row
     /// (`qkv_dim * 4` bytes) × `max_n`. Reused across all LA layers.
     pub tape_gather_scratch: GpuTensor,
+    /// Path B per-FA-layer pre-RoPE K capture (slow-path-kill, WIP).
+    /// One F32 tensor of `[max_n × n_kv_heads × head_dim]` per FullAttention
+    /// layer in `config.layer_types`. Tree verify memcpy_dtods K into the
+    /// matching slot BEFORE the RoPE kernel rotates K in-place. Slow path
+    /// then re-RoPEs with committed positions instead of linearization
+    /// positions. Empty Vec when Path B isn't wired (default today).
+    pub pre_rope_k: Vec<GpuTensor>,
 }
 
 impl DdtreeScratch {
@@ -835,6 +842,7 @@ impl DdtreeScratch {
         n_kv_heads: usize,
         head_dim: usize,
         qkv_dim: usize,
+        n_fa_layers: usize,
     ) -> HipResult<Self> {
         let max_n = 1 + max_budget;
         let attn_bias = gpu.alloc_tensor(
@@ -845,6 +853,16 @@ impl DdtreeScratch {
             &[max_n * 4],
             rdna_compute::DType::Raw,
         )?;
+        // Path B per-FA-layer pre-RoPE K capture. Sized once at session
+        // init. Empty on n_fa_layers=0 → capture is a no-op even if the
+        // env gate is set (slow-path-kill won't have data to consume).
+        let mut pre_rope_k: Vec<GpuTensor> = Vec::with_capacity(n_fa_layers);
+        for _ in 0..n_fa_layers {
+            pre_rope_k.push(gpu.alloc_tensor(
+                &[max_n * n_kv_heads * head_dim],
+                rdna_compute::DType::F32,
+            )?);
+        }
 
         // Widest bytes-per-position across KV quant modes we might run under.
         // Mirrors TriAttention's `widest_bpp` sizing (see triattn.rs:784).
@@ -882,6 +900,7 @@ impl DdtreeScratch {
             kv_gather_scratch_k,
             kv_gather_scratch_v,
             tape_gather_scratch,
+            pre_rope_k,
         })
     }
 
@@ -892,6 +911,9 @@ impl DdtreeScratch {
         let _ = gpu.free_tensor(self.kv_gather_scratch_k);
         let _ = gpu.free_tensor(self.kv_gather_scratch_v);
         let _ = gpu.free_tensor(self.tape_gather_scratch);
+        for t in self.pre_rope_k {
+            let _ = gpu.free_tensor(t);
+        }
     }
 }
 
@@ -3672,10 +3694,27 @@ pub fn spec_step_ddtree_batched(
     // Parent-indices sub-view sized to big_n (one i32 per slot; stored as
     // 4 × big_n raw bytes). Only populated when HIPFIRE_DDTREE_TREE_LA=1.
     let parent_view = scratch.parent_indices.sub_offset(0, big_n * 4);
+    // Path B (slow-path-kill, work-in-progress): when enabled, supply the
+    // per-FA-layer pre-RoPE K capture scratch so tree verify can dump K
+    // BEFORE rope_partial_interleaved mutates it. Slow path then gathers
+    // accepted rows out of the scratch, re-RoPEs with committed phases,
+    // and quant-writes to the committed kv slots — no full re-verify
+    // forward. CONSUMER NOT YET WIRED: capture is currently a no-op
+    // overhead until the slow-path branch is replaced. Keep gated until
+    // the eyeball-tested smoke (see PRD trap surface) passes.
+    let pre_rope_capture = if std::env::var("HIPFIRE_DDTREE_PATH_B_CAPTURE")
+        .ok().as_deref() == Some("1")
+        && !scratch.pre_rope_k.is_empty()
+    {
+        Some(scratch.pre_rope_k.as_slice())
+    } else {
+        None
+    };
     let ctx = qwen35::TreeVerifyCtx {
         positions: &verify_positions,
         attn_bias: &attn_bias_view,
         parent_indices: if use_tree_la { Some(&parent_view) } else { None },
+        pre_rope_k_capture: pre_rope_capture,
     };
     let t_pre_verify = t_all.elapsed();
     let verify_out = verify_dflash_block_tree(

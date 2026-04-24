@@ -465,12 +465,16 @@ fn main() {
         let vd = target.config.linear_num_value_heads * target.config.linear_value_head_dim;
         kd * 2 + vd
     };
+    let ddtree_n_fa_layers = target.config.layer_types.iter()
+        .filter(|t| **t == engine::qwen35::LayerType::FullAttention)
+        .count();
     let ddtree_scratch = engine::speculative::DdtreeScratch::new(
         &mut gpu,
         ddtree_budget,
         target.config.n_kv_heads,
         target.config.head_dim,
         ddtree_qkv_dim,
+        ddtree_n_fa_layers,
     ).expect("alloc ddtree scratch");
     // VerifyScratch: persistent per-cycle tensors (final_hidden, logits,
     // rotation scratch, argmax buf). Sized to max_n = max(block_size,
