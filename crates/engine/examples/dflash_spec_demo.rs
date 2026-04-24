@@ -408,9 +408,28 @@ fn main() {
     eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
     vram_report(&gpu.hip, "after draft load");
 
-    // Adaptive-B scratch sizing: if the user raised adaptive_b_max above the
-    // draft's trained block_size, scratches need to handle the larger B.
-    // Otherwise stick with draft_cfg.block_size (backward-compat default).
+    // Adaptive-B scratch sizing: the draft was trained at a specific
+    // block_size; going past it is out-of-distribution for its positional
+    // encoding. Measured on 27B MQ4 (2026-04-24, 3-run median) with range
+    // 8:20:
+    //   code: 161.5 → 113.7 tok/s (-30 %) as B grew to 17+, τ only
+    //         dropped 8 % so the loss is dominated by verify cost × B
+    //         at OOD positions, not by τ collapse.
+    //   prose/instr: unchanged (B never grew past 10 on low-τ workloads).
+    // → clamp adaptive_b_max to draft_cfg.block_size with a warning when
+    // the user explicitly widens. Opt out via HIPFIRE_ADAPTIVE_B_UNSAFE=1
+    // for experiments on a refit draft.
+    let unsafe_adaptive = std::env::var("HIPFIRE_ADAPTIVE_B_UNSAFE").ok().as_deref() == Some("1");
+    if adaptive_b && adaptive_b_max > draft_cfg.block_size && !unsafe_adaptive {
+        eprintln!(
+            "adaptive-b: WARN requested MAX={} > draft trained block_size={}; clamping to {} (past-trained B regresses code by ~30 %; set HIPFIRE_ADAPTIVE_B_UNSAFE=1 to override)",
+            adaptive_b_max, draft_cfg.block_size, draft_cfg.block_size,
+        );
+        adaptive_b_max = draft_cfg.block_size;
+    }
+    // Scratches allocated for the *effective* max B we'll ever use. When
+    // user overrides with UNSAFE, this is larger; normally this equals
+    // draft_cfg.block_size.
     let draft_scratch_b = if adaptive_b {
         draft_cfg.block_size.max(adaptive_b_max)
     } else {
@@ -418,7 +437,7 @@ fn main() {
     };
     if draft_scratch_b > draft_cfg.block_size {
         eprintln!(
-            "adaptive-b: pre-sizing draft scratch for B_MAX={} (trained at {})",
+            "adaptive-b: pre-sizing draft scratch for B_MAX={} (trained at {}) [UNSAFE=on]",
             draft_scratch_b, draft_cfg.block_size,
         );
     }
