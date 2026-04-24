@@ -262,6 +262,38 @@ unique-token-ratio check (< 0.3 fail) on first 256 IDs, max-frequency
 check (> 50% fail) on emitted IDs, or decoded text printed for human
 eyeball.
 
+## Prompt-structure τ sensitivity (mandatory bench rule)
+
+**One newline character can swing τ by 17% on 27B DFlash.** Two prompts
+that tokenize to the same number of tokens (e.g. both 232) but with
+different whitespace patterns produce dramatically different draft-target
+acceptance:
+
+```
+PEP-8 strict (\n\n\n between top-level defs):    27B-3.5 LRU max=120  → 161 tok/s τ=8.07 (deterministic ±2%)
+Single-blank (\n\n between top-level defs):      27B-3.5 LRU max=120  → 184 tok/s τ=9.42 (range 173-204)
+```
+
+**Why:** identical token COUNT, different token SEQUENCE → different
+prefix-conditioned distribution shape at each position → different
+draft/target argmax alignment → different τ. Same model, same flags,
+same kernels, same binary md5.
+
+**How to apply:** ANY tok/s or τ comparison across sessions, agents, or
+commits MUST use byte-identical prompts. Embed prompts as committed
+files (not heredocs in scripts that get reformatted by editors), and
+record the prompt md5 alongside the result. A 14% perf delta from a
+whitespace cleanup is invisible in code review but catastrophic for
+benchmarking. See `docs/plans/prompt-structure-tau-discovery-2026-04-24.prd`
+for the forensic timeline + reproduction commands. Discovery cost
+~6 hours of phantom-regression chasing on 2026-04-24 (rocBLAS, DKMS,
+firmware, kernel cache, mold/sccache, DPM — all null) before isolating
+to a single newline.
+
+**Corollary**: agent-to-agent perf claims that lack prompt md5 are
+unverifiable. Don't accept "X agent got Y tok/s" without reproducing
+on the exact prompt bytes they ran.
+
 ## GPU Lock Protocol (Multi-Agent)
 
 When multiple Claude Code agents work in parallel (e.g. via worktrees), they coordinate

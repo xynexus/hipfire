@@ -85,6 +85,42 @@ change compensates.
 - Do NOT interpret a prose-prompt τ of 2-3 as a bug. That is the
   prose ceiling.
 
+**Whitespace inside the prompt ALSO dictates τ — discovered 2026-04-24.**
+Same prompt content, same prompt token COUNT, but different whitespace
+SEQUENCING produces 14-17% deltas:
+
+| Prompt | Tok count | tok/s | τ |
+|---|---|---|---|
+| LRU-cache, PEP-8 strict (`\n\n\n` between top-level defs) | 232 | 161 | 8.07 |
+| LRU-cache, single blank line (`\n\n` between top-level defs) | 232 | **184** | **9.42** |
+
+Both are valid Python. Both tokenize to 232 prompt tokens. Different
+whitespace token SEQUENCING produces different prefix-conditioned
+distributions at each emit position → different draft/target argmax
+alignment → different τ. Same model, same flags, same kernels, same
+binary md5.
+
+**Forensic case (cost ~6 hours)**: A different agent's bench at 10:07
+on 2026-04-24 reported `27b-3.5 LRU max=120 = 183 tok/s τ=9.42`. A
+follow-up Claude session reproducing with a PEP-8-formatted prompt got
+deterministic 161 τ=8.07 and chased phantom regression hypotheses
+(rocBLAS 6.4 vs 7.2, DKMS amdgpu vs in-tree, firmware shadow,
+ppfeaturemask, mold/sccache build, kernel cache, DPM compute mode,
+GPU runtime PM) — all null deltas. The variable was a single newline
+in the prompt heredoc. Reproduced once matched byte-exact.
+
+**Rules:**
+- Bench scripts MUST commit prompts as separate files (no embedded
+  heredocs that get reformatted by editors / autoformatters).
+- Bench output MUST include the prompt md5 (or path + git rev).
+- Cross-session perf claims (mine vs another agent's, today vs last
+  week) are unverifiable without byte-exact prompt match. Check
+  `prompt md5` first when delta seems unexplainable.
+- Whitespace cleanups in prompt files are perf changes. Treat as such.
+
+See `docs/plans/prompt-structure-tau-discovery-2026-04-24.prd` for full
+forensic timeline + reproduction commands.
+
 ## 2. The speed-gate is the source of truth
 
 `./scripts/speed-gate.sh` runs `bench_qwen35_mq4` on the 4 MQ4 sizes with
