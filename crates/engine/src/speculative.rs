@@ -644,6 +644,67 @@ impl GdnTape {
         }
         Ok(())
     }
+
+    /// Slow-path companion to `replay_gdn` (Task #101 slow-path-kill, 2026-04-23).
+    ///
+    /// When the committed tree path diverges from the linearization order
+    /// (`spine_accept = false` in `spec_step_ddtree_batched`), the per-tree-
+    /// node qkv / alpha / beta innovations captured during tree verify at
+    /// positions `[0..big_n]` need to be rearranged so that linear replay
+    /// position `i+1` holds the values for accepted tree node
+    /// `accepted_node_indices[i]`. Position 0 (seed) is already correct and
+    /// stays put; positions 1..=accept_len are gathered from their
+    /// tree-linearization slots.
+    ///
+    /// Uses `kv_compact_gather` (a generic slot-indexed row-gather kernel)
+    /// via `gather_scratch` as staging, then memcpys back to the tape's
+    /// own storage. The caller uploads `gather_indices_dev` with:
+    ///   indices[0] = 0                              (seed stays at 0)
+    ///   indices[i+1] = accepted_node_indices[i] + 1 (tree node → tape row)
+    /// for `i ∈ [0, accept_len)`.
+    pub fn gather_accepted(
+        &self,
+        gpu: &mut Gpu,
+        gather_indices_dev: &GpuTensor,
+        gather_scratch: &GpuTensor,
+        n_positions: usize,
+    ) -> HipResult<()> {
+        let qkv_row_bytes = self.qkv_dim * 4;
+        let alpha_row_bytes = self.n_v_heads * 4;
+        for layer in 0..self.qkv_bufs.len() {
+            // qkv
+            gpu.kv_compact_gather(
+                &self.qkv_bufs[layer], gather_scratch, gather_indices_dev,
+                qkv_row_bytes, n_positions,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &self.qkv_bufs[layer].buf, 0,
+                &gather_scratch.buf, 0,
+                n_positions * qkv_row_bytes,
+            )?;
+            // alpha
+            gpu.kv_compact_gather(
+                &self.alpha_bufs[layer], gather_scratch, gather_indices_dev,
+                alpha_row_bytes, n_positions,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &self.alpha_bufs[layer].buf, 0,
+                &gather_scratch.buf, 0,
+                n_positions * alpha_row_bytes,
+            )?;
+            // beta
+            gpu.kv_compact_gather(
+                &self.beta_bufs[layer], gather_scratch, gather_indices_dev,
+                alpha_row_bytes, n_positions,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &self.beta_bufs[layer].buf, 0,
+                &gather_scratch.buf, 0,
+                n_positions * alpha_row_bytes,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 impl DeltaNetTape {
@@ -738,11 +799,43 @@ pub struct DdtreeScratch {
     /// cycle via `memcpy_htod` before calling `verify_dflash_block_tree`.
     /// Allocated as Raw bytes (4 × max_n) since there's no i32 DType.
     pub parent_indices: GpuTensor,
+    /// Slow-path gather scratch (Task #101 slow-path-kill, 2026-04-23).
+    /// When the committed tree path diverges from the rank-0 linearization
+    /// (`spine_accept = false`), we need to rearrange already-computed
+    /// per-position state into committed-chain order instead of paying a
+    /// full re-verify forward. Three buffers:
+    ///  - `kv_gather_indices`: [max_n] i32 device buf holding absolute KV
+    ///    slot indices `[start_pos + 0, start_pos + 1 + accepted[0], ...]`
+    ///    that `kv_compact_gather` reads to select K/V rows per layer.
+    ///  - `kv_gather_scratch_k` / `_v`: per-layer gather destination + memcpy
+    ///    staging, sized to hold `max_n × widest_k_bpp` / `widest_v_bpp`
+    ///    bytes for the KV quant modes this model may use.
+    pub kv_gather_indices: GpuTensor,
+    pub kv_gather_scratch_k: GpuTensor,
+    pub kv_gather_scratch_v: GpuTensor,
+    /// Separately: the GdnTape also needs a gather-then-copy-back staging
+    /// buffer for qkv/alpha/beta bufs. Sized to the widest tape row
+    /// (`qkv_dim * 4` bytes) × `max_n`. Reused across all LA layers.
+    pub tape_gather_scratch: GpuTensor,
 }
 
 impl DdtreeScratch {
     /// Allocate for a worst-case tree of `max_budget` non-root nodes.
-    pub fn new(gpu: &mut Gpu, max_budget: usize) -> HipResult<Self> {
+    ///
+    /// `n_kv_heads` / `head_dim` come from the target's Qwen35Config and
+    /// size the KV-gather staging buffers for the widest-possible quant
+    /// mode (Q8, asym2/3/4 all ≤ Q8 bpp in bytes-per-position on K;
+    /// V is always Q8 for the asym* modes).
+    ///
+    /// `qkv_dim` is the per-position GdnTape qkv row width (k_dim × 2 +
+    /// v_dim) — see `GdnTape::new_for_config`.
+    pub fn new(
+        gpu: &mut Gpu,
+        max_budget: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        qkv_dim: usize,
+    ) -> HipResult<Self> {
         let max_n = 1 + max_budget;
         let attn_bias = gpu.alloc_tensor(
             &[max_n * max_n],
@@ -752,12 +845,53 @@ impl DdtreeScratch {
             &[max_n * 4],
             rdna_compute::DType::Raw,
         )?;
-        Ok(Self { max_n, attn_bias, parent_indices })
+
+        // Widest bytes-per-position across KV quant modes we might run under.
+        // Mirrors TriAttention's `widest_bpp` sizing (see triattn.rs:784).
+        let q8_bpp = n_kv_heads * (head_dim / 32) * 34;
+        let asym3_k_bpp = n_kv_heads * (4 + (head_dim * 3) / 8);
+        let asym4_k_bpp = n_kv_heads * (4 + head_dim / 2);
+        let asym2_k_bpp = n_kv_heads * (4 + head_dim / 4);
+        let widest_k_bpp = q8_bpp.max(asym3_k_bpp).max(asym4_k_bpp).max(asym2_k_bpp);
+        let widest_v_bpp = q8_bpp;
+
+        let kv_gather_indices = gpu.alloc_tensor(
+            &[max_n * 4],
+            rdna_compute::DType::Raw,
+        )?;
+        // Raw byte buffers sized to hold `max_n` full K / V rows.
+        let kv_gather_scratch_k = gpu.alloc_tensor(
+            &[(max_n * widest_k_bpp + 3) / 4],
+            rdna_compute::DType::F32,
+        )?;
+        let kv_gather_scratch_v = gpu.alloc_tensor(
+            &[(max_n * widest_v_bpp + 3) / 4],
+            rdna_compute::DType::F32,
+        )?;
+        // Tape rows are F32 projections, so sized in F32 elements directly.
+        let tape_gather_scratch = gpu.alloc_tensor(
+            &[max_n * qkv_dim],
+            rdna_compute::DType::F32,
+        )?;
+
+        Ok(Self {
+            max_n,
+            attn_bias,
+            parent_indices,
+            kv_gather_indices,
+            kv_gather_scratch_k,
+            kv_gather_scratch_v,
+            tape_gather_scratch,
+        })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.attn_bias);
         let _ = gpu.free_tensor(self.parent_indices);
+        let _ = gpu.free_tensor(self.kv_gather_indices);
+        let _ = gpu.free_tensor(self.kv_gather_scratch_k);
+        let _ = gpu.free_tensor(self.kv_gather_scratch_v);
+        let _ = gpu.free_tensor(self.tape_gather_scratch);
     }
 }
 
@@ -3631,6 +3765,22 @@ pub fn spec_step_ddtree_batched(
     } else {
         // Slow path: committed path diverges from linear order. Re-verify
         // the committed prefix to get a linear-order tape that matches.
+        //
+        // NOTE (2026-04-23): a "gather only" slow-path kill was attempted
+        // (see `GdnTape::gather_accepted` + `DdtreeScratch.kv_gather_*` —
+        // kept as unused infrastructure for when Path B lands). It failed
+        // a prose smoke with τ 4.94 → 3.67. Root cause: tree verify writes
+        // K with RoPE phase keyed off the LINEARIZATION slot (qwen35.rs
+        // :3048-3067 — "flat linear start_pos..start_pos+n"). A byte-wise
+        // gather from `start_pos + 1 + acc[j-1]` into the committed slot
+        // `start_pos + j` moves the K bytes but leaves the baked RoPE
+        // phase stale — next cycle's FA attention computes Q·K with wrong
+        // relative position and τ drops. A correct kill needs Path B:
+        // decouple `rope_phase` from `kv_slot_index` in the FA kernel so
+        // the tree verify can store K at a unique slot with RoPE phase
+        // pre-computed for the EVENTUAL committed slot (unknown a priori
+        // though, so in practice: store pre-RoPE K + apply RoPE per-slot
+        // at commit time). ~500 LOC kernel + dispatch work, separate task.
         let tape_block: Vec<u32> = committed[..accept_len + 1].to_vec();
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         let _tape_verify = verify_dflash_block(

@@ -456,8 +456,22 @@ fn main() {
     // avoids the per-cycle malloc+htod+free churn that dominated early wall-
     // clock numbers. Also allocated for non-ddtree runs (cheap, small) so
     // callers can switch strategies at runtime without reinit.
-    let ddtree_scratch = engine::speculative::DdtreeScratch::new(&mut gpu, ddtree_budget)
-        .expect("alloc ddtree scratch");
+    // KV-gather + tape-gather scratch are sized here too (slow-path-kill,
+    // 2026-04-23). Widths come from the target config: FA K/V row byte
+    // counts depend on n_kv_heads × head_dim × quant, and the GdnTape's
+    // qkv_dim = 2*k_dim + v_dim on the LA side.
+    let ddtree_qkv_dim = {
+        let kd = target.config.linear_num_key_heads * target.config.linear_key_head_dim;
+        let vd = target.config.linear_num_value_heads * target.config.linear_value_head_dim;
+        kd * 2 + vd
+    };
+    let ddtree_scratch = engine::speculative::DdtreeScratch::new(
+        &mut gpu,
+        ddtree_budget,
+        target.config.n_kv_heads,
+        target.config.head_dim,
+        ddtree_qkv_dim,
+    ).expect("alloc ddtree scratch");
     // VerifyScratch: persistent per-cycle tensors (final_hidden, logits,
     // rotation scratch, argmax buf). Sized to max_n = max(block_size,
     // 1 + ddtree_budget) to cover plain DFlash and DDTree. Drops ~8
