@@ -1,0 +1,148 @@
+# DDTree Path B — decouple RoPE phase from KV slot index
+
+_Follow-up to Path A reverted in ecbc49d (2026-04-23). Unblocks DDTree slow-path kill._
+
+## Why this exists
+
+DDTree-batched on 27B asym3 hits 35-50% slow-path cycles on prose / instruct (per
+HIPFIRE_DDTREE_TAPE_DUMP). Each fires a full re-verify (~40-50 ms) that we'd like
+to replace with a cheap KV / tape gather (~0.5 ms). Path A tried the gather-only
+fix and reverted because:
+
+> Tree verify writes K with RoPE phase baked in for the LINEARIZATION slot
+> (`qwen35.rs:3048-3067` — "flat linear start_pos..start_pos+n"). Byte-wise
+> gathering K from `start_pos + 1 + acc[j-1]` into the committed slot
+> `start_pos + j` moves the bytes but leaves the baked RoPE phase stale.
+
+Path B fixes this structurally: tree verify writes K either (a) without RoPE so
+RoPE can be applied later at commit time, or (b) with a rope_phase array that's
+INDEPENDENT of the kv_slot index, so the "right" phase can be chosen based on
+where the committed slot will land.
+
+Both options require splitting one `positions` array (currently doing double
+duty) into two — `rope_phase[i]` and `kv_slot_index[i]` — and threading both
+through the FA dispatch.
+
+## Two implementation variants
+
+### B1 — Pre-RoPE K storage + post-commit RoPE pass
+
+- Tree verify dispatches FA with `rope_phase = position + linear_idx` (current)
+  AND stores **pre-RoPE K** in a per-tree-verify scratch buffer (sized
+  `big_n × n_kv_heads × head_dim × 2` bytes F16, ~26 KB for 27B at budget=12).
+- Post-commit, a small kernel reads pre-RoPE K from scratch at slot
+  `accepted_node_indices[j]+1`, applies RoPE for `position + j + 1`, writes
+  to `kv_cache[position + j + 1]`. One launch per FA layer per slow cycle.
+- Pros: minimal kernel surgery — RoPE-apply kernel is ~50 LOC, dispatch
+  wiring is straightforward.
+- Cons: doubles K storage cost during tree verify. V doesn't need this
+  treatment (no RoPE on V).
+
+### B2 — Two-array FA kernel
+
+- FA kernel takes `rope_phase: &[i32]` AND `kv_slot_index: &[i32]` as
+  separate args. RoPE rotates Q/K with `rope_phase[i]`. KV cache write
+  uses `kv_slot_index[i]`. Tree verify sets:
+  - `rope_phase[i] = position + i` (current, keeps RoPE distinct per tree node)
+  - `kv_slot_index[i] = position + i` (current, distinct slot per tree node)
+- Tree verify path is BIT-IDENTICAL to today (both arrays equal).
+- Slow-path kill becomes a pure byte gather BUT we need to ALSO somehow
+  apply the right RoPE — defeats the purpose unless paired with a per-commit
+  rotate.
+- Worse than B1 unless we also build the rotate kernel — at which point we
+  might as well do B1 instead.
+
+**Pick B1.** B2 buys nothing on its own.
+
+## Implementation scope (B1)
+
+### New kernels (~150 LOC HIP)
+
+`kernels/src/kv_apply_rope_post_gather.hip`:
+```c
+__global__ void kv_apply_rope_post_gather_f16(
+    const __half* k_pre_rope,       // [n_positions × n_kv_heads × head_dim]
+    __half*       k_cache_out,      // sub-view at slot `dst_base`
+    const i32*    src_indices,      // [n_positions] — read pre_rope row src_indices[i]
+    const i32*    rope_positions,   // [n_positions] — apply RoPE phase for these
+    int n_kv_heads, int head_dim,
+    float rope_theta,
+    int dst_base                    // start writing at kv_cache[dst_base × bpp]
+);
+```
+
+Plus a quantized variant for asym3/4/2 K (more involved — RoPE must precede
+Givens rotation + quantization). Likely a separate kernel per quant mode.
+Order: ship F16 first as proof, then port to asym3.
+
+### qwen35.rs changes (~100 LOC)
+
+- Tree verify branch: when `tree_verify.is_some()`, allocate a per-cycle
+  pre-RoPE K scratch (or take it from PrefillBatchScratch), dispatch the
+  existing wqkv kernel WITHOUT applying RoPE to K (probably via a flag arg
+  or a new kernel entry point — needs to look at gemm_qkv kernel surface),
+  and store the K rows.
+- Apply RoPE inline (current behavior) for Q only — Q's phase is the live
+  query position, no problem.
+- Keep the existing kv_cache_write_* call unchanged: it still writes K at
+  `kv_slot_index = position + i` so that later cycles read the gathered K.
+
+### speculative.rs changes (~50 LOC + revert un-revert)
+
+- Reapply the `gather_accepted` slow-path branch I shipped in ecbc49d (the
+  scaffolding is still there, currently unused).
+- Add a step between tape gather and replay: dispatch the
+  `kv_apply_rope_post_gather` kernel per FA layer, reading from the new
+  pre-RoPE K scratch with `src_indices = [position, position+1+acc[0],
+  position+1+acc[1], ...]` and `rope_positions = [position+0, position+1,
+  position+2, ...]` (the committed-chain phases).
+
+### dflash_spec_demo.rs (~5 LOC)
+
+- Allocate the pre-RoPE K scratch alongside DdtreeScratch (or fold into it).
+
+## Speed / quality gates
+
+**Speed gate (regression ≤ noise on existing paths):**
+- 27B linear asym3 HumanEval n=33 within ±5% of pre-fix mean (128 tok/s).
+- 27B fast-path-only DDTree b12-k2 asym3 prose (force_slow=0 condition) within
+  ±5% of pre-fix mean.
+
+**Speed gate (slow-path kill must move the needle):**
+- 27B b12-k2 asym3 prose: ≥ +15% mean tok/s vs pre-fix (76 → 87+ tok/s) on
+  3-run mean to defeat ksplit-atomic variance.
+- 27B b12-k2 asym3 instruct: ≥ +10% mean tok/s vs pre-fix (70 → 77+ tok/s).
+- 27B b12-k2 asym3 code (HumanEval n=33): mean tok/s within −5% of pre-fix
+  (84 → 80+ tok/s) — code is mostly fast-path so no big lift expected.
+
+**Quality gate:**
+- Coherence-gate on prose + instruct + code at b12-k2 + asym3.
+- HumanEval n=33 mean τ within ±0.3 of pre-fix (5.39 mean).
+- Spot-check: 5 prose runs, no degenerate token-loop output.
+
+## Sequencing
+
+1. F16 prototype kernel + dispatch (3-4 hours): un-revert speculative.rs gather
+   path, add F16 KV-only branch in qwen35.rs, wire pre-RoPE scratch. Smoke on
+   F16 KV mode (which we don't normally use but is the cheapest path to validate
+   the design before touching quantized kernels).
+2. Asym3 quant variant (4-6 hours): port the post-gather RoPE kernel to operate
+   on asym3 K. Validate Givens rotation + 3-bit quantization composition.
+3. Other quant modes (asym2, asym4, q8) — port in parallel once asym3 works.
+4. Speed/quality gate sweep + commit.
+
+Total: ~1-2 days of focused engineering.
+
+## Rollback
+
+All changes are inside `if tree_verify.is_some()` branches and the slow-path
+of `spec_step_ddtree_batched`. A bad result reverts cleanly to today's
+behavior (full re-verify). Path A scaffolding stays untouched.
+
+## Out of scope
+
+- Multi-arch testing (BC-250, V620, MI300X) — gfx1100 first.
+- Generalizing decouple to AR-decode path — DDTree-only for now.
+- Path B2 (two-array FA without per-commit rotate) — strictly worse than B1.
+- Per-genre dispatch policy work (handled separately in
+  `ddtree-b12k2-asym3-prose-instruct-win.prd`).
