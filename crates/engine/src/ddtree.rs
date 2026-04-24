@@ -139,6 +139,36 @@ pub fn build_ddtree_tree(
     topk: usize,
     budget: usize,
 ) -> DdTree {
+    build_ddtree_tree_with_cutoff(top_tokens, top_log_probs, depth, topk, budget, f32::NEG_INFINITY)
+}
+
+/// Same as `build_ddtree_tree`, but also stops expansion when the next
+/// heap-pop candidate's cumulative log-weight falls below `logw_cutoff`.
+/// Use `f32::NEG_INFINITY` to disable (= original behaviour — only the
+/// `budget` cap applies).
+///
+/// Rationale: the reference's Algorithm 1 pops candidates in
+/// descending-cumulative-logw order, so later pops are strictly lower
+/// probability than earlier ones. When a candidate's cumulative log-prob
+/// drops below, say, -4.0 (≈ 1.8 % absolute probability), further
+/// expansion has diminishing returns — those slots are rarely accepted
+/// by the target anyway, yet each costs verify time linear in B.
+///
+/// This is a zero-training "meta-verifier" pruner: per-cycle dynamic
+/// budget that shrinks the tree on high-confidence cycles (where top-1
+/// logw is near zero and the heap's tail collapses fast) but keeps full
+/// budget on uncertain ones (where many candidates are plausible).
+///
+/// Measured on 27B MQ4 / 7900XTX (2026-04-24, 3-run median):
+/// TODO: populate once the bench lands.
+pub fn build_ddtree_tree_with_cutoff(
+    top_tokens: &[u32],
+    top_log_probs: &[f32],
+    depth: usize,
+    topk: usize,
+    budget: usize,
+    logw_cutoff: f32,
+) -> DdTree {
     // Early out: no draft positions or no budget → root-only tree.
     if budget == 0 || depth == 0 {
         return DdTree {
@@ -183,6 +213,14 @@ pub fn build_ddtree_tree(
 
     while let Some(entry) = heap.pop() {
         if nodes.len() >= budget {
+            break;
+        }
+        // Meta-verifier pruner: heap pops in strictly descending logw, so
+        // once a candidate falls below the cutoff, every remaining one is
+        // also below. Bail early to shrink the tree for high-confidence
+        // cycles — verify cost saved ∝ nodes-pruned, acceptance loss ≈ 0
+        // (those nodes' target-accept probability is bounded by exp(logw)).
+        if entry.logw < logw_cutoff {
             break;
         }
         let HeapEntry {

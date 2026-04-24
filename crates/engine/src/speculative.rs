@@ -80,6 +80,60 @@ pub fn reset_seed_oracle_stats() {
     SEED_ORACLE_ACCEPT_LEN_SUM.store(0, Ordering::Relaxed);
 }
 
+/// Parse HIPFIRE_DDTREE_LOGW_CUTOFF. Positive value X means "stop tree
+/// expansion when next candidate's cumulative logw < -X". 0.0 / unset /
+/// unparseable disables (= expand all the way to `budget`).
+fn ddtree_logw_cutoff() -> f32 {
+    match std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+    {
+        Some(x) if x > 0.0 => -x,
+        _ => f32::NEG_INFINITY,
+    }
+}
+
+/// DDTree meta-verifier pruner telemetry: per-cycle tree-size histogram.
+/// `cycle_count` = cycles observed; `total_nodes` = sum of tree.num_nodes()
+/// across cycles; `max_nodes` / `min_nodes` = range observed.
+static DDTREE_META_CYCLES: AtomicU64 = AtomicU64::new(0);
+static DDTREE_META_TOTAL_NODES: AtomicU64 = AtomicU64::new(0);
+static DDTREE_META_MAX_NODES: AtomicU64 = AtomicU64::new(0);
+static DDTREE_META_MIN_NODES: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub fn record_ddtree_meta_nodes(n: usize) {
+    let n64 = n as u64;
+    DDTREE_META_CYCLES.fetch_add(1, Ordering::Relaxed);
+    DDTREE_META_TOTAL_NODES.fetch_add(n64, Ordering::Relaxed);
+    DDTREE_META_MAX_NODES.fetch_max(n64, Ordering::Relaxed);
+    DDTREE_META_MIN_NODES.fetch_min(n64, Ordering::Relaxed);
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DdtreeMetaStats {
+    pub cycles: u64,
+    pub total_nodes: u64,
+    pub max_nodes: u64,
+    pub min_nodes: u64,
+}
+
+pub fn read_ddtree_meta_stats() -> DdtreeMetaStats {
+    let c = DDTREE_META_CYCLES.load(Ordering::Relaxed);
+    DdtreeMetaStats {
+        cycles: c,
+        total_nodes: DDTREE_META_TOTAL_NODES.load(Ordering::Relaxed),
+        max_nodes: DDTREE_META_MAX_NODES.load(Ordering::Relaxed),
+        min_nodes: if c == 0 { 0 } else { DDTREE_META_MIN_NODES.load(Ordering::Relaxed) },
+    }
+}
+
+pub fn reset_ddtree_meta_stats() {
+    DDTREE_META_CYCLES.store(0, Ordering::Relaxed);
+    DDTREE_META_TOTAL_NODES.store(0, Ordering::Relaxed);
+    DDTREE_META_MAX_NODES.store(0, Ordering::Relaxed);
+    DDTREE_META_MIN_NODES.store(u64::MAX, Ordering::Relaxed);
+}
+
 /// Which KV cache layout to use when allocating a slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvMode {
@@ -3389,13 +3443,19 @@ pub fn spec_step_ddtree(
         crate::ddtree::topk_from_logits(&draft_logits, b - 1, vocab, tree_topk);
 
     // ── 3. Build the DDTree ───────────────────────────────────────────────
-    let tree = crate::ddtree::build_ddtree_tree(
+    // HIPFIRE_DDTREE_LOGW_CUTOFF=<f32> enables the meta-verifier pruner: stop
+    // heap expansion when the next candidate's cumulative log-probability
+    // drops below -cutoff. Per-cycle dynamic budget. Disabled (= 0.0 or
+    // unset) preserves the fixed-budget behaviour.
+    let tree = crate::ddtree::build_ddtree_tree_with_cutoff(
         &top_tokens,
         &top_log_probs,
         b - 1,
         tree_topk,
         tree_budget,
+        ddtree_logw_cutoff(),
     );
+    record_ddtree_meta_nodes(tree.num_nodes());
 
     // Edge case: empty tree (shouldn't happen if budget≥1 and b≥2, but guard).
     // With zero nodes there's nothing to verify — just forward seed, sample,
@@ -3701,13 +3761,19 @@ pub fn spec_step_ddtree_batched(
     let t_topk = t_draft; // fused with draft now
 
     // ── 3. Build the DDTree ───────────────────────────────────────────────
-    let tree = crate::ddtree::build_ddtree_tree(
+    // HIPFIRE_DDTREE_LOGW_CUTOFF=<f32> enables the meta-verifier pruner: stop
+    // heap expansion when the next candidate's cumulative log-probability
+    // drops below -cutoff. Per-cycle dynamic budget. Disabled (= 0.0 or
+    // unset) preserves the fixed-budget behaviour.
+    let tree = crate::ddtree::build_ddtree_tree_with_cutoff(
         &top_tokens,
         &top_log_probs,
         b - 1,
         tree_topk,
         tree_budget,
+        ddtree_logw_cutoff(),
     );
+    record_ddtree_meta_nodes(tree.num_nodes());
 
     let t_build = t_all.elapsed();
 

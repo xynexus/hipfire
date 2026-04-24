@@ -854,6 +854,7 @@ fn main() {
     // Reset Task #93 Phase B seed-oracle counters so stats reflect this run
     // only (process-cumulative counters would poison multi-run harnesses).
     engine::speculative::reset_seed_oracle_stats();
+    engine::speculative::reset_ddtree_meta_stats();
 
     // Adaptive-B state: tracks current B between cycles, plus a cooldown
     // counter and a histogram for end-of-run reporting.
@@ -1252,6 +1253,17 @@ fn main() {
         "histogram: {:?}",
         stats.acceptance_hist.iter().enumerate().collect::<Vec<_>>()
     );
+    // DDTree meta-verifier pruner stats — only meaningful under --ddtree-*
+    // with HIPFIRE_DDTREE_LOGW_CUTOFF set. Cycles == 0 on pure-DFlash runs.
+    let meta = engine::speculative::read_ddtree_meta_stats();
+    if meta.cycles > 0 {
+        let mean_nodes = meta.total_nodes as f32 / meta.cycles as f32;
+        eprintln!(
+            "ddtree-meta: cycles={} mean_nodes={:.2} min={} max={} (cutoff={:?})",
+            meta.cycles, mean_nodes, meta.min_nodes, meta.max_nodes,
+            std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF").unwrap_or_else(|_| "off".to_string()),
+        );
+    }
     // Adaptive-B usage report — only meaningful when --adaptive-b is on.
     if adaptive_b && !adaptive_b_histogram.is_empty() {
         let mut buckets: Vec<(usize, u32)> = adaptive_b_histogram.iter()
