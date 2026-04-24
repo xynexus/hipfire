@@ -849,8 +849,19 @@ fn main() {
     //   util > UP   → draft keeps up, stretch B further.
     //   util < DOWN → draft lags, shrink B to cut verify cost.
     // Gap between the two prevents flapping at one util value.
-    const ADAPTIVE_B_UP: f64 = 0.70;
-    const ADAPTIVE_B_DOWN: f64 = 0.30;
+    //
+    // Measured util ceilings at fixed-B16 (2026-04-24 3-run median):
+    //   code  τ≈7.68 / (B-1=15) = 0.51
+    //   prose τ≈1.65 / 15 = 0.11
+    //   instr τ≈1.82 / 15 = 0.12
+    // UP=0.70 never triggers — B never grows past start. UP=0.45 picks up
+    // code's high-confidence stretches without firing on prose/instr, where
+    // shrinking is the right move. Env override for tuning:
+    //   HIPFIRE_ADAPTIVE_B_UP=0.XX / HIPFIRE_ADAPTIVE_B_DOWN=0.XX
+    let adaptive_b_up: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_UP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.45);
+    let adaptive_b_down: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_DOWN")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.25);
 
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
@@ -946,13 +957,13 @@ fn main() {
                 let ewma: f64 = accepts_window.iter().copied().sum::<usize>() as f64
                     / accepts_window.len() as f64;
                 let util = ewma / (current_adaptive_b.saturating_sub(1).max(1)) as f64;
-                if util > ADAPTIVE_B_UP
+                if util > adaptive_b_up
                     && current_adaptive_b + ADAPTIVE_B_STEP <= adaptive_b_max
                 {
                     current_adaptive_b += ADAPTIVE_B_STEP;
                     adaptive_b_cycles_since_change = 0;
                     adaptive_b_changes += 1;
-                } else if util < ADAPTIVE_B_DOWN
+                } else if util < adaptive_b_down
                     && current_adaptive_b >= adaptive_b_min + ADAPTIVE_B_STEP
                 {
                     current_adaptive_b -= ADAPTIVE_B_STEP;
