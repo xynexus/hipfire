@@ -71,12 +71,27 @@ fn main() {
     let mut seed: u64 = 42;
     let mut repeat_penalty: f32 = 1.0;
     let mut repeat_window: usize = 128;
-    // Adaptive block size: on by default (2026-04-16). Shrinks B from 16
-    // → 8 when rolling τ drops below 4 so hard/creative prompts where the
-    // draft diverges per position don't pay the full 16-token verify cost.
-    // Empirically adds no regression on high-τ content (draft keeps up, τ
-    // recovers, B snaps back to 16). Opt out with --no-adaptive-b.
+    // Adaptive block size: on by default.
+    //
+    // 2026-04-16: initial two-level version shrank B from 16→8 when rolling
+    // τ dropped below 4.
+    //
+    // 2026-04-24 (Task #93 Phase B fallback — see docs/plans/task-93-inter-
+    // cycle-pipelining.prd): replaced with a continuous scheduler that
+    // adjusts B across the range [ADAPTIVE_B_MIN .. ADAPTIVE_B_MAX] using
+    // EWMA of accept_len with hysteresis + cooldown. Raises B when the
+    // recent cycle is under-budgeted (draft accepting almost everything →
+    // amortize verify over more positions). Drops B when draft is losing
+    // early (small B cuts verify cost and lets τ recover). Override range
+    // with --adaptive-b-range MIN:MAX.
+    //
+    // ADAPTIVE_B_MAX caps: scratches are pre-allocated to it, so setting a
+    // larger max raises VRAM cost. Default 16 preserves the pre-Task-#93
+    // behaviour (draft trained at block_size=16; larger B is OOD for the
+    // draft's positional encoding and may degrade τ).
     let mut adaptive_b: bool = true;
+    let mut adaptive_b_min: usize = 8;
+    let mut adaptive_b_max: usize = 16;
     let mut ngram: bool = false;
     let mut ngram_min_count: u32 = 3;
     // CACTUS bumped acceptance (Hao & Mou 2026). 0.0 = vanilla SpS;
@@ -202,6 +217,17 @@ fn main() {
             "--no-adaptive-b" => {
                 adaptive_b = false;
                 i += 1;
+            }
+            "--adaptive-b-range" => {
+                // Format: "MIN:MAX" e.g. "8:20". Both inclusive.
+                let v = &args[i + 1];
+                let (lo, hi) = v.split_once(':').unwrap_or_else(||
+                    panic!("--adaptive-b-range expects MIN:MAX, got {v:?}"));
+                adaptive_b_min = lo.parse().expect("--adaptive-b-range MIN");
+                adaptive_b_max = hi.parse().expect("--adaptive-b-range MAX");
+                assert!(adaptive_b_min >= 2 && adaptive_b_max >= adaptive_b_min,
+                    "--adaptive-b-range invalid: {adaptive_b_min}..{adaptive_b_max}");
+                i += 2;
             }
             "--ngram" => {
                 ngram = true;
@@ -355,8 +381,11 @@ fn main() {
     // Draft fits afterward because pool::alloc uses EXACT HIP allocation
     // (pool.rs::alloc), so the target's per-layer buckets don't pad up
     // to the next power of 2 and waste the room the draft needs.
+    // Compute adaptive-B scratch ceiling early so KV + ring-buffer sizing
+    // upstream of the draft-load accounts for the max possible B we'll use.
+    let cfg_block_size_for_slot = draft_cfg.block_size.max(if adaptive_b { adaptive_b_max } else { 0 });
     let mut slot_cfg = ModelSlotConfig::default();
-    slot_cfg.max_seq = ctx_capacity + draft_cfg.block_size + 16;
+    slot_cfg.max_seq = ctx_capacity + cfg_block_size_for_slot + 16;
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
         "q8" => engine::speculative::KvMode::Q8,
         "asym4" | "turbo4" => engine::speculative::KvMode::Asym4,
@@ -379,8 +408,22 @@ fn main() {
     eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
     vram_report(&gpu.hip, "after draft load");
 
+    // Adaptive-B scratch sizing: if the user raised adaptive_b_max above the
+    // draft's trained block_size, scratches need to handle the larger B.
+    // Otherwise stick with draft_cfg.block_size (backward-compat default).
+    let draft_scratch_b = if adaptive_b {
+        draft_cfg.block_size.max(adaptive_b_max)
+    } else {
+        draft_cfg.block_size
+    };
+    if draft_scratch_b > draft_cfg.block_size {
+        eprintln!(
+            "adaptive-b: pre-sizing draft scratch for B_MAX={} (trained at {})",
+            draft_scratch_b, draft_cfg.block_size,
+        );
+    }
     let mut draft_scratch = DflashScratch::new_with_mq(
-        &mut gpu, &draft_cfg, draft_cfg.block_size, ctx_capacity, draft_weights.has_mq,
+        &mut gpu, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
     ).expect("alloc draft scratch");
     if draft_weights.has_mq {
         eprintln!("draft: MQ4 weights detected, FWHT rotation scratch enabled");
@@ -424,13 +467,16 @@ fn main() {
     eprintln!("prompt tokens ({}): {:?}", prompt_tokens.len(), prompt_tokens);
 
     // ── Hidden ring buffer + snapshot + target_hidden_host ────────────
+    // Size for the max block we may use this session so adaptive-B-up
+    // doesn't overflow.
+    let hrb_max_block = draft_scratch_b;
     let mut hidden_rb = HiddenStateRingBuffer::new(
         &mut gpu,
         target.config.n_layers,
         draft_cfg.num_extract(),
         draft_cfg.hidden,
-        ctx_capacity + draft_cfg.block_size,
-        engine::qwen35::PREFILL_MAX_BATCH.max(draft_cfg.block_size),
+        ctx_capacity + hrb_max_block,
+        engine::qwen35::PREFILL_MAX_BATCH.max(hrb_max_block),
     )
     .expect("alloc hidden_rb");
 
@@ -447,7 +493,7 @@ fn main() {
     // (seed + tree nodes). Size max_n = max(block_size, 1 + tree_budget) so
     // the tape is large enough whether we run per-path DFS, batched tree,
     // or plain DFlash.
-    let tape_max_n = draft_cfg.block_size.max(1 + ddtree_budget);
+    let tape_max_n = draft_scratch_b.max(1 + ddtree_budget);
     let mut gdn_tape = engine::speculative::GdnTape::new_for_config(
         &mut gpu, &target.config, tape_max_n,
     ).expect("alloc gdn tape");
@@ -481,7 +527,7 @@ fn main() {
     // 1 + ddtree_budget) to cover plain DFlash and DDTree. Drops ~8
     // hipMalloc/hipFree pairs per cycle (biggest is 16 MB logits buffer),
     // saving 0.5-1.5 ms/cycle.
-    let verify_max_n = draft_cfg.block_size.max(1 + ddtree_budget);
+    let verify_max_n = draft_scratch_b.max(1 + ddtree_budget);
     let verify_scratch = engine::speculative::VerifyScratch::with_prefill(
         &mut gpu,
         verify_max_n,
@@ -539,10 +585,10 @@ fn main() {
         // existing slot_cfg sized it to ctx_capacity + block_size + 16 — we
         // don't resize here; just assert.
         assert!(
-            target.kv_cache.max_seq >= cask_budget + cask_beta + draft_cfg.block_size + 4,
+            target.kv_cache.max_seq >= cask_budget + cask_beta + draft_scratch_b + 4,
             "target.kv_cache.max_seq ({}) < cask_budget+beta+B+4 ({}) — raise --ctx or lower --cask-budget/beta",
             target.kv_cache.max_seq,
-            cask_budget + cask_beta + draft_cfg.block_size + 4,
+            cask_budget + cask_beta + draft_scratch_b + 4,
         );
         let base = EvictionCtx::new(
             &mut gpu, &centers, fa_layer_ids,
@@ -609,10 +655,19 @@ fn main() {
     // `position` was already declared above (it may have been advanced by a
     // post-prefill CASK eviction). Keep it as-is.
     let mut seed_token: u32 = first_token;
-    let mut stats = SpecStats::new(draft_cfg.block_size);
+    // SpecStats histogram must fit the max accept_len we'll ever see, so
+    // size by draft_scratch_b (which accounts for adaptive_b_max).
+    let mut stats = SpecStats::new(draft_scratch_b);
     let eos_id: u32 = tokenizer.eos_id;
 
-    eprintln!("decoding (max {max_tokens} tokens, block_size {})...", draft_cfg.block_size);
+    if adaptive_b && draft_scratch_b != draft_cfg.block_size {
+        eprintln!(
+            "decoding (max {max_tokens} tokens, adaptive-B range {adaptive_b_min}..={adaptive_b_max}, draft trained at {})...",
+            draft_cfg.block_size,
+        );
+    } else {
+        eprintln!("decoding (max {max_tokens} tokens, block_size {})...", draft_cfg.block_size);
+    }
 
     // Rolling τ window for live emit + future adaptive routing decisions.
     // τ_window[i] = accepted draft tokens in cycle i. Running mean over the
@@ -781,9 +836,25 @@ fn main() {
     // only (process-cumulative counters would poison multi-run harnesses).
     engine::speculative::reset_seed_oracle_stats();
 
+    // Adaptive-B state: tracks current B between cycles, plus a cooldown
+    // counter and a histogram for end-of-run reporting.
+    let mut current_adaptive_b: usize = draft_cfg.block_size;
+    let mut adaptive_b_cycles_since_change: usize = 0;
+    let mut adaptive_b_histogram: std::collections::HashMap<usize, u32> =
+        std::collections::HashMap::new();
+    let mut adaptive_b_changes: u32 = 0;
+    const ADAPTIVE_B_STEP: usize = 2;
+    const ADAPTIVE_B_COOLDOWN: usize = 3;
+    // Hysteresis thresholds on util = EWMA(accept_len) / (current_B - 1):
+    //   util > UP   → draft keeps up, stretch B further.
+    //   util < DOWN → draft lags, shrink B to cut verify cost.
+    // Gap between the two prevents flapping at one util value.
+    const ADAPTIVE_B_UP: f64 = 0.70;
+    const ADAPTIVE_B_DOWN: f64 = 0.30;
+
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
-        if position + draft_cfg.block_size >= ctx_capacity {
+        if position + draft_scratch_b >= ctx_capacity {
             eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
             break;
         }
@@ -859,25 +930,39 @@ fn main() {
                 }
             }
         }
-        // Adaptive B: when rolling τ falls below threshold, shrink block_size
-        // from 16 to 8 to lower per-cycle cost so we stay above AR when draft
-        // accuracy is poor. Raise back to 16 when τ recovers.
+        // Adaptive-B scheduler (Task #93 Phase B replacement — 2026-04-24).
         //
-        // Threshold tuning (2026-04-16, 9B MQ4 / 7900XTX):
-        //   AR is 7.58 ms/tok. B=16 cycle ~25 ms → break-even τ ≈ 2.3.
-        //   B=8 cycle ~16 ms → break-even τ ≈ 1.1.
-        //   B=16 amortizes per-cycle overhead better whenever τ clears 2.3,
-        //   so B=8 only wins against B=16 when τ stays in [1, 2.5].
-        // Use τ<2.5 as the trip wire; anything higher and B=16 is cleanly
-        // faster.
+        // Online rule, no training. Tracks recent EWMA(accept_len), divides
+        // by current_B-1 to get "utilization". When draft is over-performing
+        // (util > UP), bump B — amortize verify over more positions. When
+        // draft is under-performing (util < DOWN), shrink B — cut verify
+        // cost, let τ recover. Hysteresis + cooldown prevent flapping.
+        //
+        // adaptive_b_min/max default to 8..=16 (pre-2026-04-24 behaviour
+        // bounded by the draft's trained block_size). User can widen with
+        // --adaptive-b-range MIN:MAX; scratches upstream pre-sized for MAX.
         let block_override = if adaptive_b {
-            if accepts_window.len() >= 4 {
-                let win_tau: f64 =
-                    accepts_window.iter().copied().sum::<usize>() as f64 / accepts_window.len() as f64;
-                if win_tau < 2.5 { Some(8usize) } else { None }
-            } else {
-                None
+            if accepts_window.len() >= 4 && adaptive_b_cycles_since_change >= ADAPTIVE_B_COOLDOWN {
+                let ewma: f64 = accepts_window.iter().copied().sum::<usize>() as f64
+                    / accepts_window.len() as f64;
+                let util = ewma / (current_adaptive_b.saturating_sub(1).max(1)) as f64;
+                if util > ADAPTIVE_B_UP
+                    && current_adaptive_b + ADAPTIVE_B_STEP <= adaptive_b_max
+                {
+                    current_adaptive_b += ADAPTIVE_B_STEP;
+                    adaptive_b_cycles_since_change = 0;
+                    adaptive_b_changes += 1;
+                } else if util < ADAPTIVE_B_DOWN
+                    && current_adaptive_b >= adaptive_b_min + ADAPTIVE_B_STEP
+                {
+                    current_adaptive_b -= ADAPTIVE_B_STEP;
+                    adaptive_b_cycles_since_change = 0;
+                    adaptive_b_changes += 1;
+                }
             }
+            adaptive_b_cycles_since_change += 1;
+            *adaptive_b_histogram.entry(current_adaptive_b).or_insert(0) += 1;
+            Some(current_adaptive_b)
         } else {
             None
         };
@@ -1137,6 +1222,23 @@ fn main() {
         "histogram: {:?}",
         stats.acceptance_hist.iter().enumerate().collect::<Vec<_>>()
     );
+    // Adaptive-B usage report — only meaningful when --adaptive-b is on.
+    if adaptive_b && !adaptive_b_histogram.is_empty() {
+        let mut buckets: Vec<(usize, u32)> = adaptive_b_histogram.iter()
+            .map(|(&b, &c)| (b, c)).collect();
+        buckets.sort_by_key(|(b, _)| *b);
+        let total: u32 = buckets.iter().map(|(_, c)| *c).sum();
+        let mean_b: f32 = buckets.iter()
+            .map(|(b, c)| (*b as f32) * (*c as f32))
+            .sum::<f32>() / total.max(1) as f32;
+        let dist: String = buckets.iter()
+            .map(|(b, c)| format!("B={b}:{:.1}%", *c as f32 * 100.0 / total.max(1) as f32))
+            .collect::<Vec<_>>().join(" ");
+        eprintln!(
+            "adaptive-b: range={}..={} mean_B={:.2} changes={} dist=[{}]",
+            adaptive_b_min, adaptive_b_max, mean_b, adaptive_b_changes, dist,
+        );
+    }
     // Task #93 Phase B seed-prediction oracle. Zero cycles = pure-AR or tree
     // paths that didn't invoke spec_step_dflash; skip in that case.
     let s = engine::speculative::read_seed_oracle_stats();
