@@ -3763,24 +3763,27 @@ pub fn spec_step_ddtree_batched(
         )?;
         hidden_rows_written = big_n;
     } else {
-        // Slow path: committed path diverges from linear order. Re-verify
-        // the committed prefix to get a linear-order tape that matches.
+        // Slow path: full re-verify on the committed prefix to get a
+        // linear-order tape AND correctly RoPE'd K written to committed
+        // slots. ~40-50 ms cost on 27B; the only known correct slow path
+        // until Path B (decouple RoPE from KV slot index) lands.
         //
-        // NOTE (2026-04-23): a "gather only" slow-path kill was attempted
-        // (see `GdnTape::gather_accepted` + `DdtreeScratch.kv_gather_*` —
-        // kept as unused infrastructure for when Path B lands). It failed
-        // a prose smoke with τ 4.94 → 3.67. Root cause: tree verify writes
-        // K with RoPE phase keyed off the LINEARIZATION slot (qwen35.rs
-        // :3048-3067 — "flat linear start_pos..start_pos+n"). A byte-wise
-        // gather from `start_pos + 1 + acc[j-1]` into the committed slot
-        // `start_pos + j` moves the K bytes but leaves the baked RoPE
-        // phase stale — next cycle's FA attention computes Q·K with wrong
-        // relative position and τ drops. A correct kill needs Path B:
-        // decouple `rope_phase` from `kv_slot_index` in the FA kernel so
-        // the tree verify can store K at a unique slot with RoPE phase
-        // pre-computed for the EVENTUAL committed slot (unknown a priori
-        // though, so in practice: store pre-RoPE K + apply RoPE per-slot
-        // at commit time). ~500 LOC kernel + dispatch work, separate task.
+        // Path A (gather-only kill) was attempted under env gate
+        // HIPFIRE_DDTREE_PATH_A and CORRECTNESS-CONFIRMED BROKEN by an
+        // eyeball test on 27B asym3 code (HE/0): output collapsed to
+        // "numbers(numbers(numbers(..." forever. The 5-run mean stats
+        // (tok/s +120%, τ +79%, sd 0.15) were a degenerate loop — same
+        // token predicted every step → 100% draft acceptance → metric
+        // wins despite garbage output. Cause: tree verify bakes RoPE
+        // phase per linearization slot; gather moves K bytes but stale
+        // phase pollutes next-cycle attention enough to lock the model
+        // into a token attractor. Removed the env gate. The
+        // GdnTape::gather_accepted + DdtreeScratch.kv_gather_*
+        // infrastructure stays — Path B reuses it verbatim with a per-
+        // commit RoPE rotation kernel.
+        // Default slow path: re-verify the committed prefix to get a
+        // linear-order tape AND correctly RoPE'd K written to committed
+        // slots. ~40-50 ms cost on 27B; opt out via HIPFIRE_DDTREE_PATH_A=1.
         let tape_block: Vec<u32> = committed[..accept_len + 1].to_vec();
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         let _tape_verify = verify_dflash_block(
@@ -3799,9 +3802,24 @@ pub fn spec_step_ddtree_batched(
     }
 
     // ── 11. Append (1 + accept_len) hidden rows to target_hidden_host ────
+    // Default slow path's 2nd verify wrote accept_len+1 rows in committed
+    // order → first N rows are correct. Fast path: rank-0 chain == linear
+    // prefix → first N rows still correct. Path A slow path keeps tree-
+    // verify's big_n rows in linearization order → CPU-gather committed
+    // rows out of the block.
     let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
-    let rows_to_keep = accept_len + 1;
-    target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
+    let row_stride = ne * h;
+    if hidden_rows_written == big_n && !fast_tape_ok {
+        target_hidden_host.extend_from_slice(&hidden_block[0..row_stride]);
+        for i in 0..accept_len {
+            let src_row = accepted_node_indices[i] + 1;
+            let src_start = src_row * row_stride;
+            target_hidden_host.extend_from_slice(&hidden_block[src_start..src_start + row_stride]);
+        }
+    } else {
+        let rows_to_keep = accept_len + 1;
+        target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * row_stride]);
+    }
 
     if debug_tm {
         let total = t_all.elapsed();
