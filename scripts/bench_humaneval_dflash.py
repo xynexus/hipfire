@@ -25,6 +25,11 @@ def main():
     ap.add_argument("--max", type=int, default=128, help="max tokens per prompt")
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--n", type=int, default=33, help="sample size (0..164)")
+    ap.add_argument("--kv-mode", default="q8", help="q8 | asym3 | asym4 | asym2")
+    ap.add_argument("--ddtree-batched", action="store_true", help="enable --ddtree-batched")
+    ap.add_argument("--ddtree-budget", type=int, default=None)
+    ap.add_argument("--ddtree-topk", type=int, default=None)
+    ap.add_argument("--label", default="", help="label printed in the summary (e.g. 'linear-asym3')")
     args = ap.parse_args()
 
     with open(args.jsonl) as f:
@@ -37,7 +42,16 @@ def main():
     print(f"# sampling {len(sampled)} of {len(tasks)} HumanEval prompts (stride={stride})")
     print(f"# target: {args.target}")
     print(f"# draft:  {args.draft}")
-    print(f"# max={args.max} ctx={args.ctx} --no-chatml")
+    extra_args = ["--kv-mode", args.kv_mode]
+    if args.ddtree_batched:
+        extra_args.append("--ddtree-batched")
+    if args.ddtree_budget is not None:
+        extra_args += ["--ddtree-budget", str(args.ddtree_budget)]
+    if args.ddtree_topk is not None:
+        extra_args += ["--ddtree-topk", str(args.ddtree_topk)]
+    label = args.label or ("ddtree" if args.ddtree_batched else "linear")
+    print(f"# label={label}  max={args.max} ctx={args.ctx} --no-chatml kv={args.kv_mode}  "
+          f"extra={' '.join(extra_args)}")
     print()
     print(f"{'task_id':<16} {'tok/s':>8} {'tau':>7} {'emitted':>8} {'cyc':>5} {'acc':>5} {'run_s':>6}")
     print("-" * 64)
@@ -51,8 +65,8 @@ def main():
             proc = subprocess.run(
                 [args.demo, "--target", args.target, "--draft", args.draft,
                  "--prompt", prompt, "--max", str(args.max), "--ctx", str(args.ctx),
-                 "--no-chatml"],
-                capture_output=True, text=True, timeout=180)
+                 "--no-chatml", *extra_args],
+                capture_output=True, text=True, timeout=240)
             out = proc.stdout + proc.stderr
         except subprocess.TimeoutExpired:
             print(f"{tid:<16} TIMEOUT")
