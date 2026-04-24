@@ -66,7 +66,69 @@ through the FA dispatch.
 
 ## Two implementation variants
 
-### B1 — Pre-RoPE K storage + post-commit RoPE pass (CHOSEN)
+## ⚠️ STRUCTURAL DEAD-END FOUND (2026-04-23, commit f9c920a) ⚠️
+
+Phase 1 + Phase 2 implemented. Phase 2 produces the same `numbers(
+numbers(numbers(...)` token attractor as Path A on code, caught
+correctly by the dflash coherence battery (commit 9883e98).
+
+**Root cause** (only obvious in hindsight, validated by composing
+two memories — `project_k_kernel_head256_fix.md` and
+`feedback_attention_precision.md`):
+
+Tree-mode FA attention uses **linearization slot deltas** for
+relative position phase (RoPE):
+  - Tree node at linear slot i, attending to linear slot j ⇒
+    Q · K depends on `(i - j)` via RoPE.
+  - For accepted nodes [0, 1, 4, 5] this gives deltas [1, 3, 1].
+
+A linear forward on the same accepted tokens would use
+**committed slot deltas**:
+  - Accepted i, committed at slot i, attending to committed slot
+    i-1 ⇒ delta = 1 every step.
+  - For [0, 1, 4, 5] committed at [0, 1, 2, 3] this gives [1, 1, 1].
+
+These are **different relative position phases** → different attention
+scores → different FA output → different wqkv input → different K
+post-projection. The pre-RoPE K we capture in tree mode is ALREADY
+poisoned by the upstream FA's use of wrong relative phases.
+
+Per `feedback_attention_precision.md`: **5% attention error is fatal
+under greedy decode** — cascades into a token-attractor loop within
+~10 tokens. Our K isn't off by 5% per se, but the per-position phase
+delta error compounds across layers and cycles.
+
+**No per-commit RoPE rotation on the gathered K can fix this** — the
+problem is that tree-mode FA's *upstream* attention computation used
+the wrong phase deltas, poisoning everything downstream of that FA
+layer. Path B Variant B1 was designed assuming K is the only thing
+that needs phase correction. It isn't.
+
+### Updated viable paths
+
+1. **FA-only re-verify** (likely best). Skip FFN + LM head + tape
+   replay. Run a real linear forward through every FA layer on the
+   committed chain, which gives K at correct phases. ~50% savings vs
+   full re-verify. Doesn't need decoupled RoPE/KV-slot at all.
+2. **Pipeline the slow path with the next draft cycle** (Task #93 —
+   inter-cycle pipelining). Slow path's wall cost stays the same but
+   gets hidden behind the next draft.
+3. **Run tree FA with committed-equivalent positions a priori** —
+   impossible without knowing the accept chain ahead of time.
+4. **Switch tree attention to depth-based phases** (paper scheme) —
+   restores per-position-phase consistency with committed slots BUT
+   re-introduces sibling KV-write race (which the linearization
+   scheme was solving).
+
+Path B1 is closed. Phase 1 + 2 code stays in-tree env-gated as
+the historical record / instructive failure. The pre_rope_k
+infrastructure could be reused IF we ever pursue option 1 (FA-only
+re-verify can use the captured pre-RoPE K to skip wqkv too — saving
+~5-10% more on top of the FA-skip).
+
+---
+
+### B1 — Pre-RoPE K storage + post-commit RoPE pass (CHOSEN — but FAILED, see above)
 
 - Tree verify dispatches FA with `rope_phase = position + linear_idx` (current)
   AND stores **pre-RoPE K (F32)** in a per-tree-verify scratch buffer
