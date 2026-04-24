@@ -1895,13 +1895,34 @@ fn verify_dflash_block_inner(
     // verify kernels into one graph replay and saving ~1.3 ms of per-cycle
     // launch overhead). Opt out with HIPFIRE_VERIFY_GRAPH=0.
     // Tree-verify was historically excluded (tree_verify.is_none()) because
-    // the tree-attention mask varies per cycle. But mask + parent_indices
-    // already live in fixed `ddtree_scratch` buffers populated BEFORE the
-    // forward (same pattern as pbs.tokens / positions), so capture sees a
-    // read-from-fixed-buffer which replays correctly as long as callers
-    // upload fresh mask contents pre-launch. Opt-in via
-    // HIPFIRE_VERIFY_GRAPH_TREE=1 until gate-verified.
+    // the tree-attention mask varies per cycle. In theory mask +
+    // parent_indices live in fixed `ddtree_scratch` buffers that the caller
+    // repopulates via uncaptured memcpy_htod before each graph replay, so
+    // the graph's kernels would read fresh data every cycle.
+    //
+    // DIAGNOSTIC ONLY — known broken 2026-04-24 (commit 480e51e +
+    // A/B bench ee0bedf-followup). 3-run median on 27B MQ4 asym3 b12-k2:
+    //   code     τ 7.08 → 4.51 (-36 %)   tok/s 110 → 80.1 (-27 %)
+    //   prose    τ 2.50 → 3.58 (+43 %)   tok/s 45.8 → 60.2 (+31 %, noisy)
+    //   instr    τ 2.19 → 1.77 (-19 %)   tok/s 47.6 → 35.6 (-25 %)
+    // Coherence-gate-dflash passes (no attractors), so it's a τ bug, not a
+    // correctness bug. Suspect: a scalar kernarg or intra-forward memcpy
+    // inside captured region bakes in first-cycle state; when tree shape
+    // varies, acceptance collapses on code (high-variance trees) but
+    // coincidentally holds on prose (more uniform trees). Needs root-cause
+    // dive: most likely candidates are GDN tape-offset scalar kernargs or
+    // the parent_indices-driven conv1d path. DO NOT ENABLE in production.
+    //
+    // Gate kept live so the next session can bisect without re-plumbing.
     let tree_graph_enabled = std::env::var("HIPFIRE_VERIFY_GRAPH_TREE").ok().as_deref() == Some("1");
+    if tree_graph_enabled && tree_verify.is_some() {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[verify-graph-tree] WARN: HIPFIRE_VERIFY_GRAPH_TREE=1 is DIAGNOSTIC ONLY — known τ regression on code/instruct. Do not use for production benchmarks."
+            );
+        }
+    }
     let tree_ok_for_graph = tree_verify.is_none() || tree_graph_enabled;
     let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
         && tree_ok_for_graph
