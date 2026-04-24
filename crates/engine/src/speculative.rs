@@ -3851,14 +3851,20 @@ pub fn spec_step_ddtree_batched(
         gpu.hip.memcpy_htod(&scratch.attn_bias.buf, mask_bytes)?;
     }
 
-    // ── 5b. Upload parent_indices for tree-aware LA kernels (opt-in) ─────
+    // ── 5b. Upload parent_indices for tree-aware LA kernels ──────────────
     //
-    // Gated on HIPFIRE_DDTREE_TREE_LA=1 during correctness bring-up. When
-    // off, linear LA kernels run (existing behavior) and the slow-path 2nd
-    // verify handles sibling pollution. When on, tree-aware LA kernels
-    // read parent_indices from scratch and fast-tape should always match
-    // since topology is correct per-token.
-    let use_tree_la = std::env::var("HIPFIRE_DDTREE_TREE_LA").ok().as_deref() == Some("1");
+    // ON BY DEFAULT as of 2026-04-24 — Task #101 Phase 3d validation bench
+    // (3-run medians on 27B MQ4 asym3 b12-k2, commit 4a3f2b3):
+    //   code:     110.0 → 119.1 tok/s (+8.3 %)   τ 6.80 → 7.30 (+7 %)
+    //   prose:     52.3 →  57.8 tok/s (+10.5 %)  τ 3.00 → 3.52 (+17 %)
+    //   instruct:  42.1 →  47.4 tok/s (+12.6 %)  τ 2.02 → 2.47 (+22 %)
+    // Coherence-gate-dflash passes on all 4 tests. Mechanism: tree-aware
+    // LA kernels read parent_indices to walk ancestor chains correctly at
+    // topk>1, so the fast-tape path fires on 90 %+ of cycles instead of
+    // the slow-path re-verify that used to trigger on sibling pollution.
+    //
+    // Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected.
+    let use_tree_la = std::env::var("HIPFIRE_DDTREE_TREE_LA").ok().as_deref() != Some("0");
     if use_tree_la {
         let parent_bytes = unsafe {
             std::slice::from_raw_parts(parent_host.as_ptr() as *const u8, parent_host.len() * 4)
