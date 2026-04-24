@@ -137,6 +137,14 @@ pub struct Gpu {
     pool: crate::pool::GpuPool,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// Task #93 Phase A (2026-04-24): optional secondary streams for
+    /// inter-cycle pipelining. `draft_stream` is where a speculatively-
+    /// launched draft N+1 runs concurrently with verify N on
+    /// `verify_stream`. Left as None until a pipeline-aware caller opts
+    /// in via `init_pipeline_streams()`. Currently unused by any caller
+    /// — Phase A is a non-behavioral scaffold.
+    pub draft_stream: Option<hip_bridge::Stream>,
+    pub verify_stream: Option<hip_bridge::Stream>,
     /// MagnumQuant FWHT signs (256 floats each) + rotation scratch buffer.
     pub mq_signs1: Option<GpuTensor>,
     pub mq_signs2: Option<GpuTensor>,
@@ -311,6 +319,8 @@ impl Gpu {
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
             active_stream: None,
+            draft_stream: None,
+            verify_stream: None,
             mq_signs1: None,
             mq_signs2: None,
             mq_x_rot: None,
