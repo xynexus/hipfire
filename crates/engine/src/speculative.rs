@@ -20,6 +20,65 @@ use crate::tokenizer::Tokenizer;
 use hip_bridge::{DeviceBuffer, HipResult};
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Task #93 Phase B seed-prediction oracle counters.
+///
+/// Three proxies, all derived from data the draft already computes (zero
+/// extra device work). For each cycle:
+///   - REJ_BOUNDARY: `drafted[accept_len + 1] == bonus_token` (PRD's "naive"
+///     proxy — argmax at rejection position). Zero-by-construction when
+///     `accept_len < b - 1` because the accept loop broke precisely because
+///     those didn't match. Reported anyway to document the dead-end.
+///   - TAIL: `drafted[b - 1] == bonus_token`. Draft's final-position argmax.
+///     Gives a non-zero signal. If the usual case is "target's bonus happens
+///     at position b-1 because accept_len = b-2", this proxy catches those.
+///   - ANYPOS: `bonus_token ∈ drafted[1..b]`. Upper bound of any position-
+///     based single-guess proxy. Useful as a ceiling.
+///
+/// FULLACCEPT counts cycles where `accept_len == b - 1` (full acceptance —
+/// draft has no native prediction at position `b`, so REJ_BOUNDARY is
+/// undefined and TAIL/ANYPOS are the only candidates there).
+///
+/// See docs/plans/task-93-inter-cycle-pipelining.prd Phase B.
+static SEED_ORACLE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SEED_ORACLE_REJ_MATCH: AtomicU64 = AtomicU64::new(0);
+static SEED_ORACLE_TAIL_MATCH: AtomicU64 = AtomicU64::new(0);
+static SEED_ORACLE_ANYPOS_MATCH: AtomicU64 = AtomicU64::new(0);
+static SEED_ORACLE_FULLACCEPT: AtomicU64 = AtomicU64::new(0);
+static SEED_ORACLE_ACCEPT_LEN_SUM: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SeedOracleStats {
+    pub total: u64,
+    pub rej_match: u64,
+    pub tail_match: u64,
+    pub anypos_match: u64,
+    pub full_accept: u64,
+    pub accept_len_sum: u64,
+}
+
+/// Snapshot the process-global seed-oracle counters.
+pub fn read_seed_oracle_stats() -> SeedOracleStats {
+    SeedOracleStats {
+        total: SEED_ORACLE_TOTAL.load(Ordering::Relaxed),
+        rej_match: SEED_ORACLE_REJ_MATCH.load(Ordering::Relaxed),
+        tail_match: SEED_ORACLE_TAIL_MATCH.load(Ordering::Relaxed),
+        anypos_match: SEED_ORACLE_ANYPOS_MATCH.load(Ordering::Relaxed),
+        full_accept: SEED_ORACLE_FULLACCEPT.load(Ordering::Relaxed),
+        accept_len_sum: SEED_ORACLE_ACCEPT_LEN_SUM.load(Ordering::Relaxed),
+    }
+}
+
+/// Zero all seed-oracle counters. Call before a fresh generation run.
+pub fn reset_seed_oracle_stats() {
+    SEED_ORACLE_TOTAL.store(0, Ordering::Relaxed);
+    SEED_ORACLE_REJ_MATCH.store(0, Ordering::Relaxed);
+    SEED_ORACLE_TAIL_MATCH.store(0, Ordering::Relaxed);
+    SEED_ORACLE_ANYPOS_MATCH.store(0, Ordering::Relaxed);
+    SEED_ORACLE_FULLACCEPT.store(0, Ordering::Relaxed);
+    SEED_ORACLE_ACCEPT_LEN_SUM.store(0, Ordering::Relaxed);
+}
 
 /// Which KV cache layout to use when allocating a slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2731,6 +2790,50 @@ pub fn spec_step_dflash(
             }
         }
         bonus_token = argmax_per_pos[accept_len];
+    }
+
+    // ── 7b. Seed-prediction oracle (Task #93 Phase B) ───────────────────
+    // Three position-based proxies for the next cycle's `seed_token`
+    // (= this cycle's `bonus_token`). See comment at top of file for the
+    // reasoning — the PRD's "naive argmax at rejection boundary" proxy is
+    // 0 % by construction (the accept loop broke precisely there), which
+    // we measure as REJ_MATCH to document the dead-end. TAIL_MATCH and
+    // ANYPOS_MATCH are the actually-usable ceilings.
+    let rej_proxy: Option<u32> = if accept_len + 1 < b {
+        Some(drafted[accept_len + 1])
+    } else {
+        None
+    };
+    let tail_proxy: u32 = drafted[b - 1];
+    let anypos_hit: bool = drafted[1..b].iter().any(|&t| t == bonus_token);
+    let rej_hit: bool = rej_proxy == Some(bonus_token);
+    let tail_hit: bool = tail_proxy == bonus_token;
+    SEED_ORACLE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    SEED_ORACLE_ACCEPT_LEN_SUM.fetch_add(accept_len as u64, Ordering::Relaxed);
+    if rej_hit {
+        SEED_ORACLE_REJ_MATCH.fetch_add(1, Ordering::Relaxed);
+    }
+    if tail_hit {
+        SEED_ORACLE_TAIL_MATCH.fetch_add(1, Ordering::Relaxed);
+    }
+    if anypos_hit {
+        SEED_ORACLE_ANYPOS_MATCH.fetch_add(1, Ordering::Relaxed);
+    }
+    if rej_proxy.is_none() {
+        SEED_ORACLE_FULLACCEPT.fetch_add(1, Ordering::Relaxed);
+    }
+    if std::env::var("HIPFIRE_DFLASH_SEED_ORACLE").ok().as_deref() == Some("1") {
+        let s = read_seed_oracle_stats();
+        let denom = s.total.max(1) as f32;
+        eprintln!(
+            "[seed-oracle] cycle: accept_len={} b={} bonus={} rej={:?}/{} tail={}/{} anypos={} fullacc={} | cum rej={:.3} tail={:.3} anypos={:.3} mean_accept={:.2}",
+            accept_len, b, bonus_token, rej_proxy, rej_hit,
+            tail_proxy, tail_hit, anypos_hit, rej_proxy.is_none(),
+            s.rej_match as f32 / denom,
+            s.tail_match as f32 / denom,
+            s.anypos_match as f32 / denom,
+            s.accept_len_sum as f32 / denom,
+        );
     }
 
     // ── 8. Committed sequence ───────────────────────────────────────────

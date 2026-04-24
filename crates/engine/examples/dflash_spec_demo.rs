@@ -777,6 +777,10 @@ fn main() {
         }
     }
 
+    // Reset Task #93 Phase B seed-oracle counters so stats reflect this run
+    // only (process-cumulative counters would poison multi-run harnesses).
+    engine::speculative::reset_seed_oracle_stats();
+
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
         if position + draft_cfg.block_size >= ctx_capacity {
@@ -1133,6 +1137,19 @@ fn main() {
         "histogram: {:?}",
         stats.acceptance_hist.iter().enumerate().collect::<Vec<_>>()
     );
+    // Task #93 Phase B seed-prediction oracle. Zero cycles = pure-AR or tree
+    // paths that didn't invoke spec_step_dflash; skip in that case.
+    let s = engine::speculative::read_seed_oracle_stats();
+    if s.total > 0 {
+        let denom = s.total as f32;
+        eprintln!(
+            "seed-oracle: cycles={} full_accept={} mean_accept_len={:.3} | rej_match={:.3} tail_match={:.3} anypos_match={:.3}",
+            s.total, s.full_accept, s.accept_len_sum as f32 / denom,
+            s.rej_match as f32 / denom,
+            s.tail_match as f32 / denom,
+            s.anypos_match as f32 / denom,
+        );
+    }
     if host_timing && !per_cycle_wall_us.is_empty() {
         // Skip first 2 cycles (JIT warm-up), summarize the rest as mean / median.
         let skip = 2.min(per_cycle_wall_us.len().saturating_sub(1));
