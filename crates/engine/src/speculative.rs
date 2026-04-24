@@ -1894,8 +1894,17 @@ fn verify_dflash_block_inner(
     // showed +14 % tok/s 25.6→29.2, wall-per-cycle 89→80 ms via coalescing
     // verify kernels into one graph replay and saving ~1.3 ms of per-cycle
     // launch overhead). Opt out with HIPFIRE_VERIFY_GRAPH=0.
+    // Tree-verify was historically excluded (tree_verify.is_none()) because
+    // the tree-attention mask varies per cycle. But mask + parent_indices
+    // already live in fixed `ddtree_scratch` buffers populated BEFORE the
+    // forward (same pattern as pbs.tokens / positions), so capture sees a
+    // read-from-fixed-buffer which replays correctly as long as callers
+    // upload fresh mask contents pre-launch. Opt-in via
+    // HIPFIRE_VERIFY_GRAPH_TREE=1 until gate-verified.
+    let tree_graph_enabled = std::env::var("HIPFIRE_VERIFY_GRAPH_TREE").ok().as_deref() == Some("1");
+    let tree_ok_for_graph = tree_verify.is_none() || tree_graph_enabled;
     let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
-        && tree_verify.is_none()
+        && tree_ok_for_graph
         && matches!(
             target.weights.embd_format,
             crate::llama::EmbeddingFormat::HFQ4G256 | crate::llama::EmbeddingFormat::Q8_0,
@@ -1936,7 +1945,7 @@ fn verify_dflash_block_inner(
                 Some(hidden_rb),
                 Some(&final_hidden),
                 gdn_tape,
-                None,
+                tree_verify,
             );
             if r.is_ok() {
                 eprintln!("[verify-graph] warmup for B={} complete — capture next cycle at this B", b);
@@ -1958,7 +1967,7 @@ fn verify_dflash_block_inner(
                 Some(hidden_rb),
                 Some(&final_hidden),
                 gdn_tape,
-                None, // tree_verify is already None per eligibility
+                tree_verify,
             );
             if r.is_ok() {
                 let blob_count = gpu.capture_blobs.len();
