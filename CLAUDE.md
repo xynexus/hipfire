@@ -236,6 +236,32 @@ Modes:
 - `./scripts/quality-gate.sh --update-baselines` — regenerate baselines
   (only do this if you verified the new outputs are CORRECT, not just different)
 
+## DFlash Coherence Gate (spec-decode token-attractor guard)
+
+Any DDTree / spec-decode / slow-path-kill change that claims a τ or tok/s
+improvement MUST pass `scripts/coherence-gate-dflash.sh` (shipped 9883e98)
+before commit. Two-tier thresholds, first 128 tokens pre-EOT: hard fail
+if `unique_token_ratio < 0.15` or `max_single_token_frequency > 0.50`.
+
+**Why:** single-token attractor failures pass every statistical gate as
+PARETO WINS. When the target gets trapped predicting one token forever,
+the draft (trivial-token bias) trivially agrees → acceptance → 100% → τ
+explodes with tight stddev. Bit DDTree Path A (fake +79% τ / +120% tok/s
+at 6c84b13) and Path B Variant B1 (f9c920a, 2026-04-23) on identical
+`numbers(numbers(numbers(...` attractor. Root cause was
+linearization-slot RoPE phase delta skew in tree-mode FA — not a
+bug in the optimization, a structural mismatch between tree-mode
+phase deltas and committed-slot phase deltas. Per
+`feedback_attention_precision.md`, 5% attention error cascades into
+attractor within ~10 tokens under greedy decode.
+
+**How to apply:** tight stddev on a spec-decode bench is actively
+SUSPICIOUS, not reassuring. Real acceptance noise is wider. Any new
+spec-decode bench script must include at least one of:
+unique-token-ratio check (< 0.3 fail) on first 256 IDs, max-frequency
+check (> 50% fail) on emitted IDs, or decoded text printed for human
+eyeball.
+
 ## GPU Lock Protocol (Multi-Agent)
 
 When multiple Claude Code agents work in parallel (e.g. via worktrees), they coordinate
