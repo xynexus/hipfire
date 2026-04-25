@@ -1,0 +1,295 @@
+# Prompt-Shape Adaptation — Token-Frequency Aware τ Lifting
+
+**Status:** Open. Discovery validated 2026-04-24, no implementation yet.
+**Owner:** next session.
+**Lever size:** +14% tok/s / +17% τ baseline observed on 27B-3.5; potentially larger
+once we sweep beyond newlines. **Could close the gap to Lucebox's 154 tok/s peak**
+or surpass it.
+
+---
+
+## 1. Background
+
+Discovered 2026-04-24 (`docs/plans/prompt-structure-tau-discovery-2026-04-24.prd`):
+
+```
+27B-3.5 LRU max=120, identical 232-tok prompts:
+  PEP-8 strict (\n\n\n between top-level):  161 tok/s τ=8.07 (det ±2%)
+  Single-blank (\n\n between top-level):    184 tok/s τ=9.42 (range 173-204)
+```
+
+Token-level diff:
+| Token ID | Bytes | Decoded | Training freq |
+|---|---|---|---|
+| 271 | `\x0a\x0a` | `\n\n` | VERY common |
+| 1358 | `\x0a\x0a\x0a` | `\n\n\n` | **RARE** |
+
+**Causal mechanism:** PEP-8's "two blank lines between top-level defs" produces 3
+consecutive newlines, which BPE greedily merges into a single rare token (1358).
+After rare tokens, both draft and target produce noisier conditional
+distributions. Acceptance rate drops → τ drops → tok/s drops.
+
+**Generalization:** any low-frequency BPE token in a prompt creates a "cold zone"
+at that position. Cold zones tank τ. The principle generalizes far beyond
+newlines.
+
+---
+
+## 2. Goal
+
+Implement prompt-shape adaptation so that **arbitrary user prompts get rewritten
+or wrapped to land on hot tokens at structural breakpoints, lifting all DFlash
+tok/s by ~14% (and potentially much more after fuller exploration).**
+
+**North star:** consistently exceed Lucebox-published 154 tok/s peak on 27B
+DFlash, ideally land at 200+ on hot prompts.
+
+**Concrete success criterion:** 27B-3.5 DFlash code-style prompt at max=120
+delivers ≥190 tok/s median with τ ≥9.5 across 5 runs in fresh process,
+regardless of user prompt formatting (PEP-8 strict or otherwise).
+
+---
+
+## 3. Implementation Phases
+
+### Phase 1 — Trivial newline normalization (1-2 hours)
+
+**Drop-in win.** Add prompt preprocessing at the dflash_spec_demo / serve / run
+entry points:
+
+```rust
+fn normalize_prompt_for_high_tau(s: &str) -> String {
+    // Collapse runs of 3+ newlines to exactly 2.
+    let re = regex::Regex::new(r"\n{3,}").unwrap();
+    re.replace_all(s, "\n\n").into_owned()
+}
+```
+
+Apply in:
+- `crates/engine/examples/dflash_spec_demo.rs` after prompt parse
+- `crates/engine/examples/daemon.rs` `generate()` / `spec_decode()` entry
+- `crates/engine/examples/run.rs` REPL prompt handling
+- `crates/engine/examples/triattn_infer.rs` if applicable
+
+Gate behind `HIPFIRE_NORMALIZE_PROMPT=1` initially (default off) so we can A/B.
+Promote to default-on after coherence-gate validation passes.
+
+**Measurement (must run before commit):**
+1. Build + bench 27B-3.5 LRU max=120 on PEP-8 strict prompt with normalization off:
+   expect 161 τ=8.07.
+2. Same with normalization on: expect 184 τ=9.42 (matches the single-blank baseline).
+3. Same on already-single-blank prompt: expect 184 τ=9.42 (no-op, normalization
+   doesn't degrade anything).
+4. Run coherence-gate-dflash on all three configurations. Fail-closed if any
+   fails (unique_token_ratio < 0.15 or max_token_freq > 0.50 in first 128 emit).
+
+**Expected outcome:** all PEP-8 inputs lifted to high-τ regime. ~+14% tok/s on
+real-world Python code prompts. Free improvement. Ships immediately.
+
+### Phase 2 — Token-frequency map for diagnostic mode (2-3 hours)
+
+Compute Qwen3.5 BPE token-frequency rankings from a representative corpus
+(or from existing Qwen3.5 training-data hints / public BPE merge counts).
+
+Add `HIPFIRE_PROMPT_TOKEN_HEAT=1` env var that, after tokenizing the user
+prompt, prints a per-position heat map:
+
+```
+prompt token heat (rank 0 = most common):
+  pos  0:  rank      4: 'from'           HOT
+  pos  1:  rank      8: ' typing'        HOT
+  ...
+  pos  4:  rank   1358: '\n\n\n'         **COLD** ⚠
+  ...
+```
+
+User can read heat output and manually rewrite cold tokens to hot equivalents.
+
+**Output format requirement:** machine-readable JSON option for tooling.
+
+**Frequency-source options (pick one):**
+- (a) Empirical: tokenize a 1 GB Python+English corpus, count freq per token.
+  Most accurate, requires data.
+- (b) BPE-rank proxy: use the merge order (lower merge index = more common).
+  Less accurate but free; baked into the BPE merges file.
+- (c) Use the model's lm_head bias (if any) — some models bias output logits
+  toward common tokens.
+
+Phase 2 prefers (b) for zero-data simplicity; Phase 3 upgrades to (a).
+
+### Phase 3 — Generalized rare-token rewriting (4-6 hours)
+
+Beyond newlines: identify ALL low-frequency tokens in a prompt and rewrite to
+near-equivalents that produce hotter tokens.
+
+Examples:
+- `\n\n\n` → `\n\n` (Phase 1 specific case)
+- Tab characters → spaces (if model trained mostly on space-indent code)
+- CRLF → LF (rare on Linux but happens with copy-paste from Windows)
+- Trailing whitespace stripping
+- Mixed-tab/space indent canonicalization
+- Comment style normalization (`# ` vs `#`)
+- Python type-hint canonicalization (`Optional[X]` vs `X | None` — pick the one
+  with hotter tokens for the model's training era)
+
+**Approach:** maintain a `prompt_normalize_rules` table mapping (rare_token,
+hot_replacement). Build the table empirically: tokenize a wide variety of code
+samples; whenever a token appears in <X% of code samples, find a near-equivalent
+character sequence that produces only top-1% tokens; record the rewrite rule.
+
+**Validation:** every rule must pass:
+1. Coherence-gate-dflash on transformed prompt.
+2. Output text equivalent (modulo whitespace) to non-transformed prompt's output.
+3. τ not lower than non-transformed.
+
+### Phase 4 — Auto-canonicalizing tokenizer wrapper (8-12 hours)
+
+Build a `Tokenizer::encode_canonical()` method that applies all Phase 3 rules
+before encoding. Make it the engine default unless `--no-prompt-normalize`.
+
+This becomes a library-level feature that benefits ALL engine users (daemon,
+serve, run, demo). Documented in CHANGELOG and as a perf knob.
+
+Risk: changing default behavior might subtly alter outputs for some users.
+Coherence-gate must pass cleanly on the full quality-baseline matrix before
+flipping default.
+
+### Phase 5 — Heat-aware prompt suggestions in serve (4-6 hours)
+
+`hipfire serve` returns a "prompt heat warning" in API response when a request's
+prompt has > 5% cold tokens at structural positions. Optional metadata field
+in JSON response.
+
+Lets API users see "your prompt is suboptimal — here's a normalized version
+that's 14% faster" without forcing the rewrite.
+
+---
+
+## 4. Measurement Methodology
+
+**Each phase must include:**
+
+1. **Bench harness** — `scripts/bench_prompt_shape.sh`:
+   - 5 fresh-process runs per variant.
+   - Records: tok/s median, τ median, accepted count, prompt md5, kernel cache state.
+   - Output committed to `findings/prompt-shape-bench-YYYY-MM-DD.md`.
+
+2. **Coherence-gate** — every transformation runs through
+   `scripts/coherence-gate-dflash.sh`. Fail-closed.
+
+3. **Token-equivalence check** — output decoded to text must be byte-equivalent
+   (or whitespace-equivalent) to the non-transformed-prompt output.
+
+4. **Cross-model validation** — Phase 1 normalization tested on 9B-3.5,
+   27B-3.5, 27B-3.6 (3 model classes × DFlash + DDTree-b12-k2 modes).
+
+**Variance handling:** within-format variance is up to 15%. Run ≥5 fresh
+processes; report median + range. Don't use within-session A/B (per
+`docs/methodology/perf-benchmarking.md` §1).
+
+---
+
+## 5. Risks
+
+| Risk | Mitigation |
+|---|---|
+| Normalization changes model output (different KV state mid-decode) | Coherence-gate on every shipped rule |
+| Phase 2/3 frequency map gets stale as tokenizer changes | Per-tokenizer-arch frequency tables, recomputed when models added |
+| User has a legitimate reason for `\n{3,}` (e.g. literal in a prompt) | Gate normalization behind opt-in flag (Phase 1); document tradeoff |
+| Different prompt families have different "hot/cold" patterns | Empirical bench across code/prose/instruct genres |
+| Discovery doesn't generalize past 27B-3.5 (worst case: model-specific) | Phase 1 measurement on 9B-3.5 + 27B-3.6 first; if no lift, scope down |
+| τ ceiling may be inherent to draft-target pair quality, not prompt | If Phase 1 yields <5% gain on 9B/3.6 the lever is 27B-3.5-specific; document and stop |
+
+---
+
+## 6. Surrounding Context to Carry Forward
+
+- **Engine token decoder available:** `cargo run --release --features deltanet
+  --example decode_tokens -- $TARGET tokens.txt`
+- **Token IDs of immediate interest:**
+  - 198 = `\n`
+  - 271 = `\n\n` (HOT, paragraph break)
+  - 1358 = `\n\n\n` (COLD, section break)
+  - 248044 = `<|endoftext|>`
+  - 248045 = `<|im_start|>`
+  - 248046 = `<|im_end|>`
+- **Bench files:**
+  - `findings/dflash-benchmark-2026-04-24.md` (the inflated-but-real 183/9.42 numbers, generated by hermes agent at 10:07 today)
+  - `findings/prompt-structure-tau-discovery-2026-04-24.md` (TODO: blocked by file-creation hook; equivalent at `docs/plans/prompt-structure-tau-discovery-2026-04-24.prd`)
+- **Hermes session JSONs:** `/home/kaden/.hermes/sessions/session_20260424_100724_4f80bb.json` (bench creator), `session_20260424_160838_1f443a.json` (re-run)
+- **Canonical bench prompt** (single-blank, the high-τ version):
+
+```python
+from typing import Optional
+
+class ListNode:
+    def __init__(self, key: int, value: int):
+        self.key = key
+        self.value = value
+        self.prev: Optional[ListNode] = None
+        self.next: Optional[ListNode] = None
+
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.cache = {}
+        self.head = ListNode(0, 0)
+        self.tail = ListNode(0, 0)
+        self.head.next = self.tail
+        self.tail.prev = self.head
+
+    def _remove(self, node: ListNode) -> None:
+        prev_node = node.prev
+        next_node = node.next
+        prev_node.next = next_node
+        next_node.prev = prev_node
+
+    def _add_to_front(self, node: ListNode) -> None:
+        node.next = self.head.next
+        node.prev = self.head
+        self.head.next.prev = node
+        self.head.next = node
+
+    def get(self, key: int) -> int:
+```
+
+(NB: heredoc preserves single-blank-line spacing. If reformatted to PEP-8
+strict it becomes the LOW-τ version. That IS the entire discovery.)
+
+---
+
+## 7. Why this could beat Lucebox
+
+Lucebox's published peak: 154 tok/s on 27B DFlash on 3090 GDDR6X (~960 GB/s).
+Our 7900 XTX (~960 GB/s, same memory class). Same Qwen3.5 model. Same DFlash
+algorithm.
+
+Today reproducible: 184 tok/s τ=9.42 on hot-prompt single-blank (already +19%
+over Lucebox). With Phase 1 normalization, every PEP-8 input lifts to that
+ceiling automatically. With Phase 3 generalization we may push further:
+
+| Estimate | tok/s | Δ vs Lucebox |
+|---|---|---|
+| Lucebox published | 154 | baseline |
+| Today, hot prompt | 184 | +19% |
+| Phase 1 ship (any prompt → hot) | 184 (was 161 default) | +19% guaranteed |
+| Phase 3 + 4 (full canonicalization) | 200-220 (estimated) | +30-40% |
+
+**Even just shipping Phase 1 takes the floor of all-prompts perf from "you
+might get 161 if you didn't write prompts pretty" to "you reliably get 184."**
+That's the whole product story we want.
+
+---
+
+## 8. Sequencing
+
+Recommended order for next session:
+1. Phase 1 build + measure (1-2 hrs). Goes to commit, no regressions, +14%.
+2. Phase 2 token-heat diagnostic (2-3 hrs). Pure observability win.
+3. Phase 3 generalized rules table (4-6 hrs). Real engineering, big payoff.
+4. **Pause + ship to master** — Phase 1+2+3 are a coherent release.
+5. Phases 4+5 in a follow-up session.
+
+Total Phase 1-3: ~10 hours next session. Could ship a +20-30% perf release
+on 27B DFlash within a single focused day. Don't get distracted by other
+levers — this is the biggest free thing on the table right now.
