@@ -8,7 +8,7 @@ hipfire run  qwen3.5:9b "What is the capital of France?"
 hipfire serve -d       # background daemon on port 11435 (OpenAI API compatible)
 ```
 
-Current release: **v0.1.7-alpha.2** — hotfix for `hipfire config` TUI crash + A3B DFlash default-off. FlashTriAttn long-ctx speculative decoding (+42% tok/s on 9B), CASK m-folding KV eviction, Qwen3.6-35B-A3B MoE support, MI300X wave64 port. See [CHANGELOG.md](CHANGELOG.md). Previous: **v0.1.6 "deltacut"**.
+Current release: **v0.1.8-alpha** — Phase 1 prompt-shape adaptation lifts 27B-3.5 DFlash by **+26.7%** on PEP-8-style code prompts (8a4a211). Plain DFlash mean **+8.2%** over Lucebox's published RTX 3090 DDTree b22 f16 mean on 10-prompt HumanEval at n_gen=256. EOT-stop fix kills the Fibonacci attractor loop. Token heat diagnostic. New `prompt_normalize` CLI toggle (opt-in until broader validation). See [CHANGELOG.md](CHANGELOG.md). Previous: **v0.1.7-alpha** (FlashTriAttn, CASK m-folding, Qwen 3.6-A3B, MI300X wave64).
 
 ## Why
 
@@ -19,7 +19,9 @@ consumer + pro + APU) with a single Rust binary that ships pre-compiled kernel
 blobs when possible and JIT-compiles the rest through HIP. No Python, no PyTorch,
 no ROCm userspace stack at runtime.
 
-**RDNA3 — RX 7900 XTX** (gfx1100, 24 GB) — primary target. WMMA prefill + hipGraph decode + Q8 KV:
+**RDNA3 — RX 7900 XTX** (gfx1100, 24 GB) — primary target.
+
+### Autoregressive decode (no spec)
 
 | Model | decode | prefill (peak) | effective BW |
 |---|---:|---:|---:|
@@ -28,9 +30,58 @@ no ROCm userspace stack at runtime.
 | Qwen 3.5 9B MQ4   | **132 tok/s** | **1663 tok/s** | **654 GiB/s** |
 | Qwen 3.5 27B MQ4  | **47 tok/s**  | **478 tok/s**  | **651 GiB/s** |
 
-9B and 27B decode saturate ~650 GiB/s of the 7900 XTX's 960 GB/s peak — 68%
-BW efficiency end-to-end (weights + KV + activations). Prefill is WMMA-bound
-on the MQ4 fused projections.
+9B and 27B decode saturate ~650 GiB/s of the 7900 XTX's 960 GB/s peak —
+68% BW efficiency end-to-end (weights + KV + activations). Prefill is
+WMMA-bound on the MQ4 fused projections.
+
+### DFlash speculative decode (v0.1.8) — by genre
+
+DFlash speedup is **genre-conditional**: huge on code (target distribution
+matches the draft's training), modest-to-tie on instruct, can be a net
+loss on long-form prose where the draft can't keep up with target's
+high-entropy continuations. With Phase 1 prompt-shape normalization
+(`HIPFIRE_NORMALIZE_PROMPT=1`, opt-in), the code-genre lift on PEP-8
+inputs is **+26.7%** over un-normalized DFlash.
+
+5-run medians, asym3 KV, `--no-chatml`, max=120, Phase 1 normalize on:
+
+| Model | genre | AR tok/s | DFlash tok/s | speedup | τ |
+|---|---|---:|---:|---:|---:|
+| Qwen 3.5 27B | code (HE/53) | 44.1 | **196.0** (peak 218.6) | **4.45×** | 9.82 |
+| Qwen 3.5 27B | prose (Rome essay) | 44.0 | 49.6 | 1.13× | 1.67 |
+| Qwen 3.5 27B | instruct (sky-color) | 44.6 | 44.7 | 1.00× | 1.39 |
+| Qwen 3.5 9B  | code (HE/53) | 124.0 | **329.1** (peak 346.7) | **2.65×** | 6.76 |
+| Qwen 3.5 9B  | code (HE/0) | 121.9 | **372.9** (peak 373.7) | **3.06×** | 8.23 |
+| Qwen 3.5 9B  | instruct (sky-color) | 124.4 | **246.9** | **1.99×** | 4.76 |
+| Qwen 3.5 9B  | prose (federalist) | **125.3** | 99.4 | 0.79× ✗ | 1.20 |
+| Qwen 3.5 9B  | prose (Rome) | **122.7** | 98.3 | 0.80× ✗ | 1.20 |
+| Qwen 3.6 27B | code (HE/53) | 44.2 | **185.5** | **4.19×** | 9.25 |
+
+**Use `dflash_mode=auto`** (default) — the engine enables DFlash for dense
+Qwen3.5 targets and skips it on configs that historically lose. Override
+per-model: `hipfire config qwen3.5:9b set dflash_mode off` if your
+workload is mostly prose.
+
+### Lucebox parity bench (RTX 3090 vs 7900 XTX, plain DFlash, n_gen=256)
+
+Same Qwen3.5-27B DFlash algorithm, comparable ~960 GB/s memory class.
+Lucebox publishes 10-prompt HumanEval at n_gen=256 in their
+[blog](https://www.lucebox.com/blog/dflash27b):
+
+| | RTX 3090 (Lucebox) | 7900 XTX (hipfire) | delta |
+|---|---:|---:|---:|
+| Plain DFlash mean (10-prompt HE @ n_gen=256) | 112.82 | **146.9** | **+30.2%** |
+| Best DDTree mean (b22 f16) | **135.80** | n/a (DDTree on RDNA3 has structural issue, see below) | — |
+| Plain DFlash beats Lucebox's BEST DDTree mean | by **+8.2%** | | |
+| HumanEval/53 single-run peak (max=120) | n/a | **214.3** | beats demo 207.6 |
+
+**Caveat**: DDTree on gfx1100 currently underperforms our linear DFlash
+(structural RoPE phase-delta-skew bug at FA layers,
+[39aa358](https://github.com/Kaden-Schutt/hipfire/commit/39aa358)). Their
+DDTree works; ours doesn't. We win on the LINEAR path; they win on the
+TREE path. Path C (trained custom draft, MI300X compute) and Path D
+(stale-context overlap) are roadmap items that compound on the +8.2%
+linear lead.
 
 ### vs ollama (Q4_K_M GGUF via llama.cpp/ROCm) — 7900 XTX
 
@@ -183,6 +234,10 @@ driven; values persist in `~/.hipfire/config.json`.
   port             11435          (default)  1–65535
   idle_timeout     300            (default)  0–86400
 
+  dflash_mode      auto           (default)  auto on off
+  dflash_adaptive_b true          (default)  true false
+  prompt_normalize false          (default)  true false  ← v0.1.8: collapse \n{3,} → \n\n for +26.7% on PEP-8 code prompts
+  cask_sidecar     ""             (default)  path or empty
   per-model configs  no overrides   → enter to open model picker
 ```
 
@@ -195,6 +250,9 @@ Environment variables (override config for one invocation):
 ```
 HIPFIRE_KV_MODE=asym3|q8|asym4|asym2
 HIPFIRE_ATTN_FLASH=auto|always|never
+HIPFIRE_NORMALIZE_PROMPT=1          # v0.1.8: collapse \n{3,} → \n\n at engine entry
+HIPFIRE_PROMPT_TOKEN_HEAT=1         # v0.1.8: dump per-position BPE merge-rank heat map
+HIPFIRE_PROMPT_HEAT_JSON=1          #   (machine-readable JSON to stdout)
 HIPFIRE_LOCAL=1                     # force run to spawn its own daemon (skip serve HTTP)
 HIPFIRE_HIPCC_EXTRA_FLAGS=...       # one-off JIT flags (e.g. -mcumode)
 ```
@@ -277,6 +335,10 @@ MIT. See [LICENSE](LICENSE).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The quality gate (`./scripts/quality-gate.sh --fast`)
-enforces byte-exact greedy output — any change to kernels, quant formats, dispatch,
-fusion, rotation, rmsnorm, or the forward pass must pass before committing.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The canonical correctness gate is
+`./scripts/coherence-gate-dflash.sh` — token-attractor detection
+(unique-token-ratio, max-token-frequency) on a fixed matrix of (model ×
+prompt × spec-decode mode). Any change to kernels, quant formats,
+dispatch, fusion, rotation, rmsnorm, or the spec-decode path must pass
+the coherence gate before commit. The byte-exact `quality-gate.sh` is
+deprecated — its baselines drift faster than the engine evolves.
