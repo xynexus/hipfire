@@ -340,6 +340,7 @@ fn main() {
     let target_path = target_path.expect("--target required");
     let draft_path = draft_path.expect("--draft required");
     let prompt = prompt.expect("--prompt required");
+    let prompt = engine::tokenizer::maybe_normalize_prompt(&prompt).into_owned();
 
     eprintln!("=== dflash_spec_demo ===");
     eprintln!("target: {target_path}");

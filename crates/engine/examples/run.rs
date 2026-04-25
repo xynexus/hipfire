@@ -169,6 +169,8 @@ fn main() {
         if stdin.read_line(&mut input).unwrap() == 0 { break; } // EOF
         let input = input.trim();
         if input.is_empty() { continue; }
+        let input_norm = engine::tokenizer::maybe_normalize_prompt(input);
+        let input: &str = &input_norm;
 
         // Commands
         match input {

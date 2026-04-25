@@ -405,6 +405,8 @@ fn main() {
 
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
                 let prompt = msg.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello");
+                let prompt_norm = engine::tokenizer::maybe_normalize_prompt(prompt);
+                let prompt: &str = &prompt_norm;
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;

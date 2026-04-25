@@ -533,3 +533,125 @@ fn decode_hex_escapes(s: &str) -> String {
     }
     result
 }
+
+/// Collapse runs of 3+ '\n' chars to exactly two.
+///
+/// Cold zone in BPE merges: `\n\n\n` → token 1358 (RARE) on Qwen3.5/3.6 vocab,
+/// while `\n\n` → token 271 (HOT). Rare tokens drop draft/target acceptance
+/// (DFlash τ) by ~17% in the worst case observed (PEP-8 PEP-8 strict on 27B-3.5
+/// LRU max=120: 161 tok/s τ=8.07 vs single-blank 184 tok/s τ=9.42).
+///
+/// Single newlines and double newlines pass through unchanged.
+pub fn collapse_newline_runs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut nl_run: usize = 0;
+    for ch in s.chars() {
+        if ch == '\n' {
+            nl_run += 1;
+            if nl_run <= 2 {
+                out.push('\n');
+            }
+        } else {
+            nl_run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Env-gated prompt normalization for higher DFlash τ.
+///
+/// `HIPFIRE_NORMALIZE_PROMPT=1` enables it. Default off (Phase 1 opt-in).
+/// Returns Cow::Borrowed when env disabled or when input has no `\n{3,}` runs;
+/// Cow::Owned only on actual rewrite. See `docs/plans/prompt-shape-adaptation.prd`.
+pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
+    if std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref() != Some("1") {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    if !needs_newline_collapse(s) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(collapse_newline_runs(s))
+}
+
+fn needs_newline_collapse(s: &str) -> bool {
+    let mut nl_run: usize = 0;
+    for b in s.bytes() {
+        if b == b'\n' {
+            nl_run += 1;
+            if nl_run >= 3 {
+                return true;
+            }
+        } else {
+            nl_run = 0;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod prompt_norm_tests {
+    use super::*;
+
+    #[test]
+    fn collapse_three_to_two() {
+        assert_eq!(collapse_newline_runs("a\n\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn collapse_six_to_two() {
+        assert_eq!(collapse_newline_runs("a\n\n\n\n\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn pass_two_unchanged() {
+        assert_eq!(collapse_newline_runs("a\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn pass_one_unchanged() {
+        assert_eq!(collapse_newline_runs("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn no_newlines_unchanged() {
+        assert_eq!(collapse_newline_runs("hello world"), "hello world");
+    }
+
+    #[test]
+    fn multiple_independent_runs() {
+        assert_eq!(
+            collapse_newline_runs("a\n\n\nb\n\n\n\nc"),
+            "a\n\nb\n\nc"
+        );
+    }
+
+    #[test]
+    fn detector_finds_three() {
+        assert!(needs_newline_collapse("a\n\n\nb"));
+    }
+
+    #[test]
+    fn detector_skips_two() {
+        assert!(!needs_newline_collapse("a\n\nb"));
+    }
+
+    #[test]
+    fn pep8_lrucache_collapses_to_single_blank() {
+        // PEP-8 strict snippet: top-level class boundary uses \n\n\n.
+        let pep8 = "from typing import Optional\n\n\nclass ListNode:\n    def __init__(self):\n        pass\n\n\nclass LRUCache:\n    pass\n";
+        let collapsed = collapse_newline_runs(pep8);
+        assert!(!collapsed.contains("\n\n\n"));
+        assert!(collapsed.contains("Optional\n\nclass ListNode"));
+        assert!(collapsed.contains("pass\n\nclass LRUCache"));
+    }
+
+    #[test]
+    fn cow_borrowed_when_env_unset() {
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+        let s = "a\n\n\nb";
+        let out = maybe_normalize_prompt(s);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), "a\n\n\nb");
+    }
+}

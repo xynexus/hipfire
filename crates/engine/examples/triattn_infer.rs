@@ -93,6 +93,7 @@ fn main() {
             buf.trim().to_string()
         }
     };
+    let prompt = engine::tokenizer::maybe_normalize_prompt(&prompt).into_owned();
 
     let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
