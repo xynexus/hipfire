@@ -207,6 +207,7 @@ output at ~Q4 bandwidth). MQ6 variants available with `:<size>-mq6` suffix.
 | `qwen3.5:4b` | 2.6 GB | 4 GB | Best speed/quality balance |
 | `qwen3.5:9b` | 5.3 GB | 6 GB | Default `serve` pre-warm |
 | `qwen3.5:27b` | 15 GB | 16 GB | Needs 16 GB+ VRAM |
+| `qwen3.6:27b` | 15 GB | 16 GB | 3.6 refresh — same hybrid arch as 3.5, newer training |
 | `qwen3.5:{size}-mq6` | 1.47× | +2 GB | Higher quality, larger file |
 | `qwen3.5:9b-draft` | 0.55 GB | (paired with 9B) | DFlash draft — 2-3× decode on code/instruct |
 | `qwen3.5:27b-draft` | 0.92 GB | (paired with 27B) | DFlash draft — 4× decode on code (212 tok/s peak) |

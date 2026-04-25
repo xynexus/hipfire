@@ -412,6 +412,11 @@ const REGISTRY: Record<string, ModelEntry> = {
   // matches 3.5 default — no engine changes needed). Local-only until upload.
   "qwen3.6:35b-a3b":  { repo: "", file: "qwen3.6-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active refresh, 148 tok/s — LOCAL ONLY" },
 
+  // Qwen3.6 dense 27B — refresh of 3.5 27B with newer training. Same hybrid
+  // (DeltaNet + FullAttention) arch as 3.5. AR baseline ~44 tok/s; with the
+  // paired DFlash draft (qwen3.6:27b-draft) ~185 tok/s on code prompts.
+  "qwen3.6:27b":      { repo: hfRepo("qwen3.6","27b"),  file: "qwen3.6-27b.mq4",    size_gb: 15.0, min_vram_gb: 16, desc: "44 tok/s AR / 185 tok/s w/ draft on code" },
+
   // Qwen3.5 MQ6 — 6-bit rotated, higher quality / larger file (~1.47× MQ4)
   "qwen3.5:0.8b-mq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq6",   size_gb: 0.67, min_vram_gb: 2,  desc: "MQ6, higher quality" },
   "qwen3.5:4b-mq6":   { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.mq6",     size_gb: 3.5,  min_vram_gb: 5,  desc: "MQ6, higher quality" },
