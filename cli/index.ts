@@ -422,6 +422,14 @@ const REGISTRY: Record<string, ModelEntry> = {
   "qwen3:0.6b":       { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b.hf4",     size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
   "qwen3:8b":         { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",       size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
 
+  // DFlash speculative-decode drafts. Paired with their target — engine
+  // auto-discovers the draft when the target is loaded (qwen3{ver}-{size}-
+  // dflash-{quant}.hfq in the same models dir). Pull one of these AFTER
+  // pulling the matching target. Filename matters: do NOT rename.
+  "qwen3.5:9b-draft":  { repo: hfRepo("qwen3.5","9b"),  file: "qwen35-9b-dflash-mq4.hfq",  size_gb: 0.55, min_vram_gb: 6,  desc: "DFlash draft for qwen3.5:9b — pairs with target for 2-3× decode on code/instruct" },
+  "qwen3.5:27b-draft": { repo: hfRepo("qwen3.5","27b"), file: "qwen35-27b-dflash-mq4.hfq", size_gb: 0.92, min_vram_gb: 16, desc: "DFlash draft for qwen3.5:27b — pairs with target for 4× decode on code (212 tok/s peak)" },
+  "qwen3.6:27b-draft": { repo: hfRepo("qwen3.6","27b"), file: "qwen36-27b-dflash-mq4.hfq", size_gb: 0.92, min_vram_gb: 16, desc: "DFlash draft for qwen3.6:27b — pairs with target for ~4× decode on code" },
+
   // Community finetunes (Qwen3.5 architecture)
   "carnice:9b":        { repo: "schuttdev/hipfire-carnice-9b",  file: "carnice-9b.mq4",  size_gb: 5.0, min_vram_gb: 6,  desc: "Hermes tool-use, MQ4" },
   "carnice:27b":       { repo: "schuttdev/hipfire-carnice-27b", file: "carnice-27b.mq4", size_gb: 15.0, min_vram_gb: 16, desc: "Hermes 27B tool-use, MQ4" },
@@ -459,6 +467,11 @@ const ALIASES: Record<string, string> = {
   // Qwopus: old hf4 tags → new mq4
   "qwopus:9b-hf4": "qwopus:9b", "qwopus:4b-hf4": "qwopus:4b", "qwopus:27b-hf4": "qwopus:27b",
   "qwopus:9b-mq4": "qwopus:9b", "qwopus:4b-mq4": "qwopus:4b", "qwopus:27b-mq4": "qwopus:27b",
+  // Draft alias — `qwen3.5-9b:draft` syntax → `qwen3.5:9b-draft`
+  "qwen3.5-9b:draft": "qwen3.5:9b-draft", "qwen3.5-27b:draft": "qwen3.5:27b-draft",
+  "qwen3.6-27b:draft": "qwen3.6:27b-draft",
+  "qwen3.5:9b:draft": "qwen3.5:9b-draft", "qwen3.5:27b:draft": "qwen3.5:27b-draft",
+  "qwen3.6:27b:draft": "qwen3.6:27b-draft",
 };
 
 function resolveModelTag(input: string): string {
@@ -815,6 +828,30 @@ async function pull(tag: string): Promise<string> {
   // Hint for 27B MQ4: suggest MQ6 for complex reasoning / coding when available
   if (resolved === "qwen3.5:27b" && REGISTRY["qwen3.5:27b-mq6"]) {
     console.error(`TIP: For coding/complex tasks, use: hipfire pull qwen3.5:27b-mq6 (needs 24GB VRAM)`);
+  }
+
+  // Hint when pulling a draft: remind the user about target pairing.
+  // Drafts are auto-discovered by filename when the matching target loads.
+  if (resolved.endsWith("-draft")) {
+    const targetTag = resolved.replace(/-draft$/, "");
+    const targetExists = REGISTRY[targetTag];
+    if (targetExists) {
+      const targetFile = join(MODELS_DIR, targetExists.file);
+      if (!existsSync(targetFile)) {
+        console.error(`NOTE: This is a DFlash draft. The target ${targetTag} is not yet downloaded.`);
+        console.error(`  Pull it with: hipfire pull ${targetTag}`);
+        console.error(`  Drafts are loaded automatically when the target runs.`);
+      } else {
+        console.error(`Draft will pair with target ${targetTag} (${targetFile}) on next run.`);
+      }
+    }
+  }
+
+  // Hint when pulling a target that has an available draft.
+  const draftTag = `${resolved}-draft`;
+  if (REGISTRY[draftTag] && !existsSync(join(MODELS_DIR, REGISTRY[draftTag].file))) {
+    console.error(`TIP: DFlash draft available — speculative decode for 2-4× tok/s on code:`);
+    console.error(`  hipfire pull ${draftTag}`);
   }
 
   const url = downloadUrl(entry);

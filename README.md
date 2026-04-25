@@ -208,8 +208,16 @@ output at ~Q4 bandwidth). MQ6 variants available with `:<size>-mq6` suffix.
 | `qwen3.5:9b` | 5.3 GB | 6 GB | Default `serve` pre-warm |
 | `qwen3.5:27b` | 15 GB | 16 GB | Needs 16 GB+ VRAM |
 | `qwen3.5:{size}-mq6` | 1.47× | +2 GB | Higher quality, larger file |
+| `qwen3.5:9b-draft` | 0.55 GB | (paired with 9B) | DFlash draft — 2-3× decode on code/instruct |
+| `qwen3.5:27b-draft` | 0.92 GB | (paired with 27B) | DFlash draft — 4× decode on code (212 tok/s peak) |
+| `qwen3.6:27b-draft` | 0.92 GB | (paired with 27B) | DFlash draft for Qwen 3.6 — ~4× decode on code |
 | `qwopus:{4,9,27}b` | Qwen 3.5 arch | as above | Jackrong reasoning fine-tune |
 | `carnice:{9,27}b` | Qwen 3.5 arch | as above | kai-os Hermes tool-use |
+
+**DFlash drafts pair with targets**: `hipfire pull qwen3.5:27b` then
+`hipfire pull qwen3.5:27b-draft` — the engine auto-discovers the draft
+by filename when the target loads. No CLI flag needed; toggle with
+`hipfire config set dflash_mode {auto,on,off}`.
 
 Full list: `hipfire list -r` or [docs/MODELS.md](docs/MODELS.md).
 
