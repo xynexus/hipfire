@@ -1,0 +1,148 @@
+# Task #93 — Path D: Stale-Context Overlap (Approach X)
+
+**Status:** Open. Phase A scaffolding done (c734860); Phase B oracle measurement
+killed the original P0/P1 oracles (6842a86). This PRD redefines the lever.
+**Source:** PRD section "Alternative: overlap at a different join point"
+in `docs/plans/task-93-inter-cycle-pipelining.prd` (line 173).
+
+---
+
+## Why the original PRD's Phases B-E are dead
+
+Measured oracle accuracy (commit 6842a86) on 27B asym3:
+- REJ_MATCH (drafted[accept_len+1] == bonus_token): **0%** by construction
+- TAIL_MATCH: 2-6%
+- ANYPOS_MATCH (upper bound): 6-23.5%
+
+PRD assumed 85-95% accuracy. The accept-loop exits exactly at draft/target
+disagreement, so the next position's draft prediction is uncorrelated with
+target's correct token. **No simple oracle exists.**
+
+---
+
+## Approach X — start draft N+1 BEFORE verify N completes, on stale hidden context
+
+Instead of predicting bonus_token: skip the wait entirely. Launch draft N+1
+on cycle N-1's last hidden state. Draft sees stale context (one cycle old)
+but runs concurrently with verify N's full body, not just the post-hidden_rb
+tail.
+
+```
+cycle N-1:  draft -> verify -> commit_{N-1} (writes hidden_rb[N-1])
+cycle N:    [draft_N on hidden_rb[N-1]] || [verify_N on draft_N's output]
+                                              -> writes hidden_rb[N]
+cycle N+1:  [draft_{N+1} on hidden_rb[N-1]   <- STILL STALE, runs in parallel
+            (or hidden_rb[N] if verify N landed in time)]
+            || [verify_{N+1} on draft_{N+1}'s output]
+```
+
+Trade tau for overlap: draft on slightly stale context loses some acceptance,
+but full-cycle parallelism saves ~draft_time per cycle.
+
+**Quantitative model** (27B-3.5 baseline):
+- draft_time ~25 ms (small MQ4 draft)
+- verify_time ~60 ms
+- cycle_time ~75 ms (ssync-bound; verify dominates)
+- Sequential: cycle = draft + verify + commit ~75 ms
+- Parallel: cycle = max(draft, verify) + commit ~60 ms (-20%)
+
+If tau stays within 90% of baseline (drops 10.36 -> ~9.3): net +12-15%.
+If tau drops 80% (10.36 -> ~8.3): break-even or slight regression.
+
+**The critical experimental question is tau-vs-stale-context sensitivity.**
+
+---
+
+## Implementation phases (post-Phase A, redefined)
+
+### Phase D1 - Lazy stream allocation (byte-no-op)
+
+Wire `HIPFIRE_DDTREE_PIPELINE=1` to lazy-allocate `Gpu::draft_stream`
+and `Gpu::verify_stream` when first needed. Default OFF preserves current
+behavior. Add path branch in `dflash_spec_demo.rs` that calls a new
+`spec_step_dflash_pipelined` only when env=1.
+
+**Acceptance**: Coherence-gate-dflash passes with env unset (no behavior
+change). Build clean. ~50 LOC. Commit-ready.
+
+### Phase D2 - Double-buffered DflashScratch
+
+Add `DflashScratchPair { a, b, active: bool }` or similar. Cycle alternates
+which scratch is in-use vs has staged outputs. Memory cost: ~draft_dim ×
+draft_layers × 2 ~= 50 MB on 27B (small draft).
+
+**Acceptance**: Two scratches alloc'd at session init; `spec_step_dflash_pipelined`
+flips between them per cycle. Single-cycle bench matches Phase D1 perf
+(no benefit yet, no regression).
+
+### Phase D3 - Concurrent draft N+1 launch on stale hidden_rb
+
+At cycle N's start, hidden_rb already holds cycle N-1's output. Launch
+draft N+1 on draft_stream NOW, reading hidden_rb's current contents.
+Verify N launches on verify_stream concurrently with its own draft input.
+
+**Mismatch handling** (rollback):
+- If draft N+1's seed (drafted[0]) is from stale-context inference, the
+  inputs may diverge from a sequential run. Coherence-gate validates output.
+- If output diverges beyond gate threshold: revert that cycle to sequential,
+  re-run draft N+1.
+
+**Phase D3 ships when**: coherence-gate-dflash passes, mean tau stays within
+90% of pre-pipeline baseline, single-cycle wallclock drops by >=10%.
+
+### Phase D4 - Adaptive bypass
+
+When tau drops below a threshold (e.g. baseline × 0.9), revert to sequential
+for next cycle. Hysteresis: 3 cycles of poor tau before fallback. Protects
+the worst-case while keeping the lever active for high-tau regimes (code).
+
+### Phase D5 - Speed gate + coherence gate + commit
+
+3-run median bench across code/prose/instruct. Compare to 120cbf5
+(Phase 2 ship). Gates:
+- Coherence: unique_token_ratio > 0.3, max_freq < 0.4 in first 256 tokens
+- Speed (PEP-8+norm, max=120, asym3, --no-chatml): >=210 tok/s median
+  (current 200, target +5%). Stretch: 215+ if tau holds.
+
+---
+
+## Code surface (concrete locations)
+
+| Site | Change |
+|---|---|
+| `crates/rdna-compute/src/dispatch.rs:146-147` | Lazy-init draft/verify streams |
+| `crates/engine/src/dflash.rs` | Add DflashScratchPair |
+| `crates/engine/src/speculative.rs:spec_step_dflash` | Branch HIPFIRE_DDTREE_PIPELINE; new `spec_step_dflash_pipelined` |
+| `crates/engine/examples/dflash_spec_demo.rs` | Pass env through to spec_step |
+| `crates/hip-bridge/src/ffi.rs` | hipEventRecord/hipStreamWaitEvent - already wired (8e9b9aa) |
+
+---
+
+## Risks
+
+| Risk | Mitigation |
+|---|---|
+| tau drops too much from stale context | Phase D4 adaptive bypass; per-genre threshold |
+| KV cache write race | verify N writes target KV; draft uses its own - no shared writes (audited in original PRD line 142-160) |
+| hidden_rb read race | Use last-committed slot which is >=1 cycle old - never written concurrently |
+| Stream creation cost | One-time per session; amortized |
+| Coherence-gate fails | Fall back to sequential; investigate as numerical bug not perf opt |
+
+---
+
+## Out of scope
+
+- Multi-step pipelining (draft N+2 ahead of verify N) - exponential mis-prediction blast radius
+- Cross-arch validation (BC-250, MI300X) - gfx1100 first
+- Path C (training-based oracle revival) - separate PRD: `docs/plans/task-93-path-c-trained-draft.prd`
+
+---
+
+## References
+
+- Original PRD: `docs/plans/task-93-inter-cycle-pipelining.prd`
+- Phase A scaffolding: c734860
+- Phase B oracle measurement (killed P0/P1): 6842a86
+- Stream FFI: 8e9b9aa
+- Phase 1 baseline: 8a4a211 (199 tok/s on PEP-8+norm)
+- Phase 2 heat diagnostic: 120cbf5
