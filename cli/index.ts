@@ -75,6 +75,15 @@ interface HipfireConfig {
   cask_beta: number;         // hysteresis buffer before re-triggering
   cask_core_frac: number;    // fraction of budget kept un-merged (CASK only)
   cask_fold_m: number;       // m-way merge factor for non-core slots (CASK only)
+
+  // ── Prompt-shape adaptation (0.1.8) ──────────────────────────────────
+  // When true, collapses runs of 3+ '\n' chars to exactly 2 before the
+  // tokenizer encode. Eliminates rare BPE token 1358 ('\n\n\n') in favor
+  // of HOT token 271 ('\n\n') on Qwen3.5/3.6, lifting τ on PEP-8-style
+  // code prompts by up to +26.7% (commit 8a4a211). Default OFF until more
+  // validation across non-Python prompt families. See PRD:
+  // docs/plans/prompt-shape-adaptation.prd
+  prompt_normalize: boolean;
 }
 
 // Detect GPU at import time for smart defaults
@@ -107,6 +116,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   cask_beta: 128,
   cask_core_frac: 0.5,
   cask_fold_m: 2,
+  prompt_normalize: false,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -132,6 +142,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "cask_beta": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
     case "cask_core_frac": return typeof value === "number" && value >= 0 && value <= 1;
     case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
+    case "prompt_normalize": return typeof value === "boolean";
     default: return false;
   }
 }
@@ -174,6 +185,7 @@ const PER_MODEL_KEYS = [
   "dflash_adaptive_b", "dflash_mode",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
+  "prompt_normalize",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -406,6 +418,11 @@ const REGISTRY: Record<string, ModelEntry> = {
   // cask_sidecar-based KV eviction — download separately via `hf download`.
   "qwen3.6:35b-a3b":  { repo: hfRepo("qwen3.6","35b-a3b"), file: "qwen3.6-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active (coding/agent)" },
 
+  // Qwen3.6 dense 27B — refresh of 3.5 27B with newer training. Same hybrid
+  // (DeltaNet + FullAttention) arch as 3.5. AR baseline ~44 tok/s; with the
+  // paired DFlash draft (qwen3.6:27b-draft) ~185 tok/s on code prompts.
+  "qwen3.6:27b":      { repo: hfRepo("qwen3.6","27b"),  file: "qwen3.6-27b.mq4",    size_gb: 15.0, min_vram_gb: 16, desc: "44 tok/s AR / 185 tok/s w/ draft on code" },
+
   // Qwen3.5 MQ6 — 6-bit rotated, higher quality / larger file (~1.47× MQ4)
   "qwen3.5:0.8b-mq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq6",   size_gb: 0.67, min_vram_gb: 2,  desc: "MQ6, higher quality" },
   "qwen3.5:4b-mq6":   { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.mq6",     size_gb: 3.5,  min_vram_gb: 5,  desc: "MQ6, higher quality" },
@@ -415,6 +432,14 @@ const REGISTRY: Record<string, ModelEntry> = {
   // Qwen3 (standard attention, not DeltaNet)
   "qwen3:0.6b":       { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b.hf4",     size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
   "qwen3:8b":         { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",       size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
+
+  // DFlash speculative-decode drafts. Paired with their target — engine
+  // auto-discovers the draft when the target is loaded (qwen3{ver}-{size}-
+  // dflash-{quant}.hfq in the same models dir). Pull one of these AFTER
+  // pulling the matching target. Filename matters: do NOT rename.
+  "qwen3.5:9b-draft":  { repo: hfRepo("qwen3.5","9b"),  file: "qwen35-9b-dflash-mq4.hfq",  size_gb: 0.55, min_vram_gb: 6,  desc: "DFlash draft for qwen3.5:9b — pairs with target for 2-3× decode on code/instruct" },
+  "qwen3.5:27b-draft": { repo: hfRepo("qwen3.5","27b"), file: "qwen35-27b-dflash-mq4.hfq", size_gb: 0.92, min_vram_gb: 16, desc: "DFlash draft for qwen3.5:27b — pairs with target for 4× decode on code (212 tok/s peak)" },
+  "qwen3.6:27b-draft": { repo: hfRepo("qwen3.6","27b"), file: "qwen36-27b-dflash-mq4.hfq", size_gb: 0.92, min_vram_gb: 16, desc: "DFlash draft for qwen3.6:27b — pairs with target for ~4× decode on code" },
 
   // Community finetunes (Qwen3.5 architecture)
   "carnice:9b":        { repo: "schuttdev/hipfire-carnice-9b",  file: "carnice-9b.mq4",  size_gb: 5.0, min_vram_gb: 6,  desc: "Hermes tool-use, MQ4" },
@@ -457,6 +482,11 @@ const ALIASES: Record<string, string> = {
   // Qwopus: old hf4 tags → new mq4
   "qwopus:9b-hf4": "qwopus:9b", "qwopus:4b-hf4": "qwopus:4b", "qwopus:27b-hf4": "qwopus:27b",
   "qwopus:9b-mq4": "qwopus:9b", "qwopus:4b-mq4": "qwopus:4b", "qwopus:27b-mq4": "qwopus:27b",
+  // Draft alias — `qwen3.5-9b:draft` syntax → `qwen3.5:9b-draft`
+  "qwen3.5-9b:draft": "qwen3.5:9b-draft", "qwen3.5-27b:draft": "qwen3.5:27b-draft",
+  "qwen3.6-27b:draft": "qwen3.6:27b-draft",
+  "qwen3.5:9b:draft": "qwen3.5:9b-draft", "qwen3.5:27b:draft": "qwen3.5:27b-draft",
+  "qwen3.6:27b:draft": "qwen3.6:27b-draft",
 };
 
 function resolveModelTag(input: string): string {
@@ -563,6 +593,13 @@ function applyConfigEnv(cfg: HipfireConfig): void {
     process.env.HIPFIRE_EXPERIMENTAL_BUDGET_ALERT = "1";
   } else {
     delete process.env.HIPFIRE_EXPERIMENTAL_BUDGET_ALERT;
+  }
+  // Prompt-shape normalization (Phase 1, commit 8a4a211). Engine-side env
+  // gate; default off until broader validation. Lifts τ on PEP-8 code prompts.
+  if (cfg.prompt_normalize) {
+    process.env.HIPFIRE_NORMALIZE_PROMPT = "1";
+  } else {
+    delete process.env.HIPFIRE_NORMALIZE_PROMPT;
   }
 }
 
@@ -806,6 +843,30 @@ async function pull(tag: string): Promise<string> {
   // Hint for 27B MQ4: suggest MQ6 for complex reasoning / coding when available
   if (resolved === "qwen3.5:27b" && REGISTRY["qwen3.5:27b-mq6"]) {
     console.error(`TIP: For coding/complex tasks, use: hipfire pull qwen3.5:27b-mq6 (needs 24GB VRAM)`);
+  }
+
+  // Hint when pulling a draft: remind the user about target pairing.
+  // Drafts are auto-discovered by filename when the matching target loads.
+  if (resolved.endsWith("-draft")) {
+    const targetTag = resolved.replace(/-draft$/, "");
+    const targetExists = REGISTRY[targetTag];
+    if (targetExists) {
+      const targetFile = join(MODELS_DIR, targetExists.file);
+      if (!existsSync(targetFile)) {
+        console.error(`NOTE: This is a DFlash draft. The target ${targetTag} is not yet downloaded.`);
+        console.error(`  Pull it with: hipfire pull ${targetTag}`);
+        console.error(`  Drafts are loaded automatically when the target runs.`);
+      } else {
+        console.error(`Draft will pair with target ${targetTag} (${targetFile}) on next run.`);
+      }
+    }
+  }
+
+  // Hint when pulling a target that has an available draft.
+  const draftTag = `${resolved}-draft`;
+  if (REGISTRY[draftTag] && !existsSync(join(MODELS_DIR, REGISTRY[draftTag].file))) {
+    console.error(`TIP: DFlash draft available — speculative decode for 2-4× tok/s on code:`);
+    console.error(`  hipfire pull ${draftTag}`);
   }
 
   const url = downloadUrl(entry);
@@ -2362,6 +2423,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "CASK m-fold factor (1 = no folding, 2+ = fold m heads into one)",
       range: [1, 16], step: 1,
     },
+    prompt_normalize: {
+      label: "prompt_normalize",
+      desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; off by default)",
+      options: ["true", "false"],
+    },
   };
 
   let selected = 0;
@@ -3763,7 +3829,9 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
         process.exit(1);
       }
       const defaultVal = CONFIG_DEFAULTS[key as keyof HipfireConfig];
-      const parsed = typeof defaultVal === "number" ? Number(value) : value;
+      const parsed = typeof defaultVal === "number" ? Number(value)
+                   : typeof defaultVal === "boolean" ? (value === "true" ? true : value === "false" ? false : value)
+                   : value;
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {

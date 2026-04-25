@@ -1,0 +1,88 @@
+# Prompt Structure Drives τ — 14% Perf Swing from One Newline (2026-04-24)
+
+## TL;DR
+
+**Identical token COUNTS produce vastly different τ depending on token CONTENT.** Two prompts that both tokenize to 232 tokens, both use the same LRU-cache code body, yield:
+
+| Prompt structure | Median tok/s | τ | Range |
+|---|---|---|---|
+| **PEP-8 strict** (`\n\n\n` between top-level defs = two blank lines) | **161** | **8.07** | tight 158-162 |
+| **Single-blank** (`\n\n` between top-level defs = one blank line) | **184** | **9.42** | wide 173-204 |
+
+That's a **14% throughput / 17% τ delta from changing one newline character**. Same model. Same flags. Same kernels. Same binary md5.
+
+## Repro (canonical)
+
+Commit `09e2c63`. Build with `--features deltanet`. Same env: `HIP_PATH=/opt/rocm HIP_VISIBLE_DEVICES=0,1 ROCM_PATH=/opt/rocm`.
+
+```bash
+EXE=./target/release/examples/dflash_spec_demo
+TARGET=$HOME/.hipfire/models/qwen3.5-27b.mq4
+DRAFT=$HOME/.hipfire/models/qwen35-27b-dflash.mq4
+
+# HIGH-τ regime — single blank lines:
+PROMPT_HIGH='from typing import Optional
+
+class ListNode:
+    def __init__(self, key: int, value: int):
+        ...
+'
+
+# LOW-τ regime — double blank lines (PEP-8 strict):
+PROMPT_LOW='from typing import Optional
+
+
+class ListNode:
+    def __init__(self, key: int, value: int):
+        ...
+'
+```
+
+Same tokenizer output: 232 tokens both. Different content. Different τ.
+
+## Why this matters
+
+1. **Bench reproducibility requires byte-exact prompts.** Whitespace alone shifts measurements by 14%. Future bench docs MUST commit prompt files (not embed in scripts) and include prompt md5 in results.
+2. **Existing bench numbers may not be comparable across sessions** unless the exact prompt bytes match.
+3. **τ "non-determinism" claim was misframed.** Task #91 documented within-session variance; this finding shows variance is dominated by prompt-token-content.
+4. **Optimization opportunity**: prompt-shape-aware decode could opt-in to high-τ regimes for code prompts.
+
+## Forensic timeline
+
+- 2026-04-24 03:38 commit `6d733e7` (bench commit).
+- 2026-04-24 10:07 hermes agent runs `/tmp/run_lru_maxperf.sh` with single-blank-line PROMPT. Reports 27B-3.5 = 183.4 tok/s τ=9.42.
+- 2026-04-24 ~14:00-16:30 Claude session reproduces with double-blank-line PROMPT, gets deterministic 161 τ=8.07. Spends hours chasing phantom regression (rocBLAS version, DKMS swap, firmware shadow, ppfeaturemask, mold/sccache, kernel cache, DPM). All null. Eventually compares hermes session log byte-by-byte and finds the single-newline diff. Reproduces 184 median / 204 peak with agent's exact prompt format.
+
+## Why agent's "DPM/thermal drift" was the wrong explanation
+
+Within single-blank prompt: 173-204 tok/s spread (~15%). Within double-blank prompt: 158-162 tok/s spread (~2.5%). Across prompt formats: 161 → 184 = 14% delta. **Format dominates DPM jitter.**
+
+## Adaptation strategies — TODO
+
+Hypotheses to test:
+1. **Token-density**: single-blank packs newlines into fewer/different sequences. Draft handles dense-newline patterns better.
+2. **Conditional entropy**: predictable boilerplate lowers entropy → higher acceptance.
+3. **KV-position rounding**: tokens at certain positions hit different KV slot rounding boundaries.
+
+Concrete experiments:
+- Sweep prompts of varied structural patterns at fixed token count.
+- Measure τ as a function of token bigram entropy in the prompt + first 32 emitted tokens.
+- Test ChatML structural variants on 3.6 family.
+
+## Action items
+
+- [ ] Commit canonical prompt files (somewhere allowed) for both formats
+- [ ] Update `scripts/sweep_dflash_full.sh` to record prompt md5 in output
+- [x] CLAUDE.md updated with prompt-structure rule
+- [x] `docs/methodology/perf-benchmarking.md` extended with prompt-shape section
+- [x] `.remember/remember.md` updated
+- [x] Memory file via memorize agent
+
+## Honest revised baseline (27B-3.5 DFlash LRU max=120)
+
+| Variant | tok/s | τ |
+|---|---|---|
+| Single-blank prompt (canonical "max-perf") | **184** ± 15 | **9.42** |
+| Double-blank prompt (PEP-8 strict) | **161** ± 2 | **8.07** |
+| Fibonacci prompt (max=120) | 119 | 5.40 |
+| Has_close_elements prompt | 133 | 6.39 |

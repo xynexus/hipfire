@@ -45,7 +45,7 @@ impl Eviction {
         gpu: &mut rdna_compute::Gpu,
         kv: &mut llama::KvCache,
         physical: usize,
-    ) -> HipResult<Option<usize>> {
+    ) -> HipResult<Option<engine::triattn::EvictionResult>> {
         match self {
             Eviction::Plain(c) => c.maybe_evict(gpu, kv, physical),
             Eviction::Cask(c) => c.maybe_evict(gpu, kv, physical),
@@ -405,6 +405,11 @@ fn main() {
 
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
                 let prompt = msg.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello");
+                let prompt_norm = engine::tokenizer::maybe_normalize_prompt(prompt);
+                let prompt: &str = &prompt_norm;
+                if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+                    if let Some(tok) = m.tokenizer.as_ref() { tok.dump_prompt_heat(prompt); }
+                }
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
@@ -866,6 +871,7 @@ fn load_dflash_state(
         draft_config.num_extract(),
         draft_config.hidden,
         ctx_capacity + draft_config.block_size,
+        engine::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
     ).map_err(|e| format!("hidden_rb: {e}"))?;
 
     let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
@@ -1061,6 +1067,8 @@ fn generate_dflash(
         eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
     }
     df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
+    df.draft_scratch.target_hidden_abs_positions =
+        (0..prompt_tokens.len() as i32).collect();
 
     // First emit = target's argmax at the final prompt position. seed_target_hidden
     // already ran the per-token forward for every prompt token; its scratch.logits
@@ -1099,12 +1107,19 @@ fn generate_dflash(
     // `budget`. compact_offset is maintained on target.kv_cache; subsequent
     // forwards inside spec_step_dflash read it for RoPE phase automatically.
     if let Some(ref ev) = m.eviction {
-        if let Some(new_phys) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
+        if let Some(res) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
+            let pre_phys = position;
             eprintln!(
                 "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
-                position, new_phys, target.kv_cache.compact_offset,
+                pre_phys, res.new_physical, target.kv_cache.compact_offset,
             );
-            position = new_phys;
+            position = res.new_physical;
+            if !res.retain_mask.is_empty() {
+                let _ = speculative::apply_eviction_retain_to_draft(
+                    gpu, &mut df.draft_scratch, &res.retain_mask,
+                    df.draft_config.num_extract(), df.draft_config.hidden, pre_phys,
+                );
+            }
         }
     }
 
@@ -1139,6 +1154,8 @@ fn generate_dflash(
             &emitted,
             0.0_f32,                   // cactus_delta
             None,                      // pld_spine
+            1.0_f32,                   // repeat_penalty (off)
+            0,                         // repeat_window
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1165,7 +1182,7 @@ fn generate_dflash(
                 emitted_bytes += vl;
             }
             generated += 1;
-            if tok == target.config.eos_token || im_end_token == Some(tok) { hit_eos = true; break; }
+            if tok == target.config.eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) { hit_eos = true; break; }
         }
         position += step.accepted + 1;
         seed_token = step.bonus_token;
@@ -1173,8 +1190,15 @@ fn generate_dflash(
         // has grown to budget+β since the last compaction. No-op when
         // physical < budget+β, so non-firing cycles pay only the check cost.
         if let Some(ref ev) = m.eviction {
-            if let Some(new_phys) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
-                position = new_phys;
+            if let Some(res) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
+                let pre_phys = position;
+                position = res.new_physical;
+                if !res.retain_mask.is_empty() {
+                    let _ = speculative::apply_eviction_retain_to_draft(
+                        gpu, &mut df.draft_scratch, &res.retain_mask,
+                        df.draft_config.num_extract(), df.draft_config.hidden, pre_phys,
+                    );
+                }
             }
         }
         if hit_eos { break; }
@@ -1349,7 +1373,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     None, None, None, None,
                 ).unwrap();
                 m.seq_pos += chunk_len;
-                if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                     m.seq_pos = new_phys;
                 }
                 remaining = rest;
@@ -1439,13 +1463,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
             m.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
-                if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                     m.seq_pos = new_phys;
                 }
             }
 
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
+            if tokenizer.is_terminator(next_token) { break; }
 
             // Budget-alert injection: once we hit the configured token count,
             // splice the nudge text into the stream. Tokens are emitted to
@@ -1521,7 +1546,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         qwen35::forward_scratch(gpu, weights, config, tok, m.seq_pos, kv, dn, scratch).unwrap();
                         m.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
-                            if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                                 m.seq_pos = new_phys;
                             }
                         }
@@ -1567,7 +1592,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
                 m.seq_pos += 1;
                 if let Some(ref ev) = m.eviction {
-                    if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                    if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                         m.seq_pos = new_phys;
                     }
                 }
@@ -1651,6 +1676,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
+            if tokenizer.is_terminator(next_token) { break; }
 
             next_token = tok;
             rng_state = rng;
@@ -1807,7 +1833,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         }
         m.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
-            if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                 m.seq_pos = new_phys;
             }
         }
@@ -1829,11 +1855,12 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
 
         if next_token == config.eos_token { break; }
         if im_end_token == Some(next_token) { break; }
+        if tokenizer.is_terminator(next_token) { break; }
 
         qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
         m.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
-            if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                 m.seq_pos = new_phys;
             }
         }
@@ -1849,7 +1876,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
             qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
             m.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
-                if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                     m.seq_pos = new_phys;
                 }
             }

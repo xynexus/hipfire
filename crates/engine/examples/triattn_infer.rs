@@ -35,7 +35,7 @@ fn main() {
     enum Policy { Plain(EvictionCtx), Cask(CaskCtx) }
     impl Policy {
         fn maybe_evict(&self, gpu: &mut Gpu, kv: &mut KvCache, physical: usize)
-            -> hip_bridge::HipResult<Option<usize>>
+            -> hip_bridge::HipResult<Option<engine::triattn::EvictionResult>>
         {
             match self {
                 Policy::Plain(c) => c.maybe_evict(gpu, kv, physical),
@@ -93,6 +93,7 @@ fn main() {
             buf.trim().to_string()
         }
     };
+    let prompt = engine::tokenizer::maybe_normalize_prompt(&prompt).into_owned();
 
     let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
@@ -138,6 +139,9 @@ fn main() {
     let nl = tok.encode("\n");
     let user_tok = tok.encode("user");
     let asst_tok = tok.encode("assistant");
+    if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+        tok.dump_prompt_heat(&prompt);
+    }
     let body = tok.encode(&prompt);
     let think = tok.encode("<think>");
 
@@ -170,8 +174,8 @@ fn main() {
     for t in &toks {
         qwen35::forward_scratch(&mut gpu, &weights, &config, *t, physical, &mut kv, &mut dn, &scratch).unwrap();
         physical += 1;
-        if let Some(new_phys) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
-            physical = new_phys;
+        if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
+            physical = ev.new_physical;
         }
         #[allow(unused)]
         let _ = &ctx;
@@ -196,8 +200,8 @@ fn main() {
     for _ in 0..max_tokens {
         qwen35::forward_scratch(&mut gpu, &weights, &config, next, physical, &mut kv, &mut dn, &scratch).unwrap();
         physical += 1;
-        if let Some(new_phys) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
-            physical = new_phys;
+        if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
+            physical = ev.new_physical;
         }
         #[allow(unused)]
         let _ = &ctx;

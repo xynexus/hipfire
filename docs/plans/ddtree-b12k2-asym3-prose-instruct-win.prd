@@ -1,0 +1,103 @@
+# DDTree on asym3 KV: b12-k2 is a net win on prose + instruct
+
+_Measured 2026-04-23, dflash @ e5534e4, 27B Qwen3.5 MQ4 target + 919 MB true-MQ4 draft, 7900 XTX gfx1100._
+
+## Headline
+
+With the production KV mode (asym3), DDTree-batched at `--ddtree-budget 12 --ddtree-topk 2`
+beats linear DFlash on **prose (+28% tok/s, +2.5× τ)** and **instruct (+29% tok/s, +2.4× τ)**.
+Code still loses (linear asym3 already hits τ=7.57, no headroom).
+
+Prior 2026-04-22 "null result" and today's earlier sweep were measured on `--kv-mode q8` (legacy
+default) — that understated DDTree's value on the real production KV mode. The user flagged it
+("when you test ddtree are you testing with q8kv or asym3?") and the rerun on asym3 flipped the sign.
+
+## Full matrix (--max 192, --ctx 2048)
+
+| prompt   | kv     | linear tok/s (τ) | b8-k2 tok/s (τ) | **b12-k2** tok/s (τ) | b12-k2 fast/slow |
+|----------|--------|-----------------:|----------------:|---------------------:|:----------------:|
+| code HE/0 | q8    | 124 (5.47)       | 98 (5.16)       | 102 (6.22)           | 19/8             |
+| code HE/0 | asym3 | **154 (7.57)**   | 90 (5.13)       | 90 (6.00)            | 4/3              |
+| prose     | q8    | 38 (0.84)        | 55 (2.90)       | 60 (3.39)            | 26/18            |
+| prose     | asym3 | 59 (1.97)        | 67 (3.83)       | **76 (4.94)**        | 17/16            |
+| instruct  | q8    | **76 (2.84)**    | 55 (2.78)       | 59 (3.29)            | 27/18            |
+| instruct  | asym3 | 54 (1.69)        | 47 (2.43)       | **70 (4.08)**        | 26/13            |
+
+Prompts:
+- **code**: HumanEval/0 (`has_close_elements` signature + docstring).
+- **prose**: Roman Empire decline continuation, no chatml.
+- **instruct**: "Explain in three paragraphs why the Roman Empire declined..." with chatml.
+
+## Secondary finding: asym3 is a regression for linear DFlash on instruct-style prompts
+
+- q8 linear instruct: 76 tok/s / τ=2.84
+- asym3 linear instruct: 54 tok/s / τ=1.69 — **-28% tok/s, -40% τ**
+
+Code and prose don't show this regression (asym3 wins on both for linear). The 3-bit K quantization
+may be biting the instruct prompt-answering token distribution in a way structured code/prose
+tokens shrug off. DDTree b12-k2 recovers past the asym3-linear floor (70 vs 54) and even
+approaches the q8-linear ceiling (70 vs 76).
+
+Worth investigating separately — a single-model sidecar / per-genre KV-mode dispatch may be
+the right response if this reproduces on more instruct-style prompts.
+
+## Why b12-k2 beats b8-k2 (and why the picture flipped from q8)
+
+- On q8 KV, the draft's native τ on prose is 0.84. b8-k2 (depth=7) is already wide enough to
+  produce strong τ lift (0.84 → 2.90).
+- On asym3 KV, draft τ on prose is 1.97 — already 2× the q8 baseline. b8-k2 has less room to
+  add value; a deeper tree (b12-k2, depth=11) finds more acceptance at committed depths ≥ 7.
+- b12-k2 pays more forward cost per cycle but fires slow on fewer cycles (prose asym3:
+  17 fast / 16 slow = 52% fast vs b8-k2's 25/15 = 63% fast — b12 trades slow-fire rate for
+  tree size and wins on wall-clock because the bigger trees find longer accepted chains).
+- Paper defaults (b60-k8) are catastrophic at 27B on gfx1100 regardless of KV mode — tree forward
+  at 60 tokens dominates everything.
+
+## Configuration recommendation
+
+Add per-genre DDTree preset to dflash_spec_demo / daemon:
+- **code detected**: linear + asym3 (fastest at τ=7.57)
+- **prose / instruct**: `--ddtree-batched --ddtree-budget 12 --ddtree-topk 2` + asym3
+
+Genre detection heuristic: first-response-block tokens. If within the first ~16 emitted tokens
+the ratio of natural-language tokens (spaces + lowercase letters + punctuation) exceeds ~75%,
+switch to DDTree b12-k2. Otherwise stay linear. Can also be set per-model-config via the
+existing `per_model_config.json` or exposed as a CLI/daemon toggle.
+
+Opt-in flag for now pending slow-path kill + speed/quality gate:
+```
+HIPFIRE_DDTREE_DEFAULT=1  # opts b12-k2 + asym3 on for prose/instruct workloads
+```
+
+## Slow-path-kill still unlocks more
+
+b12-k2 fires slow on 35-50% of cycles on prose/instruct. Each slow cycle = full target forward
+(~40-50 ms). Killing it via **Path A (KV-only mini-forward + tape gather)** — documented
+separately in `docs/plans/ddtree-kv-race-slow-path-kill.prd` — projects another +15-25% tok/s
+on prose/instruct. Timeline: 4-8 hours implementation + test, one session.
+
+## Full 33-prompt HumanEval sweep (code-only, --max 128 ctx 2048)
+
+| config              | mean tok/s | median | p10    | p90    | mean τ | median τ | min τ | max τ |
+|---------------------|-----------:|-------:|-------:|-------:|-------:|---------:|------:|------:|
+| **linear asym3**    | **128.67** | 126.73 | 100.82 | 159.08 | **6.10** | 6.00   | 2.53  | 10.55 |
+| b12-k2 asym3        | 84.49      | 84.09  | 62.56  | 102.34 | 5.39    | 5.33    | 2.56  | 7.87  |
+| Δ                   | **−34%**   | −34%   | −38%   | −36%   | −12%    | −11%    |       |       |
+
+Confirms: **DDTree is a loss on pure-code (HumanEval) workloads** at 27B asym3. Linear is the
+right config. The prose/instruct wins above are genre-specific.
+
+Raw per-prompt output: `/tmp/ddtree_bench/{linear_asym3,ddtree_b12k2_asym3}.txt`.
+
+## Action items
+
+- [x] Measure DDTree across q8 + asym3 KV on code/prose/instruct (this doc)
+- [x] Full 33-prompt HumanEval sweep at `b12-k2 + asym3` vs `linear + asym3`
+      (`python3 scripts/bench_humaneval_dflash.py --n 33` with kv-mode + ddtree flags)
+- [ ] Prose/instruct corpus sweep (20-30 prompts each, need to source — Hermes conversations
+      + Aureth corpus?)
+- [ ] Daemon / per_model_config wiring for per-genre preset
+- [ ] Task #101 status update: close as "Phase 3 complete; DDTree is a net WIN on asym3 KV
+      for prose + instruct at b12-k2; code stays linear"
+- [ ] Task #106 (implicit): Path A slow-path-kill — see companion .prd
+- [ ] Investigate asym3-instruct regression independently (may not be DDTree-related)

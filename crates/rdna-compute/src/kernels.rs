@@ -191,6 +191,11 @@ pub const GEMM_HFQ4G256_RESIDUAL_FP16_SRC: &str = include_str!("../../../kernels
 // (row = row_start + (tid & 15) instead of row = row_start + 2*j + (tid >> 4))
 // and were removed to avoid a copy-paste regression.
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_k2.hip");
+// k2x32 + ksplit retained as alternate K-tile widths used by dispatch.rs's
+// HIPFIRE_WO_WMMA_VARIANT sweep harness. Master cleaned up the older _wmma /
+// _wmma2 / _wmma_k4 variants in b3b9ddb (output-mapping bug) — those are gone.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K2X32_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_k2x32.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
@@ -391,6 +396,10 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
+
+/// TriAttention sidecar calibration: GPU band-statistics accumulator.
+/// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).
+pub const TRIATTN_ACCUMULATE_SRC: &str = include_str!("../../../kernels/src/triattn_accumulate.hip");
 
 
 /// Element-wise add
@@ -712,6 +721,18 @@ pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_d
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_Q8_SRC: &str = include_str!("../../../kernels/src/gated_delta_net_q8.hip");
 
+/// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
+/// to a caller-owned tape buffer, so sibling tokens read the parent's
+/// post-update state rather than the previous sibling's. Required for
+/// correctness when processing a DDTree-linearized token block.
+///
+/// s_q8_init / s_scales_init are the pre-block snapshot (READ-ONLY). The
+/// kernel never advances persistent dn_state.s_matrices — caller runs
+/// linear replay on the accepted spine post-acceptance to commit the
+/// trajectory (same pattern as conv1d_silu_split_tree).
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_Q8_TREE_SRC: &str = include_str!("../../../kernels/src/gated_delta_net_q8_tree.hip");
+
 
 /// GDN recurrence with Q4-quantized S state in VRAM.
 /// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
@@ -742,6 +763,18 @@ pub const CONV1D_SILU_SRC: &str = include_str!("../../../kernels/src/conv1d_silu
 /// linear-attention layer.
 #[cfg(feature = "deltanet")]
 pub const CONV1D_SILU_SPLIT_SRC: &str = include_str!("../../../kernels/src/conv1d_silu_split.hip");
+
+/// Tree-aware variant of conv1d_silu_split. Each in-block token walks its
+/// ancestor chain via parent_indices[] for the 3-tap causal window, falling
+/// back to pre-block conv_state when the chain exits the block. Leaves
+/// conv_state unchanged — caller runs linear conv1d on the accepted spine
+/// post-acceptance to advance state.
+///
+/// Ported from SGLang's `causal_conv1d_update` HAS_EAGLE_TREE_CUSTOM_ATTN_MASK
+/// branch, simplified to take a precomputed parent_indices[] (our tree layout
+/// is materialized host-side by ddtree::linearize_tree).
+#[cfg(feature = "deltanet")]
+pub const CONV1D_SILU_SPLIT_TREE_SRC: &str = include_str!("../../../kernels/src/conv1d_silu_split_tree.hip");
 
 
 /// GPU-side KV cache write using pos from a GPU buffer.
@@ -791,6 +824,16 @@ pub const EMBEDDING_Q4K_SRC: &str = include_str!("../../../kernels/src/embedding
 /// HFQ4-G256 embedding lookup: dequantize one row from HFQ4-G256 table to F32.
 /// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 elements.
 pub const EMBEDDING_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/embedding_hfq4g256.hip");
+
+/// Batched HFQ4-G256 embedding: dequantize N rows in one launch. Reads token ids
+/// from a device buffer so the launch is hipGraph-captureable — update the buffer
+/// between replays, replay the same graph. Writes into row-major `[N × dim]`.
+pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str = include_str!("../../../kernels/src/embedding_hfq4g256_batched.hip");
+
+/// Batched Q8_0 embedding: same hipGraph-captureable pattern as the HFQ4-G256
+/// variant. 27B MQ4 targets ship with Q8_0-quantized embedding tables, so the
+/// verify hot path needs this variant to enable graph capture on that model.
+pub const EMBEDDING_Q8_BATCHED_SRC: &str = include_str!("../../../kernels/src/embedding_q8_batched.hip");
 
 
 /// HFQ4-G128 embedding lookup: dequantize one row from HFQ4-G128 table to F32.

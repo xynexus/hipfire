@@ -182,6 +182,27 @@ hipfire/
 run a single forward pass on the 5700 XT, get correct output tokens.
 Performance doesn't matter yet — correctness first.
 
+## Perf benchmarking (kernel perf changes)
+
+Before claiming any kernel-level tok/s win: read
+`docs/methodology/perf-benchmarking.md`. Within-session A/B is noisy on
+gfx1100 (±10–15 % drift from DPM/thermal state); verify across a fresh
+process with `scripts/probe_commits.sh $(git rev-parse HEAD~1) HEAD` and
+confirm speed-gate passes before committing. The doc also keeps a
+negative-result log of attempts that looked like wins in one-shell A/B
+but measured as no-op or regression on fresh probe — check it before
+starting a new kernel experiment.
+
+**Diagnosing memset pressure:** run with `HIPFIRE_MEMSET_DUMP=1` — the
+gpu layer's memset helper is `#[track_caller]` and prints `file:line`
+per call. Grep the dump by source location, not by byte size. Note:
+the `memset_async` helper is **gated by `active_stream` being `Some`**;
+when the caller leaves `active_stream = None`, it silently falls
+through to sync `hipMemset`. If you add new gated async memsets,
+verify the caller actually sets a stream (fix pattern: create
+`gpu.active_stream` at the top of the caller — see da2753e for
+`spec_step_dflash`).
+
 ## MQ4 Quality Gate (mandatory)
 
 Any change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
@@ -214,6 +235,70 @@ Modes:
 - `./scripts/quality-gate.sh --verbose`      — show first divergent token on fail
 - `./scripts/quality-gate.sh --update-baselines` — regenerate baselines
   (only do this if you verified the new outputs are CORRECT, not just different)
+
+## DFlash Coherence Gate (spec-decode token-attractor guard)
+
+Any DDTree / spec-decode / slow-path-kill change that claims a τ or tok/s
+improvement MUST pass `scripts/coherence-gate-dflash.sh` (shipped 9883e98)
+before commit. Two-tier thresholds, first 128 tokens pre-EOT: hard fail
+if `unique_token_ratio < 0.15` or `max_single_token_frequency > 0.50`.
+
+**Why:** single-token attractor failures pass every statistical gate as
+PARETO WINS. When the target gets trapped predicting one token forever,
+the draft (trivial-token bias) trivially agrees → acceptance → 100% → τ
+explodes with tight stddev. Bit DDTree Path A (fake +79% τ / +120% tok/s
+at 6c84b13) and Path B Variant B1 (f9c920a, 2026-04-23) on identical
+`numbers(numbers(numbers(...` attractor. Root cause was
+linearization-slot RoPE phase delta skew in tree-mode FA — not a
+bug in the optimization, a structural mismatch between tree-mode
+phase deltas and committed-slot phase deltas. Per
+`feedback_attention_precision.md`, 5% attention error cascades into
+attractor within ~10 tokens under greedy decode.
+
+**How to apply:** tight stddev on a spec-decode bench is actively
+SUSPICIOUS, not reassuring. Real acceptance noise is wider. Any new
+spec-decode bench script must include at least one of:
+unique-token-ratio check (< 0.3 fail) on first 256 IDs, max-frequency
+check (> 50% fail) on emitted IDs, or decoded text printed for human
+eyeball.
+
+## Prompt-structure τ sensitivity (mandatory bench rule)
+
+**One newline character can swing τ by 17% on 27B DFlash.** Two prompts
+that tokenize to the same number of tokens (e.g. both 232) but with
+different whitespace patterns produce dramatically different draft-target
+acceptance:
+
+```
+PEP-8 strict (\n\n\n between top-level defs):    27B-3.5 LRU max=120  → 161 tok/s τ=8.07 (deterministic ±2%)
+Single-blank (\n\n between top-level defs):      27B-3.5 LRU max=120  → 184 tok/s τ=9.42 (range 173-204)
+```
+
+**Why:** identical token COUNT, different token SEQUENCE → different
+prefix-conditioned distribution shape at each position → different
+draft/target argmax alignment → different τ. Same model, same flags,
+same kernels, same binary md5.
+
+**How to apply:** ANY tok/s or τ comparison across sessions, agents, or
+commits MUST use byte-identical prompts. Embed prompts as committed
+files (not heredocs in scripts that get reformatted by editors), and
+record the prompt md5 alongside the result. A 14% perf delta from a
+whitespace cleanup is invisible in code review but catastrophic for
+benchmarking. See `docs/plans/prompt-structure-tau-discovery-2026-04-24.prd`
+for the forensic timeline + reproduction commands. Discovery cost
+~6 hours of phantom-regression chasing on 2026-04-24 (rocBLAS, DKMS,
+firmware, kernel cache, mold/sccache, DPM — all null) before isolating
+to a single newline.
+
+**Corollary**: agent-to-agent perf claims that lack prompt md5 are
+unverifiable. Don't accept "X agent got Y tok/s" without reproducing
+on the exact prompt bytes they ran.
+
+**Mitigation (Phase 1 implemented):** Set `HIPFIRE_NORMALIZE_PROMPT=1` to collapse
+all 3+ consecutive newlines to exactly 2 before tokenization. This eliminates the
+whitespace-variance source entirely, making PEP-8 and single-blank prompts tokenize
+identically. See `crates/engine/src/tokenizer.rs:maybe_normalize_prompt()` and
+`crates/engine/examples/encode_prompt.rs` for verification utilities.
 
 ## GPU Lock Protocol (Multi-Agent)
 

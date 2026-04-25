@@ -63,15 +63,41 @@ pub enum LayerType {
 /// `forward_prefill_batch` returns an error if tree mode is requested but
 /// any FA layer would take the fallback path.
 ///
-/// GDN (LinearAttention) layers use the existing linear-replay state
-/// advance in tree mode — correct at topk=1 (byte-exact with DFlash), an
-/// approximation at topk>1 (sibling subtrees cross-contaminate recurrent
-/// state). A per-branch state-forking kernel would eliminate the
-/// approximation but is a separate kernel project.
+/// GDN (LinearAttention) layers: if `parent_indices` is `Some`, the
+/// DeltaNet branch dispatches the tree-aware kernels
+/// (`conv1d_silu_split_tree_f32_n` + `gated_delta_net_q8_tree_batch_seq`)
+/// which walk per-token ancestor chains via `parent_indices` instead of
+/// the linear-sequence predecessor. This eliminates sibling-subtree
+/// cross-contamination of recurrent state at topk>1. If `parent_indices`
+/// is `None`, LA layers fall back to the linear path (byte-exact with
+/// DFlash at topk=1; approximation at topk>1 — used by pre-Phase-3
+/// callers that haven't been rewritten).
 #[derive(Clone, Copy)]
 pub struct TreeVerifyCtx<'a> {
     pub positions: &'a [i32],
     pub attn_bias: &'a GpuTensor,
+    /// `[N]` i32 — for each linearized slot, the slot index of its parent
+    /// in the same linearization (or -1 for the root / seed). Produced by
+    /// `crate::ddtree::linearize_tree_with_parents`. When `Some`, LA layers
+    /// use tree-aware kernels that read parent state from the per-layer
+    /// s_tape scratch in `PrefillBatchScratch`.
+    pub parent_indices: Option<&'a GpuTensor>,
+    /// Per-FA-layer F32 scratch buffers for capturing K BEFORE RoPE is
+    /// applied. Used by Path B slow-path-kill (see
+    /// `docs/plans/ddtree-path-b-decouple-rope-from-kvslot.prd`): on the
+    /// slow path, the speculative caller gathers accepted K rows out of
+    /// these scratches, re-runs RoPE with COMMITTED slot phases (instead
+    /// of the linearization phases the in-cache K carries), and re-quants
+    /// to the committed kv_cache slots — avoiding a full re-verify forward
+    /// while preserving RoPE phase correctness.
+    ///
+    /// Slice length must equal the number of FullAttention layers in
+    /// `config.layer_types`; each entry is a `[max_n × n_kv_heads × head_dim]`
+    /// F32 tensor (max_n = 1 + tree budget). When `None`, capture is
+    /// skipped (zero overhead). When `Some`, every tree-verify FA layer
+    /// memcpy_dtod's its `pbs.fa_k_batch` (post-norm, pre-RoPE) into the
+    /// scratch BEFORE the rope kernel mutates it.
+    pub pre_rope_k_capture: Option<&'a [GpuTensor]>,
 }
 
 #[derive(Debug, Clone)]
@@ -2329,6 +2355,10 @@ pub struct PrefillBatchScratch {
     // Uploaded once at the start of each chunk and reused by rope + kv_write
     // + attention kernels.
     pub positions: GpuTensor,
+    // Token-ids buffer feeding the batched embedding kernel. [max_batch] i32
+    // stored as F32 (same dtype-cosmetic pattern as `positions`). Uploaded
+    // once per batched forward and read by `embedding_lookup_hfq4g256_batched`.
+    pub tokens: GpuTensor,
     // QKV projection outputs
     pub fa_q_full_batch: GpuTensor,  // [N × n_heads × head_dim × 2] (Q + gate interleaved)
     pub fa_q_batch: GpuTensor,       // [N × n_heads × head_dim]
@@ -2353,6 +2383,20 @@ pub struct PrefillBatchScratch {
     pub moe_gate_batch:          Option<GpuTensor>,   // [N × k_top × mi]
     pub moe_up_batch:            Option<GpuTensor>,   // [N × k_top × mi]
     pub moe_rot_batch:           Option<GpuTensor>,   // [N × k_top × mi]
+
+    // ── Tree-aware LA scratch (Phase 3b of Task #101) ──
+    // Per-token S-state tape consumed by gated_delta_net_q8_tree kernel
+    // when TreeVerifyCtx.parent_indices is Some. Reused across LA layers
+    // since LA dispatch is serial per-cycle. Only allocated when the model
+    // has LA layers (linear_num_value_heads > 0). Call sites that pass
+    // parent_indices must ensure these tensors exist.
+    //
+    // s_tape_q8:     [max_batch × n_v_heads × head_dim × head_dim] Raw/i8
+    // s_tape_scales: [max_batch × n_v_heads × head_dim] f32
+    //
+    // At max_batch=22, n_v_heads=16, head_dim=128 → 5.77 MB + 180 KB total.
+    pub dn_s_tape_q8:     Option<GpuTensor>,
+    pub dn_s_tape_scales: Option<GpuTensor>,
 }
 
 impl PrefillBatchScratch {
@@ -2392,7 +2436,12 @@ impl PrefillBatchScratch {
             // F32 dtype = 4 bytes/element, same layout as i32. The rope /
             // attention / kv_write kernels cast the pointer to `const int*`,
             // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
+            // Determinism: master's deterministic-batched-prefill fix (84425b5)
+            // switched these from alloc_tensor → zeros. Keep the determinism
+            // fix; preserve the dflash-side `tokens` field (added for tree-mode
+            // parent_indices propagation in spec_step_ddtree_batched).
             positions:         gpu.zeros(&[max_batch], DType::F32)?,
+            tokens:            gpu.zeros(&[max_batch], DType::F32)?,
             fa_q_full_batch:   gpu.zeros(&[max_batch * q_dim * 2], DType::F32)?,
             fa_q_batch:        gpu.zeros(&[max_batch * q_dim], DType::F32)?,
             fa_gate_batch:     gpu.zeros(&[max_batch * q_dim], DType::F32)?,
@@ -2430,6 +2479,13 @@ impl PrefillBatchScratch {
             moe_rot_batch: if config.num_experts > 0 {
                 Some(gpu.zeros(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
             } else { None },
+            dn_s_tape_q8: if config.linear_num_value_heads > 0 {
+                let bytes = max_batch * config.linear_num_value_heads * config.linear_value_head_dim * config.linear_value_head_dim;
+                Some(gpu.alloc_tensor(&[bytes], DType::Raw)?)
+            } else { None },
+            dn_s_tape_scales: if config.linear_num_value_heads > 0 {
+                Some(gpu.alloc_tensor(&[max_batch * config.linear_num_value_heads * config.linear_value_head_dim], DType::F32)?)
+            } else { None },
         })
     }
 
@@ -2443,7 +2499,7 @@ impl PrefillBatchScratch {
             self.dn_attn_out_batch, self.dn_normed_batch,
             self.gate_ffn_batch, self.up_batch, self.ffn_hidden_batch,
             self.dn_normed_rot_batch,
-            self.positions,
+            self.positions, self.tokens,
             self.fa_q_full_batch, self.fa_q_batch, self.fa_gate_batch,
             self.fa_k_batch, self.fa_v_batch, self.fa_attn_out_batch,
             self.fa_attn_out_rot_batch,
@@ -2455,6 +2511,7 @@ impl PrefillBatchScratch {
             self.moe_shared_gate_batch, self.moe_shared_up_batch, self.moe_shared_rot_batch,
             self.moe_topk_indices_batch, self.moe_topk_weights_batch,
             self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch,
+            self.dn_s_tape_q8, self.dn_s_tape_scales,
         ] {
             if let Some(t) = t { let _ = gpu.free_tensor(t); }
         }
@@ -2502,6 +2559,78 @@ impl PrefillBatchScratch {
 /// to replay GDN recurrence from a pre-verify S-state snapshot for
 /// `accept_len + 1` steps — no full-target re-run needed.
 #[allow(clippy::too_many_arguments)]
+/// Upper bound on `forward_prefill_batch`'s per-chunk size. Exposed so
+/// callers sizing `HiddenStateRingBuffer` staging can match the chunk
+/// upper bound (staging that's smaller than a chunk will assert-fail
+/// on prompt seeding of long prompts).
+pub const PREFILL_MAX_BATCH: usize = 256;
+
+/// Host-side helper: upload token ids and positions to a `PrefillBatchScratch`
+/// via sync `memcpy_htod`. Call this BEFORE entering a hipGraph capture to
+/// pre-populate `pbs.tokens` and `pbs.positions`, then pass `pre_uploaded:
+/// true` (or use `forward_prefill_chunk_captured_safe`) so the forward
+/// does not issue any additional uploads inside the captured region.
+pub fn upload_prefill_batch_inputs(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    tokens: &[u32],
+    start_pos: usize,
+) -> HipResult<()> {
+    let n = tokens.len();
+    let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+    let tokens_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+    let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+    let positions_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    Ok(())
+}
+
+/// Capture-friendly entry point that runs the batched forward against a
+/// SINGLE chunk (`tokens.len() <= pbs.max_batch`), skipping the internal
+/// token/position upload and assuming the caller has already populated
+/// `pbs.tokens` / `pbs.positions` via `upload_prefill_batch_inputs`.
+///
+/// This exists so `hipStreamBeginCapture` can wrap the forward without
+/// the per-call `memcpy_htod` sync operations (which would either error
+/// under capture or bake stale host data into the captured graph nodes).
+///
+/// Callers still must handle `hidden_rb.commit_staging_to_ring(gpu, n)`
+/// AFTER the forward returns (outside any captured region) to scatter
+/// staging writes to the ring at the current head.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_single_chunk_captured(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+) -> HipResult<()> {
+    let n = tokens.len();
+    debug_assert!(n > 0 && n <= pbs.max_batch,
+        "single_chunk_captured: n={} but pbs.max_batch={}", n, pbs.max_batch);
+    forward_prefill_chunk(
+        gpu, weights, config, tokens, start_pos,
+        kv_cache, dn_state, scratch, pbs, hidden_rb,
+        per_token_hidden_out.map(|t| (t, 0)),
+        gdn_tape, 0, tree_verify,
+        true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
+        None, // per_layer_x_snapshots: not used by single_chunk_captured path
+    )
+}
+
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -2592,7 +2721,10 @@ pub fn forward_prefill_batch_with_pbs_and_snapshots(
     // gated_delta_net_q8_batch_seq loop is still sequential per token, so
     // the per-chunk DeltaNet cost is linear in N either way; raising the
     // batch just amortizes the NON-DeltaNet kernels more.
-    const MAX_BATCH: usize = 256;
+    //
+    // Exposed via PREFILL_MAX_BATCH so callers sizing `HiddenStateRingBuffer`
+    // staging can match the chunk upper bound.
+    const MAX_BATCH: usize = PREFILL_MAX_BATCH;
 
     let n = tokens.len();
     if n == 0 {
@@ -2759,10 +2891,17 @@ pub fn forward_prefill_batch_with_pbs_and_snapshots(
                 gpu, weights, config, chunk, start_pos + chunk_start,
                 kv_cache, dn_state, scratch, pbs, hidden_rb.as_deref(),
                 pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
+                false, // pre_uploaded: default path uploads inside
                 per_layer_x_snapshots,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
-                rb.advance_head_by(chunk_n);
+                // Scatter fixed-offset staging writes (done inside the chunk)
+                // to the ring at the current head, then advance head by n.
+                // This is the out-of-capture step: graph-captured writes went
+                // to staging[0..n*h], this commit places them at head*h
+                // where head is read from CPU state at call time (not baked
+                // into a captured graph node).
+                rb.commit_staging_to_ring(gpu, chunk_n)?;
             }
             chunk_start = chunk_end;
         }
@@ -2957,6 +3096,7 @@ fn forward_prefill_chunk(
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tape_offset: usize,
     tree_verify: Option<TreeVerifyCtx<'_>>,
+    pre_uploaded: bool,
     per_layer_x_snapshots: Option<&[GpuTensor]>,
 ) -> HipResult<()> {
     let n = tokens.len();
@@ -2971,16 +3111,45 @@ fn forward_prefill_chunk(
     let hd = config.linear_key_head_dim;
     let dim_row_bytes = dim * 4;
 
-    // ── 1. Embed each token into s.x, then copy into pbs.x_batch row ──────
-    for (i, &tok) in tokens.iter().enumerate() {
-        match weights.embd_format {
-            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &s.x, tok, dim)?,
-            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?,
-            EmbeddingFormat::Q8_0     => gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?,
-            EmbeddingFormat::F32      => gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?,
-            _ => panic!("unsupported embedding format"),
+    // ── 1. Embed tokens into pbs.x_batch ─────────────────────────────────
+    //
+    // Fast path for HFQ4G256 (all MQ4-quantized Qwen3.5 models + friends):
+    // upload token ids to a device buffer and dispatch one batched kernel
+    // that dequantizes N rows directly into `pbs.x_batch`. This collapses
+    // 2N launches (N embed + N memcpy_dtod_at) into 1 upload + 1 launch
+    // AND is hipGraph-captureable — the kernel reads token ids from a
+    // device pointer instead of taking them as a baked-in scalar arg.
+    //
+    // Other formats fall back to the per-token loop (kept for correctness
+    // breadth; the MQ4-quantized hot path doesn't hit them).
+    if matches!(weights.embd_format, EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0) {
+        if !pre_uploaded {
+            let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            let tokens_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
+            };
+            gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
         }
-        gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
+        match weights.embd_format {
+            EmbeddingFormat::HFQ4G256 => {
+                gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+            }
+            EmbeddingFormat::Q8_0 => {
+                gpu.embedding_lookup_q8_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        for (i, &tok) in tokens.iter().enumerate() {
+            match weights.embd_format {
+                EmbeddingFormat::HFQ4G256 => unreachable!(),
+                EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?,
+                EmbeddingFormat::Q8_0     => gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?,
+                EmbeddingFormat::F32      => gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?,
+                _ => panic!("unsupported embedding format"),
+            }
+            gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
+        }
     }
 
     // ── 1b. Upload positions array ────────────────────────────────────────
@@ -3002,11 +3171,13 @@ fn forward_prefill_chunk(
     // or a scatter-kernel for commit. `ctx.positions` is accepted for API
     // compatibility but ignored — the DdNode depths it carries are only
     // used by `linearize_tree` to build the attn_bias mask.
-    let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
-    let positions_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
-    };
-    gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    if !pre_uploaded {
+        let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+        let positions_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
+        };
+        gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    }
 
     // Decide whether the FA layers can take the batched path. Requires
     // (a) all FA weights to be MQ4G256 or HFQ4G256 (the batched gemm_qkv
@@ -3033,11 +3204,26 @@ fn forward_prefill_chunk(
                 is_batchable_la(l.wo.gpu_dtype),
             _ => true, // LA layers don't gate this check
         });
-    let max_ctx_len = start_pos + n;
+    // Under hipGraph capture, scalar kernargs get BAKED into the kernarg blob
+    // at capture time. `max_ctx_len = start_pos + n` grows per cycle, so the
+    // captured value would be stale on replay — the attention kernel would
+    // allocate too-small LDS for `scores[]` and over-read. Bake the physical
+    // cap instead (LDS sized for the worst case). The kernel still iterates
+    // over the actual `positions[b] + 1` per-row seq_len from a device buffer,
+    // so correctness is preserved; only the LDS allocation is over-provisioned.
+    let max_ctx_len = if gpu.capture_mode {
+        kv_cache.physical_cap
+    } else {
+        start_pos + n
+    };
 
     // ── 2. Per-layer loop ────────────────────────────────────────────────
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
+    // Path B: per-FA-layer counter, drives the index into
+    // tree_verify.pre_rope_k_capture[]. Increments alongside each
+    // FullAttention layer iteration regardless of MoE/non-MoE variant.
+    let mut fa_layer_idx = 0usize;
 
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -3148,28 +3334,44 @@ fn forward_prefill_chunk(
                     let off_a = tape_offset * alpha_row_bytes;
                     let copy_qkv = n * qkv_row_bytes;
                     let copy_a = n * alpha_row_bytes;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.qkv_bufs[delta_layer_idx].buf, off_qkv,
                         &pbs.dn_qkv_batch.buf, 0, copy_qkv,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.alpha_bufs[delta_layer_idx].buf, off_a,
                         &pbs.dn_alpha_batch.buf, 0, copy_a,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.beta_bufs[delta_layer_idx].buf, off_a,
                         &pbs.dn_beta_batch.buf, 0, copy_a,
                     )?;
                 }
 
-                // Conv1d + SiLU + Q/K/V split, advancing state N steps.
-                // State advance is byte-identical to N single-token calls.
-                gpu.conv1d_silu_split_f32_n(
-                    &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
-                    &pbs.dn_qkv_batch, &layer.conv_weight,
-                    &dn_state.conv_states[delta_layer_idx],
-                    k_dim, v_dim, n,
-                )?;
+                // Tree-aware dispatch gate: when the caller provides
+                // parent_indices (Phase 3b+ of Task #101), swap the linear
+                // conv1d + GDN for tree-walking variants that eliminate
+                // sibling-subtree state cross-contamination. The tree
+                // kernels are READ-ONLY on dn_state (don't advance it) —
+                // caller runs linear replay on the accepted spine
+                // post-acceptance to commit the trajectory.
+                let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
+                if let Some(parents) = tree_parents {
+                    gpu.conv1d_silu_split_tree_f32_n(
+                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        parents,
+                        k_dim, v_dim, n,
+                    )?;
+                } else {
+                    gpu.conv1d_silu_split_f32_n(
+                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        k_dim, v_dim, n,
+                    )?;
+                }
 
                 if trace {
                     for r in 0..n {
@@ -3213,8 +3415,8 @@ fn forward_prefill_chunk(
                     )?;
                 } else {
                     // n_key_heads == n_v_heads → k_dim == v_dim, memcpy the whole block.
-                    gpu.hip.memcpy_dtod(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
-                    gpu.hip.memcpy_dtod(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
                 }
 
                 if trace {
@@ -3227,17 +3429,35 @@ fn forward_prefill_chunk(
                     }
                 }
 
-                // Gated Delta Net — N sequential calls with offset pointers.
-                // Byte-exact with decode because each call rounds S_q8 after
-                // its single-token update.
-                gpu.gated_delta_net_q8_batch_seq(
-                    &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
-                    &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
-                    &dn_state.s_matrices[delta_layer_idx],
-                    &dn_state.s_scales[delta_layer_idx],
-                    &pbs.dn_attn_out_batch,
-                    n, n_v_heads, config.linear_value_head_dim,
-                )?;
+                // Gated Delta Net — tree variant reads per-token S from
+                // s_tape[parent] (or pre-block s_q8_init at root); linear
+                // variant advances dn_state.s_matrices in place. Byte-exact
+                // with decode because each call rounds S_q8 after its
+                // single-token update.
+                if let Some(parents) = tree_parents {
+                    let tape_q8 = pbs.dn_s_tape_q8.as_ref()
+                        .expect("tree-aware LA requires dn_s_tape_q8 scratch (check PrefillBatchScratch::new)");
+                    let tape_sc = pbs.dn_s_tape_scales.as_ref()
+                        .expect("tree-aware LA requires dn_s_tape_scales scratch (check PrefillBatchScratch::new)");
+                    gpu.gated_delta_net_q8_tree_batch_seq(
+                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx],
+                        tape_q8, tape_sc, parents,
+                        &pbs.dn_attn_out_batch,
+                        n, n_v_heads, config.linear_value_head_dim,
+                    )?;
+                } else {
+                    gpu.gated_delta_net_q8_batch_seq(
+                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx],
+                        &pbs.dn_attn_out_batch,
+                        n, n_v_heads, config.linear_value_head_dim,
+                    )?;
+                }
 
                 if trace {
                     for r in 0..n {
@@ -3395,7 +3615,7 @@ fn forward_prefill_chunk(
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
 
@@ -3462,16 +3682,54 @@ fn forward_prefill_chunk(
                 )?;
 
                 if crate::triattn::tap_enabled() {
-                    let n_q = config.n_heads * config.head_dim;
-                    let n_k = config.n_kv_heads * config.head_dim;
-                    let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
-                    let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
-                    for b in 0..n {
-                        crate::triattn::record_prerope_qk(
-                            layer_idx,
-                            &q_cpu[b * n_q..(b + 1) * n_q],
-                            Some(&k_cpu[b * n_k..(b + 1) * n_k]),
-                        );
+                    // Try GPU path first: dispatches a reduce kernel on the
+                    // device-resident Q tensor, zero PCIe transfer. Only
+                    // succeeds when install_tap_gpu() was used. Falls through
+                    // to CPU path otherwise.
+                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                        gpu, layer_idx, &pbs.fa_q_batch.buf,
+                        n, config.n_heads, config.head_dim,
+                    )?;
+                    if !gpu_handled {
+                        let n_q = config.n_heads * config.head_dim;
+                        let n_k = config.n_kv_heads * config.head_dim;
+                        let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
+                        let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
+                        for b in 0..n {
+                            crate::triattn::record_prerope_qk(
+                                layer_idx,
+                                &q_cpu[b * n_q..(b + 1) * n_q],
+                                Some(&k_cpu[b * n_k..(b + 1) * n_k]),
+                            );
+                        }
+                    }
+                }
+
+                // Path B pre-RoPE K capture (slow-path-kill, WIP).
+                // The next line mutates pbs.fa_k_batch in place — capture
+                // BEFORE so the slow path has the unrotated K available
+                // and can apply RoPE for the COMMITTED slot phases instead
+                // of these linearization-slot phases. Capture is None
+                // unless the env gate + the per-FA-layer scratch are both
+                // wired through TreeVerifyCtx.
+                if let Some(slots) = tree_verify.as_ref().and_then(|c| c.pre_rope_k_capture) {
+                    if let Some(slot) = slots.get(fa_layer_idx) {
+                        let kv_dim = config.n_kv_heads * config.head_dim;
+                        let n_bytes = n * kv_dim * 4;
+                        // Use _auto so the memcpy is recorded onto the
+                        // active stream when one exists (matches the
+                        // existing GdnTape capture pattern at line ~3193).
+                        // Plain gpu.hip.memcpy_dtod_at runs on the null
+                        // stream and sync-blocks pending async kernels,
+                        // changing kernel-launch order in ways that
+                        // perturb DDTree's ksplit-atomic nondeterminism
+                        // — output diverges even though no data is
+                        // actually changed.
+                        gpu.memcpy_dtod_at_auto(
+                            &slot.buf, 0,
+                            &pbs.fa_k_batch.buf, 0,
+                            n_bytes,
+                        )?;
                     }
                 }
 
@@ -3689,13 +3947,14 @@ fn forward_prefill_chunk(
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
 
                 // Silence unused warning if kv_dim ends up shadowed.
                 let _ = kv_dim;
                 kv_layer_idx += 1;
+                fa_layer_idx += 1;
             }
 
             (LayerWeights::FullAttn(_layer), LayerType::FullAttention) => {
@@ -3715,11 +3974,12 @@ fn forward_prefill_chunk(
                 // for all N tokens (last copy-back finishes each row).
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
 
                 kv_layer_idx += 1;
+                fa_layer_idx += 1;
             }
 
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
@@ -3777,25 +4037,37 @@ fn forward_prefill_chunk(
                     let off_a = tape_offset * alpha_row_bytes;
                     let copy_qkv = n * qkv_row_bytes;
                     let copy_a = n * alpha_row_bytes;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.qkv_bufs[delta_layer_idx].buf, off_qkv,
                         &pbs.dn_qkv_batch.buf, 0, copy_qkv,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.alpha_bufs[delta_layer_idx].buf, off_a,
                         &pbs.dn_alpha_batch.buf, 0, copy_a,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.beta_bufs[delta_layer_idx].buf, off_a,
                         &pbs.dn_beta_batch.buf, 0, copy_a,
                     )?;
                 }
-                gpu.conv1d_silu_split_f32_n(
-                    &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
-                    &pbs.dn_qkv_batch, &layer.conv_weight,
-                    &dn_state.conv_states[delta_layer_idx],
-                    k_dim, v_dim, n,
-                )?;
+                // Same tree-aware dispatch gate as dense LA branch above.
+                let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
+                if let Some(parents) = tree_parents {
+                    gpu.conv1d_silu_split_tree_f32_n(
+                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        parents,
+                        k_dim, v_dim, n,
+                    )?;
+                } else {
+                    gpu.conv1d_silu_split_f32_n(
+                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        k_dim, v_dim, n,
+                    )?;
+                }
                 gpu.fused_qk_l2_norm_scale_f32_batched(
                     &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
                     config.linear_num_key_heads, hd,
@@ -3809,17 +4081,33 @@ fn forward_prefill_chunk(
                         config.linear_num_key_heads, ratio, hd, n,
                     )?;
                 } else {
-                    gpu.hip.memcpy_dtod(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
-                    gpu.hip.memcpy_dtod(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
                 }
-                gpu.gated_delta_net_q8_batch_seq(
-                    &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
-                    &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
-                    &dn_state.s_matrices[delta_layer_idx],
-                    &dn_state.s_scales[delta_layer_idx],
-                    &pbs.dn_attn_out_batch,
-                    n, n_v_heads, config.linear_value_head_dim,
-                )?;
+                if let Some(parents) = tree_parents {
+                    let tape_q8 = pbs.dn_s_tape_q8.as_ref()
+                        .expect("tree-aware LA requires dn_s_tape_q8 scratch");
+                    let tape_sc = pbs.dn_s_tape_scales.as_ref()
+                        .expect("tree-aware LA requires dn_s_tape_scales scratch");
+                    gpu.gated_delta_net_q8_tree_batch_seq(
+                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx],
+                        tape_q8, tape_sc, parents,
+                        &pbs.dn_attn_out_batch,
+                        n, n_v_heads, config.linear_value_head_dim,
+                    )?;
+                } else {
+                    gpu.gated_delta_net_q8_batch_seq(
+                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx],
+                        &pbs.dn_attn_out_batch,
+                        n, n_v_heads, config.linear_value_head_dim,
+                    )?;
+                }
                 gpu.gated_norm_f32_batched(
                     &pbs.dn_attn_out_batch, &pbs.dn_z_batch, &layer.norm_weight,
                     &pbs.dn_normed_batch,
@@ -3843,7 +4131,7 @@ fn forward_prefill_chunk(
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
                 delta_layer_idx += 1;
@@ -3901,16 +4189,35 @@ fn forward_prefill_chunk(
                     n * config.n_kv_heads, config.head_dim, config.norm_eps,
                 )?;
                 if crate::triattn::tap_enabled() {
-                    let n_q = config.n_heads * config.head_dim;
-                    let n_k = config.n_kv_heads * config.head_dim;
-                    let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
-                    let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
-                    for b in 0..n {
-                        crate::triattn::record_prerope_qk(
-                            layer_idx,
-                            &q_cpu[b * n_q..(b + 1) * n_q],
-                            Some(&k_cpu[b * n_k..(b + 1) * n_k]),
-                        );
+                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                        gpu, layer_idx, &pbs.fa_q_batch.buf,
+                        n, config.n_heads, config.head_dim,
+                    )?;
+                    if !gpu_handled {
+                        let n_q = config.n_heads * config.head_dim;
+                        let n_k = config.n_kv_heads * config.head_dim;
+                        let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
+                        let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
+                        for b in 0..n {
+                            crate::triattn::record_prerope_qk(
+                                layer_idx,
+                                &q_cpu[b * n_q..(b + 1) * n_q],
+                                Some(&k_cpu[b * n_k..(b + 1) * n_k]),
+                            );
+                        }
+                    }
+                }
+                // Path B pre-RoPE K capture (MoE FA variant). See same
+                // block in the FullAttn branch for rationale.
+                if let Some(slots) = tree_verify.as_ref().and_then(|c| c.pre_rope_k_capture) {
+                    if let Some(slot) = slots.get(fa_layer_idx) {
+                        let kv_dim = config.n_kv_heads * config.head_dim;
+                        let n_bytes = n * kv_dim * 4;
+                        gpu.memcpy_dtod_at_auto(
+                            &slot.buf, 0,
+                            &pbs.fa_k_batch.buf, 0,
+                            n_bytes,
+                        )?;
                     }
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
@@ -4042,13 +4349,14 @@ fn forward_prefill_chunk(
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
 
                 let _ = kv_dim;
                 let _ = q_dim;
                 kv_layer_idx += 1;
+                fa_layer_idx += 1;
             }
 
             _ => panic!("layer type mismatch at layer {layer_idx}"),

@@ -1,0 +1,204 @@
+# Task #93 — Path C: Trained Custom Draft for τ + Oracle Revival
+
+**Status:** Open. Multi-week scope. Targets Red Hat / vLLM training recipe.
+**Source:** `../dflash-fe/RECIPE_RedHat_DFlash_MI300X.md` (recipe doc).
+**Companion:** `docs/plans/task-93-path-d-stale-context.prd` (different lever, can ship in parallel).
+
+---
+
+## Why this exists
+
+Two compounded wins from training a custom DFlash draft on the target's
+own distribution:
+
+1. **Direct tau lift** — better draft alignment lifts baseline tok/s
+   independent of any pipelining. Per recipe section "Acceptance Rate
+   Targets": pos-0 acceptance 30%->50% achievable. Today our z-lab DFlash
+   draft gives tau=10.36 on PEP-8 LRU; a target-aligned draft could push
+   tau toward 12-14 (mean accept length 1.5->2.0+ in recipe terms).
+
+2. **Oracle revival for Path D / pipelining** — Phase B (commit 6842a86)
+   measured ANYPOS_MATCH at 23.5% on code with z-lab draft. A target-
+   aligned draft should lift this materially because draft argmax tracks
+   target argmax much more closely. If ANYPOS_MATCH crosses 50% break-even,
+   the original PRD's pipelining (P0 oracle) becomes viable -> +12-22%
+   on top of the direct tau lift.
+
+Compounded ceiling: 199 tok/s -> 240-260 tok/s plausible if both land.
+
+---
+
+## What our current dflash_train_poc.py is missing (per recipe)
+
+Recipe section 7 ("Hipfire-Specific Adaptations") lists the gaps. Audited
+against `scripts/dflash_train_poc.py`:
+
+| Recipe gap | Current state | Severity |
+|---|---|---|
+| Target-generated responses | Missing entirely (training on raw corpus text) | **CRITICAL** |
+| Reduced draft vocab (8192) | Hard-coded full vocab (151936) | **HIGH** |
+| Hand-picked target_layer_ids | Auto via `build_target_layer_ids` | **MEDIUM** |
+| Loss mask on assistant turns | All-tokens loss | **MEDIUM** |
+| Conversational data | Default corpus is wikitext | **HIGH** |
+| Block-size randomization | Fixed at 16 | LOW |
+
+---
+
+## Implementation phases
+
+### Phase C1 - Add missing flags to dflash_train_poc.py (script-only, low risk)
+
+- `--draft-vocab-size N` (default 8192 per recipe)
+- `--loss-mask {assistant,all}` (default assistant)
+- `--target-layer-ids "i,j,k"` (override auto)
+- `--use-vllm-hidden-states URL` (online mode hook for future Phase C3)
+
+Acceptance: argparse passes; existing default-args runs unchanged
+(byte-no-op when new flags omitted at their default).
+
+### Phase C2 - Build target-self-generation script
+
+New: `scripts/generate_target_responses.py`
+
+For each conversation in input corpus:
+1. Take user/system messages.
+2. Run target model (Qwen3.5 9B/27B) to generate assistant response.
+3. Write `{messages: [...]}` JSONL with target-generated response.
+
+Implementations:
+- (a) Local: use `crates/engine/examples/run.rs --max-seq 8192` + Python wrapper.
+- (b) Remote: vLLM serve + OpenAI-compatible client (per recipe section 4).
+- Choose (a) when MI300X available; (b) for local fallback on 7900XTX.
+
+Acceptance: 1K-sample test run produces JSONL with target-aligned responses.
+Validate with `dflash_diag_zlab_loss.py`.
+
+### Phase C3 - vLLM hidden-state generation pipeline
+
+Per recipe section 4 ("vLLM Hidden-State Generation"):
+
+```bash
+vllm serve Qwen/Qwen3.5-9B \
+  --tensor-parallel-size N \
+  --enable-hidden-states \
+  --hidden-state-layer-ids 2,18,33 \
+  --port 8000
+```
+
+Wrap with offline-mode generator (recipe section 4.1) that pulls hidden
+states for each conversation and saves as safetensors shards.
+
+Out of scope on local 7900XTX (one-card, can't shard target). MI300X
+required.
+
+### Phase C4 - Run actual training on MI300X
+
+Per recipe section 5 ("Training Pipeline"):
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  scripts/dflash_train_poc.py \
+  --target-repo Qwen/Qwen3.5-9B \
+  --corpus /root/sharegpt_target.jsonl \
+  --draft-vocab-size 8192 \
+  --loss-mask assistant \
+  --target-layer-ids "2,18,33" \
+  --seq-len 8192 \
+  --batch-size 4 \
+  --lr 3e-4 \
+  --steps 25000
+```
+
+Sanity-check on 5K samples first (per recipe section 8 "Validation").
+Targets: pos-0 acceptance >=30%, mean accept length >=1.3.
+
+### Phase C5 - Convert to HFQ + validate
+
+Use `crates/engine/examples/dflash_convert` (or build it if missing) to
+convert safetensors -> .hfq with MQ4 quantization. Then bench against
+z-lab baseline using existing sweep_dflash_full.sh.
+
+Acceptance: tau on PEP-8 LRU >= 11.0 (vs current 10.36); mean accept
+length >= 1.5 on Red Hat sanity test.
+
+### Phase C6 - Re-measure oracle accuracy
+
+Re-run Phase B (`6842a86`) seed-prediction oracle measurement with new
+draft. If ANYPOS_MATCH > 50% on code -> Path D's revived P0 oracle is
+viable. Combine with Path D's stale-context overlap for compounded win.
+
+### Phase C7 - Train domain-specialized variants (stretch)
+
+Per recipe section 6.3 "Agentic Trace Generation": use Hermes/Aureth
+corpus we already have (`scripts/aureth_to_corpus.py` +
+`scripts/hermes_traces_to_corpus.py`) to train a Carnice-9b-aligned
+draft for tool-calling targets.
+
+---
+
+## Compute requirements
+
+- **MI300X (or comparable)**: vLLM hidden-state gen + 8-GPU training.
+- **Storage**: 50-100 GB for hidden states + checkpoints per draft.
+- **Wall time**: 1-2 days per draft training run (5 epochs @ 50K samples).
+- **Cost**: ~$200-500 in MI300X rental for one full training run.
+
+---
+
+## Coherence + speed gates
+
+Same as original PRD plus:
+- Quality gate (`scripts/quality-gate.sh --fast`): byte-exact greedy parity
+  between new draft + non-DFlash AR. (DFlash byte-parity holds when tau
+  is high.)
+- Coherence-gate-dflash with new draft: no token attractors.
+- Per-position acceptance: pos-0 >=30%, mean >=1.3 (recipe minimums).
+
+---
+
+## Code surface
+
+| Site | Change |
+|---|---|
+| `scripts/dflash_train_poc.py` | Add flags from Phase C1 |
+| `scripts/generate_target_responses.py` | NEW - Phase C2 |
+| `scripts/vllm_hidden_state_offline.py` | NEW - Phase C3 |
+| `crates/engine/src/dflash.rs` | Reduced vocab head support (lm_head dim != target vocab) |
+| `crates/engine/src/hfq.rs` | Maybe: variant for reduced-vocab draft weights |
+| `crates/engine/examples/dflash_convert.rs` | safetensors -> .hfq pipeline |
+
+---
+
+## Risks
+
+| Risk | Mitigation |
+|---|---|
+| Reduced vocab (8K) breaks coherence on rare-token continuations | Recipe acknowledges this; falls back to top-K projection |
+| Training diverges (non-trivial dataset issue) | Recipe troubleshooting section; verify with dflash_diag_zlab_loss.py |
+| MI300X unavailable | Local fallback: train smaller (4B target, 5-layer draft) on 7900XTX as POC |
+| Trained draft underperforms z-lab baseline | Iterate on data quality first per recipe; rare to fully fail given clean data |
+| Time investment vs uncertain payoff | Phase C1+C2 are <1 day; can validate the data path before committing to full training |
+
+---
+
+## Out of scope
+
+- Targets other than Qwen3.5/3.6 (separate effort)
+- Non-DFlash speculator types (EAGLE-3, Medusa) — different paradigm
+- Cross-arch dispatch (gfx1100 first, MI300X for training only)
+- Path D (stale-context overlap) — separate PRD, can ship in parallel
+
+---
+
+## References
+
+- Recipe doc: `../dflash-fe/RECIPE_RedHat_DFlash_MI300X.md`
+- RedHatAI DFlash Gemma 4: https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.dflash
+- vLLM Speculators: https://github.com/vllm-project/speculators
+- DFlash paper: arXiv:2602.06036
+- Phase A scaffolding: c734860
+- Phase B oracle measurement: 6842a86
+- Aureth corpus pipeline: scripts/aureth_to_corpus.py
+- Hermes traces pipeline: scripts/hermes_traces_to_corpus.py
+- Original PRD: docs/plans/task-93-inter-cycle-pipelining.prd
+- Path D PRD: docs/plans/task-93-path-d-stale-context.prd

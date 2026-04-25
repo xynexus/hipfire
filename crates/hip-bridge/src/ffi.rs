@@ -20,17 +20,26 @@ pub mod launch_counters {
                 thread_local! {
                     pub(super) static TIME_NS: Cell<u64> = const { Cell::new(0) };
                     pub(super) static COUNT: Cell<u64> = const { Cell::new(0) };
+                    pub(super) static BYTES: Cell<u64> = const { Cell::new(0) };
                 }
                 #[inline]
                 pub fn record(ns: u64) {
                     TIME_NS.with(|c| c.set(c.get() + ns));
                     COUNT.with(|c| c.set(c.get() + 1));
                 }
+                #[inline]
+                pub fn record_bytes(ns: u64, bytes: u64) {
+                    TIME_NS.with(|c| c.set(c.get() + ns));
+                    COUNT.with(|c| c.set(c.get() + 1));
+                    BYTES.with(|c| c.set(c.get() + bytes));
+                }
                 pub fn time_ns() -> u64 { TIME_NS.with(|c| c.get()) }
                 pub fn count() -> u64 { COUNT.with(|c| c.get()) }
+                pub fn bytes() -> u64 { BYTES.with(|c| c.get()) }
                 pub fn reset() {
                     TIME_NS.with(|c| c.set(0));
                     COUNT.with(|c| c.set(0));
+                    BYTES.with(|c| c.set(0));
                 }
             }
         };
@@ -58,6 +67,10 @@ pub mod launch_counters {
         memcpy_dtoh::reset();
         memset::reset();
         ensure_kernel_lookup::reset();
+        stream_sync::reset();
+        event_sync::reset();
+        device_sync::reset();
+        graph_launch::reset();
     }
 
     pub fn time_ns() -> u64 { TIME_NS.with(|c| c.get()) }
@@ -70,6 +83,10 @@ pub mod launch_counters {
     counter!(memcpy_dtoh);
     counter!(memset);
     counter!(ensure_kernel_lookup);
+    counter!(stream_sync);
+    counter!(event_sync);
+    counter!(device_sync);
+    counter!(graph_launch);
 }
 
 // Opaque HIP handles (pointers to internal structs)
@@ -100,6 +117,7 @@ pub struct HipRuntime {
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
+    fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
 
     // Streams
     fn_stream_create: unsafe extern "C" fn(*mut HipStream) -> u32,
@@ -131,6 +149,7 @@ pub struct HipRuntime {
     fn_event_synchronize: unsafe extern "C" fn(HipEvent) -> u32,
     fn_event_elapsed_time: unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32,
     fn_event_destroy: unsafe extern "C" fn(HipEvent) -> u32,
+    fn_stream_wait_event: unsafe extern "C" fn(HipStream, HipEvent, c_uint) -> u32,
 
     // Error
     fn_get_error_string: unsafe extern "C" fn(u32) -> *const i8,
@@ -225,6 +244,7 @@ impl HipRuntime {
                 fn_memcpy: load_fn!(lib, "hipMemcpy", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32),
                 fn_memcpy_async: load_fn!(lib, "hipMemcpyAsync", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32),
                 fn_memset: load_fn!(lib, "hipMemset", unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32),
+                fn_memset_async: load_fn!(lib, "hipMemsetAsync", unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32),
                 fn_stream_create: load_fn!(lib, "hipStreamCreate", unsafe extern "C" fn(*mut HipStream) -> u32),
                 fn_stream_synchronize: load_fn!(lib, "hipStreamSynchronize", unsafe extern "C" fn(HipStream) -> u32),
                 fn_stream_destroy: load_fn!(lib, "hipStreamDestroy", unsafe extern "C" fn(HipStream) -> u32),
@@ -237,6 +257,7 @@ impl HipRuntime {
                 fn_event_synchronize: load_fn!(lib, "hipEventSynchronize", unsafe extern "C" fn(HipEvent) -> u32),
                 fn_event_elapsed_time: load_fn!(lib, "hipEventElapsedTime", unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32),
                 fn_event_destroy: load_fn!(lib, "hipEventDestroy", unsafe extern "C" fn(HipEvent) -> u32),
+                fn_stream_wait_event: load_fn!(lib, "hipStreamWaitEvent", unsafe extern "C" fn(HipStream, HipEvent, c_uint) -> u32),
                 fn_get_error_string: load_fn!(lib, "hipGetErrorString", unsafe extern "C" fn(u32) -> *const i8),
                 fn_get_last_error: load_fn!(lib, "hipGetLastError", unsafe extern "C" fn() -> u32),
                 fn_stream_begin_capture: load_fn!(lib, "hipStreamBeginCapture", unsafe extern "C" fn(HipStream, c_uint) -> u32),
@@ -402,6 +423,7 @@ impl HipRuntime {
         self.check(code, "hipMemcpy H2D")
     }
 
+    #[track_caller]
     pub fn memcpy_dtoh(&self, dst: &mut [u8], src: &DeviceBuffer) -> HipResult<()> {
         assert!(
             dst.len() <= src.size,
@@ -409,6 +431,7 @@ impl HipRuntime {
             dst.len(),
             src.size
         );
+        let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
         let code = unsafe {
             (self.fn_memcpy)(
@@ -418,12 +441,21 @@ impl HipRuntime {
                 MemcpyKind::DeviceToHost as c_uint,
             )
         };
-        crate::ffi::launch_counters::memcpy_dtoh::record(t.elapsed().as_nanos() as u64);
+        let elapsed = t.elapsed().as_nanos() as u64;
+        crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1")
+        });
+        if dump {
+            eprintln!("dtoh bytes={} us={} at {}:{}", dst.len(), elapsed / 1000, loc.file(), loc.line());
+        }
         self.check(code, "hipMemcpy D2H")
     }
 
     /// Copy bytes from a GPU buffer at a given source offset to host.
     /// `dst.len()` bytes are copied starting from `src.ptr + src_offset`.
+    #[track_caller]
     pub fn memcpy_dtoh_at(
         &self,
         dst: &mut [u8],
@@ -436,6 +468,7 @@ impl HipRuntime {
             src_offset, dst.len(), src.size
         );
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
         let code = unsafe {
             (self.fn_memcpy)(
@@ -445,7 +478,15 @@ impl HipRuntime {
                 MemcpyKind::DeviceToHost as c_uint,
             )
         };
-        crate::ffi::launch_counters::memcpy_dtoh::record(t.elapsed().as_nanos() as u64);
+        let elapsed = t.elapsed().as_nanos() as u64;
+        crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1")
+        });
+        if dump {
+            eprintln!("dtoh_at bytes={} us={} at {}:{}", dst.len(), elapsed / 1000, loc.file(), loc.line());
+        }
         self.check(code, "hipMemcpy D2H at offset")
     }
 
@@ -469,12 +510,48 @@ impl HipRuntime {
         self.check(code, "hipMemcpy D2D")
     }
 
+    #[track_caller]
     pub fn memset(&self, buf: &DeviceBuffer, value: i32, size: usize) -> HipResult<()> {
         assert!(size <= buf.size);
+        let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
         let code = unsafe { (self.fn_memset)(buf.ptr, value, size) };
-        crate::ffi::launch_counters::memset::record(t.elapsed().as_nanos() as u64);
+        let elapsed = t.elapsed().as_nanos() as u64;
+        crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1")
+        });
+        if dump {
+            eprintln!("memset bytes={} us={} at {}:{}", size, elapsed / 1000, loc.file(), loc.line());
+        }
         self.check(code, "hipMemset")
+    }
+
+    /// Async memset on a specific stream — does NOT block the host.
+    /// Caller must ensure stream-ordering downstream work syncs correctly.
+    #[track_caller]
+    pub fn memset_async(
+        &self,
+        buf: &DeviceBuffer,
+        value: i32,
+        size: usize,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert!(size <= buf.size);
+        let loc = std::panic::Location::caller();
+        let t = std::time::Instant::now();
+        let code = unsafe { (self.fn_memset_async)(buf.ptr, value, size, stream.0) };
+        let elapsed = t.elapsed().as_nanos() as u64;
+        crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1")
+        });
+        if dump {
+            eprintln!("memset_async bytes={} us={} at {}:{}", size, elapsed / 1000, loc.file(), loc.line());
+        }
+        self.check(code, "hipMemsetAsync")
     }
 
     // ── Streams ─────────────────────────────────────────────────
@@ -487,7 +564,9 @@ impl HipRuntime {
     }
 
     pub fn stream_synchronize(&self, stream: &Stream) -> HipResult<()> {
+        let t = std::time::Instant::now();
         let code = unsafe { (self.fn_stream_synchronize)(stream.0) };
+        crate::ffi::launch_counters::stream_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipStreamSynchronize")
     }
 
@@ -642,7 +721,9 @@ impl HipRuntime {
     }
 
     pub fn event_synchronize(&self, event: &Event) -> HipResult<()> {
+        let t = std::time::Instant::now();
         let code = unsafe { (self.fn_event_synchronize)(event.0) };
+        crate::ffi::launch_counters::event_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipEventSynchronize")
     }
 
@@ -657,6 +738,11 @@ impl HipRuntime {
         let code = unsafe { (self.fn_event_destroy)(event.0) };
         std::mem::forget(event);
         self.check(code, "hipEventDestroy")
+    }
+
+    pub fn stream_wait_event(&self, stream: &Stream, event: &Event) -> HipResult<()> {
+        let code = unsafe { (self.fn_stream_wait_event)(stream.0, event.0, 0) };
+        self.check(code, "hipStreamWaitEvent")
     }
 
     // ── Error query ─────────────────────────────────────────────
@@ -705,6 +791,33 @@ impl HipRuntime {
         self.check(code, "hipMemcpyAsync D2H")
     }
 
+    /// Async D→D copy with optional offsets on both sides. Ordered on
+    /// `stream` and capturable by hipStreamBeginCapture — use this in
+    /// place of sync `memcpy_dtod_at` wherever the copy needs to live
+    /// inside a hipGraph.
+    pub fn memcpy_dtod_async_at(
+        &self,
+        dst: &DeviceBuffer,
+        dst_offset: usize,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        size: usize,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert!(dst_offset + size <= dst.size);
+        assert!(src_offset + size <= src.size);
+        let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
+        let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                dst_ptr, src_ptr, size,
+                MemcpyKind::DeviceToDevice as c_uint,
+                stream.0,
+            )
+        };
+        self.check(code, "hipMemcpyAsync D2D offset")
+    }
+
     // ── Graph capture & replay ──────────────────────────────────
 
     /// Begin capturing all operations on `stream` into a graph.
@@ -734,7 +847,9 @@ impl HipRuntime {
 
     /// Launch an executable graph on `stream`.
     pub fn graph_launch(&self, exec: &GraphExec, stream: &Stream) -> HipResult<()> {
+        let t = std::time::Instant::now();
         let code = unsafe { (self.fn_graph_launch)(exec.0, stream.0) };
+        crate::ffi::launch_counters::graph_launch::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipGraphLaunch")
     }
 
@@ -760,7 +875,9 @@ impl HipRuntime {
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {
+        let t = std::time::Instant::now();
         let code = unsafe { (self.fn_device_synchronize)() };
+        crate::ffi::launch_counters::device_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipDeviceSynchronize")
     }
 

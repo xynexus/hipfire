@@ -1,0 +1,257 @@
+# Task #93 — Inter-cycle pipelining (draft N+1 ‖ verify N)
+
+_Opened 2026-04-24 after Path A + Path B + FA-only re-verify all hit the
+same "tree-mode phase deltas poison downstream residuals" structural
+dead-end (39aa358). Inter-cycle pipelining is the remaining viable
+slow-path-latency lever that doesn't touch FA/RoPE/KV semantics._
+
+## Why this exists
+
+Current DFlash cycle is strictly sequential:
+
+```
+seed_N → draft_N (~20-30 ms) → verify_N (~60-80 ms) → commit_N → seed_{N+1} → ...
+```
+
+Draft and verify use separate weights (draft is small; verify is target).
+They could run in parallel. The blocker is that `seed_{N+1}` is produced
+by `verify_N` (it's the `bonus_token` — the target's prediction at the
+last committed position).
+
+Pipelining approach: start draft N+1 SPECULATIVELY on a PREDICTED seed
+while verify N is still running. When verify N completes and we know the
+actual bonus_token:
+
+- If predicted seed == actual seed → keep draft N+1's work. Net save:
+  min(draft N+1 time, verify N time) per cycle.
+- If predicted seed != actual seed → discard draft N+1 and redo. Net
+  cost: wasted draft N+1 time.
+
+Profit when: `prediction_accuracy × draft_time > (1-accuracy) × draft_time`
+→ `accuracy > 0.5`.
+
+In practice a naive predictor (use draft N's own argmax at the last
+accepted position as the bonus guess) tracks target at ~85-95% on code,
+75-90% on prose. Well above the 50% break-even.
+
+## Projected win
+
+- Draft forward: ~20-30 ms (small draft model, MQ4)
+- Target verify: ~60-80 ms (full forward on block)
+- Parallel overlap: `min(draft, verify) × prediction_accuracy`
+- ~20 ms × 0.85 ≈ 17 ms saved per cycle out of ~75 ms cycle time
+- **Projected speedup: ~22-28 % across all DFlash modes (linear + DDTree)**
+
+Applied to current 2026-04-24 baseline (27B asym3, 3-run median):
+
+| genre    | current (DFlash linear) | +pipeline | current (DDTree b12) | +pipeline |
+|----------|------------------------:|----------:|---------------------:|----------:|
+| code     | 160.4 / τ=7.91          | ~200      | 111.7 / τ=6.96       | ~140      |
+| prose    |  58.0 / τ=1.91          |  ~70      |  71.8 / τ=4.66       |  ~88      |
+| instruct |  51.7 / τ=1.57          |  ~62      |  67.8 / τ=3.85       |  ~83      |
+
+DFlash linear on code with pipelining → ~200 tok/s. DDTree b12 on code
+still short of ~200 but much closer to 140.
+
+## Seed prediction strategies
+
+The quality of the seed-prediction oracle determines the win. Ordered
+by implementation complexity + expected accuracy:
+
+**P0 — Trivial oracle: use draft's own argmax at last accepted slot**
+
+During draft N's forward, the draft produces logits at every position in
+its draft block. The argmax at the LAST accepted position is the draft's
+best guess for the NEXT token. Target's bonus_token is target's argmax
+at the same position. Draft and target agree on argmax at τ ≈ high, which
+is the regime where DFlash shines.
+
+Zero extra compute. Cheap to implement.
+
+Expected accuracy: **~85-95 % on high-τ content** (code), **~75-85 % on
+prose**, **~70-80 % on instruct**. Matches draft-target argmax agreement
+rate, which is exactly `accept_rate`. For the DFlash-winning regimes
+where this optimization matters most, the oracle is already accurate.
+
+**P1 — Cache last-cycle's bonus_token position from draft**
+
+Draft's last-position logits might not land at the "last accepted slot"
+depending on how acceptance actually walks. Needs a quick per-cycle
+post-accept re-run of draft lm_head at the exact accept boundary.
+Slightly more accurate; marginal win over P0.
+
+**P2 — Tiny "bonus predictor" model**
+
+Train a tiny sidecar (even a LUT or small transformer) to predict target's
+bonus_token from accept pattern + last accepted tokens. Higher accuracy
+at runtime cost. Out of scope unless P0/P1 hit a low ceiling.
+
+**Recommendation: ship P0 first.** Instrument accept rate at the bonus
+slot specifically; if it's clearly worse than the claimed 0.85, revisit.
+
+## Scope / design
+
+### Stream layout
+
+Need a second compute stream so draft N+1 runs genuinely concurrent with
+verify N. HipBridge's `hip.stream_create()` gives a new stream handle.
+Current code uses at most one `active_stream`; we add:
+
+- `draft_stream: Option<HipStream>` — owned by the draft pipeline
+- `verify_stream: Option<HipStream>` — owned by the verify pipeline
+- Legacy single-stream callers keep working via fallback to null stream
+
+Draft kernels explicitly launched on `draft_stream`. Verify kernels on
+`verify_stream`. Cross-stream sync via hipEventRecord + hipStreamWaitEvent
+at the specific join points (draft-N+1-completion waits for verify-N
+completion, so we know which draft was right).
+
+### Draft-scratch isolation
+
+`DflashScratch` holds per-draft-layer scratch tensors. Running two drafts
+concurrently on the same scratch would corrupt state. Options:
+
+1. **Two DflashScratch instances** (one per in-flight draft). Memory cost:
+   ~(draft_dim × draft_layers × a few) — small, probably under 100 MB on
+   the small draft. Simplest correctness story.
+2. Single DflashScratch, time-sliced so draft N+1 starts only AFTER draft
+   N's forward is fully COMPLETE on-device (draft N's work enqueued on
+   draft_stream in sequence). No extra memory, but loses some concurrency
+   with draft N's tail phase.
+
+Start with Option 1. Double-buffer at startup cost; simpler invariants.
+
+### Rollback mechanism
+
+After verify N completes, compare predicted_seed_N+1 against actual
+bonus_token_N. If match → draft N+1's work is valid; proceed to verify
+N+1 normally using draft N+1's output. If mismatch → discard draft N+1's
+device-side state (reset DflashScratch[N+1] lazily; the next real draft
+just overwrites it) and run draft N+1 from scratch on actual seed.
+
+Rollback cost: one wasted draft forward. Needs:
+
+- Draft's pre-forward snapshot of DN state if draft has any persistent
+  state that would advance (DeltaNet snapshot pattern, mirrors the
+  existing `draft_snap: DeltaNetSnapshot` that DFlash already keeps).
+- Mechanism to NOT advance KV cache writes from the speculative draft
+  (draft doesn't write to target KV cache — it has its own; correct).
+
+### Concurrency-correctness audit checklist
+
+- [ ] Target weights: read-only, safe under concurrent read ✓
+- [ ] Draft weights: read-only, safe under concurrent read ✓
+- [ ] Target KV cache: written by verify N, NOT read by draft N+1
+      (draft uses its own KV). Concurrent OK.
+- [ ] Draft KV cache / DN state: each draft instance uses its own
+      (DflashScratch option 1). Concurrent OK.
+- [ ] GdnTape: written by verify N at tree-node positions. Not read by
+      draft N+1. Concurrent OK.
+- [ ] hidden_rb: written by verify N at committed positions. Read by
+      draft N+1 to seed its forward's "previous accepted hidden" input.
+      Potential RACE: verify N writes hidden_rb AFTER draft N+1 already
+      read a STALE hidden_rb. Must wait for verify N to produce
+      hidden_rb before starting draft N+1.
+      → draft N+1 starts AFTER verify N writes hidden_rb for last
+      committed position (which happens PARTWAY through verify — target
+      per-layer writes happen mid-forward, but the final layer's hidden
+      is what draft reads). So draft N+1 can only start after verify N's
+      final FA/LA layer completes writing to hidden_rb at the committed
+      slots.
+
+Actually: in current code, hidden_rb is written at THE FINAL LAYER of
+target (per_token_hidden_out). That happens near the END of verify N's
+forward, leaving ~30 % of verify N still running (final-norm + LM head).
+So overlap window is only the last ~30 %, not the full verify.
+
+**This shrinks the projected win significantly.** Draft takes ~25 ms.
+Post-hidden-rb-write portion of verify is ~20 ms. Overlap = min(25, 20)
+× accuracy = ~17 ms saved out of 75 ms cycle time → 22 % speedup.
+Still material, but not as fat as the first back-of-envelope.
+
+### Alternative: overlap at a different join point
+
+Instead of "draft N+1 starts after verify N's hidden_rb write", we could
+have draft N+1 start immediately using LAST cycle's (cycle N-1's) hidden
+state — skipping verify N's contribution entirely. This is WRONG for the
+draft's input quality (hidden state is stale by one cycle) but may be
+OK-ish given the draft is already a lossy approximation.
+
+This is "Approach X" — draft runs on stale context; τ drops slightly but
+overlap is full-cycle. Test empirically before committing.
+
+Measure both strategies; ship the one with better wall-clock.
+
+## Implementation phases
+
+**Phase A — Second stream infrastructure.** Non-behavioral. Add
+`draft_stream` + `verify_stream` fields to ModelSlot / speculative
+driver. Current callers still use whichever stream. Build + confirm
+byte-no-op.
+
+**Phase B — Instrumented seed-prediction oracle.** Add a no-op path that
+records draft's last-position argmax before verify starts, then compares
+against actual bonus_token post-verify. Log accuracy per cycle. No
+actual pipelining yet — just collect data.
+
+**Phase C — Double-buffered DflashScratch.** Allocate two draft
+scratches at session init. Per-cycle logic uses a flip-flop index.
+
+**Phase D — Concurrent draft N+1.** Launch draft N+1 on draft_stream
+BEFORE verify N completes. Insert hipEventRecord at verify-N's final
+hidden_rb write. Insert hipStreamWaitEvent on draft_stream so draft
+reads stable hidden_rb.
+
+**Phase E — Rollback on mis-prediction.** On mismatch, re-dispatch draft
+on actual seed. Draft-scratch flip-flop already isolates.
+
+**Phase F — Gate pass + bench.** Coherence-gate-dflash + speed-gate. 3-run
+medians on code/prose/instruct. Compare to committed baselines.
+
+## Speed / correctness gates
+
+**Correctness**:
+- Coherence-gate-dflash must pass unchanged (no token attractors).
+- Output with pipelining ON must be coherent on eyeball + token-
+  distribution detector.
+- Output MAY differ byte-exact from default due to ksplit nondeterminism,
+  but must stay within same τ noise band (±10 %).
+- Mis-prediction rate in Phase B logging must be < 30 % on all genres
+  (accuracy > 70 % → positive-sum on P0 oracle).
+
+**Speed**:
+- 27B DFlash linear code: **≥ 180 tok/s** (current 160 → +12 %).
+- 27B DFlash linear prose: **≥ 64 tok/s** (current 58 → +10 %).
+- 27B DDTree b12-k2 code: **≥ 130 tok/s** (current 112 → +16 %).
+- 27B DDTree b12-k2 prose: **≥ 82 tok/s** (current 72 → +14 %).
+- If prediction accuracy is high and hidden_rb overlap window is larger
+  than I've estimated, real numbers could be higher. If overlap is
+  smaller than estimated, targets may slip.
+
+**Regressions to avoid**:
+- Single-stream mode (pipelining OFF) must be within ±2 % of pre-change
+  perf. Opt-in env gate until gates pass.
+- Multi-agent GPU lock: stream creation cost is per-session (paid once),
+  so no per-cycle hit on the lock.
+
+## Opt-in env gate
+
+`HIPFIRE_DDTREE_PIPELINE=1` (or similar). Default OFF. Ship phases A-E
+as env-gated, flip to on-by-default only after ≥ 5 full-matrix benches
+pass all gates.
+
+## Out of scope
+
+- Multi-stream KV cache writes (separate task — current per-layer writes
+  to same stream are fine).
+- Draft model concurrency beyond N+1 (could pipeline N+2 too, but rare
+  incremental value and much higher mis-prediction blast radius).
+- Target-side parallelism beyond single-stream verify (different task).
+- Cross-arch validation (BC-250, MI300X) — gfx1100 first.
+
+## References
+
+- Path A failure: commit 6c84b13
+- Path B structural dead-end: commit 39aa358 + PRD
+- Mandatory coherence gate: commit 9883e98 + CLAUDE.md section
+- DDTree per-genre results (2026-04-23): commit 5298b00

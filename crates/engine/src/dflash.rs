@@ -183,14 +183,27 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
         .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
     match info.quant_type {
         1 => {
-            // F16 on disk → F32 on GPU (legacy upload path).
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
-            let buf = gpu.upload_f32(&f32_data, &[m * k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+            // F16 on disk. Default: upload as F16 (no lift) and dispatch through
+            // the mw16 WMMA kernel — 3-5× faster draft at B=16 on gfx1100 than
+            // the F32 lift path (which bypassed WMMA entirely via the naive
+            // gemm_f32_batched kernel at ~100 GB/s / 10 % peak).
+            //
+            // HIPFIRE_DRAFT_F16=0 falls back to the legacy F16→F32 lift for
+            // A/B comparison.
+            let use_f16 = std::env::var("HIPFIRE_DRAFT_F16").ok().as_deref() != Some("0");
+            if use_f16 {
+                assert_eq!(data.len(), m * k * 2, "dflash {name} F16 byte-size mismatch");
+                let buf = gpu.upload_raw(data, &[m * k])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0 })
+            } else {
+                let f32_data: Vec<f32> = data
+                    .chunks_exact(2)
+                    .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
+                let buf = gpu.upload_f32(&f32_data, &[m * k])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+            }
         }
         2 => {
             let f32_data: Vec<f32> = data
@@ -330,6 +343,46 @@ pub struct DflashScratch {
     // Set to 0 by `reset_upload_tracking` (called at new-prompt boundary).
     // draft_forward updates it after each partial upload.
     pub uploaded_target_hidden_rows: usize,
+
+    /// Absolute (pre-compaction) position of every populated row of
+    /// `target_hidden` on GPU. Length always equals the number of valid rows.
+    /// Used by `spec_step_dflash` to build non-contiguous `positions_k` when
+    /// a TriAttention eviction has compacted `target_hidden` out of order.
+    /// Seeded during prompt ingestion and updated on every cycle commit and
+    /// every eviction mirror. Empty on the ctx_slice=Some path (caller
+    /// manages positions explicitly for that diagnostic mode).
+    pub target_hidden_abs_positions: Vec<i32>,
+
+    /// Per-layer cache of `k_ctx` and `v_ctx` (post-GEMM-of-target_hidden_proj,
+    /// K additionally post-RMSNorm-via-k_norm, both pre-RoPE). Filled
+    /// incrementally as draft_forward sees new target_hidden rows.
+    ///
+    /// The win: without this cache, each `draft_forward` call re-ran 2
+    /// big GEMMs per layer over ALL L context rows, even though only the
+    /// tail (accept+1 new rows) had changed since the previous cycle. On
+    /// 27B at L=512, that cost ~230 ms/cycle. With the cache, only the
+    /// delta rows are recomputed and appended — ~5 ms/cycle for typical
+    /// τ ≈ 5.
+    ///
+    /// Lucebox calls the same structure a "rolling target_feat ring" in
+    /// its DFlash-on-ggml writeup; this is our equivalent.
+    ///
+    /// Shapes: each entry is `[max_ctx, kv_dim]` f32.
+    pub k_ctx_cached: Vec<GpuTensor>,
+    pub v_ctx_cached: Vec<GpuTensor>,
+
+    /// Number of rows valid in `target_hidden_proj`, `k_ctx_cached[*]`, and
+    /// `v_ctx_cached[*]`. Rows `[0..draft_ctx_cached_rows)` have finished
+    /// all of (a) fc + hidden_norm projection into target_hidden_proj,
+    /// (b) per-layer wk/wv GEMMs, (c) per-layer k_norm. They are still
+    /// pre-RoPE — RoPE applies to the full concatenated k_cat each cycle
+    /// (cheap; memory-bound on tiny kv_dim tensors).
+    ///
+    /// Reset to 0 on `reset_upload_tracking` (new prompt) and on
+    /// eviction via `invalidate_draft_ctx_cache`. Next cycle after a
+    /// reset rebuilds the full prefix in one shot — same cost as a
+    /// pre-cache cycle, but amortized thereafter.
+    pub draft_ctx_cached_rows: usize,
 }
 
 impl DflashScratch {
@@ -372,6 +425,17 @@ impl DflashScratch {
             None
         };
 
+        // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K, pre-rope).
+        // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
+        // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
+        // = 128 MB. Trivial vs 24 GB VRAM.
+        let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        for _ in 0..cfg.n_layers {
+            k_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+            v_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+        }
+
         Ok(DflashScratch {
             max_block_size: b,
             max_ctx_len: l,
@@ -402,15 +466,34 @@ impl DflashScratch {
 
             mq_x_rot,
             uploaded_target_hidden_rows: 0,
+            target_hidden_abs_positions: Vec::new(),
+            k_ctx_cached,
+            v_ctx_cached,
+            draft_ctx_cached_rows: 0,
         })
     }
 
     /// Reset the incremental-upload tracker for target_hidden. Call this
     /// at the start of a new prompt / session — otherwise stale tracker
     /// state from a prior prompt would cause the next draft_forward to
-    /// skip required rows.
+    /// skip required rows. Also clears the draft-ctx projection cache so
+    /// the first draft_forward after reset does a full rebuild.
     pub fn reset_upload_tracking(&mut self) {
         self.uploaded_target_hidden_rows = 0;
+        self.target_hidden_abs_positions.clear();
+        self.draft_ctx_cached_rows = 0;
+    }
+
+    /// Invalidate the per-layer k_ctx/v_ctx projection cache. Called from
+    /// `apply_eviction_retain_to_draft` (in speculative.rs) when CASK
+    /// evicts positions — the cached rows no longer correspond to the
+    /// right absolute positions, so the simplest correct thing is to
+    /// rebuild on the next cycle. A finer mirror (applying retain_mask
+    /// to the cache) could preserve the cache across eviction but adds
+    /// complexity; the rebuild cost is bounded by one slow cycle per
+    /// eviction which is rare relative to total cycles.
+    pub fn invalidate_draft_ctx_cache(&mut self) {
+        self.draft_ctx_cached_rows = 0;
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -434,6 +517,12 @@ impl DflashScratch {
         let _ = gpu.free_tensor(self.v_cat);
         let _ = gpu.free_tensor(self.positions_q);
         let _ = gpu.free_tensor(self.positions_k);
+        for t in self.k_ctx_cached {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.v_ctx_cached {
+            let _ = gpu.free_tensor(t);
+        }
         if let Some(t) = self.mq_x_rot {
             let _ = gpu.free_tensor(t);
         }
@@ -467,8 +556,18 @@ fn gemm_dispatch(
     // on the same matmuls without touching AR-greedy numerics (AR on
     // Qwen3.5 doesn't call `gpu.gemm_hfq4g256` directly — it uses the
     // fused qkvza / gate_up / residual WMMA variants instead).
-    match w.gpu_dtype {
+    // HIPFIRE_DRAFT_GEMM_DUMP=1: per-call (dtype, M, K, B, us, GB/s) dump for
+    // draft GEMM triage. Cached via OnceLock so the fast path pays a single
+    // atomic load per call rather than an env lookup.
+    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let dump = *DUMP.get_or_init(|| {
+        std::env::var("HIPFIRE_DRAFT_GEMM_DUMP").ok().as_deref() == Some("1")
+    });
+    if dump { gpu.hip.device_synchronize()?; }
+    let t0 = if dump { Some(std::time::Instant::now()) } else { None };
+    let result = match w.gpu_dtype {
         DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
+        DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
             let scratch = mq_x_rot.expect("MQ4 dispatch requires mq_x_rot scratch");
@@ -478,7 +577,22 @@ fn gemm_dispatch(
             gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &rot_view, y, w.m, w.k, batch)
         }
         other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
+    };
+    if let Some(t) = t0 {
+        gpu.hip.device_synchronize()?;
+        let us = t.elapsed().as_micros();
+        let weight_bytes = match w.gpu_dtype {
+            DType::F32 => w.m * w.k * 4,
+            DType::F16 => w.m * w.k * 2,
+            // HFQ4/MQ4: 136B per group of 256
+            _ => w.m * (w.k / 256).max(1) * 136,
+        };
+        let bytes = weight_bytes + batch * w.k * 4 + batch * w.m * 4 * 2;
+        let gbs = (bytes as f64) / (us.max(1) as f64) / 1000.0;
+        eprintln!("[draft-gemm] dtype={:?} M={} K={} B={} us={} bytes={}KB GB/s={:.1}",
+            w.gpu_dtype, w.m, w.k, batch, us, bytes / 1024, gbs);
     }
+    result
 }
 
 /// Upload f32 slice into a GPU tensor (bytes via memcpy_htod).
@@ -610,25 +724,71 @@ pub fn draft_forward(
     upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
 
     // ── 1. target_hidden_proj = hidden_norm(fc @ target_hidden) ──────────
+    // Incremental-projection fast path (2026-04-20): only compute the
+    // delta rows [cached..L) that haven't been projected yet. Rows
+    // [0..cached) were projected and cached by a previous draft_forward
+    // call and are still valid. After this block, rows [0..L) of
+    // target_hidden_proj are usable by the per-layer K/V step below.
+    //
+    // `draft_ctx_cached_rows` is the scratch-owned invariant: how many
+    // prefix rows have been computed end-to-end (fc + hidden_norm +
+    // per-layer wk + k_norm + per-layer wv). It resets to 0 at new
+    // prompts (reset_upload_tracking) and on eviction
+    // (invalidate_draft_ctx_cache).
+    //
+    // Full-rebuild cases: delta == L (first cycle after reset), or
+    // delta > L somehow (shouldn't happen — this would be a bug). Those
+    // go through the same code path with delta == L, same cost as before.
+    //
     // Dispatch on fc weight dtype: F32 → gemm_f32_batched (legacy),
     // MQ4 → FWHT-rotate target_hidden then gemm_hfq4g256.
-    gemm_dispatch(
-        gpu,
-        &scratch.target_hidden,         // x [L, ne*h]
-        &weights.fc,                    // w [hidden, ne*h]
-        &scratch.target_hidden_proj,    // y [L, hidden]
-        l,
-        scratch.mq_x_rot.as_ref(),
-    )?;
-    // RMSNorm across each L-row of size hidden with hidden_norm weight.
-    gpu.rmsnorm_batched(
-        &scratch.target_hidden_proj,
-        &weights.hidden_norm,
-        &scratch.target_hidden_proj,
-        l,
-        h,
-        eps,
-    )?;
+    let cached_rows = scratch.draft_ctx_cached_rows;
+    let delta = l.saturating_sub(cached_rows);
+    if delta > 0 {
+        let src_offset_elems = cached_rows * ne * h;
+        let dst_offset_elems = cached_rows * h;
+        let th_slice = scratch.target_hidden.sub_offset(src_offset_elems, delta * ne * h);
+        let thp_slice = scratch.target_hidden_proj.sub_offset(dst_offset_elems, delta * h);
+        gemm_dispatch(
+            gpu,
+            &th_slice,
+            &weights.fc,
+            &thp_slice,
+            delta,
+            scratch.mq_x_rot.as_ref(),
+        )?;
+        gpu.rmsnorm_batched(
+            &thp_slice,
+            &weights.hidden_norm,
+            &thp_slice,
+            delta,
+            h,
+            eps,
+        )?;
+    }
+
+    // HIPFIRE_DRAFT_SUBPHASE=1: per-layer-section timing inside draft_forward.
+    // Diagnostic only — device_synchronize at each boundary makes this 2-3×
+    // slower than a production run. Printed once per forward.
+    //
+    // First measurement (2026-04-21, 27B HumanEval, B=16, steady-state):
+    //   attn_gemm: 7.4 ms  (wq + wk/v_noise + wk/v_ctx)
+    //   concat:    0.4 ms  (K/V cache concat D2Ds)
+    //   attn_krn:  0.6 ms  (attention_dflash_f32)
+    //   ffn_gemm:  56 ms   (wo + w_gate + w_up + w_down + silu_mul + adds)
+    //
+    // 87 % of draft_forward lives in the FFN GEMM block. w_gate/w_up/w_down
+    // at M=17408/K=5120 should be ~0.5 ms/layer BW-bound but is ~11 ms/layer
+    // observed. Next lever: route draft's w_gate/w_up through the fused
+    // gemm_gate_up_hfq4g256_wmma kernel (measured 73 µs/call on the same
+    // shape in target; vs ksplit's 288 µs/call on a different shape). Or
+    // find the real cause of the ksplit slowdown on draft shapes.
+    let dbg = std::env::var("HIPFIRE_DRAFT_SUBPHASE").ok().as_deref() == Some("1");
+    let mut us_attn_gemm: u128 = 0;
+    let mut us_attn_kernel: u128 = 0;
+    let mut us_ffn_gemm: u128 = 0;
+    let mut us_concat: u128 = 0;
+    if dbg { gpu.hip.device_synchronize()?; }
 
     // ── 2. Per-layer decoder ─────────────────────────────────────────────
     for li in 0..cfg.n_layers {
@@ -647,30 +807,77 @@ pub fn draft_forward(
             eps,
         )?;
 
+        let t0 = if dbg {
+            gpu.hip.device_synchronize()?;
+            Some(std::time::Instant::now())
+        } else { None };
+
         // Q/K/V projections — dispatched on each weight's dtype.
+        // Q and K/V noise (over the B block positions) must be computed
+        // every cycle. K_ctx and V_ctx (over the L context positions)
+        // are *incrementally* cached — see the per-layer block below.
         gemm_dispatch(gpu, &scratch.x_norm, &layer.wq, &scratch.q,       b, scratch.mq_x_rot.as_ref())?;
         gemm_dispatch(gpu, &scratch.x_norm, &layer.wk, &scratch.k_noise, b, scratch.mq_x_rot.as_ref())?;
         gemm_dispatch(gpu, &scratch.x_norm, &layer.wv, &scratch.v_noise, b, scratch.mq_x_rot.as_ref())?;
 
         // K_ctx / V_ctx — same wk/wv weights but projected over the L
-        // accepted-context rows of target_hidden_proj.
-        gemm_dispatch(gpu, &scratch.target_hidden_proj, &layer.wk, &scratch.k_ctx, l, scratch.mq_x_rot.as_ref())?;
-        gemm_dispatch(gpu, &scratch.target_hidden_proj, &layer.wv, &scratch.v_ctx, l, scratch.mq_x_rot.as_ref())?;
+        // accepted-context rows of target_hidden_proj. INCREMENTAL PATH:
+        // only rows [cached_rows..L) need projection; rows [0..cached_rows)
+        // were projected in a prior call and stored in the per-layer
+        // k_ctx_cached / v_ctx_cached buffers (post-k_norm for K).
+        //
+        // If delta > 0, run wk/wv on the delta slice of target_hidden_proj
+        // and write into the tail of the per-layer cache. Then run k_norm
+        // on those same delta rows (per-head) in-place on the cache.
+        //
+        // For correctness note: the per-head K RMSNorm is row-local
+        // (normalizes each kv_head row of size hd independently), so
+        // applying it to delta rows of the cache is exactly equivalent
+        // to applying it to the full k_cat post-concat. V has no
+        // draft-level norm so v_ctx_cached stores raw GEMM output.
+        let k_cache_layer = &scratch.k_ctx_cached[li];
+        let v_cache_layer = &scratch.v_ctx_cached[li];
+        if delta > 0 {
+            let src_offset_elems = cached_rows * h;
+            let dst_offset_elems = cached_rows * kvd;
+            let thp_slice = scratch.target_hidden_proj.sub_offset(src_offset_elems, delta * h);
+            let k_slot = k_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
+            let v_slot = v_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
+            gemm_dispatch(gpu, &thp_slice, &layer.wk, &k_slot, delta, scratch.mq_x_rot.as_ref())?;
+            gemm_dispatch(gpu, &thp_slice, &layer.wv, &v_slot, delta, scratch.mq_x_rot.as_ref())?;
+            // Per-head RMSNorm on K delta rows only. batch = delta × n_kv_heads.
+            gpu.rmsnorm_batched(&k_slot, &layer.k_norm, &k_slot, delta * cfg.n_kv_heads, hd, eps)?;
+        }
 
-        // Concat K = [K_ctx | K_noise] → [L + B, kv_dim]
-        //         V = [V_ctx | V_noise] → [L + B, kv_dim]
+        if let Some(t) = t0 {
+            gpu.hip.device_synchronize()?;
+            us_attn_gemm += t.elapsed().as_micros();
+        }
+        let t1 = if dbg {
+            Some(std::time::Instant::now())
+        } else { None };
+
+        // Concat K = [K_ctx_cached | K_noise] → k_cat [L + B, kv_dim].
+        // The cached K prefix is already post-k_norm (applied incrementally
+        // above); the noise tail still needs k_norm applied below.
         let ctx_bytes   = (l * kvd) * 4;
         let noise_bytes = (b * kvd) * 4;
-        gpu.hip.memcpy_dtod_at(&scratch.k_cat.buf, 0,          &scratch.k_ctx.buf,   0, ctx_bytes)?;
+        gpu.hip.memcpy_dtod_at(&scratch.k_cat.buf, 0,          &k_cache_layer.buf,   0, ctx_bytes)?;
         gpu.hip.memcpy_dtod_at(&scratch.k_cat.buf, ctx_bytes,  &scratch.k_noise.buf, 0, noise_bytes)?;
-        gpu.hip.memcpy_dtod_at(&scratch.v_cat.buf, 0,          &scratch.v_ctx.buf,   0, ctx_bytes)?;
+        gpu.hip.memcpy_dtod_at(&scratch.v_cat.buf, 0,          &v_cache_layer.buf,   0, ctx_bytes)?;
         gpu.hip.memcpy_dtod_at(&scratch.v_cat.buf, ctx_bytes,  &scratch.v_noise.buf, 0, noise_bytes)?;
 
         // Per-head RMSNorm on Q: each of B*n_heads rows, size head_dim,
         // weight [head_dim].
-        gpu.rmsnorm_batched(&scratch.q,    &layer.q_norm, &scratch.q,    b * cfg.n_heads,   hd, eps)?;
-        // Per-head RMSNorm on K_cat: each of (L+B)*n_kv_heads rows.
-        gpu.rmsnorm_batched(&scratch.k_cat, &layer.k_norm, &scratch.k_cat, tot * cfg.n_kv_heads, hd, eps)?;
+        gpu.rmsnorm_batched(&scratch.q, &layer.q_norm, &scratch.q, b * cfg.n_heads, hd, eps)?;
+        // Per-head RMSNorm on the NOISE tail of K_cat only — the cached
+        // prefix was already normed when it was inserted into the layer's
+        // k_ctx_cached. batch = B × n_kv_heads, applied to the last B rows
+        // of k_cat.
+        {
+            let noise_slot = scratch.k_cat.sub_offset(l * kvd, b * kvd);
+            gpu.rmsnorm_batched(&noise_slot, &layer.k_norm, &noise_slot, b * cfg.n_kv_heads, hd, eps)?;
+        }
 
         // RoPE. rope_batched_f32 expects q and k at the SAME batch size,
         // rotating at per-row positions. We call it twice with a zero
@@ -699,6 +906,14 @@ pub fn draft_forward(
             tot,
         )?;
 
+        if let Some(t) = t1 {
+            gpu.hip.device_synchronize()?;
+            us_concat += t.elapsed().as_micros();
+        }
+        let t2 = if dbg {
+            Some(std::time::Instant::now())
+        } else { None };
+
         // Attention: Q [B, n_heads, hd] × K [tot, n_kv_heads, hd]^T → scores
         // (with GQA expansion) → softmax → @V.
         gpu.attention_dflash_f32(
@@ -712,6 +927,11 @@ pub fn draft_forward(
             cfg.n_kv_heads,
             hd,
         )?;
+        if let Some(t) = t2 {
+            gpu.hip.device_synchronize()?;
+            us_attn_kernel += t.elapsed().as_micros();
+        }
+        let t3 = if dbg { Some(std::time::Instant::now()) } else { None };
 
         // attn_proj = attn_out @ wo^T → [B, hidden]
         gemm_dispatch(gpu, &scratch.attn_out, &layer.wo, &scratch.attn_proj, b, scratch.mq_x_rot.as_ref())?;
@@ -728,6 +948,13 @@ pub fn draft_forward(
         // gate = x_norm @ w_gate^T; up = x_norm @ w_up^T
         gemm_dispatch(gpu, &scratch.x_norm, &layer.w_gate, &scratch.gate, b, scratch.mq_x_rot.as_ref())?;
         gemm_dispatch(gpu, &scratch.x_norm, &layer.w_up,   &scratch.up,   b, scratch.mq_x_rot.as_ref())?;
+        // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
+        // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
+        // on 27B HumanEval (median 76.47 fused vs 76.74 baseline; ±7 % run-to-
+        // run variance from ksplit's non-deterministic atomicAdd dominates).
+        // Kept per-weight dispatch for clarity. The real draft perf lever is
+        // the ~56 ms of ffn_gemm per cycle (see HIPFIRE_DRAFT_SUBPHASE=1);
+        // fusion alone doesn't move that number — kernel engineering does.
 
         // SiLU(gate) * up → gate_up
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
@@ -737,10 +964,29 @@ pub fn draft_forward(
 
         // x = residual_ffn + x
         gpu.add_f32(&scratch.residual_ffn, &scratch.x, &scratch.x)?;
+
+        if let Some(t) = t3 {
+            gpu.hip.device_synchronize()?;
+            us_ffn_gemm += t.elapsed().as_micros();
+        }
+    }
+
+    if dbg {
+        gpu.hip.device_synchronize()?;
+        eprintln!(
+            "[draft-sub] attn_gemm={}µs concat={}µs attn_kernel={}µs ffn_gemm={}µs (B={} L={})",
+            us_attn_gemm, us_concat, us_attn_kernel, us_ffn_gemm, b, l,
+        );
     }
 
     // ── 3. Final norm ────────────────────────────────────────────────────
     gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, b, h, eps)?;
+
+    // ── 4. Advance the draft-ctx projection cache pointer ────────────────
+    // All rows [0..l) of target_hidden_proj and every layer's
+    // k_ctx_cached / v_ctx_cached now contain finalized per-layer
+    // projections. Next call's delta starts from here.
+    scratch.draft_ctx_cached_rows = l;
 
     Ok(())
 }

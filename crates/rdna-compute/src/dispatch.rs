@@ -4,7 +4,7 @@
 use crate::compiler::KernelCompiler;
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -137,6 +137,14 @@ pub struct Gpu {
     pool: crate::pool::GpuPool,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// Task #93 Phase A (2026-04-24): optional secondary streams for
+    /// inter-cycle pipelining. `draft_stream` is where a speculatively-
+    /// launched draft N+1 runs concurrently with verify N on
+    /// `verify_stream`. Left as None until a pipeline-aware caller opts
+    /// in via `init_pipeline_streams()`. Currently unused by any caller
+    /// — Phase A is a non-behavioral scaffold.
+    pub draft_stream: Option<hip_bridge::Stream>,
+    pub verify_stream: Option<hip_bridge::Stream>,
     /// MagnumQuant FWHT signs (256 floats each) + rotation scratch buffer.
     pub mq_signs1: Option<GpuTensor>,
     pub mq_signs2: Option<GpuTensor>,
@@ -155,6 +163,12 @@ pub struct Gpu {
     /// Kernarg blobs are stored in `capture_blobs` and must stay alive until the
     /// captured graph is destroyed.
     pub capture_mode: bool,
+    /// Diagnostic: when true, `launch_maybe_blob` takes the blob path even when
+    /// `capture_mode=false`. Isolates "blob-vs-kernelParams path" bugs without
+    /// the rest of the graph-capture machinery (stream capture, staging, etc).
+    /// Set via `HIPFIRE_BLOB_FORCE=1` at init. Blobs accumulate unbounded in
+    /// `capture_blobs` while set — only intended for short diagnostic runs.
+    pub force_blob_path: bool,
     /// Heap-stored kernarg blobs for the current capture session. The blob
     /// pointers are baked into the graph at capture time — do NOT clear this
     /// vec until after `graph_exec_destroy`.
@@ -163,6 +177,51 @@ pub struct Gpu {
     pub graph_exec: Option<hip_bridge::GraphExec>,
     /// The raw captured graph (kept alive for potential update operations).
     captured_graph: Option<hip_bridge::Graph>,
+    /// When the captured graph belongs to a verify-forward, this is the batch
+    /// size it was captured for. `None` means no verify graph captured (the
+    /// graph slot may hold the AR forward graph instead, or be unused).
+    /// Used to invalidate + re-capture when the DFlash budget changes mid-run.
+    ///
+    /// DEPRECATED for verify: the verify path now uses `verify_graph_cache`
+    /// keyed by B, keeping separate graphs live for each B value PLD may
+    /// oscillate through. This field stays for any legacy single-slot usage.
+    pub graph_verify_n: Option<usize>,
+    /// Counter of verify forward calls seen since the last graph invalidate.
+    /// We run the first call direct (no capture) to let kernel JIT and any
+    /// lazy scratch allocations settle — then capture on the second call.
+    /// Capturing the first call itself hits "hipMalloc not permitted during
+    /// stream capture" the first time a kernel is JITted inside capture.
+    ///
+    /// DEPRECATED for verify: replaced by `verify_warmed_up` (per-B set).
+    pub graph_verify_warmup: u32,
+
+    /// Per-B cache of captured verify-forward graphs. Each entry owns its
+    /// graph + exec + the kernarg blobs that graph captured pointers into.
+    /// Blobs must stay alive for the life of the graph — they're baked into
+    /// the graph nodes by hipStreamEndCapture.
+    ///
+    /// Keyed by `b` (draft block size). DFlash's PLD intermittently shortens
+    /// b from 16 → 8 on short self-match spines; caching graphs per-B avoids
+    /// graph_destroy + re-capture every oscillation, which was wiping out the
+    /// hipGraph replay gain entirely.
+    pub verify_graph_cache: HashMap<usize, (hip_bridge::Graph, hip_bridge::GraphExec, Vec<Vec<u8>>)>,
+    /// Set of B values that have completed the once-per-B JIT/scratch warmup.
+    /// Capture can safely begin only after warmup — see graph_verify_warmup doc.
+    pub verify_warmed_up: HashSet<usize>,
+    /// B being captured right now (between begin_verify_graph_capture and
+    /// end_verify_graph_capture). None outside that window.
+    verify_capturing_b: Option<usize>,
+
+    /// Per-n_steps cache of captured tape-replay graphs (DeltaNetTape::replay_gdn).
+    /// Keyed by n_steps = accept_len + 1 (per-cycle accepted count). On 27B
+    /// HumanEval, replay scales linearly with accept — e.g. accept=10 runs
+    /// 48 LA layers × 4 kernels = ~192 launches. Graphing collapses those
+    /// into one replay. Same shape as verify_graph_cache: graph + exec + blobs.
+    pub replay_graph_cache: HashMap<usize, (hip_bridge::Graph, hip_bridge::GraphExec, Vec<Vec<u8>>)>,
+    /// n_steps values that have completed their once-per-n_steps JIT/scratch warmup.
+    pub replay_warmed_up: HashSet<usize>,
+    /// n_steps being captured right now. None outside the capture window.
+    replay_capturing_n: Option<usize>,
 
     // ── rocBLAS (CDNA3 MFMA-accelerated GEMM) ─────────────────────────────
     /// Optional rocBLAS handle. `None` on non-CDNA3 archs or when
@@ -186,6 +245,44 @@ impl Gpu {
     /// Returns the active stream ref for kernel launches (None = null stream).
     fn stream_ref(&self) -> Option<&hip_bridge::Stream> {
         self.active_stream.as_ref()
+    }
+
+    /// Drive the GPU to full DPM perf level before a perf-sensitive measurement.
+    ///
+    /// gfx1100 (and other RDNA cards) return to a low-power DPM state when
+    /// GPU utilization drops. A fresh process, or a process that just did
+    /// light CPU-side setup, will find the GPU partially idling. Kernels run
+    /// at reduced sclk/mclk until enough sustained load convinces the driver
+    /// to ramp up. That ramp-up is slow and variable (~1-10 s observed), and
+    /// its variance produces cycle-time swings like 52 ms vs 358 ms on the
+    /// same bench. See `docs/methodology/perf-benchmarking.md`.
+    ///
+    /// This runs a tight memset + small-gemm loop for `secs` seconds to pin
+    /// the GPU at high DPM before the caller's timer starts. Memset stresses
+    /// mclk; the existing JITed `gemv_hfq4g256` kernel (available on any
+    /// caller that has compiled a DFlash/Qwen3.5 model) stresses sclk.
+    pub fn dpm_warmup(&mut self, secs: f32) -> HipResult<()> {
+        // 256 MB scratch — large enough to defeat L2 and tax the memory
+        // controller. GDDR6 on the 7900 XTX is 24 GB so 256 MB is trivial.
+        const SCRATCH_BYTES: usize = 256 * 1024 * 1024;
+        let scratch = self.hip.malloc(SCRATCH_BYTES)?;
+        eprintln!("[dpm-warmup] running memset loop for {secs:.1}s to pin GPU at high DPM...");
+        let t0 = std::time::Instant::now();
+        let mut n: u64 = 0;
+        while t0.elapsed().as_secs_f32() < secs {
+            // Rotate the fill byte so the driver/card can't short-circuit
+            // repeated identical writes via any dedup or cache-match path.
+            self.hip.memset(&scratch, (n & 0xFF) as i32, SCRATCH_BYTES)?;
+            self.hip.device_synchronize()?;
+            n = n.wrapping_add(1);
+        }
+        let elapsed = t0.elapsed().as_secs_f32();
+        eprintln!(
+            "[dpm-warmup] {n} memsets in {elapsed:.2}s ({:.2} ms/iter, {:.1} GiB/s effective)",
+            1000.0 * elapsed / n as f32,
+            (n as f64 * SCRATCH_BYTES as f64) / (1024.0 * 1024.0 * 1024.0) / elapsed as f64
+        );
+        Ok(())
     }
 
     pub fn init() -> HipResult<Self> {
@@ -222,6 +319,8 @@ impl Gpu {
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
             active_stream: None,
+            draft_stream: None,
+            verify_stream: None,
             mq_signs1: None,
             mq_signs2: None,
             mq_x_rot: None,
@@ -231,12 +330,24 @@ impl Gpu {
             fp16_x_scratch_bytes: 0,
             fp16_x_source_ptr: std::ptr::null_mut(),
             capture_mode: false,
+            force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             capture_blobs: Vec::new(),
             graph_exec: None,
             captured_graph: None,
+            graph_verify_n: None,
+            graph_verify_warmup: 0,
+            verify_graph_cache: HashMap::new(),
+            verify_warmed_up: HashSet::new(),
+            verify_capturing_b: None,
+            replay_graph_cache: HashMap::new(),
+            replay_warmed_up: HashSet::new(),
+            replay_capturing_n: None,
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
         }).map(|mut gpu| {
+            if gpu.force_blob_path {
+                eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
+            }
             // Auto-init rocBLAS on CDNA3 so the batched-prefill MFMA path is
             // available out of the box. No-op on consumer arches.
             gpu.try_init_rocblas();
@@ -414,6 +525,178 @@ impl Gpu {
             let _ = self.hip.graph_destroy(graph);
         }
         self.capture_blobs.clear();
+        self.graph_verify_n = None;
+        self.graph_verify_warmup = 0;
+    }
+
+    // ── Per-B verify-forward graph cache ─────────────────────────────────
+    //
+    // DFlash's PLD intermittently changes b (e.g. 16 → 8 on short self-match
+    // spines). With the old single-slot graph API, every b transition triggered
+    // `graph_destroy` + warmup + re-capture, wiping out the hipGraph replay
+    // gain. These methods cache one graph per distinct b value so oscillation
+    // becomes free.
+
+    pub fn verify_has_graph(&self, b: usize) -> bool {
+        self.verify_graph_cache.contains_key(&b)
+    }
+
+    pub fn verify_needs_warmup(&self, b: usize) -> bool {
+        !self.verify_warmed_up.contains(&b)
+    }
+
+    pub fn verify_mark_warmup_done(&mut self, b: usize) {
+        self.verify_warmed_up.insert(b);
+    }
+
+    /// Begin capturing a verify-forward graph for batch size `b`. Subsequent
+    /// launch_maybe_blob calls will push their kernargs into `capture_blobs`,
+    /// which is drained into the per-B cache entry on end_verify_graph_capture.
+    pub fn begin_verify_graph_capture(&mut self, b: usize) -> HipResult<()> {
+        debug_assert!(self.verify_capturing_b.is_none(),
+            "begin_verify_graph_capture: already capturing for b={:?}",
+            self.verify_capturing_b);
+        debug_assert!(!self.capture_mode,
+            "begin_verify_graph_capture: capture_mode already set");
+        self.capture_blobs.clear();
+        self.verify_capturing_b = Some(b);
+        self.capture_mode = true;
+        let stream = self.active_stream.as_ref()
+            .expect("verify graph capture requires an explicit stream");
+        self.hip.stream_begin_capture(stream, 0) // hipStreamCaptureModeGlobal
+    }
+
+    /// End capture, instantiate, stash into the per-B cache (taking ownership
+    /// of the current capture_blobs).
+    pub fn end_verify_graph_capture(&mut self) -> HipResult<()> {
+        let b = self.verify_capturing_b.take()
+            .expect("end_verify_graph_capture without matching begin");
+        self.capture_mode = false;
+        let stream = self.active_stream.as_ref().unwrap();
+        let graph = self.hip.stream_end_capture(stream)?;
+        let exec = self.hip.graph_instantiate(&graph)?;
+        let blobs = std::mem::take(&mut self.capture_blobs);
+        self.verify_graph_cache.insert(b, (graph, exec, blobs));
+        Ok(())
+    }
+
+    /// Replay the cached verify graph for batch size `b`.
+    pub fn verify_graph_launch(&self, b: usize) -> HipResult<()> {
+        let entry = self.verify_graph_cache.get(&b)
+            .unwrap_or_else(|| panic!("no captured verify graph for b={}", b));
+        let stream = self.active_stream.as_ref().unwrap();
+        self.hip.graph_launch(&entry.1, stream)
+    }
+
+    /// How many captured verify graphs are in the cache (for debug logs).
+    pub fn verify_graph_count(&self) -> usize {
+        self.verify_graph_cache.len()
+    }
+
+    /// Destroy all cached verify graphs and their blobs.
+    pub fn verify_graph_destroy_all(&mut self) {
+        for (_, (graph, exec, _blobs)) in self.verify_graph_cache.drain() {
+            let _ = self.hip.graph_exec_destroy(exec);
+            let _ = self.hip.graph_destroy(graph);
+        }
+        self.verify_warmed_up.clear();
+        self.verify_capturing_b = None;
+    }
+
+    // ── Replay-graph cache (tape replay after verify) ────────────────────
+    // Same pattern as verify graph, keyed by n_steps instead of B. Captured
+    // once per distinct accept_len + 1 seen in a run; reused across cycles.
+    // On 27B HumanEval where n_steps hovers around 8-11, this caches 3-4
+    // graphs. Per-cycle savings target: 1-3 ms of launch overhead over
+    // ~192 kernel dispatches per replay.
+
+    pub fn replay_has_graph(&self, n_steps: usize) -> bool {
+        self.replay_graph_cache.contains_key(&n_steps)
+    }
+
+    pub fn replay_needs_warmup(&self, n_steps: usize) -> bool {
+        !self.replay_warmed_up.contains(&n_steps)
+    }
+
+    pub fn replay_mark_warmup_done(&mut self, n_steps: usize) {
+        self.replay_warmed_up.insert(n_steps);
+    }
+
+    pub fn begin_replay_graph_capture(&mut self, n_steps: usize) -> HipResult<()> {
+        debug_assert!(self.replay_capturing_n.is_none(),
+            "begin_replay_graph_capture: already capturing for n_steps={:?}",
+            self.replay_capturing_n);
+        debug_assert!(!self.capture_mode,
+            "begin_replay_graph_capture: capture_mode already set");
+        self.capture_blobs.clear();
+        self.replay_capturing_n = Some(n_steps);
+        self.capture_mode = true;
+        let stream = self.active_stream.as_ref()
+            .expect("replay graph capture requires an explicit stream");
+        self.hip.stream_begin_capture(stream, 0)
+    }
+
+    pub fn end_replay_graph_capture(&mut self) -> HipResult<()> {
+        let n_steps = self.replay_capturing_n.take()
+            .expect("end_replay_graph_capture without matching begin");
+        self.capture_mode = false;
+        let stream = self.active_stream.as_ref().unwrap();
+        let graph = self.hip.stream_end_capture(stream)?;
+        let exec = self.hip.graph_instantiate(&graph)?;
+        let blobs = std::mem::take(&mut self.capture_blobs);
+        self.replay_graph_cache.insert(n_steps, (graph, exec, blobs));
+        Ok(())
+    }
+
+    pub fn replay_graph_launch(&self, n_steps: usize) -> HipResult<()> {
+        let entry = self.replay_graph_cache.get(&n_steps)
+            .unwrap_or_else(|| panic!("no captured replay graph for n_steps={}", n_steps));
+        let stream = self.active_stream.as_ref().unwrap();
+        self.hip.graph_launch(&entry.1, stream)
+    }
+
+    pub fn replay_graph_count(&self) -> usize {
+        self.replay_graph_cache.len()
+    }
+
+    pub fn replay_graph_destroy_all(&mut self) {
+        for (_, (graph, exec, _blobs)) in self.replay_graph_cache.drain() {
+            let _ = self.hip.graph_exec_destroy(exec);
+            let _ = self.hip.graph_destroy(graph);
+        }
+        self.replay_warmed_up.clear();
+        self.replay_capturing_n = None;
+    }
+
+    /// D→D copy with offsets that picks async (on the active stream) when
+    /// a stream is set and sync otherwise. Captured graphs require async on
+    /// the captured stream — sync `hipMemcpy` errors with "would make the
+    /// legacy stream depend on a capturing blocking stream" under capture
+    /// mode Global. Use this helper whenever the copy might live inside
+    /// a captured region.
+    pub fn memcpy_dtod_at_auto(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        dst_offset: usize,
+        src: &hip_bridge::DeviceBuffer,
+        src_offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        if let Some(stream) = self.active_stream.as_ref() {
+            self.hip.memcpy_dtod_async_at(dst, dst_offset, src, src_offset, size, stream)
+        } else {
+            self.hip.memcpy_dtod_at(dst, dst_offset, src, src_offset, size)
+        }
+    }
+
+    /// D→D copy (whole buffer) that picks async on the active stream when set.
+    pub fn memcpy_dtod_auto(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        src: &hip_bridge::DeviceBuffer,
+        size: usize,
+    ) -> HipResult<()> {
+        self.memcpy_dtod_at_auto(dst, 0, src, 0, size)
     }
 
     /// Helper: launch a kernel using the blob path during graph capture,
@@ -428,8 +711,14 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
-        if self.capture_mode {
-            let blob = blob_builder();
+        if self.capture_mode || self.force_blob_path {
+            let mut blob = blob_builder();
+            // Pad tail to 16-byte alignment — some kernel struct layouts that
+            // HIP's loader expects have an implicit final pad to the struct's
+            // alignment. gfx1100 typically doesn't care, but under graph
+            // capture on ROCm 7.x the loader is stricter and unpadded tails
+            // have been observed to cause silent argument corruption.
+            blob.pad_to(16);
             self.capture_blobs.push(blob.into_vec());
             // Re-borrow fields separately to avoid conflicting borrows on self
             let buf = self.capture_blobs.last_mut().unwrap();
@@ -689,7 +978,10 @@ impl Gpu {
 
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         let tensor = self.alloc_tensor(shape, dtype)?;
-        self.hip.memset(&tensor.buf, 0, tensor.byte_size())?;
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?,
+            None => self.hip.memset(&tensor.buf, 0, tensor.byte_size())?,
+        }
         Ok(tensor)
     }
 
@@ -865,6 +1157,93 @@ impl Gpu {
         };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
+    }
+
+    /// Batched Q8_0 embedding lookup. Same hipGraph-captureable pattern as
+    /// the HFQ4G256 variant. `output` shape: `[n × dim]` row-major.
+    pub fn embedding_lookup_q8_batched(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_ids: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "embedding_q8_batched",
+            kernels::EMBEDDING_Q8_BATCHED_SRC,
+            "embedding_q8_batched",
+        )?;
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tidp = token_ids.buf.as_ptr();
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tidp as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "embedding_q8_batched",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp); b.push_ptr(op); b.push_ptr(tidp); b.push_i32(d);
+                b
+            },
+        )
+    }
+
+    /// Batched HFQ4-G256 embedding lookup. Dequantizes N rows in a single
+    /// launch, reading token ids from a device buffer. hipGraph-capture-safe:
+    /// callers update `token_ids` between replays and replay the same graph.
+    ///
+    /// `output` shape: `[n × dim]` row-major. `token_ids` shape: `[n]` i32.
+    pub fn embedding_lookup_hfq4g256_batched(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_ids: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "embedding_hfq4g256_batched",
+            kernels::EMBEDDING_HFQ4G256_BATCHED_SRC,
+            "embedding_hfq4g256_batched",
+        )?;
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tidp = token_ids.buf.as_ptr();
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tidp as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "embedding_hfq4g256_batched",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp); b.push_ptr(op); b.push_ptr(tidp); b.push_i32(d);
+                b
+            },
+        )
     }
 
     /// HFQ4-G128 embedding lookup: dequantize one row on GPU, output F32.
@@ -3944,9 +4323,43 @@ impl Gpu {
         if std::env::var("HIPFIRE_MW16").map_or(false, |v| v == "1") {
             return self.gemm_mw16_residual_wmma_via_dequant(a_raw, x, y, m, k, batch_size);
         }
-        // K2: 2× K-tile unroll with vmcnt(2) pipelining (optimal for 4-bit dequant)
-        let (kernel_name, kernel_src, block_size, row_step) =
-            ("gemm_hfq4g256_residual_wmma_k2", kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC, 32u32, 16usize);
+        // Shape-aware default: ksplit only pays for itself when the un-split
+        // grid is CU-starved (target wo_residual at M=5120 → 320 blocks,
+        // ~3.3/CU on gfx1100 — ksplit 4×'s it to 13/CU). For draft-FFN shapes
+        // (M=17408, K=5120, B=16) the un-split grid is already 1088 blocks
+        // (~11/CU) and the atomicAdd reduce is pure overhead. k2 removes the
+        // split + atomics and runs deterministically.
+        //
+        // Threshold picked at M=8192: covers M∈{5120,6144} (target wo) on the
+        // ksplit side and M∈{17408} (draft gate/up/down) on the k2 side. lm_head
+        // (M=vocab) is always way above threshold → k2.
+        //
+        // HIPFIRE_WO_WMMA_VARIANT=ksplit|k2|k2x32|k4|wmma|wmma2 overrides the
+        // auto selection (applies to every call, both target and draft).
+        //   ksplit — K-split + atomicAdd (non-deterministic accum order)
+        //   k2     — 2× K-tile pipeline (byte-exact accum order)
+        //   k2x32  — 32-row block with shared X fragment per K-tile; measured
+        //            46% slower than k2 at M=248320 on 7900 XTX (1564µs → 2287µs,
+        //            450→310 GB/s). Likely register pressure / occupancy loss
+        //            from the doubled accumulator + 4× dequant path. Kept opt-in
+        //            for future revisit (needs LDS-staged B share + reg budget).
+        //   k4     — 4× K-tile pipeline (output-mapping bug, τ=0 on dflash — debug only)
+        //   wmma   — base WMMA         (output-mapping bug — debug only)
+        //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
+        let auto_variant = if m >= 8192 { "k2" } else { "ksplit" };
+        let variant_override = std::env::var("HIPFIRE_WO_WMMA_VARIANT").ok();
+        let variant = variant_override.as_deref().unwrap_or(auto_variant);
+        let (kernel_name, kernel_src, block_size, row_step, k_splits) = match variant {
+            "k2"     => ("gemm_hfq4g256_residual_wmma_k2",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC, 32u32, 16usize, 1u32),
+            "k2x32"  => ("gemm_hfq4g256_residual_wmma_k2x32",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2X32_SRC, 32u32, 32usize, 1u32),
+            // Older _wmma / _wmma2 / _wmma_k4 variants removed in master cleanup
+            // (b3b9ddb) — output-mapping bug in those siblings. ksplit is the
+            // remaining alternate path (smaller-M fallback for the auto router).
+            _        => ("gemm_hfq4g256_residual_wmma_ksplit",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC, 32u32, 16usize, 4u32),
+        };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -3973,9 +4386,19 @@ impl Gpu {
             + batch_size * k * 2
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        // HIPFIRE_GEMM_DUMP=1: per-call shape+wall-clock dump of this kernel.
+        // Synchronously times only the ksplit kernel launch (not memset / convert).
+        // Measures actual GPU execution time via device_synchronize pre+post —
+        // costs latency vs async pipelining but gives shape-accurate µs.
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            std::env::var("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1")
+        });
+        if dump { self.hip.device_synchronize()?; }
+        let dump_start = if dump { Some(std::time::Instant::now()) } else { None };
         let result = self.launch_maybe_blob(
             kernel_name,
-            [row_tiles as u32, batch_tiles as u32, 1],
+            [row_tiles as u32, batch_tiles as u32, k_splits],
             [block_size, 1, 1],
             0,
             &mut params,
@@ -3987,6 +4410,13 @@ impl Gpu {
             },
         );
         if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = dump_start {
+            self.hip.device_synchronize()?;
+            let us = t.elapsed().as_micros();
+            let gbs = (bytes as f64) / (us.max(1) as f64) / 1000.0; // MB/ms == GB/s
+            eprintln!("[gemm-dump] {} M={} K={} B={} bytes={}KB us={} GB/s={:.1}",
+                kernel_name, m, k, batch_size, bytes / 1024, us, gbs);
+        }
         result
     }
 
@@ -4147,6 +4577,75 @@ impl Gpu {
         result
     }
 
+    /// FP16-weight lm_head fast path for DFlash drafts that ship F16 (not
+    /// quantized) weights. Routes through `gemm_mw16_residual_wmma` with the
+    /// usual memset-then-atomicAdd residual pattern.
+    ///
+    /// Shape requirements: K must be a multiple of 32 (mw16 processes 32 K
+    /// elements per WMMA iteration). All 27B/9B draft shapes satisfy this
+    /// (hidden=5120, intermediate=17408, q_dim=4096, kv_dim=1024, fc-K=25600).
+    ///
+    /// Non-gfx11 falls through to `gemm_f32_batched` — same semantics but
+    /// weight is read as F16 bytes, so the caller must have uploaded it that
+    /// way. (Currently only gfx11 is expected to hit this path; other archs
+    /// should use MQ4/HFQ4 drafts.)
+    pub fn gemm_f16_batched_lmhead(
+        &mut self,
+        w_f16: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if !self.arch.starts_with("gfx11") {
+            // No mw16 WMMA on non-RDNA3 — fall back to the scalar F32 GEMM.
+            // This is slow but correct; non-gfx11 isn't the intended target.
+            return self.gemm_f32_batched(x, w_f16, y, batch_size, k, m);
+        }
+        self.ensure_kernel(
+            "gemm_mw16_residual_wmma",
+            kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
+            "gemm_mw16_residual_wmma",
+        )?;
+        // Pre-zero Y (residual WMMA does y += acc) and force FP16-X reconversion
+        // (the draft reuses the same scratch pointer every cycle with new data).
+        self.fp16_x_source_ptr = std::ptr::null_mut();
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+        }
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let func = &self.functions["gemm_mw16_residual_wmma"];
+        let mut wp = w_f16.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let rows = ((m + 15) / 16) as u32;
+        let batches = ((batch_size + 15) / 16) as u32;
+        // Bytes: FP16 weight + FP16 x + FP32 y (read+write).
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_mw16_residual_wmma", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func, [rows, batches, 1], [32, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// WMMA lm_head fast path for DFlash. Computes y = A @ x at batch>1 via
     /// the residual-WMMA kernel on pre-zeroed y — 8-10× faster than the
     /// scalar `gemm_hfq4g256` on 9B lm_head (batch=16, vocab=248K, k=2560).
@@ -4182,7 +4681,10 @@ impl Gpu {
             && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
-            self.hip.memset(&y.buf, 0, batch_size * m * 4)?;
+            match self.active_stream.as_ref() {
+                Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+            }
             return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
         self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
@@ -5727,6 +6229,73 @@ impl Gpu {
 
     /// Batched RMSNorm: normalize `batch` vectors of length `n` independently.
     /// x and out can be the same buffer (in-place). Weight is [n], applied per vector.
+    /// TriAttention sidecar calibration: accumulate band statistics for one
+    /// chunk's Q tensor (batched across all tokens in the chunk).
+    ///
+    /// q_batch: [n_tokens, n_heads, head_dim] f32 pre-RoPE Q (already on GPU).
+    /// accs_sum_re/im/abs: [n_layers * n_heads * n_bands] f64 accumulators.
+    /// accs_count: [n_layers * n_heads * n_bands] u64 sample counters.
+    /// All accs_* buffers persist across calls; the kernel ADDS into them.
+    ///
+    /// Grid = [n_heads, n_bands, 1]. Block = [64, 1, 1]. Zero cross-block
+    /// contention since each (layer, head, band) is written by exactly one
+    /// block at a time (called sequentially per layer per chunk).
+    pub fn triattn_accumulate(
+        &mut self,
+        q_batch: &DeviceBuffer,
+        accs_sum_re: &DeviceBuffer,
+        accs_sum_im: &DeviceBuffer,
+        accs_sum_abs: &DeviceBuffer,
+        accs_count: &DeviceBuffer,
+        n_tokens: usize, n_heads: usize, head_dim: usize,
+        layer_idx: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "triattn_accumulate",
+            kernels::TRIATTN_ACCUMULATE_SRC,
+            "triattn_accumulate_f32",
+        )?;
+
+        let n_bands = head_dim / 2;
+
+        let mut q_ptr = q_batch.as_ptr();
+        let mut sre_ptr = accs_sum_re.as_ptr();
+        let mut sim_ptr = accs_sum_im.as_ptr();
+        let mut sab_ptr = accs_sum_abs.as_ptr();
+        let mut cnt_ptr = accs_count.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut li = layer_idx as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut sre_ptr as *mut _ as *mut c_void,
+            &mut sim_ptr as *mut _ as *mut c_void,
+            &mut sab_ptr as *mut _ as *mut c_void,
+            &mut cnt_ptr as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "triattn_accumulate_f32",
+            [n_heads as u32, n_bands as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr); b.push_ptr(sre_ptr); b.push_ptr(sim_ptr);
+                b.push_ptr(sab_ptr); b.push_ptr(cnt_ptr);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(li);
+                b
+            },
+        )
+    }
+
     pub fn rmsnorm_batched(
         &mut self,
         x: &GpuTensor, weight: &GpuTensor, out: &GpuTensor,
@@ -9317,6 +9886,102 @@ impl Gpu {
         Ok(())
     }
 
+    /// Tree-aware variant of `gated_delta_net_q8_batch_seq`. Per-token
+    /// S-tile persist-write so sibling tokens read the parent's post-update
+    /// state via `s_tape_q8[parent_indices[t]]`. `parent_indices[t] < 0`
+    /// means "read pre-block initial state from `s_q8_init`".
+    ///
+    /// Does NOT advance persistent `s_q8_init` / `s_scales_init` (those
+    /// are the pre-block snapshot, read-only). Caller runs linear replay
+    /// on the accepted spine post-acceptance to commit the trajectory.
+    ///
+    /// Tape layout (caller responsibility):
+    /// - `s_tape_q8`:     `[n_tokens × n_heads × HD × HD]` i8 (scratch)
+    /// - `s_tape_scales`: `[n_tokens × n_heads × HD]` f32 (scratch)
+    /// - `parent_indices`: `[n_tokens]` i32 (host materialized by
+    ///   `ddtree::linearize_tree`; spine topology is [-1, 0, 1, 2, ...])
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_q8_tree_batch_seq(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8_init: &GpuTensor,
+        s_scales_init: &GpuTensor,
+        s_tape_q8: &GpuTensor,
+        s_tape_scales: &GpuTensor,
+        parent_indices: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gated_delta_net_q8_tree",
+            kernels::GATED_DELTA_NET_Q8_TREE_SRC,
+            "gated_delta_net_q8_tree",
+        )?;
+
+        let n_tiles = (128 / 4) as u32;
+
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sip = s_q8_init.buf.as_ptr();
+        let mut scip = s_scales_init.buf.as_ptr();
+        let mut stp = s_tape_q8.buf.as_ptr();
+        let mut stsp = s_tape_scales.buf.as_ptr();
+        let mut pp = parent_indices.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp   as *mut _ as *mut c_void,
+            &mut kp   as *mut _ as *mut c_void,
+            &mut vp   as *mut _ as *mut c_void,
+            &mut gp   as *mut _ as *mut c_void,
+            &mut bp   as *mut _ as *mut c_void,
+            &mut sip  as *mut _ as *mut c_void,
+            &mut scip as *mut _ as *mut c_void,
+            &mut stp  as *mut _ as *mut c_void,
+            &mut stsp as *mut _ as *mut c_void,
+            &mut pp   as *mut _ as *mut c_void,
+            &mut op   as *mut _ as *mut c_void,
+            &mut nt   as *mut _ as *mut c_void,
+            &mut nh   as *mut _ as *mut c_void,
+            &mut hd   as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "deltanet", "gated_delta_net_q8_tree_batch_seq", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_q8_tree",
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(gp); b.push_ptr(bp);
+                b.push_ptr(sip); b.push_ptr(scip);
+                b.push_ptr(stp); b.push_ptr(stsp);
+                b.push_ptr(pp); b.push_ptr(op);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// GDN recurrence with Q4-quantized S state.
     #[cfg(feature = "deltanet")]
     pub fn gated_delta_net_q4(
@@ -9603,6 +10268,79 @@ impl Gpu {
         Ok(())
     }
 
+    /// Tree-aware variant of `conv1d_silu_split_f32_n`. `parent_indices[t]`
+    /// is the linear slot index of token t's parent within the block, or
+    /// a negative sentinel for pre-block ancestors: -1 selects conv_state[0]
+    /// (most recent pre-block), -2 → state[1], -3 → state[2].
+    ///
+    /// Does NOT update conv_state — caller runs linear conv1d on the
+    /// accepted spine post-acceptance to advance state.
+    ///
+    /// Port of SGLang's `HAS_EAGLE_TREE_CUSTOM_ATTN_MASK` branch in
+    /// `causal_conv1d_update`. parent_indices supersedes retrieve_next_token
+    /// / retrieve_next_sibling / retrieve_parent_token (the tree is already
+    /// materialized host-side by `ddtree::linearize_tree`).
+    #[cfg(feature = "deltanet")]
+    pub fn conv1d_silu_split_tree_f32_n(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        parent_indices: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "conv1d_silu_split_tree",
+            kernels::CONV1D_SILU_SPLIT_TREE_SRC,
+            "conv1d_silu_split_tree_f32",
+        )?;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let pp = parent_indices.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        let n_channels = 2 * k_dim + v_dim;
+        let block = 256u32;
+        let grid = ((n_channels as u32) + block - 1) / block;
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_tree_f32_n", bytes);
+        let result = self.launch_maybe_blob(
+            "conv1d_silu_split_tree_f32", [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(ip); b.push_ptr(wp); b.push_ptr(sp);
+                b.push_ptr(pp);
+                b.push_i32(kd); b.push_i32(vd); b.push_i32(nt);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Compute cross-entropy loss for a single token on GPU.
     /// Returns -log(softmax(logits)[target]). Downloads 4 bytes instead of 600KB.
     pub fn cross_entropy_loss(
@@ -9877,6 +10615,8 @@ impl Gpu {
             ("fused_qk_l2_norm_scale",   kernels::FUSED_QK_L2_NORM_SCALE_SRC.to_string()),
             ("fused_sigmoid_alpha_gate", kernels::FUSED_SIGMOID_ALPHA_GATE_SRC.to_string()),
             ("conv1d_silu_split",        kernels::CONV1D_SILU_SPLIT_SRC.to_string()),
+            ("conv1d_silu_split_tree",   kernels::CONV1D_SILU_SPLIT_TREE_SRC.to_string()),
+            ("gated_delta_net_q8_tree",  kernels::GATED_DELTA_NET_Q8_TREE_SRC.to_string()),
             ("sigmoid_mul",              kernels::SIGMOID_MUL_SRC.to_string()),
             ("topk_logits",              kernels::TOPK_LOGITS_SRC.to_string()),
             ("scale_f32",                kernels::SCALE_F32_SRC.to_string()),
@@ -10008,6 +10748,8 @@ impl Gpu {
         specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));
         specs.push(("embedding_hfq4g256", kernels::EMBEDDING_HFQ4G256_SRC.to_string()));
         specs.push(("embedding_hfq4g128", kernels::EMBEDDING_HFQ4G128_SRC.to_string()));
+        specs.push(("embedding_hfq4g256_batched", kernels::EMBEDDING_HFQ4G256_BATCHED_SRC.to_string()));
+        specs.push(("embedding_q8_batched", kernels::EMBEDDING_Q8_BATCHED_SRC.to_string()));
 
         // DeltaNet kernels
         specs.push(("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC.to_string()));
@@ -10087,6 +10829,8 @@ impl Gpu {
                 "fused_qk_l2_norm_scale" => vec!["fused_qk_l2_norm_scale_f32"],
                 "fused_sigmoid_alpha_gate" => vec!["fused_sigmoid_alpha_gate_f32"],
                 "conv1d_silu_split" => vec!["conv1d_silu_split_f32"],
+                "conv1d_silu_split_tree" => vec!["conv1d_silu_split_tree_f32"],
+                "gated_delta_net_q8_tree" => vec!["gated_delta_net_q8_tree"],
                 "sigmoid_mul" => vec!["sigmoid_mul_f32"],
                 "topk_logits"  => vec!["topk_logits_f32"],
                 "scale_f32" => vec!["scale_f32"],

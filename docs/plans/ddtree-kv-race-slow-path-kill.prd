@@ -1,0 +1,114 @@
+# DDTree: kill the slow-path re-verify
+
+_Prereq: Task #101 Phase 3 (landed, e5534e4). Ships after Task #106 validation._
+
+## Context
+
+DDTree batched tree verify is correct and τ-wise beats linear on low-τ genres:
+
+| prompt 27B MQ4 | linear tok/s (τ) | b22-k4 tok/s (τ) | **b8-k2** tok/s (τ) |
+|----------------|-----------------:|-----------------:|--------------------:|
+| code HE/0      | 134 (6.10)       | 82 (7.50)        | 97 (5.16)           |
+| prose cont     | 38 (0.85)        | 28 (2.23)        | **55 (3.02)**       |
+| instruct       | 81 (3.24)        | 44 (3.95)        | 56 (2.98)           |
+
+b8-k2 wins prose by +44% tok/s and +3.55× τ. Code and instruct still net-lose on wall-clock because the slow-path re-verify eats ~43% of prose cycles and 35% of instruct cycles at topk>1.
+
+## What the slow path does
+
+```rust
+// speculative.rs ~3632
+let tape_block: Vec<u32> = committed[..accept_len + 1].to_vec();
+target_snap.restore_to(&mut target.dn_state, gpu)?;
+let _tape_verify = verify_dflash_block(      // full forward on accept_len+1 tokens
+    gpu, target, &tape_block, position, hidden_rb,
+    Some(gdn_tape), false, verify_scratch,
+)?;
+target_snap.restore_to(&mut target.dn_state, gpu)?;
+gdn_tape.replay_gdn(gpu, ..., accept_len + 1)?;
+```
+
+Fires when `accepted_node_indices != [0,1,2,...]`. Fixes:
+
+1. **GdnTape rows** — qkv/alpha/beta captured during tree verify are at tree-linear positions, not committed-chain positions.
+2. **KV cache rows** — tree verify writes K/V at `kv_cache[base+depth]`. Siblings at same depth race; last write wins. Committed sibling's K/V is lost unless overwritten.
+
+## Path A (chosen): KV-only mini-forward + tape gather
+
+### Tape gather (easy, ~50 LOC)
+
+GdnTape already contains qkv/alpha/beta for **every** tree node at positions `[0..big_n]`. Gather remaps:
+- `tape[0]` stays (seed)
+- `tape[i+1]` ← `tape[accepted_node_indices[i] + 1]` for `i ∈ [0, accept_len)`
+
+Implementation:
+```rust
+pub fn gather_accepted(
+    &self, gpu: &mut Gpu,
+    accepted_node_indices: &[usize],
+    gather_scratch: &GpuTensor,        // max_n × qkv_dim × 4 bytes
+) -> HipResult<()> { ... }
+```
+
+Cost: `~(1 + N_LA_LAYERS × 3 × (accept_len+1))` memcpy_dtod calls. On 27B (N_LA=48, accept_len≈5): ~720 ops × 3 µs launch ≈ 2 ms. Well under the 50 ms full-verify cost.
+
+Gather scratch allocated once in `GdnTape::new_for_config` (shared across layers — serial gather is fine).
+
+### KV-only mini-forward (~150 LOC)
+
+New `verify_dflash_block_kv_only(gpu, target, tokens, position, hidden_rb, verify_scratch)`:
+- Per FA layer: rmsnorm → wqkv → rope → kv_write.
+- Skip: all LA-layer compute (tape already gathered), all FA attention compute, all FFN, final rmsnorm, LM head, posterior dump.
+- Input hidden state: pulled from `hidden_rb` at committed position (already computed during tree verify — tree verify DID emit `per_token_hidden_out` for accepted nodes via the existing FA-layer hidden writeback; confirm scope in code review).
+
+Est. cost: ~10 ms on 27B (vs 50 ms full forward). Savings per slow cycle: ~40 ms.
+
+### Slow-path replacement
+
+```rust
+if fast_tape_ok {
+    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    gdn_tape.replay_gdn(gpu, ..., accept_len + 1)?;
+} else {
+    // Step 1: gather tape into committed-chain linear order.
+    gdn_tape.gather_accepted(gpu, &accepted_node_indices[..accept_len], gather_scratch)?;
+    // Step 2: KV-only pass — rewrite kv_cache rows raced by siblings.
+    let tape_block: Vec<u32> = committed[..accept_len + 1].to_vec();
+    verify_dflash_block_kv_only(gpu, target, &tape_block, position, hidden_rb, verify_scratch)?;
+    // Step 3: replay tape (now in linear order).
+    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    gdn_tape.replay_gdn(gpu, ..., accept_len + 1)?;
+}
+```
+
+## Speed / quality gates
+
+**Speed-gate** (must pass before merge):
+- 27B b8-k2 prose ≥ 65 tok/s (+18% vs current 55 — mid-range of expected +23%)
+- 27B b8-k2 code ≥ 110 tok/s (close gap with linear 134)
+- 27B b8-k2 instruct ≥ 70 tok/s
+
+**Quality-gate**:
+- Coherence-gate pass on 27B prose + instruct + code (existing `scripts/coherence-gate.sh`)
+- No τ regression vs pre-fix b8-k2 (+/- 0.2 noise)
+- HumanEval sample (n=33, `scripts/bench_humaneval_dflash.py`) mean τ unchanged within 5%
+
+## Path B (deferred unless Path A doesn't close the gap on prose)
+
+Decouple KV slot from RoPE position in tree verify:
+- Tree linearization: `rope_positions = base + depth` (unchanged), `kv_slot_indices = base + linear_idx` (new, unique per tree node).
+- FA kernel accepts separate arrays.
+- Post-accept: `memcpy_dtod` `kv[base+accepted_node_indices[i]]` → `kv[base+i]` for `i ∈ [0, accept_len)`.
+
+~500 LOC. Touches `attention_flash_*_batched.hip` plus all tree-verify call sites. Eliminates the race structurally — no 2nd pass needed.
+
+## Open questions to resolve during implementation
+
+1. Does `per_token_hidden_out` in tree verify already contain hidden states at ALL tree node positions? If so, KV-only pass can reuse them directly. If only at accepted positions, KV-only pass needs its own forward-up-to-pre-wqkv.
+2. Scratch-buffer sizing: `gather_scratch` at `max_n × max(qkv_dim, n_v_heads) × 4` bytes. For 27B: ~22 × 6144 × 4 ≈ 540 KB. Negligible VRAM.
+3. Does `gdn_tape.replay_gdn` require the tape to be contiguous in physical positions `[0..n]`? Answer: yes — it indexes linearly. Gather must produce that layout.
+
+## Out of scope
+
+- Cross-arch testing (MI300X / BC-250) — separate follow-up after gfx1100 validation.
+- Path B decouple-positions kernel work — deferred unless Path A is insufficient.

@@ -29,14 +29,14 @@ fn main() {
         self, DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, ModelSlotConfig, SpecStats,
     };
     use engine::tokenizer::Tokenizer;
-    use engine::triattn::{EvictionCtx, TriAttnCenters};
+    use engine::triattn::{EvictionCtx, EvictionResult, TriAttnCenters};
     use std::path::Path;
     use std::time::Instant;
 
     enum CaskPolicy { Plain(EvictionCtx), Cask(CaskCtx) }
     impl CaskPolicy {
         fn maybe_evict(&self, gpu: &mut rdna_compute::Gpu, kv: &mut engine::llama::KvCache, physical: usize)
-            -> hip_bridge::HipResult<Option<usize>>
+            -> hip_bridge::HipResult<Option<EvictionResult>>
         {
             match self {
                 CaskPolicy::Plain(c) => c.maybe_evict(gpu, kv, physical),
@@ -69,12 +69,29 @@ fn main() {
     let mut block_size_override: Option<usize> = None;
     let mut temp: f32 = 0.0;
     let mut seed: u64 = 42;
-    // Adaptive block size: on by default (2026-04-16). Shrinks B from 16
-    // → 8 when rolling τ drops below 4 so hard/creative prompts where the
-    // draft diverges per position don't pay the full 16-token verify cost.
-    // Empirically adds no regression on high-τ content (draft keeps up, τ
-    // recovers, B snaps back to 16). Opt out with --no-adaptive-b.
+    let mut repeat_penalty: f32 = 1.0;
+    let mut repeat_window: usize = 128;
+    // Adaptive block size: on by default.
+    //
+    // 2026-04-16: initial two-level version shrank B from 16→8 when rolling
+    // τ dropped below 4.
+    //
+    // 2026-04-24 (Task #93 Phase B fallback — see docs/plans/task-93-inter-
+    // cycle-pipelining.prd): replaced with a continuous scheduler that
+    // adjusts B across the range [ADAPTIVE_B_MIN .. ADAPTIVE_B_MAX] using
+    // EWMA of accept_len with hysteresis + cooldown. Raises B when the
+    // recent cycle is under-budgeted (draft accepting almost everything →
+    // amortize verify over more positions). Drops B when draft is losing
+    // early (small B cuts verify cost and lets τ recover). Override range
+    // with --adaptive-b-range MIN:MAX.
+    //
+    // ADAPTIVE_B_MAX caps: scratches are pre-allocated to it, so setting a
+    // larger max raises VRAM cost. Default 16 preserves the pre-Task-#93
+    // behaviour (draft trained at block_size=16; larger B is OOD for the
+    // draft's positional encoding and may degrade τ).
     let mut adaptive_b: bool = true;
+    let mut adaptive_b_min: usize = 8;
+    let mut adaptive_b_max: usize = 16;
     let mut ngram: bool = false;
     let mut ngram_min_count: u32 = 3;
     // CACTUS bumped acceptance (Hao & Mou 2026). 0.0 = vanilla SpS;
@@ -185,6 +202,14 @@ fn main() {
                 seed = args[i + 1].parse().unwrap();
                 i += 2;
             }
+            "--repeat-penalty" => {
+                repeat_penalty = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--repeat-window" => {
+                repeat_window = args[i + 1].parse().unwrap();
+                i += 2;
+            }
             "--adaptive-b" => {
                 adaptive_b = true;
                 i += 1;
@@ -192,6 +217,17 @@ fn main() {
             "--no-adaptive-b" => {
                 adaptive_b = false;
                 i += 1;
+            }
+            "--adaptive-b-range" => {
+                // Format: "MIN:MAX" e.g. "8:20". Both inclusive.
+                let v = &args[i + 1];
+                let (lo, hi) = v.split_once(':').unwrap_or_else(||
+                    panic!("--adaptive-b-range expects MIN:MAX, got {v:?}"));
+                adaptive_b_min = lo.parse().expect("--adaptive-b-range MIN");
+                adaptive_b_max = hi.parse().expect("--adaptive-b-range MAX");
+                assert!(adaptive_b_min >= 2 && adaptive_b_max >= adaptive_b_min,
+                    "--adaptive-b-range invalid: {adaptive_b_min}..{adaptive_b_max}");
+                i += 2;
             }
             "--ngram" => {
                 ngram = true;
@@ -304,6 +340,7 @@ fn main() {
     let target_path = target_path.expect("--target required");
     let draft_path = draft_path.expect("--draft required");
     let prompt = prompt.expect("--prompt required");
+    let prompt = engine::tokenizer::maybe_normalize_prompt(&prompt).into_owned();
 
     eprintln!("=== dflash_spec_demo ===");
     eprintln!("target: {target_path}");
@@ -345,8 +382,11 @@ fn main() {
     // Draft fits afterward because pool::alloc uses EXACT HIP allocation
     // (pool.rs::alloc), so the target's per-layer buckets don't pad up
     // to the next power of 2 and waste the room the draft needs.
+    // Compute adaptive-B scratch ceiling early so KV + ring-buffer sizing
+    // upstream of the draft-load accounts for the max possible B we'll use.
+    let cfg_block_size_for_slot = draft_cfg.block_size.max(if adaptive_b { adaptive_b_max } else { 0 });
     let mut slot_cfg = ModelSlotConfig::default();
-    slot_cfg.max_seq = ctx_capacity + draft_cfg.block_size + 16;
+    slot_cfg.max_seq = ctx_capacity + cfg_block_size_for_slot + 16;
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
         "q8" => engine::speculative::KvMode::Q8,
         "asym4" | "turbo4" => engine::speculative::KvMode::Asym4,
@@ -369,8 +409,41 @@ fn main() {
     eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
     vram_report(&gpu.hip, "after draft load");
 
+    // Adaptive-B scratch sizing: the draft was trained at a specific
+    // block_size; going past it is out-of-distribution for its positional
+    // encoding. Measured on 27B MQ4 (2026-04-24, 3-run median) with range
+    // 8:20:
+    //   code: 161.5 → 113.7 tok/s (-30 %) as B grew to 17+, τ only
+    //         dropped 8 % so the loss is dominated by verify cost × B
+    //         at OOD positions, not by τ collapse.
+    //   prose/instr: unchanged (B never grew past 10 on low-τ workloads).
+    // → clamp adaptive_b_max to draft_cfg.block_size with a warning when
+    // the user explicitly widens. Opt out via HIPFIRE_ADAPTIVE_B_UNSAFE=1
+    // for experiments on a refit draft.
+    let unsafe_adaptive = std::env::var("HIPFIRE_ADAPTIVE_B_UNSAFE").ok().as_deref() == Some("1");
+    if adaptive_b && adaptive_b_max > draft_cfg.block_size && !unsafe_adaptive {
+        eprintln!(
+            "adaptive-b: WARN requested MAX={} > draft trained block_size={}; clamping to {} (past-trained B regresses code by ~30 %; set HIPFIRE_ADAPTIVE_B_UNSAFE=1 to override)",
+            adaptive_b_max, draft_cfg.block_size, draft_cfg.block_size,
+        );
+        adaptive_b_max = draft_cfg.block_size;
+    }
+    // Scratches allocated for the *effective* max B we'll ever use. When
+    // user overrides with UNSAFE, this is larger; normally this equals
+    // draft_cfg.block_size.
+    let draft_scratch_b = if adaptive_b {
+        draft_cfg.block_size.max(adaptive_b_max)
+    } else {
+        draft_cfg.block_size
+    };
+    if draft_scratch_b > draft_cfg.block_size {
+        eprintln!(
+            "adaptive-b: pre-sizing draft scratch for B_MAX={} (trained at {}) [UNSAFE=on]",
+            draft_scratch_b, draft_cfg.block_size,
+        );
+    }
     let mut draft_scratch = DflashScratch::new_with_mq(
-        &mut gpu, &draft_cfg, draft_cfg.block_size, ctx_capacity, draft_weights.has_mq,
+        &mut gpu, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
     ).expect("alloc draft scratch");
     if draft_weights.has_mq {
         eprintln!("draft: MQ4 weights detected, FWHT rotation scratch enabled");
@@ -384,6 +457,9 @@ fn main() {
     );
 
     let tokenizer: Tokenizer = target.load_tokenizer().expect("target tokenizer");
+    if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+        tokenizer.dump_prompt_heat(&prompt);
+    }
     let mut prompt_tokens = tokenizer.encode(&prompt);
     if chatml {
         // Match daemon.rs production path: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n
@@ -414,12 +490,16 @@ fn main() {
     eprintln!("prompt tokens ({}): {:?}", prompt_tokens.len(), prompt_tokens);
 
     // ── Hidden ring buffer + snapshot + target_hidden_host ────────────
+    // Size for the max block we may use this session so adaptive-B-up
+    // doesn't overflow.
+    let hrb_max_block = draft_scratch_b;
     let mut hidden_rb = HiddenStateRingBuffer::new(
         &mut gpu,
         target.config.n_layers,
         draft_cfg.num_extract(),
         draft_cfg.hidden,
-        ctx_capacity + draft_cfg.block_size,
+        ctx_capacity + hrb_max_block,
+        engine::qwen35::PREFILL_MAX_BATCH.max(hrb_max_block),
     )
     .expect("alloc hidden_rb");
 
@@ -436,7 +516,7 @@ fn main() {
     // (seed + tree nodes). Size max_n = max(block_size, 1 + tree_budget) so
     // the tape is large enough whether we run per-path DFS, batched tree,
     // or plain DFlash.
-    let tape_max_n = draft_cfg.block_size.max(1 + ddtree_budget);
+    let tape_max_n = draft_scratch_b.max(1 + ddtree_budget);
     let mut gdn_tape = engine::speculative::GdnTape::new_for_config(
         &mut gpu, &target.config, tape_max_n,
     ).expect("alloc gdn tape");
@@ -445,14 +525,32 @@ fn main() {
     // avoids the per-cycle malloc+htod+free churn that dominated early wall-
     // clock numbers. Also allocated for non-ddtree runs (cheap, small) so
     // callers can switch strategies at runtime without reinit.
-    let ddtree_scratch = engine::speculative::DdtreeScratch::new(&mut gpu, ddtree_budget)
-        .expect("alloc ddtree scratch");
+    // KV-gather + tape-gather scratch are sized here too (slow-path-kill,
+    // 2026-04-23). Widths come from the target config: FA K/V row byte
+    // counts depend on n_kv_heads × head_dim × quant, and the GdnTape's
+    // qkv_dim = 2*k_dim + v_dim on the LA side.
+    let ddtree_qkv_dim = {
+        let kd = target.config.linear_num_key_heads * target.config.linear_key_head_dim;
+        let vd = target.config.linear_num_value_heads * target.config.linear_value_head_dim;
+        kd * 2 + vd
+    };
+    let ddtree_n_fa_layers = target.config.layer_types.iter()
+        .filter(|t| **t == engine::qwen35::LayerType::FullAttention)
+        .count();
+    let ddtree_scratch = engine::speculative::DdtreeScratch::new(
+        &mut gpu,
+        ddtree_budget,
+        target.config.n_kv_heads,
+        target.config.head_dim,
+        ddtree_qkv_dim,
+        ddtree_n_fa_layers,
+    ).expect("alloc ddtree scratch");
     // VerifyScratch: persistent per-cycle tensors (final_hidden, logits,
     // rotation scratch, argmax buf). Sized to max_n = max(block_size,
     // 1 + ddtree_budget) to cover plain DFlash and DDTree. Drops ~8
     // hipMalloc/hipFree pairs per cycle (biggest is 16 MB logits buffer),
     // saving 0.5-1.5 ms/cycle.
-    let verify_max_n = draft_cfg.block_size.max(1 + ddtree_budget);
+    let verify_max_n = draft_scratch_b.max(1 + ddtree_budget);
     let verify_scratch = engine::speculative::VerifyScratch::with_prefill(
         &mut gpu,
         verify_max_n,
@@ -489,7 +587,12 @@ fn main() {
     )
     .expect("seed scatter");
     draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
-    eprintln!("prefill (per-token) in {:.2}s", t2.elapsed().as_secs_f64());
+    // Seed per-row absolute positions for the draft's cross-attention RoPE.
+    // Pre-eviction these match [0..prompt_len) exactly, so FlashCASK-free runs
+    // stay byte-identical to the old contiguous-range behaviour.
+    draft_scratch.target_hidden_abs_positions =
+        (0..prompt_tokens.len() as i32).collect();
+    eprintln!("prefill in {:.2}s", t2.elapsed().as_secs_f64());
 
     // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
     // The policy evicts target.kv_cache between spec_step cycles.
@@ -505,10 +608,10 @@ fn main() {
         // existing slot_cfg sized it to ctx_capacity + block_size + 16 — we
         // don't resize here; just assert.
         assert!(
-            target.kv_cache.max_seq >= cask_budget + cask_beta + draft_cfg.block_size + 4,
+            target.kv_cache.max_seq >= cask_budget + cask_beta + draft_scratch_b + 4,
             "target.kv_cache.max_seq ({}) < cask_budget+beta+B+4 ({}) — raise --ctx or lower --cask-budget/beta",
             target.kv_cache.max_seq,
-            cask_budget + cask_beta + draft_cfg.block_size + 4,
+            cask_budget + cask_beta + draft_scratch_b + 4,
         );
         let base = EvictionCtx::new(
             &mut gpu, &centers, fa_layer_ids,
@@ -530,13 +633,26 @@ fn main() {
     // budget-sized physical state.
     let mut position: usize = prompt_tokens.len();
     if let Some(ref p) = cask_policy {
-        if let Some(new_phys) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
+        if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
             .expect("post-prefill cask evict") {
+            let pre_phys = position;
             eprintln!(
                 "FlashCASK: post-prefill compact {} -> {} (compact_offset={})",
-                position, new_phys, target.kv_cache.compact_offset,
+                pre_phys, ev.new_physical, target.kv_cache.compact_offset,
             );
-            position = new_phys;
+            position = ev.new_physical;
+            // Mirror the KV eviction into the draft's target_hidden so
+            // draft/target see the same windowed context.
+            if !ev.retain_mask.is_empty() {
+                speculative::apply_eviction_retain_to_draft(
+                    &mut gpu,
+                    &mut draft_scratch,
+                    &ev.retain_mask,
+                    draft_cfg.num_extract(),
+                    draft_cfg.hidden,
+                    pre_phys,
+                ).expect("mirror eviction to draft (post-prefill)");
+            }
         }
     }
 
@@ -562,10 +678,18 @@ fn main() {
     // `position` was already declared above (it may have been advanced by a
     // post-prefill CASK eviction). Keep it as-is.
     let mut seed_token: u32 = first_token;
-    let mut stats = SpecStats::new(draft_cfg.block_size);
-    let eos_id: u32 = tokenizer.eos_id;
+    // SpecStats histogram must fit the max accept_len we'll ever see, so
+    // size by draft_scratch_b (which accounts for adaptive_b_max).
+    let mut stats = SpecStats::new(draft_scratch_b);
 
-    eprintln!("decoding (max {max_tokens} tokens, block_size {})...", draft_cfg.block_size);
+    if adaptive_b && draft_scratch_b != draft_cfg.block_size {
+        eprintln!(
+            "decoding (max {max_tokens} tokens, adaptive-B range {adaptive_b_min}..={adaptive_b_max}, draft trained at {})...",
+            draft_cfg.block_size,
+        );
+    } else {
+        eprintln!("decoding (max {max_tokens} tokens, block_size {})...", draft_cfg.block_size);
+    }
 
     // Rolling τ window for live emit + future adaptive routing decisions.
     // τ_window[i] = accepted draft tokens in cycle i. Running mean over the
@@ -686,13 +810,14 @@ fn main() {
             emitted.push(next);
             position += 1;
             if let Some(ref p) = cask_policy {
-                if let Some(new_phys) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
+                if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
                     .expect("ar cask evict") {
-                    position = new_phys;
+                    // AR baseline doesn't touch draft state — no mirror needed.
+                    position = ev.new_physical;
                 }
             }
-            if next == eos_id {
-                eprintln!("eos");
+            if tokenizer.is_terminator(next) {
+                eprintln!("eos (id={next})");
                 break;
             }
             cur_token = next;
@@ -713,16 +838,73 @@ fn main() {
     // hip-bridge launch_counters around each cycle.
     let host_timing = std::env::var("HIPFIRE_HOST_TIMING").ok().as_deref() == Some("1");
     let mut per_cycle_wall_us: Vec<u64> = Vec::new();
-    let mut per_cycle_api_us: Vec<(u64, u64, u64, u64, u64)> = Vec::new(); // launch, h2d, d2h, d2d, memset
+    let mut per_cycle_api_us: Vec<(u64, u64, u64, u64, u64, u64, u64, u64, u64)> = Vec::new();
+    // columns: launch, h2d, d2h, d2d, memset, stream_sync, event_sync, device_sync, graph_launch
+
+    // HIPFIRE_DPM_WARMUP_SECS: run a memset loop on a 256 MB scratch before
+    // the decode timer starts, to pin the GPU at high DPM. See dispatch.rs
+    // `dpm_warmup` for rationale — between-process DPM variance has been
+    // observed at 7× wall-clock (52 ms vs 358 ms/cycle on the same bench),
+    // which is orders of magnitude more than the ±10-15% noise band our
+    // methodology doc calls out. Default 0 (disabled) for backward compat.
+    if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
+        let secs: f32 = secs_str.parse().unwrap_or(0.0);
+        if secs > 0.0 {
+            gpu.dpm_warmup(secs).expect("dpm warmup");
+        }
+    }
+
+    // Reset Task #93 Phase B seed-oracle counters so stats reflect this run
+    // only (process-cumulative counters would poison multi-run harnesses).
+    engine::speculative::reset_seed_oracle_stats();
+    engine::speculative::reset_ddtree_meta_stats();
+
+    // Adaptive-B state: tracks current B between cycles, plus a cooldown
+    // counter and a histogram for end-of-run reporting.
+    let mut current_adaptive_b: usize = draft_cfg.block_size;
+    let mut adaptive_b_cycles_since_change: usize = 0;
+    let mut adaptive_b_histogram: std::collections::HashMap<usize, u32> =
+        std::collections::HashMap::new();
+    let mut adaptive_b_changes: u32 = 0;
+    const ADAPTIVE_B_STEP: usize = 2;
+    const ADAPTIVE_B_COOLDOWN: usize = 3;
+    // Hysteresis thresholds on util = EWMA(accept_len) / (current_B - 1):
+    //   util > UP   → draft keeps up, stretch B further.
+    //   util < DOWN → draft lags, shrink B to cut verify cost.
+    // Gap between the two prevents flapping at one util value.
+    //
+    // Measured util ceilings at fixed-B16 (2026-04-24 3-run median):
+    //   code  τ≈7.68 / (B-1=15) = 0.51
+    //   prose τ≈1.65 / 15 = 0.11
+    //   instr τ≈1.82 / 15 = 0.12
+    // UP=0.70 never triggers — B never grows past start. UP=0.45 picks up
+    // code's high-confidence stretches without firing on prose/instr, where
+    // shrinking is the right move. Env override for tuning:
+    //   HIPFIRE_ADAPTIVE_B_UP=0.XX / HIPFIRE_ADAPTIVE_B_DOWN=0.XX
+    let adaptive_b_up: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_UP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.45);
+    let adaptive_b_down: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_DOWN")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.25);
 
     let t_decode = Instant::now();
     while emitted.len() < max_tokens {
-        if position + draft_cfg.block_size >= ctx_capacity {
+        if position + draft_scratch_b >= ctx_capacity {
             eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
             break;
         }
         // Per-cycle host timing snapshot (before the step).
-        let (wall_start, l_start, htod_start, dtoh_start, dtod_start, memset_start) = if host_timing {
+        let (
+            wall_start,
+            l_start,
+            htod_start,
+            dtoh_start,
+            dtod_start,
+            memset_start,
+            ssync_start,
+            esync_start,
+            dsync_start,
+            glaunch_start,
+        ) = if host_timing {
             use hip_bridge::launch_counters as lc;
             (
                 Instant::now(),
@@ -731,9 +913,13 @@ fn main() {
                 lc::memcpy_dtoh::time_ns(),
                 lc::memcpy_dtod::time_ns(),
                 lc::memset::time_ns(),
+                lc::stream_sync::time_ns(),
+                lc::event_sync::time_ns(),
+                lc::device_sync::time_ns(),
+                lc::graph_launch::time_ns(),
             )
         } else {
-            (Instant::now(), 0, 0, 0, 0, 0)
+            (Instant::now(), 0, 0, 0, 0, 0, 0, 0, 0, 0)
         };
         if do_profile && stats.cycles == 1 && !profile_armed {
             // First cycle was the JIT warm-up. Arm profiling now and drain
@@ -778,25 +964,39 @@ fn main() {
                 }
             }
         }
-        // Adaptive B: when rolling τ falls below threshold, shrink block_size
-        // from 16 to 8 to lower per-cycle cost so we stay above AR when draft
-        // accuracy is poor. Raise back to 16 when τ recovers.
+        // Adaptive-B scheduler (Task #93 Phase B replacement — 2026-04-24).
         //
-        // Threshold tuning (2026-04-16, 9B MQ4 / 7900XTX):
-        //   AR is 7.58 ms/tok. B=16 cycle ~25 ms → break-even τ ≈ 2.3.
-        //   B=8 cycle ~16 ms → break-even τ ≈ 1.1.
-        //   B=16 amortizes per-cycle overhead better whenever τ clears 2.3,
-        //   so B=8 only wins against B=16 when τ stays in [1, 2.5].
-        // Use τ<2.5 as the trip wire; anything higher and B=16 is cleanly
-        // faster.
+        // Online rule, no training. Tracks recent EWMA(accept_len), divides
+        // by current_B-1 to get "utilization". When draft is over-performing
+        // (util > UP), bump B — amortize verify over more positions. When
+        // draft is under-performing (util < DOWN), shrink B — cut verify
+        // cost, let τ recover. Hysteresis + cooldown prevent flapping.
+        //
+        // adaptive_b_min/max default to 8..=16 (pre-2026-04-24 behaviour
+        // bounded by the draft's trained block_size). User can widen with
+        // --adaptive-b-range MIN:MAX; scratches upstream pre-sized for MAX.
         let block_override = if adaptive_b {
-            if accepts_window.len() >= 4 {
-                let win_tau: f64 =
-                    accepts_window.iter().copied().sum::<usize>() as f64 / accepts_window.len() as f64;
-                if win_tau < 2.5 { Some(8usize) } else { None }
-            } else {
-                None
+            if accepts_window.len() >= 4 && adaptive_b_cycles_since_change >= ADAPTIVE_B_COOLDOWN {
+                let ewma: f64 = accepts_window.iter().copied().sum::<usize>() as f64
+                    / accepts_window.len() as f64;
+                let util = ewma / (current_adaptive_b.saturating_sub(1).max(1)) as f64;
+                if util > adaptive_b_up
+                    && current_adaptive_b + ADAPTIVE_B_STEP <= adaptive_b_max
+                {
+                    current_adaptive_b += ADAPTIVE_B_STEP;
+                    adaptive_b_cycles_since_change = 0;
+                    adaptive_b_changes += 1;
+                } else if util < adaptive_b_down
+                    && current_adaptive_b >= adaptive_b_min + ADAPTIVE_B_STEP
+                {
+                    current_adaptive_b -= ADAPTIVE_B_STEP;
+                    adaptive_b_cycles_since_change = 0;
+                    adaptive_b_changes += 1;
+                }
             }
+            adaptive_b_cycles_since_change += 1;
+            *adaptive_b_histogram.entry(current_adaptive_b).or_insert(0) += 1;
+            Some(current_adaptive_b)
         } else {
             None
         };
@@ -900,6 +1100,8 @@ fn main() {
                 &emitted,
                 cactus_delta,
                 pld_spine,
+                repeat_penalty,
+                repeat_window,
             )
             .expect("spec step")
         };
@@ -949,8 +1151,15 @@ fn main() {
             let dtoh_us = (lc::memcpy_dtoh::time_ns() - dtoh_start) / 1000;
             let dtod_us = (lc::memcpy_dtod::time_ns() - dtod_start) / 1000;
             let memset_us = (lc::memset::time_ns() - memset_start) / 1000;
+            let ssync_us = (lc::stream_sync::time_ns() - ssync_start) / 1000;
+            let esync_us = (lc::event_sync::time_ns() - esync_start) / 1000;
+            let dsync_us = (lc::device_sync::time_ns() - dsync_start) / 1000;
+            let glaunch_us = (lc::graph_launch::time_ns() - glaunch_start) / 1000;
             per_cycle_wall_us.push(wall_us);
-            per_cycle_api_us.push((launch_us, htod_us, dtoh_us, dtod_us, memset_us));
+            per_cycle_api_us.push((
+                launch_us, htod_us, dtoh_us, dtod_us, memset_us,
+                ssync_us, esync_us, dsync_us, glaunch_us,
+            ));
         }
 
         // Rolling τ.
@@ -981,14 +1190,32 @@ fn main() {
         // budget+β. compact_offset is maintained on the cache so the next
         // cycle's target.forward_scratch uses the right RoPE phase.
         if let Some(ref p) = cask_policy {
-            if let Some(new_phys) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
+            if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
                 .expect("spec cask evict") {
-                position = new_phys;
+                let pre_phys = position;
+                position = ev.new_physical;
+                // Mirror the KV eviction into the draft's target_hidden view.
+                // Empty retain_mask (CASK m-fold path) → skip; draft keeps the
+                // pre-eviction buffer, the old τ-collapse behaviour still
+                // applies there until m-fold gets a compatible draft mirror.
+                if !ev.retain_mask.is_empty() {
+                    speculative::apply_eviction_retain_to_draft(
+                        &mut gpu,
+                        &mut draft_scratch,
+                        &ev.retain_mask,
+                        draft_cfg.num_extract(),
+                        draft_cfg.hidden,
+                        pre_phys,
+                    ).expect("mirror eviction to draft");
+                }
             }
         }
 
-        // Stop on EOS.
-        if step.committed.iter().skip(1).any(|&t| t == eos_id) {
+        // Stop on any terminator (eos_id OR eot_id). Checking only eos_id
+        // misses `<|endoftext|>` when running --no-chatml on a raw-text draft
+        // — see findings/dflash-benchmark-2026-04-24.md §3.5 (post-EOT
+        // attractor loop). `is_terminator` covers both.
+        if step.committed.iter().skip(1).any(|&t| tokenizer.is_terminator(t)) {
             eprintln!("eos");
             break;
         }
@@ -1032,11 +1259,52 @@ fn main() {
         "histogram: {:?}",
         stats.acceptance_hist.iter().enumerate().collect::<Vec<_>>()
     );
+    // DDTree meta-verifier pruner stats — only meaningful under --ddtree-*
+    // with HIPFIRE_DDTREE_LOGW_CUTOFF set. Cycles == 0 on pure-DFlash runs.
+    let meta = engine::speculative::read_ddtree_meta_stats();
+    if meta.cycles > 0 {
+        let mean_nodes = meta.total_nodes as f32 / meta.cycles as f32;
+        eprintln!(
+            "ddtree-meta: cycles={} mean_nodes={:.2} min={} max={} (cutoff={:?})",
+            meta.cycles, mean_nodes, meta.min_nodes, meta.max_nodes,
+            std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF").unwrap_or_else(|_| "off".to_string()),
+        );
+    }
+    // Adaptive-B usage report — only meaningful when --adaptive-b is on.
+    if adaptive_b && !adaptive_b_histogram.is_empty() {
+        let mut buckets: Vec<(usize, u32)> = adaptive_b_histogram.iter()
+            .map(|(&b, &c)| (b, c)).collect();
+        buckets.sort_by_key(|(b, _)| *b);
+        let total: u32 = buckets.iter().map(|(_, c)| *c).sum();
+        let mean_b: f32 = buckets.iter()
+            .map(|(b, c)| (*b as f32) * (*c as f32))
+            .sum::<f32>() / total.max(1) as f32;
+        let dist: String = buckets.iter()
+            .map(|(b, c)| format!("B={b}:{:.1}%", *c as f32 * 100.0 / total.max(1) as f32))
+            .collect::<Vec<_>>().join(" ");
+        eprintln!(
+            "adaptive-b: range={}..={} mean_B={:.2} changes={} dist=[{}]",
+            adaptive_b_min, adaptive_b_max, mean_b, adaptive_b_changes, dist,
+        );
+    }
+    // Task #93 Phase B seed-prediction oracle. Zero cycles = pure-AR or tree
+    // paths that didn't invoke spec_step_dflash; skip in that case.
+    let s = engine::speculative::read_seed_oracle_stats();
+    if s.total > 0 {
+        let denom = s.total as f32;
+        eprintln!(
+            "seed-oracle: cycles={} full_accept={} mean_accept_len={:.3} | rej_match={:.3} tail_match={:.3} anypos_match={:.3}",
+            s.total, s.full_accept, s.accept_len_sum as f32 / denom,
+            s.rej_match as f32 / denom,
+            s.tail_match as f32 / denom,
+            s.anypos_match as f32 / denom,
+        );
+    }
     if host_timing && !per_cycle_wall_us.is_empty() {
         // Skip first 2 cycles (JIT warm-up), summarize the rest as mean / median.
         let skip = 2.min(per_cycle_wall_us.len().saturating_sub(1));
         let wall: Vec<u64> = per_cycle_wall_us.iter().skip(skip).copied().collect();
-        let api: Vec<(u64, u64, u64, u64, u64)> =
+        let api: Vec<(u64, u64, u64, u64, u64, u64, u64, u64, u64)> =
             per_cycle_api_us.iter().skip(skip).copied().collect();
         let n = wall.len().max(1);
         let mean_wall = wall.iter().sum::<u64>() / n as u64;
@@ -1045,11 +1313,33 @@ fn main() {
         let mean_dtoh = api.iter().map(|x| x.2).sum::<u64>() / n as u64;
         let mean_dtod = api.iter().map(|x| x.3).sum::<u64>() / n as u64;
         let mean_memset = api.iter().map(|x| x.4).sum::<u64>() / n as u64;
-        let tracked = mean_launch + mean_htod + mean_dtoh + mean_dtod + mean_memset;
+        let mean_ssync = api.iter().map(|x| x.5).sum::<u64>() / n as u64;
+        let mean_esync = api.iter().map(|x| x.6).sum::<u64>() / n as u64;
+        let mean_dsync = api.iter().map(|x| x.7).sum::<u64>() / n as u64;
+        let mean_glaunch = api.iter().map(|x| x.8).sum::<u64>() / n as u64;
+        let tracked = mean_launch + mean_htod + mean_dtoh + mean_dtod + mean_memset
+            + mean_ssync + mean_esync + mean_dsync + mean_glaunch;
         let untracked = mean_wall.saturating_sub(tracked);
+        // Cumulative counts — post-run totals divided by elapsed cycles give
+        // mean per-cycle API call counts. Helpful for isolating which op is
+        // the hot path (few-but-fat vs many-but-thin).
+        use hip_bridge::launch_counters as lc;
+        let total_cycles = per_cycle_wall_us.len() as u64;
+        let n_launch = lc::launch_kernel::count() / total_cycles.max(1);
+        let n_htod = lc::memcpy_htod::count() / total_cycles.max(1);
+        let n_dtoh = lc::memcpy_dtoh::count() / total_cycles.max(1);
+        let n_dtod = lc::memcpy_dtod::count() / total_cycles.max(1);
+        let n_memset = lc::memset::count() / total_cycles.max(1);
+        let n_ssync = lc::stream_sync::count() / total_cycles.max(1);
+        let n_glaunch = lc::graph_launch::count() / total_cycles.max(1);
+        let b_dtoh = lc::memcpy_dtoh::bytes() / total_cycles.max(1);
+        let b_memset = lc::memset::bytes() / total_cycles.max(1);
         eprintln!(
-            "host timing (mean over {} cycles, µs): wall={} | launch={} htod={} dtoh={} dtod={} memset={} → other={}",
-            n, mean_wall, mean_launch, mean_htod, mean_dtoh, mean_dtod, mean_memset, untracked,
+            "host timing (mean over {} cycles, µs): wall={}\n  launch={} (n={}) h2d={} (n={}) d2h={} (n={}, {}KB) d2d={} (n={}) memset={} (n={}, {}MB) glaunch={} (n={})\n  ssync={} (n={}) esync={} dsync={} → other={}",
+            n, mean_wall,
+            mean_launch, n_launch, mean_htod, n_htod, mean_dtoh, n_dtoh, b_dtoh / 1024,
+            mean_dtod, n_dtod, mean_memset, n_memset, b_memset / (1024*1024), mean_glaunch, n_glaunch,
+            mean_ssync, n_ssync, mean_esync, mean_dsync, untracked,
         );
     }
     eprintln!("DFlash tokens: {:?}", emitted);

@@ -169,6 +169,11 @@ fn main() {
         if stdin.read_line(&mut input).unwrap() == 0 { break; } // EOF
         let input = input.trim();
         if input.is_empty() { continue; }
+        let input_norm = engine::tokenizer::maybe_normalize_prompt(input);
+        let input: &str = &input_norm;
+        if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+            tokenizer.dump_prompt_heat(input);
+        }
 
         // Commands
         match input {
@@ -298,7 +303,7 @@ fn main() {
                 print!("{}", text);
                 std::io::stdout().flush().unwrap();
             }
-            tok == eos_token || im_end_token_val == Some(tok)
+            tok == eos_token || im_end_token_val == Some(tok) || tokenizer.is_terminator(tok)
         };
 
         if spec_active {

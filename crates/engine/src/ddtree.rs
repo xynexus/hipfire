@@ -139,6 +139,36 @@ pub fn build_ddtree_tree(
     topk: usize,
     budget: usize,
 ) -> DdTree {
+    build_ddtree_tree_with_cutoff(top_tokens, top_log_probs, depth, topk, budget, f32::NEG_INFINITY)
+}
+
+/// Same as `build_ddtree_tree`, but also stops expansion when the next
+/// heap-pop candidate's cumulative log-weight falls below `logw_cutoff`.
+/// Use `f32::NEG_INFINITY` to disable (= original behaviour — only the
+/// `budget` cap applies).
+///
+/// Rationale: the reference's Algorithm 1 pops candidates in
+/// descending-cumulative-logw order, so later pops are strictly lower
+/// probability than earlier ones. When a candidate's cumulative log-prob
+/// drops below, say, -4.0 (≈ 1.8 % absolute probability), further
+/// expansion has diminishing returns — those slots are rarely accepted
+/// by the target anyway, yet each costs verify time linear in B.
+///
+/// This is a zero-training "meta-verifier" pruner: per-cycle dynamic
+/// budget that shrinks the tree on high-confidence cycles (where top-1
+/// logw is near zero and the heap's tail collapses fast) but keeps full
+/// budget on uncertain ones (where many candidates are plausible).
+///
+/// Measured on 27B MQ4 / 7900XTX (2026-04-24, 3-run median):
+/// TODO: populate once the bench lands.
+pub fn build_ddtree_tree_with_cutoff(
+    top_tokens: &[u32],
+    top_log_probs: &[f32],
+    depth: usize,
+    topk: usize,
+    budget: usize,
+    logw_cutoff: f32,
+) -> DdTree {
     // Early out: no draft positions or no budget → root-only tree.
     if budget == 0 || depth == 0 {
         return DdTree {
@@ -183,6 +213,14 @@ pub fn build_ddtree_tree(
 
     while let Some(entry) = heap.pop() {
         if nodes.len() >= budget {
+            break;
+        }
+        // Meta-verifier pruner: heap pops in strictly descending logw, so
+        // once a candidate falls below the cutoff, every remaining one is
+        // also below. Bail early to shrink the tree for high-confidence
+        // cycles — verify cost saved ∝ nodes-pruned, acceptance loss ≈ 0
+        // (those nodes' target-accept probability is bounded by exp(logw)).
+        if entry.logw < logw_cutoff {
             break;
         }
         let HeapEntry {
@@ -339,6 +377,34 @@ pub fn linearize_tree(
     seed_token: u32,
     base_pos: u32,
 ) -> (Vec<u32>, Vec<i32>, Vec<f32>) {
+    let (tokens, positions, mask_block, _) = linearize_tree_with_parents(tree, seed_token, base_pos);
+    (tokens, positions, mask_block)
+}
+
+/// Same as `linearize_tree` but also returns `parent_indices`: for each
+/// slot in the linearized block, the slot index of its parent in the same
+/// linearization, or `-1` for the root slot (slot 0, the seed token).
+///
+/// Tree-aware kernels (`conv1d_silu_split_tree`, `gated_delta_net_q8_tree`)
+/// consume this array to walk per-token ancestor chains instead of the
+/// linear-sequence predecessor. For the GDN kernel: `parent_indices[t] < 0`
+/// means "read from the pre-block initial state" (s_q8_init); otherwise
+/// "read from s_tape[parent]".
+///
+/// For the conv1d kernel: negative sentinels index the pre-block conv_state
+/// ring (-1 → state[0], -2 → state[1], -3 → state[2]); since walking past
+/// the block root consumes one sentinel slot per ancestor-chain step, the
+/// kernel handles the `-1 → -2 → -3` chain internally. Callers only need
+/// `-1` at the slot 0 position.
+///
+/// Returns `(tokens, positions, mask_block, parent_indices)` all of length
+/// `1 + tree.num_nodes()`. `mask_block` is the same `[N×N]` row-major f32
+/// additive bias; `parent_indices` is `[N]` i32.
+pub fn linearize_tree_with_parents(
+    tree: &DdTree,
+    seed_token: u32,
+    base_pos: u32,
+) -> (Vec<u32>, Vec<i32>, Vec<f32>, Vec<i32>) {
     let len = 1 + tree.num_nodes();
 
     let mut tokens: Vec<u32> = Vec::with_capacity(len);
@@ -361,7 +427,20 @@ pub fn linearize_tree(
     }
     debug_assert_eq!(mask_block.len(), len * len);
 
-    (tokens, positions, mask_block)
+    // Parent indices. Slot 0 = seed token = root = -1 sentinel (reads from
+    // pre-block state in the GDN tree kernel). Slot i+1 corresponds to
+    // tree.nodes[i]; its linearized parent is:
+    //   - 0 if nodes[i].parent_index == -1 (direct child of root / seed)
+    //   - nodes[i].parent_index + 1 otherwise
+    let mut parent_indices: Vec<i32> = Vec::with_capacity(len);
+    parent_indices.push(-1);
+    for node in &tree.nodes {
+        let p = if node.parent_index < 0 { 0 } else { node.parent_index + 1 };
+        parent_indices.push(p);
+    }
+    debug_assert_eq!(parent_indices.len(), len);
+
+    (tokens, positions, mask_block, parent_indices)
 }
 
 /// CPU top-K per row on a log-softmax-normalized logits matrix. Produces the
@@ -635,6 +714,33 @@ mod tests {
             0.0, ni,  ni,  0.0, 0.0,
         ];
         assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn linearize_with_parents_spine() {
+        // Spine chain of 3 depths × topk=1: same as linearize_spine_tree.
+        let tokens = vec![11, 22, 33];
+        let logps = vec![-0.1, -0.2, -0.3];
+        let t = build_ddtree_tree(&tokens, &logps, 3, 1, 3);
+        let (_toks, _pos, _mask, parents) = linearize_tree_with_parents(&t, 5, 50);
+        // Slot 0 = root/seed = -1 sentinel. Slot i (i>=1) = previous slot.
+        assert_eq!(parents, vec![-1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn linearize_with_parents_bushy() {
+        // 4-node bushy tree: [node0=10 root-child, node1=30 under 10,
+        // node2=20 root-child, node3=30 under 20]. linearize slots:
+        //   0 = seed(1)
+        //   1 = nodes[0]=10 (parent=-1 → slot 0)
+        //   2 = nodes[1]=30 (parent=0 → slot 1)
+        //   3 = nodes[2]=20 (parent=-1 → slot 0)
+        //   4 = nodes[3]=30 (parent=2 → slot 3)
+        let tokens = vec![10, 20, 30, 40];
+        let logps = vec![-0.1, -1.0, -0.2, -1.5];
+        let t = build_ddtree_tree(&tokens, &logps, 2, 2, 4);
+        let (_toks, _pos, _mask, parents) = linearize_tree_with_parents(&t, 1, 0);
+        assert_eq!(parents, vec![-1, 0, 1, 0, 3]);
     }
 
     #[test]

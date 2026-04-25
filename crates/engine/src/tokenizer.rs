@@ -17,6 +17,11 @@ pub struct Tokenizer {
     /// Special tokens
     pub bos_id: u32,
     pub eos_id: u32,
+    /// Auxiliary end-of-generation id (e.g. `<|endoftext|>` when `eos_id` is
+    /// `<|im_end|>`). When a raw-text draft without ChatML finishes naturally
+    /// it emits this, not `eos_id` — stop-loops must check both via
+    /// `is_terminator()`. None if the vocab only has one terminator.
+    pub eot_id: Option<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA)
     is_gpt2_bpe: bool,
 }
@@ -64,6 +69,13 @@ impl Tokenizer {
 
         let bos_id = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
         let eos_id = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
+        let endoftext = token_to_id.get("<|endoftext|>").copied();
+        let im_end    = token_to_id.get("<|im_end|>").copied();
+        let eot_id = match (endoftext, im_end) {
+            (Some(et), Some(ie)) if et != eos_id && ie == eos_id => Some(et),
+            (Some(et), _) if et != eos_id => Some(et),
+            _ => None,
+        };
 
         // Detect tokenizer type
         let model_type = gguf.meta_str("tokenizer.ggml.model").unwrap_or("llama");
@@ -88,6 +100,7 @@ impl Tokenizer {
             special_tokens,
             bos_id,
             eos_id,
+            eot_id,
             is_gpt2_bpe,
         })
     }
@@ -165,6 +178,11 @@ impl Tokenizer {
             .or_else(|| token_to_id.get("<|endoftext|>").copied())
             .or_else(|| token_to_id.get("</s>").copied())
             .unwrap_or(2);
+        let endoftext = token_to_id.get("<|endoftext|>").copied();
+        let eot_id = match endoftext {
+            Some(et) if et != eos_id => Some(et),
+            _ => None,
+        };
 
         let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
 
@@ -175,6 +193,7 @@ impl Tokenizer {
             special_tokens,
             bos_id,
             eos_id,
+            eot_id,
             is_gpt2_bpe,
         })
     }
@@ -184,6 +203,17 @@ impl Tokenizer {
         let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
         let tok_str = meta.get("tokenizer")?.as_str()?;
         Self::from_hf_json(tok_str)
+    }
+
+    /// True if `id` is any end-of-generation terminator (`eos_id` or the
+    /// auxiliary `eot_id` — e.g. `<|endoftext|>` when `eos_id` is `<|im_end|>`).
+    /// Decode loops MUST check this instead of `== eos_id` — a raw-text draft
+    /// without ChatML naturally emits `<|endoftext|>`, not `<|im_end|>`, and a
+    /// bare `eos_id` compare silently falls through, causing the post-EOT
+    /// attractor loop (bench findings 2026-04-24 §3.5).
+    #[inline]
+    pub fn is_terminator(&self, id: u32) -> bool {
+        id == self.eos_id || self.eot_id == Some(id)
     }
 
     /// Decode a sequence of token IDs to text.
@@ -502,4 +532,275 @@ fn decode_hex_escapes(s: &str) -> String {
         }
     }
     result
+}
+
+/// Heat-class buckets keyed off BPE merge rank. Lower rank = earlier merge =
+/// more common building block during BPE training. Empirical proxy for
+/// training-data frequency.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HeatClass {
+    /// Base byte / no merge (rank 0). The most universal building blocks.
+    Base,
+    /// Merge rank < 1000. Top-1k merges — extremely common multi-byte tokens.
+    Hot,
+    /// Merge rank 1000-9999. Common but not top-tier.
+    Warm,
+    /// Merge rank 10000-99999. Uncommon — likely a τ depressor when adjacent
+    /// to model-defining tokens.
+    Cold,
+    /// Merge rank ≥ 100000. Exotic / out-of-distribution.
+    Frozen,
+    /// Token id has no merge entry (special tokens, isolated vocab).
+    Unknown,
+}
+
+impl HeatClass {
+    pub fn from_rank(rank: Option<usize>) -> Self {
+        match rank {
+            None => Self::Unknown,
+            Some(0) => Self::Base,
+            Some(r) if r < 1000 => Self::Hot,
+            Some(r) if r < 10000 => Self::Warm,
+            Some(r) if r < 100000 => Self::Cold,
+            Some(_) => Self::Frozen,
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Base => "BASE   ",
+            Self::Hot => "HOT    ",
+            Self::Warm => "WARM   ",
+            Self::Cold => "COLD   ",
+            Self::Frozen => "FROZEN ",
+            Self::Unknown => "SPECIAL",
+        }
+    }
+}
+
+impl Tokenizer {
+    /// Build a token-id → merge-rank table by scanning the BPE merges list.
+    /// O(n_merges) one-time. Used only by diagnostics; not on the hot path.
+    pub fn build_merge_rank_table(&self) -> HashMap<u32, usize> {
+        let mut out = HashMap::with_capacity(self.merges.len());
+        let mut buf = String::new();
+        for (i, (l, r)) in self.merges.iter().enumerate() {
+            buf.clear();
+            buf.push_str(l);
+            buf.push_str(r);
+            if let Some(&id) = self.token_to_id.get(&buf) {
+                out.entry(id).or_insert(i);
+            }
+        }
+        out
+    }
+
+    /// Look up a single token's merge rank. For repeated lookups, cache
+    /// `build_merge_rank_table` once instead — this method is O(merges).
+    pub fn merge_rank(&self, id: u32) -> Option<usize> {
+        let s = self.vocab.get(id as usize)?;
+        if s.len() <= 1 {
+            return Some(0); // base byte
+        }
+        let mut buf = String::new();
+        for (i, (l, r)) in self.merges.iter().enumerate() {
+            buf.clear();
+            buf.push_str(l);
+            buf.push_str(r);
+            if buf == *s {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn rank_of(&self, id: u32, table: &HashMap<u32, usize>) -> Option<usize> {
+        table.get(&id).copied().or_else(|| {
+            let s = self.vocab.get(id as usize)?;
+            if s.len() <= 1 { Some(0) } else { None }
+        })
+    }
+
+    /// Dump a per-position heat map for `text`, plus a summary line.
+    /// Identifies cold-zone tokens that depress draft/target acceptance in DFlash.
+    /// Env knobs:
+    /// - `HIPFIRE_PROMPT_HEAT_LIMIT=N` — max rows (default 64)
+    /// - `HIPFIRE_PROMPT_HEAT_JSON=1` — emit JSON to stdout instead of pretty stderr
+    pub fn dump_prompt_heat(&self, text: &str) {
+        let ids = self.encode(text);
+        let table = self.build_merge_rank_table();
+        let total = ids.len().max(1);
+        let mut counts = [0usize; 6];
+        for &id in &ids {
+            counts[HeatClass::from_rank(self.rank_of(id, &table)) as usize] += 1;
+        }
+        if std::env::var("HIPFIRE_PROMPT_HEAT_JSON").ok().as_deref() == Some("1") {
+            let mut s = String::with_capacity(2048);
+            s.push_str("{\"bytes\":");
+            s.push_str(&text.len().to_string());
+            s.push_str(",\"tokens\":");
+            s.push_str(&ids.len().to_string());
+            s.push_str(",\"summary\":{");
+            s.push_str(&format!("\"base\":{},\"hot\":{},\"warm\":{},\"cold\":{},\"frozen\":{},\"special\":{}",
+                counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]));
+            s.push_str("},\"positions\":[");
+            for (pos, &id) in ids.iter().enumerate() {
+                if pos > 0 { s.push(','); }
+                let rank = self.rank_of(id, &table);
+                let decoded = self.decode(&[id]).replace('\\', "\\\\").replace('"', "\\\"")
+                    .replace('\n', "\\n").replace('\t', "\\t").replace('\r', "\\r");
+                s.push_str(&format!("{{\"pos\":{pos},\"id\":{id},\"rank\":{},\"text\":\"{decoded}\"}}",
+                    rank.map(|r| r.to_string()).unwrap_or_else(|| "null".to_string())));
+            }
+            s.push_str("]}");
+            println!("{s}");
+            return;
+        }
+        let limit: usize = std::env::var("HIPFIRE_PROMPT_HEAT_LIMIT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        eprintln!("[token-heat] prompt={} bytes  tokens={}", text.len(), ids.len());
+        eprintln!("[token-heat] {:>4}  {:>6}  {:>7}  {:7}  {}", "pos", "id", "rank", "class", "decoded");
+        for (pos, &id) in ids.iter().take(limit).enumerate() {
+            let rank = self.rank_of(id, &table);
+            let class = HeatClass::from_rank(rank);
+            let display = self.decode(&[id]).replace('\n', "\\n").replace('\t', "\\t");
+            let rank_str = rank.map(|r| r.to_string()).unwrap_or_else(|| "-".to_string());
+            eprintln!("[token-heat] {pos:>4}  {id:>6}  {rank_str:>7}  {}  {display:?}", class.label());
+        }
+        if ids.len() > limit {
+            eprintln!("[token-heat] ... ({} more tokens omitted)", ids.len() - limit);
+        }
+        eprintln!("[token-heat] summary: BASE={} ({:.0}%)  HOT={} ({:.0}%)  WARM={} ({:.0}%)  COLD={} ({:.0}%)  FROZEN={} ({:.0}%)  SPECIAL={} ({:.0}%)",
+            counts[0], 100.0*counts[0] as f32/total as f32,
+            counts[1], 100.0*counts[1] as f32/total as f32,
+            counts[2], 100.0*counts[2] as f32/total as f32,
+            counts[3], 100.0*counts[3] as f32/total as f32,
+            counts[4], 100.0*counts[4] as f32/total as f32,
+            counts[5], 100.0*counts[5] as f32/total as f32);
+        let cold_frac = (counts[3] + counts[4]) as f32 / total as f32;
+        if cold_frac > 0.05 {
+            eprintln!("[token-heat] WARNING: {:.1}% cold tokens — likely τ depressor", 100.0 * cold_frac);
+        }
+    }
+}
+
+/// Collapse runs of 3+ '\n' chars to exactly two.
+///
+/// Cold zone in BPE merges: `\n\n\n` → token 1358 (RARE) on Qwen3.5/3.6 vocab,
+/// while `\n\n` → token 271 (HOT). Rare tokens drop draft/target acceptance
+/// (DFlash τ) by ~17% in the worst case observed (PEP-8 PEP-8 strict on 27B-3.5
+/// LRU max=120: 161 tok/s τ=8.07 vs single-blank 184 tok/s τ=9.42).
+///
+/// Single newlines and double newlines pass through unchanged.
+pub fn collapse_newline_runs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut nl_run: usize = 0;
+    for ch in s.chars() {
+        if ch == '\n' {
+            nl_run += 1;
+            if nl_run <= 2 {
+                out.push('\n');
+            }
+        } else {
+            nl_run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Env-gated prompt normalization for higher DFlash τ.
+///
+/// `HIPFIRE_NORMALIZE_PROMPT=1` enables it. Default off (Phase 1 opt-in).
+/// Returns Cow::Borrowed when env disabled or when input has no `\n{3,}` runs;
+/// Cow::Owned only on actual rewrite. See `docs/plans/prompt-shape-adaptation.prd`.
+pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
+    if std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref() != Some("1") {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    if !needs_newline_collapse(s) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(collapse_newline_runs(s))
+}
+
+fn needs_newline_collapse(s: &str) -> bool {
+    let mut nl_run: usize = 0;
+    for b in s.bytes() {
+        if b == b'\n' {
+            nl_run += 1;
+            if nl_run >= 3 {
+                return true;
+            }
+        } else {
+            nl_run = 0;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod prompt_norm_tests {
+    use super::*;
+
+    #[test]
+    fn collapse_three_to_two() {
+        assert_eq!(collapse_newline_runs("a\n\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn collapse_six_to_two() {
+        assert_eq!(collapse_newline_runs("a\n\n\n\n\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn pass_two_unchanged() {
+        assert_eq!(collapse_newline_runs("a\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn pass_one_unchanged() {
+        assert_eq!(collapse_newline_runs("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn no_newlines_unchanged() {
+        assert_eq!(collapse_newline_runs("hello world"), "hello world");
+    }
+
+    #[test]
+    fn multiple_independent_runs() {
+        assert_eq!(
+            collapse_newline_runs("a\n\n\nb\n\n\n\nc"),
+            "a\n\nb\n\nc"
+        );
+    }
+
+    #[test]
+    fn detector_finds_three() {
+        assert!(needs_newline_collapse("a\n\n\nb"));
+    }
+
+    #[test]
+    fn detector_skips_two() {
+        assert!(!needs_newline_collapse("a\n\nb"));
+    }
+
+    #[test]
+    fn pep8_lrucache_collapses_to_single_blank() {
+        // PEP-8 strict snippet: top-level class boundary uses \n\n\n.
+        let pep8 = "from typing import Optional\n\n\nclass ListNode:\n    def __init__(self):\n        pass\n\n\nclass LRUCache:\n    pass\n";
+        let collapsed = collapse_newline_runs(pep8);
+        assert!(!collapsed.contains("\n\n\n"));
+        assert!(collapsed.contains("Optional\n\nclass ListNode"));
+        assert!(collapsed.contains("pass\n\nclass LRUCache"));
+    }
+
+    #[test]
+    fn cow_borrowed_when_env_unset() {
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+        let s = "a\n\n\nb";
+        let out = maybe_normalize_prompt(s);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), "a\n\n\nb");
+    }
 }

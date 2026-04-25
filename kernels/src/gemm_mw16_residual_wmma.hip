@@ -52,13 +52,20 @@ extern "C" __global__ void gemm_mw16_residual_wmma(
         acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc);
     }
 
-    const int out_row = row_start + (tid & 15);
-    if (out_row < M) {
-        const int col_base = batch_start + (tid >> 4) * 8;
+    // RDNA3 wave32 WMMA output: acc[j] = C[2*j + (tid>>4)][tid & 15].
+    // A operand = weight rows (m-dim), B operand = batch X cols (n-dim).
+    // Matches `gemm_hfq4g256_residual_wmma` post-correctness-fix convention.
+    // (Pre-fix mapping `out_row = row_start + (tid & 15)` + col_base = (tid>>4)*8
+    // shipped silently wrong in this kernel from 1c9cc99 2026-04-12 until the
+    // DFlash F16-draft path exposed it.)
+    const int out_col = batch_start + (tid & 15);
+    if (out_col < N) {
         #pragma unroll
         for (int j = 0; j < 8; j++) {
-            if (col_base + j < N)
-                Y[(long long)(col_base + j) * M + out_row] += acc[j];
+            int out_row = row_start + 2 * j + (tid >> 4);
+            if (out_row < M) {
+                Y[(long long)out_col * M + out_row] += acc[j];
+            }
         }
     }
 }
