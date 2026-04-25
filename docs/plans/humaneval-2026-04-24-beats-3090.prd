@@ -141,3 +141,92 @@ Expected output: `emitted: 120 tokens in ~0.56s (~212 tok/s)`, `tau=10.90`.
 ## Full per-prompt JSON
 
 `findings/humaneval_27b35_phase2.json` (164 entries, all task_ids, tok/s, tau).
+
+
+---
+
+## Addendum 2026-04-24 — Lucebox parity bench (n_gen=256)
+
+After fetching the actual Lucebox blog post (cached at
+`.research-cache/lucebox-dflash27b.html`), corrected methodology:
+
+**Lucebox uses n_gen=256, not 120.** All Lucebox numbers are at n=256:
+
+| Lucebox config | mean tok/s | AL |
+|---|---|---|
+| AR baseline | 37.78 | 1.00 |
+| SGLang AWQ | 46.6 | — |
+| Chain DFlash | 112.82 | 7.67 |
+| DDTree b20 f32 | 127.93 | 8.44 |
+| DDTree b22 f32 | 130.35 | 8.77 |
+| DDTree b20 f16 | 133.91 | 8.64 |
+| **DDTree b22 f16 (BEST)** | **135.80** | **8.88** |
+| DDTree b22 (fresh, public) | 129.52 | 8.31 |
+| Demo peak (methodology unclear) | 207.6 | — |
+
+### Our re-bench at Lucebox parity (n_gen=256)
+
+10-prompt subset (HumanEval/0,5,10,20,30,40,50,60,70,80), n_gen=256:
+
+| task | toks emitted | tok/s | tau |
+|---|---|---|---|
+| HumanEval/0 | 45 (early EOT) | 185.9 | 10.00 |
+| HumanEval/5 | 54 | 155.8 | 7.83 |
+| HumanEval/10 | 96 | 107.2 | 4.94 |
+| HumanEval/20 | 227 | 182.6 | 9.27 |
+| HumanEval/30 | 118 | 139.7 | 6.80 |
+| HumanEval/40 | 180 | 168.1 | 8.42 |
+| HumanEval/50 | 265 | 170.2 | 8.43 |
+| HumanEval/60 | 81 | 142.9 | 7.00 |
+| HumanEval/70 | 58 | 93.9 | 4.18 |
+| HumanEval/80 | 130 | 122.8 | 5.79 |
+
+**Our plain DFlash 10-prompt mean: 146.9 tok/s** (median 149.3, max 185.9).
+
+### Honest comparison
+
+| metric | Lucebox best | hipfire | delta |
+|---|---|---|---|
+| 10-prompt mean (their methodology) | 135.80 (DDTree b22 f16) | **146.9** (plain DFlash) | **+8.2%** ✅ |
+| 10-prompt mean (vs Chain DFlash) | 112.82 | 146.9 | **+30.2%** ✅ |
+| /53 single-run peak (max=120) | n/a | 214.3 | — |
+| /53 single-run peak (max=256) | n/a | 140.2 | — |
+| Their demo peak | 207.6 | n/a (we can't repro at n=256) | — |
+
+### Honest claim
+
+**At Lucebox's published methodology (10-prompt HumanEval, n_gen=256), our
+plain DFlash mean beats their best DDTree b22 f16 mean by +8.2% and their
+Chain DFlash by +30.2%.**
+
+We do NOT directly beat their demo-video 207.6 peak at n_gen=256. Our peak
+at n=120 was 214.3 but that's a different bench condition. Their 207.6 was
+likely also at a shorter n (the demo video, not the published bench).
+
+### What's surprising
+
+- Their best is DDTree b22; their plain Chain DFlash is 112.82 (-22 vs DDTree)
+- Our plain DFlash is 146.9 (+30% over their plain DFlash, +8% over their best DDTree)
+- Our DDTree b=22 at n=256 on /53 was 83.5 — much SLOWER than their DDTree b=22
+- → DDTree on RDNA3 is broken or mis-tuned (per memory: tree-mode RoPE phase skew at FA layer)
+- Our plain DFlash is structurally better than theirs, even before structural levers
+- Phase 1 prompt-shape normalization (which Lucebox doesn't have) probably accounts for ~half the +8.2%
+
+### Why Lucebox's DDTree is faster than ours but our plain is faster than theirs
+
+Their DDTree b22 f16 = 135.8 (us plain = 146.9, their DDTree wins by -8%).
+Our DDTree b22 = 83.5 (theirs = 130.35 at f32). Our DDTree is ~38% slower
+than theirs at same budget.
+
+This points to a structural bug or arch mismatch in our DDTree implementation
+on gfx1100 (separate task, not a perf optimization — likely the
+linearization-slot RoPE phase delta skew documented at 39aa358).
+
+### Replication
+
+Lucebox blog cached at `.research-cache/lucebox-dflash27b.html`
+(gitignored, re-fetchable from https://www.lucebox.com/blog/dflash27b).
+
+Our parity bench: `HIPFIRE_NORMALIZE_PROMPT=1 ... --max 256 --kv-mode asym3
+--no-adaptive-b --no-chatml` across HumanEval [0, 5, 10, 20, 30, 40, 50, 60,
+70, 80].

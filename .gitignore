@@ -65,3 +65,6 @@ findings/
 .plugkit-agent-worktree/
 .code-search/
 *.stackdump
+
+# Cached external research pages (re-fetchable, large, not source)
+.research-cache/
