@@ -8,7 +8,7 @@ hipfire run  qwen3.5:9b "What is the capital of France?"
 hipfire serve -d       # background daemon on port 11435 (OpenAI API compatible)
 ```
 
-Current release: **v0.1.8-alpha** — Phase 1 prompt-shape adaptation lifts 27B-3.5 DFlash by **+26.7%** on PEP-8-style code prompts (8a4a211). 10-prompt HumanEval mean of 146.9 tok/s @ n_gen=256 sits near the published targets for parallel-hardware DFlash work (see [Lucebox reference](#reference-numbers--alongside-lucebox-rtx-3090-ggmlcuda) below). EOT-stop fix kills the Fibonacci attractor loop. Token heat diagnostic. New `prompt_normalize` CLI toggle (opt-in until broader validation). See [CHANGELOG.md](CHANGELOG.md). Previous: **v0.1.7-alpha** (FlashTriAttn, CASK m-folding, Qwen 3.6-A3B, MI300X wave64).
+Current release: **v0.1.8-alpha** — Phase 1 prompt-shape adaptation lifts 27B-3.5 DFlash by **+26.7%** on PEP-8-style code prompts (8a4a211). EOT-stop fix kills the Fibonacci attractor loop. Token heat diagnostic. New `prompt_normalize` CLI toggle (opt-in until broader validation). DFlash perf work this cycle was substantially [inspired by Lucebox](#inspiration-lucebox)'s ggml/CUDA implementation — credit to Davide Ciffa for the published targets and bench methodology. See [CHANGELOG.md](CHANGELOG.md). Previous: **v0.1.7-alpha** (FlashTriAttn, CASK m-folding, Qwen 3.6-A3B, MI300X wave64).
 
 ## Why
 
@@ -62,38 +62,38 @@ Qwen3.5 targets and skips it on configs that historically lose. Override
 per-model: `hipfire config qwen3.5:9b set dflash_mode off` if your
 workload is mostly prose.
 
-### Reference numbers — alongside Lucebox (RTX 3090, ggml/CUDA)
+### Inspiration: Lucebox
 
-Davide Ciffa's [Lucebox DFlash on ggml](https://www.lucebox.com/blog/dflash27b)
-runs the same Qwen3.5-27B DFlash algorithm on a RTX 3090 (24 GB GDDR6X,
-~960 GB/s) — comparable memory class to a 7900 XTX. His public bench
-(10-prompt HumanEval @ n_gen=256) gave us a concrete, well-documented
-target on parallel hardware: a clean number to **hipfire** at, as it were.
-His work was instrumental in setting our DFlash performance bar.
+hipfire's DFlash work was substantially shaped by Davide Ciffa's
+[Lucebox DFlash on ggml](https://www.lucebox.com/blog/dflash27b) —
+a standalone C++/ggml/CUDA DFlash implementation for Qwen3.5-27B
+running on a single NVIDIA RTX 3090. Different stack, different
+hardware vendor, different runtime — but Lucebox's blog gave us
+specifics that mattered:
 
-Same algorithm, same model, comparable bandwidth — different stacks
-(ggml/CUDA vs. Rust/HIP), so this isn't a head-to-head. Both projects
-are pushing the same lever from different sides:
+- **Concrete published numbers** to target. Knowing a 27B DFlash
+  implementation could hit ~135 tok/s mean on the HumanEval n_gen=256
+  bench gave us a real bar to **hipfire** at, as it were.
+- **n_gen-aware bench methodology**. The blog's careful bench discipline
+  (reporting mean, peak, AL across a fixed prompt set) shaped how we
+  measure on RDNA.
+- **Pointers at where the fat is**. Their persist-write of the SSM
+  intermediate is task #72 in our queue. Their bounded rolling target-
+  feature buffer for 128K-on-24GB is on our roadmap.
+- **Lucebox's DDTree works**. Ours has a structural RoPE phase-delta
+  skew on gfx1100 ([39aa358](https://github.com/Kaden-Schutt/hipfire/commit/39aa358))
+  — knowing tree-mode IS achievable at the algorithmic level keeps the
+  problem scoped as an RDNA implementation issue, not a fundamental
+  blocker.
 
-| 10-prompt HE @ n_gen=256 | RTX 3090 (Lucebox, ggml) | 7900 XTX (hipfire, Rust/HIP) |
+For folks comparing the two projects' published numbers (different
+hardware, different stack, just for a sense of order-of-magnitude):
+
+| 10-prompt HE @ n_gen=256 | Lucebox 3090 (ggml/CUDA) | hipfire 7900 XTX (Rust/HIP) |
 |---|---:|---:|
-| Plain DFlash mean | 112.82 tok/s | 146.9 tok/s |
-| Best DDTree mean | **135.80** (b22 f16) | n/a — see below |
+| Plain DFlash mean | 112.82 | 146.9 |
+| Best DDTree mean | 135.80 (b22 f16) | n/a — RDNA tree path broken |
 | Single-run peak (HE/53, max=120) | demo 207.6 | 214.3 |
-
-**Their DDTree works on gfx1100, ours doesn't (yet)** — we have a
-structural RoPE phase-delta-skew bug at FA layers
-([39aa358](https://github.com/Kaden-Schutt/hipfire/commit/39aa358)) that
-makes our tree path slower than our linear path. So our 146.9 is our
-plain-DFlash linear number; their 135.80 is their tuned DDTree number.
-Once our tree path is fixed, the apples-to-apples comparison shifts.
-
-What's helped us hit these numbers stems directly from problems Lucebox
-documented or hinted at: the importance of n_gen-aware bench
-methodology, the persistence-write opportunity in DFlash inner loops
-(task #72), the hidden-buffer-bounding trick for 128K-on-24GB. Path C
-(trained custom draft) and Path D (stale-context overlap) are roadmap
-items.
 
 Cached blog snapshot at `.research-cache/lucebox-dflash27b.html` with
 canonical-numbers index for forensic reproducibility.
