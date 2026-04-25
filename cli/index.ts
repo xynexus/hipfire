@@ -75,6 +75,15 @@ interface HipfireConfig {
   cask_beta: number;         // hysteresis buffer before re-triggering
   cask_core_frac: number;    // fraction of budget kept un-merged (CASK only)
   cask_fold_m: number;       // m-way merge factor for non-core slots (CASK only)
+
+  // ── Prompt-shape adaptation (0.1.8) ──────────────────────────────────
+  // When true, collapses runs of 3+ '\n' chars to exactly 2 before the
+  // tokenizer encode. Eliminates rare BPE token 1358 ('\n\n\n') in favor
+  // of HOT token 271 ('\n\n') on Qwen3.5/3.6, lifting τ on PEP-8-style
+  // code prompts by up to +26.7% (commit 8a4a211). Default OFF until more
+  // validation across non-Python prompt families. See PRD:
+  // docs/plans/prompt-shape-adaptation.prd
+  prompt_normalize: boolean;
 }
 
 // Detect GPU at import time for smart defaults
@@ -107,6 +116,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   cask_beta: 128,
   cask_core_frac: 0.5,
   cask_fold_m: 2,
+  prompt_normalize: false,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -132,6 +142,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "cask_beta": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
     case "cask_core_frac": return typeof value === "number" && value >= 0 && value <= 1;
     case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
+    case "prompt_normalize": return typeof value === "boolean";
     default: return false;
   }
 }
@@ -174,6 +185,7 @@ const PER_MODEL_KEYS = [
   "dflash_adaptive_b", "dflash_mode",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
+  "prompt_normalize",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -553,6 +565,13 @@ function applyConfigEnv(cfg: HipfireConfig): void {
     process.env.HIPFIRE_EXPERIMENTAL_BUDGET_ALERT = "1";
   } else {
     delete process.env.HIPFIRE_EXPERIMENTAL_BUDGET_ALERT;
+  }
+  // Prompt-shape normalization (Phase 1, commit 8a4a211). Engine-side env
+  // gate; default off until broader validation. Lifts τ on PEP-8 code prompts.
+  if (cfg.prompt_normalize) {
+    process.env.HIPFIRE_NORMALIZE_PROMPT = "1";
+  } else {
+    delete process.env.HIPFIRE_NORMALIZE_PROMPT;
   }
 }
 
@@ -2352,6 +2371,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "CASK m-fold factor (1 = no folding, 2+ = fold m heads into one)",
       range: [1, 16], step: 1,
     },
+    prompt_normalize: {
+      label: "prompt_normalize",
+      desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; off by default)",
+      options: ["true", "false"],
+    },
   };
 
   let selected = 0;
@@ -3753,7 +3777,9 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
         process.exit(1);
       }
       const defaultVal = CONFIG_DEFAULTS[key as keyof HipfireConfig];
-      const parsed = typeof defaultVal === "number" ? Number(value) : value;
+      const parsed = typeof defaultVal === "number" ? Number(value)
+                   : typeof defaultVal === "boolean" ? (value === "true" ? true : value === "false" ? false : value)
+                   : value;
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
