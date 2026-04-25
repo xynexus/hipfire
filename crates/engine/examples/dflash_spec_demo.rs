@@ -457,6 +457,9 @@ fn main() {
     );
 
     let tokenizer: Tokenizer = target.load_tokenizer().expect("target tokenizer");
+    if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+        tokenizer.dump_prompt_heat(&prompt);
+    }
     let mut prompt_tokens = tokenizer.encode(&prompt);
     if chatml {
         // Match daemon.rs production path: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n

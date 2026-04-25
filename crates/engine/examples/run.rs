@@ -171,6 +171,9 @@ fn main() {
         if input.is_empty() { continue; }
         let input_norm = engine::tokenizer::maybe_normalize_prompt(input);
         let input: &str = &input_norm;
+        if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+            tokenizer.dump_prompt_heat(input);
+        }
 
         // Commands
         match input {

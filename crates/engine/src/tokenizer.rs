@@ -534,6 +534,155 @@ fn decode_hex_escapes(s: &str) -> String {
     result
 }
 
+/// Heat-class buckets keyed off BPE merge rank. Lower rank = earlier merge =
+/// more common building block during BPE training. Empirical proxy for
+/// training-data frequency.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HeatClass {
+    /// Base byte / no merge (rank 0). The most universal building blocks.
+    Base,
+    /// Merge rank < 1000. Top-1k merges — extremely common multi-byte tokens.
+    Hot,
+    /// Merge rank 1000-9999. Common but not top-tier.
+    Warm,
+    /// Merge rank 10000-99999. Uncommon — likely a τ depressor when adjacent
+    /// to model-defining tokens.
+    Cold,
+    /// Merge rank ≥ 100000. Exotic / out-of-distribution.
+    Frozen,
+    /// Token id has no merge entry (special tokens, isolated vocab).
+    Unknown,
+}
+
+impl HeatClass {
+    pub fn from_rank(rank: Option<usize>) -> Self {
+        match rank {
+            None => Self::Unknown,
+            Some(0) => Self::Base,
+            Some(r) if r < 1000 => Self::Hot,
+            Some(r) if r < 10000 => Self::Warm,
+            Some(r) if r < 100000 => Self::Cold,
+            Some(_) => Self::Frozen,
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Base => "BASE   ",
+            Self::Hot => "HOT    ",
+            Self::Warm => "WARM   ",
+            Self::Cold => "COLD   ",
+            Self::Frozen => "FROZEN ",
+            Self::Unknown => "SPECIAL",
+        }
+    }
+}
+
+impl Tokenizer {
+    /// Build a token-id → merge-rank table by scanning the BPE merges list.
+    /// O(n_merges) one-time. Used only by diagnostics; not on the hot path.
+    pub fn build_merge_rank_table(&self) -> HashMap<u32, usize> {
+        let mut out = HashMap::with_capacity(self.merges.len());
+        let mut buf = String::new();
+        for (i, (l, r)) in self.merges.iter().enumerate() {
+            buf.clear();
+            buf.push_str(l);
+            buf.push_str(r);
+            if let Some(&id) = self.token_to_id.get(&buf) {
+                out.entry(id).or_insert(i);
+            }
+        }
+        out
+    }
+
+    /// Look up a single token's merge rank. For repeated lookups, cache
+    /// `build_merge_rank_table` once instead — this method is O(merges).
+    pub fn merge_rank(&self, id: u32) -> Option<usize> {
+        let s = self.vocab.get(id as usize)?;
+        if s.len() <= 1 {
+            return Some(0); // base byte
+        }
+        let mut buf = String::new();
+        for (i, (l, r)) in self.merges.iter().enumerate() {
+            buf.clear();
+            buf.push_str(l);
+            buf.push_str(r);
+            if buf == *s {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn rank_of(&self, id: u32, table: &HashMap<u32, usize>) -> Option<usize> {
+        table.get(&id).copied().or_else(|| {
+            let s = self.vocab.get(id as usize)?;
+            if s.len() <= 1 { Some(0) } else { None }
+        })
+    }
+
+    /// Dump a per-position heat map for `text`, plus a summary line.
+    /// Identifies cold-zone tokens that depress draft/target acceptance in DFlash.
+    /// Env knobs:
+    /// - `HIPFIRE_PROMPT_HEAT_LIMIT=N` — max rows (default 64)
+    /// - `HIPFIRE_PROMPT_HEAT_JSON=1` — emit JSON to stdout instead of pretty stderr
+    pub fn dump_prompt_heat(&self, text: &str) {
+        let ids = self.encode(text);
+        let table = self.build_merge_rank_table();
+        let total = ids.len().max(1);
+        let mut counts = [0usize; 6];
+        for &id in &ids {
+            counts[HeatClass::from_rank(self.rank_of(id, &table)) as usize] += 1;
+        }
+        if std::env::var("HIPFIRE_PROMPT_HEAT_JSON").ok().as_deref() == Some("1") {
+            let mut s = String::with_capacity(2048);
+            s.push_str("{\"bytes\":");
+            s.push_str(&text.len().to_string());
+            s.push_str(",\"tokens\":");
+            s.push_str(&ids.len().to_string());
+            s.push_str(",\"summary\":{");
+            s.push_str(&format!("\"base\":{},\"hot\":{},\"warm\":{},\"cold\":{},\"frozen\":{},\"special\":{}",
+                counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]));
+            s.push_str("},\"positions\":[");
+            for (pos, &id) in ids.iter().enumerate() {
+                if pos > 0 { s.push(','); }
+                let rank = self.rank_of(id, &table);
+                let decoded = self.decode(&[id]).replace('\\', "\\\\").replace('"', "\\\"")
+                    .replace('\n', "\\n").replace('\t', "\\t").replace('\r', "\\r");
+                s.push_str(&format!("{{\"pos\":{pos},\"id\":{id},\"rank\":{},\"text\":\"{decoded}\"}}",
+                    rank.map(|r| r.to_string()).unwrap_or_else(|| "null".to_string())));
+            }
+            s.push_str("]}");
+            println!("{s}");
+            return;
+        }
+        let limit: usize = std::env::var("HIPFIRE_PROMPT_HEAT_LIMIT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        eprintln!("[token-heat] prompt={} bytes  tokens={}", text.len(), ids.len());
+        eprintln!("[token-heat] {:>4}  {:>6}  {:>7}  {:7}  {}", "pos", "id", "rank", "class", "decoded");
+        for (pos, &id) in ids.iter().take(limit).enumerate() {
+            let rank = self.rank_of(id, &table);
+            let class = HeatClass::from_rank(rank);
+            let display = self.decode(&[id]).replace('\n', "\\n").replace('\t', "\\t");
+            let rank_str = rank.map(|r| r.to_string()).unwrap_or_else(|| "-".to_string());
+            eprintln!("[token-heat] {pos:>4}  {id:>6}  {rank_str:>7}  {}  {display:?}", class.label());
+        }
+        if ids.len() > limit {
+            eprintln!("[token-heat] ... ({} more tokens omitted)", ids.len() - limit);
+        }
+        eprintln!("[token-heat] summary: BASE={} ({:.0}%)  HOT={} ({:.0}%)  WARM={} ({:.0}%)  COLD={} ({:.0}%)  FROZEN={} ({:.0}%)  SPECIAL={} ({:.0}%)",
+            counts[0], 100.0*counts[0] as f32/total as f32,
+            counts[1], 100.0*counts[1] as f32/total as f32,
+            counts[2], 100.0*counts[2] as f32/total as f32,
+            counts[3], 100.0*counts[3] as f32/total as f32,
+            counts[4], 100.0*counts[4] as f32/total as f32,
+            counts[5], 100.0*counts[5] as f32/total as f32);
+        let cold_frac = (counts[3] + counts[4]) as f32 / total as f32;
+        if cold_frac > 0.05 {
+            eprintln!("[token-heat] WARNING: {:.1}% cold tokens — likely τ depressor", 100.0 * cold_frac);
+        }
+    }
+}
+
 /// Collapse runs of 3+ '\n' chars to exactly two.
 ///
 /// Cold zone in BPE merges: `\n\n\n` → token 1358 (RARE) on Qwen3.5/3.6 vocab,

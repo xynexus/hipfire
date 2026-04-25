@@ -407,6 +407,9 @@ fn main() {
                 let prompt = msg.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello");
                 let prompt_norm = engine::tokenizer::maybe_normalize_prompt(prompt);
                 let prompt: &str = &prompt_norm;
+                if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+                    if let Some(tok) = m.tokenizer.as_ref() { tok.dump_prompt_heat(prompt); }
+                }
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;

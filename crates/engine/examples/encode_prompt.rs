@@ -1,5 +1,5 @@
 //! Encode a prompt file to token IDs (and optionally count rare-token positions).
-//! Usage: encode_prompt <model.hfq> <prompt.txt> [--normalize]
+//! Usage: encode_prompt <model.hfq> <prompt.txt> [--normalize] [--heat]
 
 use engine::hfq::HfqFile;
 use std::path::Path;
@@ -9,6 +9,7 @@ fn main() {
     let model_path = args.get(1).expect("model path");
     let prompt_path = args.get(2).expect("prompt path");
     let normalize = args.iter().any(|a| a == "--normalize");
+    let heat = args.iter().any(|a| a == "--heat");
 
     let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -23,6 +24,10 @@ fn main() {
     } else {
         raw
     };
+    if heat {
+        tokenizer.dump_prompt_heat(&text);
+        return;
+    }
     let ids = tokenizer.encode(&text);
     eprintln!("text bytes: {}", text.len());
     eprintln!("token count: {}", ids.len());
