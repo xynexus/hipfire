@@ -231,27 +231,37 @@ a regression.
 
 Any DDTree / spec-decode / slow-path-kill change that claims a τ or tok/s
 improvement MUST pass `scripts/coherence-gate-dflash.sh` (shipped 9883e98)
-before commit. Two-tier thresholds, first 128 tokens pre-EOT: hard fail
-if `unique_token_ratio < 0.15` or `max_single_token_frequency > 0.50`.
+before commit. Enhanced three-tier thresholds (as of 2026-04-26):
 
-**Why:** single-token attractor failures pass every statistical gate as
-PARETO WINS. When the target gets trapped predicting one token forever,
-the draft (trivial-token bias) trivially agrees → acceptance → 100% → τ
-explodes with tight stddev. Bit DDTree Path A (fake +79% τ / +120% tok/s
-at 6c84b13) and Path B Variant B1 (f9c920a, 2026-04-23) on identical
-`numbers(numbers(numbers(...` attractor. Root cause was
-linearization-slot RoPE phase delta skew in tree-mode FA — not a
-bug in the optimization, a structural mismatch between tree-mode
-phase deltas and committed-slot phase deltas. Per
-`feedback_attention_precision.md`, 5% attention error cascades into
-attractor within ~10 tokens under greedy decode.
+**Tier 1 — First 128 tokens (hard fail, catches single-token attractors):**
+- `unique_token_ratio < 0.15` OR `max_single_token_frequency > 0.50`
+
+**Tier 2 — Last 128 tokens (hard fail, catches block-level attractors):**
+- `unique_token_ratio < 0.30` OR `max_single_token_frequency > 0.50`
+
+**Tier 3 — Full output (soft flag, requires human eyeball):**
+- Consecutive 3gram repetition density > 50% in final half → structural loop signature
+- Full-output unique-token ratio << 0.10 → structural code loop even if early tokens pass
+
+**Why:** Attractors manifest in two forms: (1) single-token loops visible in first 128,
+and (2) block-level structural loops (5+ token sequences repeating) that appear later.
+CASK m-fold + DFlash 2026-04-26 example: τ=8.98 with tight stddev passed first-128 gate
+but emitted 1500-token garbage (47-token vocabulary, 76+ reps of `[1734, 2357, 2733, 283, 869]`).
+Root cause: m-fold hidden-state drift off draft distribution. Per `feedback_attention_precision.md`,
+5% attention error cascades into attractor within ~10 tokens under greedy decode.
+
+Bit DDTree Path A (fake +79% τ / +120% tok/s at 6c84b13) and Path B Variant B1 
+(f9c920a, 2026-04-23) on identical `numbers(numbers(numbers(...` attractor were single-token.
+Linearization-slot RoPE phase delta skew in tree-mode FA — not a bug, structural mismatch 
+between tree-mode and committed-slot phase deltas.
 
 **How to apply:** tight stddev on a spec-decode bench is actively
 SUSPICIOUS, not reassuring. Real acceptance noise is wider. Any new
-spec-decode bench script must include at least one of:
-unique-token-ratio check (< 0.3 fail) on first 256 IDs, max-frequency
-check (> 50% fail) on emitted IDs, or decoded text printed for human
-eyeball.
+spec-decode bench script must include ALL of:
+1. unique-token-ratio check on FIRST 128 (< 0.15 fail) AND LAST 128 (< 0.30 fail)
+2. max-frequency check (> 50% fail) on both windows
+3. decoded text printed for human eyeball (REQUIRED, not optional)
+4. 3gram density check over second half of output (> 50% repetition → block-attractor flag)
 
 ## Prompt-structure τ sensitivity (mandatory bench rule)
 
