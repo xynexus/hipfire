@@ -1,0 +1,306 @@
+# hipfire tune — offline autotuner CLI + agent skill
+
+**Task:** #110
+**Status:** DEFERRED — design + scoping
+**Owner:** TBD
+**Date opened:** 2026-04-26
+**Companion:** `docs/plans/dflash-governor-autotuner.prd` (#108 — runtime side of the same coin)
+
+## Background
+
+Today's defaults come from `cli/index.ts` constants and `archDefaults()`
+hardware detection — coarse, hardcoded, not workload-aware. The runtime
+governor (#108) handles per-cycle adaptation but starts from those same
+hardcoded defaults. **The actual optimum varies wildly per (hardware,
+model, workload) triple, and the user shouldn't have to hand-tune.**
+
+User insight: this should run on the user's system, run real evals, pick
+best settings. Optionally packageable as a Claude Code agent skill for
+zero-friction invocation.
+
+The two tracks (offline + runtime) compose cleanly:
+- **Offline (#110, this PRD)**: cold-path. Run once on first install or
+  on user request. Evals workload × knob matrix, writes
+  `per_model_config.json`. Heavy compute (~5-30 min).
+- **Runtime (#108)**: hot-path. Per-cycle state machine watching τ +
+  accept_rate. Adapts within a single generation. ~ns overhead.
+
+## Goal
+
+`hipfire tune <model>` runs a workload × knob matrix, scores results,
+writes the winning config to `per_model_config.json` for that model.
+Optional `--quick` / `--full` mode for time-vs-thoroughness tradeoff.
+
+End-user surface:
+```
+hipfire tune qwen3.5:9b              # 5-10 min, default workload set
+hipfire tune qwen3.5:9b --quick      # ~2 min, single canonical workload
+hipfire tune qwen3.5:9b --full       # 30+ min, exhaustive grid
+hipfire tune qwen3.5:9b --workload code     # focus on code prompts
+hipfire tune qwen3.5:9b --workload chat     # focus on conversational
+hipfire tune --all                   # tune every locally-installed model
+```
+
+Acceptance criterion: `hipfire run <model>` post-tune is ≥10% faster on
+its primary workload than pre-tune defaults, with no quality regression
+on coherence-gate.
+
+## Architecture
+
+### Eval matrix
+
+```
+Workloads (rows) — per-user-customizable, defaults below:
+  - bounded code completion (humaneval-style, ~50-200 tok output)
+  - mid-length code with example (LRU-class style, ~500 tok)
+  - prose / essay (long-form open-ended, 1500 tok max)
+  - instruction multi-step (5-day plan, structured-list, ~1000 tok)
+  - long-context (8k+ prompt, ~512 tok response — needs sidecar)
+  - multi-turn chat (3-5 alternations, recurring patterns)
+
+Knobs (columns) — sweep these:
+  - kv_cache: {asym3, asym4, q8}      [LOAD-time, must restart]
+  - dflash_mode: {on, off, auto}       [LOAD-time]
+  - block_size: {8, 12, 16}            [per-cycle, but stable per workload]
+  - dflash_ngram_block: {auto, on, off}
+  - loop_break: {none, stop, escalate}
+  - cask budget+β: {(512,128), (2048,512), (8192,1024)}
+  - cask sidecar: {none, blended_v2}   [requires sidecar to be downloaded]
+  - chained_ngram_n: {0 (off), 4, 6}   [per-session]
+  - repeat_penalty: {1.0, 1.05}        [per-cycle]
+  - prompt_normalize: {true, false}    [LOAD-time]
+```
+
+Scoring: `score = decode_tok_s × coherence_pass_rate`. Coherence pass =
+output passes the relevant gate (no single-token attractor, unique-ratio
+> threshold, optional human-or-judge rubric).
+
+### Pruning
+
+Full grid is intractable (~3000 cells). Real implementation:
+
+1. **Two-phase grid**: bench LOAD-time knobs first (kv_cache,
+   dflash_mode, prompt_normalize) — these require restart. Pick winner.
+2. **Cycle knobs second**: with LOAD-time fixed, sweep per-cycle knobs
+   in a single load (much cheaper).
+3. **Bayesian-light prior**: warm-start from `archDefaults()` and the
+   community fingerprint cache (see below). Most cells skipped because
+   prior strongly suggests same-as-default.
+4. **Workload subsetting**: `--workload code` only runs the code rows,
+   etc. `--quick` runs one row × ~5 most-impactful knob columns.
+
+### Implementation pieces
+
+```
+hipfire/
+├── cli/
+│   └── index.ts             # `tune` command, argparse, calls hipfire-tune binary
+├── crates/
+│   └── tune/                # NEW crate
+│       ├── src/lib.rs       # Public API: run_tune(workload_set, knob_grid, ...)
+│       ├── src/eval.rs      # Eval execution: load model, run prompts, score
+│       ├── src/grid.rs      # Knob-grid expansion + pruning
+│       ├── src/scoring.rs   # tok/s × coherence × ttft, weighted
+│       └── src/persist.rs   # Write to per_model_config.json + fingerprint cache
+└── benchmarks/
+    └── workloads/           # NEW canonical workload library
+        ├── code_humaneval.txt
+        ├── code_lru_class.txt   (already exists)
+        ├── code_merge_sort.txt  (already exists)
+        ├── prose_essay.txt
+        ├── instruction_multistep.txt
+        ├── chat_recurring.txt
+        └── longctx_book_qa.txt
+```
+
+### Fingerprint cache
+
+Persistent at `~/.hipfire/tune-cache.json`:
+
+```json
+{
+  "fingerprints": {
+    "<sha256-hex of (gpu_arch + model_path + workload_set)>": {
+      "best_config": {
+        "kv_cache": "asym3",
+        "dflash_mode": "auto",
+        "block_size": 16,
+        "dflash_ngram_block": "auto",
+        "loop_break": "stop",
+        "cask_budget": 2048,
+        "cask_beta": 512,
+        "chained_ngram_n": 0,
+        "repeat_penalty": 1.0,
+        "prompt_normalize": true
+      },
+      "score": 478.2,
+      "score_components": {"tok_s": 575.2, "coherence_pass_rate": 0.83},
+      "tuned_at": "2026-04-26T18:30:00Z",
+      "engine_version": "0.1.8-alpha+0b2bf72",
+      "workload_hash": "..."
+    }
+  }
+}
+```
+
+Lookup hits reuse the prior result without re-tuning. Engine-version
+mismatch → invalidate (config from older engine may not apply).
+
+### Optional community fingerprint cache
+
+For users who opt in (`hipfire tune --share`), upload anonymized
+fingerprint + winning config to a community-curated cache (e.g., a
+GitHub Pages JSON). New users get warm-start defaults without running
+their own tune. Engine version + GPU arch hash only — never user prompts
+or workload data.
+
+This is opt-in and can be deferred to a v2; the local fingerprint cache
+delivers most of the value.
+
+### Claude Code agent skill (optional wrapper)
+
+`.claude/skills/hipfire-tune/skill.md`:
+
+```
+---
+name: hipfire-tune
+description: Run hipfire's offline autotuner on the user's hardware to
+discover optimal config for their installed models. Invoke when the user
+asks "what's the best setup for hipfire on my GPU?", "tune hipfire",
+"can you optimize my hipfire config?", or after they install a new model.
+---
+
+# hipfire-tune
+
+When invoked:
+1. Run `hipfire ps` to confirm hipfire is installed.
+2. Run `hipfire list` to enumerate locally-installed models.
+3. For each model, run `hipfire tune <model>` (default `--workload code`
+   unless the user specified a workload class).
+4. Stream the eval output to the user with brief explanations.
+5. After all tunes complete, summarize the wins: which models got faster,
+   by how much, on which workloads.
+6. Optionally run `hipfire bench` post-tune to confirm the gains.
+
+This skill drives `hipfire tune` (a hipfire CLI command); the actual
+evaluation logic lives in the hipfire-tune crate, not this skill.
+```
+
+The skill is sugar — it gives Claude users a "tune my hipfire" verb but
+all real work is in the CLI. Power users invoke `hipfire tune` directly.
+
+## Phases
+
+### Phase 1 — `hipfire tune --quick` minimal viable autotuner
+
+- New crate at `crates/tune/`
+- Single workload (the model's primary class — code for `qwen3.5:9b`,
+  chat for `carnice-9b`, etc.)
+- Sweep ~5 most-impactful knobs (kv_cache, dflash_mode,
+  dflash_ngram_block, loop_break, prompt_normalize)
+- Score by tok/s × coherence-gate-pass
+- Write winner to `per_model_config.json`
+- ~5 min on 7900 XTX
+
+**Acceptance:**
+- `hipfire tune qwen3.5:9b --quick` finishes in < 10 min
+- `hipfire run qwen3.5:9b "<canonical-prompt>"` post-tune is ≥ 5% faster
+  than pre-tune (or no regression if defaults were already optimal)
+
+### Phase 2 — Multi-workload + fingerprint cache
+
+- Default mode runs all 6 workload classes (~25 min)
+- Local fingerprint cache at `~/.hipfire/tune-cache.json`
+- Skips re-tuning if fingerprint hits
+
+**Acceptance:**
+- `hipfire tune qwen3.5:9b` populates fingerprint cache
+- Re-running after no engine update completes in < 30 seconds (cache hit)
+- `hipfire tune --all` tunes all installed models in serial
+
+### Phase 3 — `hipfire tune --workload <class>` + custom workload sets
+
+- User can target specific workload classes
+- Custom workload files under `~/.hipfire/workloads/<name>.txt` for
+  user-specific evals (e.g., your codebase's actual prompts)
+
+### Phase 4 — Claude Code agent skill
+
+- Skill metadata in `.claude/skills/hipfire-tune/`
+- Invoked by user requests like "tune my hipfire setup"
+- Streams progress to Claude Code, summarizes results
+
+### Phase 5 — Community fingerprint cache (optional, opt-in)
+
+- `hipfire tune --share` uploads anonymized fingerprint + winning config
+- New users on `hipfire tune --warm-start` query community cache first,
+  fall back to local tune if no match
+- Privacy gate: only GPU arch + model + winning config; never workload
+  content
+
+## Risk
+
+- **Eval-time vs shipping-time coherence**: workloads we eval might not
+  match user's actual prompts. Mitigation: per-workload-class subsetting
+  + custom workload paths.
+- **Thermal/DPM noise**: per-prompt timing varies ~10-15% on consumer
+  RDNA between cold and warm GPU. Mitigation: 3 runs per cell, take
+  median (already standard hipfire bench practice).
+- **Coherence-gate brittleness**: if scoring relies only on tok/s,
+  tuner could pick configs that loop fast. Coherence-pass weight in
+  score formula prevents this; see methodology in
+  `docs/methodology/perf-benchmarking.md`.
+- **Storage growth**: fingerprint cache is bounded by
+  hardware × model × workload triples; for typical user (1 GPU, 5 models,
+  6 workloads) that's 30 entries × ~500 bytes = 15 KB. Trivial.
+- **Privacy on community cache**: any uploaded data is a leak vector.
+  Phase 5 is opt-in only and explicitly documents what's sent.
+
+## Why deferred
+
+- #108 runtime governor lands first — its signal-collection hooks
+  (rolling τ window, accept_rate, window-hash) are reusable infra
+  for the offline tuner's eval scoring
+- ChainedNgramCache integration (#107) lands ahead so the tuner's
+  knob grid includes `chained_ngram_n` from day one
+- Sidecar-aware draft training (#106) lands ahead so the tuner can
+  evaluate sidecar+draft as a coherent unit
+
+## Triggers to start
+
+- #108 (runtime governor) Phase 1 ships
+- User feedback that hipfire is "fast but config-heavy"
+- New hardware target (5700 XT bringup, 9070 XT, etc.) where defaults
+  are unknown — autotune surfaces optimal config without manual
+  benchmarking
+
+## Open questions
+
+1. **Coherence scoring**: how to score qualitatively without an LLM judge
+   in the loop? Options:
+   a. Lightweight (current dflash coherence-gate metrics: unique-ratio,
+      max-token-frequency, n-gram repeat detection)
+   b. Add a small judge model (3B-class) to grade outputs — heavyweight
+   c. Optional: use the user's target as judge ("Does this output answer
+      the prompt? yes/no") — recursive but workable
+   Recommendation: (a) for v1, (c) optional flag for v2.
+
+2. **Multi-tenant / serve daemon**: this PRD covers `hipfire run` /
+   `hipfire bench` paths. The serve daemon path needs per-request
+   selection from the tuned config. Hooks to revisit when serve becomes
+   primary deployment target.
+
+3. **Hosting community fingerprint cache**: GitHub Pages JSON is simple
+   but slow to update; alternative is a CloudFlare Worker + KV. Either
+   works. Decide before Phase 5.
+
+## References
+
+- `docs/plans/dflash-governor-autotuner.prd` (#108) — runtime
+  per-cycle controller, complements this offline tuner
+- `cli/index.ts` — current archDefaults() + per_model_config.json
+  mechanism
+- `scripts/speed-gate.sh` — existing best-of-N bench infrastructure
+  (Phase 1 will reuse this scoring approach)
+- `docs/methodology/perf-benchmarking.md` — bench rigor methodology
+  (canonical configs, prompt-md5 invariants, DPM warmup)
