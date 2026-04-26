@@ -3,6 +3,16 @@
 **Date:** 2026-04-19
 **Status:** Active priority. Replaces from-scratch DFlash draft training per `dflash-from-scratch-replication.md`.
 
+**Scope clarification (2026-04-25):** This doc is **sidecar calibration**
+(producing `.triattn.bin` band-center files) — not draft model training.
+For **draft training corpus** discussion (where the prompt mix lives,
+including Qwen-reasoning data) see `docs/plans/task-93-path-c-trained-
+draft.prd`. Both docs reuse `scripts/fetch_calibration_corpus.sh` to
+build the corpus, but consume it differently: sidecar cal feeds the
+corpus to `triattn_validate` to compute attention-band statistics; draft
+training uses the corpus prompts as input for target-regeneration, then
+trains a draft on the resulting `(prompt, target_response)` pairs.
+
 ## Background
 
 TriAttention (hipfire's sidecar) is a per-target calibration that captures band-wise statistics of pre-RoPE Q vectors from the target model's attention heads on a representative corpus. The sidecar then pairs with any compatible draft at inference to improve τ — especially on OOD or domain-specific text where the target's vanilla attention patterns don't match the draft's assumptions.

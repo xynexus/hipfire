@@ -1,11 +1,9 @@
 #include <hip/hip_runtime.h>
 
-// NOTE: __restrict__ removed — same hipcc/clang miscompile on gfx1100
-// (ROCm 7.2) as rope_partial_interleaved.hip and gemm_qkv_hfq4g256.hip.
 extern "C" __global__ void kv_cache_write_q8_0_batched(
-    unsigned char* dst,
-    const float* src,        // [batch_size × kv_dim]
-    const int* positions,    // [batch_size]
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,        // [batch_size × kv_dim]
+    const int* __restrict__ positions,    // [batch_size]
     int n_kv_heads,
     int head_dim,
     int batch_size

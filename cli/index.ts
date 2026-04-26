@@ -116,7 +116,10 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   cask_beta: 128,
   cask_core_frac: 0.5,
   cask_fold_m: 2,
-  prompt_normalize: false,
+  // Default ON since 2026-04-26: collapses \n{3,} → \n\n at engine entry,
+  // +24% τ on PEP-8-style code prompts (159→196 tok/s on 27B-3.5 LRU DFlash).
+  // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
+  prompt_normalize: true,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -407,16 +410,10 @@ const REGISTRY: Record<string, ModelEntry> = {
   // `hipfire run` still works once the file is in MODELS_DIR (auto-pull
   // sees the local copy and skips the download).
   "qwen3.5:35b-a3b":  { repo: "", file: "qwen3.5-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active, 115 tok/s — LOCAL ONLY (no HF repo yet)" },
-
-  // Qwen3.6 MoE (A3B) — 35B total / 3B activated, released April 2026.
-  // HF config still declares `model_type: qwen3_5_moe` so it loads through
-  // the existing A3B (arch_id=6) code path; weights differ (coding/agentic
-  // fine-tune) but architecture (256 experts top-8, hybrid DeltaNet+FA,
-  // head_dim=256 with partial_rotary=0.25, shared expert) is identical.
-  // Pre-quant at schuttdev/hipfire-qwen3.6-35b-a3b; includes an Aureth-
-  // corpus Hermes sidecar (qwen3.6-35b-a3b.mq4.hermes.triattn.bin) for
-  // cask_sidecar-based KV eviction — download separately via `hf download`.
-  "qwen3.6:35b-a3b":  { repo: hfRepo("qwen3.6","35b-a3b"), file: "qwen3.6-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active (coding/agent)" },
+  // Qwen3.6-MoE (A3B) refresh — same arch_id=6 / layers / hidden / head_dim as
+  // 3.5 A3B, weights refreshed upstream (partial_rotary_factor explicit @ 0.25,
+  // matches 3.5 default — no engine changes needed). Local-only until upload.
+  "qwen3.6:35b-a3b":  { repo: "", file: "qwen3.6-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active refresh, 148 tok/s — LOCAL ONLY" },
 
   // Qwen3.6 dense 27B — refresh of 3.5 27B with newer training. Same hybrid
   // (DeltaNet + FullAttention) arch as 3.5. AR baseline ~44 tok/s; with the
@@ -461,11 +458,7 @@ const ALIASES: Record<string, string> = {
   "qwen3.5:latest": "qwen3.5:9b",
   "qwen3.5:small": "qwen3.5:0.8b",
   "qwen3.5:large": "qwen3.5:27b",
-  // Qwen3.6 only ships as 35B-A3B MoE (no dense variants) — all short tags
-  // fall through to the single entry.
   "qwen3.6": "qwen3.6:35b-a3b",
-  "qwen3.6:latest": "qwen3.6:35b-a3b",
-  "qwen3.6:35b": "qwen3.6:35b-a3b",
   "qwen3.6:a3b": "qwen3.6:35b-a3b",
   "qwen3": "qwen3:8b",
   "carnice": "carnice:9b",
@@ -595,11 +588,13 @@ function applyConfigEnv(cfg: HipfireConfig): void {
     delete process.env.HIPFIRE_EXPERIMENTAL_BUDGET_ALERT;
   }
   // Prompt-shape normalization (Phase 1, commit 8a4a211). Engine-side env
-  // gate; default off until broader validation. Lifts τ on PEP-8 code prompts.
+  // gate. **Default ON since 2026-04-26** — empirical +24% τ on PEP-8 code
+  // prompts (159→196 tok/s on 27B-3.5 LRU DFlash). Set explicit "0" when
+  // disabled so the engine's default-ON path is overridden.
   if (cfg.prompt_normalize) {
     process.env.HIPFIRE_NORMALIZE_PROMPT = "1";
   } else {
-    delete process.env.HIPFIRE_NORMALIZE_PROMPT;
+    process.env.HIPFIRE_NORMALIZE_PROMPT = "0";
   }
 }
 

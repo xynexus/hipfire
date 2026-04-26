@@ -55,6 +55,7 @@ MATRIX=(
     "Qwen/Qwen3.5-9B:qwen3.5-9b:mq4"
     "Qwen/Qwen3.5-27B:qwen3.5-27b:mq4"
     "Qwen/Qwen3.5-35B-A3B:qwen3.5-35b-a3b:mq4"
+    "Qwen/Qwen3.6-27B:qwen3.6-27b:mq4"
     "Qwen/Qwen3.6-35B-A3B:qwen3.6-35b-a3b:mq4"
     # Hermes-tuned carnice (kai-os publishes the full safetensors)
     "kai-os/Carnice-9b:carnice-9b:mq4"

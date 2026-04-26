@@ -20,13 +20,9 @@
 // Uses wave-reduction over head_dim, same pattern as the single l2_norm
 // kernel. head_dim must fit "reasonable" sizes (≤ 4096, easily).
 
-// __restrict__ stripped: hipcc/clang (ROCm 7.2) miscompile on gfx1100 —
-// leaving restrict on pointer params of batched-path kernels produces
-// deterministic-wrong output at LA layer 0 and nondeterministic output
-// at layers ≥ 1 in prefill (diagnosed via prefill_state_diff harness).
 extern "C" __global__ void fused_qk_l2_norm_scale_f32(
-    float* q,
-    float* k,
+    float* __restrict__ q,
+    float* __restrict__ k,
     int n_heads,
     int head_dim,
     float q_scale,   // e.g. 1.0f / sqrtf((float)head_dim)

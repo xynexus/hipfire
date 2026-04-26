@@ -23,21 +23,17 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
-// __restrict__ stripped: hipcc/clang (ROCm 7.2) miscompile on gfx1100 —
-// leaving restrict on pointer params of batched-path kernels produces
-// deterministic-wrong output at LA layer 0 and nondeterministic output
-// at layers ≥ 1 in prefill (diagnosed via prefill_state_diff harness).
 __launch_bounds__(32, 2)
 extern "C" __global__ void gemm_qkvza_hfq4g256_wmma(
-    const char*    A_qkv,
-    const char*    A_z,
-    const char*    A_beta,
-    const char*    A_alpha,
-    const _Float16* X,         // [N x K], FP16
-    float*         Y_qkv,      // [N x qkv_m]
-    float*         Y_z,        // [N x z_m]
-    float*         Y_beta,     // [N x beta_m]
-    float*         Y_alpha,    // [N x alpha_m]
+    const char*    __restrict__ A_qkv,
+    const char*    __restrict__ A_z,
+    const char*    __restrict__ A_beta,
+    const char*    __restrict__ A_alpha,
+    const _Float16* __restrict__ X,         // [N x K], FP16
+    float*         __restrict__ Y_qkv,      // [N x qkv_m]
+    float*         __restrict__ Y_z,        // [N x z_m]
+    float*         __restrict__ Y_beta,     // [N x beta_m]
+    float*         __restrict__ Y_alpha,    // [N x alpha_m]
     int qkv_m, int z_m, int beta_m, int alpha_m,
     int K, int N
 ) {
@@ -77,13 +73,8 @@ extern "C" __global__ void gemm_qkvza_hfq4g256_wmma(
 
     for (int g = 0; g < groups_per_row; g++) {
         const char* gp = row_base + g * 136;
-        // Keep scale/zero-point in FP32. Dequant done in FP32 and narrowed to
-        // FP16 only at the WMMA input boundary. FP16 multiply-add over
-        // K=4096 accumulates enough rounding error to flip LM-head argmax
-        // into degenerate attractors — same fix PR #28 applied to the
-        // sibling _wmma_k2 / qkv_wmma / gate_up_wmma kernels.
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
+        _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
 
         const _Float16* x_base = X + (long long)safe_batch * K + g * 256;
 
@@ -103,9 +94,9 @@ extern "C" __global__ void gemm_qkvza_hfq4g256_wmma(
             half16_t b_a = *(const half16_t*)(x_base + k_off_a);
             half16_t b_b = *(const half16_t*)(x_base + k_off_b);
 
-            // Dequant tile A (FP32 arithmetic, narrow at last step)
+            // Dequant tile A
             half16_t a_reg;
-            #define DQ(i, pk, sh) a_reg[i] = (_Float16)(sc * (float)(((pk) >> (sh)) & 0xFu) + zp)
+            #define DQ(i, pk, sh) a_reg[i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h
             DQ(0,  pk0a,  0); DQ(1,  pk0a,  4); DQ(2,  pk0a,  8); DQ(3,  pk0a, 12);
             DQ(4,  pk0a, 16); DQ(5,  pk0a, 20); DQ(6,  pk0a, 24); DQ(7,  pk0a, 28);
             DQ(8,  pk1a,  0); DQ(9,  pk1a,  4); DQ(10, pk1a,  8); DQ(11, pk1a, 12);
