@@ -248,25 +248,30 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   return { ...base, ...overrides };
 }
 
-// thinking: "off" prepends Qwen3.x's documented `/no_think` directive to the
-// system prompt. The token is recognized at training time and reliably
-// suppresses <think>...</think> emission.
+// thinking: "off" prepends Qwen3.x's documented `/no_think` directive at
+// the front of the USER prompt. Per the Qwen3 instruct spec the directive
+// is honored when it appears in the user turn (and only loosely when in
+// system); empirically on qwen3.5-9b at temp=0:
+//
+//   placement     | "first 5 primes"        | "Return number 100"     | "Return 1..10"
+//   --------------|-------------------------|-------------------------|------------
+//   system        | works (~19 tok)         | empty <think><|im_end|> | empty
+//   user-prefix   | thinks heavily          | works (3 tok)           | works (~12 tok)
+//
+// User-prefix is canonical and gives reliable answer emission across
+// terse imperatives, even though it lets the model think on more open
+// prompts (which the existing max_tokens budget already handles).
 //
 // The previous prose directive ("Respond directly without using
-// <think>...</think> reasoning blocks") embedded the literal special tokens
-// in the system prompt, which Qwen3.5 interpreted as a partial generation:
-// the model emitted "<think>" followed by 1-2 garbage tokens and an
-// immediate <|im_end|>, halting at 3-4 tokens regardless of max_tokens.
-//
-// The trailing newline matters too: `/no_think` alone halts at 3 tokens
-// because the daemon's chatml wrapper tokenizes `/no_think<|im_end|>` as
-// one BPE merge that the model doesn't recognize. `/no_think\n` separates
-// the directive from the turn-end token cleanly and yields direct answers
-// in ~19 tokens on the prime-numbers probe.
-function applyThinkingMode(systemPrompt: string | undefined, thinking: string): string | undefined {
-  if (thinking !== "off") return systemPrompt;
-  const directive = "/no_think\n";
-  return systemPrompt ? `${directive}\n${systemPrompt}` : directive;
+// <think>...</think> reasoning blocks") embedded the literal special
+// tokens in the system prompt, which Qwen3.5 interpreted as a partial
+// generation: the model emitted "<think>" followed by 1-2 garbage tokens
+// and an immediate <|im_end|>, halting at 3-4 tokens regardless of
+// max_tokens. The current returns the prompt-prefix variant so the
+// thinking=off contract holds across both terse and complex requests.
+function applyNoThinkPrefix(prompt: string, thinking: string): string {
+  if (thinking !== "off") return prompt;
+  return `/no_think\n${prompt}`;
 }
 
 // Build the {type: "load", ...} message for the daemon, carrying per-model
@@ -688,9 +693,10 @@ async function runViaHttp(
   // wrapper doesn't expose — fall back to local spawn.
   if (image) return false;
 
+  const effectivePrompt = applyNoThinkPrefix(prompt, resolveModelConfig(model).thinking);
   const body: any = {
     model, stream: true,
-    messages: [{ role: "user", content: prompt }],
+    messages: [{ role: "user", content: effectivePrompt }],
     temperature: temp, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
@@ -772,7 +778,11 @@ async function runViaHttp(
       } catch {}
     }
   }
-  if (inThink && flushUnclosedThink && thinkBuffer) {
+  // See run() flush logic: only flush an unclosed-think buffer if it
+  // contains <|im_end|> — broken /no_think pattern, buffered text is the
+  // answer. Otherwise the model is in a runaway think loop and flushing
+  // would leak the reasoning trace.
+  if (inThink && flushUnclosedThink && thinkBuffer.includes("<|im_end|>")) {
     emit(thinkBuffer.replace(/^\s+/, ""));
   }
   const secs = (Date.now() - t0) / 1000;
@@ -1018,13 +1028,12 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   }
 
   const modelCfg = resolveModelConfig(model);
-  const thinkingDirective = applyThinkingMode(undefined, modelCfg.thinking);
+  const effectivePrompt = applyNoThinkPrefix(prompt, modelCfg.thinking);
   const genMsg: any = {
-    type: "generate", id: "run", prompt,
+    type: "generate", id: "run", prompt: effectivePrompt,
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
-  if (thinkingDirective) genMsg.system = thinkingDirective;
   if (modelCfg.max_think_tokens > 0) genMsg.max_think_tokens = modelCfg.max_think_tokens;
   if (image) {
     genMsg.image = resolve(image);
@@ -1076,7 +1085,13 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
       emit(text);
     }
     else if (msg.type === "done") {
-      if (inThink && flushUnclosedThink && thinkBuffer) {
+      // Only flush an unclosed-think buffer if it contains <|im_end|>: that
+      // signals the broken /no_think pattern (Qwen3.5 emits "<think>" then
+      // the actual answer then <|im_end|> with no closing tag) and the
+      // buffered text is the answer. If <|im_end|> isn't in the buffer the
+      // model is in a runaway thinking loop that hit max_tokens — flushing
+      // would leak the full reasoning, so discard.
+      if (inThink && flushUnclosedThink && thinkBuffer.includes("<|im_end|>")) {
         emit(thinkBuffer.replace(/^\s+/, ""));
       }
       console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
@@ -1259,6 +1274,17 @@ async function serve(port: number) {
            .replace(/<think>[\s\S]*$/, "");
 
         const nonSystem = messages.filter((m: any) => m.role !== "system");
+        // When thinking=off, prepend Qwen's `/no_think\n` to the last user
+        // turn (canonical Qwen3 placement). Putting the directive in system
+        // works only loosely — terse imperatives ("Return number 100",
+        // "Return 1..10") still emit empty `<think><|im_end|>` from the 9b
+        // model. User-prefix produces reliable answers across prompt
+        // shapes.
+        const noThinkPrefixThisRequest = resolveModelConfig(body.model).thinking === "off";
+        let lastUserIdx = -1;
+        for (let i = nonSystem.length - 1; i >= 0; i--) {
+          if (nonSystem[i].role === "user") { lastUserIdx = i; break; }
+        }
         const convParts: string[] = [];
         for (let i = 0; i < nonSystem.length; i++) {
           const m = nonSystem[i];
@@ -1277,6 +1303,9 @@ async function serve(port: number) {
             }
           } else {
             text = m.content || "";
+            if (noThinkPrefixThisRequest && i === lastUserIdx && !text.startsWith("/no_think")) {
+              text = `/no_think\n${text}`;
+            }
           }
 
           if (i === 0) {
@@ -1343,11 +1372,14 @@ async function serve(port: number) {
           repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : effective.repeat_penalty),
           top_p: body.top_p ?? effective.top_p,
         };
-        // Per-model thinking mode: prepend the "no-think" directive when
-        // this model's override (or the global config) sets thinking=off.
+        // Per-model thinking mode: when off, /no_think is already injected
+        // at the head of the last user turn (above) — the canonical Qwen3
+        // placement. Pass the client-provided system prompt through
+        // unchanged. Combining system + user-prefix can re-introduce the
+        // empty <think><|im_end|> halt on terse prompts, so we deliberately
+        // do NOT layer the directive in system as well.
         const thinkModel = resolveModelConfig(body.model).thinking;
-        const resolvedSystem = applyThinkingMode(systemPrompt || undefined, thinkModel);
-        if (resolvedSystem) genParams.system = resolvedSystem;
+        if (systemPrompt) genParams.system = systemPrompt;
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
         function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
@@ -1422,7 +1454,11 @@ async function serve(port: number) {
                     }
                     emit(text);
                   } else if (msg.type === "done") {
-                    if (inThink && flushUnclosedThink && thinkBuffer) {
+                    // See run() flush logic: only flush unclosed-think
+                    // buffer if it contains <|im_end|> (broken /no_think
+                    // pattern). Otherwise it's a runaway think loop and
+                    // flushing would leak reasoning.
+                    if (inThink && flushUnclosedThink && thinkBuffer.includes("<|im_end|>")) {
                       emit(thinkBuffer.replace(/^\s+/, ""));
                     }
                     // When tools are present, parse accumulated text for tool calls
@@ -1524,17 +1560,25 @@ async function serve(port: number) {
         // Mode-specific handling for an UNCLOSED <think> at end of output:
         //   • thinking=on   → strip from <think> to end (model failed to
         //                     finish thinking; suppress entirely).
-        //   • thinking=off  → strip just the literal "<think>" tag and
-        //                     keep the trailing content. Qwen3.5 with
-        //                     /no_think sometimes emits a stray "<think>"
-        //                     followed by the actual answer and <|im_end|>
-        //                     without closing — discarding would eat the
-        //                     answer; preserving it is the right call.
+        //   • thinking=off  → if the unclosed-think tail contains
+        //                     <|im_end|>, it's the broken /no_think pattern
+        //                     (Qwen3.5 emits "<think>" + answer + <|im_end|>
+        //                     with no closing tag) — strip just the tag and
+        //                     keep the tail. If <|im_end|> is absent the
+        //                     model is in a runaway think loop that hit
+        //                     max_tokens; strip from <think> to end so
+        //                     reasoning doesn't leak.
         content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "");
         if (thinkModel !== "off") {
           content = content.replace(/<think>[\s\S]*$/, ""); // unclosed: discard
         } else {
-          content = content.replace(/<think>/g, ""); // unclosed: keep tail
+          const m = content.match(/<think>([\s\S]*)$/);
+          if (m) {
+            const tail = m[1];
+            content = tail.includes("<|im_end|>")
+              ? content.replace(/<think>/g, "")
+              : content.replace(/<think>[\s\S]*$/, "");
+          }
         }
         content = content.replace(/<\|im_end\|>/g, "").trim();
 
