@@ -678,6 +678,71 @@ fn main() {
     // `position` was already declared above (it may have been advanced by a
     // post-prefill CASK eviction). Keep it as-is.
     let mut seed_token: u32 = first_token;
+
+    // Loop-break cycle detector (HIPFIRE_DFLASH_LOOP_BREAK=stop|escalate|temp).
+    // After each commit, hash the trailing 32-token window. Hit = the
+    // model has entered a structural repeat (block-level attractor — the
+    // kind that slips past the first-128-tok coherence gate).
+    //
+    // Modes:
+    //   stop (=1, default): track consecutive hits; once >= STOP_AFTER
+    //     terminate decode as if EOS was emitted. Simple, gracefully
+    //     stops degeneration.
+    //   escalate: on each STOP_AFTER threshold trigger, bump runtime
+    //     repeat_penalty by RP_STEP (cap at RP_MAX). The bumped RP
+    //     penalizes the loop's vocabulary; gen continues. After
+    //     RECOVERY_CYCLES cycles with no hits, decay RP back toward
+    //     baseline. Terminate only if MAX_ESCALATIONS hit (RP cap reached
+    //     AND the bumped value still loops).
+    //   temp: legacy diagnostic — bump temp on each hit, reset on miss.
+    //     Empirically bounces the model between attractors.
+    //
+    // Detection cost: one DefaultHasher pass over 32 u32s per cycle (~ns).
+    // Memory: HashSet<u64>, ≤ max_tokens / 12 entries (~125 for max=1500).
+    let loop_break_raw = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK").ok();
+    let loop_break_mode: &str = match loop_break_raw.as_deref() {
+        Some("temp") => "temp",
+        Some("escalate") | Some("recover") => "escalate",
+        Some("stop") | Some("1") | Some("on") | Some("true") => "stop",
+        _ => "off",
+    };
+    let loop_break_on = loop_break_mode != "off";
+    let loop_break_temp: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_TEMP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let loop_break_stop_after: usize = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_STOP_AFTER")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let loop_break_rp_step: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_RP_STEP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.10);
+    let loop_break_rp_max: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_RP_MAX")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.30);
+    let loop_break_recovery: usize = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_RECOVERY")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+    let loop_break_max_escalations: usize = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    const LOOP_BREAK_WINDOW: usize = 32;
+    let mut runtime_temp: f32 = temp;
+    let mut runtime_repeat_penalty: f32 = repeat_penalty;
+    let mut loop_break_hits: usize = 0;
+    let mut loop_break_consecutive: usize = 0;
+    let mut loop_break_escalations: usize = 0;
+    let mut loop_break_clean_streak: usize = 0;
+    let mut window_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    if loop_break_on {
+        match loop_break_mode {
+            "stop" => eprintln!(
+                "[loop-break] enabled: mode=stop window={LOOP_BREAK_WINDOW} stop_after={loop_break_stop_after}"
+            ),
+            "escalate" => eprintln!(
+                "[loop-break] enabled: mode=escalate window={LOOP_BREAK_WINDOW} stop_after={loop_break_stop_after} \
+                 rp_step={loop_break_rp_step} rp_max={loop_break_rp_max} recovery={loop_break_recovery} \
+                 max_escalations={loop_break_max_escalations} (baseline rp={repeat_penalty})"
+            ),
+            _ => eprintln!(
+                "[loop-break] enabled: mode=temp window={LOOP_BREAK_WINDOW} bump_temp={loop_break_temp} (canonical temp={temp})"
+            ),
+        }
+    }
+
     // SpecStats histogram must fit the max accept_len we'll ever see, so
     // size by draft_scratch_b (which accounts for adaptive_b_max).
     let mut stats = SpecStats::new(draft_scratch_b);
@@ -1093,14 +1158,14 @@ fn main() {
                 seed_token,
                 ctx_slice,
                 if no_tape { None } else { Some(&mut gdn_tape) },
-                temp,
+                runtime_temp,
                 &mut rng_state,
                 block_override,
                 ngram_cache.as_ref(),
                 &emitted,
                 cactus_delta,
                 pld_spine,
-                repeat_penalty,
+                runtime_repeat_penalty,
                 repeat_window,
             )
             .expect("spec step")
@@ -1180,6 +1245,125 @@ fn main() {
         // `step.committed[0]` is the seed_token (already emitted). Emit [1..].
         for (&tok, _) in step.committed.iter().skip(1).zip(0..) {
             emitted.push(tok);
+        }
+
+        // Loop-break cycle detector: hash trailing 32-token window, look
+        // up in known-hash set. Hit = repeating block. The shift-by-cycle
+        // (each iter advances ~12 tokens, window=32) means consecutive
+        // windows overlap heavily but yield distinct hashes; only a true
+        // verbatim repeat re-hashes to a previously-seen value.
+        let mut loop_break_force_stop = false;
+        if loop_break_on && emitted.len() >= LOOP_BREAK_WINDOW {
+            use std::hash::{Hash, Hasher};
+            let tail = &emitted[emitted.len() - LOOP_BREAK_WINDOW..];
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            tail.hash(&mut hasher);
+            let h = hasher.finish();
+            let hit = window_hashes.contains(&h);
+            if hit {
+                loop_break_hits += 1;
+                loop_break_consecutive += 1;
+                loop_break_clean_streak = 0;
+                let trigger = loop_break_consecutive >= loop_break_stop_after;
+                match loop_break_mode {
+                    "stop" => {
+                        if trigger {
+                            eprintln!(
+                                "[loop-break] cycle {} pos {}: {} consecutive repeats → terminating decode (synthetic EOS); total_hits={}",
+                                stats.cycles, position, loop_break_consecutive, loop_break_hits
+                            );
+                            loop_break_force_stop = true;
+                        } else {
+                            eprintln!(
+                                "[loop-break] cycle {} pos {}: window repeat ({}/{} consecutive)",
+                                stats.cycles, position, loop_break_consecutive, loop_break_stop_after
+                            );
+                        }
+                    }
+                    "escalate" => {
+                        if trigger {
+                            // Either escalate RP or give up if escalation
+                            // ladder exhausted (max bumps reached AND the
+                            // bumped value still loops).
+                            if loop_break_escalations >= loop_break_max_escalations
+                                || runtime_repeat_penalty >= loop_break_rp_max - 1e-4
+                            {
+                                eprintln!(
+                                    "[loop-break] cycle {} pos {}: escalation exhausted (rp={:.2} after {} bumps) → terminating; total_hits={}",
+                                    stats.cycles, position, runtime_repeat_penalty,
+                                    loop_break_escalations, loop_break_hits
+                                );
+                                loop_break_force_stop = true;
+                            } else {
+                                let prev_rp = runtime_repeat_penalty;
+                                runtime_repeat_penalty = (runtime_repeat_penalty + loop_break_rp_step)
+                                    .min(loop_break_rp_max);
+                                if runtime_repeat_penalty < 1.0 + loop_break_rp_step {
+                                    runtime_repeat_penalty = 1.0 + loop_break_rp_step;
+                                }
+                                loop_break_escalations += 1;
+                                loop_break_consecutive = 0;
+                                // Wipe the hash set so the bumped RP gets
+                                // a fresh judgment window — otherwise the
+                                // same stale tokens trigger immediately.
+                                window_hashes.clear();
+                                eprintln!(
+                                    "[loop-break] cycle {} pos {}: ESCALATE rp {:.2} → {:.2} (bump {}/{}); total_hits={}",
+                                    stats.cycles, position, prev_rp, runtime_repeat_penalty,
+                                    loop_break_escalations, loop_break_max_escalations, loop_break_hits
+                                );
+                            }
+                        } else {
+                            eprintln!(
+                                "[loop-break] cycle {} pos {}: window repeat ({}/{} consecutive, rp={:.2})",
+                                stats.cycles, position, loop_break_consecutive,
+                                loop_break_stop_after, runtime_repeat_penalty
+                            );
+                        }
+                    }
+                    _ => {
+                        // legacy temp-bump mode
+                        runtime_temp = loop_break_temp;
+                        eprintln!(
+                            "[loop-break] cycle {} pos {}: window repeat → temp={} for next cycle (count={})",
+                            stats.cycles, position, loop_break_temp, loop_break_hits
+                        );
+                    }
+                }
+            } else {
+                loop_break_consecutive = 0;
+                loop_break_clean_streak += 1;
+                if loop_break_mode == "temp" {
+                    runtime_temp = temp;
+                }
+                // Escalate-mode RP decay: after RECOVERY cycles of clean
+                // output, halve the gap toward baseline. Repeat each
+                // RECOVERY cycles until back at baseline. Lets the model
+                // regain natural entropy once the basin is escaped.
+                if loop_break_mode == "escalate"
+                    && runtime_repeat_penalty > repeat_penalty + 1e-4
+                    && loop_break_clean_streak > 0
+                    && loop_break_clean_streak % loop_break_recovery == 0
+                {
+                    let prev_rp = runtime_repeat_penalty;
+                    runtime_repeat_penalty =
+                        repeat_penalty + (runtime_repeat_penalty - repeat_penalty) * 0.5;
+                    if runtime_repeat_penalty < repeat_penalty + 0.01 {
+                        runtime_repeat_penalty = repeat_penalty;
+                        loop_break_escalations = loop_break_escalations.saturating_sub(1);
+                    }
+                    eprintln!(
+                        "[loop-break] cycle {} pos {}: clean for {} cycles → DECAY rp {:.2} → {:.2}",
+                        stats.cycles, position, loop_break_clean_streak, prev_rp, runtime_repeat_penalty
+                    );
+                }
+            }
+            window_hashes.insert(h);
+        }
+
+        if loop_break_force_stop {
+            eprintln!("eos");
+            break;
         }
 
         // Advance position + pick next seed (= bonus_token).

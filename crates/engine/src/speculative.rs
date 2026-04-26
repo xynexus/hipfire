@@ -2437,6 +2437,15 @@ pub fn spec_step_dflash(
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
     let use_temp_sampling = temp > 0.0;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
+    // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply llama::apply_ngram_block to every
+    // host-path row in BOTH draft and target argmax paths. Bans the next
+    // token after any 3/4/5/6-gram repeat (NEG_INFINITY logit). Matches the
+    // production-path defense in daemon/run/infer for the AR sampler.
+    // Forces the per-row host download even when RP is off (extra D2H per
+    // cycle); off-by-default for that reason.
+    let ngram_block_active = !use_temp_sampling
+        && std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1");
+    let host_path_active = rp_active || ngram_block_active;
 
     if let Some(pld) = pld_spine {
         // PLD spine path: drafted tokens come from context-suffix match.
@@ -2626,16 +2635,22 @@ pub fn spec_step_dflash(
                 drafted.push(t);
                 draft_softmaxes.push(probs);
             }
-        } else if rp_active {
-            // RP-adjusted greedy: apply repeat_penalty to each row before argmax
-            // so draft and target pick from the same reshaped distribution. Keeps
-            // spec-decode aligned (τ doesn't collapse from mismatched argmaxes).
+        } else if host_path_active {
+            // RP / n-gram-block path: apply per-row penalties before argmax
+            // so draft and target pick from the same reshaped distribution.
+            // Keeps spec-decode aligned (τ doesn't collapse from mismatched
+            // argmaxes — both sides see identical -inf logits on banned toks).
             let host_logits = gpu.download_f32(&logits_batch)?;
             debug_assert_eq!(host_logits.len(), batch * vocab);
             let mut row = vec![0f32; vocab];
             for i in 0..batch {
                 row.copy_from_slice(&host_logits[i * vocab..(i + 1) * vocab]);
-                llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
+                if rp_active {
+                    llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
+                }
+                if ngram_block_active {
+                    llama::apply_ngram_block(&mut row, prev_committed);
+                }
                 drafted.push(argmax_u32(&row));
             }
         } else {
@@ -2668,9 +2683,14 @@ pub fn spec_step_dflash(
                 draft_probs_at_drafted.push(probs[t as usize]);
                 drafted.push(t);
                 draft_softmaxes.push(probs);
-            } else if rp_active {
+            } else if host_path_active {
                 let mut row = logits.clone();
-                llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
+                if rp_active {
+                    llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
+                }
+                if ngram_block_active {
+                    llama::apply_ngram_block(&mut row, prev_committed);
+                }
                 drafted.push(argmax_u32(&row));
             } else {
                 drafted.push(argmax_u32(&logits));
@@ -2760,7 +2780,7 @@ pub fn spec_step_dflash(
     let verify_out = verify_dflash_block(
         gpu, target, &block, position, hidden_rb,
         gdn_tape_opt.as_deref_mut(),
-        use_temp_sampling || rp_active,  // full target logits needed for rejection sampling or RP-adjusted argmax
+        use_temp_sampling || host_path_active,  // full target logits needed for rejection sampling, RP, or n-gram block
         verify_scratch,
     )?;
 
@@ -2849,17 +2869,23 @@ pub fn spec_step_dflash(
             sample_categorical(&target_probs, u)
         };
     } else {
-        // Greedy path. If RP is active, re-derive argmax per row after applying
-        // the repeat_penalty to the full target logits (requires want_full_logits).
-        // `prev_committed` carries the emitted history used as the penalty window.
-        let argmax_per_pos: std::borrow::Cow<'_, [u32]> = if rp_active {
+        // Greedy path. If RP or n-gram-block is active, re-derive argmax per
+        // row after applying penalties to the full target logits (requires
+        // want_full_logits). `prev_committed` carries the emitted history
+        // used as the penalty / block window.
+        let argmax_per_pos: std::borrow::Cow<'_, [u32]> = if host_path_active {
             let tgt_logits = &verify_out.logits_per_pos;
             debug_assert_eq!(tgt_logits.len(), b * vocab);
             let mut out: Vec<u32> = Vec::with_capacity(b);
             let mut row = vec![0f32; vocab];
             for i in 0..b {
                 row.copy_from_slice(&tgt_logits[i * vocab..(i + 1) * vocab]);
-                llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
+                if rp_active {
+                    llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
+                }
+                if ngram_block_active {
+                    llama::apply_ngram_block(&mut row, prev_committed);
+                }
                 out.push(argmax_u32(&row));
             }
             std::borrow::Cow::Owned(out)
