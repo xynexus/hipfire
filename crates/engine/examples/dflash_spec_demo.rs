@@ -853,6 +853,8 @@ fn main() {
     if ar_baseline {
         eprintln!("AR-BASELINE MODE: pure greedy target decode (no DFlash)");
         let t_ar = Instant::now();
+        let mut ar_ttft_ms: Option<f64> = None;
+        let mut ar_evictions: usize = 0;
         // Position already advanced to prompt_tokens.len() during prefill.
         // seed_token = target's argmax at position `prompt_len` (first emit).
         let mut cur_token = seed_token;
@@ -876,12 +878,16 @@ fn main() {
                 if v > bv { (i as u32, v) } else { (best, bv) }
             }).0;
             emitted.push(next);
+            if ar_ttft_ms.is_none() {
+                ar_ttft_ms = Some(prefill_secs * 1000.0 + t_ar.elapsed().as_secs_f64() * 1000.0);
+            }
             position += 1;
             if let Some(ref p) = cask_policy {
                 if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
                     .expect("ar cask evict") {
                     // AR baseline doesn't touch draft state — no mirror needed.
                     position = ev.new_physical;
+                    ar_evictions += 1;
                 }
             }
             if tokenizer.is_terminator(next) {
@@ -891,13 +897,34 @@ fn main() {
             cur_token = next;
         }
         let ar_elapsed = t_ar.elapsed().as_secs_f64();
+        let ar_tok_s = emitted.len() as f64 / ar_elapsed;
         let text = tokenizer.decode(&emitted);
         eprintln!("--- AR-BASELINE OUTPUT ---");
         println!("{text}");
         eprintln!("--------------------------");
         eprintln!("emitted: {} tokens in {:.2}s  ({:.2} tok/s)",
-                  emitted.len(), ar_elapsed, emitted.len() as f64 / ar_elapsed);
+                  emitted.len(), ar_elapsed, ar_tok_s);
         eprintln!("AR tokens: {:?}", emitted);
+        // Mirror the BENCH METRICS block emitted by the spec path so the
+        // AR baseline is parseable by the same downstream tools (LMX
+        // submitter, speed-gate, etc).
+        let (vram_free_b, vram_total_b) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+        let vram_used_mb = ((vram_total_b.saturating_sub(vram_free_b)) as f64 / (1024.0 * 1024.0)) as u64;
+        let vram_total_mb = (vram_total_b as f64 / (1024.0 * 1024.0)) as u64;
+        eprintln!("=== BENCH METRICS ===");
+        eprintln!("prompt_tokens: {}", prompt_tokens.len());
+        eprintln!("prefill_secs: {:.4}", prefill_secs);
+        eprintln!("prefill_tok_s: {:.2}", prefill_tok_s);
+        eprintln!("ttft_ms: {:.2}", ar_ttft_ms.unwrap_or(0.0));
+        eprintln!("decode_tokens_emitted: {}", emitted.len());
+        eprintln!("decode_secs: {:.4}", ar_elapsed);
+        eprintln!("decode_tok_s: {:.2}", ar_tok_s);
+        eprintln!("decode_tau: 1.0000");
+        eprintln!("decode_accept_rate: 1.0000");
+        eprintln!("vram_used_mb: {}", vram_used_mb);
+        eprintln!("vram_total_mb: {}", vram_total_mb);
+        eprintln!("ar_evictions: {}", ar_evictions);
+        eprintln!("=====================");
         return;
     }
 
