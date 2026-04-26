@@ -1487,6 +1487,222 @@ impl NgramCache {
     }
 }
 
+/// Higher-order chained n-gram cache modeled on llama.cpp's `ngram_mod`
+/// (PR ggml-org/llama.cpp#19164). Bigram NgramCache above answers
+/// "given (a,b), what's the most-frequent c?" — one position at a time.
+/// This struct answers "given the last (n-1) tokens, what's the c that
+/// followed?" AND can chain: c becomes the new tail, ask again, repeat
+/// until cache miss. Single hash lookup per step.
+///
+/// Storage: open-addressing hash, overwrite-on-collision. Trades exact
+/// histogram accuracy for O(1) lookup and bounded memory. Default 1M
+/// entries × 4 bytes = 4 MB.
+///
+/// Self-reset heuristics:
+///  - Occupancy > 25% → reset (collision rate too high for reliable
+///    prediction; stale or noisy data).
+///  - 3 consecutive predict-rounds with accept-rate < 50% → reset
+///    (predictions are stale, table is poisoning the draft).
+///
+/// Compatibility: complementary to `NgramCache`. Both can run; this one
+/// takes priority when its chain extends the draft beyond what bigram
+/// alone would propose. Wire via HIPFIRE_DFLASH_CHAINED_NGRAM_N=<n>.
+pub struct ChainedNgramCache {
+    /// n-gram order: key = (n-1) tokens, value = the n-th token.
+    n: usize,
+    /// Table[hash(key)] = predicted token id, or EMPTY (-1).
+    table: Vec<i32>,
+    /// Number of distinct entries occupied. Used for occupancy threshold.
+    used: usize,
+    /// Streak of consecutive predict-rounds with accept-rate below
+    /// `low_accept_threshold`. Reset to 0 on any good round.
+    consecutive_low_accept: u32,
+
+    pub low_accept_threshold: f32,
+    pub max_occupancy: f32,
+    pub max_chain: usize,
+}
+
+impl ChainedNgramCache {
+    pub const EMPTY: i32 = -1;
+
+    /// `n` is the n-gram order (3-8 reasonable; 4 default per ngram_mod
+    /// guidance). `size` is the hash-table cardinality (rounded down to
+    /// power-of-two-ish — we just modulo). 1M × i32 = 4 MB default.
+    pub fn new(n: usize, size: usize) -> Self {
+        assert!(n >= 2, "ChainedNgramCache: n must be >= 2");
+        assert!(size > 0, "ChainedNgramCache: size must be > 0");
+        Self {
+            n,
+            table: vec![Self::EMPTY; size],
+            used: 0,
+            consecutive_low_accept: 0,
+            low_accept_threshold: 0.5,
+            max_occupancy: 0.25,
+            max_chain: 16,
+        }
+    }
+
+    #[inline]
+    fn hash(&self, key: &[u32]) -> usize {
+        debug_assert_eq!(key.len() + 1, self.n, "key must be n-1 tokens");
+        // Same multiplier as llama.cpp's ngram_mod (Knuth's mixer).
+        let mut h: u64 = 0;
+        for &t in key {
+            h = h.wrapping_mul(6364136223846793005).wrapping_add(t as u64);
+        }
+        (h as usize) % self.table.len()
+    }
+
+    /// Record `key → next` (key is (n-1) tokens, next is the n-th).
+    /// On collision, overwrites — newer wins.
+    #[inline]
+    pub fn add(&mut self, key: &[u32], next: u32) {
+        let i = self.hash(key);
+        if self.table[i] == Self::EMPTY {
+            self.used += 1;
+        }
+        self.table[i] = next as i32;
+    }
+
+    /// Lookup `key → next`. Returns None on miss.
+    #[inline]
+    pub fn get(&self, key: &[u32]) -> Option<u32> {
+        let i = self.hash(key);
+        let v = self.table[i];
+        if v == Self::EMPTY { None } else { Some(v as u32) }
+    }
+
+    /// Walk `tokens` and record every (n-1)-gram → n-th-token transition.
+    /// Caller supplies the full committed stream; this walks `windows(n)`.
+    pub fn observe_many(&mut self, tokens: &[u32]) {
+        if tokens.len() < self.n {
+            return;
+        }
+        for w in tokens.windows(self.n) {
+            let (key, next) = w.split_at(self.n - 1);
+            self.add(key, next[0]);
+        }
+    }
+
+    /// Chain predictions starting from `seed` (must be ≥ n-1 tokens).
+    /// Walks the cache: take last (n-1) of (seed ++ predictions),
+    /// look up next, append, repeat. Stops on miss or when chain
+    /// reaches `max_len` (capped by `self.max_chain`).
+    pub fn predict_chain(&self, seed: &[u32], max_len: usize) -> Vec<u32> {
+        let want = self.n - 1;
+        if seed.len() < want {
+            return Vec::new();
+        }
+        let cap = max_len.min(self.max_chain);
+        let mut out: Vec<u32> = Vec::with_capacity(cap);
+        // Rolling tail of (n-1) tokens we look up against.
+        let mut tail: Vec<u32> = seed[seed.len() - want..].to_vec();
+        for _ in 0..cap {
+            match self.get(&tail) {
+                Some(next) => {
+                    out.push(next);
+                    // Slide tail: drop front, push next.
+                    tail.rotate_left(1);
+                    let last = tail.len() - 1;
+                    tail[last] = next;
+                }
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Returns true if either heuristic fires and the table was reset.
+    /// Caller invokes this AFTER each predict-round completes so the
+    /// accept-rate signal can drive resets.
+    pub fn maybe_reset(&mut self, accepted: usize, drafted: usize) -> bool {
+        let mut should = false;
+        if drafted > 0 {
+            let f = accepted as f32 / drafted as f32;
+            if f < self.low_accept_threshold {
+                self.consecutive_low_accept += 1;
+                if self.consecutive_low_accept >= 3 {
+                    should = true;
+                }
+            } else {
+                self.consecutive_low_accept = 0;
+            }
+        }
+        let occ = self.used as f32 / self.table.len() as f32;
+        if occ > self.max_occupancy {
+            should = true;
+        }
+        if should {
+            self.reset();
+            return true;
+        }
+        false
+    }
+
+    pub fn reset(&mut self) {
+        self.table.fill(Self::EMPTY);
+        self.used = 0;
+        self.consecutive_low_accept = 0;
+    }
+
+    pub fn occupancy(&self) -> f32 {
+        self.used as f32 / self.table.len() as f32
+    }
+    pub fn used(&self) -> usize { self.used }
+    pub fn capacity(&self) -> usize { self.table.len() }
+    pub fn order(&self) -> usize { self.n }
+}
+
+#[cfg(test)]
+mod chained_ngram_tests {
+    use super::*;
+
+    #[test]
+    fn n4_observe_get() {
+        let mut c = ChainedNgramCache::new(4, 4096);
+        // Stream "1 2 3 4 5 6 7" — windows of 4: (1,2,3)→4, (2,3,4)→5, (3,4,5)→6, (4,5,6)→7
+        c.observe_many(&[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(c.get(&[1, 2, 3]), Some(4));
+        assert_eq!(c.get(&[2, 3, 4]), Some(5));
+        assert_eq!(c.get(&[3, 4, 5]), Some(6));
+        assert_eq!(c.get(&[4, 5, 6]), Some(7));
+        assert_eq!(c.get(&[7, 7, 7]), None); // miss
+    }
+
+    #[test]
+    fn chain_extends_until_miss() {
+        let mut c = ChainedNgramCache::new(3, 4096);
+        // (1,2)→3, (2,3)→4, (3,4)→5, (4,5)→6, (5,6)→missing
+        c.observe_many(&[1, 2, 3, 4, 5, 6]);
+        let chain = c.predict_chain(&[1, 2], 10);
+        assert_eq!(chain, vec![3, 4, 5, 6]); // walks until (5,6) misses
+    }
+
+    #[test]
+    fn collision_overwrite() {
+        // Force a collision: tiny table.
+        let mut c = ChainedNgramCache::new(2, 4);
+        c.add(&[100], 1);
+        c.add(&[100], 2); // same key, overwrites — used stays the same
+        assert_eq!(c.get(&[100]), Some(2));
+        assert_eq!(c.used(), 1);
+    }
+
+    #[test]
+    fn reset_on_low_accept() {
+        let mut c = ChainedNgramCache::new(3, 4096);
+        c.observe_many(&[1, 2, 3, 4, 5]);
+        assert_eq!(c.used(), 3);
+        // 3 rounds of < 50% accept → reset
+        c.maybe_reset(0, 10);
+        c.maybe_reset(0, 10);
+        let did = c.maybe_reset(0, 10);
+        assert!(did);
+        assert_eq!(c.used(), 0);
+    }
+}
+
 /// Prompt Lookup Decoding (Saxena 2023): training-free deterministic draft
 /// built from context suffix self-match. If the last N tokens of context
 /// appeared earlier in context, the tokens that followed that earlier
