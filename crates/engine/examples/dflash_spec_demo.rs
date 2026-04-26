@@ -678,6 +678,30 @@ fn main() {
     // `position` was already declared above (it may have been advanced by a
     // post-prefill CASK eviction). Keep it as-is.
     let mut seed_token: u32 = first_token;
+
+    // Loop-break cycle detector (HIPFIRE_DFLASH_LOOP_BREAK=1).
+    // After each commit, hash the trailing 32-token window. If the hash
+    // matches any prior window's hash, the model has entered a structural
+    // repeat (block-level attractor — the kind that slips past the first-
+    // 128-tok coherence gate). Bump temp for the NEXT verify cycle to
+    // shake the model off the basin; if the next window also hashes to a
+    // known value, keep the bump until a fresh window appears.
+    //
+    // Detection cost: one DefaultHasher pass over 32 u32s per cycle (~ns).
+    // Memory: HashSet<u64>, ≤ max_tokens / 12 entries (~125 for max=1500).
+    let loop_break_on = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK").ok().as_deref() == Some("1");
+    let loop_break_temp: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_TEMP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    const LOOP_BREAK_WINDOW: usize = 32;
+    let mut runtime_temp: f32 = temp;
+    let mut loop_break_hits: usize = 0;
+    let mut window_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    if loop_break_on {
+        eprintln!(
+            "[loop-break] enabled: window={LOOP_BREAK_WINDOW} bump_temp={loop_break_temp} (canonical temp={temp})"
+        );
+    }
+
     // SpecStats histogram must fit the max accept_len we'll ever see, so
     // size by draft_scratch_b (which accounts for adaptive_b_max).
     let mut stats = SpecStats::new(draft_scratch_b);
@@ -1093,7 +1117,7 @@ fn main() {
                 seed_token,
                 ctx_slice,
                 if no_tape { None } else { Some(&mut gdn_tape) },
-                temp,
+                runtime_temp,
                 &mut rng_state,
                 block_override,
                 ngram_cache.as_ref(),
@@ -1180,6 +1204,31 @@ fn main() {
         // `step.committed[0]` is the seed_token (already emitted). Emit [1..].
         for (&tok, _) in step.committed.iter().skip(1).zip(0..) {
             emitted.push(tok);
+        }
+
+        // Loop-break cycle detector: hash trailing 32-token window, look up
+        // in known-hash set. Hit = repeating block — bump runtime_temp for
+        // next cycle. Miss = reset to canonical temp. The shift-by-cycle
+        // (each iter advances ~12 tokens, window=32) means consecutive
+        // windows overlap heavily but yield distinct hashes; only a true
+        // verbatim repeat re-hashes to a previously-seen value.
+        if loop_break_on && emitted.len() >= LOOP_BREAK_WINDOW {
+            use std::hash::{Hash, Hasher};
+            let tail = &emitted[emitted.len() - LOOP_BREAK_WINDOW..];
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            tail.hash(&mut hasher);
+            let h = hasher.finish();
+            if window_hashes.contains(&h) {
+                loop_break_hits += 1;
+                runtime_temp = loop_break_temp;
+                eprintln!(
+                    "[loop-break] cycle {} pos {}: 32-tok window-hash repeat → temp={} for next cycle (count={})",
+                    stats.cycles, position, loop_break_temp, loop_break_hits
+                );
+            } else {
+                runtime_temp = temp;
+            }
+            window_hashes.insert(h);
         }
 
         // Advance position + pick next seed (= bonus_token).
