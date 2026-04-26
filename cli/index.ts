@@ -1265,18 +1265,65 @@ async function serve(port: number) {
           const role = m.role;
           let text = "";
 
-          // OpenAI accepts message.content as a string OR an array of
-          // content parts ([{type:"text", text:"..."}, {type:"image_url", ...}, ...]).
+          // OpenAI accepts message.content as several shapes:
+          //   • string                                    → use as-is
+          //   • null / undefined                          → "" (e.g. assistant
+          //                                                with only tool_calls)
+          //   • array of content parts (vision spec):
+          //       - plain string element                  → kept verbatim
+          //       - {type:"text"|"input_text", text:"..."} → text kept
+          //       - {type:"image_url"|"input_image", ...}  → dropped, warned
+          //       - any other shape                        → dropped, warned
+          //   • non-string non-array (number, boolean)    → String() coerce
+          //
           // Coerce to a single string before any role-specific shaping —
           // otherwise stripThinking, template literals, and startsWith all
           // crash or silently produce "[object Object]".
+          //
+          // Image parts are NOT yet wired through serve to the daemon's VL
+          // path (the existing image flow only runs through `hipfire run
+          // --image`). Dropping silently was the prior behavior; we now log
+          // a one-line warning per request so VL clients hitting
+          // /v1/chat/completions get a clear reason for missing context
+          // instead of a confusing answer about a non-existent image.
           const rawContent = m.content;
-          const contentText = Array.isArray(rawContent)
-            ? rawContent
-                .map((part: any) => typeof part === "string" ? part : (part?.text ?? ""))
-                .filter(Boolean)
-                .join("\n")
-            : (rawContent || "");
+          let contentText: string;
+          if (rawContent == null) {
+            contentText = "";
+          } else if (Array.isArray(rawContent)) {
+            const textPieces: string[] = [];
+            let droppedImage = false;
+            let droppedOther = 0;
+            for (const part of rawContent) {
+              if (typeof part === "string") {
+                textPieces.push(part);
+              } else if (part && typeof part === "object") {
+                const t = (part as any).type;
+                const txt = (part as any).text;
+                if (typeof txt === "string" && txt.length > 0
+                    && (t === "text" || t === "input_text" || t == null)) {
+                  textPieces.push(txt);
+                } else if (t === "image_url" || t === "input_image") {
+                  droppedImage = true;
+                } else {
+                  droppedOther++;
+                }
+              } else {
+                droppedOther++;
+              }
+            }
+            if (droppedImage) {
+              console.error(`[hipfire] /v1/chat/completions: image content parts dropped — serve does not yet route images to the daemon's VL path. Use \`hipfire run --image <path>\` for vision flows.`);
+            }
+            if (droppedOther > 0) {
+              console.error(`[hipfire] /v1/chat/completions: dropped ${droppedOther} unsupported content part(s)`);
+            }
+            contentText = textPieces.join("\n");
+          } else if (typeof rawContent === "string") {
+            contentText = rawContent;
+          } else {
+            contentText = String(rawContent);
+          }
           if (role === "tool") {
             text = `<tool_response>\n${contentText}\n</tool_response>`;
           } else if (role === "assistant") {
