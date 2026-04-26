@@ -154,11 +154,15 @@ bench_dflash_27b_lru() {
 # Anchors the high-τ ceiling (real production-shape bounded code) since
 # the LRU max=120 anchor above is loop-edge. Echoes "tok_s tau ttft_ms"
 # or one of MISSING_*/CRASH. Best-of-3.
-bench_dflash_27b_merge_sort() {
+#
+# Generic core: takes target + draft basenames, runs the bench, returns
+# best of 3. Per-size wrappers below pin the model paths.
+_bench_dflash_merge_sort_core() {
+    local target_name="$1" draft_name="$2"
     local target draft
     for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
-        [ -f "$dir/qwen3.5-27b.mq4" ] && [ -z "${target:-}" ] && target="$dir/qwen3.5-27b.mq4"
-        [ -f "$dir/qwen35-27b-dflash.mq4" ] && [ -z "${draft:-}" ] && draft="$dir/qwen35-27b-dflash.mq4"
+        [ -f "$dir/$target_name" ] && [ -z "${target:-}" ] && target="$dir/$target_name"
+        [ -f "$dir/$draft_name" ]  && [ -z "${draft:-}" ]  && draft="$dir/$draft_name"
     done
     [ ! -x "$DFLASH_EXE" ] && { echo "MISSING_BIN"; return; }
     [ -z "${target:-}" ] && { echo "MISSING_TARGET"; return; }
@@ -182,6 +186,14 @@ bench_dflash_27b_merge_sort() {
         fi
     done
     if [ "$best_t" = "0" ]; then echo "CRASH"; else echo "$best_t $best_tau $best_ttft"; fi
+}
+
+bench_dflash_27b_merge_sort() {
+    _bench_dflash_merge_sort_core "qwen3.5-27b.mq4" "qwen35-27b-dflash.mq4"
+}
+
+bench_dflash_9b_merge_sort() {
+    _bench_dflash_merge_sort_core "qwen3.5-9b.mq4" "qwen35-9b-dflash-mq4.hfq"
 }
 
 # Run bench_qwen35_mq4 once at a given prefill size.
@@ -341,6 +353,21 @@ if [ "$UPDATE" -eq 1 ]; then
             } >> "$tmpfile"
             ;;
     esac
+
+    printf "  9B-3.5 DFlash merge_sort   "
+    ms9_result=$(bench_dflash_9b_merge_sort)
+    case "$ms9_result" in
+        MISSING_*|CRASH) color yellow "$ms9_result"; echo "" ;;
+        *)
+            read -r mst9 mstau9 msttft9 <<< "$ms9_result"
+            printf "tok/s=%-7.1f τ=%s ttft_ms=%s\n" "$mst9" "$mstau9" "$msttft9"
+            {
+                echo "9b_3.5_dflash_merge_sort_tok_s=${mst9}"
+                echo "9b_3.5_dflash_merge_sort_tau=${mstau9}"
+                echo "9b_3.5_dflash_merge_sort_ttft_ms=${msttft9}"
+            } >> "$tmpfile"
+            ;;
+    esac
     echo "" >> "$tmpfile"
 
     mkdir -p "$(dirname "$BASELINE_FILE")"
@@ -477,6 +504,33 @@ if [ "$FAST" -eq 0 ]; then
                 skip=$((skip+1))
             else
                 check_metric "27B-3.5 DFlash merge_sort" "$ms_base" "$mst"
+                case $? in 0) pass=$((pass+1)) ;; *) fail=$((fail+1)) ;; esac
+            fi
+            ;;
+    esac
+
+    # Third DFlash anchor: 9B merge_sort (small-model high-τ ceiling).
+    ms9_result=$(bench_dflash_9b_merge_sort)
+    case "$ms9_result" in
+        MISSING_*)
+            printf "  9B-3.5 DFlash merge_sort   "
+            color yellow "SKIP"; echo " ($ms9_result)"
+            skip=$((skip+1))
+            ;;
+        CRASH)
+            printf "  9B-3.5 DFlash merge_sort   "
+            color red "CRASH"; echo
+            fail=$((fail+1))
+            ;;
+        *)
+            read -r mst9 mstau9 msttft9 <<< "$ms9_result"
+            ms9_base=$(grep -oE "^9b_3.5_dflash_merge_sort_tok_s=[0-9.]+" "$BASELINE_FILE" | cut -d= -f2)
+            if [ -z "$ms9_base" ]; then
+                printf "  9B-3.5 DFlash merge_sort   "
+                color yellow "NO BASELINE"; echo " (add with --update-baselines; observed=${mst9} τ=${mstau9} ttft=${msttft9}ms)"
+                skip=$((skip+1))
+            else
+                check_metric "9B-3.5 DFlash merge_sort" "$ms9_base" "$mst9"
                 case $? in 0) pass=$((pass+1)) ;; *) fail=$((fail+1)) ;; esac
             fi
             ;;
