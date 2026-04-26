@@ -62,6 +62,20 @@ interface HipfireConfig {
   // draft. Override per-model with `hipfire config set dflash_mode on`.
   dflash_mode: "on" | "off" | "auto";
 
+  // `dflash_ngram_block`:
+  //   true   → set HIPFIRE_DFLASH_NGRAM_BLOCK=1 (verify-path n-gram defense)
+  //   false  → never set
+  //   "auto" → enable on dense models <9B (qwen3.5:0.8b, qwen3.5:4b, qwen3:0.6b);
+  //            disable on 9B+ targets where it actively destroys output
+  //            (27B LRU at ngram_block=1 produces gibberish — see commit ee78b90).
+  //
+  // The defense bans any 3/4/5/6-gram from repeating its next-token via
+  // NEG_INFINITY logit. Small models loop on bounded code (over-specified
+  // tasks); the block forces graceful EOS. Large models terminate natively
+  // and the block destroys their high-fluency outputs (every common 3-gram
+  // gets banned).
+  dflash_ngram_block: "auto" | boolean;
+
   // ── TriAttention / CASK KV eviction (0.1.7-alpha) ─────────────────────
   // `cask_sidecar` is a .triattn.bin path. Empty string = eviction disabled.
   // When set, the engine compacts KV against the sidecar's band-centers
@@ -110,6 +124,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   experimental_budget_alert: false,
   dflash_adaptive_b: true,
   dflash_mode: "auto",
+  dflash_ngram_block: "auto",
   cask_sidecar: "",
   cask: false,
   cask_budget: 512,
@@ -139,6 +154,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "experimental_budget_alert": return typeof value === "boolean";
     case "dflash_adaptive_b": return typeof value === "boolean";
     case "dflash_mode": return ["on", "off", "auto"].includes(value);
+    case "dflash_ngram_block": return value === "auto" || typeof value === "boolean";
     case "cask_sidecar": return typeof value === "string";  // "" = disabled
     case "cask": return typeof value === "boolean";
     case "cask_budget": return typeof value === "number" && Number.isInteger(value) && value >= 64 && value <= 65536;
@@ -564,10 +580,25 @@ function resolveKvMode(cfg: HipfireConfig): string {
   return raw;
 }
 
+// Resolve dflash_ngram_block "auto" → bool based on resolved model tag.
+// Per commit ee78b90 + per-model docs above: ON for dense small models that
+// loop on bounded code (LRU class etc), OFF for 9B+ where the block destroys
+// natural-EOS code output.
+function resolveNgramBlock(value: "auto" | boolean, modelTag: string | null | undefined): boolean {
+  if (typeof value === "boolean") return value;
+  if (!modelTag) return false; // no tag → can't auto-resolve, default off
+  const t = modelTag.toLowerCase();
+  // Match the small-dense set: 0.6b, 0.8b, 1b, 2b, 4b. Explicitly NOT 9b
+  // (per perf data: 9B benefits but cost is high; user opts in).
+  return /(:|-)(0\.[68]b|0\.6b|1b|2b|4b)\b/.test(t);
+}
+
 // Set all config-driven env vars in one place so every daemon-spawning
 // codepath picks up the user's current settings consistently.
-// Called before `new Engine().start()`.
-function applyConfigEnv(cfg: HipfireConfig): void {
+// Called before `new Engine().start()`. Optional `modelTag` enables
+// auto-resolution of model-size-dependent flags (currently only
+// dflash_ngram_block).
+function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
   process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
   // Only set HIPFIRE_ATTN_FLASH if the user hasn't already set it in their
   // shell (env overrides config). `auto` is the engine default — skip the
@@ -595,6 +626,14 @@ function applyConfigEnv(cfg: HipfireConfig): void {
     process.env.HIPFIRE_NORMALIZE_PROMPT = "1";
   } else {
     process.env.HIPFIRE_NORMALIZE_PROMPT = "0";
+  }
+  // dflash_ngram_block: auto-resolve from model tag when "auto", else honor
+  // explicit boolean. Only set the env var when we want it ON; daemon /
+  // dflash_spec_demo treat unset as OFF (zero overhead).
+  if (resolveNgramBlock(cfg.dflash_ngram_block, modelTag)) {
+    process.env.HIPFIRE_DFLASH_NGRAM_BLOCK = "1";
+  } else {
+    delete process.env.HIPFIRE_DFLASH_NGRAM_BLOCK;
   }
 }
 
@@ -936,7 +975,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     // runViaHttp logged its own failure reason; fall back to local spawn.
   }
 
-  applyConfigEnv(cfg);
+  applyConfigEnv(cfg, model);
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
@@ -1871,7 +1910,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     }
   }
 
-  applyConfigEnv(cfg);
+  applyConfigEnv(cfg, model);
 
   // Start daemon
   const e = new Engine();
@@ -2178,7 +2217,7 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
       }
     }
     if (modelPath) {
-      applyConfigEnv(cfg);
+      applyConfigEnv(cfg, modelTag);
       await e.send(buildLoadMessage(modelPath, modelTag));
       const loaded = await e.recv();
       if (loaded.type === "error") {
