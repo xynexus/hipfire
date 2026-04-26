@@ -1,0 +1,132 @@
+# Post-Mortem: dflash 27B DFlash perf regression + recovery (2026-04-26)
+
+**Status:** RESOLVED. Default canonical perf restored on `dflash`. Pending cherry-pick to `master`.
+
+**TL;DR:** A four-day perf regression on `dflash` traced to two compounding issues: (1) PR #32 (`cleanup/dead-wmma-kernels`) on master removed three WMMA kernel files + dispatch entries that were load-bearing, doubling per-cycle cost on 27B DFlash verify; (2) `HIPFIRE_NORMALIZE_PROMPT` was an undocumented major perf lever (+24% τ on PEP-8 prompts) that defaulted OFF, so even unregressed code appeared 24% slower than memory's "200+ tok/s" recollection. Recovery: confirm GPU clean → checkout pre-merge engine → revert merge → cherry-pick remaining valuable master fixes → flip `prompt_normalize` default to ON. Final 27B-3.5 LRU code DFlash @ max=120 = **199 tok/s τ=10.36** (vs prior session's "WTF" 95 tok/s).
+
+---
+
+## Timeline
+
+### Recent prior context (last week, on `dflash`)
+
+| Date | Event |
+|---|---|
+| 2026-04-22..23 | DDTree experiments, hipGraph+MoE corruption fixes, EOT-stop fix |
+| 2026-04-24 | Phase 1 prompt-shape adaptation (`8a4a211`) ships — `HIPFIRE_NORMALIZE_PROMPT=1` env-gated, **default OFF until broader validation** (the trap that bit us today) |
+| 2026-04-24 14:47 | Last known-good DFlash sweep in `dflash-sweep` tmux: 27B-3.5 LRU code = 118.9 tok/s τ=5.40 (no normalize) |
+| 2026-04-25 | v0.1.8-alpha released. PR #37 `dflash → master` merged via admin |
+| 2026-04-25 evening | dflash absorbs master content via `e3a3da2` merge to prep release. Master had landed PRs #32-#34 since v0.1.7 — including dead-wmma-kernels cleanup |
+
+### Session of 2026-04-25 (~5 hr crusade)
+
+| t | Event |
+|---|---|
+| t=0 | "what does 27B dflash bench at?" — `hipfire bench` → 34 tok/s. User identifies `hipfire bench` doesn't exercise DFlash properly |
+| t+0:45 | `dflash_spec_demo` direct → 80-92 tok/s. User: "WTF... weeks of work wasted" |
+| t+1:00 | I incorrectly anchor against the 200+ "peak" memory. Real anchor was 161 tok/s canonical baseline |
+| t+1:15 | Diagnose: ollama running concurrently. Killed via `! sudo systemctl stop ollama`. Cache nuked. DPM warmup added |
+| t+1:30 | Re-bench → 88-95 tok/s. **Regression real**, not transient |
+| t+1:45 | User: "probably artifact from merging with main. revert to before merge with main and try again" |
+| t+2:00 | `git checkout 49ac688 -- crates/ kernels/` → bench restores to **159 tok/s τ=8.07**. Regression isolated to merge content |
+| t+2:15 | `git revert -m 1 e3a3da2` → 159-168 tok/s confirmed. Pushed `357e314` to dflash |
+| t+2:30 | "force-update master to dflash". Caught: master had 8 commits ahead that would be lost |
+| t+2:45 | "A3 — cherry-pick 8 master commits onto dflash" |
+| t+3:00 | Cherry-pick 8 commits (conflict on quality-baselines deletion → resolved by taking master's deletion). Bench → 159 tok/s. No regression from cherry-picks |
+| t+3:30 | Env-var sweep: NORMALIZE=1 → **197 peak**. **Found**: NORMALIZE was the missing piece |
+| t+4:00 | Flipped `prompt_normalize` default ON in CLI + tokenizer.rs. Re-bench → **199 tok/s τ=10.36** (matches user's "200+" memory) |
+| t+4:30 | Document in 5+ spots, write this post-mortem, push |
+
+---
+
+## Root causes
+
+### Primary: PR #32 cleanup-dead-wmma-kernels removed load-bearing kernels
+
+```
+6096db3 Merge pull request #32 from Kaden-Schutt/cleanup/dead-wmma-kernels
+```
+
+Files removed (and reinstated by the eventual revert + reintroduced via cherry-picked dflash content):
+- `kernels/src/gemm_hfq4g256_residual_wmma.hip`
+- `kernels/src/gemm_hfq4g256_residual_wmma2.hip`
+- `kernels/src/gemm_hfq4g256_residual_wmma_k4.hip`
+
+Plus dispatch table entries for K4 / wmma / wmma2 variants. Dispatch fell back to K2 / KSPLIT for 27B verify-shape GEMMs that previously hit K4. Per-cycle cost on 64-layer × B=16 verify forward: **+45-50ms / cycle** (57 → 100+ ms).
+
+Cleanup PR titled "dead" — kernels appeared unused in static analysis but were actively dispatched at runtime via shape-aware variant selection. Earlier in this session I myself removed a K4 reference in dispatch.rs because the kernel file was missing — that was the smoking gun missed at the time.
+
+### Secondary: HIPFIRE_NORMALIZE_PROMPT default-OFF was a forensic landmine
+
+Phase 1 prompt-shape commit (`8a4a211`, 2026-04-24) shipped with `HIPFIRE_NORMALIZE_PROMPT=1` as opt-in. User's in-memory 200+ tok/s baseline measured WITH this on, the default-off shipped. Subsequent un-flagged benches looked ~17-24% slower than memory suggested even when no real regression existed. Compounded with the actual primary regression to make the "regression" appear catastrophically worse.
+
+---
+
+## What worked / repeat
+
+1. **Checking out a known-good commit (49ac688) and re-benching** isolated the regression in ~10 min. `git checkout COMMIT -- crates/ kernels/` is faster than full checkout when working-tree state matters.
+2. **Empirical anchor first, hypothesis second.** When user said "WTF ~50% drop", I correctly resisted catastrophizing by computing actual regression vs realistic baseline (161, not 200) before declaring scope.
+3. **Killing `ollama` was a real fix even though rocm-smi showed 0% GPU usage.** Ollama-as-second-agent caused contention. `pkill -9` failed (different user); needed `! sudo systemctl stop ollama`.
+4. **Env-var sweep matrix to find missing default.** Once code-side fixed, sweeping (no env) / NORMALIZE / GRAPH / both found the missing lever in 3 minutes.
+
+## What failed / avoid
+
+1. **Static "dead code" cleanup of compute kernels is dangerous.** Kernels can be load-bearing through runtime dispatch tables that static analysis won't catch. Future kernel-cleanup PRs MUST include before/after perf benches on the canonical matrix.
+2. **Big bang merges into long-lived branches** hide single-commit regressions inside a wall of changes. Smaller, perf-tested merges or rebase-ff would have surfaced PR #32 at merge time.
+3. **"Phase N: opt-in" defaults that materially change perf are a foot-gun.** Once an env-gate lifts a benchmark by 24%, it stops being "opt-in for advanced users" and becomes "the canonical config we measure against without realizing it". Either flip default ON when validated, or never quote the on-with-flag numbers as if they're the baseline.
+4. **My session-side instincts missed the K4 file deletion.** I removed a K4 dispatch reference earlier in the same session because the kernel file was missing. Should have asked "WHY is the file missing?" — answer was "because of the regression we're now hunting".
+
+---
+
+## Hard rules going forward
+
+1. **Kernel-cleanup PRs MUST run `scripts/sweep_dflash_full.sh` before/after** — diff must be ≤2% on canonical bench. PRs failing this gate get `perf-needs-review`.
+2. **Default env vars matter.** `HIPFIRE_NORMALIZE_PROMPT` is now default ON. Any future flag changing canonical bench by >5% gets default-on once validated.
+3. **Canonical bench config (post-2026-04-26) for 27B-3.5 LRU code:**
+   ```
+   max=120 --no-chatml --kv-mode asym3
+   PEP-8 strict prompt (\n\n\n between top-level defs)
+   prompt_normalize=true (default)
+   ```
+   Expected: **199 tok/s τ=10.36** on 7900 XTX. ±2% deterministic.
+4. **`coherence-gate-dflash.sh` is the canonical correctness gate.** `quality-gate.sh` removed (commit `da36d72`).
+5. **Before claiming "regression": compute regression vs the correct baseline.** Memory-recalled "peak" numbers are upper-bound special-config; baseline is the no-flag canonical. Use the baseline.
+
+---
+
+## Documentation footprint
+
+1. **CLAUDE.md** — Prompt-structure τ sensitivity section noting default ON
+2. **AGENTS.md** — Prompt-normalize entry: "Default ON, opt out via `prompt_normalize=false`"
+3. **README.md** — Perf section showing post-flip numbers as default
+4. **CHANGELOG.md** — Entry for the default flip
+5. **docs/methodology/perf-benchmarking.md** — Canonical-flags-for-bench section
+6. **`docs/plans/perf-regression-recovery-2026-04-26.prd`** — This doc
+7. **`benchmarks/results/2026-04-26-perf-regression-recovery.json`** — Empirical data
+8. **memory/feedback_perf_regression_recovery_2026_04_26.md** — Cross-session memory
+
+---
+
+## Files changed
+
+```
+crates/engine/src/tokenizer.rs        — flip default ON, update docstring + tests
+cli/index.ts                          — prompt_normalize: true (was false), env-set "0" on opt-out
+benchmarks/results/2026-04-26-...     — empirical data archive
+docs/plans/perf-regression-recovery-2026-04-26.prd  — this doc
+README.md / AGENTS.md / CLAUDE.md / CHANGELOG.md / docs/methodology/perf-benchmarking.md
+                                      — default flag documented in 5+ spots
+```
+
+Plus the cherry-pick chain on dflash:
+```
+357e314 Revert "merge: master into dflash for v0.1.8 release prep"
+0cd889b chore: gitignore .gm-stop-verified, .codeinsight, research/
+da36d72 chore: remove deprecated quality-gate.sh + baselines
+0180b68 fix(qwen35): warmup AR forward graph capture; capture-aware LA fallback memcpy
+5705a59 fix(qwen35): graph_launch after AR forward capture (#36 follow-up)
+d9263d6 docs(AGENTS): pitfall row for HIPFIRE_GRAPH=1 dangling-kernel-argument drift
+ea8450b fix(dispatch): migrate AR forward helpers to launch_maybe_blob
+713a832 cli: warn in config view when HIPFIRE_GRAPH=1 is set
+0b39d75 chore: bump workspace version to 0.1.8-alpha (match v0.1.8-alpha tag)
+```

@@ -116,7 +116,10 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   cask_beta: 128,
   cask_core_frac: 0.5,
   cask_fold_m: 2,
-  prompt_normalize: false,
+  // Default ON since 2026-04-26: collapses \n{3,} → \n\n at engine entry,
+  // +24% τ on PEP-8-style code prompts (159→196 tok/s on 27B-3.5 LRU DFlash).
+  // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
+  prompt_normalize: true,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -585,11 +588,13 @@ function applyConfigEnv(cfg: HipfireConfig): void {
     delete process.env.HIPFIRE_EXPERIMENTAL_BUDGET_ALERT;
   }
   // Prompt-shape normalization (Phase 1, commit 8a4a211). Engine-side env
-  // gate; default off until broader validation. Lifts τ on PEP-8 code prompts.
+  // gate. **Default ON since 2026-04-26** — empirical +24% τ on PEP-8 code
+  // prompts (159→196 tok/s on 27B-3.5 LRU DFlash). Set explicit "0" when
+  // disabled so the engine's default-ON path is overridden.
   if (cfg.prompt_normalize) {
     process.env.HIPFIRE_NORMALIZE_PROMPT = "1";
   } else {
-    delete process.env.HIPFIRE_NORMALIZE_PROMPT;
+    process.env.HIPFIRE_NORMALIZE_PROMPT = "0";
   }
 }
 

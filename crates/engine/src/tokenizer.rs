@@ -708,14 +708,26 @@ pub fn collapse_newline_runs(s: &str) -> String {
     out
 }
 
-/// Env-gated prompt normalization for higher DFlash τ.
+/// Prompt normalization for higher DFlash τ.
 ///
-/// `HIPFIRE_NORMALIZE_PROMPT=1` enables it. Default off (Phase 1 opt-in).
-/// Returns Cow::Borrowed when env disabled or when input has no `\n{3,}` runs;
-/// Cow::Owned only on actual rewrite. See `docs/plans/prompt-shape-adaptation.prd`.
+/// **Default ON since 2026-04-26.** Empirical: collapsing `\n{3,}` → `\n\n`
+/// at engine entry lifts 27B-3.5 LRU DFlash from 159 → 196 tok/s (+24%) by
+/// putting the BPE tokenizer on a tighter τ trajectory. Tested across
+/// PEP-8-strict (3-newline) prompts that are dominant in real-world code.
+/// Set `HIPFIRE_NORMALIZE_PROMPT=0` to opt out (rare cases where the raw
+/// `\n{3,}` whitespace is semantically load-bearing).
+///
+/// Returns Cow::Borrowed when input has no `\n{3,}` runs or when explicitly
+/// disabled; Cow::Owned only on actual rewrite.
+/// See `docs/plans/prompt-shape-adaptation.prd` and the post-mortem at
+/// `docs/post-mortems/2026-04-26-perf-regression-recovery.md`.
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
-    if std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref() != Some("1") {
-        return std::borrow::Cow::Borrowed(s);
+    // Default ON. Explicit "0" / "false" / "off" opts out.
+    if let Ok(v) = std::env::var("HIPFIRE_NORMALIZE_PROMPT") {
+        let v = v.to_ascii_lowercase();
+        if v == "0" || v == "false" || v == "off" || v == "no" {
+            return std::borrow::Cow::Borrowed(s);
+        }
     }
     if !needs_newline_collapse(s) {
         return std::borrow::Cow::Borrowed(s);
@@ -796,11 +808,32 @@ mod prompt_norm_tests {
     }
 
     #[test]
-    fn cow_borrowed_when_env_unset() {
+    fn default_on_collapses_when_env_unset() {
+        // Default flipped to ON 2026-04-26 — env unset → still collapses.
         std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+        let s = "a\n\n\nb";
+        let out = maybe_normalize_prompt(s);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        assert_eq!(out.as_ref(), "a\n\nb");
+    }
+
+    #[test]
+    fn explicit_zero_opts_out() {
+        std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         let s = "a\n\n\nb";
         let out = maybe_normalize_prompt(s);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), "a\n\n\nb");
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+    }
+
+    #[test]
+    fn cow_borrowed_when_no_runs() {
+        // Even with default-ON, no `\n{3,}` runs means no rewrite needed.
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+        let s = "a\n\nb"; // already single-blank
+        let out = maybe_normalize_prompt(s);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), "a\n\nb");
     }
 }

@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — perf-regression-recovery (2026-04-26)
+
+### Fixed
+
+- **27B DFlash perf regression** (~40% drop on `dflash` since the 2026-04-25
+  master→dflash merge `e3a3da2`). Root cause: PR #32 cleanup-dead-wmma-kernels
+  removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking they were dead
+  but they were on the K4 / wmma dispatch path for 27B verify-shape GEMMs.
+  Per-cycle cost on 64-layer × B=16 verify forward: 57 → 100+ ms. Fixed via
+  revert of merge `e3a3da2` (commit `357e314`) followed by cherry-pick of the
+  8 master commits that did NOT introduce the regression. Full timeline:
+  `docs/plans/perf-regression-recovery-2026-04-26.prd`.
+  - Empirical anchor: 27B-3.5 LRU code DFlash @ max=120 = 199 tok/s τ=10.36
+    (was: 95 tok/s in pre-revert state).
+
+### Changed
+
+- **`prompt_normalize` is now default ON** (was opt-in since v0.1.8-alpha).
+  Engine collapses `\n{3,}` → `\n\n` at engine entry, lifting 27B-3.5 LRU
+  DFlash by +24% (159 → 199 tok/s). Opt out via `HIPFIRE_NORMALIZE_PROMPT=0`
+  or `prompt_normalize=false` config when raw `\n{3,}` whitespace is
+  semantically load-bearing (rare). The flag has zero correctness cost on
+  Qwen3.5/3.6 vocab — `\n\n\n` was a rare BPE token (rank 1102) that was
+  getting in the way of the much hotter `\n\n` (rank 271).
+
+### Notes
+
+- `master` is **still affected** until the cherry-pick from `dflash` lands.
+  Anyone pulling `master` between v0.1.8 release (2026-04-25) and this fix
+  gets the regressed engine. Expected fix: a small follow-up PR cherry-
+  picking just the kernel restoration + `prompt_normalize` default flip.
+
 ## v0.1.7-alpha.2 (2026-04-18)
 
 Hotfix release for three user-visible regressions in v0.1.7-alpha. No

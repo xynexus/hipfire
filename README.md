@@ -39,11 +39,14 @@ WMMA-bound on the MQ4 fused projections.
 DFlash speedup is **genre-conditional**: huge on code (target distribution
 matches the draft's training), modest-to-tie on instruct, can be a net
 loss on long-form prose where the draft can't keep up with target's
-high-entropy continuations. With Phase 1 prompt-shape normalization
-(`HIPFIRE_NORMALIZE_PROMPT=1`, opt-in), the code-genre lift on PEP-8
-inputs is **+26.7%** over un-normalized DFlash.
+high-entropy continuations. Phase 1 prompt-shape normalization
+(`HIPFIRE_NORMALIZE_PROMPT`, **default ON since 2026-04-26**) lifts the
+code-genre numbers **+24%** over the opt-out path. Reverting to opt-out
+or running with `prompt_normalize=false` will undercut the table below
+by ~20% on PEP-8 prompts.
 
-5-run medians, asym3 KV, `--no-chatml`, max=120, Phase 1 normalize on:
+5-run medians, asym3 KV, `--no-chatml`, max=120, default flags
+(prompt_normalize=true):
 
 | Model | genre | AR tok/s | DFlash tok/s | speedup | τ |
 |---|---|---:|---:|---:|---:|
@@ -260,7 +263,7 @@ driven; values persist in `~/.hipfire/config.json`.
 
   dflash_mode      auto           (default)  auto on off
   dflash_adaptive_b true          (default)  true false
-  prompt_normalize false          (default)  true false  ← v0.1.8: collapse \n{3,} → \n\n for +26.7% on PEP-8 code prompts
+  prompt_normalize true           (default)  true false  ← collapse \n{3,} → \n\n at engine entry (+24% on PEP-8 code; default ON since 2026-04-26)
   cask_sidecar     ""             (default)  path or empty
   per-model configs  no overrides   → enter to open model picker
 ```
@@ -274,7 +277,7 @@ Environment variables (override config for one invocation):
 ```
 HIPFIRE_KV_MODE=asym3|q8|asym4|asym2
 HIPFIRE_ATTN_FLASH=auto|always|never
-HIPFIRE_NORMALIZE_PROMPT=1          # v0.1.8: collapse \n{3,} → \n\n at engine entry
+HIPFIRE_NORMALIZE_PROMPT=0          # opt out of default \n{3,} → \n\n collapse (default ON since 2026-04-26)
 HIPFIRE_PROMPT_TOKEN_HEAT=1         # v0.1.8: dump per-position BPE merge-rank heat map
 HIPFIRE_PROMPT_HEAT_JSON=1          #   (machine-readable JSON to stdout)
 HIPFIRE_LOCAL=1                     # force run to spawn its own daemon (skip serve HTTP)

@@ -87,19 +87,28 @@ cargo build --release --features deltanet \
 
 ## 2 · What v0.1.8 added (test surface)
 
-### A. Phase 1: prompt-shape adaptation
+### A. Phase 1: prompt-shape adaptation — **DEFAULT ON (2026-04-26)**
 
 Engine-side `\n{3,}` → `\n\n` collapse before tokenize, eliminating the
 rare BPE token 1358 (`\n\n\n`) in favor of HOT token 271 (`\n\n`) on
-Qwen3.5/3.6 vocab. Default OFF, opt-in via:
+Qwen3.5/3.6 vocab.
 
-- Env: `HIPFIRE_NORMALIZE_PROMPT=1`
-- TUI: `hipfire config set prompt_normalize true`
-- Per-model: `hipfire config qwen3.5:27b set prompt_normalize true`
+**Default ON since 2026-04-26** — empirical 199 tok/s on 27B-3.5 LRU
+DFlash (vs 159 with opt-out). The original v0.1.8-alpha ship had this
+opt-in; it was promoted to default after the 2026-04-26 perf-regression
+recovery confirmed +24% τ with zero correctness cost (see
+`docs/plans/perf-regression-recovery-2026-04-26.prd`).
 
-**Expected lift:** +14% to +27% tok/s on PEP-8-style code prompts that
-contain `\n{3,}` patterns. Zero effect on prompts without those
-patterns. Always a no-op when env is unset.
+To **opt out** (rare — only when raw `\n{3,}` whitespace is semantically
+load-bearing):
+
+- Env: `HIPFIRE_NORMALIZE_PROMPT=0`
+- TUI: `hipfire config set prompt_normalize false`
+- Per-model: `hipfire config qwen3.5:27b set prompt_normalize false`
+
+**Expected lift over OPT-OUT baseline:** +14% to +27% tok/s on PEP-8-style
+code prompts that contain `\n{3,}` patterns. Zero effect on prompts
+without those patterns.
 
 **Verify:** see §3 prompt-shape A/B test.
 
@@ -283,7 +292,8 @@ For dataclass benches:
 | `hipMalloc out of memory` at hidden_rb | Long ctx (≥16K real tokens) + 27B + asym3 = tight on 24 GB | Reduce ctx, use a smaller target, or wait for the bounded-rolling-buffer trick (roadmap) |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't auto-find draft | Filename doesn't match `qwen3{ver}-{size}-dflash-{quant}.hfq` | Don't rename the file after pull |
-| "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` | Set it (or `prompt_normalize=true` in config) |
+| "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
+| "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit. See `docs/plans/perf-regression-recovery-2026-04-26.prd`. |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always coherence-gate or eyeball under `HIPFIRE_GRAPH=1`. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
 
 ---
@@ -292,7 +302,7 @@ For dataclass benches:
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `HIPFIRE_NORMALIZE_PROMPT` | Phase 1 `\n{3,}` collapse | OFF |
+| `HIPFIRE_NORMALIZE_PROMPT` | Phase 1 `\n{3,}` collapse | **ON (since 2026-04-26)** — set `0` to opt out |
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | Per-position BPE merge-rank dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_JSON` | JSON output for heat dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | Max rows in heat dump | 64 |

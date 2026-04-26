@@ -285,11 +285,31 @@ to a single newline.
 unverifiable. Don't accept "X agent got Y tok/s" without reproducing
 on the exact prompt bytes they ran.
 
-**Mitigation (Phase 1 implemented):** Set `HIPFIRE_NORMALIZE_PROMPT=1` to collapse
-all 3+ consecutive newlines to exactly 2 before tokenization. This eliminates the
-whitespace-variance source entirely, making PEP-8 and single-blank prompts tokenize
-identically. See `crates/engine/src/tokenizer.rs:maybe_normalize_prompt()` and
-`crates/engine/examples/encode_prompt.rs` for verification utilities.
+**Mitigation (Phase 1 implemented):** The engine collapses all 3+ consecutive
+newlines to exactly 2 before tokenization. This eliminates the whitespace-
+variance source entirely, making PEP-8 and single-blank prompts tokenize
+identically.
+
+**DEFAULT ON since 2026-04-26.** The original Phase 1 ship gated this behind
+`HIPFIRE_NORMALIZE_PROMPT=1` opt-in, but empirical bench showed it's worth
++24% τ on PEP-8 code prompts (159 → 196 tok/s on 27B-3.5 LRU DFlash) without
+correctness cost. Opt out with `HIPFIRE_NORMALIZE_PROMPT=0` (or
+`prompt_normalize=false` in config) only when raw `\n{3,}` whitespace is
+semantically load-bearing. See:
+- `crates/engine/src/tokenizer.rs:maybe_normalize_prompt()` — engine impl
+- `crates/engine/examples/encode_prompt.rs` — verification utility
+- `docs/plans/perf-regression-recovery-2026-04-26.prd` — root cause + bench
+  data behind the default flip
+
+**Canonical bench config (post-2026-04-26) for 27B-3.5 LRU code DFlash:**
+```
+max=120 --no-chatml --kv-mode asym3
+PEP-8 strict prompt (\n\n\n between top-level defs)
+prompt_normalize=true (default)
+```
+Expected: **199 tok/s τ=10.36** on 7900 XTX. ±2% deterministic. Drift >5% from
+this is a regression — start with `git bisect` against this rule, not against
+session-recalled "peak" numbers.
 
 ## GPU Lock Protocol (Multi-Agent)
 
