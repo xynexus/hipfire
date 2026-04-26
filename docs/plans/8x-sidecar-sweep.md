@@ -4,6 +4,14 @@ Status: **DEFERRED** (2026-04-19). Superseded by domain-trained DFlash draft
 training. Resurrect when draft training is de-risked and we want to refresh
 all sidecars with recipe-matched calibration.
 
+**Scope clarification (2026-04-25):** This doc is sidecar calibration
+*only* (producing `.triattn.bin`). For DFlash **draft model training**
+(producing `.hfq` weights) and its corpus discussion — including
+`Jackrong/Qwen3.5-reasoning-700x` and the broader prompt mix — see
+`docs/plans/task-93-path-c-trained-draft.prd`. Both flows feed off
+`scripts/fetch_calibration_corpus.sh` recipes but produce different
+artifacts.
+
 ## Context
 
 Today we proved two things from single-GPU tests on the current MI300X:

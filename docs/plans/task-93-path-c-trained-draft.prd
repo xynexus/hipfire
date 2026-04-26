@@ -4,6 +4,16 @@
 **Source:** `../dflash-fe/RECIPE_RedHat_DFlash_MI300X.md` (recipe doc).
 **Companion:** `docs/plans/task-93-path-d-stale-context.prd` (different lever, can ship in parallel).
 
+**Scope clarification (2026-04-25):** This PRD is about **DFlash draft model
+training** — the corpus discussed below is the *training input* (prompt
+side of `(prompt, response)` pairs that the draft learns from). It is
+distinct from the **sidecar calibration corpora** discussed in
+`docs/plans/sidecar-training-strategy.md` and
+`docs/plans/8x-sidecar-sweep.md`. They reuse some datasets (via
+`scripts/fetch_calibration_corpus.sh`) but the artifact produced is
+different (draft `.hfq` weights vs `.triattn.bin` sidecar centers).
+When in doubt: **draft training = this PRD; sidecar cal = sidecar-*.md**.
+
 ---
 
 ## Why this exists
@@ -64,6 +74,35 @@ For each conversation in input corpus:
 1. Take user/system messages.
 2. Run target model (Qwen3.5 9B/27B) to generate assistant response.
 3. Write `{messages: [...]}` JSONL with target-generated response.
+
+#### Input prompt corpus mix (the "qwen reasoning, not just hermes" piece)
+
+For target regeneration, pull prompts from a **broad** mix — not hermes
+alone. Reasoning-heavy data is required so the resulting draft doesn't
+degenerate when the target enters `<think>` mode (a known failure
+pattern of hermes-only-trained drafts on Qwen3.5/3.6 reasoning prompts).
+
+| Dataset | Source | Why include |
+|---|---|---|
+| `lambda/hermes-agent-reasoning-traces` | `fetch_calibration_corpus.sh src_hermes` | Tool-calling baseline (kimi + glm-5.1 traces) |
+| **`Jackrong/Qwen3.5-reasoning-700x`** | `src_qwen_reason` | **Qwen-distilled reasoning — primary lever for thinking-mode coverage** |
+| `nohurry/Opus-4.6-Reasoning-3000x-filtered` | `src_opus_reason` | Long-CoT reasoning, structurally diverse |
+| `Roman1111111/claude-opus-4.6-10000x` | `src_claude_opus` | Opus diversity / problem-solving |
+| `nvidia/Nemotron-Agentic-v1` | `src_nemotron_agentic` | 335k rows, large-scale agentic |
+| `xlam` + `tool_calls_mt` + `hermes_filtered` | `src_*` | Multi-turn tool-call diversity |
+
+Practical recipes (build with `scripts/fetch_calibration_corpus.sh`):
+- **General-purpose drafts (9B / 27B / 3.6:27b)**: `--recipe blended` (hermes
+  + qwen_reason + opus_reason + claude_opus + prompts_chat). Covers tool-
+  calling AND reasoning AND chat.
+- **Agentic drafts (A3B targets, carnice)**: `--recipe agentic_xl` (hermes +
+  nemotron + xlam + hermes_filtered + tool_calls_mt) for tool-call
+  density. Add `qwen_reason` separately if A3B is also used in
+  thinking mode.
+
+**The corpus output of `fetch_calibration_corpus.sh` is reused as
+prompt input here**, but in this PRD we then run the regeneration
+step on top — for sidecar cal it's used as-is.
 
 Implementations:
 - (a) Local: use `crates/engine/examples/run.rs --max-seq 8192` + Python wrapper.
