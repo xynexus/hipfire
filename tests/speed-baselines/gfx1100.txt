@@ -1,6 +1,7 @@
 # hipfire speed-gate baseline — gfx1100
-# Captured 2026-04-12 against commit c825dfa
-# Config: KV=givens4, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)
+# Captured 2026-04-12 against commit c825dfa (AR rows)
+#         2026-04-26 (DFlash row, post-perf-regression-recovery)
+# Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)
 # Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))
 #
 # Measurements: best-of-2 via bench_qwen35_mq4. Two prefill sizes per model:
@@ -24,4 +25,12 @@
 27b_mq4_pp32_prefill_tok_s=406.1
 27b_mq4_gen_tok_s=46.5
 27b_mq4_pp128_prefill_tok_s=491.1
+
+# DFlash canonical gate — 27B-3.5 LRU PEP-8 strict code @ max=120.
+# Added 2026-04-26 after PR #32 dead-wmma-kernels regressed DFlash by 40%
+# while passing the AR-only gate. AR + DFlash both gate now.
+# Best-of-3 dflash_spec_demo runs, default flags (prompt_normalize=true,
+# DPM warmup 10s). See docs/plans/perf-regression-recovery-2026-04-26.prd.
+27b_3.5_dflash_lru_code_tok_s=199.0
+27b_3.5_dflash_lru_code_tau=10.36
 

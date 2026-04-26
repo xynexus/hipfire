@@ -69,3 +69,4 @@ findings/
 # Cached external research pages (re-fetchable, large, not source)
 .research-cache/
 research/
+.hipfire_kernels.prerebsave/
