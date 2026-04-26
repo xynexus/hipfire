@@ -114,8 +114,16 @@ mkdir -p "$LOG_DIR"
 
 # Launch one background job per model, each pinned to GPU (index % N_GPUS).
 # GNU Parallel would be nicer but keeping it dependency-free.
-declare -A PID_TO_MODEL
-declare -a RUNNING_PIDS
+# Explicit `=()` initializers — `set -u` rejects expansion of declared-
+# but-uninitialized arrays under bash 4.x (unbound variable on
+# `${arr[@]}` / `${#arr[@]}`). Bash 5+ usually tolerates it but the
+# explicit form is portable and the bug is silent: the launch loop
+# never runs, the wait loop never runs, FAILED stays empty, and the
+# script reports "all N calibrations finished ok" while having
+# launched zero jobs.
+declare -A PID_TO_MODEL=()
+declare -a RUNNING_PIDS=()
+declare -a FAILED=()
 
 launch() {
     local idx=$1
@@ -150,8 +158,7 @@ while [ $pending_idx -lt $N_MODELS ] && [ ${#RUNNING_PIDS[@]} -lt $N_GPUS ]; do
     pending_idx=$((pending_idx + 1))
 done
 
-# Drain + refill as jobs complete.
-FAILED=()
+# Drain + refill as jobs complete. (FAILED already initialized above.)
 while [ ${#RUNNING_PIDS[@]} -gt 0 ]; do
     # wait -n returns as soon as ANY background job finishes.
     if ! wait -n; then
