@@ -9,34 +9,6 @@ use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-// ─── LA bisection trace (debug) ─────────────────────────────────────────
-//
-// HIPFIRE_LA_TRACE=1 turns on FNV-1a-64 hash prints of layer-0 row-0 of
-// each intermediate buffer in both the batched and per-token LA preamble.
-// Used to locate the first diverging kernel in batched-prefill debugging.
-// Zero cost when unset (short-circuited at the top of each insertion site).
-
-fn la_trace_enabled() -> bool {
-    std::env::var("HIPFIRE_LA_TRACE").ok().as_deref() == Some("1")
-}
-
-fn fnv1a_u64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-/// Hash `len_bytes` starting at `offset_bytes` of the device tensor `t`.
-/// Panics on device-copy failure (debug trace — we want it loud).
-fn la_hash_gpu_range(gpu: &Gpu, t: &GpuTensor, offset_bytes: usize, len_bytes: usize) -> u64 {
-    let mut buf = vec![0u8; len_bytes];
-    gpu.hip.memcpy_dtoh_at(&mut buf, &t.buf, offset_bytes).unwrap();
-    fnv1a_u64(&buf)
-}
-
 // ─── Config ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2077,69 +2049,51 @@ impl Qwen35Scratch {
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
 
-        // NOTE: all persistent scratch buffers are allocated with `gpu.zeros()`
-        // rather than `gpu.alloc_tensor()`. The pool gives us dirty VRAM
-        // (hipMalloc does not zero, and freed buffers aren't scrubbed on
-        // return to the free-list). If any kernel in the forward pass reads
-        // a scratch cell before writing it — even transiently, e.g. a tail
-        // element outside the "used" range of a ragged reduction — the dirty
-        // bytes bleed into the logits and cause per-daemon nondeterminism
-        // (different dirty pattern per process → different argmax at temp=0).
-        // Zero-init adds a one-shot memset at model load, not per-token.
         Ok(Self {
-            x: gpu.zeros(&[dim], DType::F32)?,
-            tmp: gpu.zeros(&[dim], DType::F32)?,
+            x: gpu.alloc_tensor(&[dim], DType::F32)?,
+            tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,
 
-            dn_qkv: gpu.zeros(&[qkv_dim], DType::F32)?,
-            dn_z: gpu.zeros(&[v_dim], DType::F32)?,
-            dn_alpha: gpu.zeros(&[config.linear_num_value_heads], DType::F32)?,
-            dn_beta: gpu.zeros(&[config.linear_num_value_heads], DType::F32)?,
-            dn_conv_out: gpu.zeros(&[qkv_dim], DType::F32)?,
-            dn_q: gpu.zeros(&[v_dim], DType::F32)?,
-            dn_k: gpu.zeros(&[v_dim], DType::F32)?,
-            dn_v: gpu.zeros(&[v_dim], DType::F32)?,
-            dn_q_raw: gpu.zeros(&[k_dim], DType::F32)?,
-            dn_k_raw: gpu.zeros(&[k_dim], DType::F32)?,
-            dn_attn_out: gpu.zeros(&[v_dim], DType::F32)?,
-            dn_normed: gpu.zeros(&[v_dim], DType::F32)?,
+            dn_qkv: gpu.alloc_tensor(&[qkv_dim], DType::F32)?,
+            dn_z: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_alpha: gpu.alloc_tensor(&[config.linear_num_value_heads], DType::F32)?,
+            dn_beta: gpu.alloc_tensor(&[config.linear_num_value_heads], DType::F32)?,
+            dn_conv_out: gpu.alloc_tensor(&[qkv_dim], DType::F32)?,
+            dn_q: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_k: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_v: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_q_raw: gpu.alloc_tensor(&[k_dim], DType::F32)?,
+            dn_k_raw: gpu.alloc_tensor(&[k_dim], DType::F32)?,
+            dn_attn_out: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_normed: gpu.alloc_tensor(&[v_dim], DType::F32)?,
 
-            fa_q_full: gpu.zeros(&[q_dim * 2], DType::F32)?,
-            fa_q: gpu.zeros(&[q_dim], DType::F32)?,
-            fa_gate: gpu.zeros(&[q_dim], DType::F32)?,
-            fa_k: gpu.zeros(&[kv_dim], DType::F32)?,
-            fa_v: gpu.zeros(&[kv_dim], DType::F32)?,
-            fa_attn_out: gpu.zeros(&[q_dim], DType::F32)?,
+            fa_q_full: gpu.alloc_tensor(&[q_dim * 2], DType::F32)?,
+            fa_q: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            fa_gate: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            fa_k: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            fa_v: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            fa_attn_out: gpu.alloc_tensor(&[q_dim], DType::F32)?,
 
-            o: gpu.zeros(&[dim], DType::F32)?,
-            gate_ffn: gpu.zeros(&[config.hidden_dim], DType::F32)?,
-            up: gpu.zeros(&[config.hidden_dim], DType::F32)?,
-            ffn_hidden: gpu.zeros(&[config.hidden_dim], DType::F32)?,
-            ffn_out: gpu.zeros(&[dim], DType::F32)?,
+            o: gpu.alloc_tensor(&[dim], DType::F32)?,
+            gate_ffn: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
+            up: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
+            ffn_hidden: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
+            ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
 
-            logits: gpu.zeros(&[config.vocab_size], DType::F32)?,
-            sample_buf: gpu.zeros(&[2], DType::F32)?,
-            repeat_buf: gpu.zeros(&[repeat_window], DType::F32)?,
-            x_rot: gpu.zeros(&[dim.max(config.hidden_dim)], DType::F32)?,
+            logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
+            sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
+            repeat_buf: gpu.alloc_tensor(&[repeat_window], DType::F32)?,
+            x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
 
             // Flash attention partials: enough for max_seq with tile_size=128.
             // n_heads * max_tiles * (2 + head_dim) floats.
-            // MUST be zero-initialized: the tile→reduce flash path only writes
-            // the tiles actually covered by the current (pos, kv_len), but the
-            // reduce kernel reads every tile slot for the head; any dirty
-            // tail bleeds into the softmax.
             flash_partials: {
                 let tile_size = 128usize;
                 let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-                // MUST match MAX_BATCH in forward_prefill_batch_with_pbs. Commit
-                // 43501f7 raised MAX_BATCH 64→256 without resizing this scratch,
-                // so batched flash kernels write past the end on chunks >64
-                // tokens and corrupt adjacent pooled VRAM allocations. The
-                // corruption layout varies per daemon process (pool reuse order
-                // depends on alloc sequence), which shows up as nondeterministic
-                // greedy decode at temp=0. Keep these two in sync.
-                let batch_mult = 256usize;
-                gpu.zeros(&[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)], DType::F32)?
+                // Sized for batched flash prefill: 64 positions × per-position partials.
+                // Reused across layers (not per-call allocated). ~33MB for 9B at 32K.
+                let batch_mult = 64usize;
+                gpu.alloc_tensor(&[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)], DType::F32)?
             },
             // Flash attention tri-state for the Q8 path. Asym modes always
             // flash regardless.
@@ -2177,24 +2131,22 @@ impl Qwen35Scratch {
                 let smi = config.shared_expert_intermediate_size;
                 let max_inter = mi.max(smi);
                 let k = config.num_experts_per_tok;
-                // Zero-init to avoid per-daemon nondeterminism from dirty VRAM
-                // — see main struct init comment.
-                s.moe_router_logits = Some(gpu.zeros(&[n_exp], DType::F32)?);
-                s.moe_scalar_buf    = Some(gpu.zeros(&[1], DType::F32)?);
-                s.moe_x_rot         = Some(gpu.zeros(&[hidden], DType::F32)?);
-                s.moe_gate_up_buf   = Some(gpu.zeros(&[2 * max_inter], DType::F32)?);
-                s.moe_gate_buf      = Some(gpu.zeros(&[max_inter], DType::F32)?);
-                s.moe_up_buf        = Some(gpu.zeros(&[max_inter], DType::F32)?);
-                s.moe_ffn_hidden    = Some(gpu.zeros(&[max_inter], DType::F32)?);
-                s.moe_ffn_out       = Some(gpu.zeros(&[hidden], DType::F32)?);
-                s.moe_gate_batch    = Some(gpu.zeros(&[k * mi], DType::F32)?);
-                s.moe_up_batch      = Some(gpu.zeros(&[k * mi], DType::F32)?);
-                s.moe_rot_batch     = Some(gpu.zeros(&[k * mi], DType::F32)?);
+                s.moe_router_logits = Some(gpu.alloc_tensor(&[n_exp], DType::F32)?);
+                s.moe_scalar_buf    = Some(gpu.alloc_tensor(&[1], DType::F32)?);
+                s.moe_x_rot         = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
+                s.moe_gate_up_buf   = Some(gpu.alloc_tensor(&[2 * max_inter], DType::F32)?);
+                s.moe_gate_buf      = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
+                s.moe_up_buf        = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
+                s.moe_ffn_hidden    = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
+                s.moe_ffn_out       = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
+                s.moe_gate_batch    = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                s.moe_up_batch      = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                s.moe_rot_batch     = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
                 // i32 topk_indices stored in an F32 tensor (same byte width).
                 // The kernel that writes it casts the buffer to int*, and the
                 // indexed MoE GEMV kernels read it as int*.
-                s.moe_topk_indices  = Some(gpu.zeros(&[k], DType::F32)?);
-                s.moe_topk_weights  = Some(gpu.zeros(&[k], DType::F32)?);
+                s.moe_topk_indices  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
+                s.moe_topk_weights  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
                 // Pre-warm MQ FWHT sign tables (otherwise the lazy init in
                 // ensure_mq_signs fires during the first moe_ffn_decode and
                 // blows up hipGraph capture with a hipMalloc-in-capture
@@ -2410,74 +2362,66 @@ impl PrefillBatchScratch {
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
 
-        // Zero-initialized for the same reason as Qwen35Scratch: dirty VRAM
-        // across daemon restarts produces non-deterministic logits at temp=0
-        // whenever a prefill kernel reads a ragged tail slot before writing
-        // it. One-shot memset at model load, no per-token cost.
         Ok(Self {
             max_batch,
-            x_batch:           gpu.zeros(&[max_batch * dim], DType::F32)?,
-            x_rot_batch:       gpu.zeros(&[max_batch * dim], DType::F32)?,
-            dn_qkv_batch:      gpu.zeros(&[max_batch * qkv_dim], DType::F32)?,
-            dn_z_batch:        gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
-            dn_alpha_batch:    gpu.zeros(&[max_batch * n_v_heads], DType::F32)?,
-            dn_beta_batch:     gpu.zeros(&[max_batch * n_v_heads], DType::F32)?,
-            dn_q_raw_batch:    gpu.zeros(&[max_batch * k_dim],   DType::F32)?,
-            dn_k_raw_batch:    gpu.zeros(&[max_batch * k_dim],   DType::F32)?,
-            dn_v_batch:        gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
-            dn_q_batch:        gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
-            dn_k_batch:        gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
-            dn_attn_out_batch: gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
-            dn_normed_batch:   gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
-            gate_ffn_batch:    gpu.zeros(&[max_batch * hidden_dim], DType::F32)?,
-            up_batch:          gpu.zeros(&[max_batch * hidden_dim], DType::F32)?,
-            ffn_hidden_batch:  gpu.zeros(&[max_batch * hidden_dim], DType::F32)?,
-            dn_normed_rot_batch: gpu.zeros(&[max_batch * v_dim],   DType::F32)?,
+            x_batch:           gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
+            x_rot_batch:       gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
+            dn_qkv_batch:      gpu.alloc_tensor(&[max_batch * qkv_dim], DType::F32)?,
+            dn_z_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            dn_alpha_batch:    gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
+            dn_beta_batch:     gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
+            dn_q_raw_batch:    gpu.alloc_tensor(&[max_batch * k_dim],   DType::F32)?,
+            dn_k_raw_batch:    gpu.alloc_tensor(&[max_batch * k_dim],   DType::F32)?,
+            dn_v_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            dn_q_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            dn_k_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            dn_attn_out_batch: gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            dn_normed_batch:   gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            gate_ffn_batch:    gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            up_batch:          gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            ffn_hidden_batch:  gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            dn_normed_rot_batch: gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
             // F32 dtype = 4 bytes/element, same layout as i32. The rope /
             // attention / kv_write kernels cast the pointer to `const int*`,
             // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
-            // Determinism: master's deterministic-batched-prefill fix (84425b5)
-            // switched these from alloc_tensor → zeros. Keep the determinism
-            // fix; preserve the dflash-side `tokens` field (added for tree-mode
-            // parent_indices propagation in spec_step_ddtree_batched).
-            positions:         gpu.zeros(&[max_batch], DType::F32)?,
-            tokens:            gpu.zeros(&[max_batch], DType::F32)?,
-            fa_q_full_batch:   gpu.zeros(&[max_batch * q_dim * 2], DType::F32)?,
-            fa_q_batch:        gpu.zeros(&[max_batch * q_dim], DType::F32)?,
-            fa_gate_batch:     gpu.zeros(&[max_batch * q_dim], DType::F32)?,
-            fa_k_batch:        gpu.zeros(&[max_batch * kv_dim], DType::F32)?,
-            fa_v_batch:        gpu.zeros(&[max_batch * kv_dim], DType::F32)?,
-            fa_attn_out_batch: gpu.zeros(&[max_batch * q_dim], DType::F32)?,
-            fa_attn_out_rot_batch: gpu.zeros(&[max_batch * q_dim], DType::F32)?,
+            positions:         gpu.alloc_tensor(&[max_batch], DType::F32)?,
+            tokens:            gpu.alloc_tensor(&[max_batch], DType::F32)?,
+            fa_q_full_batch:   gpu.alloc_tensor(&[max_batch * q_dim * 2], DType::F32)?,
+            fa_q_batch:        gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
+            fa_gate_batch:     gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
+            fa_k_batch:        gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
+            fa_v_batch:        gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
+            fa_attn_out_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
+            fa_attn_out_rot_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
             moe_router_logits_batch: if config.num_experts > 0 {
-                Some(gpu.zeros(&[max_batch * config.num_experts], DType::F32)?)
+                Some(gpu.alloc_tensor(&[max_batch * config.num_experts], DType::F32)?)
             } else { None },
             moe_shared_scalar_batch: if config.num_experts > 0 {
-                Some(gpu.zeros(&[max_batch], DType::F32)?)
+                Some(gpu.alloc_tensor(&[max_batch], DType::F32)?)
             } else { None },
             moe_shared_gate_batch: if config.num_experts > 0 {
-                Some(gpu.zeros(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
+                Some(gpu.alloc_tensor(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
             } else { None },
             moe_shared_up_batch: if config.num_experts > 0 {
-                Some(gpu.zeros(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
+                Some(gpu.alloc_tensor(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
             } else { None },
             moe_shared_rot_batch: if config.num_experts > 0 {
-                Some(gpu.zeros(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
+                Some(gpu.alloc_tensor(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
             } else { None },
             moe_topk_indices_batch: if config.num_experts > 0 {
-                Some(gpu.zeros(&[max_batch * config.num_experts_per_tok], DType::F32)?)
+                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok], DType::F32)?)
             } else { None },
             moe_topk_weights_batch: if config.num_experts > 0 {
-                Some(gpu.zeros(&[max_batch * config.num_experts_per_tok], DType::F32)?)
+                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok], DType::F32)?)
             } else { None },
             moe_gate_batch: if config.num_experts > 0 {
-                Some(gpu.zeros(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
+                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
             } else { None },
             moe_up_batch: if config.num_experts > 0 {
-                Some(gpu.zeros(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
+                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
             } else { None },
             moe_rot_batch: if config.num_experts > 0 {
-                Some(gpu.zeros(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
+                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
             } else { None },
             dn_s_tape_q8: if config.linear_num_value_heads > 0 {
                 let bytes = max_batch * config.linear_num_value_heads * config.linear_value_head_dim * config.linear_value_head_dim;
@@ -2627,7 +2571,6 @@ pub fn forward_prefill_batch_single_chunk_captured(
         per_token_hidden_out.map(|t| (t, 0)),
         gdn_tape, 0, tree_verify,
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
-        None, // per_layer_x_snapshots: not used by single_chunk_captured path
     )
 }
 
@@ -2669,43 +2612,11 @@ pub fn forward_prefill_batch_with_pbs(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
-    hidden_rb: Option<&mut HiddenStateRingBuffer>,
-    per_token_hidden_out: Option<&GpuTensor>,
-    gdn_tape: Option<&mut crate::speculative::GdnTape>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
-    pbs_in: Option<&PrefillBatchScratch>,
-) -> HipResult<()> {
-    forward_prefill_batch_with_pbs_and_snapshots(
-        gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
-        hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, pbs_in, None,
-    )
-}
-
-/// Like `forward_prefill_batch_with_pbs` but with an optional per-layer
-/// x_batch snapshot slice for diagnostics. `per_layer_x_snapshots`, if
-/// provided, must have length `config.n_layers`; each tensor must hold at
-/// least `tokens.len() * config.dim` f32 rows. After every layer completes
-/// its contribution to `pbs.x_batch`, rows `[0..n*dim]` are copied into
-/// `per_layer_x_snapshots[layer_idx]` at offset `chunk_start * dim`. This
-/// is used by `examples/prefill_state_diff.rs` to locate the first layer
-/// whose output diverges between batched runs (nondeterminism) or between
-/// batched and per-token (correctness).
-#[allow(clippy::too_many_arguments)]
-pub fn forward_prefill_batch_with_pbs_and_snapshots(
-    gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    tokens: &[u32],
-    start_pos: usize,
-    kv_cache: &mut llama::KvCache,
-    dn_state: &mut DeltaNetState,
-    scratch: &Qwen35Scratch,
     mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
-    per_layer_x_snapshots: Option<&[GpuTensor]>,
 ) -> HipResult<()> {
     // Threshold below which the batching overhead isn't worth the alloc +
     // per-layer dispatch. Single-token prefill obviously should not take
@@ -2892,7 +2803,6 @@ pub fn forward_prefill_batch_with_pbs_and_snapshots(
                 kv_cache, dn_state, scratch, pbs, hidden_rb.as_deref(),
                 pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
                 false, // pre_uploaded: default path uploads inside
-                per_layer_x_snapshots,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -3097,7 +3007,6 @@ fn forward_prefill_chunk(
     tape_offset: usize,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
-    per_layer_x_snapshots: Option<&[GpuTensor]>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -3236,14 +3145,6 @@ fn forward_prefill_chunk(
                 let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
 
-                let trace = la_trace_enabled() && layer_idx == 0;
-                if trace {
-                    for r in 0..n {
-                        let h = la_hash_gpu_range(gpu, &pbs.x_batch, r * dim * 4, dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} pre_rmsnorm x_batch      : {:016x}", h);
-                    }
-                }
-
                 // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
                 // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
                 // we reuse x_rot_batch as the "normed, unrotated" output
@@ -3259,13 +3160,6 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
-                if trace {
-                    for r in 0..n {
-                        let h = la_hash_gpu_range(gpu, &pbs.x_rot_batch, r * dim * 4, dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_rmsnorm x_rot_batch : {:016x}", h);
-                    }
-                }
-
                 // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
                 if is_6bit {
                     gpu.gemm_qkvza_hfq6g256(
@@ -3276,12 +3170,6 @@ fn forward_prefill_chunk(
                         layer.wqkv.k, n,
                     )?;
                 } else {
-                    // NOTE: `gemm_qkvza_hfq4g256` (the batched 4-way kernel) diverges from
-                    // `fused_qkvza_hfq4g256` on real Qwen weights for row 0 even when inputs
-                    // are byte-identical, producing incoherent greedy output. Until the
-                    // divergence is root-caused, use `gemm_qkvza_hfq4g256_per_row`, which
-                    // runs N × fused_qkvza_hfq4g256 (same kernel as the per-token path) so
-                    // the batched path is guaranteed byte-exact with the per-token path.
                     gpu.gemm_qkvza_hfq4g256(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
@@ -3291,36 +3179,12 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
-                if trace {
-                    let qkv_m = layer.wqkv.m;
-                    let z_m = layer.wz.m;
-                    for r in 0..n {
-                        let h_q = la_hash_gpu_range(gpu, &pbs.dn_qkv_batch, r * qkv_m * 4, qkv_m * 4);
-                        let h_z = la_hash_gpu_range(gpu, &pbs.dn_z_batch, r * z_m * 4, z_m * 4);
-                        let h_b = la_hash_gpu_range(gpu, &pbs.dn_beta_batch, r * n_v_heads * 4, n_v_heads * 4);
-                        let h_a = la_hash_gpu_range(gpu, &pbs.dn_alpha_batch, r * n_v_heads * 4, n_v_heads * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_qkvza qkv           : {:016x}", h_q);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_qkvza z             : {:016x}", h_z);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_qkvza beta_raw      : {:016x}", h_b);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_qkvza alpha_raw     : {:016x}", h_a);
-                    }
-                }
-
                 // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
                 gpu.fused_sigmoid_alpha_gate_f32_batched(
                     &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
                     &layer.dt_bias, &layer.a_log,
                     n_v_heads, n,
                 )?;
-
-                if trace {
-                    for r in 0..n {
-                        let h_b = la_hash_gpu_range(gpu, &pbs.dn_beta_batch, r * n_v_heads * 4, n_v_heads * 4);
-                        let h_a = la_hash_gpu_range(gpu, &pbs.dn_alpha_batch, r * n_v_heads * 4, n_v_heads * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_sig_agate beta      : {:016x}", h_b);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_sig_agate alpha     : {:016x}", h_a);
-                    }
-                }
 
                 // DFlash tape capture: snap pre-conv1d qkv + post-sigmoid α/β
                 // for this layer into the per-layer tape slots. The next LA
@@ -3373,35 +3237,12 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
-                if trace {
-                    for r in 0..n {
-                        let h_q = la_hash_gpu_range(gpu, &pbs.dn_q_raw_batch, r * k_dim * 4, k_dim * 4);
-                        let h_k = la_hash_gpu_range(gpu, &pbs.dn_k_raw_batch, r * k_dim * 4, k_dim * 4);
-                        let h_v = la_hash_gpu_range(gpu, &pbs.dn_v_batch, r * v_dim * 4, v_dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_conv1d q_raw        : {:016x}", h_q);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_conv1d k_raw        : {:016x}", h_k);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_conv1d v            : {:016x}", h_v);
-                    }
-                    let cs = &dn_state.conv_states[delta_layer_idx];
-                    let h_cs = la_hash_gpu_range(gpu, cs, 0, cs.numel() * 4);
-                    eprintln!("[LA_TRACE][B] L0 full post_conv1d conv_states  : {:016x}", h_cs);
-                }
-
                 // Batched L2-norm(Q) + L2-norm(K) + scale(Q).
                 gpu.fused_qk_l2_norm_scale_f32_batched(
                     &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
                     config.linear_num_key_heads, hd,
                     1.0 / (hd as f32).sqrt(), config.norm_eps, n,
                 )?;
-
-                if trace {
-                    for r in 0..n {
-                        let h_q = la_hash_gpu_range(gpu, &pbs.dn_q_raw_batch, r * k_dim * 4, k_dim * 4);
-                        let h_k = la_hash_gpu_range(gpu, &pbs.dn_k_raw_batch, r * k_dim * 4, k_dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_qkl2 q_raw          : {:016x}", h_q);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_qkl2 k_raw          : {:016x}", h_k);
-                    }
-                }
 
                 // Repeat-interleave Q/K if n_key_heads < n_v_heads.
                 // 0.8B has n_key=n_value=16 so the memcpy path runs.
@@ -3419,21 +3260,9 @@ fn forward_prefill_chunk(
                     gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
                 }
 
-                if trace {
-                    let q_row_bytes = n_v_heads * hd * 4;
-                    for r in 0..n {
-                        let h_q = la_hash_gpu_range(gpu, &pbs.dn_q_batch, r * q_row_bytes, q_row_bytes);
-                        let h_k = la_hash_gpu_range(gpu, &pbs.dn_k_batch, r * q_row_bytes, q_row_bytes);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_rpt_ilv q           : {:016x}", h_q);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_rpt_ilv k           : {:016x}", h_k);
-                    }
-                }
-
                 // Gated Delta Net — tree variant reads per-token S from
                 // s_tape[parent] (or pre-block s_q8_init at root); linear
-                // variant advances dn_state.s_matrices in place. Byte-exact
-                // with decode because each call rounds S_q8 after its
-                // single-token update.
+                // variant advances dn_state.s_matrices in place.
                 if let Some(parents) = tree_parents {
                     let tape_q8 = pbs.dn_s_tape_q8.as_ref()
                         .expect("tree-aware LA requires dn_s_tape_q8 scratch (check PrefillBatchScratch::new)");
@@ -3459,32 +3288,12 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
-                if trace {
-                    for r in 0..n {
-                        let h_ao = la_hash_gpu_range(gpu, &pbs.dn_attn_out_batch, r * v_dim * 4, v_dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_gdn   attn_out      : {:016x}", h_ao);
-                    }
-                    let sm = &dn_state.s_matrices[delta_layer_idx];
-                    let ss = &dn_state.s_scales[delta_layer_idx];
-                    let h_sm = la_hash_gpu_range(gpu, sm, 0, sm.numel() * 1);
-                    let h_ss = la_hash_gpu_range(gpu, ss, 0, ss.numel() * 4);
-                    eprintln!("[LA_TRACE][B] L0 full post_gdn   s_matrices    : {:016x}", h_sm);
-                    eprintln!("[LA_TRACE][B] L0 full post_gdn   s_scales      : {:016x}", h_ss);
-                }
-
                 // Batched gated output norm.
                 gpu.gated_norm_f32_batched(
                     &pbs.dn_attn_out_batch, &pbs.dn_z_batch, &layer.norm_weight,
                     &pbs.dn_normed_batch,
                     n_v_heads, config.linear_value_head_dim, config.norm_eps, n,
                 )?;
-
-                if trace {
-                    for r in 0..n {
-                        let h = la_hash_gpu_range(gpu, &pbs.dn_normed_batch, r * v_dim * 4, v_dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_gnorm  dn_normed     : {:016x}", h);
-                    }
-                }
 
                 // Batched wo + residual.
                 //
@@ -3514,13 +3323,6 @@ fn forward_prefill_chunk(
                         &layer.wo.buf, wo_input, &pbs.x_batch,
                         layer.wo.m, layer.wo.k, n,
                     )?;
-                }
-
-                if trace {
-                    for r in 0..n {
-                        let h = la_hash_gpu_range(gpu, &pbs.x_batch, r * dim * 4, dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_wo_resid x_batch    : {:016x}", h);
-                    }
                 }
 
                 // FFN: rmsnorm (+ rotate for MQ).
@@ -3575,23 +3377,6 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
-                if trace {
-                    for r in 0..n {
-                        let h = la_hash_gpu_range(gpu, &pbs.x_rot_batch, r * dim * 4, dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_ffn_norm x_rot      : {:016x}", h);
-                    }
-                    for r in 0..n {
-                        let h_g = la_hash_gpu_range(gpu, &pbs.gate_ffn_batch, r * hidden_dim * 4, hidden_dim * 4);
-                        let h_u = la_hash_gpu_range(gpu, &pbs.up_batch,       r * hidden_dim * 4, hidden_dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_gate_up gate        : {:016x}", h_g);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_gate_up up          : {:016x}", h_u);
-                    }
-                    for r in 0..n {
-                        let h = la_hash_gpu_range(gpu, &pbs.ffn_hidden_batch, r * hidden_dim * 4, hidden_dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_silu_mul hidden     : {:016x}", h);
-                    }
-                }
-
                 // Batched w_down + residual.
                 if w_down_is_6bit {
                     gpu.gemm_hfq6g256_residual(
@@ -3603,13 +3388,6 @@ fn forward_prefill_chunk(
                         &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
                         layer.w_down.m, layer.w_down.k, n,
                     )?;
-                }
-
-                if trace {
-                    for r in 0..n {
-                        let h = la_hash_gpu_range(gpu, &pbs.x_batch, r * dim * 4, dim * 4);
-                        eprintln!("[LA_TRACE][B] L0 r{r} post_wdown_resid x       : {:016x}", h);
-                    }
                 }
 
                 // Post-layer hidden extract for the DFlash draft path.
@@ -4011,12 +3789,6 @@ fn forward_prefill_chunk(
                         layer.wqkv.k, n,
                     )?;
                 } else {
-                    // NOTE: `gemm_qkvza_hfq4g256` (the batched 4-way kernel) diverges from
-                    // `fused_qkvza_hfq4g256` on real Qwen weights for row 0 even when inputs
-                    // are byte-identical, producing incoherent greedy output. Until the
-                    // divergence is root-caused, use `gemm_qkvza_hfq4g256_per_row`, which
-                    // runs N × fused_qkvza_hfq4g256 (same kernel as the per-token path) so
-                    // the batched path is guaranteed byte-exact with the per-token path.
                     gpu.gemm_qkvza_hfq4g256(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
@@ -4361,26 +4133,6 @@ fn forward_prefill_chunk(
 
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
-
-        // Diagnostics: snapshot `pbs.x_batch` at the end of this layer.
-        // Used by `prefill_state_diff.rs` to bisect the first layer whose
-        // output diverges between two batched runs (nondeterminism) or
-        // between batched and per-token (correctness). No effect when
-        // caller passes `None`.
-        if let Some(snaps) = per_layer_x_snapshots {
-            debug_assert!(
-                snaps.len() == config.n_layers,
-                "per_layer_x_snapshots must have length n_layers ({}) but got {}",
-                config.n_layers, snaps.len(),
-            );
-            let n_bytes = n * dim_row_bytes;
-            let dst_offset = tape_offset * dim_row_bytes;
-            gpu.hip.memcpy_dtod_at(
-                &snaps[layer_idx].buf, dst_offset,
-                &pbs.x_batch.buf, 0,
-                n_bytes,
-            )?;
-        }
     }
 
     // ── 3. Final output norm + logits ───────────────────────────────────
@@ -4647,11 +4399,6 @@ fn forward_scratch_layers(
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                let trace = la_trace_enabled() && layer_idx == 0;
-                if trace {
-                    let h = la_hash_gpu_range(gpu, &s.x, 0, dim * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} pre_rmsnorm x             : {:016x}", h);
-                }
                 // Fused RMSNorm + FWHT rotation (Phase 3.6). For MQ4 weights this
                 // writes rmsnorm(x) followed by FWHT into s.x_rot in a single
                 // kernel launch. For non-MQ weights it falls back to plain rmsnorm
@@ -4659,11 +4406,6 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                if trace {
-                    let xref = match x_rot { Some(xr) => xr, None => &s.tmp };
-                    let h = la_hash_gpu_range(gpu, xref, 0, dim * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_rmsnorm x_rot        : {:016x}", h);
-                }
                 // Cross-arch fast path: one fused 4-way projection kernel
                 // (wqkv + wz + w_beta + w_alpha) in a single launch. Works
                 // for BOTH MQ4 (weights FWHT-rotated, input x_rot FWHT-rotated)
@@ -4698,31 +4440,12 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 }
-                if trace {
-                    let qkv_m = layer.wqkv.m;
-                    let z_m = layer.wz.m;
-                    let h_q = la_hash_gpu_range(gpu, &s.dn_qkv, 0, qkv_m * 4);
-                    let h_z = la_hash_gpu_range(gpu, &s.dn_z, 0, z_m * 4);
-                    let h_b = la_hash_gpu_range(gpu, &s.dn_beta, 0, n_v_heads * 4);
-                    let h_a = la_hash_gpu_range(gpu, &s.dn_alpha, 0, n_v_heads * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_qkvza qkv           : {:016x}", h_q);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_qkvza z             : {:016x}", h_z);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_qkvza beta_raw      : {:016x}", h_b);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_qkvza alpha_raw     : {:016x}", h_a);
-                }
                 // Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are
                 // elementwise scalar transforms on independent buffers of size
                 // n_v_heads — merging into one launch shaves one dispatch per LA.
                 gpu.fused_sigmoid_alpha_gate_f32(
                     &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
                 )?;
-
-                if trace {
-                    let h_b = la_hash_gpu_range(gpu, &s.dn_beta, 0, n_v_heads * 4);
-                    let h_a = la_hash_gpu_range(gpu, &s.dn_alpha, 0, n_v_heads * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_sig_agate beta      : {:016x}", h_b);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_sig_agate alpha     : {:016x}", h_a);
-                }
 
                 // Fused conv1d+SiLU+split: writes directly to q_raw/k_raw/v,
                 // eliminating the 3 DtoD copies that used to follow a
@@ -4733,18 +4456,6 @@ fn forward_scratch_layers(
                     &dn_state.conv_states[delta_layer_idx],
                     k_dim, v_dim,
                 )?;
-
-                if trace {
-                    let h_q = la_hash_gpu_range(gpu, &s.dn_q_raw, 0, k_dim * 4);
-                    let h_k = la_hash_gpu_range(gpu, &s.dn_k_raw, 0, k_dim * 4);
-                    let h_v = la_hash_gpu_range(gpu, &s.dn_v, 0, v_dim * 4);
-                    let cs = &dn_state.conv_states[delta_layer_idx];
-                    let h_cs = la_hash_gpu_range(gpu, cs, 0, cs.numel() * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_conv1d q_raw        : {:016x}", h_q);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_conv1d k_raw        : {:016x}", h_k);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_conv1d v            : {:016x}", h_v);
-                    eprintln!("[LA_TRACE][P] L0 full post_conv1d conv_states  : {:016x}", h_cs);
-                }
 
                 // Fused: l2_norm(q_raw) + l2_norm(k_raw) + scale(q_raw).
                 // Three launches collapsed to one — saves ~2 dispatches per
@@ -4757,13 +4468,6 @@ fn forward_scratch_layers(
                     1.0 / (hd as f32).sqrt(),
                     config.norm_eps,
                 )?;
-
-                if trace {
-                    let h_q = la_hash_gpu_range(gpu, &s.dn_q_raw, 0, k_dim * 4);
-                    let h_k = la_hash_gpu_range(gpu, &s.dn_k_raw, 0, k_dim * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_qkl2 q_raw          : {:016x}", h_q);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_qkl2 k_raw          : {:016x}", h_k);
-                }
 
                 // Repeat-interleave Q/K if needed.
                 // Phase 3a-A fix: replace per-head memcpy loop with one fused kernel.
@@ -4778,14 +4482,6 @@ fn forward_scratch_layers(
                 } else {
                     gpu.hip.memcpy_dtod(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
                     gpu.hip.memcpy_dtod(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
-                }
-
-                if trace {
-                    let q_bytes = n_v_heads * hd * 4;
-                    let h_q = la_hash_gpu_range(gpu, &s.dn_q, 0, q_bytes);
-                    let h_k = la_hash_gpu_range(gpu, &s.dn_k, 0, q_bytes);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_rpt_ilv q           : {:016x}", h_q);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_rpt_ilv k           : {:016x}", h_k);
                 }
 
                 match dn_state.quant {
@@ -4808,29 +4504,10 @@ fn forward_scratch_layers(
                     )?,
                 }
 
-                if trace {
-                    let h_ao = la_hash_gpu_range(gpu, &s.dn_attn_out, 0, v_dim * 4);
-                    let sm = &dn_state.s_matrices[delta_layer_idx];
-                    let ss = &dn_state.s_scales[delta_layer_idx];
-                    let h_sm = la_hash_gpu_range(gpu, sm, 0, sm.numel() * 1);
-                    let h_ss = la_hash_gpu_range(gpu, ss, 0, ss.numel() * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_gdn   attn_out      : {:016x}", h_ao);
-                    eprintln!("[LA_TRACE][P] L0 full post_gdn   s_matrices    : {:016x}", h_sm);
-                    eprintln!("[LA_TRACE][P] L0 full post_gdn   s_scales      : {:016x}", h_ss);
-                }
-
                 gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
                     n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
-                if trace {
-                    let h = la_hash_gpu_range(gpu, &s.dn_normed, 0, v_dim * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_gnorm  dn_normed     : {:016x}", h);
-                }
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.dn_normed
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
-                if trace {
-                    let h = la_hash_gpu_range(gpu, &s.x, 0, dim * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_wo_resid x           : {:016x}", h);
-                }
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
@@ -4857,23 +4534,12 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                     weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 }
-                if trace {
-                    let h_g = la_hash_gpu_range(gpu, &s.gate_ffn, 0, config.hidden_dim * 4);
-                    let h_u = la_hash_gpu_range(gpu, &s.up, 0, config.hidden_dim * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_gate_up gate        : {:016x}", h_g);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_gate_up up          : {:016x}", h_u);
-                }
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
                 weight_gemv_swiglu_residual(
                     gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
                 )?;
-
-                if trace {
-                    let h = la_hash_gpu_range(gpu, &s.x, 0, dim * 4);
-                    eprintln!("[LA_TRACE][P] L0 p{pos} post_wdown_resid x       : {:016x}", h);
-                }
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -4934,7 +4600,6 @@ fn forward_scratch_layers(
                     gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-
                 gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
                 if kv_cache.compact_offset > 0 {

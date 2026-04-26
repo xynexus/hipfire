@@ -24,17 +24,13 @@
 // row-major. For decode, `n_tokens = 1` gives byte-identical behaviour
 // to the pre-batching version (the loop runs once).
 
-// __restrict__ stripped: hipcc/clang (ROCm 7.2) miscompile on gfx1100 —
-// leaving restrict on the state ring buffer pointer produces
-// nondeterministic output across fresh processes in batched prefill
-// (diagnosed via prefill_state_diff harness after DN strip).
 extern "C" __global__ void conv1d_silu_split_f32(
-    float* q_out,
-    float* k_out,
-    float* v_out,
-    const float* input,
-    const float* weight,
-    float* state,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ state,
     int k_dim,
     int v_dim,
     int n_tokens

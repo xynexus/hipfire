@@ -18,22 +18,15 @@
 
 #define BATCH_TILE 8
 
-// NOTE: __restrict__ removed from all pointers — when batch N>1, the same
-// hipcc/clang miscompile on gfx1100 (ROCm 7.2) that hit rope_partial_interleaved.hip
-// produces non-deterministic KV-cache writes here. Confirmed by
-// crates/engine/examples/prefill_state_diff.rs: with __restrict__, every FA
-// layer's K AND V caches diverge between batched and per-token prefill AND
-// across fresh daemon processes. Stripping restores correct determinism.
-// Batch-1 path is unaffected so the per-token fallback was always fine.
 __launch_bounds__(32, 8)
 extern "C" __global__ void gemm_qkv_hfq4g256(
-    const char*  A_q,
-    const char*  A_k,
-    const char*  A_v,
-    const float* X,     // [N × K]
-    float*       Y_q,   // [N × q_m]
-    float*       Y_k,   // [N × k_m]
-    float*       Y_v,   // [N × v_m]
+    const char*  __restrict__ A_q,
+    const char*  __restrict__ A_k,
+    const char*  __restrict__ A_v,
+    const float* __restrict__ X,     // [N × K]
+    float*       __restrict__ Y_q,   // [N × q_m]
+    float*       __restrict__ Y_k,   // [N × k_m]
+    float*       __restrict__ Y_v,   // [N × v_m]
     int q_m, int k_m, int v_m,
     int K, int N
 ) {

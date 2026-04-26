@@ -1590,23 +1590,10 @@ impl Gpu {
         result
     }
 
-    /// Batched `fused_rmsnorm_rotate_mq`. Processes N tokens' [N × K] x into
-    /// [N × K] x_rot. Implemented as N single-row launches rather than one
-    /// multi-block launch: on ROCm 7.2 / gfx1100, the
-    /// `multi-block grid + large dynamic LDS + __launch_bounds__(256, 1)`
-    /// combination triggers a compiler/scheduler pathology that
-    /// *non-deterministically* produces blobs where only block 0 of the grid
-    /// actually executes — rows 1..N-1 of x_rot silently get zeros.
-    ///
-    /// Reproduced by repeatedly `rm`-ing the cached hsaco and recompiling:
-    /// identical source yields md5-different blobs, some correct and some
-    /// broken (rows 1..N-1 all zero). Compiler is not deterministic here, so
-    /// we can't rely on a "good" compile sticking.
-    ///
-    /// Single-row launches (grid = [1, 1, 1]) are always safe since they
-    /// never trigger the multi-block pathology. The per-launch overhead on
-    /// typical prefill sizes (N ≤ 16) is negligible vs the bandwidth of the
-    /// kernel itself.
+    /// Batched `fused_rmsnorm_rotate_mq`. Grid.x is the batch dim — processes
+    /// N tokens' [N × K] x into [N × K] x_rot in a single launch. Byte-exact
+    /// against calling `fused_rmsnorm_rotate_mq` N times on separate x/x_rot
+    /// buffers. Weight/signs are shared across the batch.
     pub fn fused_rmsnorm_rotate_mq_batched(
         &mut self,
         x: &GpuTensor,
@@ -1625,60 +1612,43 @@ impl Gpu {
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
+        let mut xp = x.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+        ];
         let block_size = 256u32;
         let shared_mem = ((k + 256) * 4) as u32;
-        let bytes_per_row = k * 4 * 3 + 2 * 256 * 4;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            "fused_rmsnorm_mq_rotate_batched",
-            bytes_per_row * batch_size,
+        let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_rmsnorm_mq_rotate_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_rmsnorm_mq_rotate",
+            [batch_size as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(wp);
+                b.push_ptr(s1); b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_i32(kv); b.push_f32(eps_v);
+                b
+            },
         );
-
-        let x_base = x.buf.as_ptr() as usize;
-        let xr_base = x_rot.buf.as_ptr() as usize;
-        let row_bytes = k * 4;
-
-        for row in 0..batch_size {
-            let mut xp = (x_base + row * row_bytes) as *const std::ffi::c_void;
-            let mut wp = weight.buf.as_ptr();
-            let mut xrp = (xr_base + row * row_bytes) as *const std::ffi::c_void;
-            let mut s1 = s1_ptr;
-            let mut s2 = s2_ptr;
-            let mut kv = k as i32;
-            let mut eps_v = eps;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut xp as *mut _ as *mut c_void,
-                &mut wp as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void,
-                &mut s2 as *mut _ as *mut c_void,
-                &mut xrp as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-                &mut eps_v as *mut _ as *mut c_void,
-            ];
-            let result = self.launch_maybe_blob(
-                "fused_rmsnorm_mq_rotate",
-                [1, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(xp); b.push_ptr(wp);
-                    b.push_ptr(s1); b.push_ptr(s2);
-                    b.push_ptr(xrp);
-                    b.push_i32(kv); b.push_f32(eps_v);
-                    b
-                },
-            );
-            if result.is_err() {
-                if let Some(t) = timer { t.finish(&self.hip); }
-                return result;
-            }
-        }
-
         if let Some(t) = timer { t.finish(&self.hip); }
-        Ok(())
+        result
     }
 
     /// Fused SwiGLU + FWHT rotation. Reads gate/up, computes
@@ -1732,15 +1702,8 @@ impl Gpu {
         result
     }
 
-    /// Batched `fused_silu_mul_rotate_mq`. Dispatches N single-row launches
-    /// with pre-offset pointers rather than a single `grid=[_, N, 1]` launch.
-    ///
-    /// The `grid=[_, N, 1]` form hit the ROCm 7.2 multi-block miscompile on
-    /// gfx1100 (rows 1..N-1 silently zeroed — same pattern documented for
-    /// `fused_rmsnorm_mq_rotate`). Per-row dispatch is byte-equivalent to
-    /// calling `fused_silu_mul_rotate_mq` N times and is robust across
-    /// hipcc recompiles. Per-launch overhead at prefill batch sizes (N ≤ 16)
-    /// is negligible vs the FWHT bandwidth of the kernel itself.
+    /// Batched `fused_silu_mul_rotate_mq`. Grid.y is the batch dim — processes
+    /// N tokens' [N × K] gate/up/x_rot in a single launch.
     pub fn fused_silu_mul_rotate_mq_batched(
         &mut self,
         gate: &GpuTensor,
@@ -1758,57 +1721,38 @@ impl Gpu {
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
-
-        let bytes_per_row = k * 4 * 3 + 2 * 256 * 4;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            "fused_silu_mul_mq_rotate_batched",
-            bytes_per_row * batch_size,
+        let mut gp = gate.buf.as_ptr();
+        let mut up_p = up.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_p as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_silu_mul_mq_rotate_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_silu_mul_mq_rotate",
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp); b.push_ptr(up_p);
+                b.push_ptr(s1); b.push_ptr(s2); b.push_ptr(xrp);
+                b.push_i32(kv);
+                b
+            },
         );
-
-        let gate_base = gate.buf.as_ptr() as usize;
-        let up_base = up.buf.as_ptr() as usize;
-        let xr_base = x_rot.buf.as_ptr() as usize;
-        let row_bytes = k * 4;
-
-        for row in 0..batch_size {
-            let mut gp = (gate_base + row * row_bytes) as *const std::ffi::c_void;
-            let mut up_p = (up_base + row * row_bytes) as *const std::ffi::c_void;
-            let mut xrp = (xr_base + row * row_bytes) as *const std::ffi::c_void;
-            let mut s1 = s1_ptr;
-            let mut s2 = s2_ptr;
-            let mut kv = k as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut gp as *mut _ as *mut c_void,
-                &mut up_p as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void,
-                &mut s2 as *mut _ as *mut c_void,
-                &mut xrp as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-            ];
-            let result = self.launch_maybe_blob(
-                "fused_silu_mul_mq_rotate",
-                [n_groups, 1, 1],
-                [32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(gp); b.push_ptr(up_p);
-                    b.push_ptr(s1); b.push_ptr(s2); b.push_ptr(xrp);
-                    b.push_i32(kv);
-                    b
-                },
-            );
-            if result.is_err() {
-                if let Some(t) = timer { t.finish(&self.hip); }
-                return result;
-            }
-        }
-
         if let Some(t) = timer { t.finish(&self.hip); }
-        Ok(())
+        result
     }
 
     /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
@@ -1839,10 +1783,7 @@ impl Gpu {
         result
     }
 
-    /// Batched `rotate_x_mq`. Dispatches N single-row launches with pre-offset
-    /// pointers rather than a single `grid=[_, N, 1]` launch, to avoid the
-    /// ROCm 7.2 gfx1100 multi-block miscompile that silently zeros rows
-    /// 1..N-1 for this FWHT kernel family.
+    /// Batched `rotate_x_mq`. Grid.y is the batch dim.
     pub fn rotate_x_mq_batched(
         &mut self,
         x: &GpuTensor,
@@ -1856,48 +1797,36 @@ impl Gpu {
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
-
+        let mut xp = x.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
         let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_batched", bytes);
-
-        let x_base = x.buf.as_ptr() as usize;
-        let xr_base = x_rot.buf.as_ptr() as usize;
-        let row_bytes = k * 4;
-
-        for row in 0..batch_size {
-            let mut xp = (x_base + row * row_bytes) as *const std::ffi::c_void;
-            let mut xrp = (xr_base + row * row_bytes) as *const std::ffi::c_void;
-            let mut s1 = s1_ptr;
-            let mut s2 = s2_ptr;
-            let mut kv = k as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut xp as *mut _ as *mut c_void,
-                &mut xrp as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void,
-                &mut s2 as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-            ];
-            let result = self.launch_maybe_blob(
-                "mq_rotate_x",
-                [n_groups, 1, 1],
-                [32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(xp); b.push_ptr(xrp);
-                    b.push_ptr(s1); b.push_ptr(s2);
-                    b.push_i32(kv);
-                    b
-                },
-            );
-            if result.is_err() {
-                if let Some(t) = timer { t.finish(&self.hip); }
-                return result;
-            }
-        }
+        let result = self.launch_maybe_blob(
+            "mq_rotate_x",
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(xrp);
+                b.push_ptr(s1); b.push_ptr(s2);
+                b.push_i32(kv);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
-        Ok(())
+        result
     }
 
     /// MagnumQuant MQ4: rotate x once, then GEMV against rotated x.
@@ -2338,125 +2267,6 @@ impl Gpu {
         result
     }
 
-    /// Per-row 4-way fused HFQ4-G256 GEMM: N sequential single-row launches
-    /// using the known-good `fused_qkvza_hfq4g256` kernel. Byte-exact with
-    /// the per-token forward path by construction — the kernel is literally
-    /// the same one decode uses.
-    ///
-    /// Exists to sidestep a discovered divergence on gfx1100 + ROCm 7.2
-    /// between `gemm_qkvza_hfq4g256(n=N)` (batched scalar / WMMA / dot2 /
-    /// fp16 variants) and `fused_qkvza_hfq4g256(n=1) × N`, which produces
-    /// incoherent prefill output (model emits <|endoftext|> immediately
-    /// instead of the answer). The batched kernel passes the synthetic
-    /// test harness (`test_gemm_qkvza_batched_vs_scalar`) with
-    /// HIPFIRE_FP16=0 but diverges from the per-token reference at LA
-    /// layer 0, row 0 when invoked through `forward_prefill_batch` on
-    /// real Qwen3.5 weights — both with and without HIPFIRE_FP16=0. Root
-    /// cause is still under investigation (possibly weight-layout-sensitive
-    /// WMMA miscompile, or subtle numerical difference in the scalar
-    /// batched kernel that the synthetic harness misses).
-    ///
-    /// `x`: [N × K] row-major activation batch.
-    /// `y_*`: [N × *_m] row-major outputs (overwrite semantics).
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemm_qkvza_hfq4g256_per_row(
-        &mut self,
-        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
-        x: &GpuTensor,
-        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
-        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
-        k: usize,
-        batch_size: usize,
-    ) -> HipResult<()> {
-        // Dispatch once via fused_qkvza_hfq4g256 to guarantee the kernel is
-        // compiled/resolved before the per-row loop. Pick the right name.
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_x) = if cdna3 {
-            self.ensure_kernel(
-                "fused_qkvza_hfq4g256_wave64",
-                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
-                "fused_qkvza_hfq4g256_wave64",
-            )?;
-            let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
-            ("fused_qkvza_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
-        } else {
-            self.ensure_kernel(
-                "fused_qkvza_hfq4g256",
-                kernels::FUSED_QKVZA_HFQ4G256_SRC,
-                "fused_qkvza_hfq4g256",
-            )?;
-            ("fused_qkvza_hfq4g256", [32u32, 1, 1], (qkv_m + z_m + beta_m + alpha_m) as u32)
-        };
-        let grid = [grid_x, 1, 1];
-
-        let q_m_i = qkv_m as i32;
-        let z_m_i = z_m as i32;
-        let b_m_i = beta_m as i32;
-        let a_m_i = alpha_m as i32;
-        let k_i = k as i32;
-
-        let x_base = x.buf.as_ptr() as usize;
-        let yq_base = y_qkv.buf.as_ptr() as usize;
-        let yz_base = y_z.buf.as_ptr() as usize;
-        let yb_base = y_beta.buf.as_ptr() as usize;
-        let ya_base = y_alpha.buf.as_ptr() as usize;
-
-        let x_row_bytes = k * 4;
-        let yq_row_bytes = qkv_m * 4;
-        let yz_row_bytes = z_m * 4;
-        let yb_row_bytes = beta_m * 4;
-        let ya_row_bytes = alpha_m * 4;
-
-        let aq = a_qkv.buf.as_ptr();
-        let az = a_z.buf.as_ptr();
-        let ab = a_beta.buf.as_ptr();
-        let aa = a_alpha.buf.as_ptr();
-
-        let bytes_per = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
-            + crate::profile::gemv_hfq4g256_bytes(z_m, k)
-            + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
-            + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
-        let timer = crate::profile::begin_timer(
-            &self.hip, "gemm", "gemm_qkvza_hfq4g256_per_row", bytes_per * batch_size);
-
-        for b in 0..batch_size {
-            let xp = (x_base + b * x_row_bytes) as *const std::ffi::c_void;
-            let yq = (yq_base + b * yq_row_bytes) as *const std::ffi::c_void;
-            let yz = (yz_base + b * yz_row_bytes) as *const std::ffi::c_void;
-            let yb = (yb_base + b * yb_row_bytes) as *const std::ffi::c_void;
-            let ya = (ya_base + b * ya_row_bytes) as *const std::ffi::c_void;
-
-            let mut params: Vec<*mut c_void> = vec![
-                &aq as *const _ as *mut c_void, &az as *const _ as *mut c_void,
-                &ab as *const _ as *mut c_void, &aa as *const _ as *mut c_void,
-                &xp as *const _ as *mut c_void, &yq as *const _ as *mut c_void,
-                &yz as *const _ as *mut c_void, &yb as *const _ as *mut c_void,
-                &ya as *const _ as *mut c_void,
-                &q_m_i as *const _ as *mut c_void, &z_m_i as *const _ as *mut c_void,
-                &b_m_i as *const _ as *mut c_void, &a_m_i as *const _ as *mut c_void,
-                &k_i as *const _ as *mut c_void,
-            ];
-            let r = self.launch_maybe_blob(
-                func_name, grid, block, 0, &mut params,
-                || {
-                    let mut kb = hip_bridge::KernargBlob::new();
-                    kb.push_ptr(aq); kb.push_ptr(az); kb.push_ptr(ab); kb.push_ptr(aa);
-                    kb.push_ptr(xp); kb.push_ptr(yq); kb.push_ptr(yz);
-                    kb.push_ptr(yb); kb.push_ptr(ya);
-                    kb.push_i32(q_m_i); kb.push_i32(z_m_i); kb.push_i32(b_m_i);
-                    kb.push_i32(a_m_i); kb.push_i32(k_i);
-                    kb
-                },
-            );
-            if r.is_err() {
-                if let Some(t) = timer { t.finish(&self.hip); }
-                return r;
-            }
-        }
-        if let Some(t) = timer { t.finish(&self.hip); }
-        Ok(())
-    }
-
     /// Batched 4-way fused HFQ4-G256 GEMM for the LA preamble.
     ///
     /// Processes N tokens × four projections (wqkv + wz + w_beta + w_alpha)
@@ -2511,32 +2321,92 @@ impl Gpu {
                 return r1.and(r2).and(r3).and(r4);
             }
         }
-        // Verified-correct batched fast path: WMMA on gfx11/gfx12 with
-        // HIPFIRE_FP16=1 (default). The FP32-dequant-at-WMMA-boundary fix
-        // landed with this PR and parity-verified against `_per_row` via
-        // greedy_dump on Qwen3.5-9B (coherent output, +28% pp128).
-        if batch_size > 1
-            && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
-            && (self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12"))
-        {
-            return self.gemm_qkvza_hfq4g256_wmma(
-                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha,
-                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
-            );
+        // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
+        if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            if self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12") {
+                return self.gemm_qkvza_hfq4g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
+            }
+            // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
+            // Excludes gfx1010 (Navi 10, 5700 XT) and gfx1013 (Van Gogh/BC-250 APU).
+            if has_dot2_f32_f16(&self.arch) {
+                return self.gemm_qkvza_hfq4g256_dot2(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
+            }
+            // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
+            return self.gemm_qkvza_hfq4g256_fp16(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
         }
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+            self.ensure_kernel(
+                "gemm_qkvza_hfq4g256_wave64",
+                kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC,
+                "gemm_qkvza_hfq4g256_wave64",
+            )?;
+            ("gemm_qkvza_hfq4g256_wave64", [64, 1, 1], 2)
+        } else {
+            self.ensure_kernel(
+                "gemm_qkvza_hfq4g256",
+                kernels::GEMM_QKVZA_HFQ4G256_SRC,
+                "gemm_qkvza_hfq4g256",
+            )?;
+            ("gemm_qkvza_hfq4g256", [32, 1, 1], 1)
+        };
+        let func = &self.functions[func_name];
 
-        // Every other path — dot2 (gfx1011/1012/1030-1032), fp16-packed
-        // (gfx1010/1013), the scalar-batched `gemm_qkvza_hfq4g256[_wave64]`
-        // kernel, and HIPFIRE_FP16=0 on any arch — shares the row-0
-        // divergence against the per-token reference tracked in #30. Route
-        // through `_per_row` (N × fused_qkvza_hfq4g256) until each path is
-        // individually root-caused and verified. This preserves correctness
-        // across RDNA1/2, gfx1030–1032, CDNA3 (when rocBLAS is unavailable),
-        // and the HIPFIRE_FP16=0 opt-out.
-        self.gemm_qkvza_hfq4g256_per_row(
-            a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha,
-            qkv_m, z_m, beta_m, alpha_m, k, batch_size,
-        )
+        let mut aq = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yq = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut q_m = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut b_m = beta_m as i32;
+        let mut a_m = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut q_m as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut b_m as *mut _ as *mut c_void,
+            &mut a_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
+        let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let grid_x = (total_m + grid_div - 1) / grid_div;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, batch_tiles as u32, 1],
+                block,
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// FP16-packed batched 4-way fused HFQ4-G256 GEMM (qkv + z + beta + alpha).
@@ -4354,9 +4224,12 @@ impl Gpu {
                          kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC, 32u32, 16usize, 1u32),
             "k2x32"  => ("gemm_hfq4g256_residual_wmma_k2x32",
                          kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2X32_SRC, 32u32, 32usize, 1u32),
-            // Older _wmma / _wmma2 / _wmma_k4 variants removed in master cleanup
-            // (b3b9ddb) — output-mapping bug in those siblings. ksplit is the
-            // remaining alternate path (smaller-M fallback for the auto router).
+            "k4"     => ("gemm_hfq4g256_residual_wmma_k4",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K4_SRC, 32u32, 16usize, 1u32),
+            "wmma"   => ("gemm_hfq4g256_residual_wmma",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_SRC, 32u32, 16usize, 1u32),
+            "wmma2"  => ("gemm_hfq4g256_residual_wmma2",
+                         kernels::GEMM_HFQ4G256_RESIDUAL_WMMA2_SRC, 64u32, 32usize, 1u32),
             _        => ("gemm_hfq4g256_residual_wmma_ksplit",
                          kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC, 32u32, 16usize, 4u32),
         };
@@ -9489,19 +9362,7 @@ impl Gpu {
         result
     }
 
-    /// Batched `fused_qk_l2_norm_scale_f32`.
-    ///
-    /// Originally dispatched as a single launch with grid = `[n_heads, batch_size, 1]`
-    /// and the kernel using `blockIdx.y` for the batch offset. That pattern is
-    /// affected by the ROCm 7.2 / gfx1100 non-deterministic compilation pathology
-    /// — see `fused_rmsnorm_rotate_mq_batched` for the long-form write-up.
-    /// Rows 1..N-1 intermittently don't execute, leaving q/k for those rows
-    /// identical to the conv1d output (unnormalized, unscaled), which silently
-    /// corrupts LA attention for batched prefill.
-    ///
-    /// Workaround: dispatch N single-row launches with grid = `[n_heads, 1, 1]`
-    /// and pre-offset q/k pointers. Q and K are laid out `[N × (n_heads*head_dim)]`
-    /// row-major, so row `r` starts at `r * n_heads * head_dim * 4` bytes.
+    /// Batched `fused_qk_l2_norm_scale_f32`. Grid.y is the batch dim.
     #[cfg(feature = "deltanet")]
     pub fn fused_qk_l2_norm_scale_f32_batched(
         &mut self,
@@ -9518,50 +9379,38 @@ impl Gpu {
             kernels::FUSED_QK_L2_NORM_SCALE_SRC,
             "fused_qk_l2_norm_scale_f32",
         )?;
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut qs = q_scale;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut qs as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
         let bytes = crate::profile::elementwise1_bytes(n_heads * head_dim) * 2 * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qk_l2_norm_scale_f32_batched", bytes);
-
-        let q_base = q.buf.as_ptr() as usize;
-        let k_base = k.buf.as_ptr() as usize;
-        let row_bytes = n_heads * head_dim * 4;
-
-        for row in 0..batch_size {
-            let mut qp = (q_base + row * row_bytes) as *const std::ffi::c_void;
-            let mut kp = (k_base + row * row_bytes) as *const std::ffi::c_void;
-            let mut nh = n_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut qs = q_scale;
-            let mut ep = eps;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut qp as *mut _ as *mut c_void,
-                &mut kp as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut qs as *mut _ as *mut c_void,
-                &mut ep as *mut _ as *mut c_void,
-            ];
-            let result = self.launch_maybe_blob(
-                "fused_qk_l2_norm_scale_f32",
-                [n_heads as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(qp); b.push_ptr(kp);
-                    b.push_i32(nh); b.push_i32(hd);
-                    b.push_f32(qs); b.push_f32(ep);
-                    b
-                },
-            );
-            if result.is_err() {
-                if let Some(t) = timer { t.finish(&self.hip); }
-                return result;
-            }
-        }
-
+        let result = self.launch_maybe_blob(
+            "fused_qk_l2_norm_scale_f32",
+            [n_heads as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp);
+                b.push_i32(nh); b.push_i32(hd);
+                b.push_f32(qs); b.push_f32(ep);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
-        Ok(())
+        result
     }
 
     /// 1D causal conv (kernel_size=4) for decode. Updates ring buffer state.
@@ -9623,20 +9472,7 @@ impl Gpu {
         result
     }
 
-    /// Batched `gated_norm_f32`.
-    ///
-    /// Originally dispatched as `grid=[n_heads, N, 1]` using `blockIdx.y` as
-    /// the batch index. On gfx1100 / ROCm 7.2 this exhibits the multi-block
-    /// miscompile: blocks with `blockIdx.y >= 1` silently skip, leaving the
-    /// output slots for rows 1..N-1 at their initial value (observable as
-    /// identical hashes across rows 1..N-1 in the LA trace, with only row 0
-    /// matching the per-token reference). This corrupts the LA residual add
-    /// for every non-first token in the batch.
-    ///
-    /// To stay on a known-good code path while remaining portable across
-    /// RDNA generations, dispatch N single-row launches with `grid=[_, 1, 1]`
-    /// and pre-offset pointers. Per-launch overhead is negligible relative
-    /// to the GEMMs dominating LA prefill.
+    /// Batched `gated_norm_f32`. Grid.y is the batch dim.
     #[cfg(feature = "deltanet")]
     pub fn gated_norm_f32_batched(
         &mut self,
@@ -9645,47 +9481,37 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.ensure_kernel("gated_norm", kernels::GATED_NORM_SRC, "gated_norm_f32")?;
-        let nh = n_heads as i32;
-        let hd = head_dim as i32;
-        let ep = eps;
-        let row_bytes = n_heads * head_dim * 4;
+        let mut xp = x.buf.as_ptr();
+        let mut zp = z.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut zp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
         let bytes = crate::profile::gated_norm_bytes(n_heads * head_dim) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "gated_norm_f32_batched", bytes);
-        let x_base = x.buf.as_ptr() as usize;
-        let z_base = z.buf.as_ptr() as usize;
-        let o_base = out.buf.as_ptr() as usize;
-        let wp = weight.buf.as_ptr();
-        for b in 0..batch_size {
-            let xp = (x_base + b * row_bytes) as *const std::ffi::c_void;
-            let zp = (z_base + b * row_bytes) as *const std::ffi::c_void;
-            let op = (o_base + b * row_bytes) as *const std::ffi::c_void;
-            let mut params: Vec<*mut c_void> = vec![
-                &xp as *const _ as *mut c_void, &zp as *const _ as *mut c_void,
-                &wp as *const _ as *mut c_void, &op as *const _ as *mut c_void,
-                &nh as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
-                &ep as *const _ as *mut c_void,
-            ];
-            let r = self.launch_maybe_blob(
-                "gated_norm_f32",
-                [n_heads as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(xp); b.push_ptr(zp);
-                    b.push_ptr(wp); b.push_ptr(op);
-                    b.push_i32(nh); b.push_i32(hd); b.push_f32(ep);
-                    b
-                },
-            );
-            if r.is_err() {
-                if let Some(t) = timer { t.finish(&self.hip); }
-                return r;
-            }
-        }
+        let result = self.launch_maybe_blob(
+            "gated_norm_f32",
+            [n_heads as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(zp);
+                b.push_ptr(wp); b.push_ptr(op);
+                b.push_i32(nh); b.push_i32(hd); b.push_f32(ep);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
-        Ok(())
+        result
     }
 
     /// Gated Delta Net recurrence. S matrix in LDS. Processes all tokens sequentially.
@@ -9802,88 +9628,55 @@ impl Gpu {
 
         let n_tiles = (128 / 4) as u32;
 
-        // N separate launches, each with n_tokens=1, matching the decode
-        // path byte-exact.
-        //
-        // History: commit 18ffaf0 changed this to a single launch with
-        // n_tokens=N and moved the per-token loop INTO the kernel,
-        // claiming "strictly higher quality" by deferring Q8 requant to
-        // the end of the whole batch. The claim is wrong for Qwen3.5-9B:
-        // empirically, batched prefill produced garbage output (Chinese
-        // token spam instead of "Paris" for "The capital of France is")
-        // while per-token + decode produced correct output. Diagnosed via
-        // the prefill_state_diff harness — DN state at layer 0 was
-        // deterministically different from the per-token reference.
-        //
-        // The per-token stochastic-rounding trajectory is load-bearing:
-        // each token sees the Q8-rounded state from the previous token,
-        // not the raw FP32. Collapsing N rounds into 1 changes the
-        // recurrence semantically, not just numerically. Batched decode
-        // must match decode byte-exactly to keep greedy output
-        // reproducible between prefill and streaming.
-        //
-        // Cost: N extra launches per LA layer per forward. On 9B MQ4 this
-        // is ~16 layers × N-token launches. Correctness over throughput.
-        let stride_qkv_bytes = n_heads * head_dim * 4;
-        let stride_ab_bytes = n_heads * 4;
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sp = s_q8.buf.as_ptr();
+        let mut scp = s_scales.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut scp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
 
-        let q_base = q_batch.buf.as_ptr() as *mut u8;
-        let k_base = k_batch.buf.as_ptr() as *mut u8;
-        let v_base = v_batch.buf.as_ptr() as *mut u8;
-        let g_base = gate_batch.buf.as_ptr() as *mut u8;
-        let b_base = beta_batch.buf.as_ptr() as *mut u8;
-        let o_base = output_batch.buf.as_ptr() as *mut u8;
-        let s_ptr_raw = s_q8.buf.as_ptr();
-        let sc_ptr_raw = s_scales.buf.as_ptr();
-
-        let bytes = crate::profile::gated_delta_net_q8_bytes(1, n_heads, head_dim) * n_tokens;
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8_batch_seq", bytes);
-
-        for i in 0..n_tokens {
-            let off_qkv = i * stride_qkv_bytes;
-            let off_ab = i * stride_ab_bytes;
-            let mut qp = unsafe { q_base.add(off_qkv) as *mut c_void };
-            let mut kp = unsafe { k_base.add(off_qkv) as *mut c_void };
-            let mut vp = unsafe { v_base.add(off_qkv) as *mut c_void };
-            let mut gp = unsafe { g_base.add(off_ab) as *mut c_void };
-            let mut bp = unsafe { b_base.add(off_ab) as *mut c_void };
-            let mut op = unsafe { o_base.add(off_qkv) as *mut c_void };
-            let mut sp = s_ptr_raw;
-            let mut scp = sc_ptr_raw;
-            let mut nt = 1i32;
-            let mut nh = n_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut qp as *mut _ as *mut c_void,
-                &mut kp as *mut _ as *mut c_void,
-                &mut vp as *mut _ as *mut c_void,
-                &mut gp as *mut _ as *mut c_void,
-                &mut bp as *mut _ as *mut c_void,
-                &mut sp as *mut _ as *mut c_void,
-                &mut scp as *mut _ as *mut c_void,
-                &mut op as *mut _ as *mut c_void,
-                &mut nt as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-            ];
-            self.launch_maybe_blob(
-                "gated_delta_net_q8",
-                [n_heads as u32, n_tiles, 1],
-                [32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
-                    b.push_ptr(gp); b.push_ptr(bp);
-                    b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
-                    b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
-                    b
-                },
-            )?;
-        }
+        // Single launch — the kernel loops over n_tokens internally,
+        // keeping state in F32 LDS across all tokens. Q8 quantization
+        // happens once at the end instead of per-token, reducing noise
+        // accumulation. Not byte-exact with N×1 decode calls but
+        // strictly higher quality.
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_q8",
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(gp); b.push_ptr(bp);
+                b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
-        Ok(())
+        result
     }
 
     /// Tree-aware variant of `gated_delta_net_q8_batch_seq`. Per-token
@@ -10186,15 +9979,6 @@ impl Gpu {
     /// (identical state trajectory to calling the single-token variant N
     /// times). `input` / `q_out` / `k_out` / `v_out` are all [N × stride]
     /// row-major.
-    ///
-    /// Implemented as N single-token launches rather than one N-token launch:
-    /// on ROCm 7.2 / gfx1100 the kernel's internal `for (t=0; t<n_tokens; t++)`
-    /// loop is miscompiled such that only iteration t=0 has visible side
-    /// effects — tokens 1..N-1 see zeros in q/k/v_out. Reproduces
-    /// deterministically against prefill_state_diff regardless of
-    /// `__restrict__` stripping or recompile. Single-token launches avoid the
-    /// miscompiled loop entirely, at the cost of N-1 extra kernel launches
-    /// (negligible for N ≤ 16 prefill chunks).
     #[cfg(feature = "deltanet")]
     pub fn conv1d_silu_split_f32_n(
         &mut self,
@@ -10213,59 +9997,43 @@ impl Gpu {
             kernels::CONV1D_SILU_SPLIT_SRC,
             "conv1d_silu_split_f32",
         )?;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
         let n_channels = 2 * k_dim + v_dim;
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
         let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32_n", bytes);
-
-        let q_base = q_out.buf.as_ptr() as usize;
-        let k_base = k_out.buf.as_ptr() as usize;
-        let v_base = v_out.buf.as_ptr() as usize;
-        let i_base = input.buf.as_ptr() as usize;
-        let q_row = k_dim * 4;
-        let k_row = k_dim * 4;
-        let v_row = v_dim * 4;
-        let i_row = n_channels * 4;
-
-        for t in 0..n_tokens {
-            let qp = (q_base + t * q_row) as *const std::ffi::c_void;
-            let kp = (k_base + t * k_row) as *const std::ffi::c_void;
-            let vp = (v_base + t * v_row) as *const std::ffi::c_void;
-            let ip = (i_base + t * i_row) as *const std::ffi::c_void;
-            let wp = weight.buf.as_ptr();
-            let sp = state.buf.as_ptr();
-            let kd = k_dim as i32;
-            let vd = v_dim as i32;
-            let nt = 1i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &qp as *const _ as *mut c_void,
-                &kp as *const _ as *mut c_void,
-                &vp as *const _ as *mut c_void,
-                &ip as *const _ as *mut c_void,
-                &wp as *const _ as *mut c_void,
-                &sp as *const _ as *mut c_void,
-                &kd as *const _ as *mut c_void,
-                &vd as *const _ as *mut c_void,
-                &nt as *const _ as *mut c_void,
-            ];
-            let result = self.launch_maybe_blob(
-                "conv1d_silu_split_f32", [grid, 1, 1], [block, 1, 1], 0, &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
-                    b.push_ptr(ip); b.push_ptr(wp); b.push_ptr(sp);
-                    b.push_i32(kd); b.push_i32(vd); b.push_i32(nt);
-                    b
-                },
-            );
-            if result.is_err() {
-                if let Some(t) = timer { t.finish(&self.hip); }
-                return result;
-            }
-        }
+        let result = self.launch_maybe_blob(
+            "conv1d_silu_split_f32", [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(ip); b.push_ptr(wp); b.push_ptr(sp);
+                b.push_i32(kd); b.push_i32(vd); b.push_i32(nt);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
-        Ok(())
+        result
     }
 
     /// Tree-aware variant of `conv1d_silu_split_f32_n`. `parent_indices[t]`
