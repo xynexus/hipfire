@@ -195,6 +195,15 @@ pub struct Gpu {
     /// DEPRECATED for verify: replaced by `verify_warmed_up` (per-B set).
     pub graph_verify_warmup: u32,
 
+    /// AR `forward_scratch` (single-token decode) capture warmup flag.
+    /// First call with `HIPFIRE_GRAPH=1` runs direct so kernel JIT and lazy
+    /// scratch allocations (MQ signs/x_rot/x_q8, FP16 shadow, kernel modules)
+    /// happen outside any captured region. Capturing the first call hits
+    /// `hipMalloc not permitted under stream capture`. Set after the first
+    /// direct run; the next call captures the graph for replay. Mirrors
+    /// `verify_warmed_up` but uses a scalar flag (no per-B keying).
+    pub ar_forward_warmed_up: bool,
+
     /// Per-B cache of captured verify-forward graphs. Each entry owns its
     /// graph + exec + the kernarg blobs that graph captured pointers into.
     /// Blobs must stay alive for the life of the graph — they're baked into
@@ -336,6 +345,7 @@ impl Gpu {
             captured_graph: None,
             graph_verify_n: None,
             graph_verify_warmup: 0,
+            ar_forward_warmed_up: false,
             verify_graph_cache: HashMap::new(),
             verify_warmed_up: HashSet::new(),
             verify_capturing_b: None,

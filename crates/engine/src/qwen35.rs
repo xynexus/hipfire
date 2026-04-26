@@ -2242,18 +2242,31 @@ pub fn forward_scratch(
         gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
         gpu.graph_launch()?;
     } else if use_graph && gpu.graph_exec.is_none() {
-        // ── First decode: capture the forward pass as a graph ──
-        // Ensure we have an explicit stream for capture.
-        if gpu.active_stream.is_none() {
-            gpu.active_stream = Some(gpu.hip.stream_create()?);
-        }
-        // Write pos_buf before capture (this write is NOT in the graph)
         let pos_i32 = pos as i32;
-        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        gpu.begin_graph_capture()?;
-        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
-        gpu.end_graph_capture()?;
-        eprintln!("[hipGraph] captured {} blobs, instantiated", gpu.capture_blobs.len());
+        if !gpu.ar_forward_warmed_up {
+            // ── Warmup: run direct so kernel JIT and lazy scratch
+            // allocations (MQ signs/x_rot/x_q8, FP16 shadow, kernel module
+            // load) happen outside any captured region. Capturing the first
+            // call hits "hipMalloc not permitted under stream capture" — the
+            // same trap `verify_warmed_up` solves for the verify path. The
+            // next call will capture. (See bench_qwen35_mq4 / forward_prefill_batch
+            // for the production warmup path.)
+            gpu.ar_forward_warmed_up = true;
+            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+            forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        } else {
+            // ── First post-warmup call: capture the forward pass as a graph ──
+            // Ensure we have an explicit stream for capture.
+            if gpu.active_stream.is_none() {
+                gpu.active_stream = Some(gpu.hip.stream_create()?);
+            }
+            // Write pos_buf before capture (this write is NOT in the graph)
+            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+            gpu.begin_graph_capture()?;
+            forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+            gpu.end_graph_capture()?;
+            eprintln!("[hipGraph] captured {} blobs, instantiated", gpu.capture_blobs.len());
+        }
     } else {
         // ── Direct path (no graph) ──
         let pos_i32 = pos as i32;
@@ -4480,8 +4493,12 @@ fn forward_scratch_layers(
                         config.linear_num_key_heads, ratio, hd,
                     )?;
                 } else {
-                    gpu.hip.memcpy_dtod(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
-                    gpu.hip.memcpy_dtod(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                    // Use the capture-aware auto helper: routes to async on the
+                    // active stream when capturing, sync otherwise. The raw
+                    // gpu.hip.memcpy_dtod hits "would make the legacy stream
+                    // depend on a capturing blocking stream" under hipGraph.
+                    gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
                 }
 
                 match dn_state.quant {
@@ -4782,8 +4799,9 @@ fn forward_scratch_layers(
                         config.linear_num_key_heads, ratio, hd,
                     )?;
                 } else {
-                    gpu.hip.memcpy_dtod(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
-                    gpu.hip.memcpy_dtod(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                    // Capture-aware: see matching path in the GroupQuery layer above.
+                    gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
                 }
                 match dn_state.quant {
                     StateQuant::FP32 => gpu.gated_delta_net_f32(
