@@ -2313,6 +2313,13 @@ pub fn forward_scratch(
             gpu.begin_graph_capture()?;
             forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
             gpu.end_graph_capture()?;
+            // hipStreamCaptureModeGlobal RECORDS kernels — they do not execute
+            // during capture. Launch the freshly-instantiated graph once so
+            // this pos's forward actually runs (KV write, state advance,
+            // logits update). Same pattern as the verify path's
+            // begin_verify_graph_capture / end_verify_graph_capture /
+            // verify_graph_launch sequence.
+            gpu.graph_launch()?;
             eprintln!("[hipGraph] captured {} blobs, instantiated", gpu.capture_blobs.len());
         }
     } else {
