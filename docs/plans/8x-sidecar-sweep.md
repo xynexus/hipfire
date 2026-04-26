@@ -89,9 +89,11 @@ The 8× premium only pencils if you're doing multiple parallel jobs
 
 ## Known gaps (to fix before running)
 
-- [ ] `calibrate_multigpu.sh` doesn't take `--recipes` per-model mapping;
-      either run multiple waves with different `--corpus`, or extend the
-      script to accept a `model:recipe` matrix.
+- [x] `calibrate_multigpu.sh` doesn't take `--recipe`. **FIXED 2026-04-25**:
+      script now accepts `--recipe NAME` and auto-builds the corpus via
+      `fetch_calibration_corpus.sh`, caching at
+      `/root/calib_corpus_<NAME>.txt`. Per-model recipe mapping (different
+      recipe per model in one call) still requires multiple waves.
 - [ ] MoE MQ6 support in `hipfire-quantize` (main.rs:1318). Affects
       A3B mq6 artifacts. Skip for now.
 - [ ] `stage_models.sh` quantizes even if artifact exists but not if it
