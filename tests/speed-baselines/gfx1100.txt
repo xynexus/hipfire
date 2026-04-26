@@ -48,3 +48,12 @@
 27b_3.5_dflash_merge_sort_tau=13.18
 27b_3.5_dflash_merge_sort_ttft_ms=160.0
 
+# 9B-3.5 DFlash merge_sort thinking-OFF @ max=256.
+# Same prompt as 27B anchor — 9B writes the same correct merge_sort but
+# 2.3× faster wallclock (575 vs 250 tok/s) at identical τ=13.08. TTFT
+# 75.5 ms (about half of 27B's 154.7) reflecting smaller prefill cost.
+# Median-of-3, ±0.84% range, deterministic.
+9b_3.5_dflash_merge_sort_tok_s=575.0
+9b_3.5_dflash_merge_sort_tau=13.08
+9b_3.5_dflash_merge_sort_ttft_ms=80.0
+
