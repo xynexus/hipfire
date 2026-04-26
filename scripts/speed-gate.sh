@@ -31,7 +31,7 @@ REPO_ROOT="$(pwd)"
 EXE="./target/release/examples/bench_qwen35_mq4"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
-# ── Arch detection (matches quality-gate.sh) ─────────────────────────────
+# ── Arch detection ────────────────────────────────────────────────────────
 BASELINE_ARCH=""
 if [ -n "${HIPFIRE_BASELINE_ARCH:-}" ]; then
     BASELINE_ARCH="$HIPFIRE_BASELINE_ARCH"
