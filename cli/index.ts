@@ -248,14 +248,25 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   return { ...base, ...overrides };
 }
 
-// thinking: "off" prepends a directive to the system prompt asking the model
-// to skip <think> reasoning. Effective on instruction-tuned models (Qwen 3.5
-// in particular honors this); advisory-only — for hard suppression we'd need
-// a daemon-side <think></think> bypass injection.
+// thinking: "off" prepends Qwen3.x's documented `/no_think` directive to the
+// system prompt. The token is recognized at training time and reliably
+// suppresses <think>...</think> emission.
+//
+// The previous prose directive ("Respond directly without using
+// <think>...</think> reasoning blocks") embedded the literal special tokens
+// in the system prompt, which Qwen3.5 interpreted as a partial generation:
+// the model emitted "<think>" followed by 1-2 garbage tokens and an
+// immediate <|im_end|>, halting at 3-4 tokens regardless of max_tokens.
+//
+// The trailing newline matters too: `/no_think` alone halts at 3 tokens
+// because the daemon's chatml wrapper tokenizes `/no_think<|im_end|>` as
+// one BPE merge that the model doesn't recognize. `/no_think\n` separates
+// the directive from the turn-end token cleanly and yields direct answers
+// in ~19 tokens on the prime-numbers probe.
 function applyThinkingMode(systemPrompt: string | undefined, thinking: string): string | undefined {
   if (thinking !== "off") return systemPrompt;
-  const directive = "Respond directly without using <think>...</think> reasoning blocks. Give the final answer only.";
-  return systemPrompt ? `${directive}\n\n${systemPrompt}` : directive;
+  const directive = "/no_think\n";
+  return systemPrompt ? `${directive}\n${systemPrompt}` : directive;
 }
 
 // Build the {type: "load", ...} message for the daemon, carrying per-model
@@ -702,6 +713,7 @@ async function runViaHttp(
   }
   if (!resp.body) { console.error("[hipfire] serve returned no body"); return false; }
 
+  const stripThinkBlocks = resolveModelConfig(model).thinking !== "off";
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -732,13 +744,17 @@ async function runViaHttp(
         const delta = chunk.choices?.[0]?.delta ?? {};
         let text: string = delta.content ?? "";
         if (!text) continue;
-        if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
-        if (inThink) {
-          if (text.includes("</think>")) {
-            text = text.split("</think>").slice(1).join("</think>");
-            inThink = false;
-            stripNextLeadingNl = true;
-          } else { continue; }
+        if (stripThinkBlocks) {
+          if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
+          if (inThink) {
+            if (text.includes("</think>")) {
+              text = text.split("</think>").slice(1).join("</think>");
+              inThink = false;
+              stripNextLeadingNl = true;
+            } else { continue; }
+          }
+        } else {
+          text = text.replace(/<think>|<\/think>/g, "");
         }
         text = text.replace(/<\|im_end\|>/g, "");
         if (!text) continue;
@@ -1004,18 +1020,28 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     console.error(`[VL: ${image}]`);
   }
 
+  // When thinking=off, /no_think suppresses canonical <think>...</think> blocks
+  // but Qwen3.5 still emits the literal "<think>" token early in some prompts
+  // and never closes it — so the strip-on-open / strip-until-close filter would
+  // eat the entire response. Skip the think filter in that mode and just drop
+  // the literal "<think>" tokens inline.
+  const stripThinkBlocks = modelCfg.thinking !== "off";
   let inThink = false;
   let stripNextLeadingNl = false;
   for await (const msg of e.generate(genMsg)) {
     if (msg.type === "token") {
       let text = msg.text as string;
-      if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
-      if (inThink) {
-        if (text.includes("</think>")) {
-          text = text.split("</think>").slice(1).join("</think>");
-          inThink = false;
-          stripNextLeadingNl = true; // strip newline between </think> and content
-        } else { continue; }
+      if (stripThinkBlocks) {
+        if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
+        if (inThink) {
+          if (text.includes("</think>")) {
+            text = text.split("</think>").slice(1).join("</think>");
+            inThink = false;
+            stripNextLeadingNl = true; // strip newline between </think> and content
+          } else { continue; }
+        }
+      } else {
+        text = text.replace(/<think>|<\/think>/g, "");
       }
       text = text.replace(/<\|im_end\|>/g, "");
       if (!text) continue;
@@ -1320,6 +1346,7 @@ async function serve(port: number) {
           let streamCancelled = false;
           e.generating = true;
           const hasTool = tools.length > 0;
+          const stripThinkBlocks = thinkModel !== "off";
           return new Response(new ReadableStream({
             async start(ctrl) {
               try {
@@ -1331,13 +1358,17 @@ async function serve(port: number) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
                     let text = msg.text as string;
-                    if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
-                    if (inThink) {
-                      if (text.includes("</think>")) {
-                        text = text.split("</think>").slice(1).join("</think>");
-                        inThink = false;
-                        stripNextLeadingNl = true;
-                      } else { continue; }
+                    if (stripThinkBlocks) {
+                      if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
+                      if (inThink) {
+                        if (text.includes("</think>")) {
+                          text = text.split("</think>").slice(1).join("</think>");
+                          inThink = false;
+                          stripNextLeadingNl = true;
+                        } else { continue; }
+                      }
+                    } else {
+                      text = text.replace(/<think>|<\/think>/g, "");
                     }
                     text = text.replace(/<\|im_end\|>/g, "");
                     if (!text) continue;
@@ -1441,11 +1472,19 @@ async function serve(port: number) {
         }
 
         // Strip think tags and special tokens.
-        // Greedy match: strip everything from first <think> to last </think>.
-        // If <think> is unclosed, strip from <think> to end of content.
-        content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-          .replace(/<think>[\s\S]*$/, "") // unclosed think block
-          .replace(/<\|im_end\|>/g, "").trim();
+        // When the model is supposed to think (thinking="on"), greedy-match
+        // and remove blocks. If <think> is unclosed, strip from <think> to
+        // end of content. With thinking="off", /no_think suppresses canonical
+        // blocks but Qwen3.5 still emits a literal "<think>" token early on
+        // some prompts and never closes — in that mode just drop the tag
+        // text inline so the actual answer survives.
+        if (thinkModel !== "off") {
+          content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+            .replace(/<think>[\s\S]*$/, ""); // unclosed think block
+        } else {
+          content = content.replace(/<think>|<\/think>/g, "");
+        }
+        content = content.replace(/<\|im_end\|>/g, "").trim();
 
         // Check for tool calls in response
         const parsed = parseToolCalls(content);
