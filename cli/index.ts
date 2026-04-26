@@ -719,22 +719,14 @@ async function runViaHttp(
   }
   if (!resp.body) { console.error("[hipfire] serve returned no body"); return false; }
 
-  const flushUnclosedThink = resolveModelConfig(model).thinking === "off";
+  // serve's SSE stream is already post-strip — it does the inThink /
+  // </think> / buffer-flush logic server-side and only emits clean
+  // delta.content. Our job here is just to print what arrives.
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let inThink = false;
-  let thinkBuffer = "";
-  let stripNextLeadingNl = false;
   let tokens = 0;
   const t0 = Date.now();
-  const emit = (s: string) => {
-    let t = s.replace(/<\|im_end\|>/g, "");
-    if (!t) return;
-    if (stripNextLeadingNl) { t = t.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!t) return; }
-    process.stdout.write(t);
-    tokens++;
-  };
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -756,34 +748,12 @@ async function runViaHttp(
           continue;
         }
         const delta = chunk.choices?.[0]?.delta ?? {};
-        let text: string = delta.content ?? "";
+        const text: string = delta.content ?? "";
         if (!text) continue;
-        if (text.includes("<think>")) {
-          inThink = true;
-          text = text.replace(/<think>/g, "");
-        }
-        if (inThink) {
-          if (text.includes("</think>")) {
-            text = text.split("</think>").slice(1).join("</think>");
-            inThink = false;
-            thinkBuffer = "";
-            stripNextLeadingNl = true;
-            emit(text);
-          } else {
-            thinkBuffer += text;
-          }
-          continue;
-        }
-        emit(text);
+        process.stdout.write(text);
+        tokens++;
       } catch {}
     }
-  }
-  // See run() flush logic: only flush an unclosed-think buffer if it
-  // contains <|im_end|> — broken /no_think pattern, buffered text is the
-  // answer. Otherwise the model is in a runaway think loop and flushing
-  // would leak the reasoning trace.
-  if (inThink && flushUnclosedThink && thinkBuffer.includes("<|im_end|>")) {
-    emit(thinkBuffer.replace(/^\s+/, ""));
   }
   const secs = (Date.now() - t0) / 1000;
   if (tokens > 0) console.error(`\n[${tokens} tok, ${(tokens / secs).toFixed(1)} tok/s via serve]`);
@@ -1085,13 +1055,17 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
       emit(text);
     }
     else if (msg.type === "done") {
-      // Only flush an unclosed-think buffer if it contains <|im_end|>: that
-      // signals the broken /no_think pattern (Qwen3.5 emits "<think>" then
-      // the actual answer then <|im_end|> with no closing tag) and the
-      // buffered text is the answer. If <|im_end|> isn't in the buffer the
-      // model is in a runaway thinking loop that hit max_tokens — flushing
-      // would leak the full reasoning, so discard.
-      if (inThink && flushUnclosedThink && thinkBuffer.includes("<|im_end|>")) {
+      // Flush conditions for a still-open <think> at end of stream:
+      //   1. Buffer contains <|im_end|>: explicit broken /no_think pattern
+      //      (Qwen emits "<think>" + answer + <|im_end|> w/o closing tag).
+      //   2. Generation stopped naturally (msg.tokens < requested max_tokens):
+      //      model emitted EOS — even if the EOS bytes didn't make it into
+      //      the streamed text (UTF-8 boundary, terminator-token variants
+      //      that aren't literal "<|im_end|>"), the answer is complete.
+      // Otherwise the model is in a runaway think loop that hit max_tokens
+      // and the buffer is reasoning — discard to honor thinking=off.
+      const naturalStop = typeof msg.tokens === "number" && msg.tokens < maxTokens;
+      if (inThink && flushUnclosedThink && (thinkBuffer.includes("<|im_end|>") || naturalStop)) {
         emit(thinkBuffer.replace(/^\s+/, ""));
       }
       console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
@@ -1291,10 +1265,22 @@ async function serve(port: number) {
           const role = m.role;
           let text = "";
 
+          // OpenAI accepts message.content as a string OR an array of
+          // content parts ([{type:"text", text:"..."}, {type:"image_url", ...}, ...]).
+          // Coerce to a single string before any role-specific shaping —
+          // otherwise stripThinking, template literals, and startsWith all
+          // crash or silently produce "[object Object]".
+          const rawContent = m.content;
+          const contentText = Array.isArray(rawContent)
+            ? rawContent
+                .map((part: any) => typeof part === "string" ? part : (part?.text ?? ""))
+                .filter(Boolean)
+                .join("\n")
+            : (rawContent || "");
           if (role === "tool") {
-            text = `<tool_response>\n${m.content}\n</tool_response>`;
+            text = `<tool_response>\n${contentText}\n</tool_response>`;
           } else if (role === "assistant") {
-            text = stripThinking(m.content || "");
+            text = stripThinking(contentText);
             if (m.tool_calls) {
               for (const tc of m.tool_calls) {
                 const fn = tc.function || tc;
@@ -1302,7 +1288,7 @@ async function serve(port: number) {
               }
             }
           } else {
-            text = m.content || "";
+            text = contentText;
             if (noThinkPrefixThisRequest && i === lastUserIdx && !text.startsWith("/no_think")) {
               text = `/no_think\n${text}`;
             }
@@ -1454,11 +1440,14 @@ async function serve(port: number) {
                     }
                     emit(text);
                   } else if (msg.type === "done") {
-                    // See run() flush logic: only flush unclosed-think
-                    // buffer if it contains <|im_end|> (broken /no_think
-                    // pattern). Otherwise it's a runaway think loop and
-                    // flushing would leak reasoning.
-                    if (inThink && flushUnclosedThink && thinkBuffer.includes("<|im_end|>")) {
+                    // Same flush conditions as run(): explicit <|im_end|>
+                    // in buffer (broken /no_think) OR natural stop
+                    // (msg.tokens < requestMaxTokens — model emitted EOS
+                    // even if its bytes didn't reach the streamed text).
+                    // Otherwise discard so a runaway thinking loop that
+                    // hit max_tokens doesn't leak reasoning.
+                    const naturalStop = typeof msg.tokens === "number" && msg.tokens < requestMaxTokens;
+                    if (inThink && flushUnclosedThink && (thinkBuffer.includes("<|im_end|>") || naturalStop)) {
                       emit(thinkBuffer.replace(/^\s+/, ""));
                     }
                     // When tools are present, parse accumulated text for tool calls
@@ -1560,14 +1549,16 @@ async function serve(port: number) {
         // Mode-specific handling for an UNCLOSED <think> at end of output:
         //   • thinking=on   → strip from <think> to end (model failed to
         //                     finish thinking; suppress entirely).
-        //   • thinking=off  → if the unclosed-think tail contains
-        //                     <|im_end|>, it's the broken /no_think pattern
-        //                     (Qwen3.5 emits "<think>" + answer + <|im_end|>
-        //                     with no closing tag) — strip just the tag and
-        //                     keep the tail. If <|im_end|> is absent the
-        //                     model is in a runaway think loop that hit
-        //                     max_tokens; strip from <think> to end so
-        //                     reasoning doesn't leak.
+        //   • thinking=off  → keep the tail (strip just the tag) when
+        //                     either (a) the tail contains <|im_end|> —
+        //                     broken /no_think pattern with completed
+        //                     answer, or (b) the daemon emitted fewer
+        //                     tokens than requested (natural EOS, even
+        //                     when the EOS bytes didn't reach the text
+        //                     stream — common on the AR path). Otherwise
+        //                     the model is in a runaway think loop that
+        //                     hit max_tokens; strip from <think> to end
+        //                     so reasoning doesn't leak.
         content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "");
         if (thinkModel !== "off") {
           content = content.replace(/<think>[\s\S]*$/, ""); // unclosed: discard
@@ -1575,7 +1566,8 @@ async function serve(port: number) {
           const m = content.match(/<think>([\s\S]*)$/);
           if (m) {
             const tail = m[1];
-            content = tail.includes("<|im_end|>")
+            const naturalStop = completionTokens < requestMaxTokens;
+            content = (tail.includes("<|im_end|>") || naturalStop)
               ? content.replace(/<think>/g, "")
               : content.replace(/<think>[\s\S]*$/, "");
           }
