@@ -1,0 +1,182 @@
+# ChainedNgramCache → spec_step_dflash integration
+
+**Task:** #107
+**Status:** DEFERRED — prototype shipped (eaf36aa), engine integration pending workload-realistic bench
+**Owner:** TBD
+**Date opened:** 2026-04-26
+
+## Background
+
+Commit `eaf36aa` shipped `ChainedNgramCache` as a self-contained struct
+in `engine/src/speculative.rs`, modeled on llama.cpp's `ngram_mod`
+(PR ggml-org/llama.cpp#19164). Storage: open-addressing hash with
+overwrite-on-collision, 4 MB default. Self-resets on occupancy > 25%
+or 3 consecutive predict-rounds with < 50% accept-rate.
+
+A microbench (`crates/engine/examples/chained_ngram_microbench.rs`)
+trains the cache on the first half of a real DFlash-emitted token
+stream and predicts the second half. Results on the LRU 1501-token
+loop output:
+
+| order  | top-1 acc | mean chain hit (of 16) | Δ vs bigram |
+|--------|-----------|------------------------|-------------|
+| bigram | 80.0%     | n/a                    | —           |
+| n=3    | 78.1%     | 3.7                    | -1.9%       |
+| n=4    | 90.4%     | 6.7                    | **+10.4%**  |
+| n=6    | 99.2%     | 15.0                   | **+19.1%**  |
+
+At n=6, 39 of 45 sampled chains hit all 16 tokens. This is the upper
+bound — LRU output is loop-dominant. Production-shape prompts will
+show smaller deltas, but the **shape** of the win is what we'd capture:
+- Boilerplate / repeated structures (function signatures, JSON arrays)
+- Recurring variable-name + access patterns (`self.cache[key]`)
+- Trailing tokens of a B=16 block where draft entropy compounds
+
+## Goal
+
+Replace the bigram (a, b) lookup at `engine/src/speculative.rs:2712`
+with a chained `get(tail)` where `tail` is the rolling (n-1)-token
+suffix of `prev_committed ++ drafted[..i]`. Same per-position override
+pattern, longer context window. A/B-gated; bigram remains the default.
+
+Acceptance criterion: τ delta vs current bigram on the workload mix
+(humaneval / merge_sort / prose / instruction / chat) ≥ +5% mean,
+with no individual workload regressing more than 2%.
+
+## Approach
+
+### Plumbing change (~30 lines)
+
+`spec_step_dflash` signature already takes `ngram_cache: Option<&NgramCache>`.
+Add a sibling parameter:
+
+```rust
+chained_cache: Option<&ChainedNgramCache>,
+```
+
+Inside the override loop (lines 2711-2729 today):
+
+```rust
+if pld_spine.is_none() {
+    // Try chained first when present (longer context = more confident).
+    if let Some(ng) = chained_cache {
+        let order = ng.order();
+        for i in 1..b {
+            // Rolling tail of (n-1) tokens.
+            let want = order - 1;
+            let mut tail: Vec<u32> = Vec::with_capacity(want);
+            // Pull from prev_committed first, then from drafted as it grows.
+            let prev_len = prev_committed.len();
+            for j in 0..want {
+                let global_idx = prev_len + i - want + j;
+                tail.push(if global_idx < prev_len {
+                    prev_committed[global_idx]
+                } else {
+                    drafted[global_idx - prev_len + 1]  // +1 for seed offset
+                });
+            }
+            if let Some(tok) = ng.get(&tail) {
+                block[i] = tok;
+                drafted[i] = tok;
+            }
+        }
+    } else if let Some(ng) = ngram_cache {
+        // Fall back to existing bigram path
+        // ... (current code)
+    }
+}
+```
+
+### Wiring in dflash_spec_demo
+
+```rust
+let chained_n: usize = std::env::var("HIPFIRE_DFLASH_CHAINED_NGRAM_N")
+    .ok().and_then(|s| s.parse().ok()).unwrap_or(0);  // 0 = disabled
+let chained_size: usize = std::env::var("HIPFIRE_DFLASH_CHAINED_NGRAM_SIZE")
+    .ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 20);  // 1M default
+
+let mut chained_cache = if chained_n >= 2 {
+    let mut c = engine::speculative::ChainedNgramCache::new(chained_n, chained_size);
+    c.observe_many(&prompt_tokens);
+    eprintln!("chained-ngram cache: n={chained_n} cap={chained_size} (4MB at 1M)");
+    Some(c)
+} else {
+    None
+};
+```
+
+After each commit:
+```rust
+if let Some(ref mut ng) = chained_cache {
+    ng.observe_many(&new_committed_window);
+    // Optional self-reset hook:
+    let accepted = step.accepted as usize;
+    let drafted_n = step.committed.len() - 1;  // exclude seed
+    if ng.maybe_reset(accepted, drafted_n) {
+        eprintln!("[chained-ngram] reset triggered");
+    }
+}
+```
+
+### Exclusivity gate
+
+Initial integration: chained takes priority over bigram when both are
+configured. Future option: layered fallback — chained first, bigram
+second on miss, target argmax third. Defer the layered version until
+A/B data justifies the complexity.
+
+## Workload bench plan
+
+Run the integrated version vs current bigram on a 6-prompt mix:
+1. **humaneval_0** (clean, novel function) — should see ~0% delta (no
+   structure to memorize)
+2. **merge_sort thinking-OFF** (current 27B / 9B anchors) — small lift
+   if any (~0-3%)
+3. **LRU class** at max=120 (canonical) — measurable lift on bigram
+   tail tokens
+4. **Long-form essay** (~500 tok prose) — small to negative; novel
+   text per-position
+5. **JSON array generation** (50 records) — strong lift; structural
+   repetition is exactly the target case
+6. **Multi-turn chat** with recurring assistant phrases — measurable
+   lift on the recurring tail
+
+Per-prompt: median of 3 at temp=0, deterministic. Compare τ + tok/s +
+acceptance_rate vs bigram baseline.
+
+n sweep: try n=3, n=4, n=6 at 1M-entry capacity. Pick winner for
+default. Microbench data suggests n=4 is the sweet spot (chain length
+~7 = half of B=16) — captures localized structure without requiring
+deep history.
+
+## Risk
+
+- **n too high → cache underutilized.** At n=6 with sparse history,
+  most lookups miss and we waste a hash op per draft position. The
+  microbench occupancy was 0.01% — irrelevant on small streams.
+  Production: cap chain length per cycle (already in struct, default 16).
+- **Cache poisoning** in long sessions. Mitigated by `maybe_reset`,
+  but tune `low_accept_threshold` carefully — if too aggressive,
+  we throw away useful state. Default 0.5 is liberal; could go to 0.3.
+- **Interaction with PLD/bigram override**: current bigram path is
+  conditioned on `pld_spine.is_none()`. The same gate applies to
+  chained. PLD should still win when active (per Goose paper's 2-18×
+  acceptance superiority).
+
+## Triggers to un-defer
+
+- Workload-realistic bench measured (deferred until MI300X load
+  frees up post-Phase B)
+- A user/CI workload exhibits structural-repeat patterns where the
+  current bigram override leaves measurable τ on the table
+- Composes naturally with the DFlash governor PRD (#108): chained
+  cache could be one of the controlled signals (turn on under
+  DEGENERATING, off under NORMAL)
+
+## References
+
+- Commit `eaf36aa`: ChainedNgramCache struct + microbench + tests
+- llama.cpp `common/ngram-mod.{cpp,h}`, `common/speculative.cpp:642-756`
+- llama.cpp PR ggml-org/llama.cpp#19164
+- engine/src/speculative.rs:1438 — current bigram NgramCache (kept)
+- engine/src/speculative.rs:2712 — current override call site

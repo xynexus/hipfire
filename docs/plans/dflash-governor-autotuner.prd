@@ -1,0 +1,301 @@
+# DFlash governor / autotuner
+
+**Task:** #108
+**Status:** DEFERRED — design only, replaces today's env-var zoo
+**Owner:** TBD
+**Date opened:** 2026-04-26
+
+## Background
+
+Today's DFlash configuration surface is an environment-variable zoo
+that the user has to set manually:
+
+| Knob | Range | Cost to switch |
+|---|---|---|
+| `dflash_mode` | on / off | ~1 cycle (drop draft) |
+| `block_size` (B) | 8-16 | already adaptive (commit c8b2724) |
+| `kv_cache` | asym3 / asym4 / Q8 | LOAD-time only — can't hot-swap |
+| `dflash_ngram_block` | on / off | per-cycle (verify-path gate) |
+| `loop_break` mode | stop / escalate / temp | per-cycle |
+| `cask_sidecar` + `cask_budget` + β | varies | per-cycle (sidecar load is one-time) |
+| `repeat_penalty` | 1.0–1.3 | per-cycle, host-path forced when ≠ 1.0 |
+| `prompt_normalize` | on / off | LOAD-time |
+| `thinking` | on / off (chatml only) | LOAD-time |
+| ChainedNgramCache `n` + `min_count` | 2-8 | per-session (#107) |
+
+For end-users this is unusable. Even for power users it's hard to
+remember which knob to flip when output starts looping or τ
+degrades. **The fix isn't documentation — it's a controller that
+watches the signals we already track and toggles the cheap knobs
+automatically.** End-user surface collapses to `--mode {auto, fast, safe}`.
+
+## Goal
+
+Replace per-cycle env vars with a state-machine controller. User
+sets `--mode auto` (default), governor watches τ + accept_rate +
+window-hash + chain-hit-rate signals every cycle, transitions
+between {NORMAL, DEGENERATING, RECOVERING, LOOPING} states, and
+toggles the cheap knobs (ngram_block, loop_break, B size, RP, chained
+ngram) per state.
+
+Acceptance criteria:
+- `--mode auto` matches or beats hand-tuned env-var configurations on
+  the canonical workload mix (LRU / merge_sort / prose / instruction)
+  without per-prompt tuning
+- End-user surface area: only `--mode {auto, fast, safe}` exposed by
+  default; existing env vars remain as overrides for power users
+- No measurable regression on production prompts (humaneval, merge_sort)
+  in NORMAL state — governor overhead must be ~ns per cycle
+
+## Two gear-shift levels
+
+### 1. Per-cycle (real-time): controller in spec_step_dflash
+
+State machine with four states + per-state policy:
+
+| State | Entry condition | Active policy |
+|---|---|---|
+| **NORMAL** | τ_window ≥ 8 AND no window-hash hits in last K | full B=16, no ngram_block, no loop-break, RP=1.0 |
+| **DEGENERATING** | τ_window < 4 for 5+ cycles | enable ngram_block, escalate mode, B=12, RP=1.05 |
+| **RECOVERING** | τ_window > 6 for 3+ cycles after DEGENERATING | drop ngram_block, ramp B back to 16 over 3 cycles, RP→1.0 |
+| **LOOPING** | 3+ window-hash hits in last 16 cycles | hard-stop (synthetic EOS) OR fall back to AR for next 50 tokens |
+
+Transitions are unidirectional except RECOVERING → NORMAL (after a
+hysteresis window). LOOPING is terminal for the current generation —
+the governor doesn't try to escape; it cleans up.
+
+Signals (all already collected today):
+- `tau_window_avg` — rolling τ over last 8 cycles, cheap (single divide)
+- `accept_rate_window` — `accepted / (cycles × (B-1))` over last 8
+- `window_hash_hits` — already in HIPFIRE_DFLASH_LOOP_BREAK detector
+- `chain_hit_rate` — when ChainedNgramCache (#107) is integrated, fraction of chain predictions accepted
+
+Cost: rolling counters + state-machine transition checks per cycle =
+microseconds. Negligible vs ~5 ms per spec_step cycle.
+
+### 2. Per-request (gear-shift): prompt classifier at load time
+
+Before the first cycle, classify the prompt and pre-commit to:
+- `budget + β` → eviction frequency target (rare for short prompts,
+  frequent for long-ctx)
+- `kv_cache` mode (this is LOAD-time so can't hot-swap)
+- Initial state: NORMAL vs SUSPICIOUS (prompts that historically loop
+  start in DEGENERATING-light mode)
+
+Classifier features (all cheap, computed on tokenized prompt):
+- Token count (bucketed: <500, 500-2k, 2k-8k, 8k+)
+- Token-class ratios: code chars (`(` `)` `{` `}` indent), prose
+  whitespace runs (`\n\n`), ChatML markers
+- Vocab diversity in prompt (unique-token-ratio over first 256)
+- Prompt-fingerprint hash → look up "what config worked best last
+  time we saw this fingerprint shape" (the autotuner learns)
+
+Output: a `RequestPolicy` struct passed into spec_step_dflash that
+seeds the governor's initial state and decides static knobs.
+
+## Architecture sketch
+
+### `DflashGovernor` struct (spec_step_dflash module)
+
+```rust
+pub enum GovernorState {
+    Normal,
+    Degenerating { cycles_in_state: u32 },
+    Recovering { cycles_in_state: u32, baseline_tau: f32 },
+    Looping,
+}
+
+pub struct DflashGovernor {
+    state: GovernorState,
+    tau_window: VecDeque<f32>,           // last 8
+    accept_window: VecDeque<f32>,        // last 8
+    window_hash_hits_recent: u32,        // last 16 cycles
+    chain_hit_rate_recent: f32,          // when chained-ngram active
+    window_hashes: HashSet<u64>,         // shared with loop-break detector
+
+    // Output policy (consumed by spec_step_dflash each cycle)
+    pub current_policy: CyclePolicy,
+}
+
+pub struct CyclePolicy {
+    pub block_size: usize,
+    pub repeat_penalty: f32,
+    pub ngram_block: bool,
+    pub loop_break_mode: LoopBreakMode,  // none | escalate | stop
+    pub fall_back_to_ar: bool,
+}
+
+impl DflashGovernor {
+    pub fn observe(&mut self, cycle: &SpecStepResult, emitted_tail_hash: u64) {
+        // 1. Update rolling windows
+        // 2. Check window-hash hits
+        // 3. Compute new state via state-transition table
+        // 4. Update self.current_policy from state
+    }
+}
+```
+
+### `RequestPolicy` (computed at load-time)
+
+```rust
+pub struct RequestPolicy {
+    pub initial_state: GovernorState,    // NORMAL | SUSPICIOUS
+    pub budget: usize,                   // sidecar budget target
+    pub beta: usize,
+    pub kv_mode: KvMode,                 // already exists
+    pub chained_ngram_n: Option<usize>,  // 0 = off, n=4 default for chat
+    pub fingerprint: u64,                // for cache-hit telemetry
+}
+
+impl RequestPolicy {
+    pub fn classify(prompt_tokens: &[u32], history: Option<&FingerprintCache>) -> Self {
+        // Cheap features → choose policy
+    }
+}
+```
+
+### Fingerprint cache (long-term)
+
+Persisted per-user table:
+```
+fingerprint hash → { best_policy, sample_count, mean_tau, last_used }
+```
+
+On cache hit: use best_policy directly. On miss: compute heuristic
+classifier policy, record post-generation outcome. Over a coding
+agent's lifetime, ~80% of requests hit cache after a week.
+
+Storage: `~/.hipfire/governor-cache.json`, ~10 KB per ~100 entries.
+
+## End-user surface
+
+Today's CLI:
+```
+hipfire run qwen3.5:9b "..."
+HIPFIRE_DFLASH_LOOP_BREAK=stop \
+HIPFIRE_DFLASH_NGRAM_BLOCK=1 \
+HIPFIRE_DFLASH_CHAINED_NGRAM_N=4 \
+hipfire run qwen3.5:9b "..."  # power user
+```
+
+Proposed:
+```
+hipfire run qwen3.5:9b "..."                  # auto (default)
+hipfire run --mode fast qwen3.5:9b "..."      # disable all guards, max speed
+hipfire run --mode safe qwen3.5:9b "..."      # eager guards (always-on)
+HIPFIRE_DFLASH_NGRAM_BLOCK=1 hipfire run ...  # power-user override still works
+```
+
+`--mode auto`: governor controls everything per cycle.
+`--mode fast`: governor disabled, all guards off (current default
+when no env vars set). For benchmarking and trusted prompts.
+`--mode safe`: all guards always on. For unknown prompts in production
+where conservative behavior beats peak speed.
+
+## Implementation phases
+
+### Phase 1: Per-cycle governor (~300 lines)
+
+- New `DflashGovernor` struct in `engine/src/speculative.rs`
+- Plumb signal collection into spec_step_dflash (rolling τ, accept,
+  window-hash count) — all already computed, just need to thread
+  them out
+- `CyclePolicy` consumed by spec_step_dflash to gate the existing
+  knobs (replaces direct env-var reads)
+- Env-gate behind `HIPFIRE_DFLASH_GOVERNOR=1` initially, default OFF
+  (no behavior change). Promote to default after benching.
+
+### Phase 2: Prompt classifier (~150 lines)
+
+- `RequestPolicy::classify` impl with feature extraction
+- Hand-tuned heuristic mapping (code → budget=8k+β=2k, prose → 16k+2k,
+  chat → 4k+1k)
+- No fingerprint cache yet — just deterministic from features
+
+### Phase 3: Fingerprint cache (~200 lines)
+
+- Persistent JSON store at `~/.hipfire/governor-cache.json`
+- Update mechanic: post-generation, record actual τ + tok/s, blend
+  into table entry
+- Eviction: LRU at 1000 entries
+
+### Phase 4: CLI surface (~80 lines)
+
+- `--mode {auto, fast, safe}` flag on `run` and `serve`
+- `auto` enables governor + classifier + fingerprint cache
+- Existing env vars remain as overrides
+
+## Bench plan
+
+For each phase, compare against:
+- Current default (no env vars set, all guards off)
+- Hand-tuned-per-workload (the env-var combo we'd manually pick)
+
+Workloads:
+- humaneval (no governor effect expected — NORMAL state throughout)
+- merge_sort (no effect — also NORMAL)
+- LRU class with max=2000 (governor should detect loop early, transition
+  to LOOPING, hard-stop within 5-10 cycles of degeneration)
+- Multi-turn chat with deliberate repetitive prompts
+- Mixed-length prompt batch (validates classifier)
+
+Acceptance for Phase 1: governor matches or beats best hand-tuned
+per-workload by ≥ 5% mean tok/s, while reducing user-visible config
+to a single flag.
+
+## Risk
+
+- **State-machine oscillation**: poorly-tuned hysteresis could
+  flip-flop between NORMAL and DEGENERATING. Mitigation: minimum
+  cycles-in-state thresholds (already in design), well-tested
+  transition table.
+- **Wrong-classifier penalty**: if the prompt-fingerprint cache
+  associates a workload with a bad config, future generations
+  inherit the penalty. Mitigation: blend with default heuristic at
+  low sample counts; explicit cache-bust command.
+- **Telemetry leak**: fingerprint cache stores prompt hashes — these
+  are not the prompt text but could correlate. Mitigation: opt-in
+  via `--mode auto`, opt-out via `HIPFIRE_NO_FINGERPRINT_CACHE=1`,
+  document clearly in privacy notes.
+- **Maintenance cost**: state machines are hard to debug and easy to
+  ossify. Plan: per-state telemetry exposed via `--mode auto --debug`
+  showing transitions + signal values per cycle, so misbehavior is
+  visible.
+
+## Out of scope
+
+- Hot-swap of `kv_cache` (impossible without re-loading model)
+- Hot-swap of `prompt_normalize` (LOAD-time)
+- Hot-swap of `thinking` mode (LOAD-time)
+- ML-based classifier (deterministic heuristic + fingerprint cache
+  is enough for now; ML adds latency + maintenance)
+
+## Why deferred
+
+- Phase 1 alone is ~300 lines + a state machine + a controller
+  interface. Solid week of focused work to do well.
+- Current operational surface (env vars) works for the limited number
+  of users we have. Investment in `--mode auto` makes sense once we
+  have user complaints about the env-var zoo.
+- ChainedNgramCache integration (#107) lands first — its chain-hit-rate
+  signal is one of the governor's inputs. Without it, governor is
+  watching one fewer signal.
+
+## Triggers to un-defer
+
+- User/CI complaints about env-var config burden
+- ChainedNgramCache integration (#107) ships and we want to compose
+- Multi-tenant serve daemon needs per-request adaptive config (each
+  client has different workload shape)
+- Telemetry shows some prompts loop-spiral while others run clean —
+  the governor catches the difference automatically
+
+## References
+
+- engine/examples/dflash_spec_demo.rs: existing env-var integrations
+  (HIPFIRE_DFLASH_LOOP_BREAK, NGRAM_BLOCK, etc.)
+- engine/src/speculative.rs: ChainedNgramCache (eaf36aa)
+- Commit c8b2724: existing adaptive-B implementation (precedent for
+  state-driven cycle policy)
+- Task #107: ChainedNgramCache integration (signal source for governor)
+- Task #106: sidecar-aware draft training (independent — orthogonal axis)
