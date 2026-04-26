@@ -289,6 +289,7 @@ For dataclass benches:
 | `τ=9.42` on first run, `τ=8.07` on next | Different prompt — see above | Same fix |
 | "0 evictions even though sidecar loaded" | `cask_beta` too high (default 128) means trigger is at budget+128 | Lower beta to 16 to actually exercise the eviction policy |
 | "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | This is expected with z-lab drafts; fix is Path C (train custom draft) |
+| 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B until Path C (custom 3.6 draft training) completes. 3.5-A3B DFlash works (τ=4.91) |
 | `hipMalloc out of memory` at hidden_rb | Long ctx (≥16K real tokens) + 27B + asym3 = tight on 24 GB | Reduce ctx, use a smaller target, or wait for the bounded-rolling-buffer trick (roadmap) |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't auto-find draft | Filename doesn't match `qwen3{ver}-{size}-dflash-{quant}.hfq` | Don't rename the file after pull |
