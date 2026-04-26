@@ -201,7 +201,7 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 const PER_MODEL_KEYS = [
   "kv_cache", "flash_mode", "temperature", "top_p",
   "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens",
-  "dflash_adaptive_b", "dflash_mode",
+  "dflash_adaptive_b", "dflash_mode", "dflash_ngram_block",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
   "prompt_normalize",
@@ -2428,6 +2428,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "DFlash speculative decoding: on = always, off = disable, auto = arch+model aware",
       options: ["auto", "on", "off"],
     },
+    dflash_ngram_block: {
+      label: "dflash_ngram_block",
+      desc: "verify-path n-gram block (auto = ON for dense <9B, OFF for 9B+; true/false override)",
+      options: ["auto", "true", "false"],
+    },
     cask_sidecar: {
       label: "cask_sidecar",
       desc: "path to CASK sidecar .bin (empty = disabled; enables KV cache pruning)",
@@ -2519,10 +2524,13 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     let idx = m.options.indexOf(cur);
     if (idx < 0) idx = 0;
     const next = m.options[(idx + dir + m.options.length) % m.options.length];
-    // Booleans live as true/false in config but render as "true"/"false" in meta.
-    // Convert back so validateConfigValue + saveConfig see the right type.
-    const defaultVal = CONFIG_DEFAULTS[k];
-    const finalVal = typeof defaultVal === "boolean" ? next === "true" : next;
+    // Booleans live as true/false in config but render as "true"/"false"
+    // in meta. For tri-state fields like dflash_ngram_block ("auto" |
+    // boolean), "auto" stays a string while "true"/"false" coerce to bool
+    // so validateConfigValue + saveConfig see the right type.
+    const finalVal = next === "true" ? true
+                   : next === "false" ? false
+                   : next;
     setValue(k, finalVal);
   };
 
@@ -3877,8 +3885,12 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
         process.exit(1);
       }
       const defaultVal = CONFIG_DEFAULTS[key as keyof HipfireConfig];
+      // Tri-state aware: "true"/"false" coerce to bool regardless of default
+      // type, so fields like dflash_ngram_block ("auto" | boolean) accept
+      // all three string forms cleanly.
       const parsed = typeof defaultVal === "number" ? Number(value)
-                   : typeof defaultVal === "boolean" ? (value === "true" ? true : value === "false" ? false : value)
+                   : value === "true" ? true
+                   : value === "false" ? false
                    : value;
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
