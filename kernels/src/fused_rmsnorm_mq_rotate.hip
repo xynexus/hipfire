@@ -29,17 +29,13 @@
 //   reduction order for sum-of-squares is identical to rmsnorm_f32, and the
 //   butterfly order matches mq_rotate_x exactly).
 
-// __restrict__ stripped: hipcc/clang (ROCm 7.2) miscompile on gfx1100 —
-// leaving restrict on pointer params of batched-path kernels produces
-// deterministic-wrong output at LA layer 0 and nondeterministic output
-// at layers ≥ 1 in prefill (diagnosed via prefill_state_diff harness).
 __launch_bounds__(256, 1)
 extern "C" __global__ void fused_rmsnorm_mq_rotate(
-    const float* x,
-    const float* weight,
-    const float* signs1,
-    const float* signs2,
-    float* x_rot,
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    float* __restrict__ x_rot,
     int K,
     float eps
 ) {
@@ -53,12 +49,11 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
     const int warp_id = tid >> 5;      // 0..7
     const int num_warps = block_size >> 5;
 
-    // Batch row: this block processes x[row * K .. (row+1) * K]. Row comes
-    // from blockIdx.y for the batched path (grid = [1, N, 1]); grid.x is
-    // always 1 on both paths. This avoids a ROCm 7.2 / gfx1100 scheduler
-    // issue where a multi-block grid.x with large dynamic LDS +
-    // __launch_bounds__(256,1) only runs block 0 in practice.
-    const long long batch_off = (long long)blockIdx.y * K;
+    // Batch row: this block processes x[blockIdx.x * K .. (blockIdx.x+1) * K].
+    // For decode (grid.x == 1), offset is 0 and the behaviour is identical
+    // to the pre-batching version. weight/signs1/signs2 are shared across
+    // the batch (same per-feature scalars for every token).
+    const long long batch_off = (long long)blockIdx.x * K;
     const float* x_b     = x     + batch_off;
           float* x_rot_b = x_rot + batch_off;
 

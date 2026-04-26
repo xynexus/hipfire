@@ -214,3 +214,57 @@ Before starting a new kernel-level perf experiment, check this list. If
 it's been tried and failed, don't rediscover unless you have a specific
 reason to believe conditions changed (new ROCm version, new hardware,
 different kernel family).
+
+---
+
+## 4. Canonical bench config (lock these flags)
+
+After the 2026-04-26 perf-regression-recovery
+(`docs/plans/perf-regression-recovery-2026-04-26.prd`), these are the
+canonical flags. Bench numbers without them are NOT comparable to README
+or CLAUDE.md numbers.
+
+**27B-3.5 LRU code DFlash (the canonical bench, used for regression detection):**
+
+```
+./target/release/examples/dflash_spec_demo \
+    --target ~/.hipfire/models/qwen3.5-27b.mq4 \
+    --draft  ~/.hipfire/models/qwen35-27b-dflash.mq4 \
+    --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
+    --max 120 --no-chatml --kv-mode asym3
+```
+
+Expected on 7900 XTX (gfx1100): **199 tok/s τ=10.36** (3-run hot-cache
+median, ±2% deterministic).
+
+**Required defaults (verify before reporting numbers):**
+
+| Setting | Required value | Where set |
+|---|---|---|
+| `prompt_normalize` | `true` (default since 2026-04-26) | CLI default; `HIPFIRE_NORMALIZE_PROMPT=0` opts out |
+| `kv_mode` | `asym3` | `--kv-mode asym3` |
+| chatml wrap | OFF | `--no-chatml` (3.5 drafts trained on raw text) |
+| `dflash_mode` | `auto` or `on` (off = AR, different bench) | CLI per_model |
+| `HIPFIRE_DPM_WARMUP_SECS` | 10 | env (built-in to dflash_spec_demo) |
+
+**Forensic landmines (have bitten this team repeatedly):**
+
+- **Concurrent `ollama serve`** quietly competes for GPU even at
+  rocm-smi 0% busy — `sudo systemctl stop ollama` before benching.
+- **Stale kernel cache after rebuild** → silent regressions.
+  `rm -rf .hipfire_kernels/ ~/.hipfire/bin/kernels/compiled/` before any
+  bench you intend to compare to a prior number.
+- **Pre-2026-04-26 numbers measured with `HIPFIRE_NORMALIZE_PROMPT=1`
+  set manually** are equivalent to post-2026-04-26 default numbers (same
+  flag, just default flipped). Don't double-count by enabling it on top
+  of the new default.
+- **"Peak" tok/s from prior-session memory is upper-bound special-config.**
+  The CANONICAL is 199 tok/s on 27B-3.5 LRU code. Compare against the
+  canonical, not the peak. Memory's "200+ tok/s" claim was the canonical
+  with normalize on, which is now the default — match the canonical, not
+  the memory.
+- **Static "dead code" cleanup of compute kernels is dangerous.** PR #32
+  removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead — they
+  were load-bearing on the 27B verify dispatch path. Any kernel-cleanup
+  PR MUST run `scripts/sweep_dflash_full.sh` before/after with diff ≤2%
+  on canonical bench.

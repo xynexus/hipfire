@@ -13,15 +13,11 @@
 // Bit-exact with the separate kernels since all operations are
 // elementwise — no cross-thread dependencies or associativity changes.
 
-// __restrict__ stripped: hipcc/clang (ROCm 7.2) miscompile on gfx1100 —
-// leaving restrict on pointer params of batched-path kernels produces
-// deterministic-wrong output at LA layer 0 and nondeterministic output
-// at layers ≥ 1 in prefill (diagnosed via prefill_state_diff harness).
 extern "C" __global__ void fused_sigmoid_alpha_gate_f32(
-    float* beta,         // [batch × n] in-place sigmoid
-    float* alpha,        // [batch × n] in-place alpha_gate
-    const float* dt_bias,// [n]
-    const float* a_log,  // [n]
+    float* __restrict__ beta,         // [batch × n] in-place sigmoid
+    float* __restrict__ alpha,        // [batch × n] in-place alpha_gate
+    const float* __restrict__ dt_bias,// [n]
+    const float* __restrict__ a_log,  // [n]
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

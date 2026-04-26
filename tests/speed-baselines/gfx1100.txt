@@ -1,5 +1,6 @@
 # hipfire speed-gate baseline — gfx1100
-# Captured 2026-04-19 against commit 2c297f1
+# Captured 2026-04-12 against commit c825dfa (AR rows)
+#         2026-04-26 (DFlash row, post-perf-regression-recovery)
 # Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)
 # Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))
 #
@@ -7,24 +8,29 @@
 #   pp32  — short-context / launch-overhead regression detector
 #   pp128 — realistic prompt / GEMM-efficiency detector
 # Decode numbers are taken from the pp32 run (warmup+50 gen is enough to settle).
-#
-# NOTE: this refresh re-baselines PREFILL throughput down substantially
-# (9B pp32 1001→417, pp128 1515→432; 27B pp32 406→161, pp128 491→160)
-# because the deterministic-prefill correctness fix dispatches N
-# single-row kernel launches instead of one grid=[_,N,1] batched launch
-# (see .auto-memory/project_hipfire_rocm72_multiblock_miscompile.md).
-# The old grid-y batched launches were faster but miscompiled under ROCm 7.2
-# on gfx1100 (blocks 1..N-1 silently skipped); output was incoherent at N>1.
-# Decode (N=1) is within the 5% tolerance of the prior floor.
-#
-# 0.8B and 4B baselines were dropped because the models are not present in
-# this working tree; re-add via --update-baselines on a host that has them.
 # GROUND FLOOR — no commit may regress below these numbers.
 
-9b_mq4_pp32_prefill_tok_s=416.7
-9b_mq4_gen_tok_s=127.6
-9b_mq4_pp128_prefill_tok_s=432.3
+0.8b_mq4_pp32_prefill_tok_s=2007.9
+0.8b_mq4_gen_tok_s=365.6
+0.8b_mq4_pp128_prefill_tok_s=4672.5
 
-27b_mq4_pp32_prefill_tok_s=161.1
-27b_mq4_gen_tok_s=45.1
-27b_mq4_pp128_prefill_tok_s=159.5
+4b_mq4_pp32_prefill_tok_s=1014.0
+4b_mq4_gen_tok_s=178.0
+4b_mq4_pp128_prefill_tok_s=2004.3
+
+9b_mq4_pp32_prefill_tok_s=1001.0
+9b_mq4_gen_tok_s=130.8
+9b_mq4_pp128_prefill_tok_s=1515.1
+
+27b_mq4_pp32_prefill_tok_s=406.1
+27b_mq4_gen_tok_s=46.5
+27b_mq4_pp128_prefill_tok_s=491.1
+
+# DFlash canonical gate — 27B-3.5 LRU PEP-8 strict code @ max=120.
+# Added 2026-04-26 after PR #32 dead-wmma-kernels regressed DFlash by 40%
+# while passing the AR-only gate. AR + DFlash both gate now.
+# Best-of-3 dflash_spec_demo runs, default flags (prompt_normalize=true,
+# DPM warmup 10s). See docs/plans/perf-regression-recovery-2026-04-26.prd.
+27b_3.5_dflash_lru_code_tok_s=199.0
+27b_3.5_dflash_lru_code_tau=10.36
+

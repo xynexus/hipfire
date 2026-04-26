@@ -1136,28 +1136,24 @@ impl ForwardScratch {
         let max_chunks = 16;
         let partial_stride = 2 + config.head_dim;
         let partials_size = config.n_heads * max_chunks * partial_stride;
-        // Zero-init (not alloc_tensor) — pool / hipMalloc returns dirty VRAM,
-        // and dirty tails in e.g. attn_partials bleed into flash-decode
-        // reductions. Nondeterminism across daemon restarts at temp=0 traces
-        // back to this. One-time memset at model load.
         Ok(Self {
-            x: gpu.zeros(&[dim], DType::F32)?,
-            tmp: gpu.zeros(&[dim], DType::F32)?,
-            q: gpu.zeros(&[q_dim], DType::F32)?,
-            k: gpu.zeros(&[kv_dim], DType::F32)?,
-            v: gpu.zeros(&[kv_dim], DType::F32)?,
-            attn_out: gpu.zeros(&[q_dim], DType::F32)?,
-            o: gpu.zeros(&[dim], DType::F32)?,
-            gate: gpu.zeros(&[config.hidden_dim], DType::F32)?,
-            up: gpu.zeros(&[config.hidden_dim], DType::F32)?,
-            ffn_hidden: gpu.zeros(&[config.hidden_dim], DType::F32)?,
-            ffn_out: gpu.zeros(&[dim], DType::F32)?,
-            logits: gpu.zeros(&[config.vocab_size], DType::F32)?,
-            sample_buf: gpu.zeros(&[2], DType::F32)?,
-            repeat_buf: gpu.zeros(&[64], DType::F32)?,
-            attn_partials: gpu.zeros(&[partials_size], DType::F32)?,
+            x: gpu.alloc_tensor(&[dim], DType::F32)?,
+            tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
+            q: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            k: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            v: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            attn_out: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            o: gpu.alloc_tensor(&[dim], DType::F32)?,
+            gate: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
+            up: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
+            ffn_hidden: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
+            ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
+            logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
+            sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
+            repeat_buf: gpu.alloc_tensor(&[64], DType::F32)?,
+            attn_partials: gpu.alloc_tensor(&[partials_size], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,  // single i32
-            x_rot: gpu.zeros(&[dim.max(config.hidden_dim)], DType::F32)?,
+            x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
         })
     }
 

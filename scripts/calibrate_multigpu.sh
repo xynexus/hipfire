@@ -7,12 +7,17 @@
 # Usage:
 #   bash calibrate_multigpu.sh \
 #       --models model1.mq4,model2.mq4,... \
-#       --corpus /root/hermes_corpus.txt \
+#       (--corpus FILE | --recipe NAME) \
 #       [--max-tokens 1000000] \
 #       [--chunk-len 1024] \
 #       [--suffix .triattn.bin] \
 #       [--sidecar-dir /root/models] \
 #       [--log-dir /root/calib_logs]
+#
+# --recipe NAME auto-builds a corpus via fetch_calibration_corpus.sh.
+# Recipes: agentic | agentic_xl | reasoning | chat | blended | all.
+# Corpus is cached at /root/calib_corpus_<NAME>.txt for reuse across
+# back-to-back calibration waves.
 #
 # Each model M gets calibrated against --corpus, writing:
 #   <sidecar-dir>/$(basename M)<suffix>
@@ -24,6 +29,7 @@ set -uo pipefail
 
 MODELS=""
 CORPUS=""
+RECIPE=""
 MAX_TOKENS=1000000
 CHUNK_LEN=1024
 SUFFIX=".triattn.bin"
@@ -35,6 +41,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --models) MODELS="$2"; shift 2 ;;
         --corpus) CORPUS="$2"; shift 2 ;;
+        --recipe) RECIPE="$2"; shift 2 ;;
         --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
         --chunk-len) CHUNK_LEN="$2"; shift 2 ;;
         --suffix) SUFFIX="$2"; shift 2 ;;
@@ -46,8 +53,38 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+log() { printf '[calibrate-mg] %s\n' "$*"; }
+
+# --recipe NAME auto-builds a corpus via fetch_calibration_corpus.sh into
+# /root/calib_corpus_<recipe>.txt and uses it as --corpus. Saves the
+# two-step "fetch + then calibrate" gotcha. Mutually exclusive with
+# --corpus (explicit path wins; refuse if both given to surface user
+# intent).
+if [ -n "$RECIPE" ]; then
+    if [ -n "$CORPUS" ]; then
+        echo "ERROR: --recipe and --corpus are mutually exclusive" >&2
+        exit 2
+    fi
+    CORPUS="/root/calib_corpus_${RECIPE}.txt"
+    if [ ! -f "$CORPUS" ]; then
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+        FETCH="${SCRIPT_DIR}/fetch_calibration_corpus.sh"
+        if [ ! -x "$FETCH" ]; then
+            echo "ERROR: --recipe given but $FETCH not found/executable" >&2
+            exit 2
+        fi
+        log "recipe=$RECIPE — fetching corpus to $CORPUS via $FETCH"
+        "$FETCH" "$CORPUS" --recipe "$RECIPE" || {
+            echo "ERROR: fetch_calibration_corpus.sh --recipe $RECIPE failed" >&2
+            exit 2
+        }
+    else
+        log "recipe=$RECIPE — reusing cached corpus at $CORPUS"
+    fi
+fi
+
 if [ -z "$MODELS" ] || [ -z "$CORPUS" ]; then
-    echo "ERROR: --models and --corpus are required" >&2
+    echo "ERROR: --models and (--corpus FILE | --recipe NAME) are required" >&2
     exit 2
 fi
 if [ ! -x "$BIN" ]; then
@@ -58,8 +95,6 @@ if [ ! -f "$CORPUS" ]; then
     echo "ERROR: corpus file not found: $CORPUS" >&2
     exit 2
 fi
-
-log() { printf '[calibrate-mg] %s\n' "$*"; }
 
 # Detect visible GPUs (rocminfo lists one Agent per GPU + one for the CPU).
 N_GPUS=$(/opt/rocm/bin/rocminfo 2>/dev/null | grep -c "Agent " || echo 1)
@@ -79,8 +114,16 @@ mkdir -p "$LOG_DIR"
 
 # Launch one background job per model, each pinned to GPU (index % N_GPUS).
 # GNU Parallel would be nicer but keeping it dependency-free.
-declare -A PID_TO_MODEL
-declare -a RUNNING_PIDS
+# Explicit `=()` initializers — `set -u` rejects expansion of declared-
+# but-uninitialized arrays under bash 4.x (unbound variable on
+# `${arr[@]}` / `${#arr[@]}`). Bash 5+ usually tolerates it but the
+# explicit form is portable and the bug is silent: the launch loop
+# never runs, the wait loop never runs, FAILED stays empty, and the
+# script reports "all N calibrations finished ok" while having
+# launched zero jobs.
+declare -A PID_TO_MODEL=()
+declare -a RUNNING_PIDS=()
+declare -a FAILED=()
 
 launch() {
     local idx=$1
@@ -115,8 +158,7 @@ while [ $pending_idx -lt $N_MODELS ] && [ ${#RUNNING_PIDS[@]} -lt $N_GPUS ]; do
     pending_idx=$((pending_idx + 1))
 done
 
-# Drain + refill as jobs complete.
-FAILED=()
+# Drain + refill as jobs complete. (FAILED already initialized above.)
 while [ ${#RUNNING_PIDS[@]} -gt 0 ]; do
     # wait -n returns as soon as ANY background job finishes.
     if ! wait -n; then

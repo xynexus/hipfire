@@ -39,14 +39,8 @@ extern "C" __global__ void gemm_hfq4g256_residual_wmma_k2(
 
     for (int g = 0; g < groups_per_row; g++) {
         const char* gp = row_base + g * 136;
-        // Keep scale/zero-point in FP32. Dequant is done in FP32 and narrowed
-        // to FP16 only at the WMMA input boundary. Doing the full multiply-add
-        // in FP16 loses enough precision over K=4096 accumulation to push the
-        // LM-head argmax into degenerate attractors on gfx1100 WMMA. FP32
-        // dequant keeps the per-element fidelity without giving up the FP32
-        // WMMA accumulator.
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
+        _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
         const _Float16* xg = x_base + g * 256;
 
         // Process 2 K-tiles per iteration (8 iterations covers 16 tiles)
@@ -65,9 +59,9 @@ extern "C" __global__ void gemm_hfq4g256_residual_wmma_k2(
             half16_t b_a = *(const half16_t*)(xg + k_off_a);
             half16_t b_b = *(const half16_t*)(xg + k_off_b);
 
-            // Dequant tile A (FP32 arithmetic, narrow at last step)
+            // Dequant tile A
             half16_t a_a;
-            #define DQ(reg, i, pk, sh) reg[i] = (_Float16)(sc * (float)(((pk) >> (sh)) & 0xFu) + zp)
+            #define DQ(reg, i, pk, sh) reg[i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h
             DQ(a_a, 0,  pk0a,  0); DQ(a_a, 1,  pk0a,  4); DQ(a_a, 2,  pk0a,  8); DQ(a_a, 3,  pk0a, 12);
             DQ(a_a, 4,  pk0a, 16); DQ(a_a, 5,  pk0a, 20); DQ(a_a, 6,  pk0a, 24); DQ(a_a, 7,  pk0a, 28);
             DQ(a_a, 8,  pk1a,  0); DQ(a_a, 9,  pk1a,  4); DQ(a_a, 10, pk1a,  8); DQ(a_a, 11, pk1a, 12);

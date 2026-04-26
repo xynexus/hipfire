@@ -29,6 +29,8 @@ cd "$(dirname "$0")/.."
 
 REPO_ROOT="$(pwd)"
 EXE="./target/release/examples/bench_qwen35_mq4"
+DFLASH_EXE="./target/release/examples/dflash_spec_demo"
+DFLASH_PROMPT_FILE="benchmarks/prompts/lru_cache_pep8_strict.txt"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
 # ── Arch detection ────────────────────────────────────────────────────────
@@ -106,6 +108,45 @@ ensure_build() {
             exit 2
         fi
     fi
+    # DFlash gate is opt-in by default — only requires dflash_spec_demo + the
+    # 27B target + draft + prompt file. Skip silently if unavailable.
+}
+
+# DFlash LRU-code gate. Echoes "tok_s tau" or one of: MISSING_TARGET,
+# MISSING_DRAFT, MISSING_PROMPT, MISSING_BIN, CRASH.
+# Canonical bench: 27B-3.5 LRU code @ max=120, asym3 KV, no chatml, no
+# adaptive-b. Default flags include prompt_normalize=true (engine default
+# since 2026-04-26). Best-of-2 (within 5% jitter on hot-cache).
+bench_dflash_27b_lru() {
+    # Models may live at $MODELS_DIR (project-local) or ~/.hipfire/models/
+    # (install). Drafts in particular are usually only at the install path.
+    local target draft
+    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
+        [ -f "$dir/qwen3.5-27b.mq4" ] && [ -z "${target:-}" ] && target="$dir/qwen3.5-27b.mq4"
+        [ -f "$dir/qwen35-27b-dflash.mq4" ] && [ -z "${draft:-}" ] && draft="$dir/qwen35-27b-dflash.mq4"
+    done
+    [ ! -x "$DFLASH_EXE" ] && { echo "MISSING_BIN"; return; }
+    [ -z "${target:-}" ] && { echo "MISSING_TARGET"; return; }
+    [ -z "${draft:-}" ] && { echo "MISSING_DRAFT"; return; }
+    [ ! -f "$DFLASH_PROMPT_FILE" ] && { echo "MISSING_PROMPT"; return; }
+    local best_t=0 best_tau=0
+    local prompt
+    prompt=$(cat "$DFLASH_PROMPT_FILE")
+    for run in 1 2 3; do
+        local out
+        out=$(HIPFIRE_DPM_WARMUP_SECS=10 "$DFLASH_EXE" \
+            --target "$target" --draft "$draft" \
+            --prompt "$prompt" \
+            --max 120 --no-chatml --kv-mode asym3 2>&1)
+        local t tau
+        t=$(echo "$out" | sed -nE 's/.*emitted: [0-9]+ tokens in [0-9.]+s\s+\(([0-9.]+) tok\/s\).*/\1/p' | tail -1)
+        tau=$(echo "$out" | sed -nE 's/.*τ=([0-9.]+).*/\1/p' | tail -1)
+        if [ -n "$t" ] && awk "BEGIN { exit !($t > $best_t) }"; then
+            best_t="$t"
+            best_tau="$tau"
+        fi
+    done
+    if [ "$best_t" = "0" ]; then echo "CRASH"; else echo "$best_t $best_tau"; fi
 }
 
 # Run bench_qwen35_mq4 once at a given prefill size.
@@ -233,6 +274,25 @@ if [ "$UPDATE" -eq 1 ]; then
         echo "" >> "$tmpfile"
     done
 
+    # DFlash canonical gate (added 2026-04-26 per perf-regression-recovery).
+    # 27B-3.5 LRU code @ max=120, default flags (prompt_normalize=true since
+    # 2026-04-26). Catches the regression class that PR #32 dead-wmma-kernels
+    # missed because it only affected DFlash verify, not AR prefill.
+    printf "  27B-3.5 DFlash LRU code  "
+    dflash_result=$(bench_dflash_27b_lru)
+    case "$dflash_result" in
+        MISSING_*|CRASH) color yellow "$dflash_result"; echo "" ;;
+        *)
+            read -r dt dtau <<< "$dflash_result"
+            printf "tok/s=%-7.1f τ=%s\n" "$dt" "$dtau"
+            {
+                echo "27b_3.5_dflash_lru_code_tok_s=${dt}"
+                echo "27b_3.5_dflash_lru_code_tau=${dtau}"
+            } >> "$tmpfile"
+            ;;
+    esac
+    echo "" >> "$tmpfile"
+
     mkdir -p "$(dirname "$BASELINE_FILE")"
     cp "$tmpfile" "$BASELINE_FILE"
     rm -f "$tmpfile"
@@ -313,6 +373,38 @@ for size in "${SIZES[@]}"; do
         fi
     fi
 done
+
+# DFlash canonical gate — 27B-3.5 LRU code, max=120, default flags.
+# Added 2026-04-26 after PR #32 dead-wmma-kernels passed AR-only speed-gate
+# while regressing 27B DFlash by 40%. AR-only gates are insufficient for
+# perf protection. Skipped in --fast mode (DFlash bench takes ~5s × 3 runs).
+if [ "$FAST" -eq 0 ]; then
+    dflash_result=$(bench_dflash_27b_lru)
+    case "$dflash_result" in
+        MISSING_*)
+            printf "  27B-3.5 DFlash LRU code  "
+            color yellow "SKIP"; echo " ($dflash_result)"
+            skip=$((skip+1))
+            ;;
+        CRASH)
+            printf "  27B-3.5 DFlash LRU code  "
+            color red "CRASH"; echo
+            fail=$((fail+1))
+            ;;
+        *)
+            read -r dt dtau <<< "$dflash_result"
+            dflash_base=$(grep -oE "^27b_3.5_dflash_lru_code_tok_s=[0-9.]+" "$BASELINE_FILE" | cut -d= -f2)
+            if [ -z "$dflash_base" ]; then
+                printf "  27B-3.5 DFlash LRU code  "
+                color yellow "NO BASELINE"; echo " (add with --update-baselines; observed=${dt} τ=${dtau})"
+                skip=$((skip+1))
+            else
+                check_metric "27B-3.5 DFlash LRU code" "$dflash_base" "$dt"
+                case $? in 0) pass=$((pass+1)) ;; *) fail=$((fail+1)) ;; esac
+            fi
+            ;;
+    esac
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then

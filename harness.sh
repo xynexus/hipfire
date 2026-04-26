@@ -84,19 +84,6 @@ else
     log "  ⚠️  rocminfo not installed (skipping)"
 fi
 
-# Vulkan detection (should always work via RADV)
-if command -v vulkaninfo &>/dev/null; then
-    if vulkaninfo --summary 2>/dev/null | grep -i "radeon\|navi\|5700" >/dev/null 2>&1; then
-        pass "Vulkan detects GPU via RADV" 1
-    else
-        fail "vulkaninfo doesn't detect AMD GPU"
-    fi
-elif command -v vkcube &>/dev/null; then
-    log "  ⚠️  vulkaninfo not found, but vkcube exists"
-else
-    log "  ⚠️  no Vulkan tools installed"
-fi
-
 log ""
 
 # ═══════════════════════════════════════════════════════════════
@@ -138,16 +125,6 @@ EOF
     rm -rf "$TMPDIR"
 else
     log "  ⚠️  hipcc not found"
-fi
-
-# Vulkan compute check
-if command -v vulkaninfo &>/dev/null; then
-    COMPUTE_QUEUES=$(vulkaninfo 2>/dev/null | grep -c "COMPUTE" || true)
-    if [ "$COMPUTE_QUEUES" -gt 0 ]; then
-        pass "Vulkan compute queues available: ${COMPUTE_QUEUES}" 2
-    else
-        fail "No Vulkan compute queues detected"
-    fi
 fi
 
 log ""

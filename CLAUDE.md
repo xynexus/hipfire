@@ -94,17 +94,17 @@ They write structured findings to `findings/phase1-*.md`.
 - Agent 7: HIP compilation path for gfx1010 — can hipcc target gfx1010 directly? What flags are needed? Does it need the GFX override or can it be told explicitly? Search ROCm issues and forums.
 - Agent 8: rocBLAS/MIOpen gfx1010 status — these libraries ship precompiled kernels per GFX ID. Are gfx1010 kernels included in any version? If not, can they be compiled from source targeting gfx1010?
 
-**Mesa/open-source path agents (4):**
-- Agent 9: RADV compute shader dispatch — Vulkan compute works on gfx1010 via RADV. Trace how RADV dispatches compute shaders. This is a known-working path to the hardware.
-- Agent 10: radeonsi OpenCL — does Mesa's rusticl or clover provide OpenCL on gfx1010? This could be an alternative compute path.
-- Agent 11: Mesa's register headers for gfx10 — find `sid.h`, `gfx10_format_table.h`, etc. Map the compute-relevant registers (COMPUTE_DISPATCH_INITIATOR, shader resource descriptors, etc.)
-- Agent 12: Compare gfx1010 vs gfx1030 ISA differences — what RDNA2 instructions are actually missing from RDNA1? This determines whether the HSA override hack is fundamentally sound or just lucky.
+**Mesa/open-source path agents (3):**
+- Agent 9: radeonsi OpenCL — does Mesa's rusticl or clover provide OpenCL on gfx1010? This could be an alternative compute path.
+- Agent 10: Mesa's register headers for gfx10 — find `sid.h`, `gfx10_format_table.h`, etc. Map the compute-relevant registers (COMPUTE_DISPATCH_INITIATOR, shader resource descriptors, etc.)
+- Agent 11: Compare gfx1010 vs gfx1030 ISA differences — what RDNA2 instructions are actually missing from RDNA1? This determines whether the HSA override hack is fundamentally sound or just lucky.
 
-**Rust ecosystem agents (4):**
-- Agent 13: Survey existing Rust AMD GPU crates — ash (Vulkan), hip-rs, ocl (OpenCL), any direct amdgpu bindings. What's the state of the art?
-- Agent 14: Study rustane's ane-bridge FFI pattern — how they dlopen private frameworks, wrap unsafe calls in safe Rust. Document the pattern for adaptation to HIP/HSA.
-- Agent 15: Evaluate wgpu compute shaders as a path — wgpu targets Vulkan on AMD. Could this be a "it just works" baseline while we build the HIP path?
-- Agent 16: Research candle-rs AMD support — candle has some ROCm support. What's the status? Could we build on it rather than from scratch?
+**Rust ecosystem agents (3):**
+- Agent 12: Survey existing Rust AMD GPU crates — hip-rs, ocl (OpenCL), any direct amdgpu bindings. What's the state of the art?
+- Agent 13: Study rustane's ane-bridge FFI pattern — how they dlopen private frameworks, wrap unsafe calls in safe Rust. Document the pattern for adaptation to HIP/HSA.
+- Agent 14: Research candle-rs AMD support — candle has some ROCm support. What's the status? Could we build on it rather than from scratch?
+
+**Note:** Vulkan/wgpu/RADV is explicitly **out of scope** as of 2026-04-25 (issue #44 closed). hipfire ships a single HIP/ROCm-direct backend; cross-vendor compute is not a goal.
 
 **After all agents complete:** Synthesize findings into `findings/phase1-synthesis.md`.
 Identify the actual blocking points (not folklore). Rank the viable paths forward.
@@ -118,9 +118,9 @@ Expected approach categories (adjust based on Phase 1 findings):
 
 - **Approach A: Patch ROCm** — Find and bypass the gfx1010 gating. Compile ROCm components from source targeting gfx1010. Most direct path if feasible.
 - **Approach B: Rust FFI to HIP/HSA directly** — Skip the ROCm userspace stack. dlopen libhsa-runtime64.so and libamdhip64.so directly, replicate the dispatch path in Rust. Like rustane does for ANE.
-- **Approach C: Vulkan compute baseline** — Use RADV (which already works) as the compute backend. Write Rust inference engine on wgpu or ash. Less optimal but known-working.
 - **Approach D: Direct KMD dispatch** — Bypass all userspace. Talk to /dev/dri/renderD128 via amdgpu ioctls. Build command buffers (PM4 packets) in Rust. Maximum control, maximum effort.
-- **Approach E: Hybrid** — Vulkan for known-working baseline, HIP FFI for optimized paths, fallback gracefully.
+
+**Note:** Vulkan-based approaches (former Approach C "compute baseline" and Approach E "hybrid") are out of scope as of 2026-04-25. We do not ship a second backend; cross-vendor compute is not a goal of this project.
 
 Each approach gets a dedicated agent that writes a structured proposal to `approaches/approach-X.md`:
 - Prerequisites and dependencies
@@ -165,14 +165,14 @@ Target architecture (adapt based on what works):
 ```
 hipfire/
 ├── crates/
-│   ├── hip-bridge/      # (or vulkan-bridge, or kmd-bridge — whatever won)
+│   ├── hip-bridge/      # (or kmd-bridge — whichever HIP path won)
 │   │   └── src/lib.rs   # Safe Rust FFI to AMD compute runtime
 │   ├── rdna-compute/    # Compute shader dispatch, kernel management
 │   │   └── src/lib.rs   # Kernel compilation, buffer management, dispatch
 │   └── engine/          # Inference orchestrator
 │       └── src/lib.rs   # Model loading, tensor ops, inference loop
-├── kernels/             # HIP/Vulkan compute shaders
-│   ├── gemv.hip         # (or .comp for Vulkan SPIR-V)
+├── kernels/             # HIP compute shaders
+│   ├── gemv.hip
 │   ├── rmsnorm.hip
 │   └── rope.hip
 └── Cargo.toml
@@ -285,11 +285,31 @@ to a single newline.
 unverifiable. Don't accept "X agent got Y tok/s" without reproducing
 on the exact prompt bytes they ran.
 
-**Mitigation (Phase 1 implemented):** Set `HIPFIRE_NORMALIZE_PROMPT=1` to collapse
-all 3+ consecutive newlines to exactly 2 before tokenization. This eliminates the
-whitespace-variance source entirely, making PEP-8 and single-blank prompts tokenize
-identically. See `crates/engine/src/tokenizer.rs:maybe_normalize_prompt()` and
-`crates/engine/examples/encode_prompt.rs` for verification utilities.
+**Mitigation (Phase 1 implemented):** The engine collapses all 3+ consecutive
+newlines to exactly 2 before tokenization. This eliminates the whitespace-
+variance source entirely, making PEP-8 and single-blank prompts tokenize
+identically.
+
+**DEFAULT ON since 2026-04-26.** The original Phase 1 ship gated this behind
+`HIPFIRE_NORMALIZE_PROMPT=1` opt-in, but empirical bench showed it's worth
++24% τ on PEP-8 code prompts (159 → 196 tok/s on 27B-3.5 LRU DFlash) without
+correctness cost. Opt out with `HIPFIRE_NORMALIZE_PROMPT=0` (or
+`prompt_normalize=false` in config) only when raw `\n{3,}` whitespace is
+semantically load-bearing. See:
+- `crates/engine/src/tokenizer.rs:maybe_normalize_prompt()` — engine impl
+- `crates/engine/examples/encode_prompt.rs` — verification utility
+- `docs/plans/perf-regression-recovery-2026-04-26.prd` — root cause + bench
+  data behind the default flip
+
+**Canonical bench config (post-2026-04-26) for 27B-3.5 LRU code DFlash:**
+```
+max=120 --no-chatml --kv-mode asym3
+PEP-8 strict prompt (\n\n\n between top-level defs)
+prompt_normalize=true (default)
+```
+Expected: **199 tok/s τ=10.36** on 7900 XTX. ±2% deterministic. Drift >5% from
+this is a regression — start with `git bisect` against this rule, not against
+session-recalled "peak" numbers.
 
 ## GPU Lock Protocol (Multi-Agent)
 
@@ -312,7 +332,7 @@ and release after completion.
 4. **Portability matters.** Every decision should consider: will this work on RDNA2? RDNA3? RDNA4? If it's 5700XT-only it's a hack, not a solution.
 5. **No HSA_OVERRIDE_GFX_VERSION as a permanent solution.** It's acceptable as a temporary test during Phase 3, but the final engine must not depend on lying about the hardware identity.
 6. **When blocked, search.** You have internet access. Use it aggressively — GitHub issues, AMD docs, Mesa source, phoronix forums, reddit r/ROCm, Tom's Hardware.
-7. **If Phase 3 yields nothing by Tier 4, pivot.** Fall back to Vulkan compute (Approach C) which is known-working. A working Vulkan engine is infinitely better than a non-working HIP engine.
+7. **No Vulkan / wgpu / cross-vendor compute backend.** Out of scope as of 2026-04-25 (issue #44 closed). hipfire ships a single HIP/ROCm-direct backend; cross-vendor coverage is not a goal of this project. If Phase 3 yields nothing, pivot to a different HIP-side approach (KMD direct, ROCm patch, HSA FFI), not to Vulkan.
 
 ## Success Criteria
 

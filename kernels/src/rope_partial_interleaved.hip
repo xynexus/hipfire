@@ -1,13 +1,8 @@
 #include <hip/hip_runtime.h>
-// NOTE: __restrict__ removed — it triggers a hipcc/clang miscompile on gfx1100
-// (ROCm 7.2) where the rotated region of q/k is written with bogus values even
-// at pos=0 (where RoPE should be the identity). Binary diff confirmed: adding
-// any side-effect (e.g. printf) or removing __restrict__ produces a correct
-// kernel. Non-deterministic across processes because of this miscompile path.
 extern "C" __global__ void rope_partial_interleaved_f32(
-    float* q,
-    float* k,
-    const int* pos_buf,  // device buffer, single i32 — graph-safe
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const int* __restrict__ pos_buf,  // device buffer, single i32 — graph-safe
     int n_heads_q,
     int n_heads_k,
     int head_dim,

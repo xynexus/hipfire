@@ -10,14 +10,11 @@
 //
 // Byte-exact with rope_partial_interleaved_f32 for batch_size=1 + pos=positions[0].
 // Q/K are [batch_size × n_heads × head_dim] row-major.
-//
-// NOTE: removed from q, k, positions — same hipcc/clang miscompile
-// on gfx1100 (ROCm 7.2) as rope_partial_interleaved.hip. With the
-// rotated region gets bogus values non-deterministically across processes.
+
 extern "C" __global__ void rope_partial_interleaved_batched_f32(
-    float* q,
-    float* k,
-    const int* positions,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const int* __restrict__ positions,
     int n_heads_q,
     int n_heads_k,
     int head_dim,

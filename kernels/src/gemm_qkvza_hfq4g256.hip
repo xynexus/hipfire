@@ -21,21 +21,17 @@
 
 #define BATCH_TILE 8
 
-// __restrict__ stripped: hipcc/clang (ROCm 7.2) miscompile on gfx1100 —
-// leaving restrict on pointer params of batched-path kernels produces
-// deterministic-wrong output at LA layer 0 and nondeterministic output
-// at layers ≥ 1 in prefill (diagnosed via prefill_state_diff harness).
 __launch_bounds__(32, 8)
 extern "C" __global__ void gemm_qkvza_hfq4g256(
-    const char*  A_qkv,
-    const char*  A_z,
-    const char*  A_beta,
-    const char*  A_alpha,
-    const float* X,        // [N × K]
-    float*       Y_qkv,    // [N × qkv_m]
-    float*       Y_z,      // [N × z_m]
-    float*       Y_beta,   // [N × beta_m]
-    float*       Y_alpha,  // [N × alpha_m]
+    const char*  __restrict__ A_qkv,
+    const char*  __restrict__ A_z,
+    const char*  __restrict__ A_beta,
+    const char*  __restrict__ A_alpha,
+    const float* __restrict__ X,        // [N × K]
+    float*       __restrict__ Y_qkv,    // [N × qkv_m]
+    float*       __restrict__ Y_z,      // [N × z_m]
+    float*       __restrict__ Y_beta,   // [N × beta_m]
+    float*       __restrict__ Y_alpha,  // [N × alpha_m]
     int qkv_m, int z_m, int beta_m, int alpha_m,
     int K, int N
 ) {

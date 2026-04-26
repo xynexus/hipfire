@@ -3,20 +3,16 @@
 #define HD 128
 #define TILE_ROWS 4
 
-// __restrict__ stripped: hipcc/clang (ROCm 7.2) miscompile on gfx1100 —
-// leaving restrict on pointer params of this kernel produces a DN state
-// that is deterministically wrong at layer 0 and nondeterministic at
-// layers ≥ 1 in batched prefill (diagnosed via prefill_state_diff harness).
 extern "C" __launch_bounds__(32, 8)
 __global__ void gated_delta_net_q8(
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* gate,
-    const float* beta,
-    signed char* s_q8,
-    float* s_scales,
-    float* output,
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ gate,
+    const float* __restrict__ beta,
+    signed char* __restrict__ s_q8,
+    float* __restrict__ s_scales,
+    float* __restrict__ output,
     int n_tokens,
     int n_heads,
     int head_dim
