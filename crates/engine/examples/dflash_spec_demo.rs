@@ -679,27 +679,49 @@ fn main() {
     // post-prefill CASK eviction). Keep it as-is.
     let mut seed_token: u32 = first_token;
 
-    // Loop-break cycle detector (HIPFIRE_DFLASH_LOOP_BREAK=1).
+    // Loop-break cycle detector (HIPFIRE_DFLASH_LOOP_BREAK=1|stop|temp).
     // After each commit, hash the trailing 32-token window. If the hash
     // matches any prior window's hash, the model has entered a structural
     // repeat (block-level attractor — the kind that slips past the first-
-    // 128-tok coherence gate). Bump temp for the NEXT verify cycle to
-    // shake the model off the basin; if the next window also hashes to a
-    // known value, keep the bump until a fresh window appears.
+    // 128-tok coherence gate).
+    //
+    // Modes:
+    //   stop (default when =1): track consecutive hits; once >= STOP_AFTER
+    //     the model is "done" — terminate decode (acts like a synthetic
+    //     EOS, since once stuck in a basin, every continuation will be
+    //     looping content the user doesn't want anyway).
+    //   temp: bump temp on each hit; reset on miss. Empirically bounces
+    //     the model between attractors — kept for diagnostic continuity
+    //     with the original detector.
     //
     // Detection cost: one DefaultHasher pass over 32 u32s per cycle (~ns).
     // Memory: HashSet<u64>, ≤ max_tokens / 12 entries (~125 for max=1500).
-    let loop_break_on = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK").ok().as_deref() == Some("1");
+    let loop_break_raw = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK").ok();
+    let loop_break_mode: &str = match loop_break_raw.as_deref() {
+        Some("temp") => "temp",
+        Some("stop") | Some("1") | Some("on") | Some("true") => "stop",
+        _ => "off",
+    };
+    let loop_break_on = loop_break_mode != "off";
     let loop_break_temp: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_TEMP")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let loop_break_stop_after: usize = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_STOP_AFTER")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
     const LOOP_BREAK_WINDOW: usize = 32;
     let mut runtime_temp: f32 = temp;
     let mut loop_break_hits: usize = 0;
+    let mut loop_break_consecutive: usize = 0;
     let mut window_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
     if loop_break_on {
-        eprintln!(
-            "[loop-break] enabled: window={LOOP_BREAK_WINDOW} bump_temp={loop_break_temp} (canonical temp={temp})"
-        );
+        if loop_break_mode == "stop" {
+            eprintln!(
+                "[loop-break] enabled: mode=stop window={LOOP_BREAK_WINDOW} stop_after={loop_break_stop_after} consecutive hits"
+            );
+        } else {
+            eprintln!(
+                "[loop-break] enabled: mode=temp window={LOOP_BREAK_WINDOW} bump_temp={loop_break_temp} (canonical temp={temp})"
+            );
+        }
     }
 
     // SpecStats histogram must fit the max accept_len we'll ever see, so
@@ -1206,29 +1228,61 @@ fn main() {
             emitted.push(tok);
         }
 
-        // Loop-break cycle detector: hash trailing 32-token window, look up
-        // in known-hash set. Hit = repeating block — bump runtime_temp for
-        // next cycle. Miss = reset to canonical temp. The shift-by-cycle
+        // Loop-break cycle detector: hash trailing 32-token window, look
+        // up in known-hash set. Hit = repeating block. The shift-by-cycle
         // (each iter advances ~12 tokens, window=32) means consecutive
         // windows overlap heavily but yield distinct hashes; only a true
         // verbatim repeat re-hashes to a previously-seen value.
+        //
+        // Mode `stop`: count consecutive hits. Once >= stop_after, the
+        //   model is degenerating — emit synthetic EOS by breaking the
+        //   decode loop. Effectively "boost EOS to ∞ on persistent loop"
+        //   without plumbing a logit bias through 22-arg spec_step_dflash.
+        // Mode `temp`: legacy diagnostic — bump runtime_temp on each hit.
+        let mut loop_break_force_stop = false;
         if loop_break_on && emitted.len() >= LOOP_BREAK_WINDOW {
             use std::hash::{Hash, Hasher};
             let tail = &emitted[emitted.len() - LOOP_BREAK_WINDOW..];
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             tail.hash(&mut hasher);
             let h = hasher.finish();
-            if window_hashes.contains(&h) {
+            let hit = window_hashes.contains(&h);
+            if hit {
                 loop_break_hits += 1;
-                runtime_temp = loop_break_temp;
-                eprintln!(
-                    "[loop-break] cycle {} pos {}: 32-tok window-hash repeat → temp={} for next cycle (count={})",
-                    stats.cycles, position, loop_break_temp, loop_break_hits
-                );
+                loop_break_consecutive += 1;
+                if loop_break_mode == "stop" {
+                    if loop_break_consecutive >= loop_break_stop_after {
+                        eprintln!(
+                            "[loop-break] cycle {} pos {}: {} consecutive 32-tok repeats → terminating decode (synthetic EOS); total_hits={}",
+                            stats.cycles, position, loop_break_consecutive, loop_break_hits
+                        );
+                        loop_break_force_stop = true;
+                    } else {
+                        eprintln!(
+                            "[loop-break] cycle {} pos {}: 32-tok window-hash repeat ({}/{} consecutive)",
+                            stats.cycles, position, loop_break_consecutive, loop_break_stop_after
+                        );
+                    }
+                } else {
+                    // legacy temp-bump mode
+                    runtime_temp = loop_break_temp;
+                    eprintln!(
+                        "[loop-break] cycle {} pos {}: 32-tok window-hash repeat → temp={} for next cycle (count={})",
+                        stats.cycles, position, loop_break_temp, loop_break_hits
+                    );
+                }
             } else {
-                runtime_temp = temp;
+                loop_break_consecutive = 0;
+                if loop_break_mode == "temp" {
+                    runtime_temp = temp;
+                }
             }
             window_hashes.insert(h);
+        }
+
+        if loop_break_force_stop {
+            eprintln!("eos");
+            break;
         }
 
         // Advance position + pick next seed (= bonus_token).
