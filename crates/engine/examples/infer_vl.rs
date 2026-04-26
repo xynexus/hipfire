@@ -51,7 +51,11 @@ fn main() {
 
     // Load and preprocess image
     eprintln!("Preprocessing image...");
-    let (pixels, img_h, img_w) = engine::image::load_and_preprocess(Path::new(image_path), vision_config.patch_size);
+    let (pixels, img_h, img_w) = engine::image::load_and_preprocess(
+        Path::new(image_path),
+        vision_config.patch_size,
+        vision_config.spatial_merge_size,
+    );
     let grid_h = img_h / vision_config.patch_size;
     let grid_w = img_w / vision_config.patch_size;
     let n_patches = grid_h * grid_w;

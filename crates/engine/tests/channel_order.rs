@@ -44,7 +44,7 @@ fn channel_at_origin(out: &[f32], h: usize, w: usize, channel: usize) -> f32 {
 fn pure_red_preserves_red_channel() {
     // Red = (255, 0, 0). patch_size=16 is what Qwen3.5-VL uses.
     let path = write_solid_png("red", 255, 0, 0);
-    let (out, h, w) = load_and_preprocess(&path, 16);
+    let (out, h, w) = load_and_preprocess(&path, 16, 2);
     // Channel layout post-fix: [R, B, G].
     assert!(
         (channel_at_origin(&out, h, w, 0) - norm(255)).abs() < 1e-5,
@@ -65,7 +65,7 @@ fn pure_green_routes_g_byte_to_channel_2() {
     // Green = (0, 255, 0). Pre-fix this was going to channel 1 and the model
     // saw it as blue. Post-fix the G byte lands in channel 2.
     let path = write_solid_png("green", 0, 255, 0);
-    let (out, h, w) = load_and_preprocess(&path, 16);
+    let (out, h, w) = load_and_preprocess(&path, 16, 2);
     assert!(
         (channel_at_origin(&out, h, w, 0) - norm(0)).abs() < 1e-5,
         "R channel should be 0 for pure green"
@@ -85,7 +85,7 @@ fn pure_blue_routes_b_byte_to_channel_1() {
     // Blue = (0, 0, 255). Pre-fix this was going to channel 2 and the model
     // saw it as green. Post-fix the B byte lands in channel 1.
     let path = write_solid_png("blue", 0, 0, 255);
-    let (out, h, w) = load_and_preprocess(&path, 16);
+    let (out, h, w) = load_and_preprocess(&path, 16, 2);
     assert!(
         (channel_at_origin(&out, h, w, 0) - norm(0)).abs() < 1e-5,
         "R channel should be 0 for pure blue"
@@ -104,7 +104,7 @@ fn pure_blue_routes_b_byte_to_channel_1() {
 fn mixed_pixel_round_trips_all_three_bytes() {
     // Distinctive per-channel values so a transposition bug would be obvious.
     let path = write_solid_png("mixed", 10, 200, 50);
-    let (out, h, w) = load_and_preprocess(&path, 16);
+    let (out, h, w) = load_and_preprocess(&path, 16, 2);
     assert!(
         (channel_at_origin(&out, h, w, 0) - norm(10)).abs() < 1e-5,
         "R (10) should land in channel 0"

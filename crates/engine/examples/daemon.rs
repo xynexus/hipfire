@@ -1739,7 +1739,11 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
 
     // Load and preprocess image (smart resize matching HuggingFace)
     eprintln!("[VL-DEBUG] preprocessing image: {}", image_path);
-    let (pixels, img_h, img_w) = engine::image::load_and_preprocess(Path::new(image_path), vision_config.patch_size);
+    let (pixels, img_h, img_w) = engine::image::load_and_preprocess(
+        Path::new(image_path),
+        vision_config.patch_size,
+        vision_config.spatial_merge_size,
+    );
     eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
     let grid_h = img_h / vision_config.patch_size;
     let grid_w = img_w / vision_config.patch_size;

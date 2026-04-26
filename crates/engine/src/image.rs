@@ -3,8 +3,15 @@
 
 use std::path::Path;
 
-/// Smart resize matching HuggingFace Qwen2VLImageProcessorFast.
-/// Uses factor=28 (= patch_size * sms * 2 for Qwen3.5) to ensure grid is multiple of sms.
+/// Smart resize matching HuggingFace Qwen2_5_VLImageProcessor.
+///
+/// `factor` MUST equal `patch_size * spatial_merge_size`. With that constraint
+/// the returned (h, w) are multiples of `patch_size * sms`, which guarantees
+/// (1) clean patch extraction at `patch_size` stride and (2) a patch grid
+/// divisible by `sms` so the spatial merger does not silently truncate a
+/// row/column. Passing any other factor (e.g. the legacy `28` from Qwen2-VL
+/// when patch_size=16) yields odd patch grids on small images and a
+/// merger/LM token-count mismatch downstream.
 pub fn smart_resize(height: usize, width: usize, factor: usize, min_pixels: usize, max_pixels: usize) -> (usize, usize) {
     let h_bar = ((height as f64 / factor as f64).round() as usize) * factor;
     let w_bar = ((width as f64 / factor as f64).round() as usize) * factor;
@@ -25,26 +32,29 @@ pub fn smart_resize(height: usize, width: usize, factor: usize, min_pixels: usiz
 }
 
 /// Load an image, smart-resize to match HuggingFace, normalize.
-/// Returns (CHW data, height, width) where height and width are multiples of patch_size.
-pub fn load_and_preprocess(path: &Path, patch_size: usize) -> (Vec<f32>, usize, usize) {
+/// Returns (CHW data, height, width) where height and width are multiples of
+/// `patch_size * spatial_merge_size`, so (h/patch_size) and (w/patch_size)
+/// are both multiples of `spatial_merge_size` — required by the merger
+/// downstream.
+pub fn load_and_preprocess(
+    path: &Path,
+    patch_size: usize,
+    spatial_merge_size: usize,
+) -> (Vec<f32>, usize, usize) {
     let img = image::open(path)
         .unwrap_or_else(|e| panic!("Failed to open image {}: {e}", path.display()));
 
     let (orig_w, orig_h) = (img.width() as usize, img.height() as usize);
-    
-    // Smart resize matching HuggingFace Qwen2VLImageProcessorFast
-    // factor=28 ensures the grid is multiple of sms (28/16=1.75, but patches extracted
-    // via unfold with stride=16 gives floor(dim/16) which is always multiple of sms=2
-    // because 28 = 7*4 and 16 divides into the result evenly for the grid)
-    let factor = 28;
+
+    // factor = patch_size * spatial_merge_size matches HuggingFace
+    // Qwen2_5_VLImageProcessor and guarantees the patch grid is sms-divisible.
+    // Qwen3.5-VL: patch_size=16, sms=2 → factor=32. (Qwen2-VL was
+    // patch_size=14, sms=2 → factor=28; the literal 28 was wrong here.)
+    let factor = patch_size * spatial_merge_size;
     let min_pixels = 56 * 56;         // 3136
     let max_pixels = 14 * 14 * 4 * 1280; // 1003520
-    let (resized_h, resized_w) = smart_resize(orig_h, orig_w, factor, min_pixels, max_pixels);
-    
-    // Round down to nearest multiple of patch_size for clean patch extraction
-    let final_h = (resized_h / patch_size) * patch_size;
-    let final_w = (resized_w / patch_size) * patch_size;
-    
+    let (final_h, final_w) = smart_resize(orig_h, orig_w, factor, min_pixels, max_pixels);
+
     let img = img.resize_exact(
         final_w as u32,
         final_h as u32,
