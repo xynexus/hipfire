@@ -2,7 +2,7 @@
 //! GPU path: gemm_f16 (9 VGPRs), layernorm (13), gelu (8), vit_attention, transpose.
 
 use crate::hfq::HfqFile;
-use crate::llama::f16_to_f32;
+use crate::llama::{f16_to_f32, f32_to_f16};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -94,20 +94,75 @@ fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
     let vals: Vec<f32> = match info.quant_type {
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
+        6 | 7 => dequant_hfq4(data, n, info.group_size as usize),
+        _ => panic!("expected F16/F32/HFQ4 for {name}, got qt={}", info.quant_type),
     };
     gpu.upload_f32(&vals[..n], &[n])
 }
 
-fn load_f16_gpu(hfq: &HfqFile, gpu: &Gpu, name: &str) -> HipResult<GpuTensor> {
+fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
     let (info, data) = hfq.tensor_data(name)
         .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
-    assert_eq!(info.quant_type, 1, "{name}: expected F16, got qt={}", info.quant_type);
-    gpu.upload_raw(data, &[data.len()])
+    let n: usize = info.shape.iter().map(|&s| s as usize).product();
+    match info.quant_type {
+        1 => {
+            // F16 — upload directly. Shape records element count, not byte count.
+            gpu.upload_raw(data, &[n])
+        }
+        6 | 7 => {
+            // HFQ4 — dequantize to F32, then convert to F16 for gemm_f16.
+            // Shape records element count, not byte count.
+            let f32_data = dequant_hfq4(data, n, info.group_size as usize);
+            let f16_bytes: Vec<u8> = f32_data.iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+            gpu.upload_raw(&f16_bytes, &[n])
+        }
+        other => panic!("{name}: unsupported vision quant_type={other} (expected F16=1, HFQ4=6/7)"),
+    }
+}
+
+/// Dequantize HFQ4 blocks to F32, using actual group_size (128 or 256).
+/// G256 block: [scale:f32, zero:f32, 128 bytes nibbles] = 136 bytes per 256 values.
+/// G128 block: [scale:f32, zero:f32, 64 bytes nibbles] = 72 bytes per 128 values.
+fn dequant_hfq4(data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
+    let nibble_bytes = group_size / 2;
+    let block_size = 8 + nibble_bytes; // 4+4 scale/zero + nibbles
+    let mut out = Vec::with_capacity(n);
+    let n_groups = n.div_ceil(group_size);
+    for g in 0..n_groups {
+        let off = g * block_size;
+        if off + 8 > data.len() { break; }
+        let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+        let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+        let nibbles = &data[off+8..(off+block_size).min(data.len())];
+        let base = g * group_size;
+        for i in 0..group_size.min(n.saturating_sub(base)) {
+            let byte_idx = i / 2;
+            if byte_idx >= nibbles.len() { break; }
+            let nibble = if i % 2 == 0 { nibbles[byte_idx] & 0xF } else { nibbles[byte_idx] >> 4 };
+            out.push(scale * nibble as f32 + zero);
+        }
+    }
+    out.truncate(n);
+    out
 }
 
 pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) -> HipResult<VisionWeights> {
     let h = config.hidden_size;
+    // Detect vision weight format (F16 direct vs HFQ4 auto-dequant) and log once.
+    // HFQ4 vision weights (qt=6 G256, qt=7 G128) are dequantized to F16 at load
+    // time for the gemm_f16 path — there is no GPU HFQ4 kernel for vision yet.
+    // See CHANGELOG.md "v0.1.7-alpha.4 / Vision" for details.
+    if let Some((info, _)) = hfq.tensor_data("model.visual.patch_embed.proj.weight") {
+        let fmt = match info.quant_type {
+            1 => "F16 (direct)",
+            6 => "HFQ4-G256 (dequanting to F16 on load)",
+            7 => "HFQ4-G128 (dequanting to F16 on load)",
+            other => &format!("qt={other}"),
+        };
+        eprintln!("  vision weight format: {fmt}");
+    }
     eprintln!("  loading vision weights (GPU)...");
     let patch_embed_w = load_f16_gpu(hfq, gpu, "model.visual.patch_embed.proj.weight")?;
     let patch_embed_b = load_f32_gpu(hfq, gpu, "model.visual.patch_embed.proj.bias", h)?;
@@ -232,12 +287,11 @@ pub fn vision_forward(
         // Residual: x += fc2
         gpu.add_inplace_f32(&x, &fc2)?;
         gpu.free_tensor(fc2)?;
-
-        if li % 9 == 0 || li == config.num_layers - 1 {
-            gpu.hip.device_synchronize()?;
-            eprintln!("  vision layer {}/{} ({:.2}s)", li + 1, config.num_layers, t0.elapsed().as_secs_f32());
-        }
     }
+
+    // Single sync at end of all layers (avoids per-layer sync overhead)
+    gpu.hip.device_synchronize()?;
+    eprintln!("  vision forward complete ({:.2}s)", t0.elapsed().as_secs_f32());
 
     // Spatial merge: [n, h] → [n_merged, merge_dim] (CPU rearrange, small data)
     let sms = config.spatial_merge_size;
