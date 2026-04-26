@@ -31,6 +31,7 @@ REPO_ROOT="$(pwd)"
 EXE="./target/release/examples/bench_qwen35_mq4"
 DFLASH_EXE="./target/release/examples/dflash_spec_demo"
 DFLASH_PROMPT_FILE="benchmarks/prompts/lru_cache_pep8_strict.txt"
+DFLASH_PROMPT_MERGE_SORT="benchmarks/prompts/merge_sort_thinking_off.txt"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
 # ── Arch detection ────────────────────────────────────────────────────────
@@ -147,6 +148,40 @@ bench_dflash_27b_lru() {
         fi
     done
     if [ "$best_t" = "0" ]; then echo "CRASH"; else echo "$best_t $best_tau"; fi
+}
+
+# DFlash high-acceptance gate — merge_sort thinking-OFF, max=256.
+# Anchors the high-τ ceiling (real production-shape bounded code) since
+# the LRU max=120 anchor above is loop-edge. Echoes "tok_s tau ttft_ms"
+# or one of MISSING_*/CRASH. Best-of-3.
+bench_dflash_27b_merge_sort() {
+    local target draft
+    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
+        [ -f "$dir/qwen3.5-27b.mq4" ] && [ -z "${target:-}" ] && target="$dir/qwen3.5-27b.mq4"
+        [ -f "$dir/qwen35-27b-dflash.mq4" ] && [ -z "${draft:-}" ] && draft="$dir/qwen35-27b-dflash.mq4"
+    done
+    [ ! -x "$DFLASH_EXE" ] && { echo "MISSING_BIN"; return; }
+    [ -z "${target:-}" ] && { echo "MISSING_TARGET"; return; }
+    [ -z "${draft:-}" ] && { echo "MISSING_DRAFT"; return; }
+    [ ! -f "$DFLASH_PROMPT_MERGE_SORT" ] && { echo "MISSING_PROMPT"; return; }
+    local best_t=0 best_tau=0 best_ttft=0
+    local prompt
+    prompt=$(cat "$DFLASH_PROMPT_MERGE_SORT")
+    for run in 1 2 3; do
+        local out
+        out=$(HIPFIRE_DPM_WARMUP_SECS=10 "$DFLASH_EXE" \
+            --target "$target" --draft "$draft" \
+            --prompt "$prompt" \
+            --max 256 --no-chatml --kv-mode asym3 2>&1)
+        local t tau ttft
+        t=$(echo "$out" | sed -nE 's/^decode_tok_s: ([0-9.]+).*/\1/p' | tail -1)
+        tau=$(echo "$out" | sed -nE 's/^decode_tau: ([0-9.]+).*/\1/p' | tail -1)
+        ttft=$(echo "$out" | sed -nE 's/^ttft_ms: ([0-9.]+).*/\1/p' | tail -1)
+        if [ -n "$t" ] && awk "BEGIN { exit !($t > $best_t) }"; then
+            best_t="$t"; best_tau="$tau"; best_ttft="$ttft"
+        fi
+    done
+    if [ "$best_t" = "0" ]; then echo "CRASH"; else echo "$best_t $best_tau $best_ttft"; fi
 }
 
 # Run bench_qwen35_mq4 once at a given prefill size.
@@ -291,6 +326,21 @@ if [ "$UPDATE" -eq 1 ]; then
             } >> "$tmpfile"
             ;;
     esac
+
+    printf "  27B-3.5 DFlash merge_sort  "
+    ms_result=$(bench_dflash_27b_merge_sort)
+    case "$ms_result" in
+        MISSING_*|CRASH) color yellow "$ms_result"; echo "" ;;
+        *)
+            read -r mst mstau msttft <<< "$ms_result"
+            printf "tok/s=%-7.1f τ=%s ttft_ms=%s\n" "$mst" "$mstau" "$msttft"
+            {
+                echo "27b_3.5_dflash_merge_sort_tok_s=${mst}"
+                echo "27b_3.5_dflash_merge_sort_tau=${mstau}"
+                echo "27b_3.5_dflash_merge_sort_ttft_ms=${msttft}"
+            } >> "$tmpfile"
+            ;;
+    esac
     echo "" >> "$tmpfile"
 
     mkdir -p "$(dirname "$BASELINE_FILE")"
@@ -400,6 +450,33 @@ if [ "$FAST" -eq 0 ]; then
                 skip=$((skip+1))
             else
                 check_metric "27B-3.5 DFlash LRU code" "$dflash_base" "$dt"
+                case $? in 0) pass=$((pass+1)) ;; *) fail=$((fail+1)) ;; esac
+            fi
+            ;;
+    esac
+
+    # Second DFlash anchor: merge_sort thinking-OFF (high-τ ceiling).
+    ms_result=$(bench_dflash_27b_merge_sort)
+    case "$ms_result" in
+        MISSING_*)
+            printf "  27B-3.5 DFlash merge_sort  "
+            color yellow "SKIP"; echo " ($ms_result)"
+            skip=$((skip+1))
+            ;;
+        CRASH)
+            printf "  27B-3.5 DFlash merge_sort  "
+            color red "CRASH"; echo
+            fail=$((fail+1))
+            ;;
+        *)
+            read -r mst mstau msttft <<< "$ms_result"
+            ms_base=$(grep -oE "^27b_3.5_dflash_merge_sort_tok_s=[0-9.]+" "$BASELINE_FILE" | cut -d= -f2)
+            if [ -z "$ms_base" ]; then
+                printf "  27B-3.5 DFlash merge_sort  "
+                color yellow "NO BASELINE"; echo " (add with --update-baselines; observed=${mst} τ=${mstau} ttft=${msttft}ms)"
+                skip=$((skip+1))
+            else
+                check_metric "27B-3.5 DFlash merge_sort" "$ms_base" "$mst"
                 case $? in 0) pass=$((pass+1)) ;; *) fail=$((fail+1)) ;; esac
             fi
             ;;

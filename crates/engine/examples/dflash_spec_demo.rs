@@ -592,7 +592,10 @@ fn main() {
     // stay byte-identical to the old contiguous-range behaviour.
     draft_scratch.target_hidden_abs_positions =
         (0..prompt_tokens.len() as i32).collect();
-    eprintln!("prefill in {:.2}s", t2.elapsed().as_secs_f64());
+    let prefill_secs = t2.elapsed().as_secs_f64();
+    let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
+    eprintln!("prefill in {:.2}s ({:.1} tok/s)", prefill_secs, prefill_tok_s);
+    vram_report(&gpu.hip, "after_prefill");
 
     // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
     // The policy evicts target.kv_cache between spec_step cycles.
@@ -952,6 +955,11 @@ fn main() {
         .ok().and_then(|s| s.parse().ok()).unwrap_or(0.25);
 
     let t_decode = Instant::now();
+    // TTFT capture: production-realistic measure excluding DPM warmup
+    // (which inflates wall-clock by HIPFIRE_DPM_WARMUP_SECS during benches).
+    // Reported value = prefill_ms + first_cycle_ms, taken from t_decode
+    // (set AFTER warmup) plus the previously-recorded prefill_secs.
+    let mut ttft_ms: Option<f64> = None;
     while emitted.len() < max_tokens {
         if position + draft_scratch_b >= ctx_capacity {
             eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
@@ -1246,6 +1254,12 @@ fn main() {
         for (&tok, _) in step.committed.iter().skip(1).zip(0..) {
             emitted.push(tok);
         }
+        if ttft_ms.is_none() && step.committed.len() > 1 {
+            // Use t_decode (post-warmup) + prefill_secs so the reported
+            // TTFT is what a serving-mode client would actually see.
+            let first_cycle_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+            ttft_ms = Some(prefill_secs * 1000.0 + first_cycle_ms);
+        }
 
         // Loop-break cycle detector: hash trailing 32-token window, look
         // up in known-hash set. Hit = repeating block. The shift-by-cycle
@@ -1438,6 +1452,28 @@ fn main() {
     } else {
         0.0
     };
+
+    // ── BENCH METRICS (machine-parseable) ─────────────────────────────────
+    // Single source of truth for downstream submission scripts (LMX,
+    // benchmarks/results/*.py). Keep flat key=value lines so a simple regex
+    // pulls each field; do not change format without updating callers.
+    // hip.get_vram_info returns (free_bytes, total_bytes) — see line 356.
+    let (vram_free_bytes, vram_total_bytes) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+    let vram_used_mb = ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
+    let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
+    eprintln!("=== BENCH METRICS ===");
+    eprintln!("prompt_tokens: {}", prompt_tokens.len());
+    eprintln!("prefill_secs: {:.4}", prefill_secs);
+    eprintln!("prefill_tok_s: {:.2}", prefill_tok_s);
+    eprintln!("ttft_ms: {:.2}", ttft_ms.unwrap_or(0.0));
+    eprintln!("decode_tokens_emitted: {}", emitted.len());
+    eprintln!("decode_secs: {:.4}", elapsed);
+    eprintln!("decode_tok_s: {:.2}", tok_s);
+    eprintln!("decode_tau: {:.4}", stats.tau());
+    eprintln!("decode_accept_rate: {:.4}", accept_rate);
+    eprintln!("vram_used_mb: {}", vram_used_mb);
+    eprintln!("vram_total_mb: {}", vram_total_mb);
+    eprintln!("=====================");
     eprintln!("accept_rate (accepted / (cycles × (B-1))): {accept_rate:.3}");
     eprintln!(
         "histogram: {:?}",

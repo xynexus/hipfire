@@ -34,3 +34,17 @@
 27b_3.5_dflash_lru_code_tok_s=199.0
 27b_3.5_dflash_lru_code_tau=10.36
 
+# DFlash high-acceptance gate — 27B-3.5 merge_sort thinking-OFF @ max=256.
+# Added 2026-04-26 (post PR #51) as a second anchor measuring the real
+# high-τ ceiling. The LRU max=120 number above is loop-edge — model is
+# still emitting class header at cap. merge_sort runs to natural EOS at
+# 157 tokens with τ=13.18, acc=0.88 — what production-shape bounded code
+# actually looks like. Median-of-3, ±0.6% range, deterministic.
+# Prompt: benchmarks/prompts/merge_sort_thinking_off.txt
+#         (md5 253c7ac50857fe6d0e10fb0d2c5e35c0, chatml-wrapped + closed
+#          <think></think> block for explicit thinking-off)
+# TTFT excludes DPM warmup (= prefill + first cycle).
+27b_3.5_dflash_merge_sort_tok_s=250.0
+27b_3.5_dflash_merge_sort_tau=13.18
+27b_3.5_dflash_merge_sort_ttft_ms=160.0
+
