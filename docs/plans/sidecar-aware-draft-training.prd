@@ -1,0 +1,165 @@
+# Sidecar-aware draft training (compacted-context DFlash)
+
+**Task:** #106
+**Status:** DEFERRED — spec-only, no implementation work
+**Owner:** TBD
+**Date opened:** 2026-04-26
+**Branch:** TBD (likely a new path-c-* branch)
+
+## Problem
+
+DFlash drafts are trained on **contiguous, sequential** target hidden states.
+After sidecar eviction (TriAttention drop-eviction or CASK m-fold), the
+target's KV cache is compacted: arbitrary tokens are dropped, the position
+counter rewinds via `compact_offset`, and the draft sees a discontinuous
+subset of hidden states.
+
+The draft's cross-attention is now operating **out-of-distribution**.
+Empirical impact (commit 8685da8 measurements, 9B + blended_v2 sidecar,
+ctx=4096 budget=512+128, max=2000):
+
+| Mode | no eviction (ctx=32k budget=18k) | eviction active (ctx=4k budget=640) | Δ |
+|------|----------------------------------|-------------------------------------|---|
+| AR   | 119 tok/s | 117 tok/s | -1.7% (eviction itself is cheap) |
+| DFlash | 503 tok/s | 360 tok/s | **-28%** (draft pays the OOD tax) |
+| DFlash τ | 13.06 | 9.19 | -30% |
+| DFlash accept | 0.87 | 0.61 | -30% |
+
+So:
+- For workloads that fit in `budget + β`: DFlash + sidecar is 4× AR. No issue.
+- For workloads that exceed `budget + β`: DFlash drops 28% per eviction event.
+  Still beats AR 3×, but the *advantage of having a sidecar* is much
+  smaller for DFlash than AR — the sidecar's whole purpose (extending
+  context cheaply) is partially negated.
+
+This is the architectural reason DFlash is a poor fit for very-long-context
+serving (>budget+β) on the existing draft. Path C work targets the draft
+itself.
+
+## Goal
+
+Train a draft variant whose cross-attention is **invariant to compaction
+pattern**. After eviction the draft predicts at parity (or near-parity) with
+its no-eviction τ.
+
+Acceptance criterion: τ delta between (no-eviction) and (sustained eviction
+every ~150 tokens, budget=640) drops from current -30% to ≤ -5% on the
+canonical merge_sort + LRU + prose mix.
+
+## Approach options
+
+### A. Random-eviction data augmentation (simplest)
+During draft training, simulate sidecar eviction at random positions in the
+target hidden-state stream that's fed to the draft's cross-attention. The
+draft sees a mix of contiguous + compacted views during training.
+
+- Eviction simulation: drop a random 25-50% of recent hidden state rows,
+  shift the remaining ones to the front, update the position-index array
+  the draft consumes (`target_hidden_abs_positions`).
+- Requires changes to `crates/engine/src/dflash/training/*` (or wherever the
+  draft training corpus is generated) — feed compacted views as
+  augmentation, not just contiguous.
+- Cost: dataset preprocessing only, no model architecture change. Same
+  parameters, same FLOPs, same inference path. Just retrain.
+
+### B. Compaction-aware position embedding (harder, better)
+The draft has its own RoPE for cross-attention. Currently it uses absolute
+position indices from the target. If we replace those with **relative
+distances to the most recent retained position**, the draft becomes
+position-pattern-invariant (it doesn't matter which absolute slots were
+kept; it always sees a stream of "1 ago, 2 ago, 5 ago, 12 ago, ...").
+
+- Inference path needs to compute relative distances on the fly post-eviction.
+- Training data also needs the relative-distance representation, so this is
+  draft-architecture change AND retrain.
+
+### C. Sidecar-conditioned draft (most invasive)
+Pass the sidecar's keep/drop mask as an explicit conditioning input to the
+draft. The draft learns "given this compaction pattern, predict the next
+B tokens." Maximally flexible but adds a feature dim and requires more data.
+
+## Recommended: A first, then evaluate B
+
+Path A is the cheapest, lowest-risk, and most likely to recover ~80% of the
+gap. It's pure data augmentation — no model surgery, no inference-path
+changes. If A delivers ≤ -5% τ on the gate, ship A.
+
+If A leaves a gap (-10 to -20% τ), B is the natural next step: same
+augmented data, plus a small inference-path change to use relative
+distances. If A is enough, B is unnecessary complexity.
+
+C is overkill for the current problem.
+
+## Implementation outline (Approach A)
+
+1. **Augment draft training corpus generator** to inject random eviction
+   patterns into the target hidden-state stream. Eviction policy options:
+   - Random drop (25-50% of recent N positions)
+   - Sidecar-policy-matched (run TriAttention drop-eviction or CASK
+     m-fold on the corpus to get realistic compaction patterns —
+     better-aligned augmentation)
+
+2. **Retrain qwen35-9b-dflash and qwen35-27b-dflash** with augmented data.
+   Estimate: ~6-12 hours per model on MI300X (similar to existing draft
+   training).
+
+3. **Speed-gate variants:**
+   - Add `9b_3.5_dflash_merge_sort_with_eviction_tok_s` baseline that runs
+     with budget tight enough to force eviction. Catches if a future change
+     accidentally regresses sidecar-aware behavior.
+
+4. **LMX submission of the new draft** demonstrating long-ctx parity:
+   compare AR-vs-DFlash at budget=640 budget+β ctx=4096 max=2000 — should
+   show DFlash ≥ 3× AR with sidecar-aware draft (currently ≥ 3× anyway, but
+   τ closer to 13 than 9).
+
+## Out of scope
+
+- Architectural changes to DFlash's spec-step verify path — eviction
+  handling is correct as-is, only the draft's input distribution is wrong.
+- New sidecar formats or new TriAttention variants — keep using
+  blended_v2 as the production sidecar.
+- The Path C custom DFlash draft retraining (task #93) is a different
+  axis (3.6 family draft alignment, not eviction-awareness). Coordinate
+  the two retrains so we don't double-spend MI300X time.
+
+## Risk
+
+- **Capacity ceiling**: forcing the draft to handle both contiguous and
+  compacted views may reduce its peak τ on contiguous inputs (the
+  no-eviction case). If the trade is, say, "503 → 480 tok/s no-eviction
+  but 360 → 470 tok/s with eviction," that's a clear win for long-ctx
+  workloads but a small regression for short-ctx. The speed-gate
+  baselines guard against catastrophic regression.
+- **Training data drift**: if the augmentation distribution doesn't match
+  production sidecar eviction patterns, gain may be small. Mitigation in
+  step 1 — use the actual production sidecar policy to generate the
+  augmentation.
+
+## Why deferred
+
+- Current 27B Phase B sidecar calibration (target side) is in-flight on
+  MI300X. Wait for that to finish + bench the new sidecar against the
+  existing artifacts before committing to another retrain cycle.
+- The DFlash path-C retraining (#93) is also in the queue. Fire those
+  in sequence, don't fork the MI300X budget.
+- "Eviction-active long-context" workloads aren't a stated user priority
+  yet — current usage stays well under budget+β on most prompts.
+
+## Triggers to un-defer
+
+- A user workload that consistently exceeds budget+β and feels the 28% τ
+  drop
+- Sidecar Phase B finishes and there's spare MI300X budget to invest
+- AR vs DFlash crossover concerns surface in LMX or production telemetry
+
+## References
+
+- `docs/plans/perf-regression-recovery-2026-04-26.prd` — context on the
+  speed-gate two-anchor system that protects this work
+- Commit 8685da8 — empirical AR vs DFlash eviction comparison
+- Memory: `feedback_a3b_dflash_regression.md` — related "draft in
+  unfamiliar territory" pattern (different cause, similar symptom)
+- llama.cpp PR #19164 — `ngram_mod` is a different fallback strategy
+  (n-gram replay alongside trained draft) that could compose with
+  sidecar-aware training
