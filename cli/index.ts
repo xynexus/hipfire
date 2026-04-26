@@ -713,14 +713,22 @@ async function runViaHttp(
   }
   if (!resp.body) { console.error("[hipfire] serve returned no body"); return false; }
 
-  const stripThinkBlocks = resolveModelConfig(model).thinking !== "off";
+  const flushUnclosedThink = resolveModelConfig(model).thinking === "off";
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let inThink = false;
+  let thinkBuffer = "";
   let stripNextLeadingNl = false;
   let tokens = 0;
   const t0 = Date.now();
+  const emit = (s: string) => {
+    let t = s.replace(/<\|im_end\|>/g, "");
+    if (!t) return;
+    if (stripNextLeadingNl) { t = t.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!t) return; }
+    process.stdout.write(t);
+    tokens++;
+  };
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -744,25 +752,28 @@ async function runViaHttp(
         const delta = chunk.choices?.[0]?.delta ?? {};
         let text: string = delta.content ?? "";
         if (!text) continue;
-        if (stripThinkBlocks) {
-          if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
-          if (inThink) {
-            if (text.includes("</think>")) {
-              text = text.split("</think>").slice(1).join("</think>");
-              inThink = false;
-              stripNextLeadingNl = true;
-            } else { continue; }
-          }
-        } else {
-          text = text.replace(/<think>|<\/think>/g, "");
+        if (text.includes("<think>")) {
+          inThink = true;
+          text = text.replace(/<think>/g, "");
         }
-        text = text.replace(/<\|im_end\|>/g, "");
-        if (!text) continue;
-        if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
-        process.stdout.write(text);
-        tokens++;
+        if (inThink) {
+          if (text.includes("</think>")) {
+            text = text.split("</think>").slice(1).join("</think>");
+            inThink = false;
+            thinkBuffer = "";
+            stripNextLeadingNl = true;
+            emit(text);
+          } else {
+            thinkBuffer += text;
+          }
+          continue;
+        }
+        emit(text);
       } catch {}
     }
+  }
+  if (inThink && flushUnclosedThink && thinkBuffer) {
+    emit(thinkBuffer.replace(/^\s+/, ""));
   }
   const secs = (Date.now() - t0) / 1000;
   if (tokens > 0) console.error(`\n[${tokens} tok, ${(tokens / secs).toFixed(1)} tok/s via serve]`);
@@ -1020,35 +1031,56 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     console.error(`[VL: ${image}]`);
   }
 
-  // When thinking=off, /no_think suppresses canonical <think>...</think> blocks
-  // but Qwen3.5 still emits the literal "<think>" token early in some prompts
-  // and never closes it — so the strip-on-open / strip-until-close filter would
-  // eat the entire response. Skip the think filter in that mode and just drop
-  // the literal "<think>" tokens inline.
-  const stripThinkBlocks = modelCfg.thinking !== "off";
+  // <think>...</think> handling is uniform across modes:
+  //   • on "<think>": enter buffering (no emit until we know if the block closes)
+  //   • on "</think>": closed block — discard buffer, emit suffix
+  //   • on `done` while still buffering:
+  //       - thinking=on  → discard buffer (model never closed, suppress)
+  //       - thinking=off → flush buffer (Qwen3.5 with /no_think sometimes
+  //         emits a stray "<think>" + answer + <|im_end|> with no closing
+  //         tag; contents are the actual answer)
+  //
+  // Buffering means thinking=off responses don't stream until a "</think>"
+  // is seen or the generation ends. In practice /no_think keeps the
+  // unclosed-think prefix to ~1-3 tokens before the real answer so the
+  // delay is unnoticeable.
+  const flushUnclosedThink = modelCfg.thinking === "off";
   let inThink = false;
+  let thinkBuffer = "";
   let stripNextLeadingNl = false;
+  const emit = (s: string) => {
+    let t = s.replace(/<\|im_end\|>/g, "");
+    if (!t) return;
+    if (stripNextLeadingNl) { t = t.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!t) return; }
+    process.stdout.write(t);
+  };
   for await (const msg of e.generate(genMsg)) {
     if (msg.type === "token") {
       let text = msg.text as string;
-      if (stripThinkBlocks) {
-        if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
-        if (inThink) {
-          if (text.includes("</think>")) {
-            text = text.split("</think>").slice(1).join("</think>");
-            inThink = false;
-            stripNextLeadingNl = true; // strip newline between </think> and content
-          } else { continue; }
-        }
-      } else {
-        text = text.replace(/<think>|<\/think>/g, "");
+      if (text.includes("<think>")) {
+        inThink = true;
+        text = text.replace(/<think>/g, "");
       }
-      text = text.replace(/<\|im_end\|>/g, "");
-      if (!text) continue;
-      if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
-      process.stdout.write(text);
+      if (inThink) {
+        if (text.includes("</think>")) {
+          text = text.split("</think>").slice(1).join("</think>");
+          inThink = false;
+          thinkBuffer = "";
+          stripNextLeadingNl = true;
+          emit(text);
+        } else {
+          thinkBuffer += text;
+        }
+        continue;
+      }
+      emit(text);
     }
-    else if (msg.type === "done") console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
+    else if (msg.type === "done") {
+      if (inThink && flushUnclosedThink && thinkBuffer) {
+        emit(thinkBuffer.replace(/^\s+/, ""));
+      }
+      console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
+    }
     else if (msg.type === "error") {
       // Surface daemon-side rejections (e.g. KV-budget overrun) instead of
       // exiting 0 with no visible output. Sets exitCode so downstream shell
@@ -1346,42 +1378,53 @@ async function serve(port: number) {
           let streamCancelled = false;
           e.generating = true;
           const hasTool = tools.length > 0;
-          const stripThinkBlocks = thinkModel !== "off";
+          const flushUnclosedThink = thinkModel === "off";
           return new Response(new ReadableStream({
             async start(ctrl) {
               try {
                 let inThink = false;
+                let thinkBuffer = "";
                 let stripNextLeadingNl = false;
                 // When tools are present, accumulate full output for tool-call parsing
                 let accumulated = hasTool ? "" : null;
+                const emit = (raw: string) => {
+                  let t = raw.replace(/<\|im_end\|>/g, "");
+                  if (!t) return;
+                  if (stripNextLeadingNl) { t = t.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!t) return; }
+                  if (accumulated !== null) {
+                    accumulated += t;
+                  } else {
+                    ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                      id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                      choices: [{ index: 0, delta: { content: t }, finish_reason: null }]
+                    })}\n\n`));
+                  }
+                };
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
                     let text = msg.text as string;
-                    if (stripThinkBlocks) {
-                      if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
-                      if (inThink) {
-                        if (text.includes("</think>")) {
-                          text = text.split("</think>").slice(1).join("</think>");
-                          inThink = false;
-                          stripNextLeadingNl = true;
-                        } else { continue; }
+                    if (text.includes("<think>")) {
+                      inThink = true;
+                      text = text.replace(/<think>/g, "");
+                    }
+                    if (inThink) {
+                      if (text.includes("</think>")) {
+                        text = text.split("</think>").slice(1).join("</think>");
+                        inThink = false;
+                        thinkBuffer = "";
+                        stripNextLeadingNl = true;
+                        emit(text);
+                      } else {
+                        thinkBuffer += text;
                       }
-                    } else {
-                      text = text.replace(/<think>|<\/think>/g, "");
+                      continue;
                     }
-                    text = text.replace(/<\|im_end\|>/g, "");
-                    if (!text) continue;
-                    if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
-                    if (accumulated !== null) {
-                      accumulated += text; // buffer for tool-call parsing at end
-                    } else {
-                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
-                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                        choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
-                      })}\n\n`));
-                    }
+                    emit(text);
                   } else if (msg.type === "done") {
+                    if (inThink && flushUnclosedThink && thinkBuffer) {
+                      emit(thinkBuffer.replace(/^\s+/, ""));
+                    }
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
@@ -1472,17 +1515,26 @@ async function serve(port: number) {
         }
 
         // Strip think tags and special tokens.
-        // When the model is supposed to think (thinking="on"), greedy-match
-        // and remove blocks. If <think> is unclosed, strip from <think> to
-        // end of content. With thinking="off", /no_think suppresses canonical
-        // blocks but Qwen3.5 still emits a literal "<think>" token early on
-        // some prompts and never closes — in that mode just drop the tag
-        // text inline so the actual answer survives.
+        //
+        // Both modes: completed <think>...</think> blocks are removed
+        // (contents discarded — leaking reasoning would break the
+        // thinking=off contract and waste tokens for thinking=on
+        // clients that don't want the trace).
+        //
+        // Mode-specific handling for an UNCLOSED <think> at end of output:
+        //   • thinking=on   → strip from <think> to end (model failed to
+        //                     finish thinking; suppress entirely).
+        //   • thinking=off  → strip just the literal "<think>" tag and
+        //                     keep the trailing content. Qwen3.5 with
+        //                     /no_think sometimes emits a stray "<think>"
+        //                     followed by the actual answer and <|im_end|>
+        //                     without closing — discarding would eat the
+        //                     answer; preserving it is the right call.
+        content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "");
         if (thinkModel !== "off") {
-          content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-            .replace(/<think>[\s\S]*$/, ""); // unclosed think block
+          content = content.replace(/<think>[\s\S]*$/, ""); // unclosed: discard
         } else {
-          content = content.replace(/<think>|<\/think>/g, "");
+          content = content.replace(/<think>/g, ""); // unclosed: keep tail
         }
         content = content.replace(/<\|im_end\|>/g, "").trim();
 
