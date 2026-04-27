@@ -1581,7 +1581,7 @@ fn main() {
     let use_hfq2g128 = format == "hfq2g128" || format == "hfq2" || format == "hf2";
     let use_hfq_mixed = format == "hfq-mixed";  // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
-    let use_hfq6 = format == "hfq6" || format == "hfq6g256";
+    let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
 
     // GGUF input branch: if --input is a `.gguf` file, run the GGUF
     // pipeline and exit. Tensor names are translated GGUF → safetensors
