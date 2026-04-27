@@ -198,11 +198,103 @@ impl Tokenizer {
         })
     }
 
-    /// Load tokenizer from HFQ metadata (extracts embedded tokenizer.json).
+    /// Load tokenizer from HFQ metadata. Tries (in order):
+    ///
+    ///   1. `meta.tokenizer` as a HuggingFace `tokenizer.json` blob —
+    ///      the format the safetensors-side quantizer writes.
+    ///   2. `meta.gguf_meta.tokenizer.ggml.*` array fields — the format the
+    ///      GGUF-side quantizer writes (preserves the original GGUF
+    ///      tokenizer verbatim, no HF-format translation).
+    ///
+    /// Returns None if neither is present.
     pub fn from_hfq_metadata(metadata_json: &str) -> Option<Self> {
         let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
-        let tok_str = meta.get("tokenizer")?.as_str()?;
-        Self::from_hf_json(tok_str)
+        if let Some(tok_str) = meta.get("tokenizer").and_then(|v| v.as_str()) {
+            return Self::from_hf_json(tok_str);
+        }
+        if let Some(gguf_meta) = meta.get("gguf_meta") {
+            return Self::from_gguf_meta_json(gguf_meta);
+        }
+        None
+    }
+
+    /// Load tokenizer from a JSON-serialized GGUF metadata tree. Mirrors
+    /// `from_gguf` field-for-field but reads `serde_json::Value` instead of
+    /// the live `GgufFile`. Used by the GGUF→MQ4 quantize path so a
+    /// converted `.mq4` is fully self-sufficient (no GGUF-on-disk fallback).
+    pub fn from_gguf_meta_json(meta: &serde_json::Value) -> Option<Self> {
+        let tokens_arr = meta.get("tokenizer.ggml.tokens")?.as_array()?;
+        let vocab: Vec<String> = tokens_arr
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect();
+
+        let mut token_to_id = HashMap::with_capacity(vocab.len());
+        for (i, tok) in vocab.iter().enumerate() {
+            token_to_id.insert(tok.clone(), i as u32);
+        }
+
+        let merges: Vec<(String, String)> = meta
+            .get("tokenizer.ggml.merges")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| {
+                        let s = s.as_str()?;
+                        let parts: Vec<&str> = s.splitn(2, ' ').collect();
+                        if parts.len() == 2 {
+                            Some((parts[0].to_string(), parts[1].to_string()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let bos_id = meta
+            .get("tokenizer.ggml.bos_token_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+        let eos_id = meta
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2) as u32;
+
+        let endoftext = token_to_id.get("<|endoftext|>").copied();
+        let im_end = token_to_id.get("<|im_end|>").copied();
+        let eot_id = match (endoftext, im_end) {
+            (Some(et), Some(ie)) if et != eos_id && ie == eos_id => Some(et),
+            (Some(et), _) if et != eos_id => Some(et),
+            _ => None,
+        };
+
+        let model_type = meta
+            .get("tokenizer.ggml.model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("llama");
+        let is_gpt2_bpe = model_type == "gpt2";
+
+        let mut special_tokens: Vec<(String, u32)> = Vec::new();
+        for (i, tok) in vocab.iter().enumerate() {
+            if (tok.starts_with("<|") && tok.ends_with("|>"))
+                || (tok.starts_with("<") && tok.ends_with(">") && tok.len() > 3 && !tok.contains(' '))
+            {
+                special_tokens.push((tok.clone(), i as u32));
+            }
+        }
+        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+        Some(Tokenizer {
+            vocab,
+            token_to_id,
+            merges,
+            special_tokens,
+            bos_id,
+            eos_id,
+            eot_id,
+            is_gpt2_bpe,
+        })
     }
 
     /// True if `id` is any end-of-generation terminator (`eos_id` or the
