@@ -1574,25 +1574,34 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
     process.exit(1);
   }
 
-  // GGUF input supports hfq4 (default for dense), hfq6 (dense, higher
+  // GGUF input supports hf4 (default for dense), hf6 (dense, higher
   // quality), mq4 / mq6 (FWHT-rotated, Qwen3.5+ DeltaNet hot path).
-  // Q8 / safetensors-only formats are rejected.
+  // Q8 / safetensors-only formats are rejected. The format string is also
+  // the file extension — keep it short ("hf4") to match how the rest of
+  // the CLI (resolveModelTag, list/ps enumeration) recognizes models.
   if (isGgufFile) {
-    const ggufOk = new Set(["hfq4", "hfq6", "mq4", "mq6"]);
+    // Normalize hfq4/hfq4g256 → hf4, hfq6/hfq6g256 → hf6 so the output
+    // filename uses the canonical extension that CLI discovery picks up.
+    opts.formats = opts.formats.map(f => {
+      if (f === "hfq4" || f === "hfq4g256") return "hf4";
+      if (f === "hfq6" || f === "hfq6g256") return "hf6";
+      return f;
+    });
+    const ggufOk = new Set(["hf4", "hf6", "mq4", "mq6"]);
     const filtered = opts.formats.filter(f => ggufOk.has(f));
     const dropped = opts.formats.filter(f => !ggufOk.has(f));
     if (dropped.length > 0) {
       console.error(
         `GGUF input rejects --format: ${dropped.join(", ")}. ` +
-        `Supported for GGUF: hfq4 (default for dense), hfq6, mq4, mq6.`,
+        `Supported for GGUF: hf4 (default for dense), hf6, mq4, mq6.`,
       );
     }
     if (filtered.length === 0) {
-      // No explicit format passed — pick HFQ4 since most GGUFs in the wild
+      // No explicit format passed — pick HF4 since most GGUFs in the wild
       // are non-Qwen3.5 dense (Llama / Mistral / Gemma / older Qwen).
       // `hipfire quantize <gguf> --format mq4` is the override for
       // Qwen3.5+ family GGUFs.
-      filtered.push("hfq4");
+      filtered.push("hf4");
     }
     opts.formats = filtered;
   }
@@ -3756,17 +3765,19 @@ Formats:
   mq6   FWHT-rotated 6-bit — higher quality, ~1.47x file size (safetensors only)
   q8    Symmetric Q8 — reference/debugging (safetensors only)
 
-GGUF input (single .gguf file): supports --format hfq4 (default) /
-hfq6 / mq4 / mq6. Source weights are dequantized (Q4_K_M / Q8_0 /
+GGUF input (single .gguf file): supports --format hf4 (default) /
+hf6 / mq4 / mq6. Source weights are dequantized (Q4_K_M / Q8_0 /
 Q4_0 / Q6_K / F16 / BF16 / F32) and re-quantized to the chosen
 format. Pick by model architecture:
 
-  hfq4 / hfq6: dense (Llama / Mistral / Gemma / older Qwen). DEFAULT.
+  hf4 / hf6:   dense (Llama / Mistral / Gemma / older Qwen). DEFAULT.
+               Output extensions: .hf4 / .hf6.
   mq4 / mq6:   Qwen3.5+ family (DeltaNet hot path). Override only when
                the source GGUF is a Qwen3.5+ model.
+               Output extensions: .mq4 / .mq6.
 
 Quality is lower than quantizing from full-precision safetensors due
-to the double-quant roundtrip; raise to hfq6 / mq6 if you can spare
+to the double-quant roundtrip; raise to hf6 / mq6 if you can spare
 the +47% file size.
 
 Examples:
@@ -3778,8 +3789,9 @@ Examples:
   # Local fine-tune → MQ4:
   hipfire quantize ./my-finetune --format mq4 -o finetune.mq4
 
-  # GGUF → HFQ4 (one-shot, install into ~/.hipfire/models):
+  # GGUF → HF4 (one-shot, install into ~/.hipfire/models):
   hipfire quantize ./tinyllama.Q4_K_M.gguf --install --register tinyllama:1b-gguf
+  # → ~/.hipfire/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.hf4
 
   # Qwen3.5+ GGUF → MQ4 (DeltaNet hot path):
   hipfire quantize ./qwen3.5.Q4_K_M.gguf --format mq4 --install --register q35:9b-gguf
@@ -3842,9 +3854,10 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
       const looksLikeGguf = existsSync(input)
         && statSync(input).isFile()
         && input.toLowerCase().endsWith(".gguf");
-      formats.push(looksLikeGguf ? "hfq4" : "mq4");
+      formats.push(looksLikeGguf ? "hf4" : "mq4");
     }
-    const validFormats = ["mq4", "mq6", "q8", "q8f16", "hfq4", "hfq4g256", "hfq6", "hfq6g256"];
+    const validFormats = ["mq4", "mq6", "q8", "q8f16",
+                          "hf4", "hf6", "hfq4", "hfq4g256", "hfq6", "hfq6g256"];
     for (const f of formats) {
       if (!validFormats.includes(f)) {
         console.error(`Unsupported format: ${f}\nSupported: mq4, mq6, q8`);
