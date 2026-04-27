@@ -52,14 +52,19 @@ interface HipfireConfig {
 
   // `dflash_mode`:
   //   "on"   → always attempt draft auto-discovery / honor HIPFIRE_DFLASH_DRAFT
-  //   "off"  → never load the draft; temp=0 falls back to AR
+  //   "off"  → never load the draft; temp=0 falls back to AR (default)
   //   "auto" → dense Qwen3.5 → on; A3B (MoE) targets → off
   //
-  // Rationale: A3B DFlash is a NET LOSS vs AR on non-math prompts on
-  // 7900 XTX (τ≈1.0-1.5, 2-5× slower than AR on code/prose). Only math
-  // shows DFlash-positive τ. Default-off for A3B prevents the silent
-  // slowdown when a user serves an A3B target with an auto-discovered
-  // draft. Override per-model with `hipfire config set dflash_mode on`.
+  // Default OFF: DFlash speculative decode is still experimental. It can
+  // produce subtle output drift on certain prompt shapes that hide behind
+  // higher peak tok/s — confounded debugging when DFlash was silently
+  // on by default (auto). Opt in per-model with
+  // `hipfire config set-model <tag> dflash_mode on` once you've confirmed
+  // the model + prompt shape on your hardware.
+  //
+  // A3B-specific rationale (kept for the `auto` path): A3B DFlash is a
+  // NET LOSS vs AR on non-math prompts on 7900 XTX (τ≈1.0-1.5, 2-5×
+  // slower than AR on code/prose). Only math shows DFlash-positive τ.
   dflash_mode: "on" | "off" | "auto";
 
   // `dflash_ngram_block`:
@@ -123,7 +128,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   idle_timeout: 300,
   experimental_budget_alert: false,
   dflash_adaptive_b: true,
-  dflash_mode: "auto",
+  dflash_mode: "off",
   dflash_ngram_block: "auto",
   cask_sidecar: "",
   cask: false,
@@ -2441,8 +2446,8 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     dflash_mode: {
       label: "dflash_mode",
-      desc: "DFlash speculative decoding: on = always, off = disable, auto = arch+model aware",
-      options: ["auto", "on", "off"],
+      desc: "DFlash speculative decoding (EXPERIMENTAL — opt-in only). off (default) = pure AR. on = always-load draft + spec-decode at temp=0. auto = arch heuristic (dense Qwen3.5 → on, A3B → off). DFlash can produce subtle output drift on some prompts; enable per-model after validating on your hardware.",
+      options: ["off", "auto", "on"],
     },
     dflash_ngram_block: {
       label: "dflash_ngram_block",
