@@ -64,14 +64,21 @@ have hit are documented here so you don't repeat them.
 | `validation.md` | Three-gate procedure with troubleshooting |
 | `contributor-onboarding.md` | Fork → port → PR workflow with agent-assist guidance |
 
-## Cross-references in repo memory
+## Cross-references (commits + ops notes)
 
-- `memory/project_wmma_correctness_fix.md` — gfx11 C-mapping was
-  silently wrong for 6 weeks; assume any new arch's C-mapping is
-  wrong until proven by channel-test on hardware.
-- `memory/feedback_quality_gate_baselines_degenerate.md` — greedy
-  decode degenerates on Qwen3.5; relevant when validating a port
-  with thinking-model coherence-gate prompts.
-- `memory/feedback_firmware_shadowing_perf_trap.md` — `/lib/
-  firmware/updates/amdgpu` shadowing causes ~50% prefill drop that
-  looks like a code regression but is environmental.
+- **WMMA correctness fix (gfx11):** commit `b7ac66a` ("wmma
+  correctness fix + MQ6 family + cross-arch prefill + gate
+  framework"). The gfx11 C-mapping (`acc[j] = C[2*j + (tid>>4)]
+  [tid & 15]`) was silently wrong for ~6 weeks before being caught.
+  Assume any new arch's C-mapping is wrong until proven by
+  channel-test on hardware.
+- **Greedy decode degeneracy (Qwen3.5):** thinking-model prompts
+  often emit empty `<think><|im_end|>` at `--temp 0` because the
+  reasoning step exhausts max_tokens without closing. Use
+  `--temp 0.3 --repeat-penalty 1.05` and `--max-tokens 1500+` for
+  9b in coherence-gate-style validation.
+- **Firmware shadowing (perf trap):** if the speed-gate flags a
+  ~50% prefill drop after a "should-be-no-op" change, check
+  `dmesg | tail` for SMU IF mismatch. The fix is system-side:
+  `sudo mv /lib/firmware/updates/amdgpu /lib/firmware/updates/amdgpu.bak
+  && sudo reboot`. Documented operationally; no code commit.

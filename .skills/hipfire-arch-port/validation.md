@@ -9,10 +9,11 @@ contributor who does (`contributor-onboarding.md`).
 
 This is the load-bearing one. WMMA / MFMA kernels have arch-specific
 per-lane mappings, and getting the C-mapping wrong silently
-corrupts all matrix outputs. The 6-week WMMA bug
-(`memory/project_wmma_correctness_fix.md`) is a documented case of
-this passing the speed-gate AND coherence-gate while silently
-producing garbage.
+corrupts all matrix outputs. The 6-week gfx11 WMMA bug (fixed in
+commit `b7ac66a` — "wmma correctness fix + MQ6 family + cross-arch
+prefill + gate framework") is a documented case of this passing the
+speed-gate AND coherence-gate while silently producing garbage.
+Channel-test caught it; the other two gates didn't.
 
 ### What it tests
 
@@ -157,11 +158,11 @@ diff so reviewers see the trade-off explicitly.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Channel-test FAIL on a new arch | Per-lane C-mapping wrong | Add `eprintln!` of `(tid, acc[j])` for first warp, compare to CPU reference, derive correct mapping. See `memory/project_wmma_correctness_fix.md` for the gfx11 case. |
+| Channel-test FAIL on a new arch | Per-lane C-mapping wrong | Add `eprintln!` of `(tid, acc[j])` for first warp, compare to CPU reference, derive correct mapping. See commit `b7ac66a` for the gfx11 case. |
 | Coherence-gate panic | Codegen failure, missing kernel file, bad dispatch | Read the panic message; usually a stack trace from `dispatch.rs` or `kernels.rs` |
-| Coherence-gate zero-tokens | Daemon stops at EOS immediately, often a tokenizer / chat-template / KV-init bug | Check `m.seq_pos` and `prompt_tokens` — see `feedback_dflash_chatml_and_drift.md` |
+| Coherence-gate zero-tokens | Daemon stops at EOS immediately, often a tokenizer / chat-template / KV-init bug | Check `m.seq_pos` and `prompt_tokens` in the daemon's generate path. Common cause: chatml wrap missing the trailing `\n` after `<|im_end|>`. |
 | Speed-gate regress on gfx1100 from "should-be-no-op" refactor | Could be: cached build artifact (most likely — invalidate with `cargo clean -p rdna-compute`); inlining/register-alloc difference (possible, unverified); GPU thermal drift; firmware shadowing | (1) `cargo clean -p rdna-compute && cargo build --release ...` to rule out cache; (2) `cat /sys/class/drm/card*/device/pp_dpm_sclk` to check DPM state; (3) `dmesg \| tail -40` for firmware errors; (4) re-run gate. If still regressed, revert the diff and bisect |
-| Speed-gate regress with system in known-good state | Firmware shadowing | `sudo mv /lib/firmware/updates/amdgpu .bak && reboot` (`feedback_firmware_shadowing_perf_trap.md`) |
+| Speed-gate regress with system in known-good state | Firmware shadowing — `/lib/firmware/updates/amdgpu` overrides kernel firmware → SMU IF mismatch | `sudo mv /lib/firmware/updates/amdgpu /lib/firmware/updates/amdgpu.bak && sudo reboot` |
 
 ## Last verified
 

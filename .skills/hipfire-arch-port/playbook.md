@@ -113,8 +113,10 @@ baseline (1014→1047 tok/s).
   if the source didn't change between runs, leaving the regressed
   binary in place when I thought I was testing master.
 - GPU thermal / DPM state drift over the long debugging session.
-- Firmware shadowing (`feedback_firmware_shadowing_perf_trap.md`)
-  pre-existing on the host.
+- Firmware shadowing pre-existing on the host
+  (`/lib/firmware/updates/amdgpu` overriding kernel firmware → SMU
+  IF mismatch). Fix: `sudo mv /lib/firmware/updates/amdgpu .bak
+  && sudo reboot`.
 
 I did NOT isolate the cause before committing the revert. The
 "predicate refactor regresses gfx11" hypothesis is one
@@ -185,22 +187,22 @@ If you don't have hardware for the target arch, you cannot merge
 - WMMA matrix → `wmma-matrix.md`
 - Validation procedure → `validation.md`
 - Contributing without privileged repo access → `contributor-onboarding.md`
-- Memory pin on this topic: `memory/project_wmma_correctness_fix.md`
-  (the gfx11 `acc[j] = C[2*j + (tid>>4)][tid & 15]` mapping was
-  silently wrong for 6 weeks before being caught — assume any
-  per-lane mapping for a new arch is wrong until proven by channel-
-  test on hardware).
+- gfx11 C-mapping reference: commit `b7ac66a` ("wmma correctness
+  fix"). The mapping `acc[j] = C[2*j + (tid>>4)][tid & 15]` was
+  silently wrong for ~6 weeks before being caught — assume any
+  per-lane mapping for a new arch is wrong until proven by
+  channel-test on hardware.
 
 ## Known traps
 
 | Trap | Symptom | Memory |
 |---|---|---|
-| WMMA C-mapping wrong | All-WMMA models emit garbage / fail correctness | `project_wmma_correctness_fix.md` |
-| Removing "dead" WMMA kernels | Per-cycle GEMM cost ~2× on dispatch path that secretly uses it | `project_27b_dflash_perf_analysis_2026_04_22.md` (PR #32 → 9a2c667 recovery) |
-| Bypassing speed-gate | Local-env regression masked by `--no-verify` lands on master | feedback (this session, commit `a048544` → reverted in `1f3bad3`) |
+| WMMA C-mapping wrong | All-WMMA models emit garbage / fail correctness | Commit `b7ac66a` (gfx11 mapping fix). Assume new-arch mapping is wrong until proven on hardware. |
+| Removing "dead" WMMA kernels | Per-cycle GEMM cost ~2× on dispatch path that secretly uses it | PR #32 removed 27B-load-bearing WMMA variants; recovery in commit `9a2c667`. Don't delete WMMA kernel files without checking dispatch.rs `include_str!` references first. |
+| Bypassing speed-gate | Local-env regression masked by `--no-verify` lands on master | This session: commit `a048544` → reverted in `1f3bad3`. Don't do it. |
 | "Should-be-no-op" dispatch.rs refactor regresses speed-gate | Most often a stale build cache during re-verification; less often a real codegen difference. Always run the gate after any dispatch change | This session, root cause unverified — see `validation.md` |
-| Greedy degenerate decode | "Engine bug" smoke tests halt; turns out `--temp 0` + `<think>` exhaust max_tokens | `feedback_quality_gate_baselines_degenerate.md` |
-| Firmware shadowing | `/lib/firmware/updates/amdgpu` overrides kernel firmware → SMU IF mismatch → 50% prefill drop, looks like code regression | `feedback_firmware_shadowing_perf_trap.md` |
+| Greedy degenerate decode | "Engine bug" smoke tests halt; turns out `--temp 0` + `<think>` exhaust max_tokens before model closes | Use `--temp 0.3 --repeat-penalty 1.05` + `--max-tokens 1500+` for 9b in any output-correctness assertion. |
+| Firmware shadowing | `/lib/firmware/updates/amdgpu` overrides kernel firmware → SMU IF mismatch → 50% prefill drop, looks like code regression | System-side fix only: `sudo mv /lib/firmware/updates/amdgpu .bak && sudo reboot`. No code commit. |
 
 ## Skill discoverability
 

@@ -114,8 +114,9 @@ the active feature macros.
 - `/opt/rocm/include/ck_tile/ops/gemm/warp/warp_gemm_attribute_wmma_impl_16bit_traits.hpp` —
   the `#ifdef __gfx11__` / `#ifdef __gfx12__` dispatch pattern AMD
   themselves use in CK.
-- `memory/project_wmma_correctness_fix.md` — the gfx11 C-mapping
-  story; assume any new arch's C-mapping is wrong until proven.
+- Commit `b7ac66a` ("wmma correctness fix + MQ6 family + cross-arch
+  prefill + gate framework") — fixes the gfx11 C-mapping. Assume
+  any new arch's C-mapping is wrong until proven on hardware.
 
 ## Last verified
 
