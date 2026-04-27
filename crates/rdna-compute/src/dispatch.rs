@@ -38,11 +38,12 @@ fn gemv_rows_default(arch: &str) -> u32 {
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" => 1,
         "gfx1030" | "gfx1031" => 1,
-        // CDNA3 (MI300X): wave64 native. `gemv_hfq4g256_wide` uses
-        // block=[64,1,1] = exactly one wave — zero lane waste. The 32-
-        // thread multirow variants run on half a wave, so the wide
-        // kernel is the natural fit. Return rows=1 to trigger use_wide.
-        "gfx940" | "gfx941" | "gfx942" => 1,
+        // CDNA1 (MI100, gfx908) + CDNA3 (MI300X): wave64 native.
+        // `gemv_hfq4g256_wide` uses block=[64,1,1] = exactly one wave —
+        // zero lane waste. The 32-thread multirow variants run on half a
+        // wave, so the wide kernel is the natural fit. Return rows=1 to
+        // trigger use_wide.
+        "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
         _ => 2,
     }
 }
@@ -85,6 +86,16 @@ fn has_wmma_f16(arch: &str) -> bool {
 /// `test_wmma_*_gfx12` channel-test examples (issue #54, PR #56).
 fn has_wmma_f16_gfx12(arch: &str) -> bool {
     arch.starts_with("gfx12")
+}
+
+/// CDNA wave64-native arches: CDNA1 (gfx908, MI100) and CDNA3 (gfx94x,
+/// MI300X). On these, wave32 kernels (block=[32,1,1]) waste the upper 32
+/// lanes of every wave slot. The `*_wave64.hip` kernel variants pack two
+/// rows per block (one per warp) with block=[64,1,1] and halve the grid
+/// count. Adding gfx90a (CDNA2, MI200) here is a one-line change once it
+/// has been bring-up validated.
+fn has_wave64_native(arch: &str) -> bool {
+    matches!(arch, "gfx908" | "gfx940" | "gfx941" | "gfx942")
 }
 
 /// Tensor stored on the GPU. Tracks shape and element type.
@@ -2168,8 +2179,8 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_x) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "fused_qkv_hfq4g256_wave64",
                 kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC,
@@ -2251,10 +2262,12 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        // CDNA3 (MI300X / gfx94x) wave64-native path: 2 rows per block, halves
-        // grid count vs wave32 kernel which wastes half the wave slot.
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_x) = if cdna3 {
+        // CDNA1 (MI100, gfx908) + CDNA3 (MI300X / gfx94x) wave64-native path:
+        // 2 rows per block, halves grid count vs wave32 kernel which wastes half
+        // the wave slot. gfx908 added 2026-04-27 — kernel uses no MFMA, just
+        // FMA + shfl_down within wave64.
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_wave64",
                 kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
@@ -2388,8 +2401,8 @@ impl Gpu {
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
             return self.gemm_qkvza_hfq4g256_fp16(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
         }
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_qkvza_hfq4g256_wave64",
                 kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC,
@@ -2665,8 +2678,8 @@ impl Gpu {
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
             return self.gemm_qkv_hfq4g256_fp16(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_qkv_hfq4g256_wave64",
                 kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC,
@@ -4018,8 +4031,8 @@ impl Gpu {
         y_up:   &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_x) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed_wave64",
                 kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC,
@@ -4082,8 +4095,8 @@ impl Gpu {
         x_residual: &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_x) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_down_indexed_wave64",
                 kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC,
@@ -4193,8 +4206,8 @@ impl Gpu {
         y_up:   &GpuTensor,
         m: usize, k: usize, k_top: usize, batch_size: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
                 kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC,
@@ -4261,8 +4274,8 @@ impl Gpu {
         x_residual: &GpuTensor,
         m: usize, k: usize, k_top: usize, batch_size: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_down_indexed_batched_wave64",
                 kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC,
@@ -4366,8 +4379,8 @@ impl Gpu {
             // FP16 packed on all other RDNA: ~15% prefill improvement
             return self.gemm_hfq4g256_residual_fp16(a_raw, x, y, m, k, batch_size);
         }
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_hfq4g256_residual_wave64",
                 kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC,
@@ -4698,8 +4711,8 @@ impl Gpu {
             // Shadow allocation failed — fall through to the GEMV path.
         }
 
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_hfq4g256_wave64",
                 kernels::GEMM_HFQ4G256_WAVE64_SRC,
@@ -7188,7 +7201,23 @@ impl Gpu {
         y_gate: &GpuTensor, y_up: &GpuTensor,
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel("fused_gate_up_hfq4g256", kernels::FUSED_GATE_UP_HFQ4G256_SRC, "fused_gate_up_hfq4g256")?;
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_x) = if cdna_wave64 {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_wave64",
+                kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC,
+                "fused_gate_up_hfq4g256_wave64",
+            )?;
+            let total = (gate_m + up_m) as u32;
+            ("fused_gate_up_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+        } else {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256",
+                kernels::FUSED_GATE_UP_HFQ4G256_SRC,
+                "fused_gate_up_hfq4g256",
+            )?;
+            ("fused_gate_up_hfq4g256", [32u32, 1, 1], (gate_m + up_m) as u32)
+        };
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -7203,9 +7232,8 @@ impl Gpu {
             &yu as *const _ as *mut c_void, &gm as *const _ as *mut c_void,
             &um as *const _ as *mut c_void, &kv as *const _ as *mut c_void,
         ];
-        let total_rows = (gate_m + up_m) as u32;
         self.launch_maybe_blob(
-            "fused_gate_up_hfq4g256", [total_rows, 1, 1], [32, 1, 1], 0, &mut params,
+            func_name, [grid_x, 1, 1], block, 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xp);
@@ -11120,17 +11148,18 @@ impl Gpu {
                             kernels::FUSED_QKV_HFQ4G256_SRC.to_string()));
                 specs.push(("fused_gate_up_hfq4g256",
                             kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string()));
-                // CDNA3 (MI300X / gfx94x) wave64-native variants — cut
-                // wavefront pressure in half on the three hottest kernels
-                // (30 LA fused + 40 MoE gate_up + 40 MoE down per token
-                // on A3B). Wave32 block=[32,1,1] kernels otherwise waste
-                // the upper 32 lanes of every wave slot.
-                if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942") {
+                // CDNA1 (gfx908) + CDNA3 (gfx94x) wave64-native variants — cut
+                // wavefront pressure in half on the hottest kernels. Wave32
+                // block=[32,1,1] kernels otherwise waste the upper 32 lanes
+                // of every wave slot on these wave64-native arches.
+                if has_wave64_native(&self.arch) {
                     // Single-token (draft / single-layer paths).
                     specs.push(("fused_qkvza_hfq4g256_wave64",
                                 kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
                     specs.push(("fused_qkv_hfq4g256_wave64",
                                 kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("fused_gate_up_hfq4g256_wave64",
+                                kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string()));
                     specs.push(("gemv_hfq4g256_moe_gate_up_indexed_wave64",
                                 kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string()));
                     specs.push(("gemv_hfq4g256_moe_down_indexed_wave64",
@@ -11179,13 +11208,15 @@ impl Gpu {
                             kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string()));
                 specs.push(("fused_silu_mul_mq_rotate",
                             kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string()));
-                // CDNA3 wave64 variants — see hfq4 branch for rationale.
-                if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942") {
+                // CDNA1 (gfx908) + CDNA3 wave64 variants — see hfq4 branch for rationale.
+                if has_wave64_native(&self.arch) {
                     // Single-token (draft / single-layer paths).
                     specs.push(("fused_qkvza_hfq4g256_wave64",
                                 kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
                     specs.push(("fused_qkv_hfq4g256_wave64",
                                 kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("fused_gate_up_hfq4g256_wave64",
+                                kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string()));
                     specs.push(("gemv_hfq4g256_moe_gate_up_indexed_wave64",
                                 kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string()));
                     specs.push(("gemv_hfq4g256_moe_down_indexed_wave64",
