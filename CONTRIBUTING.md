@@ -6,21 +6,32 @@ model architecture support — all welcome.
 
 ## Two ways to help, no Rust required
 
-### 1. Run the test + bench matrix on your GPU
+Both paths below use only the installer-provided binaries (the
+`hipfire` wrapper, daemon, and quantizer dropped into `~/.hipfire/bin/`
+by `scripts/install.sh`). No `cargo`, no ROCm SDK, no source build.
+
+### 1. Run the bench matrix on your GPU
 
 If you have an RDNA card the maintainer doesn't, the highest-leverage
 thing is running the standard tester workflow and posting numbers.
 
 ```bash
-hipfire diag                            # confirms ROCm + arch detection
-./scripts/test-kernels.sh               # GPU kernel sanity (~30s)
-./scripts/megabench-q35.sh 2>&1 | tee bench-<your-gpu>.txt
+hipfire diag                            # ROCm + arch detection sanity check
+hipfire pull qwen3.5:0.8b               # ~0.5 GB; fits any RDNA card
+hipfire pull qwen3.5:9b                 # ~5.3 GB; needs 6 GB+ VRAM
+hipfire bench qwen3.5:0.8b --runs 5     # decode + prefill tok/s over 5 runs
+hipfire bench qwen3.5:9b   --runs 5
 ```
 
-Open an issue titled `Benchmarks: <your GPU>` and paste the output. The
-results land in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The
-`hipfire-tester` skill in `.skills/hipfire-tester/` walks an AI agent
-through this end-to-end if you want help.
+For 16 GB+ cards, also pull and bench `qwen3.5:27b`. For mixed-arch
+or non-Linux setups, see `hipfire diag --help` for environment-
+specific guidance.
+
+Open an issue titled `Benchmarks: <your GPU>` and paste the `diag`
+output + each `bench` block. Results land in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md). The `hipfire-tester` skill
+in `.skills/hipfire-tester/` walks an AI agent through this end-to-
+end if you want help.
 
 ### 2. Diagnose and report a bug
 
@@ -45,12 +56,24 @@ the case we want filed.
 git clone https://github.com/Kaden-Schutt/hipfire
 cd hipfire
 cargo build --release --features deltanet --example daemon -p engine
+cargo build --release --features deltanet --example test_kernels -p engine
 cargo build --release -p hipfire-quantize
 ```
 
-Requires ROCm 6+ for kernel JIT. Pre-compiled kernel blobs ship for
-gfx1010 / gfx1030 / gfx1100 / gfx1200; other arches JIT-compile on
-first load.
+Requires Rust 1.75+ and ROCm 6+ (the dev workflow needs `hipcc` for
+kernel JIT). Pre-compiled kernel blobs ship for gfx1010 / gfx1030 /
+gfx1100 / gfx1200; other arches JIT-compile on first load.
+
+### GPU kernel correctness check
+
+```bash
+./target/release/examples/test_kernels      # ~30s, no model needed
+```
+
+Validates every dispatched kernel against a CPU reference on the
+detected arch. This is the load-bearing correctness gate for any
+arch port; if it fails on your hardware we want to hear about it
+(see issue template / autoheal skill).
 
 ### The three gates
 
