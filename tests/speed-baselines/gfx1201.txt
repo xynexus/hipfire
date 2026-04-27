@@ -1,6 +1,6 @@
 # hipfire speed-gate baseline — gfx1201
 # Captured 2026-04-27 against commit fa6b885
-# Config: KV=givens4, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)
+# Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)
 # Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))
 #
 # Measurements: best-of-2 via bench_qwen35_mq4. Two prefill sizes per model:

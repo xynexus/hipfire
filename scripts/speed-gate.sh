@@ -291,7 +291,7 @@ if [ "$UPDATE" -eq 1 ]; then
     {
         echo "# hipfire speed-gate baseline — $BASELINE_ARCH"
         echo "# Captured $(date -u +%Y-%m-%d) against commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-        echo "# Config: KV=givens4, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)"
+        echo "# Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)"
         echo "# Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))"
         echo "#"
         echo "# Measurements: best-of-2 via bench_qwen35_mq4. Two prefill sizes per model:"
