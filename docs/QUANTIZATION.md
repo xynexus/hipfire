@@ -1,119 +1,168 @@
-# Quantization Guide
+# Quantization
 
-## Formats
+How hipfire stores weights and KV cache. This is the design / math
+side. For the user-facing "how do I quantize my model" page, see
+[QUANTIZE.md](QUANTIZE.md).
 
-hipfire supports multiple quantization formats. The choice depends on your VRAM
-budget and target throughput.
+## Weight formats
 
-### Q8_0 (1.06 bytes/weight)
-- Block: f16 scale (2B) + 32 int8 values (32B) = 34 bytes per 32 elements
-- Symmetric: `scale = max(|w|) / 127`, `q = round(w / scale)`
-- Dequant: `weight = scale * q` (one multiply per element)
-- **Best throughput on RDNA**: 84% peak bandwidth (375 GB/s on RX 5700 XT)
-- 16 VGPRs → maximum occupancy
+All weight formats group elements into 256-wide blocks (G256). Each
+block has independent scale + zero-point metadata. The bitwidth and
+whether a Walsh-Hadamard rotation runs before quantization defines the
+four production formats.
 
-### Q4_K (0.56 bytes/weight)
-- GGML-compatible block: 144 bytes per 256 elements
-- Hierarchical: super-block f16 scale/min + 8 sub-blocks with 6-bit integer scales
-- Complex dequant: packed scale decode + nibble extraction + multiply + subtract
-- **42% peak bandwidth** on RDNA1 due to 40 VGPRs from extraction chain
-- Best compression ratio that hipfire supports natively
+| Format | Bits | Rotation | Bytes / 256 elements | Use case |
+|---|---|---|---|---|
+| HFQ4-G256 | 4 | none | 136 (8 hdr + 128 data) | Llama / Qwen3 / dense |
+| HFQ6-G256 | 6 | none | 200 | Dense, higher quality |
+| MQ4-G256 | 4 | FWHT | 136 | Qwen 3.5+ hybrid |
+| MQ6-G256 | 6 | FWHT | 200 | Qwen 3.5+ higher quality |
 
-### Q4_F16_G64 (0.56 bytes/weight)
-- Hipfire-native format: f16 scale + f16 min + 32 packed nibble bytes = 36 bytes per 64 elements
-- Simpler metadata than Q4_K but same bandwidth (format doesn't determine speed — VGPRs do)
-- Useful as a baseline for format experiments
+Header layout (8 bytes): 4 bytes scale (f32-bitcast-from-f16) + 4 bytes
+zero point. Data: bitwidth × 256 / 8 bytes = 128 (4-bit) or 192 (6-bit)
+of packed nibbles / sextets.
 
-### Mixed Q8+Q4_K (variable, ~0.7-0.8 bytes/weight)
-- **Recommended for VRAM-constrained models**
-- Attention weights (q/k/v/o projections): Q8_0 for maximum bandwidth
-- FFN weights (gate/up/down): Q4_K for compression
-- Embedding + lm_head: Q8_0
-- Norms: F16
+For embedding tables: always Q8F16 (32 elements per block, 1-byte
+scale + 32 int8 codes — total 33 bytes). Q4-grade is too lossy for
+large-dim embeddings; the per-token absolute lookup error compounds
+through the rest of the network.
 
-## Using hipfire-quantize
+For 1D norms / scale vectors: F16 unmodified. They're tiny (one float
+per dim) and precision-sensitive.
 
-### Prerequisites
-- HuggingFace model directory with `config.json` and `*.safetensors`
-- Source weights should be FP16 or BF16 (**never quantize from pre-quantized GGUF**)
+## FWHT rotation (the M in MQ)
 
-### Commands
+Each 256-wide group is multiplied element-wise by a `±1` sign vector,
+then transformed by a fast Walsh-Hadamard transform, then divided by
+sqrt(256). The same operation runs on the input vector at inference
+time (kernels apply the inverse), so the GEMV math is unchanged.
 
-```bash
-# Full Q8 (best speed, most VRAM)
-cargo run --release -p hipfire-quantize -- \
-  --input /path/to/model-dir \
-  --output model-q8.hfq \
-  --format q8f16
+What this buys: outliers in the original weight distribution get
+*spread* across the group, making the post-rotation distribution more
+uniform. Quantization to 4 bits is then less destructive — the per-
+group dynamic range is narrower.
 
-# Mixed Q8+Q4_K (best speed/VRAM tradeoff) — RECOMMENDED
-cargo run --release -p hipfire-quantize -- \
-  --input /path/to/model-dir \
-  --output model-mixed.hfq \
-  --format q8-mixed
-
-# Full Q4_F16 (maximum compression, slower)
-cargo run --release -p hipfire-quantize -- \
-  --input /path/to/model-dir \
-  --output model-q4.hfq \
-  --format q4f16
-
-# Q8-fast: Q8 attention + Q4-as-Q8 FFN (all Q8 speed, larger file)
-cargo run --release -p hipfire-quantize -- \
-  --input /path/to/model-dir \
-  --output model-fast.hfq \
-  --format q8-fast
-```
-
-### VRAM Budget Guide
-
-| Model Size | Q8 Full | Q8+Q4K Mixed | Q4_F16 | Fits 8GB? |
-|-----------|---------|-------------|--------|-----------|
-| 0.5-1B | ~0.6-1.2 GB | ~0.5-0.8 GB | ~0.3-0.6 GB | All fit |
-| 3-4B | ~3.5-4.5 GB | ~2.5-3.5 GB | ~1.8-2.5 GB | All fit |
-| 7-8B | ~8-9 GB | ~5.5-6.5 GB | ~4-5 GB | Mixed + Q4 fit |
-| 13B+ | ~14+ GB | ~10+ GB | ~7-8 GB | Q4 only (tight) |
-
-### Running Inference
-
-```bash
-# HFQ models
-cargo run --release --example infer_hfq -- model.hfq "Your prompt here"
-
-# GGUF models (also supported)
-cargo run --release --example infer -- model.gguf "Your prompt here"
-```
-
-## Why Not Double-Quantize?
-
-Converting Q4_K_M GGUF → F32 → Q4_F16 introduces compounding quantization error:
-- Q4_K already maps each weight to one of 16 levels per sub-block
-- Re-quantizing those 16 levels to a different 16-level scheme loses information
-- The first few tokens may be correct, but generation quality degrades rapidly
-
-Always quantize from the original FP16/BF16 weights. Download them from HuggingFace:
-
-```bash
-hf download Qwen/Qwen3-8B --include "*.safetensors" --local-dir ./qwen3-8b
-hf download Qwen/Qwen3-8B config.json --local-dir ./qwen3-8b
-```
-
-## Format Details: .hfq
-
-The `.hfq` (HipFire Quantized) file format:
+The sign vectors are deterministic (PRNG seeds 42 / 1042) and shared
+between the quantizer and the engine; no per-model calibration.
 
 ```
-Header (32 bytes):
-  magic: "HFQM" (4B)
-  version: u32
-  architecture: u32 (0=LLaMA, 1=Qwen3, 2=Qwen3.5)
-  n_tensors: u32
-  metadata_offset: u64
-  data_offset: u64
-
-Metadata: JSON blob (model config + tokenizer reference)
-Tensor Index: per-tensor name, quant_type, shape, data_size
-Tensor Data: 4096-byte aligned, directly mmap-able
-
-Quant types: 0=Q4_F16_G64, 1=F16, 2=F32, 3=Q8_FP16, 4=Q4_K
+quant time:    w' = WHT(signs ⊙ w) / 16
+                     → quantize w' to 4 bits per block
+inference:     y = w'·x  =  WHT(signs ⊙ w)·x / 16
+                          =  signs ⊙ w · WHT(x) / 16    (WHT self-adjoint)
+                            └────────┘    └──────┘
+                            stored MQ4    rotate_x_mq
 ```
+
+So the engine does `rotate_x_mq` on the input vector once per layer
+and the quantized GEMV consumes the pre-rotated input. The cancellation
+is exact in fp32 arithmetic; in mixed precision there's a small
+numerical drift but well below the per-block quantization error.
+
+## When MQ vs HFQ matters
+
+The FWHT rotation was calibrated against the Qwen 3.5 / 3.6 weight
+distributions (DeltaNet hybrid models). On those, MQ4 hits Q8-level
+quality at Q4 bandwidth — the project's central claim.
+
+On Llama-style dense models that weren't trained against this weight
+space, the rotation still works mathematically (the cancellation is
+exact) but provides no quality lift over plain HFQ4. It only adds the
+runtime `rotate_x_mq` kernel-launch cost.
+
+**Practical rule**: pick MQ for Qwen 3.5+, HF for everything else.
+The CLI defaults reflect this — `hipfire quantize <safetensors-dir>`
+defaults to `--format mq4`, `hipfire quantize <file.gguf>` defaults to
+`--format hf4`.
+
+## KV cache (asym format)
+
+The KV cache stores per-token K and V for every prefix position.
+Memory grows linearly with seq_len, so quantizing it has out-sized
+impact on long-context inference.
+
+```
+mode      K layout                              V layout
+─────────────────────────────────────────────────────────
+q8        Q8_0 (32-element blocks)              Q8_0
+asym4     Lloyd-Max rotated 4-bit               Q8_0
+asym3     Lloyd-Max rotated 3-bit  (default)    Q8_0
+asym2     rotated 2-bit                         Q8_0
+```
+
+K and V are quantized differently because they have different
+sensitivities. K participates in the softmax — small numerical errors
+get exponentiated and shift attention mass between tokens, especially
+on multi-turn recall (`"Kaden"` becomes `"Kendall"` if you go too
+aggressive). V is the value bank that the attention probabilities
+already weight; modest noise smears across all positions and matters
+less.
+
+So K gets the rotation + Lloyd-Max scalar quantization at low
+bitwidth, V stays Q8.
+
+Lloyd-Max here means: per-block, find the K-bit codebook that
+minimizes squared error against the rotated K vector for that head,
+not a uniform scale + zero. The codebook is two floats (min / max)
+plus 2^K codes implied uniformly between them — same storage cost as
+asymmetric uniform, slightly better fit on the actual K distribution.
+
+## Asym KV per arch defaults
+
+| Arch | Default | Reason |
+|---|---|---|
+| gfx1100 (RDNA3) | asym3 | 24 GB VRAM affords it; perceptual quality at K=3 matches Q8 |
+| gfx1030 (RDNA2) | asym3 | Same |
+| gfx1010 (RDNA1) | asym2 | 8 GB VRAM forces tighter quant |
+| gfx1013 (BC-250 APU) | asym2 | 14 GB shared, prioritize ctx length |
+| gfx94x (CDNA3) | q8 | Fewer KV-bound hot paths; saturate compute |
+
+Override with `hipfire config set kv_cache <mode>` or
+`HIPFIRE_KV_MODE=<mode>` env.
+
+## Why a custom format at all
+
+llama.cpp's GGUF Q4_K_M has nearly the same on-disk size and in-place
+GEMV cost. The win comes from two places:
+
+1. **Fused projections**. hipfire's GEMV+GEMM kernels for HFQ4 / MQ4
+   fuse the 3-way QKV (or 6-way QKVZA in DeltaNet) into one kernel
+   launch. This is where the 1.7–2.1× decode lead over llama.cpp
+   comes from in the bench table.
+2. **WMMA prefill**. Batched MQ4 GEMM uses RDNA3's WMMA intrinsic
+   directly — it's smaller-batch-friendly than the cuBLAS-style
+   replacement llama.cpp's ROCm path uses.
+
+Neither is exotic — they're both engineering, not algorithmic
+breakthroughs. But they add up.
+
+## Format file format (.hfq / .mq / .hf)
+
+```
+0x00  "HFQM"        (magic, 4 bytes)
+0x04  version       (u32 LE = 1)
+0x08  arch_id       (u32 LE — 0=llama, 1=qwen3, 5=qwen3_5, 6=qwen3_5_moe)
+0x0C  n_tensors     (u32 LE)
+0x10  metadata_offset  (u64 LE)
+0x18  data_offset      (u64 LE — 4096-aligned)
+
+[metadata_offset .. data_offset]:
+  metadata_json  (UTF-8 JSON: config, tokenizer, gguf_meta, source)
+  tensor_index:
+    n_tensors: u32 LE
+    for each tensor:
+      name_len: u16 LE
+      name: utf-8
+      quant_type: u8     (0=Q4F16G64, 1=F16, ..., 6=HFQ4G256, 13=MQ4G256, ...)
+      n_dims: u8
+      shape: u32 LE × n_dims
+      group_size: u32 LE
+      data_size: u64 LE
+
+[data_offset .. EOF]:
+  tensor data, sequential, in tensor_index order
+```
+
+`HfqFile::open` mmaps the file; `tensor_data(name)` returns a slice
+into the mapping. The daemon never copies tensor bytes — they go
+straight from mmap to a HIP `hipMalloc` + `hipMemcpy` upload.

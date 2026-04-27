@@ -1,270 +1,162 @@
-# Perf benchmarking — methodology
+# Perf benchmarking methodology
 
-Read this before claiming any kernel-level decode or prefill win. Written
-after a session where a −13% regression shipped as a "+2% improvement"
-because adjacent within-session measurements lied.
+The protocol for measuring kernel-level tok/s honestly. Read this
+before claiming any win in a commit message; the gates assume you've
+followed it.
 
-## 1. Within-session A/B is noisy
+## The within-session noise band
 
-On gfx1100 specifically, `tok/s` measured on successive `bench_qwen35_mq4`
-invocations within the same shell session can drift ±10–15% from each
-other due to:
+On gfx1100 (7900 XTX) the within-session A/B noise band on a fresh
+process is **±10–15%** depending on DPM state, thermal headroom, and
+firmware version. This is BIG. A "+8%" win measured by changing some
+code in one shell session and re-running is **inside the noise**.
 
-- DPM / clock-state settling. After many benches the GPU may sit at a
-  different sclk DPM level than on a fresh process.
-- Thermal history. The `edge` temp may look fine (<50 °C) while the memory
-  sensor is 65 °C and memory clock is throttled.
-- JIT cache state. A warm `.hipfire_kernels/` dir serves .hsaco blobs that
-  may not match the current source if a hash collision or stale sidecar
-  slipped through.
-- rocprof / rocprofv3 instrumentation sometimes leaves the GPU in a
-  degraded clock mode that a normal process exit doesn't clear.
+Sources of within-session drift, ranked by impact:
 
-**Rule:** Any `tok/s` delta under ~5 % measured within one shell session
-is noise. Do not claim a win on it.
+1. **Stale build cache**. The speed-gate's `ensure_build()` is a
+   no-op when the bench binary already exists. A "stash and re-bench"
+   flow leaves the post-change binary in place, so both runs measure
+   the same code. Always `rm target/release/examples/<bench>` before
+   re-running.
+2. **DPM state**. The GPU clocks ramp up over the first ~5 seconds of
+   sustained load; benchmarks that include warmup catch this, ones
+   that don't measure cold clocks for the first run and hot clocks
+   for subsequent runs. Use `cat /sys/class/drm/card*/device/pp_dpm_sclk`
+   to inspect.
+3. **Firmware shadowing**. `/lib/firmware/updates/amdgpu` overrides
+   the kernel's bundled firmware; if the dkms-installed firmware
+   doesn't match the kernel-installed firmware, you get a SMU IF
+   mismatch and ~50% prefill cratering. Fix:
+   `sudo mv /lib/firmware/updates/amdgpu /lib/firmware/updates/amdgpu.bak
+   && sudo reboot`. Symptoms in `dmesg | tail -40`.
+4. **Thermal throttle**. After 10+ minutes of sustained DFlash runs
+   with the case closed, the 7900 XTX throttles. Check
+   `cat /sys/class/drm/card*/device/hwmon/hwmon*/temp*_input`.
 
-**DPM pinning via `HIPFIRE_DPM_WARMUP_SECS=N`:** Both `bench_qwen35_mq4`
-and `dflash_spec_demo` accept this env var. It runs a 256 MB memset loop
-for `N` seconds before the decode timer starts, which pins the card at
-high DPM (effective ~770 GiB/s during warmup, verified with
-`rocm-smi --showclocks`). Use 10 s for most runs. If bench-to-bench
-variance is still >5 % with warmup, the noise source is elsewhere
-(thermal, kernel cache, etc.) — don't ship until you understand it.
+## Cross-process verification
 
-**Never pass `--no-chatml` for `dflash_spec_demo` perf runs.** That flag
-strips the ChatML template wrap (`<|im_start|>user…<|im_end|><|im_start|>assistant`)
-and feeds raw-prompt tokens that don't match the model's training
-distribution. The target then rejects draft speculations more often,
-τ crashes, tok/s drops ~25 %. Measured 2026-04-22 on 27B DFlash,
-Fibonacci-continuation prompt, HEAD `5cd6117`:
+To trust a perf delta as real:
 
-| flags | tok/s | τ |
+```bash
+# 1. Pin to the candidate commit
+git checkout <candidate>
+
+# 2. Rebuild from clean
+cargo clean -p rdna-compute
+rm -f target/release/examples/bench_qwen35_mq4
+cargo build --release --features deltanet -p engine \
+    --example bench_qwen35_mq4
+
+# 3. Run the gate
+./scripts/speed-gate.sh --fast
+
+# 4. Same procedure for the baseline
+git checkout <baseline>
+# ... (same build + bench)
+```
+
+Or via the harness directly:
+
+```bash
+./scripts/probe_commits.sh <baseline-sha> <candidate-sha>
+```
+
+`probe_commits.sh` does this end-to-end with fresh process per commit
++ a multi-run median. A delta that survives this protocol is real;
+one that doesn't probably isn't.
+
+## Speed-gate baselines
+
+`tests/speed-baselines/<arch>.txt` records the "ground floor" decode
++ prefill numbers per arch. The pre-commit hook runs
+`scripts/speed-gate.sh --fast` automatically when the staged diff
+touches kernel / dispatch / forward-pass files. Tolerance is ±5% from
+the committed baseline.
+
+If a legitimate change trades a small regression on the baseline arch
+for a much bigger win on another arch (rare, but happens), update the
+baseline in the same commit:
+
+```bash
+./scripts/speed-gate.sh --update-baselines
+git add tests/speed-baselines/
+git commit
+```
+
+The baseline change stays in the same commit so a reviewer sees the
+trade-off explicitly. Don't sneak baseline updates into separate
+"chore" commits.
+
+**Do not use `--no-verify` to bypass the gate.** A regression that
+the gate catches is information you need; bypassing produces a commit
+that masks the issue from `git bisect` later. Authorized exceptions
+must be explicitly stated in writing by the maintainer for that
+specific change.
+
+## Prompt structure matters
+
+Two prompts that tokenize to the same number of tokens but with
+different whitespace patterns produce dramatically different DFlash τ.
+Same model, same flags, same binary md5:
+
+```
+PEP-8 strict (\n\n\n between top-level defs):    27B-3.5  τ=8.07  → 161 tok/s
+Single-blank (\n\n between top-level defs):      27B-3.5  τ=9.42  → 184 tok/s
+```
+
+A 14% perf swing from a whitespace cleanup is invisible in code
+review but catastrophic for benchmarking. **All cross-session perf
+comparisons MUST use byte-identical prompts**:
+
+- Embed prompts as committed files (not heredocs in scripts that
+  editors reformat).
+- Record the prompt md5 alongside the result.
+- If you can't verify the prompt md5, treat the comparison as
+  unreliable.
+
+The engine collapses `\n{3,}` → `\n\n` at prompt entry by default
+(`prompt_normalize=true`). This eliminates the whitespace-variance
+source for normal use, but bench scripts that bypass the engine entry
+point still need the prompt-md5 discipline.
+
+## DFlash speed gate
+
+`scripts/coherence-gate-dflash.sh` runs the spec-decode coherence
+battery: a fixed (model × prompt × spec-mode) matrix that catches
+token-attractor regressions (output that passes the perf gate while
+emitting `[1734 2357 2733 283 869 1734 2357 ...]` for 1500 tokens).
+
+Three-tier thresholds:
+
+| Tier | Window | Hard fail if |
 |---|---|---|
-| `--max 120` (default chatml) | **151** | 7.64 |
-| `--max 120 --ctx 2048 --no-chatml` | 111 | 5.3 |
+| 1 | First 128 tokens | unique_token_ratio < 0.15 OR max_token_freq > 0.50 |
+| 2 | Last 128 tokens | unique_token_ratio < 0.30 OR max_token_freq > 0.50 |
+| 3 | Full output | 3-gram repetition density > 50% in second half |
 
-`--no-chatml` is correct for coherence-gate / byte-exact token-ID
-comparisons where you need to compare raw-prompt outputs without
-template noise. Never for perf.
+Why both ends: single-token attractors show up in the first 128;
+block-level structural loops (5+ token sequences repeating) appear
+later. The CASK m-fold + DFlash 2026-04-26 case (τ=8.98, tight
+stddev) passed the first-128 gate but emitted 76+ block-loop reps in
+the last 1000 tokens.
 
-**Prompt SHAPE dictates τ — not just the template flag.** On the same
-27B weights / same commit / same hardware / same chatml wrap, the
-*content genre* of the prompt swings τ by ~3×:
+Any DFlash perf bench that lacks the unique-token + max-frequency
+checks AND visual eyeballing of output is unreliable. **Tight stddev
+on a spec-decode bench is actively suspicious, not reassuring**:
+real acceptance noise is wider; tight stddev correlates with
+deterministic attractors.
 
-| Prompt style                                                | tok/s | τ    |
-|-------------------------------------------------------------|-------|------|
-| Instruct "Explain why this is O(2^n)..."                    | 66    | 2.34 |
-| Prose continuation (Fibonacci numbers + prose context)      | 71    | 2.71 |
-| Pure code continuation (`def fib` / `def fib_memo` stubs)   | 168   | 8.18 |
+## What the gates do NOT catch
 
-Measured 2026-04-23, 27B DFlash gfx1100 at `9ab691d`. The canonical
-"162 tok/s / τ=7.7" baseline is a **pure code continuation** — starts
-inside a `def`, no "explain" suffix, nothing pushing toward natural
-language. User rule: *"if the model will output language (not code)
-it will tank tau."*
+- Per-lane WMMA mapping bugs (see commit `b7ac66a` — the gfx11 C-mapping
+  was silently wrong for 6 weeks while the gates were green).
+- Output drift that's coherent but worse on a benchmark task hipfire
+  doesn't measure. The coherence gate is unique-token / repetition; it
+  doesn't measure HumanEval pass-rate.
+- Long-context drift past the prompts the gates exercise.
 
-**Why:** draft-target acceptance tracks token-distribution predictability.
-Code tokens are syntactically constrained (`def` → name → `(` → args →
-`):` → `\n    ` → ...) so the HFQ4 draft agrees with target far more
-often than on high-entropy prose. τ ceiling is prompt-bound; no engine
-change compensates.
-
-**Rules:**
-- When quoting DFlash τ for release notes / regression gates / commits,
-  specify the prompt genre (code-cont / prose / instruct) alongside τ.
-  "162 tok/s τ=7.7" alone is meaningless without "on code-cont prompt".
-- A/B regression benches must hold the prompt genre constant. Mixing
-  prose baseline with code-cont candidate produces a fake 2-3× delta.
-- When supposed regression shows τ drop 7-8 → 2-3, FIRST check the
-  prompt genre. Bench scripts reading a path that now points to prose
-  / a missing file / an "explain this" variant are the likely cause —
-  not hardware, not code. (This bit once in 2026-04-23 as an imaginary
-  firmware/DPM regression.)
-- Canonical 27B code-cont prompt: Python function stubs with no
-  natural-language preamble.
-- Do NOT interpret a prose-prompt τ of 2-3 as a bug. That is the
-  prose ceiling.
-
-**Whitespace inside the prompt ALSO dictates τ — discovered 2026-04-24.**
-Same prompt content, same prompt token COUNT, but different whitespace
-SEQUENCING produces 14-17% deltas:
-
-| Prompt | Tok count | tok/s | τ |
-|---|---|---|---|
-| LRU-cache, PEP-8 strict (`\n\n\n` between top-level defs) | 232 | 161 | 8.07 |
-| LRU-cache, single blank line (`\n\n` between top-level defs) | 232 | **184** | **9.42** |
-
-Both are valid Python. Both tokenize to 232 prompt tokens. Different
-whitespace token SEQUENCING produces different prefix-conditioned
-distributions at each emit position → different draft/target argmax
-alignment → different τ. Same model, same flags, same kernels, same
-binary md5.
-
-**Forensic case (cost ~6 hours)**: A different agent's bench at 10:07
-on 2026-04-24 reported `27b-3.5 LRU max=120 = 183 tok/s τ=9.42`. A
-follow-up Claude session reproducing with a PEP-8-formatted prompt got
-deterministic 161 τ=8.07 and chased phantom regression hypotheses
-(rocBLAS 6.4 vs 7.2, DKMS amdgpu vs in-tree, firmware shadow,
-ppfeaturemask, mold/sccache build, kernel cache, DPM compute mode,
-GPU runtime PM) — all null deltas. The variable was a single newline
-in the prompt heredoc. Reproduced once matched byte-exact.
-
-**Rules:**
-- Bench scripts MUST commit prompts as separate files (no embedded
-  heredocs that get reformatted by editors / autoformatters).
-- Bench output MUST include the prompt md5 (or path + git rev).
-- Cross-session perf claims (mine vs another agent's, today vs last
-  week) are unverifiable without byte-exact prompt match. Check
-  `prompt md5` first when delta seems unexplainable.
-- Whitespace cleanups in prompt files are perf changes. Treat as such.
-
-See `docs/plans/prompt-structure-tau-discovery-2026-04-24.prd` for full
-forensic timeline + reproduction commands.
-
-## 2. The speed-gate is the source of truth
-
-`./scripts/speed-gate.sh` runs `bench_qwen35_mq4` on the 4 MQ4 sizes with
-reproducible config (`HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1`, specific
-prefill lengths, best-of-2) and compares against committed baselines in
-`tests/speed-baselines/gfx1100.txt`.
-
-- **If speed-gate passes, the change is shippable as far as perf goes.**
-- **If speed-gate fails, the change is not shippable until the regression
-  is understood** — not "noise", not "thermal", not "it worked in my last
-  bench". Understand it.
-
-Re-baselining (`--update-baselines`) is a load-bearing operation. Only
-do it if the delta is intentional and explained in the commit message.
-Never to mask an unexplained regression.
-
-## 3. Verify across a fresh process before claiming a win
-
-Before committing a perf change:
-
-```bash
-# On HEAD~1 (the commit before your change)
-./scripts/probe_commits.sh $(git rev-parse HEAD~1) $(git rev-parse HEAD)
-```
-
-This force-checks out each commit, does an incremental build, and runs
-the bench in a fresh process each time. The delta across commits is the
-delta that matters; the delta within one shell is not.
-
-If HEAD doesn't beat HEAD~1 on this probe, your within-session A/B lied.
-
-## 4. Purge the JIT cache before a perf baseline
-
-```bash
-rm -rf .hipfire_kernels/
-cargo build --release --features deltanet -p engine --example bench_qwen35_mq4
-```
-
-`include_str!` embeds kernel source at compile time, but the JIT cache
-blobs in `.hipfire_kernels/*.hsaco` are keyed by a content-hash sidecar.
-When the hash matches, the cached blob is served without recompilation.
-A stale hash + stale blob combination silently runs old code against a
-new binary. Always purge when baselining.
-
-## 5. Bisecting decode regressions
-
-`scripts/bisect_9b_decode.sh` is a `git bisect run`-compatible driver:
-
-```bash
-git bisect start
-git bisect bad $REGRESSED_COMMIT
-git bisect good $KNOWN_GOOD_COMMIT
-git bisect run ./scripts/bisect_9b_decode.sh
-```
-
-Defaults: 9B MQ4 at `~/.hipfire/models/qwen3.5-9b.mq4`, pp=16 / warmup=3 /
-gen=30, 125 tok/s threshold. Override via `HIPFIRE_9B_MODEL` and
-`BISECT_TOK_S`. Build failures return 125 (skip). Takes ~2–5 min per step.
-
-For spot checks rather than full bisect, `scripts/probe_commits.sh <hashes>`
-runs the same bench on each listed commit without the pass/fail threshold.
-
-## 6. Negative-result log
-
-Things that looked like wins on gfx1100 / 7900 XTX in within-session A/B
-but measured as no-op or regression on fresh-process probe. Commit hash
-is where it was tried and reverted, so you can `git show` the kernel code.
-
-| attempt | expected | measured | commit | notes |
-|---|---|---|---|---|
-| `__builtin_nontemporal_load` on HFQ4-G256 weight reads | +2 % (session A/B) | **−13 %** (fresh probe) | `0532579` → reverted in `34eb024` | Defeats default load-path wave coalescing. Don't try this on weight-streaming kernels. |
-| block=64 "wave64" variant for `gemv_hfq4g256_residual` | +6.5 % | **no-op** | (discarded; see wave64 investigation branch before the revert) | The +6.5 % was an artifact of the nontemporal regression on the wave32 baseline. Once baseline is clean, block=64 and wave32 tie. |
-| true wave64 compile (`-mwavefrontsize64` via `HIPFIRE_COMPILER_FLAGS` marker) | +4 % | **slightly worse than block=64** | (discarded) | RDNA3 wave64 doubles per-wave VGPR budget and halves occupancy without compensating throughput. |
-| LA-preamble fusion: `fused_qk_l2_norm_scale + repeat_interleave → fused_qk_l2_norm_scale_repeat` | +2–4 % (fewer launches) | **neutral / slightly worse** (−2 % tok/s avg, within noise) | (discarded 2026-04-22) | 27B DFlash Fibonacci-continuation @ B=16: baseline avg 127.0 tok/s τ=6.24 vs fused 124.4 tok/s τ=6.00 (3-run each). Save ≈1 launch/LA-layer but cycle is kernel-compute-bound (ssync ≈ 38.6/55 ms); trimming 9 µs × a few launches is noise. τ itself is non-deterministic run-to-run (range 5.85–6.73), which dominates signal on short benches. |
-| mw16 32-row block variant (shared X tile across 2 weight rows, halves block count) | +3–5 % via X BW amortization | **null** tok/s; τ determinism improves (locks to 5.316) | (discarded 2026-04-22) | 27B DFlash: baseline 112.9 tok/s (σ 4.4, τ 5.0–5.83) vs 32r 111.3 tok/s (σ 0.3, τ locked). X BW is tiny at batch=16 (~0.3 % of GEMM BW) so amortization saves nothing. τ determinism is a real side-effect — useful for #91 investigation but not tok/s. |
-| mw16 K4 unroll (4 WMMAs per K-iter, 8 loads in flight) | +3–5 % from better load-latency hiding | **null** | (discarded 2026-04-22) | 27B DFlash 6-run: 112.7 tok/s vs baseline 112.9 (-0.2 %). Compiler at -O3 already pipelines the K2 kernel's 4 loads / 2 WMMAs adequately; K4 adds VGPR pressure without freeing new ILP slots. |
-| mw16 LDS staging (cooperative A/B half-warp split into LDS, stride-17-dword row padding) | +10–20 % via dedup of duplicate wave32 A/B fragment loads | **−30 %** (222 µs/call vs 170 µs baseline) | (discarded 2026-04-22) | LDS round-trip + `__syncthreads` overhead dominates the theoretical dedup savings. Bank conflicts may also still fire on 16-lane column reads despite padding. mw16 inputs are already well-L1-cached across lane-halves. |
-| mw16 non-residual (`Y = acc` not `+=`, skip pre-memset) | +2–5 % (fewer Y reads + skip memset) | kernel −2.5 % (38.1 vs 39.1 ms); **wallclock null** | (discarded 2026-04-22) | 27B DFlash 6-run: 112.8 tok/s vs baseline 112.9. The kernel-time saving is real but doesn't reduce wallclock because memset is async-overlapped with other stream work. |
-|  | | | | |
-| **Insight (#90, 2026-04-22)**: per-cycle host-timing probe showed `ssync = 39.8 ms` + `d2h = 11.4 ms` = 92 % of the 55 ms cycle wallclock. mw16 kernel time is 7.8 ms/cycle (14 % of wallclock). Further mw16 tile-level optimization has essentially no wallclock impact because mw16 isn't on the critical path — the cycle is serialization-bound, not kernel-compute-bound. Future perf work on this path should target ssync (`hipStreamSynchronize` in `commit_staging_to_ring`) and d2h sync overhead instead of kernel tiling. | | | | |
-| `commit_staging_to_ring` async scatter (drop `stream_synchronize`, queue D2Ds async on `active_stream`) | −40 ms/cycle from the ssync | **null tok/s** (+1.0 % within noise; tokens byte-match baseline) | (discarded 2026-04-22) | ssync dropped from 39.8 ms → 0, but d2h grew from 11.4 ms → 50.8 ms to compensate. Total wallclock 54998 vs 55252 µs ≈ unchanged. The sync wasn't pure overhead — it was genuine GPU work time (kernels + memsets + d2d queued on the stream) that had to complete somewhere before the null-stream `download_f32` could return. Moving the wait from ssync-site to d2h-site preserves total. To actually eliminate the wait, the next cycle's work must be pipelined with the current cycle's d2h (inter-iteration overlap), not just scheduled on the same stream. |
-| `__builtin_amdgcn_iglp_opt(0)` on `gemm_gate_up_hfq4g256_wmma` (task #74) | +5–10 % from MMA issue-slot rescheduling (per audit) | **−2.21 %** (150.78 vs 154.19 baseline, σ grew 1.17 → 6.92) | (discarded 2026-04-22) | 27B DFlash 5-run (excl. cold JIT): iglp produced a 6.688 τ outlier and 137 tok/s run, baseline never did. Compiler's default MMA scheduling on RDNA3 K2 kernel is already tight; iglp hint disrupts it. |
-| `__builtin_amdgcn_iglp_opt(0)` on `gemm_qkvza_hfq4g256_wmma` (task #75) | +5–10 % (same audit item) | **−11.39 %** (136.62 vs 154.19, σ 20.06 with 2 runs at ~112 tok/s τ≈5.3) | (discarded 2026-04-22) | Worse than gate_up — qkvza's 4-way output routing seems more sensitive to scheduler perturbation. Same underlying failure mode. |
-|  | | | | |
-| **Insight (#74 + #75, 2026-04-22)**: HFQ4G256 K2 WMMA kernel class is at RDNA3 compiler-scheduling ceiling. Both iglp_opt(0) probes regressed. Combined with the earlier mw16 LDS-staging result (−30 %) and mw16 K4-unroll null, this class has no further tile-level tuning lever available on gfx1100. Further tok/s on `gemm_*_hfq4g256_wmma` kernels requires either algorithmic change (different decomposition, different quant, different tile shape that changes the compiler's optimization basin) or hardware change. | | | | |
-| DDTree spec-decode with batched tree verify (tasks #96 #97 #98 #99) | +34–50 % tok/s (handoff projection 170–190 tok/s) | **−13 % code / −6 % creative** (best config 111 vs 127 linear; creative 71 vs 75) | `aa44dcf` — discarded as 27B default 2026-04-22 | 27B Qwen3.5 MQ4 draft on gfx1100: swept `--ddtree-batched` budgets b={4,8,12,16,22} × topk k={1,4,8}. Best code p3: k=1 b=22 → 111.3 tok/s τ=5.56 (vs linear 127.2 τ=5.80). Best creative: k=1 b=12 → 71.0 τ=3.00 (vs linear 75.7 τ=2.83). DFS variant (`--ddtree` alone) far worse: 9.85 tok/s (9 ssync × 37 ms/cycle = 335 ms). Batched 3.16× faster than DFS but still loses to linear. Stage 1 (ssync collapse) + Stage 2 (batched tree verify) were already shipped in `spec_step_ddtree_batched` at speculative.rs:3367; `verify_dflash_block_tree` at 1558; tree-mask infrastructure from 835aa46/f0ee980/704bf11. |
-|  | | | | |
-| **Insight (DDTree, 2026-04-22)**: DDTree ROI is inversely proportional to draft quality. On 27B our MQ4 draft already delivers τ=5.80 accept_rate=0.39 — draft top-1 matches target top-1 often enough that tree fan-out adds marginal τ but costs verify time (big_n=23 tree ≈ 60ms vs B=16 linear ≈ 52ms). Needs τ boost >15 % to break even; observed τ gain −4 % at k=1. DDTree is a lever for WEAK drafters / low-τ regimes (Lucebox's RTX 3090 bf16 draft + Q4_K_M target hits 3.43× speedup over their 37.78 tok/s AR — our AR is 44.84 tok/s, already close to their DDTree absolute). Keep code (CLI `--ddtree-batched` works), do not enable by default on 27B. Stage 3 (GPU top-K) + Stage 4 (GPU tree build) deleted from queue — infrastructure gains dominated by fundamental cycle-cost identity. | | | | |
-
-Before starting a new kernel-level perf experiment, check this list. If
-it's been tried and failed, don't rediscover unless you have a specific
-reason to believe conditions changed (new ROCm version, new hardware,
-different kernel family).
-
----
-
-## 4. Canonical bench config (lock these flags)
-
-After the 2026-04-26 perf-regression-recovery
-(`docs/plans/perf-regression-recovery-2026-04-26.prd`), these are the
-canonical flags. Bench numbers without them are NOT comparable to README
-or CLAUDE.md numbers.
-
-**27B-3.5 LRU code DFlash (the canonical bench, used for regression detection):**
-
-```
-./target/release/examples/dflash_spec_demo \
-    --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-    --draft  ~/.hipfire/models/qwen35-27b-dflash.mq4 \
-    --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
-    --max 120 --no-chatml --kv-mode asym3
-```
-
-Expected on 7900 XTX (gfx1100): **199 tok/s τ=10.36** (3-run hot-cache
-median, ±2% deterministic).
-
-**Required defaults (verify before reporting numbers):**
-
-| Setting | Required value | Where set |
-|---|---|---|
-| `prompt_normalize` | `true` (default since 2026-04-26) | CLI default; `HIPFIRE_NORMALIZE_PROMPT=0` opts out |
-| `kv_mode` | `asym3` | `--kv-mode asym3` |
-| chatml wrap | OFF | `--no-chatml` (3.5 drafts trained on raw text) |
-| `dflash_mode` | `auto` or `on` (off = AR, different bench) | CLI per_model |
-| `HIPFIRE_DPM_WARMUP_SECS` | 10 | env (built-in to dflash_spec_demo) |
-
-**Forensic landmines (have bitten this team repeatedly):**
-
-- **Concurrent `ollama serve`** quietly competes for GPU even at
-  rocm-smi 0% busy — `sudo systemctl stop ollama` before benching.
-- **Stale kernel cache after rebuild** → silent regressions.
-  `rm -rf .hipfire_kernels/ ~/.hipfire/bin/kernels/compiled/` before any
-  bench you intend to compare to a prior number.
-- **Pre-2026-04-26 numbers measured with `HIPFIRE_NORMALIZE_PROMPT=1`
-  set manually** are equivalent to post-2026-04-26 default numbers (same
-  flag, just default flipped). Don't double-count by enabling it on top
-  of the new default.
-- **"Peak" tok/s from prior-session memory is upper-bound special-config.**
-  The CANONICAL is 199 tok/s on 27B-3.5 LRU code. Compare against the
-  canonical, not the peak. Memory's "200+ tok/s" claim was the canonical
-  with normalize on, which is now the default — match the canonical, not
-  the memory.
-- **Static "dead code" cleanup of compute kernels is dangerous.** PR #32
-  removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead — they
-  were load-bearing on the 27B verify dispatch path. Any kernel-cleanup
-  PR MUST run `scripts/sweep_dflash_full.sh` before/after with diff ≤2%
-  on canonical bench.
+For correctness on a new arch port: run
+`crates/engine/examples/test_kernels.rs` on the target hardware. It
+runs each kernel through small golden cases against a CPU reference.
+That's the load-bearing correctness gate; the perf and coherence
+gates are optimization gates.

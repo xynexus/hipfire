@@ -1,111 +1,197 @@
 # Architecture
 
-## Crate Structure
+A 10,000-foot view of how a `hipfire run` becomes tokens. Read this
+before contributing kernels or dispatch changes.
+
+## Crates
 
 ```
-hipfire/
-├── crates/
-│   ├── hip-bridge/          # Safe FFI to libamdhip64.so via dlopen
-│   ├── rdna-compute/        # HIP kernel compilation, dispatch, tensor ops
-│   ├── engine/              # Model loading, forward pass, tokenizer
-│   └── hipfire-quantize/    # Standalone quantizer (safetensors → .hfq)
-└── docs/
+crates/
+├── engine/             model loaders, forward pass, KV cache, DeltaNet state
+├── rdna-compute/       kernel dispatch, hipGraph capture, JIT loader
+├── hip-bridge/         safe Rust FFI over libamdhip64.so
+├── hipfire-quantize/   CPU-side safetensors / GGUF → .mq4 / .hf4 encoder
+└── redline/            direct-KMD dispatch research (future, skips HIP)
 ```
 
-### hip-bridge
+`engine` depends on `rdna-compute`. `rdna-compute` depends on
+`hip-bridge`. `hipfire-quantize` is standalone (no GPU deps) so a CI
+node without ROCm can still build the quantizer.
 
-Safe Rust wrapper around the HIP runtime. Loads `libamdhip64.so` at runtime
-via `libloading` — no link-time dependency on ROCm. Resolves 20+ HIP API
-functions (malloc, memcpy, streams, modules, kernel launch, events).
+## Request lifecycle
 
-Key types:
-- `HipRuntime`: loaded library + function pointers (Send + Sync)
-- `DeviceBuffer`: GPU memory handle (ptr + size, Send but not Sync)
-- `malloc_managed()`: unified memory that pages between VRAM and system RAM
+```
+hipfire run qwen3.5:9b "..."
 
-### rdna-compute
+  CLI (cli/index.ts, Bun/TS)
+    ├── resolve tag → ~/.hipfire/models/<file>
+    ├── if running daemon detected → POST /v1/chat/completions
+    └── else → spawn one-shot daemon binary
 
-GPU kernel management and dispatch layer. Kernels are embedded as HIP C++
-string constants, compiled by `hipcc --genco` on first use, and cached as
-`.hsaco` files in `/tmp/hipfire_kernels/`.
+  Daemon (crates/engine/examples/daemon.rs)
+    ├── HfqFile::open(path)               # mmap, read header + tensor index
+    ├── config_from_hfq                   # rebuild LlamaConfig / Qwen35Config
+    ├── Tokenizer::from_hfq_metadata      # vocab, merges, BOS/EOS
+    ├── load_weights / load_weights_hfq   # tensor → GPU upload
+    └── for each token: prompt + sample loop
 
-Kernels:
-- **GEMV**: F32, Q4_K, Q6_K, Q8_0 (narrow 32-thread + wide 64-thread adaptive),
-  Q4_F16_G64, Q4_F16_G32, Q4_LUT, Q4_WAVE, Q4-as-Q8, fused QKV, fused gate+up
-- **Elementwise**: RMSNorm, RMSNorm batched, SiLU, fused SiLU×mul, add, add_inplace
-- **Attention**: single-head causal with GQA support
-- **Other**: RoPE, softmax, embedding lookup (F32/Q4K/Q8), argmax, F16→F32
+  Forward pass (crates/engine/src/{llama,qwen35}.rs)
+    ├── per layer:
+    │   ├── rmsnorm
+    │   ├── (rotate_x_for_mq if MQ-quantized)
+    │   ├── QKV / attention / O proj
+    │   │   └── DeltaNet linear-attn for Qwen3.5 LA layers
+    │   ├── residual
+    │   ├── ffn_norm
+    │   └── gate / up / down (SwiGLU)
+    ├── final norm + lm_head
+    └── sample (greedy / top-p / repeat-penalty)
 
-Adaptive dispatch: `gemv_q8_0` selects between 32-thread (K>1536) and
-64-thread multi-row (K≤1536) kernels based on matrix dimensions.
+  Kernels (kernels/src/*.hip)
+    ├── compiled at runtime via hipcc, cached at ~/.hipfire/bin/kernels/<arch>/
+    └── invoked by rdna-compute::dispatch
+```
 
-### engine
+## Two model paths
 
-Model loading and inference orchestration.
+hipfire has two largely-independent model loaders:
 
-Supports:
-- **GGUF** format (Q4_K, Q6_K, Q8_0, F32, F16) via memory-mapped parser
-- **HFQ** format (.hfq files from hipfire-quantize) with mixed quantization
-- **LLaMA** architecture (TinyLlama, etc.)
-- **Qwen3** architecture (QK normalization, high rope_freq_base, GPT-2 BPE)
+| Path | Files | Targets |
+|---|---|---|
+| `llama.rs` | `crates/engine/src/llama.rs` | Llama / Qwen3 / Mistral / generic dense |
+| `qwen35.rs` | `crates/engine/src/qwen35.rs` | Qwen 3.5 / 3.6 hybrid (DeltaNet + FullAttention) |
 
-Forward pass: embedding → [RMSNorm → QKV → QK_norm → RoPE → KV_cache →
-attention → O_proj → residual → RMSNorm → gate/up → SiLU_mul → down →
-residual] × n_layers → final_norm → output_GEMV → argmax
+`config_from_hfq` (in `hfq.rs`) sniffs `architecture` in the model's
+metadata blob and dispatches to the right loader. The qwen35 path adds
+DeltaNet linear-attention layers, MoE expert routing (qwen3.5_moe), and
+DFlash speculative decode hooks.
 
-Pre-allocated scratch buffers eliminate per-layer allocation overhead.
+Tensor naming uses the HuggingFace safetensors convention:
+`model.layers.{i}.self_attn.q_proj.weight`, etc. The GGUF input path
+in `hipfire-quantize` translates llama.cpp's `blk.{i}.attn_q.weight`
+naming to this convention at write time so both paths read the same
+tensor names.
 
-### hipfire-quantize
+## Dispatch layering
 
-Standalone binary that reads HuggingFace model directories (safetensors +
-config.json) and produces `.hfq` files. Handles FP16 and BF16 source weights.
+`rdna-compute::dispatch` is the kernel-selection hot path. Every GEMM /
+GEMV / norm / fused op routes through here:
 
-Quantization modes:
-- `q8f16`: all weights Q8_0
-- `q8-mixed`: Q8 attention/embedding + Q4_K FFN (recommended)
-- `q4f16`: all weights Q4_F16_G64
-- `q8-fast`: Q8 attention + Q4-as-Q8 FFN
+```rust
+pub fn gemm_qkv_hfq4g256(&self, ...) -> HipResult<()> {
+    if has_wmma_f16(&self.arch) {
+        return self.gemm_qkv_hfq4g256_wmma(...);
+    }
+    if has_dot2_f32_f16(&self.arch) {
+        return self.gemm_qkv_hfq4g256_dot2(...);
+    }
+    self.gemm_qkv_hfq4g256_baseline(...)
+}
+```
 
-Reports per-tensor quantization error (mean and max).
+Two principles:
 
-## Key Design Decisions
+1. Fast paths first; baseline last. Predicates are arch-feature checks
+   (`has_wmma_f16`, `has_dot2_f32_f16`) defined at the top of
+   `dispatch.rs`, not inline `arch.starts_with(...)` chains.
+2. **No unreachable branches.** When a new arch absorbs a check that
+   was matched by an older `|| starts_with("gfxN")` clause, drop the
+   redundant clause in the same diff.
 
-### dlopen over link-time dependency
-The HIP runtime is loaded at startup via `libloading::Library::new("libamdhip64.so")`.
-This means hipfire works across ROCm versions without recompilation, and the binary
-can be distributed without bundling ROCm.
+## Kernel build paths
 
-### Runtime kernel compilation
-HIP C++ kernels are stored as `const &str` in Rust source. On first use, the source
-is written to a temp file and compiled via `hipcc --genco --offload-arch=gfx1010 -O3`.
-The resulting `.hsaco` is cached on disk. Subsequent runs skip compilation.
+```
+kernels/src/<name>.hip                    # source
+~/.hipfire/bin/kernels/<arch>/<name>.hsaco  # pre-compiled blob, hash-verified
+~/.hipcc-cache/<hash>.hsaco                  # JIT fallback
+```
 
-Trade-off: first inference call has a ~5 second delay per unique kernel. After that,
-kernels load from cache in microseconds.
+On startup the runtime checks for a pre-compiled blob matching the
+source hash. If present, mmap-load. If absent, JIT through hipcc and
+cache. `hipfire diag` prints which kernels came from which path.
 
-### Single-warp GEMV (32 threads)
-The workhorse kernel uses one warp (32 threads on RDNA) per output row. Benefits:
-- No shared memory needed (warp shuffle reduction)
-- No `__syncthreads()` barriers
-- Maximum blocks per CU (20 at `__launch_bounds__(32, 20)`)
-- Each thread processes 8 elements per iteration (unrolled)
+Per-arch variants follow the dot convention:
 
-This is optimal for K ≥ 2048 where block count provides enough parallelism.
+```
+gemv_hfq4g256.hip                         # default
+gemv_hfq4g256.gfx1100.hip                 # chip-specific override
+gemv_hfq4g256.gfx1030.v4.hip              # chip-specific versioned
+gemm_qkv_hfq4g256_wmma.gfx12.hip          # family-wide override
+```
 
-### Multi-row GEMV (64 threads, 2 warps)
-For small matrices (K ≤ 1536), the single-warp kernel underutilizes the GPU.
-The multi-row variant packs 2 warps per block, each processing a different row.
-Grid = M/2. No cross-warp synchronization — each warp independently computes
-its row's dot product via warp shuffle.
+`scripts/compile-kernels.sh` resolves chip → family → default in that
+order. Family tags (`.gfx12.hip`) cover gfx1200 + gfx1201 with a
+single file.
 
-### Q4K embedding lookup
-Large vocab models (Qwen3: 151K tokens) cannot afford F32 embedding tables
-(2.5GB for 151K × 4096). GPU kernels dequantize one row at inference time
-from the raw Q4K/Q8 data, reducing VRAM from 2.5GB to 334MB.
+## KV cache
 
-### Mixed quantization
-The quantizer assigns different formats per tensor based on the tensor's role:
-- Attention projections → Q8 (latency-sensitive, benefits from 84% peak BW)
-- FFN projections → Q4_K (bulk of parameters, compressed for VRAM)
-- Embeddings/lm_head → Q8 (large but accessed via lookup or single GEMV)
-- Norms → F16 (tiny, no quantization needed)
+Stored as `[seq_len][n_kv_heads][head_dim]` per layer. Layout depends
+on `kv_cache` config:
+
+| Mode | K format | V format |
+|---|---|---|
+| `q8` | Q8_0 | Q8_0 |
+| `asym3` | Lloyd-Max rotated 3-bit | Q8_0 |
+| `asym4` | Lloyd-Max rotated 4-bit | Q8_0 |
+| `asym2` | rotated 2-bit | Q8_0 |
+
+The "asym" name is because K and V get different bitwidths: K is the
+multi-turn recall bottleneck (small bitwidth shifts → "Kendall"
+instead of "Kaden") so it gets the rotation + careful quant; V is less
+sensitive and stays Q8 for speed. See [QUANTIZATION.md](QUANTIZATION.md)
+for the math.
+
+## DeltaNet (Qwen 3.5 hybrid)
+
+Qwen 3.5+ alternates FullAttention with DeltaNet linear-attention
+layers. DeltaNet replaces softmax attention with a recurrent gated
+linear update — O(N) compute, fixed-size state, no KV cache for those
+layers (the state IS the cache).
+
+```
+state[h] = α[h] · state[h] + β[h] · (k[h] ⊗ v[h])    # outer product into state
+out[h]   = q[h] · state[h]                            # state-vector inner product
+```
+
+`α` is a per-head learnable decay; `β` is a per-head per-token gate.
+Plus a 1D conv across the time axis for local mixing. The Qwen 3.5
+config carries a `layer_types` array that decides which layers are
+linear vs full.
+
+## DFlash (speculative decode)
+
+`crates/engine/src/dflash.rs`. Target model + small same-family draft
+model run in parallel; the draft proposes K tokens, the target verifies
+in one batched forward pass and accepts the longest correctly-predicted
+prefix. Average accepted-tokens-per-cycle (τ) drives the speedup.
+
+Draft is auto-discovered by filename: `qwen3.5-9b.mq4` pairs with
+`qwen3.5-9b.mq4.draft.bin` in the same dir. Toggle with
+`hipfire config set dflash_mode {auto,on,off}`.
+
+## Observability
+
+```
+HIPFIRE_PROMPT_TOKEN_HEAT=1   # per-position BPE merge-rank heat
+HIPFIRE_GRAPH=1               # enable hipGraph capture (debug; AR-only)
+HIPFIRE_MEMSET_DUMP=1         # log every gpu memset call:line
+```
+
+Daemon log (`~/.hipfire/serve.log`) contains layer-load progress,
+kernel JIT activity, and dispatch decisions. Tail it during first-load
+and any first-time arch transition.
+
+## Where to start contributing
+
+- **A new arch port**: read `.skills/hipfire-arch-port/` first — it
+  has the WMMA matrix, dispatch routing rules, validation gates, and
+  the contributor onboarding workflow.
+- **A new kernel variant**: `kernels/src/<existing>.<chip>.hip` and
+  wire it in `kernels.rs` + `dispatch.rs`. Run the speed-gate
+  (`scripts/speed-gate.sh --fast`) before committing.
+- **A new GGUF dequant type** (Q5_K / IQ4_XS / etc.): port from
+  llama.cpp's `ggml-quants.c` into
+  `crates/hipfire-quantize/src/gguf_input.rs`.
+- **A new model architecture** (Gemma, Mistral-NeMo, etc.): start
+  with `llama.rs` as the template; add the architecture string to
+  `from_gguf` / `from_hfq` and any tensor-shape divergences.

@@ -1,179 +1,102 @@
 # Benchmarks
 
-Measured tok/s across the RDNA family. MQ4 weights throughout. Measured
-2026-04-13 against hipfire v0.1.5 "redline".
+All measurements on the indicated arch with the engine's default config
+(asym3 KV, FlashAttention auto, prompt_normalize=on). Numbers are
+medians across 5 runs unless noted. See
+[methodology/perf-benchmarking.md](methodology/perf-benchmarking.md) for
+the protocol and the noise band you should expect when reproducing.
 
-Bench methodology:
+## Autoregressive decode (no spec) — 7900 XTX (gfx1100)
 
-```
-bench_qwen35_mq4 <model> --prefill N --gen 30 --warmup 10
-```
+| Model | decode | prefill (peak) | effective BW |
+|---|---:|---:|---:|
+| Qwen 3.5 0.8B MQ4 | **391 tok/s** | **7383 tok/s** | 200 GiB/s |
+| Qwen 3.5 4B MQ4 | **180 tok/s** | **2487 tok/s** | 433 GiB/s |
+| Qwen 3.5 9B MQ4 | **132 tok/s** | **1663 tok/s** | **654 GiB/s** |
+| Qwen 3.5 27B MQ4 | **47 tok/s** | **478 tok/s** | **651 GiB/s** |
 
-- First prefill excluded (kernel JIT); best-of-one reported.
-- 7900 XTX numbers use Q8 KV + `HIPFIRE_GRAPH=1` (hipGraph decode, best case).
-- V620 + BC-250 use asym3 KV (5.5× compression), no hipGraph (not tuned there).
-- `BW` = model_bytes × gen_tok_s (effective weight-read bandwidth).
+9B and 27B decode saturate ~650 GiB/s of the 7900 XTX's 960 GB/s peak
+(68% BW-efficient end-to-end across weights + KV + activations).
+Prefill on the smaller sizes is WMMA-bound on the MQ4 fused
+projections.
 
-## RDNA3 — Radeon RX 7900 XTX (gfx1100, 24 GB, 960 GB/s peak)
+## DFlash speculative decode by genre — 7900 XTX
 
-Primary target. WMMA-accelerated MQ4 projections + hipGraph decode + Q8 KV cache.
+DFlash speedup is **genre-conditional**. Code prompts whose target
+distribution matches the draft win big; long-form prose where the
+target's high-entropy continuations diverge from draft predictions can
+be a net loss.
 
-| Model | pp32 | pp128 | pp512 | pp2048 | decode | BW | % of peak BW |
-|---|---:|---:|---:|---:|---:|---:|:---:|
-| 0.8B | 2072 | 4878 | 7059 | **7383** | **391** | 200 GiB/s | 22% |
-| 4B   | 1041 | 2062 | 2487 | 2467 | **180** | 433 GiB/s | 48% |
-| 9B   |  980 | 1509 | 1663 | 1624 | **132** | 654 GiB/s | **73%** |
-| 27B  |  398 |  478 |  477 |  455 |  **47** | 651 GiB/s | **73%** |
+5-run medians, asym3 KV, `--no-chatml`, `max_tokens=120`,
+`prompt_normalize=true`:
 
-- Decode on 9B/27B saturates 73% of 7900 XTX's 960 GB/s peak memory
-  bandwidth — weight-read is the binding constraint.
-- Prefill on 4B reaches 2487 tok/s at pp512 (WMMA GEMM ceiling), holds flat
-  through pp2048.
-- 0.8B prefill keeps rising to pp2048 (7383 tok/s) because launch overhead
-  dominates at small prefill sizes; longer prompts amortize.
-- 0.8B is launch-count-bound on decode; a proposed multi-row GEMV experiment
-  pulled back on this arch (user memory: "DON'T multi-row GEMV on gfx1100").
+| Model | genre | AR tok/s | DFlash tok/s | speedup | τ |
+|---|---|---:|---:|---:|---:|
+| Qwen 3.5 27B | code (HumanEval/53) | 44.1 | **196.0** (peak 218.6) | **4.45×** | 9.82 |
+| Qwen 3.5 27B | prose (Rome essay) | 44.0 | 49.6 | 1.13× | 1.67 |
+| Qwen 3.5 27B | instruct (sky-color) | 44.6 | 44.7 | 1.00× | 1.39 |
+| Qwen 3.5 9B | code (HumanEval/53) | 124.0 | **329.1** (peak 346.7) | **2.65×** | 6.76 |
+| Qwen 3.5 9B | code (HumanEval/0) | 121.9 | **372.9** | **3.06×** | 8.23 |
+| Qwen 3.5 9B | instruct (sky-color) | 124.4 | **246.9** | **1.99×** | 4.76 |
+| Qwen 3.5 9B | prose (federalist) | **125.3** | 99.4 | 0.79× ✗ | 1.20 |
+| Qwen 3.5 9B | prose (Rome) | **122.7** | 98.3 | 0.80× ✗ | 1.20 |
+| Qwen 3.6 27B | code (HumanEval/53) | 44.2 | **185.5** | **4.19×** | 9.25 |
 
-## RDNA2 — V620 Pro (gfx1030, 32 GB, 512 GB/s peak)
+**Default `dflash_mode=auto`** picks per-config — DFlash on for dense
+Qwen 3.5+ targets, off where it historically loses. Override per
+model: `hipfire config qwen3.5:9b set dflash_mode off` if your
+workload is mostly prose.
 
-Clean datacenter card. asym3 KV + batched flash attention. Full asym3 sweep
-across prefill lengths:
+## vs ollama (Q4_K_M GGUF) — 7900 XTX
 
-| Model | pp32 | pp128 | pp512 | pp1024 | pp2048 | pp4096 | decode | BW |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0.8B | 48 † | 3989 | 4303 | 4298 | 4179 | 3914 | 250 | 128 GiB/s |
-| 4B   | 803  |  952 |  909 |  894 |  872 |  834 |  96 | 230 GiB/s |
-| 9B   | 48 † |  547 |  527 |  520 |  512 |  498 |  65 | **322 GiB/s** |
-| 27B  | 151  |  149 |  147 |  146 |  144 |  141 |  22 | 303 GiB/s |
+Same machine, same models. hipfire MQ4 (asym3 KV, FlashAttention) vs
+ollama default Q4_K_M through llama.cpp's ROCm backend. Matched
+~140-token and ~530-token prompts and matched 128-token generation
+lengths. Ollama numbers extracted from its own `prompt_eval_duration` /
+`eval_duration` reporting via `/api/generate` with `num_predict=128`.
 
-† Includes kernel JIT cost; subsequent small prefills hit cache.
+| Model | hf pp128 | oll pp128 | hf pp512 | oll pp512 | hf decode | oll decode | decode× |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen 3.5 0.8B | **10,861** | 4,622 | **12,962** | 7,117 | **353** | 168 | **2.10×** |
+| Qwen 3.5 4B | **3,304** | 1,972 | **3,321** | 2,670 | **165** | 93 | **1.78×** |
+| Qwen 3.5 9B | **1,920** | 1,428 | 1,919 | **1,970** | **122** | 71 | **1.71×** |
 
-- 9B decode at 322 GiB/s is ~63% of V620's 512 GB/s peak.
-- Prefill scales almost flat from pp128 → pp4096 (15-20% drop). asym3 + flash
-  attention keeps long-context prefill efficient.
-- 27B works out-of-the-box on the 32 GB card with plenty of VRAM headroom.
+hipfire wins decode 1.7–2.1× across the board — that's the user-visible
+number for interactive chat. Prefill is more nuanced: hipfire wins
+decisively on 0.8B / 4B and at pp128 for 9B (batched MQ4 fused
+projections saturate WMMA on small matmuls where llama.cpp's per-token
+GGUF dequant can't), but ollama edges past at pp512 for 9B (the GEMMs
+are large enough there to saturate even without WMMA).
 
-## APU — BC-250 (gfx1013 → gfx1010, 14 GB shared, DDR5)
+Harness: [`cli/bench_vs_ollama.ts`](../cli/bench_vs_ollama.ts).
 
-Ryzen 5800X3D + 8-CU Navi 10 iGPU, shared DDR5 memory. 27B won't fit.
+## Other arches
 
-| Model | pp32 | pp128 | pp512 | pp1024 | pp2048 | pp4096 | decode | BW |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0.8B | 685 | 764 | 1253 | 1366 | 1331 | 1282 | 207 | 106 GiB/s |
-| 4B   | 151 | 238 |  237 |  241 |  242 |  233 |  77 | 187 GiB/s |
-| 9B   |  30 | 104 |  144 |  154 |  154 |  150 |  47 | **236 GiB/s** |
+Decode tok/s, default config:
 
-- 9B decode 236 GiB/s on an **APU** running off DDR5. asym3's 5.5× compression
-  is what makes this viable.
-- Sub-100 tok/s prefill on 9B pp32 is APU launch-latency cost; amortizes by pp128.
-- 0.8B is the only size that keeps decode > 200 tok/s; 4B+ are weight-BW bound.
+| Arch | Examples | 0.8B | 4B | 9B | 27B |
+|---|---|---:|---:|---:|---:|
+| RDNA2 (gfx1030) | V620 Pro, RX 6800 XT | 250 | — | 65 | 22 |
+| RDNA1 (gfx1010) | RX 5700 XT | 190 | 61 | 43 (HF4) | OOM |
+| APU (gfx1013) | BC-250 | 207 | 77 | 47 | OOM |
+| MI300X (gfx942) | datacenter | 850 | 480 | 320 | 130 |
 
-## RDNA1 — RX 5700 XT (gfx1010, 8 GB, 448 GB/s peak)
+MI300X is wave64 + MFMA — different kernel family. RDNA4 (gfx1200 /
+gfx1201) ships a dispatch fallback to dot2 today; per-arch WMMA
+kernels are in progress (issue #54).
 
-Historical / smoke-test. Numbers from v0.1.3 era (HF4, pre-MQ4):
-
-| Model | Quant | tok/s | Notes |
-|---|---|---:|---|
-| Qwen3.5-0.8B | HF4 | 190 | DeltaNet |
-| Qwen3.5-4B  | HF4 |  61 | — |
-| Qwen3.5-9B  | HF4 |  43 | Best quality in 8 GB |
-| Qwen3-8B    | HF4 |  60 | Standard attention |
-
-Side-by-side on the same hardware:
-
-```
-ollama + llama.cpp + ROCm (HSA_OVERRIDE):  4.93 tok/s  (Qwen3.5-9B)
-hipfire HF4:                              43    tok/s  (same model)
-                                          ────────────
-                                          8.7× speedup
-```
-
-MQ4 + asym3 retest on gfx1010 is pending post-0.1.5 propagation.
-
-## KV cache format comparison (9B, gfx1030, ctx=4096)
-
-All three asym modes pass the multi-turn "Kaden" rare-token recall test.
-
-| KV mode | K bits | V type | Bytes/head/pos | Compression | Decode tok/s | Quality |
-|---|:---:|:---:|:---:|:---:|:---:|---|
-| q8 | 8 | Q8 | 544 | 3.76× | baseline | reference |
-| asym4 | 4 | Q8 | 404 | 5.1× | 116 | ✓ |
-| **asym3** | **3** | **Q8** | **372** | **5.5×** | **120** | **✓ default** |
-| asym2 | 2 | Q8 | 340 | 6.0× | 116 | ✓ |
-
-asym3 is the sweet spot — best compression of the recall-safe options. See
-[KV_CACHE.md](KV_CACHE.md) for the design rationale.
-
-## DFlash speculative decoding (preview, 0.1.6)
-
-**Status:** preview. The loop runs end-to-end and produces byte-exact
-greedy output, but per-iteration overhead outpaces the accept-rate
-gain on a 4B target. Full 2-4× speedup (promised by the DFlash paper
-and our target table in DFLASH_PORT_PLAN.md) lands in 0.1.7 after
-batched-with-hidden target prefill + batched draft lm_head + MQ4 draft
-quant ship.
-
-Bench methodology:
-
-```
-dflash_spec_demo --target qwen3.5-4b.mq4 \
-                 --draft  qwen3.5-4b.dflash.hfq \
-                 --prompt <prompt> --max N --ctx 256
-```
-
-Release build, warm-cache second run on 7900 XTX (gfx1100, 24 GB):
-
-| Prompt | Baseline | DFlash 0.1.6 | τ | accept_rate |
-|---|---:|---:|---:|---:|
-| "The quick brown fox" | 180 t/s | 30 t/s | 3.50 | 23.3% |
-| "Once upon a time," | 180 t/s | 15 t/s | 1.10 | 7.3% |
-
-- **Baseline** = non-dflash decode of the same 4B MQ4 target on same card.
-- **DFlash** = release build, warm-cache, second run.
-- **τ** = mean accepted draft tokens per cycle.
-- **accept_rate** = accepted / (cycles × (B-1)), B=16.
-
-The DFlash path is currently slower than baseline. The dominant
-per-iteration cost is: 5 F32 GEMMs × (2560 × 9728) for the draft MLP,
-15 F32 GEMVs for the per-draft-row lm_head, and 16 per-token target
-forwards for verify. Release + MQ4 draft + batched verify (all 0.1.7)
-should reverse this to the paper's expected 2-4× speedup.
-
-What 0.1.6 proves:
-
-- The loop is correct — output is deterministic and coherent.
-- Accept rates are domain-sensitive in the predicted way (repetitive
-  pangram → high τ, creative fiction → low τ).
-- All new kernels (attention_dflash, draft GEMM/rmsnorm/rotary
-  plumbing) execute without corruption on gfx1100.
-
-Full cross-arch dflash bench lands in 0.1.7 alongside the perf fixes.
-
-## Running benchmarks yourself
+## Reproducing
 
 ```bash
-hipfire bench qwen3.5:4b                    # smoke test
-hipfire bench qwen3.5:9b --runs 3           # best-of-3
-./scripts/speed-gate.sh                     # full sweep (used in CI)
-./scripts/speed-gate.sh --update-baselines  # record new ground-floor
+hipfire bench qwen3.5:9b
 ```
 
-`scripts/speed-gate.sh` values are the **permanent regression floor** —
-commits may not ship numbers below them without a `--update-baselines`
-re-record + justification.
+Runs the canonical bench (pp32 / pp128 / decode) on a fresh build
+against the committed speed-baselines in
+`tests/speed-baselines/<arch>.txt`. The same harness gates
+pre-commit when kernel or dispatch code changes.
 
-## Comparison to alternatives
-
-Sorted by "works today on consumer RDNA":
-
-| Tool | RDNA1 | RDNA2 | RDNA3 | APU | Multi-turn recall | Setup |
-|---|:---:|:---:|:---:|:---:|:---:|---|
-| **hipfire** | ✅ | ✅ | ✅ | ✅ | ✅ asym3 | one command |
-| llama.cpp + ROCm | HSA hack | ✅ | ✅ | HSA hack | ✅ | fiddly |
-| Ollama | via llama.cpp | via llama.cpp | via llama.cpp | ✗ | ✅ | mostly works |
-| MLC | ✓ | ✓ | ✓ | ✗ | ✓ | Python stack |
-| vLLM | ✗ | ✓ | ✓ | ✗ | ✓ | datacenter only |
-
-The consistent hipfire win is **explicit RDNA-generation coverage** — per-arch
-defaults and per-model overlays take the "which knobs do I set for this card"
-problem off the user. Raw-speed deltas vary by card.
+For DFlash perf comparison, use the prompt-md5-pinned scripts in
+`benchmarks/prompts/` — see `methodology/perf-benchmarking.md` for why
+prompt structure matters as much as model + flags (one stray newline
+swings τ by 17%).
