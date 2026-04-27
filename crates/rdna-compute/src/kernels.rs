@@ -254,6 +254,11 @@ pub const GEMM_QKV_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_
 pub const GEMM_QKV_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_fp16.hip");
 pub const GEMM_QKV_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_dot2.hip");
 pub const GEMM_QKV_HFQ6G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wmma.hip");
+// gfx12 (RDNA4) sister of GEMM_QKV_HFQ6G256_WMMA_SRC. Same gfx12 recipe
+// as the hfq4 scaffolds, with the hfq6 dequant inner loop carried over
+// (200B groups, 4-byte unaligned reads at byte-offsets {0, 3} per K
+// half-tile to extract 8 6-bit values per lane).
+pub const GEMM_QKV_HFQ6G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256.hip");
 pub const GEMM_GATE_UP_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_fp16.hip");
 pub const GEMM_GATE_UP_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_dot2.hip");
