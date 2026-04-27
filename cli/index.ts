@@ -532,6 +532,25 @@ function downloadUrl(entry: ModelEntry): string {
 }
 
 // ─── GPU arch detection + per-arch defaults ──────────────
+function gfxTargetVersionToArch(ver: number): string {
+  const known: Record<number, string> = {
+    100100: "gfx1010",
+    100300: "gfx1030",
+    100302: "gfx1030",
+    110000: "gfx1100",
+    110001: "gfx1100",
+    110501: "gfx1151",
+    120000: "gfx1200",
+    120001: "gfx1201",
+  };
+  if (known[ver]) return known[ver];
+
+  const major = Math.floor(ver / 10000);
+  const minor = Math.floor((ver % 10000) / 100);
+  const step = ver % 100;
+  return `gfx${major}${minor}${step}`;
+}
+
 function detectGpuArch(): string {
   // Read KFD sysfs for GPU arch (same as install command)
   for (const node of ["1", "0"]) {
@@ -539,12 +558,7 @@ function detectGpuArch(): string {
       const props = require("fs").readFileSync(`/sys/class/kfd/kfd/topology/nodes/${node}/properties`, "utf8");
       const m = props.match(/gfx_target_version\s+(\d+)/);
       if (m) {
-        const ver = parseInt(m[1]);
-        const major = Math.floor(ver / 10000);
-        const minor = Math.floor((ver % 10000) / 100);
-        const step = ver % 100;
-        let arch = `gfx${major}${minor.toString().padStart(2, '0')}${step || '0'}`;
-        return arch.replace(/^(gfx\d{4})0$/, '$1');
+        return gfxTargetVersionToArch(parseInt(m[1]));
       }
     } catch {}
   }
@@ -3434,14 +3448,8 @@ switch (cmd) {
     const verMatch = archOut.match(/gfx_target_version\s+(\d+)/);
     let gpuArch = "unknown";
     if (verMatch) {
-      // Derive gfx arch from version number: e.g. 100100→gfx1010, 110001→gfx1100, 115100→gfx1151
-      const ver = parseInt(verMatch[1]);
-      const major = Math.floor(ver / 10000);
-      const minor = Math.floor((ver % 10000) / 100);
-      const step = ver % 100;
-      gpuArch = `gfx${major}${minor.toString().padStart(2, '0')}${step || '0'}`;
-      // Normalize: gfx10010 → gfx1010, gfx110000 stays gfx1100
-      gpuArch = gpuArch.replace(/^(gfx\d{4})0$/, '$1');
+      // Derive gfx arch from version number: e.g. 100100→gfx1010, 110501→gfx1151.
+      gpuArch = gfxTargetVersionToArch(parseInt(verMatch[1]));
     }
     if (gpuArch !== "unknown") {
       const kernelSrc = join(repoDir, "kernels/compiled", gpuArch);
