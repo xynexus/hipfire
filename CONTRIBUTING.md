@@ -1,271 +1,193 @@
 # Contributing to hipfire
 
-hipfire is an alpha project. Testers and contributors are essential — we need benchmark
-numbers across RDNA2/3/4 cards, bug reports, kernel optimizations, and new model support.
+hipfire is alpha. Real-world testing on cards we don't have, kernel work
+on archs we don't ship for, bug reports with full reproduction, and new
+model architecture support — all welcome.
 
-## Focus areas
+## Two ways to help, no Rust required
 
-- Benchmarks on new GPUs (6800 XT, 7900 XTX, 9070 — we need your numbers)
-- Model testing (correctness, coherence, edge cases)
-- Kernel optimization (RDNA3/4 have different VGPR budgets)
-- Bug reports with full reproduction steps
-- New model architecture support (beyond Qwen3/3.5)
+### 1. Run the test + bench matrix on your GPU
+
+If you have an RDNA card the maintainer doesn't, the highest-leverage
+thing is running the standard tester workflow and posting numbers.
+
+```bash
+hipfire diag                            # confirms ROCm + arch detection
+./scripts/test-kernels.sh               # GPU kernel sanity (~30s)
+./scripts/megabench-q35.sh 2>&1 | tee bench-<your-gpu>.txt
+```
+
+Open an issue titled `Benchmarks: <your GPU>` and paste the output. The
+results land in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The
+`hipfire-tester` skill in `.skills/hipfire-tester/` walks an AI agent
+through this end-to-end if you want help.
+
+### 2. Diagnose and report a bug
+
+```
+hipfire diag                            # capture everything first
+```
+
+Open an issue with: GPU + ROCm version, exact command, full error
+output (not just the last line), and the diag output. The
+`hipfire-autoheal` skill (in `.skills/hipfire-autoheal/`) is a
+fix-catalog walkthrough that an agent can apply on your behalf for
+common runtime issues; if it doesn't resolve cleanly, that's exactly
+the case we want filed.
 
 ---
 
-## For Testers (non-developers)
-
-You don't need to know Rust. If you have a supported AMD GPU, you can help.
-
-### 1. Install hipfire
-
-Follow the quickstart in [README.md](README.md):
-
-```bash
-# Linux
-curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
-
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1 | iex
-```
-
-### 2. Run benchmarks
-
-```bash
-# Automated — runs all models and KV modes
-bash scripts/megabench-q35.sh 2>&1 | tee my-bench-results.txt
-
-# Quick single-model check
-timeout 60 target/release/examples/infer models/qwen3.5-4b.q4.hfq --no-think \
-  "Explain the three laws of thermodynamics" 2>&1 | grep "Done"
-```
-
-### 3. Submit results
-
-Open a GitHub issue titled **"Benchmarks: [your GPU name]"** and paste:
-
-```
-GPU: [card name] ([gfx ID], [VRAM]GB)
-OS: [Linux distro + kernel / Windows version]
-ROCm version: [dpkg -l | grep rocm-core | awk '{print $3}']
-Model: [model name and quant, e.g. Qwen3.5-9B HFQ4]
-tok/s: [number from === Done line]
-Coherence: [OK / LOOP / REPET / SHORT]
-KV mode: [Q8 / turbo4 / turbo2]
-Context: [short (~10 tok input) / long (~400 tok input)]
-Notes: [anything unusual]
-```
-
-Results get added to [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
-
-**Coherence codes:**
-- `OK` — output is coherent and on-topic
-- `LOOP` — model repeats the same phrase in a loop
-- `REPET` — output degrades into repetition after N tokens
-- `SHORT` — output stops abnormally short (< 20 tokens)
-
-### 4. Report bugs
-
-Open a GitHub issue with:
-- GPU model and OS
-- The exact command you ran
-- Full error output (not just the last line)
-- Output of `.skills/hipfire-diag/run-diagnostics.sh` if available
-
----
-
-## For Developers
+## Developer workflow
 
 ### Setup
 
 ```bash
-# Fork and clone
-git clone https://github.com/YOUR-USERNAME/hipfire
+git clone https://github.com/Kaden-Schutt/hipfire
 cd hipfire
-
-# Build (requires ROCm SDK for kernel compilation; pre-compiled kernels ship for 4 arches)
-cargo build --release --features deltanet -p engine
-```
-
-### Running tests
-
-```bash
-# Unit tests (no GPU required)
-cargo test
-
-# GPU kernel tests
-scripts/test-kernels.sh
-```
-
-### Branch naming
-
-| Type | Pattern | Example |
-|------|---------|---------|
-| Feature | `feature/xyz` | `feature/rope-interleave` |
-| Bug fix | `fix/xyz` | `fix/oom-on-27b` |
-| Benchmark | `bench/gpu-name` | `bench/7900-xtx` |
-
-### PR process
-
-1. Describe what changed and why
-2. Include benchmark numbers if your change affects performance (before/after tok/s)
-3. Keep PRs focused — one logical change per PR
-4. Run `cargo fmt` and `cargo clippy` before submitting
-
-### Pre-push regression checklist
-
-Before pushing any change that touches kernels, dispatch, sampling, or the forward pass:
-
-```bash
-# 1. Build clean
-cargo build --release --features deltanet --example daemon --example infer -p engine
-
-# 2. Kernel tests (no model needed, ~30s)
-target/release/examples/test_kernels
-
-# 3. Speed regression — compare against documented baselines
-target/release/examples/infer models/qwen3.5-9b.q4.hfq --max-tokens 64 "Hello"
-# Expected: ~45 tok/s on gfx1010. Flag if >10% slower.
-
-# 4. Correctness — model should answer this correctly
-target/release/examples/infer models/qwen3.5-9b.q4.hfq --max-tokens 32 \
-  "What is the capital of France? One sentence."
-# Expected: output contains "Paris"
-
-# 5. Qwen3 path (if touching sampling or daemon)
-# Tests the non-DeltaNet code path + repeat_window clamping
-echo '{"type":"load","model":"models/qwen3-8b.q4.hfq"}' | timeout 15 target/release/examples/daemon
-```
-
-**Speed baselines (gfx1010 / RX 5700 XT):**
-
-| Model | Binary | Expected tok/s | Alarm if below |
-|-------|--------|----------------|----------------|
-| Qwen3.5-0.8B HFQ4 | infer | 220 | 180 |
-| Qwen3.5-9B HFQ4 | infer | 45 | 38 |
-| Qwen3.5-9B HFQ4 | daemon (turbo4) | 40 | 33 |
-| Qwen3-8B HFQ4 | daemon | 38 | 30 |
-
-**Multi-arch notes:**
-- We can only test gfx1010 locally. Changes to kernels, dispatch, or compilation
-  paths MUST be validated by a tester on gfx1100+ before release.
-- Kernel hash files must be regenerated after any `.hip` source change:
-  `cargo run --release -p rdna-compute --example gen_kernel_hashes`
-- Pre-compiled blobs without matching hashes are rejected at runtime (the engine
-  falls back to hipcc recompilation).
-
-### Code style
-
-- `cargo fmt` — required, enforced in CI
-- `cargo clippy` — no warnings
-- **No Python in the hot path.** Python is allowed for tooling and benchmarks, never
-  in the inference engine itself.
-- Comment HIP kernel parameters: explain VGPR counts, wave occupancy, LDS usage.
-
----
-
-## Quantizing New Models
-
-To add support for a model that isn't in the supported list:
-
-### 1. Check prerequisites
-
-- Model must be on HuggingFace in safetensors format
-- Model architecture must be supported (currently: Qwen3, Qwen3.5, Qwen3.5-VL)
-
-### 2. Build the quantizer
-
-```bash
+cargo build --release --features deltanet --example daemon -p engine
 cargo build --release -p hipfire-quantize
 ```
 
-### 3. Run the quantizer
+Requires ROCm 6+ for kernel JIT. Pre-compiled kernel blobs ship for
+gfx1010 / gfx1030 / gfx1100 / gfx1200; other arches JIT-compile on
+first load.
+
+### The three gates
+
+Any change to kernels, dispatch, fusion, rotation, rmsnorm, sampling,
+the spec-decode path, or the forward pass MUST pass the relevant gates
+before commit. The pre-commit hook runs them automatically when staged
+files match the hotspot regex.
 
 ```bash
-# HFQ4 — recommended starting point
-target/release/hipfire-quantize \
-  --input Owner/ModelName \
-  --output models/modelname.q4.hfq \
-  --format hfq4
-
-# HFQ6 — better quality
-target/release/hipfire-quantize \
-  --input Owner/ModelName \
-  --output models/modelname.hfq6.hfq \
-  --format hfq6
+./scripts/coherence-gate.sh             # AR coherence (panic / zero-tokens / timeout = hard fail)
+./scripts/coherence-gate-dflash.sh      # spec-decode token-attractor detection
+./scripts/speed-gate.sh --fast          # 4B prefill+decode regression vs tests/speed-baselines/<arch>.txt
 ```
 
-### 4. Test it
+**Don't bypass with `--no-verify`.** A regression the gate catches is
+information. Authorized exceptions need explicit written sign-off from
+the maintainer for that specific change. Read
+[docs/methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md)
+before claiming any perf win — within-session A/B noise is ±10–15% on
+gfx1100, and the bench harness has a stale-binary trap that's bitten
+us before.
+
+### New kernel files
 
 ```bash
-target/release/examples/infer models/modelname.q4.hfq "Hello, who are you?"
+# Kernel source: kernels/src/<name>.hip
+# Per-arch overrides: kernels/src/<name>.gfx12.hip       (family tag)
+#                     kernels/src/<name>.gfx1100.hip     (chip tag)
+
+# Register in: crates/rdna-compute/src/kernels.rs
+# Wire dispatch in: crates/rdna-compute/src/dispatch.rs
+
+# After editing any .hip file, regenerate hashes for the pre-compiled
+# blob loader (otherwise the runtime falls back to JIT):
+./scripts/write-kernel-hashes.sh
+
+# Compile-check across the supported arch matrix:
+./scripts/compile-kernels.sh gfx1010 gfx1030 gfx1100 gfx1200 gfx1201
 ```
 
-### 5. Submit a PR
+Architecture deep-dive: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Quantization design (MQ4 / HF4 / asym KV math):
+[docs/QUANTIZATION.md](docs/QUANTIZATION.md).
 
-If it works, open a PR that adds the model to the supported list in README.md.
-Include your benchmark numbers.
+### Porting to a new GPU arch
+
+The `.skills/hipfire-arch-port/` directory is the canonical entry
+point — playbook, WMMA matrix, validation procedure, contributor
+onboarding. Don't write code before reading it; six-week silent-
+corruption bugs from getting WMMA C-mappings wrong are how every
+prior arch port has gone sideways.
+
+Recent reference: PR #56 (RobinVanCauter, gfx1201 / 9070 XT) walked
+the skill end-to-end and shipped a full validated 5-kernel port +
+6 channel tests in one round. That's the bar.
+
+### New model architectures
+
+Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s "Two model
+paths" section — `crates/engine/src/llama.rs` is the template for
+dense Llama-style models, `qwen35.rs` is the Qwen 3.5 hybrid path
+with DeltaNet linear attention. Add the architecture string to
+`from_gguf` / `from_hfq` and patch the tensor-shape divergences.
+
+For a new GGUF dequant type (Q5_K, IQ-quants, etc.), port from
+llama.cpp's `ggml-quants.c` into
+`crates/hipfire-quantize/src/gguf_input.rs`. ~150 lines per format.
+
+### Branch naming
+
+| Type | Pattern |
+|---|---|
+| Feature | `feature/<short-name>` |
+| Bug fix | `fix/<short-name>` |
+| Arch port | `port/<arch>-<kernel>` |
+| Benchmark contribution | `bench/<gpu-name>` |
+
+### PR template
+
+Concise description, before/after numbers if perf-sensitive, mention
+which gates passed. One logical change per PR. Run `cargo fmt` and
+`cargo clippy` before submit; CI enforces both.
+
+For perf claims: include the binary md5
+(`md5sum target/release/examples/bench_qwen35_mq4`) and the prompt
+md5 if the bench is prompt-dependent. Without these, the result is
+unreproducible — see
+[docs/methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md).
+
+### Code style
+
+- `cargo fmt` — required, CI-enforced.
+- `cargo clippy` — no new warnings.
+- **No Python in the inference hot path.** Python is fine for
+  tooling, benchmarks, and offline analysis; never in the engine.
+- Comment HIP kernel parameters: VGPR budget, wave occupancy, LDS
+  usage, K-tile depth — anything a reader needs to understand the
+  perf shape without inspecting `--save-temps` output.
 
 ---
 
-## Benchmark Submission Template
+## Skills (agent-driven workflows)
 
-For the benchmark database ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)), include:
+| Skill | When to use |
+|---|---|
+| [`hipfire-tester`](.skills/hipfire-tester/) | First-time bringup + bench submission on a new GPU. |
+| [`hipfire-diag`](.skills/hipfire-diag/) | "Hipfire isn't working — what's wrong?" Captures GPU/HIP/kernel state. |
+| [`hipfire-autoheal`](.skills/hipfire-autoheal/) | Runtime issue triage: daemon hangs, JIT failures, port conflicts, OOM. |
+| [`hipfire-arch-port`](.skills/hipfire-arch-port/) | Porting hipfire to a new GPU arch (gfx12, gfx1152, gfx94x, …). |
 
-```
-GPU: [card name] ([gfx ID], [VRAM]GB)
-OS: [Linux distro + kernel / Windows version]
-ROCm version: [e.g. 6.3.1]
-hipfire version: [git rev-parse --short HEAD]
-Model: [model name and quant]
-tok/s: [number]
-Coherence: [OK / LOOP / REPET / SHORT]
-KV mode: [Q8 / turbo4 / turbo2]
-Context: [short / long (~400 tok input)]
-Notes: [anything unusual]
-```
-
-Run at least two prompts per configuration for stable numbers:
-1. Short: `"Hello, who are you?"`
-2. Long: a multi-paragraph prompt or use `scripts/megabench-q35.sh`
+Each skill has a `SKILL.md` (or `skill.json` + sibling `.md` files)
+that any agent framework can load. Designed for Claude Code / Cursor /
+Codex but framework-agnostic.
 
 ---
 
-## Architecture Overview
+## Where the active asks are
 
-```
-crates/hip-bridge/       → FFI to HIP runtime (dlopen, no link dep)
-crates/rdna-compute/     → GPU dispatch, kernel management
-crates/engine/           → Inference orchestrator, model loading
-crates/hipfire-quantize/ → Model quantizer (safetensors → .hfq)
-cli/                     → Bun TypeScript CLI (hipfire serve/run/list)
-kernels/src/             → HIP kernel sources (.hip)
-kernels/compiled/        → Pre-compiled .hsaco blobs per GPU arch
-```
+These three are real open questions where contributor input would
+land cleanly:
 
-The key architectural constraint: hip-bridge uses `dlopen` to load the HIP runtime at
-startup, so no ROCm SDK link dependency is needed at build time. Pre-compiled `.hsaco`
-kernel blobs ship in the repo for each supported arch, so end users don't need `hipcc`.
+- **Issue #57** — gfx12 (RDNA4) WMMA dispatch wiring + perf
+  measurement vs the dot2 fallback. Needs R9700 / 9070 XT hardware.
+  PR #56 landed the kernels; #57 measures and flips the dispatch.
+- **Issue #58** — multi-GPU support roadmap. Pipeline-parallel first
+  cut design open for discussion. Mostly weighing in vs writing code,
+  unless you have a multi-GPU rig and want to prototype the
+  device-aware tensor allocator.
+- **Issue #50** — gfx1152 (Strix Halo APU) crash — awaiting a
+  reproducer + dmesg from the original reporter. If you have one,
+  comment there.
+
+For everything else, `hipfire list -r` + a benchmark issue on any
+arch we don't have local numbers for is welcome.
 
 ---
 
-## What We Need Help With
+## License
 
-### High priority
-
-- **Benchmarks on 6800 XT (gfx1030)** — we have no external gfx1030 numbers yet
-- **Benchmarks on 7900 XTX (gfx1100)** — same
-- **Benchmarks on 9070 (gfx1200)** — brand new arch, very interested in these
-- **Qwen3.5-27B benchmarks** — needs 16GB+ VRAM; submit numbers from any card that fits
-
-### Medium priority
-
-- **Windows testing** — the PowerShell installer is new and needs real-world testing
-- **Kernel optimization for RDNA3/4** — gfx1100/gfx1200 have larger VGPR budgets and
-  different wavefront scheduling; the current kernels are tuned for gfx1010
-
-### Lower priority (but welcome)
-
-- **New model architectures** — Llama 3, Mistral, Phi-4, etc.
-- **OpenAI API compatibility testing** — does `hipfire serve` work with your tool chain?
-- **Long-context testing** — turbo4/turbo2 KV compression at 4K+ context lengths
+MIT. Files contributed under the same terms.
