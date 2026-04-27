@@ -253,6 +253,9 @@ pub const GEMM_QKVZA_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gem
 pub const GEMM_QKVZA_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_fp16.hip");
 pub const GEMM_QKVZA_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_dot2.hip");
 pub const GEMM_QKVZA_HFQ6G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_wmma.hip");
+// gfx12 (RDNA4) sister: pure composition of validated patterns —
+// hfq6 dequant + 4-output qkv/z/beta/alpha routing.
+pub const GEMM_QKVZA_HFQ6G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_wmma.gfx12.hip");
 pub const GEMM_QKV_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256.hip");
 pub const GEMM_QKV_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_fp16.hip");
 pub const GEMM_QKV_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_dot2.hip");
