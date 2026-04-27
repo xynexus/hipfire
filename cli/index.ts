@@ -3756,11 +3756,18 @@ Formats:
   mq6   FWHT-rotated 6-bit — higher quality, ~1.47x file size (safetensors only)
   q8    Symmetric Q8 — reference/debugging (safetensors only)
 
-GGUF input (single .gguf file): only --format mq4 is supported. Source
-weights are dequantized (Q4_K_M / Q8_0 / Q4_0 / Q6_K / F16 / BF16 / F32),
-FWHT-rotated, and re-quantized to MQ4G256. Quality is lower than
-quantizing from full-precision safetensors due to the double-quant
-roundtrip (raise to MQ6 if you have the safetensors).
+GGUF input (single .gguf file): supports --format hfq4 (default) /
+hfq6 / mq4 / mq6. Source weights are dequantized (Q4_K_M / Q8_0 /
+Q4_0 / Q6_K / F16 / BF16 / F32) and re-quantized to the chosen
+format. Pick by model architecture:
+
+  hfq4 / hfq6: dense (Llama / Mistral / Gemma / older Qwen). DEFAULT.
+  mq4 / mq6:   Qwen3.5+ family (DeltaNet hot path). Override only when
+               the source GGUF is a Qwen3.5+ model.
+
+Quality is lower than quantizing from full-precision safetensors due
+to the double-quant roundtrip; raise to hfq6 / mq6 if you can spare
+the +47% file size.
 
 Examples:
   # Quantize any Qwen 3.5 model from HF, both formats, upload + install:
@@ -3771,8 +3778,11 @@ Examples:
   # Local fine-tune → MQ4:
   hipfire quantize ./my-finetune --format mq4 -o finetune.mq4
 
-  # GGUF → MQ4 (one-shot, install into ~/.hipfire/models):
+  # GGUF → HFQ4 (one-shot, install into ~/.hipfire/models):
   hipfire quantize ./tinyllama.Q4_K_M.gguf --install --register tinyllama:1b-gguf
+
+  # Qwen3.5+ GGUF → MQ4 (DeltaNet hot path):
+  hipfire quantize ./qwen3.5.Q4_K_M.gguf --format mq4 --install --register q35:9b-gguf
 
   # One-shot all formats from local dir:
   hipfire quantize ./model --format mq4 --format mq6 --output-dir ./out
