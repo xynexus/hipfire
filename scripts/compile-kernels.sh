@@ -22,20 +22,46 @@ echo "Architectures: ${ARCHS[*]}"
 TOTAL=0
 FAILED=0
 
+# Variant-tag regex: matches .gfxNNNN. (chip, e.g. .gfx1201.) and .gfxNN.
+# (family, e.g. .gfx12.). Files matching this are treated as overrides for
+# their parent name, not as independent kernels.
+VARIANT_TAG_RE='\.gfx[0-9]+\.hip$'
+
 for arch in "${ARCHS[@]}"; do
     out_dir="$OUT_BASE/$arch"
     mkdir -p "$out_dir"
     echo ""
     echo "--- $arch ---"
 
+    # Family tag: first 5 chars of arch ("gfx12" for gfx1201/gfx1200,
+    # "gfx94" for gfx940/gfx942, etc.). Falls back gracefully for any
+    # non-standard chip name (just won't match family variants).
+    arch_family="${arch:0:5}"
+
     for src in "$SRC_DIR"/*.hip; do
+        base=$(basename "$src")
+
+        # Skip variant-tagged files during the parent iteration; they get
+        # picked up below via the override lookup. This prevents the script
+        # from trying to compile e.g. a gfx12-only kernel for gfx1100.
+        if [[ "$base" =~ $VARIANT_TAG_RE ]]; then
+            continue
+        fi
+
         name=$(basename "$src" .hip)
 
-        # Check for arch-specific variant: name.arch.hip overrides name.hip
-        variant="$SRC_DIR/${name}.${arch}.hip"
-        if [ -f "$variant" ]; then
-            src="$variant"
-            echo "  [variant] $name ($arch-specific)"
+        # Variant precedence:
+        #   1. ${name}.${arch}.hip          (chip-specific, e.g. .gfx1100.)
+        #   2. ${name}.${arch_family}.hip   (family, e.g. .gfx12.)
+        #   3. ${name}.hip                  (default)
+        chip_variant="$SRC_DIR/${name}.${arch}.hip"
+        family_variant="$SRC_DIR/${name}.${arch_family}.hip"
+        if [ -f "$chip_variant" ]; then
+            src="$chip_variant"
+            echo "  [variant] $name ($arch chip-specific)"
+        elif [ -f "$family_variant" ]; then
+            src="$family_variant"
+            echo "  [variant] $name ($arch_family family)"
         fi
 
         out="$out_dir/${name}.hsaco"
