@@ -37,7 +37,7 @@ while [ $# -gt 0 ]; do
 done
 
 EXE="./target/release/examples/daemon"
-MODELS_DIR="${HIPFIRE_MODELS_DIR:-/home/kaden/ClaudeCode/autorocm/hipfire/models}"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
