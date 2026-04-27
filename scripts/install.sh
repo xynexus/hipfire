@@ -27,6 +27,31 @@ ask() {
     fi
 }
 
+# Pick the right HIP runtime package name for dnf-based distros. Fedora's
+# rocm-hip package is what ships libamdhip64.so.6; the rocm-hip-runtime
+# meta-package only exists on RHEL / Rocky / Alma via AMD's repo. Detect
+# via /etc/os-release ID + ID_LIKE. Reported in #64 (kamikazechaser).
+dnf_hip_pkg() {
+    local id="" id_like=""
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        id="${ID:-}"
+        id_like="${ID_LIKE:-}"
+    fi
+    case "$id" in
+        fedora) echo "rocm-hip" ;;
+        rhel|rocky|almalinux|centos|ol) echo "rocm-hip-runtime" ;;
+        *)
+            case "$id_like" in
+                *fedora*) echo "rocm-hip" ;;
+                *rhel*|*centos*) echo "rocm-hip-runtime" ;;
+                *) echo "rocm-hip-runtime" ;;
+            esac
+            ;;
+    esac
+}
+
 # ─── OS Detection ────────────────────────────────────────
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
@@ -105,23 +130,31 @@ echo ""
 echo "Checking HIP runtime..."
 HIP_FOUND=false
 HIP_LIB=""
-for lib in /opt/rocm/lib/libamdhip64.so \
-           /opt/rocm/lib64/libamdhip64.so \
-           /usr/lib/libamdhip64.so \
-           /usr/lib64/libamdhip64.so \
-           /usr/lib/x86_64-linux-gnu/libamdhip64.so \
-           /usr/lib64/rocm/libamdhip64.so; do
-    if [ -f "$lib" ]; then
-        echo "  libamdhip64.so: found at $lib ✓"
-        HIP_FOUND=true
-        HIP_LIB="$lib"
-        break
-    fi
+# Probe each known install directory for either the unversioned .so symlink
+# or a versioned ABI variant (.so.6 / .so.7 / .so.8). Fedora's `rocm-hip`
+# package installs only `libamdhip64.so.6` — the unversioned symlink ships
+# in `rocm-hip-devel` which most users don't have. So checking only `.so`
+# misses Fedora installs entirely.
+for dir in /opt/rocm/lib /opt/rocm/lib64 \
+           /usr/lib /usr/lib64 \
+           /usr/lib/x86_64-linux-gnu /usr/lib64/rocm; do
+    for suffix in "" ".6" ".7" ".8"; do
+        lib="$dir/libamdhip64.so${suffix}"
+        if [ -f "$lib" ]; then
+            echo "  libamdhip64.so: found at $lib ✓"
+            HIP_FOUND=true
+            HIP_LIB="$lib"
+            break 2
+        fi
+    done
 done
 
-# Fallback: ask ldconfig if none of the hardcoded paths matched
+# Fallback: ask ldconfig if none of the hardcoded paths matched. Match both
+# unversioned (`libamdhip64.so`) and versioned (`libamdhip64.so.N`) entries
+# — the trailing-space pattern from the previous version only matched the
+# unversioned line, missing Fedora's `.so.6` SONAME.
 if ! $HIP_FOUND; then
-    ldconfig_hit=$(ldconfig -p 2>/dev/null | grep -m1 'libamdhip64.so ' | awk '{print $NF}' || true)
+    ldconfig_hit=$(ldconfig -p 2>/dev/null | grep -m1 -E '\blibamdhip64\.so(\.[0-9]+)?\b' | awk '{print $NF}' || true)
     if [ -n "$ldconfig_hit" ] && [ -f "$ldconfig_hit" ]; then
         echo "  libamdhip64.so: found via ldconfig at $ldconfig_hit ✓"
         HIP_FOUND=true
@@ -165,7 +198,7 @@ if $HIP_FOUND; then
             if command -v apt &>/dev/null; then
                 PKG_CMD="sudo apt install -y rocm-hip-runtime"
             elif command -v dnf &>/dev/null; then
-                PKG_CMD="sudo dnf install -y rocm-hip-runtime"
+                PKG_CMD="sudo dnf install -y $(dnf_hip_pkg)"
             elif command -v pacman &>/dev/null; then
                 PKG_CMD="sudo pacman -S --noconfirm rocm-hip-runtime"
             fi
@@ -193,7 +226,7 @@ if ! $HIP_FOUND; then
     if command -v apt &>/dev/null; then
         PKG_CMD="sudo apt install -y rocm-hip-runtime"
     elif command -v dnf &>/dev/null; then
-        PKG_CMD="sudo dnf install -y rocm-hip-runtime"
+        PKG_CMD="sudo dnf install -y $(dnf_hip_pkg)"
     elif command -v pacman &>/dev/null; then
         PKG_CMD="sudo pacman -S --noconfirm rocm-hip-runtime"
     elif command -v zypper &>/dev/null; then

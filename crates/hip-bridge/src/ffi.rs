@@ -226,12 +226,24 @@ impl HipRuntime {
 
         #[cfg(not(target_os = "windows"))]
         let lib = unsafe {
-            Library::new("libamdhip64.so").map_err(|e| {
-                HipError::new(
-                    0,
-                    &format!("failed to dlopen libamdhip64.so: {e}. Is ROCm installed?"),
-                )
-            })?
+            // Try unversioned first (canonical with rocm-hip-devel symlink),
+            // then versioned SONAMEs. Fedora's `rocm-hip` package ships only
+            // `libamdhip64.so.6` — the unversioned `.so` symlink is in the
+            // `-devel` package which most users don't have. Reported in #64.
+            Library::new("libamdhip64.so")
+                .or_else(|_| Library::new("libamdhip64.so.7"))
+                .or_else(|_| Library::new("libamdhip64.so.6"))
+                .or_else(|_| Library::new("libamdhip64.so.5"))
+                .map_err(|e| {
+                    HipError::new(
+                        0,
+                        &format!(
+                            "failed to dlopen libamdhip64.so: {e}. \
+                             Tried: libamdhip64.so, libamdhip64.so.7, .so.6, .so.5. \
+                             Is ROCm installed?"
+                        ),
+                    )
+                })?
         };
 
         unsafe {

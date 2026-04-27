@@ -92,8 +92,12 @@ impl Rocblas {
     pub fn load() -> RocblasResult<Self> {
         let candidates = [
             "librocblas.so",
+            "librocblas.so.7",
+            "librocblas.so.6",
             "librocblas.so.5",
             "/opt/rocm/lib/librocblas.so",
+            "/opt/rocm/lib/librocblas.so.7",
+            "/opt/rocm/lib/librocblas.so.6",
             "/opt/rocm/lib/librocblas.so.5",
         ];
         let lib = candidates.iter().find_map(|name| {
