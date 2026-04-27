@@ -1,13 +1,17 @@
 #!/bin/bash
 # Comprehensive kernel test harness. Validates every dispatch path
 # with synthetic data — no model loading required.
-# Usage: ./scripts/test-kernels.sh [arch]
+# Usage: ./scripts/test-kernels.sh [arch]   # arch defaults to detected
 set -euo pipefail
 
+SCRIPT_DIR_BIN="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-ARCH=${1:-gfx1010}
+# Auto-detect arch when no arg passed. Fall back to gfx1100 only if
+# detection truly fails (no rocminfo / amdgpu-arch / offload-arch).
+. "$SCRIPT_DIR_BIN/_detect-gpu.sh"
+ARCH="${1:-${HIPFIRE_DETECTED_ARCH:-gfx1100}}"
 echo "=== hipfire kernel test harness (${ARCH}) ==="
 
 # Build the test binary

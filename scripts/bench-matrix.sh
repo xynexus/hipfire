@@ -3,10 +3,13 @@
 # Runs all KV configs on Qwen3-8B, produces publication-quality table.
 set -euo pipefail
 
-REPO=/home/kaden/ClaudeCode/autorocm/hipfire
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 MODEL=${1:-/tmp/qwen3-8b-hfq4.hfq}
 INFER=$REPO/target/release/examples/infer_hfq
 OUT=$REPO/bench/results/turbo-matrix.txt
+
+# GPU banner detection — replaces the prior hardcoded "RX 5700 XT".
+. "$(dirname "$0")/_detect-gpu.sh"
 
 mkdir -p "$REPO/bench/results"
 
@@ -27,7 +30,7 @@ run() {
 
 echo "=== TurboQuant Benchmark Matrix ===" | tee "$OUT"
 echo "Model: $(basename $MODEL)" | tee -a "$OUT"
-echo "GPU: AMD Radeon RX 5700 XT (8GB VRAM, RDNA1)" | tee -a "$OUT"
+echo "GPU: $(hipfire_gpu_banner)" | tee -a "$OUT"
 echo "Date: $(date '+%Y-%m-%d %H:%M')" | tee -a "$OUT"
 echo "" | tee -a "$OUT"
 

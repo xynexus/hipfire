@@ -1,6 +1,6 @@
 #!/bin/bash
 # Qwen3.5 megabench — all models, all quants, KV modes, coherence check.
-# Runs on RX 5700 XT (8GB, gfx1010).
+# Auto-detects the GPU; runs on whatever the host happens to be.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -8,6 +8,10 @@ INFER="$REPO/target/release/examples/infer"
 MODELS_DIR="$REPO/models"
 OUT_DIR="$REPO/dev/bench"
 mkdir -p "$OUT_DIR"
+
+# Detected GPU populates the report banner instead of a hardcoded
+# "RX 5700 XT" line. Override per-var if rocminfo is unavailable.
+. "$(dirname "$0")/_detect-gpu.sh"
 
 RESULTS="$OUT_DIR/megabench-q35-$(date '+%Y%m%d-%H%M').md"
 LONG_RESULTS="$OUT_DIR/longctx-q35-$(date '+%Y%m%d-%H%M').md"
@@ -28,7 +32,7 @@ The field of natural language processing has evolved dramatically. Early systems
 Now, based on this context, answer the following question with specific references to the passage above: What were the key technological transitions that enabled modern AI, and how does GPU computing fit into this narrative? Be thorough and cite specific dates and inventions from the passage."
 
 echo "=== Qwen3.5 Megabench ===" | tee "$RESULTS"
-echo "GPU: AMD Radeon RX 5700 XT (8GB VRAM, RDNA1, gfx1010)" | tee -a "$RESULTS"
+echo "GPU: $(hipfire_gpu_banner)" | tee -a "$RESULTS"
 echo "Date: $(date '+%Y-%m-%d %H:%M')" | tee -a "$RESULTS"
 echo "" | tee -a "$RESULTS"
 
