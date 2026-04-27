@@ -1554,16 +1554,47 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
     process.exit(1);
   }
 
+  // Three input shapes: HF model ID, local safetensors dir, single GGUF file.
   // HF ID = exactly one `/`, HF-valid chars, and no such directory exists.
   const looksLikeHfId = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+$/.test(input)
     && !existsSync(input);
-  const inputDir = looksLikeHfId ? await hfDownloadModel(input) : resolve(input);
-  if (!looksLikeHfId && !existsSync(inputDir)) {
-    console.error(`Input not found: ${inputDir}`);
+  const isGgufFile = !looksLikeHfId
+    && existsSync(input)
+    && statSync(input).isFile()
+    && input.toLowerCase().endsWith(".gguf");
+
+  const inputForBinary = looksLikeHfId
+    ? await hfDownloadModel(input)
+    : isGgufFile
+      ? resolve(input)            // pass the .gguf path directly through
+      : resolve(input);            // safetensors dir (existing behavior)
+
+  if (!looksLikeHfId && !existsSync(inputForBinary)) {
+    console.error(`Input not found: ${inputForBinary}`);
     process.exit(1);
   }
 
-  const baseName = opts.stem ?? (looksLikeHfId ? input.split("/").pop()! : basename(inputDir));
+  // GGUF input currently only supports MQ4 output (the FWHT-rotated 4-bit
+  // hot path — see `crates/hipfire-quantize/src/main.rs::run_gguf_pipeline`).
+  // Other formats fall back to the safetensors path which expects a
+  // directory + config.json.
+  if (isGgufFile) {
+    const nonMq4 = opts.formats.filter(f => f !== "mq4");
+    if (nonMq4.length > 0) {
+      console.error(
+        `GGUF input only supports --format mq4 (got: ${nonMq4.join(", ")}). ` +
+        `Forcing mq4. To produce other formats, convert the GGUF to safetensors first.`,
+      );
+    }
+    opts.formats = ["mq4"];
+  }
+
+  const baseName = opts.stem
+    ?? (looksLikeHfId
+        ? input.split("/").pop()!
+        : isGgufFile
+          ? basename(input).replace(/\.gguf$/i, "")
+          : basename(inputForBinary));
 
   // Sanity: --output is only meaningful with a single format
   if (opts.output && opts.formats.length > 1) {
@@ -1580,11 +1611,11 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
       ? resolve(opts.output)
       : join(outDir, `${baseName}.${format}`);
 
-    console.error(`\nQuantizing ${inputDir}`);
+    console.error(`\nQuantizing ${inputForBinary}`);
     console.error(`  → ${out} (${format})`);
     const t0 = Date.now();
     const proc = Bun.spawnSync(
-      [bin, "--input", inputDir, "--output", out, "--format", format],
+      [bin, "--input", inputForBinary, "--output", out, "--format", format],
       { stdio: ["inherit", "inherit", "inherit"] },
     );
     if ((proc.exitCode ?? 1) !== 0) {
@@ -3699,7 +3730,7 @@ Examples:
   case "quantize": {
     const input = rest[0];
     if (!input || input === "-h" || input === "--help") {
-      console.error(`Usage: hipfire quantize <hf-model-id | local-dir> [flags]
+      console.error(`Usage: hipfire quantize <hf-model-id | local-dir | file.gguf> [flags]
 
 Flags:
   --format <mq4|mq6|q8>      Quantization format (repeatable — default: mq4)
@@ -3714,8 +3745,14 @@ Flags:
 
 Formats:
   mq4   FWHT-rotated 4-bit, quality-gated — recommended for production
-  mq6   FWHT-rotated 6-bit — higher quality, ~1.47x file size
-  q8    Symmetric Q8 — reference/debugging
+  mq6   FWHT-rotated 6-bit — higher quality, ~1.47x file size (safetensors only)
+  q8    Symmetric Q8 — reference/debugging (safetensors only)
+
+GGUF input (single .gguf file): only --format mq4 is supported. Source
+weights are dequantized (Q4_K_M / Q8_0 / Q4_0 / Q6_K / F16 / BF16 / F32),
+FWHT-rotated, and re-quantized to MQ4G256. Quality is lower than
+quantizing from full-precision safetensors due to the double-quant
+roundtrip (raise to MQ6 if you have the safetensors).
 
 Examples:
   # Quantize any Qwen 3.5 model from HF, both formats, upload + install:
@@ -3725,6 +3762,9 @@ Examples:
 
   # Local fine-tune → MQ4:
   hipfire quantize ./my-finetune --format mq4 -o finetune.mq4
+
+  # GGUF → MQ4 (one-shot, install into ~/.hipfire/models):
+  hipfire quantize ./tinyllama.Q4_K_M.gguf --install --register tinyllama:1b-gguf
 
   # One-shot all formats from local dir:
   hipfire quantize ./model --format mq4 --format mq6 --output-dir ./out
