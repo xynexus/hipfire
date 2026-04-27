@@ -1846,7 +1846,7 @@ function listLocal() {
     let entries: string[];
     try { entries = readdirSync(dir); } catch { continue; }
     for (const f of entries) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq4")) && !seen.has(f)) {
+      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq4") || f.endsWith(".mq6")) && !seen.has(f)) {
         seen.add(f);
         // statSync may throw on dangling symlinks or files removed mid-scan;
         // skip those individually instead of aborting the rest of the loop
