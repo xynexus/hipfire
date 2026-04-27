@@ -932,10 +932,39 @@ fn load_dflash_state(
     // tree nodes), not just `block_size`. Reading the env-var here keeps
     // a single source of truth and avoids re-allocating these scratches
     // after the model is on GPU.
-    let ddtree_budget_env: usize = std::env::var("HIPFIRE_DDTREE_BUDGET")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
+    //
+    // DdtreeScratch::attn_bias is sized `max_n²` (max_n = 1 + budget),
+    // so the allocation is quadratic in budget. The paper's Algorithm 1
+    // typically uses budget ≤ 22; we cap at 256 to leave huge headroom
+    // while killing the OOM cliff from a typo'd budget value (`=10000`
+    // would request 400 MB just for attn_bias; `=100000` would OOM most
+    // GPUs). Invalid / out-of-range values warn loudly and disable
+    // DDTree rather than silently falling through.
+    const DDTREE_BUDGET_MAX: usize = 256;
+    let ddtree_budget_env: usize = match std::env::var("HIPFIRE_DDTREE_BUDGET").ok() {
+        None => 0,
+        Some(s) if s.is_empty() => 0,
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) => 0,
+            Ok(n) if n <= DDTREE_BUDGET_MAX => n,
+            Ok(n) => {
+                eprintln!(
+                    "[hipfire-daemon] HIPFIRE_DDTREE_BUDGET={} exceeds cap {DDTREE_BUDGET_MAX} \
+                     (attn_bias is O(budget²); typical values are 12-22). Disabling DDTree.",
+                    n
+                );
+                0
+            }
+            Err(_) => {
+                eprintln!(
+                    "[hipfire-daemon] HIPFIRE_DDTREE_BUDGET={:?} is not a non-negative integer. \
+                     Disabling DDTree.",
+                    s
+                );
+                0
+            }
+        },
+    };
     let scratch_max_n = if ddtree_budget_env > 0 {
         std::cmp::max(draft_config.block_size, 1 + ddtree_budget_env)
     } else {
@@ -965,11 +994,36 @@ fn load_dflash_state(
     // the existing DFlash chain-mode path untouched.
     let ddtree = match Some(ddtree_budget_env).filter(|&n| n > 0) {
         Some(budget) => {
-            let topk = std::env::var("HIPFIRE_DDTREE_TOPK")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&k| k >= 1 && k <= target_config.vocab_size)
-                .unwrap_or(4);
+            // topk caps the per-position branching factor in the tree
+            // builder. Algorithm 1's typical setting is 4; values above
+            // ~32 stop being meaningful (siblings beyond rank-32 contribute
+            // ≪1% mass on a Qwen-class draft) and inflate scratch usage
+            // without acceptance benefit. The vocab_size upper bound the
+            // previous version used was permissive to the point of being
+            // a footgun (152064 on Qwen3.6 → unbounded children).
+            const DDTREE_TOPK_MAX: usize = 32;
+            let topk = match std::env::var("HIPFIRE_DDTREE_TOPK").ok() {
+                None => 4,
+                Some(s) if s.is_empty() => 4,
+                Some(s) => match s.parse::<usize>() {
+                    Ok(k) if k >= 1 && k <= DDTREE_TOPK_MAX => k,
+                    Ok(k) => {
+                        eprintln!(
+                            "[hipfire-daemon] HIPFIRE_DDTREE_TOPK={k} out of range [1, {DDTREE_TOPK_MAX}]. \
+                             Falling back to default topk=4."
+                        );
+                        4
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "[hipfire-daemon] HIPFIRE_DDTREE_TOPK={:?} is not a positive integer. \
+                             Falling back to default topk=4.",
+                            s
+                        );
+                        4
+                    }
+                },
+            };
             let post_seed_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
                 .map_err(|e| format!("ddtree post_seed_snap: {e}"))?;
             let path_c_parent_pre_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
@@ -1263,6 +1317,34 @@ fn generate_dflash(
     generated += 1;
 
     let mut rng_state: u64 = 0x13579BDFu64;
+
+    // Resolve `HIPFIRE_DDTREE_PATH_C` ONCE before the decode loop. The
+    // previous version re-read the env-var on every spec cycle which
+    // is microseconds of waste on a hot path. Validate eagerly: invalid
+    // values fall back to spec_step_ddtree_batched (the documented
+    // behavior) but warn so misconfigurations don't fail silently.
+    //
+    // Only meaningful when DDTree itself is enabled (HIPFIRE_DDTREE_BUDGET).
+    // `phase1` runs Step 1 only (linear main-path verify); `phase2` adds
+    // the lazy branch FA-only re-verify (Steps 2+3). See
+    // `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
+    let path_c_mode_owned: Option<&'static str> = match std::env::var("HIPFIRE_DDTREE_PATH_C").ok() {
+        None => None,
+        Some(s) if s.is_empty() => None,
+        Some(s) if s == "phase1" => Some("phase1"),
+        Some(s) if s == "phase2" => Some("phase2"),
+        Some(s) => {
+            if df.ddtree.is_some() {
+                eprintln!(
+                    "[hipfire-daemon] HIPFIRE_DDTREE_PATH_C={:?} is not 'phase1' or 'phase2'. \
+                     Falling back to spec_step_ddtree_batched.",
+                    s
+                );
+            }
+            None
+        }
+    };
+
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     while generated < max_tokens {
         if position + df.block_size >= ctx_capacity { break; }
@@ -1273,16 +1355,7 @@ fn generate_dflash(
         // produce the same `SpecStepResult` shape so the rest of the loop
         // is unchanged. Note: `spec_step_ddtree_batched` is greedy-only
         // (temp=0); the daemon currently runs at 0.0_f32 so this matches.
-        //
-        // `HIPFIRE_DDTREE_PATH_C={phase1|phase2}` (only meaningful when
-        // DDTree itself is enabled) reroutes to `spec_step_ddtree_path_c`,
-        // which runs the PRD's main-path-first orchestrator. `phase1`
-        // runs Step 1 only (linear main-path verify); `phase2` adds the
-        // lazy branch FA-only re-verify (Steps 2+3). Anything else falls
-        // back to `spec_step_ddtree_batched`. See
-        // `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
-        let path_c_phase = std::env::var("HIPFIRE_DDTREE_PATH_C").ok();
-        let path_c_mode = path_c_phase.as_deref();
+        let path_c_mode = path_c_mode_owned;
         let step_result = if let Some(dd) = df.ddtree.as_mut() {
             if path_c_mode == Some("phase1") || path_c_mode == Some("phase2") {
                 let phase2_snaps = if path_c_mode == Some("phase2") {
