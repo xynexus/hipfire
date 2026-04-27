@@ -248,27 +248,15 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   return { ...base, ...overrides };
 }
 
-// thinking=off is now ADVISORY ONLY. We previously injected Qwen's
-// `/no_think` directive (in system, in user-suffix, in user-prefix —
-// every documented placement); each variant has a different failure
-// mode on Qwen3.5: 3-token halts on terse imperatives, 2-token halts
-// when combined with a non-empty system prompt, and degenerate
-// thinking loops on open-ended conversational prompts. None of these
-// reliably suppress thinking without breaking some other prompt
-// shape, and chasing them through patches has consumed multiple
-// sessions worth of work.
-//
-// The current contract: thinking=off does NOT inject any directive
-// into the prompt. The model thinks normally; we strip the
-// `<think>...</think>` block from the displayed output. That keeps
-// the user-visible behavior of "no reasoning shown" without the
-// brittleness of trying to make Qwen3.5 actually skip thinking.
-//
-// For a hard cap on thinking budget, set `max_think_tokens` in
-// per-model config — that's daemon-enforced and reliable.
-//
-// IMPORTANT: do not re-introduce a `/no_think` injection here. See
-// memory/feedback_no_think_directive_loops.md for the full history.
+// thinking: "off" prepends a directive to the system prompt asking the model
+// to skip <think> reasoning. Effective on instruction-tuned models (Qwen 3.5
+// in particular honors this); advisory-only — for hard suppression we'd need
+// a daemon-side <think></think> bypass injection.
+function applyThinkingMode(systemPrompt: string | undefined, thinking: string): string | undefined {
+  if (thinking !== "off") return systemPrompt;
+  const directive = "Respond directly without using <think>...</think> reasoning blocks. Give the final answer only.";
+  return systemPrompt ? `${directive}\n\n${systemPrompt}` : directive;
+}
 
 // Build the {type: "load", ...} message for the daemon, carrying per-model
 // params (max_seq). The tag is optional — pass it from the caller when known,
@@ -714,12 +702,11 @@ async function runViaHttp(
   }
   if (!resp.body) { console.error("[hipfire] serve returned no body"); return false; }
 
-  // serve's SSE stream is already post-strip — it does the inThink /
-  // </think> / buffer-flush logic server-side and only emits clean
-  // delta.content. Our job here is just to print what arrives.
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let inThink = false;
+  let stripNextLeadingNl = false;
   let tokens = 0;
   const t0 = Date.now();
   while (true) {
@@ -743,8 +730,19 @@ async function runViaHttp(
           continue;
         }
         const delta = chunk.choices?.[0]?.delta ?? {};
-        const text: string = delta.content ?? "";
+        let text: string = delta.content ?? "";
         if (!text) continue;
+        if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
+        if (inThink) {
+          if (text.includes("</think>")) {
+            text = text.split("</think>").slice(1).join("</think>");
+            inThink = false;
+            stripNextLeadingNl = true;
+          } else { continue; }
+        }
+        text = text.replace(/<\|im_end\|>/g, "");
+        if (!text) continue;
+        if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
         process.stdout.write(text);
         tokens++;
       } catch {}
@@ -993,56 +991,38 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   }
 
   const modelCfg = resolveModelConfig(model);
+  const thinkingDirective = applyThinkingMode(undefined, modelCfg.thinking);
   const genMsg: any = {
     type: "generate", id: "run", prompt,
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
+  if (thinkingDirective) genMsg.system = thinkingDirective;
   if (modelCfg.max_think_tokens > 0) genMsg.max_think_tokens = modelCfg.max_think_tokens;
   if (image) {
     genMsg.image = resolve(image);
     console.error(`[VL: ${image}]`);
   }
 
-  // <think>...</think> filter (same in both thinking modes — see the
-  // applyNoThinkPrefix removal note above). On "<think>" enter buffering;
-  // on "</think>" close the block, discard buffered reasoning, emit the
-  // post-close suffix. If `done` arrives while still buffering, the model
-  // ran out of budget mid-reasoning — discard the buffer so we don't leak
-  // a half-written reasoning trace.
   let inThink = false;
-  let thinkBuffer = "";
   let stripNextLeadingNl = false;
-  const emit = (s: string) => {
-    let t = s.replace(/<\|im_end\|>/g, "");
-    if (!t) return;
-    if (stripNextLeadingNl) { t = t.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!t) return; }
-    process.stdout.write(t);
-  };
   for await (const msg of e.generate(genMsg)) {
     if (msg.type === "token") {
       let text = msg.text as string;
-      if (text.includes("<think>")) {
-        inThink = true;
-        text = text.replace(/<think>/g, "");
-      }
+      if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
       if (inThink) {
         if (text.includes("</think>")) {
           text = text.split("</think>").slice(1).join("</think>");
           inThink = false;
-          thinkBuffer = "";
-          stripNextLeadingNl = true;
-          emit(text);
-        } else {
-          thinkBuffer += text;
-        }
-        continue;
+          stripNextLeadingNl = true; // strip newline between </think> and content
+        } else { continue; }
       }
-      emit(text);
+      text = text.replace(/<\|im_end\|>/g, "");
+      if (!text) continue;
+      if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
+      process.stdout.write(text);
     }
-    else if (msg.type === "done") {
-      console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
-    }
+    else if (msg.type === "done") console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
     else if (msg.type === "error") {
       // Surface daemon-side rejections (e.g. KV-budget overrun) instead of
       // exiting 0 with no visible output. Sets exitCode so downstream shell
@@ -1186,56 +1166,13 @@ async function serve(port: number) {
         // Reset daemon state so prior requests don't bleed into this one.
         await e.send({ type: "reset" }); await e.recv();
 
-        // OpenAI accepts message.content as several shapes (string,
-        // null/undefined, array of mixed parts, sometimes coerced
-        // primitives). normalizeMessageContent collapses all of them to a
-        // single string so downstream concatenation, regex (stripThinking),
-        // and template literals don't crash on arrays or silently emit
-        // "[object Object]". Image / unsupported parts are dropped with a
-        // one-line stderr warning so VL clients on /v1/chat/completions
-        // see why their image was ignored. Used for system, user,
-        // assistant, and tool messages.
-        const normalizeMessageContent = (raw: any, where: string): string => {
-          if (raw == null) return "";
-          if (typeof raw === "string") return raw;
-          if (!Array.isArray(raw)) return String(raw);
-          const textPieces: string[] = [];
-          let droppedImage = false;
-          let droppedOther = 0;
-          for (const part of raw) {
-            if (typeof part === "string") {
-              textPieces.push(part);
-            } else if (part && typeof part === "object") {
-              const t = (part as any).type;
-              const txt = (part as any).text;
-              if (typeof txt === "string" && txt.length > 0
-                  && (t === "text" || t === "input_text" || t == null)) {
-                textPieces.push(txt);
-              } else if (t === "image_url" || t === "input_image") {
-                droppedImage = true;
-              } else {
-                droppedOther++;
-              }
-            } else {
-              droppedOther++;
-            }
-          }
-          if (droppedImage) {
-            console.error(`[hipfire] /v1/chat/completions ${where}: image content parts dropped — serve does not yet route images to the daemon's VL path. Use \`hipfire run --image <path>\` for vision flows.`);
-          }
-          if (droppedOther > 0) {
-            console.error(`[hipfire] /v1/chat/completions ${where}: dropped ${droppedOther} unsupported content part(s)`);
-          }
-          return textPieces.join("\n");
-        };
-
         // Build prompt from messages with proper role handling
         let systemPrompt = "";
         let userPrompt = "";
 
         // Extract system message
         const sysMsg = messages.find((m: any) => m.role === "system");
-        if (sysMsg) systemPrompt = normalizeMessageContent(sysMsg.content, "system");
+        if (sysMsg) systemPrompt = sysMsg.content;
 
         // Format tools into system prompt (Hermes format)
         if (tools.length > 0) {
@@ -1270,11 +1207,10 @@ async function serve(port: number) {
           const role = m.role;
           let text = "";
 
-          const contentText = normalizeMessageContent(m.content, role);
           if (role === "tool") {
-            text = `<tool_response>\n${contentText}\n</tool_response>`;
+            text = `<tool_response>\n${m.content}\n</tool_response>`;
           } else if (role === "assistant") {
-            text = stripThinking(contentText);
+            text = stripThinking(m.content || "");
             if (m.tool_calls) {
               for (const tc of m.tool_calls) {
                 const fn = tc.function || tc;
@@ -1282,7 +1218,7 @@ async function serve(port: number) {
               }
             }
           } else {
-            text = contentText;
+            text = m.content || "";
           }
 
           if (i === 0) {
@@ -1349,15 +1285,11 @@ async function serve(port: number) {
           repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : effective.repeat_penalty),
           top_p: body.top_p ?? effective.top_p,
         };
-        // thinking=off used to inject Qwen's `/no_think` directive into
-        // the prompt, but every documented placement broke some prompt
-        // shape on Qwen3.5 (3-token halts on terse imperatives, 2-token
-        // halts when combined with a system prompt, degenerate thinking
-        // loops elsewhere). It is now advisory-only — the model thinks
-        // normally and the <think>...</think> filter below strips the
-        // visible reasoning. See applyNoThinkPrefix removal note for the
-        // full history. Do not re-add a /no_think injection here.
-        if (systemPrompt) genParams.system = systemPrompt;
+        // Per-model thinking mode: prepend the "no-think" directive when
+        // this model's override (or the global config) sets thinking=off.
+        const thinkModel = resolveModelConfig(body.model).thinking;
+        const resolvedSystem = applyThinkingMode(systemPrompt || undefined, thinkModel);
+        if (resolvedSystem) genParams.system = resolvedSystem;
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
         function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
@@ -1392,44 +1324,32 @@ async function serve(port: number) {
             async start(ctrl) {
               try {
                 let inThink = false;
-                let thinkBuffer = "";
                 let stripNextLeadingNl = false;
                 // When tools are present, accumulate full output for tool-call parsing
                 let accumulated = hasTool ? "" : null;
-                const emit = (raw: string) => {
-                  let t = raw.replace(/<\|im_end\|>/g, "");
-                  if (!t) return;
-                  if (stripNextLeadingNl) { t = t.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!t) return; }
-                  if (accumulated !== null) {
-                    accumulated += t;
-                  } else {
-                    ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
-                      id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                      choices: [{ index: 0, delta: { content: t }, finish_reason: null }]
-                    })}\n\n`));
-                  }
-                };
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
                     let text = msg.text as string;
-                    if (text.includes("<think>")) {
-                      inThink = true;
-                      text = text.replace(/<think>/g, "");
-                    }
+                    if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
                     if (inThink) {
                       if (text.includes("</think>")) {
                         text = text.split("</think>").slice(1).join("</think>");
                         inThink = false;
-                        thinkBuffer = "";
                         stripNextLeadingNl = true;
-                        emit(text);
-                      } else {
-                        thinkBuffer += text;
-                      }
-                      continue;
+                      } else { continue; }
                     }
-                    emit(text);
+                    text = text.replace(/<\|im_end\|>/g, "");
+                    if (!text) continue;
+                    if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
+                    if (accumulated !== null) {
+                      accumulated += text; // buffer for tool-call parsing at end
+                    } else {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+                      })}\n\n`));
+                    }
                   } else if (msg.type === "done") {
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
@@ -1520,15 +1440,12 @@ async function serve(port: number) {
           );
         }
 
-        // Strip think tags. Completed <think>...</think> blocks are
-        // removed wholesale; an unclosed <think> at end of output means
-        // the model ran out of budget mid-reasoning, so strip from the
-        // tag to end of content. (Same behavior in both thinking modes —
-        // the previous mode-specific divergence existed to recover the
-        // broken `/no_think` pattern, which we no longer inject.)
+        // Strip think tags and special tokens.
+        // Greedy match: strip everything from first <think> to last </think>.
+        // If <think> is unclosed, strip from <think> to end of content.
         content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-          .replace(/<think>[\s\S]*$/, "");
-        content = content.replace(/<\|im_end\|>/g, "").trim();
+          .replace(/<think>[\s\S]*$/, "") // unclosed think block
+          .replace(/<\|im_end\|>/g, "").trim();
 
         // Check for tool calls in response
         const parsed = parseToolCalls(content);
@@ -2478,7 +2395,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     thinking: {
       label: "thinking",
-      desc: "Reasoning mode. on (default) = model thinks normally; <think> blocks stripped from display. off = ADVISORY ONLY — Qwen3's /no_think directive caused 3-token halts and degenerate thinking loops on every placement we tried, so we no longer inject it. thinking=off currently behaves identically to on. Use max_think_tokens for a hard cap.",
+      desc: "Reasoning mode. on = model uses <think>...</think> (stripped from display); off = suppress thinking, answer directly",
       options: ["on", "off"],
     },
     max_think_tokens: {
@@ -2615,9 +2532,6 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
                    : next === "false" ? false
                    : next;
     setValue(k, finalVal);
-    if (k === "thinking" && finalVal === "off") {
-      flash = `${C.yellow}⚠ /no_think is known to cause degenerate Qwen3.5 looping; advisory-only (no /no_think injected — see desc).${C.reset}`;
-    }
   };
 
   const nudge = (k: keyof HipfireConfig, dir: number) => {
@@ -2648,9 +2562,6 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
         : parsed;
       setValue(k, finalVal);
       flash = `${C.green}${k} = ${fmtValue(k)}${C.reset}`;
-      if (k === "thinking" && finalVal === "off") {
-        flash += `  ${C.yellow}⚠ /no_think is known to cause degenerate Qwen3.5 looping; this setting is now advisory-only (no /no_think injected — see desc).${C.reset}`;
-      }
     } else {
       flash = `${C.red}invalid value for ${k}${C.reset}`;
     }
