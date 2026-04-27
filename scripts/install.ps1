@@ -269,11 +269,14 @@ $RepoDir = $SrcDir
 Write-Host ""
 Write-Host "Installing hipfire binaries..." -ForegroundColor Cyan
 
-# Look for pre-built daemon.exe: local first, then download from GitHub release
+# Source preference order — the prior install's $BinDir\daemon.exe is NOT
+# a source. Including it would re-use stale binaries forever. The repo-side
+# paths (only meaningful when running install.ps1 from a checkout) are
+# treated as developer-authoritative and used if present; everyone else
+# always pulls the latest release asset.
 $PreBuilt = @(
     "$RepoDir\target\release\examples\daemon.exe",
-    "$RepoDir\bin\daemon.exe",
-    "$BinDir\daemon.exe"
+    "$RepoDir\bin\daemon.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if (-not $PreBuilt) {
@@ -286,13 +289,27 @@ if (-not $PreBuilt) {
         $LatestRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/$GithubRepo/releases/latest" -UseBasicParsing
         $DaemonAsset = $LatestRelease.assets | Where-Object { $_.name -eq "daemon.exe" } | Select-Object -First 1
         if ($DaemonAsset) {
-            Write-Host "  Pulling daemon.exe from release $($LatestRelease.tag_name)..." -ForegroundColor Cyan
-            try {
-                Invoke-WebRequest -Uri $DaemonAsset.browser_download_url -OutFile "$BinDir\daemon.exe" -UseBasicParsing
-                $PreBuilt = "$BinDir\daemon.exe"
-                Write-Host "  Downloaded ✓" -ForegroundColor Green
-            } catch {
-                Write-Host "  Download failed: $_" -ForegroundColor Yellow
+            $ReleaseDest = "$BinDir\daemon.exe"
+            $NeedsDownload = $true
+            if (Test-Path $ReleaseDest) {
+                $LocalSize = (Get-Item $ReleaseDest).Length
+                if ($LocalSize -eq $DaemonAsset.size) {
+                    Write-Host "  daemon.exe matches release $($LatestRelease.tag_name) by size ($LocalSize bytes) — keeping" -ForegroundColor Green
+                    $PreBuilt = $ReleaseDest
+                    $NeedsDownload = $false
+                } else {
+                    Write-Host "  Existing daemon.exe is stale (local=$LocalSize, release=$($DaemonAsset.size)) — refreshing" -ForegroundColor Yellow
+                }
+            }
+            if ($NeedsDownload) {
+                Write-Host "  Pulling daemon.exe from release $($LatestRelease.tag_name)..." -ForegroundColor Cyan
+                try {
+                    Invoke-WebRequest -Uri $DaemonAsset.browser_download_url -OutFile $ReleaseDest -UseBasicParsing
+                    $PreBuilt = $ReleaseDest
+                    Write-Host "  Downloaded ✓" -ForegroundColor Green
+                } catch {
+                    Write-Host "  Download failed: $_" -ForegroundColor Yellow
+                }
             }
         } else {
             Write-Host "  No daemon.exe in release $($LatestRelease.tag_name) — falling through to source build" -ForegroundColor Yellow
