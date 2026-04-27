@@ -206,9 +206,10 @@ pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str = include_str!("../../../kern
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
-// and half8_t operands (vs half16_t). C-output mapping is a HYPOTHESIS
-// pending channel-test on RDNA4 silicon; see issue #54 and
-// `.skills/hipfire-arch-port/wmma-matrix.md`.
+// and half8_t operands (vs half16_t). C-output mapping
+// `acc[j] = C[8*(tid>>4) + j][tid & 15]` (lane group 0 → rows 0..7, group
+// 1 → rows 8..15) — derived from the CK trait kCM0/kCM1PerLane swap and
+// validated on R9700 in PR #56's channel-tests.
 pub const GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip");
 
 // Batched 4-way fused HFQ4-G256 GEMM (LA preamble: wqkv + wz + w_beta + w_alpha).
