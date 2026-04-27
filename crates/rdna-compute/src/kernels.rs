@@ -263,6 +263,10 @@ pub const GEMM_GATE_UP_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/g
 pub const GEMM_GATE_UP_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_fp16.hip");
 pub const GEMM_GATE_UP_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_dot2.hip");
 pub const GEMM_GATE_UP_HFQ6G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_wmma.hip");
+// gfx12 (RDNA4) sister: combines the hfq6 dequant inner loop (validated
+// in gemm_qkv_hfq6g256_wmma.gfx12.hip) with the 2-output gate/up
+// routing (validated in gemm_gate_up_hfq4g256_wmma.gfx12.hip).
+pub const GEMM_GATE_UP_HFQ6G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_wmma.gfx12.hip");
 
 // Multi-row GEMV variants: one warp computes R output rows at a time, sharing
 // x register state across rows. Exposes R=2, R=4, R=8 extern "C" entry points
