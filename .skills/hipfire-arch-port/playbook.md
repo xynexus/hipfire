@@ -51,43 +51,60 @@ if has_<fallback_feature>(&self.arch) {
 return self.<kernel>_baseline(...);
 ```
 
-Don't `||` your new arch onto the existing predicate — author a new
-predicate function (e.g. `has_wmma_f16_gfx12`) and add a NEW dispatch
-branch above the fallback. Keep gfx11 untouched. Empirical reason
-in the next section.
+Style for new dispatch branches: match the surrounding code. Some
+sites use `arch.starts_with(...)` inline, others factor into
+`has_<feature>(arch)` helpers (`has_dot2_f32_f16`, etc.). Either
+shape is fine in principle. The existing helpers are co-located
+near the top of `dispatch.rs` (around lines 30–80) — extend them
+when the same predicate would be tested in 3+ places. Add new
+inline checks when one site needs the test once.
 
-### 3. The "predicate-vs-inline" gfx11 perf trap
+When adding a new arch's dispatch branch, **do not modify the
+existing inline check for the previous arch in the same commit**.
+Land the new arch as a strictly additive change (a new `if` above
+or below the existing one), then run the speed-gate on the
+baseline arch (gfx1100 on the local 7900 XTX bench) before
+considering any refactor. See "Open root-cause" below.
 
-Earlier this session (commit `a048544`, reverted in `1f3bad3`)
-replacing six inline
+### 3. Open root-cause: "predicate-vs-inline" gfx11 perf observation
+
+In commit `a048544` (reverted in `1f3bad3`) I replaced six inline
 
 ```rust
 if self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12") {
 ```
 
-calls with a single `has_wmma_f16(&self.arch)` predicate (returning
-`arch.starts_with("gfx11")` for gfx11) caused a measured 50% prefill
-regression on gfx1100 — even though the predicate evaluates to the
-same `true` on gfx1100. Mechanism is **not yet root-caused**; could
-be inlining / register-allocator interaction with the dispatch
-function's hot loop.
+calls with a single `has_wmma_f16(&self.arch)` predicate. The
+post-commit speed-gate measured a ~50% prefill regression on
+gfx1100. The post-revert speed-gate restored 4b prefill to the
+baseline (1014→1047 tok/s).
 
-Until that's diagnosed: **do not factor existing inline arch checks
-into helper functions**. Add new arch branches *above* the existing
-inline check, e.g.:
+**This observation is unverified.** Possible explanations:
 
-```rust
-if self.arch.starts_with("gfx12") {
-    return self.gemm_<x>_wmma_gfx12(...);
-}
-if self.arch.starts_with("gfx11") {
-    return self.gemm_<x>_wmma(...);  // existing gfx11 path, unchanged
-}
-```
+- A real inlining / register-allocator interaction in the dispatch
+  hot loop (would manifest as a function-call frame in the GEMM
+  prefill path).
+- Cached build artifact during my "stash and re-run" verification:
+  the speed-gate's `cargo build --release` may have been a no-op
+  if the source didn't change between runs, leaving the regressed
+  binary in place when I thought I was testing master.
+- GPU thermal / DPM state drift over the long debugging session.
+- Firmware shadowing (`feedback_firmware_shadowing_perf_trap.md`)
+  pre-existing on the host.
 
-This is verbose but byte-identical to the old codegen for the gfx11
-host. Once we figure out why predicate-vs-inline matters, we can
-refactor.
+I did NOT isolate the cause before committing the revert. The
+"predicate refactor regresses gfx11" hypothesis is one
+possibility among several and **should not be encoded as standard
+practice** until reproduced from a clean checkout with explicit
+build-cache invalidation.
+
+**For contributors today:** if you hit a perf regression after a
+dispatch.rs edit that "should be a no-op", root-cause it before
+working around it. `cargo clean -p rdna-compute && cargo build
+--release ...` to rule out cache, GPU `pp_dpm_sclk` to rule out
+thermal/DPM drift, `dmesg | tail` to rule out firmware mismatch,
+THEN look at the diff. Don't pre-emptively avoid helper functions
+based on the observation above.
 
 ### 4. Author the new arch's kernel(s) as separate `.hip` files
 
@@ -157,7 +174,7 @@ If you don't have hardware for the target arch, you cannot merge
 | WMMA C-mapping wrong | All-WMMA models emit garbage / fail correctness | `project_wmma_correctness_fix.md` |
 | Removing "dead" WMMA kernels | Per-cycle GEMM cost ~2× on dispatch path that secretly uses it | `project_27b_dflash_perf_analysis_2026_04_22.md` (PR #32 → 9a2c667 recovery) |
 | Bypassing speed-gate | Local-env regression masked by `--no-verify` lands on master | feedback (this session, commit `a048544` → reverted in `1f3bad3`) |
-| Predicate-vs-inline arch check | 50% prefill regression on gfx11 from a "no-op" refactor | This session, root cause not yet found |
+| "Should-be-no-op" dispatch.rs refactor regresses speed-gate | Most often a stale build cache during re-verification; less often a real codegen difference. Always run the gate after any dispatch change | This session, root cause unverified — see `validation.md` |
 | Greedy degenerate decode | "Engine bug" smoke tests halt; turns out `--temp 0` + `<think>` exhaust max_tokens | `feedback_quality_gate_baselines_degenerate.md` |
 | Firmware shadowing | `/lib/firmware/updates/amdgpu` overrides kernel firmware → SMU IF mismatch → 50% prefill drop, looks like code regression | `feedback_firmware_shadowing_perf_trap.md` |
 

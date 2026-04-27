@@ -92,13 +92,21 @@ the committed ground-floor baselines in `tests/speed-baselines/`.
 
 ### Why this matters even for an arch port
 
-A "no-op" arch-conditional refactor of `dispatch.rs` regressed 4b
-prefill on gfx1100 by 50% in this session
-(`master a048544 → reverted in 1f3bad3`). The mechanism is not
-yet root-caused — possibly inlining / register-allocator
-interactions in the dispatch hot loop. **Until that's diagnosed,
-any change to `dispatch.rs` MUST run the speed-gate and pass on
-the baseline arch.**
+Every change to `dispatch.rs` MUST run the speed-gate on the
+baseline arch (gfx1100). The pre-commit hook enforces this; do not
+bypass it.
+
+In this session, commit `a048544` (a "no-op" predicate refactor)
+was reported by the speed-gate as a 50% prefill regression on
+gfx1100 and was reverted in `1f3bad3`. The cause was not isolated
+— it could be a real inlining issue, a cached-binary measurement
+artifact during my own re-run verification, or GPU thermal/DPM
+drift from the long debugging session that preceded it. The
+revert restored 4b prefill to baseline regardless. **The lesson
+is "trust the gate", not "avoid predicate functions"**; the
+gate caught the regression (whether real or measurement) before
+master shipped. Do the same: change → run gate → trust the
+result.
 
 ### How to run
 
@@ -152,7 +160,7 @@ diff so reviewers see the trade-off explicitly.
 | Channel-test FAIL on a new arch | Per-lane C-mapping wrong | Add `eprintln!` of `(tid, acc[j])` for first warp, compare to CPU reference, derive correct mapping. See `memory/project_wmma_correctness_fix.md` for the gfx11 case. |
 | Coherence-gate panic | Codegen failure, missing kernel file, bad dispatch | Read the panic message; usually a stack trace from `dispatch.rs` or `kernels.rs` |
 | Coherence-gate zero-tokens | Daemon stops at EOS immediately, often a tokenizer / chat-template / KV-init bug | Check `m.seq_pos` and `prompt_tokens` — see `feedback_dflash_chatml_and_drift.md` |
-| Speed-gate regress on gfx1100 from "no-op" arch refactor | The predicate-vs-inline trap | Revert the refactor; add new arch via separate inline branch above the existing gfx11 inline check |
+| Speed-gate regress on gfx1100 from "should-be-no-op" refactor | Could be: cached build artifact (most likely — invalidate with `cargo clean -p rdna-compute`); inlining/register-alloc difference (possible, unverified); GPU thermal drift; firmware shadowing | (1) `cargo clean -p rdna-compute && cargo build --release ...` to rule out cache; (2) `cat /sys/class/drm/card*/device/pp_dpm_sclk` to check DPM state; (3) `dmesg \| tail -40` for firmware errors; (4) re-run gate. If still regressed, revert the diff and bisect |
 | Speed-gate regress with system in known-good state | Firmware shadowing | `sudo mv /lib/firmware/updates/amdgpu .bak && reboot` (`feedback_firmware_shadowing_perf_trap.md`) |
 
 ## Last verified

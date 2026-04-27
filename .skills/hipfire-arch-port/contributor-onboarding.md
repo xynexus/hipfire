@@ -99,25 +99,37 @@ side and walk through:
 new kernel.
 
 `crates/rdna-compute/src/dispatch.rs`: add an arch-conditional
-branch ABOVE the existing inline check for the new arch. **Do
-not** factor the existing inline check into a helper function —
-that triggered a 50% regression on gfx1100 in this session for
-mechanism-not-yet-known reasons. Just add a new `if` above:
+branch for the new arch. Two principles:
+
+1. **Make the change strictly additive**: don't modify existing
+   arch checks for previous archs in the same diff. Add the new
+   arch, run the gate, then if you also want to clean up the
+   existing dispatch (e.g. remove the now-unreachable `gfx12` from
+   an old `gfx11 || gfx12` check), do that as a SEPARATE commit
+   so the gate can attribute any regression cleanly.
+
+2. **Match the surrounding style**: if the nearby code uses inline
+   `arch.starts_with(...)`, match it. If it uses a `has_<feature>`
+   helper, match that. Don't invent a new convention for your one
+   arch.
+
+Example, additive-style:
 
 ```rust
 // New arch port (gfx12, RDNA4):
 if self.arch.starts_with("gfx12") {
     return self.gemm_<x>_wmma_gfx12(...);
 }
-// Existing gfx11 path (RDNA3) — unchanged byte-for-byte:
+// Existing gfx11 path (unchanged in this commit):
 if self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12") {
     return self.gemm_<x>_wmma(...);
 }
 ```
 
-(Yes the existing gfx11 inline check still mentions gfx12 — leaving
-it alone is the safest path until the predicate-vs-inline mystery
-is solved. The new branch above takes precedence.)
+The existing inline check's `|| starts_with("gfx12")` is now
+unreachable but keeping it intact means the gfx11 codegen and
+register pressure are byte-identical to before your diff. Land
+that cleanup in a follow-up commit.
 
 `crates/engine/examples/test_kernels.rs`: add a test case that
 exercises your new kernel on the new arch.
