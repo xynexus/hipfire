@@ -162,14 +162,30 @@ verifies in one batched forward pass and accepts the longest
 correctly-predicted prefix. Average accepted-tokens-per-cycle (τ)
 drives the speedup.
 
-Draft pairing is registry-driven, not filename-derived. Each shipped
-target tag has a sibling `:<size>-draft` registry entry pointing at a
-distinct file (e.g. `qwen3.5:27b` ↔ `qwen3.5:27b-draft` with files
-`qwen3.5-27b.mq4` and `qwen35-27b-dflash-mq4.hfq`). The CLI passes
-the resolved draft path to the daemon, which loads both target and
-draft together. Toggle with `hipfire config set dflash_mode
-{auto,on,off}` — default is `off` as of v0.1.8 (opt-in until the
-speedup is more universally a win).
+Draft resolution (in `cli/index.ts`, in priority order):
+
+1. `HIPFIRE_DFLASH_DRAFT=<path>` env override — highest priority. Pass
+   an empty string to opt out even when a draft would otherwise match.
+2. **Filename auto-match**: when the target path matches the regex
+   `qwen3?.?(5|6)[-_]?<size>\.(mq4|mq6|hfq4|hfq6|q8)`, the CLI looks
+   for a sibling file named `qwen3{ver}-{size}-dflash-{quant}.hfq`
+   in `./models/`, `../../models/`, or `~/.hipfire/models/`. First
+   hit wins. Logs `[hipfire] DFlash draft detected: <path>` to stderr.
+3. Registry tags `:<size>-draft` (e.g. `qwen3.5:27b-draft`) point at
+   exactly those filenames, so `hipfire pull qwen3.5:27b-draft` puts
+   the file where the auto-match looks. The tags are a convenience
+   for `pull`, not a separate code path.
+
+The CLI passes the resolved path to the daemon as a `draft` param;
+the daemon loads it. No filename logic on the daemon side — it
+trusts the CLI's resolution.
+
+Toggle with `hipfire config set dflash_mode {auto,on,off}` — default
+is `off` as of v0.1.8 (opt-in until the speedup is more universally a
+win). `auto` gates A3B (MoE) targets off because their drafts reject
+most tokens on non-math prompts; an A3B target with a TriAttention
+sidecar configured stays DFlash-on because long-ctx A3B on 24 GB
+needs the eviction policy.
 
 ## Observability
 

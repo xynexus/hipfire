@@ -26,7 +26,7 @@ Higher-quality variants:
 |---|---|
 | `qwen3.5:<size>-mq6` | 6-bit quant, +47% file size, closer-to-Q8 quality |
 
-DFlash speculative-decode drafts (registry-paired):
+DFlash speculative-decode drafts:
 
 | Tag | Pairs with | Effect |
 |---|---|---|
@@ -40,13 +40,18 @@ hipfire pull qwen3.5:27b-draft
 hipfire config set dflash_mode auto       # opt in (default is off)
 ```
 
-`hipfire pull <target>` already prompts to also pull the matching
-`-draft` if the registry has one. The CLI resolves both tags via the
-registry and hands the daemon the literal target + draft file paths;
-no on-disk filename pattern is involved. See
-[ARCHITECTURE.md](ARCHITECTURE.md#dflash-speculative-decode) for what
-DFlash is, [BENCHMARKS.md](BENCHMARKS.md) for the per-genre speedup
-table.
+`hipfire pull <target>` prompts to also pull the matching `-draft` if
+the registry has one. At inference time the CLI does **filename
+auto-match**: when the target path matches
+`qwen3?.?(5|6)[-_]?<size>.(mq4|mq6|...)`, the CLI looks for a sibling
+file `qwen3{ver}-{size}-dflash-{quant}.hfq` next to it (in
+`~/.hipfire/models/` or alongside) and wires it up as the draft
+without an explicit flag. Override with `HIPFIRE_DFLASH_DRAFT=<path>`
+or disable via empty string.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md#dflash-speculative-decode) for
+the resolution priority and the daemon load path,
+[BENCHMARKS.md](BENCHMARKS.md) for the per-genre speedup table.
 
 Hermes / Aureth / Qwopus fine-tunes (Qwen 3.5 architecture):
 
@@ -109,7 +114,7 @@ guidance and the double-quantization quality tradeoff.
 ```
 ~/.hipfire/models/
 ├── qwen3.5-9b.mq4                  # MQ4 (FWHT-rotated, Qwen3.5 hot path)
-├── qwen35-9b-dflash-mq4.hfq        # DFlash draft for qwen3.5:9b (registry-paired)
+├── qwen35-9b-dflash-mq4.hfq        # DFlash draft for qwen3.5:9b (filename auto-match)
 ├── tinyllama.Q4_K_M.hf4            # HFQ4 (no rotation, dense)
 └── ...
 ```
