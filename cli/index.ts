@@ -1574,19 +1574,27 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
     process.exit(1);
   }
 
-  // GGUF input currently only supports MQ4 output (the FWHT-rotated 4-bit
-  // hot path — see `crates/hipfire-quantize/src/main.rs::run_gguf_pipeline`).
-  // Other formats fall back to the safetensors path which expects a
-  // directory + config.json.
+  // GGUF input supports hfq4 (default for dense), hfq6 (dense, higher
+  // quality), mq4 / mq6 (FWHT-rotated, Qwen3.5+ DeltaNet hot path).
+  // Q8 / safetensors-only formats are rejected.
   if (isGgufFile) {
-    const nonMq4 = opts.formats.filter(f => f !== "mq4");
-    if (nonMq4.length > 0) {
+    const ggufOk = new Set(["hfq4", "hfq6", "mq4", "mq6"]);
+    const filtered = opts.formats.filter(f => ggufOk.has(f));
+    const dropped = opts.formats.filter(f => !ggufOk.has(f));
+    if (dropped.length > 0) {
       console.error(
-        `GGUF input only supports --format mq4 (got: ${nonMq4.join(", ")}). ` +
-        `Forcing mq4. To produce other formats, convert the GGUF to safetensors first.`,
+        `GGUF input rejects --format: ${dropped.join(", ")}. ` +
+        `Supported for GGUF: hfq4 (default for dense), hfq6, mq4, mq6.`,
       );
     }
-    opts.formats = ["mq4"];
+    if (filtered.length === 0) {
+      // No explicit format passed — pick HFQ4 since most GGUFs in the wild
+      // are non-Qwen3.5 dense (Llama / Mistral / Gemma / older Qwen).
+      // `hipfire quantize <gguf> --format mq4` is the override for
+      // Qwen3.5+ family GGUFs.
+      filtered.push("hfq4");
+    }
+    opts.formats = filtered;
   }
 
   const baseName = opts.stem
@@ -3815,7 +3823,17 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
         process.exit(1);
       }
     }
-    if (formats.length === 0) formats.push("mq4");
+    // Pick the default format based on input shape — GGUFs are typically
+    // non-DeltaNet dense (Llama / Mistral / older Qwen / Gemma), so the
+    // sensible default is HFQ4 (no FWHT). The MQ4 default is reserved for
+    // safetensors paths where the user is intentionally targeting the
+    // Qwen3.5+ rotated hot path. quantize() may further override.
+    if (formats.length === 0) {
+      const looksLikeGguf = existsSync(input)
+        && statSync(input).isFile()
+        && input.toLowerCase().endsWith(".gguf");
+      formats.push(looksLikeGguf ? "hfq4" : "mq4");
+    }
     const validFormats = ["mq4", "mq6", "q8", "q8f16", "hfq4", "hfq4g256", "hfq6", "hfq6g256"];
     for (const f of formats) {
       if (!validFormats.includes(f)) {

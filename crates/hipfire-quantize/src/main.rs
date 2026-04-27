@@ -1329,14 +1329,57 @@ fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
     }
 }
 
-/// Convert a GGUF file to a hipfire `.hfq` using MQ4 (FWHT-rotated HFQ4-G256)
-/// for 2D weight matrices, Q8 for the embedding table, F16 for 1D norms.
-/// Tensor names are preserved verbatim from the GGUF (e.g.
-/// `blk.0.attn_q.weight`) so a future engine-side Llama .hfq loader can
-/// look them up the same way `llama.rs::load_weights` looks them up in a
-/// `GgufFile` today.
-fn run_gguf_pipeline(input: &Path, output: &Path) -> std::io::Result<()> {
-    eprintln!("=== GGUF → MQ4 conversion ===");
+/// 2D-weight quantization target chosen at the per-tensor level. The choice
+/// per format flag:
+///
+/// | --format | 2D weights      | embedding | comment                          |
+/// |----------|-----------------|-----------|----------------------------------|
+/// | hfq4     | HFQ4G256        | Q8F16     | dense default — no FWHT, plain   |
+/// | hfq6     | HFQ6G256        | Q8F16     | dense + higher quality           |
+/// | mq4      | MQ4G256         | Q8F16     | Qwen3.5+ (DeltaNet) — FWHT-rot   |
+/// | mq6      | MQ6G256         | Q8F16     | Qwen3.5+ (DeltaNet) + higher q   |
+///
+/// **MQ4/MQ6 for non-Qwen3.5 dense produces correct output on the Llama path
+/// (the rotation cancels via `gemv_mq4g256_with_rotate`) but adds per-layer
+/// `rotate_x_mq` overhead with no quality benefit — those rotations were
+/// calibrated for Qwen3.5+ training.** Default is HFQ4 for dense GGUFs;
+/// pass `--format mq4` only when the source is a Qwen3.5+ family model.
+#[derive(Clone, Copy, Debug)]
+enum GgufFormat {
+    Hfq4,
+    Hfq6,
+    Mq4,
+    Mq6,
+}
+
+impl GgufFormat {
+    fn from_flag(flag: &str) -> Option<Self> {
+        match flag {
+            "hfq4" | "hfq4g256" | "hf4" => Some(Self::Hfq4),
+            "hfq6" | "hfq6g256" | "hf6" => Some(Self::Hfq6),
+            "mq4" | "mq4g256" | "magnum" => Some(Self::Mq4),
+            "mq6" | "mq6g256" => Some(Self::Mq6),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hfq4 => "HFQ4G256",
+            Self::Hfq6 => "HFQ6G256",
+            Self::Mq4 => "MQ4G256",
+            Self::Mq6 => "MQ6G256",
+        }
+    }
+}
+
+/// Convert a GGUF file to a hipfire `.hfq`. Per-format quantization target
+/// applies to 2D weight matrices; the embedding table is always Q8F16
+/// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
+/// names are translated GGUF → safetensors style so the engine's existing
+/// `load_weights_hfq` can consume the output.
+fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io::Result<()> {
+    eprintln!("=== GGUF → {} conversion ===", format.label());
     eprintln!("Input:  {}", input.display());
     eprintln!("Output: {}", output.display());
 
@@ -1372,10 +1415,11 @@ fn run_gguf_pipeline(input: &Path, output: &Path) -> std::io::Result<()> {
     });
     let metadata_json = serde_json::to_string(&metadata)?;
 
-    // Quant signs (shared across all MQ4 tensors — same seed pair as the
-    // safetensors path so the engine's runtime FWHT inverse stays identical).
-    let signs1 = gen_fwht_signs(42, 256);
-    let signs2 = gen_fwht_signs(1042, 256);
+    // FWHT signs — only used when --format is mq4/mq6. Same seed pair as the
+    // safetensors path so the engine's runtime FWHT inverse stays identical.
+    let needs_signs = matches!(format, GgufFormat::Mq4 | GgufFormat::Mq6);
+    let signs1 = if needs_signs { gen_fwht_signs(42, 256) } else { Vec::new() };
+    let signs2 = if needs_signs { gen_fwht_signs(1042, 256) } else { Vec::new() };
 
     let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(gguf.tensors.len());
     let mut total_params: u64 = 0;
@@ -1418,13 +1462,31 @@ fn run_gguf_pipeline(input: &Path, output: &Path) -> std::io::Result<()> {
             quant_params += n_elements as u64;
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
         } else if k_dim % 256 == 0 {
-            // MQ4 (FWHT-rotated HFQ4-G256) — the hot path target.
+            // 256-aligned 2D weight — quantize per the chosen format.
             let f32_data = gguf_input::tensor_to_f32(info, raw);
-            let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
             quant_params += n_elements as u64;
-            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+            match format {
+                GgufFormat::Hfq4 => {
+                    let q = quantize_hfq4g256(&f32_data);
+                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                }
+                GgufFormat::Hfq6 => {
+                    let q = quantize_hfq6g256(&f32_data);
+                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                }
+                GgufFormat::Mq4 => {
+                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                }
+                GgufFormat::Mq6 => {
+                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                }
+            }
         } else {
             // K not divisible by 256 — fall back to HFQ4-G128 (no rotation).
+            // This branch fires for the rare ragged dim; ignores --format
+            // (no G128 variant of mq4/mq6 exists).
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let q = quantize_hfq4g128(&f32_data);
             quant_params += n_elements as u64;
@@ -1521,15 +1583,28 @@ fn main() {
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256";
 
-    // GGUF input branch: if --input is a `.gguf` file, run the GGUF→MQ4
-    // pipeline (see `run_gguf_pipeline`) and exit. Tensor names are kept
-    // verbatim from the GGUF (`token_embd.weight`, `blk.{i}.attn_q.weight`,
-    // ...). The safetensors path below is unchanged.
+    // GGUF input branch: if --input is a `.gguf` file, run the GGUF
+    // pipeline and exit. Tensor names are translated GGUF → safetensors
+    // style. The 2D quantization target follows --format:
+    //   hfq4 (default for GGUF) | hfq6 | mq4 | mq6
+    // Per CLAUDE.md guidance: dense (non-DeltaNet) models should use
+    // hfq4/hfq6. mq4/mq6 are calibrated for Qwen3.5+ — using them on a
+    // Llama-style model produces correct output (the FWHT cancels in
+    // `gemv_mq4g256_with_rotate`) but adds runtime rotation overhead
+    // with no quality benefit.
     {
         let raw_input = Path::new(input_dir.as_str());
         if is_gguf_input(raw_input) {
+            let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
+                eprintln!(
+                    "GGUF input: --format '{format}' not recognized. \
+                     Supported: hfq4 (default), hfq6, mq4, mq6. \
+                     Falling back to hfq4."
+                );
+                GgufFormat::Hfq4
+            });
             let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(raw_input, out) {
+            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
             }
