@@ -84,49 +84,67 @@ struct CaskConfig {
     fold_m: usize,
 }
 
-/// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid via flock(2).
-/// Ensures only one hipfire daemon runs at a time; a second instance exits
-/// immediately with a clear error naming the running PID. The kernel releases
-/// the flock automatically on process death (including SIGKILL), so no manual
-/// cleanup is required — stale PID file contents are fine, the fd is what
-/// holds the lock.
+/// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
+///
+/// On Unix: flock(2) is the kernel-level lock. The kernel releases it
+/// automatically on process death (including SIGKILL), so no manual
+/// cleanup is required — stale PID file contents are fine, the fd is
+/// what holds the lock.
+///
+/// On Windows: no kernel-level lock; we write the PID file but don't
+/// guarantee single-instance semantics. A second daemon launch may
+/// silently overwrite the PID. This matches the v0.1.0-alpha Windows
+/// behavior; tightening it is tracked in a follow-up.
 ///
 /// Returns the File handle; caller MUST keep it alive for the process
-/// lifetime (dropping it closes the fd and releases the lock).
+/// lifetime (on Unix, dropping it closes the fd and releases the lock).
 fn acquire_daemon_lock() -> std::fs::File {
-    use std::io::{Read, Seek, Write};
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
+    use std::io::{Seek, Write};
 
+    #[cfg(unix)]
     let home = std::env::var("HOME").expect("HOME environment variable not set");
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE")
+        .expect("USERPROFILE environment variable not set");
+
     let hipfire_dir = std::path::PathBuf::from(home).join(".hipfire");
     std::fs::create_dir_all(&hipfire_dir).expect("failed to create ~/.hipfire");
     let pid_path = hipfire_dir.join("daemon.pid");
 
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .open(&pid_path)
-        .expect("failed to open ~/.hipfire/daemon.pid");
+    let mut f = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&pid_path)
+            .expect("failed to open ~/.hipfire/daemon.pid")
+    };
 
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let mut existing = String::new();
-        let _ = f.read_to_string(&mut existing);
-        let pid = existing.trim();
-        let pid_display = if pid.is_empty() { "<unknown>" } else { pid };
-        let kill_arg = if pid.is_empty() { "<pid>" } else { pid };
-        eprintln!(
-            "FATAL: hipfire daemon already running (PID {}). Run `kill {}` and retry.",
-            pid_display, kill_arg
-        );
-        std::process::exit(1);
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let mut existing = String::new();
+            let _ = f.read_to_string(&mut existing);
+            let pid = existing.trim();
+            let pid_display = if pid.is_empty() { "<unknown>" } else { pid };
+            let kill_arg = if pid.is_empty() { "<pid>" } else { pid };
+            eprintln!(
+                "FATAL: hipfire daemon already running (PID {}). Run `kill {}` and retry.",
+                pid_display, kill_arg
+            );
+            std::process::exit(1);
+        }
     }
 
-    // Got the lock. Truncate any stale content and write our PID so tooling
-    // and the user-facing error above can both show a useful number.
+    // Got the lock (Unix) / opened the PID file (Windows). Truncate any stale
+    // content and write our PID so tooling and the Unix-side error above can
+    // both show a useful number.
     f.set_len(0).ok();
     f.seek(std::io::SeekFrom::Start(0)).ok();
     writeln!(f, "{}", std::process::id()).ok();

@@ -277,15 +277,28 @@ $PreBuilt = @(
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if (-not $PreBuilt) {
-    # Download pre-built Windows binary from GitHub release
-    Write-Host "  Downloading pre-built daemon.exe from GitHub release..."
-    $ReleaseUrl = "https://github.com/$GithubRepo/releases/download/v0.1.0-alpha/daemon.exe"
+    # Query the latest GitHub release dynamically — never pin to an old tag.
+    # If the latest release has a daemon.exe asset, use it; otherwise fall
+    # through to the source-build path below. This way every Windows install
+    # tracks current master without requiring a script bump per release.
+    Write-Host "  Querying latest GitHub release..."
     try {
-        Invoke-WebRequest -Uri $ReleaseUrl -OutFile "$BinDir\daemon.exe" -UseBasicParsing
-        $PreBuilt = "$BinDir\daemon.exe"
-        Write-Host "  Downloaded ✓" -ForegroundColor Green
+        $LatestRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/$GithubRepo/releases/latest" -UseBasicParsing
+        $DaemonAsset = $LatestRelease.assets | Where-Object { $_.name -eq "daemon.exe" } | Select-Object -First 1
+        if ($DaemonAsset) {
+            Write-Host "  Pulling daemon.exe from release $($LatestRelease.tag_name)..." -ForegroundColor Cyan
+            try {
+                Invoke-WebRequest -Uri $DaemonAsset.browser_download_url -OutFile "$BinDir\daemon.exe" -UseBasicParsing
+                $PreBuilt = "$BinDir\daemon.exe"
+                Write-Host "  Downloaded ✓" -ForegroundColor Green
+            } catch {
+                Write-Host "  Download failed: $_" -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "  No daemon.exe in release $($LatestRelease.tag_name) — falling through to source build" -ForegroundColor Yellow
+        }
     } catch {
-        Write-Host "  Download failed: $_" -ForegroundColor Yellow
+        Write-Host "  Could not query GitHub release API: $_ — falling through to source build" -ForegroundColor Yellow
     }
 }
 
