@@ -1931,6 +1931,19 @@ fn verify_dflash_block_inner(
         )
         && verify_scratch.prefill_batch.is_some();
 
+    // Per-cycle timing for verify-graph A/B diagnostic
+    // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the
+    // forward + lm_head; the recorded mode tag distinguishes replay vs
+    // warmup-direct vs first-capture vs no-graph-eligible.
+    let vg_timing = std::env::var("HIPFIRE_VERIFY_GRAPH_TIMING").ok().as_deref() == Some("1");
+    let mut vg_mode = "direct";
+    let vg_t0 = if vg_timing {
+        gpu.hip.device_synchronize()?;
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     let batch_result = if verify_graph_ok {
         let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
         debug_assert!(b <= pbs.max_batch);
@@ -1941,11 +1954,13 @@ fn verify_dflash_block_inner(
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
         if gpu.verify_has_graph(b) {
+            vg_mode = "replay";
             // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
             // kv_cache contents that were freshly updated above + upstream.
             gpu.verify_graph_launch(b)?;
             Ok(())
         } else if gpu.verify_needs_warmup(b) {
+            vg_mode = "warmup";
             // Warmup for this b: run direct so kernel JIT and any lazy scratch
             // allocations (e.g., MQ signs/x_rot/x_q8, FP16 shadow) happen
             // outside any captured region. Capturing a JIT + scratch-malloc
@@ -1972,6 +1987,7 @@ fn verify_dflash_block_inner(
             }
             r
         } else {
+            vg_mode = "capture";
             // Capture path: first call at this B after warmup.
             gpu.begin_verify_graph_capture(b)?;
             let r = qwen35::forward_prefill_batch_single_chunk_captured(
@@ -2149,6 +2165,14 @@ fn verify_dflash_block_inner(
             argmax_per_pos.push(argmax_u32(&row));
             logits_per_pos.extend_from_slice(&row);
         }
+    }
+
+    if let Some(t0) = vg_t0 {
+        gpu.hip.device_synchronize()?;
+        eprintln!(
+            "[vg-time] B={} mode={} elapsed_us={}",
+            b, vg_mode, t0.elapsed().as_micros()
+        );
     }
 
     Ok(DflashVerifyOutput {
@@ -4274,6 +4298,416 @@ pub fn spec_step_ddtree_batched(
     Ok(SpecStepResult {
         accepted: accept_len,
         bonus_token,
+        drafted,
+        committed,
+    })
+}
+
+/// Auxiliary DeltaNet snapshots that Path C Phase 2 needs but Phase 1
+/// does not. Pre-allocated by the caller (one of each at session start)
+/// and re-used across cycles. Pass `Some(...)` to enable Phase 2 (Step 2
+/// + Step 3 of the PRD); pass `None` for Phase 1 behavior.
+///
+/// - `parent_pre_snap`: the DN state at "after position + accepted_main −
+///   1", i.e. immediately before the branch's parent is forwarded. Saved
+///   by the orchestrator, restored before the branch FA forward.
+/// - `main_end_snap`: the DN state at "after position + accepted_main",
+///   i.e. the main path's final committed state. Saved before the branch
+///   FA forward. Restored on branch reject so callers see the same
+///   `target.dn_state` they would have under Phase 1.
+#[cfg(feature = "deltanet")]
+pub struct Phase2Snapshots<'a> {
+    pub parent_pre_snap: &'a mut DeltaNetSnapshot,
+    pub main_end_snap: &'a mut DeltaNetSnapshot,
+}
+
+/// Path C — main-path-first lazy FA-only re-verify (PRD orchestrator).
+///
+/// PRD: `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
+///
+/// **Phase 1** (`path_c_phase2 = None`): runs Step 1 only — linear verify
+/// on the DDTree's greedy main chain, no branches. Output is bit-exact
+/// with calling [`verify_dflash_block`] directly on the same chain (by
+/// construction — the only forward run IS that linear verify).
+///
+/// **Phase 2** (`path_c_phase2 = Some(...)`): adds Steps 2+3 — at most
+/// **one** lazy branch FA-only re-verify per cycle (the candidate sibling
+/// at fork depth = `accepted_main` whose first token equals the main
+/// verify's bonus). On branch accept the commit is extended by the
+/// accepted branch tokens; on reject behavior matches Phase 1.
+///
+/// **No KV backup buffers needed**. Phase 2 lets the branch FA forward
+/// freely overwrite KV slots past the main path's accept boundary
+/// (`position + accepted_main + 1` onwards). Stale branch K/V written
+/// past the new commit boundary is tolerated by the same mechanism that
+/// makes [`spec_step_dflash`]'s rejected-tail K/V tolerable: the next
+/// decode cycle's verify starts at the new commit boundary and overwrites
+/// every slot it will subsequently read. See `spec_step_dflash` ~line
+/// 3097 for the original write-up of this invariant.
+///
+/// Signature mirrors [`spec_step_ddtree_batched`] for drop-in dispatch
+/// from the daemon, minus the `post_seed_snap` and `scratch` arguments
+/// (this function uses `target_snap` + `path_c_phase2` snapshots instead).
+#[cfg(feature = "deltanet")]
+pub fn spec_step_ddtree_path_c(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    target_snap: &mut DeltaNetSnapshot,
+    gdn_tape: &mut GdnTape,
+    verify_scratch: &VerifyScratch,
+    position: usize,
+    seed_token: u32,
+    ctx_slice: Option<usize>,
+    tree_budget: usize,
+    tree_topk: usize,
+    path_c_phase2: Option<Phase2Snapshots<'_>>,
+) -> HipResult<SpecStepResult> {
+    let b = draft_cfg.block_size;
+    let vocab = target.config.vocab_size;
+    let h = draft_cfg.hidden;
+    let ne = draft_cfg.num_extract();
+    assert!(b >= 2, "spec_step_ddtree_path_c: block_size must be ≥ 2");
+    assert_eq!(
+        target_hidden_host.len(),
+        position * ne * h,
+        "target_hidden_host size mismatches position"
+    );
+    assert!(
+        tree_topk >= 1 && tree_topk <= vocab,
+        "tree_topk must be in [1, vocab]"
+    );
+
+    // ── 1+2. GPU-resident draft + per-row top-K (identical to batched path) ──
+    let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
+        gpu,
+        target,
+        draft_weights,
+        draft_cfg,
+        draft_scratch,
+        target_hidden_host,
+        position,
+        seed_token,
+        ctx_slice,
+        b,
+        tree_topk,
+    )?;
+
+    // ── 3. Build the DDTree ───────────────────────────────────────────────
+    let tree = crate::ddtree::build_ddtree_tree_with_cutoff(
+        &top_tokens,
+        &top_log_probs,
+        b - 1,
+        tree_topk,
+        tree_budget,
+        ddtree_logw_cutoff(),
+    );
+    record_ddtree_meta_nodes(tree.num_nodes());
+
+    // ── 3b. Empty-tree shortcut (matches spec_step_ddtree_batched). Also
+    //       handles the degenerate case where build returned a tree with no
+    //       direct root child (would imply main_path is empty too).
+    let main_path: Vec<usize> = if tree.nodes.is_empty() {
+        Vec::new()
+    } else {
+        crate::ddtree::select_main_path(&tree)
+    };
+    if main_path.is_empty() {
+        target_snap.save_from(&target.dn_state, gpu)?;
+        qwen35::forward_scratch_with_hidden(
+            gpu, &target.weights, &target.config, seed_token, position,
+            &mut target.kv_cache, &mut target.dn_state, &target.scratch, hidden_rb,
+        )?;
+        let logits0 = gpu.download_f32(&target.scratch.logits)?;
+        let bonus = argmax_u32(&logits0);
+        let hidden_block = download_hidden_block(gpu, hidden_rb, 1)?;
+        target_hidden_host.extend_from_slice(&hidden_block[..ne * h]);
+        return Ok(SpecStepResult {
+            accepted: 0,
+            bonus_token: bonus,
+            drafted: vec![seed_token],
+            committed: vec![seed_token, bonus],
+        });
+    }
+
+    // ── 4. Build the main-path verify chain: [seed, main_path tokens…] ───
+    let mut verify_tokens: Vec<u32> = Vec::with_capacity(1 + main_path.len());
+    verify_tokens.push(seed_token);
+    for &ni in &main_path {
+        verify_tokens.push(tree.nodes[ni].token);
+    }
+
+    // ── 5. Snapshot pre-seed target DN state for tape replay below. ──────
+    target_snap.save_from(&target.dn_state, gpu)?;
+
+    // ── 6. Linear verify on the main chain. No tree mask, no linearization
+    //       phase poisoning — RoPE phases match committed slots exactly.
+    //       This is the entire "Step 1" of the PRD's three-step pattern.
+    let main_verify_out = verify_dflash_block(
+        gpu, target, &verify_tokens, position, hidden_rb, Some(gdn_tape), false,
+        verify_scratch,
+    )?;
+    let main_posterior = main_verify_out.argmax_per_pos;
+    debug_assert_eq!(main_posterior.len(), 1 + main_path.len());
+
+    // ── 7. Greedy walk on the main chain (see Phase 1 doc-comment). ──────
+    let mut accepted_main: usize = 0;
+    for j in 0..main_path.len() {
+        let drafted_tok = tree.nodes[main_path[j]].token;
+        if main_posterior[j] == drafted_tok {
+            accepted_main = j + 1;
+        } else {
+            break;
+        }
+    }
+    let bonus_token = main_posterior[accepted_main];
+
+    // ── 8. Drive DN state to "main-end" via tape replay. Same as Phase 1.
+    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    gdn_tape.replay_gdn(
+        gpu,
+        &target.weights,
+        &target.config,
+        &mut target.dn_state,
+        accepted_main + 1,
+    )?;
+
+    // ── 9. Download main verify's hidden rows. download_hidden_block
+    //       reads the LAST `n` rows from the ring; after main verify's
+    //       writes those last `n` rows ARE the main chain's hidden states.
+    //       Branch verify (if any) will overwrite this region of the ring,
+    //       so we must download main rows BEFORE running it.
+    let main_chain_len = 1 + main_path.len();
+    let main_hidden_block = download_hidden_block(gpu, hidden_rb, main_chain_len)?;
+    let row_stride = ne * h;
+
+    // ── 10. Phase 2: lazy branch FA-only re-verify. At most one branch
+    //        per cycle is structurally able to accept (PRD §"Architecture
+    //        /Step 2"): the candidate is the sibling at fork depth =
+    //        `accepted_main` whose first token equals `bonus_token`. All
+    //        other branches' first tokens are guaranteed to mismatch the
+    //        target's posterior at their fork depth (because main verify
+    //        accepted main_path's child there, OR rejected with a posterior
+    //        != any siblings' tokens). So one candidate at most.
+    let mut accepted_branch_indices: Vec<usize> = Vec::new();
+    let mut effective_bonus = bonus_token;
+    let mut branch_hidden_block: Option<Vec<f32>> = None;
+    // Diagnostic counters keyed by HIPFIRE_DDTREE_PATH_C_VERBOSE=1. Tracks
+    // the funnel: how often does the tree even contain a sibling at the
+    // right fork depth, how often does its first token match the main
+    // verify's bonus, and how often does the branch FA forward then accept
+    // ≥1 of its tokens. Lets us tell a "draft has no useful siblings"
+    // signal apart from "draft has them but target rejects" signal.
+    thread_local! {
+        static PATH_C_TOTAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PATH_C_PHASE2: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PATH_C_HAS_FORK_SIBLING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PATH_C_CANDIDATE_FOUND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PATH_C_BRANCH_ACCEPTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PATH_C_BRANCH_TOKENS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    PATH_C_TOTAL.with(|c| c.set(c.get() + 1));
+    let verbose = std::env::var("HIPFIRE_DDTREE_PATH_C_VERBOSE").ok().as_deref() == Some("1");
+    let mut diag_phase2 = false;
+    let mut diag_fork_sibling = false;
+    let mut diag_candidate = false;
+    let mut diag_accept_branch: usize = 0;
+    if let Some(snaps) = path_c_phase2 {
+        diag_phase2 = true;
+        PATH_C_PHASE2.with(|c| c.set(c.get() + 1));
+        // Save the main-end DN state so we can roll back on branch reject.
+        snaps.main_end_snap.save_from(&target.dn_state, gpu)?;
+
+        // Find the unique candidate branch.
+        let branches = crate::ddtree::enumerate_branches(&tree, &main_path, accepted_main);
+        diag_fork_sibling = branches
+            .iter()
+            .any(|b| b.fork_depth as usize == accepted_main);
+        if diag_fork_sibling {
+            PATH_C_HAS_FORK_SIBLING.with(|c| c.set(c.get() + 1));
+        }
+        let candidate = branches.into_iter().find(|b| {
+            b.fork_depth as usize == accepted_main
+                && tree
+                    .nodes
+                    .get(b.chain[0])
+                    .map(|n| n.token == bonus_token)
+                    .unwrap_or(false)
+        });
+        diag_candidate = candidate.is_some();
+        if diag_candidate {
+            PATH_C_CANDIDATE_FOUND.with(|c| c.set(c.get() + 1));
+        }
+
+        if let Some(branch) = candidate {
+            // Step 2.1: restore DN to the branch parent's pre-state.
+            target_snap.restore_to(&mut target.dn_state, gpu)?;
+            if accepted_main > 0 {
+                gdn_tape.replay_gdn(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    accepted_main,
+                )?;
+            }
+            // Save it: we'll restore here again on accept to replay
+            // branch tape rows into the correct intermediate state.
+            snaps.parent_pre_snap.save_from(&target.dn_state, gpu)?;
+
+            // Step 2.2: run the branch FA forward. start_pos =
+            // position + accepted_main is the parent's absolute slot;
+            // forwarding [parent_tok, c0, c1, ...] there has the model
+            // see committed RoPE phases (no linearization-slot phase
+            // poisoning) and a freshly-restored DN state for LA layers.
+            //
+            // We pass `Some(gdn_tape)`: branch innovations are captured
+            // into tape rows [0..1+chain.len()], CLOBBERING main verify's
+            // captures. That's safe — main tape was already replayed in
+            // step 8 to drive DN to main-end, we don't need it anymore.
+            let parent_tok = if accepted_main == 0 {
+                seed_token
+            } else {
+                tree.nodes[main_path[accepted_main - 1]].token
+            };
+            let mut branch_chain_tokens: Vec<u32> =
+                Vec::with_capacity(1 + branch.chain.len());
+            branch_chain_tokens.push(parent_tok);
+            for &ni in &branch.chain {
+                branch_chain_tokens.push(tree.nodes[ni].token);
+            }
+            let branch_start_pos = position + accepted_main;
+            let branch_verify_out = verify_dflash_block(
+                gpu, target, &branch_chain_tokens, branch_start_pos, hidden_rb,
+                Some(gdn_tape), false, verify_scratch,
+            )?;
+            let branch_posterior = branch_verify_out.argmax_per_pos;
+            debug_assert_eq!(branch_posterior.len(), 1 + branch.chain.len());
+
+            // Step 2.3: greedy walk on the branch.
+            //   branch_posterior[j] = target's predict at branch_start_pos+j+1
+            //   given prefix [parent, c0, ..., c_{j-1}]. Accept c_j iff
+            //   branch_posterior[j] == c_j.tok.
+            let mut accepted_branch: usize = 0;
+            for j in 0..branch.chain.len() {
+                let drafted_tok = tree.nodes[branch.chain[j]].token;
+                if branch_posterior[j] == drafted_tok {
+                    accepted_branch = j + 1;
+                } else {
+                    break;
+                }
+            }
+
+            diag_accept_branch = accepted_branch;
+            if accepted_branch > 0 {
+                PATH_C_BRANCH_ACCEPTED.with(|c| c.set(c.get() + 1));
+                PATH_C_BRANCH_TOKENS.with(|c| c.set(c.get() + accepted_branch as u32));
+            }
+
+            if accepted_branch == 0 {
+                // Branch reject: restore main-end DN state. KV writes the
+                // branch did at slots > position+accepted_main are stale
+                // but tolerated (next cycle overwrites — see fn doc-comment).
+                snaps.main_end_snap.restore_to(&mut target.dn_state, gpu)?;
+            } else {
+                // Branch accept: extend commit by accepted_branch tokens.
+                // Step 3: drive DN state to "after position + accepted_main +
+                // accepted_branch" via tape replay on the branch tape we
+                // just captured (rows [0..1+accepted_branch]).
+                snaps.parent_pre_snap.restore_to(&mut target.dn_state, gpu)?;
+                gdn_tape.replay_gdn(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    1 + accepted_branch,
+                )?;
+
+                // Branch hidden rows (1 + chain.len() rows for [parent,
+                // c0..c_{chain.len()-1}]). Download now while they're the
+                // most-recent ring writes; we'll skip parent's row at index 0
+                // (it's a duplicate of the corresponding main verify row).
+                let bb = download_hidden_block(gpu, hidden_rb, 1 + branch.chain.len())?;
+                branch_hidden_block = Some(bb);
+
+                // Update the bonus token to the branch's predict-after-last-
+                // accepted slot (= branch_posterior[accepted_branch] —
+                // same off-by-one convention as the main greedy walk).
+                effective_bonus = branch_posterior[accepted_branch];
+
+                // Capture which branch nodes we accepted so we can build
+                // the final committed/drafted lists once we're out of the
+                // Phase 2 block (where the borrow on `branch.chain` ends).
+                accepted_branch_indices.extend_from_slice(&branch.chain[..accepted_branch]);
+            }
+        }
+    }
+
+    // ── 11. Build committed + drafted sequences. Includes any accepted
+    //        branch tokens (empty when Phase 2 is off, no candidate, or
+    //        candidate rejected).
+    let total_accepted = accepted_main + accepted_branch_indices.len();
+    let mut committed: Vec<u32> = Vec::with_capacity(total_accepted + 2);
+    committed.push(seed_token);
+    for j in 0..accepted_main {
+        committed.push(tree.nodes[main_path[j]].token);
+    }
+    for &ni in &accepted_branch_indices {
+        committed.push(tree.nodes[ni].token);
+    }
+    committed.push(effective_bonus);
+
+    let mut drafted: Vec<u32> = Vec::with_capacity(1 + main_path.len() + accepted_branch_indices.len());
+    drafted.push(seed_token);
+    for &ni in &main_path {
+        drafted.push(tree.nodes[ni].token);
+    }
+    for &ni in &accepted_branch_indices {
+        drafted.push(tree.nodes[ni].token);
+    }
+
+    // ── 12. Append accepted hidden rows to target_hidden_host. Same row
+    //        accounting as spec_step_dflash: keep `1 + accepted_count`
+    //        rows (seed + accepted committed); the bonus-token row is
+    //        deliberately NOT appended because its hidden was captured at
+    //        a wrong-token slot (will materialize correctly on next cycle's
+    //        verify). See spec_step_dflash §"step 9" comment block.
+    let main_rows_to_keep = accepted_main + 1; // seed + accepted main
+    target_hidden_host.extend_from_slice(&main_hidden_block[..main_rows_to_keep * row_stride]);
+    if let Some(bb) = &branch_hidden_block {
+        // Branch block layout: row 0 = parent (duplicate), rows
+        // [1..1+accepted_branch] = c_0 .. c_{accepted_branch-1}.
+        let start = row_stride;
+        let end = (1 + accepted_branch_indices.len()) * row_stride;
+        target_hidden_host.extend_from_slice(&bb[start..end]);
+    }
+
+    if verbose {
+        let total = PATH_C_TOTAL.with(|c| c.get());
+        let p2 = PATH_C_PHASE2.with(|c| c.get());
+        let fs = PATH_C_HAS_FORK_SIBLING.with(|c| c.get());
+        let cf = PATH_C_CANDIDATE_FOUND.with(|c| c.get());
+        let ba = PATH_C_BRANCH_ACCEPTED.with(|c| c.get());
+        let bt = PATH_C_BRANCH_TOKENS.with(|c| c.get());
+        let mean_branch = if ba > 0 { bt as f32 / ba as f32 } else { 0.0 };
+        let cand_rate = if p2 > 0 { 100.0 * cf as f32 / p2 as f32 } else { 0.0 };
+        let accept_rate = if cf > 0 { 100.0 * ba as f32 / cf as f32 } else { 0.0 };
+        eprintln!(
+            "[path-c] cycle: phase2={} acc_main={} fork_sibling={} candidate={} accept_branch={} \
+             | cumul: cycles={} phase2={} fork_sib={} cand={} ({:.1}% of phase2) \
+             accept={} ({:.1}% of cand) mean_branch_tok={:.2}",
+            diag_phase2, accepted_main, diag_fork_sibling, diag_candidate, diag_accept_branch,
+            total, p2, fs, cf, cand_rate, ba, accept_rate, mean_branch,
+        );
+    }
+
+    Ok(SpecStepResult {
+        accepted: total_accepted,
+        bonus_token: effective_bonus,
         drafted,
         committed,
     })
