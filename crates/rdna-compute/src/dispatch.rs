@@ -3550,6 +3550,76 @@ impl Gpu {
         result
     }
 
+    /// gfx12 (RDNA4) sister of `gemm_hfq4g256_residual_wmma` (specifically
+    /// the `_k2` variant — the gfx11 dispatch default for M >= 8192, with
+    /// the validated C-output mapping).
+    ///
+    /// Closes the residual-GEMM gap on 9B prefill: before this kernel,
+    /// gfx12 fell through to the dot2 fp16 fallback for the residual call
+    /// site (attn-out + ffn-down), which accounted for ~42% of 9B prefill
+    /// time on R9700. The other six gfx12 WMMA kernels shipped in PR #62.
+    ///
+    /// Same recipe as the qkv / qkvza / gate_up gfx12 ports: `_w32_gfx12`
+    /// builtin, half8_t operands, K-split via `tid >> 4`, contiguous
+    /// C-row mapping (`acc[j] = C[8*(tid>>4) + j][tid & 15]`). Validated
+    /// on R9700 by the `test_wmma_residual_gfx12` channel-test against
+    /// the dot2 reference path.
+    pub fn gemm_hfq4g256_residual_wmma_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_gfx12",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC,
+            "gemm_hfq4g256_residual_wmma_gfx12",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_wmma_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_residual_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
     /// instead of overwriting. Used for wo / w_down projections where the
@@ -4372,6 +4442,13 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            // WMMA on gfx12 (RDNA4): K2-unroll port, validated by
+            // test_wmma_residual_gfx12 against the dot2 fp16 reference.
+            // Closes the 9B-prefill residual gap (was ~42% of GEMM time on
+            // the dot2 fallback below).
+            if has_wmma_f16_gfx12(&self.arch) {
+                return self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
+            }
             // WMMA on gfx11+ (RDNA3): 16×16 tiled, ~8-10× over scalar
             if self.arch.starts_with("gfx11") {
                 return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
