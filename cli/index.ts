@@ -1312,6 +1312,13 @@ async function serve(port: number) {
           repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : effective.repeat_penalty),
           top_p: body.top_p ?? effective.top_p,
         };
+        // Mirror the `hipfire run` path's per-model max_think_tokens
+        // propagation. Without this, models with thinking=on can consume
+        // the entire max_tokens budget inside a single <think>...</think>
+        // block, leaving message.content empty after the downstream strip.
+        // Reported in #74 with qwen3.6:27b returning empty content + full
+        // 8192 completion_tokens despite max_think_tokens=2048 in config.
+        if (effective.max_think_tokens > 0) genParams.max_think_tokens = effective.max_think_tokens;
         // thinking=off is currently a no-op at the CLI layer. Earlier
         // versions injected a prose system directive ("Respond directly
         // without using <think>...</think> reasoning blocks") here, but
@@ -1453,10 +1460,12 @@ async function serve(port: number) {
 
         let content = "";
         let completionTokens = 0;
+        let promptTokens = 0;
         let daemonError: string | null = null;
         e.generating = true;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
+          else if (msg.type === "done") { promptTokens = msg.prefill_tokens ?? 0; }
           else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
         }
         e.generating = false;
@@ -1493,7 +1502,7 @@ async function serve(port: number) {
         return Response.json({
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
-          usage: { prompt_tokens: 0, completion_tokens: completionTokens, total_tokens: completionTokens }
+          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
         });
       } catch (err: any) {
         safeRelease();
