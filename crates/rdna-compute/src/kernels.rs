@@ -195,8 +195,21 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str = include_str!("../../../
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
+// gfx12 (RDNA4) sister of GEMM_GATE_UP_HFQ4G256_WMMA_SRC. Same recipe as
+// the QKV gfx12 scaffold (validated on R9700): _w32_gfx12 builtin,
+// half8_t operands, K-split via tid>>4, contiguous C-row mapping.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.gfx12.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.hip");
+// gfx12 (RDNA4) sister: gfx12 hfq4 recipe + 4-output qkv/z/beta/alpha
+// routing for the DeltaNet LinearAttention preamble.
+pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
+// gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
+// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
+// and half8_t operands (vs half16_t). C-output mapping is a HYPOTHESIS
+// pending channel-test on RDNA4 silicon; see issue #54 and
+// `.skills/hipfire-arch-port/wmma-matrix.md`.
+pub const GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip");
 
 // Batched 4-way fused HFQ4-G256 GEMM (LA preamble: wqkv + wz + w_beta + w_alpha).
 // Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
@@ -240,14 +253,26 @@ pub const GEMM_QKVZA_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gem
 pub const GEMM_QKVZA_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_fp16.hip");
 pub const GEMM_QKVZA_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_dot2.hip");
 pub const GEMM_QKVZA_HFQ6G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_wmma.hip");
+// gfx12 (RDNA4) sister: pure composition of validated patterns —
+// hfq6 dequant + 4-output qkv/z/beta/alpha routing.
+pub const GEMM_QKVZA_HFQ6G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_wmma.gfx12.hip");
 pub const GEMM_QKV_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256.hip");
 pub const GEMM_QKV_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_fp16.hip");
 pub const GEMM_QKV_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_dot2.hip");
 pub const GEMM_QKV_HFQ6G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wmma.hip");
+// gfx12 (RDNA4) sister of GEMM_QKV_HFQ6G256_WMMA_SRC. Same gfx12 recipe
+// as the hfq4 scaffolds, with the hfq6 dequant inner loop carried over
+// (200B groups, 4-byte unaligned reads at byte-offsets {0, 3} per K
+// half-tile to extract 8 6-bit values per lane).
+pub const GEMM_QKV_HFQ6G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256.hip");
 pub const GEMM_GATE_UP_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_fp16.hip");
 pub const GEMM_GATE_UP_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_dot2.hip");
 pub const GEMM_GATE_UP_HFQ6G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_wmma.hip");
+// gfx12 (RDNA4) sister: combines the hfq6 dequant inner loop (validated
+// in gemm_qkv_hfq6g256_wmma.gfx12.hip) with the 2-output gate/up
+// routing (validated in gemm_gate_up_hfq4g256_wmma.gfx12.hip).
+pub const GEMM_GATE_UP_HFQ6G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_wmma.gfx12.hip");
 
 // Multi-row GEMV variants: one warp computes R output rows at a time, sharing
 // x register state across rows. Exposes R=2, R=4, R=8 extern "C" entry points
