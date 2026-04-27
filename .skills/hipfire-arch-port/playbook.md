@@ -90,7 +90,7 @@ Run the speed-gate on the baseline arch (gfx1100 on the local
 root-cause it (see `validation.md` troubleshooting) rather than
 splitting the diff to dodge the regression.
 
-### 3. Open root-cause: "predicate-vs-inline" gfx11 perf observation
+### 3. Closed: "predicate-vs-inline" was a stale-binary artifact
 
 In commit `a048544` (reverted in `1f3bad3`) I replaced six inline
 
@@ -100,55 +100,78 @@ if self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12") {
 
 calls with a single `has_wmma_f16(&self.arch)` predicate. The
 post-commit speed-gate measured a ~50% prefill regression on
-gfx1100. The post-revert speed-gate restored 4b prefill to the
-baseline (1014→1047 tok/s).
+gfx1100. I reverted on suspicion of an inlining/register-alloc
+issue, but **the regression was a measurement artifact**, not a
+real codegen difference.
 
-**This observation is unverified.** Possible explanations:
+**Root cause (re-tested 2026-04-27 in commit 6e100c2):** the
+speed-gate's `ensure_build()` only invokes `cargo build --release`
+when `target/release/examples/bench_qwen35_mq4` does NOT already
+exist. A "stash the change and re-run" flow leaves the previously-
+built binary in place, so the re-bench measures the SAME code as
+the post-change run. Both numbers reflect the same binary; the
+delta is just run-to-run thermal noise.
 
-- A real inlining / register-allocator interaction in the dispatch
-  hot loop (would manifest as a function-call frame in the GEMM
-  prefill path).
-- Cached build artifact during my "stash and re-run" verification:
-  the speed-gate's `cargo build --release` may have been a no-op
-  if the source didn't change between runs, leaving the regressed
-  binary in place when I thought I was testing master.
-- GPU thermal / DPM state drift over the long debugging session.
-- Firmware shadowing pre-existing on the host
-  (`/lib/firmware/updates/amdgpu` overriding kernel firmware → SMU
-  IF mismatch). Fix: `sudo mv /lib/firmware/updates/amdgpu .bak
-  && sudo reboot`.
+After `rm target/release/examples/bench_qwen35_mq4` and a forced
+rebuild on the predicate refactor:
 
-I did NOT isolate the cause before committing the revert. The
-"predicate refactor regresses gfx11" hypothesis is one
-possibility among several and **should not be encoded as standard
-practice** until reproduced from a clean checkout with explicit
-build-cache invalidation.
+  clean master rebuild:        1080 tok/s 4b pp32 prefill
+  predicate refactor rebuild:  1138.6 tok/s (+5.4% noise band)
+
+Both well above the 1014 committed floor. The predicate is
+functionally identical to the inline `||` chain for gfx11.
 
 **For contributors today:** if you hit a perf regression after a
 dispatch.rs edit that "should be a no-op", root-cause it before
-working around it. `cargo clean -p rdna-compute && cargo build
---release ...` to rule out cache, GPU `pp_dpm_sclk` to rule out
-thermal/DPM drift, `dmesg | tail` to rule out firmware mismatch,
-THEN look at the diff. Don't pre-emptively avoid helper functions
-based on the observation above.
+working around it:
+
+1. `rm target/release/examples/<bench>` to force a fresh build of
+   the bench binary specifically (the gate's `ensure_build` will
+   then rebuild it).
+2. `cargo clean -p rdna-compute && cargo build --release ...` to
+   invalidate the dispatch-crate artifacts.
+3. `cat /sys/class/drm/card*/device/pp_dpm_sclk` to check DPM state.
+4. `dmesg | tail -40` for firmware errors / SMU mismatch.
+5. `ls /lib/firmware/updates/amdgpu` — if present, may be shadowing
+   kernel firmware (system-side fix only; see troubleshooting).
+6. Re-run the gate.
+
+If the regression survives a clean rebuild AND the system is in
+known-good state, NOW it's a real codegen problem and you can
+investigate the diff. Don't preemptively avoid helper functions
+based on a measurement that hasn't been isolated.
 
 ### 4. Author the new arch's kernel(s) as separate `.hip` files
 
-Naming convention: `<existing_kernel_name>_gfx12.hip` (or
-`_gfx1201.hip` if the variant is sub-arch-specific). Examples in
-the existing tree:
+Naming convention: `<existing_kernel_name>.<arch_tag>.hip` (dot-
+separated tag in the middle of the filename, NOT trailing
+underscore). The tag is one of:
 
-- `kernels/src/gemv_hfq4g256.gfx1030.v1.hip` — gfx1030 RDNA2 variant
-- `kernels/src/gemm_hfq4g256_residual_wmma_k4.hip` — gfx11 K4 WMMA
+- `.gfxNNNN.` — chip-specific (e.g. `.gfx1100.` for Navi 31).
+- `.gfxNN.` — family-wide (e.g. `.gfx12.` for both gfx1200 and
+  gfx1201). `scripts/compile-kernels.sh` resolves family tags as a
+  fallback when no chip-specific variant exists.
+
+Existing examples:
+
+- `kernels/src/gemv_hfq4g256.gfx1100.hip` — gfx1100 chip-specific.
+- `kernels/src/gemv_hfq4g256.gfx1030.v1.hip` ... `.v5.hip` —
+  multiple gfx1030 versions (each registered as an INDEPENDENT kernel
+  in `kernels.rs`, not a fallback override).
+- `kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip` — **the canonical
+  gfx12 WMMA reference** (commit 6924f2a). Read this file end-to-end
+  before porting any other gfx11 WMMA kernel — it documents the four
+  load-bearing differences (builtin name, operand vector size, K-split
+  across lane-groups, C-output mapping hypothesis) inline.
 
 Single-file `#ifdef __gfx12__` is fine *only* when:
-- The operand types are identical across archs (rare for WMMA/MFMA)
-- The lane layout is identical (rare)
-- The tuning constants are identical (rare)
+- The operand types are identical across archs (rare for WMMA/MFMA).
+- The lane layout is identical (rare).
+- The tuning constants are identical (rare).
 
 For WMMA in particular, **the gfx11 → gfx12 port is NOT a single-file
 ifdef**; operand vector lengths differ (`<16 x fp16>` vs `<8 x fp16>`)
-and per-lane K-packing differs. Use a separate file.
+and per-lane K-packing differs. Use a separate `.gfx12.hip` file.
 
 ### 5. Wire the include + dispatch
 
@@ -200,7 +223,7 @@ If you don't have hardware for the target arch, you cannot merge
 | WMMA C-mapping wrong | All-WMMA models emit garbage / fail correctness | Commit `b7ac66a` (gfx11 mapping fix). Assume new-arch mapping is wrong until proven on hardware. |
 | Removing "dead" WMMA kernels | Per-cycle GEMM cost ~2× on dispatch path that secretly uses it | PR #32 removed 27B-load-bearing WMMA variants; recovery in commit `9a2c667`. Don't delete WMMA kernel files without checking dispatch.rs `include_str!` references first. |
 | Bypassing speed-gate | Local-env regression masked by `--no-verify` lands on master | This session: commit `a048544` → reverted in `1f3bad3`. Don't do it. |
-| "Should-be-no-op" dispatch.rs refactor regresses speed-gate | Most often a stale build cache during re-verification; less often a real codegen difference. Always run the gate after any dispatch change | This session, root cause unverified — see `validation.md` |
+| "Should-be-no-op" dispatch.rs refactor regresses speed-gate | The speed-gate's `ensure_build` only rebuilds when the bench binary is absent. Stash-and-re-bench flows can measure the SAME (post-change) binary on both runs. ALWAYS `rm target/release/examples/<bench>` before re-running the gate to compare diffs. | Resolved 2026-04-27 in commit 6e100c2 — re-tested with forced rebuild, no regression. See `playbook.md` step 3. |
 | Greedy degenerate decode | "Engine bug" smoke tests halt; turns out `--temp 0` + `<think>` exhaust max_tokens before model closes | Use `--temp 0.3 --repeat-penalty 1.05` + `--max-tokens 1500+` for 9b in any output-correctness assertion. |
 | Firmware shadowing | `/lib/firmware/updates/amdgpu` overrides kernel firmware → SMU IF mismatch → 50% prefill drop, looks like code regression | System-side fix only: `sudo mv /lib/firmware/updates/amdgpu .bak && sudo reboot`. No code commit. |
 

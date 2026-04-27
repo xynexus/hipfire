@@ -66,6 +66,17 @@ have hit are documented here so you don't repeat them.
 
 ## Cross-references (commits + ops notes)
 
+- **gfx12 dispatch fallback (issue #54):** commit `6e100c2` routes
+  gfx1200/gfx1201 to the dot2 path until per-arch WMMA kernels land.
+  Mild perf regression vs peak WMMA, but eliminates the codegen
+  crash on 9070 XT.
+- **First canonical gfx12 WMMA kernel:** commit `6924f2a` adds
+  `kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip` as the worked-out
+  pattern reference for porting the remaining 5 gfx11 WMMA kernels.
+  Includes inline documentation of the four load-bearing changes
+  (builtin name, operand vector size, K-split lane decomposition,
+  C-mapping hypothesis). NOT YET WIRED into dispatch.rs pending
+  R9700 channel-test of the C-mapping hypothesis.
 - **WMMA correctness fix (gfx11):** commit `b7ac66a` ("wmma
   correctness fix + MQ6 family + cross-arch prefill + gate
   framework"). The gfx11 C-mapping (`acc[j] = C[2*j + (tid>>4)]
@@ -77,8 +88,15 @@ have hit are documented here so you don't repeat them.
   reasoning step exhausts max_tokens without closing. Use
   `--temp 0.3 --repeat-penalty 1.05` and `--max-tokens 1500+` for
   9b in coherence-gate-style validation.
+- **Stale-binary speed-gate measurement (resolved 2026-04-27):**
+  the speed-gate's `ensure_build()` is a no-op when the bench
+  binary already exists, so "stash and re-bench" verification can
+  measure the same code twice. Always `rm
+  target/release/examples/bench_qwen35_mq4` before re-running the
+  gate to compare diffs. See `validation.md` troubleshooting table.
 - **Firmware shadowing (perf trap):** if the speed-gate flags a
-  ~50% prefill drop after a "should-be-no-op" change, check
-  `dmesg | tail` for SMU IF mismatch. The fix is system-side:
-  `sudo mv /lib/firmware/updates/amdgpu /lib/firmware/updates/amdgpu.bak
-  && sudo reboot`. Documented operationally; no code commit.
+  ~50% prefill drop after a "should-be-no-op" change AND the cause
+  isn't the stale binary above, check `dmesg | tail` for SMU IF
+  mismatch. The fix is system-side: `sudo mv
+  /lib/firmware/updates/amdgpu /lib/firmware/updates/amdgpu.bak &&
+  sudo reboot`. Documented operationally; no code commit.

@@ -99,15 +99,20 @@ bypass it.
 
 In this session, commit `a048544` (a "no-op" predicate refactor)
 was reported by the speed-gate as a 50% prefill regression on
-gfx1100 and was reverted in `1f3bad3`. The cause was not isolated
-— it could be a real inlining issue, a cached-binary measurement
-artifact during my own re-run verification, or GPU thermal/DPM
-drift from the long debugging session that preceded it. The
-revert restored 4b prefill to baseline regardless. **The lesson
-is "trust the gate", not "avoid predicate functions"**; the
-gate caught the regression (whether real or measurement) before
-master shipped. Do the same: change → run gate → trust the
-result.
+gfx1100 and was reverted in `1f3bad3`. **Re-tested 2026-04-27 in
+commit 6e100c2 with forced rebuild — the regression was a stale-
+binary measurement artifact**, not a real codegen difference. The
+gate's `ensure_build()` is a no-op when the bench binary already
+exists, so a "stash and re-bench" flow leaves the post-change
+binary in place during the "before" measurement, and both runs
+measure the same binary.
+
+**The fix is simple but mandatory:** `rm
+target/release/examples/bench_qwen35_mq4` before re-running the
+gate to compare diffs. The gate's `ensure_build()` will detect
+the missing binary and rebuild from current sources. Without
+this, your "regression" measurement might be measuring the wrong
+code entirely.
 
 ### How to run
 
@@ -161,11 +166,15 @@ diff so reviewers see the trade-off explicitly.
 | Channel-test FAIL on a new arch | Per-lane C-mapping wrong | Add `eprintln!` of `(tid, acc[j])` for first warp, compare to CPU reference, derive correct mapping. See commit `b7ac66a` for the gfx11 case. |
 | Coherence-gate panic | Codegen failure, missing kernel file, bad dispatch | Read the panic message; usually a stack trace from `dispatch.rs` or `kernels.rs` |
 | Coherence-gate zero-tokens | Daemon stops at EOS immediately, often a tokenizer / chat-template / KV-init bug | Check `m.seq_pos` and `prompt_tokens` in the daemon's generate path. Common cause: chatml wrap missing the trailing `\n` after `<|im_end|>`. |
-| Speed-gate regress on gfx1100 from "should-be-no-op" refactor | Could be: cached build artifact (most likely — invalidate with `cargo clean -p rdna-compute`); inlining/register-alloc difference (possible, unverified); GPU thermal drift; firmware shadowing | (1) `cargo clean -p rdna-compute && cargo build --release ...` to rule out cache; (2) `cat /sys/class/drm/card*/device/pp_dpm_sclk` to check DPM state; (3) `dmesg \| tail -40` for firmware errors; (4) re-run gate. If still regressed, revert the diff and bisect |
+| Speed-gate regress on gfx1100 from "should-be-no-op" refactor | **Most common cause**: gate's `ensure_build` is a no-op when the bench binary exists, so "stash and re-bench" measures the same binary twice. Less common: real codegen difference, GPU thermal drift, firmware shadowing. | (1) `rm target/release/examples/bench_qwen35_mq4` to force a clean bench-binary rebuild (the gate detects missing exe and rebuilds); (2) `cargo clean -p rdna-compute && cargo build --release ...` to invalidate the dispatch crate; (3) `cat /sys/class/drm/card*/device/pp_dpm_sclk` to check DPM state; (4) `dmesg \| tail -40` for firmware errors; (5) re-run gate. If still regressed, revert the diff and bisect |
 | Speed-gate regress with system in known-good state | Firmware shadowing — `/lib/firmware/updates/amdgpu` overrides kernel firmware → SMU IF mismatch | `sudo mv /lib/firmware/updates/amdgpu /lib/firmware/updates/amdgpu.bak && sudo reboot` |
 
 ## Last verified
 
 This procedure was used to validate gfx1100 (RDNA3) and gfx1030
-(RDNA2) ports. gfx1201 (RDNA4) port is in progress as of 2026-04-27
-(tracking issue #54).
+(RDNA2) ports. gfx1201 (RDNA4) port is in progress as of 2026-04-27:
+- 6e100c2 — dispatch fallback (gfx12 routes to dot2 path) shipped.
+- 6924f2a — first canonical gfx12 WMMA kernel scaffolded
+  (`kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip`); compile-tests
+  green for gfx1200/gfx1201, NOT yet wired into dispatch.rs pending
+  R9700 channel-test (see issue #54).

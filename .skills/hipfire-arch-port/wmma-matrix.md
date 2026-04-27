@@ -33,7 +33,14 @@ in LDS → WMMA into fp32 accumulator).
    `acc[j] = C[2*j + (tid>>4)][tid & 15]` (validated 2026-04-12 in
    `project_wmma_correctness_fix.md` after a 6-week silent
    corruption bug). **gfx12's mapping is unverified by hipfire** —
-   needs hardware validation, do NOT assume identical.
+   needs hardware validation, do NOT assume identical. Working
+   hypothesis baked into the canonical scaffold
+   (`gemm_qkv_hfq4g256_wmma.gfx12.hip`, commit 6924f2a) is
+   `acc[j] = C[8*(tid>>4) + j][tid & 15]` — derived from the CK
+   trait swap of `kCM0PerLane: 8 → 1` and `kCM1PerLane: 1 → 8`.
+   Lane group 0 holds output rows 0..7; group 1 holds rows 8..15.
+   This must be channel-tested on R9700 / 9070 XT before any
+   kernel using it is wired into `dispatch.rs`.
 
 ## bf16×bf16→fp32 16×16×16
 

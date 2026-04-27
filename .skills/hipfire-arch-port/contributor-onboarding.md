@@ -83,15 +83,26 @@ scaling.
 
 ### 4. Author the kernel(s) as separate `.hip` files
 
-`kernels/src/<existing_name>_<arch>.hip`. Naming convention is
-documented in `playbook.md`. Reference the gfx11 version side-by-
-side and walk through:
+`kernels/src/<existing_name>.<arch_tag>.hip` (dot-separated). The
+tag is `.gfxNN.` (family) or `.gfxNNNN.` (chip). Naming convention
++ family-tag resolution is documented in `playbook.md` step 4.
 
-- LDS staging (does the K-tile striding need to change? for gfx11→
-  gfx12 — yes, K-packing per lane goes 16→8).
-- WMMA call (swap builtin name AND adjust operand vector types).
-- Output writeback (does the C-mapping change? assume yes, verify
-  empirically).
+**Read the canonical reference first:**
+`kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip` (commit 6924f2a) is
+the worked-out gfx12 port of `gemm_qkv_hfq4g256_wmma.hip`. It
+documents inline:
+
+- LDS staging changes (K-packing per lane goes 16→8 for gfx12).
+- WMMA call (swap builtin name AND adjust operand vector types from
+  `half16_t` to `half8_t`).
+- K-direction split across 2 lane-groups via `tid >> 4`.
+- Output writeback hypothesis (rows contiguous per lane-group on
+  gfx12 vs interleaved on gfx11) — marked as needing channel-test
+  validation.
+
+Fork the canonical file as the starting point for each of the five
+remaining gfx11 WMMA kernels (`qkvza-hfq4`, `gate_up-hfq4`, plus
+the three `hfq6` variants).
 
 ### 5. Wire dispatch + add the channel-test case
 
@@ -243,11 +254,30 @@ review the plan before any code is written, then iterate.
 - A naive dispatch fallback was attempted (commit `a048544`) and
   reverted (`1f3bad3`) because:
   - It bypassed the speed-gate inappropriately.
-  - The "no-op" predicate refactor regressed gfx1100 prefill 50%.
+  - The "no-op" predicate refactor APPEARED to regress gfx1100
+    prefill 50%.
+- Re-tested in 6e100c2 with forced rebuild after `rm
+  target/release/examples/bench_qwen35_mq4`: the regression was a
+  stale-binary measurement artifact. The predicate refactor is
+  functionally identical for gfx1100 codegen. **Lesson:** the
+  speed-gate's `ensure_build` is a no-op when the binary already
+  exists, so a "stash and re-bench" verification flow can lie. Force
+  a rebuild before drawing any conclusion from a re-bench.
 - This skill was authored to capture the lessons before the next
-  port attempt.
+  port attempt (commits `a088396` → `f676520`).
+- The gfx12 dispatch fallback ships in 6e100c2: gfx12 routes to the
+  dot2 path until per-arch WMMA kernels land. 9070 XT users now have
+  a working baseline.
+- The first gfx12 WMMA kernel (`gemm_qkv_hfq4g256_wmma.gfx12.hip`)
+  ships in 6924f2a as the canonical pattern reference. Five more
+  gfx11 WMMA kernels still need ports — fork the canonical file.
+- `scripts/compile-kernels.sh` now resolves family tags
+  (`.gfxNN.hip`) in addition to chip tags (`.gfxNNNN.hip`), so a
+  single `name.gfx12.hip` file covers both gfx1200 and gfx1201.
 - kmbandy (GitHub) volunteered to do the gfx1201 port with R9700
-  hardware — see issue #45 comment for context.
+  hardware — see issue #45 comment for context. The runtime
+  channel-test on the canonical kernel's C-mapping hypothesis is
+  the next blocker.
 
 ## You're contributing into a small, opinionated codebase
 
