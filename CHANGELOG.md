@@ -1,53 +1,168 @@
 # Changelog
 
-## Unreleased — perf-regression-recovery (2026-04-26)
+## v0.1.8-alpha.1 (2026-04-27)
 
-### Fixed
+Point release rolling up the post-v0.1.8-alpha work. Two contributor PRs land in
+this cycle (gfx1201 RDNA4 WMMA port from @RobinVanCauter, gfx1151 Strix Halo
+autodetect from @KotDath), plus a feature on the input side (GGUF →
+HFQ4/MQ4 conversion) and a docs nuke + rewrite that swaps a 39-file legacy
+tree for 10 canonical pages.
 
-- **27B DFlash perf regression** (~40% drop on `dflash` since the 2026-04-25
-  master→dflash merge `e3a3da2`). Root cause: PR #32 cleanup-dead-wmma-kernels
-  removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking they were dead
-  but they were on the K4 / wmma dispatch path for 27B verify-shape GEMMs.
-  Per-cycle cost on 64-layer × B=16 verify forward: 57 → 100+ ms. Fixed via
-  revert of merge `e3a3da2` (commit `357e314`) followed by cherry-pick of the
-  8 master commits that did NOT introduce the regression. Full timeline in
-  the recovery commit (`9a2c667`).
-  - Empirical anchor: 27B-3.5 LRU code DFlash @ max=120 = 199 tok/s τ=10.36
-    (was: 95 tok/s in pre-revert state).
+### Highlights
+
+- **RDNA4 / 9070 XT unblock end-to-end** (#54). gfx1201 WMMA codegen crash
+  resolved via dispatch fallback (`6e100c2`); first canonical gfx12 WMMA
+  scaffold (`6924f2a`) with C-output mapping hypothesis derived from the
+  CK trait swap; full validated 5-kernel + 6-channel-test contributor port
+  (PR #56) hardware-tested on R9700 silicon. C-mapping
+  `acc[j] = C[8*(tid>>4) + j][tid & 15]` validated, propagated across the
+  family. Public dispatch still routes gfx12 through dot2 fallback pending
+  perf measurement (#57); the WMMA methods on `Gpu` are exposed for
+  channel-tests now and ready to flip when numbers land.
+- **gfx1151 / Strix Halo autodetect fix** (PR #59, @KotDath). KFD
+  `gfx_target_version 110501` was decoding to `gfx11051` instead of
+  `gfx1151`; fixed via explicit known-version table in `cli/index.ts`
+  + `scripts/install.sh`. Same refactor incidentally fixes a latent
+  same-class bug for any arch with non-zero step bytes
+  (`100302 → gfx1003` was equally wrong before this PR). Hardware-validated
+  on Ryzen AI Max+ 395 / Radeon 8060S; speed-baseline contribution welcome
+  at #61. Issue #50 (gfx1152, separate Strix Halo SKU) untouched —
+  detection now correctly resolves the arch, but the engine-side segfault
+  reported there still needs reproduction info.
+- **GGUF → HFQ4 / MQ4 import**. New `hipfire quantize <file.gguf>` mode
+  accepts any GGUF the engine can load (`Q4_K_M` / `Q8_0` / `Q4_0` / `Q6_K`
+  / `F16` / `BF16` / `F32` source quantizations) and re-quantizes to
+  hipfire's native HFQ4-G256 (default for dense Llama / Mistral / older
+  Qwen) or MQ4-G256 (FWHT-rotated, opt-in for Qwen 3.5+ family). Tensor
+  names are translated GGUF → safetensors style at write time so the
+  engine's existing `load_weights_hfq` consumes the output unchanged;
+  the GGUF tokenizer is preserved verbatim under `meta.gguf_meta` and
+  `Tokenizer::from_hfq_metadata` reads it directly (no GGUF-on-disk
+  fallback). End-to-end UX:
+  ```bash
+  hipfire quantize ./tinyllama.Q4_K_M.gguf --install --register tinyllama:1b-gguf
+  hipfire run tinyllama:1b-gguf "..."
+  ```
+  Quality is lower than quantizing from full-precision safetensors (it's a
+  double-quant roundtrip — raise to `--format hf6` or `--format mq6` if
+  you have the disk space). Format defaults are dense-aware: HF4 for GGUF
+  input, MQ4 for safetensors directories.
+- **`dflash_mode` default flipped to `off`** (was `auto`). DFlash is now
+  opt-in: `hipfire config set dflash_mode auto` re-enables the genre-
+  conditional auto-routing (DFlash on for dense Qwen 3.5+ targets, off
+  for A3B without a TriAttention sidecar). Bare `hipfire run <target>`
+  without that config flip stays pure AR even when a paired draft is on
+  disk; the daemon logs `[hipfire] DFlash disabled (dflash_mode=off)` so
+  it's not a silent footgun. Background: per-genre measurements show
+  DFlash a clear win on code, modest on instruct, and a net loss on
+  long-form prose. Default-on overpromised; default-off + opt-in matches
+  the actual win surface.
+- **Docs rewrite + LICENSE**. The 39-file `docs/` tree (mix of canonical
+  user docs and operational artifacts: agent prompts, daily standups,
+  port plans, perf checkpoints) consolidated to 10 canonical pages —
+  `GETTING_STARTED` / `CLI` / `MODELS` / `QUANTIZE` / `CONFIG` / `SERVE` /
+  `BENCHMARKS` / `ARCHITECTURE` / `QUANTIZATION` /
+  `methodology/perf-benchmarking`. README cut 371 → 89 lines; first-time
+  visitors see the pitch + headline benchmark + install in 10 seconds
+  rather than scrolling through the model catalog. New top-level `LICENSE`
+  file (was missing despite the README and `Cargo.toml` declaring MIT).
+- **New `hipfire-kernel-tuning` agent skill**. Sibling to the
+  `hipfire-arch-port` skill from earlier this cycle. Codifies the
+  empirical kernel-perf methodology from this repo's git log: 6-step
+  workflow (measure → root-cause → pick lever → cross-arch verify →
+  three gates → cross-process measure), levers catalog (multi-row,
+  K-tile depth, wave64 port, `s_prefetch_data`, WMMA / MFMA, fused
+  projections, ISA flags, rocBLAS fallback), cross-arch dispatch
+  routing rules, and five worked case studies — wave64 CDNA3 port
+  (+2× MI300X decode, `4105035`), nontemporal-load fake-win revert
+  (-13% caught only by clean-baseline bisect, `34eb024`), k2x32 null
+  result kept for posterity (`f670e16`), gfx11 WMMA C-mapping silent
+  corruption (~6 weeks before catch, `b7ac66a`), and 27B DFlash perf
+  recovery root-caused to a single newline character in a bench
+  prompt (`9a2c667`).
+- **Vision correctness** (#23 / PR #35). `load_and_preprocess` writes
+  pixel bytes in R,B,G order so the upstream HuggingFace
+  `patch_embed`-export channel transposition cancels at inference; full
+  details below in "Fixed".
+- **27B DFlash perf restored** (`9a2c667`, ~40% recovery). PR #32
+  cleanup-dead-wmma-kernels removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip`
+  thinking they were dead — they were on the K4 / WMMA dispatch path for
+  27B verify-shape GEMMs. Per-cycle cost on 64-layer × B=16 verify forward
+  was 57 → 100+ ms. Fix landed via revert + cherry-pick of the 8 master
+  commits that did NOT introduce the regression. Empirical anchor: 27B-3.5
+  LRU code DFlash @ max=120 = 199 tok/s τ=10.36 (was: 95 tok/s in
+  pre-revert state).
+
+### Added
+
+- **`hipfire quantize <file.gguf>`** — see GGUF import in highlights.
+  New `crates/hipfire-quantize/src/gguf_input.rs` (self-contained reader +
+  dequant for Q4_0 / Q8_0 / Q4_K / Q6_K / F16 / BF16 / F32). New
+  `Tokenizer::from_gguf_meta_json` engine-side path so converted files
+  carry their own tokenizer metadata.
+- **gfx12 (RDNA4) WMMA kernels**: 6 new `kernels/src/gemm_*_wmma.gfx12.hip`
+  kernels with channel tests in `crates/engine/examples/test_wmma_*_gfx12.rs`.
+  Compile-tested green on gfx1200 + gfx1201 via the family-tag override
+  in `scripts/compile-kernels.sh`.
+- **`scripts/_detect-gpu.sh`** — shared `rocminfo` + `amdgpu-arch` GPU
+  detection helper. Three previously hardcoded "RX 5700 XT" bench banners
+  now derive from `hipfire_gpu_banner`.
+- **`hipfire-kernel-tuning` skill** + extension to the `hipfire-arch-port`
+  skill (canonical kernel referenced, validated C-mapping documented).
+- **`gfx_target_version` known-version table** (PR #59). Explicit
+  Record<number, string> for 100100 / 100300 / 100302 / 110000 / 110001 /
+  110501 / 120000 / 120001, with algorithmic fallback for unknown versions.
+- **CONTRIBUTING.md rewrite**. 271 → 216 lines, tester path now genuinely
+  uses installer-provided binaries (`hipfire diag` + `hipfire bench`), all
+  four agent skills indexed.
+- **Top-level `LICENSE` file** (MIT, copyright 2026 Kaden Schutt).
 
 ### Changed
 
-- **`prompt_normalize` is now default ON** (was opt-in since v0.1.8-alpha).
+- **`prompt_normalize` default ON** (was opt-in since v0.1.8-alpha).
   Engine collapses `\n{3,}` → `\n\n` at engine entry, lifting 27B-3.5 LRU
   DFlash by +24% (159 → 199 tok/s). Opt out via `HIPFIRE_NORMALIZE_PROMPT=0`
   or `prompt_normalize=false` config when raw `\n{3,}` whitespace is
-  semantically load-bearing (rare). The flag has zero correctness cost on
-  Qwen3.5/3.6 vocab — `\n\n\n` was a rare BPE token (rank 1102) that was
-  getting in the way of the much hotter `\n\n` (rank 271).
+  semantically load-bearing (rare). Zero correctness cost on Qwen3.5/3.6
+  vocab — `\n\n\n` was a rare BPE token (rank 1102) getting in the way of
+  the much hotter `\n\n` (rank 271).
+- **`dflash_mode` default OFF** (was `auto`). See highlights.
+- **GGUF input format default**: `--format hf4` (was implicitly `mq4`).
+  MQ4's FWHT rotation is calibrated for Qwen 3.5+ training; on Llama-style
+  dense models it adds runtime overhead with no quality benefit. Override
+  with `--format mq4` for Qwen 3.5+ family GGUFs.
+- **CLI test-kernels.sh + megabench-q35.sh + bench-matrix.sh** auto-detect
+  arch + GPU name via `_detect-gpu.sh`; the previous hardcoded "RX 5700 XT
+  / gfx1010" defaults that bled into bench reports are gone.
+- **AGENTS.md** — DFlash default-off surfaced in §3.6 pull-flow recipe and
+  added to the §6 pitfalls table; flag table corrected
+  (`HIPFIRE_DFLASH_DRAFT` description now says "filename auto-match" not
+  "auto-discover", with empty-string opt-out path documented).
 
-### Notes
+### Fixed
 
-- `master` is **still affected** until the cherry-pick from `dflash` lands.
-  Anyone pulling `master` between v0.1.8 release (2026-04-25) and this fix
-  gets the regressed engine. Expected fix: a small follow-up PR cherry-
-  picking just the kernel restoration + `prompt_normalize` default flip.
-
-## Unreleased — vision correctness bundle (PR #35)
-
-Fixes issue #23 (VL color misidentification) and addresses review feedback
-on the superseded PR #22.
-
-### Fixes
-
-- **`#23` — VL model misidentifies green and blue objects.** Pure-color
-  probing (red/green/blue PNGs, temp=0 greedy decoding) showed the vision
-  encoder reading green pixels as blue and blue pixels as green while red
-  came through correctly — a classic G↔B transposition. Root cause is most
-  likely a channel permutation in the HuggingFace `patch_embed` weight
-  export (input conv channels 1 and 2 appear transposed); the repair here
-  lives in preprocessing: `load_and_preprocess` now writes pixel bytes in
-  R,B,G order into the CHW tensor so the two transpositions cancel.
-  Regression test pins the contract at
+- **gfx1201 WMMA codegen crash on first dispatch** (#54). Routes to dot2
+  fallback until per-arch WMMA kernels land. The dispatch predicate
+  `has_wmma_f16` now matches gfx11 only; the gfx12 WMMA path is exposed
+  on `Gpu` for channel-tests and will flip via #57 when perf is measured
+  on R9700.
+- **gfx1151 (Strix Halo) autodetect** (PR #59). KFD `gfx_target_version
+  110501` decoded to `gfx11051` instead of `gfx1151` due to a
+  `padStart(2, '0')` + `replace(/^(gfx\d{4})0$/, '$1')` interaction in
+  the version decoder. Same class of bug also affected `100302 →
+  gfx1003` (should be `gfx1030`). Fixed via explicit known-version table
+  + algorithmic fallback consolidation in `cli/index.ts` and
+  `scripts/install.sh`.
+- **27B DFlash perf** — see highlights.
+- **#23 — VL model misidentifies green and blue objects.** Pure-color
+  probing (red/green/blue PNGs, temp=0 greedy decoding) showed the
+  vision encoder reading green pixels as blue and blue pixels as green
+  while red came through correctly — a classic G↔B transposition. Root
+  cause is most likely a channel permutation in the HuggingFace
+  `patch_embed` weight export (input conv channels 1 and 2 appear
+  transposed); the repair lives in preprocessing — `load_and_preprocess`
+  now writes pixel bytes in R,B,G order so the two transpositions
+  cancel. Regression test pins the contract at
   `crates/engine/tests/channel_order.rs`.
 - **Vision weight upload shape encoding.** `qwen35_vl::load_f16_gpu`
   passed byte-length as the tensor shape on both the F16-direct and
@@ -59,9 +174,59 @@ on the superseded PR #22.
   `model.visual.patch_embed.proj.weight` at load time so HFQ4 models
   can be distinguished from F16 models at a glance during debugging.
 - **Dead kernel file cleanup.** Removed `gemm_f16_wmma_tiled.hip` and
-  `vit_attention_flash.hip` — neither was referenced via
-  `ensure_kernel` dispatch and both were stale copies superseded by the
-  active vit_attention and gemm kernels.
+  `vit_attention_flash.hip` — neither was referenced via `ensure_kernel`
+  dispatch and both were stale copies superseded by the active
+  `vit_attention` and `gemm` kernels.
+- **CLI `quantize` `--format hf6` symmetry** — the safetensors path's
+  `use_hfq6` flag now accepts the `hf6` short alias to match the GGUF
+  path's `GgufFormat::from_flag`, eliminating a silent fall-through where
+  `hipfire quantize <safetensors-dir> --format hf6` would silently
+  downgrade to the q4k default.
+- **Output extension on GGUF conversion** — was `.hfq4` / `.hfq6` (which
+  the CLI's `resolveModelTag` / `list` / fuzzy lookup don't recognize),
+  now `.hf4` / `.hf6` so converted files surface in `hipfire list` and
+  resolve via tag aliases.
+- **CONTRIBUTING tester path** — was claiming "no Rust required" but
+  pointed at scripts that run `cargo build`. Tester path now uses
+  installer-provided `hipfire diag` + `hipfire bench`.
+
+### Documentation
+
+- 10 canonical `docs/` pages replace the prior 39-file tree (archive at
+  `~/hipfire-docs-archive-2026-04-27/`, history preserved by git).
+- `.skills/hipfire-kernel-tuning/` — new agent skill (5 markdown files,
+  893 lines total).
+- `README.md` cut 371 → 89 lines.
+- `CONTRIBUTING.md` rewritten end-to-end.
+- `AGENTS.md` updated for default-off DFlash + flag table corrections.
+
+### Issues filed for follow-up
+
+- **#57** — gfx12 WMMA dispatch wiring + perf vs dot2 (R9700 / 9070 XT
+  hardware-gated; PR #56 landed kernels but didn't flip dispatch).
+- **#58** — multi-GPU support roadmap. Pipeline-parallel first cut design
+  open for discussion.
+- **#60** — prefill scaling regression vs llama.cpp at pp≥512 on 9B+.
+  Diagnostic phase needs no kernel writing, anyone with a 7900 XTX can
+  contribute the per-kernel `HIPFIRE_PROFILE=1` breakdown.
+- **#61** — gfx1151 (Strix Halo) speed-baseline + perf bench. One-command
+  bootstrap for any Strix Halo owner.
+
+### Upgrade
+
+```
+hipfire update
+```
+
+No config migration. `~/.hipfire/config.json` from v0.1.8-alpha remains
+compatible. If you were relying on default-on DFlash, re-enable
+explicitly:
+
+```
+hipfire config set dflash_mode auto
+```
+
+---
 
 ## v0.1.7-alpha.2 (2026-04-18)
 
