@@ -995,26 +995,23 @@ fn load_dflash_state(
     let ddtree = match Some(ddtree_budget_env).filter(|&n| n > 0) {
         Some(budget) => {
             // topk caps the per-position branching factor in the tree
-            // builder. Algorithm 1's typical setting is 4; values above
-            // ~32 stop being meaningful (siblings beyond rank-32 contribute
-            // ≪1% mass on a Qwen-class draft) and inflate scratch usage
-            // without acceptance benefit.
+            // builder. Algorithm 1's typical setting is 4; the active
+            // kernel `run_dflash_draft_for_topk_gpu` (called by both
+            // `spec_step_ddtree_batched` and `spec_step_ddtree_path_c`)
+            // asserts `k >= 1 && k <= 8` at speculative.rs:3302 and panics
+            // outside that range. Take the kernel's bound as authoritative;
+            // anything looser would let env-var values pass daemon
+            // validation but blow up at the first decode cycle.
             //
             // Two upper bounds:
-            //   - DDTREE_TOPK_MAX: usability cap (32) — beyond this, no
-            //     acceptance gain on Qwen-class targets.
-            //   - vocab_size: HARD correctness cap. Asking the tree builder
-            //     to extract top-K from a distribution narrower than K
-            //     would panic in the kernel. Almost never the binding
-            //     constraint on real LLMs (vocab ~50K-200K), but matters
-            //     for small / test / character-level vocabs.
+            //   - DDTREE_TOPK_KERNEL_MAX = 8 — kernel's hardcoded assert.
+            //   - vocab_size — extra correctness cap for tiny-vocab /
+            //     character-level targets where vocab can be < 8.
             //
-            // Effective cap = min(32, vocab_size). Default = min(4, vocab_size).
-            // The previous-iteration vocab_size-only filter (no usability cap)
-            // was a footgun on Qwen3.6; the no-vocab-check version was a
-            // panic vector on tiny-vocab models. Need both.
+            // Effective cap = min(8, vocab_size). Default = min(4, vocab_size).
+            const DDTREE_TOPK_KERNEL_MAX: usize = 8;
             let vocab = target_config.vocab_size;
-            let effective_topk_max = std::cmp::min(32usize, vocab);
+            let effective_topk_max = std::cmp::min(DDTREE_TOPK_KERNEL_MAX, vocab);
             let default_topk = std::cmp::min(4usize, vocab.max(1));
             let topk = match std::env::var("HIPFIRE_DDTREE_TOPK").ok() {
                 None => default_topk,
