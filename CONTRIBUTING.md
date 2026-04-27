@@ -116,7 +116,11 @@ us before.
 
 Architecture deep-dive: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 Quantization design (MQ4 / HF4 / asym KV math):
-[docs/QUANTIZATION.md](docs/QUANTIZATION.md).
+[docs/QUANTIZATION.md](docs/QUANTIZATION.md). Tuning an existing
+kernel for perf (multi-row, K-tile depth, wave64 port, prefetch,
+ISA flags) — see [`.skills/hipfire-kernel-tuning/`](.skills/hipfire-kernel-tuning/),
+which catalogs the empirical methodology + every lever this repo's
+git log has actually used.
 
 ### Porting to a new GPU arch
 
@@ -183,6 +187,7 @@ unreproducible — see
 | [`hipfire-diag`](.skills/hipfire-diag/) | "Hipfire isn't working — what's wrong?" Captures GPU/HIP/kernel state. |
 | [`hipfire-autoheal`](.skills/hipfire-autoheal/) | Runtime issue triage: daemon hangs, JIT failures, port conflicts, OOM. |
 | [`hipfire-arch-port`](.skills/hipfire-arch-port/) | Porting hipfire to a new GPU arch (gfx12, gfx1152, gfx94x, …). |
+| [`hipfire-kernel-tuning`](.skills/hipfire-kernel-tuning/) | Optimize an existing kernel — pick a lever (multi-row, K-tile depth, prefetch, wave64 port, WMMA/MFMA, fused projections, ISA flags) and validate the win across the supported arch matrix. |
 
 Each skill has a `SKILL.md` (or `skill.json` + sibling `.md` files)
 that any agent framework can load. Designed for Claude Code / Cursor /
