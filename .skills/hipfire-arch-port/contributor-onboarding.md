@@ -98,38 +98,45 @@ side and walk through:
 `crates/rdna-compute/src/kernels.rs`: add `include_str!` for the
 new kernel.
 
-`crates/rdna-compute/src/dispatch.rs`: add an arch-conditional
-branch for the new arch. Two principles:
+`crates/rdna-compute/src/dispatch.rs`: add the dispatch branch
+for the new arch and **simultaneously remove the new arch from
+any older check that now has a more specific match**. Don't leave
+dead `|| starts_with("gfxN")` clauses in master — the dispatch
+tree must accurately reflect which arch each branch serves, or
+the next reader (human or agent) will be misled about routing.
 
-1. **Make the change strictly additive**: don't modify existing
-   arch checks for previous archs in the same diff. Add the new
-   arch, run the gate, then if you also want to clean up the
-   existing dispatch (e.g. remove the now-unreachable `gfx12` from
-   an old `gfx11 || gfx12` check), do that as a SEPARATE commit
-   so the gate can attribute any regression cleanly.
+Two principles:
+
+1. **Each arch must appear in exactly one dispatch branch per
+   site.** When you add `if starts_with("gfx12")` above a check
+   that previously matched gfx12 via `gfx11 || gfx12`, simplify
+   the older check to just `starts_with("gfx11")` in the same diff.
 
 2. **Match the surrounding style**: if the nearby code uses inline
    `arch.starts_with(...)`, match it. If it uses a `has_<feature>`
    helper, match that. Don't invent a new convention for your one
    arch.
 
-Example, additive-style:
+Example:
 
 ```rust
 // New arch port (gfx12, RDNA4):
 if self.arch.starts_with("gfx12") {
     return self.gemm_<x>_wmma_gfx12(...);
 }
-// Existing gfx11 path (unchanged in this commit):
-if self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12") {
+// Existing gfx11 path — `|| starts_with("gfx12")` removed
+// because the new arch is fully handled above:
+if self.arch.starts_with("gfx11") {
     return self.gemm_<x>_wmma(...);
 }
 ```
 
-The existing inline check's `|| starts_with("gfx12")` is now
-unreachable but keeping it intact means the gfx11 codegen and
-register pressure are byte-identical to before your diff. Land
-that cleanup in a follow-up commit.
+Run the speed-gate after the combined change. If the gate
+regresses on the baseline arch (gfx1100), **root-cause it before
+landing** — see `validation.md`'s troubleshooting table (stale
+build cache and firmware shadowing are the most common false-
+positive sources). Do NOT split the diff into "add new arch" +
+"clean up dead branch" as a workaround for a regressing gate.
 
 `crates/engine/examples/test_kernels.rs`: add a test case that
 exercises your new kernel on the new arch.

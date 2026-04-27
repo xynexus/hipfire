@@ -59,12 +59,19 @@ near the top of `dispatch.rs` (around lines 30–80) — extend them
 when the same predicate would be tested in 3+ places. Add new
 inline checks when one site needs the test once.
 
-When adding a new arch's dispatch branch, **do not modify the
-existing inline check for the previous arch in the same commit**.
-Land the new arch as a strictly additive change (a new `if` above
-or below the existing one), then run the speed-gate on the
-baseline arch (gfx1100 on the local 7900 XTX bench) before
-considering any refactor. See "Open root-cause" below.
+When adding a new arch's dispatch branch, ensure each arch
+appears in exactly one branch per dispatch site. If the new arch
+was previously absorbed by a more permissive check (e.g. an
+existing `gfx11 || gfx12` branch routing gfx12 to the gfx11
+kernel), narrow that older check to drop the now-handled arch in
+the same commit — don't leave dead alternates. The dispatch tree
+is read by humans and agents trying to figure out which arch
+takes which path; stale conditions corrupt that signal.
+
+Run the speed-gate on the baseline arch (gfx1100 on the local
+7900 XTX bench) after the combined change. If the gate
+regresses, root-cause it (see `validation.md` troubleshooting)
+rather than splitting the diff to dodge the regression.
 
 ### 3. Open root-cause: "predicate-vs-inline" gfx11 perf observation
 
