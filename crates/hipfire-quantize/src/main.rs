@@ -1,9 +1,12 @@
 //! hipfire-quantize: Quantize raw FP16/BF16/FP32 model weights to Q4_F16 format.
 //!
-//! Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format q4f16-g64]
+//! Usage: hipfire-quantize --input <model_dir-or-gguf> --output <output.hfq> [--format mq4]
 //!
-//! Reads safetensors files from a HuggingFace model directory and produces
-//! a .hfq (HipFire Quantized) file with RDNA-native Q4_F16 quantized weights.
+//! Reads safetensors files from a HuggingFace model directory OR a single
+//! `.gguf` file and produces a `.hfq` (HipFire Quantized) file with
+//! RDNA-native quantized weights.
+
+mod gguf_input;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -1115,6 +1118,359 @@ fn resolve_model_path(input: &str) -> String {
     input.to_string()
 }
 
+// ─── GGUF input pipeline ────────────────────────────────────────────────────
+
+/// True if the path points to a `.gguf` file on disk.
+fn is_gguf_input(p: &Path) -> bool {
+    p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("gguf")
+}
+
+/// Translate llama.cpp GGUF tensor names to the HuggingFace safetensors
+/// names that `engine::hfq::load_weights_hfq` expects. The mapping is
+/// the canonical llama.cpp ↔ HF convention.
+///
+/// Returns None for tensors that don't have a known safetensors equivalent
+/// (we then keep them under their GGUF name; the future loader can decide
+/// what to do, or they're skipped).
+fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
+    // Top-level tensors.
+    match gguf_name {
+        "token_embd.weight" => return Some("model.embed_tokens.weight".to_string()),
+        "output.weight" => return Some("lm_head.weight".to_string()),
+        "output_norm.weight" => return Some("model.norm.weight".to_string()),
+        _ => {}
+    }
+    // Per-layer: blk.{N}.<slot>.weight  →  model.layers.{N}.<slot>.weight
+    if let Some(rest) = gguf_name.strip_prefix("blk.") {
+        // rest = "{N}.<slot>.weight"
+        let dot = rest.find('.')?;
+        let layer_idx = &rest[..dot];
+        let slot_full = &rest[dot + 1..]; // "<slot>.weight"
+        // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
+        let slot = slot_full.strip_suffix(".weight")?;
+        let translated = match slot {
+            "attn_norm" => "input_layernorm".to_string(),
+            "ffn_norm" => "post_attention_layernorm".to_string(),
+            "attn_q" => "self_attn.q_proj".to_string(),
+            "attn_k" => "self_attn.k_proj".to_string(),
+            "attn_v" => "self_attn.v_proj".to_string(),
+            "attn_output" => "self_attn.o_proj".to_string(),
+            "attn_q_norm" => "self_attn.q_norm".to_string(),
+            "attn_k_norm" => "self_attn.k_norm".to_string(),
+            "ffn_gate" => "mlp.gate_proj".to_string(),
+            "ffn_up" => "mlp.up_proj".to_string(),
+            "ffn_down" => "mlp.down_proj".to_string(),
+            other => return Some(format!("model.layers.{layer_idx}.{other}.weight")),
+        };
+        return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
+    }
+    None
+}
+
+/// True if the GGUF tensor's name is a 1D norm / RMSNorm scaling vector.
+/// These stay F16 in the .hfq (no benefit from quantization, precision-sensitive).
+fn gguf_is_norm_tensor(name: &str) -> bool {
+    name.contains("_norm") || name.contains("norm.weight")
+}
+
+/// True if the tensor is the token embedding. We Q8 these (matches the
+/// safetensors path's `is_embed` rule — Q4 is too lossy for embedding tables).
+fn gguf_is_embed_tensor(name: &str) -> bool {
+    name == "token_embd.weight"
+}
+
+/// Build the `config` JSON object that `engine::hfq::config_from_hfq`
+/// reads. Mirrors the field names HuggingFace uses in `config.json` for
+/// LlamaForCausalLM / Qwen3ForCausalLM, populated from the GGUF
+/// `<arch>.*` metadata keys.
+fn config_json_from_gguf(
+    gguf: &gguf_input::GgufFile,
+    arch_str: &str,
+) -> serde_json::Value {
+    // GGUF prefixes its model hyperparameters with the architecture name —
+    // e.g. for `general.architecture=llama` the keys live under `llama.*`.
+    let prefix = arch_str;
+
+    let read_u = |k: &str| -> Option<u64> {
+        gguf.metadata
+            .get(k)
+            .and_then(|v| match v {
+                gguf_input::MetaValue::U8(x) => Some(*x as u64),
+                gguf_input::MetaValue::I8(x) => Some(*x as u64),
+                gguf_input::MetaValue::U16(x) => Some(*x as u64),
+                gguf_input::MetaValue::I16(x) => Some(*x as u64),
+                gguf_input::MetaValue::U32(x) => Some(*x as u64),
+                gguf_input::MetaValue::I32(x) => Some(*x as u64),
+                gguf_input::MetaValue::U64(x) => Some(*x),
+                gguf_input::MetaValue::I64(x) => Some(*x as u64),
+                _ => None,
+            })
+    };
+    let read_f = |k: &str| -> Option<f64> {
+        gguf.metadata
+            .get(k)
+            .and_then(|v| match v {
+                gguf_input::MetaValue::F32(x) => Some(*x as f64),
+                gguf_input::MetaValue::F64(x) => Some(*x),
+                _ => None,
+            })
+    };
+
+    let dim = read_u(&format!("{prefix}.embedding_length"));
+    let n_layers = read_u(&format!("{prefix}.block_count"));
+    let n_heads = read_u(&format!("{prefix}.attention.head_count"));
+    let n_kv_heads = read_u(&format!("{prefix}.attention.head_count_kv"))
+        .or(n_heads);
+    let hidden_dim = read_u(&format!("{prefix}.feed_forward_length"));
+    // vocab_size: prefer metadata, fall back to token_embd shape[1].
+    let vocab_size = read_u(&format!("{prefix}.vocab_size")).or_else(|| {
+        gguf.tensors
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .and_then(|t| t.shape.get(1).map(|&s| s as u64))
+    });
+    let max_seq_len = read_u(&format!("{prefix}.context_length"));
+    let rope_theta = read_f(&format!("{prefix}.rope.freq_base"));
+    let rms_eps = read_f(&format!("{prefix}.attention.layer_norm_rms_epsilon"));
+    let head_dim = read_u(&format!("{prefix}.attention.key_length"))
+        .or_else(|| {
+            // Fall back: head_dim = dim / n_heads.
+            dim.zip(n_heads)
+                .map(|(d, h)| if h > 0 { d / h } else { d })
+        });
+    let bos = read_u("tokenizer.ggml.bos_token_id").unwrap_or(1);
+    let eos = read_u("tokenizer.ggml.eos_token_id").unwrap_or(2);
+
+    let mut cfg = serde_json::Map::new();
+    cfg.insert(
+        "model_type".to_string(),
+        serde_json::Value::from(arch_str.to_string()),
+    );
+    if let Some(v) = dim {
+        cfg.insert("hidden_size".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = n_layers {
+        cfg.insert("num_hidden_layers".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = n_heads {
+        cfg.insert(
+            "num_attention_heads".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    if let Some(v) = n_kv_heads {
+        cfg.insert(
+            "num_key_value_heads".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    if let Some(v) = hidden_dim {
+        cfg.insert(
+            "intermediate_size".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    if let Some(v) = vocab_size {
+        cfg.insert("vocab_size".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = max_seq_len {
+        cfg.insert(
+            "max_position_embeddings".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    if let Some(v) = rope_theta {
+        cfg.insert("rope_theta".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = rms_eps {
+        cfg.insert("rms_norm_eps".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = head_dim {
+        cfg.insert("head_dim".to_string(), serde_json::Value::from(v));
+    }
+    cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
+    cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
+    serde_json::Value::Object(cfg)
+}
+
+/// Translate the GGUF metadata HashMap into a JSON object that ends up in
+/// the `.hfq` header's metadata blob. A future engine-side `from_hfq` for
+/// Llama-style models can read these fields the same way the existing
+/// `from_gguf` reads them today.
+fn gguf_meta_to_json(meta: &HashMap<String, gguf_input::MetaValue>) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (k, v) in meta {
+        let json_v = mv_to_json(v);
+        map.insert(k.clone(), json_v);
+    }
+    serde_json::Value::Object(map)
+}
+
+fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
+    use gguf_input::MetaValue as MV;
+    match v {
+        MV::U8(x) => serde_json::Value::from(*x),
+        MV::I8(x) => serde_json::Value::from(*x),
+        MV::U16(x) => serde_json::Value::from(*x),
+        MV::I16(x) => serde_json::Value::from(*x),
+        MV::U32(x) => serde_json::Value::from(*x),
+        MV::I32(x) => serde_json::Value::from(*x),
+        MV::F32(x) => serde_json::Value::from(*x),
+        MV::Bool(x) => serde_json::Value::from(*x),
+        MV::String(s) => serde_json::Value::from(s.clone()),
+        MV::U64(x) => serde_json::Value::from(*x),
+        MV::I64(x) => serde_json::Value::from(*x),
+        MV::F64(x) => serde_json::Value::from(*x),
+        // Tokenizer arrays (tokens, scores, merges, ...) can be huge —
+        // serialize them as JSON arrays so the engine side can re-parse.
+        MV::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(mv_to_json).collect())
+        }
+    }
+}
+
+/// Convert a GGUF file to a hipfire `.hfq` using MQ4 (FWHT-rotated HFQ4-G256)
+/// for 2D weight matrices, Q8 for the embedding table, F16 for 1D norms.
+/// Tensor names are preserved verbatim from the GGUF (e.g.
+/// `blk.0.attn_q.weight`) so a future engine-side Llama .hfq loader can
+/// look them up the same way `llama.rs::load_weights` looks them up in a
+/// `GgufFile` today.
+fn run_gguf_pipeline(input: &Path, output: &Path) -> std::io::Result<()> {
+    eprintln!("=== GGUF → MQ4 conversion ===");
+    eprintln!("Input:  {}", input.display());
+    eprintln!("Output: {}", output.display());
+
+    let gguf = gguf_input::GgufFile::open(input)?;
+    eprintln!("GGUF version: {}", gguf.version);
+    eprintln!("Tensors: {}", gguf.tensors.len());
+
+    let arch_str = gguf
+        .meta_str("general.architecture")
+        .unwrap_or("llama")
+        .to_string();
+    let arch_id: u32 = match arch_str.as_str() {
+        "llama" => 0,
+        "qwen3" | "qwen2" => 1,
+        "qwen3moe" => 6,
+        other => {
+            eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
+            0
+        }
+    };
+    eprintln!("Architecture: {arch_str} (id={arch_id})");
+
+    // Metadata JSON: must populate `config.*` so engine's `config_from_hfq`
+    // can reconstruct LlamaConfig at load time. Also keep the raw GGUF
+    // metadata tree under `gguf_meta` for any consumer that wants original
+    // values (chat template, vocab, scores, merges, etc.).
+    let config_json = config_json_from_gguf(&gguf, &arch_str);
+    let metadata = serde_json::json!({
+        "architecture": arch_str,
+        "source": "gguf",
+        "config": config_json,
+        "gguf_meta": gguf_meta_to_json(&gguf.metadata),
+    });
+    let metadata_json = serde_json::to_string(&metadata)?;
+
+    // Quant signs (shared across all MQ4 tensors — same seed pair as the
+    // safetensors path so the engine's runtime FWHT inverse stays identical).
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+
+    let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(gguf.tensors.len());
+    let mut total_params: u64 = 0;
+    let mut quant_params: u64 = 0;
+    let mut total_bytes_in: u64 = 0;
+    let mut total_bytes_out: u64 = 0;
+
+    for info in &gguf.tensors {
+        let raw = gguf.tensor_data(info);
+        let n_elements = info.numel();
+        total_params += n_elements as u64;
+        total_bytes_in += raw.len() as u64;
+
+        let shape: Vec<u32> = info.shape.iter().map(|&s| s as u32).collect();
+
+        // Tensor classification (uses the original GGUF name).
+        let is_norm = gguf_is_norm_tensor(&info.name);
+        let is_embed = gguf_is_embed_tensor(&info.name);
+        let is_2d = info.shape.len() == 2;
+        let k_dim = if is_2d { info.shape[0] } else { n_elements };
+
+        // Translate to the safetensors-style name `engine::hfq::load_weights_hfq`
+        // expects. If we don't have a translation, keep the original name —
+        // the future loader can ignore unknown tensors.
+        let out_name = gguf_to_safetensors_name(&info.name)
+            .unwrap_or_else(|| info.name.clone());
+
+        let (data, quant_type, group_size, label) = if is_norm || !is_2d {
+            // Store as F16 — convert via dequant→f32→f16 for any source dtype.
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+            (f16_bytes, QuantType::F16, 0u32, "F16")
+        } else if is_embed {
+            // Q8 embedding (matches safetensors path's is_embed rule).
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let q = quantize_q8f16(&f32_data);
+            quant_params += n_elements as u64;
+            (q, QuantType::Q8F16, 32u32, "Q8_F16")
+        } else if k_dim % 256 == 0 {
+            // MQ4 (FWHT-rotated HFQ4-G256) — the hot path target.
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+            quant_params += n_elements as u64;
+            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+        } else {
+            // K not divisible by 256 — fall back to HFQ4-G128 (no rotation).
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let q = quantize_hfq4g128(&f32_data);
+            quant_params += n_elements as u64;
+            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+        };
+
+        total_bytes_out += data.len() as u64;
+        eprintln!(
+            "  {label:>9}: {} → {} {:?} ({} src={:?}, {:.1} KB → {:.1} KB)",
+            info.name,
+            out_name,
+            info.shape,
+            n_elements,
+            info.dtype,
+            raw.len() as f64 / 1024.0,
+            data.len() as f64 / 1024.0,
+        );
+
+        hfq_tensors.push(HfqTensor {
+            name: out_name,
+            quant_type,
+            shape,
+            group_size,
+            data,
+        });
+    }
+
+    eprintln!("\n=== GGUF → MQ4 Summary ===");
+    eprintln!("  Tensors:        {}", hfq_tensors.len());
+    eprintln!("  Total params:   {total_params}");
+    eprintln!(
+        "  Quant'd params: {quant_params} ({:.1}%)",
+        100.0 * quant_params as f64 / total_params as f64
+    );
+    eprintln!("  Input size:     {:.1} MB", total_bytes_in as f64 / 1e6);
+    eprintln!(
+        "  Output size:    {:.1} MB ({:.1}% of input)",
+        total_bytes_out as f64 / 1e6,
+        100.0 * total_bytes_out as f64 / total_bytes_in as f64,
+    );
+
+    write_hfq(output, arch_id, &metadata_json, &hfq_tensors)?;
+    eprintln!("\nWrote: {}", output.display());
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -1164,6 +1520,22 @@ fn main() {
     let use_hfq_mixed = format == "hfq-mixed";  // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256";
+
+    // GGUF input branch: if --input is a `.gguf` file, run the GGUF→MQ4
+    // pipeline (see `run_gguf_pipeline`) and exit. Tensor names are kept
+    // verbatim from the GGUF (`token_embd.weight`, `blk.{i}.attn_q.weight`,
+    // ...). The safetensors path below is unchanged.
+    {
+        let raw_input = Path::new(input_dir.as_str());
+        if is_gguf_input(raw_input) {
+            let out = Path::new(output_path);
+            if let Err(e) = run_gguf_pipeline(raw_input, out) {
+                eprintln!("GGUF pipeline failed: {e}");
+                std::process::exit(2);
+            }
+            return;
+        }
+    }
 
     // Resolve input: local path or HuggingFace model ID (e.g. "Qwen/Qwen3-8B")
     let input_dir = resolve_model_path(input_dir);
