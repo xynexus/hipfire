@@ -72,17 +72,24 @@ if [ -r "$LOCK_SCRIPT" ]; then
 fi
 
 # ── Test matrix ───────────────────────────────────────────────────────────
-# Format: "model_file|id|prompt|max_tokens"
-# Short battery: the three dense sizes + a small multi-turn recall check.
+# Format: "model_file|id|prompt|max_tokens[|system_prompt_file]"
+# The optional 5th field names a file under benchmarks/prompts/ to be read
+# verbatim and passed as the daemon's `system` field. Used for tool-call
+# coverage (see #87 — auto-MMQ regression slipped through previous gates
+# because none exercised tool-emission shapes).
+# Short battery: the three dense sizes + a small multi-turn recall check
+# + a tool-call shape (auto-MMQ regression detector for #87 redo).
 # Full battery (--full): adds A3B MoE tests (loads large models, ~2-3 min each).
 SHORT_TESTS=(
     "qwen3.5-0.8b.mq4|cap|What is the capital of France? Answer in one short sentence.|80"
     "qwen3.5-4b.mq4|code|Write a one-line Python function named square that returns n*n.|180"
     "qwen3.5-9b.mq4|reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    "qwen3.5-9b.mq4|tool-call|What does the file /tmp/fibonacci.c contain?|180|tool_call_system.txt"
 )
 FULL_EXTRA=(
     "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
     "qwen3.6-35b-a3b.mq4|moe36-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
+    "qwen3.6-27b.mq4|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
 )
 tests=("${SHORT_TESTS[@]}")
 if [ "$FULL" -eq 1 ]; then
@@ -106,7 +113,7 @@ hard_errors=0
 } > "$OUT"
 
 for entry in "${tests[@]}"; do
-    IFS='|' read -r model_file prompt_id prompt max_tok <<< "$entry"
+    IFS='|' read -r model_file prompt_id prompt max_tok system_file <<< "$entry"
     model_path="$MODELS_DIR/$model_file"
     if [ ! -f "$model_path" ]; then
         echo "## $model_file — $prompt_id — SKIPPED (model not present)" >> "$OUT"
@@ -114,13 +121,33 @@ for entry in "${tests[@]}"; do
         continue
     fi
 
+    # Optional system prompt: load from benchmarks/prompts/ if specified
+    # in the test entry. Used for tool-call shape coverage (#87) where the
+    # system block contains the tools <tools>...</tools> definition.
+    system_json=""
+    if [ -n "${system_file:-}" ]; then
+        system_path="benchmarks/prompts/$system_file"
+        if [ -f "$system_path" ]; then
+            system_text=$(python3 -c "import sys,json; print(json.dumps(open(sys.argv[1]).read()))" "$system_path")
+            system_json=",\"system\":${system_text}"
+        else
+            echo "## $model_file — $prompt_id — SKIPPED (system prompt $system_path not found)" >> "$OUT"
+            continue
+        fi
+    fi
+
     echo "== $model_file / $prompt_id =="
-    # JSONL input for daemon
+    # JSONL input for daemon. Use python json.dumps for the user prompt so
+    # special tokens / quotes / backslashes in the fixture survive intact
+    # (the previous sed-based escape only handled `"`, missing tabs, JSON
+    # control chars, and `\n` literals — a tool-emit fixture would need
+    # those).
     in_file="/tmp/coh_in_$$.jsonl"
     out_file="/tmp/coh_out_$$.log"
+    prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$prompt")
     cat > "$in_file" <<JL
 {"type":"load","model":"$model_path","params":{"max_seq":4096}}
-{"type":"generate","id":"r1","prompt":"$(printf '%s' "$prompt" | sed 's/"/\\"/g')","temperature":0.0,"max_tokens":$max_tok,"repeat_penalty":1.05}
+{"type":"generate","id":"r1","prompt":${prompt_json},"temperature":0.0,"max_tokens":$max_tok,"repeat_penalty":1.05${system_json}}
 {"type":"unload"}
 JL
     t0=$(date +%s.%N)
@@ -137,6 +164,34 @@ JL
         status="HARD_ERROR (exit=$ec tokens=$n_tokens panic=${panic:+yes})"
         hard_errors=$((hard_errors + 1))
     fi
+
+    # Tool-call shape: hard-fail on ChatML special-token leakage in the
+    # visible output. Healthy tool-call emit looks like:
+    #   <tool_call>{"name":"read","arguments":{"path":"/tmp/foo.c"}}</tool_call><|im_end|>
+    # The corruption signature from #87 (auto-MMQ regression on gfx1151) is
+    # `<|im_start|>` *inside* the tool_call body, e.g.
+    #   <tool_call>\n<|im_start|>box", "bash","command":"..."
+    # Count `<|im_start|>` in the assembled token text; healthy = 0,
+    # corrupted ≥ 1. Trailing `<|im_end|>` is fine and stripped by clients;
+    # we only flag im_start as a hard failure since legitimate output
+    # never embeds it.
+    case "$prompt_id" in
+        tool-call*)
+            text=$(grep -a '"type":"token"' "$out_file" | python3 -c '
+import sys, json
+print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))')
+            im_start_leaks=$(printf '%s' "$text" | grep -oE '<\|im_start\|>' | wc -l | tr -d ' ')
+            if [ "${im_start_leaks:-0}" -gt 0 ]; then
+                status="HARD_ERROR (tool-call corruption: ${im_start_leaks}× <|im_start|> leaked into visible output — see #87)"
+                hard_errors=$((hard_errors + 1))
+            elif ! printf '%s' "$text" | grep -qE '<tool_call>'; then
+                # Soft warn — model didn't emit a tool_call at all. Could
+                # be quantization noise (small model decided to answer
+                # directly); not a corruption signal.
+                status="OK (soft: no <tool_call> emitted; model answered inline)"
+            fi
+            ;;
+    esac
 
     {
         echo "## $model_file — $prompt_id"
