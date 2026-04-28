@@ -1115,9 +1115,27 @@ async function serve(port: number) {
         let systemPrompt = "";
         let userPrompt = "";
 
+        // OpenAI API allows `content` to be a string OR an array of content
+        // parts (multi-modal: text + image). Pi coding agent and several other
+        // OpenAI clients send the array form even for text-only messages —
+        // raw `m.content` then stringifies to "[object Object]" as the
+        // prompt, which the model has no way to recover from. Issue #79.
+        // Image parts are filtered out (no vision encoder in serve path);
+        // matches the daemon's existing text-only behaviour.
+        const extractText = (content: any): string => {
+          if (typeof content === "string") return content;
+          if (Array.isArray(content)) {
+            return content
+              .filter((p: any) => p && p.type === "text")
+              .map((p: any) => p.text ?? "")
+              .join("");
+          }
+          return "";
+        };
+
         // Extract system message
         const sysMsg = messages.find((m: any) => m.role === "system");
-        if (sysMsg) systemPrompt = sysMsg.content;
+        if (sysMsg) systemPrompt = extractText(sysMsg.content);
 
         // Format tools into system prompt (Hermes format)
         if (tools.length > 0) {
@@ -1153,9 +1171,9 @@ async function serve(port: number) {
           let text = "";
 
           if (role === "tool") {
-            text = `<tool_response>\n${m.content}\n</tool_response>`;
+            text = `<tool_response>\n${extractText(m.content)}\n</tool_response>`;
           } else if (role === "assistant") {
-            text = stripThinking(m.content || "");
+            text = stripThinking(extractText(m.content));
             if (m.tool_calls) {
               for (const tc of m.tool_calls) {
                 const fn = tc.function || tc;
@@ -1163,7 +1181,7 @@ async function serve(port: number) {
               }
             }
           } else {
-            text = m.content || "";
+            text = extractText(m.content);
           }
 
           if (i === 0) {
