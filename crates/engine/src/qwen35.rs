@@ -2089,13 +2089,36 @@ impl Qwen35Scratch {
             x_rot: gpu.alloc_tensor(&[dim.max(config.hidden_dim)], DType::F32)?,
 
             // Flash attention partials: enough for max_seq with tile_size=128.
-            // n_heads * max_tiles * (2 + head_dim) floats.
+            // n_heads * max_tiles * (2 + head_dim) floats per batched query
+            // position; total buffer = batch_mult × per-position-bytes.
+            //
+            // batch_mult is the maximum query positions a single FA dispatch
+            // can fit; the dispatcher (`launch_asym_flash_batched`) reads the
+            // buffer's actual capacity at call time and auto-chunks larger
+            // prefill batches into multiple sub-launches. So a lower
+            // batch_mult here trades ~linear extra dispatch overhead on
+            // prefill (PREFILL_MAX_BATCH=256 → ceil(256/batch_mult) calls per
+            // FA layer) for ~linearly less VRAM at long context.
+            //
+            // The per-position size scales with kv_max_seq (= physical_cap
+            // post-eviction), and that scaling is what made #85 visible: at
+            // max_seq=170k, no CASK, 27B (n_heads=24, head_dim=256) the old
+            // batch_mult=64 → 2.1 GB just for these partials, exceeding VRAM
+            // headroom on 24 GB cards. Cutting batch_mult by 4× (16) keeps
+            // the prefill chunking moderate while saving 1.6 GB at that
+            // worst-case shape; CASK-on workloads (small physical_cap) are
+            // unaffected because the buffer is already tiny there.
+            //
+            // Override with HIPFIRE_FLASH_PARTIALS_BATCH for tuning. Power of
+            // two preferred (matches FA dispatcher chunking).
             flash_partials: {
                 let tile_size = 128usize;
                 let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-                // Sized for batched flash prefill: 64 positions × per-position partials.
-                // Reused across layers (not per-call allocated). ~33MB for 9B at 32K.
-                let batch_mult = 64usize;
+                let batch_mult = std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
+                    .unwrap_or(16);
                 gpu.alloc_tensor(&[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)], DType::F32)?
             },
             // Flash attention tri-state for the Q8 path. Asym modes always
