@@ -1013,10 +1013,29 @@ async function serve(port: number) {
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
+  //
+  // CRITICAL: `lastRequestTime` is only bumped when a new request *arrives*
+  // (line below in the fetch handler). It is NOT updated while a long
+  // single request is generating. So a request that legitimately runs
+  // longer than idle_timeout — e.g. a thinking-heavy A3B turn that
+  // reasons for 4-6 minutes before answering — would have the eviction
+  // timer fire mid-stream, send `unload` to the daemon while it was
+  // emitting tokens, and silently kill the active generation. Reported by
+  // @mikiadev in #79 ("engine gives up after 300s while clearly still
+  // working in btop"). The CLI's SSE heartbeat keeps the *connection*
+  // alive but can't save the dispatch from this race.
+  //
+  // Fix: also gate eviction on `e.generating` — never unload while a
+  // generation is in flight, regardless of how stale lastRequestTime
+  // looks. Once the generate completes (`e.generating = false` in the
+  // streaming finally / non-streaming completion path), the timer's
+  // next tick re-evaluates and evicts cleanly if the connection has
+  // since gone idle.
   let lastRequestTime = Date.now();
   const idleTimeoutMs = cfg.idle_timeout * 1000;
   const evictionInterval = idleTimeoutMs > 0 ? setInterval(async () => {
     if (!current) return;                              // nothing to unload
+    if (e.generating) return;                          // active stream — don't yank
     if (Date.now() - lastRequestTime < idleTimeoutMs) return;
     try {
       console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
