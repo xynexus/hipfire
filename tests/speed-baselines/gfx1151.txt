@@ -30,6 +30,20 @@
 27b_3.5_dflash_merge_sort_tok_s=98.36
 27b_3.5_dflash_merge_sort_tau=13.2727
 27b_3.5_dflash_merge_sort_ttft_ms=358.07
-9b_3.5_dflash_merge_sort_tok_s=245.03
+# Re-baselined 2026-04-28 from KotDath's PR #88 floor. The original
+# capture (245.03 tok/s at commit 42566de) was not reproducible in
+# KotDath's Strix Halo toolbox: the same prompt + commit + binary md5
+# reached only ~151 tok/s post-warm-JIT in their setup. The 245 figure
+# appears Strix-Halo-power-profile or firmware specific (gfx1151 is
+# RDNA 3.5 / Strix Halo APU; thermal headroom and DPM behavior vary
+# meaningfully across vendor BIOS/EC configs).
+#
+# Lowered to 151 so the gate stops false-failing on the more common
+# Strix Halo configurations. Real DFlash regressions still trip easily:
+# KotDath's #88 measured 127 tok/s on master pre-fix and 167 post-fix —
+# both clearly distinguishable from this floor.
+#
+# Original 245 figure preserved in git blame for archaeology.
+9b_3.5_dflash_merge_sort_tok_s=151.0
 9b_3.5_dflash_merge_sort_tau=13.1538
 9b_3.5_dflash_merge_sort_ttft_ms=135.08
