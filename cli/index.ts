@@ -1250,11 +1250,43 @@ async function serve(port: number) {
         // Fall back to the user's configured defaults (global or per-model) when
         // an OpenAI client doesn't set a field. 512 was a hardcoded surprise
         // that ignored `hipfire config set max_tokens …`.
+        // OpenAI repeat-penalty mapping: take the larger of frequency_penalty
+        // and presence_penalty when present. Both are -2..2 in the OpenAI
+        // surface; we map non-negative values to repeat_penalty = 1 + p.
+        // (Negative penalties — boosts — aren't meaningful for hipfire's
+        // multiplicative repeat_penalty kernel, so they're treated as zero.)
+        // Requested by @shilga in #79; previously only frequency_penalty was
+        // honored.
+        const oaiPenalty = Math.max(
+          0,
+          Number(body.frequency_penalty) || 0,
+          Number(body.presence_penalty) || 0,
+        );
+        const oaiPenaltySet = body.frequency_penalty != null || body.presence_penalty != null;
+
+        // chat_template_kwargs (Qwen / DeepSeek / pi-coding-agent extension).
+        // Two recognized keys, both per-request overrides on top of
+        // global / per-model config:
+        //   enable_thinking   — false forces an effective no-think turn
+        //                       (max_think_tokens=1, model still emits <think>
+        //                       but is hard-capped to one token before
+        //                       being forced to close).
+        //   preserve_thinking — true leaves <think>...</think> intact in
+        //                       message.content (non-streaming) instead of
+        //                       stripping it. Streaming still uses the
+        //                       reasoning_content channel; this flag only
+        //                       affects the final concatenated message.
+        // Requested by @shilga in #79.
+        const ctk = (body.chat_template_kwargs && typeof body.chat_template_kwargs === "object")
+          ? body.chat_template_kwargs : {};
+        const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
+        const preserveThinking: boolean = ctk.preserve_thinking === true;
+
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
-          repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : effective.repeat_penalty),
+          repeat_penalty: body.repeat_penalty ?? (oaiPenaltySet ? 1.0 + oaiPenalty : effective.repeat_penalty),
           top_p: body.top_p ?? effective.top_p,
         };
         // Mirror the `hipfire run` path's per-model max_think_tokens
@@ -1264,6 +1296,11 @@ async function serve(port: number) {
         // Reported in #74 with qwen3.6:27b returning empty content + full
         // 8192 completion_tokens despite max_think_tokens=2048 in config.
         if (effective.max_think_tokens > 0) genParams.max_think_tokens = effective.max_think_tokens;
+        // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1
+        // token (model emits <think> then is forced to close). Overrides
+        // per-model max_think_tokens because the request semantics are more
+        // specific than the static config.
+        if (enableThinking === false) genParams.max_think_tokens = 1;
         // thinking=off is currently a no-op at the CLI layer. Earlier
         // versions injected a prose system directive ("Respond directly
         // without using <think>...</think> reasoning blocks") here, but
@@ -1480,9 +1517,17 @@ async function serve(port: number) {
         // Strip think tags and special tokens.
         // Greedy match: strip everything from first <think> to last </think>.
         // If <think> is unclosed, strip from <think> to end of content.
-        content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-          .replace(/<think>[\s\S]*$/, "") // unclosed think block
-          .replace(/<\|im_end\|>/g, "").trim();
+        // chat_template_kwargs.preserve_thinking=true keeps <think>...</think>
+        // intact in message.content for clients that want a single-string
+        // representation including reasoning. <|im_end|> stripping always
+        // applies (it would break clients that re-encode message history).
+        if (preserveThinking) {
+          content = content.replace(/<\|im_end\|>/g, "").trim();
+        } else {
+          content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+            .replace(/<think>[\s\S]*$/, "") // unclosed think block
+            .replace(/<\|im_end\|>/g, "").trim();
+        }
 
         // Check for tool calls in response
         const parsed = parseToolCalls(content);
