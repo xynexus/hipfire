@@ -57,7 +57,13 @@ __global__ void attention_flash_asym3_tile_batched(
     // on for 100% acceptance. In tree mode the in-block keys handle their
     // own per-row causality via tree_bias (-inf for future / non-ancestor
     // in-block keys); only pre-block prompt keys are gated by this window.
-    const int q_pos = tree_mode ? (block_start + local_bid) : positions[global_bid];
+    // Use global_bid for tree-mode row index. local_bid is chunk-local
+    // (0..chunk-1) but the tree row position is block_start + (absolute
+    // batch index). For the first chunk (batch_offset=0) these match;
+    // for subsequent chunks local_bid is wrong → corrupts kv_start and
+    // softmax weights for rows 8..15 at long-ctx where partials buffer
+    // forces sub_batch < batch_size. Codex stop-time review caught this.
+    const int q_pos = tree_mode ? (block_start + global_bid) : positions[global_bid];
     const int kv_start = (kv_window > 0 && q_pos + 1 > kv_window) ? (q_pos + 1 - kv_window) : 0;
     const int tile_start_raw = tile_id * tile_size;
     if (tile_start_raw >= seq_len) return;
