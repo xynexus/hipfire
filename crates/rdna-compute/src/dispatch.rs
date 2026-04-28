@@ -102,10 +102,6 @@ fn has_mmq_i8_wmma(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151")
 }
 
-fn prefer_dot2_hfq4_prefill(arch: &str) -> bool {
-    matches!(arch, "gfx1150" | "gfx1151")
-}
-
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
     pub buf: DeviceBuffer,
@@ -2471,7 +2467,7 @@ impl Gpu {
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkvza_hfq4g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
-            if has_wmma_f16(&self.arch) && !prefer_dot2_hfq4_prefill(&self.arch) {
+            if has_wmma_f16(&self.arch) {
                 return self.gemm_qkvza_hfq4g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -2764,7 +2760,7 @@ impl Gpu {
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkv_hfq4g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
-            if has_wmma_f16(&self.arch) && !prefer_dot2_hfq4_prefill(&self.arch) {
+            if has_wmma_f16(&self.arch) {
                 return self.gemm_qkv_hfq4g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -3039,7 +3035,7 @@ impl Gpu {
                 return self.gemm_gate_up_hfq4g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // WMMA on gfx11 (RDNA3)
-            if has_wmma_f16(&self.arch) && !prefer_dot2_hfq4_prefill(&self.arch) {
+            if has_wmma_f16(&self.arch) {
                 return self.gemm_gate_up_hfq4g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
