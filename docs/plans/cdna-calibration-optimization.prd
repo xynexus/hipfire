@@ -28,7 +28,7 @@ Goal: flip GPU-default at production chunk_len, plus targeted kernel-side optimi
 
 The actual calibration math (per `triattn.rs:549-572` + `triattn_accumulate.hip`): for each (layer, head, band) accumulate four FP64 statistics — `Σre`, `Σim`, `Σ|q|` (with `sqrt`), and `count` — across the corpus. NOT a GEMM, NOT matmul-shaped. A reduction with embedded sqrt.
 
-1. **CPU-side calibration tap is per-token-per-layer.** `triattn_validate.rs:178` flips `gpu_calib = false` by default because the GPU kernel "regressed 40% on short-chunk corpora (avg ~3 tok/chunk)". On a 1M+ corpus chunked at 1024, launch-overhead is amortized 340× more — the regression-trigger condition no longer holds. The CPU path forces ~16M small (16KB) device-to-host transfers + ~16M `Mutex<TapState>` acquisitions per 1M-token 27B corpus. Per the kernel comment header: "99%+ of wall time on MI300X EPYC host". **Fix: flip default to `--gpu-calib` when `chunk_len >= 256` (or always; bench-confirm short-chunk regression isn't worse than CPU's).** Expected: 5-8× speedup per the kernel header annotation.
+1. **CPU-side calibration tap dispatches rayon per-token-per-layer.** `triattn_validate.rs:178` defaults `gpu_calib = false`. The CPU path's `add_sample` (`triattn.rs:236-255`) calls `par_chunks_mut` on the per-(layer, head) accumulator slice — rayon thread-pool dispatch *for every individual sample*. Per the kernel header at `triattn_accumulate.hip:13-14`: "Measured 99%+ of wall time on MI300X EPYC host with rayon-per-sample giving only ~15% speedup (rayon overhead dominates small work units)." On 1M corpus + 27B (16 FA layers): 16M rayon dispatches, each contributing thread-park / cache-thrash overhead. The Q download itself (~16 KB per (chunk, layer)) is also expensive at that frequency, but the per-sample dispatch is the actual dominant cost. **Fix: always use the GPU tap when installed; the original 40% regression was at avg ~3 tokens/chunk, never realized at production sizes since `forward_prefill_batch` is hard-capped at ~508 tokens/call regardless of `chunk_len`.** Expected: 5-8× speedup per the kernel header annotation.
 
 2. **`triattn_accumulate_f32` uses FP64 accumulators.** Lines 27-30, 41-44, 50-52 of the kernel all use `double`. CDNA3 FP64 throughput is ~1/2 of FP32; on RDNA3 it's ~1/16. Switching to FP32 accumulators (with optional Kahan summation for the sqrt path) is roughly 2× kernel speedup on MI300X. Correctness gate: R̄ stays within ±0.005 of FP64 baseline. If R̄ drifts outside tolerance, fall back to FP64 — drop the optimization.
 
@@ -62,19 +62,25 @@ Goal: confirm the bottleneck stack from "Hypothesized bottleneck stack" above. O
 - Look for: % wall time in `triattn_score` / `triattn_accumulate_f32` kernels vs CPU-side runtime. If kernel time is < 10% of wall, host-side path is dominant. If kernel time is > 50%, MFMA tuning is the lever.
 - Save the rocprof traces to `benchmarks/calib/profile-mi300x-baseline.csv` for later comparison.
 
-### Phase 2 — flip GPU-aggregation default + bench (~1h)
+### Phase 2 — flip GPU-aggregation default + skip K download (~1h)
 
-- Default `gpu_calib = true` in `triattn_validate.rs` when `chunk_len >= 256` (or always; bench on the 7900 XTX first to confirm short-chunk regression isn't catastrophic — likely fine since real corpora use chunk_len=1024+).
-- Re-run the 1M corpus calibration on MI300X. Expected: 5-15× speedup just from skipping the CPU loop. (8.4h baseline → ~30-90 min.)
-- **Correctness gate**: R̄ on the produced sidecar must match the Phase 0 baseline within ±0.01 across all (layer, head, band) means. If R̄ shifts, debug before moving on.
+Two changes here, both in `triattn_validate.rs` + `qwen35.rs`:
+
+1. **Default `gpu_calib = true`** unconditionally. The original "short-chunk regression" guard (line 42-46) was tuned for an `avg ~3 tok/chunk` corpus where rayon per-sample dispatch was even slower than kernel launch — but `forward_prefill_batch` is always capped at `kv_seq.saturating_sub(4) = 508` tokens per call regardless of `chunk_len`. So *every* production calibration call has 508-ish tokens per forward, never 3. The regression-trigger condition can't fire at production sizes. Don't gate on `chunk_len` — gate on whether the GPU tap is installed.
+
+2. **Skip the K download in the calibrate-tap path.** `qwen35.rs:3506-3512` downloads both Q and K to host when the GPU path returns false, but `record_prerope_qk` discards K when `TapState::Calibrate` is active — only `TapState::Capture` uses it. The K download is pure waste for calibration (~33 GB PCIe per 1M-token 27B corpus). Add a tap-state inspector that returns whether K is needed; skip the download if Calibrate.
+
+Re-run the 1M corpus calibration on MI300X. Expected: 5-8× from #1 per the kernel header annotation. #2 helps the fallback-CPU path if it's ever hit but doesn't move the needle on GPU-default. Together they deliver the headline win.
+
+**Correctness gate**: R̄ on the produced sidecar must match the Phase 0 baseline within ±0.005 across all (layer, head, band) means. If R̄ shifts, debug before moving on.
 
 ### Phase 3 — kernel-side tuning (~1-2h)
 
-The accumulator kernel is a reduction with FP64 accumulators, not a GEMM. MFMA does not apply here. Optimizations are mundane but effective:
+The accumulator kernel is a reduction with FP64 accumulators. Optimizations are launch-amortization-focused, not compute-tuning:
 
-- **FP64 → FP32 accumulator.** Drop `double` to `float` for `accs_sum_re`, `accs_sum_im`, `accs_sum_abs`. Optional Kahan compensation for the sqrt path if drift on `Σ|q|` exceeds ±0.005 R̄. Expected: ~2× kernel-side on MI300X (FP64 throughput is half of FP32 on CDNA3), ~16× on RDNA3 if we ever exercise this path there. Gate on R̄ correctness.
-- **Block size 64 → 128.** Switch static `__shared__ double s_re[64]` etc. to extern shmem so block size is launch-time tunable. Bench 64/128/256-thread blocks; pick best per-arch. Likely 1.3-1.5× on its own.
-- **Multi-layer grid.** Change `[n_heads, n_bands]` → `[n_heads, n_bands, n_layers]` so calibration calls the kernel once per chunk instead of once per (chunk × layer). 16× fewer launches; saves ~1-2% wall time which is small but free.
+- **Multi-chunk batching.** Currently one kernel launch per (chunk, layer) = 32K launches for 1M corpus 27B. Refactor to accumulate N consecutive chunks of Q into one launch: extend the time axis from `n_tokens` to `N × n_tokens` (Q from each chunk concatenated in the input buffer). Reduces launch count by ~Nx without changing math; each sample still maps to its (layer, head, band) accumulator. Pick N to keep Q buffer ≤ a few hundred MB. Expected: 2-4× depending on launch overhead share.
+- **Multi-layer grid.** Change `[n_heads, n_bands]` → `[n_heads, n_bands, n_layers]` so the kernel processes all FA layers in one launch. 16× fewer launches; small win on its own (~1-2% of wall) but composes with multi-chunk batching for compounded effect.
+- **FP64 → FP32 accumulator** (gated by R̄ correctness). Drop `double` → `float` for sum_re, sum_im, sum_abs. Optional Kahan compensation on `Σ|q|` if drift exceeds ±0.005 R̄. Expected: ~2× kernel-side on MI300X (FP64 throughput is half of FP32 on CDNA3). The compute itself isn't the dominant bound, but the smaller accumulator memory footprint helps cache hit rate at large `n_layers × n_heads × n_bands`. Stop here if R̄ shifts.
 
 Bench standalone (independent of the calibration loop) to attribute speedup per change. Stack changes one at a time.
 
@@ -107,12 +113,14 @@ sum_abs  = Σ sqrt(re² + im²)
 count    = N
 ```
 
-This is **not** a matmul — it's a per-band reduction with embedded sqrt. MFMA-style matrix instructions don't apply. The kernel is bandwidth + sqrt-bound at the per-thread level, with shmem reduction at the per-block level. Optimizations live in:
-- accumulator dtype (FP64 → FP32),
-- thread-block size (64 → 128/256, requires extern shmem),
-- launch-grid shape (per-layer → per-chunk, multi-layer in z-axis).
+`finalize()` (`triattn.rs:379-432`) divides each sum by count to produce mean (re, im, |q|) per band — `BandCenter`. No clustering, no K-means. The bands are structural: `n_bands = head_dim / 2 = 128` for all production models, indexed by consecutive complex-pair `(q[2f], q[2f+1])`. The "calibration" is just population statistics, not optimization.
 
-The *actual* compute load per 1M-token corpus on 27B: 1M × 16 FA layers × 16 heads × 128 bands = ~33 billion sample-band updates. Each update is 4 fadd + 1 sqrt = ~5 FLOPs. Total ~165 GFLOPs of accumulator work. MI300X delivers ~1.3 PFLOPS FP16 / ~0.65 PFLOPS FP32 / ~0.32 PFLOPS FP64 peak. Even at 10% sustained the accumulator should run in ≪ 1 second of GPU compute. The 8h figure is dominated by the **per-token mutex + small PCIe transfer dance in the CPU path**, not by accumulator math.
+This is **not** a matmul — it's a per-band reduction with embedded sqrt. MFMA-style matrix instructions don't apply. The kernel is launch-overhead bound at small block counts and bandwidth+sqrt bound at large block counts. Optimizations live in:
+- accumulator dtype (FP64 → FP32; gated by R̄ tolerance),
+- multi-chunk batching in one launch (process N chunks of Q in a single kernel pass to amortize per-launch overhead),
+- launch-grid extension (per-layer → per-chunk, multi-layer in z-axis: 16× fewer launches).
+
+The *actual* compute load per 1M-token corpus on 27B: 1M × 16 FA layers × 16 heads × 128 bands = ~33 billion sample-band updates. Each update is 4 fadd + 1 sqrt = ~5 FLOPs. Total ~165 GFLOPs of accumulator work. MI300X delivers ~1.3 PFLOPS FP16 / ~0.65 PFLOPS FP32 / ~0.32 PFLOPS FP64 peak. Even at 10% sustained the accumulator should run in ≪ 1 second of GPU compute. The 8h figure is dominated by the **per-sample rayon dispatch in the CPU path** (kernel header confirms "99%+ of wall time on MI300X EPYC host"), not by accumulator math.
 
 ### Cost projections
 
