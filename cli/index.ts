@@ -410,9 +410,6 @@ function buildLoadMessage(path: string, tag?: string | null): any {
 
 const HF_BASE = "https://huggingface.co";
 
-// Per-model HuggingFace repos: schuttdev/hipfire-{family}-{size}
-function hfRepo(family: string, size: string) { return `schuttdev/hipfire-${family}-${size}`; }
-
 interface ModelEntry {
   /// Empty string = local-only. `pull()` short-circuits with a clear message
   /// instead of attempting a 404'ing fetch against a HF repo that doesn't
@@ -425,93 +422,14 @@ interface ModelEntry {
   desc: string;
 }
 
-const REGISTRY: Record<string, ModelEntry> = {
-  // Qwen3.5 MagnumQuant MQ4 — rotated 4-bit with quality gate.
-  // Default format: best quality-per-bit, WMMA-accelerated prefill on RDNA3.
-  // Perf: RX 7900 XTX (gfx1100), decode tok/s / prefill tok/s with WMMA.
-  "qwen3.5:0.8b":     { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq4",   size_gb: 0.55, min_vram_gb: 1,  desc: "386 / 5100 tok/s" },
-  "qwen3.5:4b":       { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.mq4",     size_gb: 2.6,  min_vram_gb: 4,  desc: "169 / 1900 tok/s" },
-  "qwen3.5:9b":       { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.mq4",     size_gb: 5.3,  min_vram_gb: 6,  desc: "125 / 1720 tok/s" },
-  "qwen3.5:27b":      { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.mq4",    size_gb: 15.0, min_vram_gb: 16, desc: "45 / 489 tok/s, 16GB+" },
-  // Qwen3.5-MoE (A3B): 35B total / 3B activated (256 experts, top-8). The
-  // hipfire MoE decode path runs ~162 tok/s on RX 7900 XTX with hipGraph.
-  // No HF repo yet — the file is local-only until upload lands.
-  // Local-only until upload lands — `repo: ""` makes `hipfire pull` exit
-  // with a clear message rather than 404'ing against a non-existent HF repo.
-  // `hipfire run` still works once the file is in MODELS_DIR (auto-pull
-  // sees the local copy and skips the download).
-  "qwen3.5:35b-a3b":  { repo: "", file: "qwen3.5-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active, 115 tok/s — LOCAL ONLY (no HF repo yet)" },
-  // Qwen3.6-MoE (A3B) refresh — same arch_id=6 / layers / hidden / head_dim as
-  // 3.5 A3B, weights refreshed upstream (partial_rotary_factor explicit @ 0.25,
-  // matches 3.5 default — no engine changes needed). Local-only until upload.
-  "qwen3.6:35b-a3b":  { repo: "", file: "qwen3.6-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active refresh, 148 tok/s — LOCAL ONLY" },
+// Registry data lives in cli/registry.json. The CLI is bundled as a single
+// binary by `bun build --compile`, so the JSON is inlined at build time via
+// `await import` with `assert: { type: "json" }`. Edit-then-rebuild flow
+// keeps the JSON as the source of truth without a runtime fs dep.
+import registryData from "./registry.json" with { type: "json" };
 
-  // Qwen3.6 dense 27B — refresh of 3.5 27B with newer training. Same hybrid
-  // (DeltaNet + FullAttention) arch as 3.5. AR baseline ~44 tok/s; with the
-  // paired DFlash draft (qwen3.6:27b-draft) ~185 tok/s on code prompts.
-  "qwen3.6:27b":      { repo: hfRepo("qwen3.6","27b"),  file: "qwen3.6-27b.mq4",    size_gb: 15.0, min_vram_gb: 16, desc: "44 tok/s AR / 185 tok/s w/ draft on code" },
-
-  // Qwen3.5 MQ6 — 6-bit rotated, higher quality / larger file (~1.47× MQ4)
-  "qwen3.5:0.8b-mq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq6",   size_gb: 0.67, min_vram_gb: 2,  desc: "MQ6, higher quality" },
-  "qwen3.5:4b-mq6":   { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.mq6",     size_gb: 3.5,  min_vram_gb: 5,  desc: "MQ6, higher quality" },
-  "qwen3.5:9b-mq6":   { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.mq6",     size_gb: 7.3,  min_vram_gb: 8,  desc: "MQ6, higher quality" },
-  "qwen3.5:27b-mq6":  { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.mq6",    size_gb: 21.4, min_vram_gb: 24, desc: "MQ6, higher quality" },
-
-  // Qwen3 (standard attention, not DeltaNet)
-  "qwen3:0.6b":       { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b.hf4",     size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
-  "qwen3:8b":         { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",       size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
-
-  // DFlash speculative-decode drafts. Paired with their target — engine
-  // auto-discovers the draft when the target is loaded (qwen3{ver}-{size}-
-  // dflash-{quant}.hfq in the same models dir). Pull one of these AFTER
-  // pulling the matching target. Filename matters: do NOT rename.
-  "qwen3.5:9b-draft":  { repo: hfRepo("qwen3.5","9b"),  file: "qwen35-9b-dflash-mq4.hfq",  size_gb: 0.55, min_vram_gb: 6,  desc: "DFlash draft for qwen3.5:9b — pairs with target for 2-3× decode on code/instruct" },
-  "qwen3.5:27b-draft": { repo: hfRepo("qwen3.5","27b"), file: "qwen35-27b-dflash-mq4.hfq", size_gb: 0.92, min_vram_gb: 16, desc: "DFlash draft for qwen3.5:27b — pairs with target for 4× decode on code (212 tok/s peak)" },
-  "qwen3.6:27b-draft": { repo: hfRepo("qwen3.6","27b"), file: "qwen36-27b-dflash-mq4.hfq", size_gb: 0.92, min_vram_gb: 16, desc: "DFlash draft for qwen3.6:27b — pairs with target for ~4× decode on code" },
-
-  // Community finetunes (Qwen3.5 architecture)
-  "carnice:9b":        { repo: "schuttdev/hipfire-carnice-9b",  file: "carnice-9b.mq4",  size_gb: 5.0, min_vram_gb: 6,  desc: "Hermes tool-use, MQ4" },
-  "carnice:27b":       { repo: "schuttdev/hipfire-carnice-27b", file: "carnice-27b.mq4", size_gb: 15.0, min_vram_gb: 16, desc: "Hermes 27B tool-use, MQ4" },
-  "carnice:9b-mq6":    { repo: "schuttdev/hipfire-carnice-9b",  file: "carnice-9b.mq6",  size_gb: 7.3, min_vram_gb: 8,  desc: "Hermes tool-use, MQ6 higher quality" },
-  "carnice:27b-mq6":   { repo: "schuttdev/hipfire-carnice-27b", file: "carnice-27b.mq6", size_gb: 21.4, min_vram_gb: 24, desc: "Hermes 27B, MQ6 higher quality" },
-  // Qwopus 3.5 v3 — Jackrong fine-tune (reasoning, CoT, competitive programming)
-  "qwopus:9b":         { repo: "schuttdev/hipfire-qwopus-9b", file: "qwopus-9b.mq4",  size_gb: 5.3, min_vram_gb: 6,  desc: "Qwopus3.5 v3, MQ4" },
-  "qwopus:4b":         { repo: "schuttdev/hipfire-qwopus-4b", file: "qwopus-4b.mq4",  size_gb: 2.6, min_vram_gb: 4,  desc: "Qwopus3.5 v3, 4B MQ4" },
-  "qwopus:27b":        { repo: "schuttdev/hipfire-qwopus-27b", file: "qwopus-27b.mq4", size_gb: 15.0, min_vram_gb: 16, desc: "Qwopus3.5 v3, 27B MQ4" },
-  "qwopus:9b-mq6":     { repo: "schuttdev/hipfire-qwopus-9b", file: "qwopus-9b.mq6",  size_gb: 7.3, min_vram_gb: 8,  desc: "Qwopus3.5 v3, MQ6 higher quality" },
-  "qwopus:4b-mq6":     { repo: "schuttdev/hipfire-qwopus-4b", file: "qwopus-4b.mq6",  size_gb: 3.8, min_vram_gb: 5,  desc: "Qwopus3.5 v3, 4B MQ6" },
-  "qwopus:27b-mq6":    { repo: "schuttdev/hipfire-qwopus-27b", file: "qwopus-27b.mq6", size_gb: 21.4, min_vram_gb: 24, desc: "Qwopus3.5 v3, 27B MQ6" },
-};
-
-// Aliases (also map retired hf4/hf6/mq4 tags to current names)
-const ALIASES: Record<string, string> = {
-  "qwen3.5": "qwen3.5:4b",
-  "qwen3.5:latest": "qwen3.5:9b",
-  "qwen3.5:small": "qwen3.5:0.8b",
-  "qwen3.5:large": "qwen3.5:27b",
-  "qwen3.6": "qwen3.6:35b-a3b",
-  "qwen3.6:a3b": "qwen3.6:35b-a3b",
-  "qwen3": "qwen3:8b",
-  "carnice": "carnice:9b",
-  "qwopus": "qwopus:9b",
-  // Retired format tags → current MQ4
-  "qwen3.5:0.8b-mq4": "qwen3.5:0.8b", "qwen3.5:4b-mq4": "qwen3.5:4b",
-  "qwen3.5:9b-mq4": "qwen3.5:9b", "qwen3.5:27b-mq4": "qwen3.5:27b",
-  "qwen3.5:0.8b-hf4": "qwen3.5:0.8b", "qwen3.5:2b-hf4": "qwen3.5:4b",
-  "qwen3.5:4b-hf4": "qwen3.5:4b", "qwen3.5:9b-hf4": "qwen3.5:9b",
-  "qwen3.5:27b-hf4": "qwen3.5:27b",
-  "qwen3.5:0.8b-hf6": "qwen3.5:0.8b-mq6", "qwen3.5:2b-hf6": "qwen3.5:4b-mq6",
-  "qwen3.5:4b-hf6": "qwen3.5:4b-mq6", "qwen3.5:9b-hf6": "qwen3.5:9b-mq6",
-  "qwen3.5:27b-hf6": "qwen3.5:27b-mq6",
-  // Qwopus: old hf4 tags → new mq4
-  "qwopus:9b-hf4": "qwopus:9b", "qwopus:4b-hf4": "qwopus:4b", "qwopus:27b-hf4": "qwopus:27b",
-  "qwopus:9b-mq4": "qwopus:9b", "qwopus:4b-mq4": "qwopus:4b", "qwopus:27b-mq4": "qwopus:27b",
-  // Draft alias — `qwen3.5-9b:draft` syntax → `qwen3.5:9b-draft`
-  "qwen3.5-9b:draft": "qwen3.5:9b-draft", "qwen3.5-27b:draft": "qwen3.5:27b-draft",
-  "qwen3.6-27b:draft": "qwen3.6:27b-draft",
-  "qwen3.5:9b:draft": "qwen3.5:9b-draft", "qwen3.5:27b:draft": "qwen3.5:27b-draft",
-  "qwen3.6:27b:draft": "qwen3.6:27b-draft",
-};
+const REGISTRY: Record<string, ModelEntry> = registryData.models as Record<string, ModelEntry>;
+const ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
 
 function resolveModelTag(input: string): string {
   // Backward compat: old hfq4/hfq6 tags → hf4/hf6
@@ -3410,6 +3328,7 @@ switch (cmd) {
     const exe = process.platform === "win32" ? ".exe" : "";
     const binDir = join(HIPFIRE_DIR, "bin");
     copyFileSync(join(repoDir, "cli/index.ts"), join(HIPFIRE_DIR, "cli/index.ts"));
+    copyFileSync(join(repoDir, "cli/registry.json"), join(HIPFIRE_DIR, "cli/registry.json"));
     console.error("  CLI updated ✓");
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");

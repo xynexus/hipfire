@@ -392,6 +392,7 @@ cp "$REPO_DIR/target/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 2>/dev/nul
 mkdir -p "$HIPFIRE_DIR/cli"
 cp "$REPO_DIR/cli/index.ts" "$HIPFIRE_DIR/cli/index.ts"
 cp "$REPO_DIR/cli/package.json" "$HIPFIRE_DIR/cli/package.json"
+cp "$REPO_DIR/cli/registry.json" "$HIPFIRE_DIR/cli/registry.json"
 
 # Create hipfire wrapper. The shim resolves `bun` even when it isn't on
 # $PATH — rustup and bun both install to under-home bindirs that shell
