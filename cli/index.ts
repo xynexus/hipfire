@@ -354,6 +354,15 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       console.error(`[hipfire] DFlash disabled (dflash_mode=off).`);
     }
   } else {
+    // Surface the #89 risk when the user explicitly opted into DFlash on an
+    // A3B target without a TriAttention sidecar. The "auto" path filters this
+    // case out silently (above), but mode === "on" is force-on and skips that
+    // gate — without this warning the user only finds out when a thinking
+    // turn loops on the last 1/3 of <think>. R̄≈0.39 is a structural ceiling
+    // (MoE routing variance); per-expert sidecars are the long-term fix.
+    if (isA3B && !hasSidecar && mode === "on") {
+      console.error(`[hipfire] WARNING: DFlash on A3B target without sidecar — known thinking-loop attractor (~20-40% rate on long greedy decode, see #89). Set dflash_mode=auto to disable, or attach a TriAttention sidecar.`);
+    }
     const explicit = process.env.HIPFIRE_DFLASH_DRAFT;
     if (explicit !== undefined) {
       if (explicit.length > 0) params.draft = explicit;
