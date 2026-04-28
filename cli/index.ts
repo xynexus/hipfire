@@ -3327,8 +3327,23 @@ switch (cmd) {
     const { copyFileSync } = await import("fs");
     const exe = process.platform === "win32" ? ".exe" : "";
     const binDir = join(HIPFIRE_DIR, "bin");
-    copyFileSync(join(repoDir, "cli/index.ts"), join(HIPFIRE_DIR, "cli/index.ts"));
-    copyFileSync(join(repoDir, "cli/registry.json"), join(HIPFIRE_DIR, "cli/registry.json"));
+    // Order: registry.json BEFORE index.ts. The new index.ts imports the JSON
+    // at startup; if we copied index.ts first and the JSON copy then failed
+    // (missing in repoDir, IO error, partial git pull), the install would be
+    // stranded — new TS that can't resolve its own data file. Copying JSON
+    // first means a partial failure leaves the CLI in a recoverable state:
+    // either old TS + old JSON, or old TS + new JSON (still loads OK).
+    const registrySrc = join(repoDir, "cli/registry.json");
+    const indexSrc    = join(repoDir, "cli/index.ts");
+    if (!existsSync(registrySrc) || !existsSync(indexSrc)) {
+      console.error("\nUpdate aborted: cli/registry.json or cli/index.ts missing in repo checkout at");
+      console.error(`  ${repoDir}`);
+      console.error("Repo may be on a pre-migration commit or in a dirty state. Verify with:");
+      console.error(`  git -C ${repoDir} status && git -C ${repoDir} log -1 --stat`);
+      process.exit(1);
+    }
+    copyFileSync(registrySrc, join(HIPFIRE_DIR, "cli/registry.json"));
+    copyFileSync(indexSrc,    join(HIPFIRE_DIR, "cli/index.ts"));
     console.error("  CLI updated ✓");
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");

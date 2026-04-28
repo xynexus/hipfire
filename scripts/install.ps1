@@ -394,9 +394,17 @@ Write-Host "Installing CLI..." -ForegroundColor Cyan
 
 $CliDir = "$HipfireDir\cli"
 New-Item -ItemType Directory -Force -Path $CliDir | Out-Null
-Copy-Item "$RepoDir\cli\index.ts"     "$CliDir\index.ts"     -Force
-Copy-Item "$RepoDir\cli\package.json" "$CliDir\package.json" -Force
+# Order: registry.json BEFORE index.ts. The CLI imports the JSON at startup;
+# if we wrote the new index.ts first and the JSON copy then failed, the install
+# would be stranded — new TS unable to resolve its own data file.
+if (-not (Test-Path "$RepoDir\cli\registry.json") -or -not (Test-Path "$RepoDir\cli\index.ts")) {
+    Write-Host "ERROR: cli\registry.json or cli\index.ts missing in $RepoDir" -ForegroundColor Red
+    Write-Host "       Repo checkout may be incomplete; aborting install." -ForegroundColor Red
+    exit 1
+}
 Copy-Item "$RepoDir\cli\registry.json" "$CliDir\registry.json" -Force
+Copy-Item "$RepoDir\cli\package.json"  "$CliDir\package.json"  -Force
+Copy-Item "$RepoDir\cli\index.ts"      "$CliDir\index.ts"      -Force
 
 # Create hipfire.cmd wrapper
 $CmdWrapper = "@echo off`r`nbun run `"%USERPROFILE%\.hipfire\cli\index.ts`" %*`r`n"

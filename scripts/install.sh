@@ -390,9 +390,18 @@ cp "$REPO_DIR/target/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 2>/dev/nul
 
 # Copy CLI
 mkdir -p "$HIPFIRE_DIR/cli"
-cp "$REPO_DIR/cli/index.ts" "$HIPFIRE_DIR/cli/index.ts"
-cp "$REPO_DIR/cli/package.json" "$HIPFIRE_DIR/cli/package.json"
+# Order: registry.json BEFORE index.ts. The CLI imports the JSON at startup;
+# if we wrote the new index.ts before the JSON and the JSON copy then failed,
+# the install would be stranded — new TS that can't resolve its own data file.
+# JSON-first means a partial-failure window leaves a recoverable state.
+if [ ! -f "$REPO_DIR/cli/registry.json" ] || [ ! -f "$REPO_DIR/cli/index.ts" ]; then
+    echo "ERROR: cli/registry.json or cli/index.ts missing in $REPO_DIR" >&2
+    echo "       Repo checkout may be incomplete; aborting install." >&2
+    exit 1
+fi
 cp "$REPO_DIR/cli/registry.json" "$HIPFIRE_DIR/cli/registry.json"
+cp "$REPO_DIR/cli/package.json"  "$HIPFIRE_DIR/cli/package.json"
+cp "$REPO_DIR/cli/index.ts"      "$HIPFIRE_DIR/cli/index.ts"
 
 # Create hipfire wrapper. The shim resolves `bun` even when it isn't on
 # $PATH — rustup and bun both install to under-home bindirs that shell
