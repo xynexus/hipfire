@@ -1161,8 +1161,13 @@ async function serve(port: number) {
           return "";
         };
 
-        // Extract system message
-        const sysMsg = messages.find((m: any) => m.role === "system");
+        // Extract system message. OpenAI's o1/o3-style reasoning surface
+        // (and pi-coding-agent) sends `role:"developer"` instead of
+        // `role:"system"` for the same purpose — strict instructions that
+        // outrank user messages. Treat both identically; first match wins
+        // if both happen to be present (last-wins would silently shadow
+        // an upstream system block).
+        const sysMsg = messages.find((m: any) => m.role === "system" || m.role === "developer");
         if (sysMsg) systemPrompt = extractText(sysMsg.content);
 
         // Format tools into system prompt (Hermes format)
@@ -1191,7 +1196,7 @@ async function serve(port: number) {
           s.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
            .replace(/<think>[\s\S]*$/, "");
 
-        const nonSystem = messages.filter((m: any) => m.role !== "system");
+        const nonSystem = messages.filter((m: any) => m.role !== "system" && m.role !== "developer");
         const convParts: string[] = [];
         for (let i = 0; i < nonSystem.length; i++) {
           const m = nonSystem[i];
@@ -1301,6 +1306,21 @@ async function serve(port: number) {
         const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
         const preserveThinking: boolean = ctk.preserve_thinking === true;
 
+        // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
+        // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
+        // pass this when the user picks a reasoning depth in their UI. Map
+        // each level to a max_think_tokens cap; hipfire's thinking budget
+        // is the same shape (cap on tokens emitted inside <think>...</think>).
+        // none ≈ enable_thinking=false (hard 1-token cap so the model
+        // closes <think> immediately). xhigh stays uncapped (0). Requested
+        // by @mikiadev in #79.
+        const reasoning = (body.reasoning && typeof body.reasoning === "object") ? body.reasoning : null;
+        const effortMap: Record<string, number> = {
+          none: 1, minimal: 64, low: 256, medium: 1024, high: 4096, xhigh: 0,
+        };
+        const reasoningEffort: number | null = reasoning && typeof reasoning.effort === "string"
+          && reasoning.effort in effortMap ? effortMap[reasoning.effort] : null;
+
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
@@ -1320,6 +1340,14 @@ async function serve(port: number) {
         // per-model max_think_tokens because the request semantics are more
         // specific than the static config.
         if (enableThinking === false) genParams.max_think_tokens = 1;
+        // reasoning.effort wins over both per-model and enable_thinking
+        // when present (it's the most explicit per-request signal). xhigh
+        // (0 = uncapped) only applies when set; we don't unconditionally
+        // clobber a per-model max_think_tokens with 0.
+        if (reasoningEffort !== null) {
+          if (reasoningEffort === 0) delete genParams.max_think_tokens;
+          else genParams.max_think_tokens = reasoningEffort;
+        }
         // thinking=off is currently a no-op at the CLI layer. Earlier
         // versions injected a prose system directive ("Respond directly
         // without using <think>...</think> reasoning blocks") here, but
