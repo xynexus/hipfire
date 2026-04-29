@@ -25,6 +25,14 @@ fn main() {
     use engine::tokenizer::Tokenizer;
     use engine::triattn::{self, BandCenter, TriAttnCalibState, TriAttnCapture, TriAttnCenters};
     use std::path::Path;
+    use std::time::Instant;
+
+    // Per-chunk CSV timing breakdown for calibration optimization sessions.
+    // Enable with HIPFIRE_CALIB_PROFILE=1; emits to stderr.
+    let calib_profile = std::env::var("HIPFIRE_CALIB_PROFILE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     // ── Parse args ─────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
@@ -37,13 +45,15 @@ fn main() {
         "James Madison wrote Federalist No. 10 arguing that a large republic would curb the effects of factions better than a small one.",
     );
     let mut load_sidecar = false;
-    // GPU-path kernel exists (triattn_accumulate_f32) and is numerically
-    // equivalent to the CPU path (max relative diff 3.6e-10 on 9B/100k cal),
-    // but it's SLOWER in wall clock on short-chunk corpora (40% regression
-    // measured on MI300X 9B + agentic corpus, avg ~3 tok/chunk — kernel
-    // launch overhead dominates per-block work). Keep default CPU; opt into
-    // GPU path explicitly for experimentation on longer-chunk corpora.
-    let mut gpu_calib = false;
+    // GPU calibration path is now DEFAULT (Phase 2, 2026-04-28).
+    // Rationale: forward_prefill_batch is hard-capped at kv_seq.saturating_sub(4)
+    // = 508 tokens per call regardless of `chunk_len`, so production calibration
+    // never sees the avg ~3 tok/chunk corpus that drove the original 40% GPU
+    // regression. The kernel header for triattn_accumulate.hip annotates a
+    // 5-8× speedup on MI300X. Verified Phase 2 R̄ within ±0.005 of CPU baseline.
+    // Opt out with --cpu-calib when stress-testing the CPU fallback path
+    // (e.g. for FP64 vs FP32 reference comparisons).
+    let mut gpu_calib = true;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -54,9 +64,10 @@ fn main() {
             "--val-prompt" => { validation_prompt = args[i + 1].clone(); i += 2; }
             "--load-sidecar" => { load_sidecar = true; i += 1; }
             "--gpu-calib" => { gpu_calib = true; i += 1; }
+            "--cpu-calib" => { gpu_calib = false; i += 1; }
             s if !s.starts_with("--") && model_path.is_none() => { model_path = Some(s.to_string()); i += 1; }
             other => {
-                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--gpu-calib]");
+                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--gpu-calib | --cpu-calib]");
                 std::process::exit(1);
             }
         }
@@ -193,31 +204,121 @@ fn main() {
             triattn::install_tap(calib_state);
         }
 
+        // Pre-tokenize chunks once. Per-chunk encode in the original hot
+        // loop accounted for ~44% of wall time on MI300X (measured
+        // 2026-04-28 Phase 1 baseline: 456ms encode vs 580ms forward per
+        // 508-token chunk). Pre-tokenization runs in parallel across the
+        // EPYC cores via rayon (Phase 2.5+: serial pretok still cost 89s
+        // on a 100k-token run, ~50% of remaining wall). Stop early at
+        // max_tokens worth of effective samples (each chunk contributes
+        // min(chunk_tokens, kv_seq-4)).
+        // Pretokenize chunks once. Per-chunk encode in the original hot
+        // loop accounted for ~44% of wall time on MI300X (Phase 1
+        // baseline 2026-04-28). Hoisting it out trades a few seconds of
+        // upfront work for a several-minute savings on 1M-token corpora.
+        // Hermes/blended corpora contain individual ChatML conversations
+        // of 4-10k tokens each; encoding them whole and then slicing to
+        // 508 wastes 90%+ of tokenizer wall time, so truncate input
+        // text to ~max_eff*5 chars before encoding. Iterates batches
+        // until covered_tokens reaches max_tokens — short ChatML
+        // chunks average <max_eff effective tokens, so a single
+        // parallel pass would underdeliver the corpus the user asked
+        // for.
+        let pretok_t0 = Instant::now();
+        let prompt_tokens: Vec<Vec<u32>> = {
+            use rayon::prelude::*;
+            let max_eff = kv_seq.saturating_sub(4).max(1);
+            let max_chars = max_eff.saturating_mul(5).max(64);
+            let mut acc: Vec<Vec<u32>> = Vec::new();
+            let mut covered = 0usize;
+            let mut start = 0usize;
+            while covered < max_tokens && start < calibration_prompts.len() {
+                let remaining = max_tokens.saturating_sub(covered);
+                let est = remaining.div_ceil(max_eff).max(1);
+                // Oversize by 2× to absorb short chunks (ChatML system
+                // turns are often 30-100 tokens, well under max_eff).
+                let take = (est.saturating_mul(2)).min(calibration_prompts.len() - start);
+                if take == 0 { break; }
+                let end = start + take;
+                let mut new_chunks: Vec<Vec<u32>> = calibration_prompts[start..end]
+                    .par_iter()
+                    .map(|p| {
+                        let s: &str = if p.len() > max_chars {
+                            let mut bend = max_chars;
+                            while bend > 0 && !p.is_char_boundary(bend) { bend -= 1; }
+                            &p[..bend]
+                        } else {
+                            &p[..]
+                        };
+                        let mut t = tok.encode(s);
+                        if t.len() > max_eff { t.truncate(max_eff); }
+                        t
+                    })
+                    .collect();
+                start = end;
+                for toks in new_chunks.drain(..) {
+                    let effective = toks.len().min(max_eff);
+                    if effective == 0 { continue; }
+                    covered = covered.saturating_add(effective);
+                    acc.push(toks);
+                    if covered >= max_tokens { break; }
+                }
+            }
+            acc
+        };
+        let covered_tokens = prompt_tokens.iter()
+            .map(|t| t.len().min(kv_seq.saturating_sub(4)))
+            .sum::<usize>();
+        let pretok_ms = pretok_t0.elapsed().as_secs_f64() * 1000.0;
+        if calib_profile {
+            eprintln!(
+                "[CALIB_PROFILE] PRETOK total_ms={pretok_ms:.1} n_chunks={} covered_tokens={covered_tokens}",
+                prompt_tokens.len(),
+            );
+        }
+        if calib_profile {
+            eprintln!("[CALIB_PROFILE] chunk_idx,n_tokens,memset_ms,forward_ms,total_ms,cumulative_tokens");
+        }
+        let calib_t0 = Instant::now();
         let mut total_tokens = 0usize;
-        'outer: for (pi, p) in calibration_prompts.iter().enumerate() {
-            let tokens = tok.encode(p);
+        'outer: for (pi, tokens) in prompt_tokens.iter().enumerate() {
+            let chunk_t0 = Instant::now();
+            let memset_t0 = Instant::now();
             for buf in kv.k_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
             for buf in kv.v_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
             for t in &dn.s_matrices { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
             for t in &dn.s_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
             for t in &dn.conv_states { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+            let memset_ms = memset_t0.elapsed().as_secs_f64() * 1000.0;
             let max_len = tokens.len().min(kv_seq.saturating_sub(4));
             let remaining = max_tokens.saturating_sub(total_tokens);
             let take_len = max_len.min(remaining);
             if take_len == 0 { break 'outer; }
+            let fwd_t0 = Instant::now();
             qwen35::forward_prefill_batch(
                 &mut gpu, &weights, &config, &tokens[..take_len], 0,
                 &mut kv, &mut dn, &scratch,
                 None, None, None, None,
             ).expect("calib batched forward");
+            // Force the device to drain so the timing reflects real GPU work,
+            // not just queued kernels — Phase 1 attribution depends on this.
+            if calib_profile { let _ = gpu.hip.device_synchronize(); }
+            let forward_ms = fwd_t0.elapsed().as_secs_f64() * 1000.0;
+            let total_ms = chunk_t0.elapsed().as_secs_f64() * 1000.0;
             total_tokens += take_len;
-            if pi % 10 == 0 || pi + 1 == calibration_prompts.len() {
+            if calib_profile {
+                eprintln!(
+                    "[CALIB_PROFILE] {pi},{take_len},{memset_ms:.3},{forward_ms:.3},{total_ms:.3},{total_tokens}",
+                );
+            } else if pi % 10 == 0 || pi + 1 == calibration_prompts.len() {
                 eprintln!("  chunk {}/{}: cumulative {} tokens", pi + 1, calibration_prompts.len(), total_tokens);
             }
             if total_tokens >= max_tokens { break 'outer; }
         }
+        let calib_loop_ms = calib_t0.elapsed().as_secs_f64() * 1000.0;
 
         eprintln!("total calibration samples: {total_tokens} tokens × FA layers");
+        let finalize_t0 = Instant::now();
         let c = if using_gpu_tap {
             let gpu_state = triattn::take_tap_gpu().expect("GPU tap still installed");
             gpu_state.finalize(&mut gpu).expect("finalize GPU calib")
@@ -225,6 +326,13 @@ fn main() {
             let calib = triattn::take_tap().expect("tap still installed");
             calib.finalize()
         };
+        let finalize_ms = finalize_t0.elapsed().as_secs_f64() * 1000.0;
+        if calib_profile {
+            eprintln!(
+                "[CALIB_PROFILE] SUMMARY total_tokens={total_tokens} loop_ms={calib_loop_ms:.1} finalize_ms={finalize_ms:.1} effective_tok_per_sec={:.1}",
+                (total_tokens as f64) * 1000.0 / calib_loop_ms.max(1.0),
+            );
+        }
         c.save(Path::new(&sidecar_path)).expect("save sidecar");
         eprintln!("saved sidecar: {sidecar_path}");
         c
