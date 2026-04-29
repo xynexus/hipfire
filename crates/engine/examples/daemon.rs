@@ -488,11 +488,28 @@ fn main() {
                 let budget_alert_text = if experimental_ok {
                     msg.get("budget_alert_text").and_then(|v| v.as_str()).unwrap_or("").to_string()
                 } else { String::new() };
+                // Budget for tokens emitted INSIDE the model's <think>...</think>
+                // block. 0 = uncapped (model thinks until it naturally closes).
+                // Triggered from the CLI by per-model `max_think_tokens` config,
+                // OpenAI `chat_template_kwargs.enable_thinking=false` (cap=1),
+                // and `reasoning.effort` (none=1, minimal=64, low=256, medium=
+                // 1024, high=4096, xhigh=0).
+                //
+                // When the cap is reached the daemon force-emits "</think>\n"
+                // through the same KV-write + sample path as a normal token,
+                // closing the thinking block so the model commits to an
+                // answer with the remaining max_tokens budget. Caught by
+                // Codex stop-time review on 2026-04-28: the field had been
+                // shipping in genParams since cli/index.ts but the daemon
+                // was silently ignoring it, making the new reasoning.effort
+                // / enable_thinking knobs no-ops on the wire.
+                let max_think_tokens = msg.get("max_think_tokens")
+                    .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
                 if image.is_some() && m.vision_config.is_some() {
                     generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 } else {
-                    generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window, budget_alert_at_tok, &budget_alert_text);
+                    generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window, budget_alert_at_tok, &budget_alert_text, max_think_tokens);
                 }
             }
 
@@ -1494,11 +1511,24 @@ fn generate_dflash(
     let _ = stdout.flush();
 }
 
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize) {
     // DFlash fast path — only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
     if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) {
+        if max_think_tokens > 0 {
+            // DFlash's spec-cycle emit path doesn't yet honor max_think_tokens
+            // — wiring close-injection through the verify loop is a separate
+            // change. Tell the operator their cap is being ignored on this
+            // path so they don't think a runaway thinking turn is a daemon
+            // hang. AR path (no draft, or temp>0) does enforce it.
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"info","id":"{}","message":"max_think_tokens={} ignored on DFlash path (only enforced on AR; set dflash_mode=off to use the AR path with the cap)"}}"#,
+                id, max_think_tokens
+            );
+            let _ = stdout.flush();
+        }
         generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens);
         // Silence unused-variable warnings for the params we didn't need.
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text);
@@ -1693,6 +1723,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let mut streamed_tokens: Vec<u32> = Vec::new();
         let mut emitted_bytes = 0usize;
         let mut alert_fired = false;
+        // max_think_tokens enforcement state. think_count increments only
+        // while we observe ourselves to be inside a `<think>...</think>`
+        // block via the same decoded-text scan budget_alert uses. When the
+        // cap is hit we splice "</think>\n" into the stream (KV write +
+        // stdout emit + advance generated) so the model finishes thinking
+        // and commits to an answer with the remaining max_tokens budget.
+        // Re-armable: if the model later opens another <think> in the same
+        // turn (rare) the counter resets and the cap re-fires.
+        let mut think_count: usize = 0;
+        let mut prev_in_think: bool = false;
 
         // `while` instead of `for 0..max_tokens` so budget-alert injection
         // (which increments `generated` beyond the iteration count) can't
@@ -1733,6 +1773,71 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
             if tokenizer.is_terminator(next_token) { break; }
+
+            // max_think_tokens enforcement. Track whether we're inside an
+            // open <think>...</think> block and how many tokens we've
+            // emitted there. When the cap is hit, splice "</think>\n" into
+            // the stream (KV write + stdout emit + advance generated) so
+            // the model commits to an answer with the remaining budget.
+            // Same decoded-text scan budget_alert uses; counter is
+            // incremented per-iteration only when we're still inside.
+            if max_think_tokens > 0 {
+                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let open_idx = raw_str.rfind("<think>");
+                let close_idx = raw_str.rfind("</think>");
+                let in_think = match (open_idx, close_idx) {
+                    (Some(o), Some(c)) => o > c,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if in_think {
+                    if !prev_in_think { think_count = 1; } else { think_count += 1; }
+                } else {
+                    think_count = 0;
+                }
+                prev_in_think = in_think;
+
+                if in_think && think_count >= max_think_tokens {
+                    // Force-close. Encode the close sequence and run each
+                    // token through the KV write + emit path the same way
+                    // a normally-sampled token does. This ensures the
+                    // model's next sample is conditioned on having "said"
+                    // </think>\n itself, instead of seeing a hidden-state
+                    // discontinuity. Respect max_tokens — clip the close
+                    // sequence if not enough room remains and bail.
+                    let close_tokens = tokenizer.encode("</think>\n");
+                    let budget_left = max_tokens.saturating_sub(generated);
+                    let take = close_tokens.len().min(budget_left);
+                    for &t in &close_tokens[..take] {
+                        qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+                        m.seq_pos += 1;
+                        if let Some(ref ev) = m.eviction {
+                            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                                m.seq_pos = new_phys;
+                            }
+                        }
+                        m.conversation_tokens.push(t);
+                        streamed_tokens.push(t);
+                        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                        let new_bytes = &all_bytes[emitted_bytes..];
+                        let vl = match std::str::from_utf8(new_bytes) {
+                            Ok(_) => new_bytes.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if vl > 0 {
+                            let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                            let _ = stdout.flush();
+                            emitted_bytes += vl;
+                        }
+                        generated += 1;
+                    }
+                    think_count = 0;
+                    prev_in_think = false;
+                    if generated >= max_tokens { break; }
+                }
+            }
 
             // Budget-alert injection: once we hit the configured token count,
             // splice the nudge text into the stream. Tokens are emitted to
