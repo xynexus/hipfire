@@ -715,6 +715,60 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
 
+    // DFlash speculative-decode requires the target's lm_head to have a
+    // batched-GEMM kernel (used for verify and DDTree top-K). Only
+    // Q8_0 (qt=3) / HFQ4G256 (qt=6) / MQ4G256 (qt=13) are wired into
+    // speculative.rs's `try_batched` predicate (lines 2083-2087,
+    // 2606-2609); every other dtype falls through to a per-row sequential
+    // GEMV path that hangs spec verify (observed: 1 token in 240 s on
+    // 27B MQ3 + dflash-mq4 draft).
+    //
+    // Refuse fast at the HFQ-index level — BEFORE any weight upload, KV
+    // alloc, or scratch alloc — so we don't strand ~12 GB of VRAM in the
+    // pool when the operator passed a draft against an unsupported target.
+    // Read the lm_head tensor's `quant_type` byte directly from the index
+    // (no GPU work). lm_head can be a separate tensor or tied to
+    // embed_tokens, and the tensor names differ by arch:
+    //   - Qwen3.5/3.6 separate: "lm_head.weight" or "model.language_model.lm_head.weight"
+    //   - Qwen3.5/3.6 tied:     "model.language_model.embed_tokens.weight"
+    //   - LLaMA separate:       "lm_head.weight"
+    //   - LLaMA tied:           "model.embed_tokens.weight"
+    // Cover all four; the order mirrors what qwen35::load_weights /
+    // hfq::load_weights_hfq do at runtime, so the qt we read here is the
+    // qt that will end up driving `weights.output.gpu_dtype`.
+    if draft_path.is_some() {
+        let lm_qt = hfq.tensor_data("lm_head.weight")
+            .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
+            .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
+            .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
+            .map(|(info, _)| info.quant_type);
+        // Whitelist: Q8_0=3, HFQ4G256=6, MQ4G256=13. Future quant formats
+        // refused by default until they're explicitly wired into both the
+        // verify GEMM and the DDTree top-K paths. If we can't locate the
+        // lm_head tensor at any known name, refuse defensively — better
+        // than letting load_weights panic later after burning ~12 GB of
+        // VRAM on a malformed model.
+        let supported = matches!(lm_qt, Some(3 | 6 | 13));
+        if !supported {
+            let qt_desc = match lm_qt {
+                Some(qt) => format!("quant_type={qt}"),
+                None => "no lm_head/embed_tokens tensor found at any known name".to_string(),
+            };
+            return Err(format!(
+                "DFlash draft requested but target lm_head {} is not \
+                 supported by speculative.rs's batched GEMM paths. Only \
+                 Q8_0 (qt=3), HFQ4G256 (qt=6), and MQ4G256 (qt=13) have \
+                 batched lm_head kernels; everything else (MQ3/MQ2 \
+                 qt=17/18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) \
+                 falls through to a per-row GEMV that hangs verify. \
+                 Reload without a draft, or use an MQ4 / HFQ4 / Q8 \
+                 target. (PRD Phase 2: extend speculative.rs match arms \
+                 + add gemm_*_batched_lmhead kernels.)",
+                qt_desc
+            ));
+        }
+    }
+
     // Derive physical_cap. With eviction (cask.sidecar set), the physical
     // buffer only needs to hold budget+beta+safety slots; max_seq is the
     // advertised window the client targets. Without eviction, the two are
