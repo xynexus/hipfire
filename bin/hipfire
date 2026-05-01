@@ -1,0 +1,14 @@
+#!/bin/bash
+set -e
+if command -v bun >/dev/null 2>&1; then
+    BUN=bun
+elif [ -x "$HOME/.bun/bin/bun" ]; then
+    BUN="$HOME/.bun/bin/bun"
+elif [ -x "/usr/local/bin/bun" ]; then
+    BUN="/usr/local/bin/bun"
+else
+    echo "hipfire: 'bun' not found in PATH, ~/.bun/bin/, or /usr/local/bin/." >&2
+    echo "         Install it: curl -fsSL https://bun.sh/install | bash" >&2
+    exit 127
+fi
+exec "$BUN" run "$HOME/.hipfire/cli/index.ts" "$@"
