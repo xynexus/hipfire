@@ -1536,6 +1536,28 @@ impl Gpu {
         }
     }
 
+    /// Tear down all captured hipGraphs + their kernarg blobs. Captured
+    /// graphs hold device pointers into the model's KV cache, scratch, and
+    /// draft weights baked into kernarg memory by hipStreamEndCapture. Once
+    /// any of those tensors are freed and the pool re-uses their buffers
+    /// for the next model, replaying the captured graph would execute against
+    /// either dangling or wrong-content pointers. The warmup sets would also
+    /// wrongly skip the per-B / per-n_steps JIT step on the new model. Must
+    /// be called from `unload_model` before the underlying tensors are
+    /// returned to the pool.
+    ///
+    /// Affected state:
+    ///   * graph_exec / captured_graph: single-slot AR forward graph.
+    ///   * verify_graph_cache + verify_warmed_up + verify_capturing_b:
+    ///     DFlash per-B verify-forward graphs.
+    ///   * replay_graph_cache + replay_warmed_up + replay_capturing_n:
+    ///     DFlash per-n_steps tape-replay graphs.
+    pub fn invalidate_graph_state(&mut self) {
+        self.graph_destroy();
+        self.verify_graph_destroy_all();
+        self.replay_graph_destroy_all();
+    }
+
     // ── Kernel operations ───────────────────────────────────────
 
     /// y = A * x (matrix-vector multiply, A is [M, K], x is [K], y is [M])

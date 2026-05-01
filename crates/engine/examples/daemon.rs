@@ -1072,6 +1072,13 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // can land at the same device address and silently inherit stale
     // verdicts (mmq_screen_cache) or leaked FP16 shadows (fp16_shadow_cache).
     gpu.invalidate_weight_caches();
+    // Tear down any captured hipGraphs (single-slot AR forward graph plus
+    // DFlash verify and replay graph caches). These bake KV-cache, scratch,
+    // and draft-weight pointers into kernarg memory at capture time; the
+    // tensors backing those pointers are freed above, so replaying after
+    // a model swap would dispatch against dangling or wrong-content
+    // memory.
+    gpu.invalidate_graph_state();
     gpu.drain_pool();
 }
 
