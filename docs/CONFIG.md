@@ -62,7 +62,7 @@ crossover for the current arch. `never` is the byte-exact reference;
 
 | Key | Default | Range | Notes |
 |---|---|---|---|
-| `mmq_screen` | true | bool | Per-weight outlier detection for the i8 WMMA (MMQ) prefill path. Screens each weight matrix on first use; outlier rows fall back to f16 WMMA. |
+| `mmq_screen` | auto | off / on / auto | Per-weight outlier detection for the i8 WMMA (MMQ) prefill path. `off` disables screening entirely (max throughput, risks #87 corruption when MMQ is active). `on` forces the load-time sweep on RDNA3/3.5. `auto` lets the daemon decide per arch (today identical to `on`, reserved so future versions can demote/promote per validated arch+model combo without forcing users to retune). |
 | `mmq_screen_threshold` | 0.10 | 0.01–1.0 | Max per-row abs error threshold. Lower = more conservative (more fallbacks). 0.10 validated on 9B/27B for byte-identical output vs pure WMMA. |
 
 MMQ (i8 WMMA + Q8_1 activation quantization) gives +40-50% prefill
@@ -70,14 +70,22 @@ speedup on RDNA3/3.5 but certain weight rows produce 5-9x higher
 quantization error than normal. Without screening, these outliers
 corrupt tool-call output (ChatML special-token leakage, ref #87).
 
+MMQ itself is opt-in via `HIPFIRE_MMQ=1` or `HIPFIRE_WO_MMQ=1`.
+`mmq_screen` only takes effect when MMQ is active; the daemon also
+arch-gates the sweep to RDNA3/3.5 (`gfx1100` / `gfx1101` / `gfx1102` /
+`gfx1103` / `gfx1150` / `gfx1151`).
+
 Screening runs a batch=16 synthetic comparison (WMMA vs MMQ) per weight
-matrix at first use (~0.1ms per weight, cached). On qwen3.5-9b, 25/216
+matrix at load time (~0.1ms per weight, cached). On qwen3.5-9b, 25/216
 weights fall back to WMMA; on qwen3.6-27b, 73/432. The remaining 83-88%
 of weights keep the fast MMQ path.
 
-Set `mmq_screen=false` only for benchmarking raw MMQ throughput. Not
+Set `mmq_screen=off` only for benchmarking raw MMQ throughput. Not
 recommended for production — output quality degrades on tool-call and
 structured-output prompts.
+
+Legacy boolean values from the PR #104 ship (`true`/`false`) are
+auto-migrated on load: `true → on`, `false → off`.
 
 ## CASK (TriAttention KV eviction)
 

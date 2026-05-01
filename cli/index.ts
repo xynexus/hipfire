@@ -110,13 +110,20 @@ interface HipfireConfig {
   prompt_normalize: boolean;
 
   // ── MMQ per-weight screening (#87) ──────────────────────────────────
-  // When true (default), the i8 WMMA (MMQ) prefill path screens each
-  // weight matrix on first use. A quick synthetic comparison (batch=16)
-  // checks per-row max abs error — weights with outlier rows fall back
-  // to f16 WMMA. Prevents tool-call corruption from Q8_1 precision loss
-  // on specific weight channels (e.g. row 3994 in Wo projections).
-  // Only effective when MMQ is active (HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1).
-  mmq_screen: boolean;
+  // Tri-state guard for the i8 WMMA (MMQ) prefill path. When MMQ is
+  // active (HIPFIRE_MMQ=1 / HIPFIRE_WO_MMQ=1), Q8_1 precision loss on
+  // specific weight rows (e.g. row 3994 in Wo) can corrupt structured
+  // output (#87). Screening compares MMQ vs f16 WMMA per row and falls
+  // back to WMMA on outliers.
+  //   off:  never screen; if MMQ is active, all weights take the fast
+  //         path (max speed, risk of tool-call/JSON corruption).
+  //   on:   always screen on RDNA3/3.5 archs at load time. The daemon
+  //         already no-ops on non-RDNA3 archs, so this is safe to set
+  //         globally.
+  //   auto: same as `on` today; reserved so the daemon can promote or
+  //         demote per arch+model without forcing users to retune
+  //         their config. Default.
+  mmq_screen: "off" | "on" | "auto";
   // Abs error threshold for MMQ screening. Weights with any output row
   // exceeding this fall back to WMMA. Default 0.10 — validated on both
   // qwen3.5-9b and qwen3.6-27b to produce byte-identical output vs WMMA.
@@ -160,10 +167,11 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
   prompt_normalize: true,
   // MMQ per-weight screening: detect Q8_1 outlier rows and fall back to
-  // WMMA. Default OFF — no single threshold produces byte-identical output
-  // across models without screening out 90%+ of weights. Opt in to prevent
-  // tool-call corruption (#87) when using HIPFIRE_MMQ=1.
-  mmq_screen: false,
+  // WMMA. Default `auto`: the daemon arch-gates this to RDNA3/3.5
+  // (gfx1100/1101/1102/1103/1150/1151) and only fires when MMQ is active
+  // (HIPFIRE_MMQ=1). Set `off` for max speed (risks #87 tool-call
+  // corruption); set `on` to force the sweep.
+  mmq_screen: "auto",
   mmq_screen_threshold: 0.10,
 };
 
@@ -193,7 +201,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
     case "cask_auto_attach": return typeof value === "boolean";
     case "prompt_normalize": return typeof value === "boolean";
-    case "mmq_screen": return typeof value === "boolean";
+    case "mmq_screen": return ["off", "on", "auto"].includes(value);
     case "mmq_screen_threshold": return typeof value === "number" && value > 0 && value <= 1;
     default: return false;
   }
@@ -202,6 +210,12 @@ function validateConfigValue(key: string, value: any): boolean {
 function loadConfig(): HipfireConfig {
   try {
     const raw = JSON.parse(require("fs").readFileSync(CONFIG_PATH, "utf-8"));
+    // Migrate legacy boolean mmq_screen → tri-state. Pre-2026-05-01 configs
+    // saved `false` (the prior PR #104 default). Coerce silently rather
+    // than dropping the key on validation failure.
+    if (typeof raw.mmq_screen === "boolean") {
+      raw.mmq_screen = raw.mmq_screen ? "on" : "off";
+    }
     const result = { ...CONFIG_DEFAULTS };
     for (const key of Object.keys(CONFIG_DEFAULTS)) {
       if (key in raw && validateConfigValue(key, raw[key])) {
@@ -250,13 +264,27 @@ function loadPerModelConfigs(): PerModelConfigs {
   try {
     const raw = JSON.parse(require("fs").readFileSync(PER_MODEL_CONFIG_PATH, "utf-8"));
     const out: PerModelConfigs = {};
+    let migrated = false;
     for (const [tag, ov] of Object.entries(raw ?? {})) {
       const clean: PerModelOverride = {};
+      // Migrate legacy boolean mmq_screen → tri-state. Pre-2026-05-01 per-model
+      // overlays from PR #104 stored true/false; without this they'd fail the
+      // new tri-state validator and the override would silently disappear.
+      if (typeof (ov as any)?.mmq_screen === "boolean") {
+        (ov as any).mmq_screen = (ov as any).mmq_screen ? "on" : "off";
+        migrated = true;
+      }
       for (const k of PER_MODEL_KEYS) {
         const v = (ov as any)?.[k];
         if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
       }
       if (Object.keys(clean).length > 0) out[tag] = clean;
+    }
+    // Persist migration so the legacy boolean doesn't sit in the file forever
+    // tripping every read. Best-effort: if the write fails (read-only fs,
+    // permission), the in-memory result is still correct for this run.
+    if (migrated) {
+      try { savePerModelConfigs(out); } catch {}
     }
     return out;
   } catch { return {}; }
@@ -491,8 +519,12 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     }
   }
 
-  // MMQ per-weight screening (#87)
-  params.mmq_screen = resolved.mmq_screen;
+  // MMQ per-weight screening (#87). Tri-state at the CLI surface,
+  // boolean at the daemon. `auto` resolves to true today; the daemon
+  // arch-gates the sweep to RDNA3/3.5, so on non-RDNA3 archs this is a
+  // no-op. `off` forces the sweep off even on RDNA3 (max speed, risks
+  // #87 tool-call corruption).
+  params.mmq_screen = resolved.mmq_screen !== "off";
   params.mmq_screen_threshold = resolved.mmq_screen_threshold;
 
   return { type: "load", model: path, params };
@@ -2932,6 +2964,16 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "prompt_normalize",
       desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; off by default)",
       options: ["true", "false"],
+    },
+    mmq_screen: {
+      label: "mmq_screen",
+      desc: "MMQ Q8_1 outlier-row screening (#87). off = max prefill speed, risks tool-call/JSON corruption on some weights. on = always screen on RDNA3/3.5 at load. auto = let the daemon decide per arch (default).",
+      options: ["off", "on", "auto"],
+    },
+    mmq_screen_threshold: {
+      label: "mmq_screen_threshold",
+      desc: "max abs error tolerated per output row before falling back to WMMA. 0.10 validated on 9B/27B; lower = stricter (more weights screened, slower).",
+      range: [0.01, 1.0], step: 0.01, decimals: 2,
     },
   };
 
