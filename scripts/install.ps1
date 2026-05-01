@@ -414,6 +414,12 @@ Write-Host "  CLI installed to $CliDir ✓" -ForegroundColor Green
 Write-Host "  Wrapper: $BinDir\hipfire.cmd ✓" -ForegroundColor Green
 
 # ─── Kernels ─────────────────────────────────────────────
+# kernels/compiled/<arch>/ is gitignored, so a fresh git clone never ships
+# .hsaco blobs. We mirror the Linux flow (install.sh): seed any blobs that
+# happen to be present in the checkout (developer case), then run
+# daemon.exe --precompile to JIT-compile the default Qwen3.5 kernel set
+# into ~/.hipfire/bin/kernels/compiled/<arch>/. First `hipfire run` is then
+# instant instead of a multi-minute hipcc wall.
 Write-Host ""
 if ($GpuArch -ne "unknown") {
     Write-Host "Setting up kernels for $GpuArch..." -ForegroundColor Cyan
@@ -423,21 +429,56 @@ if ($GpuArch -ne "unknown") {
 
     if (Test-Path $KernelSrc) {
         $Hsacos = Get-ChildItem "$KernelSrc\*.hsaco" -ErrorAction SilentlyContinue
-        if ($Hsacos.Count -gt 0) {
+        if ($Hsacos -and $Hsacos.Count -gt 0) {
             Copy-Item "$KernelSrc\*.hsaco" $KernelDest -Force
             Copy-Item "$KernelSrc\*.hash" $KernelDest -Force -ErrorAction SilentlyContinue
-            Write-Host "  Copied $($Hsacos.Count) kernels + hashes to $KernelDest ✓" -ForegroundColor Green
+            Write-Host "  Seeded $($Hsacos.Count) kernels from repo checkout to $KernelDest ✓" -ForegroundColor Green
         } else {
-            Write-Host "  WARNING: No .hsaco files found in $KernelSrc" -ForegroundColor Yellow
+            Write-Host "  No pre-compiled .hsaco found in repo (gitignored). Will JIT-compile below." -ForegroundColor Yellow
         }
     } else {
-        Write-Host "  WARNING: No pre-compiled kernels for $GpuArch in repo." -ForegroundColor Yellow
-        Write-Host "  Compile them: cd $RepoDir && scripts\compile-kernels.ps1 $GpuArch"
-        Write-Host "  Then copy: Copy-Item kernels\compiled\$GpuArch\*.hsaco $KernelDest"
+        Write-Host "  No pre-compiled kernels for $GpuArch in repo (gitignored). Will JIT-compile below." -ForegroundColor Yellow
     }
 } else {
     Write-Host "Skipping kernel setup (GPU arch unknown)." -ForegroundColor Yellow
-    Write-Host "  Re-run installer after fixing GPU detection, or copy kernels manually."
+    Write-Host "  Re-run installer after fixing GPU detection, or run scripts\compile-kernels.ps1 manually."
+}
+
+# ─── Pre-compile via daemon (parity with install.sh) ─────
+# Fills in any missing kernels for the active GPU. Uses hipcc in the
+# background; writes back to ~/.hipfire/bin/kernels/compiled/<arch>/.
+# Runs even when GpuArch is "unknown"; Gpu::init resolves the active arch
+# at runtime regardless of install-time detection.
+$DaemonExe = "$BinDir\daemon.exe"
+if (Test-Path $DaemonExe) {
+    Write-Host ""
+    Write-Host "Pre-compiling GPU kernels (first run will be instant afterward)..." -ForegroundColor Cyan
+    $hipccAvailable = $false
+    if ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\hipcc.bat"))) { $hipccAvailable = $true }
+    elseif ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\hipcc.exe"))) { $hipccAvailable = $true }
+    elseif (Get-Command hipcc -ErrorAction SilentlyContinue) { $hipccAvailable = $true }
+    elseif (Test-Path "C:\Program Files\AMD\ROCm") {
+        $rocmHipcc = Get-ChildItem "C:\Program Files\AMD\ROCm" -Recurse -Filter "hipcc.bat" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($rocmHipcc) { $hipccAvailable = $true }
+    }
+
+    if (-not $hipccAvailable) {
+        Write-Host "  hipcc not found in PATH or `$env:HIP_PATH; skipping pre-compile." -ForegroundColor Yellow
+        Write-Host "  Install the AMD HIP SDK to enable JIT compilation:" -ForegroundColor Yellow
+        Write-Host "    https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html" -ForegroundColor Yellow
+        Write-Host "  Pre-compiled blobs in the repo will still load if available."
+    } else {
+        try {
+            & $DaemonExe --precompile
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  Pre-compile complete ✓" -ForegroundColor Green
+            } else {
+                Write-Host "  Pre-compile finished with warnings; missing kernels will JIT on first use." -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "  Pre-compile failed: $_; missing kernels will JIT on first use." -ForegroundColor Yellow
+        }
+    }
 }
 
 # ─── Config ──────────────────────────────────────────────

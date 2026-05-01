@@ -13,8 +13,29 @@ fetches matching pre-compiled kernel blobs, drops the daemon and quantizer
 binaries into `~/.hipfire/bin/`, and adds a wrapper to `~/.local/bin/`. Make
 sure `~/.local/bin` is on your `PATH`.
 
-For Windows: WSL2 only (`/dev/kfd` is required). Inside Ubuntu under WSL2 run
-`sudo amdgpu-install --usecase=wsl` first, then the installer above.
+For Windows (native, with the AMD HIP SDK):
+
+```powershell
+irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1 | iex
+```
+
+The installer detects your AMD GPU via `Win32_VideoController`, downloads
+the prebuilt `daemon.exe` from the latest GitHub release, sets up the
+`bun`-based CLI, and runs `daemon.exe --precompile` to JIT-compile kernels
+for your arch into `~\.hipfire\bin\kernels\compiled\<arch>\`. This requires
+the [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)
+to be installed (provides `hipcc.bat` + `amdhip64.dll`).
+
+If hipcc is not available, kernels can still load from any prebuilt blobs
+in the repo. To force a fresh compile of the full kernel set:
+
+```powershell
+.\scripts\compile-kernels.ps1 gfx1100   # or your arch
+```
+
+For WSL2 (Linux paths, `/dev/kfd` available): inside Ubuntu under WSL2
+run `sudo amdgpu-install --usecase=wsl` first, then the Linux installer
+above.
 
 For source builds:
 
