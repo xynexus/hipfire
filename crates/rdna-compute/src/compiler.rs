@@ -230,6 +230,35 @@ impl KernelCompiler {
         out
     }
 
+    /// On Windows, convert a path containing spaces to its 8.3 short-path
+    /// form (e.g. `C:\Program Files\AMD\ROCm\6.4\include` to
+    /// `C:\PROGRA~1\AMD\ROCm\6.4\include`) so it can be embedded as a single
+    /// argv element to hipcc.bat without being split by the inner clang.exe
+    /// re-tokenisation. Falls back to the original path on any error or on
+    /// non-Windows hosts. Reported as #82.
+    #[cfg(target_os = "windows")]
+    fn win_short_path_if_needed(p: &str) -> String {
+        if !p.contains(' ') { return p.to_string(); }
+        // Use cmd.exe's `for %A in (LONG) do echo %~sA` to ask the OS for the
+        // 8.3 alias. Subprocess approach avoids pulling in a winapi crate dep
+        // for this single call site.
+        let out = Command::new("cmd")
+            .args(["/c", &format!("for %A in (\"{}\") do @echo %~sA", p)])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if !s.is_empty() && !s.contains(' ') { s } else { p.to_string() }
+            }
+            _ => p.to_string(),
+        }
+    }
+
+    /// No-op on non-Windows: POSIX argv handling preserves embedded spaces
+    /// and ROCm's standard `/opt/rocm/include` has no spaces anyway.
+    #[cfg(not(target_os = "windows"))]
+    fn win_short_path_if_needed(p: &str) -> String { p.to_string() }
+
     /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
     fn hipcc_compile(arch: &str, src_path: &Path, obj_path: &Path, name: &str, source: &str) -> HipResult<()> {
         std::fs::write(src_path, source).map_err(|e| {
@@ -249,7 +278,7 @@ impl KernelCompiler {
         ];
         // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
         // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
-        // fails with "file not found". Add well-known candidates as -I flags —
+        // fails with "file not found". Add well-known candidates as -I flags;
         // existence-checked so wrong paths on other distros don't leak in.
         let hip_path = std::env::var("HIP_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
         for candidate in [
@@ -257,7 +286,15 @@ impl KernelCompiler {
             "/opt/rocm/include".to_string(),
         ] {
             if Path::new(&candidate).join("hip/hip_runtime.h").exists() {
-                args.push(format!("-I{candidate}"));
+                // Windows hipcc (hipcc.bat) re-tokenises its argv on the inner
+                // clang.exe command line WITHOUT preserving quoting around
+                // embedded spaces, so an include path inside `Program Files`
+                // gets split at the space and clang sees the half before the
+                // split. Convert to the 8.3 short-path form (e.g.
+                // C:\PROGRA~1\AMD\ROCm\6.4\include) which contains no spaces.
+                // Reported in #82.
+                let resolved = Self::win_short_path_if_needed(&candidate);
+                args.push(format!("-I{resolved}"));
                 break;
             }
         }
