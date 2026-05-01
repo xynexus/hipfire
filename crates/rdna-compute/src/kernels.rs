@@ -46,6 +46,7 @@ pub const GEMV_HFQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq8
 /// Block: [f32 scale][f32 zero][192B data] = 200 bytes per 256 weights (0.78 B/w).
 /// Packing: 4 weights per 3 bytes (24 bits = 4×6 bits).
 pub const GEMV_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256.hip");
+pub const GEMV_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256_residual.hip");
 
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.

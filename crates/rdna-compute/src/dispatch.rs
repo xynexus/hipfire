@@ -2260,6 +2260,23 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// HFQ6-G256 GEMV with fused residual add: y[row] += A[row] . x.
+    /// Same shape as gemv_hfq6g256; only the final write differs (+= vs =).
+    /// Used for wo and w_down in HFQ6 / MQ6 forward paths so the
+    /// add_inplace_f32 follow-up launch can be elided.
+    pub fn gemv_hfq6g256_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq6g256_residual", kernels::GEMV_HFQ6G256_RESIDUAL_SRC, "gemv_hfq6g256_residual")?;
+        let func = &self.functions["gemv_hfq6g256_residual"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// HFQ6-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq6g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.ensure_kernel("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC, "gemv_hfq6g256")?;
