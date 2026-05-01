@@ -8,7 +8,7 @@
 
 import { spawn } from "bun";
 import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
-import { join, resolve, basename } from "path";
+import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
@@ -436,10 +436,24 @@ function buildLoadMessage(path: string, tag?: string | null): any {
         const ver = m[1];                 // "5" or "6"
         const size = m[2].toLowerCase();  // "9b", "27b", "35b-a3b", ...
         const quant = m[3].toLowerCase();
+        const draftFile = `qwen3${ver}-${size}-dflash-${quant}.hfq`;
+        // Candidate order:
+        //   1. dirname(target). Highest priority. The most reliable signal we
+        //      have for "where this user keeps their weights" is the directory
+        //      the target was loaded from. In Docker (#110), `process.cwd()`
+        //      is `/hipfire` (the workdir) but models are mounted at
+        //      `/root/.hipfire/models`, so cwd-relative paths never resolve.
+        //      Using the target's own directory works for Docker, raw-file
+        //      invocations, and registry-tag invocations alike.
+        //   2-3. cwd-relative legacy candidates. Kept for back-compat with
+        //        existing scripts that lay drafts out alongside a project
+        //        `models/` dir.
+        //   4. ~/.hipfire/models: final fallback for native installs.
         const candidates = [
-          resolve(`${process.cwd()}/models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
-          resolve(`${process.cwd()}/../../models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
-          resolve(`${homedir()}/.hipfire/models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
+          resolve(`${dirname(path)}/${draftFile}`),
+          resolve(`${process.cwd()}/models/${draftFile}`),
+          resolve(`${process.cwd()}/../../models/${draftFile}`),
+          resolve(`${homedir()}/.hipfire/models/${draftFile}`),
         ];
         for (const c of candidates) {
           if (existsSync(c)) {
