@@ -819,19 +819,38 @@ pub fn weight_gemv_swiglu_residual(
     ffn_hidden_scratch: &GpuTensor,
     x: &GpuTensor,
 ) -> HipResult<()> {
-    if w_down.gpu_dtype == DType::MQ4G256 {
-        gpu.ensure_mq_signs()?;
-        let x_rot_alias = GpuTensor {
-            buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-            dtype: DType::F32,
-        };
-        gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
-        return gpu.gemv_hfq4g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k);
+    match w_down.gpu_dtype {
+        DType::MQ4G256 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            gpu.gemv_hfq4g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+        }
+        DType::MQ3G256 => {
+            // Same shape as MQ4: silu(gate)*up rotated through the FWHT into
+            // the shared mq_x_rot scratch, then the fused HFQ3 residual GEMV
+            // does the down projection plus residual add in one launch. Saves
+            // one silu_mul_f32 launch and one add_inplace_f32 launch versus
+            // the four-step generic path.
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            gpu.gemv_hfq3g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+        }
+        _ => {
+            // Non-MQ fallback: plain two-step.
+            gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
+            weight_gemv_residual(gpu, w_down, ffn_hidden_scratch, x)
+        }
     }
-    // Non-MQ fallback: plain two-step.
-    gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
-    weight_gemv_residual(gpu, w_down, ffn_hidden_scratch, x)
 }
 
 /// Batched weight GEMM: y[b] = W * x[b] for all batch elements.
