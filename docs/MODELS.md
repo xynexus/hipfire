@@ -109,6 +109,118 @@ quantizer panics on encounter (port from llama.cpp's `ggml-quants.c` if
 you need one). See [QUANTIZE.md](QUANTIZE.md) for format-by-arch
 guidance and the double-quantization quality tradeoff.
 
+## Thinking mode and chat templates
+
+### Thinking mode mechanics
+
+Qwen 3.5 / 3.6 are reasoning models: by default they emit a hidden
+`<think>...</think>` reasoning block before the visible answer. hipfire's
+data flow through that block:
+
+1. The daemon receives the full token stream from the model (no daemon-side
+   filter).
+2. The CLI / OpenAI server layer strips the visible `<think>...</think>`
+   substring from `content`. Tokens emitted while inside `<think>` are also
+   re-broadcast to OpenAI streaming clients as `delta.reasoning_content`
+   (a field convention shared by DeepSeek and the pi-coding-agent harness),
+   so reasoning-aware UIs can render the thinking view live without it
+   leaking into the assistant message.
+3. After `</think>`, the leading newline is stripped and the answer
+   streams as normal `delta.content`.
+
+Two consequences worth knowing:
+- `hipfire run`'s stdout shows the answer only. Thinking is invisible
+  but still consumes tokens.
+- Reasoning-heavy turns can sit silent on the visible-content channel
+  for thousands of tokens. The OpenAI streaming server emits SSE
+  comment heartbeats every 10 s during prefill and reasoning-content
+  deltas during the think phase to keep the connection alive (sub-minute
+  idle timeouts in OpenCode / pi-coding-agent would otherwise abort).
+
+### `thinking: on / off`
+
+`thinking` is a hipfire config knob, not a prompt directive. It controls
+whether the visible `<think>...</think>` block is *kept* in the assistant
+message. Setting `thinking=off` does NOT inject a `/no_think` directive
+into the prompt.
+
+The "advisory only" semantics are deliberate. Earlier versions of hipfire
+tried injecting `/no_think` into system messages, user prefixes, mixed
+positions, etc.; every placement broke a different Qwen3.5 prompt shape
+with empty `<think><|im_end|>` halts (commits 3798399, 2d9c24b, 799c268,
+cf2a3d8, 68b32ee, b292565, all reverted in 5533926). The current contract:
+
+- The model decides whether to think.
+- `thinking=on` (default): visible `<think>...</think>` blocks are kept
+  in the assistant message stream as-is.
+- `thinking=off`: the existing `<think>...</think>` filter strips the
+  visible reasoning so the user only sees the answer. The model still
+  thinks; you just don't see it. The TUI flashes a yellow warning when
+  enabling this so the cost is visible.
+
+### `max_think_tokens`
+
+Cap how many tokens the model may emit before `</think>` closes. 0
+(default) means no cap. When the cap is hit, the daemon force-emits
+`</think>` and the model proceeds to the answer phase. Useful when:
+- You want predictable latency on a thinking model.
+- A specific model loops in `<think>` (the A3B family historically does
+  this on hard prompts; see #89 for the long-budget block-loop attractor).
+
+```bash
+hipfire config set max_think_tokens 4096                  # global
+hipfire config set-model qwen3.6:35b-a3b max_think_tokens 1024  # per-model
+```
+
+Per-model settings take precedence; the registry pre-applies sane caps
+for known offenders.
+
+### OpenAI / API knobs
+
+The OpenAI server accepts three additional fields beyond the OpenAI
+spec, contributed by @shilga in #79:
+
+- `enable_thinking: bool`. Same as `thinking`, scoped to one request.
+  Overrides global / per-model config for this turn only.
+- `preserve_thinking: bool`. Keep the model's `<think>...</think>` in
+  the assistant message it writes back to the chat history (default
+  off). Useful when you're feeding the conversation back through a tool
+  loop and want the model's prior reasoning visible on the next turn.
+- `presence_penalty: float`. Forwarded to the sampler. Standard OpenAI
+  semantics; -2.0 to 2.0 range.
+
+`reasoning.effort: "low" | "medium" | "high"` is also accepted (OpenAI
+o1-style); maps to `max_think_tokens` of 1024 / 4096 / 32768
+respectively.
+
+### Chat template
+
+hipfire applies the **ChatML** template for Qwen 3.5 / 3.6 / Carnice /
+Qwopus; the daemon expects messages already serialized by the CLI
+into:
+
+```
+<|im_start|>system
+{system}<|im_end|>
+<|im_start|>user
+{user}<|im_end|>
+<|im_start|>assistant
+```
+
+`hipfire run` and the OpenAI server both build this string from
+`messages[]` before sending to the daemon. Per-model template tweaks
+live in `cli/registry.json` under each model entry; you don't normally
+edit them. Custom system prompts are forwarded as a `system` role
+message and inserted at the top of the ChatML envelope.
+
+One implicit normalization step: the engine collapses runs of three or
+more `\n` characters down to exactly two before tokenization
+(`prompt_normalize: true` by default). Eliminates the rare BPE token
+1358 (`\n\n\n`) in favour of HOT token 271 (`\n\n`) on Qwen3.5/3.6,
+lifting τ on PEP-8-style code prompts up to +26.7%. Set
+`prompt_normalize: false` only if your input semantically depends on
+preserving raw `\n{3,}` whitespace.
+
 ## Model files on disk
 
 ```
