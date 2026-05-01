@@ -753,8 +753,9 @@ pub fn weight_gemv_residual(
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
+        DType::HFQ3G256 => gpu.gemv_hfq3g256_residual(&w.buf, x, y, w.m, w.k),
         DType::HFQ6G256 | DType::MQ6G256 => {
-            // No dedicated residual GEMV for HFQ6 yet — fall through to generic path.
+            // No dedicated residual GEMV for HFQ6 yet; fall through to generic path.
             let tmp = gpu.alloc_tensor(&[w.m], DType::F32)?;
             weight_gemv(gpu, w, x, &tmp)?;
             gpu.add_inplace_f32(y, &tmp)?;
@@ -771,9 +772,22 @@ pub fn weight_gemv_residual(
             gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
             gpu.gemv_hfq4g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
+        DType::MQ3G256 => {
+            // FWHT-rotate x into the shared mq_x_rot scratch, then dispatch
+            // hfq3g256_residual against the rotated activations. Saves one
+            // add_inplace_f32 launch per layer per token vs the generic path.
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
+            gpu.gemv_hfq3g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
+        }
         _ => {
             // Fallback: plain weight_gemv into a scratch, then add_inplace.
-            // Allocates a scratch each call — only used for niche dtypes.
+            // Allocates a scratch each call; only used for niche dtypes.
             let tmp = gpu.alloc_tensor(&[w.m], DType::F32)?;
             weight_gemv(gpu, w, x, &tmp)?;
             gpu.add_inplace_f32(y, &tmp)?;
