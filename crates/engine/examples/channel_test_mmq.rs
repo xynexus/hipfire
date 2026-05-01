@@ -64,7 +64,7 @@
 //! # Hardware requirements
 //!
 //! MMQ (i8 WMMA) is only available on RDNA3/3.5: gfx1100, gfx1101, gfx1102,
-//! gfx1103, gfx1150, gfx1151. The binary exits 0 with a message on other archs.
+//! gfx1103, gfx1150, gfx1151, gfx1152. The binary exits 0 with a message on other archs.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -151,10 +151,10 @@ fn main() {
     let arch = gpu.arch.clone();
     eprintln!("GPU: {arch}");
 
-    let mmq_archs = ["gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151"];
+    let mmq_archs = ["gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152"];
     if !mmq_archs.contains(&arch.as_str()) {
         eprintln!(
-            "SKIP: MMQ requires RDNA3/3.5 (gfx1100..gfx1103, gfx1150, gfx1151). \
+            "SKIP: MMQ requires RDNA3/3.5 (gfx1100..gfx1103, gfx1150, gfx1151, gfx1152). \
              Current arch: {arch}"
         );
         std::process::exit(0);

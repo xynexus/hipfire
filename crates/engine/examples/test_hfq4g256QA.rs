@@ -141,7 +141,7 @@ fn run() -> Result<String, Outcome> {
 }
 
 fn supports_mmq_i8_wmma(arch: &str) -> bool {
-    matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151")
+    matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152")
 }
 
 fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
