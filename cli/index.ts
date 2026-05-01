@@ -1524,27 +1524,135 @@ async function serve(port: number) {
         if (systemPrompt) genParams.system = systemPrompt;
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
+        //
+        // Defensive against MQ4 quantization drift on structured-token positions
+        // (see #111). MQ4 FWHT rotation can shift the per-position distribution
+        // enough to flip greedy-decode argmax for `{`, `"`, `:`, `}` tokens, so
+        // the visible JSON sometimes lands in two off-spec shapes:
+        //   (a) flat: {"name": "write", "path": "...", "content": "..."}
+        //       (no `arguments` wrapper; args inlined as siblings of `name`).
+        //   (b) XML-corruption: <plain>write</param> {"path": "...", "content": "..."}
+        //       (Hermes / func-call template tokens leaking into JSON position).
+        // Both are still semantically recoverable: the model knows the function
+        // name and arg payload, just emits them in the wrong frame.
+        //
+        // The reverse-tag (`</tool_call>`) is not affected (single-token in BPE),
+        // so block boundary detection is reliable; only the inner payload needs
+        // repair.
+        //
+        // This is a stopgap. The proper fix is MQ4 calibration retraining with
+        // tool-call samples weighted on structured tokens; tracked in
+        // MANUAL_REVIEW.md against #111.
         function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
           if (!text.includes("<tool_call>")) return { content: text, tool_calls: null };
           const pattern = /<tool_call>\s*(.*?)\s*<\/tool_call>|<tool_call>\s*(.*)/gs;
           const matches = [...text.matchAll(pattern)];
           if (!matches.length) return { content: text, tool_calls: null };
           const tool_calls: any[] = [];
+          let repaired = 0;
           for (const m of matches) {
             const raw = (m[1] || m[2] || "").trim();
             if (!raw) continue;
-            try {
-              const tc = JSON.parse(raw);
-              tool_calls.push({
-                id: `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-                type: "function",
-                function: { name: tc.name, arguments: JSON.stringify(tc.arguments || {}) }
-              });
-            } catch {}
+            const parsed = parseOneToolCall(raw);
+            if (!parsed) continue;
+            if (parsed.repaired) repaired++;
+            tool_calls.push({
+              id: `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+              type: "function",
+              function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) }
+            });
           }
           if (!tool_calls.length) return { content: text, tool_calls: null };
+          if (repaired > 0) {
+            // Single line on stderr so harness logs flag the recovery without
+            // breaking SSE streams or stdout JSON.
+            console.error(`[hipfire] tool_call: repaired ${repaired} malformed block(s) (MQ4 #111 stopgap)`);
+          }
           const before = text.slice(0, text.indexOf("<tool_call>")).trim();
           return { content: before || null, tool_calls };
+        }
+
+        // Returns {name, arguments, repaired} for valid or repairable blocks,
+        // null when the payload is unrecoverable. `repaired === true` means we
+        // had to coerce off-spec JSON / XML-tag shapes; valid OpenAI-spec input
+        // sets repaired=false.
+        function parseOneToolCall(raw: string): { name: string; arguments: any; repaired: boolean } | null {
+          // Form 1: spec-compliant {"name": ..., "arguments": {...}}.
+          try {
+            const tc = JSON.parse(raw);
+            if (tc && typeof tc === "object" && typeof tc.name === "string") {
+              if (tc.arguments !== undefined) {
+                return { name: tc.name, arguments: tc.arguments, repaired: false };
+              }
+              // Form 2: flat object with name + sibling args, no `arguments`
+              // wrapper. Treat every key other than `name` and a few known
+              // metadata keys as part of the arguments payload.
+              const drop = new Set(["name", "type", "id", "function"]);
+              const args: Record<string, any> = {};
+              let coerced = false;
+              for (const [k, v] of Object.entries(tc)) {
+                if (drop.has(k)) continue;
+                args[k] = v;
+                coerced = true;
+              }
+              if (coerced) return { name: tc.name, arguments: args, repaired: true };
+              // Bare `{"name": "X"}` with no args at all is legal for zero-arg
+              // tools; pass through.
+              return { name: tc.name, arguments: {}, repaired: false };
+            }
+          } catch {}
+
+          // Form 3: XML-tag corruption. Look for a function name in
+          //   <plain>NAME</param>  or  <function=NAME>  or  <NAME>
+          // patterns at the head of the block, followed by a JSON object.
+          const xmlPatterns = [
+            /^<\s*plain\s*>\s*([A-Za-z_][\w.]*)\s*<\s*\/\s*param\s*>/,
+            /^<\s*function\s*=\s*([A-Za-z_][\w.]*)\s*>/,
+            /^<\s*tool\s*name\s*=\s*"?([A-Za-z_][\w.]*)"?\s*>/,
+          ];
+          for (const pat of xmlPatterns) {
+            const nm = raw.match(pat);
+            if (!nm) continue;
+            const after = raw.slice(nm[0].length).trim();
+            // Find the first balanced JSON object in the remainder.
+            const args = extractFirstJsonObject(after);
+            if (args !== null) {
+              return { name: nm[1], arguments: args, repaired: true };
+            }
+            // Even if we cannot parse args, the function name is usable;
+            // emit empty args rather than dropping the call entirely.
+            return { name: nm[1], arguments: {}, repaired: true };
+          }
+          return null;
+        }
+
+        // Best-effort balanced-brace JSON extraction. Returns the parsed
+        // object or null. Skips JSON inside strings.
+        function extractFirstJsonObject(s: string): any | null {
+          const start = s.indexOf("{");
+          if (start < 0) return null;
+          let depth = 0;
+          let inStr = false;
+          let escape = false;
+          for (let i = start; i < s.length; i++) {
+            const ch = s[i];
+            if (inStr) {
+              if (escape) { escape = false; continue; }
+              if (ch === "\\") { escape = true; continue; }
+              if (ch === '"') inStr = false;
+              continue;
+            }
+            if (ch === '"') { inStr = true; continue; }
+            if (ch === "{") depth++;
+            else if (ch === "}") {
+              depth--;
+              if (depth === 0) {
+                try { return JSON.parse(s.slice(start, i + 1)); }
+                catch { return null; }
+              }
+            }
+          }
+          return null;
         }
 
         if (body.stream) {
