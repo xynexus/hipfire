@@ -1513,10 +1513,27 @@ impl Gpu {
         Ok(())
     }
 
-    /// Drain the GPU memory pool — actually calls hipFree on all pooled buffers.
+    /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
         self.pool.drain(&self.hip);
+    }
+
+    /// Invalidate every weight-pointer-keyed cache on the Gpu. Must be called
+    /// any time a loaded model's weights are about to be freed; otherwise the
+    /// next model load can allocate buffers at addresses that previously held
+    /// different weights and the cache will incorrectly hit on stale entries.
+    /// Affected caches:
+    ///   * mmq_screen_cache: per-weight (safe, unsafe) screening verdicts (#87).
+    ///   * fp16_shadow_cache: lazily-built FP16 dequant of HFQ4 weights for
+    ///     the rocBLAS prefill path (CDNA3-only). Owns GpuTensors, so the
+    ///     entries are released back to the pool here.
+    pub fn invalidate_weight_caches(&mut self) {
+        self.mmq_screen_cache.clear();
+        let shadows: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
+        for t in shadows {
+            let _ = self.free_tensor(t);
+        }
     }
 
     // ── Kernel operations ───────────────────────────────────────

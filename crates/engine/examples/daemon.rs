@@ -1067,6 +1067,11 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
     if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
     if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
+    // Drop pointer-keyed caches whose keys point at weight buffers that are
+    // about to be returned to the pool. Without this, the next model loaded
+    // can land at the same device address and silently inherit stale
+    // verdicts (mmq_screen_cache) or leaked FP16 shadows (fp16_shadow_cache).
+    gpu.invalidate_weight_caches();
     gpu.drain_pool();
 }
 
