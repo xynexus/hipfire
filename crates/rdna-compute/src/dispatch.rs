@@ -609,6 +609,14 @@ impl Gpu {
         self.capture_blobs.clear();
         self.graph_verify_n = None;
         self.graph_verify_warmup = 0;
+        // Without this, model swap leaves the flag stuck on `true`. The
+        // forward path in qwen35::forward_scratch then jumps straight from
+        // graph_exec.is_none() into capture mode on the new model's first
+        // AR forward call, before kernel JIT / scratch allocations have
+        // happened against the new tensors. That trips
+        // "hipMalloc not permitted under stream capture" the same way
+        // verify_warmed_up does for the DFlash verify path.
+        self.ar_forward_warmed_up = false;
     }
 
     // ── Per-B verify-forward graph cache ─────────────────────────────────
