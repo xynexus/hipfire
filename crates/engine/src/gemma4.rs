@@ -74,6 +74,18 @@ pub struct Gemma4Config {
     pub tie_word_embeddings: bool,         // true — lm_head aliases embed_tokens
     pub embed_scale: f32,                  // sqrt(dim), applied at embed lookup
 
+    // Per-layer embedding (Gemma 3n / Gemma 4 E-series). 0 when absent
+    // (31B and 26B-A4B have no per-layer embedding; E2B/E4B have 256).
+    // Adds a side-channel signal injected after each layer's FFN+residual,
+    // before the learned `layer_scalar` multiply. See `forward_scratch` for
+    // the pre-loop projection and `apply_per_layer_inject` for the per-layer
+    // application. References:
+    //   • llama.cpp/src/models/gemma4-iswa.cpp lines 33-38, 202-224, 263-313
+    //   • HF tensor names: `embed_tokens_per_layer`, `per_layer_model_projection`,
+    //     `per_layer_projection_norm`, `per_layer_input_gate`,
+    //     `per_layer_projection`, `post_per_layer_input_norm`
+    pub n_embd_per_layer: usize,
+
     // Per-layer dispatch (len == n_layers)
     pub layer_types: Vec<LayerType>,
 
@@ -134,6 +146,10 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Gemma4Config> {
 
     let hidden_dim = tc.get("intermediate_size")?.as_u64()? as usize;
 
+    // Per-layer embedding feature (E2B / E4B / Gemma 3n). 0 ≙ disabled.
+    let n_embd_per_layer = tc.get("hidden_size_per_layer_input")
+        .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
     let final_logit_softcapping = tc.get("final_logit_softcapping")
         .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
     let tie_word_embeddings = tc.get("tie_word_embeddings").and_then(|v| v.as_bool())
@@ -167,6 +183,7 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Gemma4Config> {
         full_partial_rotary_factor, attention_k_eq_v,
         hidden_dim,
         final_logit_softcapping, tie_word_embeddings, embed_scale,
+        n_embd_per_layer,
         layer_types,
         has_vision,
         image_token_id, boi_token_id, eoi_token_id, audio_token_id, video_token_id,
@@ -198,6 +215,12 @@ pub struct SlidingLayerWeights {
     pub gate_proj: WeightTensor, // [hidden_dim, dim]
     pub up_proj: WeightTensor,   // [hidden_dim, dim]
     pub down_proj: WeightTensor, // [dim, hidden_dim]
+
+    // Per-layer embedding side-channel (Some on E2B / E4B; None on 31B / 26B-A4B).
+    // Applied at layer end after FFN+residual but BEFORE the layer_scalar.
+    pub per_layer_input_gate: Option<WeightTensor>,    // [n_embd_per_layer, dim]
+    pub per_layer_projection: Option<WeightTensor>,    // [dim, n_embd_per_layer]
+    pub post_per_layer_input_norm: Option<GpuTensor>,  // [dim]
 }
 
 /// Per-layer weights for a FULL layer (head_dim=512, 4 KV heads, K=V shared).
@@ -229,6 +252,12 @@ pub struct FullLayerWeights {
     pub gate_proj: WeightTensor,
     pub up_proj: WeightTensor,
     pub down_proj: WeightTensor,
+
+    // Per-layer embedding side-channel — same as on sliding layers when the
+    // model uses this feature. See `SlidingLayerWeights` for shapes.
+    pub per_layer_input_gate: Option<WeightTensor>,
+    pub per_layer_projection: Option<WeightTensor>,
+    pub post_per_layer_input_norm: Option<GpuTensor>,
 }
 
 pub enum LayerWeights {
@@ -246,6 +275,20 @@ pub struct Gemma4Weights {
     pub lm_head: WeightTensor,
     /// Model-final RMSNorm scale [dim].
     pub final_norm: GpuTensor,
+    // ─── Per-layer embedding (Gemma 4 E-series) — Some when n_embd_per_layer > 0 ───
+    // Per-token embedding into the per-layer side channel.
+    /// `embed_tokens_per_layer.weight` [vocab_size, n_embd_per_layer * n_layers].
+    /// Looked up per token, then split into n_layers slots of n_embd_per_layer.
+    /// Forced to Q8F16 in the loader so row-lookup uses the existing
+    /// embedding_lookup_q8 dispatch with `dim = n_embd_per_layer * n_layers`.
+    pub per_layer_tok_embd: Option<GpuTensor>,
+    pub per_layer_tok_embd_format: EmbeddingFormat,
+    /// `per_layer_model_projection.weight` [n_embd_per_layer * n_layers, dim].
+    /// Mixes the regular post-embed hidden state into the per-layer slots.
+    pub per_layer_model_proj: Option<WeightTensor>,
+    /// `per_layer_projection_norm.weight` [n_embd_per_layer].
+    /// Applied per-slot via rmsnorm_batched(batch=n_layers, n=n_embd_per_layer).
+    pub per_layer_proj_norm: Option<GpuTensor>,
     /// Per-layer weights indexed by layer ordinal.
     pub layers: Vec<LayerWeights>,
 }
@@ -256,6 +299,10 @@ impl Gemma4Weights {
         let _ = gpu.free_tensor(self.final_norm);
         // lm_head may alias embed_tokens — skip if so (we rely on the loader
         // to set `lm_head.buf` to an alias and not a separate allocation).
+        // Per-layer embedding model-level tensors (Some on E-series only).
+        if let Some(t) = self.per_layer_tok_embd { let _ = gpu.free_tensor(t); }
+        if let Some(wt) = self.per_layer_model_proj { let _ = gpu.free_tensor(wt.buf); }
+        if let Some(t) = self.per_layer_proj_norm { let _ = gpu.free_tensor(t); }
         for l in self.layers {
             match l {
                 LayerWeights::Sliding(s) => {
@@ -268,6 +315,9 @@ impl Gemma4Weights {
                                s.gate_proj.buf, s.up_proj.buf, s.down_proj.buf] {
                         let _ = gpu.free_tensor(wt);
                     }
+                    if let Some(wt) = s.per_layer_input_gate { let _ = gpu.free_tensor(wt.buf); }
+                    if let Some(wt) = s.per_layer_projection { let _ = gpu.free_tensor(wt.buf); }
+                    if let Some(t) = s.post_per_layer_input_norm { let _ = gpu.free_tensor(t); }
                 }
                 LayerWeights::Full(f) => {
                     for t in [f.input_layernorm, f.post_attention_layernorm,
@@ -279,6 +329,9 @@ impl Gemma4Weights {
                                f.gate_proj.buf, f.up_proj.buf, f.down_proj.buf] {
                         let _ = gpu.free_tensor(wt);
                     }
+                    if let Some(wt) = f.per_layer_input_gate { let _ = gpu.free_tensor(wt.buf); }
+                    if let Some(wt) = f.per_layer_projection { let _ = gpu.free_tensor(wt.buf); }
+                    if let Some(t) = f.post_per_layer_input_norm { let _ = gpu.free_tensor(t); }
                 }
             }
         }
@@ -456,6 +509,46 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
     eprintln!("gemma4: loading final norm...");
     let final_norm = load_gemma4_norm(hfq, gpu, "model.language_model.norm.weight", config.dim)?;
 
+    // Per-layer embedding model-level tensors (only present when
+    // n_embd_per_layer > 0). E2B / E4B have these; 31B / 26B-A4B don't.
+    // The per-token embedding table `embed_tokens_per_layer` is forced to
+    // Q8F16 by the quantizer (same is_embed treatment as `embed_tokens`),
+    // so engine-side row lookup uses the existing embedding_lookup_q8 path
+    // with `dim = n_embd_per_layer * n_layers`.
+    let (per_layer_tok_embd, per_layer_tok_embd_format,
+         per_layer_model_proj, per_layer_proj_norm) = if config.n_embd_per_layer > 0 {
+        eprintln!("gemma4: loading per-layer embedding tensors (n_embd_per_layer={})...",
+                  config.n_embd_per_layer);
+        let pl_dim = config.n_embd_per_layer * config.n_layers;
+        // embed_tokens_per_layer: row-lookup table.
+        let pl_embd_name = "model.language_model.embed_tokens_per_layer.weight";
+        let (pl_embd_info, pl_embd_data) = hfq.tensor_data(pl_embd_name).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "embed_tokens_per_layer not found in HFQ")
+        })?;
+        let (pl_embd, pl_fmt) = match pl_embd_info.quant_type {
+            3 => (gpu.upload_raw(pl_embd_data, &[pl_embd_data.len()])?, EmbeddingFormat::Q8_0),
+            6 => (gpu.upload_raw(pl_embd_data, &[pl_embd_data.len()])?, EmbeddingFormat::HFQ4G256),
+            7 => (gpu.upload_raw(pl_embd_data, &[pl_embd_data.len()])?, EmbeddingFormat::HFQ4G128),
+            1 => {
+                let f32_data: Vec<f32> = pl_embd_data.chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+                (gpu.upload_f32(&f32_data, &[config.vocab_size, pl_dim])?, EmbeddingFormat::F32)
+            }
+            qt => return Err(hip_bridge::HipError::new(
+                0, &format!("unsupported per_layer_tok_embd quant_type {qt}"),
+            )),
+        };
+        // per_layer_model_projection: standard 2D weight, projects [dim] → [pl_dim].
+        let model_proj = load_gemma4_weight(hfq, gpu,
+            "model.language_model.per_layer_model_projection.weight", pl_dim, config.dim)?;
+        // per_layer_projection_norm: shape [n_embd_per_layer], applied per-slot.
+        let proj_norm = load_gemma4_norm(hfq, gpu,
+            "model.language_model.per_layer_projection_norm.weight", config.n_embd_per_layer)?;
+        (Some(pl_embd), pl_fmt, Some(model_proj), Some(proj_norm))
+    } else {
+        (None, EmbeddingFormat::F32, None, None)
+    };
+
     eprintln!("gemma4: loading {} layers...", config.n_layers);
     let mut layers = Vec::with_capacity(config.n_layers);
     for i in 0..config.n_layers {
@@ -467,6 +560,16 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                 let q_dim = config.n_heads * hd;
                 let (layer_scalar, layer_scalar_host) =
                     load_layer_scalar(hfq, gpu, &format!("{p}.layer_scalar"))?;
+                let (pl_gate, pl_proj, pl_post_norm) = if config.n_embd_per_layer > 0 {
+                    (Some(load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.per_layer_input_gate.weight"),
+                        config.n_embd_per_layer, config.dim)?),
+                     Some(load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.per_layer_projection.weight"),
+                        config.dim, config.n_embd_per_layer)?),
+                     Some(load_gemma4_norm(hfq, gpu,
+                        &format!("{p}.post_per_layer_input_norm.weight"), config.dim)?))
+                } else { (None, None, None) };
                 layers.push(LayerWeights::Sliding(SlidingLayerWeights {
                     input_layernorm: load_gemma4_norm(hfq, gpu,
                         &format!("{p}.input_layernorm.weight"), config.dim)?,
@@ -496,6 +599,9 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                         &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
                     down_proj: load_gemma4_weight(hfq, gpu,
                         &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                    per_layer_input_gate: pl_gate,
+                    per_layer_projection: pl_proj,
+                    post_per_layer_input_norm: pl_post_norm,
                 }));
             }
             LayerType::Full => {
@@ -504,6 +610,16 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                 let q_dim = config.n_heads * hd;
                 let (layer_scalar, layer_scalar_host) =
                     load_layer_scalar(hfq, gpu, &format!("{p}.layer_scalar"))?;
+                let (pl_gate, pl_proj, pl_post_norm) = if config.n_embd_per_layer > 0 {
+                    (Some(load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.per_layer_input_gate.weight"),
+                        config.n_embd_per_layer, config.dim)?),
+                     Some(load_gemma4_weight(hfq, gpu,
+                        &format!("{p}.per_layer_projection.weight"),
+                        config.dim, config.n_embd_per_layer)?),
+                     Some(load_gemma4_norm(hfq, gpu,
+                        &format!("{p}.post_per_layer_input_norm.weight"), config.dim)?))
+                } else { (None, None, None) };
                 layers.push(LayerWeights::Full(FullLayerWeights {
                     input_layernorm: load_gemma4_norm(hfq, gpu,
                         &format!("{p}.input_layernorm.weight"), config.dim)?,
@@ -533,6 +649,9 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                         &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
                     down_proj: load_gemma4_weight(hfq, gpu,
                         &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                    per_layer_input_gate: pl_gate,
+                    per_layer_projection: pl_proj,
+                    post_per_layer_input_norm: pl_post_norm,
                 }));
             }
         }
@@ -544,6 +663,10 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
         embd_format,
         lm_head,
         final_norm,
+        per_layer_tok_embd,
+        per_layer_tok_embd_format,
+        per_layer_model_proj,
+        per_layer_proj_norm,
         layers,
     })
 }
@@ -612,6 +735,25 @@ pub struct Gemma4Scratch {
     // a learned weight — we pass this ones-filled tensor to the existing
     // rmsnorm kernel to get no-scale RMS semantics).
     pub v_norm_ones_full: GpuTensor, // [full_head_dim]
+
+    // ─── Per-layer embedding scratch (E-series only — zero-sized when n_embd_per_layer == 0) ───
+    /// Stages the per-layer side-channel signal: looked up from
+    /// `per_layer_tok_embd` once per token, then `per_layer_model_proj @ x`
+    /// is added in. Sliced as `[il*n_embd_per_layer..(il+1)*n_embd_per_layer]`
+    /// inside each layer. Shape: [n_embd_per_layer * n_layers] flat.
+    pub per_layer_inp: GpuTensor,
+    /// Scratch for the projection branch (`per_layer_model_proj @ x`) before
+    /// it gets added into `per_layer_inp`. Same shape as `per_layer_inp`.
+    pub per_layer_inp_proj: GpuTensor,
+    /// Per-layer-decode scratch: holds `per_layer_input_gate @ x` then
+    /// `gelu(...)` then `... * per_layer_inp_slice`. [n_embd_per_layer].
+    pub per_layer_tmp: GpuTensor,
+    /// Per-layer-decode scratch: holds `per_layer_projection @ tmp` (before
+    /// rmsnorm + residual add). [dim].
+    pub per_layer_out: GpuTensor,
+    /// Pre-saved residual at the per-layer inject site (after FFN+residual,
+    /// before the side-channel additions). [dim].
+    pub per_layer_pe_in: GpuTensor,
 }
 
 impl Gemma4Scratch {
@@ -665,6 +807,19 @@ impl Gemma4Scratch {
         // apply no-scale v_norm.)
         let v_norm_ones_full = gpu.zeros(&[config.full_head_dim], DType::F32)?;
 
+        // Per-layer embedding scratch. Allocated as size-1 placeholder when
+        // the model doesn't use this feature (31B / 26B-A4B) so the GpuTensor
+        // fields are valid; the forward path branches on
+        // `config.n_embd_per_layer > 0` and never touches them in that case.
+        let pl_dim = config.n_embd_per_layer * config.n_layers;
+        let pl_dim_alloc = pl_dim.max(1);
+        let pl_w_alloc = config.n_embd_per_layer.max(1);
+        let per_layer_inp      = gpu.zeros(&[pl_dim_alloc], DType::F32)?;
+        let per_layer_inp_proj = gpu.zeros(&[pl_dim_alloc], DType::F32)?;
+        let per_layer_tmp      = gpu.zeros(&[pl_w_alloc],   DType::F32)?;
+        let per_layer_out      = gpu.zeros(&[dim],          DType::F32)?;
+        let per_layer_pe_in    = gpu.zeros(&[dim],          DType::F32)?;
+
         Ok(Gemma4Scratch {
             x, residual, tmp, pos_buf,
             q, k, v, attn_out,
@@ -673,6 +828,8 @@ impl Gemma4Scratch {
             flash_partials,
             sliding_cos, sliding_sin, full_cos, full_sin,
             v_norm_ones_full,
+            per_layer_inp, per_layer_inp_proj, per_layer_tmp,
+            per_layer_out, per_layer_pe_in,
         })
     }
 
@@ -701,10 +858,71 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.full_cos);
         let _ = gpu.free_tensor(self.full_sin);
         let _ = gpu.free_tensor(self.v_norm_ones_full);
+        let _ = gpu.free_tensor(self.per_layer_inp);
+        let _ = gpu.free_tensor(self.per_layer_inp_proj);
+        let _ = gpu.free_tensor(self.per_layer_tmp);
+        let _ = gpu.free_tensor(self.per_layer_out);
+        let _ = gpu.free_tensor(self.per_layer_pe_in);
     }
 }
 
 // ─── Forward pass ───────────────────────────────────────────────────────
+
+/// Apply the Gemma 4 E-series per-layer-embedding side channel at the end of
+/// a layer's forward pass — between FFN+residual and `layer_scalar`. Mirrors
+/// llama.cpp gemma4-iswa.cpp lines 202-224:
+///
+///     pe_in = cur                                  # save the residual stream
+///     cur = per_layer_input_gate @ cur             # [n_embd_per_layer]
+///     cur = gelu(cur)
+///     cur = cur * inp_per_layer[il]                # [n_embd_per_layer], element-wise
+///     cur = per_layer_projection @ cur             # [dim]
+///     cur = rmsnorm(cur, post_per_layer_input_norm)
+///     cur = pe_in + cur                            # residual back into x
+///
+/// Caller is responsible for the `n_embd_per_layer == 0` skip — no-op layers
+/// don't pay any cost (zero-sized scratch buffers, no kernel launches).
+///
+/// We use `gelu_tanh_f32` here because Gemma 4 follows the gemma-pytorch-tanh
+/// convention everywhere else (FFN SwiGLU activation). The exact GELU vs
+/// tanh-approximation difference is sub-1% per element; if a future test
+/// shows divergence vs HF reference, swap to an exact-erf GELU kernel.
+fn apply_per_layer_inject(
+    gpu: &mut Gpu,
+    config: &Gemma4Config,
+    scratch: &Gemma4Scratch,
+    inp_gate: &WeightTensor,
+    proj: &WeightTensor,
+    post_norm: &GpuTensor,
+    layer_idx: usize,
+) -> HipResult<()> {
+    let pl_w = config.n_embd_per_layer;
+    let dim = config.dim;
+    let dim_bytes = dim * 4;
+
+    // Save current x → pe_in (residual stream snapshot before the inject).
+    gpu.hip.memcpy_dtod(&scratch.per_layer_pe_in.buf, &scratch.x.buf, dim_bytes)?;
+
+    // tmp_pl = per_layer_input_gate @ x → [n_embd_per_layer]
+    weight_gemv(gpu, inp_gate, &scratch.x, &scratch.per_layer_tmp)?;
+    // gelu_tanh in place
+    gpu.gelu_tanh_f32(&scratch.per_layer_tmp, &scratch.per_layer_tmp, pl_w)?;
+
+    // tmp_pl *= inp_per_layer[layer_idx*pl_w .. (layer_idx+1)*pl_w]
+    let inp_slice = scratch.per_layer_inp.sub_offset(layer_idx * pl_w, pl_w);
+    gpu.mul_f32(&scratch.per_layer_tmp, &inp_slice, &scratch.per_layer_tmp)?;
+
+    // x_pl = per_layer_projection @ tmp_pl → [dim]
+    weight_gemv(gpu, proj, &scratch.per_layer_tmp, &scratch.per_layer_out)?;
+    // rmsnorm in place with post_per_layer_input_norm weight.
+    gpu.rmsnorm_f32(&scratch.per_layer_out, post_norm, &scratch.per_layer_out, config.norm_eps)?;
+
+    // x = pe_in + x_pl. Restore pe_in into x then add the projected channel.
+    gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.per_layer_pe_in.buf, dim_bytes)?;
+    gpu.add_inplace_f32(&scratch.x, &scratch.per_layer_out)?;
+
+    Ok(())
+}
 
 /// Single-token decode. Phase 3 implementation.
 ///
@@ -741,17 +959,65 @@ pub fn forward_scratch(
     let pos_i32 = pos as i32;
     gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
 
+    // 2b) Per-layer embedding pre-loop (E2B / E4B only — NOOP on 31B / 26B-A4B
+    // where n_embd_per_layer == 0). Builds scratch.per_layer_inp = the per-token
+    // per-layer side-channel signal that gets injected after each layer's
+    // FFN+residual but before layer_scalar. Mirrors llama.cpp gemma4-iswa.cpp
+    // build_inp_per_layer + project_per_layer_inputs (lines 263-322):
+    //
+    //     a = embed_tokens_per_layer[T]                       # [pl_dim]
+    //     a *= sqrt(n_embd_per_layer)
+    //     b = per_layer_model_proj @ x_embed                  # [pl_dim] = [n_embd_per_layer * n_layers]
+    //     b *= 1 / sqrt(n_embd)
+    //     b = rmsnorm_batched(b, per_layer_proj_norm, batch=n_layers, n=n_embd_per_layer)
+    //     per_layer_inp = (a + b) * (1 / sqrt(2))
+    if config.n_embd_per_layer > 0 {
+        let pl_dim = config.n_embd_per_layer * config.n_layers;
+        let pl_embd = weights.per_layer_tok_embd.as_ref().expect("per_layer_tok_embd loaded");
+        let model_proj = weights.per_layer_model_proj.as_ref().expect("per_layer_model_proj loaded");
+        let proj_norm = weights.per_layer_proj_norm.as_ref().expect("per_layer_proj_norm loaded");
+
+        // (a) Per-token row lookup → scratch.per_layer_inp.
+        // The per-layer embed table is forced to Q8F16 by the quantizer (see
+        // `should_quantize` + the `embed_tokens_per_layer.weight` carve-out
+        // in hipfire-quantize), so this dispatch always works regardless of
+        // the model-level weight quant.
+        match weights.per_layer_tok_embd_format {
+            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(pl_embd, &scratch.per_layer_inp, token, pl_dim)?,
+            EmbeddingFormat::F32  => gpu.embedding_lookup(pl_embd, &scratch.per_layer_inp, token, pl_dim)?,
+            other => return Err(hip_bridge::HipError::new(
+                0, &format!("unsupported per_layer_tok_embd format {other:?}"),
+            )),
+        }
+        gpu.scale_f32(&scratch.per_layer_inp, (config.n_embd_per_layer as f32).sqrt())?;
+
+        // (b) Project the regular post-embed hidden state into the per-layer
+        // slots. weight_gemv reads scratch.x (already scaled by sqrt(dim)
+        // above — that scaling is the standard embed_scale, NOT specific to
+        // the per-layer branch), produces [pl_dim] into per_layer_inp_proj.
+        weight_gemv(gpu, model_proj, &scratch.x, &scratch.per_layer_inp_proj)?;
+        gpu.scale_f32(&scratch.per_layer_inp_proj, 1.0 / (config.dim as f32).sqrt())?;
+        // Per-slot RMSNorm: weight is [n_embd_per_layer], applied identically
+        // to each of n_layers consecutive slots.
+        gpu.rmsnorm_batched(&scratch.per_layer_inp_proj, proj_norm, &scratch.per_layer_inp_proj,
+            config.n_layers, config.n_embd_per_layer, config.norm_eps)?;
+
+        // (c) Combine: per_layer_inp = (per_layer_inp + per_layer_inp_proj) * (1/sqrt(2)).
+        gpu.add_inplace_f32(&scratch.per_layer_inp, &scratch.per_layer_inp_proj)?;
+        gpu.scale_f32(&scratch.per_layer_inp, 1.0 / 2.0_f32.sqrt())?;
+    }
+
     // 3) Per-layer forward.
     let mut sliding_kv_idx = 0usize;
     let mut full_kv_idx = 0usize;
     for (layer_idx, layer_type) in config.layer_types.iter().copied().enumerate() {
         match (layer_type, &weights.layers[layer_idx]) {
             (LayerType::Sliding, LayerWeights::Sliding(lw)) => {
-                sliding_layer_decode(gpu, config, lw, pos, kv_sliding, sliding_kv_idx, scratch)?;
+                sliding_layer_decode(gpu, config, lw, pos, kv_sliding, sliding_kv_idx, layer_idx, scratch)?;
                 sliding_kv_idx += 1;
             }
             (LayerType::Full, LayerWeights::Full(lw)) => {
-                full_layer_decode(gpu, config, lw, pos, kv_full, full_kv_idx, scratch)?;
+                full_layer_decode(gpu, config, lw, pos, kv_full, full_kv_idx, layer_idx, scratch)?;
                 full_kv_idx += 1;
             }
             _ => return Err(hip_bridge::HipError::new(
@@ -809,6 +1075,7 @@ fn sliding_layer_decode(
     pos: usize,
     kv_cache: &mut llama::KvCache,
     kv_layer_idx: usize,
+    layer_idx: usize,
     scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
     let dim = config.dim;
@@ -948,6 +1215,15 @@ fn sliding_layer_decode(
     gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
     gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
 
+    // Per-layer embedding inject (E2B / E4B only — None on 31B / 26B-A4B).
+    if let (Some(g), Some(p), Some(n)) = (
+        lw.per_layer_input_gate.as_ref(),
+        lw.per_layer_projection.as_ref(),
+        lw.post_per_layer_input_norm.as_ref(),
+    ) {
+        apply_per_layer_inject(gpu, config, scratch, g, p, n, layer_idx)?;
+    }
+
     // Learned per-layer scalar multiplier.
     gpu.scale_f32(&scratch.x, lw.layer_scalar_host)?;
 
@@ -982,6 +1258,7 @@ fn full_layer_decode(
     pos: usize,
     kv_cache: &mut llama::KvCache,
     kv_layer_idx: usize,
+    layer_idx: usize,
     scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
     let dim = config.dim;
@@ -1073,6 +1350,16 @@ fn full_layer_decode(
     // x = residual + tmp.
     gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
     gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
+
+    // Per-layer embedding inject (E-series only). See sliding decoder for
+    // the rationale; same call site (after FFN+residual, before layer_scalar).
+    if let (Some(g), Some(p), Some(n)) = (
+        lw.per_layer_input_gate.as_ref(),
+        lw.per_layer_projection.as_ref(),
+        lw.post_per_layer_input_norm.as_ref(),
+    ) {
+        apply_per_layer_inject(gpu, config, scratch, g, p, n, layer_idx)?;
+    }
 
     // Learned per-layer scalar multiplier.
     gpu.scale_f32(&scratch.x, lw.layer_scalar_host)?;

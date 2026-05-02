@@ -2199,9 +2199,12 @@ fn main() {
                     let q = quantize_hfq4g128(&f32_data);
                     (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                 }
-            } else if use_mg4g256 && is_embed {
+            } else if use_mg4g256 && (is_embed || name.ends_with("embed_tokens_per_layer.weight")) {
                 // Same embedding policy as MQ4 — Q8 is the floor for embed
-                // tables regardless of weight quant choice.
+                // tables regardless of weight quant choice. Also force the
+                // Gemma 4 E-series per-layer embedding (`embed_tokens_per_layer`)
+                // to Q8 so engine-side row lookup uses the existing
+                // `embedding_lookup_q8` dispatch with `dim = n_embd_per_layer * n_layers`.
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
             } else if use_mg4g256 {
