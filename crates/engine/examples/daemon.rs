@@ -2532,10 +2532,34 @@ fn generate_gemma4(
         tokenizer.encode(prompt)
     };
 
-    // Auto-reset on overflow. Gemma 4 has no eviction wired up so seq_pos
-    // grows monotonically until it hits max_seq; reset to keep the model
-    // usable across long-running chat sessions.
-    if m.seq_pos + new_tokens.len() + max_tokens > m.max_seq {
+    // KV-cache capacity guard. Gemma 4 has no eviction wired up so
+    // seq_pos grows monotonically. The KV cache is allocated for
+    // max_seq positions (indices 0..max_seq-1); the *last* write happens
+    // at pos = m.seq_pos + new_tokens.len() + (max_tokens - 1), so we
+    // need that to be < max_seq, i.e. seq_pos + new_tokens.len() +
+    // max_tokens <= max_seq. Use >= here, not >, to keep the off-by-one
+    // out of the kernel's bounds check.
+    let single_turn_floor = if m.seq_pos == 0 {
+        // First turn already includes BOS in new_tokens.
+        new_tokens.len() + max_tokens
+    } else {
+        // Reset will re-insert BOS, so add 1 for that.
+        new_tokens.len() + max_tokens + 1
+    };
+    if single_turn_floor > m.max_seq {
+        // Even after reset the request itself doesn't fit. Fail loud
+        // rather than silently truncating max_tokens or letting the
+        // KV writer scribble past the buffer.
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"gemma4: prompt({} tok) + max_tokens({}) + BOS exceeds max_seq({}); raise max_seq at load time or shorten the request"}}"#,
+            id, new_tokens.len(), max_tokens, m.max_seq,
+        );
+        let _ = stdout.flush();
+        m.g4_kv_full = Some(kv_full);
+        return;
+    }
+    if m.seq_pos + new_tokens.len() + max_tokens >= m.max_seq {
         eprintln!(
             "[daemon] gemma4: context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq,
@@ -2546,6 +2570,9 @@ fn generate_gemma4(
         if new_tokens.first() != Some(&bos_token) {
             new_tokens.insert(0, bos_token);
         }
+        // Re-validate after the BOS-insert grew new_tokens by 1.
+        // single_turn_floor already accounted for this growth.
+        debug_assert!(new_tokens.len() + max_tokens <= m.max_seq);
     }
 
     let t0 = Instant::now();
@@ -2556,6 +2583,18 @@ fn generate_gemma4(
     let prefill_start = m.seq_pos;
     for (i, &tok) in new_tokens.iter().enumerate() {
         let pos = prefill_start + i;
+        // Defense-in-depth bounds check (the capacity guard above should
+        // prevent this; this catches future-loosening of that guard).
+        if pos >= m.max_seq {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"gemma4 prefill: pos {} >= max_seq {} (prompt longer than cache)"}}"#,
+                id, pos, m.max_seq,
+            );
+            let _ = stdout.flush();
+            m.g4_kv_full = Some(kv_full);
+            return;
+        }
         if let Err(e) = gemma4::forward_scratch(
             gpu, weights, config, tok, pos, kv_sliding, &mut kv_full, scratch,
         ) {
@@ -2632,6 +2671,19 @@ fn generate_gemma4(
         // Forward the accepted token to populate KV for the next position,
         // then sample for the next iteration.
         let pos = m.seq_pos + generated - 1;
+        // Defense-in-depth: hard cap before the KV writer indexes past the
+        // cache. The capacity guard at the top of generate_gemma4 should
+        // already have prevented this; the in-loop check is here so a
+        // future change that loosens the entry guard (or a caller that
+        // bypasses generate_gemma4) doesn't quietly scribble out of bounds.
+        if pos >= m.max_seq {
+            let _ = writeln!(stdout,
+                r#"{{"type":"info","id":"{}","message":"gemma4: truncating decode at pos={} (max_seq={}) — generated {} of {} requested tokens"}}"#,
+                id, pos, m.max_seq, generated.saturating_sub(1), max_tokens);
+            let _ = stdout.flush();
+            generated = generated.saturating_sub(1);
+            break;
+        }
         if let Err(e) = gemma4::forward_scratch(
             gpu, weights, config, next_token, pos, kv_sliding, &mut kv_full, scratch,
         ) {
