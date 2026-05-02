@@ -137,6 +137,13 @@ impl HfqFile {
         Some((info, &self.mmap[info.data_offset..info.data_offset + info.data_size]))
     }
 
+    /// Read-only view of the full tensor index — used by tooling that needs to
+    /// enumerate every tensor without fishing them out by name (e.g. the
+    /// `dump_hfq_tensors` example for arch verification).
+    pub fn tensors(&self) -> &[HfqTensorInfo] {
+        &self.tensors
+    }
+
     fn find_tensor(&self, name: &str) -> Option<&HfqTensorInfo> {
         self.tensor_map.get(name).map(|&i| &self.tensors[i])
     }

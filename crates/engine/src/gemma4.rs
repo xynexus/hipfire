@@ -823,9 +823,22 @@ fn sliding_layer_decode(
     weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
     weight_gemv(gpu, &lw.v_proj, &scratch.tmp, &scratch.v)?;
 
-    // q_norm + k_norm across head_dim (in-place).
+    // q_norm + k_norm + v_norm across head_dim (in-place).
+    //
+    // V uses the same no-scale RMSNorm pattern as full-attn layers: the
+    // shared `v_norm_ones_full` buffer is filled with 1.0 by
+    // `init_scratch_constants`, so passing it as the weight gives
+    // `weight * x_normalized = 1.0 * x_normalized` — i.e. just the rms
+    // divide, no learned gain. The buffer is sized for full_head_dim
+    // (512); sliding only reads the first head_dim=256 elements via the
+    // `n` param, which is always-1.0 territory so the over-allocation
+    // is harmless. Matches llama.cpp gemma4-iswa.cpp line 92:
+    //   Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
+    // applied identically on every layer that has its own KV.
     gpu.rmsnorm_batched(&scratch.q, &lw.q_norm, &scratch.q, n_heads, head_dim, config.norm_eps)?;
     gpu.rmsnorm_batched(&scratch.k, &lw.k_norm, &scratch.k, n_kv, head_dim, config.norm_eps)?;
+    gpu.rmsnorm_batched(&scratch.v, &scratch.v_norm_ones_full, &scratch.v,
+        n_kv, head_dim, config.norm_eps)?;
 
     // Pre-scale Q by sqrt(head_dim) so the flash-attn kernel's internal
     // 1/sqrt(head_dim) cancels, leaving the effective Gemma 4 scale of 1.0.
