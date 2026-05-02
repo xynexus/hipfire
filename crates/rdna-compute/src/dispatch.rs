@@ -255,6 +255,9 @@ pub struct Gpu {
     /// Max per-row abs error threshold for screening. Weights with any row
     /// exceeding this fall back to WMMA. Default: 0.10.
     pub mmq_screen_threshold: f32,
+    /// Print per-weight MMQ screening verdicts. Default is false; load-time
+    /// screening already prints an aggregate safe/unsafe summary.
+    mmq_screen_verbose: bool,
 
     // ── hipGraph capture state ────────────────────────────────────────────
     /// When true, dispatch methods use the blob launch path (graph-capture-safe).
@@ -459,6 +462,8 @@ impl Gpu {
                 .unwrap_or(false),
             mmq_screen_threshold: std::env::var("HIPFIRE_MMQ_SCREEN_THRESHOLD")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(0.10),
+            mmq_screen_verbose: std::env::var("HIPFIRE_MMQ_SCREEN_VERBOSE").ok().as_deref()
+                == Some("1"),
             capture_mode: false,
             force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             capture_blobs: Vec::new(),
@@ -1215,7 +1220,7 @@ impl Gpu {
             }
 
             let safe = worst_err <= threshold;
-            if !safe {
+            if !safe && self.mmq_screen_verbose {
                 eprintln!(
                     "  MMQ screen: UNSAFE weight ptr={key:#x} m={m} k={k} \
                      worst_row={worst_row} max_err={worst_err:.4} > threshold={threshold:.4} — falling back to WMMA"
