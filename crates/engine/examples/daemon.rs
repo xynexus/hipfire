@@ -1057,7 +1057,10 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             g4_kv_sliding: None, g4_kv_full: None,
             g4_vision_config: None, g4_vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, conversation_tokens: Vec::new(),
+            seq_pos: 0, max_seq, physical_cap, eviction,
+            conversation_tokens: Vec::new(),
+            model_path: path.to_string(),
+            dflash,
         })
     } else if hfq.arch_id == 7 {
         // Gemma 4 (gemma-4-31B dense + vision tower).
@@ -1101,15 +1104,16 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         //     gates only the *read* side via attention's window_size uniform —
         //     it does NOT make writes modular. So we allocate at max_seq to
         //     avoid past-end writes at pos >= sliding_window.
-        //   • Full cache must use FP32 for correctness on this model: the
-        //     quantized flash kernels (asym3/asym4/asym2/q8) all iterate 32
-        //     threads × N dims where N∈{4,8} — i.e. ≤256 covered dims. Gemma 4
-        //     full layers have head_dim=512, so the quantized kernels would
-        //     silently truncate every head. Plain attention_f32 + FP32 KV
-        //     processes arbitrary head_dim correctly and (since full layers
-        //     never use sliding-window) doesn't need the window_size uniform.
-        //     This is why the kv_mode choice is honored on sliding but forced
-        //     to FP32 on full.
+        //   • Full cache: asym3 supports head_dim=512 via the *_hd512 kernel
+        //     variants (commit 6f5cb8b — `kv_cache_write_asym_k_givens3_hd512`
+        //     and `attention_flash_asym3_tile_hd512`). Memory win is 5.5×
+        //     vs FP32 which is what unblocks long-context (17 GB → 3 GB at
+        //     128K on 31B). asym4/asym2/q8 still hardcode hd=256-only
+        //     layouts and would silently truncate Gemma 4 full layers, so
+        //     those modes still fall back to FP32 here. Caller can force
+        //     FP32 unconditionally via HIPFIRE_GEMMA4_FULL_KV=fp32 (e.g.
+        //     when the asym3 quant noise flips argmax on small models —
+        //     observed on 26B-A4B at single-token decode).
         // KV cache slot counts respect KV-sharing — on Gemma 4 E-series
         // (E2B/E4B), the LAST `num_kv_shared_layers` layers don't compute
         // their own K/V (they reuse anchor layer's KV). Cache sizing must
@@ -1125,10 +1129,18 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, max_seq),
             _ => llama::KvCache::new_gpu_asym3(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, max_seq),
         }.map_err(|e| format!("{e}"))?;
-        // Full-attn layers always use FP32 KV (see above). kv_mode is advisory
-        // only for the sliding side on Gemma 4.
-        let kv_full = llama::KvCache::new_gpu(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq)
-            .map_err(|e| format!("{e}"))?;
+        // Full-attn layers: asym3 when sliding is asym3 AND no opt-out.
+        // Other quants (asym4/asym2/q8) and explicit override → FP32.
+        let force_fp32_full = std::env::var("HIPFIRE_GEMMA4_FULL_KV")
+            .ok().as_deref() == Some("fp32");
+        let kv_full = if !force_fp32_full && kv_mode.as_str() != "q8"
+            && kv_mode.as_str() != "asym4" && kv_mode.as_str() != "turbo4"
+            && kv_mode.as_str() != "asym2" && kv_mode.as_str() != "turbo2"
+        {
+            llama::KvCache::new_gpu_asym3(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq)
+        } else {
+            llama::KvCache::new_gpu(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq)
+        }.map_err(|e| format!("{e}"))?;
 
         let scratch = gemma4::Gemma4Scratch::new(gpu, &config, 128).map_err(|e| format!("{e}"))?;
         // One-time init of the ones-filled v_norm buffer used by full-attn layers.
@@ -1145,10 +1157,15 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             g4_kv_sliding: Some(kv_sliding), g4_kv_full: Some(kv_full),
             g4_vision_config, g4_vision_weights,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap, eviction,
+            seq_pos: 0, max_seq, physical_cap,
+            // Gemma 4 doesn't go through the CASK eviction or DFlash spec
+            // paths today (those are Qwen3.5-specific wirings). These slots
+            // are reserved for when those features are ported across; until
+            // then the gemma4 path is plain greedy decode.
+            eviction: None,
+            dflash: None,
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
-            dflash,
         })
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
