@@ -47,6 +47,9 @@ __pycache__/
 *.log
 /tmp/
 
+# Generated validation reports
+benchmarks/results/quantization-*/
+
 # Local Claude agent state
 .claude/
 # Personal CLI instructions
