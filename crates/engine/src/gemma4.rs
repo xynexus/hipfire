@@ -625,10 +625,18 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> HipResult<Vec<f
 /// Distinct from qwen35::load_norm_weight which shifts by +1 for HF Gemma
 /// 2/3-style `x * (1 + weight)`. Gemma 4 uses plain `x * weight` with weights
 /// initialized to 1.0 (see modeling_gemma4.py::Gemma4RMSNorm line 157).
+///
+/// HIPFIRE_GEMMA4_NORM_PLUS_ONE=1 forces the Gemma 3 +1 shift at load time
+/// (diagnostic only — for testing whether 26B-A4B's MoE-norm weights need
+/// the alternate convention even though convert_hf_to_gguf.py says they
+/// don't).
 fn load_gemma4_norm(hfq: &HfqFile, gpu: &mut Gpu, name: &str, dim: usize)
     -> HipResult<GpuTensor>
 {
-    let f32_data = load_f32_vec(hfq, name, dim)?;
+    let mut f32_data = load_f32_vec(hfq, name, dim)?;
+    if std::env::var("HIPFIRE_GEMMA4_NORM_PLUS_ONE").ok().as_deref() == Some("1") {
+        for v in f32_data.iter_mut() { *v += 1.0; }
+    }
     gpu.upload_f32(&f32_data, &[dim])
 }
 
@@ -1407,6 +1415,35 @@ fn apply_moe_branch(
     // 1) cur_mlp = post_feedforward_layernorm_1(scratch.ffn_out)
     gpu.rmsnorm_f32(&scratch.ffn_out, &moe.post_feedforward_layernorm_1,
         &scratch.moe_cur_mlp, config.norm_eps)?;
+    // HIPFIRE_DUMP_MOE_VALS=1 prints magnitude (rms, min, max, abs_mean) of
+    // each of attn_out / ffn_out / cur_mlp / cur_moe / final_combined at the
+    // first MoE layer of the first decode. Helps spot a single-branch
+    // dominating or a NaN-adjacent buffer without full reference values.
+    let dump_vals = std::env::var("HIPFIRE_DUMP_MOE_VALS").ok().as_deref() == Some("1")
+        && std::env::var("__HIPFIRE_MOE_VALS_DUMPED").is_err();
+    let stat = |gpu: &mut Gpu, t: &GpuTensor, label: &str| -> HipResult<()> {
+        let v = gpu.download_f32(t)?;
+        let n = v.len();
+        let rms = (v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n as f64).sqrt();
+        let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let abs_mean = v.iter().map(|x| x.abs() as f64).sum::<f64>() / n as f64;
+        let nonfinite = v.iter().filter(|x| !x.is_finite()).count();
+        eprintln!("[moe-vals] {label:30}  n={n:6}  rms={rms:.4}  min={mn:.4}  max={mx:.4}  abs_mean={abs_mean:.4}  nonfinite={nonfinite}");
+        Ok(())
+    };
+    if dump_vals {
+        stat(gpu, attn_out, "attn_out (input to MoE)")?;
+        stat(gpu, &scratch.ffn_out, "ffn_out (post-SwiGLU)")?;
+        stat(gpu, &scratch.moe_cur_mlp, "cur_mlp (post_norm_1)")?;
+        // Also dump the norm WEIGHTS to see their magnitude — large peak
+        // values would amplify post-rmsnorm outputs nonlinearly.
+        stat(gpu, &moe.post_feedforward_layernorm_1, "WEIGHT post_norm_1")?;
+        stat(gpu, &moe.pre_feedforward_layernorm_2, "WEIGHT pre_norm_2")?;
+        stat(gpu, &moe.post_feedforward_layernorm_2, "WEIGHT post_norm_2")?;
+        stat(gpu, post_ffn_norm, "WEIGHT post_norm")?;
+        stat(gpu, &moe.router_scale, "WEIGHT router_scale")?;
+    }
 
     // 2) MoE branch input: pre2 = pre_feedforward_layernorm_2(attn_out)
     gpu.rmsnorm_f32(attn_out, &moe.pre_feedforward_layernorm_2,
@@ -1509,6 +1546,10 @@ fn apply_moe_branch(
         gpu.scaled_add_inplace_cpu_scalar_f32(&scratch.moe_cur_moe, &scratch.moe_expert_out, weight)?;
     }
 
+    if dump_vals {
+        stat(gpu, &scratch.moe_cur_moe, "cur_moe (raw expert sum)")?;
+    }
+
     // 9) cur_moe = post_feedforward_layernorm_2(cur_moe), in-place
     gpu.rmsnorm_f32(&scratch.moe_cur_moe, &moe.post_feedforward_layernorm_2,
         &scratch.moe_cur_moe, config.norm_eps)?;
@@ -1518,6 +1559,13 @@ fn apply_moe_branch(
 
     // 11) tmp = post_feedforward_layernorm(combined)
     gpu.rmsnorm_f32(&scratch.tmp, post_ffn_norm, &scratch.tmp, config.norm_eps)?;
+
+    if dump_vals {
+        stat(gpu, &scratch.moe_cur_moe, "cur_moe (post_norm_2)")?;
+        stat(gpu, &scratch.tmp, "combined+post_norm")?;
+        // Set a flag so subsequent layers don't dump (only the first one).
+        std::env::set_var("__HIPFIRE_MOE_VALS_DUMPED", "1");
+    }
 
     let _ = dim_bytes;
     Ok(())
@@ -1877,8 +1925,27 @@ fn sliding_layer_decode(
     // residual = x (for the FFN residual stream).
     gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
 
+    // Diagnostic: dump magnitudes at sliding-layer 0 only.
+    if layer_idx == 0 && std::env::var("HIPFIRE_DUMP_LAYER0").ok().as_deref() == Some("1") {
+        let v = gpu.download_f32(&scratch.x)?;
+        let n = v.len();
+        let rms = (v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n as f64).sqrt();
+        let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!("[layer0] post-attn-residual  n={n}  rms={rms:.4}  min={mn:.4}  max={mx:.4}");
+    }
+
     // Pre-FFN norm.
     gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+
+    if layer_idx == 0 && std::env::var("HIPFIRE_DUMP_LAYER0").ok().as_deref() == Some("1") {
+        let v = gpu.download_f32(&scratch.tmp)?;
+        let n = v.len();
+        let rms = (v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n as f64).sqrt();
+        let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!("[layer0] pre_ffn_norm output n={n}  rms={rms:.4}  min={mn:.4}  max={mx:.4}");
+    }
 
     // SwiGLU(gelu_pytorch_tanh): gate_proj, up_proj, gelu_tanh(gate) * up → down_proj.
     // Use lw.ffn_hidden_dim — varies per layer on E2B (use_double_wide_mlp).
