@@ -377,6 +377,11 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
         13 => DType::MQ4G256,
         14 => DType::MQ8G256,
         15 => DType::MQ6G256,
+        // MG4G256 (Magnum-Gemma 4-bit, qt=19) reads back as MQ4G256: identical
+        // 136 B/group binary layout, same FWHT signs, same `q * scale + min`
+        // decode. Only the per-block scale calibration (percentile-clip vs
+        // true min..max) differs at quantize time — engine GEMV is unchanged.
+        19 => DType::MQ4G256,
         qt => return Err(hip_bridge::HipError::new(
             0, &format!("unsupported quant_type {qt} for {name}"),
         )),

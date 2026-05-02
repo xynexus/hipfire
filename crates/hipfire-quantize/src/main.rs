@@ -436,17 +436,104 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 }
 
 
-/// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
-/// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
-/// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
-fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+/// Magnum-Gemma 4-bit (MG4G256): same binary layout as MQ4G256 (136 B/group),
+/// same FWHT preconditioning, but calibration uses **percentile-clip** instead
+/// of true min..max for the per-block scale.
+///
+/// Why: MQ4's true min..max calibration spends codebook range on the rotated
+/// distribution's tails (~3σ on either side post-FWHT), leaving only ~0.4σ per
+/// bin for the bulk where ~95% of mass lives. On Gemma 4 the per-element error
+/// compounds through 60 layers under the learned `layer_scalar` per-layer gain
+/// (see modeling_gemma4.py line 228) and collapses attention into a single-
+/// token attractor. The same MQ4 calibration on Qwen3.5 stays coherent because
+/// Qwen has no equivalent per-layer scalar.
+///
+/// Calibration: clip to [P02, P98] of the rotated block (top + bottom 5 of 256
+/// values clamped to the codebook edges), giving the bulk ~30% better
+/// resolution per bin. Saturating ~4% of values at the codebook edges costs
+/// less in mean-squared error than the bin-width loss avoided. Engine-zero-
+/// change: identical 136 B/group binary, decoded as `q * scale + min` exactly
+/// like MQ4 — engine reads `quant_type=19` as `DType::MQ4G256` so the existing
+/// `gemv_mq4g256_with_rotate` kernel handles MG4 unchanged.
+fn quantize_mg4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 136;
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
 
-    for b in 0..n_blocks {
+    // Per-block parallelism: each 256-element block produces a disjoint
+    // 136-byte output region, FWHT signs1/signs2 are read-only refs.
+    output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_block)| {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+
+        // FWHT rotation — same signs1/signs2 as MQ4. The rotation cancels
+        // at GEMV time via x-side rotation, so MG4 reads back through the
+        // exact same kernel path as MQ4.
+        cpu_fwht_256(&mut group, signs1, signs2);
+
+        // Percentile-clip calibration. P02 + P98 of 256 samples == 5th and
+        // 251st when sorted (rounded down for low, up for high). Use a copy
+        // for the partial sort so we keep the unsorted `group` for the
+        // post-clip quantization step.
+        let mut sorted = group;
+        // select_nth_unstable is O(n) average, no full sort needed.
+        sorted.select_nth_unstable_by(5, |a, b| a.partial_cmp(b).unwrap());
+        let p02 = sorted[5];
+        sorted.select_nth_unstable_by(250, |a, b| a.partial_cmp(b).unwrap());
+        let p98 = sorted[250];
+
+        // If the percentile range is degenerate (e.g. all-zero block), fall
+        // back to true min..max so we don't divide by zero.
+        let (lo, hi) = if (p98 - p02).abs() < 1e-12 {
+            let mn = group.iter().cloned().fold(f32::INFINITY, f32::min);
+            let mx = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            (mn, mx)
+        } else {
+            (p02, p98)
+        };
+
+        let range = hi - lo;
+        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        out_block[0..4].copy_from_slice(&scale.to_le_bytes());
+        out_block[4..8].copy_from_slice(&lo.to_le_bytes());
+
+        for i in 0..128 {
+            // Saturating quantization: values outside [lo, hi] get clamped to
+            // the codebook edges (0 or 15). For percentile-clipped calibration
+            // this is by-design — the top and bottom ~2% of FWHT-rotated values
+            // were chosen as the saturation boundary.
+            let lo_v = group[2 * i];
+            let hi_v = group[2 * i + 1];
+            let lo_q = (((lo_v - lo) * inv_scale + 0.5).max(0.0).min(15.0)) as u8;
+            let hi_q = (((hi_v - lo) * inv_scale + 0.5).max(0.0).min(15.0)) as u8;
+            out_block[8 + i] = lo_q | (hi_q << 4);
+        }
+    });
+
+    output
+}
+
+/// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
+/// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
+/// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
+fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    use rayon::prelude::*;
+    let group_size = 256;
+    let block_bytes = 136;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_block)| {
         let start = b * group_size;
         let end = (start + group_size).min(n);
 
@@ -465,16 +552,15 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
         let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
         let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
 
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
-        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+        out_block[0..4].copy_from_slice(&scale.to_le_bytes());
+        out_block[4..8].copy_from_slice(&min_val.to_le_bytes());
 
         for i in 0..128 {
             let lo_q = ((group[2 * i] - min_val) * inv_scale + 0.5) as u8;
             let hi_q = ((group[2 * i + 1] - min_val) * inv_scale + 0.5) as u8;
-            output[out_off + 8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+            out_block[8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
         }
-    }
+    });
 
     output
 }
@@ -489,7 +575,8 @@ fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
 
-    for b in 0..n_blocks {
+    use rayon::prelude::*;
+    output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_block)| {
         let start = b * group_size;
         let end = (start + group_size).min(n);
 
@@ -508,9 +595,8 @@ fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
         let scale = if range > 0.0 { range / 63.0 } else { 1.0 };
         let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
 
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
-        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+        out_block[0..4].copy_from_slice(&scale.to_le_bytes());
+        out_block[4..8].copy_from_slice(&min_val.to_le_bytes());
 
         // Pack 4 values per 3 bytes: v0[5:0]|v1[1:0], v1[5:2]|v2[3:0], v2[5:4]|v3[5:0]
         for i in (0..256).step_by(4) {
@@ -524,11 +610,11 @@ fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
             let q3 = q3.min(63);
 
             let byte_off = 8 + (i / 4) * 3;
-            output[out_off + byte_off]     = q0 | (q1 << 6);
-            output[out_off + byte_off + 1] = (q1 >> 2) | (q2 << 4);
-            output[out_off + byte_off + 2] = (q2 >> 4) | (q3 << 2);
+            out_block[byte_off]     = q0 | (q1 << 6);
+            out_block[byte_off + 1] = (q1 >> 2) | (q2 << 4);
+            out_block[byte_off + 2] = (q2 >> 4) | (q3 << 2);
         }
-    }
+    });
 
     output
 }
@@ -544,7 +630,8 @@ fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
 
-    for b in 0..n_blocks {
+    use rayon::prelude::*;
+    output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_block)| {
         let start = b * group_size;
         let end = (start + group_size).min(n);
 
@@ -561,18 +648,17 @@ fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
         let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
         let inv_scale = if amax > 0.0 { 127.0 / amax } else { 0.0 };
 
-        let out_off = b * block_bytes;
         // Store scale as f16 (2 bytes)
         let scale_f16 = f32_to_f16(scale);
-        output[out_off] = (scale_f16 & 0xFF) as u8;
-        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        out_block[0] = (scale_f16 & 0xFF) as u8;
+        out_block[1] = (scale_f16 >> 8) as u8;
 
         // Quantize to signed INT8
         for i in 0..256 {
             let q = (group[i] * inv_scale).round().clamp(-128.0, 127.0) as i8;
-            output[out_off + 2 + i] = q as u8;
+            out_block[2 + i] = q as u8;
         }
-    }
+    });
 
     output
 }
@@ -629,7 +715,8 @@ fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
 
-    for b in 0..n_blocks {
+    use rayon::prelude::*;
+    output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_block)| {
         let start = b * group_size;
         let end = (start + group_size).min(n);
 
@@ -647,9 +734,8 @@ fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
         let scale = if range > 0.0 { range / 7.0 } else { 1.0 };
         let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
 
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
-        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+        out_block[0..4].copy_from_slice(&scale.to_le_bytes());
+        out_block[4..8].copy_from_slice(&min_val.to_le_bytes());
 
         // Pack 256 weights as 32 chunks of 8 weights × 3 bits = 3 bytes each.
         // Bit layout matches the HFQ3-G256 GEMV kernel unpack (cross-byte).
@@ -663,12 +749,12 @@ fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
             let b1 = ((q[2] >> 2) & 1) | ((q[3] & 7) << 1) | ((q[4] & 7) << 4) | ((q[5] & 1) << 7);
             let b2 = ((q[5] >> 1) & 3) | ((q[6] & 7) << 2) | ((q[7] & 7) << 5);
 
-            let bo = out_off + 8 + chunk * 3;
-            output[bo] = b0;
-            output[bo + 1] = b1;
-            output[bo + 2] = b2;
+            let bo = 8 + chunk * 3;
+            out_block[bo] = b0;
+            out_block[bo + 1] = b1;
+            out_block[bo + 2] = b2;
         }
-    }
+    });
 
     output
 }
@@ -683,7 +769,8 @@ fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
 
-    for b in 0..n_blocks {
+    use rayon::prelude::*;
+    output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_block)| {
         let start = b * group_size;
         let end = (start + group_size).min(n);
 
@@ -700,9 +787,8 @@ fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
         let scale = if range > 0.0 { range / 3.0 } else { 1.0 };
         let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
 
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
-        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+        out_block[0..4].copy_from_slice(&scale.to_le_bytes());
+        out_block[4..8].copy_from_slice(&min_val.to_le_bytes());
 
         // Pack 256 weights into 64 bytes (4 per byte at 2-bit).
         for i in 0..64 {
@@ -711,9 +797,9 @@ fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
                 let q = ((group[4 * i + j] - min_val) * inv_scale + 0.5) as u8;
                 byte_val |= q.min(3) << (j * 2);
             }
-            output[out_off + 8 + i] = byte_val;
+            out_block[8 + i] = byte_val;
         }
-    }
+    });
 
     output
 }
@@ -1027,6 +1113,13 @@ enum QuantType {
     BF16 = 16,     // Original BF16 weights (zero precision loss for vision)
     MQ3G256 = 17,  // MagnumQuant: FWHT-rotated HFQ3-G256 (3-bit, 104 B/group)
     MQ2G256 = 18,  // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
+    MG4G256 = 19,  // Magnum-Gemma 4-bit: same MQ4 binary, percentile-clip calibration.
+                   // Reads back as DType::MQ4G256 in the engine — no kernel changes
+                   // needed — but stores P02..P98 instead of true min..max so the
+                   // 16-level codebook gets ~30% better resolution on the bulk
+                   // distribution. Designed for Gemma 4 where layer_scalar
+                   // amplification across 60 layers makes MQ4's per-element error
+                   // collapse attention into a single-token attractor (2026-05-02).
 }
 
 struct HfqTensor {
@@ -1708,6 +1801,11 @@ fn main() {
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
     let use_mq3g256 = format == "mq3" || format == "mq3g256";
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
+    // Magnum-Gemma 4-bit: same MQ4 binary, percentile-clip calibration. See
+    // `quantize_mg4g256` for the design rationale (Gemma 4 layer_scalar
+    // amplification breaks MQ4's true min..max calibration). Engine reads
+    // the resulting file as MQ4G256 — no kernel changes.
+    let use_mg4g256 = format == "mg4" || format == "mg4g256";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
@@ -2098,6 +2196,26 @@ fn main() {
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                 } else {
                     // Fallback to standard HFQ4-G128 for non-256-aligned
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
+            } else if use_mg4g256 && is_embed {
+                // Same embedding policy as MQ4 — Q8 is the floor for embed
+                // tables regardless of weight quant choice.
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_mg4g256 {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 256 == 0 {
+                    // Same FWHT signs as MQ4 — engine treats MG4 as MQ4 at
+                    // GEMV time (same kernel, same x-side rotation), the
+                    // only difference is the per-block scale calibration.
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mg4g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MG4G256, 256u32, "MG4G256")
+                } else {
+                    // Same fallback as MQ4 for non-256-aligned weights.
                     let q = quantize_hfq4g128(&f32_data);
                     (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                 }

@@ -7,16 +7,29 @@ use engine::hfq::HfqFile;
 use std::path::Path;
 
 fn quant_label(qt: u8) -> &'static str {
+    // Authoritative mapping is `enum QuantType` in hipfire-quantize/src/main.rs.
+    // Keep this in sync when new variants land.
     match qt {
         0 => "Q4_F16_G64",
         1 => "F16",
         2 => "F32",
-        3 => "Q8_0",
-        4 => "HFQ4G256",
-        5 => "HFQ4G128",
-        6 => "HFQ6G256",
-        7 => "MQ3",
-        8 => "MQ2",
+        3 => "Q8_F16",
+        4 => "Q4K",
+        5 => "Q8HFQ",
+        6 => "HFQ4G256",
+        7 => "HFQ4G128",
+        8 => "HFQ6G256",
+        9 => "HFQ2G256",
+        10 => "HFQ2G128",
+        11 => "HFQ3G256",
+        12 => "HFQ3G128",
+        13 => "MQ4G256",
+        14 => "MQ8G256",
+        15 => "MQ6G256",
+        16 => "BF16",
+        17 => "MQ3G256",
+        18 => "MQ2G256",
+        19 => "MG4G256",
         _ => "?",
     }
 }
