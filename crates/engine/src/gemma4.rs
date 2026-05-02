@@ -1420,6 +1420,15 @@ fn apply_moe_branch(
         std::slice::from_raw_parts(topk_idx_bytes.as_ptr() as *const i32, k_top)
     }.iter().map(|&i| i as usize).collect();
     let topk_weights = gpu.download_f32(&scratch.moe_topk_weights)?;
+    if std::env::var("HIPFIRE_DUMP_MOE").ok().as_deref() == Some("1") {
+        let logits = gpu.download_f32(&scratch.moe_router_logits)?;
+        let mut top5: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i,&v)|(i,v)).collect();
+        top5.select_nth_unstable_by(4, |a,b| b.1.partial_cmp(&a.1).unwrap());
+        top5[..5].sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+        let scale_sample: Vec<f32> = topk_indices.iter().take(8).map(|&e| moe.per_expert_scale_host[e]).collect();
+        eprintln!("[moe] logit_top5={:?} | topk_idx={:?} | topk_w={:?} | per_expert_scale={:?}",
+            &top5[..5], topk_indices, &topk_weights[..k_top], scale_sample);
+    }
 
     // 7) Zero accumulator
     gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
@@ -1441,9 +1450,15 @@ fn apply_moe_branch(
 
         // gate_up = gate_up_proj @ moe_pre2 → [2 * mi]
         weight_gemv(gpu, &expert.gate_up_proj, &scratch.moe_pre2, &scratch.moe_expert_gate_up)?;
-        // Split: gate (first mi), up (second mi).
-        let gate = scratch.moe_expert_gate_up.sub_offset(0, mi);
-        let up   = scratch.moe_expert_gate_up.sub_offset(mi, mi);
+        // Split: gate (first mi), up (second mi). HIPFIRE_MOE_SWAP_GATE_UP=1
+        // tries the opposite layout (up first, gate second) for diagnosis.
+        let (gate, up) = if std::env::var("HIPFIRE_MOE_SWAP_GATE_UP").ok().as_deref() == Some("1") {
+            (scratch.moe_expert_gate_up.sub_offset(mi, mi),
+             scratch.moe_expert_gate_up.sub_offset(0, mi))
+        } else {
+            (scratch.moe_expert_gate_up.sub_offset(0, mi),
+             scratch.moe_expert_gate_up.sub_offset(mi, mi))
+        };
         gpu.gelu_tanh_f32(&gate, &scratch.moe_expert_hidden, mi)?;
         gpu.mul_f32(&scratch.moe_expert_hidden, &up, &scratch.moe_expert_hidden)?;
         // out = down_proj @ hidden → [dim]
