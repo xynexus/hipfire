@@ -104,8 +104,7 @@ fn acquire_daemon_lock() -> std::fs::File {
     #[cfg(unix)]
     let home = std::env::var("HOME").expect("HOME environment variable not set");
     #[cfg(windows)]
-    let home = std::env::var("USERPROFILE")
-        .expect("USERPROFILE environment variable not set");
+    let home = std::env::var("USERPROFILE").expect("USERPROFILE environment variable not set");
 
     let hipfire_dir = std::path::PathBuf::from(home).join(".hipfire");
     std::fs::create_dir_all(&hipfire_dir).expect("failed to create ~/.hipfire");
@@ -272,18 +271,25 @@ fn main() {
         // compiler's writeback path fires. Without this, Gpu::init probes for
         // an existing dir and silently disables writeback if it's missing —
         // meaning fresh installs would compile but never cache cross-invocation.
-        if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
             // Arch is unknown until Gpu::init; use a broad mkdir for the common arches
             // we support so the probe picks one up. The real arch check after init
             // will log the active dir.
-            for arch in ["gfx906", "gfx1010", "gfx1013", "gfx1030", "gfx1031", "gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1152", "gfx1200", "gfx1201"] {
-                let _ = std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
+            for arch in [
+                "gfx906", "gfx1010", "gfx1013", "gfx1030", "gfx1031", "gfx1100", "gfx1101",
+                "gfx1102", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
+            ] {
+                let _ =
+                    std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
             }
         }
         let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
         eprintln!("Pre-compiling kernels for {}...", gpu.arch);
         let mut errors = 0usize;
-        for kv in &["asym3", "q8"] {
+        for kv in &["asym3", "asym4_tqv2", "asym4_tqv4", "q8"] {
             for wq in &["mq4", "mq6", "hfq4", "hfq6", "q8"] {
                 if let Err(e) = gpu.precompile_qwen35(wq, kv, 256) {
                     eprintln!("  {wq}/{kv}: {e}");
@@ -316,12 +322,18 @@ fn main() {
             Ok(l) => l,
             Err(_) => break,
         };
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
 
         let msg: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(stdout, r#"{{"type":"error","message":"invalid JSON: {}"}}"#, e);
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","message":"invalid JSON: {}"}}"#,
+                    e
+                );
                 let _ = stdout.flush();
                 continue;
             }
@@ -337,7 +349,11 @@ fn main() {
                 }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                let max_seq = msg.get("params").and_then(|p| p.get("max_seq")).and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+                let max_seq = msg
+                    .get("params")
+                    .and_then(|p| p.get("max_seq"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(4096) as usize;
                 // Optional DFlash draft model path. When supplied AND the target
                 // is a Qwen3.5 arch (5 or 6), we load draft weights + scratch
                 // alongside the target and the temp=0 generate fast path routes
@@ -350,28 +366,44 @@ fn main() {
                 // primary path (saves the wire round-trip for the draft path
                 // string), but this guard makes the flag durable when the
                 // daemon is driven by a non-hipfire-CLI client.
-                let dflash_mode = msg.get("params").and_then(|p| p.get("dflash_mode"))
-                    .and_then(|v| v.as_str()).unwrap_or("auto");
-                let raw_draft = msg.get("params").and_then(|p| p.get("draft")).and_then(|v| v.as_str())
+                let dflash_mode = msg
+                    .get("params")
+                    .and_then(|p| p.get("dflash_mode"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("auto");
+                let raw_draft = msg
+                    .get("params")
+                    .and_then(|p| p.get("draft"))
+                    .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty());
                 let draft_path = if dflash_mode == "off" {
                     if raw_draft.is_some() {
-                        eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({})", raw_draft.unwrap());
+                        eprintln!(
+                            "[hipfire-daemon] dflash_mode=off — skipping draft load ({})",
+                            raw_draft.unwrap()
+                        );
                     }
                     None
                 } else {
                     raw_draft.map(|s| s.to_string())
                 };
-                let kv_mode_override = msg.get("params").and_then(|p| p.get("kv_mode")).and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty()).map(|s| s.to_string());
+                let kv_mode_override = msg
+                    .get("params")
+                    .and_then(|p| p.get("kv_mode"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
                 // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
                 // Accepted here; the generate loop will honor it in the
                 // 0.1.7-stable release where we port the demo's outer τ-window
                 // trip-wire (below 2.5 → shrink block to 8).
-                let _adaptive_b = msg.get("params").and_then(|p| p.get("dflash_adaptive_b"))
-                    .and_then(|v| v.as_bool()).unwrap_or(true);
+                let _adaptive_b = msg
+                    .get("params")
+                    .and_then(|p| p.get("dflash_adaptive_b"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
 
                 // 0.1.7: TriAttention / CASK eviction protocol fields. When
                 // `cask_sidecar` is set, `load_model` sizes the KV cache to a
@@ -381,18 +413,37 @@ fn main() {
                 // That decouples advertised context length from VRAM footprint —
                 // a 128K max_seq can run in ~1K-slot physical buffer when the
                 // operator opts in.
-                let cask_sidecar = msg.get("params").and_then(|p| p.get("cask_sidecar"))
-                    .and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
-                let cask_enabled = msg.get("params").and_then(|p| p.get("cask"))
-                    .and_then(|v| v.as_bool()).unwrap_or(false);
-                let cask_budget = msg.get("params").and_then(|p| p.get("cask_budget"))
-                    .and_then(|v| v.as_u64()).unwrap_or(512) as usize;
-                let cask_beta = msg.get("params").and_then(|p| p.get("cask_beta"))
-                    .and_then(|v| v.as_u64()).unwrap_or(128) as usize;
-                let cask_core_frac = msg.get("params").and_then(|p| p.get("cask_core_frac"))
-                    .and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
-                let cask_fold_m = msg.get("params").and_then(|p| p.get("cask_fold_m"))
-                    .and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+                let cask_sidecar = msg
+                    .get("params")
+                    .and_then(|p| p.get("cask_sidecar"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let cask_enabled = msg
+                    .get("params")
+                    .and_then(|p| p.get("cask"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let cask_budget = msg
+                    .get("params")
+                    .and_then(|p| p.get("cask_budget"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(512) as usize;
+                let cask_beta = msg
+                    .get("params")
+                    .and_then(|p| p.get("cask_beta"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(128) as usize;
+                let cask_core_frac = msg
+                    .get("params")
+                    .and_then(|p| p.get("cask_core_frac"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.5) as f32;
+                let cask_fold_m = msg
+                    .get("params")
+                    .and_then(|p| p.get("cask_fold_m"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(2) as usize;
                 // Known-broken combo guard: CASK m-folding + DFlash spec decode
                 // degenerates into single-token loops after the first eviction
                 // (the m-folded synthetic K/V rows are off the draft's trained
@@ -420,14 +471,29 @@ fn main() {
                 // MMQ per-weight screening (#87): detect outlier rows that
                 // cause Q8_1 precision loss and fall back to WMMA for those
                 // weights. Enabled by default; disable with mmq_screen=false.
-                if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen")).and_then(|v| v.as_bool()) {
+                if let Some(v) = msg
+                    .get("params")
+                    .and_then(|p| p.get("mmq_screen"))
+                    .and_then(|v| v.as_bool())
+                {
                     gpu.mmq_screen = v;
                 }
-                if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen_threshold")).and_then(|v| v.as_f64()) {
+                if let Some(v) = msg
+                    .get("params")
+                    .and_then(|p| p.get("mmq_screen_threshold"))
+                    .and_then(|v| v.as_f64())
+                {
                     gpu.mmq_screen_threshold = v as f32;
                 }
 
-                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, &mut gpu) {
+                match load_model(
+                    path,
+                    max_seq,
+                    draft_path.as_deref(),
+                    kv_mode_override.as_deref(),
+                    &cask,
+                    &mut gpu,
+                ) {
                     Ok(m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -439,15 +505,25 @@ fn main() {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.llama_config {
                             (c.dim, c.n_layers, c.vocab_size)
-                        } else { (0, 0, 0) };
-                        let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{}}}"#, arch, dim, layers, vocab, vl);
+                        } else {
+                            (0, 0, 0)
+                        };
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{}}}"#,
+                            arch, dim, layers, vocab, vl
+                        );
                         model = Some(m);
                     }
                     Err(e) => {
                         let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                         let free_mb = vram_free / (1024 * 1024);
                         let total_mb = vram_total / (1024 * 1024);
-                        let _ = writeln!(stdout, r#"{{"type":"error","message":"load failed: {}. GPU: {} ({} MB free / {} MB total)"}}"#, e, gpu.arch, free_mb, total_mb);
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","message":"load failed: {}. GPU: {} ({} MB free / {} MB total)"}}"#,
+                            e, gpu.arch, free_mb, total_mb
+                        );
                     }
                 }
                 let _ = stdout.flush();
@@ -457,26 +533,44 @@ fn main() {
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
-                        let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
+                        let _ =
+                            writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
                         let _ = stdout.flush();
                         continue;
                     }
                 };
 
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
-                let prompt = msg.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello");
+                let prompt = msg
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Hello");
                 let prompt_norm = engine::tokenizer::maybe_normalize_prompt(prompt);
                 let prompt: &str = &prompt_norm;
                 if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
-                    if let Some(tok) = m.tokenizer.as_ref() { tok.dump_prompt_heat(prompt); }
+                    if let Some(tok) = m.tokenizer.as_ref() {
+                        tok.dump_prompt_heat(prompt);
+                    }
                 }
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
-                let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
-                let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
+                let temp = msg
+                    .get("temperature")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.3) as f32;
+                let max_tokens = msg
+                    .get("max_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(512) as usize;
                 let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
-                let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.3) as f32;
-                let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+                let repeat_penalty = msg
+                    .get("repeat_penalty")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.3) as f32;
+                let repeat_window = msg
+                    .get("repeat_window")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(128) as usize;
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
                 // cache so the model "sees" them as part of its own trajectory,
@@ -491,13 +585,25 @@ fn main() {
                 // (`experimental_budget_alert: true` → HIPFIRE_EXPERIMENTAL_
                 // BUDGET_ALERT=1 set by the CLI). Research use only; not a
                 // stable contract.
-                let experimental_ok = std::env::var("HIPFIRE_EXPERIMENTAL_BUDGET_ALERT").ok().as_deref() == Some("1");
+                let experimental_ok = std::env::var("HIPFIRE_EXPERIMENTAL_BUDGET_ALERT")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
                 let budget_alert_at_tok = if experimental_ok {
-                    msg.get("budget_alert_at_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize
-                } else { 0 };
+                    msg.get("budget_alert_at_tok")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize
+                } else {
+                    0
+                };
                 let budget_alert_text = if experimental_ok {
-                    msg.get("budget_alert_text").and_then(|v| v.as_str()).unwrap_or("").to_string()
-                } else { String::new() };
+                    msg.get("budget_alert_text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    String::new()
+                };
                 // Budget for tokens emitted INSIDE the model's <think>...</think>
                 // block. 0 = uncapped (model thinks until it naturally closes).
                 // Triggered from the CLI by per-model `max_think_tokens` config,
@@ -513,13 +619,43 @@ fn main() {
                 // shipping in genParams since cli/index.ts but the daemon
                 // was silently ignoring it, making the new reasoning.effort
                 // / enable_thinking knobs no-ops on the wire.
-                let max_think_tokens = msg.get("max_think_tokens")
-                    .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let max_think_tokens = msg
+                    .get("max_think_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
 
                 if image.is_some() && m.vision_config.is_some() {
-                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
+                    generate_vl(
+                        m,
+                        &mut gpu,
+                        &mut stdout,
+                        id,
+                        prompt,
+                        system,
+                        image.unwrap(),
+                        temp,
+                        top_p,
+                        max_tokens,
+                        repeat_penalty,
+                        repeat_window,
+                    );
                 } else {
-                    generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window, budget_alert_at_tok, &budget_alert_text, max_think_tokens);
+                    generate(
+                        m,
+                        &mut gpu,
+                        &mut stdout,
+                        id,
+                        prompt,
+                        system,
+                        temp,
+                        top_p,
+                        max_tokens,
+                        repeat_penalty,
+                        repeat_window,
+                        budget_alert_at_tok,
+                        &budget_alert_text,
+                        max_think_tokens,
+                    );
                 }
             }
 
@@ -542,8 +678,12 @@ fn main() {
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                     }
-                    if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
-                    if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = 0; }
+                    if let Some(kv) = m.kv_cache.as_mut() {
+                        kv.compact_offset = 0;
+                    }
+                    if let Some(kv) = m.llama_kv.as_mut() {
+                        kv.compact_offset = 0;
+                    }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -568,25 +708,71 @@ fn main() {
                 let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                 let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
                 let has_model = model.is_some();
-                let model_arch = model.as_ref().map(|m| match m.arch_id {
-                    5 => "qwen3_5",
-                    6 => "qwen3_5_moe",
-                    _ => "qwen3",
-                }).unwrap_or("none");
+                let model_arch = model
+                    .as_ref()
+                    .map(|m| match m.arch_id {
+                        5 => "qwen3_5",
+                        6 => "qwen3_5_moe",
+                        _ => "qwen3",
+                    })
+                    .unwrap_or("none");
                 // Count pre-compiled kernels
-                let kernel_dir = std::env::current_exe().ok()
-                    .and_then(|e| e.parent().map(|p| p.join("kernels").join("compiled").join(&gpu.arch)))
+                let kernel_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|e| {
+                        e.parent()
+                            .map(|p| p.join("kernels").join("compiled").join(&gpu.arch))
+                    })
                     .filter(|p| p.is_dir());
-                let (hsaco_count, hash_count) = kernel_dir.map(|d| {
-                    let hsaco = std::fs::read_dir(&d).map(|r| r.filter(|e| e.as_ref().ok().map(|e| e.path().extension().map(|x| x == "hsaco").unwrap_or(false)).unwrap_or(false)).count()).unwrap_or(0);
-                    let hash = std::fs::read_dir(&d).map(|r| r.filter(|e| e.as_ref().ok().map(|e| e.path().extension().map(|x| x == "hash").unwrap_or(false)).unwrap_or(false)).count()).unwrap_or(0);
-                    (hsaco, hash)
-                }).unwrap_or((0, 0));
-                let _ = writeln!(stdout,
+                let (hsaco_count, hash_count) = kernel_dir
+                    .map(|d| {
+                        let hsaco = std::fs::read_dir(&d)
+                            .map(|r| {
+                                r.filter(|e| {
+                                    e.as_ref()
+                                        .ok()
+                                        .map(|e| {
+                                            e.path()
+                                                .extension()
+                                                .map(|x| x == "hsaco")
+                                                .unwrap_or(false)
+                                        })
+                                        .unwrap_or(false)
+                                })
+                                .count()
+                            })
+                            .unwrap_or(0);
+                        let hash = std::fs::read_dir(&d)
+                            .map(|r| {
+                                r.filter(|e| {
+                                    e.as_ref()
+                                        .ok()
+                                        .map(|e| {
+                                            e.path()
+                                                .extension()
+                                                .map(|x| x == "hash")
+                                                .unwrap_or(false)
+                                        })
+                                        .unwrap_or(false)
+                                })
+                                .count()
+                            })
+                            .unwrap_or(0);
+                        (hsaco, hash)
+                    })
+                    .unwrap_or((0, 0));
+                let _ = writeln!(
+                    stdout,
                     r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{}}}"#,
-                    gpu.arch, hip_ver.0, hip_ver.1,
-                    vram_free / (1024 * 1024), vram_total / (1024 * 1024),
-                    has_model, model_arch, hsaco_count, hash_count
+                    gpu.arch,
+                    hip_ver.0,
+                    hip_ver.1,
+                    vram_free / (1024 * 1024),
+                    vram_total / (1024 * 1024),
+                    has_model,
+                    model_arch,
+                    hsaco_count,
+                    hash_count
                 );
                 let _ = stdout.flush();
             }
@@ -599,7 +785,8 @@ fn main() {
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
-                        let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
+                        let _ =
+                            writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
                         let _ = stdout.flush();
                         continue;
                     }
@@ -610,9 +797,11 @@ fn main() {
                 // on the *physical* buffer (not the advertised max_seq) because this
                 // bench intentionally bypasses eviction to measure raw prefill.
                 if n + 32 > m.physical_cap {
-                    let _ = writeln!(stdout,
+                    let _ = writeln!(
+                        stdout,
                         r#"{{"type":"error","message":"bench_prefill tokens={} exceeds loaded physical_cap={}"}}"#,
-                        n, m.physical_cap);
+                        n, m.physical_cap
+                    );
                     let _ = stdout.flush();
                     continue;
                 }
@@ -627,9 +816,15 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 if let Some(ref dn) = m.dn_state {
-                    for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-                    for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-                    for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                    for s in &dn.s_matrices {
+                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    }
+                    for s in &dn.s_scales {
+                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    }
+                    for s in &dn.conv_states {
+                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    }
                 }
 
                 // Flush any residual GPU work so it doesn't bleed into the
@@ -644,7 +839,11 @@ fn main() {
                     let scratch = m.q35_scratch.as_ref().unwrap();
                     let kv = m.kv_cache.as_mut().unwrap();
                     let dn = m.dn_state.as_mut().unwrap();
-                    qwen35::forward_prefill_batch(&mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None, None, None).is_ok()
+                    qwen35::forward_prefill_batch(
+                        &mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None,
+                        None, None,
+                    )
+                    .is_ok()
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -652,7 +851,11 @@ fn main() {
                     let kv = m.llama_kv.as_mut().unwrap();
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
-                        if llama::forward_scratch(&mut gpu, weights, config, tok, i, kv, scratch, 0.0, 1.0, 42, 0, 1.0).is_err() {
+                        if llama::forward_scratch(
+                            &mut gpu, weights, config, tok, i, kv, scratch, 0.0, 1.0, 42, 0, 1.0,
+                        )
+                        .is_err()
+                        {
                             ok = false;
                             break;
                         }
@@ -667,18 +870,35 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 if let Some(ref dn) = m.dn_state {
-                    for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-                    for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-                    for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                    for s in &dn.s_matrices {
+                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    }
+                    for s in &dn.s_scales {
+                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    }
+                    for s in &dn.conv_states {
+                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    }
                 }
 
                 if run_ok {
-                    let tok_s = if elapsed > 0.0 { n as f64 / elapsed } else { 0.0 };
-                    let _ = writeln!(stdout,
+                    let tok_s = if elapsed > 0.0 {
+                        n as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    let _ = writeln!(
+                        stdout,
                         r#"{{"type":"prefill_result","tokens":{},"ms":{:.2},"tok_s":{:.1}}}"#,
-                        n, elapsed * 1000.0, tok_s);
+                        n,
+                        elapsed * 1000.0,
+                        tok_s
+                    );
                 } else {
-                    let _ = writeln!(stdout, r#"{{"type":"error","message":"bench_prefill forward failed"}}"#);
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"bench_prefill forward failed"}}"#
+                    );
                 }
                 let _ = stdout.flush();
             }
@@ -697,22 +917,35 @@ fn main() {
                 }
                 let (cap, kernels) = gpu.profile();
                 let kernels_json: Vec<String> = kernels.iter().map(|k| k.to_json()).collect();
-                let _ = writeln!(stdout,
+                let _ = writeln!(
+                    stdout,
                     r#"{{"type":"profile","gpu":{},"kernels":[{}]}}"#,
-                    cap.to_json(), kernels_json.join(",")
+                    cap.to_json(),
+                    kernels_json.join(",")
                 );
                 let _ = stdout.flush();
             }
 
             _ => {
-                let _ = writeln!(stdout, r#"{{"type":"error","message":"unknown type: {}"}}"#, msg_type);
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","message":"unknown type: {}"}}"#,
+                    msg_type
+                );
                 let _ = stdout.flush();
             }
         }
     }
 }
 
-fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, cask: &CaskConfig, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+fn load_model(
+    path: &str,
+    max_seq: usize,
+    draft_path: Option<&str>,
+    kv_mode_override: Option<&str>,
+    cask: &CaskConfig,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<LoadedModel, String> {
     // Per-load kv_mode (sent in load message params) overrides the env var.
     // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
     // since layer-count compounding of asym3 noise flips argmax at decision
@@ -747,7 +980,8 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     // hfq::load_weights_hfq do at runtime, so the qt we read here is the
     // qt that will end up driving `weights.output.gpu_dtype`.
     if draft_path.is_some() {
-        let lm_qt = hfq.tensor_data("lm_head.weight")
+        let lm_qt = hfq
+            .tensor_data("lm_head.weight")
             .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
             .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
             .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
@@ -790,8 +1024,13 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // cleanly at load instead. Today hipfire-quantize produces uniform
         // models so this is overwhelmingly caught by the lm_head check
         // above; the body scan is for future mixed-precision PRD Phase 3.
-        let mq_lowbit = hfq.first_tensor_with_quant_type(17).map(|n| ("MQ3 (qt=17)", n))
-            .or_else(|| hfq.first_tensor_with_quant_type(18).map(|n| ("MQ2 (qt=18)", n)));
+        let mq_lowbit = hfq
+            .first_tensor_with_quant_type(17)
+            .map(|n| ("MQ3 (qt=17)", n))
+            .or_else(|| {
+                hfq.first_tensor_with_quant_type(18)
+                    .map(|n| ("MQ2 (qt=18)", n))
+            });
         if let Some((qt_label, name)) = mq_lowbit {
             return Err(format!(
                 "DFlash draft requested but model contains {qt_label} weight \
@@ -814,7 +1053,8 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     // The `HIPFIRE_KV_PHYSICAL_CAP` env var is an explicit operator override —
     // useful for ablations or reproducing dflash_spec_demo settings.
     let physical_cap = if cask.sidecar.is_some() {
-        let env_override = std::env::var("HIPFIRE_KV_PHYSICAL_CAP").ok()
+        let env_override = std::env::var("HIPFIRE_KV_PHYSICAL_CAP")
+            .ok()
             .and_then(|s| s.parse::<usize>().ok());
         let safety = 256usize;
         let floor = cask.budget + cask.beta + 4;
@@ -831,11 +1071,17 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // Detect VL model: check if vision config AND vision tensors are present
         // Text-only models may have vision config in metadata but no actual vision weights
         let vision_config = qwen35_vl::vision_config_from_hfq(&hfq);
-        let has_vision_tensors = hfq.tensor_data("model.visual.patch_embed.proj.weight").is_some();
+        let has_vision_tensors = hfq
+            .tensor_data("model.visual.patch_embed.proj.weight")
+            .is_some();
         let (vision_config, vision_weights) = if let Some(vc) = vision_config {
             if has_vision_tensors {
-                let vw = qwen35_vl::load_vision_weights(&hfq, &vc, gpu).map_err(|e| format!("{e}"))?;
-                eprintln!("  VL model: vision encoder (hidden={}, layers={})", vc.hidden_size, vc.num_layers);
+                let vw =
+                    qwen35_vl::load_vision_weights(&hfq, &vc, gpu).map_err(|e| format!("{e}"))?;
+                eprintln!(
+                    "  VL model: vision encoder (hidden={}, layers={})",
+                    vc.hidden_size, vc.num_layers
+                );
                 (Some(vc), Some(vw))
             } else {
                 (None, None) // text-only model, no vision tensors
@@ -849,13 +1095,19 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // MMQ per-weight screening (#87): pre-screen all weight matrices at
         // load time so the first prefill doesn't pay the screening overhead.
         // Results are cached by device pointer in gpu.mmq_screen_cache.
-        if gpu.mmq_screen && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152") {
+        if gpu.mmq_screen
+            && matches!(
+                gpu.arch.as_str(),
+                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152"
+            )
+        {
             let t0 = std::time::Instant::now();
             let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, gpu);
             let elapsed = t0.elapsed();
             eprintln!(
                 "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
-                gpu.mmq_screen_threshold, elapsed.as_secs_f64() * 1000.0,
+                gpu.mmq_screen_threshold,
+                elapsed.as_secs_f64() * 1000.0,
             );
         }
 
@@ -874,27 +1126,80 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         let kv = match kv_mode.as_str() {
             "q8" => {
                 eprintln!("  KV cache: Q8");
-                llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_q8_capped(
+                    gpu,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_seq,
+                    physical_cap,
+                )
+                .map_err(|e| format!("{e}"))?
             }
-            "asym4" | "turbo4" => {
-                llama::KvCache::new_gpu_asym4_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
-            }
-            "asym2" | "turbo2" => {
-                llama::KvCache::new_gpu_asym2_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
-            }
-            "asym3" | "turbo3" | "turbo" | "auto" | "" => {
-                llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
-            }
+            "asym4_tqv2" | "tqv2" => llama::KvCache::new_gpu_asym4_tqv2_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?,
+            "asym4_tqv4" | "tqv4" => llama::KvCache::new_gpu_asym4_tqv4_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?,
+            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?,
+            "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?,
+            "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?,
             other => {
                 eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-                llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym3_capped(
+                    gpu,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_seq,
+                    physical_cap,
+                )
+                .map_err(|e| format!("{e}"))?
             }
         };
         let dn = DeltaNetState::new(gpu, &config).map_err(|e| format!("{e}"))?;
         // Flash partials size with physical_cap (bounds the max_tiles the
         // flash kernel must address). When physical_cap == max_seq this is
         // identical to sizing-by-max_seq; under eviction it's much smaller.
-        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &config, 128, physical_cap).map_err(|e| format!("{e}"))?;
+        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &config, 128, physical_cap)
+            .map_err(|e| format!("{e}"))?;
 
         // Build eviction policy if the operator supplied a sidecar. Qwen3 (arch_id < 5)
         // lacks the FA/LA hybrid wiring TriAttention needs, so sidecars only take
@@ -903,8 +1208,17 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         let eviction = if let Some(ref sidecar_path) = cask.sidecar {
             let centers = TriAttnCenters::load(Path::new(sidecar_path))
                 .map_err(|e| format!("load cask sidecar {}: {e}", sidecar_path))?;
-            let fa_layer_ids: Vec<usize> = config.layer_types.iter().enumerate()
-                .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
+            let fa_layer_ids: Vec<usize> = config
+                .layer_types
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| {
+                    if *t == LayerType::FullAttention {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             if fa_layer_ids.is_empty() {
                 eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
@@ -912,16 +1226,29 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             } else {
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 let base = EvictionCtx::new(
-                    gpu, &centers, fa_layer_ids, cask.budget, cask.beta,
-                    config.n_heads, config.n_kv_heads, config.head_dim,
-                    n_rot, config.rope_theta, physical_cap,
-                ).map_err(|e| format!("build EvictionCtx: {e}"))?;
+                    gpu,
+                    &centers,
+                    fa_layer_ids,
+                    cask.budget,
+                    cask.beta,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                    physical_cap,
+                )
+                .map_err(|e| format!("build EvictionCtx: {e}"))?;
                 if cask.cask_m_folding {
                     eprintln!(
                         "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
                         cask.core_frac, cask.fold_m, cask.budget, cask.beta, physical_cap,
                     );
-                    Some(Eviction::Cask(CaskCtx::new(base, cask.core_frac, cask.fold_m)))
+                    Some(Eviction::Cask(CaskCtx::new(
+                        base,
+                        cask.core_frac,
+                        cask.fold_m,
+                    )))
                 } else {
                     eprintln!(
                         "  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
@@ -930,7 +1257,9 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                     Some(Eviction::Plain(base))
                 }
             }
-        } else { None };
+        } else {
+            None
+        };
         // Optional DFlash draft: load the draft model's weights + a fresh set
         // of per-cycle scratch buffers (hidden ring, verify scratch, GdnTape,
         // DeltaNetSnapshot) sized for the target's max_seq. If the draft file
@@ -946,26 +1275,43 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 Ok(state) => {
                     eprintln!(
                         "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
-                        dp, state.draft_config.n_layers, state.draft_config.hidden,
+                        dp,
+                        state.draft_config.n_layers,
+                        state.draft_config.hidden,
                         state.draft_config.block_size,
                     );
                     Some(state)
                 }
                 Err(e) => {
-                    eprintln!("  DFlash draft load failed ({}): {} — falling back to AR only", dp, e);
+                    eprintln!(
+                        "  DFlash draft load failed ({}): {} — falling back to AR only",
+                        dp, e
+                    );
                     None
                 }
             }
-        } else { None };
+        } else {
+            None
+        };
 
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
-            q35_config: Some(config), q35_weights: Some(weights), q35_scratch: Some(scratch),
-            kv_cache: Some(kv), dn_state: Some(dn),
-            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
-            vision_config, vision_weights,
+            q35_config: Some(config),
+            q35_weights: Some(weights),
+            q35_scratch: Some(scratch),
+            kv_cache: Some(kv),
+            dn_state: Some(dn),
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            vision_config,
+            vision_weights,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap, eviction,
+            seq_pos: 0,
+            max_seq,
+            physical_cap,
+            eviction,
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash,
@@ -974,18 +1320,36 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
         // the FA/LA hybrid wiring from arch_id 5/6). physical_cap == max_seq.
         let config = engine::hfq::config_from_hfq(&hfq).ok_or("failed to read LLaMA config")?;
-        let weights = engine::hfq::load_weights_hfq(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
+        let weights =
+            engine::hfq::load_weights_hfq(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
         eprintln!("  KV cache: Q8");
-        let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
+        let kv = llama::KvCache::new_gpu_q8(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            max_seq,
+        )
+        .map_err(|e| format!("{e}"))?;
         let scratch = llama::ForwardScratch::new(gpu, &config).map_err(|e| format!("{e}"))?;
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
-            q35_config: None, q35_weights: None, q35_scratch: None,
-            kv_cache: None, dn_state: None,
-            llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
-            vision_config: None, vision_weights: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            llama_config: Some(config),
+            llama_weights: Some(weights),
+            llama_scratch: Some(scratch),
+            llama_kv: Some(kv),
+            vision_config: None,
+            vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
@@ -995,7 +1359,10 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
 
 /// Pre-screen all Qwen3.5/3.6 weight matrices for MMQ safety (#87).
 /// Returns (n_safe, n_unsafe). Results are cached in gpu.mmq_screen_cache.
-fn screen_weights_qwen35(weights: &qwen35::Qwen35Weights, gpu: &mut rdna_compute::Gpu) -> (usize, usize) {
+fn screen_weights_qwen35(
+    weights: &qwen35::Qwen35Weights,
+    gpu: &mut rdna_compute::Gpu,
+) -> (usize, usize) {
     use engine::qwen35::LayerWeights;
     let mut n_safe = 0usize;
     let mut n_unsafe = 0usize;
@@ -1004,23 +1371,33 @@ fn screen_weights_qwen35(weights: &qwen35::Qwen35Weights, gpu: &mut rdna_compute
         // Collect all weight tensors for this layer that could use MMQ
         let wts: Vec<(&engine::llama::WeightTensor, &str)> = match layer {
             LayerWeights::DeltaNet(l) => vec![
-                (&l.wqkv, "qkvza.qkv"), (&l.wz, "qkvza.z"),
-                (&l.w_beta, "qkvza.beta"), (&l.w_alpha, "qkvza.alpha"),
-                (&l.w_gate, "gate_up.gate"), (&l.w_up, "gate_up.up"),
+                (&l.wqkv, "qkvza.qkv"),
+                (&l.wz, "qkvza.z"),
+                (&l.w_beta, "qkvza.beta"),
+                (&l.w_alpha, "qkvza.alpha"),
+                (&l.w_gate, "gate_up.gate"),
+                (&l.w_up, "gate_up.up"),
                 (&l.wo, "residual"),
             ],
             LayerWeights::FullAttn(l) => vec![
-                (&l.wq, "qkv.q"), (&l.wk, "qkv.k"), (&l.wv, "qkv.v"),
-                (&l.w_gate, "gate_up.gate"), (&l.w_up, "gate_up.up"),
+                (&l.wq, "qkv.q"),
+                (&l.wk, "qkv.k"),
+                (&l.wv, "qkv.v"),
+                (&l.w_gate, "gate_up.gate"),
+                (&l.w_up, "gate_up.up"),
                 (&l.wo, "residual"),
             ],
             LayerWeights::DeltaNetMoe(l) => vec![
-                (&l.wqkv, "qkvza.qkv"), (&l.wz, "qkvza.z"),
-                (&l.w_beta, "qkvza.beta"), (&l.w_alpha, "qkvza.alpha"),
+                (&l.wqkv, "qkvza.qkv"),
+                (&l.wz, "qkvza.z"),
+                (&l.w_beta, "qkvza.beta"),
+                (&l.w_alpha, "qkvza.alpha"),
                 (&l.wo, "residual"),
             ],
             LayerWeights::FullAttnMoe(l) => vec![
-                (&l.wq, "qkv.q"), (&l.wk, "qkv.k"), (&l.wv, "qkv.v"),
+                (&l.wq, "qkv.q"),
+                (&l.wk, "qkv.k"),
+                (&l.wv, "qkv.v"),
                 (&l.wo, "residual"),
             ],
         };
@@ -1030,7 +1407,10 @@ fn screen_weights_qwen35(weights: &qwen35::Qwen35Weights, gpu: &mut rdna_compute
             // (MQ3, MQ2, HFQ6, etc.) use different dispatch paths and must
             // not be fed to the HFQ4-specific screening kernels — buffer
             // layout mismatch would read past the end. See PR #106.
-            if !matches!(wt.gpu_dtype, rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256) {
+            if !matches!(
+                wt.gpu_dtype,
+                rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+            ) {
                 continue;
             }
             if gpu.mmq_screen_weight(&wt.buf, wt.m, wt.k) {
@@ -1055,18 +1435,36 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         df.draft_scratch.free_gpu(gpu);
     }
     // Free eviction context (centers + scratch tensors) if active.
-    if let Some(ev) = m.eviction { ev.free_gpu(gpu); }
+    if let Some(ev) = m.eviction {
+        ev.free_gpu(gpu);
+    }
     // Free KV cache + DeltaNet state + scratch first (small fraction of VRAM).
-    if let Some(kv) = m.kv_cache { kv.free_gpu(gpu); }
-    if let Some(dn) = m.dn_state { dn.free_gpu(gpu); }
-    if let Some(s) = m.q35_scratch { s.free_gpu(gpu); }
-    if let Some(kv) = m.llama_kv { kv.free_gpu(gpu); }
-    if let Some(s) = m.llama_scratch { s.free_gpu(gpu); }
+    if let Some(kv) = m.kv_cache {
+        kv.free_gpu(gpu);
+    }
+    if let Some(dn) = m.dn_state {
+        dn.free_gpu(gpu);
+    }
+    if let Some(s) = m.q35_scratch {
+        s.free_gpu(gpu);
+    }
+    if let Some(kv) = m.llama_kv {
+        kv.free_gpu(gpu);
+    }
+    if let Some(s) = m.llama_scratch {
+        s.free_gpu(gpu);
+    }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
-    if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
-    if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
-    if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.q35_weights {
+        w.free_gpu(gpu);
+    }
+    if let Some(w) = m.llama_weights {
+        w.free_gpu(gpu);
+    }
+    if let Some(w) = m.vision_weights {
+        w.free_gpu(gpu);
+    }
     // Drop pointer-keyed caches whose keys point at weight buffers that are
     // about to be returned to the pool. Without this, the next model loaded
     // can land at the same device address and silently inherit stale
@@ -1091,10 +1489,16 @@ fn load_dflash_state(
 ) -> Result<DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;
-    let draft_weights = DflashWeights::load(gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
+    let draft_weights =
+        DflashWeights::load(gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
     let draft_scratch = DflashScratch::new_with_mq(
-        gpu, &draft_config, draft_config.block_size, ctx_capacity, draft_weights.has_mq,
-    ).map_err(|e| format!("draft scratch: {e}"))?;
+        gpu,
+        &draft_config,
+        draft_config.block_size,
+        ctx_capacity,
+        draft_weights.has_mq,
+    )
+    .map_err(|e| format!("draft scratch: {e}"))?;
 
     // Hidden ring: one row per target-layer selected by the draft config,
     // captured during each target forward. Sized so the whole context plus
@@ -1107,9 +1511,11 @@ fn load_dflash_state(
         draft_config.hidden,
         ctx_capacity + draft_config.block_size,
         engine::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
-    ).map_err(|e| format!("hidden_rb: {e}"))?;
+    )
+    .map_err(|e| format!("hidden_rb: {e}"))?;
 
-    let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
+    let target_snap =
+        DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
 
     // Read DDTree budget env-var BEFORE sizing GdnTape / VerifyScratch.
     // When DDTree is enabled, both must be sized for `1 + budget` nodes
@@ -1165,11 +1571,11 @@ fn load_dflash_state(
         target_config.vocab_size,
         target_config.dim,
         target_config,
-    ).map_err(|e| format!("verify_scratch: {e}"))?;
+    )
+    .map_err(|e| format!("verify_scratch: {e}"))?;
 
-    let target_hidden_host: Vec<f32> = Vec::with_capacity(
-        ctx_capacity * draft_config.num_extract() * draft_config.hidden,
-    );
+    let target_hidden_host: Vec<f32> =
+        Vec::with_capacity(ctx_capacity * draft_config.num_extract() * draft_config.hidden);
     let block_size = draft_config.block_size;
 
     // Optional DDTree allocation. `HIPFIRE_DDTREE_BUDGET=<n>` (positive
@@ -1233,10 +1639,8 @@ fn load_dflash_state(
                 .count();
             // qkv_dim mirrors GdnTape::new_for_config: linear-attention
             // qkv row width (k_dim × 2 + v_dim).
-            let k_dim = target_config.linear_num_key_heads
-                * target_config.linear_key_head_dim;
-            let v_dim = target_config.linear_num_value_heads
-                * target_config.linear_value_head_dim;
+            let k_dim = target_config.linear_num_key_heads * target_config.linear_key_head_dim;
+            let v_dim = target_config.linear_num_value_heads * target_config.linear_value_head_dim;
             let qkv_dim = k_dim * 2 + v_dim;
             let scratch = DdtreeScratch::new(
                 gpu,
@@ -1333,7 +1737,11 @@ fn generate_dflash(
     prompt_tokens.extend_from_slice(&asst_tok);
     prompt_tokens.extend_from_slice(&nl);
 
-    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    let im_end_token = if im_end.len() == 1 {
+        Some(im_end[0])
+    } else {
+        None
+    };
 
     // Fresh target state — DFlash seed_target_hidden_from_prompt does its own
     // full prefill, so we reset first to avoid double-accounting.
@@ -1341,9 +1749,15 @@ fn generate_dflash(
     m.conversation_tokens.clear();
     {
         let dn = m.dn_state.as_ref().unwrap();
-        for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-        for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-        for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+        for s in &dn.s_matrices {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        for s in &dn.s_scales {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        for s in &dn.conv_states {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
     }
     let df = m.dflash.as_mut().unwrap();
     df.target_hidden_host.clear();
@@ -1363,10 +1777,16 @@ fn generate_dflash(
     let hfq = match HfqFile::open(Path::new(&m.model_path)) {
         Ok(h) => h,
         Err(e) => {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"reopen model: {}"}}"#, id, e);
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"reopen model: {}"}}"#,
+                id, e
+            );
             let _ = stdout.flush();
-            m.q35_weights = Some(weights); m.kv_cache = Some(kv_cache);
-            m.dn_state = Some(dn_state); m.q35_scratch = Some(scratch);
+            m.q35_weights = Some(weights);
+            m.kv_cache = Some(kv_cache);
+            m.dn_state = Some(dn_state);
+            m.q35_scratch = Some(scratch);
             return;
         }
     };
@@ -1388,13 +1808,21 @@ fn generate_dflash(
     // effectively unbounded (eviction fires between spec cycles), but the
     // *prompt* must still fit in one physical_cap span because
     // seed_target_hidden_from_prompt writes it per-token without chunking.
-    let eff_prompt_cap = if m.eviction.is_some() { m.physical_cap } else { ctx_capacity };
+    let eff_prompt_cap = if m.eviction.is_some() {
+        m.physical_cap
+    } else {
+        ctx_capacity
+    };
     if prompt_tokens.len() + df.block_size > eff_prompt_cap {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"prompt+block_size exceeds {} {} (eviction {})"}}"#,
             id,
-            if m.eviction.is_some() { "physical_cap" } else { "ctx_capacity" },
+            if m.eviction.is_some() {
+                "physical_cap"
+            } else {
+                "ctx_capacity"
+            },
             eff_prompt_cap,
             if m.eviction.is_some() { "on" } else { "off" },
         );
@@ -1424,9 +1852,17 @@ fn generate_dflash(
     // worth of rows into target_hidden_host. The draft's first forward
     // uses these as context.
     if let Err(e) = speculative::seed_target_hidden_from_prompt(
-        gpu, &mut target, &mut df.hidden_rb, &mut df.target_hidden_host, &prompt_tokens,
+        gpu,
+        &mut target,
+        &mut df.hidden_rb,
+        &mut df.target_hidden_host,
+        &prompt_tokens,
     ) {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"prefill: {}"}}"#, id, e);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prefill: {}"}}"#,
+            id, e
+        );
         let _ = stdout.flush();
         m.q35_weights = Some(target.weights);
         m.kv_cache = Some(target.kv_cache);
@@ -1437,14 +1873,17 @@ fn generate_dflash(
     // Prime the draft's GPU target_hidden buffer from the prompt rows so the
     // first spec step can skip the CPU→GPU upload of the whole context.
     if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
-        gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
-        0, prompt_tokens.len(), prompt_tokens.len(),
+        gpu,
+        &df.hidden_rb,
+        &df.draft_scratch.target_hidden,
+        0,
+        prompt_tokens.len(),
+        prompt_tokens.len(),
     ) {
         eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
     }
     df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
-    df.draft_scratch.target_hidden_abs_positions =
-        (0..prompt_tokens.len() as i32).collect();
+    df.draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
 
     // First emit = target's argmax at the final prompt position. seed_target_hidden
     // already ran the per-token forward for every prompt token; its scratch.logits
@@ -1452,7 +1891,11 @@ fn generate_dflash(
     let first_logits = match gpu.download_f32(&target.scratch.logits) {
         Ok(v) => v,
         Err(e) => {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"download logits: {}"}}"#, id, e);
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"download logits: {}"}}"#,
+                id, e
+            );
             let _ = stdout.flush();
             m.q35_weights = Some(target.weights);
             m.kv_cache = Some(target.kv_cache);
@@ -1461,10 +1904,17 @@ fn generate_dflash(
             return;
         }
     };
-    let first_token = first_logits.iter().enumerate()
+    let first_token = first_logits
+        .iter()
+        .enumerate()
         .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-            if v > bv { (i as u32, v) } else { (best, bv) }
-        }).0;
+            if v > bv {
+                (i as u32, v)
+            } else {
+                (best, bv)
+            }
+        })
+        .0;
 
     let t_prefill = Instant::now();
 
@@ -1492,8 +1942,12 @@ fn generate_dflash(
             position = res.new_physical;
             if !res.retain_mask.is_empty() {
                 let _ = speculative::apply_eviction_retain_to_draft(
-                    gpu, &mut df.draft_scratch, &res.retain_mask,
-                    df.draft_config.num_extract(), df.draft_config.hidden, pre_phys,
+                    gpu,
+                    &mut df.draft_scratch,
+                    &res.retain_mask,
+                    df.draft_config.num_extract(),
+                    df.draft_config.hidden,
+                    pre_phys,
                 );
             }
         }
@@ -1503,10 +1957,18 @@ fn generate_dflash(
     streamed_tokens.push(first_token);
     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
     let new_bytes = &all_bytes[emitted_bytes..];
-    let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+    let vl = match std::str::from_utf8(new_bytes) {
+        Ok(_) => new_bytes.len(),
+        Err(e) => e.valid_up_to(),
+    };
     if vl > 0 {
         let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
-        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"token","id":"{}","text":{}}}"#,
+            id,
+            serde_json::to_string(&text).unwrap_or_default()
+        );
         let _ = stdout.flush();
         emitted_bytes += vl;
     }
@@ -1524,7 +1986,8 @@ fn generate_dflash(
     // `phase1` runs Step 1 only (linear main-path verify); `phase2` adds
     // the lazy branch FA-only re-verify (Steps 2+3). See
     // `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
-    let path_c_mode_owned: Option<&'static str> = match std::env::var("HIPFIRE_DDTREE_PATH_C").ok() {
+    let path_c_mode_owned: Option<&'static str> = match std::env::var("HIPFIRE_DDTREE_PATH_C").ok()
+    {
         None => None,
         Some(s) if s.is_empty() => None,
         Some(s) if s == "phase1" => Some("phase1"),
@@ -1543,7 +2006,9 @@ fn generate_dflash(
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     while generated < max_tokens {
-        if position + df.block_size >= ctx_capacity { break; }
+        if position + df.block_size >= ctx_capacity {
+            break;
+        }
 
         // Dispatch: when DDTree is configured (HIPFIRE_DDTREE_BUDGET set
         // at startup), route through `spec_step_ddtree_batched`. Otherwise
@@ -1563,50 +2028,78 @@ fn generate_dflash(
                     None
                 };
                 spec_step_ddtree_path_c(
-                    gpu, &mut target, &df.draft_weights, &df.draft_config,
-                    &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
-                    &mut df.target_snap, &mut df.gdn_tape, &df.verify_scratch,
-                    position, seed_token,
-                    None,                      // ctx_slice = full history
+                    gpu,
+                    &mut target,
+                    &df.draft_weights,
+                    &df.draft_config,
+                    &mut df.draft_scratch,
+                    &mut df.hidden_rb,
+                    &mut df.target_hidden_host,
+                    &mut df.target_snap,
+                    &mut df.gdn_tape,
+                    &df.verify_scratch,
+                    position,
+                    seed_token,
+                    None, // ctx_slice = full history
                     dd.budget,
                     dd.topk,
                     phase2_snaps,
                 )
             } else {
                 spec_step_ddtree_batched(
-                    gpu, &mut target, &df.draft_weights, &df.draft_config,
-                    &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
-                    &mut df.target_snap, &mut dd.post_seed_snap, &mut df.gdn_tape,
-                    &dd.scratch, &df.verify_scratch,
-                    position, seed_token,
-                    None,                      // ctx_slice = full history
+                    gpu,
+                    &mut target,
+                    &df.draft_weights,
+                    &df.draft_config,
+                    &mut df.draft_scratch,
+                    &mut df.hidden_rb,
+                    &mut df.target_hidden_host,
+                    &mut df.target_snap,
+                    &mut dd.post_seed_snap,
+                    &mut df.gdn_tape,
+                    &dd.scratch,
+                    &df.verify_scratch,
+                    position,
+                    seed_token,
+                    None, // ctx_slice = full history
                     dd.budget,
                     dd.topk,
                 )
             }
         } else {
             spec_step_dflash(
-                gpu, &mut target, &df.draft_weights, &df.draft_config,
-                &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
-                &mut df.target_snap, &df.verify_scratch,
-                position, seed_token,
-                None,                      // ctx_slice = full history
+                gpu,
+                &mut target,
+                &df.draft_weights,
+                &df.draft_config,
+                &mut df.draft_scratch,
+                &mut df.hidden_rb,
+                &mut df.target_hidden_host,
+                &mut df.target_snap,
+                &df.verify_scratch,
+                position,
+                seed_token,
+                None, // ctx_slice = full history
                 Some(&mut df.gdn_tape),
-                0.0_f32,                   // temperature
+                0.0_f32, // temperature
                 &mut rng_state,
-                None,                      // block_size override
-                None,                      // ngram_cache
+                None, // block_size override
+                None, // ngram_cache
                 &emitted,
-                0.0_f32,                   // cactus_delta
-                None,                      // pld_spine
-                1.0_f32,                   // repeat_penalty (off)
-                0,                         // repeat_window
+                0.0_f32, // cactus_delta
+                None,    // pld_spine
+                1.0_f32, // repeat_penalty (off)
+                0,       // repeat_window
             )
         };
         let step = match step_result {
             Ok(s) => s,
             Err(e) => {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"spec_step: {}"}}"#, id, e);
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"spec_step: {}"}}"#,
+                    id, e
+                );
                 let _ = stdout.flush();
                 break;
             }
@@ -1616,20 +2109,36 @@ fn generate_dflash(
 
         let mut hit_eos = false;
         for &tok in &committed_tail {
-            if generated >= max_tokens { break; }
+            if generated >= max_tokens {
+                break;
+            }
             emitted.push(tok);
             streamed_tokens.push(tok);
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[emitted_bytes..];
-            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+            let vl = match std::str::from_utf8(new_bytes) {
+                Ok(_) => new_bytes.len(),
+                Err(e) => e.valid_up_to(),
+            };
             if vl > 0 {
                 let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
-                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id,
+                    serde_json::to_string(&text).unwrap_or_default()
+                );
                 let _ = stdout.flush();
                 emitted_bytes += vl;
             }
             generated += 1;
-            if tok == target.config.eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) { hit_eos = true; break; }
+            if tok == target.config.eos_token
+                || im_end_token == Some(tok)
+                || tokenizer.is_terminator(tok)
+            {
+                hit_eos = true;
+                break;
+            }
         }
         position += step.accepted + 1;
         seed_token = step.bonus_token;
@@ -1642,13 +2151,19 @@ fn generate_dflash(
                 position = res.new_physical;
                 if !res.retain_mask.is_empty() {
                     let _ = speculative::apply_eviction_retain_to_draft(
-                        gpu, &mut df.draft_scratch, &res.retain_mask,
-                        df.draft_config.num_extract(), df.draft_config.hidden, pre_phys,
+                        gpu,
+                        &mut df.draft_scratch,
+                        &res.retain_mask,
+                        df.draft_config.num_extract(),
+                        df.draft_config.hidden,
+                        pre_phys,
                     );
                 }
             }
         }
-        if hit_eos { break; }
+        if hit_eos {
+            break;
+        }
     }
 
     // Put target state back on LoadedModel so the next request sees fresh
@@ -1665,21 +2180,59 @@ fn generate_dflash(
     let total_s = t_end.duration_since(t0).as_secs_f64();
     let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
     let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-    let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
-    let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
-    let prefill_tok_s = if prefill_s > 0.0 { prompt_tokens.len() as f64 / prefill_s } else { 0.0 };
-    let tau = if stats.cycles > 0 { stats.accepted_tokens as f64 / stats.cycles as f64 } else { 0.0 };
+    let tok_s = if total_s > 0.0 {
+        generated as f64 / total_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_s > 0.0 {
+        generated as f64 / decode_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_s > 0.0 {
+        prompt_tokens.len() as f64 / prefill_s
+    } else {
+        0.0
+    };
+    let tau = if stats.cycles > 0 {
+        stats.accepted_tokens as f64 / stats.cycles as f64
+    } else {
+        0.0
+    };
     let _ = writeln!(
         stdout,
         r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}}}"#,
-        id, generated, tok_s, prompt_tokens.len(),
-        prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
-        tau, stats.cycles,
+        id,
+        generated,
+        tok_s,
+        prompt_tokens.len(),
+        prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        prefill_s * 1000.0,
+        tau,
+        stats.cycles,
     );
     let _ = stdout.flush();
 }
 
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize) {
+fn generate(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+) {
     // DFlash fast path — only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
@@ -1699,7 +2252,13 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         }
         generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens);
         // Silence unused-variable warnings for the params we didn't need.
-        let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text);
+        let _ = (
+            top_p,
+            repeat_penalty,
+            repeat_window,
+            budget_alert_at_tok,
+            budget_alert_text,
+        );
         return;
     }
 
@@ -1711,17 +2270,30 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
     if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
-        eprintln!("[daemon] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
+        eprintln!(
+            "[daemon] context full ({}/{}) — resetting conversation",
+            m.seq_pos, m.max_seq
+        );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         // Zero DeltaNet state on reset
         if let Some(ref dn) = m.dn_state {
-            for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-            for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-            for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
         }
-        if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
-        if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = 0; }
+        if let Some(kv) = m.kv_cache.as_mut() {
+            kv.compact_offset = 0;
+        }
+        if let Some(kv) = m.llama_kv.as_mut() {
+            kv.compact_offset = 0;
+        }
     }
 
     let im_start = tokenizer.encode("<|im_start|>");
@@ -1774,7 +2346,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
-                id, m.seq_pos, new_tokens.len(), max_tokens, trailer, m.physical_cap
+                id,
+                m.seq_pos,
+                new_tokens.len(),
+                max_tokens,
+                trailer,
+                m.physical_cap
             );
             let _ = stdout.flush();
             return;
@@ -1783,13 +2360,22 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"request exceeds advertised context window: absolute={} + prefill={} + max_tokens={} + trailer={} > max_seq={}"}}"#,
-            id, absolute_pos, new_tokens.len(), max_tokens, trailer, m.max_seq
+            id,
+            absolute_pos,
+            new_tokens.len(),
+            max_tokens,
+            trailer,
+            m.max_seq
         );
         let _ = stdout.flush();
         return;
     }
 
-    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    let im_end_token = if im_end.len() == 1 {
+        Some(im_end[0])
+    } else {
+        None
+    };
     let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
 
@@ -1829,20 +2415,35 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 let chunk_len = remaining.len().min(space);
                 let (chunk, rest) = remaining.split_at(chunk_len);
                 qwen35::forward_prefill_batch(
-                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch,
-                    None, None, None, None,
-                ).unwrap();
+                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
+                )
+                .unwrap();
                 m.seq_pos += chunk_len;
-                if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                if let Some(engine::triattn::EvictionResult {
+                    new_physical: new_phys,
+                    ..
+                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                {
                     m.seq_pos = new_phys;
                 }
                 remaining = rest;
             }
         } else {
             qwen35::forward_prefill_batch(
-                gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
-                None, None, None, None,
-            ).unwrap();
+                gpu,
+                weights,
+                config,
+                &new_tokens,
+                m.seq_pos,
+                kv,
+                dn,
+                scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
             m.seq_pos += new_tokens.len();
         }
         m.conversation_tokens.extend_from_slice(&new_tokens);
@@ -1874,12 +2475,23 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let scope0 = &ngram_scope[scope_start0..];
         let bytes0: Vec<u8> = scope0.iter().flat_map(|t| t.to_ne_bytes()).collect();
         if !bytes0.is_empty() {
-            gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes0).unwrap();
+            gpu.hip
+                .memcpy_htod(&scratch.repeat_buf.buf, &bytes0)
+                .unwrap();
         }
-        let (tok0, rng0) = gpu.sample_top_p(
-            &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-            vocab_size, temp, top_p, rng_state, scope0.len(), repeat_penalty,
-        ).unwrap();
+        let (tok0, rng0) = gpu
+            .sample_top_p(
+                &scratch.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                vocab_size,
+                temp,
+                top_p,
+                rng_state,
+                scope0.len(),
+                repeat_penalty,
+            )
+            .unwrap();
         // First token is ready (sample_top_p's D2H forces GPU sync). This is
         // the user-observable "time to first token" boundary — prefill above,
         // decode loop below.
@@ -1912,10 +2524,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             // Incremental UTF-8: only emit complete sequences
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[emitted_bytes..];
-            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+            let vl = match std::str::from_utf8(new_bytes) {
+                Ok(_) => new_bytes.len(),
+                Err(e) => e.valid_up_to(),
+            };
             if vl > 0 {
                 let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
-                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id,
+                    serde_json::to_string(&text).unwrap_or_default()
+                );
                 let _ = stdout.flush();
                 emitted_bytes += vl;
             }
@@ -1930,17 +2550,28 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             // advance and call maybe_evict immediately so the next write
             // never overruns physical_cap. compact_offset bookkeeping on
             // the cache itself keeps RoPE phase correct across evictions.
-            qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
+            qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch)
+                .unwrap();
             m.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
-                if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                if let Some(engine::triattn::EvictionResult {
+                    new_physical: new_phys,
+                    ..
+                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                {
                     m.seq_pos = new_phys;
                 }
             }
 
-            if next_token == config.eos_token { break; }
-            if im_end_token == Some(next_token) { break; }
-            if tokenizer.is_terminator(next_token) { break; }
+            if next_token == config.eos_token {
+                break;
+            }
+            if im_end_token == Some(next_token) {
+                break;
+            }
+            if tokenizer.is_terminator(next_token) {
+                break;
+            }
 
             // max_think_tokens enforcement. Track whether we're inside an
             // open <think>...</think> block and how many tokens we've
@@ -1960,7 +2591,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     _ => false,
                 };
                 if in_think {
-                    if !prev_in_think { think_count = 1; } else { think_count += 1; }
+                    if !prev_in_think {
+                        think_count = 1;
+                    } else {
+                        think_count += 1;
+                    }
                 } else {
                     think_count = 0;
                 }
@@ -1978,10 +2613,17 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     let budget_left = max_tokens.saturating_sub(generated);
                     let take = close_tokens.len().min(budget_left);
                     for &t in &close_tokens[..take] {
-                        qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+                        qwen35::forward_scratch(
+                            gpu, weights, config, t, m.seq_pos, kv, dn, scratch,
+                        )
+                        .unwrap();
                         m.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
-                            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                            if let Some(engine::triattn::EvictionResult {
+                                new_physical: new_phys,
+                                ..
+                            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                            {
                                 m.seq_pos = new_phys;
                             }
                         }
@@ -1995,7 +2637,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         };
                         if vl > 0 {
                             let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
-                            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"token","id":"{}","text":{}}}"#,
+                                id,
+                                serde_json::to_string(&text).unwrap_or_default()
+                            );
                             let _ = stdout.flush();
                             emitted_bytes += vl;
                         }
@@ -2003,7 +2650,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     }
                     think_count = 0;
                     prev_in_think = false;
-                    if generated >= max_tokens { break; }
+                    if generated >= max_tokens {
+                        break;
+                    }
                 }
             }
 
@@ -2015,7 +2664,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             // — we never exceed the caller's requested budget — so we clip
             // the nudge if not enough room remains, and break out of the
             // outer loop if the budget is fully spent after injection.
-            if !alert_fired && budget_alert_at_tok > 0 && generated >= budget_alert_at_tok && !budget_alert_text.is_empty() {
+            if !alert_fired
+                && budget_alert_at_tok > 0
+                && generated >= budget_alert_at_tok
+                && !budget_alert_text.is_empty()
+            {
                 alert_fired = true;
                 // Only inject while the model is inside an open <think> block.
                 // The whole point of the feature is to nudge the model's
@@ -2033,7 +2686,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     _ => false,
                 };
                 if !in_think {
-                    let _ = writeln!(stdout, r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not inside an open <think> block"}}"#, id);
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not inside an open <think> block"}}"#,
+                        id
+                    );
                     let _ = stdout.flush();
                     // Fall through — resample next token as normal
                     let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
@@ -2041,12 +2698,23 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     let scope = &ngram_scope[scope_start..];
                     let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
                     if !bytes.is_empty() {
-                        gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
+                        gpu.hip
+                            .memcpy_htod(&scratch.repeat_buf.buf, &bytes)
+                            .unwrap();
                     }
-                    let (tok, rng) = gpu.sample_top_p(
-                        &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-                        vocab_size, temp, top_p, rng_state, scope.len(), repeat_penalty,
-                    ).unwrap();
+                    let (tok, rng) = gpu
+                        .sample_top_p(
+                            &scratch.logits,
+                            &scratch.sample_buf,
+                            &scratch.repeat_buf,
+                            vocab_size,
+                            temp,
+                            top_p,
+                            rng_state,
+                            scope.len(),
+                            repeat_penalty,
+                        )
+                        .unwrap();
                     next_token = tok;
                     rng_state = rng;
                     continue;
@@ -2060,7 +2728,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 // eviction the physical check is trivially satisfied (budget
                 // always holds post-evict), but we still respect the check for
                 // the non-eviction path.
-                let need_kv = m.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+                let need_kv =
+                    m.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
                 if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
                     for &tok in &nudge_tokens[..nudge_len] {
                         m.conversation_tokens.push(tok);
@@ -2071,32 +2740,57 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         // side just like any other think token).
                         let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
                         let new_bytes2 = &all_bytes2[emitted_bytes..];
-                        let vl2 = match std::str::from_utf8(new_bytes2) { Ok(_) => new_bytes2.len(), Err(e) => e.valid_up_to() };
+                        let vl2 = match std::str::from_utf8(new_bytes2) {
+                            Ok(_) => new_bytes2.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
                         if vl2 > 0 {
                             let t = std::str::from_utf8(&new_bytes2[..vl2]).unwrap();
-                            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&t).unwrap_or_default());
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"token","id":"{}","text":{}}}"#,
+                                id,
+                                serde_json::to_string(&t).unwrap_or_default()
+                            );
                             let _ = stdout.flush();
                             emitted_bytes += vl2;
                         }
-                        qwen35::forward_scratch(gpu, weights, config, tok, m.seq_pos, kv, dn, scratch).unwrap();
+                        qwen35::forward_scratch(
+                            gpu, weights, config, tok, m.seq_pos, kv, dn, scratch,
+                        )
+                        .unwrap();
                         m.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
-                            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                            if let Some(engine::triattn::EvictionResult {
+                                new_physical: new_phys,
+                                ..
+                            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                            {
                                 m.seq_pos = new_phys;
                             }
                         }
                         generated += 1;
                     }
                 } else if nudge_len < nudge_tokens.len() {
-                    let _ = writeln!(stdout, r#"{{"type":"info","id":"{}","message":"budget_alert clipped or skipped: nudge_len={} budget_left={}"}}"#, id, nudge_len, budget_left);
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"info","id":"{}","message":"budget_alert clipped or skipped: nudge_len={} budget_left={}"}}"#,
+                        id, nudge_len, budget_left
+                    );
                     let _ = stdout.flush();
                 } else {
-                    let _ = writeln!(stdout, r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not enough KV headroom"}}"#, id);
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not enough KV headroom"}}"#,
+                        id
+                    );
                     let _ = stdout.flush();
                 }
                 // Respect max_tokens: if injection used the remainder, bail
                 // before sampling another model token.
-                if generated >= max_tokens { break; }
+                if generated >= max_tokens {
+                    break;
+                }
             }
 
             // Upload fresh repeat window (scope = generated tokens so far).
@@ -2105,14 +2799,25 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             let scope = &ngram_scope[scope_start..];
             let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
             if !bytes.is_empty() {
-                gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
+                gpu.hip
+                    .memcpy_htod(&scratch.repeat_buf.buf, &bytes)
+                    .unwrap();
             }
             // GPU sample: reads scratch.logits (already on GPU), writes token+rng
             // to scratch.sample_buf. Blocks only on the 8-byte D2H readback.
-            let (tok, rng) = gpu.sample_top_p(
-                &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-                vocab_size, temp, top_p, rng_state, scope.len(), repeat_penalty,
-            ).unwrap();
+            let (tok, rng) = gpu
+                .sample_top_p(
+                    &scratch.logits,
+                    &scratch.sample_buf,
+                    &scratch.repeat_buf,
+                    vocab_size,
+                    temp,
+                    top_p,
+                    rng_state,
+                    scope.len(),
+                    repeat_penalty,
+                )
+                .unwrap();
             next_token = tok;
             rng_state = rng;
         }
@@ -2124,10 +2829,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // and DeltaNet state stay in sync with seq_pos.
         if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
             for &t in &nl {
-                qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+                qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch)
+                    .unwrap();
                 m.seq_pos += 1;
                 if let Some(ref ev) = m.eviction {
-                    if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                    if let Some(engine::triattn::EvictionResult {
+                        new_physical: new_phys,
+                        ..
+                    }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                    {
                         m.seq_pos = new_phys;
                     }
                 }
@@ -2139,14 +2849,32 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let total_s = t_end.duration_since(t0).as_secs_f64();
         let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
         let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-        let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
-        let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
-        let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+        let tok_s = if total_s > 0.0 {
+            generated as f64 / total_s
+        } else {
+            0.0
+        };
+        let prefill_tok_s = if prefill_s > 0.0 {
+            prefill_tokens as f64 / prefill_s
+        } else {
+            0.0
+        };
+        let decode_tok_s = if decode_s > 0.0 {
+            generated as f64 / decode_s
+        } else {
+            0.0
+        };
         let _ = writeln!(
             stdout,
             r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
-            id, generated, tok_s, prefill_tokens,
-            prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
+            id,
+            generated,
+            tok_s,
+            prefill_tokens,
+            prefill_s * 1000.0,
+            prefill_tok_s,
+            decode_tok_s,
+            prefill_s * 1000.0
         );
         let _ = stdout.flush();
     } else {
@@ -2159,7 +2887,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let mut rng_state = 42u32;
         for (i, &tok) in new_tokens.iter().enumerate() {
             let pos = m.seq_pos + i;
-            let (_, rng) = llama::forward_scratch(gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0).unwrap();
+            let (_, rng) = llama::forward_scratch(
+                gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
+            )
+            .unwrap();
             rng_state = rng;
         }
         let this_turn_prompt_len_llama = new_tokens.len();
@@ -2168,8 +2899,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let ngram_scope_start_llama = m.conversation_tokens.len() - this_turn_prompt_len_llama;
 
         let mut out_bytes = [0u8; 8];
-        gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf).unwrap();
-        let mut next_token = u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]);
+        gpu.hip
+            .memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf)
+            .unwrap();
+        let mut next_token =
+            u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]);
         rng_state = u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]);
         // Prefill ends here: prompt is processed AND first token is ready (D2H
         // sync is the user-observable "time to first token" boundary). Decode
@@ -2186,10 +2920,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             streamed_tokens.push(next_token);
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[emitted_bytes..];
-            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+            let vl = match std::str::from_utf8(new_bytes) {
+                Ok(_) => new_bytes.len(),
+                Err(e) => e.valid_up_to(),
+            };
             if vl > 0 {
                 let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
-                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id,
+                    serde_json::to_string(&text).unwrap_or_default()
+                );
                 let _ = stdout.flush();
                 emitted_bytes += vl;
             }
@@ -2197,21 +2939,44 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             // Scope repeat_buf to this turn's prompt + generated tokens
             // (same logic as the Qwen3.5 path: prompt anchor + current turn).
             let rw = repeat_window.min(64);
-            let scope_start = ngram_scope_start_llama.max(m.conversation_tokens.len().saturating_sub(rw));
+            let scope_start =
+                ngram_scope_start_llama.max(m.conversation_tokens.len().saturating_sub(rw));
             let hist_slice = &m.conversation_tokens[scope_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
-            gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
+            gpu.hip
+                .memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes)
+                .unwrap();
 
             // Write K/V for this token FIRST so the next turn's context is
             // always fully populated. The sampled next_token from this call
             // is discarded when we break on im_end/eos — wasteful by one
             // launch but avoids a KV cache gap at the terminator.
             let pos = m.seq_pos + generated - 1;
-            let (tok, rng) = llama::forward_scratch(gpu, weights, config, next_token, pos, kv, scratch, temp, top_p, rng_state, hist_slice.len(), repeat_penalty).unwrap();
+            let (tok, rng) = llama::forward_scratch(
+                gpu,
+                weights,
+                config,
+                next_token,
+                pos,
+                kv,
+                scratch,
+                temp,
+                top_p,
+                rng_state,
+                hist_slice.len(),
+                repeat_penalty,
+            )
+            .unwrap();
 
-            if next_token == config.eos_token { break; }
-            if im_end_token == Some(next_token) { break; }
-            if tokenizer.is_terminator(next_token) { break; }
+            if next_token == config.eos_token {
+                break;
+            }
+            if im_end_token == Some(next_token) {
+                break;
+            }
+            if tokenizer.is_terminator(next_token) {
+                break;
+            }
 
             next_token = tok;
             rng_state = rng;
@@ -2221,7 +2986,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // ChatML \n boundary — run through forward to keep KV cache in sync
         if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
             for &t in &nl {
-                let (_, rng2) = llama::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, scratch, temp, top_p, rng_state, 0, 1.0).unwrap();
+                let (_, rng2) = llama::forward_scratch(
+                    gpu, weights, config, t, m.seq_pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
+                )
+                .unwrap();
                 rng_state = rng2;
                 m.seq_pos += 1;
                 m.conversation_tokens.push(t);
@@ -2232,37 +3000,81 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let total_s = t_end.duration_since(t0).as_secs_f64();
         let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
         let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-        let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
-        let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
-        let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+        let tok_s = if total_s > 0.0 {
+            generated as f64 / total_s
+        } else {
+            0.0
+        };
+        let prefill_tok_s = if prefill_s > 0.0 {
+            prefill_tokens as f64 / prefill_s
+        } else {
+            0.0
+        };
+        let decode_tok_s = if decode_s > 0.0 {
+            generated as f64 / decode_s
+        } else {
+            0.0
+        };
         let _ = writeln!(
             stdout,
             r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
-            id, generated, tok_s, prefill_tokens,
-            prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
+            id,
+            generated,
+            tok_s,
+            prefill_tokens,
+            prefill_s * 1000.0,
+            prefill_tok_s,
+            decode_tok_s,
+            prefill_s * 1000.0
         );
         let _ = stdout.flush();
     }
 }
 
-fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
+fn generate_vl(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    image_path: &str,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+) {
     // Capacity guard — VL prompts include vision tokens + text + ChatML framing
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
-    let n_patches = (IMAGE_SIZE / vision_config.patch_size) * (IMAGE_SIZE / vision_config.patch_size);
-    let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
+    let n_patches =
+        (IMAGE_SIZE / vision_config.patch_size) * (IMAGE_SIZE / vision_config.patch_size);
+    let n_visual_tokens =
+        n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
     let prompt_est = tokenizer.encode(prompt).len() + n_visual_tokens + 20; // text + vision + ChatML overhead
     if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
-        eprintln!("[daemon/vl] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
+        eprintln!(
+            "[daemon/vl] context full ({}/{}) — resetting conversation",
+            m.seq_pos, m.max_seq
+        );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         // Zero DeltaNet state on reset
         if let Some(ref dn) = m.dn_state {
-            for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-            for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-            for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
         }
-        if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
+        if let Some(kv) = m.kv_cache.as_mut() {
+            kv.compact_offset = 0;
+        }
     }
     let config = m.q35_config.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
@@ -2283,15 +3095,21 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let grid_h = img_h / vision_config.patch_size;
     let grid_w = img_w / vision_config.patch_size;
     let n_patches = grid_h * grid_w;
-    let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
+    let n_visual_tokens =
+        n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
 
     // Extract patches and run vision encoder
     let patches = engine::image::extract_patches(
-        &pixels, 3, img_h, img_w,
-        vision_config.patch_size, vision_config.temporal_patch_size,
+        &pixels,
+        3,
+        img_h,
+        img_w,
+        vision_config.patch_size,
+        vision_config.temporal_patch_size,
     );
-    let visual_tokens = qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
-        .expect("vision forward failed");
+    let visual_tokens =
+        qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
+            .expect("vision forward failed");
 
     // Build VL prompt
     let im_start = tokenizer.encode("<|im_start|>");
@@ -2347,14 +3165,26 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq"}}"#,
-            id, m.seq_pos, prompt_tokens.len(), max_tokens, trailer,
-            if m.eviction.is_none() { m.physical_cap } else { m.max_seq },
+            id,
+            m.seq_pos,
+            prompt_tokens.len(),
+            max_tokens,
+            trailer,
+            if m.eviction.is_none() {
+                m.physical_cap
+            } else {
+                m.max_seq
+            },
         );
         let _ = stdout.flush();
         return;
     }
 
-    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    let im_end_token = if im_end.len() == 1 {
+        Some(im_end[0])
+    } else {
+        None
+    };
     let prefill_tokens = prompt_tokens.len();
     let t0 = Instant::now();
 
@@ -2374,7 +3204,11 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         }
         m.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
-            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+            if let Some(engine::triattn::EvictionResult {
+                new_physical: new_phys,
+                ..
+            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+            {
                 m.seq_pos = new_phys;
             }
         }
@@ -2391,23 +3225,44 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         generated += 1;
         m.conversation_tokens.push(next_token);
         let text = tokenizer.decode(&[next_token]);
-        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"token","id":"{}","text":{}}}"#,
+            id,
+            serde_json::to_string(&text).unwrap_or_default()
+        );
         let _ = stdout.flush();
 
-        if next_token == config.eos_token { break; }
-        if im_end_token == Some(next_token) { break; }
-        if tokenizer.is_terminator(next_token) { break; }
+        if next_token == config.eos_token {
+            break;
+        }
+        if im_end_token == Some(next_token) {
+            break;
+        }
+        if tokenizer.is_terminator(next_token) {
+            break;
+        }
 
-        qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
+        qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch)
+            .unwrap();
         m.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
-            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+            if let Some(engine::triattn::EvictionResult {
+                new_physical: new_phys,
+                ..
+            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+            {
                 m.seq_pos = new_phys;
             }
         }
         logits = gpu.download_f32(&scratch.logits).unwrap();
         llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
-        llama::apply_repeat_penalty(&mut logits, &m.conversation_tokens, repeat_window, repeat_penalty);
+        llama::apply_repeat_penalty(
+            &mut logits,
+            &m.conversation_tokens,
+            repeat_window,
+            repeat_penalty,
+        );
         next_token = llama::sample_top_p(&logits, temp, top_p);
     }
 
@@ -2417,7 +3272,11 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
             qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
             m.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
-                if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                if let Some(engine::triattn::EvictionResult {
+                    new_physical: new_phys,
+                    ..
+                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                {
                     m.seq_pos = new_phys;
                 }
             }
@@ -2429,14 +3288,32 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let total_s = t_end.duration_since(t0).as_secs_f64();
     let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
     let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-    let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
-    let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
-    let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+    let tok_s = if total_s > 0.0 {
+        generated as f64 / total_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_s > 0.0 {
+        prefill_tokens as f64 / prefill_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_s > 0.0 {
+        generated as f64 / decode_s
+    } else {
+        0.0
+    };
     let _ = writeln!(
         stdout,
         r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
-        id, generated, tok_s, prefill_tokens,
-        prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
+        id,
+        generated,
+        tok_s,
+        prefill_tokens,
+        prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        prefill_s * 1000.0
     );
     let _ = stdout.flush();
 }

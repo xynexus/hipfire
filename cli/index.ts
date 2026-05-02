@@ -21,7 +21,7 @@ mkdirSync(MODELS_DIR, { recursive: true });
 
 // ─── Persistent config ─────────────────────────────────
 interface HipfireConfig {
-  kv_cache: string;       // "auto" (per-arch default), "q8", "asym4", "asym3", "asym2"
+  kv_cache: string;       // "auto" (per-arch default), "q8", "asym4_tqv2", "asym4_tqv4", "asym4", "asym3", "asym2"
   flash_mode: string;     // "auto" (ctx-gated), "always", "never" — only affects Q8 path
   default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
   temperature: number;    // default temperature for run
@@ -177,7 +177,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
 
 function validateConfigValue(key: string, value: any): boolean {
   switch (key) {
-    case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "kv_cache": return ["auto", "q8", "asym4_tqv2", "tqv2", "asym4_tqv4", "tqv4", "asym4", "asym3", "asym2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
     case "flash_mode": return ["auto", "always", "never"].includes(value);
     case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
     case "top_p": return typeof value === "number" && value > 0 && value <= 1;
@@ -668,12 +668,14 @@ function archDefaults(arch: string): ArchDefaults {
 }
 
 // ─── KV cache mode resolver ──────────────────────────────
-// Canonical modes: q8, asym4, asym3, asym2.
+// Canonical modes: q8, asym4_tqv2, asym4_tqv4, asym4, asym3, asym2.
 // Legacy aliases: turbo→asym3, turbo2→asym2, turbo3→asym3, turbo4→asym4
 // (plus "auto" → arch default).
 function resolveKvMode(cfg: HipfireConfig): string {
   const raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
   if (raw === "auto") return ARCH_DEFAULTS.kv_cache;
+  if (raw === "tqv2") return "asym4_tqv2";
+  if (raw === "tqv4") return "asym4_tqv4";
   if (raw === "turbo" || raw === "turbo3") return "asym3";
   if (raw === "turbo2") return "asym2";
   if (raw === "turbo4") return "asym4";
@@ -2971,7 +2973,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     kv_cache: {
       label: "kv_cache",
       desc: "KV cache quantization (more bits = higher quality, more VRAM)",
-      options: ["auto", "q8", "asym4", "asym3", "asym2"],
+      options: ["auto", "q8", "asym4_tqv2", "tqv2", "asym4_tqv4", "tqv4", "asym4", "asym3", "asym2"],
     },
     flash_mode: {
       label: "flash_mode",
@@ -4674,7 +4676,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
-          kv_cache: "one of: auto, q8, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 aliases also accepted)",
+          kv_cache: "one of: auto, q8, asym4_tqv2, tqv2, asym4_tqv4, tqv4, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 aliases also accepted)",
           flash_mode: "one of: auto, always, never (applies to Q8 path; asym modes are flash-only)",
           temperature: "number between 0 and 2",
           top_p: "number in (0, 1]",

@@ -2,9 +2,10 @@
 //! Feature-gated behind `deltanet`.
 
 use crate::hfq::HfqFile;
-use crate::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
-                    weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
-                    weight_gemv_residual, weight_gemv_swiglu_residual};
+use crate::llama::{
+    self, f16_to_f32, fused_rmsnorm_rotate_for_mq, weight_gemv, weight_gemv_prerotated,
+    weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat, WeightTensor,
+};
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -13,8 +14,8 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LayerType {
-    LinearAttention,  // DeltaNet
-    FullAttention,    // Standard MHA with gated output
+    LinearAttention, // DeltaNet
+    FullAttention,   // Standard MHA with gated output
 }
 
 /// Optional tree-attention context for `forward_prefill_batch` — activates
@@ -80,9 +81,9 @@ pub struct Qwen35Config {
     pub eos_token: u32,
 
     // Full attention params
-    pub n_heads: usize,        // 8
-    pub n_kv_heads: usize,     // 2
-    pub head_dim: usize,       // 256
+    pub n_heads: usize,    // 8
+    pub n_kv_heads: usize, // 2
+    pub head_dim: usize,   // 256
     pub rope_theta: f32,
     pub partial_rotary_factor: f32, // 0.25 — only 64/256 dims get RoPE
 
@@ -94,14 +95,14 @@ pub struct Qwen35Config {
     pub conv_kernel_dim: usize,        // 4
 
     // FFN — dense; for MoE see num_experts below
-    pub hidden_dim: usize,     // 3584 (dense) or unused when num_experts > 0
+    pub hidden_dim: usize, // 3584 (dense) or unused when num_experts > 0
 
     // MoE (qwen3_5_moe / A3B). num_experts == 0 means plain dense (qwen3_5).
-    pub num_experts: usize,                      // 256 for A3B
-    pub num_experts_per_tok: usize,              // 8 for A3B
-    pub moe_intermediate_size: usize,            // 512 for A3B (per-routed-expert FFN)
-    pub shared_expert_intermediate_size: usize,  // 512 for A3B
-    pub has_shared_expert: bool,                 // true for A3B (always-on shared expert)
+    pub num_experts: usize,                     // 256 for A3B
+    pub num_experts_per_tok: usize,             // 8 for A3B
+    pub moe_intermediate_size: usize,           // 512 for A3B (per-routed-expert FFN)
+    pub shared_expert_intermediate_size: usize, // 512 for A3B
+    pub has_shared_expert: bool,                // true for A3B (always-on shared expert)
     /// If true, top-K routing weights are re-normalized to sum to 1 after
     /// softmax + top-K selection. Qwen convention (matches HF
     /// `modeling_qwen3_5_moe.py`). DeepSeek-v1 uses false.
@@ -119,57 +120,125 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     let dim = tc.get("hidden_size")?.as_u64()? as usize;
     let n_layers = tc.get("num_hidden_layers")?.as_u64()? as usize;
     let n_heads = tc.get("num_attention_heads")?.as_u64()? as usize;
-    let n_kv_heads = tc.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(n_heads as u64) as usize;
-    let head_dim = tc.get("head_dim").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(dim / n_heads);
+    let n_kv_heads = tc
+        .get("num_key_value_heads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(n_heads as u64) as usize;
+    let head_dim = tc
+        .get("head_dim")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(dim / n_heads);
     let vocab_size = tc.get("vocab_size")?.as_u64()? as usize;
     // Dense FFN intermediate dim. MoE configs (qwen3_5_moe / A3B) replace this
     // with `moe_intermediate_size` and don't ship `intermediate_size`, so don't
     // hard-fail here — we still need to load the rest of the config to detect
     // is_moe and route accordingly.
-    let hidden_dim = tc.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let norm_eps = tc.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
+    let hidden_dim = tc
+        .get("intermediate_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let norm_eps = tc
+        .get("rms_norm_eps")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-6) as f32;
 
     let rope_params = tc.get("rope_parameters");
-    let rope_theta = rope_params.and_then(|r| r.get("rope_theta")).and_then(|v| v.as_f64()).unwrap_or(10_000_000.0) as f32;
-    let partial_rotary_factor = tc.get("partial_rotary_factor")
+    let rope_theta = rope_params
+        .and_then(|r| r.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10_000_000.0) as f32;
+    let partial_rotary_factor = tc
+        .get("partial_rotary_factor")
         .or_else(|| rope_params.and_then(|r| r.get("partial_rotary_factor")))
-        .and_then(|v| v.as_f64()).unwrap_or(0.25) as f32;
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.25) as f32;
 
-    let eos_token = tc.get("eos_token_id").and_then(|v| v.as_u64()).unwrap_or(248044) as u32;
+    let eos_token = tc
+        .get("eos_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(248044) as u32;
 
-    let linear_num_key_heads = tc.get("linear_num_key_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
-    let linear_num_value_heads = tc.get("linear_num_value_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
-    let linear_key_head_dim = tc.get("linear_key_head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
-    let linear_value_head_dim = tc.get("linear_value_head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
-    let conv_kernel_dim = tc.get("linear_conv_kernel_dim").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+    let linear_num_key_heads = tc
+        .get("linear_num_key_heads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(16) as usize;
+    let linear_num_value_heads = tc
+        .get("linear_num_value_heads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(16) as usize;
+    let linear_key_head_dim = tc
+        .get("linear_key_head_dim")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(128) as usize;
+    let linear_value_head_dim = tc
+        .get("linear_value_head_dim")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(128) as usize;
+    let conv_kernel_dim = tc
+        .get("linear_conv_kernel_dim")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4) as usize;
 
-    let layer_types: Vec<LayerType> = tc.get("layer_types")
+    let layer_types: Vec<LayerType> = tc
+        .get("layer_types")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().map(|v| {
-            match v.as_str().unwrap_or("full_attention") {
-                "linear_attention" => LayerType::LinearAttention,
-                _ => LayerType::FullAttention,
-            }
-        }).collect())
+        .map(|arr| {
+            arr.iter()
+                .map(|v| match v.as_str().unwrap_or("full_attention") {
+                    "linear_attention" => LayerType::LinearAttention,
+                    _ => LayerType::FullAttention,
+                })
+                .collect()
+        })
         .unwrap_or_else(|| vec![LayerType::FullAttention; n_layers]);
 
     // MoE config (zeros = dense fallback). Qwen3.5-MoE / A3B sets these.
     let num_experts = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let num_experts_per_tok = tc.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let moe_intermediate_size = tc.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let shared_expert_intermediate_size = tc.get("shared_expert_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let num_experts_per_tok = tc
+        .get("num_experts_per_tok")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let moe_intermediate_size = tc
+        .get("moe_intermediate_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let shared_expert_intermediate_size = tc
+        .get("shared_expert_intermediate_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
     let has_shared_expert = shared_expert_intermediate_size > 0;
     // Qwen convention: re-normalize top-K routing weights to sum to 1.
     // Absent from some configs (including the shipped A3B HFQ); default on
     // for Qwen3.5-MoE / A3B to match the HF reference.
-    let norm_topk_prob = tc.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(true);
+    let norm_topk_prob = tc
+        .get("norm_topk_prob")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     Some(Qwen35Config {
-        dim, n_layers, vocab_size, norm_eps, eos_token,
-        n_heads, n_kv_heads, head_dim, rope_theta, partial_rotary_factor,
-        linear_num_key_heads, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim, conv_kernel_dim,
-        hidden_dim, layer_types,
-        num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, has_shared_expert,
+        dim,
+        n_layers,
+        vocab_size,
+        norm_eps,
+        eos_token,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        rope_theta,
+        partial_rotary_factor,
+        linear_num_key_heads,
+        linear_num_value_heads,
+        linear_key_head_dim,
+        linear_value_head_dim,
+        conv_kernel_dim,
+        hidden_dim,
+        layer_types,
+        num_experts,
+        num_experts_per_tok,
+        moe_intermediate_size,
+        shared_expert_intermediate_size,
+        has_shared_expert,
         norm_topk_prob,
     })
 }
@@ -178,31 +247,31 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
 
 /// Weights for a DeltaNet (linear attention) layer.
 pub struct DeltaNetLayerWeights {
-    pub attn_norm: GpuTensor,       // input_layernorm [dim]
-    pub wqkv: WeightTensor,         // in_proj_qkv [6144, dim] → Q+K+V concat
-    pub wz: WeightTensor,           // in_proj_z [2048, dim] → gate Z
-    pub w_alpha: WeightTensor,      // in_proj_a [n_heads, dim] → decay
-    pub w_beta: WeightTensor,       // in_proj_b [n_heads, dim] → update
-    pub a_log: GpuTensor,           // A_log [n_heads] — learnable log-decay
-    pub dt_bias: GpuTensor,         // dt_bias [n_heads]
-    pub conv_weight: GpuTensor,     // conv1d.weight [conv_channels, 1, 4] → F32
-    pub norm_weight: GpuTensor,     // norm.weight [head_dim] — gated output norm
-    pub wo: WeightTensor,           // out_proj [dim, d_inner]
-    pub ffn_norm: GpuTensor,        // post_attention_layernorm [dim]
-    pub w_gate: WeightTensor,       // mlp.gate_proj
-    pub w_up: WeightTensor,         // mlp.up_proj
-    pub w_down: WeightTensor,       // mlp.down_proj
+    pub attn_norm: GpuTensor,   // input_layernorm [dim]
+    pub wqkv: WeightTensor,     // in_proj_qkv [6144, dim] → Q+K+V concat
+    pub wz: WeightTensor,       // in_proj_z [2048, dim] → gate Z
+    pub w_alpha: WeightTensor,  // in_proj_a [n_heads, dim] → decay
+    pub w_beta: WeightTensor,   // in_proj_b [n_heads, dim] → update
+    pub a_log: GpuTensor,       // A_log [n_heads] — learnable log-decay
+    pub dt_bias: GpuTensor,     // dt_bias [n_heads]
+    pub conv_weight: GpuTensor, // conv1d.weight [conv_channels, 1, 4] → F32
+    pub norm_weight: GpuTensor, // norm.weight [head_dim] — gated output norm
+    pub wo: WeightTensor,       // out_proj [dim, d_inner]
+    pub ffn_norm: GpuTensor,    // post_attention_layernorm [dim]
+    pub w_gate: WeightTensor,   // mlp.gate_proj
+    pub w_up: WeightTensor,     // mlp.up_proj
+    pub w_down: WeightTensor,   // mlp.down_proj
 }
 
 /// Weights for a full attention (gated) layer — similar to Qwen3 but with q+gate split.
 pub struct FullAttnLayerWeights {
     pub attn_norm: GpuTensor,
-    pub wq: WeightTensor,           // q_proj [4096, dim] — 2x wide (query + gate)
-    pub wk: WeightTensor,           // k_proj
-    pub wv: WeightTensor,           // v_proj
-    pub wo: WeightTensor,           // o_proj
-    pub q_norm: GpuTensor,          // q_norm [head_dim]
-    pub k_norm: GpuTensor,          // k_norm [head_dim]
+    pub wq: WeightTensor,  // q_proj [4096, dim] — 2x wide (query + gate)
+    pub wk: WeightTensor,  // k_proj
+    pub wv: WeightTensor,  // v_proj
+    pub wo: WeightTensor,  // o_proj
+    pub q_norm: GpuTensor, // q_norm [head_dim]
+    pub k_norm: GpuTensor, // k_norm [head_dim]
     pub ffn_norm: GpuTensor,
     pub w_gate: WeightTensor,
     pub w_up: WeightTensor,
@@ -234,29 +303,29 @@ pub struct FullAttnLayerWeights {
 // gate_proj + up_proj + down_proj (it is not fused in safetensors either).
 
 pub struct ExpertWeights {
-    pub gate_up: WeightTensor,  // [2 * moe_intermediate, hidden] — fused (gate || up)
-    pub down: WeightTensor,     // [hidden, moe_intermediate]
+    pub gate_up: WeightTensor, // [2 * moe_intermediate, hidden] — fused (gate || up)
+    pub down: WeightTensor,    // [hidden, moe_intermediate]
 }
 
 /// Shared expert storage — unlike routed experts, gate_proj and up_proj are
 /// NOT fused in the safetensors, so we keep them separate here too. The
 /// forward path does two GEMVs + silu_mul + down GEMV.
 pub struct SharedExpertWeights {
-    pub gate: WeightTensor,  // [shared_expert_intermediate, hidden]
-    pub up: WeightTensor,    // [shared_expert_intermediate, hidden]
-    pub down: WeightTensor,  // [hidden, shared_expert_intermediate]
+    pub gate: WeightTensor, // [shared_expert_intermediate, hidden]
+    pub up: WeightTensor,   // [shared_expert_intermediate, hidden]
+    pub down: WeightTensor, // [hidden, shared_expert_intermediate]
 }
 
 pub struct MoeFfnWeights {
-    pub router: WeightTensor,                 // [num_experts, hidden]
-    pub experts: Vec<ExpertWeights>,          // num_experts (= 256 for A3B)
+    pub router: WeightTensor,        // [num_experts, hidden]
+    pub experts: Vec<ExpertWeights>, // num_experts (= 256 for A3B)
     pub shared_expert: SharedExpertWeights,
-    pub shared_expert_gate: WeightTensor,     // [1, hidden] — row-vector projecting to scalar
+    pub shared_expert_gate: WeightTensor, // [1, hidden] — row-vector projecting to scalar
     /// Device-side array of `unsigned long long` pointers, one per
     /// expert's `gate_up.buf`. Indexed at runtime by the GPU top-K
     /// kernel's output so the indexed MoE GEMV can stay capture-safe.
-    pub expert_gate_up_ptrs: GpuTensor,       // [num_experts * 2] f32 slots = num_experts × u64
-    pub expert_down_ptrs:    GpuTensor,       // [num_experts * 2] f32 slots = num_experts × u64
+    pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
+    pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
 }
 
 pub struct DeltaNetMoeLayerWeights {
@@ -413,14 +482,22 @@ impl DeltaNetState {
         Self::new_with_quant(gpu, config, StateQuant::Q8)
     }
 
-    pub fn new_with_quant(gpu: &mut Gpu, config: &Qwen35Config, quant: StateQuant) -> HipResult<Self> {
-        let n_delta_layers = config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count();
+    pub fn new_with_quant(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        quant: StateQuant,
+    ) -> HipResult<Self> {
+        let n_delta_layers = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::LinearAttention)
+            .count();
         let s_dim = config.linear_key_head_dim; // 128
         let n_heads = config.linear_num_value_heads; // 16
         let s_size = n_heads * s_dim * s_dim; // 16 * 128 * 128 = 262144
 
         let conv_channels = config.linear_num_key_heads * config.linear_key_head_dim * 2
-                          + config.linear_num_value_heads * config.linear_value_head_dim;
+            + config.linear_num_value_heads * config.linear_value_head_dim;
         let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
 
         let mut s_matrices = Vec::with_capacity(n_delta_layers);
@@ -436,187 +513,407 @@ impl DeltaNetState {
                     // int8 state: s_size bytes (1 byte each), per-row scales
                     let buf = gpu.hip.malloc(s_size)?;
                     gpu.hip.memset(&buf, 0, s_size)?;
-                    s_matrices.push(GpuTensor { buf, shape: vec![s_size], dtype: DType::F32 });
+                    s_matrices.push(GpuTensor {
+                        buf,
+                        shape: vec![s_size],
+                        dtype: DType::F32,
+                    });
                     s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
                 }
                 StateQuant::Q4 => {
                     // 4-bit nibble-packed: s_size/2 bytes, per-row scales
                     let buf = gpu.hip.malloc(s_size / 2)?;
                     gpu.hip.memset(&buf, 0, s_size / 2)?;
-                    s_matrices.push(GpuTensor { buf, shape: vec![s_size / 2], dtype: DType::F32 });
+                    s_matrices.push(GpuTensor {
+                        buf,
+                        shape: vec![s_size / 2],
+                        dtype: DType::F32,
+                    });
                     s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
                 }
             }
             conv_states.push(gpu.zeros(&[conv_state_size], DType::F32)?);
         }
-        Ok(Self { s_matrices, s_scales, conv_states, quant })
+        Ok(Self {
+            s_matrices,
+            s_scales,
+            conv_states,
+            quant,
+        })
     }
 
     /// Free all GPU tensors. Call before drop to return VRAM.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        for t in self.s_matrices { let _ = gpu.free_tensor(t); }
-        for t in self.s_scales { let _ = gpu.free_tensor(t); }
-        for t in self.conv_states { let _ = gpu.free_tensor(t); }
+        for t in self.s_matrices {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.s_scales {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.conv_states {
+            let _ = gpu.free_tensor(t);
+        }
     }
 }
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
 /// Load norm weight for Qwen3.5: stored as offset from 1.0 (output = x * (1 + weight))
-fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+fn load_norm_weight(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    shape: &[usize],
+) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data(&full_name)
+    let (info, data) = hfq
+        .tensor_data(&full_name)
         .or_else(|| hfq.tensor_data(name))
         .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
 
     let mut f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
     };
     // Qwen3.5 RMSNorm: output = x * rsqrt(var+eps) * (1 + weight)
-    for v in &mut f32_data { *v += 1.0; }
+    for v in &mut f32_data {
+        *v += 1.0;
+    }
     gpu.upload_f32(&f32_data, shape)
 }
 
 /// Load norm weight without the +1.0 offset — for standard RMSNorm tensors
 /// (e.g., the final `model.language_model.norm.weight` stored as raw scale,
 /// mean ~1.6 on Qwen3.5-MoE A3B). Applying +1.0 would over-amplify by ~60%.
-fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+fn load_norm_weight_raw(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    shape: &[usize],
+) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data(&full_name)
+    let (info, data) = hfq
+        .tensor_data(&full_name)
         .or_else(|| hfq.tensor_data(name))
         .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
     let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
     };
     gpu.upload_f32(&f32_data, shape)
 }
 
-
 /// Load weight tensor from raw bytes + quant_type (no name lookup needed).
-fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: usize) -> HipResult<WeightTensor> {
+fn load_weight_tensor_raw(
+    gpu: &Gpu,
+    quant_type: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
     match quant_type {
         6 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ4G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
         7 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ4G128,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
         8 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ6G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
         11 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ3G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
         12 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G128, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ3G128,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        13 => { // MQ4-G256
+        13 => {
+            // MQ4-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        14 => { // MQ8-G256
+        14 => {
+            // MQ8-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ8G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        15 => { // MQ6-G256
+        15 => {
+            // MQ6-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ6G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        17 => { // MQ3-G256
+        17 => {
+            // MQ3-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ3G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        18 => { // MQ2-G256
+        18 => {
+            // MQ2-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ2G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Q8_0,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
         1 => {
-            let f32_data: Vec<f32> = data.chunks_exact(2)
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
         _ => panic!("unsupported quant_type {} for lm_head", quant_type),
     }
 }
 
-fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
+fn load_weight_tensor(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
     let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data(&full_name)
+    let (info, data) = hfq
+        .tensor_data(&full_name)
         .or_else(|| hfq.tensor_data(name))
         .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
 
     match info.quant_type {
-        6 => { // HFQ4-G256
+        6 => {
+            // HFQ4-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ4G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        7 => { // HFQ4-G128
+        7 => {
+            // HFQ4-G128
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ4G128,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        8 => { // HFQ6-G256
+        8 => {
+            // HFQ6-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ6G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        11 => { // HFQ3-G256
+        11 => {
+            // HFQ3-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ3G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        12 => { // HFQ3-G128
+        12 => {
+            // HFQ3-G128
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G128, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ3G128,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        13 => { // MQ4-G256 — MagnumQuant
+        13 => {
+            // MQ4-G256 — MagnumQuant
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        14 => { // MQ8-G256 — MagnumQuant dp4a
+        14 => {
+            // MQ8-G256 — MagnumQuant dp4a
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ8G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        15 => { // MQ6-G256 — MagnumQuant FWHT-rotated 6-bit
+        15 => {
+            // MQ6-G256 — MagnumQuant FWHT-rotated 6-bit
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ6G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        17 => { // MQ3-G256 — MagnumQuant FWHT-rotated 3-bit
+        17 => {
+            // MQ3-G256 — MagnumQuant FWHT-rotated 3-bit
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ3G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        18 => { // MQ2-G256 — MagnumQuant FWHT-rotated 2-bit
+        18 => {
+            // MQ2-G256 — MagnumQuant FWHT-rotated 2-bit
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ2G256,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        3 => { // Q8_0
+        3 => {
+            // Q8_0
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Q8_0,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
-        1 => { // F16 → F32
-            let f32_data: Vec<f32> = data.chunks_exact(2)
+        1 => {
+            // F16 → F32
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+            })
         }
         _ => panic!("unsupported quant_type {} for {name}", info.quant_type),
     }
@@ -625,13 +922,20 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
 /// Load a tensor as F32 on GPU, handling any quant type by dequanting on CPU.
 fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data(&full_name)
+    let (info, data) = hfq
+        .tensor_data(&full_name)
         .or_else(|| hfq.tensor_data(name))
         .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
 
     let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         3 => crate::llama::dequantize_q8_0(data, n),
         14 => {
             // MQ8-G256: [f16 scale][int8 × 256] = 258 bytes per 256 weights
@@ -652,7 +956,9 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                 }
                 // Inverse FWHT to recover original values
                 let group = &mut out[start..start + 256];
-                for i in 0..256 { group[i] *= signs2[i]; }
+                for i in 0..256 {
+                    group[i] *= signs2[i];
+                }
                 let mut stride = 1;
                 while stride < 256 {
                     let mut j = 0;
@@ -668,7 +974,9 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     stride <<= 1;
                 }
                 let inv_s = 0.0625;
-                for i in 0..256 { group[i] *= inv_s * signs1[i]; }
+                for i in 0..256 {
+                    group[i] *= inv_s * signs1[i];
+                }
             }
             out
         }
@@ -677,19 +985,34 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             // MQ4/MQ6 store rotated weights. For small tensors loaded here,
             // we dequant then inverse-rotate to recover the original values.
             let is_6bit = info.quant_type == 15;
-            let group_size: usize = if info.quant_type == 6 || info.quant_type == 13 || info.quant_type == 15 { 256 } else { 128 };
+            let group_size: usize =
+                if info.quant_type == 6 || info.quant_type == 13 || info.quant_type == 15 {
+                    256
+                } else {
+                    128
+                };
             let bytes_per_group = if is_6bit { 200 } else { 8 + group_size / 2 };
             let n_groups = data.len() / bytes_per_group;
             let is_mq = info.quant_type == 13 || info.quant_type == 15;
             let mut out = Vec::with_capacity(n_groups * group_size);
             let (signs1, signs2) = if is_mq {
-                (Some(crate::llama::KvCache::gen_fwht_signs(42, 256)),
-                 Some(crate::llama::KvCache::gen_fwht_signs(1042, 256)))
-            } else { (None, None) };
+                (
+                    Some(crate::llama::KvCache::gen_fwht_signs(42, 256)),
+                    Some(crate::llama::KvCache::gen_fwht_signs(1042, 256)),
+                )
+            } else {
+                (None, None)
+            };
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
-                let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-                let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                let scale =
+                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+                let zero = f32::from_le_bytes([
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
+                ]);
                 let start = out.len();
                 if is_6bit {
                     for i in (0..group_size).step_by(4) {
@@ -706,7 +1029,11 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     for i in 0..group_size {
                         let byte_idx = i / 2;
                         let byte_val = data[off + 8 + byte_idx];
-                        let nibble = if i % 2 == 0 { byte_val & 0xF } else { byte_val >> 4 };
+                        let nibble = if i % 2 == 0 {
+                            byte_val & 0xF
+                        } else {
+                            byte_val >> 4
+                        };
                         out.push(scale * nibble as f32 + zero);
                     }
                 }
@@ -716,7 +1043,9 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     let s2 = signs2.as_ref().unwrap();
                     let group = &mut out[start..start + 256];
                     // Inverse FWHT: signs2 → butterfly → scale → signs1
-                    for i in 0..256 { group[i] *= s2[i]; }
+                    for i in 0..256 {
+                        group[i] *= s2[i];
+                    }
                     let mut stride = 1;
                     while stride < 256 {
                         let mut j = 0;
@@ -732,7 +1061,9 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                         stride <<= 1;
                     }
                     let scale_inv = 0.0625; // 1/sqrt(256)
-                    for i in 0..256 { group[i] *= scale_inv * s1[i]; }
+                    for i in 0..256 {
+                        group[i] *= scale_inv * s1[i];
+                    }
                 }
             }
             out
@@ -745,8 +1076,14 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let mut out = Vec::with_capacity(n_groups * group_size);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
-                let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-                let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                let scale =
+                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+                let zero = f32::from_le_bytes([
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
+                ]);
                 // 4 values per 3 bytes: v0[5:0]|v1[1:0], v1[5:2]|v2[3:0], v2[5:4]|v3[5:0]
                 for i in (0..group_size).step_by(4) {
                     let byte_off = 8 + (i / 4) * 3;
@@ -773,8 +1110,14 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let mut out = Vec::with_capacity(n_groups * group_size);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
-                let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-                let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                let scale =
+                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+                let zero = f32::from_le_bytes([
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
+                ]);
                 // 8 values per 3 bytes (matching kernel unpack)
                 for chunk in 0..32 {
                     let bo = off + 8 + chunk * 3;
@@ -809,8 +1152,14 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let mut out = Vec::with_capacity(n_groups * group_size);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
-                let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-                let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                let scale =
+                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+                let zero = f32::from_le_bytes([
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
+                ]);
                 for chunk in 0..16 {
                     let bo = off + 8 + chunk * 3;
                     let b0 = data[bo] as u32;
@@ -849,8 +1198,14 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             let signs2 = crate::llama::KvCache::gen_fwht_signs(1042, 256);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
-                let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-                let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                let scale =
+                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+                let zero = f32::from_le_bytes([
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
+                ]);
                 let start = out.len();
                 if is_mq3 {
                     // 8 values per 3 bytes (matches gemv_hfq3g256.hip unpack).
@@ -888,7 +1243,9 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                 }
                 // Inverse FWHT: recover original (pre-rotation) weight values.
                 let group = &mut out[start..start + 256];
-                for i in 0..256 { group[i] *= signs2[i]; }
+                for i in 0..256 {
+                    group[i] *= signs2[i];
+                }
                 let mut stride = 1;
                 while stride < 256 {
                     let mut j = 0;
@@ -904,7 +1261,9 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     stride <<= 1;
                 }
                 let scale_inv = 0.0625; // 1/sqrt(256)
-                for i in 0..256 { group[i] *= scale_inv * signs1[i]; }
+                for i in 0..256 {
+                    group[i] *= scale_inv * signs1[i];
+                }
             }
             out
         }
@@ -918,25 +1277,44 @@ fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
     load_any_as_f32(hfq, gpu, name, n)
 }
 
-pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipResult<Qwen35Weights> {
+pub fn load_weights(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    gpu: &mut Gpu,
+) -> HipResult<Qwen35Weights> {
     eprintln!("  loading token_embd...");
-    let embd_info = hfq.tensor_data("model.language_model.embed_tokens.weight")
+    let embd_info = hfq
+        .tensor_data("model.language_model.embed_tokens.weight")
         .expect("embed_tokens not found");
     let (token_embd, embd_fmt) = if embd_info.0.quant_type == 6 {
         eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G256)
+        (
+            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
+            EmbeddingFormat::HFQ4G256,
+        )
     } else if embd_info.0.quant_type == 7 {
         eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G128)
+        (
+            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
+            EmbeddingFormat::HFQ4G128,
+        )
     } else if embd_info.0.quant_type == 3 {
         // Q8_0: [f16 scale][32 × int8] per block — upload raw, use Q8 embedding lookup
         eprintln!("    (Q8_0 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q8_0)
+        (
+            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
+            EmbeddingFormat::Q8_0,
+        )
     } else {
-        let f32_data: Vec<f32> = embd_info.1.chunks_exact(2)
+        let f32_data: Vec<f32> = embd_info
+            .1
+            .chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
-        (gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
+        (
+            gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
+            EmbeddingFormat::F32,
+        )
     };
 
     eprintln!("  loading output_norm...");
@@ -955,76 +1333,205 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
     };
 
     // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens
-    let lm_head_info = hfq.tensor_data("lm_head.weight")
+    let lm_head_info = hfq
+        .tensor_data("lm_head.weight")
         .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"));
     let output = if let Some((lm_info, lm_data)) = lm_head_info {
-        eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
-        load_weight_tensor_raw(gpu, lm_info.quant_type, lm_data, config.vocab_size, config.dim)?
+        eprintln!(
+            "  loading output (separate lm_head, qt={})...",
+            lm_info.quant_type
+        );
+        load_weight_tensor_raw(
+            gpu,
+            lm_info.quant_type,
+            lm_data,
+            config.vocab_size,
+            config.dim,
+        )?
     } else {
-        eprintln!("  loading output (tied embeddings, qt={})...", embd_info.0.quant_type);
-        let embd_data = hfq.tensor_data("model.language_model.embed_tokens.weight").unwrap().1;
-        if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 || embd_info.0.quant_type == 8 {
+        eprintln!(
+            "  loading output (tied embeddings, qt={})...",
+            embd_info.0.quant_type
+        );
+        let embd_data = hfq
+            .tensor_data("model.language_model.embed_tokens.weight")
+            .unwrap()
+            .1;
+        if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 || embd_info.0.quant_type == 8
+        {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
             let dtype = match embd_info.0.quant_type {
-                6 => DType::HFQ4G256, 7 => DType::HFQ4G128, 8 => DType::HFQ6G256, _ => unreachable!()
+                6 => DType::HFQ4G256,
+                7 => DType::HFQ4G128,
+                8 => DType::HFQ6G256,
+                _ => unreachable!(),
             };
-            WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor {
+                buf,
+                gpu_dtype: dtype,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+            }
         } else if embd_info.0.quant_type == 13 {
             // MQ4-G256 tied embedding — produced by hipfire-quantize
             // `--format mq4-all`. DFlash uses this to make the target's
             // lm_head (tied to embed_tokens) hit the batched MQ4 GEMM path.
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            WeightTensor { buf, gpu_dtype: DType::MQ4G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+            }
         } else if embd_info.0.quant_type == 14 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            WeightTensor { buf, gpu_dtype: DType::MQ8G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ8G256,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+            }
         } else if embd_info.0.quant_type == 3 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::Q8_0,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+            }
         } else {
-            let f32_data: Vec<f32> = embd_data.chunks_exact(2)
+            let f32_data: Vec<f32> = embd_data
+                .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-            WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0 }
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m: config.vocab_size,
+                k: config.dim,
+                row_stride: 0,
+            }
         }
     };
 
     let is_moe = config.num_experts > 0;
     let mut layers = Vec::with_capacity(config.n_layers);
     for i in 0..config.n_layers {
-        eprintln!("  loading layer {i}/{} ({:?}{})...",
-            config.n_layers, config.layer_types[i],
-            if is_moe { " + MoE" } else { "" });
+        eprintln!(
+            "  loading layer {i}/{} ({:?}{})...",
+            config.n_layers,
+            config.layer_types[i],
+            if is_moe { " + MoE" } else { "" }
+        );
         let p = format!("layers.{i}");
 
         match (config.layer_types[i], is_moe) {
             (LayerType::LinearAttention, false) => {
                 let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
-                            + config.linear_num_value_heads * config.linear_value_head_dim;
+                    + config.linear_num_value_heads * config.linear_value_head_dim;
                 let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
 
                 layers.push(LayerWeights::DeltaNet(DeltaNetLayerWeights {
-                    attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                    wqkv: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
-                    wz: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
-                    w_alpha: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
-                        config.linear_num_value_heads, config.dim)?,
-                    w_beta: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"),
-                        config.linear_num_value_heads, config.dim)?,
-                    a_log: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
-                    dt_bias: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
-                    conv_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.conv1d.weight"),
-                        qkv_dim * config.conv_kernel_dim)?,  // flatten [channels, 1, kernel] → [channels * kernel]
-                    norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
-                    wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
-                    ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                    w_gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
-                    w_up: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
-                    w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                    attn_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.input_layernorm.weight"),
+                        &[config.dim],
+                    )?,
+                    wqkv: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.in_proj_qkv.weight"),
+                        qkv_dim,
+                        config.dim,
+                    )?,
+                    wz: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.in_proj_z.weight"),
+                        d_inner,
+                        config.dim,
+                    )?,
+                    w_alpha: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.in_proj_a.weight"),
+                        config.linear_num_value_heads,
+                        config.dim,
+                    )?,
+                    w_beta: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.in_proj_b.weight"),
+                        config.linear_num_value_heads,
+                        config.dim,
+                    )?,
+                    a_log: load_raw_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.A_log"),
+                        config.linear_num_value_heads,
+                    )?,
+                    dt_bias: load_raw_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.dt_bias"),
+                        config.linear_num_value_heads,
+                    )?,
+                    conv_weight: load_any_as_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.conv1d.weight"),
+                        qkv_dim * config.conv_kernel_dim,
+                    )?, // flatten [channels, 1, kernel] → [channels * kernel]
+                    norm_weight: load_any_as_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.norm.weight"),
+                        config.linear_value_head_dim,
+                    )?,
+                    wo: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.out_proj.weight"),
+                        config.dim,
+                        d_inner,
+                    )?,
+                    ffn_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.post_attention_layernorm.weight"),
+                        &[config.dim],
+                    )?,
+                    w_gate: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp.gate_proj.weight"),
+                        config.hidden_dim,
+                        config.dim,
+                    )?,
+                    w_up: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp.up_proj.weight"),
+                        config.hidden_dim,
+                        config.dim,
+                    )?,
+                    w_down: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp.down_proj.weight"),
+                        config.dim,
+                        config.hidden_dim,
+                    )?,
                 }));
             }
             (LayerType::FullAttention, false) => {
@@ -1032,39 +1539,158 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                 let kv_dim = config.n_kv_heads * config.head_dim;
 
                 layers.push(LayerWeights::FullAttn(FullAttnLayerWeights {
-                    attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                    wq: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
-                    wk: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
-                    wv: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
-                    wo: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
-                    q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
-                    k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
-                    ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                    w_gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
-                    w_up: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
-                    w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                    attn_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.input_layernorm.weight"),
+                        &[config.dim],
+                    )?,
+                    wq: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.q_proj.weight"),
+                        q_out_dim,
+                        config.dim,
+                    )?,
+                    wk: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.k_proj.weight"),
+                        kv_dim,
+                        config.dim,
+                    )?,
+                    wv: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.v_proj.weight"),
+                        kv_dim,
+                        config.dim,
+                    )?,
+                    wo: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.o_proj.weight"),
+                        config.dim,
+                        config.n_heads * config.head_dim,
+                    )?,
+                    q_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.q_norm.weight"),
+                        &[config.head_dim],
+                    )?,
+                    k_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.k_norm.weight"),
+                        &[config.head_dim],
+                    )?,
+                    ffn_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.post_attention_layernorm.weight"),
+                        &[config.dim],
+                    )?,
+                    w_gate: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp.gate_proj.weight"),
+                        config.hidden_dim,
+                        config.dim,
+                    )?,
+                    w_up: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp.up_proj.weight"),
+                        config.hidden_dim,
+                        config.dim,
+                    )?,
+                    w_down: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.mlp.down_proj.weight"),
+                        config.dim,
+                        config.hidden_dim,
+                    )?,
                 }));
             }
             (LayerType::LinearAttention, true) => {
                 let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
-                            + config.linear_num_value_heads * config.linear_value_head_dim;
+                    + config.linear_num_value_heads * config.linear_value_head_dim;
                 let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
 
                 layers.push(LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
-                    attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                    wqkv: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
-                    wz: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
-                    w_alpha: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
-                        config.linear_num_value_heads, config.dim)?,
-                    w_beta: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"),
-                        config.linear_num_value_heads, config.dim)?,
-                    a_log: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
-                    dt_bias: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
-                    conv_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.conv1d.weight"),
-                        qkv_dim * config.conv_kernel_dim)?,
-                    norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
-                    wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
-                    ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    attn_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.input_layernorm.weight"),
+                        &[config.dim],
+                    )?,
+                    wqkv: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.in_proj_qkv.weight"),
+                        qkv_dim,
+                        config.dim,
+                    )?,
+                    wz: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.in_proj_z.weight"),
+                        d_inner,
+                        config.dim,
+                    )?,
+                    w_alpha: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.in_proj_a.weight"),
+                        config.linear_num_value_heads,
+                        config.dim,
+                    )?,
+                    w_beta: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.in_proj_b.weight"),
+                        config.linear_num_value_heads,
+                        config.dim,
+                    )?,
+                    a_log: load_raw_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.A_log"),
+                        config.linear_num_value_heads,
+                    )?,
+                    dt_bias: load_raw_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.dt_bias"),
+                        config.linear_num_value_heads,
+                    )?,
+                    conv_weight: load_any_as_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.conv1d.weight"),
+                        qkv_dim * config.conv_kernel_dim,
+                    )?,
+                    norm_weight: load_any_as_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.norm.weight"),
+                        config.linear_value_head_dim,
+                    )?,
+                    wo: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.linear_attn.out_proj.weight"),
+                        config.dim,
+                        d_inner,
+                    )?,
+                    ffn_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.post_attention_layernorm.weight"),
+                        &[config.dim],
+                    )?,
                     ffn: load_moe_ffn(hfq, gpu, &p, config)?,
                 }));
             }
@@ -1073,28 +1699,83 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                 let kv_dim = config.n_kv_heads * config.head_dim;
 
                 layers.push(LayerWeights::FullAttnMoe(FullAttnMoeLayerWeights {
-                    attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                    wq: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
-                    wk: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
-                    wv: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
-                    wo: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
-                    q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
-                    k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
-                    ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    attn_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.input_layernorm.weight"),
+                        &[config.dim],
+                    )?,
+                    wq: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.q_proj.weight"),
+                        q_out_dim,
+                        config.dim,
+                    )?,
+                    wk: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.k_proj.weight"),
+                        kv_dim,
+                        config.dim,
+                    )?,
+                    wv: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.v_proj.weight"),
+                        kv_dim,
+                        config.dim,
+                    )?,
+                    wo: load_weight_tensor(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.o_proj.weight"),
+                        config.dim,
+                        config.n_heads * config.head_dim,
+                    )?,
+                    q_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.q_norm.weight"),
+                        &[config.head_dim],
+                    )?,
+                    k_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.k_norm.weight"),
+                        &[config.head_dim],
+                    )?,
+                    ffn_norm: load_norm_weight(
+                        hfq,
+                        gpu,
+                        &format!("{p}.post_attention_layernorm.weight"),
+                        &[config.dim],
+                    )?,
                     ffn: load_moe_ffn(hfq, gpu, &p, config)?,
                 }));
             }
         }
     }
 
-    Ok(Qwen35Weights { token_embd, embd_format: embd_fmt, output_norm, output, layers })
+    Ok(Qwen35Weights {
+        token_embd,
+        embd_format: embd_fmt,
+        output_norm,
+        output,
+        layers,
+    })
 }
 
 /// Load one layer's full MoE FFN block: router, all routed experts, shared expert,
 /// and the per-layer scalar shared-expert gate. Tensor naming follows what the
 /// quantizer emits for qwen3_5_moe (commit 4860575): the 3D stacked-expert source
 /// tensors get split per-expert into `mlp.experts.{X}.{base}.weight`.
-fn load_moe_ffn(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Qwen35Config) -> HipResult<MoeFfnWeights> {
+fn load_moe_ffn(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    p: &str,
+    config: &Qwen35Config,
+) -> HipResult<MoeFfnWeights> {
     let n_exp = config.num_experts;
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
@@ -1106,25 +1787,57 @@ fn load_moe_ffn(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Qwen35Config) ->
     // experts, gate_proj + up_proj are stored separately in the safetensors
     // (routed experts store them fused as `gate_up_proj`).
     let shared_expert = SharedExpertWeights {
-        gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.gate_proj.weight"), smi, config.dim)?,
-        up:   load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.up_proj.weight"),   smi, config.dim)?,
-        down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.down_proj.weight"), config.dim, smi)?,
+        gate: load_weight_tensor(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.shared_expert.gate_proj.weight"),
+            smi,
+            config.dim,
+        )?,
+        up: load_weight_tensor(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.shared_expert.up_proj.weight"),
+            smi,
+            config.dim,
+        )?,
+        down: load_weight_tensor(
+            hfq,
+            gpu,
+            &format!("{p}.mlp.shared_expert.down_proj.weight"),
+            config.dim,
+            smi,
+        )?,
     };
     // Scalar gate on the shared-expert add: sigmoid(shared_expert_gate · x).
     // Stored as a 1×hidden row-vector.
-    let shared_expert_gate = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert_gate.weight"), 1, config.dim)?;
+    let shared_expert_gate = load_weight_tensor(
+        hfq,
+        gpu,
+        &format!("{p}.mlp.shared_expert_gate.weight"),
+        1,
+        config.dim,
+    )?;
 
     // Routed experts — quantizer wrote per-expert tensors named
     // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
-        let gate_up = load_weight_tensor(hfq, gpu,
+        let gate_up = load_weight_tensor(
+            hfq,
+            gpu,
             &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
-            2 * mi, config.dim)?;
-        let down = load_weight_tensor(hfq, gpu,
+            2 * mi,
+            config.dim,
+        )?;
+        let down = load_weight_tensor(
+            hfq,
+            gpu,
             &format!("{p}.mlp.experts.{x}.down_proj.weight"),
-            config.dim, mi)?;
+            config.dim,
+            mi,
+        )?;
         experts.push(ExpertWeights { gate_up, down });
     }
 
@@ -1137,18 +1850,22 @@ fn load_moe_ffn(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Qwen35Config) ->
     let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
     for e in &experts {
         gu_ptrs.push(e.gate_up.buf.buf.as_ptr() as u64);
-        dn_ptrs.push(e.down.buf.buf.as_ptr()    as u64);
+        dn_ptrs.push(e.down.buf.buf.as_ptr() as u64);
     }
     let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
     let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
     let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
-    let expert_down_ptrs    = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+    let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
-    gpu.hip.memcpy_htod(&expert_down_ptrs.buf,    &dn_bytes)?;
+    gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
 
     Ok(MoeFfnWeights {
-        router, experts, shared_expert, shared_expert_gate,
-        expert_gate_up_ptrs, expert_down_ptrs,
+        router,
+        experts,
+        shared_expert,
+        shared_expert_gate,
+        expert_gate_up_ptrs,
+        expert_down_ptrs,
     })
 }
 
@@ -1192,18 +1909,18 @@ fn slice_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: usize) -> Gpu
 /// hipGraph-capturable) or from tensors they own locally (heap path).
 struct MoeScratchRef<'a> {
     router_logits: &'a GpuTensor,
-    scalar_buf:    &'a GpuTensor,
-    x_rot_local:   &'a GpuTensor,
-    gate_up_buf:   &'a GpuTensor,
-    gate_buf:      &'a GpuTensor,
-    up_buf:        &'a GpuTensor,
-    ffn_hidden:    &'a GpuTensor,
-    ffn_out:       &'a GpuTensor,
-    gate_batch:    &'a GpuTensor,
-    up_batch:      &'a GpuTensor,
-    rot_batch:     &'a GpuTensor,
-    topk_indices:  &'a GpuTensor,
-    topk_weights:  &'a GpuTensor,
+    scalar_buf: &'a GpuTensor,
+    x_rot_local: &'a GpuTensor,
+    gate_up_buf: &'a GpuTensor,
+    gate_buf: &'a GpuTensor,
+    up_buf: &'a GpuTensor,
+    ffn_hidden: &'a GpuTensor,
+    ffn_out: &'a GpuTensor,
+    gate_batch: &'a GpuTensor,
+    up_batch: &'a GpuTensor,
+    rot_batch: &'a GpuTensor,
+    topk_indices: &'a GpuTensor,
+    topk_weights: &'a GpuTensor,
 }
 
 impl<'a> MoeScratchRef<'a> {
@@ -1211,19 +1928,22 @@ impl<'a> MoeScratchRef<'a> {
     /// allocate MoE scratch (config.num_experts == 0).
     fn from_scratch(s: &'a Qwen35Scratch) -> Self {
         Self {
-            router_logits: s.moe_router_logits.as_ref().expect("MoE scratch not allocated"),
-            scalar_buf:    s.moe_scalar_buf.as_ref().expect("MoE scratch"),
-            x_rot_local:   s.moe_x_rot.as_ref().expect("MoE scratch"),
-            gate_up_buf:   s.moe_gate_up_buf.as_ref().expect("MoE scratch"),
-            gate_buf:      s.moe_gate_buf.as_ref().expect("MoE scratch"),
-            up_buf:        s.moe_up_buf.as_ref().expect("MoE scratch"),
-            ffn_hidden:    s.moe_ffn_hidden.as_ref().expect("MoE scratch"),
-            ffn_out:       s.moe_ffn_out.as_ref().expect("MoE scratch"),
-            gate_batch:    s.moe_gate_batch.as_ref().expect("MoE scratch"),
-            up_batch:      s.moe_up_batch.as_ref().expect("MoE scratch"),
-            rot_batch:     s.moe_rot_batch.as_ref().expect("MoE scratch"),
-            topk_indices:  s.moe_topk_indices.as_ref().expect("MoE scratch"),
-            topk_weights:  s.moe_topk_weights.as_ref().expect("MoE scratch"),
+            router_logits: s
+                .moe_router_logits
+                .as_ref()
+                .expect("MoE scratch not allocated"),
+            scalar_buf: s.moe_scalar_buf.as_ref().expect("MoE scratch"),
+            x_rot_local: s.moe_x_rot.as_ref().expect("MoE scratch"),
+            gate_up_buf: s.moe_gate_up_buf.as_ref().expect("MoE scratch"),
+            gate_buf: s.moe_gate_buf.as_ref().expect("MoE scratch"),
+            up_buf: s.moe_up_buf.as_ref().expect("MoE scratch"),
+            ffn_hidden: s.moe_ffn_hidden.as_ref().expect("MoE scratch"),
+            ffn_out: s.moe_ffn_out.as_ref().expect("MoE scratch"),
+            gate_batch: s.moe_gate_batch.as_ref().expect("MoE scratch"),
+            up_batch: s.moe_up_batch.as_ref().expect("MoE scratch"),
+            rot_batch: s.moe_rot_batch.as_ref().expect("MoE scratch"),
+            topk_indices: s.moe_topk_indices.as_ref().expect("MoE scratch"),
+            topk_weights: s.moe_topk_weights.as_ref().expect("MoE scratch"),
         }
     }
 }
@@ -1247,39 +1967,51 @@ fn moe_ffn_decode(
     let max_inter = mi.max(smi);
 
     let router_logits = gpu.alloc_tensor(&[n_exp], DType::F32)?;
-    let scalar_buf    = gpu.alloc_tensor(&[1], DType::F32)?;
-    let x_rot_local   = gpu.alloc_tensor(&[hidden], DType::F32)?;
-    let gate_up_buf   = gpu.alloc_tensor(&[2 * max_inter], DType::F32)?;
-    let gate_buf      = gpu.alloc_tensor(&[max_inter], DType::F32)?;
-    let up_buf        = gpu.alloc_tensor(&[max_inter], DType::F32)?;
-    let ffn_hidden    = gpu.alloc_tensor(&[max_inter], DType::F32)?;
-    let ffn_out       = gpu.alloc_tensor(&[hidden], DType::F32)?;
-    let gate_batch    = gpu.alloc_tensor(&[k * mi], DType::F32)?;
-    let up_batch      = gpu.alloc_tensor(&[k * mi], DType::F32)?;
-    let rot_batch     = gpu.alloc_tensor(&[k * mi], DType::F32)?;
-    let topk_indices  = gpu.alloc_tensor(&[k], DType::F32)?;
-    let topk_weights  = gpu.alloc_tensor(&[k], DType::F32)?;
+    let scalar_buf = gpu.alloc_tensor(&[1], DType::F32)?;
+    let x_rot_local = gpu.alloc_tensor(&[hidden], DType::F32)?;
+    let gate_up_buf = gpu.alloc_tensor(&[2 * max_inter], DType::F32)?;
+    let gate_buf = gpu.alloc_tensor(&[max_inter], DType::F32)?;
+    let up_buf = gpu.alloc_tensor(&[max_inter], DType::F32)?;
+    let ffn_hidden = gpu.alloc_tensor(&[max_inter], DType::F32)?;
+    let ffn_out = gpu.alloc_tensor(&[hidden], DType::F32)?;
+    let gate_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
+    let up_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
+    let rot_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
+    let topk_indices = gpu.alloc_tensor(&[k], DType::F32)?;
+    let topk_weights = gpu.alloc_tensor(&[k], DType::F32)?;
 
     let refs = MoeScratchRef {
         router_logits: &router_logits,
-        scalar_buf:    &scalar_buf,
-        x_rot_local:   &x_rot_local,
-        gate_up_buf:   &gate_up_buf,
-        gate_buf:      &gate_buf,
-        up_buf:        &up_buf,
-        ffn_hidden:    &ffn_hidden,
-        ffn_out:       &ffn_out,
-        gate_batch:    &gate_batch,
-        up_batch:      &up_batch,
-        rot_batch:     &rot_batch,
-        topk_indices:  &topk_indices,
-        topk_weights:  &topk_weights,
+        scalar_buf: &scalar_buf,
+        x_rot_local: &x_rot_local,
+        gate_up_buf: &gate_up_buf,
+        gate_buf: &gate_buf,
+        up_buf: &up_buf,
+        ffn_hidden: &ffn_hidden,
+        ffn_out: &ffn_out,
+        gate_batch: &gate_batch,
+        up_batch: &up_batch,
+        rot_batch: &rot_batch,
+        topk_indices: &topk_indices,
+        topk_weights: &topk_weights,
     };
     let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false);
 
-    for t in [router_logits, scalar_buf, x_rot_local, gate_up_buf, gate_buf,
-              up_buf, ffn_hidden, ffn_out, gate_batch, up_batch, rot_batch,
-              topk_indices, topk_weights] {
+    for t in [
+        router_logits,
+        scalar_buf,
+        x_rot_local,
+        gate_up_buf,
+        gate_buf,
+        up_buf,
+        ffn_hidden,
+        ffn_out,
+        gate_batch,
+        up_batch,
+        rot_batch,
+        topk_indices,
+        topk_weights,
+    ] {
         gpu.free_tensor(t)?;
     }
     result
@@ -1293,7 +2025,10 @@ fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
         && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
-        && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+        && ffn
+            .experts
+            .iter()
+            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
 }
 
 /// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
@@ -1347,12 +2082,12 @@ fn moe_ffn_decode_impl(
     let _ = hidden;
 
     let router_logits = s.router_logits;
-    let scalar_buf    = s.scalar_buf;
-    let gate_up_buf   = s.gate_up_buf;
-    let gate_buf      = s.gate_buf;
-    let up_buf        = s.up_buf;
-    let ffn_hidden    = s.ffn_hidden;
-    let ffn_out       = s.ffn_out;
+    let scalar_buf = s.scalar_buf;
+    let gate_up_buf = s.gate_up_buf;
+    let gate_buf = s.gate_buf;
+    let up_buf = s.up_buf;
+    let ffn_hidden = s.ffn_hidden;
+    let ffn_out = s.ffn_out;
 
     // Phase 2a-iii: rotate x_norm once per layer and share the rotated
     // buffer across every gate-side GEMV. Only MQ4 GEMVs benefit; mixed
@@ -1361,7 +2096,10 @@ fn moe_ffn_decode_impl(
         && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
-        && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
+        && ffn
+            .experts
+            .iter()
+            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
     let x_rot_local = if gate_side_mq4 {
         gpu.ensure_mq_signs()?;
         if !x_rot_prerotated {
@@ -1376,10 +2114,14 @@ fn moe_ffn_decode_impl(
     // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
     // device and the indexed MoE kernels consume topk_indices /
     // topk_weights directly — no D2H sync, hipGraph-capture-safe.
-    let routed_mq4 = ffn.experts.first()
+    let routed_mq4 = ffn
+        .experts
+        .first()
         .map(|e| e.down.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
-    let routed_gate_up_mq4 = ffn.experts.first()
+    let routed_gate_up_mq4 = ffn
+        .experts
+        .first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
     let use_gpu_topk = k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
@@ -1391,7 +2133,7 @@ fn moe_ffn_decode_impl(
     // with the larger 512-row gate/up bodies. 40 layers × 3 saved launches
     // = 120 launches/fwd, ~8-12% cycle-time savings on 7900 XTX.
     let shared_gate = slice_f32_view(gate_buf, 0, smi);
-    let shared_up   = slice_f32_view(up_buf,   0, smi);
+    let shared_up = slice_f32_view(up_buf, 0, smi);
     if let Some(xr) = x_rot_local {
         // All MQ4: use the 4-way fused prerotated GEMV. Router weight, shared
         // sigmoid-gate weight, shared gate weight, shared up weight — all
@@ -1399,12 +2141,19 @@ fn moe_ffn_decode_impl(
         // rotated at quant time, so `gemv_hfq4g256` inner loop with the
         // FWHT-rotated input is mathematically equivalent to `gemv_mq4g256`).
         gpu.fused_qkvza_hfq4g256(
-            &ffn.router.buf, &ffn.shared_expert_gate.buf,
-            &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
+            &ffn.router.buf,
+            &ffn.shared_expert_gate.buf,
+            &ffn.shared_expert.gate.buf,
+            &ffn.shared_expert.up.buf,
             xr,
-            router_logits, scalar_buf, &shared_gate, &shared_up,
-            ffn.router.m, ffn.shared_expert_gate.m,
-            ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
+            router_logits,
+            scalar_buf,
+            &shared_gate,
+            &shared_up,
+            ffn.router.m,
+            ffn.shared_expert_gate.m,
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.up.m,
             ffn.router.k,
         )?;
     } else {
@@ -1413,40 +2162,50 @@ fn moe_ffn_decode_impl(
         weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
         weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
         weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
-        weight_gemv(gpu, &ffn.shared_expert.up,   x_norm, &shared_up)?;
+        weight_gemv(gpu, &ffn.shared_expert.up, x_norm, &shared_up)?;
     }
 
     // ── 2a. Top-K selection — GPU fast path or CPU fallback ──
-    let (topk_indices_cpu, topk_weights_cpu): (Option<Vec<usize>>, Option<Vec<f32>>) = if use_gpu_topk {
-        // GPU path: softmax + top-K + renorm in one launch, results land
-        // in s.topk_indices [k] (i32) and s.topk_weights [k] (f32) on
-        // device. Indexed MoE kernels consume them directly — no D2H.
-        gpu.moe_softmax_topk_renorm_k8(
-            router_logits, s.topk_indices, s.topk_weights,
-            n_exp, config.norm_topk_prob,
-        )?;
-        (None, None)
-    } else {
-        // Fallback: GPU softmax → CPU download → CPU top-K + renorm.
-        gpu.softmax_f32(router_logits)?;
-        let probs = gpu.download_f32(router_logits)?;
-        let mut indices: Vec<usize> = (0..n_exp).collect();
-        indices.select_nth_unstable_by(k - 1, |&a, &b| {
-            probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
-        topk_indices.sort_by(|&a, &b| {
-            probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
-        if config.norm_topk_prob {
-            let sum: f32 = topk_weights.iter().sum();
-            if sum > 0.0 {
-                for w in topk_weights.iter_mut() { *w /= sum; }
+    let (topk_indices_cpu, topk_weights_cpu): (Option<Vec<usize>>, Option<Vec<f32>>) =
+        if use_gpu_topk {
+            // GPU path: softmax + top-K + renorm in one launch, results land
+            // in s.topk_indices [k] (i32) and s.topk_weights [k] (f32) on
+            // device. Indexed MoE kernels consume them directly — no D2H.
+            gpu.moe_softmax_topk_renorm_k8(
+                router_logits,
+                s.topk_indices,
+                s.topk_weights,
+                n_exp,
+                config.norm_topk_prob,
+            )?;
+            (None, None)
+        } else {
+            // Fallback: GPU softmax → CPU download → CPU top-K + renorm.
+            gpu.softmax_f32(router_logits)?;
+            let probs = gpu.download_f32(router_logits)?;
+            let mut indices: Vec<usize> = (0..n_exp).collect();
+            indices.select_nth_unstable_by(k - 1, |&a, &b| {
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
+            topk_indices.sort_by(|&a, &b| {
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
+            if config.norm_topk_prob {
+                let sum: f32 = topk_weights.iter().sum();
+                if sum > 0.0 {
+                    for w in topk_weights.iter_mut() {
+                        *w /= sum;
+                    }
+                }
             }
-        }
-        (Some(topk_indices), Some(topk_weights))
-    };
+            (Some(topk_indices), Some(topk_weights))
+        };
 
     // The shared-expert gate scalar (in `scalar_buf`) is the RAW logit from
     // the 4-way fused GEMV — sigmoid is applied internally by
@@ -1461,8 +2220,12 @@ fn moe_ffn_decode_impl(
         };
         gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, smi)?;
         gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
-            &ffn.shared_expert.down.buf, &x_rot_alias, x_residual, scalar_buf,
-            ffn.shared_expert.down.m, ffn.shared_expert.down.k,
+            &ffn.shared_expert.down.buf,
+            &x_rot_alias,
+            x_residual,
+            scalar_buf,
+            ffn.shared_expert.down.m,
+            ffn.shared_expert.down.k,
         )?;
     } else {
         // Non-MQ fallback path still needs the separate sigmoid + scaled-add.
@@ -1488,15 +2251,23 @@ fn moe_ffn_decode_impl(
         let down_k = ffn.experts[0].down.k;
         let gate_up_k = ffn.experts[0].gate_up.k;
         gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-            &ffn.expert_gate_up_ptrs, s.topk_indices,
-            xr, s.gate_batch, s.up_batch,
-            2 * mi, gate_up_k,
+            &ffn.expert_gate_up_ptrs,
+            s.topk_indices,
+            xr,
+            s.gate_batch,
+            s.up_batch,
+            2 * mi,
+            gate_up_k,
         )?;
         gpu.fused_silu_mul_rotate_mq_batched(s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
         gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed(
-            &ffn.expert_down_ptrs, s.topk_indices, s.topk_weights,
-            s.rot_batch, x_residual,
-            down_m, down_k,
+            &ffn.expert_down_ptrs,
+            s.topk_indices,
+            s.topk_weights,
+            s.rot_batch,
+            x_residual,
+            down_m,
+            down_k,
         )?;
     } else {
         // CPU-top-K fallback path. Two sub-paths from here:
@@ -1518,34 +2289,63 @@ fn moe_ffn_decode_impl(
             let e6 = &ffn.experts[topk_indices[6]];
             let e7 = &ffn.experts[topk_indices[7]];
             gpu.gemv_hfq4g256_moe_gate_up_k8(
-                &e0.gate_up.buf, &e1.gate_up.buf, &e2.gate_up.buf, &e3.gate_up.buf,
-                &e4.gate_up.buf, &e5.gate_up.buf, &e6.gate_up.buf, &e7.gate_up.buf,
-                xr, s.gate_batch, s.up_batch,
-                2 * mi, e0.gate_up.k,
+                &e0.gate_up.buf,
+                &e1.gate_up.buf,
+                &e2.gate_up.buf,
+                &e3.gate_up.buf,
+                &e4.gate_up.buf,
+                &e5.gate_up.buf,
+                &e6.gate_up.buf,
+                &e7.gate_up.buf,
+                xr,
+                s.gate_batch,
+                s.up_batch,
+                2 * mi,
+                e0.gate_up.k,
             )?;
             gpu.fused_silu_mul_rotate_mq_batched(s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
             let scales = [
-                topk_weights[0], topk_weights[1], topk_weights[2], topk_weights[3],
-                topk_weights[4], topk_weights[5], topk_weights[6], topk_weights[7],
+                topk_weights[0],
+                topk_weights[1],
+                topk_weights[2],
+                topk_weights[3],
+                topk_weights[4],
+                topk_weights[5],
+                topk_weights[6],
+                topk_weights[7],
             ];
             gpu.gemv_hfq4g256_moe_down_residual_scaled_k8(
-                &e0.down.buf, &e1.down.buf, &e2.down.buf, &e3.down.buf,
-                &e4.down.buf, &e5.down.buf, &e6.down.buf, &e7.down.buf,
-                s.rot_batch, x_residual, scales,
-                e0.down.m, e0.down.k,
+                &e0.down.buf,
+                &e1.down.buf,
+                &e2.down.buf,
+                &e3.down.buf,
+                &e4.down.buf,
+                &e5.down.buf,
+                &e6.down.buf,
+                &e7.down.buf,
+                s.rot_batch,
+                x_residual,
+                scales,
+                e0.down.m,
+                e0.down.k,
             )?;
         } else {
             // Per-expert fallback for layers that aren't all-MQ4 or have k != 8.
             for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
                 let expert = &ffn.experts[expert_idx];
                 if let Some(xr) = x_rot_local {
-                    gpu.gemv_mq4g256_prerotated(&expert.gate_up.buf, xr, gate_up_buf,
-                        expert.gate_up.m, expert.gate_up.k)?;
+                    gpu.gemv_mq4g256_prerotated(
+                        &expert.gate_up.buf,
+                        xr,
+                        gate_up_buf,
+                        expert.gate_up.m,
+                        expert.gate_up.k,
+                    )?;
                 } else {
                     weight_gemv(gpu, &expert.gate_up, x_norm, gate_up_buf)?;
                 }
-                let gate_view = slice_f32_view(gate_up_buf, 0,  mi);
-                let up_view   = slice_f32_view(gate_up_buf, mi, mi);
+                let gate_view = slice_f32_view(gate_up_buf, 0, mi);
+                let up_view = slice_f32_view(gate_up_buf, mi, mi);
                 if routed_mq4 {
                     let x_rot_alias = GpuTensor {
                         buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1554,8 +2354,12 @@ fn moe_ffn_decode_impl(
                     };
                     gpu.fused_silu_mul_rotate_mq(&gate_view, &up_view, &x_rot_alias, mi)?;
                     gpu.gemv_hfq4g256_residual_scaled_cpu(
-                        &expert.down.buf, &x_rot_alias, x_residual, weight,
-                        expert.down.m, expert.down.k,
+                        &expert.down.buf,
+                        &x_rot_alias,
+                        x_residual,
+                        weight,
+                        expert.down.m,
+                        expert.down.k,
                     )?;
                 } else {
                     let hid_view = slice_f32_view(ffn_hidden, 0, mi);
@@ -1588,8 +2392,12 @@ pub fn forward(
     // Embedding lookup
     let x = gpu.alloc_tensor(&[dim], DType::F32)?;
     match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
+        }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
         _ => panic!("unsupported embedding format"),
@@ -1638,7 +2446,10 @@ fn forward_from_x_gpu(
     if debug_layers && pos == 0 {
         let hid = gpu.download_f32(&x)?;
         let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
-        eprintln!("EMB: first4=[{:.6},{:.6},{:.6},{:.6}] norm={norm:.4}", hid[0], hid[1], hid[2], hid[3]);
+        eprintln!(
+            "EMB: first4=[{:.6},{:.6},{:.6},{:.6}] norm={norm:.4}",
+            hid[0], hid[1], hid[2], hid[3]
+        );
     }
 
     for layer_idx in 0..config.n_layers {
@@ -1649,7 +2460,7 @@ fn forward_from_x_gpu(
 
                 // QKV projection
                 let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
-                             + config.linear_num_value_heads * config.linear_value_head_dim;
+                    + config.linear_num_value_heads * config.linear_value_head_dim;
                 let qkv = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
                 weight_gemv(gpu, &layer.wqkv, &tmp, &qkv)?;
 
@@ -1665,14 +2476,21 @@ fn forward_from_x_gpu(
                 let alpha_out = gpu.alloc_tensor(&[n_v_heads], DType::F32)?;
                 weight_gemv(gpu, &layer.w_alpha, &tmp, &alpha_out)?;
                 gpu.fused_sigmoid_alpha_gate_f32(
-                    &beta_out, &alpha_out, &layer.dt_bias, &layer.a_log, n_v_heads,
+                    &beta_out,
+                    &alpha_out,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    n_v_heads,
                 )?;
 
                 // Fused conv1d + SiLU (one kernel instead of two)
                 let conv_out = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
                 gpu.conv1d_silu_f32(
-                    &conv_out, &qkv, &layer.conv_weight,
-                    &dn_state.conv_states[delta_layer_idx], qkv_dim,
+                    &conv_out,
+                    &qkv,
+                    &layer.conv_weight,
+                    &dn_state.conv_states[delta_layer_idx],
+                    qkv_dim,
                 )?;
 
                 // Split conv output into Q, K, V
@@ -1681,9 +2499,12 @@ fn forward_from_x_gpu(
                 let q_part = gpu.alloc_tensor(&[k_dim], DType::F32)?;
                 let k_part = gpu.alloc_tensor(&[k_dim], DType::F32)?;
                 let v_part = gpu.alloc_tensor(&[v_dim], DType::F32)?;
-                gpu.hip.memcpy_dtod_at(&q_part.buf, 0, &conv_out.buf, 0, k_dim * 4)?;
-                gpu.hip.memcpy_dtod_at(&k_part.buf, 0, &conv_out.buf, k_dim * 4, k_dim * 4)?;
-                gpu.hip.memcpy_dtod_at(&v_part.buf, 0, &conv_out.buf, k_dim * 2 * 4, v_dim * 4)?;
+                gpu.hip
+                    .memcpy_dtod_at(&q_part.buf, 0, &conv_out.buf, 0, k_dim * 4)?;
+                gpu.hip
+                    .memcpy_dtod_at(&k_part.buf, 0, &conv_out.buf, k_dim * 4, k_dim * 4)?;
+                gpu.hip
+                    .memcpy_dtod_at(&v_part.buf, 0, &conv_out.buf, k_dim * 2 * 4, v_dim * 4)?;
 
                 // Fused L2-norm(Q) + L2-norm(K) + scale(Q) — 3 launches → 1.
                 gpu.fused_qk_l2_norm_scale_f32(
@@ -1704,8 +2525,13 @@ fn forward_from_x_gpu(
                     let k_exp = gpu.alloc_tensor(&[expanded_dim], DType::F32)?;
                     let hd = config.linear_key_head_dim;
                     gpu.repeat_interleave_qk_f32(
-                        &q_part, &k_part, &q_exp, &k_exp,
-                        config.linear_num_key_heads, ratio, hd,
+                        &q_part,
+                        &k_part,
+                        &q_exp,
+                        &k_exp,
+                        config.linear_num_key_heads,
+                        ratio,
+                        hd,
                     )?;
                     (q_exp, k_exp)
                 } else {
@@ -1713,8 +2539,10 @@ fn forward_from_x_gpu(
                     // (we'll skip freeing these in the cleanup below)
                     let q_ref = gpu.alloc_tensor(&[k_dim], DType::F32)?;
                     let k_ref = gpu.alloc_tensor(&[k_dim], DType::F32)?;
-                    gpu.hip.memcpy_dtod_at(&q_ref.buf, 0, &q_part.buf, 0, k_dim * 4)?;
-                    gpu.hip.memcpy_dtod_at(&k_ref.buf, 0, &k_part.buf, 0, k_dim * 4)?;
+                    gpu.hip
+                        .memcpy_dtod_at(&q_ref.buf, 0, &q_part.buf, 0, k_dim * 4)?;
+                    gpu.hip
+                        .memcpy_dtod_at(&k_ref.buf, 0, &k_part.buf, 0, k_dim * 4)?;
                     (q_ref, k_ref)
                 };
 
@@ -1722,21 +2550,42 @@ fn forward_from_x_gpu(
                 let attn_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
                 match dn_state.quant {
                     StateQuant::FP32 => gpu.gated_delta_net_f32(
-                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
-                        &dn_state.s_matrices[delta_layer_idx], &attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &q_gdn,
+                        &k_gdn,
+                        &v_part,
+                        &alpha_out,
+                        &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                     StateQuant::Q8 => gpu.gated_delta_net_q8(
-                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
+                        &q_gdn,
+                        &k_gdn,
+                        &v_part,
+                        &alpha_out,
+                        &beta_out,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx], &attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &dn_state.s_scales[delta_layer_idx],
+                        &attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
-                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
+                        &q_gdn,
+                        &k_gdn,
+                        &v_part,
+                        &alpha_out,
+                        &beta_out,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx], &attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &dn_state.s_scales[delta_layer_idx],
+                        &attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                 }
 
@@ -1746,8 +2595,15 @@ fn forward_from_x_gpu(
 
                 // Gated norm: rmsnorm(attn_out) * silu(z)
                 let normed_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
-                gpu.gated_norm_f32(&attn_out, &z, &layer.norm_weight, &normed_out,
-                    n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+                gpu.gated_norm_f32(
+                    &attn_out,
+                    &z,
+                    &layer.norm_weight,
+                    &normed_out,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                )?;
 
                 // Output projection
                 let o = gpu.alloc_tensor(&[dim], DType::F32)?;
@@ -1769,7 +2625,10 @@ fn forward_from_x_gpu(
                 gpu.add_inplace_f32(&x, &ffn_out)?;
 
                 // Free temporaries
-                for t in [qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, q_gdn, k_gdn, attn_out, normed_out, o, gate, up, ffn_hidden, ffn_out] {
+                for t in [
+                    qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, q_gdn, k_gdn,
+                    attn_out, normed_out, o, gate, up, ffn_hidden, ffn_out,
+                ] {
                     gpu.free_tensor(t)?;
                 }
                 delta_layer_idx += 1;
@@ -1794,7 +2653,14 @@ fn forward_from_x_gpu(
                 gpu.deinterleave_f32(&q_full, &q, &gate_vec, config.n_heads, config.head_dim)?;
 
                 // Q norm
-                gpu.rmsnorm_batched(&q, &layer.q_norm, &q, config.n_heads, config.head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(
+                    &q,
+                    &layer.q_norm,
+                    &q,
+                    config.n_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
 
                 // K, V projections
                 let kv_dim = config.n_kv_heads * config.head_dim;
@@ -1804,28 +2670,71 @@ fn forward_from_x_gpu(
                 weight_gemv(gpu, &layer.wv, &tmp, &v)?;
 
                 // K norm
-                gpu.rmsnorm_batched(&k, &layer.k_norm, &k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(
+                    &k,
+                    &layer.k_norm,
+                    &k,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
 
                 // Partial interleaved RoPE: rotate first n_rot dims, pairs (d0,d1),(d2,d3),...
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize; // 64
-                gpu.rope_partial_interleaved_f32(&q, &k, &pos_buf,
-                    config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+                gpu.rope_partial_interleaved_f32(
+                    &q,
+                    &k,
+                    &pos_buf,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                )?;
 
                 // KV cache write + attention (Q8 if available, FP32 fallback)
                 let attn_out = gpu.alloc_tensor(&[q_dim], DType::F32)?;
                 if kv_cache.quant_q8 {
-                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, config.n_kv_heads, config.head_dim)?;
-                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(
+                        &kv_cache.k_gpu[layer_idx],
+                        &k,
+                        &pos_buf,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
+                    gpu.kv_cache_write_q8_0(
+                        &kv_cache.v_gpu[layer_idx],
+                        &v,
+                        &pos_buf,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     gpu.attention_q8_0_kv(
-                        &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &attn_out,
+                        &pos_buf,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                     )?;
                 } else {
                     gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
                     gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
                     gpu.attention_f32(
-                        &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &attn_out,
+                        &pos_buf,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                     )?;
                 }
 
@@ -1853,7 +2762,9 @@ fn forward_from_x_gpu(
                 weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
                 gpu.add_inplace_f32(&x, &ffn_out)?;
 
-                for t in [q_full, q, gate_vec, k, v, attn_out, o, gate_ffn, up, ffn_hidden, ffn_out] {
+                for t in [
+                    q_full, q, gate_vec, k, v, attn_out, o, gate_ffn, up, ffn_hidden, ffn_out,
+                ] {
                     gpu.free_tensor(t)?;
                 }
             }
@@ -1866,7 +2777,7 @@ fn forward_from_x_gpu(
                 gpu.rmsnorm_f32(&x, &layer.attn_norm, &tmp, config.norm_eps)?;
 
                 let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
-                             + config.linear_num_value_heads * config.linear_value_head_dim;
+                    + config.linear_num_value_heads * config.linear_value_head_dim;
                 let qkv = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
                 weight_gemv(gpu, &layer.wqkv, &tmp, &qkv)?;
 
@@ -1880,13 +2791,20 @@ fn forward_from_x_gpu(
                 let alpha_out = gpu.alloc_tensor(&[n_v_heads], DType::F32)?;
                 weight_gemv(gpu, &layer.w_alpha, &tmp, &alpha_out)?;
                 gpu.fused_sigmoid_alpha_gate_f32(
-                    &beta_out, &alpha_out, &layer.dt_bias, &layer.a_log, n_v_heads,
+                    &beta_out,
+                    &alpha_out,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    n_v_heads,
                 )?;
 
                 let conv_out = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
                 gpu.conv1d_silu_f32(
-                    &conv_out, &qkv, &layer.conv_weight,
-                    &dn_state.conv_states[delta_layer_idx], qkv_dim,
+                    &conv_out,
+                    &qkv,
+                    &layer.conv_weight,
+                    &dn_state.conv_states[delta_layer_idx],
+                    qkv_dim,
                 )?;
 
                 let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -1894,13 +2812,18 @@ fn forward_from_x_gpu(
                 let q_part = gpu.alloc_tensor(&[k_dim], DType::F32)?;
                 let k_part = gpu.alloc_tensor(&[k_dim], DType::F32)?;
                 let v_part = gpu.alloc_tensor(&[v_dim], DType::F32)?;
-                gpu.hip.memcpy_dtod_at(&q_part.buf, 0, &conv_out.buf, 0, k_dim * 4)?;
-                gpu.hip.memcpy_dtod_at(&k_part.buf, 0, &conv_out.buf, k_dim * 4, k_dim * 4)?;
-                gpu.hip.memcpy_dtod_at(&v_part.buf, 0, &conv_out.buf, k_dim * 2 * 4, v_dim * 4)?;
+                gpu.hip
+                    .memcpy_dtod_at(&q_part.buf, 0, &conv_out.buf, 0, k_dim * 4)?;
+                gpu.hip
+                    .memcpy_dtod_at(&k_part.buf, 0, &conv_out.buf, k_dim * 4, k_dim * 4)?;
+                gpu.hip
+                    .memcpy_dtod_at(&v_part.buf, 0, &conv_out.buf, k_dim * 2 * 4, v_dim * 4)?;
 
                 gpu.fused_qk_l2_norm_scale_f32(
-                    &q_part, &k_part,
-                    config.linear_num_key_heads, config.linear_key_head_dim,
+                    &q_part,
+                    &k_part,
+                    config.linear_num_key_heads,
+                    config.linear_key_head_dim,
                     1.0 / (config.linear_key_head_dim as f32).sqrt(),
                     config.norm_eps,
                 )?;
@@ -1912,42 +2835,77 @@ fn forward_from_x_gpu(
                     let k_exp = gpu.alloc_tensor(&[expanded_dim], DType::F32)?;
                     let hd = config.linear_key_head_dim;
                     gpu.repeat_interleave_qk_f32(
-                        &q_part, &k_part, &q_exp, &k_exp,
-                        config.linear_num_key_heads, ratio, hd,
+                        &q_part,
+                        &k_part,
+                        &q_exp,
+                        &k_exp,
+                        config.linear_num_key_heads,
+                        ratio,
+                        hd,
                     )?;
                     (q_exp, k_exp)
                 } else {
                     let q_ref = gpu.alloc_tensor(&[k_dim], DType::F32)?;
                     let k_ref = gpu.alloc_tensor(&[k_dim], DType::F32)?;
-                    gpu.hip.memcpy_dtod_at(&q_ref.buf, 0, &q_part.buf, 0, k_dim * 4)?;
-                    gpu.hip.memcpy_dtod_at(&k_ref.buf, 0, &k_part.buf, 0, k_dim * 4)?;
+                    gpu.hip
+                        .memcpy_dtod_at(&q_ref.buf, 0, &q_part.buf, 0, k_dim * 4)?;
+                    gpu.hip
+                        .memcpy_dtod_at(&k_ref.buf, 0, &k_part.buf, 0, k_dim * 4)?;
                     (q_ref, k_ref)
                 };
 
                 let attn_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
                 match dn_state.quant {
                     StateQuant::FP32 => gpu.gated_delta_net_f32(
-                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
-                        &dn_state.s_matrices[delta_layer_idx], &attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &q_gdn,
+                        &k_gdn,
+                        &v_part,
+                        &alpha_out,
+                        &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                     StateQuant::Q8 => gpu.gated_delta_net_q8(
-                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
+                        &q_gdn,
+                        &k_gdn,
+                        &v_part,
+                        &alpha_out,
+                        &beta_out,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx], &attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &dn_state.s_scales[delta_layer_idx],
+                        &attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
-                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
+                        &q_gdn,
+                        &k_gdn,
+                        &v_part,
+                        &alpha_out,
+                        &beta_out,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx], &attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &dn_state.s_scales[delta_layer_idx],
+                        &attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                 }
 
                 let normed_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
-                gpu.gated_norm_f32(&attn_out, &z, &layer.norm_weight, &normed_out,
-                    n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+                gpu.gated_norm_f32(
+                    &attn_out,
+                    &z,
+                    &layer.norm_weight,
+                    &normed_out,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                )?;
 
                 let o = gpu.alloc_tensor(&[dim], DType::F32)?;
                 weight_gemv(gpu, &layer.wo, &normed_out, &o)?;
@@ -1958,7 +2916,10 @@ fn forward_from_x_gpu(
                 gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
                 moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config)?;
 
-                for t in [qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, q_gdn, k_gdn, attn_out, normed_out, o] {
+                for t in [
+                    qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, q_gdn, k_gdn,
+                    attn_out, normed_out, o,
+                ] {
                     gpu.free_tensor(t)?;
                 }
                 delta_layer_idx += 1;
@@ -1977,7 +2938,14 @@ fn forward_from_x_gpu(
                 let gate_vec = gpu.alloc_tensor(&[q_dim], DType::F32)?;
                 gpu.deinterleave_f32(&q_full, &q, &gate_vec, config.n_heads, config.head_dim)?;
 
-                gpu.rmsnorm_batched(&q, &layer.q_norm, &q, config.n_heads, config.head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(
+                    &q,
+                    &layer.q_norm,
+                    &q,
+                    config.n_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
 
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 let k = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
@@ -1985,26 +2953,69 @@ fn forward_from_x_gpu(
                 weight_gemv(gpu, &layer.wk, &tmp, &k)?;
                 weight_gemv(gpu, &layer.wv, &tmp, &v)?;
 
-                gpu.rmsnorm_batched(&k, &layer.k_norm, &k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(
+                    &k,
+                    &layer.k_norm,
+                    &k,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
 
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-                gpu.rope_partial_interleaved_f32(&q, &k, &pos_buf,
-                    config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+                gpu.rope_partial_interleaved_f32(
+                    &q,
+                    &k,
+                    &pos_buf,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                )?;
 
                 let attn_out = gpu.alloc_tensor(&[q_dim], DType::F32)?;
                 if kv_cache.quant_q8 {
-                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, config.n_kv_heads, config.head_dim)?;
-                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(
+                        &kv_cache.k_gpu[layer_idx],
+                        &k,
+                        &pos_buf,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
+                    gpu.kv_cache_write_q8_0(
+                        &kv_cache.v_gpu[layer_idx],
+                        &v,
+                        &pos_buf,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     gpu.attention_q8_0_kv(
-                        &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &attn_out,
+                        &pos_buf,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                     )?;
                 } else {
                     gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
                     gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
                     gpu.attention_f32(
-                        &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &attn_out,
+                        &pos_buf,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                     )?;
                 }
 
@@ -2031,8 +3042,14 @@ fn forward_from_x_gpu(
         if debug_layers && pos == 0 {
             let hid = gpu.download_f32(&x)?;
             let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
-            let lt = match config.layer_types[layer_idx] { LayerType::LinearAttention => "D", LayerType::FullAttention => "F" };
-            eprintln!("L{layer_idx:02}({lt}): first4=[{:.4},{:.4},{:.4},{:.4}] norm={norm:.2}", hid[0], hid[1], hid[2], hid[3]);
+            let lt = match config.layer_types[layer_idx] {
+                LayerType::LinearAttention => "D",
+                LayerType::FullAttention => "F",
+            };
+            eprintln!(
+                "L{layer_idx:02}({lt}): first4=[{:.4},{:.4},{:.4},{:.4}] norm={norm:.2}",
+                hid[0], hid[1], hid[2], hid[3]
+            );
         }
     }
 
@@ -2051,12 +3068,12 @@ fn forward_from_x_gpu(
 /// Pre-allocated scratch buffers for zero-alloc qwen35 forward + GPU sampling.
 pub struct Qwen35Scratch {
     // Persistent state
-    pub x: GpuTensor,           // [dim]
-    pub tmp: GpuTensor,         // [dim]
+    pub x: GpuTensor,                      // [dim]
+    pub tmp: GpuTensor,                    // [dim]
     pub pos_buf: hip_bridge::DeviceBuffer, // 4 bytes
 
     // DeltaNet temporaries (reused across layers)
-    pub dn_qkv: GpuTensor,     // [qkv_dim]
+    pub dn_qkv: GpuTensor,      // [qkv_dim]
     pub dn_z: GpuTensor,        // [v_dim]
     pub dn_alpha: GpuTensor,    // [n_v_heads]
     pub dn_beta: GpuTensor,     // [n_v_heads]
@@ -2078,20 +3095,20 @@ pub struct Qwen35Scratch {
     pub fa_attn_out: GpuTensor, // [n_heads * head_dim]
 
     // Shared (used by both layer types)
-    pub o: GpuTensor,           // [dim]
-    pub gate_ffn: GpuTensor,    // [hidden_dim]
-    pub up: GpuTensor,          // [hidden_dim]
-    pub ffn_hidden: GpuTensor,  // [hidden_dim]
-    pub ffn_out: GpuTensor,     // [dim]
+    pub o: GpuTensor,          // [dim]
+    pub gate_ffn: GpuTensor,   // [hidden_dim]
+    pub up: GpuTensor,         // [hidden_dim]
+    pub ffn_hidden: GpuTensor, // [hidden_dim]
+    pub ffn_out: GpuTensor,    // [dim]
 
     // Sampling
-    pub logits: GpuTensor,      // [vocab_size]
-    pub sample_buf: GpuTensor,  // [2] — token_id + rng
-    pub repeat_buf: GpuTensor,  // [repeat_window]
+    pub logits: GpuTensor,     // [vocab_size]
+    pub sample_buf: GpuTensor, // [2] — token_id + rng
+    pub repeat_buf: GpuTensor, // [repeat_window]
 
     // MagnumQuant rotation scratch: FWHT(x) shared across Q/K/V (or gate/up, etc).
     // Sized to max(dim, hidden_dim) — one rotation per batch replaces one per GEMV.
-    pub x_rot: GpuTensor,       // [max(dim, hidden_dim)]
+    pub x_rot: GpuTensor, // [max(dim, hidden_dim)]
 
     // Flash attention partials buffer for tile+reduce 2-kernel path.
     // Size: n_heads * max_tiles * (2 + head_dim) floats.
@@ -2105,21 +3122,21 @@ pub struct Qwen35Scratch {
     // MoE scratch (allocated only when config.num_experts > 0). Pre-allocated
     // so moe_ffn_decode can be captured by hipGraph — the per-layer allocs
     // it used to do violated the "no allocator ops while capturing" rule.
-    pub moe_router_logits: Option<GpuTensor>,   // [num_experts]
-    pub moe_scalar_buf:    Option<GpuTensor>,   // [1] shared-expert gate scalar
-    pub moe_x_rot:         Option<GpuTensor>,   // [dim]
-    pub moe_gate_up_buf:   Option<GpuTensor>,   // [2*max_inter]   fallback path
-    pub moe_gate_buf:      Option<GpuTensor>,   // [max_inter]     fallback path
-    pub moe_up_buf:        Option<GpuTensor>,   // [max_inter]     fallback path
-    pub moe_ffn_hidden:    Option<GpuTensor>,   // [max_inter]     fallback path
-    pub moe_ffn_out:       Option<GpuTensor>,   // [dim]           fallback path
-    pub moe_gate_batch:    Option<GpuTensor>,   // [k × mi]
-    pub moe_up_batch:      Option<GpuTensor>,   // [k × mi]
-    pub moe_rot_batch:     Option<GpuTensor>,   // [k × mi]
+    pub moe_router_logits: Option<GpuTensor>, // [num_experts]
+    pub moe_scalar_buf: Option<GpuTensor>,    // [1] shared-expert gate scalar
+    pub moe_x_rot: Option<GpuTensor>,         // [dim]
+    pub moe_gate_up_buf: Option<GpuTensor>,   // [2*max_inter]   fallback path
+    pub moe_gate_buf: Option<GpuTensor>,      // [max_inter]     fallback path
+    pub moe_up_buf: Option<GpuTensor>,        // [max_inter]     fallback path
+    pub moe_ffn_hidden: Option<GpuTensor>,    // [max_inter]     fallback path
+    pub moe_ffn_out: Option<GpuTensor>,       // [dim]           fallback path
+    pub moe_gate_batch: Option<GpuTensor>,    // [k × mi]
+    pub moe_up_batch: Option<GpuTensor>,      // [k × mi]
+    pub moe_rot_batch: Option<GpuTensor>,     // [k × mi]
     /// Phase 2b: GPU-side top-K outputs (kept on-device so moe_ffn_decode
     /// can stay in a graph-capturable stream).
-    pub moe_topk_indices:  Option<GpuTensor>,   // [k] i32 stored as f32 alias
-    pub moe_topk_weights:  Option<GpuTensor>,   // [k] f32
+    pub moe_topk_indices: Option<GpuTensor>, // [k] i32 stored as f32 alias
+    pub moe_topk_weights: Option<GpuTensor>,  // [k] f32
 
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
@@ -2132,7 +3149,12 @@ impl Qwen35Scratch {
         Self::new_with_kv_max(gpu, config, repeat_window, 8192)
     }
 
-    pub fn new_with_kv_max(gpu: &mut Gpu, config: &Qwen35Config, repeat_window: usize, kv_max_seq: usize) -> HipResult<Self> {
+    pub fn new_with_kv_max(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        repeat_window: usize,
+        kv_max_seq: usize,
+    ) -> HipResult<Self> {
         let dim = config.dim;
         let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
         let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -2207,7 +3229,10 @@ impl Qwen35Scratch {
                     .and_then(|s| s.parse::<usize>().ok())
                     .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
                     .unwrap_or(16);
-                gpu.alloc_tensor(&[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)], DType::F32)?
+                gpu.alloc_tensor(
+                    &[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)],
+                    DType::F32,
+                )?
             },
             // Flash attention tri-state for the Q8 path. Asym modes always
             // flash regardless.
@@ -2221,19 +3246,19 @@ impl Qwen35Scratch {
             },
 
             moe_router_logits: None,
-            moe_scalar_buf:    None,
-            moe_x_rot:         None,
-            moe_gate_up_buf:   None,
-            moe_gate_buf:      None,
-            moe_up_buf:        None,
-            moe_ffn_hidden:    None,
-            moe_ffn_out:       None,
-            moe_gate_batch:    None,
-            moe_up_batch:      None,
-            moe_rot_batch:     None,
-            moe_topk_indices:  None,
-            moe_topk_weights:  None,
-            prefill_batch:     None,
+            moe_scalar_buf: None,
+            moe_x_rot: None,
+            moe_gate_up_buf: None,
+            moe_gate_buf: None,
+            moe_up_buf: None,
+            moe_ffn_hidden: None,
+            moe_ffn_out: None,
+            moe_gate_batch: None,
+            moe_up_batch: None,
+            moe_rot_batch: None,
+            moe_topk_indices: None,
+            moe_topk_weights: None,
+            prefill_batch: None,
         })
         .and_then(|mut s| {
             // Allocate MoE scratch only for MoE configs. Done after the
@@ -2247,21 +3272,21 @@ impl Qwen35Scratch {
                 let max_inter = mi.max(smi);
                 let k = config.num_experts_per_tok;
                 s.moe_router_logits = Some(gpu.alloc_tensor(&[n_exp], DType::F32)?);
-                s.moe_scalar_buf    = Some(gpu.alloc_tensor(&[1], DType::F32)?);
-                s.moe_x_rot         = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
-                s.moe_gate_up_buf   = Some(gpu.alloc_tensor(&[2 * max_inter], DType::F32)?);
-                s.moe_gate_buf      = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
-                s.moe_up_buf        = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
-                s.moe_ffn_hidden    = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
-                s.moe_ffn_out       = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
-                s.moe_gate_batch    = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
-                s.moe_up_batch      = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
-                s.moe_rot_batch     = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                s.moe_scalar_buf = Some(gpu.alloc_tensor(&[1], DType::F32)?);
+                s.moe_x_rot = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
+                s.moe_gate_up_buf = Some(gpu.alloc_tensor(&[2 * max_inter], DType::F32)?);
+                s.moe_gate_buf = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
+                s.moe_up_buf = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
+                s.moe_ffn_hidden = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
+                s.moe_ffn_out = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
+                s.moe_gate_batch = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                s.moe_up_batch = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                s.moe_rot_batch = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
                 // i32 topk_indices stored in an F32 tensor (same byte width).
                 // The kernel that writes it casts the buffer to int*, and the
                 // indexed MoE GEMV kernels read it as int*.
-                s.moe_topk_indices  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
-                s.moe_topk_weights  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
+                s.moe_topk_indices = Some(gpu.alloc_tensor(&[k], DType::F32)?);
+                s.moe_topk_weights = Some(gpu.alloc_tensor(&[k], DType::F32)?);
                 // Pre-warm MQ FWHT sign tables (otherwise the lazy init in
                 // ensure_mq_signs fires during the first moe_ffn_decode and
                 // blows up hipGraph capture with a hipMalloc-in-capture
@@ -2285,22 +3310,57 @@ impl Qwen35Scratch {
         let _ = gpu.free_tensor(self.x);
         let _ = gpu.free_tensor(self.tmp);
         let _ = gpu.hip.free(self.pos_buf);
-        for t in [self.dn_qkv, self.dn_z, self.dn_alpha, self.dn_beta, self.dn_conv_out,
-                   self.dn_q, self.dn_k, self.dn_v, self.dn_q_raw, self.dn_k_raw,
-                   self.dn_attn_out, self.dn_normed,
-                   self.fa_q_full, self.fa_q, self.fa_gate, self.fa_k, self.fa_v, self.fa_attn_out,
-                   self.o, self.gate_ffn, self.up, self.ffn_hidden, self.ffn_out,
-                   self.logits, self.sample_buf, self.repeat_buf, self.x_rot,
-                   self.flash_partials] {
+        for t in [
+            self.dn_qkv,
+            self.dn_z,
+            self.dn_alpha,
+            self.dn_beta,
+            self.dn_conv_out,
+            self.dn_q,
+            self.dn_k,
+            self.dn_v,
+            self.dn_q_raw,
+            self.dn_k_raw,
+            self.dn_attn_out,
+            self.dn_normed,
+            self.fa_q_full,
+            self.fa_q,
+            self.fa_gate,
+            self.fa_k,
+            self.fa_v,
+            self.fa_attn_out,
+            self.o,
+            self.gate_ffn,
+            self.up,
+            self.ffn_hidden,
+            self.ffn_out,
+            self.logits,
+            self.sample_buf,
+            self.repeat_buf,
+            self.x_rot,
+            self.flash_partials,
+        ] {
             let _ = gpu.free_tensor(t);
         }
         // MoE scratch — only present for MoE configs.
-        for t in [self.moe_router_logits, self.moe_scalar_buf, self.moe_x_rot,
-                   self.moe_gate_up_buf, self.moe_gate_buf, self.moe_up_buf,
-                   self.moe_ffn_hidden, self.moe_ffn_out,
-                   self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch,
-                   self.moe_topk_indices, self.moe_topk_weights] {
-            if let Some(buf) = t { let _ = gpu.free_tensor(buf); }
+        for t in [
+            self.moe_router_logits,
+            self.moe_scalar_buf,
+            self.moe_x_rot,
+            self.moe_gate_up_buf,
+            self.moe_gate_buf,
+            self.moe_up_buf,
+            self.moe_ffn_hidden,
+            self.moe_ffn_out,
+            self.moe_gate_batch,
+            self.moe_up_batch,
+            self.moe_rot_batch,
+            self.moe_topk_indices,
+            self.moe_topk_weights,
+        ] {
+            if let Some(buf) = t {
+                let _ = gpu.free_tensor(buf);
+            }
         }
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
@@ -2354,10 +3414,18 @@ pub fn forward_scratch(
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?,
-        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?,
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::F32 => {
+            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
+        }
         _ => panic!("unsupported embedding format"),
     }
 
@@ -2365,7 +3433,8 @@ pub fn forward_scratch(
         // ── Graph replay path ──
         // Update pos_buf on the device via stream write (no host→device copy).
         let stream = gpu.active_stream.as_ref().unwrap();
-        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+        gpu.hip
+            .stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
         gpu.graph_launch()?;
     } else if use_graph && gpu.graph_exec.is_none() {
         let pos_i32 = pos as i32;
@@ -2378,7 +3447,8 @@ pub fn forward_scratch(
             // next call will capture. (See bench_qwen35_mq4 / forward_prefill_batch
             // for the production warmup path.)
             gpu.ar_forward_warmed_up = true;
-            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+            gpu.hip
+                .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
             forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
         } else {
             // ── First post-warmup call: capture the forward pass as a graph ──
@@ -2387,7 +3457,8 @@ pub fn forward_scratch(
                 gpu.active_stream = Some(gpu.hip.stream_create()?);
             }
             // Write pos_buf before capture (this write is NOT in the graph)
-            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+            gpu.hip
+                .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
             gpu.begin_graph_capture()?;
             forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
             gpu.end_graph_capture()?;
@@ -2398,12 +3469,16 @@ pub fn forward_scratch(
             // begin_verify_graph_capture / end_verify_graph_capture /
             // verify_graph_launch sequence.
             gpu.graph_launch()?;
-            eprintln!("[hipGraph] captured {} blobs, instantiated", gpu.capture_blobs.len());
+            eprintln!(
+                "[hipGraph] captured {} blobs, instantiated",
+                gpu.capture_blobs.len()
+            );
         }
     } else {
         // ── Direct path (no graph) ──
         let pos_i32 = pos as i32;
-        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        gpu.hip
+            .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
     }
     Ok(())
@@ -2425,17 +3500,17 @@ pub struct PrefillBatchScratch {
     pub x_rot_batch: GpuTensor,
 
     // LA-layer projection outputs
-    pub dn_qkv_batch: GpuTensor,         // [N × qkv_dim]
-    pub dn_z_batch: GpuTensor,           // [N × v_dim]
-    pub dn_alpha_batch: GpuTensor,       // [N × n_v_heads]
-    pub dn_beta_batch: GpuTensor,        // [N × n_v_heads]
-    pub dn_q_raw_batch: GpuTensor,       // [N × k_dim] (pre repeat-interleave)
-    pub dn_k_raw_batch: GpuTensor,       // [N × k_dim]
-    pub dn_v_batch: GpuTensor,           // [N × v_dim]
-    pub dn_q_batch: GpuTensor,           // [N × v_dim] (post repeat-interleave)
-    pub dn_k_batch: GpuTensor,           // [N × v_dim]
-    pub dn_attn_out_batch: GpuTensor,    // [N × v_dim]
-    pub dn_normed_batch: GpuTensor,      // [N × v_dim]
+    pub dn_qkv_batch: GpuTensor,      // [N × qkv_dim]
+    pub dn_z_batch: GpuTensor,        // [N × v_dim]
+    pub dn_alpha_batch: GpuTensor,    // [N × n_v_heads]
+    pub dn_beta_batch: GpuTensor,     // [N × n_v_heads]
+    pub dn_q_raw_batch: GpuTensor,    // [N × k_dim] (pre repeat-interleave)
+    pub dn_k_raw_batch: GpuTensor,    // [N × k_dim]
+    pub dn_v_batch: GpuTensor,        // [N × v_dim]
+    pub dn_q_batch: GpuTensor,        // [N × v_dim] (post repeat-interleave)
+    pub dn_k_batch: GpuTensor,        // [N × v_dim]
+    pub dn_attn_out_batch: GpuTensor, // [N × v_dim]
+    pub dn_normed_batch: GpuTensor,   // [N × v_dim]
 
     // FFN intermediates [N × hidden_dim]
     pub gate_ffn_batch: GpuTensor,
@@ -2458,11 +3533,11 @@ pub struct PrefillBatchScratch {
     // once per batched forward and read by `embedding_lookup_hfq4g256_batched`.
     pub tokens: GpuTensor,
     // QKV projection outputs
-    pub fa_q_full_batch: GpuTensor,  // [N × n_heads × head_dim × 2] (Q + gate interleaved)
-    pub fa_q_batch: GpuTensor,       // [N × n_heads × head_dim]
-    pub fa_gate_batch: GpuTensor,    // [N × n_heads × head_dim]
-    pub fa_k_batch: GpuTensor,       // [N × n_kv_heads × head_dim]
-    pub fa_v_batch: GpuTensor,       // [N × n_kv_heads × head_dim]
+    pub fa_q_full_batch: GpuTensor, // [N × n_heads × head_dim × 2] (Q + gate interleaved)
+    pub fa_q_batch: GpuTensor,      // [N × n_heads × head_dim]
+    pub fa_gate_batch: GpuTensor,   // [N × n_heads × head_dim]
+    pub fa_k_batch: GpuTensor,      // [N × n_kv_heads × head_dim]
+    pub fa_v_batch: GpuTensor,      // [N × n_kv_heads × head_dim]
     pub fa_attn_out_batch: GpuTensor, // [N × n_heads × head_dim]
     // FWHT-rotated fa_attn_out for feeding MQ4 wo.
     pub fa_attn_out_rot_batch: GpuTensor, // [N × n_heads × head_dim]
@@ -2471,16 +3546,16 @@ pub struct PrefillBatchScratch {
     // All outputs of the fused 4-way router + shared-gate GEMM, plus the
     // per-token routed-expert gate/up/rot buffers consumed by the N-batched
     // indexed MoE kernels. Sized as [max_batch × {n_exp, smi, k_top×mi}].
-    pub moe_router_logits_batch: Option<GpuTensor>,   // [N × num_experts]
-    pub moe_shared_scalar_batch: Option<GpuTensor>,   // [N × 1] — raw shared_expert_gate logit
-    pub moe_shared_gate_batch:   Option<GpuTensor>,   // [N × smi]
-    pub moe_shared_up_batch:     Option<GpuTensor>,   // [N × smi]
-    pub moe_shared_rot_batch:    Option<GpuTensor>,   // [N × smi] — FWHT(silu(gate) * up)
-    pub moe_topk_indices_batch:  Option<GpuTensor>,   // [N × k_top] i32 in F32 slots
-    pub moe_topk_weights_batch:  Option<GpuTensor>,   // [N × k_top]
-    pub moe_gate_batch:          Option<GpuTensor>,   // [N × k_top × mi]
-    pub moe_up_batch:            Option<GpuTensor>,   // [N × k_top × mi]
-    pub moe_rot_batch:           Option<GpuTensor>,   // [N × k_top × mi]
+    pub moe_router_logits_batch: Option<GpuTensor>, // [N × num_experts]
+    pub moe_shared_scalar_batch: Option<GpuTensor>, // [N × 1] — raw shared_expert_gate logit
+    pub moe_shared_gate_batch: Option<GpuTensor>,   // [N × smi]
+    pub moe_shared_up_batch: Option<GpuTensor>,     // [N × smi]
+    pub moe_shared_rot_batch: Option<GpuTensor>,    // [N × smi] — FWHT(silu(gate) * up)
+    pub moe_topk_indices_batch: Option<GpuTensor>,  // [N × k_top] i32 in F32 slots
+    pub moe_topk_weights_batch: Option<GpuTensor>,  // [N × k_top]
+    pub moe_gate_batch: Option<GpuTensor>,          // [N × k_top × mi]
+    pub moe_up_batch: Option<GpuTensor>,            // [N × k_top × mi]
+    pub moe_rot_batch: Option<GpuTensor>,           // [N × k_top × mi]
 
     // ── Tree-aware LA scratch (Phase 3b of Task #101) ──
     // Per-token S-state tape consumed by gated_delta_net_q8_tree kernel
@@ -2493,7 +3568,7 @@ pub struct PrefillBatchScratch {
     // s_tape_scales: [max_batch × n_v_heads × head_dim] f32
     //
     // At max_batch=22, n_v_heads=16, head_dim=128 → 5.77 MB + 180 KB total.
-    pub dn_s_tape_q8:     Option<GpuTensor>,
+    pub dn_s_tape_q8: Option<GpuTensor>,
     pub dn_s_tape_scales: Option<GpuTensor>,
 }
 
@@ -2510,100 +3585,171 @@ impl PrefillBatchScratch {
 
         Ok(Self {
             max_batch,
-            x_batch:           gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
-            x_rot_batch:       gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
-            dn_qkv_batch:      gpu.alloc_tensor(&[max_batch * qkv_dim], DType::F32)?,
-            dn_z_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            dn_alpha_batch:    gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
-            dn_beta_batch:     gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
-            dn_q_raw_batch:    gpu.alloc_tensor(&[max_batch * k_dim],   DType::F32)?,
-            dn_k_raw_batch:    gpu.alloc_tensor(&[max_batch * k_dim],   DType::F32)?,
-            dn_v_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            dn_q_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            dn_k_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            dn_attn_out_batch: gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            dn_normed_batch:   gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
-            gate_ffn_batch:    gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            up_batch:          gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            ffn_hidden_batch:  gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            dn_normed_rot_batch: gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            x_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
+            x_rot_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
+            dn_qkv_batch: gpu.alloc_tensor(&[max_batch * qkv_dim], DType::F32)?,
+            dn_z_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
+            dn_alpha_batch: gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
+            dn_beta_batch: gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
+            dn_q_raw_batch: gpu.alloc_tensor(&[max_batch * k_dim], DType::F32)?,
+            dn_k_raw_batch: gpu.alloc_tensor(&[max_batch * k_dim], DType::F32)?,
+            dn_v_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
+            dn_q_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
+            dn_k_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
+            dn_attn_out_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
+            dn_normed_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
+            gate_ffn_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            up_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            ffn_hidden_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            dn_normed_rot_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
             // F32 dtype = 4 bytes/element, same layout as i32. The rope /
             // attention / kv_write kernels cast the pointer to `const int*`,
             // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
-            positions:         gpu.alloc_tensor(&[max_batch], DType::F32)?,
-            tokens:            gpu.alloc_tensor(&[max_batch], DType::F32)?,
-            fa_q_full_batch:   gpu.alloc_tensor(&[max_batch * q_dim * 2], DType::F32)?,
-            fa_q_batch:        gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            fa_gate_batch:     gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            fa_k_batch:        gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
-            fa_v_batch:        gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
+            positions: gpu.alloc_tensor(&[max_batch], DType::F32)?,
+            tokens: gpu.alloc_tensor(&[max_batch], DType::F32)?,
+            fa_q_full_batch: gpu.alloc_tensor(&[max_batch * q_dim * 2], DType::F32)?,
+            fa_q_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
+            fa_gate_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
+            fa_k_batch: gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
+            fa_v_batch: gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
             fa_attn_out_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
             fa_attn_out_rot_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
             moe_router_logits_batch: if config.num_experts > 0 {
                 Some(gpu.alloc_tensor(&[max_batch * config.num_experts], DType::F32)?)
-            } else { None },
+            } else {
+                None
+            },
             moe_shared_scalar_batch: if config.num_experts > 0 {
                 Some(gpu.alloc_tensor(&[max_batch], DType::F32)?)
-            } else { None },
+            } else {
+                None
+            },
             moe_shared_gate_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
-            } else { None },
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.shared_expert_intermediate_size],
+                    DType::F32,
+                )?)
+            } else {
+                None
+            },
             moe_shared_up_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
-            } else { None },
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.shared_expert_intermediate_size],
+                    DType::F32,
+                )?)
+            } else {
+                None
+            },
             moe_shared_rot_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.shared_expert_intermediate_size], DType::F32)?)
-            } else { None },
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.shared_expert_intermediate_size],
+                    DType::F32,
+                )?)
+            } else {
+                None
+            },
             moe_topk_indices_batch: if config.num_experts > 0 {
                 Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok], DType::F32)?)
-            } else { None },
+            } else {
+                None
+            },
             moe_topk_weights_batch: if config.num_experts > 0 {
                 Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok], DType::F32)?)
-            } else { None },
+            } else {
+                None
+            },
             moe_gate_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
-            } else { None },
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
+                    DType::F32,
+                )?)
+            } else {
+                None
+            },
             moe_up_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
-            } else { None },
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
+                    DType::F32,
+                )?)
+            } else {
+                None
+            },
             moe_rot_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
-            } else { None },
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
+                    DType::F32,
+                )?)
+            } else {
+                None
+            },
             dn_s_tape_q8: if config.linear_num_value_heads > 0 {
-                let bytes = max_batch * config.linear_num_value_heads * config.linear_value_head_dim * config.linear_value_head_dim;
+                let bytes = max_batch
+                    * config.linear_num_value_heads
+                    * config.linear_value_head_dim
+                    * config.linear_value_head_dim;
                 Some(gpu.alloc_tensor(&[bytes], DType::Raw)?)
-            } else { None },
+            } else {
+                None
+            },
             dn_s_tape_scales: if config.linear_num_value_heads > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.linear_num_value_heads * config.linear_value_head_dim], DType::F32)?)
-            } else { None },
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
+                    DType::F32,
+                )?)
+            } else {
+                None
+            },
         })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         for t in [
-            self.x_batch, self.x_rot_batch,
-            self.dn_qkv_batch, self.dn_z_batch,
-            self.dn_alpha_batch, self.dn_beta_batch,
-            self.dn_q_raw_batch, self.dn_k_raw_batch, self.dn_v_batch,
-            self.dn_q_batch, self.dn_k_batch,
-            self.dn_attn_out_batch, self.dn_normed_batch,
-            self.gate_ffn_batch, self.up_batch, self.ffn_hidden_batch,
+            self.x_batch,
+            self.x_rot_batch,
+            self.dn_qkv_batch,
+            self.dn_z_batch,
+            self.dn_alpha_batch,
+            self.dn_beta_batch,
+            self.dn_q_raw_batch,
+            self.dn_k_raw_batch,
+            self.dn_v_batch,
+            self.dn_q_batch,
+            self.dn_k_batch,
+            self.dn_attn_out_batch,
+            self.dn_normed_batch,
+            self.gate_ffn_batch,
+            self.up_batch,
+            self.ffn_hidden_batch,
             self.dn_normed_rot_batch,
-            self.positions, self.tokens,
-            self.fa_q_full_batch, self.fa_q_batch, self.fa_gate_batch,
-            self.fa_k_batch, self.fa_v_batch, self.fa_attn_out_batch,
+            self.positions,
+            self.tokens,
+            self.fa_q_full_batch,
+            self.fa_q_batch,
+            self.fa_gate_batch,
+            self.fa_k_batch,
+            self.fa_v_batch,
+            self.fa_attn_out_batch,
             self.fa_attn_out_rot_batch,
         ] {
             let _ = gpu.free_tensor(t);
         }
         for t in [
-            self.moe_router_logits_batch, self.moe_shared_scalar_batch,
-            self.moe_shared_gate_batch, self.moe_shared_up_batch, self.moe_shared_rot_batch,
-            self.moe_topk_indices_batch, self.moe_topk_weights_batch,
-            self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch,
-            self.dn_s_tape_q8, self.dn_s_tape_scales,
+            self.moe_router_logits_batch,
+            self.moe_shared_scalar_batch,
+            self.moe_shared_gate_batch,
+            self.moe_shared_up_batch,
+            self.moe_shared_rot_batch,
+            self.moe_topk_indices_batch,
+            self.moe_topk_weights_batch,
+            self.moe_gate_batch,
+            self.moe_up_batch,
+            self.moe_rot_batch,
+            self.dn_s_tape_q8,
+            self.dn_s_tape_scales,
         ] {
-            if let Some(t) = t { let _ = gpu.free_tensor(t); }
+            if let Some(t) = t {
+                let _ = gpu.free_tensor(t);
+            }
         }
     }
 }
@@ -2668,14 +3814,12 @@ pub fn upload_prefill_batch_inputs(
 ) -> HipResult<()> {
     let n = tokens.len();
     let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-    let tokens_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
-    };
+    let tokens_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
     gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
     let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
-    let positions_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
-    };
+    let positions_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
     gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
     Ok(())
 }
@@ -2709,13 +3853,27 @@ pub fn forward_prefill_batch_single_chunk_captured(
     tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
     let n = tokens.len();
-    debug_assert!(n > 0 && n <= pbs.max_batch,
-        "single_chunk_captured: n={} but pbs.max_batch={}", n, pbs.max_batch);
+    debug_assert!(
+        n > 0 && n <= pbs.max_batch,
+        "single_chunk_captured: n={} but pbs.max_batch={}",
+        n,
+        pbs.max_batch
+    );
     forward_prefill_chunk(
-        gpu, weights, config, tokens, start_pos,
-        kv_cache, dn_state, scratch, pbs, hidden_rb,
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        pbs,
+        hidden_rb,
         per_token_hidden_out.map(|t| (t, 0)),
-        gdn_tape, 0, tree_verify,
+        gdn_tape,
+        0,
+        tree_verify,
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
     )
 }
@@ -2735,8 +3893,19 @@ pub fn forward_prefill_batch(
     tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
     forward_prefill_batch_with_pbs(
-        gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
-        hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, scratch.prefill_batch.as_ref(),
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        scratch.prefill_batch.as_ref(),
     )
 }
 
@@ -2797,14 +3966,20 @@ pub fn forward_prefill_batch_with_pbs(
     // tree mask), and the positions/bias shapes must match the token count.
     if let Some(ctx) = tree_verify.as_ref() {
         assert_eq!(
-            ctx.positions.len(), n,
+            ctx.positions.len(),
+            n,
             "TreeVerifyCtx.positions length {} must equal tokens.len() {}",
-            ctx.positions.len(), n,
+            ctx.positions.len(),
+            n,
         );
         assert_eq!(
-            ctx.attn_bias.numel(), n * n,
+            ctx.attn_bias.numel(),
+            n * n,
             "TreeVerifyCtx.attn_bias must be [{} × {}] f32 ({}), got numel {}",
-            n, n, n * n, ctx.attn_bias.numel(),
+            n,
+            n,
+            n * n,
+            ctx.attn_bias.numel(),
         );
     }
 
@@ -2824,12 +3999,12 @@ pub fn forward_prefill_batch_with_pbs(
     let eligible = !force_fallback
         && n >= MIN_BATCH
         && dn_state.quant == StateQuant::Q8
-        && weights.layers.iter().any(|lw| matches!(
-            lw,
-            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
-        ))
+        && weights
+            .layers
+            .iter()
+            .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),))
         && weights.layers.iter().all(|lw| match lw {
-            LayerWeights::DeltaNet(l) =>
+            LayerWeights::DeltaNet(l) => {
                 is_batchable_la(l.wqkv.gpu_dtype)
                     && is_batchable_la(l.wz.gpu_dtype)
                     && is_batchable_la(l.w_beta.gpu_dtype)
@@ -2837,28 +4012,35 @@ pub fn forward_prefill_batch_with_pbs(
                     && is_batchable_la(l.wo.gpu_dtype)
                     && is_batchable_la(l.w_gate.gpu_dtype)
                     && is_batchable_la(l.w_up.gpu_dtype)
-                    && is_batchable_la(l.w_down.gpu_dtype),
+                    && is_batchable_la(l.w_down.gpu_dtype)
+            }
             LayerWeights::FullAttn(_) => true, // FA layer will take the gather/scatter path
             // MoE batched path: LA/FA projections must be MQ4 + every
             // routed/shared MoE weight must be MQ4. Top-K=8 and the
             // scratch tensors must exist on `pbs`.
-            LayerWeights::DeltaNetMoe(l) =>
+            LayerWeights::DeltaNetMoe(l) => {
                 moe_topk_ok
-                    && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
+                    && pbs_in
+                        .map(|p| p.moe_router_logits_batch.is_some())
+                        .unwrap_or(true)
                     && is_batchable_la(l.wqkv.gpu_dtype)
                     && is_batchable_la(l.wz.gpu_dtype)
                     && is_batchable_la(l.w_beta.gpu_dtype)
                     && is_batchable_la(l.w_alpha.gpu_dtype)
                     && is_batchable_la(l.wo.gpu_dtype)
-                    && moe_ffn_all_mq4(&l.ffn),
-            LayerWeights::FullAttnMoe(l) =>
+                    && moe_ffn_all_mq4(&l.ffn)
+            }
+            LayerWeights::FullAttnMoe(l) => {
                 moe_topk_ok
-                    && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
+                    && pbs_in
+                        .map(|p| p.moe_router_logits_batch.is_some())
+                        .unwrap_or(true)
                     && is_batchable_la(l.wq.gpu_dtype)
                     && is_batchable_la(l.wk.gpu_dtype)
                     && is_batchable_la(l.wv.gpu_dtype)
                     && is_batchable_la(l.wo.gpu_dtype)
-                    && moe_ffn_all_mq4(&l.ffn),
+                    && moe_ffn_all_mq4(&l.ffn)
+            }
         });
 
     if !eligible {
@@ -2876,21 +4058,34 @@ pub fn forward_prefill_batch_with_pbs(
         for (i, &tok) in tokens.iter().enumerate() {
             if let Some(rb) = hidden_rb.as_mut() {
                 forward_scratch_with_hidden(
-                    gpu, weights, config, tok, start_pos + i,
-                    kv_cache, dn_state, scratch, rb,
+                    gpu,
+                    weights,
+                    config,
+                    tok,
+                    start_pos + i,
+                    kv_cache,
+                    dn_state,
+                    scratch,
+                    rb,
                 )?;
             } else {
-                forward_scratch(gpu, weights, config, tok, start_pos + i, kv_cache, dn_state, scratch)?;
+                forward_scratch(
+                    gpu,
+                    weights,
+                    config,
+                    tok,
+                    start_pos + i,
+                    kv_cache,
+                    dn_state,
+                    scratch,
+                )?;
             }
             if let Some(dst) = per_token_hidden_out {
                 // scratch.tmp holds post-output-norm hidden after
                 // forward_scratch_{with_hidden,layers} — it's the same buffer
                 // lm_head reads from. Copy into the caller's output.
-                gpu.hip.memcpy_dtod_at(
-                    &dst.buf, i * dim * 4,
-                    &scratch.tmp.buf, 0,
-                    dim * 4,
-                )?;
+                gpu.hip
+                    .memcpy_dtod_at(&dst.buf, i * dim * 4, &scratch.tmp.buf, 0, dim * 4)?;
             }
         }
         return Ok(());
@@ -2903,7 +4098,8 @@ pub fn forward_prefill_batch_with_pbs(
         assert!(
             n <= max_batch,
             "tree-verify tokens {} exceeds max_batch {}; tree budget must fit",
-            n, max_batch,
+            n,
+            max_batch,
         );
     }
 
@@ -2942,9 +4138,20 @@ pub fn forward_prefill_batch_with_pbs(
             // the whole ctx through unconditionally is safe.
             let tv_for_chunk = tree_verify.as_ref().copied();
             forward_prefill_chunk(
-                gpu, weights, config, chunk, start_pos + chunk_start,
-                kv_cache, dn_state, scratch, pbs, hidden_rb.as_deref(),
-                pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
+                gpu,
+                weights,
+                config,
+                chunk,
+                start_pos + chunk_start,
+                kv_cache,
+                dn_state,
+                scratch,
+                pbs,
+                hidden_rb.as_deref(),
+                pth_slot,
+                tape_for_chunk,
+                chunk_start,
+                tv_for_chunk,
                 false, // pre_uploaded: default path uploads inside
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
@@ -2971,7 +4178,10 @@ pub fn forward_prefill_batch_with_pbs(
 /// branches in `forward_prefill_chunk`).
 #[inline]
 fn is_batchable_la(dt: DType) -> bool {
-    matches!(dt, DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256)
+    matches!(
+        dt,
+        DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256
+    )
 }
 
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
@@ -3002,8 +4212,10 @@ fn moe_ffn_all_mq4(ffn: &MoeFfnWeights) -> bool {
         && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.down.gpu_dtype == DType::MQ4G256
-        && ffn.experts.iter().all(|e|
-            e.gate_up.gpu_dtype == DType::MQ4G256 && e.down.gpu_dtype == DType::MQ4G256)
+        && ffn
+            .experts
+            .iter()
+            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256 && e.down.gpu_dtype == DType::MQ4G256)
 }
 
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
@@ -3037,18 +4249,23 @@ fn prefill_moe_ffn_body_batched(
 
     let router_logits = pbs.moe_router_logits_batch.as_ref().expect("moe scratch");
     let shared_scalar = pbs.moe_shared_scalar_batch.as_ref().expect("moe scratch");
-    let shared_gate   = pbs.moe_shared_gate_batch.as_ref().expect("moe scratch");
-    let shared_up     = pbs.moe_shared_up_batch.as_ref().expect("moe scratch");
-    let shared_rot    = pbs.moe_shared_rot_batch.as_ref().expect("moe scratch");
-    let topk_indices  = pbs.moe_topk_indices_batch.as_ref().expect("moe scratch");
-    let topk_weights  = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
-    let gate_batch    = pbs.moe_gate_batch.as_ref().expect("moe scratch");
-    let up_batch      = pbs.moe_up_batch.as_ref().expect("moe scratch");
-    let rot_batch     = pbs.moe_rot_batch.as_ref().expect("moe scratch");
+    let shared_gate = pbs.moe_shared_gate_batch.as_ref().expect("moe scratch");
+    let shared_up = pbs.moe_shared_up_batch.as_ref().expect("moe scratch");
+    let shared_rot = pbs.moe_shared_rot_batch.as_ref().expect("moe scratch");
+    let topk_indices = pbs.moe_topk_indices_batch.as_ref().expect("moe scratch");
+    let topk_weights = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
+    let gate_batch = pbs.moe_gate_batch.as_ref().expect("moe scratch");
+    let up_batch = pbs.moe_up_batch.as_ref().expect("moe scratch");
+    let rot_batch = pbs.moe_rot_batch.as_ref().expect("moe scratch");
 
     // ── 1. rmsnorm + FWHT pre-rotate for MQ4 inputs ──
     gpu.fused_rmsnorm_rotate_mq_batched(
-        &pbs.x_batch, ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+        &pbs.x_batch,
+        ffn_norm,
+        &pbs.x_rot_batch,
+        dim,
+        config.norm_eps,
+        n,
     )?;
 
     // ── 2. Router + shared-gate + shared.gate + shared.up (4 batched GEMMs) ──
@@ -3065,26 +4282,46 @@ fn prefill_moe_ffn_body_batched(
     // Launch-count cost is +3 per MoE layer; acceptable for correctness.
     // Follow-up: fix the WMMA qkvza to handle z_m=1 and re-fuse.
     gpu.gemm_hfq4g256(
-        &ffn.router.buf, &pbs.x_rot_batch, router_logits,
-        ffn.router.m, ffn.router.k, n,
+        &ffn.router.buf,
+        &pbs.x_rot_batch,
+        router_logits,
+        ffn.router.m,
+        ffn.router.k,
+        n,
     )?;
     gpu.gemm_hfq4g256(
-        &ffn.shared_expert_gate.buf, &pbs.x_rot_batch, shared_scalar,
-        ffn.shared_expert_gate.m, ffn.shared_expert_gate.k, n,
+        &ffn.shared_expert_gate.buf,
+        &pbs.x_rot_batch,
+        shared_scalar,
+        ffn.shared_expert_gate.m,
+        ffn.shared_expert_gate.k,
+        n,
     )?;
     gpu.gemm_hfq4g256(
-        &ffn.shared_expert.gate.buf, &pbs.x_rot_batch, shared_gate,
-        ffn.shared_expert.gate.m, ffn.shared_expert.gate.k, n,
+        &ffn.shared_expert.gate.buf,
+        &pbs.x_rot_batch,
+        shared_gate,
+        ffn.shared_expert.gate.m,
+        ffn.shared_expert.gate.k,
+        n,
     )?;
     gpu.gemm_hfq4g256(
-        &ffn.shared_expert.up.buf, &pbs.x_rot_batch, shared_up,
-        ffn.shared_expert.up.m, ffn.shared_expert.up.k, n,
+        &ffn.shared_expert.up.buf,
+        &pbs.x_rot_batch,
+        shared_up,
+        ffn.shared_expert.up.m,
+        ffn.shared_expert.up.k,
+        n,
     )?;
 
     // ── 3. GPU softmax + top-K + renorm, batched over N tokens ──
     gpu.moe_softmax_topk_renorm_k8_batched(
-        router_logits, topk_indices, topk_weights,
-        n_exp, config.norm_topk_prob, n,
+        router_logits,
+        topk_indices,
+        topk_weights,
+        n_exp,
+        config.norm_topk_prob,
+        n,
     )?;
 
     // ── 4. Shared-expert SwiGLU + FWHT, batched over N tokens ──
@@ -3100,8 +4337,13 @@ fn prefill_moe_ffn_body_batched(
     // internally, and atomicAdd's sigmoid(scalar) × (W_down · rot) into
     // pbs.x_batch[token × dim + row].
     gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
-        &ffn.shared_expert.down.buf, shared_rot, &pbs.x_batch, shared_scalar,
-        ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
+        &ffn.shared_expert.down.buf,
+        shared_rot,
+        &pbs.x_batch,
+        shared_scalar,
+        ffn.shared_expert.down.m,
+        ffn.shared_expert.down.k,
+        n,
     )?;
 
     // ── 6. Routed experts: batched gate_up → SwiGLU+FWHT → down ──
@@ -3113,9 +4355,15 @@ fn prefill_moe_ffn_body_batched(
     let down_k = ffn.experts[0].down.k;
     let gate_up_k = ffn.experts[0].gate_up.k;
     gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-        &ffn.expert_gate_up_ptrs, topk_indices,
-        &pbs.x_rot_batch, gate_batch, up_batch,
-        2 * mi, gate_up_k, k_top, n,
+        &ffn.expert_gate_up_ptrs,
+        topk_indices,
+        &pbs.x_rot_batch,
+        gate_batch,
+        up_batch,
+        2 * mi,
+        gate_up_k,
+        k_top,
+        n,
     )?;
 
     // SwiGLU + FWHT over [N*K_TOP × mi] — batch flatten across tokens and
@@ -3125,9 +4373,15 @@ fn prefill_moe_ffn_body_batched(
     // Down projection with per-(token, expert) scaling and atomic
     // residual-add into pbs.x_batch.
     gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
-        &ffn.expert_down_ptrs, topk_indices, topk_weights,
-        rot_batch, &pbs.x_batch,
-        down_m, down_k, k_top, n,
+        &ffn.expert_down_ptrs,
+        topk_indices,
+        topk_weights,
+        rot_batch,
+        &pbs.x_batch,
+        down_m,
+        down_k,
+        k_top,
+        n,
     )?;
 
     Ok(())
@@ -3174,20 +4428,34 @@ fn forward_prefill_chunk(
     //
     // Other formats fall back to the per-token loop (kept for correctness
     // breadth; the MQ4-quantized hot path doesn't hit them).
-    if matches!(weights.embd_format, EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0) {
+    if matches!(
+        weights.embd_format,
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+    ) {
         if !pre_uploaded {
             let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-            let tokens_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
-            };
+            let tokens_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
             gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
         }
         match weights.embd_format {
             EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+                gpu.embedding_lookup_hfq4g256_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?;
             }
             EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+                gpu.embedding_lookup_q8_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?;
             }
             _ => unreachable!(),
         }
@@ -3195,12 +4463,24 @@ fn forward_prefill_chunk(
         for (i, &tok) in tokens.iter().enumerate() {
             match weights.embd_format {
                 EmbeddingFormat::HFQ4G256 => unreachable!(),
-                EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?,
-                EmbeddingFormat::Q8_0     => gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?,
-                EmbeddingFormat::F32      => gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?,
+                EmbeddingFormat::HFQ4G128 => {
+                    gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::Q8_0 => {
+                    gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::F32 => {
+                    gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
+                }
                 _ => panic!("unsupported embedding format"),
             }
-            gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
+            gpu.hip.memcpy_dtod_at(
+                &pbs.x_batch.buf,
+                i * dim_row_bytes,
+                &s.x.buf,
+                0,
+                dim_row_bytes,
+            )?;
         }
     }
 
@@ -3225,9 +4505,8 @@ fn forward_prefill_chunk(
     // used by `linearize_tree` to build the attn_bias mask.
     if !pre_uploaded {
         let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
-        let positions_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
-        };
+        let positions_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
         gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
     }
 
@@ -3237,23 +4516,30 @@ fn forward_prefill_chunk(
     // differ by dtype and we branch on that at each layer) and (b) a Q8_0
     // or givens KV cache. If the check fails, FA layers fall back to
     // per-token gather/scatter via run_fa_layer_body.
-    let fa_batched_ok = (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
+    let fa_batched_ok = (kv_cache.quant_q8
+        || kv_cache.quant_asym4
+        || kv_cache.quant_asym4_tqv2
+        || kv_cache.quant_asym4_tqv4
+        || kv_cache.quant_asym3
+        || kv_cache.quant_asym2)
         && weights.layers.iter().all(|lw| match lw {
-            LayerWeights::FullAttn(l) =>
-                is_batchable_la(l.wq.gpu_dtype) &&
-                is_batchable_la(l.wk.gpu_dtype) &&
-                is_batchable_la(l.wv.gpu_dtype) &&
-                is_batchable_la(l.wo.gpu_dtype) &&
-                is_batchable_la(l.w_gate.gpu_dtype) &&
-                is_batchable_la(l.w_up.gpu_dtype) &&
-                is_batchable_la(l.w_down.gpu_dtype),
+            LayerWeights::FullAttn(l) => {
+                is_batchable_la(l.wq.gpu_dtype)
+                    && is_batchable_la(l.wk.gpu_dtype)
+                    && is_batchable_la(l.wv.gpu_dtype)
+                    && is_batchable_la(l.wo.gpu_dtype)
+                    && is_batchable_la(l.w_gate.gpu_dtype)
+                    && is_batchable_la(l.w_up.gpu_dtype)
+                    && is_batchable_la(l.w_down.gpu_dtype)
+            }
             // MoE variant: attention weights must be MQ4-class (FFN is
             // checked separately by moe_ffn_all_mq4 in the eligibility gate).
-            LayerWeights::FullAttnMoe(l) =>
-                is_batchable_la(l.wq.gpu_dtype) &&
-                is_batchable_la(l.wk.gpu_dtype) &&
-                is_batchable_la(l.wv.gpu_dtype) &&
-                is_batchable_la(l.wo.gpu_dtype),
+            LayerWeights::FullAttnMoe(l) => {
+                is_batchable_la(l.wq.gpu_dtype)
+                    && is_batchable_la(l.wk.gpu_dtype)
+                    && is_batchable_la(l.wv.gpu_dtype)
+                    && is_batchable_la(l.wo.gpu_dtype)
+            }
             _ => true, // LA layers don't gate this check
         });
     // Under hipGraph capture, scalar kernargs get BAKED into the kernarg blob
@@ -3294,39 +4580,71 @@ fn forward_prefill_chunk(
                 // so the subsequent GEMM can read it the same way.
                 if is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        dim,
+                        config.norm_eps,
+                        n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch,
-                        n, dim, config.norm_eps,
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        n,
+                        dim,
+                        config.norm_eps,
                     )?;
                 }
 
                 // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
                 if is_6bit {
                     gpu.gemm_qkvza_hfq6g256(
-                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
-                        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
-                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
-                        layer.wqkv.k, n,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
+                        layer.wqkv.k,
+                        n,
                     )?;
                 } else {
                     gpu.gemm_qkvza_hfq4g256(
-                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
-                        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
-                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
-                        layer.wqkv.k, n,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
+                        layer.wqkv.k,
+                        n,
                     )?;
                 }
 
                 // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
                 gpu.fused_sigmoid_alpha_gate_f32_batched(
-                    &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
-                    &layer.dt_bias, &layer.a_log,
-                    n_v_heads, n,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    n_v_heads,
+                    n,
                 )?;
 
                 // DFlash tape capture: snap pre-conv1d qkv + post-sigmoid α/β
@@ -3342,16 +4660,25 @@ fn forward_prefill_chunk(
                     let copy_qkv = n * qkv_row_bytes;
                     let copy_a = n * alpha_row_bytes;
                     gpu.memcpy_dtod_at_auto(
-                        &tape.qkv_bufs[delta_layer_idx].buf, off_qkv,
-                        &pbs.dn_qkv_batch.buf, 0, copy_qkv,
+                        &tape.qkv_bufs[delta_layer_idx].buf,
+                        off_qkv,
+                        &pbs.dn_qkv_batch.buf,
+                        0,
+                        copy_qkv,
                     )?;
                     gpu.memcpy_dtod_at_auto(
-                        &tape.alpha_bufs[delta_layer_idx].buf, off_a,
-                        &pbs.dn_alpha_batch.buf, 0, copy_a,
+                        &tape.alpha_bufs[delta_layer_idx].buf,
+                        off_a,
+                        &pbs.dn_alpha_batch.buf,
+                        0,
+                        copy_a,
                     )?;
                     gpu.memcpy_dtod_at_auto(
-                        &tape.beta_bufs[delta_layer_idx].buf, off_a,
-                        &pbs.dn_beta_batch.buf, 0, copy_a,
+                        &tape.beta_bufs[delta_layer_idx].buf,
+                        off_a,
+                        &pbs.dn_beta_batch.buf,
+                        0,
+                        copy_a,
                     )?;
                 }
 
@@ -3365,26 +4692,40 @@ fn forward_prefill_chunk(
                 let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
                 if let Some(parents) = tree_parents {
                     gpu.conv1d_silu_split_tree_f32_n(
-                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
-                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
                         &dn_state.conv_states[delta_layer_idx],
                         parents,
-                        k_dim, v_dim, n,
+                        k_dim,
+                        v_dim,
+                        n,
                     )?;
                 } else {
                     gpu.conv1d_silu_split_f32_n(
-                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
-                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
                         &dn_state.conv_states[delta_layer_idx],
-                        k_dim, v_dim, n,
+                        k_dim,
+                        v_dim,
+                        n,
                     )?;
                 }
 
                 // Batched L2-norm(Q) + L2-norm(K) + scale(Q).
                 gpu.fused_qk_l2_norm_scale_f32_batched(
-                    &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
-                    config.linear_num_key_heads, hd,
-                    1.0 / (hd as f32).sqrt(), config.norm_eps, n,
+                    &pbs.dn_q_raw_batch,
+                    &pbs.dn_k_raw_batch,
+                    config.linear_num_key_heads,
+                    hd,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                    n,
                 )?;
 
                 // Repeat-interleave Q/K if n_key_heads < n_v_heads.
@@ -3393,14 +4734,27 @@ fn forward_prefill_chunk(
                     let ratio = n_v_heads / config.linear_num_key_heads;
                     // Batched repeat-interleave: one kernel launch for all N tokens.
                     gpu.repeat_interleave_qk_f32_batched(
-                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
-                        &pbs.dn_q_batch, &pbs.dn_k_batch,
-                        config.linear_num_key_heads, ratio, hd, n,
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        config.linear_num_key_heads,
+                        ratio,
+                        hd,
+                        n,
                     )?;
                 } else {
                     // n_key_heads == n_v_heads → k_dim == v_dim, memcpy the whole block.
-                    gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
-                    gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(
+                        &pbs.dn_q_batch.buf,
+                        &pbs.dn_q_raw_batch.buf,
+                        n * k_dim * 4,
+                    )?;
+                    gpu.memcpy_dtod_auto(
+                        &pbs.dn_k_batch.buf,
+                        &pbs.dn_k_raw_batch.buf,
+                        n * k_dim * 4,
+                    )?;
                 }
 
                 // Gated Delta Net — tree variant reads per-token S from
@@ -3412,30 +4766,47 @@ fn forward_prefill_chunk(
                     let tape_sc = pbs.dn_s_tape_scales.as_ref()
                         .expect("tree-aware LA requires dn_s_tape_scales scratch (check PrefillBatchScratch::new)");
                     gpu.gated_delta_net_q8_tree_batch_seq(
-                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
                         &dn_state.s_scales[delta_layer_idx],
-                        tape_q8, tape_sc, parents,
+                        tape_q8,
+                        tape_sc,
+                        parents,
                         &pbs.dn_attn_out_batch,
-                        n, n_v_heads, config.linear_value_head_dim,
+                        n,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?;
                 } else {
                     gpu.gated_delta_net_q8_batch_seq(
-                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
                         &dn_state.s_scales[delta_layer_idx],
                         &pbs.dn_attn_out_batch,
-                        n, n_v_heads, config.linear_value_head_dim,
+                        n,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?;
                 }
 
                 // Batched gated output norm.
                 gpu.gated_norm_f32_batched(
-                    &pbs.dn_attn_out_batch, &pbs.dn_z_batch, &layer.norm_weight,
+                    &pbs.dn_attn_out_batch,
+                    &pbs.dn_z_batch,
+                    &layer.norm_weight,
                     &pbs.dn_normed_batch,
-                    n_v_heads, config.linear_value_head_dim, config.norm_eps, n,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                    n,
                 )?;
 
                 // Batched wo + residual.
@@ -3450,7 +4821,10 @@ fn forward_prefill_chunk(
                 let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let wo_input = if wo_is_mq {
                     gpu.rotate_x_mq_batched(
-                        &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
+                        &pbs.dn_normed_batch,
+                        &pbs.dn_normed_rot_batch,
+                        layer.wo.k,
+                        n,
                     )?;
                     &pbs.dn_normed_rot_batch
                 } else {
@@ -3458,46 +4832,72 @@ fn forward_prefill_chunk(
                 };
                 if wo_is_6bit {
                     gpu.gemm_hfq6g256_residual(
-                        &layer.wo.buf, wo_input, &pbs.x_batch,
-                        layer.wo.m, layer.wo.k, n,
+                        &layer.wo.buf,
+                        wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
                     )?;
                 } else {
                     gpu.gemm_hfq4g256_residual(
-                        &layer.wo.buf, wo_input, &pbs.x_batch,
-                        layer.wo.m, layer.wo.k, n,
+                        &layer.wo.buf,
+                        wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
                     )?;
                 }
 
                 // FFN: rmsnorm (+ rotate for MQ).
                 let ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
-                let ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let ffn_is_6bit =
+                    matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 if ffn_is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                        &pbs.x_batch,
+                        &layer.ffn_norm,
+                        &pbs.x_rot_batch,
+                        dim,
+                        config.norm_eps,
+                        n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
-                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch,
-                        n, dim, config.norm_eps,
+                        &pbs.x_batch,
+                        &layer.ffn_norm,
+                        &pbs.x_rot_batch,
+                        n,
+                        dim,
+                        config.norm_eps,
                     )?;
                 }
 
                 // Batched gate+up projection.
                 if ffn_is_6bit {
                     gpu.gemm_gate_up_hfq6g256(
-                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
                         &pbs.x_rot_batch,
-                        &pbs.gate_ffn_batch, &pbs.up_batch,
-                        layer.w_gate.m, layer.w_up.m,
-                        layer.w_gate.k, n,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        layer.w_gate.m,
+                        layer.w_up.m,
+                        layer.w_gate.k,
+                        n,
                     )?;
                 } else {
                     gpu.gemm_gate_up_hfq4g256(
-                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
                         &pbs.x_rot_batch,
-                        &pbs.gate_ffn_batch, &pbs.up_batch,
-                        layer.w_gate.m, layer.w_up.m,
-                        layer.w_gate.k, n,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        layer.w_gate.m,
+                        layer.w_up.m,
+                        layer.w_gate.k,
+                        n,
                     )?;
                 }
 
@@ -3507,29 +4907,40 @@ fn forward_prefill_chunk(
                 // is purely element-wise and uses numel() as its length,
                 // so a [N × hidden_dim] tensor processes all rows in one
                 // launch with no batch offset needed.
-                let w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
-                let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let w_down_is_mq =
+                    matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let w_down_is_6bit =
+                    matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 if w_down_is_mq {
                     gpu.fused_silu_mul_rotate_mq_batched(
-                        &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
-                        hidden_dim, n,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        &pbs.ffn_hidden_batch,
+                        hidden_dim,
+                        n,
                     )?;
                 } else {
-                    gpu.silu_mul_f32(
-                        &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
-                    )?;
+                    gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
                 }
 
                 // Batched w_down + residual.
                 if w_down_is_6bit {
                     gpu.gemm_hfq6g256_residual(
-                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
-                        layer.w_down.m, layer.w_down.k, n,
+                        &layer.w_down.buf,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
                     )?;
                 } else {
                     gpu.gemm_hfq4g256_residual(
-                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
-                        layer.w_down.m, layer.w_down.k, n,
+                        &layer.w_down.buf,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
                     )?;
                 }
 
@@ -3556,50 +4967,85 @@ fn forward_prefill_chunk(
                 // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
                 if qkv_is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        dim,
+                        config.norm_eps,
+                        n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch,
-                        n, dim, config.norm_eps,
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        n,
+                        dim,
+                        config.norm_eps,
                     )?;
                 }
 
                 // 2. Batched 3-way QKV projection (wq+wk+wv).
                 if qkv_is_6bit {
                     gpu.gemm_qkv_hfq6g256(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &layer.wq.buf,
+                        &layer.wk.buf,
+                        &layer.wv.buf,
                         &pbs.x_rot_batch,
-                        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
-                        layer.wq.m, layer.wk.m, layer.wv.m,
-                        layer.wq.k, n,
+                        &pbs.fa_q_full_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        layer.wq.m,
+                        layer.wk.m,
+                        layer.wv.m,
+                        layer.wq.k,
+                        n,
                     )?;
                 } else {
                     gpu.gemm_qkv_hfq4g256(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &layer.wq.buf,
+                        &layer.wk.buf,
+                        &layer.wv.buf,
                         &pbs.x_rot_batch,
-                        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
-                        layer.wq.m, layer.wk.m, layer.wv.m,
-                        layer.wq.k, n,
+                        &pbs.fa_q_full_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        layer.wq.m,
+                        layer.wk.m,
+                        layer.wv.m,
+                        layer.wq.k,
+                        n,
                     )?;
                 }
 
                 // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
                 gpu.deinterleave_f32_batched(
-                    &pbs.fa_q_full_batch, &pbs.fa_q_batch, &pbs.fa_gate_batch,
-                    config.n_heads, config.head_dim, n,
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_gate_batch,
+                    config.n_heads,
+                    config.head_dim,
+                    n,
                 )?;
 
                 // 4. Per-head Q/K rmsnorm. rmsnorm_batched uses batch =
                 // number of "rows" of head_dim. For [N × n_heads × head_dim]
                 // that's batch = N * n_heads.
                 gpu.rmsnorm_batched(
-                    &pbs.fa_q_batch, &layer.q_norm, &pbs.fa_q_batch,
-                    n * config.n_heads, config.head_dim, config.norm_eps,
+                    &pbs.fa_q_batch,
+                    &layer.q_norm,
+                    &pbs.fa_q_batch,
+                    n * config.n_heads,
+                    config.head_dim,
+                    config.norm_eps,
                 )?;
                 gpu.rmsnorm_batched(
-                    &pbs.fa_k_batch, &layer.k_norm, &pbs.fa_k_batch,
-                    n * config.n_kv_heads, config.head_dim, config.norm_eps,
+                    &pbs.fa_k_batch,
+                    &layer.k_norm,
+                    &pbs.fa_k_batch,
+                    n * config.n_kv_heads,
+                    config.head_dim,
+                    config.norm_eps,
                 )?;
 
                 if crate::triattn::tap_enabled() {
@@ -3608,8 +5054,12 @@ fn forward_prefill_chunk(
                     // succeeds when install_tap_gpu() was used. Falls through
                     // to CPU path otherwise.
                     let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
-                        gpu, layer_idx, &pbs.fa_q_batch.buf,
-                        n, config.n_heads, config.head_dim,
+                        gpu,
+                        layer_idx,
+                        &pbs.fa_q_batch.buf,
+                        n,
+                        config.n_heads,
+                        config.head_dim,
                     )?;
                     if !gpu_handled {
                         let n_q = config.n_heads * config.head_dim;
@@ -3655,55 +5105,107 @@ fn forward_prefill_chunk(
                         // perturb DDTree's ksplit-atomic nondeterminism
                         // — output diverges even though no data is
                         // actually changed.
-                        gpu.memcpy_dtod_at_auto(
-                            &slot.buf, 0,
-                            &pbs.fa_k_batch.buf, 0,
-                            n_bytes,
-                        )?;
+                        gpu.memcpy_dtod_at_auto(&slot.buf, 0, &pbs.fa_k_batch.buf, 0, n_bytes)?;
                     }
                 }
 
                 // 5. Batched partial-interleaved RoPE (per-row positions).
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32_batched(
-                    &pbs.fa_q_batch, &pbs.fa_k_batch, &pbs.positions,
-                    config.n_heads, config.n_kv_heads, config.head_dim, n_rot,
-                    config.rope_theta, n,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.positions,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                    n,
                 )?;
 
                 // 6. Batched KV cache writes (per-row positions).
-                if kv_cache.quant_asym4 {
+                if kv_cache.quant_asym4_tqv2 || kv_cache.quant_asym4_tqv4 {
+                    let ct = kv_cache.givens_cos.as_ref().unwrap();
+                    let st = kv_cache.givens_sin.as_ref().unwrap();
+                    let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
+                    let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
+                    let value_bits = if kv_cache.quant_asym4_tqv2 { 2 } else { 4 };
+                    gpu.kv_cache_write_asym4_tqv4_batched(
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        s1,
+                        s2,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        value_bits,
+                        n,
+                    )?;
+                } else if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym4_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym3_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
                     )?;
                 } else if kv_cache.quant_asym2 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym2_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
                     )?;
                 } else {
                     gpu.kv_cache_write_q8_0_batched(
-                        &kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions,
-                        config.n_kv_heads, config.head_dim, n,
+                        &kv_cache.k_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.positions,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
                     )?;
                     gpu.kv_cache_write_q8_0_batched(
-                        &kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions,
-                        config.n_kv_heads, config.head_dim, n,
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
                     )?;
                 }
 
@@ -3722,25 +5224,77 @@ fn forward_prefill_chunk(
                     Some(_) => (start_pos, n),
                     None => (0, 0),
                 };
-                if kv_cache.quant_asym4 {
+                if kv_cache.quant_asym4_tqv2 || kv_cache.quant_asym4_tqv4 {
+                    let ct = kv_cache.givens_cos.as_ref().unwrap();
+                    let st = kv_cache.givens_sin.as_ref().unwrap();
+                    let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
+                    let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
+                    let value_bits = if kv_cache.quant_asym4_tqv2 { 2 } else { 4 };
+                    gpu.attention_flash_asym4_tqv4_batched_masked(
+                        &pbs.fa_q_batch,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        s1,
+                        s2,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        value_bits,
+                        kv_cache.physical_cap,
+                        max_ctx_len,
+                        n,
+                        &s.flash_partials,
+                        tree_bias,
+                        block_start,
+                        block_cols,
+                    )?;
+                } else if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.attention_flash_asym4_batched_masked(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                        tree_bias, block_start, block_cols,
+                        &pbs.fa_q_batch,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
+                        max_ctx_len,
+                        n,
+                        &s.flash_partials,
+                        tree_bias,
+                        block_start,
+                        block_cols,
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.attention_flash_asym3_batched_masked(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                        tree_bias, block_start, block_cols,
+                        &pbs.fa_q_batch,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
+                        max_ctx_len,
+                        n,
+                        &s.flash_partials,
+                        tree_bias,
+                        block_start,
+                        block_cols,
                     )?;
                 } else if kv_cache.quant_asym2 {
                     assert!(
@@ -3750,17 +5304,28 @@ fn forward_prefill_chunk(
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.attention_flash_asym2_batched(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                        &pbs.fa_q_batch,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
+                        max_ctx_len,
+                        n,
+                        &s.flash_partials,
                     )?;
                 } else if max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
                         tree_verify.is_none(),
                         "tree-verify mode hits the long-context Q8 fallback \
                          at max_ctx_len={} > {}; tree blocks should stay small",
-                        max_ctx_len, LDS_CTX_LIMIT,
+                        max_ctx_len,
+                        LDS_CTX_LIMIT,
                     );
                     // Per-position flash Q8 attention for long-context prefill.
                     let q_dim = config.n_heads * config.head_dim;
@@ -3773,21 +5338,36 @@ fn forward_prefill_chunk(
                         let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
                         let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
                         gpu.attention_flash_q8_0(
-                            &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &out_b, &pos_buf_tmp, seq_len_b,
-                            config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.physical_cap, &s.flash_partials,
+                            &q_b,
+                            &kv_cache.k_gpu[layer_idx],
+                            &kv_cache.v_gpu[layer_idx],
+                            &out_b,
+                            &pos_buf_tmp,
+                            seq_len_b,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            kv_cache.physical_cap,
+                            &s.flash_partials,
                         )?;
                     }
                     let _ = gpu.hip.free(pos_buf_tmp);
                 } else {
                     gpu.attention_q8_0_kv_batched_masked(
                         &pbs.fa_q_batch,
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n,
-                        tree_bias, block_start, block_cols,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch,
+                        &pbs.positions,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
+                        max_ctx_len,
+                        n,
+                        tree_bias,
+                        block_start,
+                        block_cols,
                     )?;
                 }
 
@@ -3801,7 +5381,10 @@ fn forward_prefill_chunk(
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let fa_wo_input = if fa_wo_is_mq {
                     gpu.rotate_x_mq_batched(
-                        &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
+                        &pbs.fa_attn_out_batch,
+                        &pbs.fa_attn_out_rot_batch,
+                        layer.wo.k,
+                        n,
                     )?;
                     &pbs.fa_attn_out_rot_batch
                 } else {
@@ -3809,68 +5392,106 @@ fn forward_prefill_chunk(
                 };
                 if fa_wo_is_6bit {
                     gpu.gemm_hfq6g256_residual(
-                        &layer.wo.buf, fa_wo_input, &pbs.x_batch,
-                        layer.wo.m, layer.wo.k, n,
+                        &layer.wo.buf,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
                     )?;
                 } else {
                     gpu.gemm_hfq4g256_residual(
-                        &layer.wo.buf, fa_wo_input, &pbs.x_batch,
-                        layer.wo.m, layer.wo.k, n,
+                        &layer.wo.buf,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
                     )?;
                 }
 
                 // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
                 // (+ rotate for MQ), w_down residual.
-                let fa_ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
-                let fa_ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let fa_ffn_is_mq =
+                    matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let fa_ffn_is_6bit =
+                    matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 if fa_ffn_is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                        &pbs.x_batch,
+                        &layer.ffn_norm,
+                        &pbs.x_rot_batch,
+                        dim,
+                        config.norm_eps,
+                        n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
-                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch,
-                        n, dim, config.norm_eps,
+                        &pbs.x_batch,
+                        &layer.ffn_norm,
+                        &pbs.x_rot_batch,
+                        n,
+                        dim,
+                        config.norm_eps,
                     )?;
                 }
                 if fa_ffn_is_6bit {
                     gpu.gemm_gate_up_hfq6g256(
-                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
                         &pbs.x_rot_batch,
-                        &pbs.gate_ffn_batch, &pbs.up_batch,
-                        layer.w_gate.m, layer.w_up.m,
-                        layer.w_gate.k, n,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        layer.w_gate.m,
+                        layer.w_up.m,
+                        layer.w_gate.k,
+                        n,
                     )?;
                 } else {
                     gpu.gemm_gate_up_hfq4g256(
-                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
                         &pbs.x_rot_batch,
-                        &pbs.gate_ffn_batch, &pbs.up_batch,
-                        layer.w_gate.m, layer.w_up.m,
-                        layer.w_gate.k, n,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        layer.w_gate.m,
+                        layer.w_up.m,
+                        layer.w_gate.k,
+                        n,
                     )?;
                 }
-                let fa_w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
-                let fa_w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let fa_w_down_is_mq =
+                    matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let fa_w_down_is_6bit =
+                    matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 if fa_w_down_is_mq {
                     gpu.fused_silu_mul_rotate_mq_batched(
-                        &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
-                        hidden_dim, n,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        &pbs.ffn_hidden_batch,
+                        hidden_dim,
+                        n,
                     )?;
                 } else {
-                    gpu.silu_mul_f32(
-                        &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
-                    )?;
+                    gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
                 }
                 if fa_w_down_is_6bit {
                     gpu.gemm_hfq6g256_residual(
-                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
-                        layer.w_down.m, layer.w_down.k, n,
+                        &layer.w_down.buf,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
                     )?;
                 } else {
                     gpu.gemm_hfq4g256_residual(
-                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
-                        layer.w_down.m, layer.w_down.k, n,
+                        &layer.w_down.buf,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
                     )?;
                 }
 
@@ -3892,11 +5513,32 @@ fn forward_prefill_chunk(
                 // qualify for batched FA (non-MQ4 weights, non-Q8_0 KV, etc).
                 for i in 0..n {
                     let pos = start_pos + i;
-                    gpu.hip.memcpy_dtod_at(&s.x.buf, 0, &pbs.x_batch.buf, i * dim_row_bytes, dim_row_bytes)?;
+                    gpu.hip.memcpy_dtod_at(
+                        &s.x.buf,
+                        0,
+                        &pbs.x_batch.buf,
+                        i * dim_row_bytes,
+                        dim_row_bytes,
+                    )?;
                     let pos_i32 = pos as i32;
                     gpu.hip.memcpy_htod(&s.pos_buf, &pos_i32.to_ne_bytes())?;
-                    run_fa_layer_body(gpu, weights, config, layer_idx, kv_layer_idx, pos, kv_cache, s)?;
-                    gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
+                    run_fa_layer_body(
+                        gpu,
+                        weights,
+                        config,
+                        layer_idx,
+                        kv_layer_idx,
+                        pos,
+                        kv_cache,
+                        s,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &pbs.x_batch.buf,
+                        i * dim_row_bytes,
+                        &s.x.buf,
+                        0,
+                        dim_row_bytes,
+                    )?;
                 }
 
                 // Post-layer hidden extract for the DFlash draft path. After
@@ -3924,35 +5566,67 @@ fn forward_prefill_chunk(
 
                 if is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        dim,
+                        config.norm_eps,
+                        n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch,
-                        n, dim, config.norm_eps,
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        n,
+                        dim,
+                        config.norm_eps,
                     )?;
                 }
                 if is_6bit {
                     gpu.gemm_qkvza_hfq6g256(
-                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
-                        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
-                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
-                        layer.wqkv.k, n,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
+                        layer.wqkv.k,
+                        n,
                     )?;
                 } else {
                     gpu.gemm_qkvza_hfq4g256(
-                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
-                        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
-                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
-                        layer.wqkv.k, n,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
+                        layer.wqkv.k,
+                        n,
                     )?;
                 }
                 gpu.fused_sigmoid_alpha_gate_f32_batched(
-                    &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
-                    &layer.dt_bias, &layer.a_log,
-                    n_v_heads, n,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    n_v_heads,
+                    n,
                 )?;
                 if let Some(tape) = gdn_tape.as_ref() {
                     let qkv_row_bytes = tape.qkv_dim * 4;
@@ -3962,88 +5636,152 @@ fn forward_prefill_chunk(
                     let copy_qkv = n * qkv_row_bytes;
                     let copy_a = n * alpha_row_bytes;
                     gpu.memcpy_dtod_at_auto(
-                        &tape.qkv_bufs[delta_layer_idx].buf, off_qkv,
-                        &pbs.dn_qkv_batch.buf, 0, copy_qkv,
+                        &tape.qkv_bufs[delta_layer_idx].buf,
+                        off_qkv,
+                        &pbs.dn_qkv_batch.buf,
+                        0,
+                        copy_qkv,
                     )?;
                     gpu.memcpy_dtod_at_auto(
-                        &tape.alpha_bufs[delta_layer_idx].buf, off_a,
-                        &pbs.dn_alpha_batch.buf, 0, copy_a,
+                        &tape.alpha_bufs[delta_layer_idx].buf,
+                        off_a,
+                        &pbs.dn_alpha_batch.buf,
+                        0,
+                        copy_a,
                     )?;
                     gpu.memcpy_dtod_at_auto(
-                        &tape.beta_bufs[delta_layer_idx].buf, off_a,
-                        &pbs.dn_beta_batch.buf, 0, copy_a,
+                        &tape.beta_bufs[delta_layer_idx].buf,
+                        off_a,
+                        &pbs.dn_beta_batch.buf,
+                        0,
+                        copy_a,
                     )?;
                 }
                 // Same tree-aware dispatch gate as dense LA branch above.
                 let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
                 if let Some(parents) = tree_parents {
                     gpu.conv1d_silu_split_tree_f32_n(
-                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
-                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
                         &dn_state.conv_states[delta_layer_idx],
                         parents,
-                        k_dim, v_dim, n,
+                        k_dim,
+                        v_dim,
+                        n,
                     )?;
                 } else {
                     gpu.conv1d_silu_split_f32_n(
-                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
-                        &pbs.dn_qkv_batch, &layer.conv_weight,
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
                         &dn_state.conv_states[delta_layer_idx],
-                        k_dim, v_dim, n,
+                        k_dim,
+                        v_dim,
+                        n,
                     )?;
                 }
                 gpu.fused_qk_l2_norm_scale_f32_batched(
-                    &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
-                    config.linear_num_key_heads, hd,
-                    1.0 / (hd as f32).sqrt(), config.norm_eps, n,
+                    &pbs.dn_q_raw_batch,
+                    &pbs.dn_k_raw_batch,
+                    config.linear_num_key_heads,
+                    hd,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                    n,
                 )?;
                 if config.linear_num_key_heads < n_v_heads {
                     let ratio = n_v_heads / config.linear_num_key_heads;
                     gpu.repeat_interleave_qk_f32_batched(
-                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
-                        &pbs.dn_q_batch, &pbs.dn_k_batch,
-                        config.linear_num_key_heads, ratio, hd, n,
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        config.linear_num_key_heads,
+                        ratio,
+                        hd,
+                        n,
                     )?;
                 } else {
-                    gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
-                    gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(
+                        &pbs.dn_q_batch.buf,
+                        &pbs.dn_q_raw_batch.buf,
+                        n * k_dim * 4,
+                    )?;
+                    gpu.memcpy_dtod_auto(
+                        &pbs.dn_k_batch.buf,
+                        &pbs.dn_k_raw_batch.buf,
+                        n * k_dim * 4,
+                    )?;
                 }
                 if let Some(parents) = tree_parents {
-                    let tape_q8 = pbs.dn_s_tape_q8.as_ref()
+                    let tape_q8 = pbs
+                        .dn_s_tape_q8
+                        .as_ref()
                         .expect("tree-aware LA requires dn_s_tape_q8 scratch");
-                    let tape_sc = pbs.dn_s_tape_scales.as_ref()
+                    let tape_sc = pbs
+                        .dn_s_tape_scales
+                        .as_ref()
                         .expect("tree-aware LA requires dn_s_tape_scales scratch");
                     gpu.gated_delta_net_q8_tree_batch_seq(
-                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
                         &dn_state.s_scales[delta_layer_idx],
-                        tape_q8, tape_sc, parents,
+                        tape_q8,
+                        tape_sc,
+                        parents,
                         &pbs.dn_attn_out_batch,
-                        n, n_v_heads, config.linear_value_head_dim,
+                        n,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?;
                 } else {
                     gpu.gated_delta_net_q8_batch_seq(
-                        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
                         &dn_state.s_matrices[delta_layer_idx],
                         &dn_state.s_scales[delta_layer_idx],
                         &pbs.dn_attn_out_batch,
-                        n, n_v_heads, config.linear_value_head_dim,
+                        n,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?;
                 }
                 gpu.gated_norm_f32_batched(
-                    &pbs.dn_attn_out_batch, &pbs.dn_z_batch, &layer.norm_weight,
+                    &pbs.dn_attn_out_batch,
+                    &pbs.dn_z_batch,
+                    &layer.norm_weight,
                     &pbs.dn_normed_batch,
-                    n_v_heads, config.linear_value_head_dim, config.norm_eps, n,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                    n,
                 )?;
                 // wo + residual. Eligibility gate ensured layer.wo is MQ4.
                 gpu.rotate_x_mq_batched(
-                    &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
+                    &pbs.dn_normed_batch,
+                    &pbs.dn_normed_rot_batch,
+                    layer.wo.k,
+                    n,
                 )?;
                 gpu.gemm_hfq4g256_residual(
-                    &layer.wo.buf, &pbs.dn_normed_rot_batch, &pbs.x_batch,
-                    layer.wo.m, layer.wo.k, n,
+                    &layer.wo.buf,
+                    &pbs.dn_normed_rot_batch,
+                    &pbs.x_batch,
+                    layer.wo.m,
+                    layer.wo.k,
+                    n,
                 )?;
 
                 // Batched MoE FFN replaces the dense (rmsnorm + gate+up +
@@ -4075,47 +5813,86 @@ fn forward_prefill_chunk(
 
                 if qkv_is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        dim,
+                        config.norm_eps,
+                        n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch,
-                        n, dim, config.norm_eps,
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        n,
+                        dim,
+                        config.norm_eps,
                     )?;
                 }
                 if qkv_is_6bit {
                     gpu.gemm_qkv_hfq6g256(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &layer.wq.buf,
+                        &layer.wk.buf,
+                        &layer.wv.buf,
                         &pbs.x_rot_batch,
-                        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
-                        layer.wq.m, layer.wk.m, layer.wv.m,
-                        layer.wq.k, n,
+                        &pbs.fa_q_full_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        layer.wq.m,
+                        layer.wk.m,
+                        layer.wv.m,
+                        layer.wq.k,
+                        n,
                     )?;
                 } else {
                     gpu.gemm_qkv_hfq4g256(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &layer.wq.buf,
+                        &layer.wk.buf,
+                        &layer.wv.buf,
                         &pbs.x_rot_batch,
-                        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
-                        layer.wq.m, layer.wk.m, layer.wv.m,
-                        layer.wq.k, n,
+                        &pbs.fa_q_full_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        layer.wq.m,
+                        layer.wk.m,
+                        layer.wv.m,
+                        layer.wq.k,
+                        n,
                     )?;
                 }
                 gpu.deinterleave_f32_batched(
-                    &pbs.fa_q_full_batch, &pbs.fa_q_batch, &pbs.fa_gate_batch,
-                    config.n_heads, config.head_dim, n,
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_gate_batch,
+                    config.n_heads,
+                    config.head_dim,
+                    n,
                 )?;
                 gpu.rmsnorm_batched(
-                    &pbs.fa_q_batch, &layer.q_norm, &pbs.fa_q_batch,
-                    n * config.n_heads, config.head_dim, config.norm_eps,
+                    &pbs.fa_q_batch,
+                    &layer.q_norm,
+                    &pbs.fa_q_batch,
+                    n * config.n_heads,
+                    config.head_dim,
+                    config.norm_eps,
                 )?;
                 gpu.rmsnorm_batched(
-                    &pbs.fa_k_batch, &layer.k_norm, &pbs.fa_k_batch,
-                    n * config.n_kv_heads, config.head_dim, config.norm_eps,
+                    &pbs.fa_k_batch,
+                    &layer.k_norm,
+                    &pbs.fa_k_batch,
+                    n * config.n_kv_heads,
+                    config.head_dim,
+                    config.norm_eps,
                 )?;
                 if crate::triattn::tap_enabled() {
                     let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
-                        gpu, layer_idx, &pbs.fa_q_batch.buf,
-                        n, config.n_heads, config.head_dim,
+                        gpu,
+                        layer_idx,
+                        &pbs.fa_q_batch.buf,
+                        n,
+                        config.n_heads,
+                        config.head_dim,
                     )?;
                     if !gpu_handled {
                         let n_q = config.n_heads * config.head_dim;
@@ -4146,51 +5923,103 @@ fn forward_prefill_chunk(
                     if let Some(slot) = slots.get(fa_layer_idx) {
                         let kv_dim = config.n_kv_heads * config.head_dim;
                         let n_bytes = n * kv_dim * 4;
-                        gpu.memcpy_dtod_at_auto(
-                            &slot.buf, 0,
-                            &pbs.fa_k_batch.buf, 0,
-                            n_bytes,
-                        )?;
+                        gpu.memcpy_dtod_at_auto(&slot.buf, 0, &pbs.fa_k_batch.buf, 0, n_bytes)?;
                     }
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32_batched(
-                    &pbs.fa_q_batch, &pbs.fa_k_batch, &pbs.positions,
-                    config.n_heads, config.n_kv_heads, config.head_dim, n_rot,
-                    config.rope_theta, n,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.positions,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                    n,
                 )?;
-                if kv_cache.quant_asym4 {
+                if kv_cache.quant_asym4_tqv2 || kv_cache.quant_asym4_tqv4 {
+                    let ct = kv_cache.givens_cos.as_ref().unwrap();
+                    let st = kv_cache.givens_sin.as_ref().unwrap();
+                    let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
+                    let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
+                    let value_bits = if kv_cache.quant_asym4_tqv2 { 2 } else { 4 };
+                    gpu.kv_cache_write_asym4_tqv4_batched(
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        s1,
+                        s2,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        value_bits,
+                        n,
+                    )?;
+                } else if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym4_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym3_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
                     )?;
                 } else if kv_cache.quant_asym2 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym2_batched(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                        ct, st, config.n_kv_heads, config.head_dim, n,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
                     )?;
                 } else {
                     gpu.kv_cache_write_q8_0_batched(
-                        &kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions,
-                        config.n_kv_heads, config.head_dim, n,
+                        &kv_cache.k_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.positions,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
                     )?;
                     gpu.kv_cache_write_q8_0_batched(
-                        &kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions,
-                        config.n_kv_heads, config.head_dim, n,
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
                     )?;
                 }
                 const LDS_CTX_LIMIT: usize = 15000;
@@ -4199,25 +6028,77 @@ fn forward_prefill_chunk(
                     Some(_) => (start_pos, n),
                     None => (0, 0),
                 };
-                if kv_cache.quant_asym4 {
+                if kv_cache.quant_asym4_tqv2 || kv_cache.quant_asym4_tqv4 {
+                    let ct = kv_cache.givens_cos.as_ref().unwrap();
+                    let st = kv_cache.givens_sin.as_ref().unwrap();
+                    let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
+                    let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
+                    let value_bits = if kv_cache.quant_asym4_tqv2 { 2 } else { 4 };
+                    gpu.attention_flash_asym4_tqv4_batched_masked(
+                        &pbs.fa_q_batch,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        s1,
+                        s2,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        value_bits,
+                        kv_cache.physical_cap,
+                        max_ctx_len,
+                        n,
+                        &s.flash_partials,
+                        tree_bias,
+                        block_start,
+                        block_cols,
+                    )?;
+                } else if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.attention_flash_asym4_batched_masked(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                        tree_bias, block_start, block_cols,
+                        &pbs.fa_q_batch,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
+                        max_ctx_len,
+                        n,
+                        &s.flash_partials,
+                        tree_bias,
+                        block_start,
+                        block_cols,
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.attention_flash_asym3_batched_masked(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                        tree_bias, block_start, block_cols,
+                        &pbs.fa_q_batch,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
+                        max_ctx_len,
+                        n,
+                        &s.flash_partials,
+                        tree_bias,
+                        block_start,
+                        block_cols,
                     )?;
                 } else if kv_cache.quant_asym2 {
                     assert!(
@@ -4227,17 +6108,28 @@ fn forward_prefill_chunk(
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.attention_flash_asym2_batched(
-                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                        &pbs.fa_q_batch,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch,
+                        &pbs.positions,
+                        ct,
+                        st,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
+                        max_ctx_len,
+                        n,
+                        &s.flash_partials,
                     )?;
                 } else if max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
                         tree_verify.is_none(),
                         "tree-verify mode hits the long-context Q8 fallback \
                          at max_ctx_len={} > {}; tree blocks should stay small",
-                        max_ctx_len, LDS_CTX_LIMIT,
+                        max_ctx_len,
+                        LDS_CTX_LIMIT,
                     );
                     let q_dim_local = config.n_heads * config.head_dim;
                     let pos_host = gpu.download_f32(&pbs.positions)?;
@@ -4247,33 +6139,57 @@ fn forward_prefill_chunk(
                         let pos_i32 = pos_host[b] as i32;
                         gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
                         let q_b = pbs.fa_q_batch.sub_offset(b * q_dim_local, q_dim_local);
-                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim_local, q_dim_local);
+                        let out_b = pbs
+                            .fa_attn_out_batch
+                            .sub_offset(b * q_dim_local, q_dim_local);
                         gpu.attention_flash_q8_0(
-                            &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &out_b, &pos_buf_tmp, seq_len_b,
-                            config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.physical_cap, &s.flash_partials,
+                            &q_b,
+                            &kv_cache.k_gpu[layer_idx],
+                            &kv_cache.v_gpu[layer_idx],
+                            &out_b,
+                            &pos_buf_tmp,
+                            seq_len_b,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            kv_cache.physical_cap,
+                            &s.flash_partials,
                         )?;
                     }
                     let _ = gpu.hip.free(pos_buf_tmp);
                 } else {
                     gpu.attention_q8_0_kv_batched_masked(
                         &pbs.fa_q_batch,
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch, &pbs.positions,
-                        config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n,
-                        tree_bias, block_start, block_cols,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch,
+                        &pbs.positions,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
+                        max_ctx_len,
+                        n,
+                        tree_bias,
+                        block_start,
+                        block_cols,
                     )?;
                 }
                 gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 // wo + residual. Eligibility gate ensured layer.wo is MQ4.
                 gpu.rotate_x_mq_batched(
-                    &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
+                    &pbs.fa_attn_out_batch,
+                    &pbs.fa_attn_out_rot_batch,
+                    layer.wo.k,
+                    n,
                 )?;
                 gpu.gemm_hfq4g256_residual(
-                    &layer.wo.buf, &pbs.fa_attn_out_rot_batch, &pbs.x_batch,
-                    layer.wo.m, layer.wo.k, n,
+                    &layer.wo.buf,
+                    &pbs.fa_attn_out_rot_batch,
+                    &pbs.x_batch,
+                    layer.wo.m,
+                    layer.wo.k,
+                    n,
                 )?;
 
                 // Batched MoE FFN.
@@ -4303,8 +6219,12 @@ fn forward_prefill_chunk(
     if let Some((dst, offset_rows)) = per_token_hidden_out {
         let dst_view = dst.sub_offset(offset_rows * dim, n * dim);
         gpu.rmsnorm_batched(
-            &pbs.x_batch, &weights.output_norm, &dst_view,
-            n, dim, config.norm_eps,
+            &pbs.x_batch,
+            &weights.output_norm,
+            &dst_view,
+            n,
+            dim,
+            config.norm_eps,
         )?;
         // Still populate s.logits with the last-token logits for callers
         // that rely on it (the legacy prefill path's post-condition).
@@ -4314,7 +6234,13 @@ fn forward_prefill_chunk(
     } else {
         // Legacy path: only last-token logits.
         let last = n - 1;
-        gpu.hip.memcpy_dtod_at(&s.x.buf, 0, &pbs.x_batch.buf, last * dim_row_bytes, dim_row_bytes)?;
+        gpu.hip.memcpy_dtod_at(
+            &s.x.buf,
+            0,
+            &pbs.x_batch.buf,
+            last * dim_row_bytes,
+            dim_row_bytes,
+        )?;
         gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
         weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
     }
@@ -4343,7 +6269,13 @@ fn run_fa_layer_body(
 
     // Fused rmsnorm + FWHT rotation for wq/wk/wv.
     let x_rot = fused_rmsnorm_rotate_for_mq(
-        gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+        gpu,
+        &layer.wq,
+        &s.x,
+        &layer.attn_norm,
+        &s.tmp,
+        &s.x_rot,
+        config.norm_eps,
     )?;
 
     // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
@@ -4352,12 +6284,21 @@ fn run_fa_layer_body(
         && layer.wk.gpu_dtype == dt
         && layer.wv.gpu_dtype == dt;
     if fused_fa3_ok {
-        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+        let eff_x = match x_rot {
+            Some(xr) => xr,
+            None => &s.tmp,
+        };
         gpu.fused_qkv_hfq4g256(
-            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+            &layer.wq.buf,
+            &layer.wk.buf,
+            &layer.wv.buf,
             eff_x,
-            &s.fa_q_full, &s.fa_k, &s.fa_v,
-            layer.wq.m, layer.wk.m, layer.wv.m,
+            &s.fa_q_full,
+            &s.fa_k,
+            &s.fa_v,
+            layer.wq.m,
+            layer.wk.m,
+            layer.wv.m,
             layer.wq.k,
         )?;
     } else {
@@ -4366,10 +6307,30 @@ fn run_fa_layer_body(
         weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
     }
 
-    gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
-    gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
+    gpu.deinterleave_f32(
+        &s.fa_q_full,
+        &s.fa_q,
+        &s.fa_gate,
+        config.n_heads,
+        config.head_dim,
+    )?;
+    gpu.rmsnorm_batched(
+        &s.fa_q,
+        &layer.q_norm,
+        &s.fa_q,
+        config.n_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
     let kv_dim = config.n_kv_heads * config.head_dim;
-    gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+    gpu.rmsnorm_batched(
+        &s.fa_k,
+        &layer.k_norm,
+        &s.fa_k,
+        config.n_kv_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
 
     if crate::triattn::tap_enabled() {
         // Try GPU path first (matches the batched FA tap at line ~3499 in
@@ -4378,8 +6339,12 @@ fn run_fa_layer_body(
         // through to record_prerope_qk would either silently drop the
         // sample (pre-Phase-2) or panic (post-Phase-2).
         let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
-            gpu, layer_idx, &s.fa_q.buf,
-            1, config.n_heads, config.head_dim,
+            gpu,
+            layer_idx,
+            &s.fa_q.buf,
+            1,
+            config.n_heads,
+            config.head_dim,
         )?;
         if !gpu_handled {
             let n_q = config.n_heads * config.head_dim;
@@ -4403,64 +6368,187 @@ fn run_fa_layer_body(
         gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
     }
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
-        config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+    gpu.rope_partial_interleaved_f32(
+        &s.fa_q,
+        &s.fa_k,
+        &s.pos_buf,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        n_rot,
+        config.rope_theta,
+    )?;
     if kv_cache.compact_offset > 0 {
         let phys = pos as i32;
         gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
     }
 
-    if kv_cache.quant_asym4 {
+    if kv_cache.quant_asym4_tqv2 || kv_cache.quant_asym4_tqv4 {
+        let ct = kv_cache.givens_cos.as_ref().unwrap();
+        let st = kv_cache.givens_sin.as_ref().unwrap();
+        let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
+        let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
+        let value_bits = if kv_cache.quant_asym4_tqv2 { 2 } else { 4 };
+        gpu.kv_cache_write_asym4_tqv4_fused(
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_k,
+            &s.fa_v,
+            &s.pos_buf,
+            ct,
+            st,
+            s1,
+            s2,
+            config.n_kv_heads,
+            config.head_dim,
+            value_bits,
+        )?;
+        gpu.attention_flash_asym4_tqv4(
+            &s.fa_q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out,
+            &s.pos_buf,
+            ct,
+            st,
+            s1,
+            s2,
+            pos + 1,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            value_bits,
+            kv_cache.physical_cap,
+            &s.flash_partials,
+        )?;
+    } else if kv_cache.quant_asym4 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
         gpu.kv_cache_write_asym4_fused(
-            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_k,
+            &s.fa_v,
+            &s.pos_buf,
+            ct,
+            st,
+            config.n_kv_heads,
+            config.head_dim,
+        )?;
         gpu.attention_flash_asym4(
-            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+            &s.fa_q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out,
+            &s.pos_buf,
+            ct,
+            st,
+            pos + 1,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_cache.physical_cap,
             &s.flash_partials,
         )?;
     } else if kv_cache.quant_asym3 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
         gpu.kv_cache_write_asym3_fused(
-            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_k,
+            &s.fa_v,
+            &s.pos_buf,
+            ct,
+            st,
+            config.n_kv_heads,
+            config.head_dim,
+        )?;
         gpu.attention_flash_asym3(
-            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+            &s.fa_q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out,
+            &s.pos_buf,
+            ct,
+            st,
+            pos + 1,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_cache.physical_cap,
             &s.flash_partials,
         )?;
     } else if kv_cache.quant_asym2 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
         gpu.kv_cache_write_asym2_fused(
-            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_k,
+            &s.fa_v,
+            &s.pos_buf,
+            ct,
+            st,
+            config.n_kv_heads,
+            config.head_dim,
+        )?;
         gpu.attention_flash_asym2(
-            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+            &s.fa_q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out,
+            &s.pos_buf,
+            ct,
+            st,
+            pos + 1,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_cache.physical_cap,
             &s.flash_partials,
         )?;
     } else if kv_cache.quant_q8 {
-        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        gpu.kv_cache_write_q8_0(
+            &kv_cache.k_gpu[layer_idx],
+            &s.fa_k,
+            &s.pos_buf,
+            config.n_kv_heads,
+            config.head_dim,
+        )?;
+        gpu.kv_cache_write_q8_0(
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_v,
+            &s.pos_buf,
+            config.n_kv_heads,
+            config.head_dim,
+        )?;
         gpu.attention_q8_0_kv(
-            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_attn_out, &s.pos_buf, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+            &s.fa_q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out,
+            &s.pos_buf,
+            pos + 1,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_cache.physical_cap,
         )?;
     } else {
         gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
         gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, kv_dim)?;
         gpu.attention_f32(
-            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &s.fa_attn_out, &s.pos_buf, pos + 1,
-            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+            &s.fa_q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out,
+            &s.pos_buf,
+            pos + 1,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_cache.physical_cap,
         )?;
     }
 
@@ -4469,27 +6557,37 @@ fn run_fa_layer_body(
 
     // FFN: fused rmsnorm + rotate for w_gate/w_up.
     let x_rot = fused_rmsnorm_rotate_for_mq(
-        gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+        gpu,
+        &layer.w_gate,
+        &s.x,
+        &layer.ffn_norm,
+        &s.tmp,
+        &s.x_rot,
+        config.norm_eps,
     )?;
     let dt_g = layer.w_gate.gpu_dtype;
-    let fused_gu_ok = (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256)
-        && layer.w_up.gpu_dtype == dt_g;
+    let fused_gu_ok =
+        (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256) && layer.w_up.gpu_dtype == dt_g;
     if fused_gu_ok {
-        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+        let eff_x = match x_rot {
+            Some(xr) => xr,
+            None => &s.tmp,
+        };
         gpu.fused_gate_up_hfq4g256(
-            &layer.w_gate.buf, &layer.w_up.buf,
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
             eff_x,
-            &s.gate_ffn, &s.up,
-            layer.w_gate.m, layer.w_up.m,
+            &s.gate_ffn,
+            &s.up,
+            layer.w_gate.m,
+            layer.w_up.m,
             layer.w_gate.k,
         )?;
     } else {
         weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
         weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
     }
-    weight_gemv_swiglu_residual(
-        gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
-    )?;
+    weight_gemv_swiglu_residual(gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x)?;
 
     Ok(())
 }
@@ -4511,17 +6609,35 @@ pub fn forward_scratch_with_hidden(
 ) -> HipResult<()> {
     let dim = config.dim;
     let pos_i32 = pos as i32;
-    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    gpu.hip
+        .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
 
     match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?,
-        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?,
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::F32 => {
+            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
+        }
         _ => panic!("unsupported embedding format"),
     }
 
-    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, Some(hidden_rb))?;
+    forward_scratch_layers(
+        gpu,
+        weights,
+        config,
+        pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        Some(hidden_rb),
+    )?;
     hidden_rb.advance_head();
     Ok(())
 }
@@ -4538,10 +6654,14 @@ pub fn forward_scratch_embed(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let pos_i32 = pos as i32;
-    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    gpu.hip
+        .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
     // Upload embedding directly into scratch.x
     let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(embedding_data.as_ptr() as *const u8, embedding_data.len() * 4)
+        std::slice::from_raw_parts(
+            embedding_data.as_ptr() as *const u8,
+            embedding_data.len() * 4,
+        )
     };
     gpu.hip.memcpy_htod(&scratch.x.buf, bytes)?;
     forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
@@ -4580,7 +6700,13 @@ fn forward_scratch_layers(
                 // kernel launch. For non-MQ weights it falls back to plain rmsnorm
                 // into s.tmp. Either way, wqkv/wz/w_beta/w_alpha share this input.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
-                    gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    gpu,
+                    &layer.wqkv,
+                    &s.x,
+                    &layer.attn_norm,
+                    &s.tmp,
+                    &s.x_rot,
+                    config.norm_eps,
                 )?;
                 // Cross-arch fast path: one fused 4-way projection kernel
                 // (wqkv + wz + w_beta + w_alpha) in a single launch. Works
@@ -4604,10 +6730,19 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_qkvza_hfq4g256(
-                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
                         eff_x,
-                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
-                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        &s.dn_qkv,
+                        &s.dn_z,
+                        &s.dn_beta,
+                        &s.dn_alpha,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
                         layer.wqkv.k,
                     )?;
                 } else {
@@ -4620,17 +6755,25 @@ fn forward_scratch_layers(
                 // elementwise scalar transforms on independent buffers of size
                 // n_v_heads — merging into one launch shaves one dispatch per LA.
                 gpu.fused_sigmoid_alpha_gate_f32(
-                    &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
+                    &s.dn_beta,
+                    &s.dn_alpha,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    n_v_heads,
                 )?;
 
                 // Fused conv1d+SiLU+split: writes directly to q_raw/k_raw/v,
                 // eliminating the 3 DtoD copies that used to follow a
                 // contiguous conv1d_silu into dn_conv_out.
                 gpu.conv1d_silu_split_f32(
-                    &s.dn_q_raw, &s.dn_k_raw, &s.dn_v,
-                    &s.dn_qkv, &layer.conv_weight,
+                    &s.dn_q_raw,
+                    &s.dn_k_raw,
+                    &s.dn_v,
+                    &s.dn_qkv,
+                    &layer.conv_weight,
                     &dn_state.conv_states[delta_layer_idx],
-                    k_dim, v_dim,
+                    k_dim,
+                    v_dim,
                 )?;
 
                 // Fused: l2_norm(q_raw) + l2_norm(k_raw) + scale(q_raw).
@@ -4652,8 +6795,13 @@ fn forward_scratch_layers(
                 if config.linear_num_key_heads < n_v_heads {
                     let ratio = n_v_heads / config.linear_num_key_heads;
                     gpu.repeat_interleave_qk_f32(
-                        &s.dn_q_raw, &s.dn_k_raw, &s.dn_q, &s.dn_k,
-                        config.linear_num_key_heads, ratio, hd,
+                        &s.dn_q_raw,
+                        &s.dn_k_raw,
+                        &s.dn_q,
+                        &s.dn_k,
+                        config.linear_num_key_heads,
+                        ratio,
+                        hd,
                     )?;
                 } else {
                     // Use the capture-aware auto helper: routes to async on the
@@ -4666,32 +6814,66 @@ fn forward_scratch_layers(
 
                 match dn_state.quant {
                     StateQuant::FP32 => gpu.gated_delta_net_f32(
-                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
-                        &dn_state.s_matrices[delta_layer_idx], &s.dn_attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                     StateQuant::Q8 => gpu.gated_delta_net_q8(
-                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx], &s.dn_attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &dn_state.s_scales[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
-                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx], &s.dn_attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &dn_state.s_scales[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                 }
 
-                gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
-                    n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+                gpu.gated_norm_f32(
+                    &s.dn_attn_out,
+                    &s.dn_z,
+                    &layer.norm_weight,
+                    &s.dn_normed,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                )?;
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.dn_normed
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
-                    gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    gpu,
+                    &layer.w_gate,
+                    &s.x,
+                    &layer.ffn_norm,
+                    &s.tmp,
+                    &s.x_rot,
+                    config.norm_eps,
                 )?;
                 // Cross-arch fast path: fused gate+up in one launch. Works
                 // for both MQ4 (x_rot Some) and HF4 (x_rot None → s.tmp).
@@ -4704,10 +6886,13 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_gate_up_hfq4g256(
-                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
                         eff_x,
-                        &s.gate_ffn, &s.up,
-                        layer.w_gate.m, layer.w_up.m,
+                        &s.gate_ffn,
+                        &s.up,
+                        layer.w_gate.m,
+                        layer.w_up.m,
                         layer.w_gate.k,
                     )?;
                 } else {
@@ -4718,7 +6903,12 @@ fn forward_scratch_layers(
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
                 weight_gemv_swiglu_residual(
-                    gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
+                    gpu,
+                    &layer.w_down,
+                    &s.gate_ffn,
+                    &s.up,
+                    &s.ffn_hidden,
+                    &s.x,
                 )?;
 
                 if let Some(ref rb) = hidden_rb {
@@ -4733,7 +6923,13 @@ fn forward_scratch_layers(
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
                 // Fused rmsnorm + FWHT rotation for wq/wk/wv (all share input).
                 let x_rot = fused_rmsnorm_rotate_for_mq(
-                    gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    gpu,
+                    &layer.wq,
+                    &s.x,
+                    &layer.attn_norm,
+                    &s.tmp,
+                    &s.x_rot,
+                    config.norm_eps,
                 )?;
                 // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
                 // Works for MQ4 and HF4 — same kernel math as the LA 4-way.
@@ -4747,10 +6943,16 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_qkv_hfq4g256(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &layer.wq.buf,
+                        &layer.wk.buf,
+                        &layer.wv.buf,
                         eff_x,
-                        &s.fa_q_full, &s.fa_k, &s.fa_v,
-                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        &s.fa_q_full,
+                        &s.fa_k,
+                        &s.fa_v,
+                        layer.wq.m,
+                        layer.wk.m,
+                        layer.wv.m,
                         layer.wq.k,
                     )?;
                 } else {
@@ -4760,17 +6962,41 @@ fn forward_scratch_layers(
                 }
 
                 // Split interleaved Q+gate (single kernel instead of per-head memcpy loop)
-                gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
+                gpu.deinterleave_f32(
+                    &s.fa_q_full,
+                    &s.fa_q,
+                    &s.fa_gate,
+                    config.n_heads,
+                    config.head_dim,
+                )?;
 
-                gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(
+                    &s.fa_q,
+                    &layer.q_norm,
+                    &s.fa_q,
+                    config.n_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
 
                 let kv_dim = config.n_kv_heads * config.head_dim;
-                gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(
+                    &s.fa_k,
+                    &layer.k_norm,
+                    &s.fa_k,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
 
                 if crate::triattn::tap_enabled() {
                     let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
-                        gpu, layer_idx, &s.fa_q.buf,
-                        1, config.n_heads, config.head_dim,
+                        gpu,
+                        layer_idx,
+                        &s.fa_q.buf,
+                        1,
+                        config.n_heads,
+                        config.head_dim,
                     )?;
                     if !gpu_handled {
                         let n_q = config.n_heads * config.head_dim;
@@ -4778,7 +7004,11 @@ fn forward_scratch_layers(
                         if crate::triattn::tap_needs_k() {
                             let n_k = config.n_kv_heads * config.head_dim;
                             let k_cpu = gpu.download_f32(&s.fa_k)?;
-                            crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                            crate::triattn::record_prerope_qk(
+                                layer_idx,
+                                &q_cpu[..n_q],
+                                Some(&k_cpu[..n_k]),
+                            );
                         } else {
                             crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
                         }
@@ -4790,52 +7020,161 @@ fn forward_scratch_layers(
                     gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-                gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
-                    config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+                gpu.rope_partial_interleaved_f32(
+                    &s.fa_q,
+                    &s.fa_k,
+                    &s.pos_buf,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                )?;
                 if kv_cache.compact_offset > 0 {
                     let phys = pos as i32;
                     gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                if kv_cache.quant_asym4 {
+                if kv_cache.quant_asym4_tqv2 || kv_cache.quant_asym4_tqv4 {
+                    let ct = kv_cache.givens_cos.as_ref().unwrap();
+                    let st = kv_cache.givens_sin.as_ref().unwrap();
+                    let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
+                    let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
+                    let value_bits = if kv_cache.quant_asym4_tqv2 { 2 } else { 4 };
+                    gpu.kv_cache_write_asym4_tqv4_fused(
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.fa_v,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        s1,
+                        s2,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        value_bits,
+                    )?;
+                    gpu.attention_flash_asym4_tqv4(
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        s1,
+                        s2,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        value_bits,
+                        kv_cache.physical_cap,
+                        &s.flash_partials,
+                    )?;
+                } else if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym4_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.fa_v,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     gpu.attention_flash_asym4(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym3_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.fa_v,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     gpu.attention_flash_asym3(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym2 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym2_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.fa_v,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     gpu.attention_flash_asym2(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_q8 {
-                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(
+                        &kv_cache.k_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.pos_buf,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
+                    gpu.kv_cache_write_q8_0(
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_v,
+                        &s.pos_buf,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     // Flash dispatch (Q8 path):
                     //   - capture_mode (hipGraph): always flash — position-independent grid.
                     //   - flash_mode=2 (always): force flash at any ctx.
@@ -4848,25 +7187,46 @@ fn forward_scratch_layers(
                         || pos + 1 > 15000;
                     if use_flash {
                         gpu.attention_flash_q8_0(
-                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.fa_q,
+                            &kv_cache.k_gpu[layer_idx],
+                            &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out,
+                            &s.pos_buf,
+                            pos + 1,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            kv_cache.physical_cap,
                             &s.flash_partials,
                         )?;
                     } else {
                         gpu.attention_q8_0_kv(
-                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.fa_q,
+                            &kv_cache.k_gpu[layer_idx],
+                            &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out,
+                            &s.pos_buf,
+                            pos + 1,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            kv_cache.physical_cap,
                         )?;
                     }
                 } else {
                     gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
                     gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, kv_dim)?;
                     gpu.attention_f32(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                     )?;
                 }
 
@@ -4877,7 +7237,13 @@ fn forward_scratch_layers(
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
-                    gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    gpu,
+                    &layer.w_gate,
+                    &s.x,
+                    &layer.ffn_norm,
+                    &s.tmp,
+                    &s.x_rot,
+                    config.norm_eps,
                 )?;
                 // Cross-arch fast path: fused gate+up in one launch. Works
                 // for both MQ4 (x_rot Some) and HF4 (x_rot None → s.tmp).
@@ -4890,10 +7256,13 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_gate_up_hfq4g256(
-                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
                         eff_x,
-                        &s.gate_ffn, &s.up,
-                        layer.w_gate.m, layer.w_up.m,
+                        &s.gate_ffn,
+                        &s.up,
+                        layer.w_gate.m,
+                        layer.w_up.m,
                         layer.w_gate.k,
                     )?;
                 } else {
@@ -4904,7 +7273,12 @@ fn forward_scratch_layers(
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
                 weight_gemv_swiglu_residual(
-                    gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
+                    gpu,
+                    &layer.w_down,
+                    &s.gate_ffn,
+                    &s.up,
+                    &s.ffn_hidden,
+                    &s.x,
                 )?;
 
                 if let Some(ref rb) = hidden_rb {
@@ -4925,7 +7299,13 @@ fn forward_scratch_layers(
             // overhead is one of the items targeted by Phase 2/3 speedups.
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
                 let x_rot = fused_rmsnorm_rotate_for_mq(
-                    gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    gpu,
+                    &layer.wqkv,
+                    &s.x,
+                    &layer.attn_norm,
+                    &s.tmp,
+                    &s.x_rot,
+                    config.norm_eps,
                 )?;
                 let dt = layer.wqkv.gpu_dtype;
                 let fused_la4_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
@@ -4938,10 +7318,19 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_qkvza_hfq4g256(
-                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
                         eff_x,
-                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
-                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        &s.dn_qkv,
+                        &s.dn_z,
+                        &s.dn_beta,
+                        &s.dn_alpha,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
                         layer.wqkv.k,
                     )?;
                 } else {
@@ -4951,25 +7340,40 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 }
                 gpu.fused_sigmoid_alpha_gate_f32(
-                    &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
+                    &s.dn_beta,
+                    &s.dn_alpha,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    n_v_heads,
                 )?;
                 gpu.conv1d_silu_split_f32(
-                    &s.dn_q_raw, &s.dn_k_raw, &s.dn_v,
-                    &s.dn_qkv, &layer.conv_weight,
+                    &s.dn_q_raw,
+                    &s.dn_k_raw,
+                    &s.dn_v,
+                    &s.dn_qkv,
+                    &layer.conv_weight,
                     &dn_state.conv_states[delta_layer_idx],
-                    k_dim, v_dim,
+                    k_dim,
+                    v_dim,
                 )?;
                 gpu.fused_qk_l2_norm_scale_f32(
-                    &s.dn_q_raw, &s.dn_k_raw,
-                    config.linear_num_key_heads, hd,
+                    &s.dn_q_raw,
+                    &s.dn_k_raw,
+                    config.linear_num_key_heads,
+                    hd,
                     1.0 / (hd as f32).sqrt(),
                     config.norm_eps,
                 )?;
                 if config.linear_num_key_heads < n_v_heads {
                     let ratio = n_v_heads / config.linear_num_key_heads;
                     gpu.repeat_interleave_qk_f32(
-                        &s.dn_q_raw, &s.dn_k_raw, &s.dn_q, &s.dn_k,
-                        config.linear_num_key_heads, ratio, hd,
+                        &s.dn_q_raw,
+                        &s.dn_k_raw,
+                        &s.dn_q,
+                        &s.dn_k,
+                        config.linear_num_key_heads,
+                        ratio,
+                        hd,
                     )?;
                 } else {
                     // Capture-aware: see matching path in the GroupQuery layer above.
@@ -4978,25 +7382,53 @@ fn forward_scratch_layers(
                 }
                 match dn_state.quant {
                     StateQuant::FP32 => gpu.gated_delta_net_f32(
-                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
-                        &dn_state.s_matrices[delta_layer_idx], &s.dn_attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                     StateQuant::Q8 => gpu.gated_delta_net_q8(
-                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx], &s.dn_attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &dn_state.s_scales[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
-                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
                         &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx], &s.dn_attn_out,
-                        1, n_v_heads, config.linear_value_head_dim,
+                        &dn_state.s_scales[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
                     )?,
                 }
-                gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
-                    n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+                gpu.gated_norm_f32(
+                    &s.dn_attn_out,
+                    &s.dn_z,
+                    &layer.norm_weight,
+                    &s.dn_normed,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                )?;
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
 
                 // ── MoE FFN ──
@@ -5008,9 +7440,11 @@ fn forward_scratch_layers(
                 // s.x_rot_local only — `x_norm` becomes a dummy on that path.
                 if ffn_all_mq4_for_moe(&layer.ffn) {
                     gpu.fused_rmsnorm_rotate_mq(
-                        &s.x, &layer.ffn_norm,
+                        &s.x,
+                        &layer.ffn_norm,
                         s.moe_x_rot.as_ref().expect("MoE scratch"),
-                        config.dim, config.norm_eps,
+                        config.dim,
+                        config.norm_eps,
                     )?;
                     moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
                 } else {
@@ -5028,7 +7462,13 @@ fn forward_scratch_layers(
 
             (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
                 let x_rot = fused_rmsnorm_rotate_for_mq(
-                    gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    gpu,
+                    &layer.wq,
+                    &s.x,
+                    &layer.attn_norm,
+                    &s.tmp,
+                    &s.x_rot,
+                    config.norm_eps,
                 )?;
                 let dt = layer.wq.gpu_dtype;
                 let fused_fa3_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
@@ -5040,10 +7480,16 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_qkv_hfq4g256(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &layer.wq.buf,
+                        &layer.wk.buf,
+                        &layer.wv.buf,
                         eff_x,
-                        &s.fa_q_full, &s.fa_k, &s.fa_v,
-                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        &s.fa_q_full,
+                        &s.fa_k,
+                        &s.fa_v,
+                        layer.wq.m,
+                        layer.wk.m,
+                        layer.wv.m,
                         layer.wq.k,
                     )?;
                 } else {
@@ -5052,16 +7498,40 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
                 }
 
-                gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
-                gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
+                gpu.deinterleave_f32(
+                    &s.fa_q_full,
+                    &s.fa_q,
+                    &s.fa_gate,
+                    config.n_heads,
+                    config.head_dim,
+                )?;
+                gpu.rmsnorm_batched(
+                    &s.fa_q,
+                    &layer.q_norm,
+                    &s.fa_q,
+                    config.n_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
 
                 let kv_dim = config.n_kv_heads * config.head_dim;
-                gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(
+                    &s.fa_k,
+                    &layer.k_norm,
+                    &s.fa_k,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
 
                 if crate::triattn::tap_enabled() {
                     let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
-                        gpu, layer_idx, &s.fa_q.buf,
-                        1, config.n_heads, config.head_dim,
+                        gpu,
+                        layer_idx,
+                        &s.fa_q.buf,
+                        1,
+                        config.n_heads,
+                        config.head_dim,
                     )?;
                     if !gpu_handled {
                         let n_q = config.n_heads * config.head_dim;
@@ -5069,7 +7539,11 @@ fn forward_scratch_layers(
                         if crate::triattn::tap_needs_k() {
                             let n_k = config.n_kv_heads * config.head_dim;
                             let k_cpu = gpu.download_f32(&s.fa_k)?;
-                            crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                            crate::triattn::record_prerope_qk(
+                                layer_idx,
+                                &q_cpu[..n_q],
+                                Some(&k_cpu[..n_k]),
+                            );
                         } else {
                             crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
                         }
@@ -5081,77 +7555,207 @@ fn forward_scratch_layers(
                     gpu.hip.memcpy_htod(&s.pos_buf, &abs.to_ne_bytes())?;
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-                gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
-                    config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+                gpu.rope_partial_interleaved_f32(
+                    &s.fa_q,
+                    &s.fa_k,
+                    &s.pos_buf,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                )?;
                 if kv_cache.compact_offset > 0 {
                     let phys = pos as i32;
                     gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                if kv_cache.quant_asym4 {
+                if kv_cache.quant_asym4_tqv2 || kv_cache.quant_asym4_tqv4 {
+                    let ct = kv_cache.givens_cos.as_ref().unwrap();
+                    let st = kv_cache.givens_sin.as_ref().unwrap();
+                    let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
+                    let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
+                    let value_bits = if kv_cache.quant_asym4_tqv2 { 2 } else { 4 };
+                    gpu.kv_cache_write_asym4_tqv4_fused(
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.fa_v,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        s1,
+                        s2,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        value_bits,
+                    )?;
+                    gpu.attention_flash_asym4_tqv4(
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        s1,
+                        s2,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        value_bits,
+                        kv_cache.physical_cap,
+                        &s.flash_partials,
+                    )?;
+                } else if kv_cache.quant_asym4 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym4_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.fa_v,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     gpu.attention_flash_asym4(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym3_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.fa_v,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     gpu.attention_flash_asym3(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_asym2 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym2_fused(
-                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.fa_v,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     gpu.attention_flash_asym2(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        ct,
+                        st,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
                 } else if kv_cache.quant_q8 {
-                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(
+                        &kv_cache.k_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.pos_buf,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
+                    gpu.kv_cache_write_q8_0(
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_v,
+                        &s.pos_buf,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     let use_flash = gpu.capture_mode
                         || s.flash_mode == 2
                         || (s.flash_mode == 1 && pos + 1 >= 2048)
                         || pos + 1 > 15000;
                     if use_flash {
                         gpu.attention_flash_q8_0(
-                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.fa_q,
+                            &kv_cache.k_gpu[layer_idx],
+                            &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out,
+                            &s.pos_buf,
+                            pos + 1,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            kv_cache.physical_cap,
                             &s.flash_partials,
                         )?;
                     } else {
                         gpu.attention_q8_0_kv(
-                            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out, &s.pos_buf, pos + 1,
-                            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                            &s.fa_q,
+                            &kv_cache.k_gpu[layer_idx],
+                            &kv_cache.v_gpu[layer_idx],
+                            &s.fa_attn_out,
+                            &s.pos_buf,
+                            pos + 1,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            kv_cache.physical_cap,
                         )?;
                     }
                 } else {
                     gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
                     gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, kv_dim)?;
                     gpu.attention_f32(
-                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                        &s.fa_attn_out, &s.pos_buf, pos + 1,
-                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
                     )?;
                 }
 
@@ -5167,9 +7771,11 @@ fn forward_scratch_layers(
                 // s.x_rot_local only — `x_norm` becomes a dummy on that path.
                 if ffn_all_mq4_for_moe(&layer.ffn) {
                     gpu.fused_rmsnorm_rotate_mq(
-                        &s.x, &layer.ffn_norm,
+                        &s.x,
+                        &layer.ffn_norm,
                         s.moe_x_rot.as_ref().expect("MoE scratch"),
-                        config.dim, config.norm_eps,
+                        config.dim,
+                        config.norm_eps,
                     )?;
                     moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
                 } else {
@@ -5211,8 +7817,12 @@ pub fn forward_gpu(
     let dim = config.dim;
     let x = gpu.alloc_tensor(&[dim], DType::F32)?;
     match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
+        }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
         _ => panic!("unsupported embedding format"),
