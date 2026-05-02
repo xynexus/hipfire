@@ -2240,10 +2240,24 @@ fn main() {
                     let signs2 = gen_fwht_signs(1042, 256);
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                } else {
-                    // Fallback to standard HFQ4-G128 for non-256-aligned
+                } else if k_dim % 128 == 0 {
+                    // HFQ4G128 fallback (no rotation). Strict k%128 check —
+                    // unconditional fallback would silently truncate K and
+                    // mis-align row boundaries (gemv_hfq4g128 hardcodes
+                    // groups_per_row = K / 128).
                     let q = quantize_hfq4g128(&f32_data);
                     (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                } else if k_dim % 32 == 0 {
+                    // Q8 fallback for k that's 32-aligned but not 128-aligned
+                    // (e.g. Gemma 4 26B-A4B's mlp.down_proj k=2112).
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else {
+                    panic!(
+                        "MQ4: tensor {name} has k_dim={k_dim} which is not divisible by \
+                         32, 128, or 256 — no supported quant format. Add a per-element \
+                         fallback (e.g. F16) before shipping such a model."
+                    );
                 }
             } else if use_mg4g256 && (is_embed || name.ends_with("embed_tokens_per_layer.weight")) {
                 // Same embedding policy as MQ4 — Q8 is the floor for embed
@@ -2263,10 +2277,25 @@ fn main() {
                     let signs2 = gen_fwht_signs(1042, 256);
                     let q = quantize_mg4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MG4G256, 256u32, "MG4G256")
-                } else {
-                    // Same fallback as MQ4 for non-256-aligned weights.
+                } else if k_dim % 128 == 0 {
+                    // HFQ4G128 fallback (no rotation). Strict k%128 check —
+                    // see MQ4G256 branch above for rationale.
                     let q = quantize_hfq4g128(&f32_data);
                     (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                } else if k_dim % 32 == 0 {
+                    // Q8 fallback for k aligned to 32 but not 128 (e.g. Gemma 4
+                    // 26B-A4B's mlp.down_proj k=2112). The unconditional
+                    // HFQ4G128 fallback that was here previously silently
+                    // emitted garbage on this path because the GEMV kernel
+                    // truncated K and mis-aligned row boundaries.
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else {
+                    panic!(
+                        "MG4: tensor {name} has k_dim={k_dim} which is not divisible by \
+                         32, 128, or 256 — no supported quant format. Add a per-element \
+                         fallback (e.g. F16) before shipping such a model."
+                    );
                 }
             } else if use_mq6g256 && is_embed {
                 let q = quantize_q8f16(&f32_data);
