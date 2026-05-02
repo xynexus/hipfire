@@ -2307,10 +2307,17 @@ fn main() {
                     let signs2 = gen_fwht_signs(1042, 256);
                     let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                } else if k_dim % 32 == 0 {
+                    // No HFQ6G128 exists; HFQ6G256 needs k%256. Q8 is the
+                    // safe fallback (k%32-aligned, slightly larger). Same
+                    // bug-class fix as MQ4/MG4 commit 2091e77.
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
                 } else {
-                    // Fallback to HFQ6-G256 for non-256-aligned (no rotation)
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                    panic!(
+                        "MQ6: tensor {name} has k_dim={k_dim} not divisible by 32 — \
+                         no supported quant fallback."
+                    );
                 }
             } else if (use_mq3g256 || use_mq2g256) && is_embed {
                 let q = quantize_q8f16(&f32_data);
@@ -2322,10 +2329,20 @@ fn main() {
                     let signs2 = gen_fwht_signs(1042, 256);
                     let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                } else {
-                    // Fallback to HFQ3-G128 for non-256-aligned (no rotation)
+                } else if k_dim % 128 == 0 {
+                    // HFQ3-G128 needs k%128 strictly (gemv hardcodes K/128).
                     let q = quantize_hfq3g128(&f32_data);
                     (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                } else if k_dim % 32 == 0 {
+                    // Q8 fallback for k%32-only tensors (e.g. Gemma 4 26B-A4B
+                    // mlp.down_proj k=2112). Same pattern as MQ4/MG4.
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else {
+                    panic!(
+                        "MQ3: tensor {name} has k_dim={k_dim} not divisible by 32 — \
+                         no supported quant fallback."
+                    );
                 }
             } else if use_mq2g256 {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
@@ -2334,10 +2351,20 @@ fn main() {
                     let signs2 = gen_fwht_signs(1042, 256);
                     let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                } else {
-                    // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
+                } else if k_dim % 128 == 0 {
+                    // HFQ2-G128 needs k%128 strictly.
                     let q = quantize_hfq2g128(&f32_data);
                     (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
+                } else if k_dim % 32 == 0 {
+                    // Q8 fallback for k%32-only tensors. Same pattern as
+                    // MQ4/MG4/MQ6/MQ3.
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else {
+                    panic!(
+                        "MQ2: tensor {name} has k_dim={k_dim} not divisible by 32 — \
+                         no supported quant fallback."
+                    );
                 }
             } else if (use_hfq3g256 || use_hfq3g128) && is_embed {
                 let q = quantize_q8f16(&f32_data);
