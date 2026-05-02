@@ -1021,6 +1021,10 @@ pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip
 /// GELU activation (tanh approximation, matches gelu_pytorch_tanh).
 pub const GELU_TANH_SRC: &str = include_str!("../../../kernels/src/gelu_tanh.hip");
 
+/// GELU activation (exact erf-based, matches PyTorch `nn.GELU()` default).
+/// Used by Gemma 4 E-series per-layer-embedding inject.
+pub const GELU_ERF_SRC: &str = include_str!("../../../kernels/src/gelu_erf.hip");
+
 /// Final-logit soft-capping (Gemma 4): out = tanh(x/cap)*cap, in-place.
 pub const LOGIT_SOFTCAP_SRC: &str = include_str!("../../../kernels/src/logit_softcap.hip");
 

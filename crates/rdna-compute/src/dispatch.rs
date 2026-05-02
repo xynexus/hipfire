@@ -12498,6 +12498,23 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// Exact (erf-based) GELU — PyTorch `nn.GELU()` default. Used by the
+    /// Gemma 4 E-series per-layer-embedding inject. In-place capable.
+    pub fn gelu_erf_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
+        self.ensure_kernel("gelu_erf_f32", kernels::GELU_ERF_SRC, "gelu_erf_f32")?;
+        let func = &self.functions["gelu_erf_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let blocks = ((n + 255) / 256) as u32;
+        unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// Final-logit soft-capping in-place (Gemma 4): x = tanh(x/cap)*cap.
     /// Applied to the LM-head output vector (e.g. 262144 floats) before sampling.
     pub fn logit_softcap_f32(&mut self, x: &GpuTensor, n: usize, cap: f32) -> HipResult<()> {

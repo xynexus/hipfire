@@ -92,10 +92,18 @@ pub struct Gemma4Config {
     /// layer's KV cache. See llama-model.cpp `n_layer_kv_from_start`:
     ///   • Layers `[0, n_layers - num_kv_shared_layers)` compute own KV.
     ///   • Layers `[n_layers - num_kv_shared_layers, n_layers)` are KV-shared.
-    /// Sliding shared layers read from cache slot `(n_layers - shared) - 2`;
-    /// full shared layers read from `(n_layers - shared) - 1`.
+    /// Sliding shared layers read from layer-index `(n_layers - shared) - 2`;
+    /// full shared layers read from `(n_layers - shared) - 1`. Per-type cache
+    /// slot mapping is built in `kv_share_plan()`.
     /// Values for the official lineup: E2B=20, E4B=18, 26B-A4B=0, 31B=0.
     pub num_kv_shared_layers: usize,
+
+    /// `use_double_wide_mlp` flag (E2B only). When true, the LAST
+    /// `num_kv_shared_layers` layers use `intermediate_size * 2` for the
+    /// FFN width (gate / up / down projections double in their
+    /// hidden-dim direction) — see llama-model.cpp lines 4730-4735. We
+    /// don't yet handle per-layer FFN sizing; refused at load time.
+    pub use_double_wide_mlp: bool,
 
     // Per-layer dispatch (len == n_layers)
     pub layer_types: Vec<LayerType>,
@@ -107,6 +115,112 @@ pub struct Gemma4Config {
     pub eoi_token_id: u32,                 // 258882
     pub audio_token_id: u32,               // 258881 (reserved, unused on dense 31B)
     pub video_token_id: u32,               // 258884 (reserved)
+}
+
+/// Per-layer KV-cache routing for Gemma 4 E-series KV-sharing.
+///
+/// Built once at model load time from `Gemma4Config`. Indexed by layer
+/// ordinal; tells the forward pass two things per layer:
+///
+/// 1. `owns_kv[il]` — whether this layer should run its own K/V projection
+///    + RoPE-on-K + KV-cache write. False on shared layers.
+/// 2. `kv_slot[il]` — which slot in the per-type KV cache to read (and write
+///    if `owns_kv`). For own layers this is the count of same-type own-kv
+///    layers seen so far; for shared layers it's the anchor slot derived
+///    from llama-model.cpp's `(start - 2)` / `(start - 1)` rule.
+///
+/// On 31B / 26B-A4B (no shared layers) this collapses to the trivial
+/// "every layer owns its KV, slot = sequential count per type" plan.
+#[derive(Debug, Clone)]
+pub struct KvSharePlan {
+    /// `n_layers - num_kv_shared_layers` — first index where shared layers start.
+    pub n_layer_kv_from_start: usize,
+    /// Number of sliding layers in `[0, n_layer_kv_from_start)` (= kv_sliding cache size).
+    pub n_sliding_own: usize,
+    /// Number of full layers in `[0, n_layer_kv_from_start)` (= kv_full cache size).
+    pub n_full_own: usize,
+    /// True iff layer `il` writes its own K/V into the cache.
+    pub owns_kv: Vec<bool>,
+    /// Per-type cache slot to use for layer `il` (read + write if owns_kv).
+    pub kv_slot: Vec<usize>,
+}
+
+impl Gemma4Config {
+    /// Compute the KV-cache routing plan for this config. Cheap; call once
+    /// at load time and stash on the model object.
+    ///
+    /// Architectural assumption (validated for Gemma 4 E2B / E4B):
+    /// the layer at index `n_layer_kv_from_start - 2` MUST be a sliding
+    /// layer (it's the anchor for all shared sliding layers), and the layer
+    /// at index `n_layer_kv_from_start - 1` MUST be a full layer (anchor
+    /// for shared full). If those slot types don't match, the per-type
+    /// cache layouts wouldn't align (different head_dim / n_kv_heads), so
+    /// we panic loudly in that case with a diagnostic.
+    pub fn kv_share_plan(&self) -> KvSharePlan {
+        let n_kv_start = self.n_layers.saturating_sub(self.num_kv_shared_layers);
+        let mut owns_kv = Vec::with_capacity(self.n_layers);
+        let mut kv_slot = Vec::with_capacity(self.n_layers);
+        let mut n_sliding_own = 0usize;
+        let mut n_full_own = 0usize;
+        let mut s = 0usize;
+        let mut f = 0usize;
+        let mut anchor_sliding: Option<usize> = None;
+        let mut anchor_full: Option<usize> = None;
+        for (il, &lt) in self.layer_types.iter().enumerate() {
+            let owns = il < n_kv_start;
+            owns_kv.push(owns);
+            if owns {
+                let slot = match lt { LayerType::Sliding => s, LayerType::Full => f };
+                kv_slot.push(slot);
+                match lt {
+                    LayerType::Sliding => {
+                        if self.num_kv_shared_layers > 0 && il + 2 == n_kv_start {
+                            anchor_sliding = Some(s);
+                        }
+                        s += 1;
+                        n_sliding_own += 1;
+                    }
+                    LayerType::Full => {
+                        if self.num_kv_shared_layers > 0 && il + 1 == n_kv_start {
+                            anchor_full = Some(f);
+                        }
+                        f += 1;
+                        n_full_own += 1;
+                    }
+                }
+            } else {
+                kv_slot.push(usize::MAX);  // anchor filled below
+            }
+        }
+        if self.num_kv_shared_layers > 0 {
+            assert!(n_kv_start >= 2,
+                "Gemma 4 KV-sharing assumes n_layer_kv_from_start >= 2 (got {})", n_kv_start);
+            let sliding_anchor_layer = n_kv_start - 2;
+            let full_anchor_layer = n_kv_start - 1;
+            assert_eq!(
+                self.layer_types[sliding_anchor_layer], LayerType::Sliding,
+                "Gemma 4 KV-sharing expects layer {sliding_anchor_layer} to be Sliding",
+            );
+            assert_eq!(
+                self.layer_types[full_anchor_layer], LayerType::Full,
+                "Gemma 4 KV-sharing expects layer {full_anchor_layer} to be Full",
+            );
+            let asl = anchor_sliding.expect("sliding anchor slot");
+            let afl = anchor_full.expect("full anchor slot");
+            for (il, &lt) in self.layer_types.iter().enumerate() {
+                if il >= n_kv_start {
+                    kv_slot[il] = match lt { LayerType::Sliding => asl, LayerType::Full => afl };
+                }
+            }
+        }
+        KvSharePlan {
+            n_layer_kv_from_start: n_kv_start,
+            n_sliding_own,
+            n_full_own,
+            owns_kv,
+            kv_slot,
+        }
+    }
 }
 
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<Gemma4Config> {
@@ -163,6 +277,11 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Gemma4Config> {
     // KV-sharing (E-series). 0 on 31B / 26B-A4B; 18-20 on E4B / E2B.
     let num_kv_shared_layers = tc.get("num_kv_shared_layers")
         .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    // Double-wide-MLP (E2B only). When true, shared layers have
+    // intermediate_size * 2 — refused at load time until per-layer FFN
+    // sizing lands.
+    let use_double_wide_mlp = tc.get("use_double_wide_mlp")
+        .and_then(|v| v.as_bool()).unwrap_or(false);
 
     let final_logit_softcapping = tc.get("final_logit_softcapping")
         .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
@@ -199,6 +318,7 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Gemma4Config> {
         final_logit_softcapping, tie_word_embeddings, embed_scale,
         n_embd_per_layer,
         num_kv_shared_layers,
+        use_double_wide_mlp,
         layer_types,
         has_vision,
         image_token_id, boi_token_id, eoi_token_id, audio_token_id, video_token_id,
@@ -254,10 +374,13 @@ pub struct FullLayerWeights {
     /// Host-side mirror of layer_scalar. See SlidingLayerWeights for rationale.
     pub layer_scalar_host: f32,
 
-    // Attention (full — head_dim=512, K=V)
+    // Attention (full — head_dim=512)
     pub q_proj: WeightTensor,   // [n_heads * 512, dim]
-    pub k_proj: WeightTensor,   // [4 * 512, dim]
-    // no v_proj — V = pre-k_norm output of k_proj
+    pub k_proj: WeightTensor,   // [n_kv * 512, dim]
+    /// Separate V projection — present when `attention_k_eq_v == false`
+    /// (Gemma 4 E2B / E4B). Absent (None) when V is captured from K's
+    /// pre-norm output (Gemma 4 31B / 26B-A4B with `attention_k_eq_v: true`).
+    pub v_proj: Option<WeightTensor>, // [n_kv * 512, dim] when Some
     pub o_proj: WeightTensor,   // [dim, n_heads * 512]
     pub q_norm: GpuTensor,      // [512]
     pub k_norm: GpuTensor,      // [512]
@@ -344,6 +467,7 @@ impl Gemma4Weights {
                                f.gate_proj.buf, f.up_proj.buf, f.down_proj.buf] {
                         let _ = gpu.free_tensor(wt);
                     }
+                    if let Some(wt) = f.v_proj { let _ = gpu.free_tensor(wt.buf); }
                     if let Some(wt) = f.per_layer_input_gate { let _ = gpu.free_tensor(wt.buf); }
                     if let Some(wt) = f.per_layer_projection { let _ = gpu.free_tensor(wt.buf); }
                     if let Some(t) = f.post_per_layer_input_norm { let _ = gpu.free_tensor(t); }
@@ -472,29 +596,25 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
 pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
     -> HipResult<Gemma4Weights>
 {
-    // KV-sharing (E-series feature) is detected at load time and refused
-    // here rather than producing silent garbage at decode time. The
-    // forward pass currently computes K/V for every layer and writes them
-    // to that layer's own KV cache slot — for the last `num_kv_shared_layers`
-    // layers on E2B/E4B that's wrong twice over: (1) those layers' weight
-    // tensors for k_proj/v_proj are stale/unused in HF, and (2) attention
-    // should read from an earlier layer's cache slot, not the per-layer
-    // one we'd write. Until per-layer KV slot indirection lands, refuse
-    // loudly with the diagnostic the operator needs.
-    if config.num_kv_shared_layers > 0 {
+    // Refuse use_double_wide_mlp (E2B-only) until per-layer FFN sizing
+    // lands. Our SlidingLayerWeights / FullLayerWeights assume a single
+    // `hidden_dim` across all layers; with use_double_wide_mlp the last
+    // `num_kv_shared_layers` layers have `intermediate_size * 2` and the
+    // weight tensors are shaped accordingly. Loading them with the wrong
+    // expected (m, k) silently reads only the first half of the weights
+    // → garbage FFN on every shared layer.
+    if config.use_double_wide_mlp {
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "Gemma 4 E-series KV-sharing not yet implemented \
-                 (num_kv_shared_layers={}, n_layer_kv_from_start={}). \
-                 The last {} layers of this model reuse earlier layers' KV cache; \
-                 our forward pass would compute and read the wrong KV for those \
-                 layers, producing multilingual gibberish in inference. Track in \
-                 task #12 (Implement KV-sharing for Gemma 4 E2B/E4B). Supported \
-                 dense Gemma 4 today: 31B (no KV-sharing).",
+                "Gemma 4 `use_double_wide_mlp` not yet implemented (this is \
+                 E2B-only — the last {} layers have intermediate_size*2={} \
+                 instead of {}). Forward pass would silently read half of \
+                 the FFN weights. Track in task #13. Supported E-series \
+                 today: E4B (no use_double_wide_mlp).",
                 config.num_kv_shared_layers,
-                config.n_layers - config.num_kv_shared_layers,
-                config.num_kv_shared_layers,
+                config.hidden_dim * 2,
+                config.hidden_dim,
             ),
         ));
     }
@@ -676,7 +796,15 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                         &format!("{p}.self_attn.q_proj.weight"), q_dim, config.dim)?,
                     k_proj: load_gemma4_weight(hfq, gpu,
                         &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
-                    // no v_proj on full layers — V reuses k_proj's pre-norm output.
+                    v_proj: if config.attention_k_eq_v {
+                        // 31B / 26B-A4B: V is captured from K's pre-norm output;
+                        // no separate v_proj tensor.
+                        None
+                    } else {
+                        // E2B / E4B: separate v_proj on full layers.
+                        Some(load_gemma4_weight(hfq, gpu,
+                            &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?)
+                    },
                     o_proj: load_gemma4_weight(hfq, gpu,
                         &format!("{p}.self_attn.o_proj.weight"), config.dim, q_dim)?,
                     q_norm: load_gemma4_head_norm(hfq, gpu,
@@ -946,8 +1074,10 @@ fn apply_per_layer_inject(
 
     // tmp_pl = per_layer_input_gate @ x → [n_embd_per_layer]
     weight_gemv(gpu, inp_gate, &scratch.x, &scratch.per_layer_tmp)?;
-    // gelu_tanh in place
-    gpu.gelu_tanh_f32(&scratch.per_layer_tmp, &scratch.per_layer_tmp, pl_w)?;
+    // Exact (erf-based) GELU — matches PyTorch `nn.GELU()` used by HF
+    // Gemma 4 per-layer-embed block. The FFN's gelu_pytorch_tanh
+    // approximation is a different kernel (gelu_tanh_f32).
+    gpu.gelu_erf_f32(&scratch.per_layer_tmp, &scratch.per_layer_tmp, pl_w)?;
 
     // tmp_pl *= inp_per_layer[layer_idx*pl_w .. (layer_idx+1)*pl_w]
     let inp_slice = scratch.per_layer_inp.sub_offset(layer_idx * pl_w, pl_w);
@@ -1048,18 +1178,25 @@ pub fn forward_scratch(
         gpu.scale_f32(&scratch.per_layer_inp, 1.0 / 2.0_f32.sqrt())?;
     }
 
-    // 3) Per-layer forward.
-    let mut sliding_kv_idx = 0usize;
-    let mut full_kv_idx = 0usize;
+    // 3) Per-layer forward. KV-sharing routing comes from `kv_share_plan`:
+    // own-KV layers compute K/V and write to their own cache slot; shared
+    // layers (E2B / E4B last 18-20 layers) skip K/V projection and read
+    // from the anchor slot. On 31B / 26B-A4B (no shared layers) every
+    // layer owns its KV and the plan trivially returns sequential slots.
+    //
+    // Note: kv_share_plan() rebuilds per-call which is fine for decode
+    // (negligible cost vs the 60-layer forward); the daemon would lift
+    // this to load-time once we wire CLI integration.
+    let plan = config.kv_share_plan();
     for (layer_idx, layer_type) in config.layer_types.iter().copied().enumerate() {
+        let owns = plan.owns_kv[layer_idx];
+        let slot = plan.kv_slot[layer_idx];
         match (layer_type, &weights.layers[layer_idx]) {
             (LayerType::Sliding, LayerWeights::Sliding(lw)) => {
-                sliding_layer_decode(gpu, config, lw, pos, kv_sliding, sliding_kv_idx, layer_idx, scratch)?;
-                sliding_kv_idx += 1;
+                sliding_layer_decode(gpu, config, lw, pos, kv_sliding, slot, owns, layer_idx, scratch)?;
             }
             (LayerType::Full, LayerWeights::Full(lw)) => {
-                full_layer_decode(gpu, config, lw, pos, kv_full, full_kv_idx, layer_idx, scratch)?;
-                full_kv_idx += 1;
+                full_layer_decode(gpu, config, lw, pos, kv_full, slot, owns, layer_idx, scratch)?;
             }
             _ => return Err(hip_bridge::HipError::new(
                 0,
@@ -1115,7 +1252,8 @@ fn sliding_layer_decode(
     lw: &SlidingLayerWeights,
     pos: usize,
     kv_cache: &mut llama::KvCache,
-    kv_layer_idx: usize,
+    kv_slot: usize,
+    owns_kv: bool,
     layer_idx: usize,
     scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
@@ -1131,47 +1269,55 @@ fn sliding_layer_decode(
     // tmp = input_layernorm(x)
     gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
 
-    // Q/K/V projections: q[n_heads*head_dim], k/v[n_kv*head_dim].
+    // Q is always projected (every layer needs its own Q, regardless of
+    // KV ownership). K/V are skipped on shared layers — their k_proj /
+    // v_proj weights still ship in HF safetensors but are stale/unused;
+    // the actual K/V data is read from the KV cache slot of the anchor
+    // layer (sliding anchor = layer n_layer_kv_from_start - 2).
     weight_gemv(gpu, &lw.q_proj, &scratch.tmp, &scratch.q)?;
-    weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
-    weight_gemv(gpu, &lw.v_proj, &scratch.tmp, &scratch.v)?;
+    if owns_kv {
+        weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
+        weight_gemv(gpu, &lw.v_proj, &scratch.tmp, &scratch.v)?;
+    }
 
-    // q_norm + k_norm + v_norm across head_dim (in-place).
-    //
-    // V uses the same no-scale RMSNorm pattern as full-attn layers: the
-    // shared `v_norm_ones_full` buffer is filled with 1.0 by
-    // `init_scratch_constants`, so passing it as the weight gives
-    // `weight * x_normalized = 1.0 * x_normalized` — i.e. just the rms
-    // divide, no learned gain. The buffer is sized for full_head_dim
-    // (512); sliding only reads the first head_dim=256 elements via the
-    // `n` param, which is always-1.0 territory so the over-allocation
-    // is harmless. Matches llama.cpp gemma4-iswa.cpp line 92:
+    // q_norm + (own-only) k_norm + v_norm across head_dim (in-place).
+    // V uses the no-scale RMS pattern (ones buffer as weight) — same as
+    // full-attn layers. Matches llama.cpp gemma4-iswa.cpp line 92:
     //   Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
-    // applied identically on every layer that has its own KV.
     gpu.rmsnorm_batched(&scratch.q, &lw.q_norm, &scratch.q, n_heads, head_dim, config.norm_eps)?;
-    gpu.rmsnorm_batched(&scratch.k, &lw.k_norm, &scratch.k, n_kv, head_dim, config.norm_eps)?;
-    gpu.rmsnorm_batched(&scratch.v, &scratch.v_norm_ones_full, &scratch.v,
-        n_kv, head_dim, config.norm_eps)?;
+    if owns_kv {
+        gpu.rmsnorm_batched(&scratch.k, &lw.k_norm, &scratch.k, n_kv, head_dim, config.norm_eps)?;
+        gpu.rmsnorm_batched(&scratch.v, &scratch.v_norm_ones_full, &scratch.v,
+            n_kv, head_dim, config.norm_eps)?;
+    }
 
     // Pre-scale Q by sqrt(head_dim) so the flash-attn kernel's internal
     // 1/sqrt(head_dim) cancels, leaving the effective Gemma 4 scale of 1.0.
-    // Only the first n_heads*head_dim elements of scratch.q are live.
     gpu.scale_f32(&scratch.q, (head_dim as f32).sqrt())?;
 
-    // Full rotate_half RoPE, theta=10000, head_dim=256 (all dims rotate).
+    // RoPE: always rotate Q. K is rotated only on own-kv layers (we pass
+    // n_heads_k=0 to skip the K loop in the kernel for shared layers; the
+    // existing K cache contents stay untouched). theta=10000, head_dim=256
+    // (all dims rotate).
+    let n_kv_for_rope = if owns_kv { n_kv } else { 0 };
     gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
-        n_heads, n_kv, head_dim, config.sliding_rope_theta)?;
+        n_heads, n_kv_for_rope, head_dim, config.sliding_rope_theta)?;
 
     // KV cache write + flash attention with window_size=1024.
+    // - Own-KV layers: write current K/V into kv_slot, then attend.
+    // - Shared layers: skip write (cache slot already populated by an
+    //   earlier own-KV layer); just attend against the existing data.
     // Branch on cache quant mode, same as qwen35::run_fa_layer_body.
     if kv_cache.quant_asym3 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym3_fused(
-            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        if owns_kv {
+            gpu.kv_cache_write_asym3_fused(
+                &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
+                &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        }
         gpu.attention_flash_asym3(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.q, &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
             &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
@@ -1180,11 +1326,13 @@ fn sliding_layer_decode(
     } else if kv_cache.quant_asym4 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym4_fused(
-            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        if owns_kv {
+            gpu.kv_cache_write_asym4_fused(
+                &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
+                &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        }
         gpu.attention_flash_asym4(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.q, &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
             &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
@@ -1193,21 +1341,25 @@ fn sliding_layer_decode(
     } else if kv_cache.quant_asym2 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym2_fused(
-            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        if owns_kv {
+            gpu.kv_cache_write_asym2_fused(
+                &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
+                &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        }
         gpu.attention_flash_asym2(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.q, &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
             &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
             config.sliding_window as u32,
         )?;
     } else if kv_cache.quant_q8 {
-        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim)?;
-        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim)?;
+        if owns_kv {
+            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[kv_slot], &scratch.k, &scratch.pos_buf, n_kv, head_dim)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[kv_slot], &scratch.v, &scratch.pos_buf, n_kv, head_dim)?;
+        }
         gpu.attention_flash_q8_0(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.q, &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
             &scratch.attn_out, &scratch.pos_buf, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
@@ -1216,8 +1368,8 @@ fn sliding_layer_decode(
     } else {
         // Plain FP32 KV path (kvf16 / kvfp32).
         let kv_dim = n_kv * head_dim;
-        gpu.kv_cache_write(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
-        gpu.kv_cache_write(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.k_gpu[kv_slot], &scratch.k, &scratch.pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[kv_slot], &scratch.v, &scratch.pos_buf, kv_dim)?;
         // No sliding-window support in the plain attention_f32 kernel; this
         // path is used only for debugging (mostly Qwen3.5 kvf16 mode).
         return Err(hip_bridge::HipError::new(
@@ -1298,7 +1450,8 @@ fn full_layer_decode(
     lw: &FullLayerWeights,
     pos: usize,
     kv_cache: &mut llama::KvCache,
-    kv_layer_idx: usize,
+    kv_slot: usize,
+    owns_kv: bool,
     layer_idx: usize,
     scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
@@ -1315,27 +1468,45 @@ fn full_layer_decode(
     // tmp = input_layernorm(x)
     gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
 
-    // Q + K projections. V is derived from K's pre-norm output below.
+    // Q always projected. K + V only on own-KV layers — shared layers reuse
+    // the anchor full layer's KV slot.
+    //
+    // V handling depends on `attention_k_eq_v`:
+    //   • true  (31B / 26B-A4B): V is captured from K's PRE-norm output —
+    //     a memcpy from scratch.k after k_proj. lw.v_proj is None.
+    //   • false (E2B / E4B):     V comes from a separate v_proj weight.
+    //     lw.v_proj is Some.
     weight_gemv(gpu, &lw.q_proj, &scratch.tmp, &scratch.q)?;
-    weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
+    if owns_kv {
+        weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
+        match &lw.v_proj {
+            Some(vw) => {
+                weight_gemv(gpu, vw, &scratch.tmp, &scratch.v)?;
+            }
+            None => {
+                // CRITICAL: capture pre-k_norm bytes as V before applying k_norm.
+                gpu.hip.memcpy_dtod(&scratch.v.buf, &scratch.k.buf, kv_bytes)?;
+            }
+        }
+    }
 
-    // CRITICAL: capture pre-k_norm bytes as V before applying k_norm.
-    gpu.hip.memcpy_dtod(&scratch.v.buf, &scratch.k.buf, kv_bytes)?;
-
-    // q_norm, k_norm, and no-scale v_norm (all head_dim = 512).
+    // q_norm always; k_norm + v_norm only on own-KV layers (head_dim = 512).
     gpu.rmsnorm_batched(&scratch.q, &lw.q_norm, &scratch.q, n_heads, head_dim, config.norm_eps)?;
-    gpu.rmsnorm_batched(&scratch.k, &lw.k_norm, &scratch.k, n_kv, head_dim, config.norm_eps)?;
-    gpu.rmsnorm_batched(&scratch.v, &scratch.v_norm_ones_full, &scratch.v,
-        n_kv, head_dim, config.norm_eps)?;
+    if owns_kv {
+        gpu.rmsnorm_batched(&scratch.k, &lw.k_norm, &scratch.k, n_kv, head_dim, config.norm_eps)?;
+        gpu.rmsnorm_batched(&scratch.v, &scratch.v_norm_ones_full, &scratch.v,
+            n_kv, head_dim, config.norm_eps)?;
+    }
 
-    // Pre-scale Q by sqrt(head_dim=512) so the flash kernel's 1/sqrt(head_dim)
-    // cancels (Gemma 4 attention scaling is 1.0).
+    // Pre-scale Q by sqrt(head_dim=512).
     gpu.scale_f32(&scratch.q, (head_dim as f32).sqrt())?;
 
-    // Proportional RoPE: rotate_half of the first 64 pairs of every 512-dim head.
+    // Proportional RoPE: rotate Q always; K only on own-KV layers
+    // (n_heads_k=0 in the kernel skips the K loop for shared layers).
     let n_rot_pairs = ((head_dim as f32) * config.full_partial_rotary_factor * 0.5) as usize;
+    let n_kv_for_rope = if owns_kv { n_kv } else { 0 };
     gpu.rope_partial_halved_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
-        n_heads, n_kv, head_dim, n_rot_pairs, config.full_rope_theta)?;
+        n_heads, n_kv_for_rope, head_dim, n_rot_pairs, config.full_rope_theta)?;
 
     // KV cache write + attention. Full-attn layers REQUIRE the FP32 KV path:
     // the quantized flash kernels (asym3/asym4/asym2/q8) all hard-code a
@@ -1352,12 +1523,12 @@ fn full_layer_decode(
         ));
     }
     let kv_dim = n_kv * head_dim;
-    gpu.kv_cache_write(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
-    gpu.kv_cache_write(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
-    // attention_f32 bakes in scale=1/sqrt(head_dim); our pre-scale of Q by
-    // sqrt(head_dim) above cancels it, giving the Gemma 4 scale=1.0 semantics.
+    if owns_kv {
+        gpu.kv_cache_write(&kv_cache.k_gpu[kv_slot], &scratch.k, &scratch.pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[kv_slot], &scratch.v, &scratch.pos_buf, kv_dim)?;
+    }
     gpu.attention_f32(
-        &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+        &scratch.q, &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
         &scratch.attn_out, &scratch.pos_buf, pos + 1,
         n_heads, n_kv, head_dim, kv_cache.max_seq,
     )?;

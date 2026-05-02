@@ -43,6 +43,12 @@ fn main() {
         .filter(|&&t| t == gemma4::LayerType::Sliding).count();
     let n_full = config.layer_types.iter()
         .filter(|&&t| t == gemma4::LayerType::Full).count();
+    // KV cache slot counts respect KV-sharing on E-series — only own-KV
+    // layers get a slot. On 31B / 26B-A4B (no shared layers) this collapses
+    // to (n_sliding, n_full).
+    let plan = config.kv_share_plan();
+    let n_sliding_own = plan.n_sliding_own;
+    let n_full_own = plan.n_full_own;
     eprintln!(
         "Gemma 4 config: dim={}, layers={} ({} sliding + {} full), vocab={}, \
          sliding_hd={}, full_hd={}, n_heads={}, softcap={}, tie={}",
@@ -50,6 +56,12 @@ fn main() {
         config.sliding_head_dim, config.full_head_dim, config.n_heads,
         config.final_logit_softcapping, config.tie_word_embeddings,
     );
+    if config.num_kv_shared_layers > 0 {
+        eprintln!(
+            "  KV-sharing: num_kv_shared={} → kv_sliding cache sized {} (own), kv_full cache sized {} (own)",
+            config.num_kv_shared_layers, n_sliding_own, n_full_own,
+        );
+    }
 
     eprintln!("Loading weights...");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
@@ -64,12 +76,12 @@ fn main() {
     eprintln!("KV cache: sliding={kv_mode} @ {kv_seq} / full=fp32 @ {kv_seq}");
 
     let mut kv_sliding = match kv_mode.as_str() {
-        "asym4" => KvCache::new_gpu_asym4(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
-        "asym2" => KvCache::new_gpu_asym2(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
-        "q8"    => KvCache::new_gpu_q8(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
-        _       => KvCache::new_gpu_asym3(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
+        "asym4" => KvCache::new_gpu_asym4(&mut gpu, n_sliding_own, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
+        "asym2" => KvCache::new_gpu_asym2(&mut gpu, n_sliding_own, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
+        "q8"    => KvCache::new_gpu_q8(&mut gpu, n_sliding_own, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
+        _       => KvCache::new_gpu_asym3(&mut gpu, n_sliding_own, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
     }.expect("kv sliding alloc");
-    let mut kv_full = KvCache::new_gpu(&mut gpu, n_full, config.full_n_kv_heads, config.full_head_dim, kv_seq)
+    let mut kv_full = KvCache::new_gpu(&mut gpu, n_full_own, config.full_n_kv_heads, config.full_head_dim, kv_seq)
         .expect("kv full alloc");
 
     let scratch = Gemma4Scratch::new(&mut gpu, &config, 64).expect("scratch alloc");

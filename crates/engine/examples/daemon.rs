@@ -1110,8 +1110,15 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         //     never use sliding-window) doesn't need the window_size uniform.
         //     This is why the kv_mode choice is honored on sliding but forced
         //     to FP32 on full.
-        let n_sliding = config.layer_types.iter().filter(|&&t| t == gemma4::LayerType::Sliding).count();
-        let n_full = config.layer_types.iter().filter(|&&t| t == gemma4::LayerType::Full).count();
+        // KV cache slot counts respect KV-sharing — on Gemma 4 E-series
+        // (E2B/E4B), the LAST `num_kv_shared_layers` layers don't compute
+        // their own K/V (they reuse anchor layer's KV). Cache sizing must
+        // match the per-type own-KV count so anchor slot indices are
+        // valid. On 31B / 26B-A4B (no sharing) the plan trivially returns
+        // (n_sliding, n_full).
+        let plan = config.kv_share_plan();
+        let n_sliding = plan.n_sliding_own;
+        let n_full = plan.n_full_own;
         let kv_sliding = match kv_mode.as_str() {
             "q8" => llama::KvCache::new_gpu_q8(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, max_seq),
             "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4(gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, max_seq),
