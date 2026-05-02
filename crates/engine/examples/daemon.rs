@@ -1922,19 +1922,17 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         return;
     }
 
-    // Gemma 4 generate path lands in Phase 3. Early-exit with a clear error so
-    // `hipfire run gemma-4:31b ...` surfaces the TODO cleanly instead of
-    // panicking inside an Option::unwrap() on a q35_* field that Gemma 4 never
-    // populates.
+    // Gemma 4 — direct dispatch into the gemma4 generate path. Doesn't share
+    // the Q35 / LLaMA codepath because:
+    //   • forward signature differs (two KV caches: sliding + full)
+    //   • no DeltaNet, no DFlash, no CASK eviction (none ported yet)
+    //   • BOS-prepend semantics: Gemma 4 tokenizer ALWAYS leads with <bos>
+    //     regardless of multi-turn state — the engine's seq_pos is the
+    //     absolute position into the model's context.
     if m.arch_id == 7 {
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"error","id":"{}","message":"Gemma 4 generate not yet implemented (arch_id=7 is scaffolded; forward pass lands in Phase 3)"}}"#,
-            id
-        );
-        let _ = stdout.flush();
-        let _ = (prompt, system_prompt, temp, top_p, max_tokens, repeat_penalty,
-                 repeat_window, budget_alert_at_tok, budget_alert_text, max_think_tokens, gpu);
+        let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens);
+        generate_gemma4(m, gpu, stdout, id, prompt, system_prompt,
+            temp, top_p, max_tokens, repeat_penalty, repeat_window);
         return;
     }
 
@@ -2478,6 +2476,210 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         );
         let _ = stdout.flush();
     }
+}
+
+/// Gemma 4 single-turn greedy/top-p generate.
+///
+/// Mirrors the LLaMA generate path's structure (prefill → sample first
+/// token → decode loop) but talks to the gemma4 forward API which:
+///   • takes BOTH KV caches (sliding + full) per call
+///   • leaves logits in `scratch.logits` for caller-side sampling
+///   • has no DeltaNet / DFlash / CASK wiring (none ported yet)
+///
+/// Multi-turn behaviour: m.seq_pos is the absolute position into the
+/// model's max context. The Gemma 4 KV-cache writers index by absolute
+/// pos, so consecutive turns continue at the prior seq_pos. BOS is
+/// only prepended on the very first turn (seq_pos == 0); subsequent
+/// turns just feed the new prompt tokens.
+///
+/// system_prompt and budget_alert_* params are accepted but ignored —
+/// Gemma 4 chat templating + budget alerts will land alongside daemon
+/// chat-template support; for now this is raw-prompt mode (matching
+/// the smoke harness's behaviour).
+fn generate_gemma4(
+    m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout,
+    id: &str, prompt: &str, system_prompt: Option<&str>,
+    temp: f32, top_p: f32, max_tokens: usize,
+    repeat_penalty: f32, repeat_window: usize,
+) {
+    // system_prompt is currently advisory — Gemma 4 chat templating not
+    // wired into the daemon yet. The smoke harness operates in the same
+    // raw-prompt mode and produces coherent output on the dense models.
+    let _ = system_prompt;
+
+    let config = m.g4_config.as_ref().unwrap();
+    let weights = m.g4_weights.as_ref().unwrap();
+    let scratch = m.g4_scratch.as_ref().unwrap();
+    let kv_sliding = m.g4_kv_sliding.as_mut().unwrap();
+    // Take ownership of kv_full briefly — the borrow checker won't let us
+    // hold both kv_sliding (via as_mut) and kv_full (also via as_mut) on
+    // the same struct, so swap to a local. Restored at function end.
+    let mut kv_full = m.g4_kv_full.take().unwrap();
+
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let vocab_size = config.vocab_size;
+    let bos_token = config.bos_token;
+    let eos_token = config.eos_token;
+
+    // Prompt encode — prepend BOS only on the first turn (seq_pos == 0).
+    // HF Gemma 4 tokenizer ALWAYS leads sequences with <bos> per
+    // tokenizer_config.json (`add_bos_token: true`).
+    let mut new_tokens: Vec<u32> = if m.seq_pos == 0 {
+        let mut t = vec![bos_token];
+        t.extend(tokenizer.encode(prompt));
+        t
+    } else {
+        tokenizer.encode(prompt)
+    };
+
+    // Auto-reset on overflow. Gemma 4 has no eviction wired up so seq_pos
+    // grows monotonically until it hits max_seq; reset to keep the model
+    // usable across long-running chat sessions.
+    if m.seq_pos + new_tokens.len() + max_tokens > m.max_seq {
+        eprintln!(
+            "[daemon] gemma4: context full ({}/{}) — resetting conversation",
+            m.seq_pos, m.max_seq,
+        );
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        // Force BOS on the reset turn since seq_pos went back to 0.
+        if new_tokens.first() != Some(&bos_token) {
+            new_tokens.insert(0, bos_token);
+        }
+    }
+
+    let t0 = Instant::now();
+    let prefill_tokens = new_tokens.len();
+
+    // Prefill — forward each prompt token. Logits after the LAST forward
+    // are the ones we sample for the first generated token.
+    let prefill_start = m.seq_pos;
+    for (i, &tok) in new_tokens.iter().enumerate() {
+        let pos = prefill_start + i;
+        if let Err(e) = gemma4::forward_scratch(
+            gpu, weights, config, tok, pos, kv_sliding, &mut kv_full, scratch,
+        ) {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"gemma4 prefill failed at token {}: {}"}}"#,
+                id, i, e,
+            );
+            let _ = stdout.flush();
+            m.g4_kv_full = Some(kv_full);
+            return;
+        }
+    }
+    m.seq_pos += prefill_tokens;
+    m.conversation_tokens.extend_from_slice(&new_tokens);
+    let this_turn_prompt_anchor = m.conversation_tokens.len() - prefill_tokens;
+
+    // Sample first token from prefill logits.
+    let mut rng_state = 42u32;
+    let scope_start = this_turn_prompt_anchor.max(
+        m.conversation_tokens.len().saturating_sub(repeat_window.min(64)),
+    );
+    let hist_slice: Vec<u32> = m.conversation_tokens[scope_start..].to_vec();
+    let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
+    if !hist_bytes.is_empty() {
+        gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
+    }
+    let (mut next_token, rng) = match gpu.sample_top_p(
+        &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+        vocab_size, temp, top_p, rng_state, hist_slice.len(), repeat_penalty,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(stdout,
+                r#"{{"type":"error","id":"{}","message":"gemma4 sample failed: {}"}}"#, id, e);
+            let _ = stdout.flush();
+            m.g4_kv_full = Some(kv_full);
+            return;
+        }
+    };
+    rng_state = rng;
+    let t_prefill = Instant::now();
+
+    // Decode loop. Mirrors the LLaMA streaming pattern: emit token text
+    // (decoded incrementally to handle multi-byte UTF-8), forward the
+    // accepted token to populate KV for the *next* step, then sample.
+    let mut generated = 0usize;
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut emitted_bytes = 0usize;
+    for _ in 0..max_tokens {
+        generated += 1;
+        m.conversation_tokens.push(next_token);
+        streamed_tokens.push(next_token);
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[emitted_bytes..];
+        let vl = match std::str::from_utf8(new_bytes) {
+            Ok(_) => new_bytes.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if vl > 0 {
+            let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+            let _ = writeln!(stdout,
+                r#"{{"type":"token","id":"{}","text":{}}}"#,
+                id, serde_json::to_string(&text).unwrap_or_default());
+            let _ = stdout.flush();
+            emitted_bytes += vl;
+        }
+
+        // Stop checks: EOS plus tokenizer-level terminators (covers the
+        // various Gemma 4 chat-end tokens like <end_of_turn>).
+        if next_token == eos_token { break; }
+        if tokenizer.is_terminator(next_token) { break; }
+
+        // Forward the accepted token to populate KV for the next position,
+        // then sample for the next iteration.
+        let pos = m.seq_pos + generated - 1;
+        if let Err(e) = gemma4::forward_scratch(
+            gpu, weights, config, next_token, pos, kv_sliding, &mut kv_full, scratch,
+        ) {
+            let _ = writeln!(stdout,
+                r#"{{"type":"error","id":"{}","message":"gemma4 decode failed at gen {}: {}"}}"#,
+                id, generated, e);
+            let _ = stdout.flush();
+            break;
+        }
+        let scope_start = this_turn_prompt_anchor.max(
+            m.conversation_tokens.len().saturating_sub(repeat_window.min(64)),
+        );
+        let hist_slice: Vec<u32> = m.conversation_tokens[scope_start..].to_vec();
+        let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
+        if !hist_bytes.is_empty() {
+            gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
+        }
+        match gpu.sample_top_p(
+            &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+            vocab_size, temp, top_p, rng_state, hist_slice.len(), repeat_penalty,
+        ) {
+            Ok((tok, rng2)) => { next_token = tok; rng_state = rng2; }
+            Err(e) => {
+                let _ = writeln!(stdout,
+                    r#"{{"type":"error","id":"{}","message":"gemma4 sample failed at gen {}: {}"}}"#,
+                    id, generated, e);
+                let _ = stdout.flush();
+                break;
+            }
+        }
+    }
+    m.seq_pos += generated;
+
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 { (generated as f64) / total_s } else { 0.0 };
+    let prefill_tok_s = if prefill_s > 0.0 { (prefill_tokens as f64) / prefill_s } else { 0.0 };
+    let decode_tok_s = if decode_s > 0.0 { ((generated.saturating_sub(1)) as f64) / decode_s } else { 0.0 };
+    let _ = writeln!(stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        id, generated, tok_s, prefill_tokens,
+        prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0);
+    let _ = stdout.flush();
+
+    // Restore the kv_full borrow we took earlier.
+    m.g4_kv_full = Some(kv_full);
 }
 
 fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
