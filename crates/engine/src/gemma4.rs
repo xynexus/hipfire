@@ -1547,7 +1547,15 @@ fn apply_moe_branch(
             (scratch.moe_expert_gate_up.sub_offset(0, mi),
              scratch.moe_expert_gate_up.sub_offset(mi, mi))
         };
-        gpu.gelu_tanh_f32(&gate, &scratch.moe_expert_hidden, mi)?;
+        // Per Gemma 4 config `hidden_activation: 'gelu_pytorch_tanh'`, FFN
+        // uses tanh-approximation. HIPFIRE_MOE_GELU_ERF=1 swaps to exact-erf
+        // GELU for diagnosis (matches what fixed the per-layer-embed inject
+        // on E4B — the per-layer block uses `nn.GELU()` not gelu_pytorch_tanh).
+        if std::env::var("HIPFIRE_MOE_GELU_ERF").ok().as_deref() == Some("1") {
+            gpu.gelu_erf_f32(&gate, &scratch.moe_expert_hidden, mi)?;
+        } else {
+            gpu.gelu_tanh_f32(&gate, &scratch.moe_expert_hidden, mi)?;
+        }
         gpu.mul_f32(&scratch.moe_expert_hidden, &up, &scratch.moe_expert_hidden)?;
         // out = down_proj @ hidden → [dim]
         weight_gemv(gpu, &expert.down_proj, &scratch.moe_expert_hidden, &scratch.moe_expert_out)?;
