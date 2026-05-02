@@ -649,9 +649,17 @@ pub const GIVENS_COMMON_SRC: &str = include_str!("../../../kernels/src/givens_co
 // ends in normal space — the plain Q8_0 flash reduce works as-is.
 pub const KV_CACHE_WRITE_ASYM_K_GIVENS4_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens4.hip");
 pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3.hip");
+/// Same as `kv_cache_write_asym_k_givens3` but each thread covers 16
+/// dims (= 2 chunks of 8) so a 32-thread block handles head_dim=512.
+/// Required for Gemma 4 full-attention layers.
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512.hip");
 pub const KV_CACHE_WRITE_ASYM_K_GIVENS2_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens2.hip");
 pub const ATTENTION_FLASH_ASYM4_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym4_tile.hip");
 pub const ATTENTION_FLASH_ASYM3_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym3_tile.hip");
+/// Same as `attention_flash_asym3_tile` but each thread covers 2 chunks
+/// of 8 dims (= 16 dims) so a 32-thread block handles head_dim=512.
+/// Required for Gemma 4 full-attention layers (global_head_dim=512).
+pub const ATTENTION_FLASH_ASYM3_TILE_HD512_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym3_tile_hd512.hip");
 pub const ATTENTION_FLASH_ASYM2_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym2_tile.hip");
 
 // asym batched prefill variants: K rotated + V Q8 in one launch for N positions.

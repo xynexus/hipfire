@@ -9365,13 +9365,25 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        // Pick the right K-write kernel based on head_dim. hd=256 is the
+        // single-chunk variant; hd=512 (Gemma 4 full layers) loops over
+        // 2 chunks of 8 dims per thread within a single 32-thread warp.
+        let (k_kernel, k_src_const) = match head_dim {
+            256 => ("kv_cache_write_asym_k_givens3", kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC),
+            512 => ("kv_cache_write_asym_k_givens3_hd512", kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC),
+            other => return Err(hip_bridge::HipError::new(
+                0,
+                &format!("kv_cache_write_asym3_fused: head_dim={other} not supported \
+                          (only 256 and 512 implemented)"),
+            )),
+        };
         self.ensure_givens4_kernel(
-            "kv_cache_write_asym_k_givens3",
-            kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC,
-            "kv_cache_write_asym_k_givens3",
+            k_kernel,
+            k_src_const,
+            k_kernel,
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens3"];
+            let func = &self.functions[k_kernel];
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
             let mut pp = pos_buf.as_ptr();
@@ -9814,13 +9826,28 @@ impl Gpu {
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
         let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
 
+        // Pick the right kernel based on head_dim. The hd=256 kernel is a
+        // single warp × 8 dims/thread; hd=512 uses the same warp but each
+        // thread covers 2 chunks of 8 (16 dims). Other head_dims fall
+        // through to hd=256 which silently truncates — guarded by an
+        // explicit assert below to avoid the bug class that masked
+        // Gemma 4 full attention before this kernel landed.
+        let (kernel_name, kernel_src) = match head_dim {
+            256 => ("attention_flash_asym3_tile", kernels::ATTENTION_FLASH_ASYM3_TILE_SRC),
+            512 => ("attention_flash_asym3_tile_hd512", kernels::ATTENTION_FLASH_ASYM3_TILE_HD512_SRC),
+            other => return Err(hip_bridge::HipError::new(
+                0,
+                &format!("attention_flash_asym3: head_dim={other} not supported \
+                          (only 256 and 512 implemented)"),
+            )),
+        };
         self.ensure_givens4_kernel(
-            "attention_flash_asym3_tile",
-            kernels::ATTENTION_FLASH_ASYM3_TILE_SRC,
-            "attention_flash_asym3_tile",
+            kernel_name,
+            kernel_src,
+            kernel_name,
         )?;
         {
-            let func = &self.functions["attention_flash_asym3_tile"];
+            let func = &self.functions[kernel_name];
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let mut q_ptr = q.buf.as_ptr();
             let mut k_ptr = k_cache.buf.as_ptr();
@@ -12885,10 +12912,14 @@ impl Gpu {
             "asym3" => {
                 specs.push(("kv_cache_write_asym_k_givens3",
                             assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC)));
+                specs.push(("kv_cache_write_asym_k_givens3_hd512",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC)));
                 specs.push(("kv_cache_write_asym_k_givens3_batched",
                             assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC)));
                 specs.push(("attention_flash_asym3_tile",
                             assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_SRC)));
+                specs.push(("attention_flash_asym3_tile_hd512",
+                            assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_HD512_SRC)));
                 specs.push(("attention_flash_asym3_tile_batched",
                             assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC)));
                 specs.push(("attention_flash_asym_reduce_batched",

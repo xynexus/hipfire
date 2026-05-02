@@ -2276,7 +2276,13 @@ impl KvCache {
         gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize,
         max_seq_len: usize, physical_cap: usize,
     ) -> HipResult<Self> {
-        assert!(head_dim == 256, "asym3 currently requires head_dim=256 (Qwen 3.5)");
+        // asym3 supported head_dims: 256 (Qwen 3.5 / Gemma 4 sliding) and
+        // 512 (Gemma 4 full-attention global layers). Both have matching
+        // K-write + flash-read kernels (`*_givens3` / `*_givens3_hd512` and
+        // `*_asym3_tile` / `*_asym3_tile_hd512`). Other head_dims would
+        // silently truncate at GEMV time — fail loud here instead.
+        assert!(head_dim == 256 || head_dim == 512,
+            "asym3 currently requires head_dim ∈ {{256, 512}} (got {head_dim})");
         assert!(head_dim % 32 == 0);
         assert!(physical_cap > 0 && physical_cap <= max_seq_len,
             "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]");

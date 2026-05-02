@@ -2074,30 +2074,49 @@ fn full_layer_decode(
     gpu.rope_partial_halved_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
         n_heads, n_kv_for_rope, head_dim, n_rot_pairs, config.full_rope_theta)?;
 
-    // KV cache write + attention. Full-attn layers REQUIRE the FP32 KV path:
-    // the quantized flash kernels (asym3/asym4/asym2/q8) all hard-code a
-    // `32 threads × N dims` layout where N∈{4,8}, covering at most 256 dims.
-    // Gemma 4's global_head_dim=512 would silently truncate every head.
-    // Plain attention_f32 processes arbitrary head_dim correctly, and full
-    // layers never need sliding-window (window_size guard lives in the flash
-    // kernels only). daemon.rs forces this cache to FP32 at load time.
-    if kv_cache.quantized {
+    // KV cache write + attention. Full-attn layers (head_dim=512) used to
+    // require an FP32 KV path because all quantized flash kernels hardcoded
+    // a single-warp × 8-dims-per-thread layout that truncated past 256.
+    // The `*_hd512` variants (commit landing this comment) extend asym3 to
+    // 32 threads × 16 dims (= 2 chunks of 8) and unblock quantized KV on
+    // full layers. asym4/asym2/q8 are still hd=256-only; those paths
+    // continue to require FP32 here.
+    //
+    // No sliding window on full layers (window_size=0 = full causal).
+    if kv_cache.quant_asym3 {
+        let ct = kv_cache.givens_cos.as_ref().unwrap();
+        let st = kv_cache.givens_sin.as_ref().unwrap();
+        if owns_kv {
+            gpu.kv_cache_write_asym3_fused(
+                &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
+                &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        }
+        gpu.attention_flash_asym3(
+            &scratch.q, &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
+            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+            &scratch.flash_partials,
+            0u32, // full-attn layer — no sliding window
+        )?;
+    } else if kv_cache.quantized {
         return Err(hip_bridge::HipError::new(
             0,
-            "gemma4 full-attn layer requires FP32 KV cache (quantized flash kernels \
-             truncate head_dim>256); allocate via KvCache::new_gpu",
+            "gemma4 full-attn layer: only asym3 quantized KV is supported at \
+             head_dim=512 today (asym4/asym2/q8 truncate). Use new_gpu_asym3 \
+             or fall back to FP32 (KvCache::new_gpu).",
         ));
+    } else {
+        let kv_dim = n_kv * head_dim;
+        if owns_kv {
+            gpu.kv_cache_write(&kv_cache.k_gpu[kv_slot], &scratch.k, &scratch.pos_buf, kv_dim)?;
+            gpu.kv_cache_write(&kv_cache.v_gpu[kv_slot], &scratch.v, &scratch.pos_buf, kv_dim)?;
+        }
+        gpu.attention_f32(
+            &scratch.q, &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
+            &scratch.attn_out, &scratch.pos_buf, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+        )?;
     }
-    let kv_dim = n_kv * head_dim;
-    if owns_kv {
-        gpu.kv_cache_write(&kv_cache.k_gpu[kv_slot], &scratch.k, &scratch.pos_buf, kv_dim)?;
-        gpu.kv_cache_write(&kv_cache.v_gpu[kv_slot], &scratch.v, &scratch.pos_buf, kv_dim)?;
-    }
-    gpu.attention_f32(
-        &scratch.q, &kv_cache.k_gpu[kv_slot], &kv_cache.v_gpu[kv_slot],
-        &scratch.attn_out, &scratch.pos_buf, pos + 1,
-        n_heads, n_kv, head_dim, kv_cache.max_seq,
-    )?;
 
     // o_proj → tmp.
     weight_gemv(gpu, &lw.o_proj, &scratch.attn_out, &scratch.tmp)?;
