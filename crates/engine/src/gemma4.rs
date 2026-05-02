@@ -720,33 +720,6 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
 pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
     -> HipResult<Gemma4Weights>
 {
-    // Refuse 26B-A4B until MoE output is validated coherent. The full
-    // forward path (router gemv → top-K → per-expert dispatch → weighted
-    // sum → sandwich norms → SwiGLU + MoE combine) is wired and runs
-    // without crash, but output on "The capital of France is" is
-    // multilingual gibberish (" coniferous stunning ৬ scrumptious ..."),
-    // and HIPFIRE_MOE_SWAP_GATE_UP=1 produces different-but-equally-
-    // incoherent output. Diagnostics confirm the router IS dispatching
-    // (8 distinct experts/layer, weights sum-to-1, per-expert scales near
-    // 1.0), so the routing path is structurally right — the bug is in
-    // expert evaluation, scale composition, or some Gemma-4-MoE-specific
-    // tweak not yet captured. Track in task #14. Override with
-    // HIPFIRE_GEMMA4_MOE_FORCE=1 if you want to run anyway for debugging.
-    if config.enable_moe_block
-        && std::env::var("HIPFIRE_GEMMA4_MOE_FORCE").ok().as_deref() != Some("1")
-    {
-        return Err(hip_bridge::HipError::new(
-            0,
-            &format!(
-                "Gemma 4 MoE block ({} experts, top_k={}, moe_intermediate_size={}) \
-                 forward path is implemented but output is still incoherent — \
-                 refusing to load 26B-A4B until validation passes. Track in task #14. \
-                 Set HIPFIRE_GEMMA4_MOE_FORCE=1 to bypass for debugging. \
-                 Supported dense Gemma 4 today: 31B, E2B, E4B (+ IT variants).",
-                config.num_experts, config.top_k_experts, config.moe_intermediate_size,
-            ),
-        ));
-    }
     eprintln!("gemma4: loading embed_tokens...");
     let embed_name = "model.language_model.embed_tokens.weight";
     let (embed_info, embed_data) = hfq.tensor_data(embed_name).ok_or_else(|| {
