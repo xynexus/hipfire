@@ -1151,13 +1151,13 @@ pub struct Gemma4Scratch {
     // Sliding uses head_dim=256, max_tiles=sliding_window/128 (much smaller).
     pub flash_partials: GpuTensor,
 
-    // Pre-computed RoPE cos/sin tables per layer type.
-    // Sliding: default RoPE, head_dim=256, theta=10000, n_rot = head_dim.
-    pub sliding_cos: GpuTensor, // [max_seq, head_dim]
-    pub sliding_sin: GpuTensor,
-    // Full: proportional RoPE, head_dim=512, theta=1e6, rotated_dims = 64 of 256-half
-    pub full_cos: GpuTensor,
-    pub full_sin: GpuTensor,
+    // (Removed: sliding_cos/sin and full_cos/sin pre-computed RoPE tables.
+    // gpu.rope_f32 / rope_partial_halved_f32 compute cos/sin in-kernel from
+    // pos_buf + theta, so the tables were never read. Allocating them at
+    // 4× max_seq × head_dim was wasted VRAM — at the freshly-fixed
+    // max_seq=131072 default for Gemma 4 this was ~768 MB just for dead
+    // tables. Removed entirely; restoring requires actually wiring a
+    // table-using rope kernel.)
 
     // No-scale v_norm ones buffer (full-attn layers compute v_norm without
     // a learned weight — we pass this ones-filled tensor to the existing
@@ -1254,14 +1254,12 @@ impl Gemma4Scratch {
         let flash_partials_sz = config.n_heads * max_tiles_full * (2 + config.full_head_dim);
         let flash_partials = gpu.zeros(&[flash_partials_sz], DType::F32)?;
 
-        // RoPE tables. The actual sin/cos values are computed host-side and
-        // uploaded once per model load. For now allocate and zero; the loader
-        // will populate them. Sized to max_seq for the same reason as
-        // flash_partials — RoPE indexes by absolute position.
-        let sliding_cos = gpu.zeros(&[max_seq * config.sliding_head_dim], DType::F32)?;
-        let sliding_sin = gpu.zeros(&[max_seq * config.sliding_head_dim], DType::F32)?;
-        let full_cos = gpu.zeros(&[max_seq * config.full_head_dim], DType::F32)?;
-        let full_sin = gpu.zeros(&[max_seq * config.full_head_dim], DType::F32)?;
+        // (sliding_cos/sin and full_cos/sin tables removed — see struct
+        // comment. The rope_f32 and rope_partial_halved_f32 kernels compute
+        // cos/sin in-kernel from pos+theta and never indexed into these
+        // tables; allocating them at max_seq × head_dim per layer-type was
+        // pure VRAM waste that scaled badly when max_seq was lifted from
+        // the previous 32k constant to the caller's actual value.)
 
         // v_norm ones — populated on first use in the forward pass.
         // (Allocated to the full head_dim because only full-attn layers
@@ -1307,7 +1305,6 @@ impl Gemma4Scratch {
             gate_ffn, up_ffn, ffn_hidden, ffn_out,
             logits, sample_buf, repeat_buf,
             flash_partials,
-            sliding_cos, sliding_sin, full_cos, full_sin,
             v_norm_ones_full,
             per_layer_inp, per_layer_inp_proj, per_layer_tmp,
             per_layer_out, per_layer_pe_in,
@@ -1337,10 +1334,6 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.sample_buf);
         let _ = gpu.free_tensor(self.repeat_buf);
         let _ = gpu.free_tensor(self.flash_partials);
-        let _ = gpu.free_tensor(self.sliding_cos);
-        let _ = gpu.free_tensor(self.sliding_sin);
-        let _ = gpu.free_tensor(self.full_cos);
-        let _ = gpu.free_tensor(self.full_sin);
         let _ = gpu.free_tensor(self.v_norm_ones_full);
         let _ = gpu.free_tensor(self.per_layer_inp);
         let _ = gpu.free_tensor(self.per_layer_inp_proj);
