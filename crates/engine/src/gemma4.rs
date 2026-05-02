@@ -405,6 +405,9 @@ pub struct SlidingLayerWeights {
     pub per_layer_input_gate: Option<WeightTensor>,    // [n_embd_per_layer, dim]
     pub per_layer_projection: Option<WeightTensor>,    // [dim, n_embd_per_layer]
     pub post_per_layer_input_norm: Option<GpuTensor>,  // [dim]
+
+    // MoE branch — Some on 26B-A4B (where every layer is MoE), None elsewhere.
+    pub moe: Option<MoeLayerExtras>,
 }
 
 /// Per-layer weights for a FULL layer (head_dim=512, 4 KV heads, K=V shared).
@@ -447,6 +450,51 @@ pub struct FullLayerWeights {
     pub per_layer_input_gate: Option<WeightTensor>,
     pub per_layer_projection: Option<WeightTensor>,
     pub post_per_layer_input_norm: Option<GpuTensor>,
+
+    // MoE branch — Some on 26B-A4B, None elsewhere.
+    pub moe: Option<MoeLayerExtras>,
+}
+
+/// Per-routed-expert weights for a Gemma 4 MoE layer. Each layer has
+/// `n_experts` of these (128 on 26B-A4B), of which top_k_experts (8) are
+/// activated per token.
+pub struct MoeExpertWeights {
+    /// gate + up projection fused: `[2 * moe_intermediate, dim]`. The
+    /// first `moe_intermediate` rows are gate; the last are up.
+    pub gate_up_proj: WeightTensor,
+    /// `[dim, moe_intermediate]`. Projects per-expert FFN hidden back to dim.
+    pub down_proj: WeightTensor,
+}
+
+/// MoE branch weights for a Gemma 4 MoE layer (26B-A4B). Present on
+/// every layer when `config.enable_moe_block` is set.
+pub struct MoeLayerExtras {
+    /// `[n_experts, dim]` — projects router input to expert logits.
+    pub router_proj: WeightTensor,
+    /// `[dim]` — multiplicative scale on router input (`router.scale` in HF).
+    pub router_scale: GpuTensor,
+    /// `[n_experts]` — per-expert post-`down_proj` scale (`router.per_expert_scale`).
+    pub per_expert_scale: GpuTensor,
+    /// Host mirror of `per_expert_scale` for fast top-K weight composition.
+    pub per_expert_scale_host: Vec<f32>,
+    /// `[dim]` — RMSNorm applied to attn_out before the MoE branch.
+    pub pre_feedforward_layernorm_2: GpuTensor,
+    /// `[dim]` — RMSNorm applied to cur_mlp (the standard SwiGLU output) BEFORE summing.
+    pub post_feedforward_layernorm_1: GpuTensor,
+    /// `[dim]` — RMSNorm applied to cur_moe (the MoE branch output) BEFORE summing.
+    pub post_feedforward_layernorm_2: GpuTensor,
+    /// Pooled allocation for all `n_experts` gate_up_proj tensors of this layer
+    /// (concatenated). Freed once per layer; `experts[i].gate_up_proj.buf`
+    /// aliases into this buffer at offset `i * gate_up_bytes_per_expert`.
+    /// Replaces the previous per-expert hipMalloc that caused 128×30 = 3840
+    /// small allocations and fragmented the HIP heap to OOM at layer 25.
+    pub experts_gate_up_pool: GpuTensor,
+    /// Pooled allocation for all `n_experts` down_proj tensors of this layer.
+    /// Same aliasing scheme as the gate_up pool.
+    pub experts_down_pool: GpuTensor,
+    /// Per-expert WeightTensor views (aliases into the pools above).
+    /// `free_gpu` SKIPS freeing these — the pools own the bytes.
+    pub experts: Vec<MoeExpertWeights>,
 }
 
 pub enum LayerWeights {
@@ -507,6 +555,7 @@ impl Gemma4Weights {
                     if let Some(wt) = s.per_layer_input_gate { let _ = gpu.free_tensor(wt.buf); }
                     if let Some(wt) = s.per_layer_projection { let _ = gpu.free_tensor(wt.buf); }
                     if let Some(t) = s.post_per_layer_input_norm { let _ = gpu.free_tensor(t); }
+                    if let Some(moe) = s.moe { Self::free_moe(gpu, moe); }
                 }
                 LayerWeights::Full(f) => {
                     for t in [f.input_layernorm, f.post_attention_layernorm,
@@ -522,9 +571,25 @@ impl Gemma4Weights {
                     if let Some(wt) = f.per_layer_input_gate { let _ = gpu.free_tensor(wt.buf); }
                     if let Some(wt) = f.per_layer_projection { let _ = gpu.free_tensor(wt.buf); }
                     if let Some(t) = f.post_per_layer_input_norm { let _ = gpu.free_tensor(t); }
+                    if let Some(moe) = f.moe { Self::free_moe(gpu, moe); }
                 }
             }
         }
+    }
+
+    fn free_moe(gpu: &mut Gpu, moe: MoeLayerExtras) {
+        let _ = gpu.free_tensor(moe.router_proj.buf);
+        let _ = gpu.free_tensor(moe.router_scale);
+        let _ = gpu.free_tensor(moe.per_expert_scale);
+        let _ = gpu.free_tensor(moe.pre_feedforward_layernorm_2);
+        let _ = gpu.free_tensor(moe.post_feedforward_layernorm_1);
+        let _ = gpu.free_tensor(moe.post_feedforward_layernorm_2);
+        // Per-expert WeightTensors are aliases into the two pool buffers;
+        // freeing them would double-free. Drop the Vec without freeing
+        // each, then free the pools once.
+        std::mem::drop(moe.experts);
+        let _ = gpu.free_tensor(moe.experts_gate_up_pool);
+        let _ = gpu.free_tensor(moe.experts_down_pool);
     }
 }
 
@@ -647,28 +712,6 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
 pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
     -> HipResult<Gemma4Weights>
 {
-    // Refuse MoE (26B-A4B) until the routed-experts branch lands. Every
-    // layer needs: router gemv → top-K=8 of 128 experts softmax → per-
-    // expert (gate_up split, gelu, mul, down, scale) → weighted sum,
-    // running in parallel with the standard SwiGLU FFN, summed via
-    // post_feedforward_layernorm_2 then added to cur_mlp via
-    // post_feedforward_layernorm. Quantizer also needs to handle 3D
-    // stacked expert tensors (`experts.gate_up_proj` / `experts.down_proj`)
-    // — Gemma 4 names them differently from Qwen3.5-MoE so the existing
-    // expert-split code at hipfire-quantize/src/main.rs:1906 doesn't
-    // match. Track in task #14.
-    if config.enable_moe_block {
-        return Err(hip_bridge::HipError::new(
-            0,
-            &format!(
-                "Gemma 4 MoE block not yet implemented (this is 26B-A4B's \
-                 enable_moe_block=true with {} experts, top_k={}, \
-                 moe_intermediate_size={}). Track in task #14. Supported \
-                 dense Gemma 4 today: 31B, E2B, E4B (and their IT variants).",
-                config.num_experts, config.top_k_experts, config.moe_intermediate_size,
-            ),
-        ));
-    }
     eprintln!("gemma4: loading embed_tokens...");
     let embed_name = "model.language_model.embed_tokens.weight";
     let (embed_info, embed_data) = hfq.tensor_data(embed_name).ok_or_else(|| {
@@ -764,6 +807,9 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
     eprintln!("gemma4: loading {} layers...", config.n_layers);
     let mut layers = Vec::with_capacity(config.n_layers);
     for i in 0..config.n_layers {
+        if i % 5 == 0 {
+            eprintln!("  layer {i}/{}", config.n_layers);
+        }
         let p = format!("model.language_model.layers.{i}");
         match config.layer_types[i] {
             LayerType::Sliding => {
@@ -783,6 +829,9 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                         &format!("{p}.post_per_layer_input_norm.weight"), config.dim)?))
                 } else { (None, None, None) };
                 let ffn_hd = config.ffn_hidden_dim_for_layer(i);
+                let moe = if config.enable_moe_block {
+                    Some(load_moe_layer_extras(hfq, gpu, &p, config)?)
+                } else { None };
                 layers.push(LayerWeights::Sliding(SlidingLayerWeights {
                     input_layernorm: load_gemma4_norm(hfq, gpu,
                         &format!("{p}.input_layernorm.weight"), config.dim)?,
@@ -816,6 +865,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                     per_layer_input_gate: pl_gate,
                     per_layer_projection: pl_proj,
                     post_per_layer_input_norm: pl_post_norm,
+                    moe,
                 }));
             }
             LayerType::Full => {
@@ -835,6 +885,9 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                         &format!("{p}.post_per_layer_input_norm.weight"), config.dim)?))
                 } else { (None, None, None) };
                 let ffn_hd = config.ffn_hidden_dim_for_layer(i);
+                let moe = if config.enable_moe_block {
+                    Some(load_moe_layer_extras(hfq, gpu, &p, config)?)
+                } else { None };
                 layers.push(LayerWeights::Full(FullLayerWeights {
                     input_layernorm: load_gemma4_norm(hfq, gpu,
                         &format!("{p}.input_layernorm.weight"), config.dim)?,
@@ -876,6 +929,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                     per_layer_input_gate: pl_gate,
                     per_layer_projection: pl_proj,
                     post_per_layer_input_norm: pl_post_norm,
+                    moe,
                 }));
             }
         }
@@ -892,6 +946,148 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
         per_layer_model_proj,
         per_layer_proj_norm,
         layers,
+    })
+}
+
+/// Load the MoE branch tensors for one layer of Gemma 4 26B-A4B.
+/// Caller has already verified `config.enable_moe_block`. Tensor names per
+/// 26B-A4B safetensors (`<layer_path>.experts.{X}.{base}.weight` after our
+/// quantizer's 3D-stacked split):
+///
+///     <p>.router.proj.weight                  [n_experts, dim]
+///     <p>.router.scale.weight                 [dim]
+///     <p>.router.per_expert_scale.weight      [n_experts]
+///     <p>.pre_feedforward_layernorm_2.weight  [dim]
+///     <p>.post_feedforward_layernorm_1.weight [dim]
+///     <p>.post_feedforward_layernorm_2.weight [dim]
+///     <p>.experts.{X}.gate_up_proj.weight     [2 * moe_intermediate, dim]
+///     <p>.experts.{X}.down_proj.weight        [dim, moe_intermediate]
+///
+/// Per-expert scale is mirrored to host (n_experts floats) so we can fold
+/// it into the top-K weight composition without a D2H per token.
+fn load_moe_layer_extras(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Gemma4Config)
+    -> HipResult<MoeLayerExtras>
+{
+    let n_exp = config.num_experts;
+    let dim = config.dim;
+    let mi = config.moe_intermediate_size;
+
+    let router_proj = load_gemma4_weight(hfq, gpu,
+        &format!("{p}.router.proj.weight"), n_exp, dim)?;
+    // NOTE: `router.scale` and `router.per_expert_scale` ship WITHOUT the
+    // `.weight` suffix in HF's 26B-A4B safetensors (so `should_quantize`
+    // returns false → stored as F16). Loader uses bare paths.
+    let router_scale = load_gemma4_norm(hfq, gpu,
+        &format!("{p}.router.scale"), dim)?;
+    let per_expert_scale_host = load_f32_vec(hfq,
+        &format!("{p}.router.per_expert_scale"), n_exp)?;
+    let per_expert_scale = gpu.upload_f32(&per_expert_scale_host, &[n_exp])?;
+    let pre_feedforward_layernorm_2 = load_gemma4_norm(hfq, gpu,
+        &format!("{p}.pre_feedforward_layernorm_2.weight"), dim)?;
+    let post_feedforward_layernorm_1 = load_gemma4_norm(hfq, gpu,
+        &format!("{p}.post_feedforward_layernorm_1.weight"), dim)?;
+    let post_feedforward_layernorm_2 = load_gemma4_norm(hfq, gpu,
+        &format!("{p}.post_feedforward_layernorm_2.weight"), dim)?;
+
+    // Pool the per-expert weights into ONE GPU allocation per kind. With
+    // 128 experts × 2 kinds × 30 layers, the previous "1 hipMalloc per
+    // expert tensor" path created 7680 allocations and fragmented HIP's
+    // heap to OOM at layer 25/30 even though total memory fit. Pooling
+    // collapses that to 60 allocations (2 per layer).
+    //
+    // Approach: read all 128 experts of each kind, validate they share
+    // the same byte layout (same quant_type / size — guaranteed because
+    // the quantizer wrote them with identical (m, k)), concat into a
+    // single CPU buffer, upload once, then build per-expert WeightTensor
+    // views via `sub_offset` into the pool. The pool owns the bytes;
+    // per-expert views are non-owning aliases (free_gpu skips them).
+    let load_pool = |gpu: &mut Gpu, base: &str, m: usize, k: usize|
+        -> HipResult<(GpuTensor, DType, usize)>
+    {
+        // First pass: read first expert to learn quant_type + bytes-per-expert.
+        let first_name = format!("{p}.experts.0.{base}.weight");
+        let (first_info, first_data) = hfq.tensor_data(&first_name).ok_or_else(|| {
+            hip_bridge::HipError::new(0, &format!("MoE expert tensor not found: {first_name}"))
+        })?;
+        let bytes_per_expert = first_data.len();
+        let dtype = match first_info.quant_type {
+            1 => DType::F32, // dequant from F16 → F32 expansion (rare for experts)
+            3 => DType::Q8_0, 4 => DType::Q4K,
+            6 => DType::HFQ4G256, 7 => DType::HFQ4G128, 8 => DType::HFQ6G256,
+            9 => DType::HFQ2G256, 10 => DType::HFQ2G128,
+            11 => DType::HFQ3G256, 12 => DType::HFQ3G128,
+            // MG4G256 (qt=19) and MQ4G256 (qt=13) both use the MQ4 dispatch.
+            13 | 19 => DType::MQ4G256,
+            14 => DType::MQ8G256, 15 => DType::MQ6G256,
+            17 => DType::MQ3G256, 18 => DType::MQ2G256,
+            qt => return Err(hip_bridge::HipError::new(
+                0, &format!("unsupported MoE expert quant_type {qt} for {first_name}"),
+            )),
+        };
+        // Concat 128 experts' bytes into one CPU buffer, then upload once.
+        let mut concat = Vec::with_capacity(bytes_per_expert * n_exp);
+        concat.extend_from_slice(first_data);
+        for x in 1..n_exp {
+            let name = format!("{p}.experts.{x}.{base}.weight");
+            let (info, data) = hfq.tensor_data(&name).ok_or_else(|| {
+                hip_bridge::HipError::new(0, &format!("MoE expert tensor not found: {name}"))
+            })?;
+            if data.len() != bytes_per_expert {
+                return Err(hip_bridge::HipError::new(
+                    0, &format!("MoE expert {name} byte size mismatch ({} vs {bytes_per_expert})", data.len()),
+                ));
+            }
+            if info.quant_type != first_info.quant_type {
+                return Err(hip_bridge::HipError::new(
+                    0, &format!("MoE expert {name} quant_type mismatch ({} vs {})", info.quant_type, first_info.quant_type),
+                ));
+            }
+            concat.extend_from_slice(data);
+        }
+        // For F16-source path we'd need dequant before upload — Gemma 4 MoE
+        // never ships experts at F16 (always quantized) so panic if hit.
+        if first_info.quant_type == 1 {
+            return Err(hip_bridge::HipError::new(
+                0, "MoE expert pool path doesn't dequant F16 — quantizer should have produced MG4/MQ4/HFQ",
+            ));
+        }
+        let pool = gpu.upload_raw(&concat, &[concat.len()])?;
+        let _ = (m, k);
+        Ok((pool, dtype, bytes_per_expert))
+    };
+
+    let (gate_up_pool, gate_up_dtype, gate_up_bytes) = load_pool(gpu, "gate_up_proj", 2 * mi, dim)?;
+    let (down_pool, down_dtype, down_bytes) = load_pool(gpu, "down_proj", dim, mi)?;
+
+    // Build per-expert WeightTensor views. Each view aliases into the pool
+    // at offset `expert_idx * bytes_per_expert`. Per the GpuTensor
+    // contract, sub_offset returns a non-owning view — free_gpu must
+    // NOT free these (the pool owns the bytes).
+    let mut experts = Vec::with_capacity(n_exp);
+    for x in 0..n_exp {
+        let gu_view = gate_up_pool.sub_offset(x * gate_up_bytes, gate_up_bytes);
+        let dn_view = down_pool.sub_offset(x * down_bytes, down_bytes);
+        experts.push(MoeExpertWeights {
+            gate_up_proj: WeightTensor {
+                buf: gu_view, gpu_dtype: gate_up_dtype, m: 2 * mi, k: dim, row_stride: 0,
+            },
+            down_proj: WeightTensor {
+                buf: dn_view, gpu_dtype: down_dtype, m: dim, k: mi, row_stride: 0,
+            },
+        });
+    }
+
+    Ok(MoeLayerExtras {
+        router_proj,
+        router_scale,
+        per_expert_scale,
+        per_expert_scale_host,
+        pre_feedforward_layernorm_2,
+        post_feedforward_layernorm_1,
+        post_feedforward_layernorm_2,
+        experts_gate_up_pool: gate_up_pool,
+        experts_down_pool: down_pool,
+        experts,
     })
 }
 
@@ -978,6 +1174,28 @@ pub struct Gemma4Scratch {
     /// Pre-saved residual at the per-layer inject site (after FFN+residual,
     /// before the side-channel additions). [dim].
     pub per_layer_pe_in: GpuTensor,
+
+    // ─── MoE scratch (26B-A4B only — zero-sized when enable_moe_block==false) ───
+    /// `[dim]` — `rmsnorm(attn_out, router_scale) * 1/sqrt(dim)` router input.
+    pub moe_router_in: GpuTensor,
+    /// `[n_experts]` — router logits (post-gemv, pre-softmax).
+    pub moe_router_logits: GpuTensor,
+    /// `[top_k]` — i32 expert indices written by `moe_softmax_topk_renorm_k8`.
+    pub moe_topk_indices: GpuTensor,
+    /// `[top_k]` — top-K softmax weights (renormalized).
+    pub moe_topk_weights: GpuTensor,
+    /// `[dim]` — `pre_feedforward_layernorm_2(attn_out)`, the MoE branch input.
+    pub moe_pre2: GpuTensor,
+    /// `[dim]` — `post_feedforward_layernorm_1(SwiGLU output)`.
+    pub moe_cur_mlp: GpuTensor,
+    /// `[dim]` — accumulated `Σ_k weight[k] * expert[k](moe_pre2)`.
+    pub moe_cur_moe: GpuTensor,
+    /// `[2 * moe_intermediate]` — per-expert gate_up_proj output.
+    pub moe_expert_gate_up: GpuTensor,
+    /// `[moe_intermediate]` — per-expert `gelu_tanh(gate) * up`.
+    pub moe_expert_hidden: GpuTensor,
+    /// `[dim]` — per-expert `down_proj(hidden)` output.
+    pub moe_expert_out: GpuTensor,
 }
 
 impl Gemma4Scratch {
@@ -1048,6 +1266,26 @@ impl Gemma4Scratch {
         let per_layer_out      = gpu.zeros(&[dim],          DType::F32)?;
         let per_layer_pe_in    = gpu.zeros(&[dim],          DType::F32)?;
 
+        // MoE scratch — sized for the active config when enable_moe_block is
+        // set; otherwise size-1 placeholders so the GpuTensor fields are
+        // valid but unused. The forward pass branches on lw.moe.is_some()
+        // and only touches these buffers in the MoE path.
+        let moe_active = config.enable_moe_block;
+        let n_exp_alloc = if moe_active { config.num_experts.max(1) } else { 1 };
+        let topk_alloc = if moe_active { config.top_k_experts.max(1) } else { 1 };
+        let mi_alloc = if moe_active { config.moe_intermediate_size.max(1) } else { 1 };
+        let dim_alloc_moe = if moe_active { dim } else { 1 };
+        let moe_router_in       = gpu.zeros(&[dim_alloc_moe], DType::F32)?;
+        let moe_router_logits   = gpu.zeros(&[n_exp_alloc],   DType::F32)?;
+        let moe_topk_indices    = gpu.zeros(&[topk_alloc],    DType::F32)?;  // bytes interp as i32
+        let moe_topk_weights    = gpu.zeros(&[topk_alloc],    DType::F32)?;
+        let moe_pre2            = gpu.zeros(&[dim_alloc_moe], DType::F32)?;
+        let moe_cur_mlp         = gpu.zeros(&[dim_alloc_moe], DType::F32)?;
+        let moe_cur_moe         = gpu.zeros(&[dim_alloc_moe], DType::F32)?;
+        let moe_expert_gate_up  = gpu.zeros(&[2 * mi_alloc],  DType::F32)?;
+        let moe_expert_hidden   = gpu.zeros(&[mi_alloc],      DType::F32)?;
+        let moe_expert_out      = gpu.zeros(&[dim_alloc_moe], DType::F32)?;
+
         Ok(Gemma4Scratch {
             x, residual, tmp, pos_buf,
             q, k, v, attn_out,
@@ -1058,6 +1296,9 @@ impl Gemma4Scratch {
             v_norm_ones_full,
             per_layer_inp, per_layer_inp_proj, per_layer_tmp,
             per_layer_out, per_layer_pe_in,
+            moe_router_in, moe_router_logits, moe_topk_indices, moe_topk_weights,
+            moe_pre2, moe_cur_mlp, moe_cur_moe,
+            moe_expert_gate_up, moe_expert_hidden, moe_expert_out,
         })
     }
 
@@ -1091,10 +1332,139 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.per_layer_tmp);
         let _ = gpu.free_tensor(self.per_layer_out);
         let _ = gpu.free_tensor(self.per_layer_pe_in);
+        let _ = gpu.free_tensor(self.moe_router_in);
+        let _ = gpu.free_tensor(self.moe_router_logits);
+        let _ = gpu.free_tensor(self.moe_topk_indices);
+        let _ = gpu.free_tensor(self.moe_topk_weights);
+        let _ = gpu.free_tensor(self.moe_pre2);
+        let _ = gpu.free_tensor(self.moe_cur_mlp);
+        let _ = gpu.free_tensor(self.moe_cur_moe);
+        let _ = gpu.free_tensor(self.moe_expert_gate_up);
+        let _ = gpu.free_tensor(self.moe_expert_hidden);
+        let _ = gpu.free_tensor(self.moe_expert_out);
     }
 }
 
 // ─── Forward pass ───────────────────────────────────────────────────────
+
+/// Run the Gemma 4 MoE routed-experts branch. Caller has already filled
+/// `scratch.ffn_out` with the standard SwiGLU output for the same layer.
+/// On exit, `scratch.tmp` holds `post_feedforward_layernorm(cur_mlp + cur_moe)`
+/// — ready to be added into the residual by the caller.
+///
+/// Mirrors llama.cpp gemma4-iswa.cpp lines 125-179:
+///
+///     cur_mlp = post_feedforward_layernorm_1(SwiGLU output)
+///     pre2    = pre_feedforward_layernorm_2(attn_out)
+///     router_in = rmsnorm(attn_out, router_scale) * 1/sqrt(dim)
+///     logits   = router_proj @ router_in
+///     (idx, w) = top_k_softmax_renorm(logits)
+///     cur_moe  = Σ_k (per_expert_scale[idx[k]] * w[k]) * expert[idx[k]](pre2)
+///     cur_moe  = post_feedforward_layernorm_2(cur_moe)
+///     combined = cur_mlp + cur_moe
+///     out      = post_feedforward_layernorm(combined)
+fn apply_moe_branch(
+    gpu: &mut Gpu,
+    config: &Gemma4Config,
+    scratch: &Gemma4Scratch,
+    moe: &MoeLayerExtras,
+    post_ffn_norm: &GpuTensor,
+    attn_out: &GpuTensor,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let dim_bytes = dim * 4;
+    let mi = config.moe_intermediate_size;
+    let n_exp = config.num_experts;
+    let k_top = config.top_k_experts;
+
+    // 1) cur_mlp = post_feedforward_layernorm_1(scratch.ffn_out)
+    gpu.rmsnorm_f32(&scratch.ffn_out, &moe.post_feedforward_layernorm_1,
+        &scratch.moe_cur_mlp, config.norm_eps)?;
+
+    // 2) MoE branch input: pre2 = pre_feedforward_layernorm_2(attn_out)
+    gpu.rmsnorm_f32(attn_out, &moe.pre_feedforward_layernorm_2,
+        &scratch.moe_pre2, config.norm_eps)?;
+
+    // 3) Router input: rmsnorm(attn_out, router_scale) * 1/sqrt(dim).
+    //    rmsnorm_f32(x, w) = w * x / sqrt(mean(x²) + eps); identical to
+    //    the ref `rms_norm + mul(router_scale)` factoring since they're
+    //    elementwise-commutative.
+    gpu.rmsnorm_f32(attn_out, &moe.router_scale,
+        &scratch.moe_router_in, config.norm_eps)?;
+    gpu.scale_f32(&scratch.moe_router_in, 1.0 / (dim as f32).sqrt())?;
+
+    // 4) Router GEMV → logits [n_exp]
+    weight_gemv(gpu, &moe.router_proj, &scratch.moe_router_in, &scratch.moe_router_logits)?;
+
+    // 5) Top-K softmax + renorm on device. The shared kernel is hardcoded
+    //    to k_top=8 (matches Qwen3.5-MoE A3B and Gemma 4 26B-A4B).
+    if k_top != 8 {
+        return Err(hip_bridge::HipError::new(
+            0, &format!("MoE top_k_experts={k_top} unsupported (kernel hardcoded to 8)"),
+        ));
+    }
+    gpu.moe_softmax_topk_renorm_k8(
+        &scratch.moe_router_logits,
+        &scratch.moe_topk_indices,
+        &scratch.moe_topk_weights,
+        n_exp,
+        true, // renormalize selected probs
+    )?;
+
+    // 6) D2H the top-K dispatch table (8×i32 + 8×f32 = 64B per token, per layer).
+    //    The router is data-dependent so we can't avoid this sync entirely
+    //    without a fully GPU-side indexed expert dispatch — that's a v2
+    //    optimization equivalent to Qwen3.5-MoE's `gemv_indexed_*` kernels.
+    let topk_idx_bytes = gpu.download_f32(&scratch.moe_topk_indices)?;
+    let topk_indices: Vec<usize> = unsafe {
+        std::slice::from_raw_parts(topk_idx_bytes.as_ptr() as *const i32, k_top)
+    }.iter().map(|&i| i as usize).collect();
+    let topk_weights = gpu.download_f32(&scratch.moe_topk_weights)?;
+
+    // 7) Zero accumulator
+    gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
+
+    // 8) Per-expert dispatch: for each selected expert e,
+    //    out_e = down_proj_e @ (gelu_tanh(gate_up_proj_e[..mi]) * gate_up_proj_e[mi..])
+    //    cur_moe += (topk_weights[k] * per_expert_scale[e]) * out_e
+    for ki in 0..k_top {
+        let e = topk_indices[ki];
+        // Defensive bound check — invalid indices would silently OOB here,
+        // and the kernel-side top-K is supposed to clamp to [0, n_exp).
+        if e >= n_exp {
+            return Err(hip_bridge::HipError::new(
+                0, &format!("MoE topk index {e} out of range (n_exp={n_exp})"),
+            ));
+        }
+        let weight = topk_weights[ki] * moe.per_expert_scale_host[e];
+        let expert = &moe.experts[e];
+
+        // gate_up = gate_up_proj @ moe_pre2 → [2 * mi]
+        weight_gemv(gpu, &expert.gate_up_proj, &scratch.moe_pre2, &scratch.moe_expert_gate_up)?;
+        // Split: gate (first mi), up (second mi).
+        let gate = scratch.moe_expert_gate_up.sub_offset(0, mi);
+        let up   = scratch.moe_expert_gate_up.sub_offset(mi, mi);
+        gpu.gelu_tanh_f32(&gate, &scratch.moe_expert_hidden, mi)?;
+        gpu.mul_f32(&scratch.moe_expert_hidden, &up, &scratch.moe_expert_hidden)?;
+        // out = down_proj @ hidden → [dim]
+        weight_gemv(gpu, &expert.down_proj, &scratch.moe_expert_hidden, &scratch.moe_expert_out)?;
+        // cur_moe += weight * out
+        gpu.scaled_add_inplace_cpu_scalar_f32(&scratch.moe_cur_moe, &scratch.moe_expert_out, weight)?;
+    }
+
+    // 9) cur_moe = post_feedforward_layernorm_2(cur_moe), in-place
+    gpu.rmsnorm_f32(&scratch.moe_cur_moe, &moe.post_feedforward_layernorm_2,
+        &scratch.moe_cur_moe, config.norm_eps)?;
+
+    // 10) combined = cur_mlp + cur_moe → scratch.tmp
+    gpu.add_f32(&scratch.moe_cur_mlp, &scratch.moe_cur_moe, &scratch.tmp)?;
+
+    // 11) tmp = post_feedforward_layernorm(combined)
+    gpu.rmsnorm_f32(&scratch.tmp, post_ffn_norm, &scratch.tmp, config.norm_eps)?;
+
+    let _ = dim_bytes;
+    Ok(())
+}
 
 /// Apply the Gemma 4 E-series per-layer-embedding side channel at the end of
 /// a layer's forward pass — between FFN+residual and `layer_scalar`. Mirrors
@@ -1461,8 +1831,16 @@ fn sliding_layer_decode(
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
 
-    // Sandwich post-FFN norm.
-    gpu.rmsnorm_f32(&scratch.ffn_out, &lw.post_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+    // Post-FFN norm. On MoE layers (26B-A4B), apply the parallel routed-
+    // experts branch and combine via the sandwich norms before the outer
+    // post_feedforward_layernorm. On dense layers, just the standard
+    // post_feedforward_layernorm.
+    if let Some(moe) = lw.moe.as_ref() {
+        apply_moe_branch(gpu, config, scratch, moe,
+            &lw.post_feedforward_layernorm, &scratch.residual)?;
+    } else {
+        gpu.rmsnorm_f32(&scratch.ffn_out, &lw.post_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+    }
 
     // x = residual + tmp (again, reset x from saved residual).
     gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
@@ -1617,8 +1995,13 @@ fn full_layer_decode(
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
 
-    // Sandwich post-FFN norm.
-    gpu.rmsnorm_f32(&scratch.ffn_out, &lw.post_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+    // Post-FFN norm + (optional) MoE branch — same dispatch as sliding.
+    if let Some(moe) = lw.moe.as_ref() {
+        apply_moe_branch(gpu, config, scratch, moe,
+            &lw.post_feedforward_layernorm, &scratch.residual)?;
+    } else {
+        gpu.rmsnorm_f32(&scratch.ffn_out, &lw.post_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+    }
 
     // x = residual + tmp.
     gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
