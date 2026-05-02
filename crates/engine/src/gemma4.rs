@@ -1419,8 +1419,17 @@ fn apply_moe_branch(
     // each of attn_out / ffn_out / cur_mlp / cur_moe / final_combined at the
     // first MoE layer of the first decode. Helps spot a single-branch
     // dominating or a NaN-adjacent buffer without full reference values.
+    //
+    // Only the first invocation per process emits — prevents 30 layers ×
+    // N tokens × 6 lines from drowning the log. Uses an AtomicBool with
+    // acquire-release ordering so the first dispatcher to compare-exchange
+    // wins; subsequent calls see DUMPED=true and skip. Replaces the prior
+    // `std::env::set_var("__HIPFIRE_MOE_VALS_DUMPED", "1")` hack which is
+    // process-wide and unsafe in modern Rust (set_var races with reads).
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DUMPED: AtomicBool = AtomicBool::new(false);
     let dump_vals = std::env::var("HIPFIRE_DUMP_MOE_VALS").ok().as_deref() == Some("1")
-        && std::env::var("__HIPFIRE_MOE_VALS_DUMPED").is_err();
+        && DUMPED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok();
     let stat = |gpu: &mut Gpu, t: &GpuTensor, label: &str| -> HipResult<()> {
         let v = gpu.download_f32(t)?;
         let n = v.len();
@@ -1563,8 +1572,9 @@ fn apply_moe_branch(
     if dump_vals {
         stat(gpu, &scratch.moe_cur_moe, "cur_moe (post_norm_2)")?;
         stat(gpu, &scratch.tmp, "combined+post_norm")?;
-        // Set a flag so subsequent layers don't dump (only the first one).
-        std::env::set_var("__HIPFIRE_MOE_VALS_DUMPED", "1");
+        // The AtomicBool above (DUMPED) was already flipped by the
+        // compare_exchange at function entry, so subsequent layers see
+        // dump_vals=false and skip. No additional latch needed here.
     }
 
     let _ = dim_bytes;
