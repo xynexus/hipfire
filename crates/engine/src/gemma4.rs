@@ -1599,10 +1599,22 @@ fn apply_per_layer_inject(
 
     // tmp_pl = per_layer_input_gate @ x → [n_embd_per_layer]
     weight_gemv(gpu, inp_gate, &scratch.x, &scratch.per_layer_tmp)?;
-    // Exact (erf-based) GELU — matches PyTorch `nn.GELU()` used by HF
-    // Gemma 4 per-layer-embed block. The FFN's gelu_pytorch_tanh
-    // approximation is a different kernel (gelu_tanh_f32).
-    gpu.gelu_erf_f32(&scratch.per_layer_tmp, &scratch.per_layer_tmp, pl_w)?;
+    // Empirical: erf-GELU produces materially better E4B/E2B output than
+    // tanh-GELU, even though HF Gemma4TextDecoderLayer technically wires
+    // `act_fn = ACT2FN[config.hidden_activation]` (= gelu_pytorch_tanh).
+    // Tested 2026-05-02 with gelu_tanh: E4B emits pure-digit gibberish
+    // ("The capital of France is 3417"); reverted. The HF code may be
+    // inconsistent with the published checkpoint, or our pre-/post-norm
+    // path interacts with the activation differently than HF's. Either
+    // way, gelu_erf is what makes the E-series coherent at MG4 — keep
+    // until the divergence is rigorously diagnosed against a Python
+    // reference forward of layer 0 with both activations.
+    // HIPFIRE_GEMMA4_PLE_GELU_TANH=1 swaps to tanh approx for diagnosis.
+    if std::env::var("HIPFIRE_GEMMA4_PLE_GELU_TANH").ok().as_deref() == Some("1") {
+        gpu.gelu_tanh_f32(&scratch.per_layer_tmp, &scratch.per_layer_tmp, pl_w)?;
+    } else {
+        gpu.gelu_erf_f32(&scratch.per_layer_tmp, &scratch.per_layer_tmp, pl_w)?;
+    }
 
     // tmp_pl *= inp_per_layer[layer_idx*pl_w .. (layer_idx+1)*pl_w]
     let inp_slice = scratch.per_layer_inp.sub_offset(layer_idx * pl_w, pl_w);
