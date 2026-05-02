@@ -1991,21 +1991,21 @@ fn main() {
         total_params += n_elements as u64;
 
         // ── MoE 3D-stacked expert tensor split ─────────────────────────────────
-        // Qwen3.5-MoE stores routed experts as 3D tensors:
-        //   model.language_model.layers.{N}.mlp.experts.gate_up_proj
-        //     shape: [num_experts, 2 * moe_intermediate, hidden_size]
-        //   model.language_model.layers.{N}.mlp.experts.down_proj
-        //     shape: [num_experts, hidden_size, moe_intermediate]
+        // Two naming conventions supported:
+        //   • Qwen3.5-MoE: `...layers.{N}.mlp.experts.gate_up_proj` (with `mlp.`)
+        //   • Gemma 4 26B-A4B: `...layers.{N}.experts.gate_up_proj` (no `mlp.`)
+        // Both store routed experts as 3D tensors:
+        //   gate_up_proj shape: [num_experts, 2 * moe_intermediate, hidden_size]
+        //   down_proj    shape: [num_experts, hidden_size, moe_intermediate]
         // Note: no `.weight` suffix on these, so should_quantize() returns false
         // and the standard path would store them as F16 — defeating the purpose.
         // We split into per-expert 2D MQ4G256 quantized tensors named
-        //   model.language_model.layers.{N}.mlp.experts.{X}.{base}.weight
-        // so the engine loader can fish them out by expert index.
-        if is_moe
-            && name.contains("mlp.experts.")
+        //   `<parent>.{X}.{base}.weight` (parent includes the `experts.`
+        //   prefix so both conventions round-trip naturally).
+        let is_3d_expert_tensor = name.contains(".experts.")
             && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
-            && meta.shape.len() == 3
-        {
+            && meta.shape.len() == 3;
+        if is_3d_expert_tensor {
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
             let elem_size = match meta.dtype.as_str() {
@@ -2018,12 +2018,16 @@ fn main() {
             // Strip the trailing base; what remains is the parent path with `experts.` already on the end
             let parent = &name[..name.len() - base_name.len()];
 
-            // Inner MQ4G256 quantization helpers — we know we want MQ4 for experts
-            // (router/shared_expert use the standard format-flag path below).
+            // Inner quantization helpers. Format choice mirrors the outer
+            // 2D-weights flag: --format mg4 → MG4G256 (percentile-clip
+            // calibration, Gemma-tuned), --format mq4 → MQ4G256 (true
+            // min-max, Qwen-tuned). Other formats fall back to MQ4G256
+            // for legacy parity.
             let signs1 = gen_fwht_signs(42, 256);
             let signs2 = gen_fwht_signs(1042, 256);
             let inner_k = inner_shape[1] as usize;
             let supports_mq4 = inner_k % 256 == 0;
+            let use_mg4_for_experts = use_mg4g256;
 
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
@@ -2038,8 +2042,13 @@ fn main() {
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
                 let (quantized, qt, gs) = if supports_mq4 {
-                    let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32)
+                    if use_mg4_for_experts {
+                        let q = quantize_mg4g256(&f32_slice, &signs1, &signs2);
+                        (q, QuantType::MG4G256, 256u32)
+                    } else {
+                        let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
+                        (q, QuantType::MQ4G256, 256u32)
+                    }
                 } else {
                     let q = quantize_hfq4g128(&f32_slice);
                     (q, QuantType::HFQ4G128, 128u32)
@@ -2054,7 +2063,9 @@ fn main() {
             }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
-            let label = if supports_mq4 { "MQ4G256" } else { "HFQ4G128" };
+            let label = if supports_mq4 {
+                if use_mg4_for_experts { "MG4G256" } else { "MQ4G256" }
+            } else { "HFQ4G128" };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
