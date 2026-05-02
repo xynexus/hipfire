@@ -1157,11 +1157,22 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             g4_kv_sliding: Some(kv_sliding), g4_kv_full: Some(kv_full),
             g4_vision_config, g4_vision_weights,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap,
+            seq_pos: 0, max_seq,
             // Gemma 4 doesn't go through the CASK eviction or DFlash spec
             // paths today (those are Qwen3.5-specific wirings). These slots
             // are reserved for when those features are ported across; until
             // then the gemma4 path is plain greedy decode.
+            //
+            // physical_cap is forced to max_seq here — the outer-scope
+            // `physical_cap` (line 905) is CASK-derived from
+            // `cask.budget + cask.beta + safety` and only meaningful when
+            // an eviction policy is active. Storing that smaller value on
+            // a Gemma 4 model would advertise a window the cache wasn't
+            // actually sized for (kv_sliding/kv_full above use max_seq),
+            // which downstream eviction-aware code paths interpret as
+            // "trigger eviction at this position" — exactly wrong for
+            // a model with no eviction wired up.
+            physical_cap: max_seq,
             eviction: None,
             dflash: None,
             conversation_tokens: Vec::new(),
