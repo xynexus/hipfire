@@ -146,6 +146,26 @@ pub struct KvSharePlan {
 }
 
 impl Gemma4Config {
+    /// Per-layer FFN hidden_dim. On most Gemma 4 models this is constant
+    /// (config.hidden_dim across all layers). E2B sets `use_double_wide_mlp`
+    /// which doubles the FFN width on the LAST `num_kv_shared_layers` layers
+    /// (intermediate_size*2). Per llama-model.cpp lines 4730-4735.
+    pub fn ffn_hidden_dim_for_layer(&self, layer_idx: usize) -> usize {
+        if self.use_double_wide_mlp {
+            let n_kv_start = self.n_layers.saturating_sub(self.num_kv_shared_layers);
+            if layer_idx >= n_kv_start {
+                return self.hidden_dim * 2;
+            }
+        }
+        self.hidden_dim
+    }
+
+    /// Maximum FFN hidden_dim across all layers — used to size scratch
+    /// buffers (`gate_ffn`, `up_ffn`, `ffn_hidden`) once per model load.
+    pub fn max_ffn_hidden_dim(&self) -> usize {
+        if self.use_double_wide_mlp { self.hidden_dim * 2 } else { self.hidden_dim }
+    }
+
     /// Compute the KV-cache routing plan for this config. Cheap; call once
     /// at load time and stash on the model object.
     ///
@@ -346,10 +366,12 @@ pub struct SlidingLayerWeights {
     pub q_norm: GpuTensor,      // [256]
     pub k_norm: GpuTensor,      // [256]
 
-    // MLP (SwiGLU)
-    pub gate_proj: WeightTensor, // [hidden_dim, dim]
-    pub up_proj: WeightTensor,   // [hidden_dim, dim]
-    pub down_proj: WeightTensor, // [dim, hidden_dim]
+    // MLP (SwiGLU). `ffn_hidden_dim` is per-layer to support
+    // `use_double_wide_mlp` on E2B (last 20 layers have intermediate_size*2).
+    pub ffn_hidden_dim: usize,
+    pub gate_proj: WeightTensor, // [ffn_hidden_dim, dim]
+    pub up_proj: WeightTensor,   // [ffn_hidden_dim, dim]
+    pub down_proj: WeightTensor, // [dim, ffn_hidden_dim]
 
     // Per-layer embedding side-channel (Some on E2B / E4B; None on 31B / 26B-A4B).
     // Applied at layer end after FFN+residual but BEFORE the layer_scalar.
@@ -386,7 +408,9 @@ pub struct FullLayerWeights {
     pub k_norm: GpuTensor,      // [512]
     // no v_norm weight — v_norm is no-scale (divide only)
 
-    // MLP (SwiGLU, same shape as sliding)
+    // MLP (SwiGLU). `ffn_hidden_dim` is per-layer (same use_double_wide_mlp
+    // behavior as sliding layers).
+    pub ffn_hidden_dim: usize,
     pub gate_proj: WeightTensor,
     pub up_proj: WeightTensor,
     pub down_proj: WeightTensor,
@@ -596,28 +620,6 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
 pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
     -> HipResult<Gemma4Weights>
 {
-    // Refuse use_double_wide_mlp (E2B-only) until per-layer FFN sizing
-    // lands. Our SlidingLayerWeights / FullLayerWeights assume a single
-    // `hidden_dim` across all layers; with use_double_wide_mlp the last
-    // `num_kv_shared_layers` layers have `intermediate_size * 2` and the
-    // weight tensors are shaped accordingly. Loading them with the wrong
-    // expected (m, k) silently reads only the first half of the weights
-    // → garbage FFN on every shared layer.
-    if config.use_double_wide_mlp {
-        return Err(hip_bridge::HipError::new(
-            0,
-            &format!(
-                "Gemma 4 `use_double_wide_mlp` not yet implemented (this is \
-                 E2B-only — the last {} layers have intermediate_size*2={} \
-                 instead of {}). Forward pass would silently read half of \
-                 the FFN weights. Track in task #13. Supported E-series \
-                 today: E4B (no use_double_wide_mlp).",
-                config.num_kv_shared_layers,
-                config.hidden_dim * 2,
-                config.hidden_dim,
-            ),
-        ));
-    }
     eprintln!("gemma4: loading embed_tokens...");
     let embed_name = "model.language_model.embed_tokens.weight";
     let (embed_info, embed_data) = hfq.tensor_data(embed_name).ok_or_else(|| {
@@ -731,6 +733,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                      Some(load_gemma4_norm(hfq, gpu,
                         &format!("{p}.post_per_layer_input_norm.weight"), config.dim)?))
                 } else { (None, None, None) };
+                let ffn_hd = config.ffn_hidden_dim_for_layer(i);
                 layers.push(LayerWeights::Sliding(SlidingLayerWeights {
                     input_layernorm: load_gemma4_norm(hfq, gpu,
                         &format!("{p}.input_layernorm.weight"), config.dim)?,
@@ -754,12 +757,13 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                         &format!("{p}.self_attn.q_norm.weight"), hd)?,
                     k_norm: load_gemma4_head_norm(hfq, gpu,
                         &format!("{p}.self_attn.k_norm.weight"), hd)?,
+                    ffn_hidden_dim: ffn_hd,
                     gate_proj: load_gemma4_weight(hfq, gpu,
-                        &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+                        &format!("{p}.mlp.gate_proj.weight"), ffn_hd, config.dim)?,
                     up_proj: load_gemma4_weight(hfq, gpu,
-                        &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+                        &format!("{p}.mlp.up_proj.weight"), ffn_hd, config.dim)?,
                     down_proj: load_gemma4_weight(hfq, gpu,
-                        &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                        &format!("{p}.mlp.down_proj.weight"), config.dim, ffn_hd)?,
                     per_layer_input_gate: pl_gate,
                     per_layer_projection: pl_proj,
                     post_per_layer_input_norm: pl_post_norm,
@@ -781,6 +785,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                      Some(load_gemma4_norm(hfq, gpu,
                         &format!("{p}.post_per_layer_input_norm.weight"), config.dim)?))
                 } else { (None, None, None) };
+                let ffn_hd = config.ffn_hidden_dim_for_layer(i);
                 layers.push(LayerWeights::Full(FullLayerWeights {
                     input_layernorm: load_gemma4_norm(hfq, gpu,
                         &format!("{p}.input_layernorm.weight"), config.dim)?,
@@ -812,12 +817,13 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                     k_norm: load_gemma4_head_norm(hfq, gpu,
                         &format!("{p}.self_attn.k_norm.weight"), hd)?,
                     // no v_norm weight — v_norm is no-scale (ones buffer passed at decode time).
+                    ffn_hidden_dim: ffn_hd,
                     gate_proj: load_gemma4_weight(hfq, gpu,
-                        &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+                        &format!("{p}.mlp.gate_proj.weight"), ffn_hd, config.dim)?,
                     up_proj: load_gemma4_weight(hfq, gpu,
-                        &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+                        &format!("{p}.mlp.up_proj.weight"), ffn_hd, config.dim)?,
                     down_proj: load_gemma4_weight(hfq, gpu,
-                        &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                        &format!("{p}.mlp.down_proj.weight"), config.dim, ffn_hd)?,
                     per_layer_input_gate: pl_gate,
                     per_layer_projection: pl_proj,
                     post_per_layer_input_norm: pl_post_norm,
@@ -943,9 +949,13 @@ impl Gemma4Scratch {
         let v = gpu.zeros(&[kv_dim], DType::F32)?;
         let attn_out = gpu.zeros(&[q_dim], DType::F32)?;
 
-        let gate_ffn = gpu.zeros(&[config.hidden_dim], DType::F32)?;
-        let up_ffn = gpu.zeros(&[config.hidden_dim], DType::F32)?;
-        let ffn_hidden = gpu.zeros(&[config.hidden_dim], DType::F32)?;
+        // Size FFN scratch by the MAX layer hidden_dim — on E2B that's
+        // intermediate_size*2 (for the use_double_wide_mlp shared layers);
+        // every other model has a single hidden_dim across all layers.
+        let max_ffn_hd = config.max_ffn_hidden_dim();
+        let gate_ffn = gpu.zeros(&[max_ffn_hd], DType::F32)?;
+        let up_ffn = gpu.zeros(&[max_ffn_hd], DType::F32)?;
+        let ffn_hidden = gpu.zeros(&[max_ffn_hd], DType::F32)?;
         let ffn_out = gpu.zeros(&[dim], DType::F32)?;
 
         let logits = gpu.zeros(&[config.vocab_size], DType::F32)?;
@@ -1395,9 +1405,10 @@ fn sliding_layer_decode(
     gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
 
     // SwiGLU(gelu_pytorch_tanh): gate_proj, up_proj, gelu_tanh(gate) * up → down_proj.
+    // Use lw.ffn_hidden_dim — varies per layer on E2B (use_double_wide_mlp).
     weight_gemv(gpu, &lw.gate_proj, &scratch.tmp, &scratch.gate_ffn)?;
     weight_gemv(gpu, &lw.up_proj, &scratch.tmp, &scratch.up_ffn)?;
-    gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, config.hidden_dim)?;
+    gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, lw.ffn_hidden_dim)?;
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
 
@@ -1549,10 +1560,11 @@ fn full_layer_decode(
     // Pre-FFN norm.
     gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
 
-    // SwiGLU with gelu_pytorch_tanh activation.
+    // SwiGLU with gelu_pytorch_tanh activation. lw.ffn_hidden_dim is per-layer
+    // (use_double_wide_mlp on E2B doubles it for shared-KV layers).
     weight_gemv(gpu, &lw.gate_proj, &scratch.tmp, &scratch.gate_ffn)?;
     weight_gemv(gpu, &lw.up_proj, &scratch.tmp, &scratch.up_ffn)?;
-    gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, config.hidden_dim)?;
+    gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, lw.ffn_hidden_dim)?;
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
 
