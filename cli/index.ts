@@ -32,6 +32,7 @@ interface HipfireConfig {
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
   max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
   port: number;           // default serve port
+  listen_ip: string;       // extra IP for `hipfire serve`; 127.0.0.1 is always bound
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
   // ── Experimental / research knobs (OFF by default, no stable contract) ──
   // Gates the daemon's `budget_alert_at_tok` + `budget_alert_text` generate
@@ -150,6 +151,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   thinking: "on",
   max_think_tokens: 0,
   port: DEFAULT_PORT,
+  listen_ip: "127.0.0.1",
   idle_timeout: 300,
   experimental_budget_alert: false,
   dflash_adaptive_b: true,
@@ -187,6 +189,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "thinking": return ["on", "off"].includes(value);
     case "max_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 32768;
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+    case "listen_ip": return typeof value === "string" && value.trim().length > 0 && !/\s/.test(value);
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
     case "default_model": return typeof value === "string" && value.trim().length > 0;
     case "experimental_budget_alert": return typeof value === "boolean";
@@ -1272,12 +1275,7 @@ async function serve(port: number) {
     else busy = false;
   }
 
-  console.error(`[hipfire] http://localhost:${port}/v1/chat/completions`);
-
-  Bun.serve({
-    port,
-    idleTimeout: 255, // max allowed — model loading can take 30s+
-    async fetch(req) {
+  const handleFetch = async (req: Request) => {
       const url = new URL(req.url);
       if (url.pathname === "/health") {
         return Response.json({
@@ -1882,8 +1880,25 @@ async function serve(port: number) {
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
       }
-    }
-  });
+  };
+
+  const listenIp = cfg.listen_ip.trim();
+  const bindHosts = ["127.0.0.1"];
+  if (!["127.0.0.1", "localhost", "0.0.0.0"].includes(listenIp)) {
+    bindHosts.push(listenIp);
+  } else if (listenIp === "0.0.0.0") {
+    bindHosts[0] = listenIp;
+  }
+
+  for (const hostname of bindHosts) {
+    Bun.serve({
+      port,
+      hostname,
+      idleTimeout: 255, // max allowed — model loading can take 30s+
+      fetch: handleFetch,
+    });
+    console.error(`[hipfire] http://${hostname}:${port}/v1/chat/completions`);
+  }
 }
 
 // ─── Quantize ───────────────────────────────────────────
@@ -2778,6 +2793,7 @@ interface FieldMeta {
   range?: [number, number];     // numeric clamp
   step?: number;                // +/- nudge amount
   decimals?: number;            // display precision for floats
+  text?: boolean;               // free-form string, edited via `hipfire config set`
 }
 
 // TUI exit actions — the case "config" orchestrator uses these to decide
@@ -3024,6 +3040,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "port",
       desc: "HTTP port for `hipfire serve` (OpenAI-compatible API)",
       range: [1, 65535], step: 1,
+    },
+    listen_ip: {
+      label: "listen_ip",
+      desc: "extra IP for `hipfire serve`; loopback remains enabled for local tools",
+      text: true,
     },
     idle_timeout: {
       label: "idle_timeout",
@@ -4686,6 +4707,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
           thinking: "one of: on, off. Controls whether the model reasons in <think> blocks.",
           max_think_tokens: "integer 0-32768. Budget for reasoning tokens (0 = unlimited).",
           port: "integer between 1 and 65535",
+          listen_ip: "an IP address without whitespace; 127.0.0.1 stays enabled for local tools",
           idle_timeout: "seconds of inactivity before serve unloads the model (0 = never, max 86400)",
           default_model: "non-empty model tag",
         };
