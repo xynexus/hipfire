@@ -97,7 +97,9 @@ fn main() {
             .expect("kv full alloc (fp32)")
     };
 
-    let scratch = Gemma4Scratch::new(&mut gpu, &config, 64).expect("scratch alloc");
+    // Scratch sizing must match the kv_cache max_seq above — flash_partials
+    // and the RoPE tables both index by absolute position.
+    let scratch = Gemma4Scratch::new(&mut gpu, &config, kv_seq).expect("scratch alloc");
     gemma4::init_scratch_constants(&mut gpu, &scratch, config.full_head_dim)
         .expect("scratch constants init");
 

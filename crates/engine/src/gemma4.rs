@@ -1207,7 +1207,14 @@ pub struct Gemma4Scratch {
 }
 
 impl Gemma4Scratch {
-    pub fn new(gpu: &mut Gpu, config: &Gemma4Config, _max_prefill: usize) -> HipResult<Self> {
+    /// `max_seq` is the per-cache capacity used by `KvCache::new_gpu*` calls
+    /// the caller will make alongside this scratch. Must match: the flash
+    /// kernels write `partials[h * max_tiles + tile_id]` with `max_tiles =
+    /// ceil(max_seq / 128)`, and the RoPE tables are indexed by absolute
+    /// position. Sizing the scratch to a smaller value than the kv_cache
+    /// passed at dispatch time silently overruns these buffers — caller
+    /// must keep them in lockstep.
+    pub fn new(gpu: &mut Gpu, config: &Gemma4Config, max_seq: usize) -> HipResult<Self> {
         let dim = config.dim;
         let q_dim = (config.n_heads * config.sliding_head_dim).max(config.n_heads * config.full_head_dim);
         let kv_dim = (config.sliding_n_kv_heads * config.sliding_head_dim)
@@ -1237,24 +1244,24 @@ impl Gemma4Scratch {
         let sample_buf = gpu.zeros(&[2], DType::F32)?;
         let repeat_buf = gpu.zeros(&[1024], DType::F32)?;
 
-        // Flash partials sizing. Assumes max_seq <= 32768 (typical daemon max).
-        // Per-head × max_tiles × (2 + head_dim).
-        // Sized for FULL attn (larger head_dim=512, larger max_tiles).
-        const MAX_CTX_DEFAULT: usize = 32768;
+        // Flash partials sizing — must accommodate the largest max_tiles the
+        // dispatch path will compute. Sized for FULL attn (larger head_dim=512,
+        // larger max_tiles). Previously hardcoded to MAX_CTX_DEFAULT=32768
+        // which silently overran when the caller allocated a kv_cache at
+        // larger max_seq (Gemma 4 advertises max_position_embeddings=131072).
         const TILE_SIZE: usize = 128;
-        let max_tiles_full = (MAX_CTX_DEFAULT + TILE_SIZE - 1) / TILE_SIZE;
+        let max_tiles_full = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let flash_partials_sz = config.n_heads * max_tiles_full * (2 + config.full_head_dim);
         let flash_partials = gpu.zeros(&[flash_partials_sz], DType::F32)?;
 
         // RoPE tables. The actual sin/cos values are computed host-side and
         // uploaded once per model load. For now allocate and zero; the loader
-        // will populate them.
-        // Size: max_seq * head_dim (enough for every (position, rotary_dim) pair).
-        // TODO: make max_seq configurable — using 32k default.
-        let sliding_cos = gpu.zeros(&[MAX_CTX_DEFAULT * config.sliding_head_dim], DType::F32)?;
-        let sliding_sin = gpu.zeros(&[MAX_CTX_DEFAULT * config.sliding_head_dim], DType::F32)?;
-        let full_cos = gpu.zeros(&[MAX_CTX_DEFAULT * config.full_head_dim], DType::F32)?;
-        let full_sin = gpu.zeros(&[MAX_CTX_DEFAULT * config.full_head_dim], DType::F32)?;
+        // will populate them. Sized to max_seq for the same reason as
+        // flash_partials — RoPE indexes by absolute position.
+        let sliding_cos = gpu.zeros(&[max_seq * config.sliding_head_dim], DType::F32)?;
+        let sliding_sin = gpu.zeros(&[max_seq * config.sliding_head_dim], DType::F32)?;
+        let full_cos = gpu.zeros(&[max_seq * config.full_head_dim], DType::F32)?;
+        let full_sin = gpu.zeros(&[max_seq * config.full_head_dim], DType::F32)?;
 
         // v_norm ones — populated on first use in the forward pass.
         // (Allocated to the full head_dim because only full-attn layers

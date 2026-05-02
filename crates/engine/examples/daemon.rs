@@ -1142,7 +1142,9 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             llama::KvCache::new_gpu(gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq)
         }.map_err(|e| format!("{e}"))?;
 
-        let scratch = gemma4::Gemma4Scratch::new(gpu, &config, 128).map_err(|e| format!("{e}"))?;
+        // Scratch sizing must match the kv_cache max_seq above — flash_partials
+        // and the RoPE tables both index by absolute position.
+        let scratch = gemma4::Gemma4Scratch::new(gpu, &config, max_seq).map_err(|e| format!("{e}"))?;
         // One-time init of the ones-filled v_norm buffer used by full-attn layers.
         gemma4::init_scratch_constants(gpu, &scratch, config.full_head_dim)
             .map_err(|e| format!("{e}"))?;
