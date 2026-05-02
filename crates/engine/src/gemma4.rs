@@ -86,6 +86,17 @@ pub struct Gemma4Config {
     //     `per_layer_projection`, `post_per_layer_input_norm`
     pub n_embd_per_layer: usize,
 
+    /// KV-sharing layer count for Gemma 4 E-series (per HF
+    /// `num_kv_shared_layers`). When non-zero, the LAST `num_kv_shared_layers`
+    /// layers do NOT compute their own K/V projection — they reuse an earlier
+    /// layer's KV cache. See llama-model.cpp `n_layer_kv_from_start`:
+    ///   • Layers `[0, n_layers - num_kv_shared_layers)` compute own KV.
+    ///   • Layers `[n_layers - num_kv_shared_layers, n_layers)` are KV-shared.
+    /// Sliding shared layers read from cache slot `(n_layers - shared) - 2`;
+    /// full shared layers read from `(n_layers - shared) - 1`.
+    /// Values for the official lineup: E2B=20, E4B=18, 26B-A4B=0, 31B=0.
+    pub num_kv_shared_layers: usize,
+
     // Per-layer dispatch (len == n_layers)
     pub layer_types: Vec<LayerType>,
 
@@ -149,6 +160,9 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Gemma4Config> {
     // Per-layer embedding feature (E2B / E4B / Gemma 3n). 0 ≙ disabled.
     let n_embd_per_layer = tc.get("hidden_size_per_layer_input")
         .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    // KV-sharing (E-series). 0 on 31B / 26B-A4B; 18-20 on E4B / E2B.
+    let num_kv_shared_layers = tc.get("num_kv_shared_layers")
+        .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
     let final_logit_softcapping = tc.get("final_logit_softcapping")
         .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
@@ -184,6 +198,7 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Gemma4Config> {
         hidden_dim,
         final_logit_softcapping, tie_word_embeddings, embed_scale,
         n_embd_per_layer,
+        num_kv_shared_layers,
         layer_types,
         has_vision,
         image_token_id, boi_token_id, eoi_token_id, audio_token_id, video_token_id,
@@ -457,6 +472,32 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
 pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
     -> HipResult<Gemma4Weights>
 {
+    // KV-sharing (E-series feature) is detected at load time and refused
+    // here rather than producing silent garbage at decode time. The
+    // forward pass currently computes K/V for every layer and writes them
+    // to that layer's own KV cache slot — for the last `num_kv_shared_layers`
+    // layers on E2B/E4B that's wrong twice over: (1) those layers' weight
+    // tensors for k_proj/v_proj are stale/unused in HF, and (2) attention
+    // should read from an earlier layer's cache slot, not the per-layer
+    // one we'd write. Until per-layer KV slot indirection lands, refuse
+    // loudly with the diagnostic the operator needs.
+    if config.num_kv_shared_layers > 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "Gemma 4 E-series KV-sharing not yet implemented \
+                 (num_kv_shared_layers={}, n_layer_kv_from_start={}). \
+                 The last {} layers of this model reuse earlier layers' KV cache; \
+                 our forward pass would compute and read the wrong KV for those \
+                 layers, producing multilingual gibberish in inference. Track in \
+                 task #12 (Implement KV-sharing for Gemma 4 E2B/E4B). Supported \
+                 dense Gemma 4 today: 31B (no KV-sharing).",
+                config.num_kv_shared_layers,
+                config.n_layers - config.num_kv_shared_layers,
+                config.num_kv_shared_layers,
+            ),
+        ));
+    }
     eprintln!("gemma4: loading embed_tokens...");
     let embed_name = "model.language_model.embed_tokens.weight";
     let (embed_info, embed_data) = hfq.tensor_data(embed_name).ok_or_else(|| {
