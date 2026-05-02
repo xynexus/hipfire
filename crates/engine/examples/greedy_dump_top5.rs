@@ -7,7 +7,7 @@
 //! argmax flip is a near-tie (ULP-scale gap between top-1 and top-2 =
 //! FP drift) or a wide gap (= structural numerical error).
 //!
-//! Usage: greedy_dump_top5 <model.hfq> <out_prefix> [--max-gen N] [prompt...]
+//! Usage: greedy_dump_top5 <model.hfq> <out_prefix> [--max-gen N] [--system TEXT] [prompt...]
 //!   writes  <out_prefix>.tokens  — one token ID per line
 //!           <out_prefix>.top5.csv — step,rank1_id,rank1_logit,...,rank5_id,rank5_logit
 
@@ -26,18 +26,23 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: greedy_dump_top5 <model.hfq> <out_prefix> [--max-gen N] [prompt...]");
+        eprintln!("Usage: greedy_dump_top5 <model.hfq> <out_prefix> [--max-gen N] [--system TEXT] [prompt...]");
         std::process::exit(1);
     }
     let model_path = &args[1];
     let out_prefix = &args[2];
     let mut max_gen_override: Option<usize> = None;
+    let mut system_prompt: Option<String> = None;
     let mut prompt_args = Vec::new();
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
             "--max-gen" => {
                 max_gen_override = args.get(i + 1).and_then(|s| s.parse().ok());
+                i += 2;
+            }
+            "--system" => {
+                system_prompt = args.get(i + 1).cloned();
                 i += 2;
             }
             other => {
@@ -66,10 +71,19 @@ fn main() {
             let im_start = tokenizer.encode("<|im_start|>");
             let im_end = tokenizer.encode("<|im_end|>");
             let user = tokenizer.encode("user");
+            let system = tokenizer.encode("system");
             let asst = tokenizer.encode("assistant");
             let nl = tokenizer.encode("\n");
             let user_body = tokenizer.encode(&prompt_text);
             let mut chat = Vec::new();
+            if let Some(system_prompt) = system_prompt.as_deref() {
+                chat.extend_from_slice(&im_start);
+                chat.extend_from_slice(&system);
+                chat.extend_from_slice(&nl);
+                chat.extend_from_slice(&tokenizer.encode(system_prompt));
+                chat.extend_from_slice(&im_end);
+                chat.extend_from_slice(&nl);
+            }
             chat.extend_from_slice(&im_start);
             chat.extend_from_slice(&user);
             chat.extend_from_slice(&nl);

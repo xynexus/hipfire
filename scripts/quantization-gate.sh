@@ -20,6 +20,40 @@ OUT="${HIPFIRE_QUANT_OUT:-benchmarks/results/quantization-$(date +%Y%m%d-%H%M%S)
 FULL=0
 COHERENCE=0
 RUNS=1
+STRICT=0
+SKIP_BUILD=0
+TQV4_COS_FLOOR="${HIPFIRE_TQV4_COS_FLOOR:-0.995}"
+TQV2_COS_FLOOR="${HIPFIRE_TQV2_COS_FLOOR:-0.985}"
+TOP1_WARN_FLOOR="${HIPFIRE_QUANT_TOP1_WARN_FLOOR:-0.70}"
+TOP5_WARN_FLOOR="${HIPFIRE_QUANT_TOP5_WARN_FLOOR:-2.50}"
+WARNINGS=()
+ERRORS=()
+
+warn() {
+    WARNINGS+=("$*")
+    echo "warning: $*" >&2
+}
+
+hard_error() {
+    ERRORS+=("$*")
+    echo "error: $*" >&2
+}
+
+strict_or_warn() {
+    if [ "$STRICT" -eq 1 ]; then
+        hard_error "$*"
+    else
+        warn "$*"
+    fi
+}
+
+collect_diag() {
+    local kind="$1" msg="$2"
+    case "$kind" in
+        WARN) warn "$msg" ;;
+        ERROR) hard_error "$msg" ;;
+    esac
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -29,8 +63,12 @@ while [ $# -gt 0 ]; do
         --runs) RUNS="$2"; shift 2 ;;
         --full) FULL=1; shift ;;
         --coherence) COHERENCE=1; shift ;;
+        --strict) STRICT=1; shift ;;
+        --skip-build) SKIP_BUILD=1; shift ;;
         -h|--help)
-            sed -n '2,25p' "$0"
+            sed -n '2,28p' "$0"
+            echo
+            echo "Options: --model PATH --modes CSV --out DIR --runs N --full --coherence --strict --skip-build"
             exit 0
             ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -71,20 +109,32 @@ echo "quantization-gate output: $OUT"
     echo "- modes: $MODES"
     echo "- full: $FULL"
     echo "- coherence: $COHERENCE"
+    echo "- strict: $STRICT"
+    echo "- thresholds:"
+    echo "  - tqv4_cos_floor: $TQV4_COS_FLOOR"
+    echo "  - tqv2_cos_floor: $TQV2_COS_FLOOR"
+    echo "  - top1_warn_floor: $TOP1_WARN_FLOOR"
+    echo "  - top5_warn_floor: $TOP5_WARN_FLOOR"
     echo
 } > "$OUT/report.md"
 
-echo "== build examples =="
-cargo build --release --features deltanet -p engine \
-    --example daemon \
-    --example bench_qwen35_mq4 \
-    --example greedy_dump_top5 \
-    --example kv_quant_parity
+if [ "$SKIP_BUILD" -eq 0 ]; then
+    echo "== build examples =="
+    cargo build --release --features deltanet -p engine \
+        --example daemon \
+        --example bench_qwen35_mq4 \
+        --example greedy_dump_top5 \
+        --example kv_quant_parity
+else
+    echo "== build examples: skipped =="
+fi
 
 for exe in daemon bench_qwen35_mq4 greedy_dump_top5 kv_quant_parity; do
     bin="target/release/examples/$exe"
     if [ -x "$bin" ]; then
         echo "- ${exe}_md5: $(md5sum "$bin" | awk '{print $1}')" >> "$OUT/report.md"
+    else
+        hard_error "missing built example: $bin"
     fi
 done
 echo >> "$OUT/report.md"
@@ -102,6 +152,38 @@ fi
 target/release/examples/kv_quant_parity --seq "$KV_SEQS" --head-dim "$KV_HEADS" \
     > "$OUT/kernel/kv_quant_parity.csv" \
     2> "$OUT/kernel/kv_quant_parity.stderr"
+while IFS='|' read -r kind msg; do
+    collect_diag "$kind" "$msg"
+done < <(python3 - "$OUT/kernel/kv_quant_parity.csv" "$TQV4_COS_FLOOR" "$TQV2_COS_FLOOR" <<'PY'
+import csv
+import math
+import sys
+
+path, tqv4_floor, tqv2_floor = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+floors = {"asym4_tqv4": tqv4_floor, "asym4_tqv2": tqv2_floor}
+rows = list(csv.DictReader(open(path, newline="")))
+if not rows:
+    print("ERROR|kernel parity produced no rows")
+for row in rows:
+    label = f"kernel parity {row.get('mode')} head_dim={row.get('head_dim')} seq={row.get('seq')}"
+    for key in ("max_abs", "mean_abs", "cosine", "write_ms_per_token"):
+        try:
+            value = float(row[key])
+        except Exception:
+            print(f"ERROR|{label}: missing numeric {key}")
+            continue
+        if not math.isfinite(value):
+            print(f"ERROR|{label}: nonfinite {key}={value}")
+    mode = row.get("mode", "")
+    if mode in floors:
+        try:
+            cosine = float(row["cosine"])
+        except Exception:
+            continue
+        if cosine < floors[mode]:
+            print(f"ERROR|{label}: cosine {cosine:.6f} below floor {floors[mode]:.6f}")
+PY
+)
 {
     echo "## Kernel KV Parity"
     echo
@@ -148,16 +230,20 @@ echo "== logit/top-5 divergence =="
     echo
 } >> "$OUT/report.md"
 for entry in "${PROMPTS[@]}"; do
-    IFS='|' read -r pid pkind pval _system_file <<< "$entry"
+    IFS='|' read -r pid pkind pval system_file <<< "$entry"
     ptxt="$(prompt_text "$pkind" "$pval")"
     pmd5="$(prompt_md5 "$pkind" "$pval")"
+    system_args=()
+    if [ -n "${system_file:-}" ]; then
+        system_args=(--system "$(cat "$system_file")")
+    fi
     mkdir -p "$OUT/logits/$pid"
     echo "prompt=$pid md5=$pmd5"
     specs=()
     for mode in "${MODE_ARR[@]}"; do
         prefix="$OUT/logits/$pid/$mode"
         PROMPT_MODE=thinking HIPFIRE_KV_MODE="$mode" \
-            target/release/examples/greedy_dump_top5 "$MODEL" "$prefix" --max-gen "$LOGIT_STEPS" "$ptxt" \
+            target/release/examples/greedy_dump_top5 "$MODEL" "$prefix" --max-gen "$LOGIT_STEPS" "${system_args[@]}" "$ptxt" \
             > "$prefix.stdout" 2> "$prefix.stderr"
         if [ "$mode" != "$BASE_MODE" ]; then
             specs+=("$mode=$prefix")
@@ -165,15 +251,88 @@ for entry in "${PROMPTS[@]}"; do
     done
     ./scripts/quant_compare_top5.py "$OUT/logits/$pid/$BASE_MODE" "${specs[@]}" \
         > "$OUT/logits/$pid/compare.json"
+    while IFS='|' read -r kind msg; do
+        collect_diag "$kind" "$msg"
+    done < <(python3 - "$OUT/logits/$pid/compare.json" "$pid" "$TOP1_WARN_FLOOR" "$TOP5_WARN_FLOOR" "$STRICT" <<'PY'
+import json
+import math
+import sys
+
+path, pid = sys.argv[1], sys.argv[2]
+top1_floor, top5_floor = float(sys.argv[3]), float(sys.argv[4])
+strict = sys.argv[5] == "1"
+rows = json.load(open(path))
+if not rows:
+    print(f"ERROR|{pid}: top5 comparison produced no rows")
+for row in rows:
+    mode = row["mode"]
+    top1 = float(row["top1_agreement"])
+    overlap = float(row["mean_top5_overlap"])
+    steps = int(row["steps_compared"])
+    prefix = "ERROR" if strict else "WARN"
+    if steps <= 0 or not math.isfinite(top1) or not math.isfinite(overlap):
+        print(f"ERROR|{pid}/{mode}: invalid comparison metrics steps={steps} top1={top1} overlap={overlap}")
+        continue
+    if top1 < top1_floor:
+        print(f"{prefix}|{pid}/{mode}: top1 agreement {top1:.3f} below warn floor {top1_floor:.3f}")
+    if overlap < top5_floor:
+        print(f"{prefix}|{pid}/{mode}: mean top5 overlap {overlap:.3f} below warn floor {top5_floor:.3f}")
+PY
+)
+    asym4_specs=()
+    for mode in "${MODE_ARR[@]}"; do
+        if [[ "$mode" == asym4_tqv* ]]; then
+            asym4_specs+=("$mode=$OUT/logits/$pid/$mode")
+        fi
+    done
+    if [ -f "$OUT/logits/$pid/asym4.tokens" ] && [ "${#asym4_specs[@]}" -gt 0 ]; then
+        ./scripts/quant_compare_top5.py "$OUT/logits/$pid/asym4" "${asym4_specs[@]}" \
+            > "$OUT/logits/$pid/compare_vs_asym4.json"
+        while IFS='|' read -r kind msg; do
+            collect_diag "$kind" "$msg"
+        done < <(python3 - "$OUT/logits/$pid/compare_vs_asym4.json" "$pid vs asym4" "$TOP1_WARN_FLOOR" "$TOP5_WARN_FLOOR" "$STRICT" <<'PY'
+import json
+import math
+import sys
+
+path, pid = sys.argv[1], sys.argv[2]
+top1_floor, top5_floor = float(sys.argv[3]), float(sys.argv[4])
+strict = sys.argv[5] == "1"
+prefix = "ERROR" if strict else "WARN"
+for row in json.load(open(path)):
+    mode = row["mode"]
+    top1 = float(row["top1_agreement"])
+    overlap = float(row["mean_top5_overlap"])
+    steps = int(row["steps_compared"])
+    if steps <= 0 or not math.isfinite(top1) or not math.isfinite(overlap):
+        print(f"ERROR|{pid}/{mode}: invalid comparison metrics steps={steps} top1={top1} overlap={overlap}")
+        continue
+    if top1 < top1_floor:
+        print(f"{prefix}|{pid}/{mode}: top1 agreement {top1:.3f} below warn floor {top1_floor:.3f}")
+    if overlap < top5_floor:
+        print(f"{prefix}|{pid}/{mode}: mean top5 overlap {overlap:.3f} below warn floor {top5_floor:.3f}")
+PY
+)
+    fi
     {
         echo "### $pid"
         echo
         echo "- prompt_md5: $pmd5"
         echo
+        echo "q8 baseline:"
+        echo
         echo '```json'
         cat "$OUT/logits/$pid/compare.json"
         echo '```'
         echo
+        if [ -f "$OUT/logits/$pid/compare_vs_asym4.json" ]; then
+            echo "asym4 baseline:"
+            echo
+            echo '```json'
+            cat "$OUT/logits/$pid/compare_vs_asym4.json"
+            echo '```'
+            echo
+        fi
     } >> "$OUT/report.md"
 done
 
@@ -217,6 +376,47 @@ for line in open(sys.argv[1]):
         break
 PY
 )"
+        token_count="$(python3 - "$out_file" <<'PY'
+import sys
+n = 0
+for line in open(sys.argv[1]):
+    if '"type":"token"' in line:
+        n += 1
+print(n)
+PY
+)"
+        if [ -z "$done_line" ]; then
+            hard_error "$pid/$mode: missing daemon done line"
+        fi
+        if [ "${token_count:-0}" -eq 0 ]; then
+            hard_error "$pid/$mode: daemon emitted zero tokens"
+        fi
+        if [ "$pid" = "tool" ]; then
+            while IFS='|' read -r kind msg; do
+                collect_diag "$kind" "$msg"
+            done < <(python3 - "$OUT/prompts/${pid}.${mode}.txt" "$mode" "$STRICT" <<'PY'
+import json
+import re
+import sys
+
+text = open(sys.argv[1], errors="ignore").read()
+mode = sys.argv[2]
+strict = sys.argv[3] == "1"
+prefix = "ERROR" if strict else "WARN"
+if "<|im_start|>" in text or "<|im_end|>" in text:
+    print(f"WARN|tool/{mode}: emitted chat special token around tool response")
+matches = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", text, flags=re.S)
+if not matches:
+    print(f"{prefix}|tool/{mode}: no <tool_call> block emitted")
+else:
+    for idx, payload in enumerate(matches):
+        try:
+            json.loads(payload)
+        except Exception as exc:
+            print(f"ERROR|tool/{mode}: tool_call #{idx} is not valid JSON: {exc}")
+PY
+)
+        fi
         {
             echo "### $pid / $mode"
             echo
@@ -264,6 +464,29 @@ PY
         done
     done
 done
+while IFS='|' read -r kind msg; do
+    collect_diag "$kind" "$msg"
+done < <(python3 - "$OUT/perf/perf.csv" <<'PY'
+import csv
+import math
+import sys
+
+rows = list(csv.DictReader(open(sys.argv[1], newline="")))
+if not rows:
+    print("ERROR|perf produced no rows")
+for row in rows:
+    label = f"perf {row.get('mode')} prefill={row.get('prefill')} run={row.get('run')}"
+    for key in ("prefill_tok_s", "decode_tok_s"):
+        raw = row.get(key, "")
+        try:
+            value = float(raw)
+        except Exception:
+            print(f"ERROR|{label}: missing numeric {key}")
+            continue
+        if not math.isfinite(value) or value <= 0:
+            print(f"ERROR|{label}: invalid {key}={raw}")
+PY
+)
 {
     echo "## Split Perf"
     echo
@@ -288,4 +511,32 @@ if [ "$COHERENCE" -eq 1 ]; then
     echo >> "$OUT/report.md"
 fi
 
+{
+    echo "## Gate Diagnostics"
+    echo
+    echo "### Warnings"
+    echo
+    if [ "${#WARNINGS[@]}" -eq 0 ]; then
+        echo "- none"
+    else
+        for msg in "${WARNINGS[@]}"; do
+            echo "- $msg"
+        done
+    fi
+    echo
+    echo "### Hard Errors"
+    echo
+    if [ "${#ERRORS[@]}" -eq 0 ]; then
+        echo "- none"
+    else
+        for msg in "${ERRORS[@]}"; do
+            echo "- $msg"
+        done
+    fi
+    echo
+} >> "$OUT/report.md"
+
 echo "report: $OUT/report.md"
+if [ "${#ERRORS[@]}" -gt 0 ]; then
+    exit 1
+fi
