@@ -4398,7 +4398,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
                         kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                        tree_bias, block_start, block_cols,
+                        tree_bias, block_start, block_cols, 0,
                     )?;
                 } else if kv_cache.quant_asym3 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -4408,7 +4408,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
                         kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
-                        tree_bias, block_start, block_cols,
+                        tree_bias, block_start, block_cols, 0,
                     )?;
                 } else if kv_cache.quant_asym2 {
                     assert!(
@@ -4421,7 +4421,7 @@ fn forward_prefill_chunk(
                         &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
                         config.n_heads, config.n_kv_heads, config.head_dim,
-                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials, 0,
                     )?;
                 } else if max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
@@ -4443,7 +4443,7 @@ fn forward_prefill_chunk(
                             &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &out_b, &pos_buf_tmp, seq_len_b,
                             config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.physical_cap, &s.flash_partials,
+                            kv_cache.physical_cap, &s.flash_partials, 0,
                         )?;
                     }
                     let _ = gpu.hip.free(pos_buf_tmp);

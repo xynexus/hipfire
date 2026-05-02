@@ -304,7 +304,9 @@ impl Tokenizer {
             .get("tokenizer.ggml.model")
             .and_then(|v| v.as_str())
             .unwrap_or("llama");
-        let is_gpt2_bpe = model_type == "gpt2";
+        let has_spm_prefix = token_to_id.contains_key("▁the") || token_to_id.contains_key("▁a");
+        let is_spm_bpe = has_spm_prefix && !merges.is_empty();
+        let is_gpt2_bpe = !is_spm_bpe && model_type == "gpt2";
 
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
         for (i, tok) in vocab.iter().enumerate() {
@@ -325,6 +327,7 @@ impl Tokenizer {
             eos_id,
             eot_id,
             is_gpt2_bpe,
+            is_spm_bpe,
         })
     }
 
