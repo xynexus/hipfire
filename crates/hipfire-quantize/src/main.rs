@@ -2041,6 +2041,24 @@ fn main() {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
+                // Fallback chain (descending alignment requirement):
+                //   k % 256 == 0  → MG4G256 (or MQ4G256), best quality+size
+                //   k % 128 == 0  → HFQ4G128, smaller blocks
+                //   k %  32 == 0  → Q8F16, safer / larger
+                //   else          → refuse (no supported expert quant for this k)
+                //
+                // 26B-A4B's down_proj has k=moe_intermediate=704, which IS
+                // divisible by 32 but NOT by 128 — the prior unconditional
+                // HFQ4G128 fallback silently dropped k%128 elements per row
+                // AND mis-aligned group boundaries across row boundaries
+                // (gemv_hfq4g128 hardcodes `groups_per_row = K / 128`).
+                //
+                // Each tier is gated by an EXPLICIT alignment check rather
+                // than fall-through, so a future model with a weirder k
+                // (e.g. moe_intermediate=33) fails LOUD here instead of
+                // silently producing garbage at GEMV time.
+                let supports_hfq4g128 = inner_k % 128 == 0;
+                let supports_q8 = inner_k % 32 == 0;
                 let (quantized, qt, gs) = if supports_mq4 {
                     if use_mg4_for_experts {
                         let q = quantize_mg4g256(&f32_slice, &signs1, &signs2);
@@ -2049,9 +2067,20 @@ fn main() {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
                     }
-                } else {
+                } else if supports_hfq4g128 {
                     let q = quantize_hfq4g128(&f32_slice);
                     (q, QuantType::HFQ4G128, 128u32)
+                } else if supports_q8 {
+                    // Last-resort Q8: 34-byte groups of 32 elements.
+                    let q = quantize_q8f16(&f32_slice);
+                    (q, QuantType::Q8F16, 32u32)
+                } else {
+                    panic!(
+                        "MoE expert tensor {parent_owned}{{X}}.{base_owned} has \
+                         inner_k={inner_k} which is not divisible by 32, 128, or 256 — \
+                         no supported expert quant format. Add a per-element fallback \
+                         (e.g. F16) before shipping such a model."
+                    );
                 };
                 HfqTensor {
                     name: format!("{parent_owned}{x}.{base_owned}.weight"),
@@ -2065,7 +2094,13 @@ fn main() {
             // Single eprintln to summarize the whole expert sweep.
             let label = if supports_mq4 {
                 if use_mg4_for_experts { "MG4G256" } else { "MQ4G256" }
-            } else { "HFQ4G128" };
+            } else if inner_k % 128 == 0 {
+                "HFQ4G128"
+            } else if inner_k % 32 == 0 {
+                "Q8_F16"
+            } else {
+                "REFUSED"
+            };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);

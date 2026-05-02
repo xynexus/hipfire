@@ -1460,6 +1460,21 @@ fn apply_moe_branch(
     // 7) Zero accumulator
     gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
 
+    // Debug isolation: HIPFIRE_MOE_ZERO=1 skips per-expert dispatch entirely
+    // (cur_moe stays zero post the post_norm_2). Test whether output gets
+    // closer to coherent when the broken MoE branch is muted.
+    let moe_zero = std::env::var("HIPFIRE_MOE_ZERO").ok().as_deref() == Some("1");
+    if moe_zero {
+        // Skip the loop. cur_moe = 0 → cur_mlp + 0 = standard MLP path.
+        // Note: post_feedforward_layernorm_2(0) is still 0 since rmsnorm
+        // of all-zeros yields all-zeros (with eps in the denom, x/sqrt(eps)=0).
+        gpu.rmsnorm_f32(&scratch.moe_cur_moe, &moe.post_feedforward_layernorm_2,
+            &scratch.moe_cur_moe, config.norm_eps)?;
+        gpu.add_f32(&scratch.moe_cur_mlp, &scratch.moe_cur_moe, &scratch.tmp)?;
+        gpu.rmsnorm_f32(&scratch.tmp, post_ffn_norm, &scratch.tmp, config.norm_eps)?;
+        return Ok(());
+    }
+
     // 8) Per-expert dispatch: for each selected expert e,
     //    out_e = down_proj_e @ (gelu_tanh(gate_up_proj_e[..mi]) * gate_up_proj_e[mi..])
     //    cur_moe += (topk_weights[k] * per_expert_scale[e]) * out_e
@@ -1877,11 +1892,12 @@ fn sliding_layer_decode(
     // experts branch and combine via the sandwich norms before the outer
     // post_feedforward_layernorm. On dense layers, just the standard
     // post_feedforward_layernorm.
-    if let Some(moe) = lw.moe.as_ref() {
-        apply_moe_branch(gpu, config, scratch, moe,
-            &lw.post_feedforward_layernorm, &scratch.residual)?;
-    } else {
-        gpu.rmsnorm_f32(&scratch.ffn_out, &lw.post_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+    let moe_bypass = std::env::var("HIPFIRE_MOE_BYPASS").ok().as_deref() == Some("1");
+    match (lw.moe.as_ref(), moe_bypass) {
+        (Some(moe), false) => apply_moe_branch(gpu, config, scratch, moe,
+            &lw.post_feedforward_layernorm, &scratch.residual)?,
+        _ => gpu.rmsnorm_f32(&scratch.ffn_out, &lw.post_feedforward_layernorm,
+            &scratch.tmp, config.norm_eps)?,
     }
 
     // x = residual + tmp (again, reset x from saved residual).
@@ -2038,11 +2054,12 @@ fn full_layer_decode(
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
 
     // Post-FFN norm + (optional) MoE branch — same dispatch as sliding.
-    if let Some(moe) = lw.moe.as_ref() {
-        apply_moe_branch(gpu, config, scratch, moe,
-            &lw.post_feedforward_layernorm, &scratch.residual)?;
-    } else {
-        gpu.rmsnorm_f32(&scratch.ffn_out, &lw.post_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+    let moe_bypass = std::env::var("HIPFIRE_MOE_BYPASS").ok().as_deref() == Some("1");
+    match (lw.moe.as_ref(), moe_bypass) {
+        (Some(moe), false) => apply_moe_branch(gpu, config, scratch, moe,
+            &lw.post_feedforward_layernorm, &scratch.residual)?,
+        _ => gpu.rmsnorm_f32(&scratch.ffn_out, &lw.post_feedforward_layernorm,
+            &scratch.tmp, config.norm_eps)?,
     }
 
     // x = residual + tmp.
