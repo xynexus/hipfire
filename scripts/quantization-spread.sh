@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODELS="${HIPFIRE_QUANT_SPREAD_MODELS:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4,$HOME/.hipfire/models/qwen3.5-2b.mq4,$HOME/.hipfire/models/qwen3.5-9b.mq4}"
-MODES="${HIPFIRE_QUANT_MODES:-q8,asym4,asym4_tqv4,asym4_tqv2}"
+MODES="${HIPFIRE_QUANT_MODES:-q8,asym4,asym4_tqv4,asym4_tqv3,asym4_tqv2}"
 OUT="${HIPFIRE_QUANT_SPREAD_OUT:-benchmarks/results/quantization-spread-$(date +%Y%m%d-%H%M%S)}"
 RUNS=1
 FULL=0

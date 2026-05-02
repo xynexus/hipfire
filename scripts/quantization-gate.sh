@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODEL="${HIPFIRE_QUANT_MODEL:-$HOME/.hipfire/models/qwen3.5-2b.mq4}"
-MODES="${HIPFIRE_QUANT_MODES:-q8,asym4,asym4_tqv4,asym4_tqv2}"
+MODES="${HIPFIRE_QUANT_MODES:-q8,asym4,asym4_tqv4,asym4_tqv3,asym4_tqv2}"
 OUT="${HIPFIRE_QUANT_OUT:-benchmarks/results/quantization-$(date +%Y%m%d-%H%M%S)}"
 FULL=0
 COHERENCE=0
@@ -23,6 +23,7 @@ RUNS=1
 STRICT=0
 SKIP_BUILD=0
 TQV4_COS_FLOOR="${HIPFIRE_TQV4_COS_FLOOR:-0.995}"
+TQV3_COS_FLOOR="${HIPFIRE_TQV3_COS_FLOOR:-0.990}"
 TQV2_COS_FLOOR="${HIPFIRE_TQV2_COS_FLOOR:-0.985}"
 TOP1_WARN_FLOOR="${HIPFIRE_QUANT_TOP1_WARN_FLOOR:-0.70}"
 TOP5_WARN_FLOOR="${HIPFIRE_QUANT_TOP5_WARN_FLOOR:-2.50}"
@@ -112,6 +113,7 @@ echo "quantization-gate output: $OUT"
     echo "- strict: $STRICT"
     echo "- thresholds:"
     echo "  - tqv4_cos_floor: $TQV4_COS_FLOOR"
+    echo "  - tqv3_cos_floor: $TQV3_COS_FLOOR"
     echo "  - tqv2_cos_floor: $TQV2_COS_FLOOR"
     echo "  - top1_warn_floor: $TOP1_WARN_FLOOR"
     echo "  - top5_warn_floor: $TOP5_WARN_FLOOR"
@@ -154,13 +156,14 @@ target/release/examples/kv_quant_parity --seq "$KV_SEQS" --head-dim "$KV_HEADS" 
     2> "$OUT/kernel/kv_quant_parity.stderr"
 while IFS='|' read -r kind msg; do
     collect_diag "$kind" "$msg"
-done < <(python3 - "$OUT/kernel/kv_quant_parity.csv" "$TQV4_COS_FLOOR" "$TQV2_COS_FLOOR" <<'PY'
+done < <(python3 - "$OUT/kernel/kv_quant_parity.csv" "$TQV4_COS_FLOOR" "$TQV3_COS_FLOOR" "$TQV2_COS_FLOOR" <<'PY'
 import csv
 import math
 import sys
 
-path, tqv4_floor, tqv2_floor = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
-floors = {"asym4_tqv4": tqv4_floor, "asym4_tqv2": tqv2_floor}
+path = sys.argv[1]
+tqv4_floor, tqv3_floor, tqv2_floor = float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+floors = {"asym4_tqv4": tqv4_floor, "asym4_tqv3": tqv3_floor, "asym4_tqv2": tqv2_floor}
 rows = list(csv.DictReader(open(path, newline="")))
 if not rows:
     print("ERROR|kernel parity produced no rows")

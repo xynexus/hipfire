@@ -16105,7 +16105,7 @@ impl Gpu {
         // KV cache kernels. asym3 is the current default — always ships flash.
         // q8 is the compat path with its own flash tile+reduce for long context.
         match kv_type {
-            "asym4_tqv2" | "tqv2" | "asym4_tqv4" | "tqv4" => {
+            "asym4_tqv2" | "tqv2" | "asym4_tqv3" | "tqv3" | "asym4_tqv4" | "tqv4" => {
                 specs.push((
                     "kv_cache_write_asym_k_givens4",
                     assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_SRC),

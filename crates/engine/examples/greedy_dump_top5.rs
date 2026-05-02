@@ -126,6 +126,15 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
+        "asym4_tqv3" | "tqv3" => KvCache::new_gpu_asym4_tqv3_capped(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+            kv_seq,
+        )
+        .unwrap(),
         "asym4_tqv4" | "tqv4" => KvCache::new_gpu_asym4_tqv4_capped(
             &mut gpu,
             config.n_layers,
@@ -160,7 +169,7 @@ fn main() {
         )
         .unwrap(),
         other => panic!(
-            "unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4_tqv2|asym4_tqv4|asym4|asym3|asym2)"
+            "unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4_tqv2|asym4_tqv3|asym4_tqv4|asym4|asym3|asym2)"
         ),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();

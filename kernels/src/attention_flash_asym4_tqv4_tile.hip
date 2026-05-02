@@ -23,7 +23,7 @@ __global__ void attention_flash_asym4_tqv4_tile(
     const int seq_len = pos_buf[0] + 1;
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
-    if (h >= n_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 4)) return;
+    if (h >= n_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
     const int tile_start = tile_id * tile_size;
     if (tile_start >= seq_len) return;
     const int tile_end = min(tile_start + tile_size, seq_len);
@@ -110,6 +110,25 @@ __global__ void attention_flash_asym4_tqv4_tile(
             out_vec[1] += w * (cnorm * TURBO_C4[(b0 >> 4) & 0xF]);
             out_vec[2] += w * (cnorm * TURBO_C4[(b1)      & 0xF]);
             out_vec[3] += w * (cnorm * TURBO_C4[(b1 >> 4) & 0xF]);
+        } else if (value_bits == 3 && head_dim == 256) {
+            const unsigned char* packed = vb + 4 + tid * 3;
+            unsigned int pack = (unsigned int)packed[0] | ((unsigned int)packed[1] << 8) | ((unsigned int)packed[2] << 16);
+            out_vec[0] += w * (cnorm * TURBO_C3_256[(pack)       & 7]);
+            out_vec[1] += w * (cnorm * TURBO_C3_256[(pack >> 3)  & 7]);
+            out_vec[2] += w * (cnorm * TURBO_C3_256[(pack >> 6)  & 7]);
+            out_vec[3] += w * (cnorm * TURBO_C3_256[(pack >> 9)  & 7]);
+            out_vec[4] += w * (cnorm * TURBO_C3_256[(pack >> 12) & 7]);
+            out_vec[5] += w * (cnorm * TURBO_C3_256[(pack >> 15) & 7]);
+            out_vec[6] += w * (cnorm * TURBO_C3_256[(pack >> 18) & 7]);
+            out_vec[7] += w * (cnorm * TURBO_C3_256[(pack >> 21) & 7]);
+        } else if (value_bits == 3) {
+            const unsigned char* packed = vb + 4 + (tid >> 1) * 3;
+            unsigned int pack = (unsigned int)packed[0] | ((unsigned int)packed[1] << 8) | ((unsigned int)packed[2] << 16);
+            int shift = (tid & 1) ? 12 : 0;
+            out_vec[0] += w * (cnorm * TURBO_C3[(pack >> shift)       & 7]);
+            out_vec[1] += w * (cnorm * TURBO_C3[(pack >> (shift + 3)) & 7]);
+            out_vec[2] += w * (cnorm * TURBO_C3[(pack >> (shift + 6)) & 7]);
+            out_vec[3] += w * (cnorm * TURBO_C3[(pack >> (shift + 9)) & 7]);
         } else if (head_dim == 256) {
             const unsigned char* packed = vb + 4 + tid * 2;
             unsigned char b0 = packed[0], b1 = packed[1];
@@ -170,7 +189,7 @@ __global__ void attention_flash_asym4_tqv4_tile_batched(
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
     const int local_bid = blockIdx.z;
-    if (h >= n_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 4)) return;
+    if (h >= n_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
     const int tid = threadIdx.x;
 
     const int global_bid = batch_offset + local_bid;
@@ -265,6 +284,25 @@ __global__ void attention_flash_asym4_tqv4_tile_batched(
             out_vec[1] += w * (cnorm * TURBO_C4[(b0 >> 4) & 0xF]);
             out_vec[2] += w * (cnorm * TURBO_C4[(b1)      & 0xF]);
             out_vec[3] += w * (cnorm * TURBO_C4[(b1 >> 4) & 0xF]);
+        } else if (value_bits == 3 && head_dim == 256) {
+            const unsigned char* packed = vb + 4 + tid * 3;
+            unsigned int pack = (unsigned int)packed[0] | ((unsigned int)packed[1] << 8) | ((unsigned int)packed[2] << 16);
+            out_vec[0] += w * (cnorm * TURBO_C3_256[(pack)       & 7]);
+            out_vec[1] += w * (cnorm * TURBO_C3_256[(pack >> 3)  & 7]);
+            out_vec[2] += w * (cnorm * TURBO_C3_256[(pack >> 6)  & 7]);
+            out_vec[3] += w * (cnorm * TURBO_C3_256[(pack >> 9)  & 7]);
+            out_vec[4] += w * (cnorm * TURBO_C3_256[(pack >> 12) & 7]);
+            out_vec[5] += w * (cnorm * TURBO_C3_256[(pack >> 15) & 7]);
+            out_vec[6] += w * (cnorm * TURBO_C3_256[(pack >> 18) & 7]);
+            out_vec[7] += w * (cnorm * TURBO_C3_256[(pack >> 21) & 7]);
+        } else if (value_bits == 3) {
+            const unsigned char* packed = vb + 4 + (tid >> 1) * 3;
+            unsigned int pack = (unsigned int)packed[0] | ((unsigned int)packed[1] << 8) | ((unsigned int)packed[2] << 16);
+            int shift = (tid & 1) ? 12 : 0;
+            out_vec[0] += w * (cnorm * TURBO_C3[(pack >> shift)       & 7]);
+            out_vec[1] += w * (cnorm * TURBO_C3[(pack >> (shift + 3)) & 7]);
+            out_vec[2] += w * (cnorm * TURBO_C3[(pack >> (shift + 6)) & 7]);
+            out_vec[3] += w * (cnorm * TURBO_C3[(pack >> (shift + 9)) & 7]);
         } else if (head_dim == 256) {
             const unsigned char* packed = vb + 4 + tid * 2;
             unsigned char b0 = packed[0], b1 = packed[1];

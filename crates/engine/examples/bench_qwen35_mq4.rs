@@ -83,7 +83,7 @@ fn main() {
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
     // KV cache mode via HIPFIRE_KV_MODE env var:
-    //   q8 (default) | asym4_tqv2/tqv2 | asym4_tqv4/tqv4 | asym4 | asym3 | asym2
+    //   q8 (default) | asym4_tqv2/tqv2 | asym4_tqv3/tqv3 | asym4_tqv4/tqv4 | asym4 | asym3 | asym2
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
     eprintln!("KV mode: {kv_mode}");
     let make_kv = |gpu: &mut rdna_compute::Gpu| -> KvCache {
@@ -97,6 +97,15 @@ fn main() {
             )
             .unwrap(),
             "asym4_tqv2" | "tqv2" => KvCache::new_gpu_asym4_tqv2_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+                kv_seq,
+            )
+            .unwrap(),
+            "asym4_tqv3" | "tqv3" => KvCache::new_gpu_asym4_tqv3_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
@@ -139,7 +148,7 @@ fn main() {
             )
             .unwrap(),
             other => panic!(
-                "unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4_tqv2|asym4_tqv4|asym4|asym3|asym2)"
+                "unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4_tqv2|asym4_tqv3|asym4_tqv4|asym4|asym3|asym2)"
             ),
         }
     };

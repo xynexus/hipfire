@@ -289,7 +289,7 @@ fn main() {
         let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
         eprintln!("Pre-compiling kernels for {}...", gpu.arch);
         let mut errors = 0usize;
-        for kv in &["asym3", "asym4_tqv2", "asym4_tqv4", "q8"] {
+        for kv in &["asym3", "asym4_tqv2", "asym4_tqv3", "asym4_tqv4", "q8"] {
             for wq in &["mq4", "mq6", "hfq4", "hfq6", "q8"] {
                 if let Err(e) = gpu.precompile_qwen35(wq, kv, 256) {
                     eprintln!("  {wq}/{kv}: {e}");
@@ -1137,6 +1137,15 @@ fn load_model(
                 .map_err(|e| format!("{e}"))?
             }
             "asym4_tqv2" | "tqv2" => llama::KvCache::new_gpu_asym4_tqv2_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?,
+            "asym4_tqv3" | "tqv3" => llama::KvCache::new_gpu_asym4_tqv3_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,

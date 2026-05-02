@@ -2743,6 +2743,7 @@ pub struct KvCache {
     pub quant_hfq4: bool,               // true = HFQ4 co-located blocks (72 bytes/head)
     pub quant_asym4: bool, // true = K at 4-bit rotated, V at Q8_0 — RotorQuant planar4 asymmetric
     pub quant_asym4_tqv2: bool, // true = K at asym4, V at TurboQuant2/FWHT
+    pub quant_asym4_tqv3: bool, // true = K at asym4, V at TurboQuant3/FWHT
     pub quant_asym4_tqv4: bool, // true = K at asym4, V at TurboQuant4/FWHT
     pub quant_asym3: bool, // true = K at givens3 (rotated 3-bit Lloyd-Max), V at Q8_0 — best-quality rotated K per RotorQuant
     pub quant_asym2: bool, // true = K at givens2 (rotated 2-bit), V at Q8_0 (normal space)
@@ -2767,6 +2768,22 @@ impl KvCache {
     /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
         kv_ordinal < self.layer_is_boundary.len() && self.layer_is_boundary[kv_ordinal]
+    }
+
+    pub fn is_asym4_tqv(&self) -> bool {
+        self.quant_asym4_tqv2 || self.quant_asym4_tqv3 || self.quant_asym4_tqv4
+    }
+
+    pub fn tqv_value_bits(&self) -> usize {
+        if self.quant_asym4_tqv2 {
+            2
+        } else if self.quant_asym4_tqv3 {
+            3
+        } else if self.quant_asym4_tqv4 {
+            4
+        } else {
+            0
+        }
     }
 }
 
@@ -2802,6 +2819,7 @@ impl KvCache {
             quant_hfq4: false,
             quant_asym4: false,
             quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
             quant_asym3: false,
             quant_asym2: false,
@@ -2852,6 +2870,7 @@ impl KvCache {
             quant_hfq4: false,
             quant_asym4: false,
             quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
             quant_asym3: false,
             quant_asym2: false,
@@ -2925,6 +2944,7 @@ impl KvCache {
             quant_hfq4: false,
             quant_asym4: false,
             quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
             quant_asym3: false,
             quant_asym2: false,
@@ -2973,6 +2993,7 @@ impl KvCache {
             quant_hfq4: false,
             quant_asym4: false,
             quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
             quant_asym3: false,
             quant_asym2: false,
@@ -3021,6 +3042,7 @@ impl KvCache {
             quant_hfq4: true,
             quant_asym4: false,
             quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
             quant_asym3: false,
             quant_asym2: false,
@@ -3071,6 +3093,7 @@ impl KvCache {
             quant_hfq4: false,
             quant_asym4: false,
             quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
             quant_asym3: false,
             quant_asym2: false,
@@ -3123,6 +3146,7 @@ impl KvCache {
             quant_hfq4: false,
             quant_asym4: false,
             quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
             quant_asym3: false,
             quant_asym2: false,
@@ -3232,6 +3256,7 @@ impl KvCache {
             quant_hfq4: false,
             quant_asym4: true,
             quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
             quant_asym3: false,
             quant_asym2: false,
@@ -3289,6 +3314,28 @@ impl KvCache {
         )
     }
 
+    /// Create asym4_tqv3 KV cache: K at 4-bit Givens, V at TurboQuant3/FWHT.
+    /// head_dim=128 -> K=68 B/head, V=52 B/head -> 120 B/head total.
+    /// head_dim=256 -> K=132 B/head, V=100 B/head -> 232 B/head total.
+    pub fn new_gpu_asym4_tqv3_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym4_tqv_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            3,
+        )
+    }
+
     fn new_gpu_asym4_tqv_capped(
         gpu: &mut Gpu,
         n_layers: usize,
@@ -3298,7 +3345,7 @@ impl KvCache {
         physical_cap: usize,
         value_bits: usize,
     ) -> HipResult<Self> {
-        assert!(value_bits == 2 || value_bits == 4);
+        assert!(value_bits == 2 || value_bits == 3 || value_bits == 4);
         assert!(
             head_dim == 128 || head_dim == 256,
             "asym4_tqv{value_bits} requires head_dim=128 or 256"
@@ -3356,6 +3403,7 @@ impl KvCache {
             quant_hfq4: false,
             quant_asym4: false,
             quant_asym4_tqv2: value_bits == 2,
+            quant_asym4_tqv3: value_bits == 3,
             quant_asym4_tqv4: value_bits == 4,
             quant_asym3: false,
             quant_asym2: false,
@@ -3451,6 +3499,7 @@ impl KvCache {
             quant_hfq4: false,
             quant_asym4: false,
             quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
             quant_asym3: true,
             quant_asym2: false,
@@ -3545,6 +3594,7 @@ impl KvCache {
             quant_hfq4: false,
             quant_asym4: false,
             quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
             quant_asym3: false,
             quant_asym2: true,

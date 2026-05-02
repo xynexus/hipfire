@@ -62,24 +62,33 @@ fn run_case(
     value_bits: usize,
 ) -> Result<(f32, f32, f32, f64), Box<dyn Error>> {
     let n_layers = 1usize;
-    let n_heads = 1usize;
-    let n_kv_heads = 1usize;
+    let n_heads = 8usize;
+    let n_kv_heads = 2usize;
     let max_seq = seq.max(1);
+    let kv_dim = n_kv_heads * head_dim;
+    let q_dim = n_heads * head_dim;
 
     let base = KvCache::new_gpu_asym4(gpu, n_layers, n_kv_heads, head_dim, max_seq)?;
-    let tqv = if value_bits == 2 {
-        KvCache::new_gpu_asym4_tqv2_capped(gpu, n_layers, n_kv_heads, head_dim, max_seq, max_seq)?
-    } else {
-        KvCache::new_gpu_asym4_tqv4_capped(gpu, n_layers, n_kv_heads, head_dim, max_seq, max_seq)?
+    let tqv = match value_bits {
+        2 => KvCache::new_gpu_asym4_tqv2_capped(
+            gpu, n_layers, n_kv_heads, head_dim, max_seq, max_seq,
+        )?,
+        3 => KvCache::new_gpu_asym4_tqv3_capped(
+            gpu, n_layers, n_kv_heads, head_dim, max_seq, max_seq,
+        )?,
+        4 => KvCache::new_gpu_asym4_tqv4_capped(
+            gpu, n_layers, n_kv_heads, head_dim, max_seq, max_seq,
+        )?,
+        _ => return Err(format!("unsupported tqv bitwidth: {value_bits}").into()),
     };
 
     let pos_buf = gpu.hip.malloc(4)?;
     let mut write_ms = 0.0f64;
     for pos in 0..seq {
-        let k = make_vec(head_dim, 0x1234_0000u32.wrapping_add(pos as u32), 1.0);
-        let v = make_vec(head_dim, 0x5678_0000u32.wrapping_add(pos as u32), 0.8);
-        let dk = gpu.upload_f32(&k, &[head_dim])?;
-        let dv = gpu.upload_f32(&v, &[head_dim])?;
+        let k = make_vec(kv_dim, 0x1234_0000u32.wrapping_add(pos as u32), 1.0);
+        let v = make_vec(kv_dim, 0x5678_0000u32.wrapping_add(pos as u32), 0.8);
+        let dk = gpu.upload_f32(&k, &[kv_dim])?;
+        let dv = gpu.upload_f32(&v, &[kv_dim])?;
         gpu.hip.memcpy_htod(&pos_buf, &(pos as i32).to_ne_bytes())?;
         let t0 = Instant::now();
         gpu.kv_cache_write_asym4_fused(
@@ -113,10 +122,10 @@ fn run_case(
         gpu.free_tensor(dv).ok();
     }
 
-    let q = make_vec(head_dim, 0x9abc_def0, 1.0);
-    let dq = gpu.upload_f32(&q, &[head_dim])?;
-    let out_base = gpu.zeros(&[head_dim], rdna_compute::DType::F32)?;
-    let out_tqv = gpu.zeros(&[head_dim], rdna_compute::DType::F32)?;
+    let q = make_vec(q_dim, 0x9abc_def0, 1.0);
+    let dq = gpu.upload_f32(&q, &[q_dim])?;
+    let out_base = gpu.zeros(&[q_dim], rdna_compute::DType::F32)?;
+    let out_tqv = gpu.zeros(&[q_dim], rdna_compute::DType::F32)?;
     let partial_elems = n_heads * ((max_seq + 127) / 128) * (2 + head_dim);
     let partial_base = gpu.zeros(&[partial_elems], rdna_compute::DType::F32)?;
     let partial_tqv = gpu.zeros(&[partial_elems], rdna_compute::DType::F32)?;
@@ -196,7 +205,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("head_dim,seq,mode,max_abs,mean_abs,cosine,write_ms_per_token");
     for hd in head_dims {
         for &seq in &seqs {
-            for bits in [4usize, 2usize] {
+            for bits in [4usize, 3usize, 2usize] {
                 let (max_abs, mean_abs, cosine, write_ms) = run_case(&mut gpu, hd, seq, bits)?;
                 println!(
                     "{hd},{seq},asym4_tqv{bits},{max_abs:.8},{mean_abs:.8},{cosine:.8},{write_ms:.4}"

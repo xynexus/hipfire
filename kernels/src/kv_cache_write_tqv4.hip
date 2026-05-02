@@ -12,7 +12,7 @@ extern "C" __global__ void kv_cache_write_tqv4(
     int value_bits
 ) {
     const int h = blockIdx.x;
-    if (h >= n_kv_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 4)) return;
+    if (h >= n_kv_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
     const int tid = threadIdx.x;
     const int pos = pos_buf[0];
 
@@ -56,6 +56,20 @@ extern "C" __global__ void kv_cache_write_tqv4(
         i1 = turbo_quantize_4bit(v1);
         i2 = turbo_quantize_4bit(v2);
         i3 = turbo_quantize_4bit(v3);
+    } else if (value_bits == 3 && head_dim == 256) {
+        i0 = turbo_quantize_3bit_256(v0);
+        i1 = turbo_quantize_3bit_256(v1);
+        i2 = turbo_quantize_3bit_256(v2);
+        i3 = turbo_quantize_3bit_256(v3);
+        i4 = turbo_quantize_3bit_256(v4);
+        i5 = turbo_quantize_3bit_256(v5);
+        i6 = turbo_quantize_3bit_256(v6);
+        i7 = turbo_quantize_3bit_256(v7);
+    } else if (value_bits == 3) {
+        i0 = turbo_quantize_3bit(v0);
+        i1 = turbo_quantize_3bit(v1);
+        i2 = turbo_quantize_3bit(v2);
+        i3 = turbo_quantize_3bit(v3);
     } else if (head_dim == 256) {
         i0 = turbo_quantize_2bit_256(v0);
         i1 = turbo_quantize_2bit_256(v1);
@@ -81,6 +95,14 @@ extern "C" __global__ void kv_cache_write_tqv4(
     } else if (value_bits == 4) {
         rsq = TURBO_C4[i0]*TURBO_C4[i0] + TURBO_C4[i1]*TURBO_C4[i1]
              + TURBO_C4[i2]*TURBO_C4[i2] + TURBO_C4[i3]*TURBO_C4[i3];
+    } else if (value_bits == 3 && head_dim == 256) {
+        rsq = TURBO_C3_256[i0]*TURBO_C3_256[i0] + TURBO_C3_256[i1]*TURBO_C3_256[i1]
+             + TURBO_C3_256[i2]*TURBO_C3_256[i2] + TURBO_C3_256[i3]*TURBO_C3_256[i3]
+             + TURBO_C3_256[i4]*TURBO_C3_256[i4] + TURBO_C3_256[i5]*TURBO_C3_256[i5]
+             + TURBO_C3_256[i6]*TURBO_C3_256[i6] + TURBO_C3_256[i7]*TURBO_C3_256[i7];
+    } else if (value_bits == 3) {
+        rsq = TURBO_C3[i0]*TURBO_C3[i0] + TURBO_C3[i1]*TURBO_C3[i1]
+             + TURBO_C3[i2]*TURBO_C3[i2] + TURBO_C3[i3]*TURBO_C3[i3];
     } else if (head_dim == 256) {
         rsq = TURBO_C2_256[i0]*TURBO_C2_256[i0] + TURBO_C2_256[i1]*TURBO_C2_256[i1]
              + TURBO_C2_256[i2]*TURBO_C2_256[i2] + TURBO_C2_256[i3]*TURBO_C2_256[i3]
@@ -102,6 +124,38 @@ extern "C" __global__ void kv_cache_write_tqv4(
         if (head_dim == 256) {
             base[2] = (unsigned char)((i5 << 4) | (i4 & 0xF));
             base[3] = (unsigned char)((i7 << 4) | (i6 & 0xF));
+        }
+    } else if (value_bits == 3 && head_dim == 256) {
+        unsigned char* base = out + 4 + tid * 3;
+        unsigned int pack = (unsigned int)(i0 & 7)
+                          | ((unsigned int)(i1 & 7) << 3)
+                          | ((unsigned int)(i2 & 7) << 6)
+                          | ((unsigned int)(i3 & 7) << 9)
+                          | ((unsigned int)(i4 & 7) << 12)
+                          | ((unsigned int)(i5 & 7) << 15)
+                          | ((unsigned int)(i6 & 7) << 18)
+                          | ((unsigned int)(i7 & 7) << 21);
+        base[0] = (unsigned char)(pack & 0xFF);
+        base[1] = (unsigned char)((pack >> 8) & 0xFF);
+        base[2] = (unsigned char)((pack >> 16) & 0xFF);
+    } else if (value_bits == 3) {
+        int j0 = __shfl_xor(i0, 1);
+        int j1 = __shfl_xor(i1, 1);
+        int j2 = __shfl_xor(i2, 1);
+        int j3 = __shfl_xor(i3, 1);
+        if ((tid & 1) == 0) {
+            unsigned char* base = out + 4 + (tid >> 1) * 3;
+            unsigned int pack = (unsigned int)(i0 & 7)
+                              | ((unsigned int)(i1 & 7) << 3)
+                              | ((unsigned int)(i2 & 7) << 6)
+                              | ((unsigned int)(i3 & 7) << 9)
+                              | ((unsigned int)(j0 & 7) << 12)
+                              | ((unsigned int)(j1 & 7) << 15)
+                              | ((unsigned int)(j2 & 7) << 18)
+                              | ((unsigned int)(j3 & 7) << 21);
+            base[0] = (unsigned char)(pack & 0xFF);
+            base[1] = (unsigned char)((pack >> 8) & 0xFF);
+            base[2] = (unsigned char)((pack >> 16) & 0xFF);
         }
     } else {
         unsigned char* base = out + 4 + ((head_dim == 256) ? tid * 2 : tid);
@@ -125,7 +179,7 @@ extern "C" __global__ void kv_cache_write_tqv4_batched(
 ) {
     const int h = blockIdx.x;
     const int bid = blockIdx.y;
-    if (h >= n_kv_heads || bid >= batch_size || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 4)) return;
+    if (h >= n_kv_heads || bid >= batch_size || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
     const int tid = threadIdx.x;
     const int pos = positions[bid];
 
@@ -170,6 +224,20 @@ extern "C" __global__ void kv_cache_write_tqv4_batched(
         i1 = turbo_quantize_4bit(v1);
         i2 = turbo_quantize_4bit(v2);
         i3 = turbo_quantize_4bit(v3);
+    } else if (value_bits == 3 && head_dim == 256) {
+        i0 = turbo_quantize_3bit_256(v0);
+        i1 = turbo_quantize_3bit_256(v1);
+        i2 = turbo_quantize_3bit_256(v2);
+        i3 = turbo_quantize_3bit_256(v3);
+        i4 = turbo_quantize_3bit_256(v4);
+        i5 = turbo_quantize_3bit_256(v5);
+        i6 = turbo_quantize_3bit_256(v6);
+        i7 = turbo_quantize_3bit_256(v7);
+    } else if (value_bits == 3) {
+        i0 = turbo_quantize_3bit(v0);
+        i1 = turbo_quantize_3bit(v1);
+        i2 = turbo_quantize_3bit(v2);
+        i3 = turbo_quantize_3bit(v3);
     } else if (head_dim == 256) {
         i0 = turbo_quantize_2bit_256(v0);
         i1 = turbo_quantize_2bit_256(v1);
@@ -195,6 +263,14 @@ extern "C" __global__ void kv_cache_write_tqv4_batched(
     } else if (value_bits == 4) {
         rsq = TURBO_C4[i0]*TURBO_C4[i0] + TURBO_C4[i1]*TURBO_C4[i1]
              + TURBO_C4[i2]*TURBO_C4[i2] + TURBO_C4[i3]*TURBO_C4[i3];
+    } else if (value_bits == 3 && head_dim == 256) {
+        rsq = TURBO_C3_256[i0]*TURBO_C3_256[i0] + TURBO_C3_256[i1]*TURBO_C3_256[i1]
+             + TURBO_C3_256[i2]*TURBO_C3_256[i2] + TURBO_C3_256[i3]*TURBO_C3_256[i3]
+             + TURBO_C3_256[i4]*TURBO_C3_256[i4] + TURBO_C3_256[i5]*TURBO_C3_256[i5]
+             + TURBO_C3_256[i6]*TURBO_C3_256[i6] + TURBO_C3_256[i7]*TURBO_C3_256[i7];
+    } else if (value_bits == 3) {
+        rsq = TURBO_C3[i0]*TURBO_C3[i0] + TURBO_C3[i1]*TURBO_C3[i1]
+             + TURBO_C3[i2]*TURBO_C3[i2] + TURBO_C3[i3]*TURBO_C3[i3];
     } else if (head_dim == 256) {
         rsq = TURBO_C2_256[i0]*TURBO_C2_256[i0] + TURBO_C2_256[i1]*TURBO_C2_256[i1]
              + TURBO_C2_256[i2]*TURBO_C2_256[i2] + TURBO_C2_256[i3]*TURBO_C2_256[i3]
@@ -216,6 +292,38 @@ extern "C" __global__ void kv_cache_write_tqv4_batched(
         if (head_dim == 256) {
             base[2] = (unsigned char)((i5 << 4) | (i4 & 0xF));
             base[3] = (unsigned char)((i7 << 4) | (i6 & 0xF));
+        }
+    } else if (value_bits == 3 && head_dim == 256) {
+        unsigned char* base = out + 4 + tid * 3;
+        unsigned int pack = (unsigned int)(i0 & 7)
+                          | ((unsigned int)(i1 & 7) << 3)
+                          | ((unsigned int)(i2 & 7) << 6)
+                          | ((unsigned int)(i3 & 7) << 9)
+                          | ((unsigned int)(i4 & 7) << 12)
+                          | ((unsigned int)(i5 & 7) << 15)
+                          | ((unsigned int)(i6 & 7) << 18)
+                          | ((unsigned int)(i7 & 7) << 21);
+        base[0] = (unsigned char)(pack & 0xFF);
+        base[1] = (unsigned char)((pack >> 8) & 0xFF);
+        base[2] = (unsigned char)((pack >> 16) & 0xFF);
+    } else if (value_bits == 3) {
+        int j0 = __shfl_xor(i0, 1);
+        int j1 = __shfl_xor(i1, 1);
+        int j2 = __shfl_xor(i2, 1);
+        int j3 = __shfl_xor(i3, 1);
+        if ((tid & 1) == 0) {
+            unsigned char* base = out + 4 + (tid >> 1) * 3;
+            unsigned int pack = (unsigned int)(i0 & 7)
+                              | ((unsigned int)(i1 & 7) << 3)
+                              | ((unsigned int)(i2 & 7) << 6)
+                              | ((unsigned int)(i3 & 7) << 9)
+                              | ((unsigned int)(j0 & 7) << 12)
+                              | ((unsigned int)(j1 & 7) << 15)
+                              | ((unsigned int)(j2 & 7) << 18)
+                              | ((unsigned int)(j3 & 7) << 21);
+            base[0] = (unsigned char)(pack & 0xFF);
+            base[1] = (unsigned char)((pack >> 8) & 0xFF);
+            base[2] = (unsigned char)((pack >> 16) & 0xFF);
         }
     } else {
         unsigned char* base = out + 4 + ((head_dim == 256) ? tid * 2 : tid);
