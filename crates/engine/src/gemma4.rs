@@ -101,9 +101,23 @@ pub struct Gemma4Config {
     /// `use_double_wide_mlp` flag (E2B only). When true, the LAST
     /// `num_kv_shared_layers` layers use `intermediate_size * 2` for the
     /// FFN width (gate / up / down projections double in their
-    /// hidden-dim direction) — see llama-model.cpp lines 4730-4735. We
-    /// don't yet handle per-layer FFN sizing; refused at load time.
+    /// hidden-dim direction) — see llama-model.cpp lines 4730-4735.
     pub use_double_wide_mlp: bool,
+
+    /// MoE block enable (Gemma 4 26B-A4B only). When true, every layer
+    /// has the standard SwiGLU FFN PLUS a parallel routed-experts branch:
+    /// router projects to N experts, top-K activated, weighted sum.
+    /// Requires distinct sandwich norms (pre_feedforward_layernorm_2,
+    /// post_feedforward_layernorm_1, post_feedforward_layernorm_2) and
+    /// 3D-stacked expert tensors (experts.gate_up_proj / experts.down_proj).
+    pub enable_moe_block: bool,
+    /// Total number of routed experts (128 on 26B-A4B).
+    pub num_experts: usize,
+    /// Top-K experts activated per token (8 on 26B-A4B).
+    pub top_k_experts: usize,
+    /// Per-expert FFN intermediate size (704 on 26B-A4B). Distinct from
+    /// the shared-MLP `hidden_dim` (= intermediate_size = 2112).
+    pub moe_intermediate_size: usize,
 
     // Per-layer dispatch (len == n_layers)
     pub layer_types: Vec<LayerType>,
@@ -298,10 +312,19 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Gemma4Config> {
     let num_kv_shared_layers = tc.get("num_kv_shared_layers")
         .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     // Double-wide-MLP (E2B only). When true, shared layers have
-    // intermediate_size * 2 — refused at load time until per-layer FFN
-    // sizing lands.
+    // intermediate_size * 2.
     let use_double_wide_mlp = tc.get("use_double_wide_mlp")
         .and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // MoE block (26B-A4B only).
+    let enable_moe_block = tc.get("enable_moe_block")
+        .and_then(|v| v.as_bool()).unwrap_or(false);
+    let num_experts = tc.get("num_experts")
+        .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let top_k_experts = tc.get("top_k_experts")
+        .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let moe_intermediate_size = tc.get("moe_intermediate_size")
+        .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
     let final_logit_softcapping = tc.get("final_logit_softcapping")
         .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
@@ -339,6 +362,10 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Gemma4Config> {
         n_embd_per_layer,
         num_kv_shared_layers,
         use_double_wide_mlp,
+        enable_moe_block,
+        num_experts,
+        top_k_experts,
+        moe_intermediate_size,
         layer_types,
         has_vision,
         image_token_id, boi_token_id, eoi_token_id, audio_token_id, video_token_id,
@@ -620,6 +647,28 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
 pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
     -> HipResult<Gemma4Weights>
 {
+    // Refuse MoE (26B-A4B) until the routed-experts branch lands. Every
+    // layer needs: router gemv → top-K=8 of 128 experts softmax → per-
+    // expert (gate_up split, gelu, mul, down, scale) → weighted sum,
+    // running in parallel with the standard SwiGLU FFN, summed via
+    // post_feedforward_layernorm_2 then added to cur_mlp via
+    // post_feedforward_layernorm. Quantizer also needs to handle 3D
+    // stacked expert tensors (`experts.gate_up_proj` / `experts.down_proj`)
+    // — Gemma 4 names them differently from Qwen3.5-MoE so the existing
+    // expert-split code at hipfire-quantize/src/main.rs:1906 doesn't
+    // match. Track in task #14.
+    if config.enable_moe_block {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "Gemma 4 MoE block not yet implemented (this is 26B-A4B's \
+                 enable_moe_block=true with {} experts, top_k={}, \
+                 moe_intermediate_size={}). Track in task #14. Supported \
+                 dense Gemma 4 today: 31B, E2B, E4B (and their IT variants).",
+                config.num_experts, config.top_k_experts, config.moe_intermediate_size,
+            ),
+        ));
+    }
     eprintln!("gemma4: loading embed_tokens...");
     let embed_name = "model.language_model.embed_tokens.weight";
     let (embed_info, embed_data) = hfq.tensor_data(embed_name).ok_or_else(|| {
