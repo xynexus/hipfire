@@ -1558,7 +1558,14 @@ fn apply_moe_branch(
     // sum of per-expert FFN outputs); the fused path just batches the
     // gate_up GEMV across the 8 selected experts. See
     // docs/plans/gemma4-moe-indexed-gemv.md for the full rollout.
-    let use_fused = std::env::var("HIPFIRE_GEMMA4_MOE_FUSED").ok().as_deref() == Some("1");
+    // Fused path is the default — bit-identical to legacy across the
+    // coherence battery (commit 1d86adb baseline) and ~10% faster on
+    // 26B-A4B decode. HIPFIRE_GEMMA4_MOE_FUSED=0 forces legacy as a
+    // safety hatch.
+    let use_fused = match std::env::var("HIPFIRE_GEMMA4_MOE_FUSED").ok().as_deref() {
+        Some("0") | Some("off") | Some("false") => false,
+        _ => true,
+    };
     // Validate top-k indices regardless of path — the kernel-side top-K
     // is supposed to clamp to [0, n_exp), but defense-in-depth.
     for &e in topk_indices.iter().take(k_top) {
