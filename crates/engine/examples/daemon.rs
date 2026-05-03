@@ -2766,12 +2766,36 @@ fn generate_gemma4(
         //       buffering of trailing bytes that could be a marker prefix.
         let is_compact_eot = use_chat_template && next_token == GEMMA4_END_OF_TURN_TOKEN;
         if is_compact_eot {
-            // Roll back the byte counter so the next iteration (which
-            // won't run because should_stop=true and we'll forward+break)
-            // doesn't try to emit these bytes either. emitted_bytes stays
-            // at its prior value; the marker tokens decode but stay
-            // un-emitted.
-            // (No emission. Fall through to forward + break.)
+            // Drop the EOT token's bytes from the client stream, but FLUSH
+            // any prior-token bytes that the marker-prefix buffer was
+            // holding back. Without this, a sequence like
+            //   token_A decodes to '...<en'   (held back as marker prefix)
+            //   token_B = 106 (compact EOT)
+            // would silently drop the legitimate '<en' tail because the
+            // marker prefix turned out to be a false match.
+            //
+            // Decode just the prior tokens (everything except this iter's
+            // EOT) and emit anything not yet streamed.
+            let n_prior = streamed_tokens.len() - 1;
+            let prior_bytes = tokenizer.decode_bytes(&streamed_tokens[..n_prior]);
+            if prior_bytes.len() > emitted_bytes {
+                let pending = &prior_bytes[emitted_bytes..];
+                let safe_vl = match std::str::from_utf8(pending) {
+                    Ok(_) => pending.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                if safe_vl > 0 {
+                    let text = std::str::from_utf8(&pending[..safe_vl]).unwrap();
+                    let _ = writeln!(stdout,
+                        r#"{{"type":"token","id":"{}","text":{}}}"#,
+                        id, serde_json::to_string(&text).unwrap_or_default());
+                    let _ = stdout.flush();
+                    emitted_bytes += safe_vl;
+                }
+            }
+            // Fall through to forward + break. The EOT token's bytes
+            // never get emitted because we don't update emitted_bytes
+            // past prior_bytes.len().
         } else if let Some(idx) = marker_truncate_at {
             let stop_vl = idx - emitted_bytes;
             if stop_vl > 0 {
