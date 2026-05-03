@@ -2496,17 +2496,21 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 /// Gemma 4 chat templating + budget alerts will land alongside daemon
 /// chat-template support; for now this is raw-prompt mode (matching
 /// the smoke harness's behaviour).
+/// Find the first occurrence of `needle` in `haystack`. Trivial linear
+/// scan used by the chat-template `<end_of_turn>` detection on the
+/// gemma4 decode path. The decoded output is at most a few KB during
+/// streaming so a real searcher is overkill.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() { return None; }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 fn generate_gemma4(
     m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout,
     id: &str, prompt: &str, system_prompt: Option<&str>,
     temp: f32, top_p: f32, max_tokens: usize,
     repeat_penalty: f32, repeat_window: usize,
 ) {
-    // system_prompt is currently advisory — Gemma 4 chat templating not
-    // wired into the daemon yet. The smoke harness operates in the same
-    // raw-prompt mode and produces coherent output on the dense models.
-    let _ = system_prompt;
-
     let config = m.g4_config.as_ref().unwrap();
     let weights = m.g4_weights.as_ref().unwrap();
     let scratch = m.g4_scratch.as_ref().unwrap();
@@ -2521,15 +2525,63 @@ fn generate_gemma4(
     let bos_token = config.bos_token;
     let eos_token = config.eos_token;
 
+    // Chat-template detection: apply Gemma 4's literal-string template
+    // when the model is instruction-tuned (`-it` in path) OR when a
+    // system_prompt was explicitly provided. Base models on raw prompts
+    // do continuation-style decode; IT models without the template
+    // misbehave (parrot the prompt, wander into "[User N]" forum
+    // patterns, etc). Template format from chat_template.jinja in the
+    // HF E4B-it snapshot:
+    //   <bos><start_of_turn>user
+    //   {system}\n\n{user}<end_of_turn>
+    //   <start_of_turn>model
+    //
+    // The literal `<start_of_turn>` / `<end_of_turn>` strings tokenize as
+    // 7-token sequences each in the Gemma 4 tokenizer (`<`, `start`, `_`,
+    // `of`, `_`, `turn`, `>`); the model was trained on this exact
+    // sequence and recognizes the structure. End-of-turn detection
+    // happens via byte-string match in the decoded stream below.
+    //
+    // HIPFIRE_GEMMA4_CHAT=on/off forces template on/off; default is the
+    // path-based heuristic.
+    let force_chat = std::env::var("HIPFIRE_GEMMA4_CHAT").ok();
+    let path_is_it = m.model_path.contains("-it") || m.model_path.contains("_it");
+    let use_chat_template = match force_chat.as_deref() {
+        Some("on") | Some("1") | Some("true") => true,
+        Some("off") | Some("0") | Some("false") => false,
+        _ => path_is_it || system_prompt.is_some(),
+    };
+
+    let templated_prompt: String;
+    let prompt_for_encode: &str = if use_chat_template {
+        // Build the literal-string Gemma 4 template. System (if present)
+        // gets prepended to the user message with a blank line separator,
+        // matching how HF's chat_template.jinja handles 'system'/'developer'
+        // role messages (folded into the first user turn).
+        templated_prompt = match system_prompt {
+            Some(sys) if !sys.is_empty() => format!(
+                "<start_of_turn>user\n{}\n\n{}<end_of_turn>\n<start_of_turn>model\n",
+                sys, prompt,
+            ),
+            _ => format!(
+                "<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n",
+                prompt,
+            ),
+        };
+        &templated_prompt
+    } else {
+        prompt
+    };
+
     // Prompt encode — prepend BOS only on the first turn (seq_pos == 0).
     // HF Gemma 4 tokenizer ALWAYS leads sequences with <bos> per
     // tokenizer_config.json (`add_bos_token: true`).
     let mut new_tokens: Vec<u32> = if m.seq_pos == 0 {
         let mut t = vec![bos_token];
-        t.extend(tokenizer.encode(prompt));
+        t.extend(tokenizer.encode(prompt_for_encode));
         t
     } else {
-        tokenizer.encode(prompt)
+        tokenizer.encode(prompt_for_encode)
     };
 
     // KV-cache capacity guard. Gemma 4 has no eviction wired up so
@@ -2651,38 +2703,112 @@ fn generate_gemma4(
     let mut generated = 0usize;
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut emitted_bytes = 0usize;
+    // <end_of_turn> in Gemma 4 isn't a single token; it's the literal
+    // 13-byte string which tokenizes as 7 sub-tokens. To stop cleanly
+    // without leaking the marker bytes to the client, we hold back any
+    // trailing bytes that could be a prefix of the marker until the
+    // next token resolves whether it's the real marker. When the full
+    // marker appears, truncate emit and break.
+    let end_of_turn_marker = b"<end_of_turn>";
+    const GEMMA4_END_OF_TURN_TOKEN: u32 = 106;
     for _ in 0..max_tokens {
         generated += 1;
         m.conversation_tokens.push(next_token);
         streamed_tokens.push(next_token);
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-        let new_bytes = &all_bytes[emitted_bytes..];
-        let vl = match std::str::from_utf8(new_bytes) {
-            Ok(_) => new_bytes.len(),
-            Err(e) => e.valid_up_to(),
-        };
-        if vl > 0 {
-            let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
-            let _ = writeln!(stdout,
-                r#"{{"type":"token","id":"{}","text":{}}}"#,
-                id, serde_json::to_string(&text).unwrap_or_default());
-            let _ = stdout.flush();
-            emitted_bytes += vl;
+
+        // Decide whether THIS token (next_token, just pushed) ends the turn.
+        // We compute the decision BEFORE forwarding the token through the
+        // KV writer; the LLaMA path uses the same pattern (forward then
+        // break) so that the cache stays consistent for the next turn — a
+        // break that skipped the forward would leave seq_pos and conv
+        // tokens advanced past an unwritten KV slot.
+        let mut should_stop = false;
+        let mut marker_truncate_at: Option<usize> = None;
+        if use_chat_template {
+            if let Some(idx) = find_subslice(&all_bytes, end_of_turn_marker) {
+                if idx >= emitted_bytes {
+                    marker_truncate_at = Some(idx);
+                    should_stop = true;
+                }
+            }
+        }
+        if !should_stop {
+            if next_token == eos_token { should_stop = true; }
+            else if next_token == GEMMA4_END_OF_TURN_TOKEN && use_chat_template { should_stop = true; }
+            else if tokenizer.is_terminator(next_token) { should_stop = true; }
         }
 
-        // Stop checks: EOS plus tokenizer-level terminators (covers the
-        // various Gemma 4 chat-end tokens like <end_of_turn>).
-        if next_token == eos_token { break; }
-        if tokenizer.is_terminator(next_token) { break; }
+        // Emit text. Two cases:
+        //   (a) marker hit this iteration → emit prefix bytes only,
+        //       drop the marker bytes themselves so the client sees a
+        //       clean assistant response.
+        //   (b) regular emission → UTF-8-clean prefix, with chat-template
+        //       buffering of trailing bytes that could be a marker prefix.
+        if let Some(idx) = marker_truncate_at {
+            let stop_vl = idx - emitted_bytes;
+            if stop_vl > 0 {
+                let safe_vl = match std::str::from_utf8(&all_bytes[emitted_bytes..emitted_bytes + stop_vl]) {
+                    Ok(_) => stop_vl,
+                    Err(e) => e.valid_up_to(),
+                };
+                if safe_vl > 0 {
+                    let text = std::str::from_utf8(&all_bytes[emitted_bytes..emitted_bytes + safe_vl]).unwrap();
+                    let _ = writeln!(stdout,
+                        r#"{{"type":"token","id":"{}","text":{}}}"#,
+                        id, serde_json::to_string(&text).unwrap_or_default());
+                    let _ = stdout.flush();
+                    emitted_bytes += safe_vl;
+                }
+            }
+        } else {
+            // Regular emission with marker-prefix hold-back.
+            let new_bytes = &all_bytes[emitted_bytes..];
+            let utf8_vl = match std::str::from_utf8(new_bytes) {
+                Ok(_) => new_bytes.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            let mut emit_vl = utf8_vl;
+            if use_chat_template && emit_vl > 0 && !should_stop {
+                // Hold back the longest tail of new_bytes[..emit_vl] that
+                // matches a prefix of end_of_turn_marker. That tail stays
+                // pending until the next iteration confirms or denies the
+                // marker. Skipped on should_stop because we're about to
+                // exit (no next iteration to drain the buffer).
+                let max_hold = end_of_turn_marker.len() - 1;
+                let look = emit_vl.min(max_hold);
+                for hold in (1..=look).rev() {
+                    let tail = &new_bytes[emit_vl - hold..emit_vl];
+                    if end_of_turn_marker.starts_with(tail) {
+                        emit_vl -= hold;
+                        break;
+                    }
+                }
+            }
+            if emit_vl > 0 {
+                let text = std::str::from_utf8(&new_bytes[..emit_vl]).unwrap();
+                let _ = writeln!(stdout,
+                    r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = stdout.flush();
+                emitted_bytes += emit_vl;
+            }
+        }
 
-        // Forward the accepted token to populate KV for the next position,
-        // then sample for the next iteration.
+        // ALWAYS forward the accepted token to populate KV at its position,
+        // even when we're about to break. Mirrors the LLaMA generate
+        // pattern: stopping without writing this token's KV would leave
+        // the cache one slot short of seq_pos, and the next turn's first
+        // attention read would see uninitialized memory at position
+        // seq_pos - 1. Cost is one wasted forward when we break; benefit
+        // is multi-turn correctness.
         let pos = m.seq_pos + generated - 1;
-        // Defense-in-depth: hard cap before the KV writer indexes past the
-        // cache. The capacity guard at the top of generate_gemma4 should
-        // already have prevented this; the in-loop check is here so a
-        // future change that loosens the entry guard (or a caller that
-        // bypasses generate_gemma4) doesn't quietly scribble out of bounds.
+        // Defense-in-depth: hard cap before the KV writer indexes past
+        // the cache. The capacity guard at the top of generate_gemma4
+        // should already have prevented this; the in-loop check is here
+        // so a future change that loosens the entry guard (or a caller
+        // that bypasses generate_gemma4) doesn't quietly scribble out
+        // of bounds.
         if pos >= m.max_seq {
             let _ = writeln!(stdout,
                 r#"{{"type":"info","id":"{}","message":"gemma4: truncating decode at pos={} (max_seq={}) — generated {} of {} requested tokens"}}"#,
@@ -2700,6 +2826,11 @@ fn generate_gemma4(
             let _ = stdout.flush();
             break;
         }
+        // Now that next_token's KV is written, the cache is consistent
+        // through position seq_pos + generated - 1. Safe to break here
+        // for stop conditions detected this iteration.
+        if should_stop { break; }
+
         let scope_start = this_turn_prompt_anchor.max(
             m.conversation_tokens.len().saturating_sub(repeat_window.min(64)),
         );
