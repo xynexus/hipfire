@@ -2534,22 +2534,29 @@ fn generate_gemma4(
 
     // KV-cache capacity guard. Gemma 4 has no eviction wired up so
     // seq_pos grows monotonically. The KV cache is allocated for
-    // max_seq positions (indices 0..max_seq-1); the *last* write happens
-    // at pos = m.seq_pos + new_tokens.len() + (max_tokens - 1), so we
-    // need that to be < max_seq, i.e. seq_pos + new_tokens.len() +
-    // max_tokens <= max_seq. Use >= here, not >, to keep the off-by-one
-    // out of the kernel's bounds check.
+    // max_seq positions (indices 0..max_seq-1); the LAST write happens
+    // at pos = m.seq_pos + new_tokens.len() + (max_tokens - 1). We
+    // need that to be <= max_seq - 1, i.e.
+    //     seq_pos + new_tokens.len() + max_tokens <= max_seq.
+    // Use strict >, not >= — equality means the last write lands on the
+    // last valid index (max_seq - 1), which fits exactly. The previous
+    // version of this guard used >= and silently dropped context for
+    // exact-fit requests.
+    //
+    // single_turn_floor is the request's footprint as-if seq_pos were 0,
+    // already accounting for the BOS the reset path would re-insert.
     let single_turn_floor = if m.seq_pos == 0 {
-        // First turn already includes BOS in new_tokens.
+        // First turn already prepended BOS into new_tokens above.
         new_tokens.len() + max_tokens
     } else {
-        // Reset will re-insert BOS, so add 1 for that.
+        // Reset would re-insert BOS, so the post-reset footprint is
+        // new_tokens.len() + 1 + max_tokens.
         new_tokens.len() + max_tokens + 1
     };
     if single_turn_floor > m.max_seq {
-        // Even after reset the request itself doesn't fit. Fail loud
-        // rather than silently truncating max_tokens or letting the
-        // KV writer scribble past the buffer.
+        // Even after a reset the request can't fit. Fail loud — silently
+        // truncating max_tokens or letting the KV writer scribble past
+        // the buffer would both be worse.
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"gemma4: prompt({} tok) + max_tokens({}) + BOS exceeds max_seq({}); raise max_seq at load time or shorten the request"}}"#,
@@ -2559,7 +2566,7 @@ fn generate_gemma4(
         m.g4_kv_full = Some(kv_full);
         return;
     }
-    if m.seq_pos + new_tokens.len() + max_tokens >= m.max_seq {
+    if m.seq_pos + new_tokens.len() + max_tokens > m.max_seq {
         eprintln!(
             "[daemon] gemma4: context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq,
@@ -2570,8 +2577,8 @@ fn generate_gemma4(
         if new_tokens.first() != Some(&bos_token) {
             new_tokens.insert(0, bos_token);
         }
-        // Re-validate after the BOS-insert grew new_tokens by 1.
-        // single_turn_floor already accounted for this growth.
+        // Post-reset bound is single_turn_floor which we already proved
+        // <= max_seq above.
         debug_assert!(new_tokens.len() + max_tokens <= m.max_seq);
     }
 
