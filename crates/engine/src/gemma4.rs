@@ -1558,22 +1558,34 @@ fn apply_moe_branch(
     // sum of per-expert FFN outputs); the fused path just batches the
     // gate_up GEMV across the 8 selected experts. See
     // docs/plans/gemma4-moe-indexed-gemv.md for the full rollout.
-    // Fused path requires gate_up_proj weights in the HFQ4G256-byte
-    // family (HFQ4G256 / MQ4G256 — both 136 B/group). The kernel reads
-    // 136-byte blocks unconditionally; calling it on HFQ4G128 (72 B),
-    // MQ6G256 (200 B), MQ3G256 (104 B), MQ2G256 (72 B), or Q8F16
-    // (34 B/group) would silently corrupt. MG4G256 is loaded as
-    // DType::MQ4G256 by load_moe_layer_extras (quant_type=19 -> MQ4G256
-    // in the dtype table), so MG4 weights pass this gate.
+    // Fused path REQUIRES MQ4G256-rotated weights specifically. The
+    // path applies `rotate_x_mq` (FWHT) to moe_pre2 before the
+    // indexed GEMV, then the kernel does a plain dot product of the
+    // dequantized weights with the rotated input. This is correct
+    // ONLY when the weights were ALSO pre-rotated at quant time
+    // (i.e. MQ4G256 / MG4G256 — quantize_mq4g256 / quantize_mg4g256
+    // call cpu_fwht_256 before quantization).
     //
-    // Fused is the default ON when the gate passes; bit-identical to
-    // legacy across the coherence battery (commit 1d86adb) and ~10%
-    // faster on 26B-A4B decode. HIPFIRE_GEMMA4_MOE_FUSED=0 forces
-    // legacy as a safety hatch even when the gate passes.
-    let gate_up_compatible = !moe.experts.is_empty() && matches!(
-        moe.experts[0].gate_up_proj.gpu_dtype,
-        DType::HFQ4G256 | DType::MQ4G256
-    );
+    // HFQ4G256 weights share the same 136-byte block layout but are
+    // NOT pre-rotated. Feeding them rotated x would compute
+    // \`W @ FWHT(x)\` instead of \`W @ x\` and silently corrupt
+    // output. Mirrors qwen35's `gate_side_mq4` flag which gates on
+    // MQ4G256 specifically (not the broader HFQ4 family).
+    //
+    // Other dtypes (HFQ4G128 72 B, MQ6G256 200 B, MQ3G256 104 B,
+    // MQ2G256 72 B, Q8F16 34 B) have different block byte layouts
+    // entirely and would mis-read.
+    //
+    // MG4G256 loads as DType::MQ4G256 via load_moe_layer_extras
+    // (quant_type=19 -> MQ4G256 dtype-table entry), so MG4 weights
+    // pass this gate.
+    //
+    // Default ON when gate passes; bit-identical to legacy across
+    // the coherence battery (commit 1d86adb) and ~10% faster on
+    // 26B-A4B decode. HIPFIRE_GEMMA4_MOE_FUSED=0 forces legacy as a
+    // safety hatch.
+    let gate_up_compatible = !moe.experts.is_empty()
+        && moe.experts[0].gate_up_proj.gpu_dtype == DType::MQ4G256;
     let env_decision = std::env::var("HIPFIRE_GEMMA4_MOE_FUSED").ok();
     let use_fused = match env_decision.as_deref() {
         Some("0") | Some("off") | Some("false") => false,
@@ -1585,8 +1597,9 @@ fn apply_moe_branch(
                     0,
                     &format!(
                         "HIPFIRE_GEMMA4_MOE_FUSED=1 requested but gate_up_proj dtype is \
-                         {:?} (need HFQ4G256 / MQ4G256 / MG4G256 byte layout). Quantize \
-                         this model with --format mg4 / mq4 / hfq4 or unset the env var.",
+                         {:?} (need MQ4G256 / MG4G256 — fused path applies an FWHT rotation \
+                         to x that's only correct for pre-rotated weights). Quantize this \
+                         model with --format mg4 / mq4 or unset the env var.",
                         moe.experts[0].gate_up_proj.gpu_dtype,
                     ),
                 ));
