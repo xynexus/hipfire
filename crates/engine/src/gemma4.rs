@@ -1558,13 +1558,42 @@ fn apply_moe_branch(
     // sum of per-expert FFN outputs); the fused path just batches the
     // gate_up GEMV across the 8 selected experts. See
     // docs/plans/gemma4-moe-indexed-gemv.md for the full rollout.
-    // Fused path is the default — bit-identical to legacy across the
-    // coherence battery (commit 1d86adb baseline) and ~10% faster on
-    // 26B-A4B decode. HIPFIRE_GEMMA4_MOE_FUSED=0 forces legacy as a
-    // safety hatch.
-    let use_fused = match std::env::var("HIPFIRE_GEMMA4_MOE_FUSED").ok().as_deref() {
+    // Fused path requires gate_up_proj weights in the HFQ4G256-byte
+    // family (HFQ4G256 / MQ4G256 — both 136 B/group). The kernel reads
+    // 136-byte blocks unconditionally; calling it on HFQ4G128 (72 B),
+    // MQ6G256 (200 B), MQ3G256 (104 B), MQ2G256 (72 B), or Q8F16
+    // (34 B/group) would silently corrupt. MG4G256 is loaded as
+    // DType::MQ4G256 by load_moe_layer_extras (quant_type=19 -> MQ4G256
+    // in the dtype table), so MG4 weights pass this gate.
+    //
+    // Fused is the default ON when the gate passes; bit-identical to
+    // legacy across the coherence battery (commit 1d86adb) and ~10%
+    // faster on 26B-A4B decode. HIPFIRE_GEMMA4_MOE_FUSED=0 forces
+    // legacy as a safety hatch even when the gate passes.
+    let gate_up_compatible = !moe.experts.is_empty() && matches!(
+        moe.experts[0].gate_up_proj.gpu_dtype,
+        DType::HFQ4G256 | DType::MQ4G256
+    );
+    let env_decision = std::env::var("HIPFIRE_GEMMA4_MOE_FUSED").ok();
+    let use_fused = match env_decision.as_deref() {
         Some("0") | Some("off") | Some("false") => false,
-        _ => true,
+        Some("1") | Some("on") | Some("true") => {
+            // Explicit opt-in. Refuse loud rather than silently corrupt
+            // when the dtype gate would have rejected.
+            if !gate_up_compatible {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "HIPFIRE_GEMMA4_MOE_FUSED=1 requested but gate_up_proj dtype is \
+                         {:?} (need HFQ4G256 / MQ4G256 / MG4G256 byte layout). Quantize \
+                         this model with --format mg4 / mq4 / hfq4 or unset the env var.",
+                        moe.experts[0].gate_up_proj.gpu_dtype,
+                    ),
+                ));
+            }
+            true
+        }
+        _ => gate_up_compatible,
     };
     // Validate top-k indices regardless of path — the kernel-side top-K
     // is supposed to clamp to [0, n_exp), but defense-in-depth.
