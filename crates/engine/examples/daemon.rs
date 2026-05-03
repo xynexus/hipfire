@@ -2552,14 +2552,70 @@ fn generate_gemma4(
         _ => path_is_it || system_prompt.is_some(),
     };
 
+    // Defer template + BOS construction until after the capacity-reset
+    // decision. The system prompt (if any) only goes into the FIRST turn
+    // of a conversation — re-injecting it on every turn confuses the
+    // model and bloats KV. Auto-reset effectively starts a fresh
+    // conversation, so post-reset the next encode also includes system.
+    //
+    // Estimate the prompt footprint to drive the reset decision before
+    // building the actual tokens. Encode the user-text-only template to
+    // get a worst-case-no-system token count; the real encode happens
+    // after the reset decision so the system-prompt injection tracks
+    // the post-reset seq_pos correctly.
+    let user_only_estimate = {
+        let s = if use_chat_template {
+            format!("<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n", prompt)
+        } else {
+            prompt.to_string()
+        };
+        tokenizer.encode(&s).len()
+    };
+    let system_extra_estimate = match (use_chat_template, system_prompt) {
+        (true, Some(sys)) if !sys.is_empty() => tokenizer.encode(sys).len() + 4,  // sys + "\n\n" approx
+        _ => 0,
+    };
+    let bos_overhead = 1usize;
+    let single_turn_floor = user_only_estimate + system_extra_estimate + bos_overhead + max_tokens;
+    if single_turn_floor > m.max_seq {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"gemma4: prompt({} tok) + system({} tok) + max_tokens({}) + BOS exceeds max_seq({}); raise max_seq at load time or shorten the request"}}"#,
+            id, user_only_estimate, system_extra_estimate, max_tokens, m.max_seq,
+        );
+        let _ = stdout.flush();
+        m.g4_kv_full = Some(kv_full);
+        return;
+    }
+
+    // Reset trigger uses CURRENT-turn footprint (without system if
+    // we're past turn 1). Strict >, not >= — equality fits the cache
+    // exactly (last write at index max_seq-1).
+    let mid_turn_floor = if m.seq_pos == 0 {
+        single_turn_floor
+    } else {
+        // Continuation turn: no system, no BOS prepended (BOS only on
+        // the very first turn after a reset).
+        user_only_estimate + max_tokens
+    };
+    if m.seq_pos + mid_turn_floor > m.max_seq {
+        eprintln!(
+            "[daemon] gemma4: context full ({}/{}) — resetting conversation",
+            m.seq_pos, m.max_seq,
+        );
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+
+    // Build the actual prompt now that seq_pos is final. System prompt
+    // included only when seq_pos == 0 (first turn or just-reset turn);
+    // continuation turns get user-only template wrap. BOS prepended
+    // only on seq_pos == 0 (matches HF tokenizer_config.add_bos_token
+    // semantics: leading <bos> per conversation, not per turn).
     let templated_prompt: String;
     let prompt_for_encode: &str = if use_chat_template {
-        // Build the literal-string Gemma 4 template. System (if present)
-        // gets prepended to the user message with a blank line separator,
-        // matching how HF's chat_template.jinja handles 'system'/'developer'
-        // role messages (folded into the first user turn).
-        templated_prompt = match system_prompt {
-            Some(sys) if !sys.is_empty() => format!(
+        templated_prompt = match (m.seq_pos == 0, system_prompt) {
+            (true, Some(sys)) if !sys.is_empty() => format!(
                 "<start_of_turn>user\n{}\n\n{}<end_of_turn>\n<start_of_turn>model\n",
                 sys, prompt,
             ),
@@ -2573,9 +2629,6 @@ fn generate_gemma4(
         prompt
     };
 
-    // Prompt encode — prepend BOS only on the first turn (seq_pos == 0).
-    // HF Gemma 4 tokenizer ALWAYS leads sequences with <bos> per
-    // tokenizer_config.json (`add_bos_token: true`).
     let mut new_tokens: Vec<u32> = if m.seq_pos == 0 {
         let mut t = vec![bos_token];
         t.extend(tokenizer.encode(prompt_for_encode));
@@ -2584,54 +2637,17 @@ fn generate_gemma4(
         tokenizer.encode(prompt_for_encode)
     };
 
-    // KV-cache capacity guard. Gemma 4 has no eviction wired up so
-    // seq_pos grows monotonically. The KV cache is allocated for
-    // max_seq positions (indices 0..max_seq-1); the LAST write happens
-    // at pos = m.seq_pos + new_tokens.len() + (max_tokens - 1). We
-    // need that to be <= max_seq - 1, i.e.
-    //     seq_pos + new_tokens.len() + max_tokens <= max_seq.
-    // Use strict >, not >= — equality means the last write lands on the
-    // last valid index (max_seq - 1), which fits exactly. The previous
-    // version of this guard used >= and silently dropped context for
-    // exact-fit requests.
-    //
-    // single_turn_floor is the request's footprint as-if seq_pos were 0,
-    // already accounting for the BOS the reset path would re-insert.
-    let single_turn_floor = if m.seq_pos == 0 {
-        // First turn already prepended BOS into new_tokens above.
-        new_tokens.len() + max_tokens
-    } else {
-        // Reset would re-insert BOS, so the post-reset footprint is
-        // new_tokens.len() + 1 + max_tokens.
-        new_tokens.len() + max_tokens + 1
-    };
-    if single_turn_floor > m.max_seq {
-        // Even after a reset the request can't fit. Fail loud — silently
-        // truncating max_tokens or letting the KV writer scribble past
-        // the buffer would both be worse.
+    // Final bounds check — single_turn_floor is an UPPER bound on the
+    // actual encoded len, but bounded; assert against measured size.
+    if m.seq_pos + new_tokens.len() + max_tokens > m.max_seq {
         let _ = writeln!(
             stdout,
-            r#"{{"type":"error","id":"{}","message":"gemma4: prompt({} tok) + max_tokens({}) + BOS exceeds max_seq({}); raise max_seq at load time or shorten the request"}}"#,
-            id, new_tokens.len(), max_tokens, m.max_seq,
+            r#"{{"type":"error","id":"{}","message":"gemma4: encoded prompt {} + max_tokens {} overflows seq_pos={} max_seq={}"}}"#,
+            id, new_tokens.len(), max_tokens, m.seq_pos, m.max_seq,
         );
         let _ = stdout.flush();
         m.g4_kv_full = Some(kv_full);
         return;
-    }
-    if m.seq_pos + new_tokens.len() + max_tokens > m.max_seq {
-        eprintln!(
-            "[daemon] gemma4: context full ({}/{}) — resetting conversation",
-            m.seq_pos, m.max_seq,
-        );
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        // Force BOS on the reset turn since seq_pos went back to 0.
-        if new_tokens.first() != Some(&bos_token) {
-            new_tokens.insert(0, bos_token);
-        }
-        // Post-reset bound is single_turn_floor which we already proved
-        // <= max_seq above.
-        debug_assert!(new_tokens.len() + max_tokens <= m.max_seq);
     }
 
     let t0 = Instant::now();
@@ -2739,13 +2755,24 @@ fn generate_gemma4(
             else if tokenizer.is_terminator(next_token) { should_stop = true; }
         }
 
-        // Emit text. Two cases:
+        // Emit text. Three cases:
         //   (a) marker hit this iteration → emit prefix bytes only,
         //       drop the marker bytes themselves so the client sees a
         //       clean assistant response.
-        //   (b) regular emission → UTF-8-clean prefix, with chat-template
+        //   (b) compact end-of-turn token (id 106, `<turn|>`) → skip
+        //       emission entirely. Same logic: client should never see
+        //       the marker.
+        //   (c) regular emission → UTF-8-clean prefix, with chat-template
         //       buffering of trailing bytes that could be a marker prefix.
-        if let Some(idx) = marker_truncate_at {
+        let is_compact_eot = use_chat_template && next_token == GEMMA4_END_OF_TURN_TOKEN;
+        if is_compact_eot {
+            // Roll back the byte counter so the next iteration (which
+            // won't run because should_stop=true and we'll forward+break)
+            // doesn't try to emit these bytes either. emitted_bytes stays
+            // at its prior value; the marker tokens decode but stay
+            // un-emitted.
+            // (No emission. Fall through to forward + break.)
+        } else if let Some(idx) = marker_truncate_at {
             let stop_vl = idx - emitted_bytes;
             if stop_vl > 0 {
                 let safe_vl = match std::str::from_utf8(&all_bytes[emitted_bytes..emitted_bytes + stop_vl]) {
