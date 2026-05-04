@@ -157,6 +157,14 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC: &str =
 pub const GEMV_Q8_0_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_q8_0_moe_down_indexed.hip");
 
+/// Batched GELU-tanh + element-wise multiply: out[b][i] = gelu_tanh(gate[b][i]) * up[b][i].
+/// Replaces the 8× (gelu_tanh + mul) launches in Gemma 4 MoE branch
+/// (Phase 2.5) with a single launch — biggest single launch-count
+/// reduction the per-token profile flagged (16 launches/layer × 30
+/// layers = 480 → 30 launches per decode step).
+pub const GELU_TANH_MUL_BATCHED_F32_SRC: &str =
+    include_str!("../../../kernels/src/gelu_tanh_mul_batched_f32.hip");
+
 /// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
 /// for the single-token kernel when prefilling N tokens through an MoE
 /// layer; one workgroup per token. Enables batched MoE prefill.

@@ -1711,29 +1711,53 @@ fn apply_moe_branch(
         )?;
 
         if use_fused_down {
-            // Phase 2: per-expert SwiGLU into a packed hidden batch, then
-            // a single indexed-Q8 down GEMV that atomicAdds 8 weighted
-            // contributions into moe_cur_moe. Replaces 16 SwiGLU launches
-            // (gelu + mul, ×8) plus 8 (down_gemv + scaled_add) = 24
-            // launches per layer with 16 (SwiGLU) + 1 (down) = 17. Net:
-            // 7 launches saved per layer, but the dominant cost was the
-            // per-expert down GEMV serialization through ssync — fusing
-            // those is the real win.
-            for ki in 0..k_top {
-                let (gate, up) = if swap_gate_up {
-                    (scratch.moe_expert_up_batch.sub_offset(ki * mi, mi),
-                     scratch.moe_expert_gate_batch.sub_offset(ki * mi, mi))
-                } else {
-                    (scratch.moe_expert_gate_batch.sub_offset(ki * mi, mi),
-                     scratch.moe_expert_up_batch.sub_offset(ki * mi, mi))
-                };
-                let hidden_ki = scratch.moe_expert_hidden_batch.sub_offset(ki * mi, mi);
-                if use_gelu_erf {
-                    gpu.gelu_erf_f32(&gate, &hidden_ki, mi)?;
-                } else {
-                    gpu.gelu_tanh_f32(&gate, &hidden_ki, mi)?;
+            // Phase 2.5: batched gelu_tanh + mul across the 8 experts in
+            // one launch (16 launches/layer → 1) followed by the Phase 2
+            // single indexed-Q8 down GEMV. Total MoE launches per layer:
+            // 1 (gate_up) + 1 (gelu+mul batched) + 1 (down) = 3, vs the
+            // legacy 5 × 8 = 40. Per the per-token profile, the batched
+            // SwiGLU was the largest remaining launch-count reduction
+            // available (480 → 30 per decode step).
+            //
+            // The (gate, up) pair selection still follows the
+            // HIPFIRE_MOE_SWAP_GATE_UP debug flag, but in normal flow
+            // (gate first, up second) the kernel reads
+            // moe_expert_gate_batch and moe_expert_up_batch directly.
+            // HIPFIRE_MOE_GELU_ERF=1 falls back to the per-expert loop
+            // because the batched kernel hardcodes the tanh-approx GELU
+            // (matches Gemma's gemma-pytorch-tanh convention; the erf
+            // variant is a debug knob that isn't worth a duplicate
+            // kernel for — costs 16 launches/layer when set).
+            // HIPFIRE_GEMMA4_MOE_BATCHED_SWIGLU=0 forces the per-expert
+            // gelu_tanh + mul loop as a safety hatch / clean A/B baseline.
+            // Default ON when neither erf-GELU nor swap-gate-up is set.
+            let env_swiglu = std::env::var("HIPFIRE_GEMMA4_MOE_BATCHED_SWIGLU").ok();
+            let force_per_exp_swiglu = matches!(env_swiglu.as_deref(),
+                Some("0") | Some("off") | Some("false"));
+            if use_gelu_erf || swap_gate_up || force_per_exp_swiglu {
+                for ki in 0..k_top {
+                    let (gate, up) = if swap_gate_up {
+                        (scratch.moe_expert_up_batch.sub_offset(ki * mi, mi),
+                         scratch.moe_expert_gate_batch.sub_offset(ki * mi, mi))
+                    } else {
+                        (scratch.moe_expert_gate_batch.sub_offset(ki * mi, mi),
+                         scratch.moe_expert_up_batch.sub_offset(ki * mi, mi))
+                    };
+                    let hidden_ki = scratch.moe_expert_hidden_batch.sub_offset(ki * mi, mi);
+                    if use_gelu_erf {
+                        gpu.gelu_erf_f32(&gate, &hidden_ki, mi)?;
+                    } else {
+                        gpu.gelu_tanh_f32(&gate, &hidden_ki, mi)?;
+                    }
+                    gpu.mul_f32(&hidden_ki, &up, &hidden_ki)?;
                 }
-                gpu.mul_f32(&hidden_ki, &up, &hidden_ki)?;
+            } else {
+                gpu.gelu_tanh_mul_batched_f32(
+                    &scratch.moe_expert_gate_batch,
+                    &scratch.moe_expert_up_batch,
+                    &scratch.moe_expert_hidden_batch,
+                    mi, k_top,
+                )?;
             }
 
             // Fold per-expert composite weights on CPU and upload once.

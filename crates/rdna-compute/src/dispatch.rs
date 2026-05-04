@@ -12583,6 +12583,46 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// Batched GELU-tanh + element-wise multiply: out[b][i] = gelu_tanh(gate[b][i]) * up[b][i].
+    /// Single launch replaces 8× (gelu_tanh + mul) per-expert launches
+    /// in the Gemma 4 MoE branch (16 launches → 1, ×30 layers).
+    /// `gate`, `up`, `out` are all `[batch × k]` row-major. In-place
+    /// capable when `out` aliases `gate` or `up`.
+    pub fn gelu_tanh_mul_batched_f32(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gelu_tanh_mul_batched_f32",
+            kernels::GELU_TANH_MUL_BATCHED_F32_SRC,
+            "gelu_tanh_mul_batched_f32",
+        )?;
+        let func = &self.functions["gelu_tanh_mul_batched_f32"];
+        let mut gp = gate.buf.as_ptr();
+        let mut up_p = up.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_p as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let chunks = ((k + 255) / 256) as u32;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "gelu_tanh_mul_batched_f32", batch * k * 4 * 3,
+        );
+        let result = unsafe { self.hip.launch_kernel(
+            func, [chunks, batch as u32, 1], [256, 1, 1], 0, self.stream_ref(), &mut params,
+        ) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Exact (erf-based) GELU — PyTorch `nn.GELU()` default. Used by the
     /// Gemma 4 E-series per-layer-embedding inject. In-place capable.
     pub fn gelu_erf_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
