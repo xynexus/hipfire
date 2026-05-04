@@ -1142,6 +1142,85 @@ fn load_moe_layer_extras(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Gemma4C
 /// One-time init for the scratch buffers that must hold a constant value
 /// across forward passes (notably the ones-filled `v_norm_ones_full`).
 /// Call once after `Gemma4Scratch::new` before the first forward pass.
+/// Master switch for the qwen35-mirror fused-projection path. Returns true
+/// when the env var allows fusion (default ON).
+fn fused_proj_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_GEMMA4_FUSED_PROJ").ok().as_deref(),
+        Some("0") | Some("off") | Some("false")
+    )
+}
+
+/// Replaces a `rmsnorm_f32(x, w, tmp)` that's about to feed a multi-projection.
+///
+/// `will_fuse`: caller's commitment that EVERY downstream projection will use
+/// a fused-kernel path (which expects pre-rotated x for MQ4 weights and does
+/// NOT internally rotate). When true AND the sample weight is MQ4-byte-compat,
+/// this fuses the rmsnorm + FWHT into a single launch and returns `tmp_rot`.
+///
+/// Otherwise plain `rmsnorm_f32` into `tmp` returns un-rotated x — required
+/// when ANY downstream projection falls through to `weight_gemv`, which for
+/// MQ4 weights does its own internal rotation. Passing pre-rotated x to a
+/// rotation-doing GEMV would double-rotate and corrupt output.
+fn prep_norm_for_proj<'a>(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    norm_w: &GpuTensor,
+    sample_proj: &WeightTensor,
+    tmp: &'a GpuTensor,
+    tmp_rot: &'a GpuTensor,
+    dim: usize,
+    eps: f32,
+    will_fuse: bool,
+) -> HipResult<&'a GpuTensor> {
+    if fused_proj_enabled() && will_fuse && sample_proj.gpu_dtype == DType::MQ4G256 {
+        gpu.fused_rmsnorm_rotate_mq(x, norm_w, tmp_rot, dim, eps)?;
+        Ok(tmp_rot)
+    } else {
+        gpu.rmsnorm_f32(x, norm_w, tmp, eps)?;
+        Ok(tmp)
+    }
+}
+
+/// Try the qwen35-mirror fused QKV (3 GEMVs → 1 launch). Caller must have
+/// passed an `x` produced by `prep_norm_for_proj` so the dtype check here
+/// agrees on the rotation state.
+fn fused_qkv_or_fallback(
+    gpu: &mut Gpu,
+    qw: &WeightTensor, kw: &WeightTensor, vw: &WeightTensor,
+    x: &GpuTensor,
+    yq: &GpuTensor, yk: &GpuTensor, yv: &GpuTensor,
+) -> HipResult<()> {
+    let all_mq4 = qw.gpu_dtype == DType::MQ4G256
+        && kw.gpu_dtype == DType::MQ4G256
+        && vw.gpu_dtype == DType::MQ4G256;
+    if fused_proj_enabled() && all_mq4 {
+        gpu.fused_qkv_hfq4g256(&qw.buf, &kw.buf, &vw.buf, x, yq, yk, yv,
+            qw.m, kw.m, vw.m, qw.k)
+    } else {
+        weight_gemv(gpu, qw, x, yq)?;
+        weight_gemv(gpu, kw, x, yk)?;
+        weight_gemv(gpu, vw, x, yv)
+    }
+}
+
+/// Try the qwen35-mirror fused gate+up (2 GEMVs → 1 launch). Caller must
+/// have passed an `x` produced by `prep_norm_for_proj`.
+fn fused_gate_up_or_fallback(
+    gpu: &mut Gpu,
+    gw: &WeightTensor, uw: &WeightTensor,
+    x: &GpuTensor,
+    yg: &GpuTensor, yu: &GpuTensor,
+) -> HipResult<()> {
+    let both_mq4 = gw.gpu_dtype == DType::MQ4G256 && uw.gpu_dtype == DType::MQ4G256;
+    if fused_proj_enabled() && both_mq4 {
+        gpu.fused_gate_up_hfq4g256(&gw.buf, &uw.buf, x, yg, yu, gw.m, uw.m, gw.k)
+    } else {
+        weight_gemv(gpu, gw, x, yg)?;
+        weight_gemv(gpu, uw, x, yu)
+    }
+}
+
 pub fn init_scratch_constants(gpu: &mut Gpu, scratch: &Gemma4Scratch, full_head_dim: usize)
     -> HipResult<()>
 {
@@ -1270,6 +1349,13 @@ pub struct Gemma4Scratch {
     /// indexed-down kernel atomicAdds `weight × (W·hidden)` per expert
     /// row, so caller-side folding eliminates a tiny GPU mul kernel.
     pub moe_topk_weights_fused: GpuTensor,
+    /// FWHT-rotated post-rmsnorm input, written by `fused_rmsnorm_rotate_mq`
+    /// when the upcoming projection is MQ4G256. Consumed by `fused_qkv_hfq4g256`
+    /// / `fused_gate_up_hfq4g256` (the qwen35 mirrors). Pre-rotation is
+    /// what these kernels expect for MQ4-byte-compat weights — passing
+    /// raw `x` would compute `W·FWHT(x)` ≠ `W·x` and corrupt output.
+    /// Sized to `dim` (same as `tmp`).
+    pub tmp_rot: GpuTensor,
 }
 
 impl Gemma4Scratch {
@@ -1371,6 +1457,7 @@ impl Gemma4Scratch {
         let moe_expert_up_batch     = gpu.zeros(&[k_top_alloc * mi_alloc], DType::F32)?;
         let moe_expert_hidden_batch = gpu.zeros(&[k_top_alloc * mi_alloc], DType::F32)?;
         let moe_topk_weights_fused  = gpu.zeros(&[k_top_alloc],            DType::F32)?;
+        let tmp_rot                 = gpu.zeros(&[dim],                    DType::F32)?;
 
         Ok(Gemma4Scratch {
             x, residual, tmp, pos_buf,
@@ -1386,6 +1473,7 @@ impl Gemma4Scratch {
             moe_expert_gate_up, moe_expert_hidden, moe_expert_out,
             moe_pre2_rot, moe_expert_gate_batch, moe_expert_up_batch,
             moe_expert_hidden_batch, moe_topk_weights_fused,
+            tmp_rot,
         })
     }
 
@@ -1430,6 +1518,7 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.moe_expert_up_batch);
         let _ = gpu.free_tensor(self.moe_expert_hidden_batch);
         let _ = gpu.free_tensor(self.moe_topk_weights_fused);
+        let _ = gpu.free_tensor(self.tmp_rot);
     }
 }
 
@@ -2108,18 +2197,33 @@ fn sliding_layer_decode(
     // residual = x
     gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
 
-    // tmp = input_layernorm(x)
-    gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
+    // Pre-projection norm. We can pre-rotate (saving a launch under the
+    // fused_qkv kernel) only when ALL downstream projections will use the
+    // fused (rotation-free) path. That means: owns_kv (so Q+K+V all run)
+    // AND every weight is MQ4-byte-compat. Shared-KV layers run only Q,
+    // which goes through `weight_gemv` (MQ4 = self-rotating), so we must
+    // NOT pre-rotate there.
+    let will_fuse_qkv = owns_kv
+        && lw.q_proj.gpu_dtype == DType::MQ4G256
+        && lw.k_proj.gpu_dtype == DType::MQ4G256
+        && lw.v_proj.gpu_dtype == DType::MQ4G256;
+    let proj_x = prep_norm_for_proj(gpu, &scratch.x, &lw.input_layernorm,
+        &lw.q_proj, &scratch.tmp, &scratch.tmp_rot, dim, config.norm_eps, will_fuse_qkv)?;
 
     // Q is always projected (every layer needs its own Q, regardless of
     // KV ownership). K/V are skipped on shared layers — their k_proj /
     // v_proj weights still ship in HF safetensors but are stale/unused;
     // the actual K/V data is read from the KV cache slot of the anchor
     // layer (sliding anchor = layer n_layer_kv_from_start - 2).
-    weight_gemv(gpu, &lw.q_proj, &scratch.tmp, &scratch.q)?;
-    if owns_kv {
-        weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
-        weight_gemv(gpu, &lw.v_proj, &scratch.tmp, &scratch.v)?;
+    if will_fuse_qkv {
+        fused_qkv_or_fallback(gpu, &lw.q_proj, &lw.k_proj, &lw.v_proj,
+            proj_x, &scratch.q, &scratch.k, &scratch.v)?;
+    } else if owns_kv {
+        weight_gemv(gpu, &lw.q_proj, proj_x, &scratch.q)?;
+        weight_gemv(gpu, &lw.k_proj, proj_x, &scratch.k)?;
+        weight_gemv(gpu, &lw.v_proj, proj_x, &scratch.v)?;
+    } else {
+        weight_gemv(gpu, &lw.q_proj, proj_x, &scratch.q)?;
     }
 
     // q_norm + (own-only) k_norm + v_norm across head_dim (in-place).
@@ -2243,11 +2347,14 @@ fn sliding_layer_decode(
         eprintln!("[layer0] post-attn-residual  n={n}  rms={rms:.4}  min={mn:.4}  max={mx:.4}");
     }
 
-    // Pre-FFN norm.
-    gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+    // Pre-FFN norm. Fuses with rotation only when both gate+up are MQ4.
+    let will_fuse_gate_up = lw.gate_proj.gpu_dtype == DType::MQ4G256
+        && lw.up_proj.gpu_dtype == DType::MQ4G256;
+    let proj_x = prep_norm_for_proj(gpu, &scratch.x, &lw.pre_feedforward_layernorm,
+        &lw.gate_proj, &scratch.tmp, &scratch.tmp_rot, dim, config.norm_eps, will_fuse_gate_up)?;
 
     if layer_idx == 0 && std::env::var("HIPFIRE_DUMP_LAYER0").ok().as_deref() == Some("1") {
-        let v = gpu.download_f32(&scratch.tmp)?;
+        let v = gpu.download_f32(proj_x)?;
         let n = v.len();
         let rms = (v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n as f64).sqrt();
         let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -2257,8 +2364,8 @@ fn sliding_layer_decode(
 
     // SwiGLU(gelu_pytorch_tanh): gate_proj, up_proj, gelu_tanh(gate) * up → down_proj.
     // Use lw.ffn_hidden_dim — varies per layer on E2B (use_double_wide_mlp).
-    weight_gemv(gpu, &lw.gate_proj, &scratch.tmp, &scratch.gate_ffn)?;
-    weight_gemv(gpu, &lw.up_proj, &scratch.tmp, &scratch.up_ffn)?;
+    fused_gate_up_or_fallback(gpu, &lw.gate_proj, &lw.up_proj,
+        proj_x, &scratch.gate_ffn, &scratch.up_ffn)?;
     gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, lw.ffn_hidden_dim)?;
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
@@ -2336,8 +2443,16 @@ fn full_layer_decode(
     // residual = x
     gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
 
-    // tmp = input_layernorm(x)
-    gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
+    // tmp = input_layernorm(x). Pre-rotate only when the full Q/K/V
+    // path is going to fuse — that requires owns_kv AND v_proj=Some
+    // (k_eq_v has no fused-qk kernel today) AND all 3 weights MQ4.
+    let will_fuse_qkv = owns_kv
+        && lw.v_proj.as_ref().map_or(false, |vw|
+            lw.q_proj.gpu_dtype == DType::MQ4G256
+                && lw.k_proj.gpu_dtype == DType::MQ4G256
+                && vw.gpu_dtype == DType::MQ4G256);
+    let proj_x = prep_norm_for_proj(gpu, &scratch.x, &lw.input_layernorm,
+        &lw.q_proj, &scratch.tmp, &scratch.tmp_rot, dim, config.norm_eps, will_fuse_qkv)?;
 
     // Q always projected. K + V only on own-KV layers — shared layers reuse
     // the anchor full layer's KV slot.
@@ -2347,18 +2462,19 @@ fn full_layer_decode(
     //     a memcpy from scratch.k after k_proj. lw.v_proj is None.
     //   • false (E2B / E4B):     V comes from a separate v_proj weight.
     //     lw.v_proj is Some.
-    weight_gemv(gpu, &lw.q_proj, &scratch.tmp, &scratch.q)?;
-    if owns_kv {
-        weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
+    if will_fuse_qkv {
+        let vw = lw.v_proj.as_ref().expect("will_fuse_qkv implies v_proj.is_some()");
+        fused_qkv_or_fallback(gpu, &lw.q_proj, &lw.k_proj, vw,
+            proj_x, &scratch.q, &scratch.k, &scratch.v)?;
+    } else if owns_kv {
+        weight_gemv(gpu, &lw.q_proj, proj_x, &scratch.q)?;
+        weight_gemv(gpu, &lw.k_proj, proj_x, &scratch.k)?;
         match &lw.v_proj {
-            Some(vw) => {
-                weight_gemv(gpu, vw, &scratch.tmp, &scratch.v)?;
-            }
-            None => {
-                // CRITICAL: capture pre-k_norm bytes as V before applying k_norm.
-                gpu.hip.memcpy_dtod(&scratch.v.buf, &scratch.k.buf, kv_bytes)?;
-            }
+            Some(vw) => weight_gemv(gpu, vw, proj_x, &scratch.v)?,
+            None => gpu.hip.memcpy_dtod(&scratch.v.buf, &scratch.k.buf, kv_bytes)?,
         }
+    } else {
+        weight_gemv(gpu, &lw.q_proj, proj_x, &scratch.q)?;
     }
 
     // q_norm always; k_norm + v_norm only on own-KV layers (head_dim = 512).
@@ -2436,13 +2552,16 @@ fn full_layer_decode(
     // Save new residual.
     gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
 
-    // Pre-FFN norm.
-    gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+    // Pre-FFN norm. Fuses with rotation only when both gate+up are MQ4.
+    let will_fuse_gate_up = lw.gate_proj.gpu_dtype == DType::MQ4G256
+        && lw.up_proj.gpu_dtype == DType::MQ4G256;
+    let proj_x = prep_norm_for_proj(gpu, &scratch.x, &lw.pre_feedforward_layernorm,
+        &lw.gate_proj, &scratch.tmp, &scratch.tmp_rot, dim, config.norm_eps, will_fuse_gate_up)?;
 
     // SwiGLU with gelu_pytorch_tanh activation. lw.ffn_hidden_dim is per-layer
     // (use_double_wide_mlp on E2B doubles it for shared-KV layers).
-    weight_gemv(gpu, &lw.gate_proj, &scratch.tmp, &scratch.gate_ffn)?;
-    weight_gemv(gpu, &lw.up_proj, &scratch.tmp, &scratch.up_ffn)?;
+    fused_gate_up_or_fallback(gpu, &lw.gate_proj, &lw.up_proj,
+        proj_x, &scratch.gate_ffn, &scratch.up_ffn)?;
     gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, lw.ffn_hidden_dim)?;
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
