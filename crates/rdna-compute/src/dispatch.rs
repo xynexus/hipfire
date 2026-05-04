@@ -12623,6 +12623,40 @@ impl Gpu {
         result
     }
 
+    /// Compose Gemma 4 MoE per-expert composite weights on GPU:
+    ///   fused_weights[ki] = topk_weights[ki] * per_expert_scale[topk_indices[ki]]
+    /// k_top hardcoded to 8 (Gemma 4 26B-A4B). Single workgroup, 8 threads.
+    pub fn fold_topk_with_per_expert_scale_k8(
+        &mut self,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        fused_weights: &GpuTensor,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "fold_topk_with_per_expert_scale_k8",
+            kernels::FOLD_TOPK_WITH_PER_EXPERT_SCALE_K8_SRC,
+            "fold_topk_with_per_expert_scale_k8",
+        )?;
+        let func = &self.functions["fold_topk_with_per_expert_scale_k8"];
+        let mut ip = topk_indices.buf.as_ptr();
+        let mut wp = topk_weights.buf.as_ptr();
+        let mut sp = per_expert_scale.buf.as_ptr();
+        let mut fp = fused_weights.buf.as_ptr();
+        let mut kt = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ip as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut fp as *mut _ as *mut c_void,
+            &mut kt as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(
+            func, [1, 1, 1], [k_top as u32, 1, 1], 0, self.stream_ref(), &mut params,
+        ) }
+    }
+
     /// Exact (erf-based) GELU — PyTorch `nn.GELU()` default. Used by the
     /// Gemma 4 E-series per-layer-embedding inject. In-place capable.
     pub fn gelu_erf_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {

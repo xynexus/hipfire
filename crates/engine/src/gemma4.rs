@@ -1626,24 +1626,12 @@ fn apply_moe_branch(
         true, // renormalize selected probs
     )?;
 
-    // 6) D2H the top-K dispatch table (8×i32 + 8×f32 = 64B per token, per layer).
-    //    The router is data-dependent so we can't avoid this sync entirely
-    //    without a fully GPU-side indexed expert dispatch — that's a v2
-    //    optimization equivalent to Qwen3.5-MoE's `gemv_indexed_*` kernels.
-    let topk_idx_bytes = gpu.download_f32(&scratch.moe_topk_indices)?;
-    let topk_indices: Vec<usize> = unsafe {
-        std::slice::from_raw_parts(topk_idx_bytes.as_ptr() as *const i32, k_top)
-    }.iter().map(|&i| i as usize).collect();
-    let topk_weights = gpu.download_f32(&scratch.moe_topk_weights)?;
-    if std::env::var("HIPFIRE_DUMP_MOE").ok().as_deref() == Some("1") {
-        let logits = gpu.download_f32(&scratch.moe_router_logits)?;
-        let mut top5: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i,&v)|(i,v)).collect();
-        top5.select_nth_unstable_by(4, |a,b| b.1.partial_cmp(&a.1).unwrap());
-        top5[..5].sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
-        let scale_sample: Vec<f32> = topk_indices.iter().take(8).map(|&e| moe.per_expert_scale_host[e]).collect();
-        eprintln!("[moe] logit_top5={:?} | topk_idx={:?} | topk_w={:?} | per_expert_scale={:?}",
-            &top5[..5], topk_indices, &topk_weights[..k_top], scale_sample);
-    }
+    // 6) Resolve the dispatch path BEFORE any potential D2H sync — the
+    //    fully-fused path (Phase 4) keeps topk on device and folds the
+    //    per-expert scale via a tiny GPU kernel, eliminating the D2H
+    //    sync entirely. The legacy + half-fused paths still need CPU
+    //    indices to look up `moe.experts[e].{gate_up_proj,down_proj}`.
+    let dump_moe = std::env::var("HIPFIRE_DUMP_MOE").ok().as_deref() == Some("1");
 
     // 7) Zero accumulator
     gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
@@ -1759,17 +1747,42 @@ fn apply_moe_branch(
         }
         _ => down_compatible,
     };
-    // Validate top-k indices regardless of path — the kernel-side top-K
-    // is supposed to clamp to [0, n_exp), but defense-in-depth.
-    for &e in topk_indices.iter().take(k_top) {
-        if e >= n_exp {
-            return Err(hip_bridge::HipError::new(
-                0, &format!("MoE topk index {e} out of range (n_exp={n_exp})"),
-            ));
-        }
-    }
     let use_gelu_erf = std::env::var("HIPFIRE_MOE_GELU_ERF").ok().as_deref() == Some("1");
     let swap_gate_up = std::env::var("HIPFIRE_MOE_SWAP_GATE_UP").ok().as_deref() == Some("1");
+
+    // CPU-side topk_indices/weights are only needed when (a) we'll do a
+    // legacy / half-fused path that loops `for ki { let e = topk_indices[ki]; let
+    // expert = &moe.experts[e]; ... }`, or (b) HIPFIRE_DUMP_MOE wants to
+    // log them. Otherwise the GPU fold kernel keeps everything on device.
+    let needs_cpu_topk = !use_fused_down || dump_moe;
+    let (topk_indices, topk_weights): (Vec<usize>, Vec<f32>) = if needs_cpu_topk {
+        let idx_bytes = gpu.download_f32(&scratch.moe_topk_indices)?;
+        let idx: Vec<usize> = unsafe {
+            std::slice::from_raw_parts(idx_bytes.as_ptr() as *const i32, k_top)
+        }.iter().map(|&i| i as usize).collect();
+        let w = gpu.download_f32(&scratch.moe_topk_weights)?;
+        // Defense-in-depth bounds check (kernel-side top-K should clamp to
+        // [0, n_exp), but we only have CPU access to verify when we did the D2H).
+        for &e in idx.iter().take(k_top) {
+            if e >= n_exp {
+                return Err(hip_bridge::HipError::new(
+                    0, &format!("MoE topk index {e} out of range (n_exp={n_exp})"),
+                ));
+            }
+        }
+        (idx, w)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    if dump_moe {
+        let logits = gpu.download_f32(&scratch.moe_router_logits)?;
+        let mut top5: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i,&v)|(i,v)).collect();
+        top5.select_nth_unstable_by(4, |a,b| b.1.partial_cmp(&a.1).unwrap());
+        top5[..5].sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+        let scale_sample: Vec<f32> = topk_indices.iter().take(8).map(|&e| moe.per_expert_scale_host[e]).collect();
+        eprintln!("[moe] logit_top5={:?} | topk_idx={:?} | topk_w={:?} | per_expert_scale={:?}",
+            &top5[..5], topk_indices, &topk_weights[..k_top], scale_sample);
+    }
 
     if use_fused {
         // Fused path. Requires k_top == 8 (kernel hardcoded).
@@ -1849,20 +1862,20 @@ fn apply_moe_branch(
                 )?;
             }
 
-            // Fold per-expert composite weights on CPU and upload once.
-            // The kernel atomicAdds `topk_weights_fused[ki] × (W·hidden)`
-            // per (row, ki) — folding here eliminates the per-expert
-            // scaled_add launches the legacy path issues.
-            let mut fused_w = [0f32; 8];
-            for ki in 0..k_top {
-                fused_w[ki] = topk_weights[ki] * moe.per_expert_scale_host[topk_indices[ki]];
-            }
-            // SAFETY: [f32; 8] -> &[u8; 32] is a transparent byte reinterpret
-            // (f32 has no padding, no invalid bit patterns for read-as-bytes).
-            let fused_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(fused_w.as_ptr() as *const u8, fused_w.len() * 4)
-            };
-            gpu.hip.memcpy_htod(&scratch.moe_topk_weights_fused.buf, fused_bytes)?;
+            // Phase 4: GPU-side fold of per-expert composite weights:
+            //   fused_weights[ki] = topk_weights[ki] * per_expert_scale[topk_indices[ki]]
+            // Replaces the prior CPU fold (which required two D2H syncs +
+            // one H2D upload per layer per token) with one tiny launch.
+            // Combined with the indexed gate_up + indexed down, the entire
+            // MoE branch is now on-device — hipGraph-capture-safe in
+            // principle (full capture remains a follow-up).
+            gpu.fold_topk_with_per_expert_scale_k8(
+                &scratch.moe_topk_indices,
+                &scratch.moe_topk_weights,
+                &moe.per_expert_scale,
+                &scratch.moe_topk_weights_fused,
+                k_top,
+            )?;
 
             // Single launch: writes all 8 expert contributions into
             // moe_cur_moe. M = dim (output rows), K = mi (input cols).

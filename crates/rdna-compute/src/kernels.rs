@@ -165,6 +165,14 @@ pub const GEMV_Q8_0_MOE_DOWN_INDEXED_SRC: &str =
 pub const GELU_TANH_MUL_BATCHED_F32_SRC: &str =
     include_str!("../../../kernels/src/gelu_tanh_mul_batched_f32.hip");
 
+/// Compose Gemma 4 MoE per-expert composite weights on GPU:
+/// fused_weights[ki] = topk_weights[ki] * per_expert_scale[topk_indices[ki]].
+/// Phase 4 — eliminates 2 D2H syncs per layer per token (topk_indices +
+/// topk_weights downloads) plus the small H2D upload of the fused
+/// weights, replacing them with one tiny launch.
+pub const FOLD_TOPK_WITH_PER_EXPERT_SCALE_K8_SRC: &str =
+    include_str!("../../../kernels/src/fold_topk_with_per_expert_scale_k8.hip");
+
 /// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
 /// for the single-token kernel when prefilling N tokens through an MoE
 /// layer; one workgroup per token. Enables batched MoE prefill.
