@@ -504,6 +504,11 @@ pub struct MoeLayerExtras {
     /// is enabled (`HIPFIRE_GEMMA4_MOE_FUSED=1`); built unconditionally
     /// because it's tiny (256 bytes for n_exp=128).
     pub expert_gate_up_ptrs: GpuTensor,
+    /// Companion ptr table for the Phase 2 fused down kernel
+    /// (`gemv_q8_0_moe_down_residual_scaled_k8_indexed`). Same layout as
+    /// `expert_gate_up_ptrs`: `[2 * n_experts]` F32 slots packing
+    /// `n_experts × u64` addresses of each expert's `down_proj.buf`.
+    pub expert_down_ptrs: GpuTensor,
 }
 
 pub enum LayerWeights {
@@ -600,6 +605,7 @@ impl Gemma4Weights {
         let _ = gpu.free_tensor(moe.experts_gate_up_pool);
         let _ = gpu.free_tensor(moe.experts_down_pool);
         let _ = gpu.free_tensor(moe.expert_gate_up_ptrs);
+        let _ = gpu.free_tensor(moe.expert_down_ptrs);
     }
 }
 
@@ -1109,6 +1115,14 @@ fn load_moe_layer_extras(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Gemma4C
     let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
 
+    let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
+    for e in &experts {
+        dn_ptrs.push(e.down_proj.buf.buf.as_ptr() as u64);
+    }
+    let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+    gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
+
     Ok(MoeLayerExtras {
         router_proj,
         router_scale,
@@ -1121,6 +1135,7 @@ fn load_moe_layer_extras(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Gemma4C
         experts_down_pool: down_pool,
         experts,
         expert_gate_up_ptrs,
+        expert_down_ptrs,
     })
 }
 
@@ -1243,6 +1258,18 @@ pub struct Gemma4Scratch {
     pub moe_pre2_rot: GpuTensor,
     pub moe_expert_gate_batch: GpuTensor,
     pub moe_expert_up_batch: GpuTensor,
+    /// Phase 2 down-side fusion: per-expert post-SwiGLU hidden, packed
+    /// `[k_top × moe_intermediate]`. Each `gemv_q8_0_moe_down_indexed_k8`
+    /// invocation reads expert ki's slice from offset `ki × mi`. Replaces
+    /// 8 per-expert `moe_expert_hidden` writes when the fused down path
+    /// fires.
+    pub moe_expert_hidden_batch: GpuTensor,
+    /// Phase 2 down-side fusion: per-expert composite weight,
+    /// `topk_weights[ki] × per_expert_scale_host[topk_indices[ki]]`,
+    /// uploaded once per layer per token (k_top × 4 = 32 bytes). The
+    /// indexed-down kernel atomicAdds `weight × (W·hidden)` per expert
+    /// row, so caller-side folding eliminates a tiny GPU mul kernel.
+    pub moe_topk_weights_fused: GpuTensor,
 }
 
 impl Gemma4Scratch {
@@ -1339,9 +1366,11 @@ impl Gemma4Scratch {
         let moe_expert_out      = gpu.zeros(&[dim_alloc_moe], DType::F32)?;
         // Indexed-GEMV staging — k_top hardcoded to 8 to match the kernel.
         let k_top_alloc = if moe_active { 8usize } else { 1 };
-        let moe_pre2_rot          = gpu.zeros(&[dim_alloc_moe], DType::F32)?;
-        let moe_expert_gate_batch = gpu.zeros(&[k_top_alloc * mi_alloc], DType::F32)?;
-        let moe_expert_up_batch   = gpu.zeros(&[k_top_alloc * mi_alloc], DType::F32)?;
+        let moe_pre2_rot            = gpu.zeros(&[dim_alloc_moe], DType::F32)?;
+        let moe_expert_gate_batch   = gpu.zeros(&[k_top_alloc * mi_alloc], DType::F32)?;
+        let moe_expert_up_batch     = gpu.zeros(&[k_top_alloc * mi_alloc], DType::F32)?;
+        let moe_expert_hidden_batch = gpu.zeros(&[k_top_alloc * mi_alloc], DType::F32)?;
+        let moe_topk_weights_fused  = gpu.zeros(&[k_top_alloc],            DType::F32)?;
 
         Ok(Gemma4Scratch {
             x, residual, tmp, pos_buf,
@@ -1356,6 +1385,7 @@ impl Gemma4Scratch {
             moe_pre2, moe_cur_mlp, moe_cur_moe,
             moe_expert_gate_up, moe_expert_hidden, moe_expert_out,
             moe_pre2_rot, moe_expert_gate_batch, moe_expert_up_batch,
+            moe_expert_hidden_batch, moe_topk_weights_fused,
         })
     }
 
@@ -1398,6 +1428,8 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.moe_pre2_rot);
         let _ = gpu.free_tensor(self.moe_expert_gate_batch);
         let _ = gpu.free_tensor(self.moe_expert_up_batch);
+        let _ = gpu.free_tensor(self.moe_expert_hidden_batch);
+        let _ = gpu.free_tensor(self.moe_topk_weights_fused);
     }
 }
 
@@ -1586,6 +1618,14 @@ fn apply_moe_branch(
     // safety hatch.
     let gate_up_compatible = !moe.experts.is_empty()
         && moe.experts[0].gate_up_proj.gpu_dtype == DType::MQ4G256;
+    // Phase 2: fused down. The indexed-Q8 down kernel only fits when
+    // every expert's down_proj is Q8_0 (34-byte block layout). 26B-A4B's
+    // k=704 forces Q8_0 via the quantizer fallback chain so this fires
+    // unconditionally for that model. Other future Gemma 4 MoE variants
+    // with k % 256 == 0 would land HFQ4G256 down weights and need their
+    // own kernel — but no such model exists today.
+    let down_compatible = !moe.experts.is_empty()
+        && moe.experts[0].down_proj.gpu_dtype == DType::Q8_0;
     let env_decision = std::env::var("HIPFIRE_GEMMA4_MOE_FUSED").ok();
     let use_fused = match env_decision.as_deref() {
         Some("0") | Some("off") | Some("false") => false,
@@ -1607,6 +1647,28 @@ fn apply_moe_branch(
             true
         }
         _ => gate_up_compatible,
+    };
+    // Phase 2 fused-down independent gate. Default ON when down_proj is
+    // Q8_0; HIPFIRE_GEMMA4_MOE_DOWN_FUSED=0 forces the per-expert down
+    // loop as a safety hatch (mirrors the gate_up env knob).
+    let env_down = std::env::var("HIPFIRE_GEMMA4_MOE_DOWN_FUSED").ok();
+    let use_fused_down = use_fused && match env_down.as_deref() {
+        Some("0") | Some("off") | Some("false") => false,
+        Some("1") | Some("on") | Some("true") => {
+            if !down_compatible {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "HIPFIRE_GEMMA4_MOE_DOWN_FUSED=1 requested but down_proj dtype is \
+                         {:?} (need Q8_0). 26B-A4B is the only shipping Gemma 4 MoE; if you \
+                         see this, the model was quantized with a non-default down format.",
+                        moe.experts[0].down_proj.gpu_dtype,
+                    ),
+                ));
+            }
+            true
+        }
+        _ => down_compatible,
     };
     // Validate top-k indices regardless of path — the kernel-side top-K
     // is supposed to clamp to [0, n_exp), but defense-in-depth.
@@ -1648,28 +1710,84 @@ fn apply_moe_branch(
             2 * mi, dim,
         )?;
 
-        // Per-expert SwiGLU + down still serialized. The gate/up bytes
-        // for expert ki live at offset `ki * mi` in the batch buffers.
-        for ki in 0..k_top {
-            let e = topk_indices[ki];
-            let weight = topk_weights[ki] * moe.per_expert_scale_host[e];
-            let expert = &moe.experts[e];
-
-            let (gate, up) = if swap_gate_up {
-                (scratch.moe_expert_up_batch.sub_offset(ki * mi, mi),
-                 scratch.moe_expert_gate_batch.sub_offset(ki * mi, mi))
-            } else {
-                (scratch.moe_expert_gate_batch.sub_offset(ki * mi, mi),
-                 scratch.moe_expert_up_batch.sub_offset(ki * mi, mi))
-            };
-            if use_gelu_erf {
-                gpu.gelu_erf_f32(&gate, &scratch.moe_expert_hidden, mi)?;
-            } else {
-                gpu.gelu_tanh_f32(&gate, &scratch.moe_expert_hidden, mi)?;
+        if use_fused_down {
+            // Phase 2: per-expert SwiGLU into a packed hidden batch, then
+            // a single indexed-Q8 down GEMV that atomicAdds 8 weighted
+            // contributions into moe_cur_moe. Replaces 16 SwiGLU launches
+            // (gelu + mul, ×8) plus 8 (down_gemv + scaled_add) = 24
+            // launches per layer with 16 (SwiGLU) + 1 (down) = 17. Net:
+            // 7 launches saved per layer, but the dominant cost was the
+            // per-expert down GEMV serialization through ssync — fusing
+            // those is the real win.
+            for ki in 0..k_top {
+                let (gate, up) = if swap_gate_up {
+                    (scratch.moe_expert_up_batch.sub_offset(ki * mi, mi),
+                     scratch.moe_expert_gate_batch.sub_offset(ki * mi, mi))
+                } else {
+                    (scratch.moe_expert_gate_batch.sub_offset(ki * mi, mi),
+                     scratch.moe_expert_up_batch.sub_offset(ki * mi, mi))
+                };
+                let hidden_ki = scratch.moe_expert_hidden_batch.sub_offset(ki * mi, mi);
+                if use_gelu_erf {
+                    gpu.gelu_erf_f32(&gate, &hidden_ki, mi)?;
+                } else {
+                    gpu.gelu_tanh_f32(&gate, &hidden_ki, mi)?;
+                }
+                gpu.mul_f32(&hidden_ki, &up, &hidden_ki)?;
             }
-            gpu.mul_f32(&scratch.moe_expert_hidden, &up, &scratch.moe_expert_hidden)?;
-            weight_gemv(gpu, &expert.down_proj, &scratch.moe_expert_hidden, &scratch.moe_expert_out)?;
-            gpu.scaled_add_inplace_cpu_scalar_f32(&scratch.moe_cur_moe, &scratch.moe_expert_out, weight)?;
+
+            // Fold per-expert composite weights on CPU and upload once.
+            // The kernel atomicAdds `topk_weights_fused[ki] × (W·hidden)`
+            // per (row, ki) — folding here eliminates the per-expert
+            // scaled_add launches the legacy path issues.
+            let mut fused_w = [0f32; 8];
+            for ki in 0..k_top {
+                fused_w[ki] = topk_weights[ki] * moe.per_expert_scale_host[topk_indices[ki]];
+            }
+            // SAFETY: [f32; 8] -> &[u8; 32] is a transparent byte reinterpret
+            // (f32 has no padding, no invalid bit patterns for read-as-bytes).
+            let fused_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(fused_w.as_ptr() as *const u8, fused_w.len() * 4)
+            };
+            gpu.hip.memcpy_htod(&scratch.moe_topk_weights_fused.buf, fused_bytes)?;
+
+            // Single launch: writes all 8 expert contributions into
+            // moe_cur_moe. M = dim (output rows), K = mi (input cols).
+            let down_m = moe.experts[0].down_proj.m;
+            let down_k = moe.experts[0].down_proj.k;
+            gpu.gemv_q8_0_moe_down_residual_scaled_k8_indexed(
+                &moe.expert_down_ptrs,
+                &scratch.moe_topk_indices,
+                &scratch.moe_topk_weights_fused,
+                &scratch.moe_expert_hidden_batch,
+                &scratch.moe_cur_moe,
+                down_m, down_k,
+            )?;
+        } else {
+            // Per-expert SwiGLU + down still serialized. The gate/up bytes
+            // for expert ki live at offset `ki * mi` in the batch buffers.
+            // (Hit when use_fused gate_up is on but down_proj is not Q8_0.)
+            for ki in 0..k_top {
+                let e = topk_indices[ki];
+                let weight = topk_weights[ki] * moe.per_expert_scale_host[e];
+                let expert = &moe.experts[e];
+
+                let (gate, up) = if swap_gate_up {
+                    (scratch.moe_expert_up_batch.sub_offset(ki * mi, mi),
+                     scratch.moe_expert_gate_batch.sub_offset(ki * mi, mi))
+                } else {
+                    (scratch.moe_expert_gate_batch.sub_offset(ki * mi, mi),
+                     scratch.moe_expert_up_batch.sub_offset(ki * mi, mi))
+                };
+                if use_gelu_erf {
+                    gpu.gelu_erf_f32(&gate, &scratch.moe_expert_hidden, mi)?;
+                } else {
+                    gpu.gelu_tanh_f32(&gate, &scratch.moe_expert_hidden, mi)?;
+                }
+                gpu.mul_f32(&scratch.moe_expert_hidden, &up, &scratch.moe_expert_hidden)?;
+                weight_gemv(gpu, &expert.down_proj, &scratch.moe_expert_hidden, &scratch.moe_expert_out)?;
+                gpu.scaled_add_inplace_cpu_scalar_f32(&scratch.moe_cur_moe, &scratch.moe_expert_out, weight)?;
+            }
         }
     } else {
         // Legacy serialized path. Kept verbatim (modulo lifting the

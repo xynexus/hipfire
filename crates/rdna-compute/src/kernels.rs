@@ -147,6 +147,16 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_wave64.hip");
 
+/// Index-aware MoE down GEMV for Q8_0 weights. Mirrors the HFQ4G256
+/// indexed-down API but reads 34-byte Q8 blocks (f16 scale + 32 int8
+/// quants). Used by Gemma 4 26B-A4B Phase 2 fused MoE path: down_proj
+/// has k=704 which forces the Q8F16 fallback (k % 256 != 0), so the
+/// HFQ4 indexed kernel can't be used. One launch fuses 8 per-expert
+/// scaled gemv_q8_0 + scaled_add invocations. Caller folds
+/// per_expert_scale_host[e] into topk_weights before upload.
+pub const GEMV_Q8_0_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_moe_down_indexed.hip");
+
 /// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
 /// for the single-token kernel when prefilling N tokens through an MoE
 /// layer; one workgroup per token. Enables batched MoE prefill.
