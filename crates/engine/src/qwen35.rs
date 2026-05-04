@@ -588,6 +588,14 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
         }
+        19 => { // HFQ4v3 — gfx11-native K=64 with FP16 (d, m), 36 B/group
+            let buf = gpu.upload_raw_with_dtype(data, &[data.len()], DType::HFQ4V3G64)?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4V3G64, m, k, row_stride: 0 })
+        }
+        20 => { // MQ4v3 — FWHT-64 rotated HFQ4v3, same binary layout
+            let buf = gpu.upload_raw_with_dtype(data, &[data.len()], DType::MQ4V3G64)?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4V3G64, m, k, row_stride: 0 })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })

@@ -426,6 +426,17 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
         }
+        19 => { // HFQ4v3 — gfx11-native K=64 4-bit with FP16 (d, m), 36 B/group
+            // Tag the GpuTensor's dtype so the dispatch layer can short-circuit
+            // to gemm_hfq4v3_residual_iu8_mmq_gfx11 without piping the
+            // gpu_dtype through every call site.
+            let buf = gpu.upload_raw_with_dtype(data, &[data.len()], DType::HFQ4V3G64)?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4V3G64, m, k, row_stride: 0 })
+        }
+        20 => { // MQ4v3 — FWHT-64 rotated HFQ4v3, same binary layout
+            let buf = gpu.upload_raw_with_dtype(data, &[data.len()], DType::MQ4V3G64)?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4V3G64, m, k, row_stride: 0 })
+        }
         1 => { // F16 — dequant to F32 for F32 GEMV
             let f32_data: Vec<f32> = data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))

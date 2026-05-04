@@ -213,6 +213,8 @@ pub enum DType {
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
+    HFQ4V3G64, // 36 bytes per 64 elements (gfx11-native: FP16 d + FP16 m + 32 B nibbles, 4.5 b/w)
+    MQ4V3G64,  // 36 bytes per 64 elements (FWHT-64 rotated HFQ4V3, same binary layout)
     Raw,       // raw bytes, no element interpretation
 }
 
@@ -221,7 +223,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::HFQ4V3G64 | DType::MQ4V3G64 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -1571,6 +1573,21 @@ impl Gpu {
             buf,
             shape: shape.to_vec(),
             dtype: DType::Raw,
+        })
+    }
+
+    /// `upload_raw` variant that tags the resulting GpuTensor with a
+    /// specific dtype. Used by the HFQ loader to preserve weight-format
+    /// info (HFQ4V3G64 etc.) on the GpuTensor — the dispatch layer reads
+    /// `tensor.dtype` to short-circuit format-specific kernels (e.g.
+    /// HFQ4v3 → gfx11 iu8 MMQ instead of the v1 FP16 WMMA path).
+    pub fn upload_raw_with_dtype(&self, data: &[u8], shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
+        let buf = self.hip.malloc(data.len())?;
+        self.hip.memcpy_htod(&buf, data)?;
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype,
         })
     }
 
@@ -5658,6 +5675,24 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // ── HFQ4v3 short-circuit ─────────────────────────────────────────
+        // If the caller passed an HFQ4v3-format weight, route directly to
+        // the gfx11 iu8 MMQ kernel. The K=64 + FP16 (d, m) layout is
+        // incompatible with all v1 paths (FP16 dequant, WMMA, rocBLAS
+        // shadow); falling through would corrupt output. v3 is gated to
+        // RDNA3 by the kernel's __gfx11xx__ macro guard.
+        let is_v3 = matches!(a_raw.dtype, DType::HFQ4V3G64 | DType::MQ4V3G64);
+        if is_v3 {
+            if !matches!(self.arch.as_str(),
+                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151")
+            {
+                return Err(hip_bridge::HipError::new(1, &format!(
+                    "HFQ4v3 weight on unsupported arch {}: kernel is gfx11-only",
+                    self.arch,
+                )));
+            }
+            return self.gemm_hfq4v3_residual_iu8_mmq_gfx11(a_raw, x, y, m, k, batch_size);
+        }
         // CDNA3 MFMA path — Y += X·W^T via rocBLAS with beta=1.
         if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
@@ -5938,6 +5973,98 @@ impl Gpu {
             + batch_size * k
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_mmq", bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ4v3 residual GEMM via the gfx11 iu8 MMQ kernel.
+    ///
+    /// Same Q8_1 activation pre-quant + i8 WMMA pipeline as
+    /// `gemm_hfq4g256_residual_mmq`, with the only behavioral difference
+    /// being weight format: HFQ4v3 uses K=64 groups with FP16 (d, m)
+    /// instead of K=256 groups with FP32 (scale, zp). The kernel's
+    /// inner-tile structure (128×128 batch tile, 8 warps × 32 threads,
+    /// MMQ_TILE_X_K = 76) is identical so this dispatch reuses the same
+    /// (256-byte) shared-memory budget and grid sizing as the v1 MMQ
+    /// path.
+    ///
+    /// Gated to gfx11/RDNA3+ via the kernel's `__gfx11xx__` macro guard.
+    /// Calling on other arches will hit empty stub functions; the higher-
+    /// level entry point is responsible for arch routing.
+    pub fn gemm_hfq4v3_residual_iu8_mmq_gfx11(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // Reuse the existing Q8_1 MMQ activation quantizer (it lives in
+        // gemm_hfq4g256_residual_mmq.hip and is independent of the
+        // weight format).
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
+            "gemm_hfq4v3_residual_iu8_mmq_full_add"
+        } else {
+            "gemm_hfq4v3_residual_iu8_mmq"
+        };
+        self.ensure_kernel(
+            "gemm_hfq4v3_residual_iu8_mmq_gfx11",
+            kernels::GEMM_HFQ4V3_RESIDUAL_IU8_MMQ_GFX11_SRC,
+            kernel_name,
+        )?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = 1i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_X: usize = 128;
+        const MMQ_Y: usize = 128;
+        const MMQ_TILE_Y_K: usize = 36;
+        const MMQ_TILE_X_K: usize = 76;
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+        let shared_mem = ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+
+        // BW model: weight bytes are 36/64 of K per row (vs 136/256 = 17/32
+        // for v1). For accounting we use the simpler row-bytes formula.
+        let weight_bytes = m * (k / 64) * 36;
+        let bytes = weight_bytes
+            + batch_size * k
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4v3_residual_iu8_mmq_gfx11", bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
