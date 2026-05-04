@@ -12623,6 +12623,49 @@ impl Gpu {
         result
     }
 
+    /// Batched partial halved RoPE — N-token counterpart to
+    /// `rope_partial_halved_f32`. Positions are read from a device i32 array.
+    pub fn rope_partial_halved_f32_batched(
+        &mut self, q: &GpuTensor, k: &GpuTensor, positions: &GpuTensor,
+        n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot_pairs: usize,
+        freq_base: f32, batch: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "rope_partial_halved_batched",
+            kernels::ROPE_PARTIAL_HALVED_BATCHED_SRC,
+            "rope_partial_halved_f32_batched",
+        )?;
+        let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let nhq = n_heads_q as i32; let nhk = n_heads_k as i32;
+        let hd = head_dim as i32; let nrp = n_rot_pairs as i32; let fb = freq_base;
+        let bz = batch as i32;
+        let n_pairs = n_rot_pairs as u32;
+        let block = 32u32.min(n_pairs.max(1));
+        let grid = [(n_pairs + block - 1) / block, batch as u32, 1];
+        let bytes = batch * crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_halved_f32_batched", bytes);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void, &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
+            &nrp as *const _ as *mut c_void, &fb as *const _ as *mut c_void,
+            &bz as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "rope_partial_halved_f32_batched", grid, [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);
+                b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd); b.push_i32(nrp);
+                b.push_f32(fb); b.push_i32(bz);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Compose Gemma 4 MoE per-expert composite weights on GPU:
     ///   fused_weights[ki] = topk_weights[ki] * per_expert_scale[topk_indices[ki]]
     /// k_top hardcoded to 8 (Gemma 4 26B-A4B). Single workgroup, 8 threads.

@@ -2655,32 +2655,52 @@ fn generate_gemma4(
 
     // Prefill — forward each prompt token. Logits after the LAST forward
     // are the ones we sample for the first generated token.
+    //
+    // Try the batched-prefill fast path first; on Err (per-layer-embedding
+    // / MoE / dtype-not-supported / KV-mode-not-supported) fall back to
+    // the per-token forward_scratch loop.
     let prefill_start = m.seq_pos;
-    for (i, &tok) in new_tokens.iter().enumerate() {
-        let pos = prefill_start + i;
-        // Defense-in-depth bounds check (the capacity guard above should
-        // prevent this; this catches future-loosening of that guard).
-        if pos >= m.max_seq {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"gemma4 prefill: pos {} >= max_seq {} (prompt longer than cache)"}}"#,
-                id, pos, m.max_seq,
-            );
-            let _ = stdout.flush();
-            m.g4_kv_full = Some(kv_full);
-            return;
-        }
-        if let Err(e) = gemma4::forward_scratch(
-            gpu, weights, config, tok, pos, kv_sliding, &mut kv_full, scratch,
+    if prefill_start + prefill_tokens > m.max_seq {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"gemma4 prefill: prefill_start {} + tokens {} > max_seq {} (prompt longer than cache)"}}"#,
+            id, prefill_start, prefill_tokens, m.max_seq,
+        );
+        let _ = stdout.flush();
+        m.g4_kv_full = Some(kv_full);
+        return;
+    }
+    // Phase 5: batched prefill ships gated OFF by default. The framework +
+    // batched primitives are in place but a correctness bug (output diverges
+    // from per-token forward_scratch on 31B with `_BATCHED_KEQV=1`) remains
+    // to be tracked down in a follow-up. Enable with HIPFIRE_GEMMA4_BATCHED_PREFILL=1
+    // to exercise the path; default leaves the per-token loop in place.
+    let batched_ok = std::env::var("HIPFIRE_GEMMA4_BATCHED_PREFILL").ok().as_deref() == Some("1");
+    let mut needs_per_token = !batched_ok || prefill_tokens < 2;
+    if !needs_per_token {
+        match gemma4::forward_prefill_batch(
+            gpu, weights, config, &new_tokens, prefill_start,
+            kv_sliding, &mut kv_full, scratch,
         ) {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"gemma4 prefill failed at token {}: {}"}}"#,
-                id, i, e,
-            );
-            let _ = stdout.flush();
-            m.g4_kv_full = Some(kv_full);
-            return;
+            Ok(()) => { /* batched path done */ }
+            Err(_) => { needs_per_token = true; }
+        }
+    }
+    if needs_per_token {
+        for (i, &tok) in new_tokens.iter().enumerate() {
+            let pos = prefill_start + i;
+            if let Err(e) = gemma4::forward_scratch(
+                gpu, weights, config, tok, pos, kv_sliding, &mut kv_full, scratch,
+            ) {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"error","id":"{}","message":"gemma4 prefill failed at token {}: {}"}}"#,
+                    id, i, e,
+                );
+                let _ = stdout.flush();
+                m.g4_kv_full = Some(kv_full);
+                return;
+            }
         }
     }
     m.seq_pos += prefill_tokens;

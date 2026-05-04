@@ -173,6 +173,13 @@ pub const GELU_TANH_MUL_BATCHED_F32_SRC: &str =
 pub const FOLD_TOPK_WITH_PER_EXPERT_SCALE_K8_SRC: &str =
     include_str!("../../../kernels/src/fold_topk_with_per_expert_scale_k8.hip");
 
+/// Batched partial halved RoPE for Gemma 4 batched prefill (Phase 5).
+/// Reads positions from a device array and applies the rotate_half
+/// pairing convention to N tokens × n_heads_q (and N × n_heads_k) in
+/// one launch. Mirrors `rope_partial_halved_f32` row-by-row.
+pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halved_batched.hip");
+
 /// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
 /// for the single-token kernel when prefilling N tokens through an MoE
 /// layer; one workgroup per token. Enables batched MoE prefill.
