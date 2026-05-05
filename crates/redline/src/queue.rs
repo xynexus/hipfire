@@ -1,8 +1,8 @@
 //! Compute queue — submit PM4 command buffers to the GPU.
 
 use crate::device::{Device, GpuBuffer};
-use crate::drm::*;
 pub use crate::drm::AmdgpuBoListHandle;
+use crate::drm::*;
 use crate::{RedlineError, Result};
 
 pub const AMDGPU_HW_IP_COMPUTE: u32 = 1;
@@ -17,7 +17,10 @@ impl ComputeQueue {
         let mut ctx: AmdgpuContext = std::ptr::null_mut();
         let ret = unsafe { (dev.drm.cs_ctx_create2)(dev.handle, 0, &mut ctx) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("cs_ctx_create2 failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("cs_ctx_create2 failed: {ret}"),
+            });
         }
         eprintln!("[redline] Compute context created");
         Ok(Self { ctx })
@@ -48,7 +51,10 @@ impl ComputeQueue {
             )
         };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("bo_list_create failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("bo_list_create failed: {ret}"),
+            });
         }
 
         // Build IB info
@@ -80,9 +86,14 @@ impl ComputeQueue {
         // Submit
         let ret = unsafe { (dev.drm.cs_submit)(self.ctx, 0, &mut request, 1) };
         // Destroy BO list regardless of submit result
-        unsafe { (dev.drm.bo_list_destroy)(bo_list); }
+        unsafe {
+            (dev.drm.bo_list_destroy)(bo_list);
+        }
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("cs_submit failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("cs_submit failed: {ret}"),
+            });
         }
 
         // Wait for completion
@@ -95,12 +106,19 @@ impl ComputeQueue {
         };
         let mut expired = 0u32;
         let timeout_ns = 10_000_000_000u64; // 10 seconds
-        let ret = unsafe { (dev.drm.cs_query_fence_status)(&mut fence, timeout_ns, 0, &mut expired) };
+        let ret =
+            unsafe { (dev.drm.cs_query_fence_status)(&mut fence, timeout_ns, 0, &mut expired) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("fence wait failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("fence wait failed: {ret}"),
+            });
         }
         if expired == 0 {
-            return Err(RedlineError { code: -1, message: "GPU timeout (10s)".into() });
+            return Err(RedlineError {
+                code: -1,
+                message: "GPU timeout (10s)".into(),
+            });
         }
 
         Ok(())
@@ -139,7 +157,10 @@ impl ComputeQueue {
 
         let ret = unsafe { (dev.drm.cs_submit)(self.ctx, 0, &mut request, 1) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("cs_submit failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("cs_submit failed: {ret}"),
+            });
         }
 
         let mut fence = CsFence {
@@ -150,17 +171,26 @@ impl ComputeQueue {
             fence: request.seq_no,
         };
         let mut expired = 0u32;
-        let ret = unsafe { (dev.drm.cs_query_fence_status)(&mut fence, 10_000_000_000, 0, &mut expired) };
+        let ret =
+            unsafe { (dev.drm.cs_query_fence_status)(&mut fence, 10_000_000_000, 0, &mut expired) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("fence wait failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("fence wait failed: {ret}"),
+            });
         }
         if expired == 0 {
-            return Err(RedlineError { code: -1, message: "GPU timeout (10s)".into() });
+            return Err(RedlineError {
+                code: -1,
+                message: "GPU timeout (10s)".into(),
+            });
         }
         Ok(())
     }
 
     pub fn destroy(self, dev: &Device) {
-        unsafe { (dev.drm.cs_ctx_free)(self.ctx); }
+        unsafe {
+            (dev.drm.cs_ctx_free)(self.ctx);
+        }
     }
 }

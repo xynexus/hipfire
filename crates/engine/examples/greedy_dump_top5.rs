@@ -109,11 +109,28 @@ fn main() {
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
     eprintln!("kv_mode: {kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
+        "fp32" | "f32" => KvCache::new_gpu(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
         "q8" => KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,
             config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
+        "asym4_tqv1" | "tqv1" | "tq1" => KvCache::new_gpu_asym4_tqv1_capped(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
             kv_seq,
         )
         .unwrap(),
@@ -169,7 +186,7 @@ fn main() {
         )
         .unwrap(),
         other => panic!(
-            "unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4_tqv2|asym4_tqv3|asym4_tqv4|asym4|asym3|asym2)"
+            "unknown HIPFIRE_KV_MODE: {other}  (use fp32|q8|asym4_tqv1|asym4_tqv2|asym4_tqv3|asym4_tqv4|asym4|asym3|asym2)"
         ),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();

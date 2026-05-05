@@ -85,10 +85,15 @@ fn f16_to_f32(bits: u16) -> f32 {
     let exp = ((bits >> 10) & 0x1F) as u32;
     let frac = (bits & 0x3FF) as u32;
     if exp == 0 {
-        if frac == 0 { return f32::from_bits(sign << 31); }
+        if frac == 0 {
+            return f32::from_bits(sign << 31);
+        }
         let mut e = 0i32;
         let mut f = frac;
-        while f & 0x400 == 0 { f <<= 1; e -= 1; }
+        while f & 0x400 == 0 {
+            f <<= 1;
+            e -= 1;
+        }
         f &= 0x3FF;
         let exp32 = (127 - 15 + 1 + e) as u32;
         return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
@@ -114,9 +119,13 @@ fn f32_to_f16(val: f32) -> u16 {
         return ((sign << 15) | (0x1F << 10) | f16_frac) as u16;
     }
     let new_exp = exp - 127 + 15;
-    if new_exp >= 31 { return ((sign << 15) | (0x1F << 10)) as u16; }
+    if new_exp >= 31 {
+        return ((sign << 15) | (0x1F << 10)) as u16;
+    }
     if new_exp <= 0 {
-        if new_exp < -10 { return (sign << 15) as u16; }
+        if new_exp < -10 {
+            return (sign << 15) as u16;
+        }
         let f = frac | 0x800000;
         let shift = (1 - new_exp + 13) as u32;
         return ((sign << 15) | (f >> shift)) as u16;
@@ -127,21 +136,18 @@ fn f32_to_f16(val: f32) -> u16 {
 /// Convert raw tensor bytes to F32 based on dtype string
 fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     match dtype {
-        "F16" => {
-            data.chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect()
-        }
-        "BF16" => {
-            data.chunks_exact(2)
-                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect()
-        }
-        "F32" => {
-            data.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
-        }
+        "F16" => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        "BF16" => data
+            .chunks_exact(2)
+            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        "F32" => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         other => panic!("unsupported dtype: {other}"),
     }
 }
@@ -177,7 +183,11 @@ fn quantize_q4f16_g64(f32_data: &[f32]) -> Vec<u8> {
         let actual_len = end - start;
         for i in 0..32 {
             let lo_val = if i < actual_len { group[i] } else { min_val };
-            let hi_val = if 32 + i < actual_len { group[32 + i] } else { min_val };
+            let hi_val = if 32 + i < actual_len {
+                group[32 + i]
+            } else {
+                min_val
+            };
 
             let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
             let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
@@ -213,7 +223,9 @@ fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
         for sb in 0..8 {
             let start = sb_start + sb * 32;
             let end = (start + 32).min(sb_end);
-            if start >= sb_end { break; }
+            if start >= sb_end {
+                break;
+            }
             let group = &f32_data[start..end];
 
             let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -228,7 +240,11 @@ fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
         let max_scale = sub_scales.iter().cloned().fold(0.0f32, f32::max);
         let max_min = sub_mins.iter().map(|m| -m).fold(0.0f32, f32::max); // mins are typically negative
 
-        let d = if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 }; // 6-bit scale range
+        let d = if max_scale > 0.0 {
+            max_scale / 63.0
+        } else {
+            0.0
+        }; // 6-bit scale range
         let dmin = if max_min > 0.0 { max_min / 63.0 } else { 0.0 };
 
         let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
@@ -268,11 +284,19 @@ fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
 
             let eff_scale_e = d * scale_ints[sb_even] as f32;
             let eff_min_e = dmin * min_ints[sb_even] as f32;
-            let inv_se = if eff_scale_e > 0.0 { 1.0 / eff_scale_e } else { 0.0 };
+            let inv_se = if eff_scale_e > 0.0 {
+                1.0 / eff_scale_e
+            } else {
+                0.0
+            };
 
             let eff_scale_o = d * scale_ints[sb_odd] as f32;
             let eff_min_o = dmin * min_ints[sb_odd] as f32;
-            let inv_so = if eff_scale_o > 0.0 { 1.0 / eff_scale_o } else { 0.0 };
+            let inv_so = if eff_scale_o > 0.0 {
+                1.0 / eff_scale_o
+            } else {
+                0.0
+            };
 
             for l in 0..32 {
                 let idx_e = sb_start + group * 64 + l;
@@ -407,7 +431,9 @@ fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, usize) {
 /// Matches the GPU-side fwht_forward_256 in turbo_common: signs1 → butterfly → scale → signs2.
 fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert!(x.len() == 256);
-    for i in 0..256 { x[i] *= signs1[i]; }
+    for i in 0..256 {
+        x[i] *= signs1[i];
+    }
     let mut stride = 1;
     while stride < 256 {
         let mut i = 0;
@@ -423,18 +449,25 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
         stride <<= 1;
     }
     let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 { x[i] *= scale * signs2[i]; }
+    for i in 0..256 {
+        x[i] *= scale * signs2[i];
+    }
 }
 
 /// Generate FWHT sign table (matches engine's gen_fwht_signs).
 fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
-    }).collect()
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
+        })
+        .collect()
 }
-
 
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
@@ -524,7 +557,7 @@ fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
             let q3 = q3.min(63);
 
             let byte_off = 8 + (i / 4) * 3;
-            output[out_off + byte_off]     = q0 | (q1 << 6);
+            output[out_off + byte_off] = q0 | (q1 << 6);
             output[out_off + byte_off + 1] = (q1 >> 2) | (q2 << 4);
             output[out_off + byte_off + 2] = (q2 >> 4) | (q3 << 2);
         }
@@ -606,8 +639,16 @@ fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
         for i in 0..128 {
             let idx_lo = 2 * i;
             let idx_hi = 2 * i + 1;
-            let lo_val = if idx_lo < actual_len { group[idx_lo] } else { min_val };
-            let hi_val = if idx_hi < actual_len { group[idx_hi] } else { min_val };
+            let lo_val = if idx_lo < actual_len {
+                group[idx_lo]
+            } else {
+                min_val
+            };
+            let hi_val = if idx_hi < actual_len {
+                group[idx_hi]
+            } else {
+                min_val
+            };
 
             let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
             let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
@@ -753,7 +794,11 @@ fn quantize_hfq3g256(f32_data: &[f32]) -> Vec<u8> {
             let mut q = [0u8; 8];
             for j in 0..8 {
                 let idx = ci + j;
-                let val = if idx < actual_len { group[idx] } else { min_val };
+                let val = if idx < actual_len {
+                    group[idx]
+                } else {
+                    min_val
+                };
                 q[j] = ((val - min_val) * inv_scale + 0.5).clamp(0.0, 7.0) as u8;
             }
             // Pack 8 × 3-bit into 3 bytes (little-endian bitstream)
@@ -812,7 +857,11 @@ fn quantize_hfq3g128(f32_data: &[f32]) -> Vec<u8> {
             let mut q = [0u8; 8];
             for j in 0..8 {
                 let idx = ci + j;
-                let val = if idx < actual_len { group[idx] } else { min_val };
+                let val = if idx < actual_len {
+                    group[idx]
+                } else {
+                    min_val
+                };
                 q[j] = ((val - min_val) * inv_scale + 0.5).clamp(0.0, 7.0) as u8;
             }
             let b0 = (q[0] & 7) | ((q[1] & 7) << 3) | ((q[2] & 3) << 6);
@@ -847,7 +896,7 @@ fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
         let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
         let range = max_val - min_val;
-        let scale = if range > 0.0 { range / 3.0 } else { 1.0 };  // 2-bit: 4 levels (0-3)
+        let scale = if range > 0.0 { range / 3.0 } else { 1.0 }; // 2-bit: 4 levels (0-3)
         let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
 
         let out_off = b * block_bytes;
@@ -860,7 +909,11 @@ fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
             let mut byte_val = 0u8;
             for j in 0..4 {
                 let idx = 4 * i + j;
-                let val = if idx < actual_len { group[idx] } else { min_val };
+                let val = if idx < actual_len {
+                    group[idx]
+                } else {
+                    min_val
+                };
                 let q = ((val - min_val) * inv_scale + 0.5) as u8;
                 byte_val |= q.min(3) << (j * 2);
             }
@@ -901,7 +954,11 @@ fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
             let mut byte_val = 0u8;
             for j in 0..4 {
                 let idx = 4 * i + j;
-                let val = if idx < actual_len { group[idx] } else { min_val };
+                let val = if idx < actual_len {
+                    group[idx]
+                } else {
+                    min_val
+                };
                 let q = ((val - min_val) * inv_scale + 0.5) as u8;
                 byte_val |= q.min(3) << (j * 2);
             }
@@ -939,17 +996,33 @@ fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
         let actual_len = end - start;
         // Pack 4 values per 3 bytes: v0[5:0]|v1[1:0], v1[5:2]|v2[3:0], v2[5:4]|v3[5:0]
         for i in (0..256).step_by(4) {
-            let q0 = if i < actual_len { ((group[i] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q1 = if i + 1 < actual_len { ((group[i+1] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q2 = if i + 2 < actual_len { ((group[i+2] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q3 = if i + 3 < actual_len { ((group[i+3] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let q0 = if i < actual_len {
+                ((group[i] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q1 = if i + 1 < actual_len {
+                ((group[i + 1] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q2 = if i + 2 < actual_len {
+                ((group[i + 2] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q3 = if i + 3 < actual_len {
+                ((group[i + 3] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
             let q0 = q0.min(63);
             let q1 = q1.min(63);
             let q2 = q2.min(63);
             let q3 = q3.min(63);
 
             let byte_off = 8 + (i / 4) * 3;
-            output[out_off + byte_off]     = q0 | (q1 << 6);
+            output[out_off + byte_off] = q0 | (q1 << 6);
             output[out_off + byte_off + 1] = (q1 >> 2) | (q2 << 4);
             output[out_off + byte_off + 2] = (q2 >> 4) | (q3 << 2);
         }
@@ -987,8 +1060,16 @@ fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
         for i in 0..64 {
             let idx_lo = 2 * i;
             let idx_hi = 2 * i + 1;
-            let lo_val = if idx_lo < actual_len { group[idx_lo] } else { min_val };
-            let hi_val = if idx_hi < actual_len { group[idx_hi] } else { min_val };
+            let lo_val = if idx_lo < actual_len {
+                group[idx_lo]
+            } else {
+                min_val
+            };
+            let hi_val = if idx_hi < actual_len {
+                group[idx_hi]
+            } else {
+                min_val
+            };
 
             let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
             let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
@@ -1021,12 +1102,12 @@ enum QuantType {
     HFQ2G128 = 10,
     HFQ3G256 = 11,
     HFQ3G128 = 12,
-    MQ4G256 = 13,  // MagnumQuant: FWHT-rotated HFQ4-G256
-    MQ8G256 = 14,  // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target
-    MQ6G256 = 15,  // MagnumQuant: FWHT-rotated HFQ6-G256 (6-bit, 200 B/group)
-    BF16 = 16,     // Original BF16 weights (zero precision loss for vision)
-    MQ3G256 = 17,  // MagnumQuant: FWHT-rotated HFQ3-G256 (3-bit, 104 B/group)
-    MQ2G256 = 18,  // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
+    MQ4G256 = 13, // MagnumQuant: FWHT-rotated HFQ4-G256
+    MQ8G256 = 14, // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target
+    MQ6G256 = 15, // MagnumQuant: FWHT-rotated HFQ6-G256 (6-bit, 200 B/group)
+    BF16 = 16,    // Original BF16 weights (zero precision loss for vision)
+    MQ3G256 = 17, // MagnumQuant: FWHT-rotated HFQ3-G256 (3-bit, 104 B/group)
+    MQ2G256 = 18, // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
 }
 
 struct HfqTensor {
@@ -1166,7 +1247,9 @@ fn resolve_model_path(input: &str) -> String {
     }
 
     // Check if it looks like a HuggingFace model ID (contains exactly one /)
-    if input.contains('/') && !input.contains(std::path::MAIN_SEPARATOR) || (cfg!(unix) && input.matches('/').count() == 1) {
+    if input.contains('/') && !input.contains(std::path::MAIN_SEPARATOR)
+        || (cfg!(unix) && input.matches('/').count() == 1)
+    {
         let parts: Vec<&str> = input.splitn(2, '/').collect();
         if parts.len() == 2 {
             let org = parts[0];
@@ -1210,7 +1293,9 @@ fn resolve_model_path(input: &str) -> String {
                     }
                 }
                 Ok(s) => eprintln!("huggingface-cli download failed with status {s}"),
-                Err(e) => eprintln!("Failed to run huggingface-cli: {e}. Install with: pip install huggingface_hub"),
+                Err(e) => eprintln!(
+                    "Failed to run huggingface-cli: {e}. Install with: pip install huggingface_hub"
+                ),
             }
         }
     }
@@ -1247,7 +1332,7 @@ fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
         let dot = rest.find('.')?;
         let layer_idx = &rest[..dot];
         let slot_full = &rest[dot + 1..]; // "<slot>.weight"
-        // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
+                                          // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
         let slot = slot_full.strip_suffix(".weight")?;
         let translated = match slot {
             "attn_norm" => "input_layernorm".to_string(),
@@ -1284,44 +1369,36 @@ fn gguf_is_embed_tensor(name: &str) -> bool {
 /// reads. Mirrors the field names HuggingFace uses in `config.json` for
 /// LlamaForCausalLM / Qwen3ForCausalLM, populated from the GGUF
 /// `<arch>.*` metadata keys.
-fn config_json_from_gguf(
-    gguf: &gguf_input::GgufFile,
-    arch_str: &str,
-) -> serde_json::Value {
+fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str) -> serde_json::Value {
     // GGUF prefixes its model hyperparameters with the architecture name —
     // e.g. for `general.architecture=llama` the keys live under `llama.*`.
     let prefix = arch_str;
 
     let read_u = |k: &str| -> Option<u64> {
-        gguf.metadata
-            .get(k)
-            .and_then(|v| match v {
-                gguf_input::MetaValue::U8(x) => Some(*x as u64),
-                gguf_input::MetaValue::I8(x) => Some(*x as u64),
-                gguf_input::MetaValue::U16(x) => Some(*x as u64),
-                gguf_input::MetaValue::I16(x) => Some(*x as u64),
-                gguf_input::MetaValue::U32(x) => Some(*x as u64),
-                gguf_input::MetaValue::I32(x) => Some(*x as u64),
-                gguf_input::MetaValue::U64(x) => Some(*x),
-                gguf_input::MetaValue::I64(x) => Some(*x as u64),
-                _ => None,
-            })
+        gguf.metadata.get(k).and_then(|v| match v {
+            gguf_input::MetaValue::U8(x) => Some(*x as u64),
+            gguf_input::MetaValue::I8(x) => Some(*x as u64),
+            gguf_input::MetaValue::U16(x) => Some(*x as u64),
+            gguf_input::MetaValue::I16(x) => Some(*x as u64),
+            gguf_input::MetaValue::U32(x) => Some(*x as u64),
+            gguf_input::MetaValue::I32(x) => Some(*x as u64),
+            gguf_input::MetaValue::U64(x) => Some(*x),
+            gguf_input::MetaValue::I64(x) => Some(*x as u64),
+            _ => None,
+        })
     };
     let read_f = |k: &str| -> Option<f64> {
-        gguf.metadata
-            .get(k)
-            .and_then(|v| match v {
-                gguf_input::MetaValue::F32(x) => Some(*x as f64),
-                gguf_input::MetaValue::F64(x) => Some(*x),
-                _ => None,
-            })
+        gguf.metadata.get(k).and_then(|v| match v {
+            gguf_input::MetaValue::F32(x) => Some(*x as f64),
+            gguf_input::MetaValue::F64(x) => Some(*x),
+            _ => None,
+        })
     };
 
     let dim = read_u(&format!("{prefix}.embedding_length"));
     let n_layers = read_u(&format!("{prefix}.block_count"));
     let n_heads = read_u(&format!("{prefix}.attention.head_count"));
-    let n_kv_heads = read_u(&format!("{prefix}.attention.head_count_kv"))
-        .or(n_heads);
+    let n_kv_heads = read_u(&format!("{prefix}.attention.head_count_kv")).or(n_heads);
     let hidden_dim = read_u(&format!("{prefix}.feed_forward_length"));
     // vocab_size: prefer metadata, fall back to token_embd shape[1].
     let vocab_size = read_u(&format!("{prefix}.vocab_size")).or_else(|| {
@@ -1333,12 +1410,10 @@ fn config_json_from_gguf(
     let max_seq_len = read_u(&format!("{prefix}.context_length"));
     let rope_theta = read_f(&format!("{prefix}.rope.freq_base"));
     let rms_eps = read_f(&format!("{prefix}.attention.layer_norm_rms_epsilon"));
-    let head_dim = read_u(&format!("{prefix}.attention.key_length"))
-        .or_else(|| {
-            // Fall back: head_dim = dim / n_heads.
-            dim.zip(n_heads)
-                .map(|(d, h)| if h > 0 { d / h } else { d })
-        });
+    let head_dim = read_u(&format!("{prefix}.attention.key_length")).or_else(|| {
+        // Fall back: head_dim = dim / n_heads.
+        dim.zip(n_heads).map(|(d, h)| if h > 0 { d / h } else { d })
+    });
     let bos = read_u("tokenizer.ggml.bos_token_id").unwrap_or(1);
     let eos = read_u("tokenizer.ggml.eos_token_id").unwrap_or(2);
 
@@ -1366,10 +1441,7 @@ fn config_json_from_gguf(
         );
     }
     if let Some(v) = hidden_dim {
-        cfg.insert(
-            "intermediate_size".to_string(),
-            serde_json::Value::from(v),
-        );
+        cfg.insert("intermediate_size".to_string(), serde_json::Value::from(v));
     }
     if let Some(v) = vocab_size {
         cfg.insert("vocab_size".to_string(), serde_json::Value::from(v));
@@ -1424,9 +1496,7 @@ fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
         MV::F64(x) => serde_json::Value::from(*x),
         // Tokenizer arrays (tokens, scores, merges, ...) can be huge —
         // serialize them as JSON arrays so the engine side can re-parse.
-        MV::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(mv_to_json).collect())
-        }
+        MV::Array(arr) => serde_json::Value::Array(arr.iter().map(mv_to_json).collect()),
     }
 }
 
@@ -1526,9 +1596,20 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
 
     // FWHT signs — only used when --format is mq4/mq6. Same seed pair as the
     // safetensors path so the engine's runtime FWHT inverse stays identical.
-    let needs_signs = matches!(format, GgufFormat::Mq4 | GgufFormat::Mq6 | GgufFormat::Mq3 | GgufFormat::Mq2);
-    let signs1 = if needs_signs { gen_fwht_signs(42, 256) } else { Vec::new() };
-    let signs2 = if needs_signs { gen_fwht_signs(1042, 256) } else { Vec::new() };
+    let needs_signs = matches!(
+        format,
+        GgufFormat::Mq4 | GgufFormat::Mq6 | GgufFormat::Mq3 | GgufFormat::Mq2
+    );
+    let signs1 = if needs_signs {
+        gen_fwht_signs(42, 256)
+    } else {
+        Vec::new()
+    };
+    let signs2 = if needs_signs {
+        gen_fwht_signs(1042, 256)
+    } else {
+        Vec::new()
+    };
 
     let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(gguf.tensors.len());
     let mut total_params: u64 = 0;
@@ -1553,8 +1634,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
         // Translate to the safetensors-style name `engine::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
         // the future loader can ignore unknown tensors.
-        let out_name = gguf_to_safetensors_name(&info.name)
-            .unwrap_or_else(|| info.name.clone());
+        let out_name = gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
 
         let (data, quant_type, group_size, label) = if is_norm || !is_2d {
             // Store as F16 — convert via dequant→f32→f16 for any source dtype.
@@ -1657,25 +1737,41 @@ fn main() {
     // or HIPFIRE_QUANT_THREADS env). Quantization is CPU-bound and saturates
     // memory bandwidth, so leaving headroom for the rest of the system avoids
     // making the whole box unresponsive during a multi-hour quantize run.
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
     let default_threads = ((cores * 8) / 10).max(1);
-    let threads = args.iter().position(|a| a == "--threads")
+    let threads = args
+        .iter()
+        .position(|a| a == "--threads")
         .and_then(|i| args.get(i + 1).and_then(|s| s.parse::<usize>().ok()))
-        .or_else(|| std::env::var("HIPFIRE_QUANT_THREADS").ok().and_then(|s| s.parse().ok()))
+        .or_else(|| {
+            std::env::var("HIPFIRE_QUANT_THREADS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
         .unwrap_or(default_threads);
-    let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
     eprintln!("Rayon: {threads} worker threads ({cores} cores available, default 80% = {default_threads})");
 
-
-    let input_dir = args.iter().position(|a| a == "--input")
+    let input_dir = args
+        .iter()
+        .position(|a| a == "--input")
         .map(|i| &args[i + 1])
-        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq>"); std::process::exit(1); });
+        .unwrap_or_else(|| {
+            eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq>");
+            std::process::exit(1);
+        });
 
     let output_path = args.iter().position(|a| a == "--output")
         .map(|i| &args[i + 1])
         .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format q8f16|q4f16]"); std::process::exit(1); });
 
-    let format = args.iter().position(|a| a == "--format")
+    let format = args
+        .iter()
+        .position(|a| a == "--format")
         .map(|i| args[i + 1].as_str())
         .unwrap_or("q8f16");
     // q8f16 = all weights Q8 (interleaved blocks)
@@ -1696,7 +1792,7 @@ fn main() {
     let use_hfq3g128 = format == "hfq3g128" || format == "hfq3" || format == "hf3"; // default HF3 = G128
     let use_hfq2g256 = format == "hfq2g256";
     let use_hfq2g128 = format == "hfq2g128" || format == "hfq2" || format == "hf2";
-    let use_hfq_mixed = format == "hfq-mixed";  // Q8 attn + HFQ4 FFN
+    let use_hfq_mixed = format == "hfq-mixed"; // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
     let use_mq3g256 = format == "mq3" || format == "mq3g256";
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
@@ -1742,7 +1838,10 @@ fn main() {
         .unwrap_or_else(|_| panic!("Cannot read {}. If using a HuggingFace model ID, ensure it's downloaded: huggingface-cli download {}", config_path.display(), input_dir.display()));
     let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
 
-    let arch_str = config.get("model_type").and_then(|v| v.as_str()).unwrap_or("llama");
+    let arch_str = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama");
     let arch_id = match arch_str {
         "llama" => 0u32,
         "qwen3" | "qwen2" => 1,
@@ -1751,7 +1850,10 @@ fn main() {
         // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
         // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
         "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
-        other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
+        other => {
+            eprintln!("Warning: unknown architecture '{other}', treating as llama");
+            0
+        }
     };
     eprintln!("Architecture: {arch_str} (id={arch_id})");
     let is_moe = arch_id == 6;
@@ -1814,7 +1916,8 @@ fn main() {
     let mut _n_quant_groups = 0u64;
 
     let include_vision = std::env::args().any(|a| a == "--include-vision");
-    let vision_quant = std::env::args().position(|a| a == "--vision-quant")
+    let vision_quant = std::env::args()
+        .position(|a| a == "--vision-quant")
         .and_then(|i| std::env::args().nth(i + 1))
         .unwrap_or_default();
     let mut skipped_params = 0u64;
@@ -1857,12 +1960,17 @@ fn main() {
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
             let elem_size = match meta.dtype.as_str() {
-                "F32" => 4, "F16" | "BF16" => 2,
+                "F32" => 4,
+                "F16" | "BF16" => 2,
                 other => panic!("unsupported expert tensor dtype: {other}"),
             };
             let inner_bytes = inner_n * elem_size;
             let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&s| s as u32).collect();
-            let base_name = if name.ends_with("gate_up_proj") { "gate_up_proj" } else { "down_proj" };
+            let base_name = if name.ends_with("gate_up_proj") {
+                "gate_up_proj"
+            } else {
+                "down_proj"
+            };
             // Strip the trailing base; what remains is the parent path with `experts.` already on the end
             let parent = &name[..name.len() - base_name.len()];
 
@@ -1881,25 +1989,28 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
-            let mut new_tensors: Vec<HfqTensor> = (0..n_experts).into_par_iter().map(|x| {
-                let slice_off = x * inner_bytes;
-                let slice = &raw_data[slice_off..slice_off + inner_bytes];
-                let f32_slice = to_f32(slice, &dtype);
-                let (quantized, qt, gs) = if supports_mq4 {
-                    let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32)
-                } else {
-                    let q = quantize_hfq4g128(&f32_slice);
-                    (q, QuantType::HFQ4G128, 128u32)
-                };
-                HfqTensor {
-                    name: format!("{parent_owned}{x}.{base_owned}.weight"),
-                    quant_type: qt,
-                    shape: inner_shape_clone.clone(),
-                    group_size: gs,
-                    data: quantized,
-                }
-            }).collect();
+            let mut new_tensors: Vec<HfqTensor> = (0..n_experts)
+                .into_par_iter()
+                .map(|x| {
+                    let slice_off = x * inner_bytes;
+                    let slice = &raw_data[slice_off..slice_off + inner_bytes];
+                    let f32_slice = to_f32(slice, &dtype);
+                    let (quantized, qt, gs) = if supports_mq4 {
+                        let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
+                        (q, QuantType::MQ4G256, 256u32)
+                    } else {
+                        let q = quantize_hfq4g128(&f32_slice);
+                        (q, QuantType::HFQ4G128, 128u32)
+                    };
+                    HfqTensor {
+                        name: format!("{parent_owned}{x}.{base_owned}.weight"),
+                        quant_type: qt,
+                        shape: inner_shape_clone.clone(),
+                        group_size: gs,
+                        data: quantized,
+                    }
+                })
+                .collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
             let label = if supports_mq4 { "MQ4G256" } else { "HFQ4G128" };
@@ -1945,11 +2056,16 @@ fn main() {
                     }
                 }
 
-                eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB, stride={})",
-                    "Q8_HFQ", name, meta.shape, n_elements,
+                eprintln!(
+                    "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB, stride={})",
+                    "Q8_HFQ",
+                    name,
+                    meta.shape,
+                    n_elements,
                     raw_data.len() as f64 / 1024.0,
                     quantized.len() as f64 / 1024.0,
-                    row_stride);
+                    row_stride
+                );
 
                 hfq_tensors.push(HfqTensor {
                     name: name.to_string(),
@@ -1959,31 +2075,200 @@ fn main() {
                     data: quantized,
                 });
             } else {
-            // Choose quant format per tensor
-            let this_q8 = if use_q4k_all {
-                false // everything Q4_K
-            } else if use_q4k_q8embed {
-                name.contains("embed") || name.contains("lm_head") // only embed/output Q8
-            } else if use_mixed || use_fast {
-                is_q8_tensor(name)
-            } else {
-                use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
-            };
-            let this_q4as8 = use_fast && !this_q8; // FFN tensors in q8-fast mode
-            let this_q4k = use_q4k_all || use_q4k_q8embed || use_mixed;
+                // Choose quant format per tensor
+                let this_q8 = if use_q4k_all {
+                    false // everything Q4_K
+                } else if use_q4k_q8embed {
+                    name.contains("embed") || name.contains("lm_head") // only embed/output Q8
+                } else if use_mixed || use_fast {
+                    is_q8_tensor(name)
+                } else {
+                    use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
+                };
+                let this_q4as8 = use_fast && !this_q8; // FFN tensors in q8-fast mode
+                let this_q4k = use_q4k_all || use_q4k_q8embed || use_mixed;
 
-            // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
-            // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
-            let is_embed = name.contains("embed_tokens");
+                // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
+                // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
+                let is_embed = name.contains("embed_tokens");
 
-            let (quantized, qt, gs, label) = if use_hfq_mixed {
-                // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
-                let is_ffn = name.contains("mlp.") || name.contains("ffn");
-                if !is_ffn {
+                let (quantized, qt, gs, label) = if use_hfq_mixed {
+                    // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
+                    let is_ffn = name.contains("mlp.") || name.contains("ffn");
+                    if !is_ffn {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let q = quantize_hfq4g256(&f32_data);
+                            (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    }
+                } else if use_hfq6 {
+                    // HFQ6-G256: all weights 6-bit, embeddings Q8
+                    if is_embed {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else {
+                        let q = quantize_hfq6g256(&f32_data);
+                        (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                    }
+                } else if (use_hfq2g256 || use_hfq2g128) && is_embed {
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                } else {
-                    let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                } else if use_hfq2g128 {
+                    let q = quantize_hfq2g128(&f32_data);
+                    (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
+                } else if use_hfq2g256 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let q = quantize_hfq2g256(&f32_data);
+                        (q, QuantType::HFQ2G256, 256u32, "HFQ2G256")
+                    } else {
+                        // Fallback to HFQ4 for non-256-aligned
+                        let q = quantize_hfq4g128(&f32_data);
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    }
+                } else if use_mq8g256 && is_embed {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if use_mq8g256 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let q = quantize_mq8g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ8G256, 256u32, "MQ8G256")
+                    } else {
+                        // Fallback to Q8 for non-256-aligned
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    }
+                } else if use_mq4g256 && is_embed {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if use_mq4g256 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                    } else {
+                        // Fallback to standard HFQ4-G128 for non-256-aligned
+                        let q = quantize_hfq4g128(&f32_data);
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    }
+                } else if use_mq6g256 && is_embed {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if use_mq6g256 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                    } else {
+                        // Fallback to HFQ6-G256 for non-256-aligned (no rotation)
+                        let q = quantize_hfq6g256(&f32_data);
+                        (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                    }
+                } else if (use_mq3g256 || use_mq2g256) && is_embed {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if use_mq3g256 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ3G256, 256u32, "MQ3G256")
+                    } else {
+                        // Fallback to HFQ3-G128 for non-256-aligned (no rotation)
+                        let q = quantize_hfq3g128(&f32_data);
+                        (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                    }
+                } else if use_mq2g256 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ2G256, 256u32, "MQ2G256")
+                    } else {
+                        // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
+                        let q = quantize_hfq2g128(&f32_data);
+                        (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
+                    }
+                } else if (use_hfq3g256 || use_hfq3g128) && is_embed {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if use_hfq3g128 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 128 == 0 {
+                        let q = quantize_hfq3g128(&f32_data);
+                        (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                    } else {
+                        let q = quantize_hfq3g128(&f32_data);
+                        (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                    }
+                } else if use_hfq3g256 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let q = quantize_hfq3g256(&f32_data);
+                        (q, QuantType::HFQ3G256, 256u32, "HFQ3G256")
+                    } else {
+                        let q = quantize_hfq3g128(&f32_data);
+                        (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                    }
+                } else if use_hfq4g256 && is_embed {
+                    // HFQ4 embeddings: half the size of Q8, same 18-VGPR lookup kernel
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
                     if k_dim % 256 == 0 {
                         let q = quantize_hfq4g256(&f32_data);
                         (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
@@ -1991,247 +2276,162 @@ fn main() {
                         let q = quantize_hfq4g128(&f32_data);
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
-                }
-            } else if use_hfq6 {
-                // HFQ6-G256: all weights 6-bit, embeddings Q8
-                if is_embed {
+                } else if use_hfq4g256 {
+                    // Auto-select G128 vs G256 based on K dimension
+                    // G256 preferred: better coalescing, fewer scale/zero overheads
+                    // G128 only as fallback when K isn't divisible by 256
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let q = quantize_hfq4g256(&f32_data);
+                        (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                    } else if k_dim % 128 == 0 {
+                        let q = quantize_hfq4g128(&f32_data);
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    } else {
+                        // Pad to 128-element boundary
+                        let q = quantize_hfq4g128(&f32_data);
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    }
+                } else if this_q8 {
                     let q = quantize_q8f16(&f32_data);
-                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    (q, QuantType::Q8F16, 32u32, "Q8_FP16")
+                } else if this_q4as8 {
+                    let q = quantize_q4_as_q8(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q4asQ8")
+                } else if this_q4k {
+                    let q = quantize_q4k(&f32_data);
+                    (q, QuantType::Q4K, 256u32, "Q4_K")
                 } else {
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                }
-            } else if (use_hfq2g256 || use_hfq2g128) && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_hfq2g128 {
-                let q = quantize_hfq2g128(&f32_data);
-                (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
-            } else if use_hfq2g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let q = quantize_hfq2g256(&f32_data);
-                    (q, QuantType::HFQ2G256, 256u32, "HFQ2G256")
-                } else {
-                    // Fallback to HFQ4 for non-256-aligned
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if use_mq8g256 && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq8g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq8g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ8G256, 256u32, "MQ8G256")
-                } else {
-                    // Fallback to Q8 for non-256-aligned
-                    let q = quantize_q8f16(&f32_data);
-                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                }
-            } else if use_mq4g256 && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                } else {
-                    // Fallback to standard HFQ4-G128 for non-256-aligned
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if use_mq6g256 && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq6g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                } else {
-                    // Fallback to HFQ6-G256 for non-256-aligned (no rotation)
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                }
-            } else if (use_mq3g256 || use_mq2g256) && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq3g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                } else {
-                    // Fallback to HFQ3-G128 for non-256-aligned (no rotation)
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                }
-            } else if use_mq2g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                } else {
-                    // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
-                    let q = quantize_hfq2g128(&f32_data);
-                    (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
-                }
-            } else if (use_hfq3g256 || use_hfq3g128) && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_hfq3g128 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 128 == 0 {
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                } else {
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                }
-            } else if use_hfq3g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let q = quantize_hfq3g256(&f32_data);
-                    (q, QuantType::HFQ3G256, 256u32, "HFQ3G256")
-                } else {
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                }
-            } else if use_hfq4g256 && is_embed {
-                // HFQ4 embeddings: half the size of Q8, same 18-VGPR lookup kernel
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let q = quantize_hfq4g256(&f32_data);
-                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                } else {
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if use_hfq4g256 {
-                // Auto-select G128 vs G256 based on K dimension
-                // G256 preferred: better coalescing, fewer scale/zero overheads
-                // G128 only as fallback when K isn't divisible by 256
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let q = quantize_hfq4g256(&f32_data);
-                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                } else if k_dim % 128 == 0 {
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                } else {
-                    // Pad to 128-element boundary
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if this_q8 {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_FP16")
-            } else if this_q4as8 {
-                let q = quantize_q4_as_q8(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q4asQ8")
-            } else if this_q4k {
-                let q = quantize_q4k(&f32_data);
-                (q, QuantType::Q4K, 256u32, "Q4_K")
-            } else {
-                let q = quantize_q4f16_g64(&f32_data);
-                (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
-            };
+                    let q = quantize_q4f16_g64(&f32_data);
+                    (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
+                };
 
-            // Compute quantization error (skip for Q8 embeddings — always negligible)
-            let block_size = gs as usize;
-            let is_hfq4 = label == "HFQ4G256" || label == "HFQ4G128";
-            // Only compute detailed error for HFQ4 tensors — Q8/HFQ6 error is negligible
-            let skip_error = !is_hfq4;
-            let n_blocks = if !skip_error { (n_elements + block_size - 1) / block_size } else { 0 };
-            for b in 0..n_blocks {
-                let start = b * block_size;
-                let end = (start + block_size).min(n_elements);
-                if is_hfq4 {
-                    // Both G128 (72B) and G256 (136B): [f32 scale][f32 zero][nibbles]
-                    let block_bytes = if block_size == 256 { 136 } else { 72 };
-                    let off = b * block_bytes;
-                    let scale = f32::from_le_bytes([quantized[off], quantized[off+1], quantized[off+2], quantized[off+3]]);
-                    let zero = f32::from_le_bytes([quantized[off+4], quantized[off+5], quantized[off+6], quantized[off+7]]);
-                    for i in 0..(end - start) {
-                        let byte_idx = i / 2;
-                        let nibble = if i % 2 == 0 { quantized[off + 8 + byte_idx] & 0xF } else { quantized[off + 8 + byte_idx] >> 4 };
-                        let dequant = scale * nibble as f32 + zero;
-                        let err = (dequant - f32_data[start + i]).abs();
-                        total_quant_error += err as f64;
-                        max_quant_error = max_quant_error.max(err);
-                    }
-                } else if this_q8 || this_q4as8 {
-                    let off = b * 34;
-                    let scale = f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
-                    for i in 0..(end - start) {
-                        let qval = quantized[off + 2 + i] as i8;
-                        let dequant = scale * qval as f32;
-                        let err = (dequant - f32_data[start + i]).abs();
-                        total_quant_error += err as f64;
-                        max_quant_error = max_quant_error.max(err);
-                    }
+                // Compute quantization error (skip for Q8 embeddings — always negligible)
+                let block_size = gs as usize;
+                let is_hfq4 = label == "HFQ4G256" || label == "HFQ4G128";
+                // Only compute detailed error for HFQ4 tensors — Q8/HFQ6 error is negligible
+                let skip_error = !is_hfq4;
+                let n_blocks = if !skip_error {
+                    (n_elements + block_size - 1) / block_size
                 } else {
-                    let off = b * 36;
-                    let scale = f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
-                    let min_val = f16_to_f32(u16::from_le_bytes([quantized[off + 2], quantized[off + 3]]));
-                    for i in 0..(end - start) {
-                        let byte_idx = if i < 32 { i } else { i - 32 };
-                        let nibble = if i < 32 {
-                            quantized[off + 4 + byte_idx] & 0xF
-                        } else {
-                            quantized[off + 4 + byte_idx] >> 4
-                        };
-                        let dequant = nibble as f32 * scale + min_val;
-                        let err = (dequant - f32_data[start + i]).abs();
-                        total_quant_error += err as f64;
-                        max_quant_error = max_quant_error.max(err);
+                    0
+                };
+                for b in 0..n_blocks {
+                    let start = b * block_size;
+                    let end = (start + block_size).min(n_elements);
+                    if is_hfq4 {
+                        // Both G128 (72B) and G256 (136B): [f32 scale][f32 zero][nibbles]
+                        let block_bytes = if block_size == 256 { 136 } else { 72 };
+                        let off = b * block_bytes;
+                        let scale = f32::from_le_bytes([
+                            quantized[off],
+                            quantized[off + 1],
+                            quantized[off + 2],
+                            quantized[off + 3],
+                        ]);
+                        let zero = f32::from_le_bytes([
+                            quantized[off + 4],
+                            quantized[off + 5],
+                            quantized[off + 6],
+                            quantized[off + 7],
+                        ]);
+                        for i in 0..(end - start) {
+                            let byte_idx = i / 2;
+                            let nibble = if i % 2 == 0 {
+                                quantized[off + 8 + byte_idx] & 0xF
+                            } else {
+                                quantized[off + 8 + byte_idx] >> 4
+                            };
+                            let dequant = scale * nibble as f32 + zero;
+                            let err = (dequant - f32_data[start + i]).abs();
+                            total_quant_error += err as f64;
+                            max_quant_error = max_quant_error.max(err);
+                        }
+                    } else if this_q8 || this_q4as8 {
+                        let off = b * 34;
+                        let scale =
+                            f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
+                        for i in 0..(end - start) {
+                            let qval = quantized[off + 2 + i] as i8;
+                            let dequant = scale * qval as f32;
+                            let err = (dequant - f32_data[start + i]).abs();
+                            total_quant_error += err as f64;
+                            max_quant_error = max_quant_error.max(err);
+                        }
+                    } else {
+                        let off = b * 36;
+                        let scale =
+                            f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
+                        let min_val = f16_to_f32(u16::from_le_bytes([
+                            quantized[off + 2],
+                            quantized[off + 3],
+                        ]));
+                        for i in 0..(end - start) {
+                            let byte_idx = if i < 32 { i } else { i - 32 };
+                            let nibble = if i < 32 {
+                                quantized[off + 4 + byte_idx] & 0xF
+                            } else {
+                                quantized[off + 4 + byte_idx] >> 4
+                            };
+                            let dequant = nibble as f32 * scale + min_val;
+                            let err = (dequant - f32_data[start + i]).abs();
+                            total_quant_error += err as f64;
+                            max_quant_error = max_quant_error.max(err);
+                        }
                     }
+                    _n_quant_groups += 1;
                 }
-                _n_quant_groups += 1;
-            }
 
-            eprintln!("  {label:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB)",
-                name, meta.shape, n_elements,
-                raw_data.len() as f64 / 1024.0,
-                quantized.len() as f64 / 1024.0);
+                eprintln!(
+                    "  {label:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB)",
+                    name,
+                    meta.shape,
+                    n_elements,
+                    raw_data.len() as f64 / 1024.0,
+                    quantized.len() as f64 / 1024.0
+                );
 
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: qt,
-                shape,
-                group_size: gs,
-                data: quantized,
-            });
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: qt,
+                    shape,
+                    group_size: gs,
+                    data: quantized,
+                });
             } // end else (non-Q8HFQ path)
         } else if is_vision && vision_quant == "hfq4" && n_elements >= 32 {
             // Quantize vision weights to HFQ4G256 (for speed-critical VL workloads)
             let f32_data = to_f32(raw_data, &meta.dtype);
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            let k_dim = if shape.len() == 2 { shape[1] as usize } else { n_elements };
+            let k_dim = if shape.len() == 2 {
+                shape[1] as usize
+            } else {
+                n_elements
+            };
             let (quantized, gs) = if k_dim % 256 == 0 {
                 (quantize_hfq4g256(&f32_data), 256u32)
             } else {
                 (quantize_hfq4g128(&f32_data), 128u32)
             };
-            let qt = if gs == 256 { QuantType::HFQ4G256 } else { QuantType::HFQ4G128 };
+            let qt = if gs == 256 {
+                QuantType::HFQ4G256
+            } else {
+                QuantType::HFQ4G128
+            };
             let label = if gs == 256 { "HFQ4G256" } else { "HFQ4G128" };
-            eprintln!("  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
-                name, meta.shape, n_elements,
-                raw_data.len() as f64 / 1024.0, quantized.len() as f64 / 1024.0);
+            eprintln!(
+                "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                quantized.len() as f64 / 1024.0
+            );
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: qt,
@@ -2243,8 +2443,13 @@ fn main() {
             // Store vision weights as original BF16 (zero precision loss)
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!("  BF16:       {} {:?} ({} elements, {:.1} KB) [vision, lossless]",
-                name, meta.shape, n_elements, raw_data.len() as f64 / 1024.0);
+            eprintln!(
+                "  BF16:       {} {:?} ({} elements, {:.1} KB) [vision, lossless]",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0
+            );
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: QuantType::BF16,
@@ -2254,17 +2459,29 @@ fn main() {
             });
         } else if is_vision && vision_quant == "bf16" {
             // Non-BF16 source (F16/F32) — store as F16
-            let data = if meta.dtype == "F16" { raw_data.to_vec() } else {
+            let data = if meta.dtype == "F16" {
+                raw_data.to_vec()
+            } else {
                 let f32_vals = to_f32(raw_data, &meta.dtype);
-                f32_vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+                f32_vals
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect()
             };
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!("  F16:        {} {:?} ({:.1} KB) [vision, bf16 fallback]",
-                name, meta.shape, data.len() as f64 / 1024.0);
+            eprintln!(
+                "  F16:        {} {:?} ({:.1} KB) [vision, bf16 fallback]",
+                name,
+                meta.shape,
+                data.len() as f64 / 1024.0
+            );
             hfq_tensors.push(HfqTensor {
-                name: name.to_string(), quant_type: QuantType::F16,
-                shape, group_size: 0, data,
+                name: name.to_string(),
+                quant_type: QuantType::F16,
+                shape,
+                group_size: 0,
+                data,
             });
         } else {
             // Keep as F16 (convert BF16 -> F16 if needed)
@@ -2273,13 +2490,15 @@ fn main() {
                 "BF16" => {
                     // BF16 → F32 → F16
                     let f32_vals = to_f32(raw_data, "BF16");
-                    f32_vals.iter()
+                    f32_vals
+                        .iter()
                         .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                         .collect()
                 }
                 "F32" => {
                     let f32_vals = to_f32(raw_data, "F32");
-                    f32_vals.iter()
+                    f32_vals
+                        .iter()
                         .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                         .collect()
                 }
@@ -2287,8 +2506,13 @@ fn main() {
             };
 
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!("  F16:        {} {:?} ({} elements, {:.1} KB)",
-                name, meta.shape, n_elements, f16_data.len() as f64 / 1024.0);
+            eprintln!(
+                "  F16:        {} {:?} ({} elements, {:.1} KB)",
+                name,
+                meta.shape,
+                n_elements,
+                f16_data.len() as f64 / 1024.0
+            );
 
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
@@ -2304,14 +2528,21 @@ fn main() {
     let total_bytes: usize = hfq_tensors.iter().map(|t| t.data.len()).sum();
     let mean_quant_error = if quantized_params > 0 {
         total_quant_error / quantized_params as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     eprintln!("\n=== Quantization Summary ===");
     if skipped_params > 0 {
-        eprintln!("  Skipped params:   {skipped_params} (mtp/visual — use --include-vision for VL)");
+        eprintln!(
+            "  Skipped params:   {skipped_params} (mtp/visual — use --include-vision for VL)"
+        );
     }
     eprintln!("  Total params:     {total_params}");
-    eprintln!("  Quantized params: {quantized_params} ({:.1}%)", 100.0 * quantized_params as f64 / total_params as f64);
+    eprintln!(
+        "  Quantized params: {quantized_params} ({:.1}%)",
+        100.0 * quantized_params as f64 / total_params as f64
+    );
     eprintln!("  Mean quant error: {mean_quant_error:.8}");
     eprintln!("  Max quant error:  {max_quant_error:.8}");
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);

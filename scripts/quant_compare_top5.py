@@ -20,7 +20,7 @@ def load_top5(path: Path) -> list[dict[str, str]]:
 
 
 def main() -> int:
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 3:
         print(
             "usage: quant_compare_top5.py <baseline-prefix> <mode=prefix>...",
             file=sys.stderr,

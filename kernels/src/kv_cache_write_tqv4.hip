@@ -1,6 +1,30 @@
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
 
+__device__ int tqv_quantize_table(float x, const float* __restrict__ thresholds, int value_bits) {
+    int idx = 0;
+    const int n = (value_bits == 1) ? 2 : ((1 << value_bits) - 1);
+    for (int i = 0; i < n; i++) idx += (x > thresholds[i]);
+    return idx;
+}
+
+__device__ float tqv_centroid_table(int idx, int value_bits, int head_dim, const float* __restrict__ centroids) {
+    if (centroids != nullptr) return centroids[idx];
+    if (value_bits == 1 && head_dim == 256) return TURBO_C1_256[idx];
+    if (value_bits == 1) return TURBO_C1[idx];
+    if (value_bits == 4 && head_dim == 256) return TURBO_C4_256[idx];
+    if (value_bits == 4) return TURBO_C4[idx];
+    if (value_bits == 3 && head_dim == 256) return TURBO_C3_256[idx];
+    if (value_bits == 3) return TURBO_C3[idx];
+    if (head_dim == 256) return TURBO_C2_256[idx];
+    return TURBO_C2[idx];
+}
+
+__device__ int turbo_quantize_ternary(float x, int head_dim) {
+    const float* t = (head_dim == 256) ? TURBO_T1_256 : TURBO_T1;
+    return (x > t[1]) ? 2 : ((x > t[0]) ? 1 : 0);
+}
+
 extern "C" __global__ void kv_cache_write_tqv4(
     unsigned char* __restrict__ v_dst,
     const float* __restrict__ v_src,
@@ -9,14 +33,17 @@ extern "C" __global__ void kv_cache_write_tqv4(
     const float* __restrict__ signs2,
     int n_kv_heads,
     int head_dim,
-    int value_bits
+    int value_bits,
+    const float* __restrict__ tqv_centroids,
+    const float* __restrict__ tqv_thresholds
 ) {
     const int h = blockIdx.x;
-    if (h >= n_kv_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
+    if (h >= n_kv_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 1 && value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
     const int tid = threadIdx.x;
     const int pos = pos_buf[0];
 
-    const int bytes_per_head = 4 + (head_dim * value_bits) / 8;
+    const int storage_bits = (value_bits == 1) ? 2 : value_bits;
+    const int bytes_per_head = 4 + (head_dim * storage_bits) / 8;
     const int bytes_per_pos = n_kv_heads * bytes_per_head;
     const float* src = v_src + h * head_dim;
     unsigned char* out = v_dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
@@ -42,7 +69,29 @@ extern "C" __global__ void kv_cache_write_tqv4(
     }
 
     int i0, i1, i2, i3, i4 = 0, i5 = 0, i6 = 0, i7 = 0;
-    if (value_bits == 4 && head_dim == 256) {
+    if (tqv_thresholds != nullptr) {
+        i0 = tqv_quantize_table(v0, tqv_thresholds, value_bits);
+        i1 = tqv_quantize_table(v1, tqv_thresholds, value_bits);
+        i2 = tqv_quantize_table(v2, tqv_thresholds, value_bits);
+        i3 = tqv_quantize_table(v3, tqv_thresholds, value_bits);
+        if (head_dim == 256) {
+            i4 = tqv_quantize_table(v4, tqv_thresholds, value_bits);
+            i5 = tqv_quantize_table(v5, tqv_thresholds, value_bits);
+            i6 = tqv_quantize_table(v6, tqv_thresholds, value_bits);
+            i7 = tqv_quantize_table(v7, tqv_thresholds, value_bits);
+        }
+    } else if (value_bits == 1) {
+        i0 = turbo_quantize_ternary(v0, head_dim);
+        i1 = turbo_quantize_ternary(v1, head_dim);
+        i2 = turbo_quantize_ternary(v2, head_dim);
+        i3 = turbo_quantize_ternary(v3, head_dim);
+        if (head_dim == 256) {
+            i4 = turbo_quantize_ternary(v4, head_dim);
+            i5 = turbo_quantize_ternary(v5, head_dim);
+            i6 = turbo_quantize_ternary(v6, head_dim);
+            i7 = turbo_quantize_ternary(v7, head_dim);
+        }
+    } else if (value_bits == 4 && head_dim == 256) {
         i0 = turbo_quantize_4bit_256(v0);
         i1 = turbo_quantize_4bit_256(v1);
         i2 = turbo_quantize_4bit_256(v2);
@@ -87,7 +136,26 @@ extern "C" __global__ void kv_cache_write_tqv4(
     }
 
     float rsq;
-    if (value_bits == 4 && head_dim == 256) {
+    if (tqv_centroids != nullptr) {
+        rsq = tqv_centroid_table(i0, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i0, value_bits, head_dim, tqv_centroids)
+            + tqv_centroid_table(i1, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i1, value_bits, head_dim, tqv_centroids)
+            + tqv_centroid_table(i2, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i2, value_bits, head_dim, tqv_centroids)
+            + tqv_centroid_table(i3, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i3, value_bits, head_dim, tqv_centroids);
+        if (head_dim == 256) {
+            rsq += tqv_centroid_table(i4, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i4, value_bits, head_dim, tqv_centroids)
+                +  tqv_centroid_table(i5, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i5, value_bits, head_dim, tqv_centroids)
+                +  tqv_centroid_table(i6, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i6, value_bits, head_dim, tqv_centroids)
+                +  tqv_centroid_table(i7, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i7, value_bits, head_dim, tqv_centroids);
+        }
+    } else if (value_bits == 1 && head_dim == 256) {
+        rsq = TURBO_C1_256[i0]*TURBO_C1_256[i0] + TURBO_C1_256[i1]*TURBO_C1_256[i1]
+             + TURBO_C1_256[i2]*TURBO_C1_256[i2] + TURBO_C1_256[i3]*TURBO_C1_256[i3]
+             + TURBO_C1_256[i4]*TURBO_C1_256[i4] + TURBO_C1_256[i5]*TURBO_C1_256[i5]
+             + TURBO_C1_256[i6]*TURBO_C1_256[i6] + TURBO_C1_256[i7]*TURBO_C1_256[i7];
+    } else if (value_bits == 1) {
+        rsq = TURBO_C1[i0]*TURBO_C1[i0] + TURBO_C1[i1]*TURBO_C1[i1]
+             + TURBO_C1[i2]*TURBO_C1[i2] + TURBO_C1[i3]*TURBO_C1[i3];
+    } else if (value_bits == 4 && head_dim == 256) {
         rsq = TURBO_C4_256[i0]*TURBO_C4_256[i0] + TURBO_C4_256[i1]*TURBO_C4_256[i1]
              + TURBO_C4_256[i2]*TURBO_C4_256[i2] + TURBO_C4_256[i3]*TURBO_C4_256[i3]
              + TURBO_C4_256[i4]*TURBO_C4_256[i4] + TURBO_C4_256[i5]*TURBO_C4_256[i5]
@@ -175,16 +243,19 @@ extern "C" __global__ void kv_cache_write_tqv4_batched(
     int n_kv_heads,
     int head_dim,
     int value_bits,
+    const float* __restrict__ tqv_centroids,
+    const float* __restrict__ tqv_thresholds,
     int batch_size
 ) {
     const int h = blockIdx.x;
     const int bid = blockIdx.y;
-    if (h >= n_kv_heads || bid >= batch_size || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
+    if (h >= n_kv_heads || bid >= batch_size || (head_dim != 128 && head_dim != 256) || (value_bits != 1 && value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
     const int tid = threadIdx.x;
     const int pos = positions[bid];
 
     const int kv_dim = n_kv_heads * head_dim;
-    const int bytes_per_head = 4 + (head_dim * value_bits) / 8;
+    const int storage_bits = (value_bits == 1) ? 2 : value_bits;
+    const int bytes_per_head = 4 + (head_dim * storage_bits) / 8;
     const int bytes_per_pos = n_kv_heads * bytes_per_head;
     const float* src = v_src + bid * kv_dim + h * head_dim;
     unsigned char* out = v_dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
@@ -210,7 +281,29 @@ extern "C" __global__ void kv_cache_write_tqv4_batched(
     }
 
     int i0, i1, i2, i3, i4 = 0, i5 = 0, i6 = 0, i7 = 0;
-    if (value_bits == 4 && head_dim == 256) {
+    if (tqv_thresholds != nullptr) {
+        i0 = tqv_quantize_table(v0, tqv_thresholds, value_bits);
+        i1 = tqv_quantize_table(v1, tqv_thresholds, value_bits);
+        i2 = tqv_quantize_table(v2, tqv_thresholds, value_bits);
+        i3 = tqv_quantize_table(v3, tqv_thresholds, value_bits);
+        if (head_dim == 256) {
+            i4 = tqv_quantize_table(v4, tqv_thresholds, value_bits);
+            i5 = tqv_quantize_table(v5, tqv_thresholds, value_bits);
+            i6 = tqv_quantize_table(v6, tqv_thresholds, value_bits);
+            i7 = tqv_quantize_table(v7, tqv_thresholds, value_bits);
+        }
+    } else if (value_bits == 1) {
+        i0 = turbo_quantize_ternary(v0, head_dim);
+        i1 = turbo_quantize_ternary(v1, head_dim);
+        i2 = turbo_quantize_ternary(v2, head_dim);
+        i3 = turbo_quantize_ternary(v3, head_dim);
+        if (head_dim == 256) {
+            i4 = turbo_quantize_ternary(v4, head_dim);
+            i5 = turbo_quantize_ternary(v5, head_dim);
+            i6 = turbo_quantize_ternary(v6, head_dim);
+            i7 = turbo_quantize_ternary(v7, head_dim);
+        }
+    } else if (value_bits == 4 && head_dim == 256) {
         i0 = turbo_quantize_4bit_256(v0);
         i1 = turbo_quantize_4bit_256(v1);
         i2 = turbo_quantize_4bit_256(v2);
@@ -255,7 +348,26 @@ extern "C" __global__ void kv_cache_write_tqv4_batched(
     }
 
     float rsq;
-    if (value_bits == 4 && head_dim == 256) {
+    if (tqv_centroids != nullptr) {
+        rsq = tqv_centroid_table(i0, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i0, value_bits, head_dim, tqv_centroids)
+            + tqv_centroid_table(i1, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i1, value_bits, head_dim, tqv_centroids)
+            + tqv_centroid_table(i2, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i2, value_bits, head_dim, tqv_centroids)
+            + tqv_centroid_table(i3, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i3, value_bits, head_dim, tqv_centroids);
+        if (head_dim == 256) {
+            rsq += tqv_centroid_table(i4, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i4, value_bits, head_dim, tqv_centroids)
+                +  tqv_centroid_table(i5, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i5, value_bits, head_dim, tqv_centroids)
+                +  tqv_centroid_table(i6, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i6, value_bits, head_dim, tqv_centroids)
+                +  tqv_centroid_table(i7, value_bits, head_dim, tqv_centroids) * tqv_centroid_table(i7, value_bits, head_dim, tqv_centroids);
+        }
+    } else if (value_bits == 1 && head_dim == 256) {
+        rsq = TURBO_C1_256[i0]*TURBO_C1_256[i0] + TURBO_C1_256[i1]*TURBO_C1_256[i1]
+             + TURBO_C1_256[i2]*TURBO_C1_256[i2] + TURBO_C1_256[i3]*TURBO_C1_256[i3]
+             + TURBO_C1_256[i4]*TURBO_C1_256[i4] + TURBO_C1_256[i5]*TURBO_C1_256[i5]
+             + TURBO_C1_256[i6]*TURBO_C1_256[i6] + TURBO_C1_256[i7]*TURBO_C1_256[i7];
+    } else if (value_bits == 1) {
+        rsq = TURBO_C1[i0]*TURBO_C1[i0] + TURBO_C1[i1]*TURBO_C1[i1]
+             + TURBO_C1[i2]*TURBO_C1[i2] + TURBO_C1[i3]*TURBO_C1[i3];
+    } else if (value_bits == 4 && head_dim == 256) {
         rsq = TURBO_C4_256[i0]*TURBO_C4_256[i0] + TURBO_C4_256[i1]*TURBO_C4_256[i1]
              + TURBO_C4_256[i2]*TURBO_C4_256[i2] + TURBO_C4_256[i3]*TURBO_C4_256[i3]
              + TURBO_C4_256[i4]*TURBO_C4_256[i4] + TURBO_C4_256[i5]*TURBO_C4_256[i5]

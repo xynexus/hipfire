@@ -7,7 +7,7 @@ use crate::llama::{
     weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat, WeightTensor,
 };
 use crate::speculative::HiddenStateRingBuffer;
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ─────────────────────────────────────────────────────────────
@@ -3143,6 +3143,52 @@ pub struct Qwen35Scratch {
     pub prefill_batch: Option<PrefillBatchScratch>,
 }
 
+fn maybe_dump_tqv_value_samples(
+    gpu: &mut Gpu,
+    dst: &GpuTensor,
+    v_src: &GpuTensor,
+    kv_cache: &llama::KvCache,
+    config: &Qwen35Config,
+) -> HipResult<()> {
+    let path = match std::env::var("HIPFIRE_TQV_CAPTURE") {
+        Ok(path) if !path.is_empty() => path,
+        _ => return Ok(()),
+    };
+    static SAMPLE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    let kv_dim = config.n_kv_heads * config.head_dim;
+    let limit = std::env::var("HIPFIRE_TQV_CAPTURE_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    let start = SAMPLE_COUNT.fetch_add(kv_dim, std::sync::atomic::Ordering::Relaxed);
+    if start >= limit {
+        return Ok(());
+    }
+    let n = kv_dim.min(limit - start);
+
+    gpu.tqv_capture_values(
+        dst,
+        v_src,
+        kv_cache.fwht_signs1.as_ref().unwrap(),
+        kv_cache.fwht_signs2.as_ref().unwrap(),
+        config.n_kv_heads,
+        config.head_dim,
+    )?;
+
+    let mut bytes = vec![0u8; n * std::mem::size_of::<f32>()];
+    gpu.hip.memcpy_dtoh_at(&mut bytes, &dst.buf, 0)?;
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| HipError::new(1, &format!("open HIPFIRE_TQV_CAPTURE: {e}")))?;
+    file.write_all(&bytes)
+        .map_err(|e| HipError::new(1, &format!("write HIPFIRE_TQV_CAPTURE: {e}")))?;
+    Ok(())
+}
+
 impl Qwen35Scratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, repeat_window: usize) -> HipResult<Self> {
         // Flash partials are sized for up to 8192 ctx. Override via new_with_kv_max.
@@ -5142,6 +5188,8 @@ fn forward_prefill_chunk(
                         config.n_kv_heads,
                         config.head_dim,
                         value_bits,
+                        kv_cache.tqv_centroids.as_ref(),
+                        kv_cache.tqv_thresholds.as_ref(),
                         n,
                     )?;
                 } else if kv_cache.quant_asym4 {
@@ -5243,6 +5291,7 @@ fn forward_prefill_chunk(
                         config.n_kv_heads,
                         config.head_dim,
                         value_bits,
+                        kv_cache.tqv_centroids.as_ref(),
                         kv_cache.physical_cap,
                         max_ctx_len,
                         n,
@@ -5956,6 +6005,8 @@ fn forward_prefill_chunk(
                         config.n_kv_heads,
                         config.head_dim,
                         value_bits,
+                        kv_cache.tqv_centroids.as_ref(),
+                        kv_cache.tqv_thresholds.as_ref(),
                         n,
                     )?;
                 } else if kv_cache.quant_asym4 {
@@ -6047,6 +6098,7 @@ fn forward_prefill_chunk(
                         config.n_kv_heads,
                         config.head_dim,
                         value_bits,
+                        kv_cache.tqv_centroids.as_ref(),
                         kv_cache.physical_cap,
                         max_ctx_len,
                         n,
@@ -6388,6 +6440,7 @@ fn run_fa_layer_body(
         let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
         let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
         let value_bits = kv_cache.tqv_value_bits();
+        maybe_dump_tqv_value_samples(gpu, &s.fa_attn_out, &s.fa_v, kv_cache, config)?;
         gpu.kv_cache_write_asym4_tqv4_fused(
             &kv_cache.k_gpu[layer_idx],
             &kv_cache.v_gpu[layer_idx],
@@ -6401,6 +6454,8 @@ fn run_fa_layer_body(
             config.n_kv_heads,
             config.head_dim,
             value_bits,
+            kv_cache.tqv_centroids.as_ref(),
+            kv_cache.tqv_thresholds.as_ref(),
         )?;
         gpu.attention_flash_asym4_tqv4(
             &s.fa_q,
@@ -6417,6 +6472,7 @@ fn run_fa_layer_body(
             config.n_kv_heads,
             config.head_dim,
             value_bits,
+            kv_cache.tqv_centroids.as_ref(),
             kv_cache.physical_cap,
             &s.flash_partials,
         )?;
@@ -7040,6 +7096,7 @@ fn forward_scratch_layers(
                     let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
                     let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
                     let value_bits = kv_cache.tqv_value_bits();
+                    maybe_dump_tqv_value_samples(gpu, &s.fa_attn_out, &s.fa_v, kv_cache, config)?;
                     gpu.kv_cache_write_asym4_tqv4_fused(
                         &kv_cache.k_gpu[layer_idx],
                         &kv_cache.v_gpu[layer_idx],
@@ -7053,6 +7110,8 @@ fn forward_scratch_layers(
                         config.n_kv_heads,
                         config.head_dim,
                         value_bits,
+                        kv_cache.tqv_centroids.as_ref(),
+                        kv_cache.tqv_thresholds.as_ref(),
                     )?;
                     gpu.attention_flash_asym4_tqv4(
                         &s.fa_q,
@@ -7069,6 +7128,7 @@ fn forward_scratch_layers(
                         config.n_kv_heads,
                         config.head_dim,
                         value_bits,
+                        kv_cache.tqv_centroids.as_ref(),
                         kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;
@@ -7575,6 +7635,7 @@ fn forward_scratch_layers(
                     let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
                     let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
                     let value_bits = kv_cache.tqv_value_bits();
+                    maybe_dump_tqv_value_samples(gpu, &s.fa_attn_out, &s.fa_v, kv_cache, config)?;
                     gpu.kv_cache_write_asym4_tqv4_fused(
                         &kv_cache.k_gpu[layer_idx],
                         &kv_cache.v_gpu[layer_idx],
@@ -7588,6 +7649,8 @@ fn forward_scratch_layers(
                         config.n_kv_heads,
                         config.head_dim,
                         value_bits,
+                        kv_cache.tqv_centroids.as_ref(),
+                        kv_cache.tqv_thresholds.as_ref(),
                     )?;
                     gpu.attention_flash_asym4_tqv4(
                         &s.fa_q,
@@ -7604,6 +7667,7 @@ fn forward_scratch_layers(
                         config.n_kv_heads,
                         config.head_dim,
                         value_bits,
+                        kv_cache.tqv_centroids.as_ref(),
                         kv_cache.physical_cap,
                         &s.flash_partials,
                     )?;

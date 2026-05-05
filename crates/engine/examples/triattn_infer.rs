@@ -18,7 +18,9 @@
 //! in v1; other modes silently fall back to plain TriAttention.
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
@@ -32,11 +34,17 @@ fn main() {
     use std::io::{Read, Write};
     use std::path::Path;
 
-    enum Policy { Plain(EvictionCtx), Cask(CaskCtx) }
+    enum Policy {
+        Plain(EvictionCtx),
+        Cask(CaskCtx),
+    }
     impl Policy {
-        fn maybe_evict(&self, gpu: &mut Gpu, kv: &mut KvCache, physical: usize)
-            -> hip_bridge::HipResult<Option<engine::triattn::EvictionResult>>
-        {
+        fn maybe_evict(
+            &self,
+            gpu: &mut Gpu,
+            kv: &mut KvCache,
+            physical: usize,
+        ) -> hip_bridge::HipResult<Option<engine::triattn::EvictionResult>> {
             match self {
                 Policy::Plain(c) => c.maybe_evict(gpu, kv, physical),
                 Policy::Cask(c) => c.maybe_evict(gpu, kv, physical),
@@ -64,16 +72,46 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--model" => { model = Some(args[i + 1].clone()); i += 2; }
-            "--sidecar" => { sidecar = Some(args[i + 1].clone()); i += 2; }
-            "--kv-mode" => { kv_mode = args[i + 1].clone(); i += 2; }
-            "--budget" => { budget = args[i + 1].parse().unwrap(); i += 2; }
-            "--beta" => { beta = args[i + 1].parse().unwrap(); i += 2; }
-            "--max-tokens" => { max_tokens = args[i + 1].parse().unwrap(); i += 2; }
-            "--prompt" => { prompt_arg = Some(args[i + 1].clone()); i += 2; }
-            "--cask" => { use_cask = true; i += 1; }
-            "--core-frac" => { core_frac = args[i + 1].parse().unwrap(); i += 2; }
-            "--fold-m" => { fold_m = args[i + 1].parse().unwrap(); i += 2; }
+            "--model" => {
+                model = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--sidecar" => {
+                sidecar = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--kv-mode" => {
+                kv_mode = args[i + 1].clone();
+                i += 2;
+            }
+            "--budget" => {
+                budget = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--beta" => {
+                beta = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--max-tokens" => {
+                max_tokens = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--prompt" => {
+                prompt_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--cask" => {
+                use_cask = true;
+                i += 1;
+            }
+            "--core-frac" => {
+                core_frac = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--fold-m" => {
+                fold_m = args[i + 1].parse().unwrap();
+                i += 2;
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(1);
@@ -100,8 +138,17 @@ fn main() {
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let centers = TriAttnCenters::load(Path::new(&sidecar_path)).expect("load sidecar");
 
-    let fa_layer_ids: Vec<usize> = config.layer_types.iter().enumerate()
-        .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
+    let fa_layer_ids: Vec<usize> = config
+        .layer_types
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            if *t == LayerType::FullAttention {
+                Some(i)
+            } else {
+                None
+            }
+        })
         .collect();
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
 
@@ -111,21 +158,60 @@ fn main() {
     let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
 
     let mut kv = match kv_mode.as_str() {
-        "asym2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-        "asym3" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-        "asym4" => KvCache::new_gpu_asym4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-        "q8" => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-        other => { eprintln!("unsupported kv mode: {other}"); std::process::exit(1); }
+        "asym2" => KvCache::new_gpu_asym2(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
+        "asym3" => KvCache::new_gpu_asym3(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
+        "asym4" => KvCache::new_gpu_asym4(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
+        "q8" => KvCache::new_gpu_q8(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
+        other => {
+            eprintln!("unsupported kv mode: {other}");
+            std::process::exit(1);
+        }
     };
     let mut dn = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
     let base = EvictionCtx::new(
-        &mut gpu, &centers, fa_layer_ids.clone(),
-        budget, beta,
-        config.n_heads, config.n_kv_heads, config.head_dim,
-        n_rot, config.rope_theta, kv_seq,
-    ).expect("build EvictionCtx");
+        &mut gpu,
+        &centers,
+        fa_layer_ids.clone(),
+        budget,
+        beta,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        n_rot,
+        config.rope_theta,
+        kv_seq,
+    )
+    .expect("build EvictionCtx");
     let ctx = if use_cask {
         Policy::Cask(CaskCtx::new(base, core_frac, fold_m))
     } else {
@@ -165,14 +251,22 @@ fn main() {
     };
     eprintln!(
         "triattn_infer: {} prompt tokens, budget={} beta={} kv_mode={} policy={} max_tokens={}",
-        toks.len(), budget, beta, kv_mode, policy_tag, max_tokens,
+        toks.len(),
+        budget,
+        beta,
+        kv_mode,
+        policy_tag,
+        max_tokens,
     );
 
     // Prefill with in-loop eviction so long prompts don't exceed the cache.
     let mut physical = 0usize;
     let t0 = std::time::Instant::now();
     for t in &toks {
-        qwen35::forward_scratch(&mut gpu, &weights, &config, *t, physical, &mut kv, &mut dn, &scratch).unwrap();
+        qwen35::forward_scratch(
+            &mut gpu, &weights, &config, *t, physical, &mut kv, &mut dn, &scratch,
+        )
+        .unwrap();
         physical += 1;
         if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
             physical = ev.new_physical;
@@ -183,7 +277,10 @@ fn main() {
     let t_prefill = t0.elapsed();
     eprintln!(
         "[triattn] prefill: {:.2}s  physical={} compact_offset={} evictions={}",
-        t_prefill.as_secs_f64(), physical, kv.compact_offset, ctx.eviction_count(),
+        t_prefill.as_secs_f64(),
+        physical,
+        kv.compact_offset,
+        ctx.eviction_count(),
     );
 
     // Decode greedy.
@@ -198,7 +295,10 @@ fn main() {
     let _ = out.flush();
 
     for _ in 0..max_tokens {
-        qwen35::forward_scratch(&mut gpu, &weights, &config, next, physical, &mut kv, &mut dn, &scratch).unwrap();
+        qwen35::forward_scratch(
+            &mut gpu, &weights, &config, next, physical, &mut kv, &mut dn, &scratch,
+        )
+        .unwrap();
         physical += 1;
         if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
             physical = ev.new_physical;
@@ -207,7 +307,9 @@ fn main() {
         let _ = &ctx;
         logits = gpu.download_f32(&scratch.logits).unwrap();
         next = llama::argmax(&logits);
-        if next == config.eos_token { break; }
+        if next == config.eos_token {
+            break;
+        }
         emitted.push(next);
         let piece = tok.decode(&[next]);
         let _ = out.write_all(piece.as_bytes());

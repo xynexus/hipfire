@@ -289,7 +289,14 @@ fn main() {
         let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
         eprintln!("Pre-compiling kernels for {}...", gpu.arch);
         let mut errors = 0usize;
-        for kv in &["asym3", "asym4_tqv2", "asym4_tqv3", "asym4_tqv4", "q8"] {
+        for kv in &[
+            "asym3",
+            "asym4_tqv1",
+            "asym4_tqv2",
+            "asym4_tqv3",
+            "asym4_tqv4",
+            "q8",
+        ] {
             for wq in &["mq4", "mq6", "hfq4", "hfq6", "q8"] {
                 if let Err(e) = gpu.precompile_qwen35(wq, kv, 256) {
                     eprintln!("  {wq}/{kv}: {e}");
@@ -1117,6 +1124,7 @@ fn load_model(
         //   asym4 — K at 4-bit rotated, V at Q8_0. 5.1× (slightly safer).
         //   asym2 — K at 2-bit rotated, V at Q8_0. 6.0× (loses rare-token tail).
         //   q8    — K+V both Q8_0. 3.76× (reference quality).
+        //   fp32  — unquantized K+V. Quality reference for short-context gates.
         //
         // Legacy "turbo{2,3,4}" aliases map to asym{2,3,4} for backward compat.
         //
@@ -1124,6 +1132,22 @@ fn load_model(
         // physical_cap derived above. Without eviction, physical_cap==max_seq
         // and these match the back-compat wrappers byte-for-byte.
         let kv = match kv_mode.as_str() {
+            "fp32" | "f32" => {
+                if physical_cap != max_seq {
+                    eprintln!(
+                        "  KV cache: fp32 ignores physical_cap={physical_cap}; using max_seq={max_seq}"
+                    );
+                }
+                eprintln!("  KV cache: fp32");
+                llama::KvCache::new_gpu(
+                    gpu,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_seq,
+                )
+                .map_err(|e| format!("{e}"))?
+            }
             "q8" => {
                 eprintln!("  KV cache: Q8");
                 llama::KvCache::new_gpu_q8_capped(
@@ -1136,6 +1160,15 @@ fn load_model(
                 )
                 .map_err(|e| format!("{e}"))?
             }
+            "asym4_tqv1" | "tqv1" | "tq1" => llama::KvCache::new_gpu_asym4_tqv1_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?,
             "asym4_tqv2" | "tqv2" => llama::KvCache::new_gpu_asym4_tqv2_capped(
                 gpu,
                 config.n_layers,

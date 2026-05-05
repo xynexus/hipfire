@@ -119,8 +119,8 @@ fn kfd_ior<T>(nr: u8) -> libc::c_ulong {
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct AqlPacket {
-    pub header: u16,         // [0:1]
-    pub setup: u16,          // [2:3]
+    pub header: u16, // [0:1]
+    pub setup: u16,  // [2:3]
     pub workgroup_size_x: u16,
     pub workgroup_size_y: u16,
     pub workgroup_size_z: u16,
@@ -130,7 +130,7 @@ pub struct AqlPacket {
     pub grid_size_z: u32,
     pub private_segment_size: u32,
     pub group_segment_size: u32,
-    pub kernel_object: u64,  // GPU VA of kernel DESCRIPTOR
+    pub kernel_object: u64, // GPU VA of kernel DESCRIPTOR
     pub kernarg_address: u64,
     pub _reserved1: u64,
     pub completion_signal: u64,
@@ -148,14 +148,14 @@ pub struct AqlQueue {
     kfd_fd: i32,
     gpu_id: u32,
     queue_id: u32,
-    ring_base: *mut u8,          // mmap'd ring buffer
+    ring_base: *mut u8, // mmap'd ring buffer
     ring_size: u32,
-    write_ptr: *mut AtomicU64,   // mmap'd write pointer (kernel manages)
-    read_ptr: *mut AtomicU64,    // mmap'd read pointer
-    doorbell: *mut u32,          // mmap'd doorbell register
-    ring_handle: u64,            // KFD allocation handle for ring
-    eop_handle: u64,             // KFD allocation handle for EOP
-    signal_buf: *mut u64,        // mmap'd signal buffer for completion
+    write_ptr: *mut AtomicU64, // mmap'd write pointer (kernel manages)
+    read_ptr: *mut AtomicU64,  // mmap'd read pointer
+    doorbell: *mut u32,        // mmap'd doorbell register
+    ring_handle: u64,          // KFD allocation handle for ring
+    eop_handle: u64,           // KFD allocation handle for EOP
+    signal_buf: *mut u64,      // mmap'd signal buffer for completion
     signal_handle: u64,
     signal_va: u64,
 }
@@ -165,50 +165,99 @@ impl AqlQueue {
     pub fn new(dev: &Device) -> Result<Self> {
         // Open /dev/kfd
         let kfd_fd = unsafe {
-            libc::open(b"/dev/kfd\0".as_ptr() as *const i8, libc::O_RDWR | libc::O_CLOEXEC)
+            libc::open(
+                b"/dev/kfd\0".as_ptr() as *const i8,
+                libc::O_RDWR | libc::O_CLOEXEC,
+            )
         };
         if kfd_fd < 0 {
-            return Err(RedlineError { code: kfd_fd, message: "failed to open /dev/kfd".into() });
+            return Err(RedlineError {
+                code: kfd_fd,
+                message: "failed to open /dev/kfd".into(),
+            });
         }
 
         // Get KFD version
-        let mut ver = KfdGetVersionArgs { major_version: 0, minor_version: 0 };
+        let mut ver = KfdGetVersionArgs {
+            major_version: 0,
+            minor_version: 0,
+        };
         let ret = unsafe { libc::ioctl(kfd_fd, kfd_ior::<KfdGetVersionArgs>(0x01), &mut ver) };
         if ret != 0 {
-            unsafe { libc::close(kfd_fd); }
-            return Err(RedlineError { code: ret, message: "KFD get_version failed".into() });
+            unsafe {
+                libc::close(kfd_fd);
+            }
+            return Err(RedlineError {
+                code: ret,
+                message: "KFD get_version failed".into(),
+            });
         }
-        eprintln!("[redline/kfd] KFD version {}.{}", ver.major_version, ver.minor_version);
+        eprintln!(
+            "[redline/kfd] KFD version {}.{}",
+            ver.major_version, ver.minor_version
+        );
 
         // Get process apertures to discover gpu_id
-        let mut apertures = vec![KfdProcessDeviceApertures {
-            lds_base: 0, lds_limit: 0, scratch_base: 0, scratch_limit: 0,
-            gpuvm_base: 0, gpuvm_limit: 0, gpu_id: 0, pad: 0,
-        }; 8];
+        let mut apertures = vec![
+            KfdProcessDeviceApertures {
+                lds_base: 0,
+                lds_limit: 0,
+                scratch_base: 0,
+                scratch_limit: 0,
+                gpuvm_base: 0,
+                gpuvm_limit: 0,
+                gpu_id: 0,
+                pad: 0,
+            };
+            8
+        ];
         let mut get_apt = KfdGetProcessAperturesNewArgs {
             kfd_process_device_apertures_ptr: apertures.as_mut_ptr() as u64,
             num_of_nodes: apertures.len() as u32,
             pad: 0,
         };
-        let ret = unsafe { libc::ioctl(kfd_fd, kfd_iowr::<KfdGetProcessAperturesNewArgs>(0x14), &mut get_apt) };
+        let ret = unsafe {
+            libc::ioctl(
+                kfd_fd,
+                kfd_iowr::<KfdGetProcessAperturesNewArgs>(0x14),
+                &mut get_apt,
+            )
+        };
         if ret != 0 {
-            unsafe { libc::close(kfd_fd); }
-            return Err(RedlineError { code: ret, message: "KFD get_process_apertures_new failed".into() });
+            unsafe {
+                libc::close(kfd_fd);
+            }
+            return Err(RedlineError {
+                code: ret,
+                message: "KFD get_process_apertures_new failed".into(),
+            });
         }
 
         // Find GPU node (non-zero gpu_id)
         let gpu_id = apertures[..get_apt.num_of_nodes as usize]
-            .iter().find(|a| a.gpu_id != 0)
+            .iter()
+            .find(|a| a.gpu_id != 0)
             .map(|a| a.gpu_id)
-            .ok_or(RedlineError { code: -1, message: "no GPU found in KFD topology".into() })?;
+            .ok_or(RedlineError {
+                code: -1,
+                message: "no GPU found in KFD topology".into(),
+            })?;
         eprintln!("[redline/kfd] gpu_id={}", gpu_id);
 
         // Acquire VM — bridge KFD and DRM address spaces
-        let mut acq = KfdAcquireVmArgs { drm_fd: dev.fd as u32, gpu_id };
+        let mut acq = KfdAcquireVmArgs {
+            drm_fd: dev.fd as u32,
+            gpu_id,
+        };
         let ret = unsafe { libc::ioctl(kfd_fd, kfd_iow::<KfdAcquireVmArgs>(0x15), &mut acq) };
         if ret != 0 {
-            unsafe { libc::close(kfd_fd); }
-            return Err(RedlineError { code: ret, message: format!("KFD acquire_vm failed: {}", std::io::Error::last_os_error()) });
+            unsafe {
+                libc::close(kfd_fd);
+            }
+            return Err(RedlineError {
+                code: ret,
+                message: format!("KFD acquire_vm failed: {}", std::io::Error::last_os_error()),
+            });
         }
         eprintln!("[redline/kfd] VM acquired (drm_fd={})", dev.fd);
 
@@ -237,8 +286,10 @@ impl AqlQueue {
         let rptr_alloc = Self::kfd_alloc_userptr(kfd_fd, gpu_id, 4096)?;
         Self::kfd_map(kfd_fd, rptr_alloc.handle, gpu_id)?;
 
-        eprintln!("[redline/kfd] ring va=0x{:x} eop va=0x{:x} cwsr va=0x{:x}",
-            ring_alloc.gpu_va, eop_alloc.gpu_va, cwsr_alloc.gpu_va);
+        eprintln!(
+            "[redline/kfd] ring va=0x{:x} eop va=0x{:x} cwsr va=0x{:x}",
+            ring_alloc.gpu_va, eop_alloc.gpu_va, cwsr_alloc.gpu_va
+        );
 
         // Create AQL queue
         let mut cq = KfdCreateQueueArgs {
@@ -260,11 +311,21 @@ impl AqlQueue {
         };
         let ret = unsafe { libc::ioctl(kfd_fd, kfd_iowr::<KfdCreateQueueArgs>(0x02), &mut cq) };
         if ret != 0 {
-            unsafe { libc::close(kfd_fd); }
-            return Err(RedlineError { code: ret, message: format!("KFD create_queue failed: {}", std::io::Error::last_os_error()) });
+            unsafe {
+                libc::close(kfd_fd);
+            }
+            return Err(RedlineError {
+                code: ret,
+                message: format!(
+                    "KFD create_queue failed: {}",
+                    std::io::Error::last_os_error()
+                ),
+            });
         }
-        eprintln!("[redline/kfd] AQL queue created: id={}, doorbell_offset=0x{:x}",
-            cq.queue_id, cq.doorbell_offset);
+        eprintln!(
+            "[redline/kfd] AQL queue created: id={}, doorbell_offset=0x{:x}",
+            cq.queue_id, cq.doorbell_offset
+        );
 
         // Write/read pointers are already CPU-mapped (userptr)
         let write_ptr = wptr_alloc.cpu_ptr as *mut AtomicU64;
@@ -272,12 +333,23 @@ impl AqlQueue {
 
         // mmap doorbell page
         let doorbell_page = unsafe {
-            libc::mmap(std::ptr::null_mut(), 8192, libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED, kfd_fd, cq.doorbell_offset as i64)
+            libc::mmap(
+                std::ptr::null_mut(),
+                8192,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                kfd_fd,
+                cq.doorbell_offset as i64,
+            )
         };
         if doorbell_page == libc::MAP_FAILED {
-            unsafe { libc::close(kfd_fd); }
-            return Err(RedlineError { code: -1, message: format!("mmap doorbell failed: {}", std::io::Error::last_os_error()) });
+            unsafe {
+                libc::close(kfd_fd);
+            }
+            return Err(RedlineError {
+                code: -1,
+                message: format!("mmap doorbell failed: {}", std::io::Error::last_os_error()),
+            });
         }
 
         eprintln!("[redline/kfd] AQL queue ready — user-mode dispatch enabled");
@@ -316,7 +388,13 @@ impl AqlQueue {
         let pkt_offset = ((idx & ring_mask) * 64) as usize;
         let pkt_ptr = unsafe { self.ring_base.add(pkt_offset) as *mut AqlPacket };
 
-        let ndims = if grid[2] > 1 { 3u16 } else if grid[1] > 1 { 2 } else { 1 };
+        let ndims = if grid[2] > 1 {
+            3u16
+        } else if grid[1] > 1 {
+            2
+        } else {
+            1
+        };
 
         // Write payload first (everything except header)
         let pkt = AqlPacket {
@@ -367,7 +445,9 @@ impl AqlQueue {
         lds_bytes: u32,
     ) {
         // Reset signal
-        unsafe { self.signal_buf.write_volatile(1); }
+        unsafe {
+            self.signal_buf.write_volatile(1);
+        }
 
         let write_idx = unsafe { &*self.write_ptr };
         let idx = write_idx.load(Ordering::Relaxed);
@@ -375,7 +455,13 @@ impl AqlQueue {
         let pkt_offset = ((idx & ring_mask) * 64) as usize;
         let pkt_ptr = unsafe { self.ring_base.add(pkt_offset) };
 
-        let ndims = if grid[2] > 1 { 3u16 } else if grid[1] > 1 { 2 } else { 1 };
+        let ndims = if grid[2] > 1 {
+            3u16
+        } else if grid[1] > 1 {
+            2
+        } else {
+            1
+        };
 
         unsafe {
             let dst = pkt_ptr as *mut u8;
@@ -419,9 +505,14 @@ impl AqlQueue {
         let timeout = std::time::Instant::now();
         loop {
             let val = unsafe { self.signal_buf.read_volatile() };
-            if val == 0 { break; }
+            if val == 0 {
+                break;
+            }
             if timeout.elapsed().as_secs() > 10 {
-                eprintln!("[redline/kfd] TIMEOUT waiting for AQL dispatch (signal={})", val);
+                eprintln!(
+                    "[redline/kfd] TIMEOUT waiting for AQL dispatch (signal={})",
+                    val
+                );
                 break;
             }
             std::hint::spin_loop();
@@ -432,14 +523,25 @@ impl AqlQueue {
     fn kfd_alloc_userptr(kfd_fd: i32, gpu_id: u32, size: u64) -> Result<KfdUserAlloc> {
         // mmap anonymous system memory
         let cpu_ptr = unsafe {
-            libc::mmap(std::ptr::null_mut(), size as usize, libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE, -1, 0)
+            libc::mmap(
+                std::ptr::null_mut(),
+                size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
         };
         if cpu_ptr == libc::MAP_FAILED {
-            return Err(RedlineError { code: -1, message: "mmap anon failed".into() });
+            return Err(RedlineError {
+                code: -1,
+                message: "mmap anon failed".into(),
+            });
         }
         // Zero it
-        unsafe { std::ptr::write_bytes(cpu_ptr as *mut u8, 0, size as usize); }
+        unsafe {
+            std::ptr::write_bytes(cpu_ptr as *mut u8, 0, size as usize);
+        }
 
         // Register with KFD as userptr
         let mut args = KfdAllocMemoryArgs {
@@ -448,17 +550,30 @@ impl AqlQueue {
             handle: 0,
             mmap_offset: cpu_ptr as u64, // for userptr, mmap_offset = cpu address
             gpu_id,
-            flags: KFD_IOC_ALLOC_MEM_FLAGS_USERPTR | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
-                 | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE,
+            flags: KFD_IOC_ALLOC_MEM_FLAGS_USERPTR
+                | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
+                | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE,
         };
         let ret = unsafe { libc::ioctl(kfd_fd, kfd_iowr::<KfdAllocMemoryArgs>(0x16), &mut args) };
         if ret != 0 {
-            unsafe { libc::munmap(cpu_ptr, size as usize); }
-            return Err(RedlineError { code: ret,
-                message: format!("KFD alloc_userptr({} bytes) failed: {}", size, std::io::Error::last_os_error()) });
+            unsafe {
+                libc::munmap(cpu_ptr, size as usize);
+            }
+            return Err(RedlineError {
+                code: ret,
+                message: format!(
+                    "KFD alloc_userptr({} bytes) failed: {}",
+                    size,
+                    std::io::Error::last_os_error()
+                ),
+            });
         }
         let gpu_va = args.va_addr;
-        Ok(KfdUserAlloc { handle: args.handle, gpu_va, cpu_ptr: cpu_ptr as *mut u8 })
+        Ok(KfdUserAlloc {
+            handle: args.handle,
+            gpu_va,
+            cpu_ptr: cpu_ptr as *mut u8,
+        })
     }
 
     /// KFD memory allocation helper (GTT/VRAM). Returns (handle, gpu_va, mmap_offset).
@@ -474,9 +589,15 @@ impl AqlQueue {
         };
         let ret = unsafe { libc::ioctl(kfd_fd, kfd_iowr::<KfdAllocMemoryArgs>(0x16), &mut args) };
         if ret != 0 {
-            return Err(RedlineError { code: ret,
-                message: format!("KFD alloc_memory({} bytes, flags=0x{:x}) failed: {}",
-                    size, flags, std::io::Error::last_os_error()) });
+            return Err(RedlineError {
+                code: ret,
+                message: format!(
+                    "KFD alloc_memory({} bytes, flags=0x{:x}) failed: {}",
+                    size,
+                    flags,
+                    std::io::Error::last_os_error()
+                ),
+            });
         }
         Ok((args.handle, args.va_addr, args.mmap_offset))
     }
@@ -492,14 +613,19 @@ impl AqlQueue {
         };
         let ret = unsafe { libc::ioctl(kfd_fd, kfd_iowr::<KfdMapMemoryArgs>(0x18), &mut args) };
         if ret != 0 {
-            return Err(RedlineError { code: ret,
-                message: format!("KFD map_memory failed: {}", std::io::Error::last_os_error()) });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("KFD map_memory failed: {}", std::io::Error::last_os_error()),
+            });
         }
         Ok(())
     }
 
     pub fn destroy(&self) {
-        let mut dq = KfdDestroyQueueArgs { queue_id: self.queue_id, pad: 0 };
+        let mut dq = KfdDestroyQueueArgs {
+            queue_id: self.queue_id,
+            pad: 0,
+        };
         unsafe {
             libc::ioctl(self.kfd_fd, kfd_iowr::<KfdDestroyQueueArgs>(0x03), &mut dq);
             libc::close(self.kfd_fd);

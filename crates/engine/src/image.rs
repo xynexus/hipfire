@@ -12,10 +12,16 @@ use std::path::Path;
 /// row/column. Passing any other factor (e.g. the legacy `28` from Qwen2-VL
 /// when patch_size=16) yields odd patch grids on small images and a
 /// merger/LM token-count mismatch downstream.
-pub fn smart_resize(height: usize, width: usize, factor: usize, min_pixels: usize, max_pixels: usize) -> (usize, usize) {
+pub fn smart_resize(
+    height: usize,
+    width: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> (usize, usize) {
     let h_bar = ((height as f64 / factor as f64).round() as usize) * factor;
     let w_bar = ((width as f64 / factor as f64).round() as usize) * factor;
-    
+
     if h_bar * w_bar > max_pixels {
         let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
         let h_bar = factor.max(((height as f64 / beta / factor as f64).floor() as usize) * factor);
@@ -51,7 +57,7 @@ pub fn load_and_preprocess(
     // Qwen3.5-VL: patch_size=16, sms=2 → factor=32. (Qwen2-VL was
     // patch_size=14, sms=2 → factor=28; the literal 28 was wrong here.)
     let factor = patch_size * spatial_merge_size;
-    let min_pixels = 56 * 56;         // 3136
+    let min_pixels = 56 * 56; // 3136
     let max_pixels = 14 * 14 * 4 * 1280; // 1003520
     let (final_h, final_w) = smart_resize(orig_h, orig_w, factor, min_pixels, max_pixels);
 
@@ -87,8 +93,8 @@ pub fn load_and_preprocess(
         for x in 0..w {
             let pixel = rgb.get_pixel(x as u32, y as u32);
             let idx = y * w + x;
-            out[idx] = pixel[0] as f32 / 127.5 - 1.0;             // channel 0 = R
-            out[plane + idx] = pixel[2] as f32 / 127.5 - 1.0;     // channel 1 = B  (was G)
+            out[idx] = pixel[0] as f32 / 127.5 - 1.0; // channel 0 = R
+            out[plane + idx] = pixel[2] as f32 / 127.5 - 1.0; // channel 1 = B  (was G)
             out[2 * plane + idx] = pixel[1] as f32 / 127.5 - 1.0; // channel 2 = G  (was B)
         }
     }

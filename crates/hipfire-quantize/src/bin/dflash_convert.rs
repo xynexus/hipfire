@@ -61,8 +61,8 @@ impl SafetensorsFile {
         let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
         let header_json = std::str::from_utf8(&mmap[8..8 + header_len])
             .expect("safetensors header is not valid utf8");
-        let raw: serde_json::Value = serde_json::from_str(header_json)
-            .expect("safetensors header JSON parse failed");
+        let raw: serde_json::Value =
+            serde_json::from_str(header_json).expect("safetensors header JSON parse failed");
         let mut tensors = HashMap::new();
         if let serde_json::Value::Object(map) = raw {
             for (k, v) in map {
@@ -191,7 +191,9 @@ fn f32_slice_to_f32_bytes(f32_data: &[f32]) -> Vec<u8> {
 /// fwht_forward_256 in rdna_compute: signs1 → butterfly → scale → signs2.
 fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert!(x.len() == 256);
-    for i in 0..256 { x[i] *= signs1[i]; }
+    for i in 0..256 {
+        x[i] *= signs1[i];
+    }
     let mut stride = 1;
     while stride < 256 {
         let mut i = 0;
@@ -207,17 +209,25 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
         stride <<= 1;
     }
     let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 { x[i] *= scale * signs2[i]; }
+    for i in 0..256 {
+        x[i] *= scale * signs2[i];
+    }
 }
 
 /// Generate FWHT sign table matching the engine's gen_fwht_signs.
 /// Standard MQ4 seeds are 42 (signs1) and 1042 (signs2).
 fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
-    }).collect()
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
+        })
+        .collect()
 }
 
 /// MagnumQuant MQ4-G256: FWHT-rotated 4-bit quantization.
@@ -359,9 +369,8 @@ fn resolve_model_path(input: &str) -> String {
             let org = parts[0];
             let name = parts[1];
             let home = std::env::var("HOME").unwrap_or_default();
-            let cache_root = format!(
-                "{home}/.cache/huggingface/hub/models--{org}--{name}/snapshots"
-            );
+            let cache_root =
+                format!("{home}/.cache/huggingface/hub/models--{org}--{name}/snapshots");
             if let Ok(entries) = std::fs::read_dir(&cache_root) {
                 for e in entries.flatten() {
                     let p = e.path();
@@ -391,11 +400,7 @@ fn is_norm_tensor(name: &str) -> bool {
 
 fn parse_int_array(json: &serde_json::Value) -> Vec<i64> {
     json.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_i64())
-                .collect()
-        })
+        .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
         .unwrap_or_default()
 }
 
@@ -535,12 +540,26 @@ fn main() {
     );
 
     // Metadata JSON for the HFQ file.
-    let draft_dtype = if keep_f32 { "f32" } else if use_mq4 { "mq4" } else { "f16" };
+    let draft_dtype = if keep_f32 {
+        "f32"
+    } else if use_mq4 {
+        "mq4"
+    } else {
+        "f16"
+    };
     // FWHT sign tables for MQ4 rotation. Seeds 42/1042 match the engine's
     // `rdna_compute::Gpu::ensure_mq_signs()` so quantized weights here can
     // be dequantized/used correctly on GPU at inference.
-    let signs1: Vec<f32> = if use_mq4 { gen_fwht_signs(42, 256) } else { Vec::new() };
-    let signs2: Vec<f32> = if use_mq4 { gen_fwht_signs(1042, 256) } else { Vec::new() };
+    let signs1: Vec<f32> = if use_mq4 {
+        gen_fwht_signs(42, 256)
+    } else {
+        Vec::new()
+    };
+    let signs2: Vec<f32> = if use_mq4 {
+        gen_fwht_signs(1042, 256)
+    } else {
+        Vec::new()
+    };
     let metadata = serde_json::json!({
         "architecture": "dflash",
         "config": config,
@@ -570,7 +589,10 @@ fn main() {
         .inspect(|p| eprintln!("  loading: {}", p.display()))
         .map(|p| SafetensorsFile::open(p).expect("safetensors open failed"))
         .collect();
-    assert!(!st_files.is_empty(), "no .safetensors files found in input dir");
+    assert!(
+        !st_files.is_empty(),
+        "no .safetensors files found in input dir"
+    );
 
     let mut name_to_file: Vec<(String, usize)> = Vec::new();
     for (fi, st) in st_files.iter().enumerate() {
@@ -586,7 +608,9 @@ fn main() {
     let mut total_bytes_out = 0usize;
 
     for (name, fi) in &name_to_file {
-        let (meta, raw) = st_files[*fi].tensor_data(name).expect("tensor lookup failed");
+        let (meta, raw) = st_files[*fi]
+            .tensor_data(name)
+            .expect("tensor lookup failed");
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
 
@@ -627,7 +651,10 @@ fn main() {
         total_params as f64 / 1e9,
         hfq_tensors.len()
     );
-    eprintln!("  total out  : {:.2} MiB", total_bytes_out as f64 / (1024.0 * 1024.0));
+    eprintln!(
+        "  total out  : {:.2} MiB",
+        total_bytes_out as f64 / (1024.0 * 1024.0)
+    );
 
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {

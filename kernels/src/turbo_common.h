@@ -10,17 +10,29 @@
     else                  { (v) = (v) + _p; }                           \
 } while(0)
 
-// Lloyd-Max optimal centroids for N(0, 1/128) after unit-norm + FWHT(1/sqrt(128))
+// TurboQuant centroids for unit-norm + FWHT(1/sqrt(128)).
+// TQ1 is ternary {-a,0,+a} (~log2(3)=1.58 effective bits) but currently
+// stored in the 2-bit TQV packing path.
+__constant__ float TURBO_C1[3] = {-0.108214f, 0.0f, 0.108214f};
+__constant__ float TURBO_T1[2] = {-0.054155f, 0.054155f};
 __constant__ float TURBO_C2[4] = {-0.133466f, -0.040022f, 0.040022f, 0.133466f};
-__constant__ float TURBO_C3[8] = {-0.190685f, -0.117832f, -0.065717f, -0.021460f, 0.021460f, 0.065717f, 0.117832f, 0.190685f};
+__constant__ float TURBO_C3[8] = {
+    -0.189703f, -0.118656f, -0.066864f, -0.021710f,
+     0.021710f,  0.066864f,  0.118656f,  0.189703f
+};
 __constant__ float TURBO_C4[16] = {
     -0.241565f, -0.182875f, -0.143012f, -0.111016f, -0.083262f, -0.057983f, -0.034295f, -0.011225f,
      0.011225f,  0.034295f,  0.057983f,  0.083262f,  0.111016f,  0.143012f,  0.182875f,  0.241565f
 };
 
-// Lloyd-Max optimal centroids for N(0, 1/256) — all values = 128-dim × 1/sqrt(2)
+// 256-dim centroids — all values = 128-dim × 1/sqrt(2)
+__constant__ float TURBO_C1_256[3] = {-0.076581f, 0.0f, 0.076581f};
+__constant__ float TURBO_T1_256[2] = {-0.038306f, 0.038306f};
 __constant__ float TURBO_C2_256[4] = {-0.094376f, -0.028300f, 0.028300f, 0.094376f};
-__constant__ float TURBO_C3_256[8] = {-0.134860f, -0.083320f, -0.046469f, -0.015176f, 0.015176f, 0.046469f, 0.083320f, 0.134860f};
+__constant__ float TURBO_C3_256[8] = {
+    -0.134790f, -0.083911f, -0.047190f, -0.015305f,
+     0.015305f,  0.047190f,  0.083911f,  0.134790f
+};
 __constant__ float TURBO_C4_256[16] = {
     -0.170807f, -0.129321f, -0.101134f, -0.078505f, -0.058869f, -0.041003f, -0.024249f, -0.007938f,
      0.007938f,  0.024249f,  0.041003f,  0.058869f,  0.078505f,  0.101134f,  0.129321f,  0.170807f
@@ -314,8 +326,8 @@ __device__ int turbo_quantize_2bit(float x) {
 
 // Branchless 3-bit quantize: returns index 0-7
 __device__ int turbo_quantize_3bit(float x) {
-    return (x > -0.154258f) + (x > -0.091775f) + (x > -0.043589f) + (x > 0.0f)
-         + (x > 0.043589f) + (x > 0.091775f) + (x > 0.154258f);
+    return (x > -0.154180f) + (x > -0.092760f) + (x > -0.044287f) + (x > 0.0f)
+         + (x > 0.044287f) + (x > 0.092760f) + (x > 0.154180f);
 }
 
 // Branchless 4-bit quantize: returns index 0-15
@@ -331,8 +343,8 @@ __device__ int turbo_quantize_2bit_256(float x) {
     return (x > -0.061352f) + (x > 0.0f) + (x > 0.061352f);
 }
 __device__ int turbo_quantize_3bit_256(float x) {
-    return (x > -0.109068f) + (x > -0.064903f) + (x > -0.030827f) + (x > 0.0f)
-         + (x > 0.030827f) + (x > 0.064903f) + (x > 0.109068f);
+    return (x > -0.109350f) + (x > -0.065550f) + (x > -0.031248f) + (x > 0.0f)
+         + (x > 0.031248f) + (x > 0.065550f) + (x > 0.109350f);
 }
 __device__ int turbo_quantize_4bit_256(float x) {
     return (x > -0.150086f) + (x > -0.115239f) + (x > -0.089815f) + (x > -0.068691f)

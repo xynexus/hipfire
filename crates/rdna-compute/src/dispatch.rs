@@ -10917,6 +10917,8 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         value_bits: usize,
+        tqv_centroids: Option<&GpuTensor>,
+        tqv_thresholds: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.ensure_givens4_kernel(
             "kv_cache_write_asym_k_givens4",
@@ -10974,6 +10976,12 @@ impl Gpu {
         let nkv = n_kv_heads as i32;
         let hd = head_dim as i32;
         let vb = value_bits as i32;
+        let cp = tqv_centroids
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let tp = tqv_thresholds
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut params: Vec<*mut c_void> = vec![
             &vdp as *const _ as *mut c_void,
             &vsp as *const _ as *mut c_void,
@@ -10983,6 +10991,8 @@ impl Gpu {
             &nkv as *const _ as *mut c_void,
             &hd as *const _ as *mut c_void,
             &vb as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "kv_cache_write_tqv4",
@@ -11000,6 +11010,60 @@ impl Gpu {
                 b.push_i32(nkv);
                 b.push_i32(hd);
                 b.push_i32(vb);
+                b.push_ptr(cp);
+                b.push_ptr(tp);
+                b
+            },
+        )
+    }
+
+    /// Capture TQV value calibration samples.
+    ///
+    /// `dst` receives the normalized + FWHT/sign-rotated V scalars in
+    /// `[n_kv_heads, head_dim]` order. This intentionally mirrors the value
+    /// transform inside `kv_cache_write_tqv4` and does not quantize.
+    pub fn tqv_capture_values(
+        &mut self,
+        dst: &GpuTensor,
+        v_src: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel(
+            "tqv_capture_values",
+            kernels::TQV_CAPTURE_VALUES_SRC,
+            "tqv_capture_values",
+        )?;
+        let dp = dst.buf.as_ptr();
+        let vp = v_src.buf.as_ptr();
+        let s1 = signs1.buf.as_ptr();
+        let s2 = signs2.buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &dp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "tqv_capture_values",
+            [n_kv_heads as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dp);
+                b.push_ptr(vp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(nkv);
+                b.push_i32(hd);
                 b
             },
         )
@@ -11336,6 +11400,8 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         value_bits: usize,
+        tqv_centroids: Option<&GpuTensor>,
+        tqv_thresholds: Option<&GpuTensor>,
         batch_size: usize,
     ) -> HipResult<()> {
         self.launch_asym_k_batched(
@@ -11365,6 +11431,12 @@ impl Gpu {
         let nkv = n_kv_heads as i32;
         let hd = head_dim as i32;
         let vb = value_bits as i32;
+        let cp = tqv_centroids
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let tp = tqv_thresholds
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let bs = batch_size as i32;
         let mut params: Vec<*mut c_void> = vec![
             &vdp as *const _ as *mut c_void,
@@ -11375,6 +11447,8 @@ impl Gpu {
             &nkv as *const _ as *mut c_void,
             &hd as *const _ as *mut c_void,
             &vb as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
             &bs as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
@@ -11393,6 +11467,8 @@ impl Gpu {
                 b.push_i32(nkv);
                 b.push_i32(hd);
                 b.push_i32(vb);
+                b.push_ptr(cp);
+                b.push_ptr(tp);
                 b.push_i32(bs);
                 b
             },
@@ -11535,6 +11611,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         value_bits: usize,
+        tqv_centroids: Option<&GpuTensor>,
         max_seq: usize,
         max_ctx_len: usize,
         batch_size: usize,
@@ -11587,6 +11664,9 @@ impl Gpu {
                 let nkv = n_kv_heads as i32;
                 let hd = head_dim as i32;
                 let vb = value_bits as i32;
+                let cp = tqv_centroids
+                    .map(|t| t.buf.as_ptr())
+                    .unwrap_or(std::ptr::null_mut());
                 let ms = max_seq as i32;
                 let sc = scale;
                 let ts = TILE_SIZE as i32;
@@ -11607,6 +11687,7 @@ impl Gpu {
                     &nkv as *const _ as *mut c_void,
                     &hd as *const _ as *mut c_void,
                     &vb as *const _ as *mut c_void,
+                    &cp as *const _ as *mut c_void,
                     &ms as *const _ as *mut c_void,
                     &sc as *const _ as *mut c_void,
                     &ts as *const _ as *mut c_void,
@@ -11635,6 +11716,7 @@ impl Gpu {
                         b.push_i32(nkv);
                         b.push_i32(hd);
                         b.push_i32(vb);
+                        b.push_ptr(cp);
                         b.push_i32(ms);
                         b.push_f32(sc);
                         b.push_i32(ts);
@@ -12200,6 +12282,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         value_bits: usize,
+        tqv_centroids: Option<&GpuTensor>,
         max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
@@ -12229,6 +12312,9 @@ impl Gpu {
             let nkv = n_kv_heads as i32;
             let hd = head_dim as i32;
             let vb = value_bits as i32;
+            let cp = tqv_centroids
+                .map(|t| t.buf.as_ptr())
+                .unwrap_or(std::ptr::null_mut());
             let ms = max_seq as i32;
             let sc = 1.0f32 / (head_dim as f32).sqrt();
             let ts = TILE_SIZE as i32;
@@ -12245,6 +12331,7 @@ impl Gpu {
                 &nkv as *const _ as *mut c_void,
                 &hd as *const _ as *mut c_void,
                 &vb as *const _ as *mut c_void,
+                &cp as *const _ as *mut c_void,
                 &ms as *const _ as *mut c_void,
                 &sc as *const _ as *mut c_void,
                 &ts as *const _ as *mut c_void,
@@ -12269,6 +12356,7 @@ impl Gpu {
                     b.push_i32(nkv);
                     b.push_i32(hd);
                     b.push_i32(vb);
+                    b.push_ptr(cp);
                     b.push_i32(ms);
                     b.push_f32(sc);
                     b.push_i32(ts);
@@ -16105,7 +16193,8 @@ impl Gpu {
         // KV cache kernels. asym3 is the current default — always ships flash.
         // q8 is the compat path with its own flash tile+reduce for long context.
         match kv_type {
-            "asym4_tqv2" | "tqv2" | "asym4_tqv3" | "tqv3" | "asym4_tqv4" | "tqv4" => {
+            "asym4_tqv1" | "tqv1" | "tq1" | "asym4_tqv2" | "tqv2" | "asym4_tqv3" | "tqv3"
+            | "asym4_tqv4" | "tqv4" => {
                 specs.push((
                     "kv_cache_write_asym_k_givens4",
                     assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_SRC),

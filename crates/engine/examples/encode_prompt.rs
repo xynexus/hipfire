@@ -12,8 +12,8 @@ fn main() {
     let heat = args.iter().any(|a| a == "--heat");
 
     let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
-    let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .expect("tokenizer");
+    let tokenizer =
+        engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
 
     let raw = std::fs::read_to_string(prompt_path).expect("read prompt");
     let text = if normalize {
@@ -32,9 +32,15 @@ fn main() {
     eprintln!("text bytes: {}", text.len());
     eprintln!("token count: {}", ids.len());
     let mut counts = std::collections::HashMap::<u32, usize>::new();
-    for id in &ids { *counts.entry(*id).or_insert(0) += 1; }
+    for id in &ids {
+        *counts.entry(*id).or_insert(0) += 1;
+    }
     let nl_ids = [198u32, 271, 1358];
     eprintln!("newline-id counts:");
-    for nl in nl_ids { eprintln!("  id {:>5}: {}", nl, counts.get(&nl).copied().unwrap_or(0)); }
-    for id in ids { println!("{id}"); }
+    for nl in nl_ids {
+        eprintln!("  id {:>5}: {}", nl, counts.get(&nl).copied().unwrap_or(0));
+    }
+    for id in ids {
+        println!("{id}");
+    }
 }

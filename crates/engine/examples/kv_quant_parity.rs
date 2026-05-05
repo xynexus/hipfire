@@ -1,6 +1,6 @@
 //! Synthetic KV quantization parity for Qwen-style head dimensions.
 //!
-//! Compares the existing asym4 K + Q8 V path against asym4 K + TQV4/TQV2 V
+//! Compares the existing asym4 K + Q8 V path against asym4 K + TQV V
 //! on deterministic Q/K/V tensors. This isolates cache write + flash attention
 //! layout/packing/dequant bugs before text generation enters the picture.
 //!
@@ -70,6 +70,9 @@ fn run_case(
 
     let base = KvCache::new_gpu_asym4(gpu, n_layers, n_kv_heads, head_dim, max_seq)?;
     let tqv = match value_bits {
+        1 => KvCache::new_gpu_asym4_tqv1_capped(
+            gpu, n_layers, n_kv_heads, head_dim, max_seq, max_seq,
+        )?,
         2 => KvCache::new_gpu_asym4_tqv2_capped(
             gpu, n_layers, n_kv_heads, head_dim, max_seq, max_seq,
         )?,
@@ -115,6 +118,8 @@ fn run_case(
             n_kv_heads,
             head_dim,
             value_bits,
+            tqv.tqv_centroids.as_ref(),
+            tqv.tqv_thresholds.as_ref(),
         )?;
         gpu.hip.device_synchronize()?;
         write_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -162,6 +167,7 @@ fn run_case(
         n_kv_heads,
         head_dim,
         value_bits,
+        tqv.tqv_centroids.as_ref(),
         max_seq,
         &partial_tqv,
     )?;
@@ -205,7 +211,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("head_dim,seq,mode,max_abs,mean_abs,cosine,write_ms_per_token");
     for hd in head_dims {
         for &seq in &seqs {
-            for bits in [4usize, 3usize, 2usize] {
+            for bits in [4usize, 3usize, 2usize, 1usize] {
                 let (max_abs, mean_abs, cosine, write_ms) = run_case(&mut gpu, hd, seq, bits)?;
                 println!(
                     "{hd},{seq},asym4_tqv{bits},{max_abs:.8},{mean_abs:.8},{cosine:.8},{write_ms:.4}"

@@ -2,9 +2,8 @@
 //! Supports loading from GGUF files and running inference.
 
 use crate::gguf::{GgmlType, GgufFile, TensorInfo};
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
-use std::path::Path;
 
 /// Model architecture type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2739,9 +2738,10 @@ pub struct KvCache {
     pub head_dim: usize,
     pub quantized: bool,
     pub quant_q8: bool,
-    pub quant_int8: bool,               // true = INT8 with separate scales
-    pub quant_hfq4: bool,               // true = HFQ4 co-located blocks (72 bytes/head)
+    pub quant_int8: bool,                  // true = INT8 with separate scales
+    pub quant_hfq4: bool,                  // true = HFQ4 co-located blocks (72 bytes/head)
     pub quant_asym4: bool, // true = K at 4-bit rotated, V at Q8_0 — RotorQuant planar4 asymmetric
+    pub quant_asym4_tqv1: bool, // true = K at asym4, V at TurboQuant ternary/1.58b in 2-bit packing
     pub quant_asym4_tqv2: bool, // true = K at asym4, V at TurboQuant2/FWHT
     pub quant_asym4_tqv3: bool, // true = K at asym4, V at TurboQuant3/FWHT
     pub quant_asym4_tqv4: bool, // true = K at asym4, V at TurboQuant4/FWHT
@@ -2752,6 +2752,8 @@ pub struct KvCache {
     pub givens_sin: Option<GpuTensor>, // Givens rotation sin table (n_blocks × f32)
     pub fwht_signs1: Option<GpuTensor>, // TurboQuant value FWHT sign vector
     pub fwht_signs2: Option<GpuTensor>, // TurboQuant value FWHT sign vector
+    pub tqv_centroids: Option<GpuTensor>, // Optional calibrated TQV value centroids
+    pub tqv_thresholds: Option<GpuTensor>, // Optional calibrated TQV value thresholds
     /// Per-layer flag: true = this layer uses Q8 (boundary layer)
     pub layer_is_boundary: Vec<bool>,
     /// TriAttention compaction bookkeeping. After each eviction we leave the
@@ -2771,11 +2773,16 @@ impl KvCache {
     }
 
     pub fn is_asym4_tqv(&self) -> bool {
-        self.quant_asym4_tqv2 || self.quant_asym4_tqv3 || self.quant_asym4_tqv4
+        self.quant_asym4_tqv1
+            || self.quant_asym4_tqv2
+            || self.quant_asym4_tqv3
+            || self.quant_asym4_tqv4
     }
 
     pub fn tqv_value_bits(&self) -> usize {
-        if self.quant_asym4_tqv2 {
+        if self.quant_asym4_tqv1 {
+            1
+        } else if self.quant_asym4_tqv2 {
             2
         } else if self.quant_asym4_tqv3 {
             3
@@ -2818,6 +2825,7 @@ impl KvCache {
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
+            quant_asym4_tqv1: false,
             quant_asym4_tqv2: false,
             quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
@@ -2828,6 +2836,8 @@ impl KvCache {
             givens_sin: None,
             fwht_signs1: None,
             fwht_signs2: None,
+            tqv_centroids: None,
+            tqv_thresholds: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -2869,6 +2879,7 @@ impl KvCache {
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
+            quant_asym4_tqv1: false,
             quant_asym4_tqv2: false,
             quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
@@ -2879,6 +2890,8 @@ impl KvCache {
             givens_sin: None,
             fwht_signs1: None,
             fwht_signs2: None,
+            tqv_centroids: None,
+            tqv_thresholds: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -2943,6 +2956,7 @@ impl KvCache {
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
+            quant_asym4_tqv1: false,
             quant_asym4_tqv2: false,
             quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
@@ -2953,6 +2967,8 @@ impl KvCache {
             givens_sin: None,
             fwht_signs1: None,
             fwht_signs2: None,
+            tqv_centroids: None,
+            tqv_thresholds: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -2992,6 +3008,7 @@ impl KvCache {
             quant_int8: true,
             quant_hfq4: false,
             quant_asym4: false,
+            quant_asym4_tqv1: false,
             quant_asym4_tqv2: false,
             quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
@@ -3002,6 +3019,8 @@ impl KvCache {
             givens_sin: None,
             fwht_signs1: None,
             fwht_signs2: None,
+            tqv_centroids: None,
+            tqv_thresholds: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -3041,6 +3060,7 @@ impl KvCache {
             quant_int8: false,
             quant_hfq4: true,
             quant_asym4: false,
+            quant_asym4_tqv1: false,
             quant_asym4_tqv2: false,
             quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
@@ -3051,6 +3071,8 @@ impl KvCache {
             givens_sin: None,
             fwht_signs1: None,
             fwht_signs2: None,
+            tqv_centroids: None,
+            tqv_thresholds: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -3092,6 +3114,7 @@ impl KvCache {
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
+            quant_asym4_tqv1: false,
             quant_asym4_tqv2: false,
             quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
@@ -3102,6 +3125,8 @@ impl KvCache {
             givens_sin: None,
             fwht_signs1: None,
             fwht_signs2: None,
+            tqv_centroids: None,
+            tqv_thresholds: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -3145,6 +3170,7 @@ impl KvCache {
             quant_int8: true,
             quant_hfq4: false,
             quant_asym4: false,
+            quant_asym4_tqv1: false,
             quant_asym4_tqv2: false,
             quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
@@ -3155,6 +3181,8 @@ impl KvCache {
             givens_sin: None,
             fwht_signs1: None,
             fwht_signs2: None,
+            tqv_centroids: None,
+            tqv_thresholds: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -3255,6 +3283,7 @@ impl KvCache {
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: true,
+            quant_asym4_tqv1: false,
             quant_asym4_tqv2: false,
             quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
@@ -3265,6 +3294,8 @@ impl KvCache {
             givens_sin: Some(st),
             fwht_signs1: None,
             fwht_signs2: None,
+            tqv_centroids: None,
+            tqv_thresholds: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -3289,6 +3320,29 @@ impl KvCache {
             max_seq_len,
             physical_cap,
             4,
+        )
+    }
+
+    /// Create asym4_tqv1 KV cache: K at 4-bit Givens, V at ternary TurboQuant.
+    /// Stored in the same 2-bit packing as TQV2 while the codebook has 3 levels.
+    /// head_dim=128 -> K=68 B/head, V=36 B/head -> 104 B/head total.
+    /// head_dim=256 -> K=132 B/head, V=68 B/head -> 200 B/head total.
+    pub fn new_gpu_asym4_tqv1_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym4_tqv_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            1,
         )
     }
 
@@ -3336,6 +3390,85 @@ impl KvCache {
         )
     }
 
+    fn maybe_load_tqv_tables(
+        gpu: &mut Gpu,
+        head_dim: usize,
+        value_bits: usize,
+    ) -> HipResult<(Option<GpuTensor>, Option<GpuTensor>)> {
+        let path = match std::env::var("HIPFIRE_TQV_TABLES") {
+            Ok(path) if !path.is_empty() => path,
+            _ => return Ok((None, None)),
+        };
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| HipError::new(1, &format!("read HIPFIRE_TQV_TABLES={path}: {e}")))?;
+        let root: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| HipError::new(1, &format!("parse HIPFIRE_TQV_TABLES={path}: {e}")))?;
+        let head_key = format!("head_dim_{head_dim}");
+        let table_key = if value_bits == 1 {
+            "tqv1_58".to_string()
+        } else {
+            format!("tqv{value_bits}")
+        };
+        let table = root
+            .get("tables")
+            .and_then(|v| v.get(&head_key))
+            .and_then(|v| v.get("tables"))
+            .and_then(|v| v.get(&table_key))
+            .ok_or_else(|| {
+                HipError::new(
+                    1,
+                    &format!(
+                        "HIPFIRE_TQV_TABLES={path} missing tables.{head_key}.tables.{table_key}"
+                    ),
+                )
+            })?;
+
+        let read_f32_array = |name: &str| -> HipResult<Vec<f32>> {
+            let vals = table
+                .get(name)
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| HipError::new(1, &format!("{table_key}.{name} must be an array")))?;
+            vals.iter()
+                .map(|v| {
+                    v.as_f64().map(|x| x as f32).ok_or_else(|| {
+                        HipError::new(1, &format!("{table_key}.{name} must contain numbers"))
+                    })
+                })
+                .collect()
+        };
+
+        let centroids = read_f32_array("centroids")?;
+        let thresholds = read_f32_array("thresholds")?;
+        let levels = if value_bits == 1 {
+            3usize
+        } else {
+            1usize << value_bits
+        };
+        if centroids.len() != levels || thresholds.len() != levels - 1 {
+            return Err(HipError::new(
+                1,
+                &format!(
+                    "{table_key} expected {} centroids and {} thresholds, got {} and {}",
+                    levels,
+                    levels - 1,
+                    centroids.len(),
+                    thresholds.len()
+                ),
+            ));
+        }
+
+        let cb: Vec<u8> = centroids.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let tb: Vec<u8> = thresholds.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let ct = gpu.alloc_tensor(&[centroids.len()], DType::F32)?;
+        let th = gpu.alloc_tensor(&[thresholds.len()], DType::F32)?;
+        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
+        gpu.hip.memcpy_htod(&th.buf, &tb)?;
+        eprintln!(
+            "KV cache: loaded calibrated {table_key} table for head_dim={head_dim} from {path}"
+        );
+        Ok((Some(ct), Some(th)))
+    }
+
     fn new_gpu_asym4_tqv_capped(
         gpu: &mut Gpu,
         n_layers: usize,
@@ -3345,7 +3478,7 @@ impl KvCache {
         physical_cap: usize,
         value_bits: usize,
     ) -> HipResult<Self> {
-        assert!(value_bits == 2 || value_bits == 3 || value_bits == 4);
+        assert!(value_bits == 1 || value_bits == 2 || value_bits == 3 || value_bits == 4);
         assert!(
             head_dim == 128 || head_dim == 256,
             "asym4_tqv{value_bits} requires head_dim=128 or 256"
@@ -3357,7 +3490,8 @@ impl KvCache {
         let kv_dim = n_kv_heads * head_dim;
         let k_bph = 4 + head_dim / 2;
         let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_bph = 4 + (head_dim * value_bits) / 8;
+        let storage_bits = if value_bits == 1 { 2 } else { value_bits };
+        let v_bph = 4 + (head_dim * storage_bits) / 8;
         let v_elems = (physical_cap * n_kv_heads * v_bph + 3) / 4;
 
         let mut k_gpu = Vec::with_capacity(n_layers);
@@ -3384,8 +3518,15 @@ impl KvCache {
         let s2 = gpu.alloc_tensor(&[head_dim], DType::F32)?;
         gpu.hip.memcpy_htod(&s1.buf, &s1b)?;
         gpu.hip.memcpy_htod(&s2.buf, &s2b)?;
+        let (tqv_centroids, tqv_thresholds) =
+            Self::maybe_load_tqv_tables(gpu, head_dim, value_bits)?;
 
-        eprintln!("KV cache: asym4_tqv{value_bits} (K rotated-4b {k_bph}B + V TQ{value_bits} {v_bph}B = {} B/head, {:.1}x vs fp32, experimental)",
+        let tq_label = if value_bits == 1 {
+            "TQ1.58".to_string()
+        } else {
+            format!("TQ{value_bits}")
+        };
+        eprintln!("KV cache: asym4_tqv{value_bits} (K rotated-4b {k_bph}B + V {tq_label} {v_bph}B = {} B/head, {:.1}x vs fp32, experimental)",
             k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
         Ok(Self {
             k_gpu,
@@ -3402,6 +3543,7 @@ impl KvCache {
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
+            quant_asym4_tqv1: value_bits == 1,
             quant_asym4_tqv2: value_bits == 2,
             quant_asym4_tqv3: value_bits == 3,
             quant_asym4_tqv4: value_bits == 4,
@@ -3412,6 +3554,8 @@ impl KvCache {
             givens_sin: Some(st),
             fwht_signs1: Some(s1),
             fwht_signs2: Some(s2),
+            tqv_centroids,
+            tqv_thresholds,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -3498,6 +3642,7 @@ impl KvCache {
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
+            quant_asym4_tqv1: false,
             quant_asym4_tqv2: false,
             quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
@@ -3508,6 +3653,8 @@ impl KvCache {
             givens_sin: Some(st),
             fwht_signs1: None,
             fwht_signs2: None,
+            tqv_centroids: None,
+            tqv_thresholds: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -3593,6 +3740,7 @@ impl KvCache {
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
+            quant_asym4_tqv1: false,
             quant_asym4_tqv2: false,
             quant_asym4_tqv3: false,
             quant_asym4_tqv4: false,
@@ -3603,6 +3751,8 @@ impl KvCache {
             givens_sin: Some(st),
             fwht_signs1: None,
             fwht_signs2: None,
+            tqv_centroids: None,
+            tqv_thresholds: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -3648,6 +3798,12 @@ impl KvCache {
             let _ = gpu.free_tensor(t);
         }
         if let Some(t) = self.fwht_signs2 {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.tqv_centroids {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.tqv_thresholds {
             let _ = gpu.free_tensor(t);
         }
     }

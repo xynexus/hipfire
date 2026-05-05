@@ -1,14 +1,14 @@
 //! hip-bridge: Safe Rust FFI to AMD HIP runtime via dlopen.
 //! Modeled after rustane's ane-bridge — no link-time dependency on libamdhip64.
 
-mod ffi;
 mod error;
+mod ffi;
 mod kernarg;
 mod rocblas;
 
 pub use error::{HipError, HipResult};
-pub use ffi::{Event, Function, Graph, GraphExec, HipRuntime, Module, Stream};
 pub use ffi::launch_counters;
+pub use ffi::{Event, Function, Graph, GraphExec, HipRuntime, Module, Stream};
 pub use kernarg::KernargBlob;
 pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
 
@@ -51,7 +51,10 @@ impl DeviceBuffer {
     /// # Safety
     /// Caller must ensure the alias doesn't outlive the original.
     pub unsafe fn alias(&self) -> DeviceBuffer {
-        DeviceBuffer { ptr: self.ptr, size: self.size }
+        DeviceBuffer {
+            ptr: self.ptr,
+            size: self.size,
+        }
     }
 }
 

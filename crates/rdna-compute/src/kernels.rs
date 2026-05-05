@@ -668,6 +668,8 @@ pub const ATTENTION_FLASH_ASYM2_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym2_tile.hip");
 pub const KV_CACHE_WRITE_TQV4_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_tqv4.hip");
+pub const TQV_CAPTURE_VALUES_SRC: &str =
+    include_str!("../../../kernels/src/tqv_capture_values.hip");
 pub const ATTENTION_FLASH_ASYM4_TQV4_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym4_tqv4_tile.hip");
 pub const ATTENTION_FLASH_TQV4_REDUCE_SRC: &str =

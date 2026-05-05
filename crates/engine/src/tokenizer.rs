@@ -70,7 +70,7 @@ impl Tokenizer {
         let bos_id = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
         let eos_id = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
         let endoftext = token_to_id.get("<|endoftext|>").copied();
-        let im_end    = token_to_id.get("<|im_end|>").copied();
+        let im_end = token_to_id.get("<|im_end|>").copied();
         let eot_id = match (endoftext, im_end) {
             (Some(et), Some(ie)) if et != eos_id && ie == eos_id => Some(et),
             (Some(et), _) if et != eos_id => Some(et),
@@ -85,7 +85,10 @@ impl Tokenizer {
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
         for (i, tok) in vocab.iter().enumerate() {
             if (tok.starts_with("<|") && tok.ends_with("|>"))
-                || (tok.starts_with("<") && tok.ends_with(">") && tok.len() > 3 && !tok.contains(' '))
+                || (tok.starts_with("<")
+                    && tok.ends_with(">")
+                    && tok.len() > 3
+                    && !tok.contains(' '))
             {
                 special_tokens.push((tok.clone(), i as u32));
             }
@@ -125,7 +128,8 @@ impl Tokenizer {
         }
 
         let merges = if let Some(merges_arr) = model.get("merges").and_then(|v| v.as_array()) {
-            merges_arr.iter()
+            merges_arr
+                .iter()
                 .filter_map(|v| {
                     // HF tokenizer.json stores merges as either "a b" strings or ["a", "b"] arrays
                     if let Some(s) = v.as_str() {
@@ -162,7 +166,10 @@ impl Tokenizer {
                     vocab[id as usize] = content.to_string();
                     token_to_id.insert(content.to_string(), id);
                     let is_special = at.get("special").and_then(|v| v.as_bool()).unwrap_or(false)
-                        || (content.starts_with("<") && content.ends_with(">") && content.len() > 3 && !content.contains(' '));
+                        || (content.starts_with("<")
+                            && content.ends_with(">")
+                            && content.len() > 3
+                            && !content.contains(' '));
                     if is_special {
                         special_tokens.push((content.to_string(), id));
                     }
@@ -171,10 +178,14 @@ impl Tokenizer {
         }
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-        let bos_id = token_to_id.get("<|endoftext|>").copied()
+        let bos_id = token_to_id
+            .get("<|endoftext|>")
+            .copied()
             .or_else(|| token_to_id.get("<s>").copied())
             .unwrap_or(1);
-        let eos_id = token_to_id.get("<|im_end|>").copied()
+        let eos_id = token_to_id
+            .get("<|im_end|>")
+            .copied()
             .or_else(|| token_to_id.get("<|endoftext|>").copied())
             .or_else(|| token_to_id.get("</s>").copied())
             .unwrap_or(2);
@@ -278,7 +289,10 @@ impl Tokenizer {
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
         for (i, tok) in vocab.iter().enumerate() {
             if (tok.starts_with("<|") && tok.ends_with("|>"))
-                || (tok.starts_with("<") && tok.ends_with(">") && tok.len() > 3 && !tok.contains(' '))
+                || (tok.starts_with("<")
+                    && tok.ends_with(">")
+                    && tok.len() > 3
+                    && !tok.contains(' '))
             {
                 special_tokens.push((tok.clone(), i as u32));
             }
@@ -533,10 +547,7 @@ fn byte_to_gpt2_char(b: u8) -> char {
 /// Reverse of byte_to_gpt2_char.
 fn gpt2_char_to_byte(c: char) -> Option<u8> {
     let c = c as u32;
-    if (0x21..=0x7E).contains(&c)
-        || (0xA1..=0xAC).contains(&c)
-        || (0xAE..=0xFF).contains(&c)
-    {
+    if (0x21..=0x7E).contains(&c) || (0xA1..=0xAC).contains(&c) || (0xAE..=0xFF).contains(&c) {
         Some(c as u8)
     } else if c >= 256 && c < 256 + 68 {
         GPT2_OFFSET_TO_BYTE.get((c - 256) as usize).copied()
@@ -551,9 +562,8 @@ static GPT2_BYTE_TO_OFFSET: [u8; 256] = {
     let mut n = 0u8;
     let mut b = 0u16;
     while b < 256 {
-        let is_printable = (b >= 0x21 && b <= 0x7E)
-            || (b >= 0xA1 && b <= 0xAC)
-            || (b >= 0xAE && b <= 0xFF);
+        let is_printable =
+            (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF);
         if !is_printable {
             table[b as usize] = n;
             n += 1;
@@ -569,9 +579,8 @@ static GPT2_OFFSET_TO_BYTE: [u8; 68] = {
     let mut n = 0usize;
     let mut b = 0u16;
     while b < 256 {
-        let is_printable = (b >= 0x21 && b <= 0x7E)
-            || (b >= 0xA1 && b <= 0xAC)
-            || (b >= 0xAE && b <= 0xFF);
+        let is_printable =
+            (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF);
         if !is_printable {
             table[n] = b as u8;
             n += 1;
@@ -708,7 +717,11 @@ impl Tokenizer {
     fn rank_of(&self, id: u32, table: &HashMap<u32, usize>) -> Option<usize> {
         table.get(&id).copied().or_else(|| {
             let s = self.vocab.get(id as usize)?;
-            if s.len() <= 1 { Some(0) } else { None }
+            if s.len() <= 1 {
+                Some(0)
+            } else {
+                None
+            }
         })
     }
 
@@ -732,34 +745,63 @@ impl Tokenizer {
             s.push_str(",\"tokens\":");
             s.push_str(&ids.len().to_string());
             s.push_str(",\"summary\":{");
-            s.push_str(&format!("\"base\":{},\"hot\":{},\"warm\":{},\"cold\":{},\"frozen\":{},\"special\":{}",
-                counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]));
+            s.push_str(&format!(
+                "\"base\":{},\"hot\":{},\"warm\":{},\"cold\":{},\"frozen\":{},\"special\":{}",
+                counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
+            ));
             s.push_str("},\"positions\":[");
             for (pos, &id) in ids.iter().enumerate() {
-                if pos > 0 { s.push(','); }
+                if pos > 0 {
+                    s.push(',');
+                }
                 let rank = self.rank_of(id, &table);
-                let decoded = self.decode(&[id]).replace('\\', "\\\\").replace('"', "\\\"")
-                    .replace('\n', "\\n").replace('\t', "\\t").replace('\r', "\\r");
-                s.push_str(&format!("{{\"pos\":{pos},\"id\":{id},\"rank\":{},\"text\":\"{decoded}\"}}",
-                    rank.map(|r| r.to_string()).unwrap_or_else(|| "null".to_string())));
+                let decoded = self
+                    .decode(&[id])
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\t', "\\t")
+                    .replace('\r', "\\r");
+                s.push_str(&format!(
+                    "{{\"pos\":{pos},\"id\":{id},\"rank\":{},\"text\":\"{decoded}\"}}",
+                    rank.map(|r| r.to_string())
+                        .unwrap_or_else(|| "null".to_string())
+                ));
             }
             s.push_str("]}");
             println!("{s}");
             return;
         }
         let limit: usize = std::env::var("HIPFIRE_PROMPT_HEAT_LIMIT")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(64);
-        eprintln!("[token-heat] prompt={} bytes  tokens={}", text.len(), ids.len());
-        eprintln!("[token-heat] {:>4}  {:>6}  {:>7}  {:7}  {}", "pos", "id", "rank", "class", "decoded");
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        eprintln!(
+            "[token-heat] prompt={} bytes  tokens={}",
+            text.len(),
+            ids.len()
+        );
+        eprintln!(
+            "[token-heat] {:>4}  {:>6}  {:>7}  {:7}  {}",
+            "pos", "id", "rank", "class", "decoded"
+        );
         for (pos, &id) in ids.iter().take(limit).enumerate() {
             let rank = self.rank_of(id, &table);
             let class = HeatClass::from_rank(rank);
             let display = self.decode(&[id]).replace('\n', "\\n").replace('\t', "\\t");
-            let rank_str = rank.map(|r| r.to_string()).unwrap_or_else(|| "-".to_string());
-            eprintln!("[token-heat] {pos:>4}  {id:>6}  {rank_str:>7}  {}  {display:?}", class.label());
+            let rank_str = rank
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            eprintln!(
+                "[token-heat] {pos:>4}  {id:>6}  {rank_str:>7}  {}  {display:?}",
+                class.label()
+            );
         }
         if ids.len() > limit {
-            eprintln!("[token-heat] ... ({} more tokens omitted)", ids.len() - limit);
+            eprintln!(
+                "[token-heat] ... ({} more tokens omitted)",
+                ids.len() - limit
+            );
         }
         eprintln!("[token-heat] summary: BASE={} ({:.0}%)  HOT={} ({:.0}%)  WARM={} ({:.0}%)  COLD={} ({:.0}%)  FROZEN={} ({:.0}%)  SPECIAL={} ({:.0}%)",
             counts[0], 100.0*counts[0] as f32/total as f32,
@@ -770,7 +812,10 @@ impl Tokenizer {
             counts[5], 100.0*counts[5] as f32/total as f32);
         let cold_frac = (counts[3] + counts[4]) as f32 / total as f32;
         if cold_frac > 0.05 {
-            eprintln!("[token-heat] WARNING: {:.1}% cold tokens — likely τ depressor", 100.0 * cold_frac);
+            eprintln!(
+                "[token-heat] WARNING: {:.1}% cold tokens — likely τ depressor",
+                100.0 * cold_frac
+            );
         }
     }
 }
@@ -871,10 +916,7 @@ mod prompt_norm_tests {
 
     #[test]
     fn multiple_independent_runs() {
-        assert_eq!(
-            collapse_newline_runs("a\n\n\nb\n\n\n\nc"),
-            "a\n\nb\n\nc"
-        );
+        assert_eq!(collapse_newline_runs("a\n\n\nb\n\n\n\nc"), "a\n\nb\n\nc");
     }
 
     #[test]

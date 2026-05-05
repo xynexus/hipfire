@@ -33,11 +33,17 @@ fn main() {
     use std::path::Path;
     use std::time::Instant;
 
-    enum CaskPolicy { Plain(EvictionCtx), Cask(CaskCtx) }
+    enum CaskPolicy {
+        Plain(EvictionCtx),
+        Cask(CaskCtx),
+    }
     impl CaskPolicy {
-        fn maybe_evict(&self, gpu: &mut rdna_compute::Gpu, kv: &mut engine::llama::KvCache, physical: usize)
-            -> hip_bridge::HipResult<Option<EvictionResult>>
-        {
+        fn maybe_evict(
+            &self,
+            gpu: &mut rdna_compute::Gpu,
+            kv: &mut engine::llama::KvCache,
+            physical: usize,
+        ) -> hip_bridge::HipResult<Option<EvictionResult>> {
             match self {
                 CaskPolicy::Plain(c) => c.maybe_evict(gpu, kv, physical),
                 CaskPolicy::Cask(c) => c.maybe_evict(gpu, kv, physical),
@@ -104,26 +110,26 @@ fn main() {
     // acceptance on repetition-heavy content). No kernel work; hybrid-arch
     // safe (pure linear verify, no tree state forking).
     let mut pld_enabled: bool = false;
-    let mut pld_min_extract: usize = 3;  // matcher floor; ≥3 tokens to record a match
-    let mut pld_max_extract: usize = 8;  // paper cap
-    let mut pld_ngrams: Vec<usize> = vec![5, 4, 3];  // paper defaults
-    // Goose §4.3 bypass-mode confidence gate: only USE a PLD match when
-    // it's confident enough to beat DFlash. Paper uses consensus ≥ 2
-    // (at least two n-gram lengths agree on first token) and chain length
-    // ≥ 8. 0 disables the gate (use every matcher hit — useful for
-    // diagnostics; usually a net loss on content where DFlash is strong).
+    let mut pld_min_extract: usize = 3; // matcher floor; ≥3 tokens to record a match
+    let mut pld_max_extract: usize = 8; // paper cap
+    let mut pld_ngrams: Vec<usize> = vec![5, 4, 3]; // paper defaults
+                                                    // Goose §4.3 bypass-mode confidence gate: only USE a PLD match when
+                                                    // it's confident enough to beat DFlash. Paper uses consensus ≥ 2
+                                                    // (at least two n-gram lengths agree on first token) and chain length
+                                                    // ≥ 8. 0 disables the gate (use every matcher hit — useful for
+                                                    // diagnostics; usually a net loss on content where DFlash is strong).
     let mut pld_min_consensus: usize = 2;
-    let mut pld_min_chain: usize = 5;  // conservative: below paper's 8 but still filters noise
-    // DDTree (Ringel & Romano 2026): tree-structured verification built from
-    // DFlash per-position draft marginals. Per-path DFS verify (no batched
-    // tree attention) — slower per cycle but correct on hybrid arch. Spike
-    // measurement: does τ improve with the tree structure?
+    let mut pld_min_chain: usize = 5; // conservative: below paper's 8 but still filters noise
+                                      // DDTree (Ringel & Romano 2026): tree-structured verification built from
+                                      // DFlash per-position draft marginals. Per-path DFS verify (no batched
+                                      // tree attention) — slower per cycle but correct on hybrid arch. Spike
+                                      // measurement: does τ improve with the tree structure?
     let mut ddtree_enabled: bool = false;
-    let mut ddtree_budget: usize = 16;  // paper uses 60; cheaper spike default
-    let mut ddtree_topk: usize = 8;     // paper uses B-1 * budget_fanout; small k keeps tree shallow
-    // --ddtree-batched: use spec_step_ddtree_batched (single tree-attention
-    // forward) instead of the per-path DFS. Requires FA batched path (Q8 /
-    // asym3 / asym4 KV). Tree-exact on FA side, linear-replay on GDN.
+    let mut ddtree_budget: usize = 16; // paper uses 60; cheaper spike default
+    let mut ddtree_topk: usize = 8; // paper uses B-1 * budget_fanout; small k keeps tree shallow
+                                    // --ddtree-batched: use spec_step_ddtree_batched (single tree-attention
+                                    // forward) instead of the per-path DFS. Requires FA batched path (Q8 /
+                                    // asym3 / asym4 KV). Tree-exact on FA side, linear-replay on GDN.
     let mut ddtree_batched: bool = false;
     // --ddtree-path-c={phase1|phase2}: dispatch through `spec_step_ddtree_path_c`
     // (PRD docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd).
@@ -229,12 +235,15 @@ fn main() {
             "--adaptive-b-range" => {
                 // Format: "MIN:MAX" e.g. "8:20". Both inclusive.
                 let v = &args[i + 1];
-                let (lo, hi) = v.split_once(':').unwrap_or_else(||
-                    panic!("--adaptive-b-range expects MIN:MAX, got {v:?}"));
+                let (lo, hi) = v
+                    .split_once(':')
+                    .unwrap_or_else(|| panic!("--adaptive-b-range expects MIN:MAX, got {v:?}"));
                 adaptive_b_min = lo.parse().expect("--adaptive-b-range MIN");
                 adaptive_b_max = hi.parse().expect("--adaptive-b-range MAX");
-                assert!(adaptive_b_min >= 2 && adaptive_b_max >= adaptive_b_min,
-                    "--adaptive-b-range invalid: {adaptive_b_min}..{adaptive_b_max}");
+                assert!(
+                    adaptive_b_min >= 2 && adaptive_b_max >= adaptive_b_min,
+                    "--adaptive-b-range invalid: {adaptive_b_min}..{adaptive_b_max}"
+                );
                 i += 2;
             }
             "--ngram" => {
@@ -264,7 +273,11 @@ fn main() {
             "--pld-ngrams" => {
                 pld_ngrams = args[i + 1]
                     .split(',')
-                    .map(|s| s.trim().parse::<usize>().expect("--pld-ngrams: comma-separated positive ints"))
+                    .map(|s| {
+                        s.trim()
+                            .parse::<usize>()
+                            .expect("--pld-ngrams: comma-separated positive ints")
+                    })
                     .collect();
                 // Sort descending — longest-first is required by the matcher.
                 pld_ngrams.sort_by(|a, b| b.cmp(a));
@@ -405,7 +418,10 @@ fn main() {
     // to the next power of 2 and waste the room the draft needs.
     // Compute adaptive-B scratch ceiling early so KV + ring-buffer sizing
     // upstream of the draft-load accounts for the max possible B we'll use.
-    let cfg_block_size_for_slot = draft_cfg.block_size.max(if adaptive_b { adaptive_b_max } else { 0 });
+    let cfg_block_size_for_slot =
+        draft_cfg
+            .block_size
+            .max(if adaptive_b { adaptive_b_max } else { 0 });
     let mut slot_cfg = ModelSlotConfig::default();
     slot_cfg.max_seq = ctx_capacity + cfg_block_size_for_slot + 16;
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
@@ -420,8 +436,8 @@ fn main() {
     };
     eprintln!("kv_mode: {:?}", slot_cfg.kv_mode);
     let t1 = Instant::now();
-    let mut target =
-        ModelSlot::load(&mut gpu, Path::new(&target_path), "target", slot_cfg).expect("load target");
+    let mut target = ModelSlot::load(&mut gpu, Path::new(&target_path), "target", slot_cfg)
+        .expect("load target");
     eprintln!("target loaded in {:.2}s", t1.elapsed().as_secs_f64());
     vram_report(&gpu.hip, "after target load");
 
@@ -464,8 +480,13 @@ fn main() {
         );
     }
     let mut draft_scratch = DflashScratch::new_with_mq(
-        &mut gpu, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
-    ).expect("alloc draft scratch");
+        &mut gpu,
+        &draft_cfg,
+        draft_scratch_b,
+        ctx_capacity,
+        draft_weights.has_mq,
+    )
+    .expect("alloc draft scratch");
     if draft_weights.has_mq {
         eprintln!("draft: MQ4 weights detected, FWHT rotation scratch enabled");
     }
@@ -505,10 +526,17 @@ fn main() {
         chat.extend_from_slice(&asst);
         chat.extend_from_slice(&nl);
         prompt_tokens = chat;
-        eprintln!("chatml wrapping enabled: prompt is {} tokens after wrap", prompt_tokens.len());
+        eprintln!(
+            "chatml wrapping enabled: prompt is {} tokens after wrap",
+            prompt_tokens.len()
+        );
     }
     eprintln!("prompt: {:?}", prompt);
-    eprintln!("prompt tokens ({}): {:?}", prompt_tokens.len(), prompt_tokens);
+    eprintln!(
+        "prompt tokens ({}): {:?}",
+        prompt_tokens.len(),
+        prompt_tokens
+    );
 
     // ── Hidden ring buffer + snapshot + target_hidden_host ────────────
     // Size for the max block we may use this session so adaptive-B-up
@@ -528,13 +556,14 @@ fn main() {
     // DDTree needs a SECOND snapshot for the post-seed branch point (shared
     // across all DFS paths in a cycle). Allocate unconditionally — a single
     // DeltaNetSnapshot is cheap (~100 MB on 9B) and unused if --ddtree is off.
-    let mut post_seed_snap = DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("post-seed snap");
+    let mut post_seed_snap =
+        DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("post-seed snap");
     // Path C Phase 2 auxiliary snapshots. Allocated unconditionally, used
     // only when --ddtree-path-c=phase2. See speculative::Phase2Snapshots.
-    let mut path_c_parent_pre_snap = DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state)
-        .expect("path-c parent-pre snap");
-    let mut path_c_main_end_snap = DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state)
-        .expect("path-c main-end snap");
+    let mut path_c_parent_pre_snap =
+        DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("path-c parent-pre snap");
+    let mut path_c_main_end_snap =
+        DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("path-c main-end snap");
     // GdnTape: per-LA-layer (q, k, v, α, β) innovation tape — sized for B
     // positions, allocated once and reused every spec step. Enables the
     // rollback path to replay GDN recurrence without re-running the target.
@@ -544,9 +573,9 @@ fn main() {
     // the tape is large enough whether we run per-path DFS, batched tree,
     // or plain DFlash.
     let tape_max_n = draft_scratch_b.max(1 + ddtree_budget);
-    let mut gdn_tape = engine::speculative::GdnTape::new_for_config(
-        &mut gpu, &target.config, tape_max_n,
-    ).expect("alloc gdn tape");
+    let mut gdn_tape =
+        engine::speculative::GdnTape::new_for_config(&mut gpu, &target.config, tape_max_n)
+            .expect("alloc gdn tape");
     // DdtreeScratch: persistent attention-bias buffer for batched tree verify.
     // One allocation at startup (sized for max_budget), reused every cycle —
     // avoids the per-cycle malloc+htod+free churn that dominated early wall-
@@ -561,7 +590,10 @@ fn main() {
         let vd = target.config.linear_num_value_heads * target.config.linear_value_head_dim;
         kd * 2 + vd
     };
-    let ddtree_n_fa_layers = target.config.layer_types.iter()
+    let ddtree_n_fa_layers = target
+        .config
+        .layer_types
+        .iter()
         .filter(|t| **t == engine::qwen35::LayerType::FullAttention)
         .count();
     let ddtree_scratch = engine::speculative::DdtreeScratch::new(
@@ -571,7 +603,8 @@ fn main() {
         target.config.head_dim,
         ddtree_qkv_dim,
         ddtree_n_fa_layers,
-    ).expect("alloc ddtree scratch");
+    )
+    .expect("alloc ddtree scratch");
     // VerifyScratch: persistent per-cycle tensors (final_hidden, logits,
     // rotation scratch, argmax buf). Sized to max_n = max(block_size,
     // 1 + ddtree_budget) to cover plain DFlash and DDTree. Drops ~8
@@ -585,12 +618,16 @@ fn main() {
         target.config.vocab_size,
         target.weights.output.k,
         &target.config,
-    ).expect("alloc verify scratch");
+    )
+    .expect("alloc verify scratch");
     let mut target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_cfg.num_extract() * draft_cfg.hidden);
 
     // ── Prefill: seed target_hidden via per-token forward_with_hidden ──
-    eprintln!("seeding target_hidden from prompt ({} tokens)...", prompt_tokens.len());
+    eprintln!(
+        "seeding target_hidden from prompt ({} tokens)...",
+        prompt_tokens.len()
+    );
     let t2 = Instant::now();
     speculative::seed_target_hidden_from_prompt(
         &mut gpu,
@@ -617,11 +654,13 @@ fn main() {
     // Seed per-row absolute positions for the draft's cross-attention RoPE.
     // Pre-eviction these match [0..prompt_len) exactly, so FlashCASK-free runs
     // stay byte-identical to the old contiguous-range behaviour.
-    draft_scratch.target_hidden_abs_positions =
-        (0..prompt_tokens.len() as i32).collect();
+    draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
     let prefill_secs = t2.elapsed().as_secs_f64();
     let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
-    eprintln!("prefill in {:.2}s ({:.1} tok/s)", prefill_secs, prefill_tok_s);
+    eprintln!(
+        "prefill in {:.2}s ({:.1} tok/s)",
+        prefill_secs, prefill_tok_s
+    );
     vram_report(&gpu.hip, "after_prefill");
 
     // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
@@ -630,8 +669,18 @@ fn main() {
     // forward_scratch sees the right RoPE phase without extra plumbing.
     let cask_policy: Option<CaskPolicy> = if let Some(path) = cask_sidecar.as_ref() {
         let centers = TriAttnCenters::load(Path::new(path)).expect("load cask sidecar");
-        let fa_layer_ids: Vec<usize> = target.config.layer_types.iter().enumerate()
-            .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
+        let fa_layer_ids: Vec<usize> = target
+            .config
+            .layer_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                if *t == LayerType::FullAttention {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
             .collect();
         let n_rot = (target.config.head_dim as f32 * target.config.partial_rotary_factor) as usize;
         // Ensure target KV has enough headroom for budget+beta+B+margin. The
@@ -644,27 +693,45 @@ fn main() {
             cask_budget + cask_beta + draft_scratch_b + 4,
         );
         let base = EvictionCtx::new(
-            &mut gpu, &centers, fa_layer_ids,
-            cask_budget, cask_beta,
-            target.config.n_heads, target.config.n_kv_heads, target.config.head_dim,
-            n_rot, target.config.rope_theta, target.kv_cache.max_seq,
-        ).expect("build EvictionCtx for FlashCASK");
+            &mut gpu,
+            &centers,
+            fa_layer_ids,
+            cask_budget,
+            cask_beta,
+            target.config.n_heads,
+            target.config.n_kv_heads,
+            target.config.head_dim,
+            n_rot,
+            target.config.rope_theta,
+            target.kv_cache.max_seq,
+        )
+        .expect("build EvictionCtx for FlashCASK");
         Some(if use_cask {
-            eprintln!("FlashCASK: CASK α={:.2} m={} budget={} β={}", cask_core_frac, cask_fold_m, cask_budget, cask_beta);
+            eprintln!(
+                "FlashCASK: CASK α={:.2} m={} budget={} β={}",
+                cask_core_frac, cask_fold_m, cask_budget, cask_beta
+            );
             CaskPolicy::Cask(CaskCtx::new(base, cask_core_frac, cask_fold_m))
         } else {
-            eprintln!("FlashCASK: TriAttention (plain) budget={} β={}", cask_budget, cask_beta);
+            eprintln!(
+                "FlashCASK: TriAttention (plain) budget={} β={}",
+                cask_budget, cask_beta
+            );
             CaskPolicy::Plain(base)
         })
-    } else { None };
+    } else {
+        None
+    };
 
     // Post-prefill eviction: if the prompt already filled past the
     // threshold, compact once before decoding so the spec loop starts at
     // budget-sized physical state.
     let mut position: usize = prompt_tokens.len();
     if let Some(ref p) = cask_policy {
-        if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
-            .expect("post-prefill cask evict") {
+        if let Some(ev) = p
+            .maybe_evict(&mut gpu, &mut target.kv_cache, position)
+            .expect("post-prefill cask evict")
+        {
             let pre_phys = position;
             eprintln!(
                 "FlashCASK: post-prefill compact {} -> {} (compact_offset={})",
@@ -681,7 +748,8 @@ fn main() {
                     draft_cfg.num_extract(),
                     draft_cfg.hidden,
                     pre_phys,
-                ).expect("mirror eviction to draft (post-prefill)");
+                )
+                .expect("mirror eviction to draft (post-prefill)");
             }
         }
     }
@@ -690,7 +758,9 @@ fn main() {
     // Target state is at position `prompt_len` after seed_target_hidden_from_prompt.
     // Its scratch.logits at this point corresponds to the LAST prompt token's output —
     // i.e., the prediction for position prompt_len. Argmax = first emitted token.
-    let first_logits = gpu.download_f32(&target.scratch.logits).expect("download logits");
+    let first_logits = gpu
+        .download_f32(&target.scratch.logits)
+        .expect("download logits");
     let first_token = first_logits
         .iter()
         .enumerate()
@@ -738,17 +808,30 @@ fn main() {
     };
     let loop_break_on = loop_break_mode != "off";
     let loop_break_temp: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_TEMP")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
     let loop_break_stop_after: usize = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_STOP_AFTER")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     let loop_break_rp_step: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_RP_STEP")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.10);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.10);
     let loop_break_rp_max: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_RP_MAX")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.30);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.30);
     let loop_break_recovery: usize = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_RECOVERY")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
-    let loop_break_max_escalations: usize = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let loop_break_max_escalations: usize =
+        std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
     const LOOP_BREAK_WINDOW: usize = 32;
     let mut runtime_temp: f32 = temp;
     let mut runtime_repeat_penalty: f32 = repeat_penalty;
@@ -783,7 +866,10 @@ fn main() {
             draft_cfg.block_size,
         );
     } else {
-        eprintln!("decoding (max {max_tokens} tokens, block_size {})...", draft_cfg.block_size);
+        eprintln!(
+            "decoding (max {max_tokens} tokens, block_size {})...",
+            draft_cfg.block_size
+        );
     }
 
     // Rolling τ window for live emit + future adaptive routing decisions.
@@ -803,7 +889,9 @@ fn main() {
             );
         }
     } else if cactus_delta > 0.0 {
-        eprintln!("cactus_delta={cactus_delta} ignored at temp=0 (greedy path has no distribution)");
+        eprintln!(
+            "cactus_delta={cactus_delta} ignored at temp=0 (greedy path has no distribution)"
+        );
     }
     // N-gram cache: built incrementally from committed output each iter.
     // Seeded from the prompt so multi-turn repetitions in the prompt get
@@ -811,9 +899,7 @@ fn main() {
     let mut ngram_cache = if ngram {
         let mut c = engine::speculative::NgramCache::new(ngram_min_count);
         c.observe_many(&prompt_tokens);
-        eprintln!(
-            "ngram cache: bigrams seeded from prompt, min_count={ngram_min_count}"
-        );
+        eprintln!("ngram cache: bigrams seeded from prompt, min_count={ngram_min_count}");
         Some(c)
     } else {
         None
@@ -897,16 +983,27 @@ fn main() {
                 &mut target.kv_cache,
                 &mut target.dn_state,
                 &target.scratch,
-            ).expect("ar forward");
+            )
+            .expect("ar forward");
             let lg = gpu.download_f32(&target.scratch.logits).expect("logits");
-            let next = lg.iter().enumerate().fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-                if v > bv { (i as u32, v) } else { (best, bv) }
-            }).0;
+            let next = lg
+                .iter()
+                .enumerate()
+                .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                    if v > bv {
+                        (i as u32, v)
+                    } else {
+                        (best, bv)
+                    }
+                })
+                .0;
             emitted.push(next);
             position += 1;
             if let Some(ref p) = cask_policy {
-                if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
-                    .expect("ar cask evict") {
+                if let Some(ev) = p
+                    .maybe_evict(&mut gpu, &mut target.kv_cache, position)
+                    .expect("ar cask evict")
+                {
                     // AR baseline doesn't touch draft state — no mirror needed.
                     position = ev.new_physical;
                 }
@@ -922,8 +1019,12 @@ fn main() {
         eprintln!("--- AR-BASELINE OUTPUT ---");
         println!("{text}");
         eprintln!("--------------------------");
-        eprintln!("emitted: {} tokens in {:.2}s  ({:.2} tok/s)",
-                  emitted.len(), ar_elapsed, emitted.len() as f64 / ar_elapsed);
+        eprintln!(
+            "emitted: {} tokens in {:.2}s  ({:.2} tok/s)",
+            emitted.len(),
+            ar_elapsed,
+            emitted.len() as f64 / ar_elapsed
+        );
         eprintln!("AR tokens: {:?}", emitted);
         return;
     }
@@ -977,9 +1078,13 @@ fn main() {
     // shrinking is the right move. Env override for tuning:
     //   HIPFIRE_ADAPTIVE_B_UP=0.XX / HIPFIRE_ADAPTIVE_B_DOWN=0.XX
     let adaptive_b_up: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_UP")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.45);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.45);
     let adaptive_b_down: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_DOWN")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.25);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.25);
 
     let t_decode = Instant::now();
     // TTFT capture: production-realistic measure excluding DPM warmup
@@ -1027,7 +1132,8 @@ fn main() {
             rdna_compute::profile::start();
             profile_armed = true;
         }
-        if do_profile && profile_armed
+        if do_profile
+            && profile_armed
             && stats.cycles >= 1 + profile_cycles_target
             && profile_cycle_count == 0
         {
@@ -1042,18 +1148,22 @@ fn main() {
                     entry.2 += e.bytes;
                 }
                 let mut kerns: Vec<_> = by_kernel.into_iter().collect();
-                kerns.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+                kerns.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
                 let total_us: f64 = kerns.iter().map(|(_, (t, _, _))| t).sum();
                 eprintln!(
                     "\n=== PROFILE ({} kernel calls over {} cycles, {:.1}ms total kernel time) ===",
-                    entries.len(), profile_cycle_count, total_us / 1000.0,
+                    entries.len(),
+                    profile_cycle_count,
+                    total_us / 1000.0,
                 );
                 eprintln!(
                     "  {:50} {:>6} {:>10} {:>10} {:>7} {:>10}",
                     "kernel", "calls", "total_ms", "us/call", "%", "MB",
                 );
                 for (kern, (us, n, bytes)) in &kerns {
-                    if *us / total_us < 0.005 { continue; } // skip <0.5%
+                    if *us / total_us < 0.005 {
+                        continue;
+                    } // skip <0.5%
                     eprintln!(
                         "  {kern:50} {n:>6} {:>10.2} {:>10.0} {:>6.1}% {:>10.1}",
                         us / 1000.0,
@@ -1080,9 +1190,7 @@ fn main() {
                 let ewma: f64 = accepts_window.iter().copied().sum::<usize>() as f64
                     / accepts_window.len() as f64;
                 let util = ewma / (current_adaptive_b.saturating_sub(1).max(1)) as f64;
-                if util > adaptive_b_up
-                    && current_adaptive_b + ADAPTIVE_B_STEP <= adaptive_b_max
-                {
+                if util > adaptive_b_up && current_adaptive_b + ADAPTIVE_B_STEP <= adaptive_b_max {
                     current_adaptive_b += ADAPTIVE_B_STEP;
                     adaptive_b_cycles_since_change = 0;
                     adaptive_b_changes += 1;
@@ -1285,8 +1393,8 @@ fn main() {
             let glaunch_us = (lc::graph_launch::time_ns() - glaunch_start) / 1000;
             per_cycle_wall_us.push(wall_us);
             per_cycle_api_us.push((
-                launch_us, htod_us, dtoh_us, dtod_us, memset_us,
-                ssync_us, esync_us, dsync_us, glaunch_us,
+                launch_us, htod_us, dtoh_us, dtod_us, memset_us, ssync_us, esync_us, dsync_us,
+                glaunch_us,
             ));
         }
 
@@ -1296,8 +1404,8 @@ fn main() {
         }
         accepts_window.push_back(step.accepted);
         if live_tau {
-            let win_tau: f64 = accepts_window.iter().copied().sum::<usize>() as f64
-                / accepts_window.len() as f64;
+            let win_tau: f64 =
+                accepts_window.iter().copied().sum::<usize>() as f64 / accepts_window.len() as f64;
             let cum_tau: f64 = stats.accepted_tokens as f64 / stats.cycles as f64;
             eprintln!(
                 "[cycle {:3}] accepted={:2} seed={:5} τ_win={:.2} τ_cum={:.2} position={}",
@@ -1345,7 +1453,10 @@ fn main() {
                         } else {
                             eprintln!(
                                 "[loop-break] cycle {} pos {}: window repeat ({}/{} consecutive)",
-                                stats.cycles, position, loop_break_consecutive, loop_break_stop_after
+                                stats.cycles,
+                                position,
+                                loop_break_consecutive,
+                                loop_break_stop_after
                             );
                         }
                     }
@@ -1365,7 +1476,8 @@ fn main() {
                                 loop_break_force_stop = true;
                             } else {
                                 let prev_rp = runtime_repeat_penalty;
-                                runtime_repeat_penalty = (runtime_repeat_penalty + loop_break_rp_step)
+                                runtime_repeat_penalty = (runtime_repeat_penalty
+                                    + loop_break_rp_step)
                                     .min(loop_break_rp_max);
                                 if runtime_repeat_penalty < 1.0 + loop_break_rp_step {
                                     runtime_repeat_penalty = 1.0 + loop_break_rp_step;
@@ -1443,8 +1555,10 @@ fn main() {
         // budget+β. compact_offset is maintained on the cache so the next
         // cycle's target.forward_scratch uses the right RoPE phase.
         if let Some(ref p) = cask_policy {
-            if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
-                .expect("spec cask evict") {
+            if let Some(ev) = p
+                .maybe_evict(&mut gpu, &mut target.kv_cache, position)
+                .expect("spec cask evict")
+            {
                 let pre_phys = position;
                 position = ev.new_physical;
                 // Mirror the KV eviction into the draft's target_hidden view.
@@ -1459,7 +1573,8 @@ fn main() {
                         draft_cfg.num_extract(),
                         draft_cfg.hidden,
                         pre_phys,
-                    ).expect("mirror eviction to draft");
+                    )
+                    .expect("mirror eviction to draft");
                 }
             }
         }
@@ -1468,7 +1583,12 @@ fn main() {
         // misses `<|endoftext|>` when running --no-chatml on a raw-text draft
         // — see findings/dflash-benchmark-2026-04-24.md §3.5 (post-EOT
         // attractor loop). `is_terminator` covers both.
-        if step.committed.iter().skip(1).any(|&t| tokenizer.is_terminator(t)) {
+        if step
+            .committed
+            .iter()
+            .skip(1)
+            .any(|&t| tokenizer.is_terminator(t))
+        {
             eprintln!("eos");
             break;
         }
@@ -1514,7 +1634,8 @@ fn main() {
     // pulls each field; do not change format without updating callers.
     // hip.get_vram_info returns (free_bytes, total_bytes) — see line 356.
     let (vram_free_bytes, vram_total_bytes) = gpu.hip.get_vram_info().unwrap_or((0, 0));
-    let vram_used_mb = ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
+    let vram_used_mb =
+        ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
     let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
     eprintln!("=== BENCH METRICS ===");
     eprintln!("prompt_tokens: {}", prompt_tokens.len());
@@ -1541,22 +1662,29 @@ fn main() {
         let mean_nodes = meta.total_nodes as f32 / meta.cycles as f32;
         eprintln!(
             "ddtree-meta: cycles={} mean_nodes={:.2} min={} max={} (cutoff={:?})",
-            meta.cycles, mean_nodes, meta.min_nodes, meta.max_nodes,
+            meta.cycles,
+            mean_nodes,
+            meta.min_nodes,
+            meta.max_nodes,
             std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF").unwrap_or_else(|_| "off".to_string()),
         );
     }
     // Adaptive-B usage report — only meaningful when --adaptive-b is on.
     if adaptive_b && !adaptive_b_histogram.is_empty() {
-        let mut buckets: Vec<(usize, u32)> = adaptive_b_histogram.iter()
-            .map(|(&b, &c)| (b, c)).collect();
+        let mut buckets: Vec<(usize, u32)> =
+            adaptive_b_histogram.iter().map(|(&b, &c)| (b, c)).collect();
         buckets.sort_by_key(|(b, _)| *b);
         let total: u32 = buckets.iter().map(|(_, c)| *c).sum();
-        let mean_b: f32 = buckets.iter()
+        let mean_b: f32 = buckets
+            .iter()
             .map(|(b, c)| (*b as f32) * (*c as f32))
-            .sum::<f32>() / total.max(1) as f32;
-        let dist: String = buckets.iter()
+            .sum::<f32>()
+            / total.max(1) as f32;
+        let dist: String = buckets
+            .iter()
             .map(|(b, c)| format!("B={b}:{:.1}%", *c as f32 * 100.0 / total.max(1) as f32))
-            .collect::<Vec<_>>().join(" ");
+            .collect::<Vec<_>>()
+            .join(" ");
         eprintln!(
             "adaptive-b: range={}..={} mean_B={:.2} changes={} dist=[{}]",
             adaptive_b_min, adaptive_b_max, mean_b, adaptive_b_changes, dist,
@@ -1592,8 +1720,15 @@ fn main() {
         let mean_esync = api.iter().map(|x| x.6).sum::<u64>() / n as u64;
         let mean_dsync = api.iter().map(|x| x.7).sum::<u64>() / n as u64;
         let mean_glaunch = api.iter().map(|x| x.8).sum::<u64>() / n as u64;
-        let tracked = mean_launch + mean_htod + mean_dtoh + mean_dtod + mean_memset
-            + mean_ssync + mean_esync + mean_dsync + mean_glaunch;
+        let tracked = mean_launch
+            + mean_htod
+            + mean_dtoh
+            + mean_dtod
+            + mean_memset
+            + mean_ssync
+            + mean_esync
+            + mean_dsync
+            + mean_glaunch;
         let untracked = mean_wall.saturating_sub(tracked);
         // Cumulative counts — post-run totals divided by elapsed cycles give
         // mean per-cycle API call counts. Helpful for isolating which op is
@@ -1630,8 +1765,7 @@ fn main() {
             0.0
         };
         let tau_dflash = if stats.cycles > pld_hits {
-            (stats.accepted_tokens - pld_accepted) as f32
-                / (stats.cycles - pld_hits) as f32
+            (stats.accepted_tokens - pld_accepted) as f32 / (stats.cycles - pld_hits) as f32
         } else {
             0.0
         };

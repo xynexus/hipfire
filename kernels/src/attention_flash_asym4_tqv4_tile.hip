@@ -2,6 +2,18 @@
 #include "turbo_common.h"
 #include "givens_common.h"
 
+__device__ float tqv_value_table(int idx, int value_bits, int head_dim, const float* __restrict__ centroids) {
+    if (centroids != nullptr) return centroids[idx];
+    if (value_bits == 1 && head_dim == 256) return TURBO_C1_256[idx];
+    if (value_bits == 1) return TURBO_C1[idx];
+    if (value_bits == 4 && head_dim == 256) return TURBO_C4_256[idx];
+    if (value_bits == 4) return TURBO_C4[idx];
+    if (value_bits == 3 && head_dim == 256) return TURBO_C3_256[idx];
+    if (value_bits == 3) return TURBO_C3[idx];
+    if (head_dim == 256) return TURBO_C2_256[idx];
+    return TURBO_C2[idx];
+}
+
 extern "C" __launch_bounds__(32, 16)
 __global__ void attention_flash_asym4_tqv4_tile(
     const float* __restrict__ q,
@@ -15,6 +27,7 @@ __global__ void attention_flash_asym4_tqv4_tile(
     int n_kv_heads,
     int head_dim,
     int value_bits,
+    const float* __restrict__ tqv_centroids,
     int max_seq,
     float scale_attn,
     int tile_size,
@@ -23,7 +36,7 @@ __global__ void attention_flash_asym4_tqv4_tile(
     const int seq_len = pos_buf[0] + 1;
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
-    if (h >= n_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
+    if (h >= n_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 1 && value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
     const int tile_start = tile_id * tile_size;
     if (tile_start >= seq_len) return;
     const int tile_end = min(tile_start + tile_size, seq_len);
@@ -37,7 +50,8 @@ __global__ void attention_flash_asym4_tqv4_tile(
     const int k_bytes_per_head = 4 + head_dim / 2;
     const int k_bytes_per_pos = n_kv_heads * k_bytes_per_head;
     const int k_head_off = kv_h * k_bytes_per_head;
-    const int v_bytes_per_head = 4 + (head_dim * value_bits) / 8;
+    const int storage_bits = (value_bits == 1) ? 2 : value_bits;
+    const int v_bytes_per_head = 4 + (head_dim * storage_bits) / 8;
     const int v_bytes_per_pos = n_kv_heads * v_bytes_per_head;
     const int v_head_off = kv_h * v_bytes_per_head;
 
@@ -95,57 +109,57 @@ __global__ void attention_flash_asym4_tqv4_tile(
         if (value_bits == 4 && head_dim == 256) {
             const unsigned char* packed = vb + 4 + tid * 4;
             unsigned char b0 = packed[0], b1 = packed[1], b2 = packed[2], b3 = packed[3];
-            out_vec[0] += w * (cnorm * TURBO_C4_256[(b0)      & 0xF]);
-            out_vec[1] += w * (cnorm * TURBO_C4_256[(b0 >> 4) & 0xF]);
-            out_vec[2] += w * (cnorm * TURBO_C4_256[(b1)      & 0xF]);
-            out_vec[3] += w * (cnorm * TURBO_C4_256[(b1 >> 4) & 0xF]);
-            out_vec[4] += w * (cnorm * TURBO_C4_256[(b2)      & 0xF]);
-            out_vec[5] += w * (cnorm * TURBO_C4_256[(b2 >> 4) & 0xF]);
-            out_vec[6] += w * (cnorm * TURBO_C4_256[(b3)      & 0xF]);
-            out_vec[7] += w * (cnorm * TURBO_C4_256[(b3 >> 4) & 0xF]);
+            out_vec[0] += w * (cnorm * tqv_value_table((b0)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((b0 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((b1)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((b1 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[4] += w * (cnorm * tqv_value_table((b2)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[5] += w * (cnorm * tqv_value_table((b2 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[6] += w * (cnorm * tqv_value_table((b3)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[7] += w * (cnorm * tqv_value_table((b3 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
         } else if (value_bits == 4) {
             const unsigned char* packed = vb + 4 + tid * 2;
             unsigned char b0 = packed[0], b1 = packed[1];
-            out_vec[0] += w * (cnorm * TURBO_C4[(b0)      & 0xF]);
-            out_vec[1] += w * (cnorm * TURBO_C4[(b0 >> 4) & 0xF]);
-            out_vec[2] += w * (cnorm * TURBO_C4[(b1)      & 0xF]);
-            out_vec[3] += w * (cnorm * TURBO_C4[(b1 >> 4) & 0xF]);
+            out_vec[0] += w * (cnorm * tqv_value_table((b0)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((b0 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((b1)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((b1 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
         } else if (value_bits == 3 && head_dim == 256) {
             const unsigned char* packed = vb + 4 + tid * 3;
             unsigned int pack = (unsigned int)packed[0] | ((unsigned int)packed[1] << 8) | ((unsigned int)packed[2] << 16);
-            out_vec[0] += w * (cnorm * TURBO_C3_256[(pack)       & 7]);
-            out_vec[1] += w * (cnorm * TURBO_C3_256[(pack >> 3)  & 7]);
-            out_vec[2] += w * (cnorm * TURBO_C3_256[(pack >> 6)  & 7]);
-            out_vec[3] += w * (cnorm * TURBO_C3_256[(pack >> 9)  & 7]);
-            out_vec[4] += w * (cnorm * TURBO_C3_256[(pack >> 12) & 7]);
-            out_vec[5] += w * (cnorm * TURBO_C3_256[(pack >> 15) & 7]);
-            out_vec[6] += w * (cnorm * TURBO_C3_256[(pack >> 18) & 7]);
-            out_vec[7] += w * (cnorm * TURBO_C3_256[(pack >> 21) & 7]);
+            out_vec[0] += w * (cnorm * tqv_value_table((pack)       & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((pack >> 3)  & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((pack >> 6)  & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((pack >> 9)  & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[4] += w * (cnorm * tqv_value_table((pack >> 12) & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[5] += w * (cnorm * tqv_value_table((pack >> 15) & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[6] += w * (cnorm * tqv_value_table((pack >> 18) & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[7] += w * (cnorm * tqv_value_table((pack >> 21) & 7, value_bits, head_dim, tqv_centroids));
         } else if (value_bits == 3) {
             const unsigned char* packed = vb + 4 + (tid >> 1) * 3;
             unsigned int pack = (unsigned int)packed[0] | ((unsigned int)packed[1] << 8) | ((unsigned int)packed[2] << 16);
             int shift = (tid & 1) ? 12 : 0;
-            out_vec[0] += w * (cnorm * TURBO_C3[(pack >> shift)       & 7]);
-            out_vec[1] += w * (cnorm * TURBO_C3[(pack >> (shift + 3)) & 7]);
-            out_vec[2] += w * (cnorm * TURBO_C3[(pack >> (shift + 6)) & 7]);
-            out_vec[3] += w * (cnorm * TURBO_C3[(pack >> (shift + 9)) & 7]);
+            out_vec[0] += w * (cnorm * tqv_value_table((pack >> shift)       & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((pack >> (shift + 3)) & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((pack >> (shift + 6)) & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((pack >> (shift + 9)) & 7, value_bits, head_dim, tqv_centroids));
         } else if (head_dim == 256) {
             const unsigned char* packed = vb + 4 + tid * 2;
             unsigned char b0 = packed[0], b1 = packed[1];
-            out_vec[0] += w * (cnorm * TURBO_C2_256[(b0)      & 3]);
-            out_vec[1] += w * (cnorm * TURBO_C2_256[(b0 >> 2) & 3]);
-            out_vec[2] += w * (cnorm * TURBO_C2_256[(b0 >> 4) & 3]);
-            out_vec[3] += w * (cnorm * TURBO_C2_256[(b0 >> 6) & 3]);
-            out_vec[4] += w * (cnorm * TURBO_C2_256[(b1)      & 3]);
-            out_vec[5] += w * (cnorm * TURBO_C2_256[(b1 >> 2) & 3]);
-            out_vec[6] += w * (cnorm * TURBO_C2_256[(b1 >> 4) & 3]);
-            out_vec[7] += w * (cnorm * TURBO_C2_256[(b1 >> 6) & 3]);
+            out_vec[0] += w * (cnorm * tqv_value_table((b0)      & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((b0 >> 2) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((b0 >> 4) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((b0 >> 6) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[4] += w * (cnorm * tqv_value_table((b1)      & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[5] += w * (cnorm * tqv_value_table((b1 >> 2) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[6] += w * (cnorm * tqv_value_table((b1 >> 4) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[7] += w * (cnorm * tqv_value_table((b1 >> 6) & 3, value_bits, head_dim, tqv_centroids));
         } else {
             unsigned char b = *(vb + 4 + tid);
-            out_vec[0] += w * (cnorm * TURBO_C2[(b)      & 3]);
-            out_vec[1] += w * (cnorm * TURBO_C2[(b >> 2) & 3]);
-            out_vec[2] += w * (cnorm * TURBO_C2[(b >> 4) & 3]);
-            out_vec[3] += w * (cnorm * TURBO_C2[(b >> 6) & 3]);
+            out_vec[0] += w * (cnorm * tqv_value_table((b)      & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((b >> 2) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((b >> 4) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((b >> 6) & 3, value_bits, head_dim, tqv_centroids));
         }
     }
 
@@ -178,6 +192,7 @@ __global__ void attention_flash_asym4_tqv4_tile_batched(
     int n_kv_heads,
     int head_dim,
     int value_bits,
+    const float* __restrict__ tqv_centroids,
     int max_seq,
     float scale_attn,
     int tile_size,
@@ -189,7 +204,7 @@ __global__ void attention_flash_asym4_tqv4_tile_batched(
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
     const int local_bid = blockIdx.z;
-    if (h >= n_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
+    if (h >= n_heads || (head_dim != 128 && head_dim != 256) || (value_bits != 1 && value_bits != 2 && value_bits != 3 && value_bits != 4)) return;
     const int tid = threadIdx.x;
 
     const int global_bid = batch_offset + local_bid;
@@ -207,7 +222,8 @@ __global__ void attention_flash_asym4_tqv4_tile_batched(
     const int k_bytes_per_head = 4 + head_dim / 2;
     const int k_bytes_per_pos = n_kv_heads * k_bytes_per_head;
     const int k_head_off = kv_h * k_bytes_per_head;
-    const int v_bytes_per_head = 4 + (head_dim * value_bits) / 8;
+    const int storage_bits = (value_bits == 1) ? 2 : value_bits;
+    const int v_bytes_per_head = 4 + (head_dim * storage_bits) / 8;
     const int v_bytes_per_pos = n_kv_heads * v_bytes_per_head;
     const int v_head_off = kv_h * v_bytes_per_head;
 
@@ -269,57 +285,57 @@ __global__ void attention_flash_asym4_tqv4_tile_batched(
         if (value_bits == 4 && head_dim == 256) {
             const unsigned char* packed = vb + 4 + tid * 4;
             unsigned char b0 = packed[0], b1 = packed[1], b2 = packed[2], b3 = packed[3];
-            out_vec[0] += w * (cnorm * TURBO_C4_256[(b0)      & 0xF]);
-            out_vec[1] += w * (cnorm * TURBO_C4_256[(b0 >> 4) & 0xF]);
-            out_vec[2] += w * (cnorm * TURBO_C4_256[(b1)      & 0xF]);
-            out_vec[3] += w * (cnorm * TURBO_C4_256[(b1 >> 4) & 0xF]);
-            out_vec[4] += w * (cnorm * TURBO_C4_256[(b2)      & 0xF]);
-            out_vec[5] += w * (cnorm * TURBO_C4_256[(b2 >> 4) & 0xF]);
-            out_vec[6] += w * (cnorm * TURBO_C4_256[(b3)      & 0xF]);
-            out_vec[7] += w * (cnorm * TURBO_C4_256[(b3 >> 4) & 0xF]);
+            out_vec[0] += w * (cnorm * tqv_value_table((b0)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((b0 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((b1)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((b1 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[4] += w * (cnorm * tqv_value_table((b2)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[5] += w * (cnorm * tqv_value_table((b2 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[6] += w * (cnorm * tqv_value_table((b3)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[7] += w * (cnorm * tqv_value_table((b3 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
         } else if (value_bits == 4) {
             const unsigned char* packed = vb + 4 + tid * 2;
             unsigned char b0 = packed[0], b1 = packed[1];
-            out_vec[0] += w * (cnorm * TURBO_C4[(b0)      & 0xF]);
-            out_vec[1] += w * (cnorm * TURBO_C4[(b0 >> 4) & 0xF]);
-            out_vec[2] += w * (cnorm * TURBO_C4[(b1)      & 0xF]);
-            out_vec[3] += w * (cnorm * TURBO_C4[(b1 >> 4) & 0xF]);
+            out_vec[0] += w * (cnorm * tqv_value_table((b0)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((b0 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((b1)      & 0xF, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((b1 >> 4) & 0xF, value_bits, head_dim, tqv_centroids));
         } else if (value_bits == 3 && head_dim == 256) {
             const unsigned char* packed = vb + 4 + tid * 3;
             unsigned int pack = (unsigned int)packed[0] | ((unsigned int)packed[1] << 8) | ((unsigned int)packed[2] << 16);
-            out_vec[0] += w * (cnorm * TURBO_C3_256[(pack)       & 7]);
-            out_vec[1] += w * (cnorm * TURBO_C3_256[(pack >> 3)  & 7]);
-            out_vec[2] += w * (cnorm * TURBO_C3_256[(pack >> 6)  & 7]);
-            out_vec[3] += w * (cnorm * TURBO_C3_256[(pack >> 9)  & 7]);
-            out_vec[4] += w * (cnorm * TURBO_C3_256[(pack >> 12) & 7]);
-            out_vec[5] += w * (cnorm * TURBO_C3_256[(pack >> 15) & 7]);
-            out_vec[6] += w * (cnorm * TURBO_C3_256[(pack >> 18) & 7]);
-            out_vec[7] += w * (cnorm * TURBO_C3_256[(pack >> 21) & 7]);
+            out_vec[0] += w * (cnorm * tqv_value_table((pack)       & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((pack >> 3)  & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((pack >> 6)  & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((pack >> 9)  & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[4] += w * (cnorm * tqv_value_table((pack >> 12) & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[5] += w * (cnorm * tqv_value_table((pack >> 15) & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[6] += w * (cnorm * tqv_value_table((pack >> 18) & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[7] += w * (cnorm * tqv_value_table((pack >> 21) & 7, value_bits, head_dim, tqv_centroids));
         } else if (value_bits == 3) {
             const unsigned char* packed = vb + 4 + (tid >> 1) * 3;
             unsigned int pack = (unsigned int)packed[0] | ((unsigned int)packed[1] << 8) | ((unsigned int)packed[2] << 16);
             int shift = (tid & 1) ? 12 : 0;
-            out_vec[0] += w * (cnorm * TURBO_C3[(pack >> shift)       & 7]);
-            out_vec[1] += w * (cnorm * TURBO_C3[(pack >> (shift + 3)) & 7]);
-            out_vec[2] += w * (cnorm * TURBO_C3[(pack >> (shift + 6)) & 7]);
-            out_vec[3] += w * (cnorm * TURBO_C3[(pack >> (shift + 9)) & 7]);
+            out_vec[0] += w * (cnorm * tqv_value_table((pack >> shift)       & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((pack >> (shift + 3)) & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((pack >> (shift + 6)) & 7, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((pack >> (shift + 9)) & 7, value_bits, head_dim, tqv_centroids));
         } else if (head_dim == 256) {
             const unsigned char* packed = vb + 4 + tid * 2;
             unsigned char b0 = packed[0], b1 = packed[1];
-            out_vec[0] += w * (cnorm * TURBO_C2_256[(b0)      & 3]);
-            out_vec[1] += w * (cnorm * TURBO_C2_256[(b0 >> 2) & 3]);
-            out_vec[2] += w * (cnorm * TURBO_C2_256[(b0 >> 4) & 3]);
-            out_vec[3] += w * (cnorm * TURBO_C2_256[(b0 >> 6) & 3]);
-            out_vec[4] += w * (cnorm * TURBO_C2_256[(b1)      & 3]);
-            out_vec[5] += w * (cnorm * TURBO_C2_256[(b1 >> 2) & 3]);
-            out_vec[6] += w * (cnorm * TURBO_C2_256[(b1 >> 4) & 3]);
-            out_vec[7] += w * (cnorm * TURBO_C2_256[(b1 >> 6) & 3]);
+            out_vec[0] += w * (cnorm * tqv_value_table((b0)      & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((b0 >> 2) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((b0 >> 4) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((b0 >> 6) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[4] += w * (cnorm * tqv_value_table((b1)      & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[5] += w * (cnorm * tqv_value_table((b1 >> 2) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[6] += w * (cnorm * tqv_value_table((b1 >> 4) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[7] += w * (cnorm * tqv_value_table((b1 >> 6) & 3, value_bits, head_dim, tqv_centroids));
         } else {
             unsigned char b = *(vb + 4 + tid);
-            out_vec[0] += w * (cnorm * TURBO_C2[(b)      & 3]);
-            out_vec[1] += w * (cnorm * TURBO_C2[(b >> 2) & 3]);
-            out_vec[2] += w * (cnorm * TURBO_C2[(b >> 4) & 3]);
-            out_vec[3] += w * (cnorm * TURBO_C2[(b >> 6) & 3]);
+            out_vec[0] += w * (cnorm * tqv_value_table((b)      & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[1] += w * (cnorm * tqv_value_table((b >> 2) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[2] += w * (cnorm * tqv_value_table((b >> 4) & 3, value_bits, head_dim, tqv_centroids));
+            out_vec[3] += w * (cnorm * tqv_value_table((b >> 6) & 3, value_bits, head_dim, tqv_centroids));
         }
     }
 
