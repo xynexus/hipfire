@@ -117,6 +117,15 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
+        "q8_tqv4" | "q8_tq4" => KvCache::new_gpu_q8_tqv4_capped(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+            kv_seq,
+        )
+        .unwrap(),
         "q8" => KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,

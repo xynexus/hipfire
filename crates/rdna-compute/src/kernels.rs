@@ -672,6 +672,8 @@ pub const TQV_CAPTURE_VALUES_SRC: &str =
     include_str!("../../../kernels/src/tqv_capture_values.hip");
 pub const ATTENTION_FLASH_ASYM4_TQV4_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym4_tqv4_tile.hip");
+pub const ATTENTION_FLASH_Q8_TQV4_TILE_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_tqv4_tile.hip");
 pub const ATTENTION_FLASH_TQV4_REDUCE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_tqv4_reduce.hip");
 

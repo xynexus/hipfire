@@ -6470,7 +6470,40 @@ fn run_fa_layer_body(
         gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
     }
 
-    if kv_cache.is_asym4_tqv() {
+    if kv_cache.quant_q8_tqv4 {
+        let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
+        let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
+        maybe_dump_tqv_value_samples(gpu, &s.fa_attn_out, &s.fa_v, kv_cache, config)?;
+        gpu.kv_cache_write_q8_tqv4_fused(
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_k,
+            &s.fa_v,
+            &s.pos_buf,
+            s1,
+            s2,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_cache.tqv_centroids.as_ref(),
+            kv_cache.tqv_thresholds.as_ref(),
+        )?;
+        gpu.attention_flash_q8_tqv4(
+            &s.fa_q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out,
+            &s.pos_buf,
+            s1,
+            s2,
+            pos + 1,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_cache.tqv_centroids.as_ref(),
+            kv_cache.physical_cap,
+            &s.flash_partials,
+        )?;
+    } else if kv_cache.is_asym4_tqv() {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
         let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
@@ -7126,7 +7159,40 @@ fn forward_scratch_layers(
                     gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                if kv_cache.is_asym4_tqv() {
+                if kv_cache.quant_q8_tqv4 {
+                    let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
+                    let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
+                    maybe_dump_tqv_value_samples(gpu, &s.fa_attn_out, &s.fa_v, kv_cache, config)?;
+                    gpu.kv_cache_write_q8_tqv4_fused(
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.fa_v,
+                        &s.pos_buf,
+                        s1,
+                        s2,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.tqv_centroids.as_ref(),
+                        kv_cache.tqv_thresholds.as_ref(),
+                    )?;
+                    gpu.attention_flash_q8_tqv4(
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        s1,
+                        s2,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.tqv_centroids.as_ref(),
+                        kv_cache.physical_cap,
+                        &s.flash_partials,
+                    )?;
+                } else if kv_cache.is_asym4_tqv() {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
@@ -7665,7 +7731,40 @@ fn forward_scratch_layers(
                     gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                if kv_cache.is_asym4_tqv() {
+                if kv_cache.quant_q8_tqv4 {
+                    let s1 = kv_cache.fwht_signs1.as_ref().unwrap();
+                    let s2 = kv_cache.fwht_signs2.as_ref().unwrap();
+                    maybe_dump_tqv_value_samples(gpu, &s.fa_attn_out, &s.fa_v, kv_cache, config)?;
+                    gpu.kv_cache_write_q8_tqv4_fused(
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k,
+                        &s.fa_v,
+                        &s.pos_buf,
+                        s1,
+                        s2,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.tqv_centroids.as_ref(),
+                        kv_cache.tqv_thresholds.as_ref(),
+                    )?;
+                    gpu.attention_flash_q8_tqv4(
+                        &s.fa_q,
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out,
+                        &s.pos_buf,
+                        s1,
+                        s2,
+                        pos + 1,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.tqv_centroids.as_ref(),
+                        kv_cache.physical_cap,
+                        &s.flash_partials,
+                    )?;
+                } else if kv_cache.is_asym4_tqv() {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
                     let st = kv_cache.givens_sin.as_ref().unwrap();
                     let s1 = kv_cache.fwht_signs1.as_ref().unwrap();

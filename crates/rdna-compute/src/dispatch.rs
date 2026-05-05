@@ -11017,6 +11017,77 @@ impl Gpu {
         )
     }
 
+    /// Fused K+V write for q8_tqv4: K at Q8_0, V at TurboQuant/FWHT.
+    pub fn kv_cache_write_q8_tqv4_fused(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        tqv_centroids: Option<&GpuTensor>,
+        tqv_thresholds: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.kv_cache_write_q8_0(k_dst, k_src, pos_buf, n_kv_heads, head_dim)?;
+
+        self.ensure_givens4_kernel(
+            "kv_cache_write_tqv4",
+            kernels::KV_CACHE_WRITE_TQV4_SRC,
+            "kv_cache_write_tqv4",
+        )?;
+        let vdp = v_dst.buf.as_ptr();
+        let vsp = v_src.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let s1 = signs1.buf.as_ptr();
+        let s2 = signs2.buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let vb = 4i32;
+        let cp = tqv_centroids
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let tp = tqv_thresholds
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let mut params: Vec<*mut c_void> = vec![
+            &vdp as *const _ as *mut c_void,
+            &vsp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &vb as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "kv_cache_write_tqv4",
+            [n_kv_heads as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(vdp);
+                b.push_ptr(vsp);
+                b.push_ptr(pp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(vb);
+                b.push_ptr(cp);
+                b.push_ptr(tp);
+                b
+            },
+        )
+    }
+
     /// Capture TQV value calibration samples.
     ///
     /// `dst` receives the normalized + FWHT/sign-rotated V scalars in
@@ -12352,6 +12423,149 @@ impl Gpu {
                     b.push_ptr(pos_ptr);
                     b.push_ptr(ct_ptr);
                     b.push_ptr(st_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(vb);
+                    b.push_ptr(cp);
+                    b.push_i32(ms);
+                    b.push_f32(sc);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b
+                },
+            )?;
+        }
+
+        self.ensure_givens4_kernel(
+            "attention_flash_tqv4_reduce",
+            kernels::ATTENTION_FLASH_TQV4_REDUCE_SRC,
+            "attention_flash_tqv4_reduce",
+        )?;
+        {
+            let p_ptr = partials.buf.as_ptr();
+            let o_ptr = out.buf.as_ptr();
+            let pos_ptr = pos_buf.as_ptr();
+            let s1 = signs1.buf.as_ptr();
+            let s2 = signs2.buf.as_ptr();
+            let nh = n_heads as i32;
+            let hd = head_dim as i32;
+            let ts = TILE_SIZE as i32;
+            let mt = max_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &p_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &s1 as *const _ as *mut c_void,
+                &s2 as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "attention_flash_tqv4_reduce",
+                [n_heads as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(o_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_ptr(s1);
+                    b.push_ptr(s2);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Flash attention for q8_tqv4 KV (K at Q8_0, V at TurboQuant4/FWHT).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_tqv4(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        tqv_centroids: Option<&GpuTensor>,
+        max_seq: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        const TILE_SIZE: usize = 128;
+        let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
+        let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+        let launch_tiles = if self.capture_mode {
+            max_tiles
+        } else {
+            actual_tiles
+        };
+
+        self.ensure_givens4_kernel(
+            "attention_flash_q8_tqv4_tile",
+            kernels::ATTENTION_FLASH_Q8_TQV4_TILE_SRC,
+            "attention_flash_q8_tqv4_tile",
+        )?;
+        {
+            let q_ptr = q.buf.as_ptr();
+            let k_ptr = k_cache.buf.as_ptr();
+            let v_ptr = v_cache.buf.as_ptr();
+            let p_ptr = partials.buf.as_ptr();
+            let pos_ptr = pos_buf.as_ptr();
+            let nh = n_heads as i32;
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let vb = 4i32;
+            let cp = tqv_centroids
+                .map(|t| t.buf.as_ptr())
+                .unwrap_or(std::ptr::null_mut());
+            let ms = max_seq as i32;
+            let sc = 1.0f32 / (head_dim as f32).sqrt();
+            let ts = TILE_SIZE as i32;
+            let mt = max_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &vb as *const _ as *mut c_void,
+                &cp as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "attention_flash_q8_tqv4_tile",
+                [n_heads as u32, launch_tiles as u32, 1],
+                [32, 1, 1],
+                (TILE_SIZE * 4) as u32,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(pos_ptr);
                     b.push_i32(nh);
                     b.push_i32(nkv);
                     b.push_i32(hd);
@@ -16210,6 +16424,24 @@ impl Gpu {
                 specs.push((
                     "attention_flash_asym4_tqv4_tile",
                     assemble_asym(kernels::ATTENTION_FLASH_ASYM4_TQV4_TILE_SRC),
+                ));
+                specs.push((
+                    "attention_flash_tqv4_reduce",
+                    assemble_asym(kernels::ATTENTION_FLASH_TQV4_REDUCE_SRC),
+                ));
+            }
+            "q8_tqv4" | "q8_tq4" => {
+                specs.push((
+                    "kv_cache_write_q8_0",
+                    kernels::KV_CACHE_WRITE_Q8_0_SRC.to_string(),
+                ));
+                specs.push((
+                    "kv_cache_write_tqv4",
+                    assemble_asym(kernels::KV_CACHE_WRITE_TQV4_SRC),
+                ));
+                specs.push((
+                    "attention_flash_q8_tqv4_tile",
+                    assemble_asym(kernels::ATTENTION_FLASH_Q8_TQV4_TILE_SRC),
                 ));
                 specs.push((
                     "attention_flash_tqv4_reduce",

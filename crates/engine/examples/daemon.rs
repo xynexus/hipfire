@@ -295,6 +295,7 @@ fn main() {
             "asym4_tqv2",
             "asym4_tqv3",
             "asym4_tqv4",
+            "q8_tqv4",
             "q8",
         ] {
             for wq in &["mq4", "mq6", "hfq4", "hfq6", "q8"] {
@@ -1160,6 +1161,15 @@ fn load_model(
                 )
                 .map_err(|e| format!("{e}"))?
             }
+            "q8_tqv4" | "q8_tq4" => llama::KvCache::new_gpu_q8_tqv4_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+                physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?,
             "asym4_tqv1" | "tqv1" | "tq1" => llama::KvCache::new_gpu_asym4_tqv1_capped(
                 gpu,
                 config.n_layers,

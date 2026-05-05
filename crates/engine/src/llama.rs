@@ -2738,8 +2738,9 @@ pub struct KvCache {
     pub head_dim: usize,
     pub quantized: bool,
     pub quant_q8: bool,
-    pub quant_int8: bool,                  // true = INT8 with separate scales
-    pub quant_hfq4: bool,                  // true = HFQ4 co-located blocks (72 bytes/head)
+    pub quant_q8_tqv4: bool,    // true = K at Q8_0, V at TurboQuant4/FWHT
+    pub quant_int8: bool,       // true = INT8 with separate scales
+    pub quant_hfq4: bool,       // true = HFQ4 co-located blocks (72 bytes/head)
     pub quant_asym4: bool, // true = K at 4-bit rotated, V at Q8_0 — RotorQuant planar4 asymmetric
     pub quant_asym4_tqv1: bool, // true = K at asym4, V at TurboQuant ternary/1.58b in 2-bit packing
     pub quant_asym4_tqv2: bool, // true = K at asym4, V at TurboQuant2/FWHT
@@ -2780,7 +2781,9 @@ impl KvCache {
     }
 
     pub fn tqv_value_bits(&self) -> usize {
-        if self.quant_asym4_tqv1 {
+        if self.quant_q8_tqv4 {
+            4
+        } else if self.quant_asym4_tqv1 {
             1
         } else if self.quant_asym4_tqv2 {
             2
@@ -2822,6 +2825,7 @@ impl KvCache {
             head_dim,
             quantized: false,
             quant_q8: false,
+            quant_q8_tqv4: false,
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
@@ -2876,6 +2880,7 @@ impl KvCache {
             head_dim,
             quantized: true,
             quant_q8: false,
+            quant_q8_tqv4: false,
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
@@ -2953,6 +2958,7 @@ impl KvCache {
             head_dim,
             quantized: true,
             quant_q8: true,
+            quant_q8_tqv4: false,
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
@@ -2969,6 +2975,87 @@ impl KvCache {
             fwht_signs2: None,
             tqv_centroids: None,
             tqv_thresholds: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+        })
+    }
+
+    /// Create mixed Q8/TQV4 KV cache: K at Q8_0, V at TurboQuant4/FWHT.
+    /// head_dim=256 -> K=272 B/head, V=132 B/head -> 404 B/head total.
+    pub fn new_gpu_q8_tqv4_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 128 || head_dim == 256,
+            "q8_tqv4 requires head_dim=128 or 256"
+        );
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let k_blocks_per_head = head_dim / 32;
+        let k_bph = k_blocks_per_head * 34;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_bph = 4 + head_dim / 2;
+        let v_elems = (physical_cap * n_kv_heads * v_bph + 3) / 4;
+
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
+        }
+
+        let signs1 = Self::gen_fwht_signs(0x544f_5154, head_dim);
+        let signs2 = Self::gen_fwht_signs(0x5654_5154, head_dim);
+        let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1 = gpu.alloc_tensor(&[head_dim], DType::F32)?;
+        let s2 = gpu.alloc_tensor(&[head_dim], DType::F32)?;
+        gpu.hip.memcpy_htod(&s1.buf, &s1b)?;
+        gpu.hip.memcpy_htod(&s2.buf, &s2b)?;
+        let (tqv_centroids, tqv_thresholds) = Self::maybe_load_tqv_tables(gpu, head_dim, 4)?;
+
+        eprintln!(
+            "KV cache: q8_tqv4 (K Q8 {k_bph}B + V TQ4 {v_bph}B = {} B/head, {:.1}x vs fp32, experimental)",
+            k_bph + v_bph,
+            (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_q8_tqv4: true,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym4_tqv1: false,
+            quant_asym4_tqv2: false,
+            quant_asym4_tqv3: false,
+            quant_asym4_tqv4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            fwht_signs1: Some(s1),
+            fwht_signs2: Some(s2),
+            tqv_centroids,
+            tqv_thresholds,
             layer_is_boundary: vec![],
             compact_offset: 0,
         })
@@ -3005,6 +3092,7 @@ impl KvCache {
             head_dim,
             quantized: true,
             quant_q8: false,
+            quant_q8_tqv4: false,
             quant_int8: true,
             quant_hfq4: false,
             quant_asym4: false,
@@ -3057,6 +3145,7 @@ impl KvCache {
             head_dim,
             quantized: true,
             quant_q8: false,
+            quant_q8_tqv4: false,
             quant_int8: false,
             quant_hfq4: true,
             quant_asym4: false,
@@ -3111,6 +3200,7 @@ impl KvCache {
             head_dim,
             quantized: true,
             quant_q8: false,
+            quant_q8_tqv4: false,
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
@@ -3167,6 +3257,7 @@ impl KvCache {
             head_dim,
             quantized: true,
             quant_q8: false,
+            quant_q8_tqv4: false,
             quant_int8: true,
             quant_hfq4: false,
             quant_asym4: false,
@@ -3280,6 +3371,7 @@ impl KvCache {
             head_dim,
             quantized: true,
             quant_q8: false,
+            quant_q8_tqv4: false,
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: true,
@@ -3540,6 +3632,7 @@ impl KvCache {
             head_dim,
             quantized: true,
             quant_q8: false,
+            quant_q8_tqv4: false,
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
@@ -3639,6 +3732,7 @@ impl KvCache {
             head_dim,
             quantized: true,
             quant_q8: false,
+            quant_q8_tqv4: false,
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
@@ -3737,6 +3831,7 @@ impl KvCache {
             head_dim,
             quantized: true,
             quant_q8: false,
+            quant_q8_tqv4: false,
             quant_int8: false,
             quant_hfq4: false,
             quant_asym4: false,
