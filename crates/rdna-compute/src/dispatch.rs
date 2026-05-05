@@ -9771,12 +9771,24 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize, batch_size: usize,
     ) -> HipResult<()> {
-        // K: batched 3-bit rotated write.
-        self.ensure_givens4_kernel(
-            "kv_cache_write_asym_k_givens3_batched",
-            kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC,
-            "kv_cache_write_asym_k_givens3_batched",
-        )?;
+        // K: batched 3-bit rotated write. Branch on head_dim — the hd=256
+        // kernel writes a 100 B/head layout, the hd=512 (Gemma 4 full
+        // layers) variant writes 196 B/head. Mirrors the single-token
+        // kv_cache_write_asym3_fused dispatch pattern; without this branch
+        // hd=512 callers silently get the hd=256 layout and corrupt the
+        // cache (Phase 5 batched-prefill bug on 31B).
+        let (k_kernel, k_src_const) = match head_dim {
+            256 => ("kv_cache_write_asym_k_givens3_batched",
+                    kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC),
+            512 => ("kv_cache_write_asym_k_givens3_hd512_batched",
+                    kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC),
+            other => return Err(hip_bridge::HipError::new(
+                0,
+                &format!("kv_cache_write_asym3_batched: head_dim={other} not supported \
+                          (only 256 and 512 implemented)"),
+            )),
+        };
+        self.ensure_givens4_kernel(k_kernel, k_src_const, k_kernel)?;
         {
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
@@ -9798,7 +9810,7 @@ impl Gpu {
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
             self.launch_maybe_blob(
-                "kv_cache_write_asym_k_givens3_batched",
+                k_kernel,
                 [n_kv_heads as u32, batch_size as u32, 1],
                 [32, 1, 1],
                 shared_mem,

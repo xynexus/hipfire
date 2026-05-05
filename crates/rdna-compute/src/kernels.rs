@@ -173,6 +173,15 @@ pub const GELU_TANH_MUL_BATCHED_F32_SRC: &str =
 pub const FOLD_TOPK_WITH_PER_EXPERT_SCALE_K8_SRC: &str =
     include_str!("../../../kernels/src/fold_topk_with_per_expert_scale_k8.hip");
 
+/// hd=512 batched counterpart to kv_cache_write_asym_k_givens3_batched.
+/// Required for Gemma 4 full-attention layers (head_dim=512); the
+/// hd=256 batched kernel writes a 100 B/head layout that the hd=512
+/// flash reader expects to be 196 B/head, silently corrupting the
+/// cache. Mirrors the single-token kv_cache_write_asym_k_givens3_hd512
+/// kernel + the existing batched hd=256 outer loop.
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512_batched.hip");
+
 /// Batched partial halved RoPE for Gemma 4 batched prefill (Phase 5).
 /// Reads positions from a device array and applies the rotate_half
 /// pairing convention to N tokens × n_heads_q (and N × n_heads_k) in
