@@ -1439,6 +1439,15 @@ fn moe_ffn_decode_impl(
     }
 
     // ── 2a. Top-K selection — GPU fast path or CPU fallback ──
+    // Diagnostic gate (debug/moe-qwen-20260505 branch). When
+    // HIPFIRE_MOE_TOPK_CPU_OVERWRITE=1 is set on the GPU-fast-path,
+    // after the GPU softmax_topk runs, OVERWRITE its device-side
+    // outputs with CPU-computed equivalents from the same logits.
+    // Then keep using the indexed kernels (gemv_hfq4g256_moe_*_indexed).
+    // This bisects the GPU-fast-path: if output becomes coherent under
+    // this gate, the bug is in moe_softmax_topk_renorm_k8. If still
+    // broken, the bug is in the indexed kernels.
+    let topk_overwrite = std::env::var("HIPFIRE_MOE_TOPK_CPU_OVERWRITE").ok().as_deref() == Some("1");
     let (topk_indices_cpu, topk_weights_cpu): (Option<Vec<usize>>, Option<Vec<f32>>) = if use_gpu_topk {
         // GPU path: softmax + top-K + renorm in one launch, results land
         // in s.topk_indices [k] (i32) and s.topk_weights [k] (f32) on
@@ -1447,6 +1456,34 @@ fn moe_ffn_decode_impl(
             router_logits, s.topk_indices, s.topk_weights,
             n_exp, config.norm_topk_prob,
         )?;
+        if topk_overwrite {
+            // Recompute on CPU and overwrite device buffers. Logits were
+            // not stored after softmax_topk's softmax (the kernel's smem
+            // softmax never touches router_logits), so we re-softmax here.
+            gpu.softmax_f32(router_logits)?;
+            let probs = gpu.download_f32(router_logits)?;
+            let mut indices: Vec<usize> = (0..n_exp).collect();
+            indices.select_nth_unstable_by(k - 1, |&a, &b| {
+                probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut top: Vec<usize> = indices.into_iter().take(k).collect();
+            top.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut weights: Vec<f32> = top.iter().map(|&i| probs[i]).collect();
+            if config.norm_topk_prob {
+                let sum: f32 = weights.iter().sum();
+                if sum > 0.0 { for w in weights.iter_mut() { *w /= sum; } }
+            }
+            // i32 indices buffer (same size as f32 since k=8 fits both): pack
+            // u32 from each i32 into the bytes that gpu.upload_raw expects.
+            let idx_bytes: Vec<u8> = top.iter()
+                .flat_map(|&i| (i as i32).to_le_bytes())
+                .collect();
+            let w_bytes: Vec<u8> = weights.iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            gpu.hip.memcpy_htod(&s.topk_indices.buf, &idx_bytes)?;
+            gpu.hip.memcpy_htod(&s.topk_weights.buf, &w_bytes)?;
+        }
         (None, None)
     } else {
         // Fallback: GPU softmax → CPU download → CPU top-K + renorm.
