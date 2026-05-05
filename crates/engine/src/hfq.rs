@@ -471,6 +471,17 @@ fn load_weight_tensor(
                 row_stride: 0,
             })
         }
+        2 => {
+            // F32 — upload directly for F32 GEMV.
+            let buf = gpu.upload_raw(data, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+            })
+        }
         _ => panic!(
             "unsupported quant_type {} for weight {st_name}",
             info.quant_type
@@ -534,11 +545,18 @@ pub fn load_weights_hfq(
         load_weight_tensor(hfq, gpu, "lm_head.weight", config.vocab_size, config.dim)?
     } else {
         // Tied embeddings — reuse token_embd as output weights (F32 for GEMV)
-        let data = hfq.tensor_data("model.embed_tokens.weight").unwrap().1;
-        let f32_data: Vec<f32> = data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+        let (embed_info, data) = hfq.tensor_data("model.embed_tokens.weight").unwrap();
+        let f32_data: Vec<f32> = match embed_info.quant_type {
+            1 => data
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+            2 => data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            qt => panic!("unsupported tied embedding quant_type {qt} for output"),
+        };
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
         };

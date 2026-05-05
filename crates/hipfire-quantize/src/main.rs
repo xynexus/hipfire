@@ -152,6 +152,17 @@ fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     }
 }
 
+fn f32_slice_to_f16_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+        .collect()
+}
+
+fn f32_slice_to_f32_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|&v| v.to_le_bytes()).collect()
+}
+
 // ─── Q4_F16_G64 Quantization ────────────────────────────────────────────────
 
 /// Quantize F32 weights to Q4_F16_G64 format.
@@ -1767,18 +1778,22 @@ fn main() {
 
     let output_path = args.iter().position(|a| a == "--output")
         .map(|i| &args[i + 1])
-        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format q8f16|q4f16]"); std::process::exit(1); });
+        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format f16|f32|q8f16|q4f16|mq4|hfq4]"); std::process::exit(1); });
 
     let format = args
         .iter()
         .position(|a| a == "--format")
         .map(|i| args[i + 1].as_str())
         .unwrap_or("q8f16");
+    // f16/f32 = unquantized baselines. Source BF16/F32 tensors are converted
+    // to F16 for f16, or preserved as F32 for f32; both run via F32 GEMV today.
     // q8f16 = all weights Q8 (interleaved blocks)
     // q4f16 = all weights Q4_F16_G64
     // q8-mixed = Q8 attn + Q4_K FFN (best tok/s for VRAM-constrained)
     // q8-fast = Q8 attn + Q4-as-Q8 FFN (all Q8 occupancy, most VRAM)
     // q8hfq = all weights Q8_HFQ (split-metadata, 128B-aligned rows)
+    let use_f16_baseline = format == "f16" || format == "fp16" || format == "noquant";
+    let use_f32_baseline = format == "f32" || format == "fp32";
     let use_q8 = format == "q8f16" || format == "q8";
     let use_mixed = format == "q8-mixed" || format == "mixed";
     let use_fast = format == "q8-fast" || format == "fast";
@@ -1995,7 +2010,11 @@ fn main() {
                     let slice_off = x * inner_bytes;
                     let slice = &raw_data[slice_off..slice_off + inner_bytes];
                     let f32_slice = to_f32(slice, &dtype);
-                    let (quantized, qt, gs) = if supports_mq4 {
+                    let (quantized, qt, gs) = if use_f32_baseline {
+                        (f32_slice_to_f32_bytes(&f32_slice), QuantType::F32, 0u32)
+                    } else if use_f16_baseline {
+                        (f32_slice_to_f16_bytes(&f32_slice), QuantType::F16, 0u32)
+                    } else if supports_mq4 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
                     } else {
@@ -2011,9 +2030,19 @@ fn main() {
                     }
                 })
                 .collect();
-            quantized_params += inner_n as u64 * n_experts as u64;
+            if !(use_f16_baseline || use_f32_baseline) {
+                quantized_params += inner_n as u64 * n_experts as u64;
+            }
             // Single eprintln to summarize the whole expert sweep.
-            let label = if supports_mq4 { "MQ4G256" } else { "HFQ4G128" };
+            let label = if use_f32_baseline {
+                "F32"
+            } else if use_f16_baseline {
+                "F16"
+            } else if supports_mq4 {
+                "MQ4G256"
+            } else {
+                "HFQ4G128"
+            };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
@@ -2023,9 +2052,33 @@ fn main() {
 
         if should_quantize(name) && n_elements >= 32 {
             let f32_data = to_f32(raw_data, &meta.dtype);
-            quantized_params += n_elements as u64;
-
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+
+            if use_f32_baseline || use_f16_baseline {
+                let (data, quant_type, label) = if use_f32_baseline {
+                    (f32_slice_to_f32_bytes(&f32_data), QuantType::F32, "F32")
+                } else {
+                    (f32_slice_to_f16_bytes(&f32_data), QuantType::F16, "F16")
+                };
+                eprintln!(
+                    "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB, unquantized baseline)",
+                    name,
+                    meta.shape,
+                    n_elements,
+                    raw_data.len() as f64 / 1024.0,
+                    data.len() as f64 / 1024.0
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type,
+                    shape,
+                    group_size: 0,
+                    data,
+                });
+                continue;
+            }
+
+            quantized_params += n_elements as u64;
 
             // Q8HFQ path: split-metadata per-row layout (needs M and K)
             // Exclude embeddings — they use a lookup kernel, not GEMV
@@ -2484,42 +2537,42 @@ fn main() {
                 data,
             });
         } else {
-            // Keep as F16 (convert BF16 -> F16 if needed)
-            let f16_data = match meta.dtype.as_str() {
-                "F16" => raw_data.to_vec(),
-                "BF16" => {
-                    // BF16 → F32 → F16
-                    let f32_vals = to_f32(raw_data, "BF16");
-                    f32_vals
-                        .iter()
-                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                        .collect()
-                }
-                "F32" => {
-                    let f32_vals = to_f32(raw_data, "F32");
-                    f32_vals
-                        .iter()
-                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                        .collect()
-                }
-                other => panic!("unsupported dtype for norm/embd: {other}"),
+            // Keep non-matrix tensors unquantized. F32 language baselines
+            // preserve F32; vision GEMM still expects F16 weights.
+            let (data, quant_type, label) = if use_f32_baseline && !is_vision {
+                let f32_vals = to_f32(raw_data, &meta.dtype);
+                (f32_slice_to_f32_bytes(&f32_vals), QuantType::F32, "F32")
+            } else {
+                let f16_data = match meta.dtype.as_str() {
+                    "F16" => raw_data.to_vec(),
+                    "BF16" => {
+                        let f32_vals = to_f32(raw_data, "BF16");
+                        f32_slice_to_f16_bytes(&f32_vals)
+                    }
+                    "F32" => {
+                        let f32_vals = to_f32(raw_data, "F32");
+                        f32_slice_to_f16_bytes(&f32_vals)
+                    }
+                    other => panic!("unsupported dtype for norm/embd: {other}"),
+                };
+                (f16_data, QuantType::F16, "F16")
             };
 
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             eprintln!(
-                "  F16:        {} {:?} ({} elements, {:.1} KB)",
+                "  {label}:        {} {:?} ({} elements, {:.1} KB)",
                 name,
                 meta.shape,
                 n_elements,
-                f16_data.len() as f64 / 1024.0
+                data.len() as f64 / 1024.0
             );
 
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
-                quant_type: QuantType::F16,
+                quant_type,
                 shape,
                 group_size: 0,
-                data: f16_data,
+                data,
             });
         }
     }

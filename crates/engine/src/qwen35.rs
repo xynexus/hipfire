@@ -758,6 +758,16 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
             })
         }
+        2 => {
+            let buf = gpu.upload_raw(data, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+            })
+        }
         _ => panic!("unsupported quant_type {} for lm_head", quant_type),
     }
 }
@@ -907,6 +917,17 @@ fn load_weight_tensor(
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+            })
+        }
+        2 => {
+            // F32 baseline weights — upload directly for F32 GEMV.
+            let buf = gpu.upload_raw(data, &[m, k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -1306,11 +1327,19 @@ pub fn load_weights(
             EmbeddingFormat::Q8_0,
         )
     } else {
-        let f32_data: Vec<f32> = embd_info
-            .1
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+        let f32_data: Vec<f32> = match embd_info.0.quant_type {
+            1 => embd_info
+                .1
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+            2 => embd_info
+                .1
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            qt => panic!("unsupported embedding quant_type {qt}"),
+        };
         (
             gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
             EmbeddingFormat::F32,
@@ -1404,10 +1433,17 @@ pub fn load_weights(
                 row_stride: 0,
             }
         } else {
-            let f32_data: Vec<f32> = embd_data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
+            let f32_data: Vec<f32> = match embd_info.0.quant_type {
+                1 => embd_data
+                    .chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect(),
+                2 => embd_data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                qt => panic!("unsupported tied embedding quant_type {qt} for output"),
+            };
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
