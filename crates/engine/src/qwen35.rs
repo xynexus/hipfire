@@ -1464,10 +1464,11 @@ fn moe_ffn_decode_impl(
             n_exp, config.norm_topk_prob,
         )?;
         if topk_overwrite {
-            // Recompute on CPU and overwrite device buffers. Logits were
-            // not stored after softmax_topk's softmax (the kernel's smem
-            // softmax never touches router_logits), so we re-softmax here.
-            gpu.softmax_f32(router_logits)?;
+            // Diagnostic gate retained from the pre-Path-B bisection.
+            // Path B already ran gpu.softmax_f32(router_logits) above, so
+            // router_logits already holds probs; we just need a D2H copy.
+            // Used to A/B the indexed kernels independently in future
+            // bisection.
             let probs = gpu.download_f32(router_logits)?;
             let mut indices: Vec<usize> = (0..n_exp).collect();
             indices.select_nth_unstable_by(k - 1, |&a, &b| {
