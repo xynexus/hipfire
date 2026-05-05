@@ -10,7 +10,7 @@ curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/in
 
 The installer detects your GPU arch (`gfx1010` / `gfx1030` / `gfx1100` / etc.),
 fetches matching pre-compiled kernel blobs, drops the daemon and quantizer
-binaries into `~/.hipfire/bin/`, and adds a wrapper to `~/.local/bin/`. Make
+binaries into `~/.local/lib/hipfire/`, and adds a wrapper to `~/.local/bin/`. Make
 sure `~/.local/bin` is on your `PATH`.
 
 For Windows (native, with the AMD HIP SDK):
@@ -22,7 +22,7 @@ irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/instal
 The installer detects your AMD GPU via `Win32_VideoController`, downloads
 the prebuilt `daemon.exe` from the latest GitHub release, sets up the
 `bun`-based CLI, and runs `daemon.exe --precompile` to JIT-compile kernels
-for your arch into `~\.hipfire\bin\kernels\compiled\<arch>\`. This requires
+for your arch into `~/.local/lib/hipfire/kernels/compiled/<arch>/`. This requires
 the [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)
 to be installed (provides `hipcc.bat` + `amdhip64.dll`).
 

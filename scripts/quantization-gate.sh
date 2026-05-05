@@ -3,7 +3,7 @@
 #
 # Runs the mandatory layers for KV quantization work:
 #   1. synthetic KV parity: asym4+Q8 V reference vs asym4+TQV4/TQV2
-#   2. logit/top-5 divergence: fixed prompts, q8 baseline, per-mode CSV/JSON
+#   2. logit/top-5 divergence: fixed prompts, fp32 baseline, per-mode CSV/JSON
 #   3. prompt-generation smoke: daemon JSONL output + decoded text per mode
 #   4. split perf: prefill/decode matrix per mode and context size
 #   5. optional coherence gate pass per mode (--coherence)
@@ -14,14 +14,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL="${HIPFIRE_QUANT_MODEL:-$HOME/.hipfire/models/qwen3.5-2b.mq4}"
-MODES="${HIPFIRE_QUANT_MODES:-q8,asym4,asym4_tqv4,asym4_tqv3,asym4_tqv2}"
+MODEL="${HIPFIRE_QUANT_MODEL:-${XDG_DATA_HOME:-$HOME/.local/share}/hipfire/models/qwen3.5-2b.mq4}"
+MODES="${HIPFIRE_QUANT_MODES:-fp32,q8,asym4,asym3,asym2,asym4_tqv4,asym4_tqv3,asym4_tqv2,asym4_tqv1}"
 OUT="${HIPFIRE_QUANT_OUT:-benchmarks/results/quantization-$(date +%Y%m%d-%H%M%S)}"
 FULL=0
 COHERENCE=0
 RUNS=1
 STRICT=0
 SKIP_BUILD=0
+MODEL_NAME="${HIPFIRE_QUANT_MODEL_NAME:-}"
+CHECK_TOOL_JSON="${HIPFIRE_QUANT_CHECK_TOOL_JSON:-warn}" # off|warn|strict
 TQV4_COS_FLOOR="${HIPFIRE_TQV4_COS_FLOOR:-0.995}"
 TQV3_COS_FLOOR="${HIPFIRE_TQV3_COS_FLOOR:-0.990}"
 TQV2_COS_FLOOR="${HIPFIRE_TQV2_COS_FLOOR:-0.985}"
@@ -62,6 +64,8 @@ while [ $# -gt 0 ]; do
         --modes) MODES="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --runs) RUNS="$2"; shift 2 ;;
+        --model-name) MODEL_NAME="$2"; shift 2 ;;
+        --check-tool-json) CHECK_TOOL_JSON="$2"; shift 2 ;;
         --full) FULL=1; shift ;;
         --coherence) COHERENCE=1; shift ;;
         --strict) STRICT=1; shift ;;
@@ -80,6 +84,10 @@ if [ ! -f "$MODEL" ]; then
     echo "missing model: $MODEL" >&2
     exit 2
 fi
+if [[ "$CHECK_TOOL_JSON" != "off" && "$CHECK_TOOL_JSON" != "warn" && "$CHECK_TOOL_JSON" != "strict" ]]; then
+    echo "--check-tool-json must be off, warn, or strict" >&2
+    exit 2
+fi
 
 mkdir -p "$OUT"/{kernel,logits,prompts,perf,coherence}
 
@@ -93,7 +101,7 @@ fi
 
 IFS=',' read -r -a MODE_ARR <<< "$MODES"
 if [ "${#MODE_ARR[@]}" -lt 2 ]; then
-    echo "--modes must include at least q8 plus one comparison mode" >&2
+    echo "--modes must include a baseline plus at least one comparison mode" >&2
     exit 2
 fi
 BASE_MODE="${MODE_ARR[0]}"
@@ -106,11 +114,14 @@ echo "quantization-gate output: $OUT"
     echo "- branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
     echo "- commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "- model: $MODEL"
+    if [ -n "$MODEL_NAME" ]; then echo "- model_name: $MODEL_NAME"; fi
     echo "- model_md5: $(md5sum "$MODEL" | awk '{print $1}')"
+    echo "- model_size_bytes: $(stat -c%s "$MODEL" 2>/dev/null || wc -c < "$MODEL")"
     echo "- modes: $MODES"
     echo "- full: $FULL"
     echo "- coherence: $COHERENCE"
     echo "- strict: $STRICT"
+    echo "- check_tool_json: $CHECK_TOOL_JSON"
     echo "- thresholds:"
     echo "  - tqv4_cos_floor: $TQV4_COS_FLOOR"
     echo "  - tqv3_cos_floor: $TQV3_COS_FLOOR"
@@ -198,6 +209,16 @@ PY
 
 PROMPTS=(
     "cap|inline|What is the capital of France? Answer in one short sentence.|"
+    "largest_island|inline|What is the largest island? Answer with only one word.|"
+    "red_planet|inline|Which planet is known as the Red Planet? Answer with one word.|"
+    "author_1984|inline|Who wrote 1984? Answer with only the surname.|"
+    "boiling_water|inline|At sea level, water boils at what temperature in Celsius? Answer with only the number.|"
+    "speed_light|inline|What is the speed of light in vacuum, rounded to the nearest thousand km/s? Answer with only the number.|"
+    "square_root|inline|What is the square root of 144? Answer with only the number.|"
+    "chemical_water|inline|What is the chemical formula for water? Answer with only the formula.|"
+    "largest_ocean|inline|What is the largest ocean on Earth? Answer with one word.|"
+    "currency_japan|inline|What is the currency of Japan? Answer with one word.|"
+    "primary_blue_yellow|inline|What color do blue and yellow paint make when mixed? Answer with one word.|"
     "reason|inline|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|"
     "code|file|benchmarks/prompts/lru_cache_pep8_strict.txt|"
     "tool|file|benchmarks/prompts/tool_call_read_file.txt|benchmarks/prompts/tool_call_system.txt"
@@ -241,6 +262,10 @@ for entry in "${PROMPTS[@]}"; do
         system_args=(--system "$(cat "$system_file")")
     fi
     mkdir -p "$OUT/logits/$pid"
+    printf '%s' "$ptxt" > "$OUT/prompts/${pid}.prompt.txt"
+    if [ -n "${system_file:-}" ]; then
+        cat "$system_file" > "$OUT/prompts/${pid}.system.txt"
+    fi
     echo "prompt=$pid md5=$pmd5"
     specs=()
     for mode in "${MODE_ARR[@]}"; do
@@ -322,7 +347,7 @@ PY
         echo
         echo "- prompt_md5: $pmd5"
         echo
-        echo "q8 baseline:"
+        echo "$BASE_MODE baseline:"
         echo
         echo '```json'
         cat "$OUT/logits/$pid/compare.json"
@@ -397,7 +422,7 @@ PY
         if [ "$pid" = "tool" ]; then
             while IFS='|' read -r kind msg; do
                 collect_diag "$kind" "$msg"
-            done < <(python3 - "$OUT/prompts/${pid}.${mode}.txt" "$mode" "$STRICT" <<'PY'
+            done < <(python3 - "$OUT/prompts/${pid}.${mode}.txt" "$mode" "$STRICT" "$CHECK_TOOL_JSON" <<'PY'
 import json
 import re
 import sys
@@ -405,18 +430,20 @@ import sys
 text = open(sys.argv[1], errors="ignore").read()
 mode = sys.argv[2]
 strict = sys.argv[3] == "1"
+check_tool_json = sys.argv[4]
 prefix = "ERROR" if strict else "WARN"
+json_prefix = "ERROR" if (strict or check_tool_json == "strict") else "WARN"
 if "<|im_start|>" in text or "<|im_end|>" in text:
     print(f"WARN|tool/{mode}: emitted chat special token around tool response")
 matches = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", text, flags=re.S)
 if not matches:
     print(f"{prefix}|tool/{mode}: no <tool_call> block emitted")
-else:
+elif check_tool_json != "off":
     for idx, payload in enumerate(matches):
         try:
             json.loads(payload)
         except Exception as exc:
-            print(f"ERROR|tool/{mode}: tool_call #{idx} is not valid JSON: {exc}")
+            print(f"{json_prefix}|tool/{mode}: tool_call #{idx} is not valid JSON: {exc}")
 PY
 )
         fi
@@ -435,6 +462,38 @@ PY
     done
 done
 
+diag_file="$OUT/logits/tqv3-collapse.diag"
+python3 - "$OUT" "$MODES" > "$diag_file" <<'PY'
+import filecmp
+import pathlib
+import sys
+
+out = pathlib.Path(sys.argv[1])
+modes = [m.strip() for m in sys.argv[2].split(",") if m.strip()]
+if "asym4_tqv2" not in modes or "asym4_tqv3" not in modes:
+    raise SystemExit(0)
+
+prompt_dirs = [p for p in (out / "logits").iterdir() if p.is_dir()]
+checked = 0
+same = 0
+for prompt_dir in prompt_dirs:
+    t2 = prompt_dir / "asym4_tqv2.tokens"
+    t3 = prompt_dir / "asym4_tqv3.tokens"
+    k2 = prompt_dir / "asym4_tqv2.top5.csv"
+    k3 = prompt_dir / "asym4_tqv3.top5.csv"
+    if not (t2.exists() and t3.exists() and k2.exists() and k3.exists()):
+        continue
+    checked += 1
+    if filecmp.cmp(t2, t3, shallow=False) and filecmp.cmp(k2, k3, shallow=False):
+        same += 1
+
+if checked > 0 and checked == same:
+    print(f"WARN|asym4_tqv3 exactly matched asym4_tqv2 for all {checked} prompts; TQV3 is probably collapsed to the TQV2 table/path")
+PY
+while IFS='|' read -r kind msg; do
+    collect_diag "$kind" "$msg"
+done < "$diag_file"
+
 echo "== split perf =="
 if [ "$FULL" -eq 1 ]; then
     PREFILLS=(512 2048 8192 32768)
@@ -443,7 +502,7 @@ else
     PREFILLS=(512 2048)
     GEN=64
 fi
-echo "mode,prefill,run,prefill_tok_s,decode_tok_s,summary" > "$OUT/perf/perf.csv"
+printf '%s\n' "mode,prefill,run,prefill_tok_s,decode_tok_s,summary" > "$OUT/perf/perf.csv"
 for mode in "${MODE_ARR[@]}"; do
     for pp in "${PREFILLS[@]}"; do
         for run in $(seq 1 "$RUNS"); do
@@ -498,6 +557,21 @@ PY
     echo '```'
     echo
 } >> "$OUT/report.md"
+
+echo "== identicality dashboard =="
+dashboard_args=(scripts/kv_quality_dashboard.py "$OUT" --baseline "$BASE_MODE" --model "$MODEL" --out "$OUT/dashboard.html" --json-out "$OUT/identicality.json")
+if [ -n "$MODEL_NAME" ]; then dashboard_args+=(--model-name "$MODEL_NAME"); fi
+if python3 "${dashboard_args[@]}"; then
+    {
+        echo "## Identicality Dashboard"
+        echo
+        echo "- html: $OUT/dashboard.html"
+        echo "- json: $OUT/identicality.json"
+        echo
+    } >> "$OUT/report.md"
+else
+    warn "identicality dashboard generation failed"
+fi
 
 if [ "$COHERENCE" -eq 1 ]; then
     echo "== coherence =="

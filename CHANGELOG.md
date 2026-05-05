@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **XDG install layout.** User installs now put the wrapper in
+  `~/.local/bin/hipfire`, program files in `~/.local/lib/hipfire/`, models in
+  `~/.local/share/hipfire/models/`, config in `~/.config/hipfire/`, cache in
+  `~/.cache/hipfire/`, and serve state/logs in `~/.local/state/hipfire/`.
+  The old `~/.hipfire` layout is no longer probed.
+- **KV metrics dashboard.** Adds `hipfire metrics <model>` as a CLI
+  wrapper around `scripts/quantization-gate.sh`, with direct runtime
+  mode selection (`--modes`) and K/V matrix expansion (`--modes-k`,
+  `--modes-v`). Intended for repeatable fp32-vs-quantized KV quality
+  and perf reports under `benchmarks/results/`.
+- **TQV V-cache calibration modes.** Extends the accepted KV-cache mode
+  surface with `asym4_tqv1` plus `tqv1` / `tq1` aliases, alongside the
+  existing TQV2-4 modes.
 - **MQ3-G256 and MQ2-G256 sub-4-bit Magnum Quants** (`feature/mq-sub4bit`).
   Adds FWHT-rotated 3-bit and 2-bit weight formats. MQ3 = 104 B/group
   (3.25 bpw), MQ2 = 72 B/group (2.25 bpw). Quantizer flags `--format mq3`

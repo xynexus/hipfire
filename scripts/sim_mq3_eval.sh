@@ -24,7 +24,7 @@ cd "$(dirname "$0")/.."
 
 EXE="./target/release/examples/daemon"
 SIM_DIR="${SIM_DIR:-/tmp/mq3-sim/models}"
-SRC_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
+SRC_DIR="${HIPFIRE_MODELS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/hipfire/models}"
 OUT="${OUT:-/tmp/mq3-eval-$(date +%Y%m%d-%H%M%S).md}"
 
 if [ ! -x "$EXE" ]; then

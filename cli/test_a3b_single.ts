@@ -4,7 +4,7 @@
 import { spawn } from "bun";
 import { homedir } from "os";
 
-const MODEL = `${homedir()}/.hipfire/models/qwen3.5-35b-a3b.mq4`;
+const MODEL = `${process.env.XDG_DATA_HOME || `${homedir()}/.local/share`}/hipfire/models/qwen3.5-35b-a3b.mq4`;
 const DAEMON = `${import.meta.dir}/../target/release/examples/daemon`;
 
 const env: any = { ...process.env, HIPFIRE_KV_MODE: "q8" };

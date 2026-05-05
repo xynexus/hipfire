@@ -24,7 +24,7 @@ node without ROCm can still build the quantizer.
 hipfire run qwen3.5:9b "..."
 
   CLI (cli/index.ts, Bun/TS)
-    ├── resolve tag → ~/.hipfire/models/<file>
+    ├── resolve tag → ~/.local/share/hipfire/models/<file>
     ├── if running daemon detected → POST /v1/chat/completions
     └── else → spawn one-shot daemon binary
 
@@ -48,7 +48,7 @@ hipfire run qwen3.5:9b "..."
     └── sample (greedy / top-p / repeat-penalty)
 
   Kernels (kernels/src/*.hip)
-    ├── compiled at runtime via hipcc, cached at ~/.hipfire/bin/kernels/<arch>/
+    ├── compiled at runtime via hipcc, cached at ~/.local/lib/hipfire/kernels/compiled/<arch>/
     └── invoked by rdna-compute::dispatch
 ```
 
@@ -102,7 +102,7 @@ Two principles:
 
 ```
 kernels/src/<name>.hip                    # source
-~/.hipfire/bin/kernels/<arch>/<name>.hsaco  # pre-compiled blob, hash-verified
+~/.local/lib/hipfire/kernels/compiled/<arch>/<name>.hsaco  # pre-compiled blob, hash-verified
 ~/.hipcc-cache/<hash>.hsaco                  # JIT fallback
 ```
 
@@ -169,7 +169,7 @@ Draft resolution (in `cli/index.ts`, in priority order):
 2. **Filename auto-match**: when the target path matches the regex
    `qwen3?.?(5|6)[-_]?<size>\.(mq4|mq6|hfq4|hfq6|q8)`, the CLI looks
    for a sibling file named `qwen3{ver}-{size}-dflash-{quant}.hfq`
-   in `./models/`, `../../models/`, or `~/.hipfire/models/`. First
+   in `./models/`, `../../models/`, or `~/.local/share/hipfire/models/`. First
    hit wins. Logs `[hipfire] DFlash draft detected: <path>` to stderr.
 3. Registry tags `:<size>-draft` (e.g. `qwen3.5:27b-draft`) point at
    exactly those filenames, so `hipfire pull qwen3.5:27b-draft` puts
@@ -195,7 +195,7 @@ HIPFIRE_GRAPH=1               # enable hipGraph capture (debug; AR-only)
 HIPFIRE_MEMSET_DUMP=1         # log every gpu memset call:line
 ```
 
-Daemon log (`~/.hipfire/serve.log`) contains layer-load progress,
+Daemon log (`~/.local/state/hipfire/serve.log`) contains layer-load progress,
 kernel JIT activity, and dispatch decisions. Tail it during first-load
 and any first-time arch transition.
 

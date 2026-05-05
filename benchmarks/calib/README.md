@@ -2,6 +2,22 @@
 
 Two distinct corpus types live here:
 
+## TQV calibration tables
+
+`tqv/*.json` are small committed calibration artifacts for the
+TurboQuant V-cache table family. They are produced by
+`scripts/tqv_fit_tables.py` from captured post-normalization,
+post-FWHT/sign V-cache samples. Keep these tables in git when the
+runtime embeds or references them; they are calibration data, not local
+scratch.
+
+Quick synthetic smoke for the fitter:
+
+```
+scripts/tqv_fit_tables.py --synthetic 128,256 --synthetic-samples 4096 \
+  --max-iter 20 --bits 2,3,4 --out /tmp/tqv-synth.json
+```
+
 ## Optimization-bench corpora (NOT sidecar-quality)
 
 `calib-1m.txt` and `calib-5m.txt` are wikitext-103 slices used to measure

@@ -24,7 +24,7 @@ Usage (no GPU needed; uses meta device if CUDA absent):
   python3 scripts/dflash_diag_config.py \
       --target-repo Qwen/Qwen3.5-4B \
       --safetensors /root/dflash_4b_agentic/model.safetensors \
-      --compare-safetensors ~/.hipfire/reference_drafts/Qwen3.5-4B-DFlash/model.safetensors
+      --compare-safetensors ~/.local/share/hipfire/reference_drafts/Qwen3.5-4B-DFlash/model.safetensors
 """
 
 from __future__ import annotations

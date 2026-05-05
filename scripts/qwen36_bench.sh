@@ -5,7 +5,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 EXE="./target/release/examples/dflash_spec_demo"
-MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/hipfire/models}"
 TARGET="$MODELS_DIR/qwen3.6-27b.mq4"
 DRAFT="$MODELS_DIR/qwen36-27b-dflash-mq4-new.hfq"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"

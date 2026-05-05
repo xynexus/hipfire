@@ -6,7 +6,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 EXE=./target/release/examples/dflash_spec_demo
-MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/hipfire/models}"
 LOCK_SCRIPT=./scripts/gpu-lock.sh
 MAX_TOKENS="${HIPFIRE_BENCH_MAX:-192}"
 RUNS="${HIPFIRE_BENCH_RUNS:-3}"

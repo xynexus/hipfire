@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do
 done
 
 EXE="./target/release/examples/dflash_spec_demo"
-MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/hipfire/models}"
 TARGET_27B="$MODELS_DIR/qwen3.5-27b.mq4"
 DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash.mq4"
 if [ ! -f "$DRAFT_27B" ] && [ -f "$MODELS_DIR/qwen35-27b-dflash-mq4.hfq" ]; then

@@ -11,17 +11,37 @@ import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
 
-const HIPFIRE_DIR = join(homedir(), ".hipfire");
-const MODELS_DIR = join(HIPFIRE_DIR, "models");
-const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
+const HOME_DIR = homedir();
+function envPath(name: string, fallback: string): string {
+  const value = process.env[name];
+  return value && value.length > 0 ? value : fallback;
+}
+const XDG_CONFIG_HOME = envPath("XDG_CONFIG_HOME", join(HOME_DIR, ".config"));
+const XDG_DATA_HOME = envPath("XDG_DATA_HOME", join(HOME_DIR, ".local", "share"));
+const XDG_CACHE_HOME = envPath("XDG_CACHE_HOME", join(HOME_DIR, ".cache"));
+const XDG_STATE_HOME = envPath("XDG_STATE_HOME", join(HOME_DIR, ".local", "state"));
+const HIPFIRE_CONFIG_DIR = envPath("HIPFIRE_CONFIG_DIR", join(XDG_CONFIG_HOME, "hipfire"));
+const HIPFIRE_DATA_DIR = envPath("HIPFIRE_DATA_DIR", join(XDG_DATA_HOME, "hipfire"));
+const HIPFIRE_CACHE_DIR = envPath("HIPFIRE_CACHE_DIR", join(XDG_CACHE_HOME, "hipfire"));
+const HIPFIRE_STATE_DIR = envPath("HIPFIRE_STATE_DIR", join(XDG_STATE_HOME, "hipfire"));
+const HIPFIRE_LIB_DIR = envPath("HIPFIRE_LIB_DIR", join(HOME_DIR, ".local", "lib", "hipfire"));
+const MODELS_DIR = envPath("HIPFIRE_MODELS_DIR", join(HIPFIRE_DATA_DIR, "models"));
+const CONFIG_PATH = join(HIPFIRE_CONFIG_DIR, "config.json");
+const PER_MODEL_CONFIG_PATH = join(HIPFIRE_CONFIG_DIR, "per_model_config.json");
+const USER_ALIASES_PATH = join(HIPFIRE_CONFIG_DIR, "models.json");
+const SERVE_PID_FILE = join(HIPFIRE_STATE_DIR, "serve.pid");
+const SERVE_LOG_FILE = join(HIPFIRE_STATE_DIR, "serve.log");
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
 
+mkdirSync(HIPFIRE_CONFIG_DIR, { recursive: true });
+mkdirSync(HIPFIRE_CACHE_DIR, { recursive: true });
+mkdirSync(HIPFIRE_STATE_DIR, { recursive: true });
 mkdirSync(MODELS_DIR, { recursive: true });
 
 // ─── Persistent config ─────────────────────────────────
 interface HipfireConfig {
-  kv_cache: string;       // "auto" (per-arch default), "q8", "asym4_tqv2", "asym4_tqv3", "asym4_tqv4", "asym4", "asym3", "asym2"
+  kv_cache: string;       // "auto" (per-arch default), "q8", "asym4_tqv1", "asym4_tqv2", "asym4_tqv3", "asym4_tqv4", "asym4", "asym3", "asym2"
   flash_mode: string;     // "auto" (ctx-gated), "always", "never" — only affects Q8 path
   default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
   temperature: number;    // default temperature for run
@@ -179,7 +199,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
 
 function validateConfigValue(key: string, value: any): boolean {
   switch (key) {
-    case "kv_cache": return ["auto", "q8", "asym4_tqv2", "tqv2", "asym4_tqv3", "tqv3", "asym4_tqv4", "tqv4", "asym4", "asym3", "asym2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "kv_cache": return ["auto", "q8", "asym4_tqv1", "tqv1", "tq1", "asym4_tqv2", "tqv2", "asym4_tqv3", "tqv3", "asym4_tqv4", "tqv4", "asym4", "asym3", "asym2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
     case "flash_mode": return ["auto", "always", "never"].includes(value);
     case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
     case "top_p": return typeof value === "number" && value > 0 && value <= 1;
@@ -241,10 +261,8 @@ function saveConfig(cfg: HipfireConfig) {
 const cfg = loadConfig();
 
 // ─── Per-model config overlays ──────────────────────────
-// Sparse per-tag overrides. Stored in ~/.hipfire/per_model_config.json.
+// Sparse per-tag overrides. Stored in the hipfire config directory.
 // Resolution order: --flag > per-model > global > engine fallback.
-
-const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 
 // Fields that make sense to override per-model. port + idle_timeout + default_model
 // are serve-wide so they stay global-only.
@@ -443,20 +461,16 @@ function buildLoadMessage(path: string, tag?: string | null): any {
         // Candidate order:
         //   1. dirname(target). Highest priority. The most reliable signal we
         //      have for "where this user keeps their weights" is the directory
-        //      the target was loaded from. In Docker (#110), `process.cwd()`
-        //      is `/hipfire` (the workdir) but models are mounted at
-        //      `/root/.hipfire/models`, so cwd-relative paths never resolve.
-        //      Using the target's own directory works for Docker, raw-file
-        //      invocations, and registry-tag invocations alike.
-        //   2-3. cwd-relative legacy candidates. Kept for back-compat with
-        //        existing scripts that lay drafts out alongside a project
-        //        `models/` dir.
-        //   4. ~/.hipfire/models: final fallback for native installs.
+        //      the target was loaded from. Using the target's own directory
+        //      works for Docker, raw-file invocations, and registry-tag
+        //      invocations alike.
+        //   2-3. cwd-relative candidates for repo-local/model-volume layouts.
+        //   4. The configured hipfire models directory.
         const candidates = [
           resolve(`${dirname(path)}/${draftFile}`),
           resolve(`${process.cwd()}/models/${draftFile}`),
           resolve(`${process.cwd()}/../../models/${draftFile}`),
-          resolve(`${homedir()}/.hipfire/models/${draftFile}`),
+          resolve(`${MODELS_DIR}/${draftFile}`),
         ];
         for (const c of candidates) {
           if (existsSync(c)) {
@@ -671,12 +685,13 @@ function archDefaults(arch: string): ArchDefaults {
 }
 
 // ─── KV cache mode resolver ──────────────────────────────
-// Canonical modes: q8, asym4_tqv2, asym4_tqv3, asym4_tqv4, asym4, asym3, asym2.
+// Canonical modes: q8, asym4_tqv1, asym4_tqv2, asym4_tqv3, asym4_tqv4, asym4, asym3, asym2.
 // Legacy aliases: turbo→asym3, turbo2→asym2, turbo3→asym3, turbo4→asym4
 // (plus "auto" → arch default).
 function resolveKvMode(cfg: HipfireConfig): string {
   const raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
   if (raw === "auto") return ARCH_DEFAULTS.kv_cache;
+  if (raw === "tqv1" || raw === "tq1") return "asym4_tqv1";
   if (raw === "tqv2") return "asym4_tqv2";
   if (raw === "tqv3") return "asym4_tqv3";
   if (raw === "tqv4") return "asym4_tqv4";
@@ -747,9 +762,6 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
 // `hipfire serve -d` forks to background; `hipfire stop` kills it.
 // `hipfire run` auto-detects and uses a running serve via HTTP.
 
-const SERVE_PID_FILE = join(HIPFIRE_DIR, "serve.pid");
-const SERVE_LOG_FILE = join(HIPFIRE_DIR, "serve.log");
-
 function isPidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
@@ -778,6 +790,7 @@ async function runViaHttp(
   port: number, model: string, prompt: string,
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
+  maxThinkTokens?: number,
 ): Promise<boolean> {
   // VL flows go through the image-base64 path on the daemon which the HTTP
   // wrapper doesn't expose — fall back to local spawn.
@@ -789,6 +802,7 @@ async function runViaHttp(
     temperature: temp, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
+  if (maxThinkTokens !== undefined) body.max_think_tokens = maxThinkTokens;
 
   let resp: Response;
   try {
@@ -871,7 +885,7 @@ class Engine {
     const exe = process.platform === "win32" ? ".exe" : "";
     const bins = [
       resolve(__dirname, `../target/release/examples/daemon${exe}`),
-      join(HIPFIRE_DIR, "bin", `daemon${exe}`),
+      join(HIPFIRE_LIB_DIR, `daemon${exe}`),
     ];
     const bin = bins.find(p => existsSync(p));
     if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p engine");
@@ -1085,7 +1099,16 @@ async function pull(tag: string): Promise<string> {
 
 // ─── Commands ───────────────────────────────────────────
 
-async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8) {
+async function run(
+  model: string,
+  prompt: string,
+  image?: string,
+  temp = 0.3,
+  maxTokens = 512,
+  repeatPenalty = 1.3,
+  topP = 0.8,
+  maxThinkTokens?: number,
+) {
   let path = findModel(model);
 
   // Auto-pull if model tag is recognized but not downloaded
@@ -1109,7 +1132,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // Local spawn falls through only when no serve is present (or HTTP errors out).
   const useLocal = process.env.HIPFIRE_LOCAL === "1" || image !== undefined;
   if (!useLocal && await isServeUp(cfg.port)) {
-    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP, maxThinkTokens);
     if (ok) return;
     // runViaHttp logged its own failure reason; fall back to local spawn.
   }
@@ -1135,7 +1158,13 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
-  if (modelCfg.max_think_tokens > 0) genMsg.max_think_tokens = modelCfg.max_think_tokens;
+  if (maxThinkTokens !== undefined) {
+    if (maxThinkTokens > 0) genMsg.max_think_tokens = maxThinkTokens;
+  } else if (modelCfg.thinking === "off") {
+    genMsg.max_think_tokens = 1;
+  } else if (modelCfg.max_think_tokens > 0) {
+    genMsg.max_think_tokens = modelCfg.max_think_tokens;
+  }
   if (image) {
     genMsg.image = resolve(image);
     console.error(`[VL: ${image}]`);
@@ -1286,7 +1315,13 @@ async function serve(port: number) {
           pid: process.pid,
         });
       }
-      if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
+      if (url.pathname === "/v1/models") {
+        return Response.json({
+          data: listLocal()
+            .filter(m => !isDFlashDraftModel(m.name, m.tag))
+            .map(m => ({ id: m.name })),
+        });
+      }
 
       if (url.pathname !== "/v1/chat/completions" || req.method !== "POST")
         return Response.json({ error: "not found" }, { status: 404 });
@@ -1506,13 +1541,25 @@ async function serve(port: number) {
           repeat_penalty: body.repeat_penalty ?? (oaiPenaltySet ? 1.0 + oaiPenalty : effective.repeat_penalty),
           top_p: body.top_p ?? effective.top_p,
         };
-        // Mirror the `hipfire run` path's per-model max_think_tokens
-        // propagation. Without this, models with thinking=on can consume
-        // the entire max_tokens budget inside a single <think>...</think>
-        // block, leaving message.content empty after the downstream strip.
-        // Reported in #74 with qwen3.6:27b returning empty content + full
-        // 8192 completion_tokens despite max_think_tokens=2048 in config.
-        if (effective.max_think_tokens > 0) genParams.max_think_tokens = effective.max_think_tokens;
+        // Mirror the `hipfire run` path's thinking control. `thinking=off`
+        // means "hard-cap thinking to one token", not prompt injection.
+        // Without a cap, models with thinking=on can consume the entire
+        // max_tokens budget inside a single <think>...</think> block, leaving
+        // message.content empty after the downstream strip. Reported in #74
+        // with qwen3.6:27b returning empty content + full 8192
+        // completion_tokens despite max_think_tokens=2048 in config.
+        if (effective.thinking === "off") genParams.max_think_tokens = 1;
+        else if (effective.max_think_tokens > 0) genParams.max_think_tokens = effective.max_think_tokens;
+        // hipfire-run-through-serve can pass an explicit budget directly.
+        // 0 means uncapped and clears a config-derived cap.
+        if (typeof body.max_think_tokens === "number") {
+          const reqMaxThink = Math.floor(body.max_think_tokens);
+          if (reqMaxThink < 0 || reqMaxThink > 32768) {
+            return Response.json({ error: "max_think_tokens must be an integer 0-32768" }, { status: 400 });
+          }
+          if (reqMaxThink === 0) delete genParams.max_think_tokens;
+          else genParams.max_think_tokens = reqMaxThink;
+        }
         // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1
         // token (model emits <think> then is forced to close). Overrides
         // per-model max_think_tokens because the request semantics are more
@@ -1526,16 +1573,9 @@ async function serve(port: number) {
           if (reasoningEffort === 0) delete genParams.max_think_tokens;
           else genParams.max_think_tokens = reasoningEffort;
         }
-        // thinking=off is currently a no-op at the CLI layer. Earlier
-        // versions injected a prose system directive ("Respond directly
-        // without using <think>...</think> reasoning blocks") here, but
-        // the literal special tokens in that string caused Qwen3.5 to
-        // halt at 3-4 tokens — coherence-gate (which hits the daemon
-        // direct, no system injection) consistently passes on the same
-        // models, while CLI-routed requests with this directive break.
-        // Pass through whatever system prompt the client sent, no
-        // augmentation. The downstream <think>...</think> filter still
-        // strips visible reasoning so users get clean answers.
+        // Do not inject prose directives for thinking control. Prior attempts
+        // that mentioned literal thinking tags in system text caused Qwen3.5
+        // to halt at 3-4 tokens. The daemon-side token budget is the control.
         if (systemPrompt) genParams.system = systemPrompt;
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
@@ -1914,7 +1954,7 @@ function findQuantizeBinary(): string | null {
   const exe = process.platform === "win32" ? ".exe" : "";
   const candidates = [
     resolve(__dirname, `../target/release/hipfire-quantize${exe}`),
-    join(HIPFIRE_DIR, "bin", `hipfire-quantize${exe}`),
+    join(HIPFIRE_LIB_DIR, `hipfire-quantize${exe}`),
   ];
   return candidates.find(p => existsSync(p)) || null;
 }
@@ -1926,12 +1966,12 @@ interface QuantizeOpts {
   stem?: string;                     // override output basename (default: inferred from input)
   uploadRepo?: string;               // schuttdev/hipfire-... — upload after quantize
   createRepo?: boolean;              // pass --create-repo to `hf upload`
-  installLocal?: boolean;            // copy result into ~/.hipfire/models
+  installLocal?: boolean;            // copy result into the hipfire models directory
   register?: string;                 // tag to add to registry (e.g., "qwopus:4b")
 }
 
 async function hfDownloadModel(hfId: string): Promise<string> {
-  const cacheDir = join(HIPFIRE_DIR, "hf-cache", hfId.replace(/\//g, "_"));
+  const cacheDir = join(HIPFIRE_CACHE_DIR, "hf-cache", hfId.replace(/\//g, "_"));
   mkdirSync(cacheDir, { recursive: true });
   console.error(`Downloading ${hfId} from HuggingFace to ${cacheDir} ...`);
   const dl = Bun.spawnSync(
@@ -2060,7 +2100,7 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
     produced.push({ format, path: out });
   }
 
-  // Optional: drop the produced artifacts into ~/.hipfire/models so
+  // Optional: drop the produced artifacts into the hipfire models directory so
   // `hipfire list` + `hipfire run` find them without any extra steps.
   if (opts.installLocal) {
     mkdirSync(MODELS_DIR, { recursive: true });
@@ -2106,7 +2146,7 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
 
   // Optional: append a local user-alias so the custom tag is addressable.
   if (opts.register) {
-    const aliasPath = join(HIPFIRE_DIR, "models.json");
+    const aliasPath = USER_ALIASES_PATH;
     let aliases: Record<string, any> = {};
     try { aliases = JSON.parse(require("fs").readFileSync(aliasPath, "utf-8")); } catch {}
     const primary = produced.find(p => p.format === "mq4") ?? produced[0];
@@ -2133,7 +2173,7 @@ interface UserAlias {
 
 function loadUserAliases(): Record<string, UserAlias> {
   try {
-    return JSON.parse(require("fs").readFileSync(join(HIPFIRE_DIR, "models.json"), "utf-8"));
+    return JSON.parse(require("fs").readFileSync(USER_ALIASES_PATH, "utf-8"));
   } catch { return {}; }
 }
 
@@ -2262,6 +2302,10 @@ function listLocal() {
     }
   }
   return models;
+}
+
+function isDFlashDraftModel(name: string, tag = ""): boolean {
+  return tag.endsWith("-draft") || /(?:^|-)dflash(?:-|\.|$)/.test(name);
 }
 
 // ─── Bench ──────────────────────────────────────────────
@@ -2776,6 +2820,136 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
   console.log(`\n${fullOcc}/${filtered.length} kernels at max occupancy`);
 }
 
+function csvFlag(value: string | undefined, fallback: string[]): string[] {
+  if (!value) return fallback;
+  return value.split(",").map(s => s.trim()).filter(Boolean);
+}
+
+const ALL_METRICS_KV_MODES = [
+  "fp32",
+  "q8",
+  "asym4",
+  "asym3",
+  "asym2",
+  "asym4_tqv4",
+  "asym4_tqv3",
+  "asym4_tqv2",
+  "asym4_tqv1",
+];
+
+function normalizeMetricsKMode(mode: string): string {
+  const m = mode.toLowerCase();
+  if (m === "tqv1" || m === "tq1") return "asym4_tqv1";
+  if (m === "f32") return "fp32";
+  if (m === "turbo2") return "asym2";
+  if (m === "turbo3" || m === "turbo") return "asym3";
+  if (m === "turbo4") return "asym4";
+  return m;
+}
+
+function normalizeMetricsVMode(mode: string): string {
+  const m = mode.toLowerCase();
+  if (m === "f32") return "fp32";
+  if (m === "asym2") return "tqv2";
+  if (m === "asym3") return "tqv3";
+  if (m === "asym4") return "tqv4";
+  return m;
+}
+
+function kvPairToRuntimeMode(kRaw: string, vRaw: string): string | null {
+  const k = normalizeMetricsKMode(kRaw);
+  const v = normalizeMetricsVMode(vRaw);
+  if (k === "fp32" && v === "fp32") return "fp32";
+  if (k === "q8" && v === "q8") return "q8";
+  if ((k === "asym2" || k === "asym3" || k === "asym4") && v === "q8") return k;
+  if (k === "asym4" && (v === "tqv1" || v === "tqv2" || v === "tqv3" || v === "tqv4")) return `asym4_${v}`;
+  return null;
+}
+
+function expandMetricsModes(kModes: string[], vModes: string[]): { modes: string[]; skipped: string[] } {
+  const modes: string[] = [];
+  const skipped: string[] = [];
+  for (const k of kModes) {
+    for (const v of vModes) {
+      const runtime = kvPairToRuntimeMode(k, v);
+      if (!runtime) {
+        skipped.push(`${k}/${v}`);
+        continue;
+      }
+      if (!modes.includes(runtime)) modes.push(runtime);
+    }
+  }
+  const fp32Idx = modes.indexOf("fp32");
+  if (fp32Idx >= 0) modes.unshift(...modes.splice(fp32Idx, 1));
+  else modes.unshift("fp32");
+  return { modes, skipped };
+}
+
+async function metrics(model: string, opts: {
+  modesK?: string;
+  modesV?: string;
+  modes?: string;
+  out?: string;
+  runs?: string;
+  full?: boolean;
+  coherence?: boolean;
+  strict?: boolean;
+  skipBuild?: boolean;
+  checkToolJson?: string;
+}) {
+  let modelPath = findModel(model);
+  if (!modelPath) {
+    const resolved = resolveModelTag(model);
+    if (REGISTRY[resolved]) {
+      console.error(`Model not found locally. Pulling ${resolved}...`);
+      modelPath = await pull(model);
+    } else {
+      console.error(`Model not found: ${model}`);
+      process.exit(1);
+    }
+  }
+
+  const explicitModes = opts.modes ? csvFlag(opts.modes, []) : [];
+  const hasKvMatrix = opts.modesK !== undefined || opts.modesV !== undefined;
+  const expanded = explicitModes.length > 0
+    ? { modes: Array.from(new Set(explicitModes.map(normalizeMetricsKMode))), skipped: [] }
+    : hasKvMatrix
+      ? expandMetricsModes(
+        csvFlag(opts.modesK, ["fp32", "q8", "asym4", "asym3", "asym2"]),
+        csvFlag(opts.modesV, ["fp32", "q8", "tqv4", "tqv3", "tqv2", "tqv1"]),
+      )
+      : { modes: ALL_METRICS_KV_MODES, skipped: [] };
+
+  console.error(`metrics modes: ${expanded.modes.join(",")}`);
+  if (expanded.skipped.length) console.error(`skipped unsupported K/V pairs: ${expanded.skipped.join(", ")}`);
+
+  const script = resolve(__dirname, "../scripts/quantization-gate.sh");
+  const args = [script, "--model-name", model];
+  if (opts.runs) args.push("--runs", opts.runs);
+  if (opts.full) args.push("--full");
+  if (opts.coherence) args.push("--coherence");
+  if (opts.strict) args.push("--strict");
+  if (opts.skipBuild) args.push("--skip-build");
+  if (opts.checkToolJson) args.push("--check-tool-json", opts.checkToolJson);
+
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    HIPFIRE_QUANT_MODEL: modelPath,
+    HIPFIRE_QUANT_MODEL_NAME: model,
+    HIPFIRE_QUANT_MODES: expanded.modes.join(","),
+  };
+  if (opts.out) env.HIPFIRE_QUANT_OUT = opts.out;
+
+  const proc = Bun.spawn(["bash", ...args], {
+    cwd: resolve(__dirname, ".."),
+    env,
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  const code = await proc.exited;
+  process.exit(code);
+}
+
 // ─── Config TUI ─────────────────────────────────────────
 // Keyboard-driven settings editor. Raw ANSI, no deps.
 //   ↑/↓     — move between rows
@@ -2783,7 +2957,7 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
 //   -/+     — nudge numeric values by their step
 //   enter   — edit a text/number field directly
 //   r       — reset selected row to default
-//   s       — save (writes ~/.hipfire/config.json, keeps only non-defaults)
+//   s       — save (writes the hipfire config file, keeps only non-defaults)
 //   q / Esc — save+quit
 //   Ctrl+C  — abort without saving
 
@@ -2990,7 +3164,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     kv_cache: {
       label: "kv_cache",
       desc: "KV cache quantization (more bits = higher quality, more VRAM)",
-      options: ["auto", "q8", "asym4_tqv2", "tqv2", "asym4_tqv3", "tqv3", "asym4_tqv4", "tqv4", "asym4", "asym3", "asym2"],
+      options: ["auto", "q8", "asym4_tqv1", "tqv1", "tq1", "asym4_tqv2", "tqv2", "asym4_tqv3", "tqv3", "asym4_tqv4", "tqv4", "asym4", "asym3", "asym2"],
     },
     flash_mode: {
       label: "flash_mode",
@@ -3029,7 +3203,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     thinking: {
       label: "thinking",
-      desc: "Reasoning mode. on = model uses <think>...</think> (stripped from display); off = suppress thinking, answer directly",
+      desc: "Reasoning mode. on = allow <think>...</think>; off = cap thinking to one token",
       options: ["on", "off"],
     },
     max_think_tokens: {
@@ -3790,12 +3964,12 @@ switch (cmd) {
   }
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>               Temperature (default 0.3)\n  --top-p <float>              Top-p sampling (default 0.8)\n  --repeat-penalty <float>     Repeat penalty (default 1.05)\n  --max-tokens <int>           Max tokens to generate (default 512)\n  --think                      Enable uncapped thinking for this run\n  --no-think                   Cap thinking to one token for this run\n  --max-think-tokens <int>     Thinking budget, 0 = uncapped\n  --image <path>               Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --no-think \"Answer directly\"\n  hipfire run qwen3.5:9b --max-think-tokens 256 \"Solve this carefully\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
     // Parse --key value flags
     const flagDefs: Record<string, { default: number | string | undefined }> = {
       "--image": { default: undefined }, "--temp": { default: 0.3 },
       "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
-      "--max-tokens": { default: 512 },
+      "--max-tokens": { default: 512 }, "--max-think-tokens": { default: undefined },
     };
     const flags: Record<string, string> = {};
     const flagIndices = new Set<number>();
@@ -3813,19 +3987,49 @@ switch (cmd) {
         console.error(`Error: ${key} requires a value`); process.exit(1);
       }
     }
+    const thinkFlagIndices = new Set<number>();
+    const thinkOn = rest.includes("--think");
+    const thinkOff = rest.includes("--no-think");
+    for (const flag of ["--think", "--no-think"]) {
+      let idx = rest.indexOf(flag);
+      while (idx >= 0) {
+        thinkFlagIndices.add(idx);
+        idx = rest.indexOf(flag, idx + 1);
+      }
+    }
+    if (thinkOn && thinkOff) {
+      console.error("Error: --think and --no-think conflict");
+      process.exit(1);
+    }
     const image = flags["--image"];
     const runCfg = resolveModelConfig(model);
     const temp = Number(flags["--temp"] ?? runCfg.temperature);
     const topP = Number(flags["--top-p"] ?? runCfg.top_p);
     const repeatPenalty = Number(flags["--repeat-penalty"] ?? runCfg.repeat_penalty);
     const maxTokens = Math.floor(Number(flags["--max-tokens"] ?? runCfg.max_tokens));
+    let maxThinkTokens: number | undefined;
+    if (flags["--max-think-tokens"] !== undefined) {
+      maxThinkTokens = Math.floor(Number(flags["--max-think-tokens"]));
+    } else if (thinkOff) {
+      maxThinkTokens = 1;
+    } else if (thinkOn) {
+      maxThinkTokens = 0;
+    } else if (runCfg.thinking === "off") {
+      maxThinkTokens = 1;
+    } else if (runCfg.max_think_tokens > 0) {
+      maxThinkTokens = runCfg.max_think_tokens;
+    }
     if (temp < 0) { console.error("Error: --temp must be >= 0 (0 = greedy)"); process.exit(1); }
     if (topP <= 0 || topP > 1) { console.error("Error: --top-p must be in (0, 1]"); process.exit(1); }
     if (repeatPenalty < 1) { console.error("Error: --repeat-penalty must be >= 1.0"); process.exit(1); }
     if (maxTokens < 1) { console.error("Error: --max-tokens must be >= 1"); process.exit(1); }
-    const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1));
+    if (maxThinkTokens !== undefined && (maxThinkTokens < 0 || maxThinkTokens > 32768)) {
+      console.error("Error: --max-think-tokens must be an integer 0-32768");
+      process.exit(1);
+    }
+    const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1) && !thinkFlagIndices.has(i + 1));
     const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
-    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, maxThinkTokens);
     break;
   }
   case "pull": {
@@ -3941,7 +4145,7 @@ switch (cmd) {
   }
   case "update": {
     console.error("Updating hipfire...");
-    const srcDir = join(HIPFIRE_DIR, "src");
+    const srcDir = join(HIPFIRE_DATA_DIR, "src");
     const repoDir = existsSync(join(srcDir, "Cargo.toml")) ? srcDir : resolve(__dirname, "..");
     // ── Dep autodetect ──────────────────────────────────────
     // Tools we spawn during update aren't always in $PATH even when
@@ -4069,7 +4273,7 @@ switch (cmd) {
     // version — users saw "unknown model" for entries added post-install.
     const { copyFileSync } = await import("fs");
     const exe = process.platform === "win32" ? ".exe" : "";
-    const binDir = join(HIPFIRE_DIR, "bin");
+    const binDir = HIPFIRE_LIB_DIR;
     // Order: registry.json BEFORE index.ts. The new index.ts imports the JSON
     // at startup; if we copied index.ts first and the JSON copy then failed
     // (missing in repoDir, IO error, partial git pull), the install would be
@@ -4085,8 +4289,9 @@ switch (cmd) {
       console.error(`  git -C ${repoDir} status && git -C ${repoDir} log -1 --stat`);
       process.exit(1);
     }
-    copyFileSync(registrySrc, join(HIPFIRE_DIR, "cli/registry.json"));
-    copyFileSync(indexSrc,    join(HIPFIRE_DIR, "cli/index.ts"));
+    mkdirSync(join(HIPFIRE_LIB_DIR, "cli"), { recursive: true });
+    copyFileSync(registrySrc, join(HIPFIRE_LIB_DIR, "cli/registry.json"));
+    copyFileSync(indexSrc,    join(HIPFIRE_LIB_DIR, "cli/index.ts"));
     console.error("  CLI updated ✓");
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
@@ -4101,7 +4306,7 @@ switch (cmd) {
       console.error("  daemon binary was NOT rebuilt.");
       console.error("");
       console.error("  To diagnose:  hipfire diag");
-      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p engine --example daemon");
+      console.error(`  To retry:     cd ${srcDir} && cargo build --release --features deltanet -p engine --example daemon`);
       process.exit(1);
     }
     // Build the CPU quantizer binary too so `hipfire quantize` works out of the box.
@@ -4289,7 +4494,7 @@ switch (cmd) {
     const exe2 = process.platform === "win32" ? ".exe" : "";
     const daemonBins = [
       resolve(__dirname, `../target/release/examples/daemon${exe2}`),
-      join(HIPFIRE_DIR, "bin", `daemon${exe2}`),
+      join(HIPFIRE_LIB_DIR, `daemon${exe2}`),
     ];
     const daemonBin = daemonBins.find(p => existsSync(p));
     console.log(`daemon:        ${daemonBin ? "found" : "NOT FOUND — run: hipfire update"}`);
@@ -4299,7 +4504,7 @@ switch (cmd) {
     for (const m of models) console.log(`  ${m.name.padEnd(35)} ${m.size.padStart(6)}`);
 
     // 5. Pre-compiled kernels
-    const binDir2 = join(HIPFIRE_DIR, "bin");
+    const binDir2 = HIPFIRE_LIB_DIR;
     const kernelBase = join(binDir2, "kernels", "compiled");
     const cwdKernelBase = resolve(__dirname, "../kernels/compiled");
     const kBase = existsSync(kernelBase) ? kernelBase : existsSync(cwdKernelBase) ? cwdKernelBase : null;
@@ -4430,6 +4635,70 @@ Examples:
     await bench(benchModel, runs, exp, benchPrompt);
     break;
   }
+  case "metrics": {
+    const model = rest[0];
+    if (!model || model === "-h" || model === "--help") {
+      console.error(`Usage: hipfire metrics <model> [flags]
+
+Build a KV-cache identicality/perf dashboard against an fp32 baseline.
+
+Flags:
+  --modes-k <csv>          K modes to combine (matrix mode)
+  --modes-v <csv>          V modes to combine (matrix mode)
+                           V aliases asym2/asym3/asym4 map to tqv2/tqv3/tqv4.
+  --modes <csv>            Direct runtime modes; bypass K/V expansion
+  --out <dir>              Output directory (default: benchmarks/results/...)
+  --runs <n>               Perf runs per prefill size (default: 1)
+  --full                   Larger prompt/context coverage
+  --coherence              Run coherence gate per mode
+  --strict                 Promote identicality warnings to hard errors
+  --check-tool-json <mode> off|warn|strict (default: warn)
+  --skip-build             Reuse existing release examples
+
+Supported runtime modes today:
+  fp32, q8, asym4, asym3, asym2, asym4_tqv4, asym4_tqv3, asym4_tqv2, asym4_tqv1
+
+Default:
+  hipfire metrics <model> runs all supported runtime modes above.
+
+Examples:
+  hipfire metrics qwen3.5:2b --skip-build
+  hipfire metrics qwen3.5:2b --modes-k fp32,asym4 --modes-v fp32,q8,tqv4,tqv3,tqv2,tqv1
+  hipfire metrics ${join(MODELS_DIR, "qwen3.5-2b.mq4")} --modes fp32,q8,asym4_tqv4`);
+      process.exit(model ? 0 : 1);
+    }
+    const opts: any = {};
+    for (let i = 1; i < rest.length; i++) {
+      const a = rest[i];
+      const take = () => {
+        const v = rest[++i];
+        if (!v) { console.error(`${a} requires a value`); process.exit(1); }
+        return v;
+      };
+      if (a === "--modes-k") opts.modesK = take();
+      else if (a.startsWith("--modes-k=")) opts.modesK = a.slice("--modes-k=".length);
+      else if (a === "--modes-v") opts.modesV = take();
+      else if (a.startsWith("--modes-v=")) opts.modesV = a.slice("--modes-v=".length);
+      else if (a === "--modes") opts.modes = take();
+      else if (a.startsWith("--modes=")) opts.modes = a.slice("--modes=".length);
+      else if (a === "--out") opts.out = take();
+      else if (a.startsWith("--out=")) opts.out = a.slice("--out=".length);
+      else if (a === "--runs") opts.runs = take();
+      else if (a.startsWith("--runs=")) opts.runs = a.slice("--runs=".length);
+      else if (a === "--check-tool-json") opts.checkToolJson = take();
+      else if (a.startsWith("--check-tool-json=")) opts.checkToolJson = a.slice("--check-tool-json=".length);
+      else if (a === "--full") opts.full = true;
+      else if (a === "--coherence") opts.coherence = true;
+      else if (a === "--strict") opts.strict = true;
+      else if (a === "--skip-build") opts.skipBuild = true;
+      else {
+        console.error(`Unknown metrics argument: ${a}\nRun 'hipfire metrics --help' for usage.`);
+        process.exit(1);
+      }
+    }
+    await metrics(model, opts);
+    break;
+  }
   case "rm": {
     const tag = rest[0] || "";
     const resolved = resolveModelTag(tag);
@@ -4456,8 +4725,8 @@ Flags:
   --stem <name>              Override the output basename (default: input basename)
   --upload <owner/repo>      Push outputs to HuggingFace after quantize
   --create-repo              Create the HF repo if it doesn't exist
-  --install                  Copy outputs into ~/.hipfire/models (so \`hipfire run\` finds them)
-  --register <tag>           Add a local alias (e.g. my-finetune:4b) to ~/.hipfire/models.json
+  --install                  Copy outputs into ${MODELS_DIR} (so \`hipfire run\` finds them)
+  --register <tag>           Add a local alias (e.g. my-finetune:4b) to ${USER_ALIASES_PATH}
 
 Formats:
   mq4   FWHT-rotated 4-bit, quality-gated — recommended for production
@@ -4488,9 +4757,9 @@ Examples:
   # Local fine-tune → MQ4:
   hipfire quantize ./my-finetune --format mq4 -o finetune.mq4
 
-  # GGUF → HF4 (one-shot, install into ~/.hipfire/models):
+  # GGUF → HF4 (one-shot, install into ${MODELS_DIR}):
   hipfire quantize ./tinyllama.Q4_K_M.gguf --install --register tinyllama:1b-gguf
-  # → ~/.hipfire/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.hf4
+  # → ${join(MODELS_DIR, "tinyllama-1.1b-chat-v1.0.Q4_K_M.hf4")}
 
   # Qwen3.5+ GGUF → MQ4 (DeltaNet hot path):
   hipfire quantize ./qwen3.5.Q4_K_M.gguf --format mq4 --install --register q35:9b-gguf
@@ -4499,7 +4768,7 @@ Examples:
   hipfire quantize ./model --format mq4 --format mq6 --output-dir ./out
 
 The quantizer runs on CPU and takes minutes-to-tens-of-minutes
-depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
+depending on model size. HF downloads cache at ${join(HIPFIRE_CACHE_DIR, "hf-cache")}.`);
       process.exit(input ? 0 : 1);
     }
     const formats: string[] = [];
@@ -4698,7 +4967,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
-          kv_cache: "one of: auto, q8, asym4_tqv2, tqv2, asym4_tqv3, tqv3, asym4_tqv4, tqv4, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 aliases also accepted)",
+          kv_cache: "one of: auto, q8, asym4_tqv1, tqv1, tq1, asym4_tqv2, tqv2, asym4_tqv3, tqv3, asym4_tqv4, tqv4, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 aliases also accepted)",
           flash_mode: "one of: auto, always, never (applies to Q8 path; asym modes are flash-only)",
           temperature: "number between 0 and 2",
           top_p: "number in (0, 1]",
@@ -4847,6 +5116,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
   stop                  Stop the background serve daemon
   quantize <hf-id|dir>  Quantize to MQ4/MQ6 (CPU) — with optional HF upload
   bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
+  metrics <model>       Build KV quantization identicality/perf dashboard
   profile [model]       Kernel efficiency profiler (--json, --kernel <name>)
   list [-r]             Show local models (-r: show available too)
   config                Interactive settings editor (TUI); also: config [list|set|get|reset]
@@ -4869,6 +5139,7 @@ Quick start:
   hipfire pull qwen3.5:4b
   hipfire run qwen3.5:4b "What is the capital of France?"
   hipfire serve
+  hipfire metrics qwen3.5:4b --skip-build
 
 Quantize any Qwen 3.5 HF model (or local dir) — one-shot download + upload:
   hipfire quantize Qwen/Qwen3.5-4B

@@ -5,7 +5,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/rocm-env.sh"
 
-MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
+MODEL="${1:-${XDG_DATA_HOME:-$HOME/.local/share}/hipfire/models/qwen3.5-9b.mq4}"
 EXE="target/release/examples/daemon"
 ANALYZE="scripts/analyze_daemon_output.py"
 

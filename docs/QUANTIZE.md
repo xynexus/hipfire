@@ -32,9 +32,9 @@ hipfire quantize Jackrong/Qwopus3.5-4B-v3 \
     --register qwopus:4b
 ```
 
-Auto-downloads the safetensors into `~/.hipfire/hf-cache/`, quantizes
+Auto-downloads the safetensors into `~/.cache/hipfire/hf-cache/`, quantizes
 once per `--format`, optionally uploads each output as its own file in
-the target HF repo, copies into `~/.hipfire/models/`, and registers a
+the target HF repo, copies into `~/.local/share/hipfire/models/`, and registers a
 local alias.
 
 Useful flags:
@@ -48,7 +48,7 @@ Useful flags:
 | `--stem <name>` | Override the output basename. |
 | `--upload <owner/repo>` | Push outputs to HuggingFace. |
 | `--create-repo` | Create the HF repo if missing. |
-| `--install` | Copy outputs into `~/.hipfire/models/`. |
+| `--install` | Copy outputs into `~/.local/share/hipfire/models/`. |
 | `--register <tag>` | Add a local alias so `hipfire run <tag>` works. |
 
 ## From a local safetensors directory

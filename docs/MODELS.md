@@ -45,7 +45,7 @@ the registry has one. At inference time the CLI does **filename
 auto-match**: when the target path matches
 `qwen3?.?(5|6)[-_]?<size>.(mq4|mq6|...)`, the CLI looks for a sibling
 file `qwen3{ver}-{size}-dflash-{quant}.hfq` next to it (in
-`~/.hipfire/models/` or alongside) and wires it up as the draft
+`~/.local/share/hipfire/models/` or alongside) and wires it up as the draft
 without an explicit flag. Override with `HIPFIRE_DFLASH_DRAFT=<path>`
 or disable via empty string.
 
@@ -73,7 +73,7 @@ hipfire quantize Jackrong/Qwopus3.5-4B-v3 \
 ```
 
 Downloads the safetensors, quantizes, drops the result in
-`~/.hipfire/models/`, and registers a local alias so `hipfire run
+`~/.local/share/hipfire/models/`, and registers a local alias so `hipfire run
 qwopus:4b` works. See [QUANTIZE.md](QUANTIZE.md).
 
 ### From local safetensors
@@ -224,7 +224,7 @@ preserving raw `\n{3,}` whitespace.
 ## Model files on disk
 
 ```
-~/.hipfire/models/
+~/.local/share/hipfire/models/
 ├── qwen3.5-9b.mq4                  # MQ4 (FWHT-rotated, Qwen3.5 hot path)
 ├── qwen35-9b-dflash-mq4.hfq        # DFlash draft for qwen3.5:9b (filename auto-match)
 ├── tinyllama.Q4_K_M.hf4            # HFQ4 (no rotation, dense)

@@ -1,11 +1,11 @@
 #!/bin/bash
 # hipfire CLI wrapper — routes to Bun CLI
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HIPFIRE_DIR="$HOME/.hipfire"
+HIPFIRE_LIB_DIR="${HIPFIRE_LIB_DIR:-$HOME/.local/lib/hipfire}"
 
 # Find the CLI
 CLI=""
-for candidate in "$SCRIPT_DIR/../cli/index.ts" "$HIPFIRE_DIR/cli/index.ts" "$(dirname "$SCRIPT_DIR")/cli/index.ts"; do
+for candidate in "$SCRIPT_DIR/../cli/index.ts" "$HIPFIRE_LIB_DIR/cli/index.ts" "$(dirname "$SCRIPT_DIR")/cli/index.ts"; do
     if [ -f "$candidate" ]; then CLI="$candidate"; break; fi
 done
 

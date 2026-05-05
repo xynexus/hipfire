@@ -7,7 +7,7 @@ model architecture support — all welcome.
 ## Two ways to help, no Rust required
 
 Both paths below use only the installer-provided binaries (the
-`hipfire` wrapper, daemon, and quantizer dropped into `~/.hipfire/bin/`
+`hipfire` wrapper in `~/.local/bin/`, with daemon and quantizer in `~/.local/lib/hipfire/`
 by `scripts/install.sh`). No `cargo`, no ROCm SDK, no source build.
 
 ### 1. Run the bench matrix on your GPU

@@ -9,7 +9,7 @@ automatically route through this daemon when it's up, skipping the
 
 ```bash
 hipfire serve            # foreground, ctrl-c to stop
-hipfire serve -d         # background; pid in ~/.hipfire/serve.pid, log in ~/.hipfire/serve.log
+hipfire serve -d         # background; pid in ~/.local/state/hipfire/serve.pid, log in ~/.local/state/hipfire/serve.log
 ```
 
 `-d` pre-warms `default_model` (`hipfire config set default_model
@@ -53,7 +53,7 @@ HIPFIRE_LOCAL=1 hipfire run qwen3.5:9b "..."  # forced one-shot, skips HTTP
 ```
 
 Auto-routing detects the running daemon by reading
-`~/.hipfire/serve.pid` and probing `/health`. If the daemon is loaded
+`~/.local/state/hipfire/serve.pid` and probing `/health`. If the daemon is loaded
 on a different model than the request asks for, it'll evict and reload
 — that takes the cold-start hit on the first request after the model
 switch.
@@ -72,14 +72,14 @@ use" errors:
 
 ```bash
 pkill -9 daemon bun
-rm ~/.hipfire/serve.pid
+rm ~/.local/state/hipfire/serve.pid
 hipfire serve -d
 ```
 
 ## Logs
 
-- `~/.hipfire/serve.log` — daemon stdout/stderr. Tail this during
+- `~/.local/state/hipfire/serve.log` — daemon stdout/stderr. Tail this during
   first-load to watch layer upload progress.
-- `~/.hipfire/serve.pid` — current daemon pid (deleted on graceful
+- `~/.local/state/hipfire/serve.pid` — current daemon pid (deleted on graceful
   shutdown; stale pid file is the most common reason `hipfire stop`
   reports "not running").

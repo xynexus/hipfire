@@ -48,7 +48,7 @@ done
 EXE="./target/release/examples/dflash_spec_demo"
 
 # Model resolution: explicit env wins, else /tmp default, else $HOME defaults.
-MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/hipfire/models}"
 TARGET="${TARGET:-}"
 DRAFT="${DRAFT:-}"
 if [ -z "$TARGET" ]; then

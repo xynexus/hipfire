@@ -1,2 +1,2 @@
 @echo off
-bun run "%USERPROFILE%\.hipfire\cli\index.ts" %*
+bun run "%USERPROFILE%\.local\lib\hipfire\cli\index.ts" %*

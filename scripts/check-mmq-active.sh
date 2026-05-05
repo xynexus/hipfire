@@ -5,7 +5,7 @@ source "$SCRIPT_DIR/rocm-env.sh"
 export HIPFIRE_MMQ=1
 export HIPFIRE_PROFILE=1
 
-MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
+MODEL="${1:-${XDG_DATA_HOME:-$HOME/.local/share}/hipfire/models/qwen3.5-9b.mq4}"
 EXE="target/release/examples/daemon"
 SYSTEM_FILE="benchmarks/prompts/tool_call_system.txt"
 

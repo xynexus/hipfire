@@ -15,6 +15,12 @@
 # Dev / dist
 /dev/
 /dist/
+/bin/
+
+# Local runtime state
+/config.json
+/per_model_config.json
+/*.pid
 
 # Models (large binaries)
 /models/

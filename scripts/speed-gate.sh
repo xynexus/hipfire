@@ -139,10 +139,10 @@ ensure_build() {
 # adaptive-b. Default flags include prompt_normalize=true (engine default
 # since 2026-04-26). Best-of-2 (within 5% jitter on hot-cache).
 bench_dflash_27b_lru() {
-    # Models may live at $MODELS_DIR (project-local) or ~/.hipfire/models/
-    # (install). Drafts in particular are usually only at the install path.
+    # Models may live at $MODELS_DIR. Drafts in particular are usually only
+    # at the install path.
     local target draft
-    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
+    for dir in "$MODELS_DIR"; do
         [ -f "$dir/qwen3.5-27b.mq4" ] && [ -z "${target:-}" ] && target="$dir/qwen3.5-27b.mq4"
         # Registry filename is `qwen35-27b-dflash-mq4.hfq` (cli/index.ts:469).
         # The legacy `qwen35-27b-dflash.mq4` was renamed when the registry
@@ -186,7 +186,7 @@ bench_dflash_27b_lru() {
 _bench_dflash_merge_sort_core() {
     local target_name="$1" draft_name="$2"
     local target draft
-    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
+    for dir in "$MODELS_DIR"; do
         [ -f "$dir/$target_name" ] && [ -z "${target:-}" ] && target="$dir/$target_name"
         [ -f "$dir/$draft_name" ]  && [ -z "${draft:-}" ]  && draft="$dir/$draft_name"
     done
@@ -228,7 +228,7 @@ bench_dflash_27b_merge_sort() {
 # Helper: does a draft file with this basename exist in any known model dir?
 _draft_exists() {
     local name="$1"
-    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
+    for dir in "$MODELS_DIR"; do
         [ -f "$dir/$name" ] && return 0
     done
     return 1

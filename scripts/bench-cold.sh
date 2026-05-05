@@ -39,7 +39,7 @@
 #                                       [--no-warmup] [--sleep N]
 #
 # Example:
-#   ./scripts/bench-cold.sh ~/.hipfire/models/qwen3.5-9b.mq4 \
+#   ./scripts/bench-cold.sh ~/.local/share/hipfire/models/qwen3.5-9b.mq4 \
 #       --pp 32,128 --runs 5 --label "before"
 #
 # Env overrides honored:

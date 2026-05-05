@@ -2,9 +2,9 @@
 
 Two layers:
 
-1. **Global config** at `~/.hipfire/config.json` — applies to every
+1. **Global config** at `~/.config/hipfire/config.json` — applies to every
    model unless overlaid.
-2. **Per-model overlay** at `~/.hipfire/per_model_config.json` — sparse
+2. **Per-model overlay** at `~/.config/hipfire/per_model_config.json` — sparse
    keys overriding global for a specific tag.
 
 Edit interactively with `hipfire config` (global) or `hipfire config
@@ -20,19 +20,23 @@ Edit interactively with `hipfire config` (global) or `hipfire config
 | `repeat_penalty` | 1.05 | 1.0–3.0 | Default kept conservative — 1.3 causes MQ4 gibberish at low temp. |
 | `max_tokens` | 512 | 1–131072 | Per-request cap. Used by `hipfire run` and as the fallback for OpenAI API requests that omit `max_tokens` in the body. Bump if you see thinking-on responses truncated with `finish_reason=stop` mid-`<think>`. |
 | `max_seq` | 32768 | 512–524288 | KV cache physical capacity. |
-| `thinking` | on | on / off | Whether to keep `<think>...</think>` reasoning blocks. |
-| `max_think_tokens` | 0 | 0–32768 | 0 = no cap. Caps tokens emitted before `</think>` closes. |
+| `thinking` | on | on / off | `on` allows `<think>...</think>` reasoning blocks; `off` caps thinking to one token without prompt injection. |
+| `max_think_tokens` | 0 | 0–32768 | 0 = no cap. Caps tokens emitted inside `<think>...</think>` before forcing the model to close the block. |
 
 ## KV cache
 
 | Key | Default | Values |
 |---|---|---|
-| `kv_cache` | auto (per arch) | auto / q8 / asym4 / asym3 / asym2 / turbo / turbo4 / turbo3 / turbo2 |
+| `kv_cache` | auto (per arch) | auto / q8 / asym4_tqv4 / asym4_tqv3 / asym4_tqv2 / asym4_tqv1 / asym4 / asym3 / asym2 / turbo / turbo4 / turbo3 / turbo2 |
 
 Per-arch defaults: gfx1100 → asym3, gfx1030 → asym3, gfx1010/1013 →
 asym2. asym3 is rotated K (Lloyd-Max) + Q8 V — the multi-turn quality
 sweet spot. Use `q8` for byte-exact reference behavior at higher VRAM
 cost.
+
+The `asym4_tqv*` modes keep asym4 K and use calibrated TQV V-cache
+variants. Short aliases are accepted by the CLI: `tqv4`, `tqv3`,
+`tqv2`, `tqv1`, and `tq1`.
 
 ## Speculative decode (DFlash)
 
@@ -244,6 +248,8 @@ For testing without touching the config file:
 
 ```
 HIPFIRE_KV_MODE=asym3
+# also accepts q8, asym4/asym3/asym2, asym4_tqv4..asym4_tqv1,
+# and aliases tqv4/tqv3/tqv2/tqv1/tq1
 HIPFIRE_ATTN_FLASH=auto
 HIPFIRE_NORMALIZE_PROMPT=0          # opt out of \n{3,} collapse
 HIPFIRE_LOCAL=1                     # skip the running daemon

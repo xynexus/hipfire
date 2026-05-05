@@ -3,11 +3,11 @@
 $ErrorActionPreference = "Stop"
 
 # ─── Paths ───────────────────────────────────────────────
-$HipfireDir  = "$env:USERPROFILE\.hipfire"
-$BinDir      = "$HipfireDir\bin"
-$RuntimeDir  = "$HipfireDir\runtime"
-$ModelsDir   = "$HipfireDir\models"
-$SrcDir      = "$HipfireDir\src"
+$HipfireDataDir = "$env:USERPROFILE\.local\share\hipfire"
+$BinDir         = "$env:USERPROFILE\.local\lib\hipfire"
+$RuntimeDir     = "$BinDir\runtime"
+$ModelsDir      = "$HipfireDataDir\models"
+$SrcDir         = "$HipfireDataDir\src"
 
 # ─── Constants ───────────────────────────────────────────
 $GithubRepo   = "Kaden-Schutt/hipfire"
@@ -392,7 +392,7 @@ foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
 Write-Host ""
 Write-Host "Installing CLI..." -ForegroundColor Cyan
 
-$CliDir = "$HipfireDir\cli"
+$CliDir = "$BinDir\cli"
 New-Item -ItemType Directory -Force -Path $CliDir | Out-Null
 # Order: registry.json BEFORE index.ts. The CLI imports the JSON at startup;
 # if we wrote the new index.ts first and the JSON copy then failed, the install
@@ -407,7 +407,7 @@ Copy-Item "$RepoDir\cli\package.json"  "$CliDir\package.json"  -Force
 Copy-Item "$RepoDir\cli\index.ts"      "$CliDir\index.ts"      -Force
 
 # Create hipfire.cmd wrapper
-$CmdWrapper = "@echo off`r`nbun run `"%USERPROFILE%\.hipfire\cli\index.ts`" %*`r`n"
+$CmdWrapper = "@echo off`r`nbun run `"%USERPROFILE%\.local\lib\hipfire\cli\index.ts`" %*`r`n"
 [System.IO.File]::WriteAllText("$BinDir\hipfire.cmd", $CmdWrapper)
 
 Write-Host "  CLI installed to $CliDir ✓" -ForegroundColor Green
@@ -418,7 +418,7 @@ Write-Host "  Wrapper: $BinDir\hipfire.cmd ✓" -ForegroundColor Green
 # .hsaco blobs. We mirror the Linux flow (install.sh): seed any blobs that
 # happen to be present in the checkout (developer case), then run
 # daemon.exe --precompile to JIT-compile the default Qwen3.5 kernel set
-# into ~/.hipfire/bin/kernels/compiled/<arch>/. First `hipfire run` is then
+# into ~/.local/lib/hipfire/kernels/compiled/<arch>/. First `hipfire run` is then
 # instant instead of a multi-minute hipcc wall.
 Write-Host ""
 if ($GpuArch -ne "unknown") {
@@ -446,7 +446,7 @@ if ($GpuArch -ne "unknown") {
 
 # ─── Pre-compile via daemon (parity with install.sh) ─────
 # Fills in any missing kernels for the active GPU. Uses hipcc in the
-# background; writes back to ~/.hipfire/bin/kernels/compiled/<arch>/.
+# background; writes back to ~/.local/lib/hipfire/kernels/compiled/<arch>/.
 # Runs even when GpuArch is "unknown"; Gpu::init resolves the active arch
 # at runtime regardless of install-time detection.
 $DaemonExe = "$BinDir\daemon.exe"

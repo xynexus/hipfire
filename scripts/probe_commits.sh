@@ -26,7 +26,7 @@ for h in "${COMMITS[@]}"; do
         continue
     fi
     out=$(HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
-        target/release/examples/bench_qwen35_mq4 "$HOME/.hipfire/models/qwen3.5-9b.mq4" \
+        target/release/examples/bench_qwen35_mq4 "${XDG_DATA_HOME:-$HOME/.local/share}/hipfire/models/qwen3.5-9b.mq4" \
         --prefill 16 --warmup 3 --gen 30 2>&1)
     tok_s=$(echo "$out" | grep -oE 'gen_tok_s=[0-9.]+' | sed 's/gen_tok_s=//')
     if [ -z "$tok_s" ]; then

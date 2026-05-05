@@ -9,7 +9,7 @@ set -uo pipefail
 WORKDIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$WORKDIR"
 
-HOME_MODELS="$HOME/.hipfire/models"
+HOME_MODELS="${XDG_DATA_HOME:-$HOME/.local/share}/hipfire/models"
 BRANCH_MODELS="$WORKDIR/models"
 OUT_DIR="$WORKDIR/.bench_0_1_7_alpha"
 mkdir -p "$OUT_DIR"

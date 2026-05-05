@@ -3,10 +3,19 @@
 # Usage: curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
 set -euo pipefail
 
-HIPFIRE_DIR="$HOME/.hipfire"
-BIN_DIR="$HIPFIRE_DIR/bin"
-MODELS_DIR="$HIPFIRE_DIR/models"
-SRC_DIR="$HIPFIRE_DIR/src"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+HIPFIRE_CONFIG_DIR="$XDG_CONFIG_HOME/hipfire"
+HIPFIRE_DATA_DIR="$XDG_DATA_HOME/hipfire"
+HIPFIRE_CACHE_DIR="$XDG_CACHE_HOME/hipfire"
+HIPFIRE_STATE_DIR="$XDG_STATE_HOME/hipfire"
+BIN_DIR="$HOME/.local/lib/hipfire"
+CLI_DIR="$BIN_DIR/cli"
+MODELS_DIR="$HIPFIRE_DATA_DIR/models"
+SRC_DIR="$HIPFIRE_DATA_DIR/src"
+LOCAL_BIN_DIR="$HOME/.local/bin"
 GITHUB_REPO="Kaden-Schutt/hipfire"
 GITHUB_BRANCH="master"
 
@@ -18,13 +27,78 @@ ask() {
     # Usage: result=$(ask "prompt [Y/n] " "Y")
     # Safe for curl|bash: reads from /dev/tty, falls back to default if non-interactive
     local prompt="$1" default="$2"
-    if printf "%s" "$prompt" >/dev/tty 2>/dev/null; then
+    if can_prompt; then
+        printf "%s" "$prompt" >/dev/tty
         local reply
         read -r reply </dev/tty 2>/dev/null || reply="$default"
         echo "${reply:-$default}"
     else
         echo "$default"
     fi
+}
+
+can_prompt() {
+    tty -s
+}
+
+run_pkg_cmd() {
+    # Avoid noisy sudo auth failures in non-interactive shells. Root-run
+    # installers can still execute sudo-free package managers, while
+    # interactive users get the normal sudo prompt.
+    local cmd="$1"
+    if [[ "$cmd" == sudo\ * ]] && [ "$(id -u)" -ne 0 ] && ! can_prompt; then
+        echo "  Skipping non-interactive package install that requires sudo:"
+        echo "    $cmd"
+        echo "  Re-run interactively or run it manually, then re-run this installer."
+        return 1
+    fi
+    eval "$cmd"
+}
+
+install_file() {
+    # Atomic-ish file install that is safe to rerun over existing files.
+    # Usage: install_file SRC DEST [MODE]
+    local src="$1" dest="$2" mode="${3:-}"
+    local dest_dir tmp
+    if [ ! -f "$src" ]; then
+        echo "  ERROR: missing source file: $src" >&2
+        return 1
+    fi
+    dest_dir="$(dirname "$dest")"
+    mkdir -p "$dest_dir"
+    if [ -d "$dest" ]; then
+        echo "  ERROR: destination is a directory, expected file: $dest" >&2
+        return 1
+    fi
+
+    # If a local install source already points at the destination, do nothing.
+    if [ -e "$dest" ] && [ "$(readlink -f "$src" 2>/dev/null || echo "$src")" = "$(readlink -f "$dest" 2>/dev/null || echo "$dest")" ]; then
+        [ -n "$mode" ] && chmod "$mode" "$dest"
+        return 0
+    fi
+
+    tmp="$(mktemp "$dest_dir/.tmp.$(basename "$dest").XXXXXX")"
+    cp "$src" "$tmp"
+    if [ -n "$mode" ]; then
+        chmod "$mode" "$tmp"
+    elif [ -x "$src" ]; then
+        chmod 755 "$tmp"
+    else
+        chmod 644 "$tmp"
+    fi
+    mv -f "$tmp" "$dest"
+}
+
+install_text_file() {
+    # Read stdin, write destination atomically, set mode.
+    local dest="$1" mode="${2:-644}"
+    local dest_dir tmp
+    dest_dir="$(dirname "$dest")"
+    mkdir -p "$dest_dir"
+    tmp="$(mktemp "$dest_dir/.tmp.$(basename "$dest").XXXXXX")"
+    cat > "$tmp"
+    chmod "$mode" "$tmp"
+    mv -f "$tmp" "$dest"
 }
 
 # Pick the right HIP runtime package name for dnf-based distros. Fedora's
@@ -208,7 +282,7 @@ if $HIP_FOUND; then
                 reply=$(ask "  Upgrade now? ($PKG_CMD) [Y/n] " "Y")
                 if [ "$reply" != "n" ] && [ "$reply" != "N" ]; then
                     echo "  Running: $PKG_CMD"
-                    eval "$PKG_CMD" || echo "  Upgrade failed. You may need to add the ROCm repo first."
+                    run_pkg_cmd "$PKG_CMD" || echo "  Upgrade failed or skipped. You may need to add the ROCm repo first."
                 fi
             else
                 echo "  Upgrade manually: https://rocm.docs.amd.com/en/latest/deploy/linux/quick_start.html"
@@ -239,7 +313,7 @@ if ! $HIP_FOUND; then
         reply=$(ask "  Install now? ($PKG_CMD) [Y/n] " "Y")
         if [ "$reply" != "n" ] && [ "$reply" != "N" ]; then
             echo "  Running: $PKG_CMD"
-            eval "$PKG_CMD" || {
+            run_pkg_cmd "$PKG_CMD" || {
                 echo ""
                 echo "  HIP runtime install failed. Try manually:"
                 echo "    $PKG_CMD"
@@ -293,7 +367,7 @@ else
 fi
 
 # ─── Create directories ─────────────────────────────────
-mkdir -p "$BIN_DIR" "$MODELS_DIR"
+mkdir -p "$BIN_DIR" "$CLI_DIR" "$MODELS_DIR" "$HIPFIRE_CONFIG_DIR" "$HIPFIRE_CACHE_DIR" "$HIPFIRE_STATE_DIR" "$LOCAL_BIN_DIR"
 
 # ─── Determine install mode ──────────────────────────────
 # Local: running from within a repo checkout (./scripts/install.sh)
@@ -317,7 +391,7 @@ else
         if ! command -v git &>/dev/null; then
             echo "  ERROR: git is required for remote install."
             echo "  Install git and re-run, or clone manually:"
-            echo "    git clone https://github.com/$GITHUB_REPO.git ~/.hipfire/src"
+            echo "    git clone https://github.com/$GITHUB_REPO.git $SRC_DIR"
             exit 1
         fi
         echo "  Cloning https://github.com/$GITHUB_REPO.git ..."
@@ -359,7 +433,7 @@ fi
 echo ""
 echo "Installing hipfire..."
 
-if [ -f "$REPO_DIR/target/release/examples/daemon" ]; then
+if [ -f "$REPO_DIR/target/release/examples/daemon" ] && [ -f "$REPO_DIR/target/release/hipfire-quantize" ]; then
     echo "  Pre-built binaries found ✓"
 else
     echo "  No pre-built binaries. Building from source..."
@@ -370,7 +444,8 @@ else
     fi
     (cd "$REPO_DIR" && \
         echo "  cargo build --release (this may take several minutes)..." && \
-        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine 2>&1 | tail -5)
+        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine 2>&1 | tail -5 && \
+        cargo build --release -p hipfire-quantize 2>&1 | tail -5)
     if [ ! -f "$REPO_DIR/target/release/examples/daemon" ]; then
         echo ""
         echo "  BUILD FAILED."
@@ -385,13 +460,21 @@ else
     echo "  Build complete ✓"
 fi
 
-# Copy binaries
-cp "$REPO_DIR/target/release/examples/daemon" "$BIN_DIR/daemon"
-cp "$REPO_DIR/target/release/examples/infer" "$BIN_DIR/infer" 2>/dev/null || true
-cp "$REPO_DIR/target/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 2>/dev/null || true
+# Copy binaries. Use temp-file + rename so rerunning the installer over
+# existing binaries does not leave half-written files if a copy is interrupted.
+install_file "$REPO_DIR/target/release/examples/daemon" "$BIN_DIR/daemon" 755
+if [ -f "$REPO_DIR/target/release/examples/infer" ]; then
+    install_file "$REPO_DIR/target/release/examples/infer" "$BIN_DIR/infer" 755
+fi
+if [ -f "$REPO_DIR/target/release/examples/infer_hfq" ]; then
+    install_file "$REPO_DIR/target/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 755
+fi
+if [ -f "$REPO_DIR/target/release/hipfire-quantize" ]; then
+    install_file "$REPO_DIR/target/release/hipfire-quantize" "$BIN_DIR/hipfire-quantize" 755
+fi
 
 # Copy CLI
-mkdir -p "$HIPFIRE_DIR/cli"
+mkdir -p "$CLI_DIR"
 # Order: registry.json BEFORE index.ts. The CLI imports the JSON at startup;
 # if we wrote the new index.ts before the JSON and the JSON copy then failed,
 # the install would be stranded — new TS that can't resolve its own data file.
@@ -401,9 +484,9 @@ if [ ! -f "$REPO_DIR/cli/registry.json" ] || [ ! -f "$REPO_DIR/cli/index.ts" ]; 
     echo "       Repo checkout may be incomplete; aborting install." >&2
     exit 1
 fi
-cp "$REPO_DIR/cli/registry.json" "$HIPFIRE_DIR/cli/registry.json"
-cp "$REPO_DIR/cli/package.json"  "$HIPFIRE_DIR/cli/package.json"
-cp "$REPO_DIR/cli/index.ts"      "$HIPFIRE_DIR/cli/index.ts"
+install_file "$REPO_DIR/cli/registry.json" "$CLI_DIR/registry.json" 644
+install_file "$REPO_DIR/cli/package.json"  "$CLI_DIR/package.json" 644
+install_file "$REPO_DIR/cli/index.ts"      "$CLI_DIR/index.ts" 644
 
 # Create hipfire wrapper. The shim resolves `bun` even when it isn't on
 # $PATH — rustup and bun both install to under-home bindirs that shell
@@ -411,7 +494,7 @@ cp "$REPO_DIR/cli/index.ts"      "$HIPFIRE_DIR/cli/index.ts"
 # get a minimal PATH. Without this probe the first line that calls the
 # shim dies with "exec: bun: not found" before dep-autodetect inside the
 # TS CLI has a chance to run.
-cat > "$BIN_DIR/hipfire" << 'WRAPPER'
+install_text_file "$LOCAL_BIN_DIR/hipfire" 755 << 'WRAPPER'
 #!/bin/bash
 set -e
 if command -v bun >/dev/null 2>&1; then
@@ -425,14 +508,14 @@ else
     echo "         Install it: curl -fsSL https://bun.sh/install | bash" >&2
     exit 127
 fi
-exec "$BUN" run "$HOME/.hipfire/cli/index.ts" "$@"
+exec "$BUN" run "$HOME/.local/lib/hipfire/cli/index.ts" "$@"
 WRAPPER
-chmod +x "$BIN_DIR/hipfire"
 echo "  Binaries + CLI installed to $BIN_DIR/ ✓"
+echo "  hipfire wrapper installed to $LOCAL_BIN_DIR/hipfire ✓"
 
 # ─── Install kernels ────────────────────────────────────
 # Engine probes for kernels at {exe_dir}/kernels/compiled/{arch}/
-# so we place them at ~/.hipfire/bin/kernels/compiled/{arch}/
+# so we place them at ~/.local/lib/hipfire/kernels/compiled/{arch}/
 echo ""
 if [ "$GPU_ARCH" != "unknown" ]; then
     echo "Setting up kernels for $GPU_ARCH..."
@@ -440,10 +523,14 @@ if [ "$GPU_ARCH" != "unknown" ]; then
     mkdir -p "$KERNEL_DEST"
 
     if [ -d "$REPO_DIR/kernels/compiled/$GPU_ARCH" ]; then
-        cp "$REPO_DIR/kernels/compiled/$GPU_ARCH"/*.hsaco "$KERNEL_DEST/" 2>/dev/null
-        cp "$REPO_DIR/kernels/compiled/$GPU_ARCH"/*.hash "$KERNEL_DEST/" 2>/dev/null
+        copied=0
+        for kernel in "$REPO_DIR/kernels/compiled/$GPU_ARCH"/*.hsaco "$REPO_DIR/kernels/compiled/$GPU_ARCH"/*.hash; do
+            [ -f "$kernel" ] || continue
+            install_file "$kernel" "$KERNEL_DEST/$(basename "$kernel")"
+            copied=$((copied + 1))
+        done
         count=$(ls "$KERNEL_DEST"/*.hsaco 2>/dev/null | wc -l)
-        echo "  Copied $count kernels + hashes to $KERNEL_DEST/ ✓"
+        echo "  Installed $copied kernel artifact(s); $count hsaco file(s) present in $KERNEL_DEST/ ✓"
     else
         echo "  No pre-compiled kernels for $GPU_ARCH in repo — will JIT from source below."
     fi
@@ -454,7 +541,7 @@ fi
 
 # Fill in any kernels missing from the pre-compiled set, including MQ4/asym3
 # defaults that aren't always shipped for newer arches. Uses hipcc in parallel
-# and writes back to ~/.hipfire/bin/kernels/compiled/<arch>/ so first
+# and writes back to ~/.local/lib/hipfire/kernels/compiled/<arch>/ so first
 # `hipfire run` isn't a 2-minute compile wall. Runs regardless of install-time
 # arch detection — the daemon's own Gpu::init resolves the active arch.
 if [ -x "$BIN_DIR/daemon" ]; then
@@ -468,7 +555,7 @@ if [ -x "$BIN_DIR/daemon" ]; then
 fi
 
 # ─── Config ──────────────────────────────────────────────
-CONFIG="$HIPFIRE_DIR/config.json"
+CONFIG="$HIPFIRE_CONFIG_DIR/config.json"
 if [ ! -f "$CONFIG" ]; then
     cat > "$CONFIG" << CONF
 {
@@ -484,17 +571,17 @@ fi
 
 # ─── PATH setup ─────────────────────────────────────────
 echo ""
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+if [[ ":$PATH:" != *":$LOCAL_BIN_DIR:"* ]]; then
     SHELL_RC=""
     case "$(basename "${SHELL:-bash}")" in
         bash) SHELL_RC="$HOME/.bashrc" ;;
         zsh)  SHELL_RC="$HOME/.zshrc" ;;
     esac
 
-    PATH_LINE="export PATH=\"\$HOME/.hipfire/bin:\$PATH\""
+    PATH_LINE="export PATH=\"\$HOME/.local/bin:\$PATH\""
     if [ -n "$SHELL_RC" ] && [ -f "$SHELL_RC" ]; then
-        if ! grep -q '.hipfire/bin' "$SHELL_RC" 2>/dev/null; then
-            reply=$(ask "Add hipfire to PATH in $SHELL_RC? [Y/n] " "Y")
+        if ! grep -q '.local/bin' "$SHELL_RC" 2>/dev/null; then
+            reply=$(ask "Add ~/.local/bin to PATH in $SHELL_RC? [Y/n] " "Y")
             if [ "$reply" != "n" ] && [ "$reply" != "N" ]; then
                 printf '\n# hipfire\n%s\n' "$PATH_LINE" >> "$SHELL_RC"
                 echo "  Added to $SHELL_RC ✓"
@@ -517,5 +604,5 @@ echo "  hipfire list                                      # see local models"
 echo "  hipfire run <model.hfq> \"Hello\"                  # generate text"
 echo "  hipfire serve                                     # start OpenAI-compatible API"
 echo ""
-echo "Models go in ~/.hipfire/models/ or the repo's models/ directory."
+echo "Models go in $MODELS_DIR/ or the repo's models/ directory."
 echo ""
