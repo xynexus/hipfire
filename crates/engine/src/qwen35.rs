@@ -3255,7 +3255,21 @@ fn prefill_moe_ffn_body_batched(
     )?;
 
     // ── 3. GPU softmax + top-K + renorm, batched over N tokens ──
-    gpu.moe_softmax_topk_renorm_k8_batched(
+    //
+    // Path B (companion to the decode change): split the fused
+    // softmax+topk+renorm into gpu.softmax_f32 + moe_topk_renorm_k8_batched.
+    // Keeping the fused variant for prefill leaves the 1-ULP topk-weight
+    // discrepancy in the prefill activations and pollutes the KV cache,
+    // which compounds during decode and breaks A10B even with the decode
+    // path fixed. router_logits is allocated 1D as [n * n_exp]; alias it
+    // into a 2D view so gpu.softmax_f32 takes rows=n.
+    let router_logits_2d = GpuTensor {
+        buf: unsafe { router_logits.buf.alias() },
+        shape: vec![n, n_exp],
+        dtype: DType::F32,
+    };
+    gpu.softmax_f32(&router_logits_2d)?;
+    gpu.moe_topk_renorm_k8_batched(
         router_logits, topk_indices, topk_weights,
         n_exp, config.norm_topk_prob, n,
     )?;

@@ -131,6 +131,11 @@ pub const MOE_SOFTMAX_TOPK_K8_SRC: &str = include_str!("../../../kernels/src/moe
 /// attractor on Qwen3.5-A3B / 122B-A10B.
 pub const MOE_TOPK_RENORM_K8_SRC: &str = include_str!("../../../kernels/src/moe_topk_renorm_k8.hip");
 
+/// Batched companion of MOE_TOPK_RENORM_K8_SRC for the prefill path.
+/// Same per-block algorithm; one workgroup per token row.
+pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_topk_renorm_k8_batched.hip");
+
 /// Index-aware MoE gate_up GEMV — reads expert IDs from a device-side
 /// topk_indices buffer and the per-expert weight base from an
 /// expert-pointers table. hipGraph-capture-safe replacement for the

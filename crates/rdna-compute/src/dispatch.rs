@@ -5299,6 +5299,55 @@ impl Gpu {
         result
     }
 
+    /// Batched companion of `moe_topk_renorm_k8` for the prefill path.
+    /// Takes pre-softmaxed probs of shape `[batch_size × n_exp]` and writes
+    /// `[batch_size × K_TOP]` indices and weights. Caller must run a batched
+    /// softmax (`gpu.softmax_f32` on a [batch_size × n_exp] tensor) before
+    /// calling this kernel.
+    pub fn moe_topk_renorm_k8_batched(
+        &mut self,
+        probs: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w:   &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "moe_topk_renorm_k8_batched",
+            kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
+            "moe_topk_renorm_k8_batched",
+        )?;
+        let lp = probs.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n  = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n  as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = (n_exp * 4 + 8 * 8) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_topk_renorm_k8_batched", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_topk_renorm_k8_batched",
+            [batch_size as u32, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp); b.push_ptr(ip); b.push_ptr(wp);
+                b.push_i32(n); b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// N-batched indexed MoE gate_up. Grid = (M, K_TOP, N). `x` is
     /// [N × K], `topk_indices` is [N × K_TOP] i32, `y_gate` and `y_up`
     /// are [N × K_TOP × MI] where MI = M / 2.
