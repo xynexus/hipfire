@@ -353,6 +353,19 @@ __device__ int turbo_quantize_4bit_256(float x) {
          + (x > 0.089815f) + (x > 0.115239f) + (x > 0.150086f);
 }
 
+__device__ __forceinline__ int turbo_quantize_4bit_hd(float x, int head_dim) {
+    return (head_dim == 256) ? turbo_quantize_4bit_256(x) : turbo_quantize_4bit(x);
+}
+
+__device__ __forceinline__ float turbo_c4_value(int idx, int head_dim) {
+    return (head_dim == 256) ? TURBO_C4_256[idx] : TURBO_C4[idx];
+}
+
+__device__ __forceinline__ float turbo_c4_square(int idx, int head_dim) {
+    const float v = turbo_c4_value(idx, head_dim);
+    return v * v;
+}
+
 // Sign flip array for cheap decorrelation (seed=42, ±1.0)
 __constant__ float TURBO_SIGNS1[128] = {
   1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f,

@@ -55,10 +55,10 @@ __global__ void kv_fold_asym4(
             const int i2 = b1 & 0xF;
             const int i3 = (b1 >> 4) & 0xF;
             const int base = half * 4;
-            acc[base + 0] += wc * TURBO_C4[i0];
-            acc[base + 1] += wc * TURBO_C4[i1];
-            acc[base + 2] += wc * TURBO_C4[i2];
-            acc[base + 3] += wc * TURBO_C4[i3];
+            acc[base + 0] += wc * turbo_c4_value(i0, head_dim);
+            acc[base + 1] += wc * turbo_c4_value(i1, head_dim);
+            acc[base + 2] += wc * turbo_c4_value(i2, head_dim);
+            acc[base + 3] += wc * turbo_c4_value(i3, head_dim);
         }
     }
 
@@ -80,10 +80,10 @@ __global__ void kv_fold_asym4(
     int idx_out[8];
     for (int half = 0; half < n_halves; ++half) {
         const int base = half * 4;
-        idx_out[base + 0] = turbo_quantize_4bit(acc[base + 0] * inv_cnorm);
-        idx_out[base + 1] = turbo_quantize_4bit(acc[base + 1] * inv_cnorm);
-        idx_out[base + 2] = turbo_quantize_4bit(acc[base + 2] * inv_cnorm);
-        idx_out[base + 3] = turbo_quantize_4bit(acc[base + 3] * inv_cnorm);
+        idx_out[base + 0] = turbo_quantize_4bit_hd(acc[base + 0] * inv_cnorm, head_dim);
+        idx_out[base + 1] = turbo_quantize_4bit_hd(acc[base + 1] * inv_cnorm, head_dim);
+        idx_out[base + 2] = turbo_quantize_4bit_hd(acc[base + 2] * inv_cnorm, head_dim);
+        idx_out[base + 3] = turbo_quantize_4bit_hd(acc[base + 3] * inv_cnorm, head_dim);
     }
 
     // 4. Write.

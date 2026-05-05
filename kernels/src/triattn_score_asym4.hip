@@ -60,10 +60,10 @@ __global__ void triattn_score_asym4(
         const int i2 = (int)((b1     ) & 0xF);
         const int i3 = (int)((b1 >> 4) & 0xF);
 
-        const float v0 = cnorm * TURBO_C4[i0];
-        const float v1 = cnorm * TURBO_C4[i1];
-        const float v2 = cnorm * TURBO_C4[i2];
-        const float v3 = cnorm * TURBO_C4[i3];
+        const float v0 = cnorm * turbo_c4_value(i0, head_dim);
+        const float v1 = cnorm * turbo_c4_value(i1, head_dim);
+        const float v2 = cnorm * turbo_c4_value(i2, head_dim);
+        const float v3 = cnorm * turbo_c4_value(i3, head_dim);
 
         const float cA = cos_theta[block_tid * 2 + 0];
         const float sA = sin_theta[block_tid * 2 + 0];

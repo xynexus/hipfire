@@ -86,10 +86,10 @@ __global__ void attention_flash_asym4_tile(
         for (int half = 0; half < n_halves; half++) {
             // Nibble offset: 4 (cnorm) + half * 64 + tid * 2.
             unsigned short pk = *(const unsigned short*)(kb + 4 + half * 64 + tid * 2);
-            partial += mq[half * 4 + 0] * (cnorm * TURBO_C4[(pk)       & 0xF])
-                     + mq[half * 4 + 1] * (cnorm * TURBO_C4[(pk >> 4)  & 0xF])
-                     + mq[half * 4 + 2] * (cnorm * TURBO_C4[(pk >> 8)  & 0xF])
-                     + mq[half * 4 + 3] * (cnorm * TURBO_C4[(pk >> 12) & 0xF]);
+            partial += mq[half * 4 + 0] * (cnorm * turbo_c4_value((pk)       & 0xF, head_dim))
+                     + mq[half * 4 + 1] * (cnorm * turbo_c4_value((pk >> 4)  & 0xF, head_dim))
+                     + mq[half * 4 + 2] * (cnorm * turbo_c4_value((pk >> 8)  & 0xF, head_dim))
+                     + mq[half * 4 + 3] * (cnorm * turbo_c4_value((pk >> 12) & 0xF, head_dim));
         }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);

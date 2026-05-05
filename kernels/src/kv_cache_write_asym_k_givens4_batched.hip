@@ -56,10 +56,10 @@ extern "C" __global__ void kv_cache_write_asym_k_givens4_batched(
         givens_forward(fa, fb, fc, fd, cos_theta, sin_theta, block_tid);
 
         int i0 = half * 4 + 0, i1 = half * 4 + 1, i2 = half * 4 + 2, i3 = half * 4 + 3;
-        idx[i0] = turbo_quantize_4bit(fa); local_rsq += TURBO_C4[idx[i0]] * TURBO_C4[idx[i0]];
-        idx[i1] = turbo_quantize_4bit(fb); local_rsq += TURBO_C4[idx[i1]] * TURBO_C4[idx[i1]];
-        idx[i2] = turbo_quantize_4bit(fc); local_rsq += TURBO_C4[idx[i2]] * TURBO_C4[idx[i2]];
-        idx[i3] = turbo_quantize_4bit(fd); local_rsq += TURBO_C4[idx[i3]] * TURBO_C4[idx[i3]];
+        idx[i0] = turbo_quantize_4bit_hd(fa, head_dim); local_rsq += turbo_c4_square(idx[i0], head_dim);
+        idx[i1] = turbo_quantize_4bit_hd(fb, head_dim); local_rsq += turbo_c4_square(idx[i1], head_dim);
+        idx[i2] = turbo_quantize_4bit_hd(fc, head_dim); local_rsq += turbo_c4_square(idx[i2], head_dim);
+        idx[i3] = turbo_quantize_4bit_hd(fd, head_dim); local_rsq += turbo_c4_square(idx[i3], head_dim);
     }
 
     scratch[tid] = local_rsq;
