@@ -28,7 +28,9 @@ quote it: `hipfire run qwen3.5:9b "What's 2+2?"`.
 
 Thinking controls are budget-based, not prompt-injection based:
 `--no-think` caps thinking to one token, `--think` allows uncapped thinking,
-and `--max-think-tokens N` sets a per-run reasoning budget.
+and `--max-think-tokens N` sets a per-run reasoning budget. Add
+`--show-special` to print raw special tokens such as `<think>` and
+`<|im_end|>` while debugging model behavior.
 
 ## Configuration
 

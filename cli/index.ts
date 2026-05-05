@@ -791,10 +791,14 @@ async function runViaHttp(
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
   maxThinkTokens?: number,
+  showSpecial = false,
 ): Promise<boolean> {
   // VL flows go through the image-base64 path on the daemon which the HTTP
   // wrapper doesn't expose — fall back to local spawn.
   if (image) return false;
+  // The HTTP compatibility stream separates / strips thinking content. Raw
+  // special-token display needs the direct daemon stream.
+  if (showSpecial) return false;
 
   const body: any = {
     model, stream: true,
@@ -1108,6 +1112,7 @@ async function run(
   repeatPenalty = 1.3,
   topP = 0.8,
   maxThinkTokens?: number,
+  showSpecial = false,
 ) {
   let path = findModel(model);
 
@@ -1132,7 +1137,7 @@ async function run(
   // Local spawn falls through only when no serve is present (or HTTP errors out).
   const useLocal = process.env.HIPFIRE_LOCAL === "1" || image !== undefined;
   if (!useLocal && await isServeUp(cfg.port)) {
-    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP, maxThinkTokens);
+    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP, maxThinkTokens, showSpecial);
     if (ok) return;
     // runViaHttp logged its own failure reason; fall back to local spawn.
   }
@@ -1172,11 +1177,19 @@ async function run(
 
   let inThink = false;
   let stripNextLeadingNl = false;
+  let strippedThinking = false;
+  let wroteVisible = false;
   for await (const msg of e.generate(genMsg)) {
     if (msg.type === "token") {
       let text = msg.text as string;
+      if (showSpecial) {
+        process.stdout.write(text);
+        wroteVisible = true;
+        continue;
+      }
       if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
       if (inThink) {
+        strippedThinking = true;
         if (text.includes("</think>")) {
           text = text.split("</think>").slice(1).join("</think>");
           inThink = false;
@@ -1187,8 +1200,14 @@ async function run(
       if (!text) continue;
       if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
       process.stdout.write(text);
+      wroteVisible = true;
     }
-    else if (msg.type === "done") console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
+    else if (msg.type === "done") {
+      if (!showSpecial && !wroteVisible && strippedThinking) {
+        console.error("\n[hipfire] output was entirely inside <think>; re-run with --show-special to inspect it, or --no-think to force an answer.");
+      }
+      console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
+    }
     else if (msg.type === "error") {
       // Surface daemon-side rejections (e.g. KV-budget overrun) instead of
       // exiting 0 with no visible output. Sets exitCode so downstream shell
@@ -3964,7 +3983,7 @@ switch (cmd) {
   }
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>               Temperature (default 0.3)\n  --top-p <float>              Top-p sampling (default 0.8)\n  --repeat-penalty <float>     Repeat penalty (default 1.05)\n  --max-tokens <int>           Max tokens to generate (default 512)\n  --think                      Enable uncapped thinking for this run\n  --no-think                   Cap thinking to one token for this run\n  --max-think-tokens <int>     Thinking budget, 0 = uncapped\n  --image <path>               Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --no-think \"Answer directly\"\n  hipfire run qwen3.5:9b --max-think-tokens 256 \"Solve this carefully\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>               Temperature (default 0.3)\n  --top-p <float>              Top-p sampling (default 0.8)\n  --repeat-penalty <float>     Repeat penalty (default 1.05)\n  --max-tokens <int>           Max tokens to generate (default 512)\n  --think                      Enable uncapped thinking for this run\n  --no-think                   Cap thinking to one token for this run\n  --max-think-tokens <int>     Thinking budget, 0 = uncapped\n  --show-special               Print raw special tokens, including <think>\n  --image <path>               Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --no-think \"Answer directly\"\n  hipfire run qwen3.5:9b --think --show-special \"Show the reasoning stream\"\n  hipfire run qwen3.5:9b --max-think-tokens 256 \"Solve this carefully\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
     // Parse --key value flags
     const flagDefs: Record<string, { default: number | string | undefined }> = {
       "--image": { default: undefined }, "--temp": { default: 0.3 },
@@ -3990,7 +4009,8 @@ switch (cmd) {
     const thinkFlagIndices = new Set<number>();
     const thinkOn = rest.includes("--think");
     const thinkOff = rest.includes("--no-think");
-    for (const flag of ["--think", "--no-think"]) {
+    const showSpecial = rest.includes("--show-special");
+    for (const flag of ["--think", "--no-think", "--show-special"]) {
       let idx = rest.indexOf(flag);
       while (idx >= 0) {
         thinkFlagIndices.add(idx);
@@ -4029,7 +4049,7 @@ switch (cmd) {
     }
     const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1) && !thinkFlagIndices.has(i + 1));
     const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
-    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, maxThinkTokens);
+    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, maxThinkTokens, showSpecial);
     break;
   }
   case "pull": {
