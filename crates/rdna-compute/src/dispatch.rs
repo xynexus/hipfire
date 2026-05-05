@@ -3086,10 +3086,21 @@ impl Gpu {
                     return r1.and(r2).and(r3);
                 }
             }
-            if has_wmma_f16_gfx12(&self.arch) {
+            // WMMA paths process 16×16 tiles; for batch_size < 16 the
+            // out-of-bounds threads (tid & 15 >= N) clamp their batch
+            // index to 0, but their participation in the WMMA accumulation
+            // still corrupts results for the in-bounds columns. Skip
+            // WMMA for small batches and fall through to the scalar /
+            // dot2 / fp16 paths which handle any batch size correctly.
+            // Diagnosed by codex-rescue agent on 2026-05-04: empirically,
+            // HIPFIRE_FP16=0 (forces scalar) gives gate rms=3.76 matching
+            // single-token, default WMMA path gives rms=8.79 (~2.3× wrong)
+            // on Gemma 4 31B batched prefill at chunk=8. qwen35 uses
+            // PREFILL_MAX_BATCH=256 so it's never hit this bug.
+            if batch_size >= 16 && has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkv_hfq4g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
-            if has_wmma_f16(&self.arch) {
+            if batch_size >= 16 && has_wmma_f16(&self.arch) {
                 return self.gemm_qkv_hfq4g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -3365,12 +3376,14 @@ impl Gpu {
                     return r1.and(r2);
                 }
             }
-            // WMMA on gfx12 (RDNA4)
-            if has_wmma_f16_gfx12(&self.arch) {
+            // WMMA on gfx12 (RDNA4) — guarded on batch_size >= 16. See
+            // gemm_qkv_hfq4g256 above for the diagnosis (16×16 tile
+            // out-of-bounds threads contaminate in-bounds columns).
+            if batch_size >= 16 && has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_gate_up_hfq4g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
-            // WMMA on gfx11 (RDNA3)
-            if has_wmma_f16(&self.arch) {
+            // WMMA on gfx11 (RDNA3) — same guard.
+            if batch_size >= 16 && has_wmma_f16(&self.arch) {
                 return self.gemm_gate_up_hfq4g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
