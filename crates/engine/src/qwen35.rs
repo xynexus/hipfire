@@ -1398,7 +1398,13 @@ fn moe_ffn_decode_impl(
     let routed_gate_up_mq4 = ffn.experts.first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
-    let use_gpu_topk = k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
+    // Diagnostic gate (debug/moe-qwen-20260505 branch). Setting
+    // `HIPFIRE_FORCE_CPU_MOE_TOPK=1` skips the GPU-fast-path
+    // moe_softmax_topk_renorm_k8 + gemv_hfq4g256_moe_*_indexed kernels and
+    // forces the CPU top-K + per-expert kernarg-fused path. Used to A/B
+    // whether the MoE collapse lives in the GPU-fast-path kernels vs upstream.
+    let force_cpu = std::env::var("HIPFIRE_FORCE_CPU_MOE_TOPK").ok().as_deref() == Some("1");
+    let use_gpu_topk = !force_cpu && k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
 
     // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
     // All four read the SAME rotated x_rot_local with the SAME K. Fusing them
