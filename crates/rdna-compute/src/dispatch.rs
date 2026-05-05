@@ -5078,6 +5078,52 @@ impl Gpu {
         result
     }
 
+    /// MoE top-K + renorm given pre-softmaxed probs. Companion to the
+    /// regular `softmax_f32`. The dispatch site runs `softmax_f32` first,
+    /// then this kernel — same softmax math everywhere, no 1-ULP
+    /// divergence between the routing path and a CPU reference.
+    pub fn moe_topk_renorm_k8(
+        &mut self,
+        probs: &GpuTensor,        // [n_exp] f32, pre-softmaxed
+        topk_idx: &GpuTensor,     // i32 [k_top]
+        topk_w:   &GpuTensor,     // f32 [k_top]
+        n_exp: usize,
+        norm_topk: bool,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "moe_topk_renorm_k8",
+            kernels::MOE_TOPK_RENORM_K8_SRC,
+            "moe_topk_renorm_k8",
+        )?;
+        let lp = probs.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n  = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n  as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = n_exp * 4 + 8 * 8;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_topk_renorm_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_topk_renorm_k8", [1, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp); b.push_ptr(ip); b.push_ptr(wp);
+                b.push_i32(n); b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Index-aware MoE gate_up GEMV. Reads expert_ids from a device-side
     /// topk_indices buffer and weight bases from expert_ptrs[expert_id].
     /// hipGraph-capture-safe replacement for the kernarg-pointer variant.

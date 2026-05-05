@@ -1449,10 +1449,17 @@ fn moe_ffn_decode_impl(
     // broken, the bug is in the indexed kernels.
     let topk_overwrite = std::env::var("HIPFIRE_MOE_TOPK_CPU_OVERWRITE").ok().as_deref() == Some("1");
     let (topk_indices_cpu, topk_weights_cpu): (Option<Vec<usize>>, Option<Vec<f32>>) = if use_gpu_topk {
-        // GPU path: softmax + top-K + renorm in one launch, results land
-        // in s.topk_indices [k] (i32) and s.topk_weights [k] (f32) on
-        // device. Indexed MoE kernels consume them directly — no D2H.
-        gpu.moe_softmax_topk_renorm_k8(
+        // GPU path: split softmax + top-K + renorm into two kernels so
+        // the routing path uses identical softmax math to gpu.softmax_f32
+        // (and thus to a CPU reference).  The fused
+        // moe_softmax_topk_renorm_k8 variant produced topk_weights that
+        // differed from gpu.softmax_f32 + manual `*w /= sum` by exactly
+        // 1 ULP per element, which compounds across 30+ MoE layers and
+        // 8 experts/layer into a structural attractor on Qwen3.5-A3B
+        // and 122B-A10B at MQ4.  The new moe_topk_renorm_k8 takes
+        // pre-softmaxed probs and uses direct division for renorm.
+        gpu.softmax_f32(router_logits)?;
+        gpu.moe_topk_renorm_k8(
             router_logits, s.topk_indices, s.topk_weights,
             n_exp, config.norm_topk_prob,
         )?;
