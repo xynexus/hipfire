@@ -3,6 +3,15 @@
 **Status:** PRE-REGISTERED. Criterion fixed BEFORE measurement. Drafted
 2026-05-06 23:30 UTC, before any Phase 2 perplexity data was collected.
 
+**Amendment 2026-05-06 23:50 UTC (BEFORE Phase 2 PPL collection):** the
+D3 forward-pass results landed and showed activation-side SE candidates
+at layers 38-39 with completely different expert IDs from the D2
+weight-side set. To cleanly resolve which signal drives the actual
+quality cliff, Phase 2 now tests **three independent candidate sets**
+(D2-only / D3-only / D2∪D3 union) against the same All-MQ4 baseline
+and All-Q8 ceiling. Criterion thresholds (gap closure ≥ 80% / size
+overhead ≤ 2%) are unchanged.
+
 **Branch:** `survey/moe-quant-cliff-2026-05-06`
 
 **Hypothesis source:** arXiv 2507.23279 ("Super-Expert" identification in MoE LLMs).
@@ -73,20 +82,36 @@ Q8G256 on every weight tensor. No FWHT (Q8 has enough headroom that
 FWHT rotation isn't required for correctness). ~2× model size. Used
 ONLY as the perplexity ceiling reference.
 
-### V3: Outlier-Q8 (the test)
+### V3a: Outlier-Q8 (D2-derived)
 
 MQ4G256+FWHT on every weight tensor EXCEPT:
 - Layer 0 `mlp.experts.X.down_proj` for X ∈ {3, 8, 42, 49, 70, 115, 119,
   132, 164, 167, 190, 195, 203, 225, 237, 239, 253}: pinned at Q8G256, no
   FWHT.
 
-That's **17 experts × 1 layer × 1 projection** per model = 17 weight
-tensors elevated to Q8 out of ~10,240 experts × 40 layers × 3 projections
-= 1,228,800 weight tensors. (The "0.0014% of weights at Q8" framing in
-02-survey-results.md.)
+17 experts × 1 layer × 1 projection = 17 weight tensors elevated.
+Source: D2 weight-side ratio_p99 cliff at layer 0 down_proj
+(`02-survey-results.md` original synthesis, before D3 update).
 
-The 17 expert IDs are the ones concordant in BOTH models' top-20 SE
-candidates at layer 0 down_proj weight ratio_p99 (per `02-survey-results.md`).
+### V3b: Outlier-Q8 (D3-derived)
+
+MQ4G256+FWHT on every weight tensor EXCEPT:
+- `mlp.experts.X.down_proj` for the (layer, expert) pairs in:
+  ```
+  layer 38: {48, 103, 209}
+  layer 39: {5, 21, 27, 37, 101, 108, 113, 149, 155, 170, 200,
+             209, 229, 238, 251, 255}
+  ```
+  pinned at Q8G256, no FWHT.
+
+19 weight tensors elevated. Source: D3 forward-pass per-expert absmax_max
+output side, top-20 union concordant across 3.5-A3B and 3.6-A3B (19/20
+concordance, see `02-survey-results.md` D3 update section).
+
+### V3c: Outlier-Q8 (D2 ∪ D3 union)
+
+Both V3a and V3b's pinning sets simultaneously: 17 + 19 = 36 weight
+tensors elevated (no overlap; D2 is layer 0, D3 is layers 38-39).
 
 ## Methodology
 
@@ -100,7 +125,7 @@ ablation):
    `scripts/quant-survey/quant_ops.py`:
    - V1: `quantize_then_dequantize_mq4g256_fwht_vectorized()` everywhere.
    - V2: `quantize_then_dequantize_q8g256()` everywhere (need to add this).
-   - V3: V1 everywhere except the 17 pinned tensors which use V2.
+   - V3a/b/c: V1 everywhere except the pinned tensors which use V2.
 3. Replace each weight in-place via `tensor.copy_(round_tripped)`.
 
 The bf16 reference path (V_ref) is the unquantized model. PPL_All-Q8 (V2)
@@ -137,8 +162,9 @@ hiptrx, all 4 R9700s via `device_map="auto"` for the A3B inference.
 ### Wall time estimate
 
 Per variant per trial: ~5 min (model load + 100 chunks of 1024 tokens
-forward at ~300 tok/s).
-3 variants × 3 trials × 2 models = 18 runs × 5 min = **~90 min total**.
+forward at ~300 tok/s). With the 3-set design:
+5 variants (V1, V2, V3a, V3b, V3c) × 3 trials × 2 models = 30 runs × 5 min
+= **~150 min total**. Sequenced on hiptrx (each A3B uses all 4 R9700s).
 
 ## Outputs
 
@@ -153,21 +179,37 @@ Cross-model: extension of this doc with results table + verdict.
 
 ## Decision tree
 
-```
-For each model in {3.5-A3B, 3.6-A3B}:
-  if gap_closure >= 0.80 and size_overhead <= 0.02:
-    -> CONFIRMED for this model
-  elif gap_closure >= 0.30:
-    -> PARTIAL — extend SE set with D3 activation evidence (Phase 2.5)
-  elif Outlier-Q8 PPL > All-MQ4 PPL:
-    -> REFUTED — pinning hurt; SE set wrong
-  else:
-    -> REFUTED — gap closure too low
+For each model in {3.5-A3B, 3.6-A3B} and each variant in {V3a, V3b, V3c}:
 
-Both confirmed -> SE hypothesis confirmed for Qwen3.5/3.6 MoE family.
-One confirmed, one partial -> family-level partial confirmation.
-Either refuted -> single-model SE phenomenon, not family-level.
 ```
+gap_closure(variant) = (PPL_V1 - PPL_variant) / (PPL_V1 - PPL_V2)
+size_overhead(variant) = (SIZE_variant - SIZE_V1) / SIZE_V1
+
+if gap_closure >= 0.80 and size_overhead <= 0.02:
+  -> CONFIRMED for this variant on this model
+elif gap_closure >= 0.30:
+  -> PARTIAL — set is partially correct
+elif PPL_variant > PPL_V1:
+  -> REFUTED — pinning that set HURT
+else:
+  -> REFUTED — gap closure too low
+```
+
+Family-level verdict for the SE hypothesis:
+
+- If V3b (D3-derived) CONFIRMED on both models: arXiv 2507.23279 SE
+  applies cleanly to this family; the activation-side absmax_max signal
+  identifies the correct pinning set.
+- If V3a (D2-derived) CONFIRMED on both models: weight-tail ratio at
+  layer 0 is the dominant signal; the SE label per arXiv 2507.23279
+  is misnamed for this family but the pinning works.
+- If V3c (D2 ∪ D3) is the only CONFIRMED variant: both signals are
+  necessary but neither is sufficient — additive cure required.
+- If V3a is CONFIRMED but V3b is REFUTED (or vice versa): the cliffs
+  are independent failure modes. Document each.
+- All three REFUTED: neither survey-derived candidate set is correct;
+  the cliff lives in a different proxy (router-precision, attention
+  outliers, or per-tensor sensitivity ranking via Hessian-trace methods).
 
 ## Halt point
 

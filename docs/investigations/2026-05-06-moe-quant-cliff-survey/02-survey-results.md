@@ -159,6 +159,113 @@ mechanism is genuinely activation-driven (fivetide's router-Q8 path is
 sufficient and the down_proj weight-ratio is a downstream symptom not a
 cause).
 
+## D3 activation update (added 2026-05-06 23:25 UTC)
+
+After Phase 1B+1C synthesis landed, the D3 forward-pass per-expert
+absmax survey ran on all four primary models (and 3.6-27B added as a
+control). The activation-side results are **inconsistent with the
+weight-side D2 prior** in a way that fundamentally redirects Phase 2:
+
+### Top-20 D3 SE candidates by absmax_max (output side, both A3Bs)
+
+Cross-model D3 concordance is **19 / 20** — even tighter than D2's
+17/20. The shared (layer, expert) pairs across 3.5-A3B and 3.6-A3B:
+
+```
+layer 38: {48, 103, 209}
+layer 39: {5, 21, 27, 37, 101, 108, 113, 149, 155, 170, 200,
+           209, 229, 238, 251, 255}
+```
+
+19 experts spread across the FINAL TWO LAYERS only.
+
+### Layer-by-layer max(absmax_max) on output side
+
+```
+layer  3.5-A3B  3.6-A3B
+   0     0.477    0.516
+   1-37  < 10
+   38    18.875   18.625
+   39    35.000   35.000
+```
+
+The activation-magnitude cliff is at layers 38-39 — the deepest two
+layers, not layer 0 where the weight-tail D2 cliff lives.
+
+### D2 layer-0 SE candidates have NORMAL D3 magnitudes
+
+The 17 D2-derived SE candidates {3, 8, 42, 49, 70, 115, 119, 132, 164,
+167, 190, 195, 203, 225, 237, 239, 253} all have D3 absmax_max at
+layer 0 in the **0.03 to 0.36 range** — within the normal distribution
+of layer-0 experts overall. Only expert 253 appears in both D2-derived
+and D3-derived top-N at layer 0 (rank 4 in 3.5-A3B, rank 2 in 3.6-A3B
+at layer 0; absmax_max ~0.30, far below the layer 39 SE peak of ~35).
+
+### Re-interpretation: two distinct phenomena
+
+The weight-side D2 cliff and the activation-side D3 cliff measure
+**different things**:
+
+- **D2 (weight ratio_p99 at layer 0)** = experts whose weight rows have
+  extreme ratio of max-element to median-element. MQ4G256 quantization
+  buckets the per-256-element absmax to the extreme value, collapsing
+  the rest of the row into floating-point noise. Damage = output
+  *accuracy* loss at layer 0 for those specific experts.
+
+- **D3 (activation absmax_max at layers 38-39)** = experts that produce
+  large-magnitude down_proj outputs during forward. These are the
+  arXiv 2507.23279 "Super Experts" by definition. Damage if quantized
+  = disrupts the residual stream at the model's most output-sensitive
+  position.
+
+These are **different failure modes**, both real. The arXiv paper's
+"Super Expert" hypothesis is captured by D3, not D2.
+
+### Why D2 layer-0 weight tails do NOT manifest as activation outliers
+
+A row of `down_proj.weight` with a single huge `(i, j)` cell only
+contributes to `output[i] = sum_j x[j] * W[i, j]` if the input x[j]
+aligns with the outlier column. Layer 0 inputs (token embeddings)
+have a relatively narrow distribution; the D2 layer-0 weight tails
+appear to sit in (out_channel, in_channel) cells that the typical
+input rarely activates strongly. So MQ4 noise on those rows is real
+*on those specific input alignments* but doesn't show up in the
+calibration-corpus average.
+
+### Updated SE candidate set (D3-derived)
+
+Pre-registered for Phase 2 ablation alongside the original D2-derived
+set (see `03-super-expert-confirmation.md` v2 for the multi-set
+ablation design):
+
+**D3-derived 19-expert set, layers 38 + 39:**
+```
+(38, 48), (38, 103), (38, 209),
+(39, 5), (39, 21), (39, 27), (39, 37), (39, 101), (39, 108),
+(39, 113), (39, 149), (39, 155), (39, 170), (39, 200),
+(39, 209), (39, 229), (39, 238), (39, 251), (39, 255)
+```
+
+Cost at Q8 vs MQ4: 19 experts × 1 projection × ~hidden_dim*intermediate_dim
+≈ 12 MB extra per model. Same 0.014% size cost as the D2-derived set.
+
+### What this implies for the issue #171 cure
+
+fivetide's #171 router-precision finding is about routing-decision
+damage at `mlp.gate.weight` (layer 0). The D2 weight-tail cliff at
+layer 0 down_proj is a SEPARATE issue that the router patch does NOT
+address. The D3 SE phenomenon at layers 38-39 is also distinct.
+
+If Phase 2 confirms the D3-derived candidates as the correct pinning
+set, the cure-stack becomes:
+- Q8 router (fivetide) — fixes routing decisions
+- Q8 D3-derived top-N experts at layers 38-39 — fixes SE output magnitude
+- (Possibly) Q8 D2-derived layer-0 outliers — fixes per-row precision loss
+  on rare input alignments
+
+Each of the three is potentially additive. Phase 2 will quantify which
+of D2 / D3 / both is the dominant lever.
+
 ## Files
 
 - per-tensor JSONL records: `/tmp/hiptrx-survey/runs/<model>-full/per_tensor.jsonl`
