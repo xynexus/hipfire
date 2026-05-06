@@ -71,6 +71,7 @@ from diagnostics.d4_fwht import run_d4  # noqa: E402
 MODEL_REGISTRY: dict[str, str] = {
     "qwen3.5-9b": "Qwen/Qwen3.5-9B",
     "qwen3.5-27b": "Qwen/Qwen3.5-27B",
+    "qwen3.6-27b": "Qwen/Qwen3.6-27B",
     "qwen3.5-a3b": "Qwen/Qwen3.5-35B-A3B",
     "qwen3.6-a3b": "Qwen/Qwen3.6-35B-A3B",
 }
