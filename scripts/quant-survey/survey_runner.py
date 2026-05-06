@@ -290,12 +290,68 @@ def main() -> int:
 
     per_tensor_path = output_dir / "per_tensor.jsonl"
     summary_path = output_dir / "summary.json"
+    manifest_path = output_dir / "manifest.json"
 
-    # Resume support: read existing JSONL records (if any) into all_records
-    # and a "seen" set keyed by tensor (name, expert_idx). Process skips
-    # any tensor already in the set. Append-only file open for new records.
+    # Manifest validation: a fresh run writes (model, repo, diagnostics,
+    # fwht_seeds, runner_version) at start. A resume run must match — if
+    # any field differs, refuse to silently merge incompatible runs into
+    # the same output dir. The user gets a clear failure with the option
+    # to delete the dir and start fresh.
+    manifest_now = {
+        "model": args.model,
+        "repo": repo,
+        "diagnostics": sorted(diagnostics),
+        "projections": sorted(projections),
+        "fwht_seeds": [PRODUCTION_SIGNS1_SEED, PRODUCTION_SIGNS2_SEED],
+        "runner_schema_version": 1,
+    }
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                prior = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            raise SystemExit(f"survey_runner: ERROR cannot read existing manifest at {manifest_path}: {e}")
+        for k in ("model", "repo", "fwht_seeds", "runner_schema_version"):
+            if prior.get(k) != manifest_now.get(k):
+                raise SystemExit(
+                    f"survey_runner: ERROR manifest mismatch at {manifest_path}: "
+                    f"field {k!r} prior={prior.get(k)!r} != requested={manifest_now.get(k)!r}. "
+                    f"Resume into a different model/seed/schema is unsafe; "
+                    f"either delete the output dir or use a fresh --output-dir."
+                )
+        # Diagnostics: requested MUST be subset of prior (otherwise we'd
+        # silently skip tensors that lack newly-requested diagnostics).
+        prior_diag = set(prior.get("diagnostics", []))
+        if not diagnostics.issubset(prior_diag):
+            missing = diagnostics - prior_diag
+            raise SystemExit(
+                f"survey_runner: ERROR diagnostics expand on resume: "
+                f"prior ran {sorted(prior_diag)}, request adds {sorted(missing)}. "
+                f"Already-processed tensors lack {sorted(missing)} and would be silently skipped. "
+                f"Either rerun with prior diagnostics only, or delete the output dir."
+            )
+        # Projections: requested MUST be subset of prior (otherwise we'd
+        # process new projections fresh, mixing partial coverage).
+        prior_proj = set(prior.get("projections", []))
+        if not set(projections).issubset(prior_proj):
+            new_proj = set(projections) - prior_proj
+            raise SystemExit(
+                f"survey_runner: ERROR projections expand on resume: "
+                f"prior ran {sorted(prior_proj)}, request adds {sorted(new_proj)}. "
+                f"Either rerun with prior projections only, or delete the output dir."
+            )
+    else:
+        with open(manifest_path, "w") as f:
+            json.dump(manifest_now, f, indent=2)
+
+    # Build seen_keys ONLY for records whose diagnostics cover all requested
+    # diagnostics AND have no error status on any requested diagnostic.
+    # Records with partial / errored diagnostics are NOT added to seen_keys,
+    # so they get re-processed.
     all_records: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, int]] = set()
+    n_partial = 0
+    n_errored = 0
     if per_tensor_path.exists():
         with open(per_tensor_path, "r") as f:
             for line in f:
@@ -305,11 +361,30 @@ def main() -> int:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
-                    continue  # skip malformed last line if previous run was killed mid-write
+                    continue  # skip malformed last line from a killed mid-write run
                 all_records.append(rec)
-                seen_keys.add((rec["name"], rec.get("expert_idx", -1)))
-        if seen_keys:
-            print(f"survey_runner: resuming with {len(seen_keys)} existing records",
+                key = (rec["name"], rec.get("expert_idx", -1))
+                # Coverage check: every requested diagnostic must be present
+                # in the record AND must NOT have errored or been skipped.
+                covered = True
+                for d in diagnostics:
+                    rd = rec.get(d)
+                    if rd is None:
+                        covered = False
+                        break
+                    if isinstance(rd, dict) and ("error" in rd or "skipped" in rd):
+                        covered = False
+                        break
+                if covered:
+                    seen_keys.add(key)
+                else:
+                    if any(d in rec for d in diagnostics):
+                        n_partial += 1
+                    if any(isinstance(rec.get(d), dict) and "error" in rec[d] for d in diagnostics):
+                        n_errored += 1
+        if seen_keys or n_partial or n_errored:
+            print(f"survey_runner: resume — {len(seen_keys)} fully-covered records skipped, "
+                  f"{n_partial} partial, {n_errored} previously-errored will retry",
                   file=sys.stderr)
 
     n_layers_seen = 0
