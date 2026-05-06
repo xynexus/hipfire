@@ -217,10 +217,61 @@ before Phase 3) stands. Only the impossible/false specifics are amended.
 - This amendment block in INVESTIGATION-LOG.md
 - Both committed and pushed
 
-**Next:** existing ScheduleWakeup at 08:02 UTC fires with the verbatim
-contract. Next-iteration AI's FIRST action MUST be reading
-`docs/investigations/2026-05-06-moe-quant-cliff-survey/INVESTIGATION-LOG.md`
-top-to-bottom. Both audit entries (14:55 + this 15:10 entry) supersede
-the verbatim contract on the points listed above.
+**Next:** ScheduleWakeup will be re-issued in this turn (see 15:25 UTC
+entry below) with an orientation prefix forcing the next-iteration AI
+to read this log before acting. The PREVIOUS verbatim wakeup at 08:02
+UTC is superseded by the NEW orientation-prefixed wakeup; the runtime
+replaces the earlier schedule when ScheduleWakeup is called again.
+
+---
+
+## 2026-05-06 15:25 UTC — Wakeup re-scheduled with orientation prefix
+
+Per the 15:10 entry's plan, ScheduleWakeup was re-called with an amended
+prompt that:
+
+1. Prepends an `ORIENTATION CHECK FIRST` block instructing the next-iteration
+   AI to (a) cd to the worktree, (b) verify branch, (c) read this log
+   top-to-bottom, (d) read 01-survey-runner-design.md, (e) check TaskList.
+2. Inline-annotates the contract body with `[AMENDED]` and `[DEFERRED]`
+   markers on the 5-model scope, multi-NUMA assumption, "122B in cache"
+   claim, "five model surveys" deliverable, and Phase 2 122B inclusion.
+3. Adds a "KEY AMENDMENTS" summary block before the contract for fast
+   parsing if the next iteration skims.
+
+The runtime replaces the prior schedule on each ScheduleWakeup call, so
+the new orientation-prefixed prompt is what fires at 08:09 UTC. The
+earlier 08:02 UTC schedule with verbatim contract no longer exists.
+
+**Next:** the orientation-prefixed wakeup fires at 08:09 UTC. Next-iteration
+AI sees the orientation block first, reads this log + design, then
+continues Phase 1A code authoring (quant_ops.py with production seeds 42/1042,
+weight-side diagnostic modules, calibration corpus derivation).
+
+---
+
+## 2026-05-06 15:30 UTC — Codex stop-time round 3: log self-consistency
+
+Codex flagged: "handoff log still says the stale verbatim wakeup will
+fire." The 15:10 entry's "Next" subsection ended with "existing
+ScheduleWakeup at 08:02 UTC fires with the verbatim contract" — but
+that was contradicted by the 15:25 re-schedule, leaving the log internally
+inconsistent. Action: 15:10's "Next" rewritten in-place to point forward
+to the 15:25 re-schedule, AND this 15:30 entry added so the timeline is
+explicit. The actual scheduled wakeup is at 08:09 UTC with the
+orientation-prefixed prompt; no verbatim-contract wakeup is queued.
+
+State of scheduled work as of 15:30 UTC (authoritative):
+
+- ONE ScheduleWakeup is queued: 08:09 UTC, prompt has orientation prefix
+  + inline-annotated contract.
+- NO verbatim-contract wakeup exists; the prior call (08:02 UTC) was
+  superseded.
+- Three commits on `survey/moe-quant-cliff-2026-05-06`: 47ff70c (initial
+  design + log + 2026-05-05 evidence), d9908ca (round 1 remediation:
+  feasibility fixes), 26c5dd1 (round 2 remediation: amended contract +
+  recon synthesis deprecation).
+- This 15:30 entry will land in a fourth commit alongside the in-place
+  fix to 15:10's "Next" subsection.
 
 ---
