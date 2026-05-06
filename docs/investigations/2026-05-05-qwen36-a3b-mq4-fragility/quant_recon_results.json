@@ -1,0 +1,88 @@
+{
+  "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/7da1103448ba36029c34ce1a9a741dfe93ee0c50",
+  "layers_tested": [
+    10,
+    20,
+    35
+  ],
+  "layer_summaries": {
+    "10": {
+      "sampled_rows": 256,
+      "per_expert": {
+        "196": 64,
+        "242": 64,
+        "67": 64,
+        "53": 64
+      }
+    },
+    "20": {
+      "sampled_rows": 256,
+      "per_expert": {
+        "71": 64,
+        "66": 64,
+        "225": 64,
+        "118": 64
+      }
+    },
+    "35": {
+      "sampled_rows": 256,
+      "per_expert": {
+        "85": 64,
+        "26": 64,
+        "210": 64,
+        "117": 64
+      }
+    }
+  },
+  "schemes": {
+    "MQ4G256": {
+      "mean_mse": 1.1433772233078916e-06,
+      "p50_mse": 1.1690655128404615e-06,
+      "p99_mse": 2.26603226565203e-06,
+      "mean_cos": 0.9941590225013593,
+      "p01_cos": 0.9919427645206451,
+      "n_rows": 768
+    },
+    "MQ4G64": {
+      "mean_mse": 9.109623706112421e-07,
+      "p50_mse": 9.178005200283224e-07,
+      "p99_mse": 2.0418046710801782e-06,
+      "mean_cos": 0.9953006193197022,
+      "p01_cos": 0.9933791649341583,
+      "n_rows": 768
+    },
+    "MQ6G256": {
+      "mean_mse": 6.494282556631277e-08,
+      "p50_mse": 6.677832686818874e-08,
+      "p99_mse": 1.3153934972365288e-07,
+      "mean_cos": 0.9996653874404728,
+      "p01_cos": 0.9995510870218277,
+      "n_rows": 768
+    },
+    "MQ4G256+sidecar4": {
+      "mean_mse": 1.0231305765569705e-06,
+      "p50_mse": 1.0464726756254095e-06,
+      "p99_mse": 2.1280577584548168e-06,
+      "mean_cos": 0.9947924506074438,
+      "p01_cos": 0.992915740609169,
+      "n_rows": 768
+    },
+    "MQ4G256+sidecar16": {
+      "mean_mse": 8.423787625592519e-07,
+      "p50_mse": 8.786433625118661e-07,
+      "p99_mse": 1.7306813663253712e-06,
+      "mean_cos": 0.9957132298344126,
+      "p01_cos": 0.9941229903697968,
+      "n_rows": 768
+    },
+    "MQ4G256+sidecar64": {
+      "mean_mse": 4.6341391612044386e-07,
+      "p50_mse": 4.7199569053191226e-07,
+      "p99_mse": 9.447061887613019e-07,
+      "mean_cos": 0.9976255212289592,
+      "p01_cos": 0.996835857629776,
+      "n_rows": 768
+    }
+  },
+  "interpretation": "Compare 'mean_mse' and 'p99_mse'. MQ6G256 is the precision upper bound. If MQ4G256+sidecarN approaches or beats MQ6G256 at fewer bytes per row (sidecar = 4 bytes/outlier vs MQ6's +50%/group), it's worth productizing. If MQ4G64 alone closes most of the gap, smaller-group quant is the simpler win."
+}

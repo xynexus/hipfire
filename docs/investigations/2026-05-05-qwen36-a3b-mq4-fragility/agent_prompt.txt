@@ -1,0 +1,23 @@
+You are an autonomous coding agent reviewing the current state of the hipfire repository before making a pull request. The hipfire project layout is:
+
+  crates/
+    rdna-compute/        - HIP runtime FFI + per-kernel BW profiler
+    hip-bridge/          - low-level HIP/HSA bindings
+    hipfire-runtime/     - inference orchestrator, daemon, KV cache, eviction
+    hipfire-arch-qwen35/ - Qwen3.5/3.6 dense + MoE forward path
+    hipfire-arch-llama/  - dense Llama-family forward path
+    hipfire-arch-qwen35-vl/ - VL variant
+    hipx/                - NPU (AIE-2P) bindings + dmabuf import
+  kernels/               - HIP source for every kernel; .hipfire_kernels/<gfx> hosts compiled blobs
+  scripts/               - coherence/speed/pflash gates, bench harnesses, install
+  benchmarks/            - corpora + saved bench results
+  docs/plans/             - PRDs (engine-modularization, ddtree-path-b, moe-egpu-offload)
+
+The most recent commits on master are:
+  fa0592d fix(qwen35-moe): split moe_softmax_topk_renorm into softmax + topk_renorm (#164)
+  7567e9d fix(install.ps1): honor CARGO_TARGET_DIR (#161)
+  f5ee068 Generalize to custom cargo target directories (#159)
+  c584605 fix(kernels/moe): clamp top-k winner to valid expert range (#156)
+  0005cc8 chore(release): finalize 0.1.20
+
+Your task: write a short summary (no more than 200 words) that explains, for a contributor unfamiliar with the project, what hipfire is, what crates own which responsibilities, and which two recent merges most directly affect MoE quality. End the summary with a single concrete recommendation for the next contributor task. Do not invent file paths or commit hashes that are not listed above. Keep the tone professional.
