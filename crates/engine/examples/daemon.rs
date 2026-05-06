@@ -256,6 +256,44 @@ struct LoadedModel {
     dflash: Option<DflashState>,
 }
 
+fn host_timing_enabled() -> bool {
+    std::env::var("HIPFIRE_HOST_TIMING").ok().as_deref() == Some("1")
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
+fn log_ar_ttft_host_timing(id: &str, prefill_tokens: usize, prompt_ms: f64, ttft_ms: f64) {
+    use hip_bridge::launch_counters as lc;
+    eprintln!(
+        "[host-timing] id={} phase=ar_ttft prefill_tokens={} prompt_build_ms={:.2} ttft_ms={:.2} \
+hip_launch_ms={:.2}/{} htod_ms={:.2}/{} dtoh_ms={:.2}/{} dtoh_bytes={} memset_ms={:.2}/{} \
+stream_sync_ms={:.2}/{} event_sync_ms={:.2}/{} device_sync_ms={:.2}/{} graph_launch_ms={:.2}/{}",
+        id,
+        prefill_tokens,
+        prompt_ms,
+        ttft_ms,
+        ns_to_ms(lc::launch_kernel::time_ns()),
+        lc::launch_kernel::count(),
+        ns_to_ms(lc::memcpy_htod::time_ns()),
+        lc::memcpy_htod::count(),
+        ns_to_ms(lc::memcpy_dtoh::time_ns()),
+        lc::memcpy_dtoh::count(),
+        lc::memcpy_dtoh::bytes(),
+        ns_to_ms(lc::memset::time_ns()),
+        lc::memset::count(),
+        ns_to_ms(lc::stream_sync::time_ns()),
+        lc::stream_sync::count(),
+        ns_to_ms(lc::event_sync::time_ns()),
+        lc::event_sync::count(),
+        ns_to_ms(lc::device_sync::time_ns()),
+        lc::device_sync::count(),
+        ns_to_ms(lc::graph_launch::time_ns()),
+        lc::graph_launch::count(),
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -2320,6 +2358,8 @@ fn generate(
     // needs to fire — eviction reclaims slots after each token. When eviction
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
     let tokenizer = m.tokenizer.as_ref().unwrap();
+    let t_generate_start = Instant::now();
+    let profile_ttft = host_timing_enabled();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
     if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!(
@@ -2429,6 +2469,7 @@ fn generate(
         None
     };
     let prefill_tokens = new_tokens.len();
+    let prompt_build_ms = t_generate_start.elapsed().as_secs_f64() * 1000.0;
     let t0 = Instant::now();
 
     if m.arch_id == 5 || m.arch_id == 6 {
@@ -2459,6 +2500,9 @@ fn generate(
         // physical_cap. Chunk size caps out at physical capacity available —
         // when physical is at post-evict `budget`, a full `beta`-sized chunk
         // can run before the next eviction fires.
+        if profile_ttft {
+            hip_bridge::launch_counters::reset();
+        }
         if let Some(ref ev) = m.eviction {
             let window = ev.budget() + ev.beta();
             let mut remaining: &[u32] = &new_tokens;
@@ -2548,6 +2592,14 @@ fn generate(
         // the user-observable "time to first token" boundary — prefill above,
         // decode loop below.
         let t_prefill = Instant::now();
+        if profile_ttft {
+            log_ar_ttft_host_timing(
+                id,
+                prefill_tokens,
+                prompt_build_ms,
+                t_prefill.duration_since(t0).as_secs_f64() * 1000.0,
+            );
+        }
         let mut next_token = tok0;
         rng_state = rng0;
 
