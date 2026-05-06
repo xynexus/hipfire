@@ -328,3 +328,69 @@ after D1/D2/D4 (those don't need a corpus). D3 implementation last
 because it depends on transformers + torch (task #35).
 
 ---
+
+## 2026-05-06 16:20 UTC — Codex stop-time round 4: stream_layer_tensors retained full checkpoint
+
+Codex flagged the iteration-1 `stream_layer_tensors()` as buffering the
+ENTIRE checkpoint in RAM before yielding the first layer (the
+implementation populated `by_layer[]` from a single pass over
+`stream_tensors()` THEN started yielding). Docstring claimed
+"O(one layer)" but real cost was O(model). On 122B-A10B that would
+hold 244 GB resident — infeasible.
+
+Fix:
+
+1. Replaced the full-buffer implementation with a true two-pass approach:
+   - Pass 1: light enumeration of `(shard, key, TensorRef)` per tensor
+     via cached header parse. No tensor data loaded.
+   - Pass 2: per-layer (in ascending index order), open each shard
+     holding that layer's tensors and load only those tensors. Yield.
+     `del batches; del by_shard` between yields lets GC reclaim.
+
+2. Discovered the safetensors Python `framework="numpy"` backend cannot
+   materialize bf16 tensors (raises "data type 'bfloat16' not understood"
+   on `slice_handle[:]` and `f.get_tensor(key)`). The 2026-05-05
+   `expert_absmax_stats.py` had this same dead code path; it must have
+   only worked on F32/F16 or with a different safetensors version.
+   Replaced safe_open entirely with a direct safetensors-format reader:
+   - parse 8-byte header-size + UTF-8 JSON header once per shard, cache
+     the result in `_INDEX_CACHE`
+   - read each tensor's raw bytes from the file at `data_origin +
+     data_offsets[0]`, length `data_offsets[1] - data_offsets[0]`
+   - cast to f32: F32 direct, F16 via numpy, BF16 via `(u16 << 16).view(f32)`,
+     F64 via numpy.
+   No safetensors Python lib dependency at runtime now (the package is
+   only used at install time to validate the file format).
+
+Smoke verification on Qwen3.5-9B (down_proj projection only, 32 layers
+plus layer -1 for embeddings):
+
+  yielded=32 layers
+  first yield at 1.6s (NOT full-model load time)
+  total iteration time 32.1s
+  peak RSS 1086 MB (well below 18 GB full model size)
+
+STREAMING OK. The fix is structural; memory cost on 122B would cap at
+roughly the largest single layer (a3b-style with 128 experts × ~10 GB
+of expert weights per layer → ~10 GB peak), still well within hiptrx
+122 GB system RAM.
+
+Code commit: this iteration's safetensors_reader.py refactor. Same
+public API (find_hf_snapshot, parse_tensor_name, all_tensor_refs,
+stream_tensors, stream_layer_tensors) so downstream diagnostic modules
+do not need to change.
+
+Tensor-name observation worth keeping: Qwen3.5-9B layers are named
+`model.language_model.layers.N.*` (with a `language_model` prefix the
+parser handles correctly via the `_LAYER_RE` regex). Some layers also
+expose two tensors that match the `down_proj` projection label
+(observed `batches=2` for layer 0 vs `batches=1` for layers 1-31);
+likely a linear-attention `down_proj` distinct from `mlp.down_proj`.
+The parser's coarse projection grouping does not currently distinguish
+these two; the per-tensor JSONL records will carry the full name so
+the synthesis step can split them downstream if needed.
+
+Next: same goal as before — diagnostics modules + main entry — now
+unblocked by a working bf16 read path.
+
+---
