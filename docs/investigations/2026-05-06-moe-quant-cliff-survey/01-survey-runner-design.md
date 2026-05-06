@@ -51,13 +51,23 @@ What's missing from the prior evidence:
 
 ## Scope
 
-Five models, all already in `~/.cache/huggingface/hub/`:
+**Primary scope (four models, available now):**
 
-1. **Qwen 3.5-9B** (dense, control)
-2. **Qwen 3.5-27B** (dense, mid-size control)
-3. **Qwen 3.5-A3B** (35B/3B MoE, 128 experts × 40 layers)
-4. **Qwen 3.6-A3B** (35B/3B MoE, primary issue #171 reproducer target)
-5. **Qwen 3.5-122B-A10B** (125B/10B MoE, scaling test)
+1. **Qwen 3.5-9B** (dense, control). Local on k9lin; needs rsync to hiptrx.
+2. **Qwen 3.5-27B** (dense, mid-size control). Local on k9lin; needs rsync.
+3. **Qwen 3.5-35B-A3B** (35B/3B MoE, 128 experts × 40 layers). On hiptrx already.
+4. **Qwen 3.6-35B-A3B** (primary issue #171 reproducer target). On hiptrx already.
+
+**Deferred / out of immediate scope:**
+
+5. **Qwen 3.5-122B-A10B** (audited 2026-05-06: not in any local HF cache —
+   neither k9lin nor hiptrx has the snapshot). Even if downloaded (~244 GB
+   at bf16), D3 (forward pass) would require 244 GB resident, vs hiptrx's
+   128 GB VRAM + 122 GB RAM = 250 GB total addressable, with realistic
+   Python/transformers/activation overhead pushing total demand over the
+   ceiling. Decision deferred to a separate work item: either download +
+   D1/D2/D4 only (weight-side, streamable) or skip until SE evidence on
+   the 4 primary models warrants the cost.
 
 Reference dtype: bf16 from upstream safetensors. Quant target: MQ4G256 with
 FWHT rotation as currently produced by `crates/hipfire-quantize`.
@@ -70,11 +80,23 @@ For every weight tensor in the model:
 
 1. Read bf16 reference from safetensors.
 2. Apply the same MQ4G256-FWHT pipeline used by hipfire-quantize:
-   per-256-element group, FWHT rotate (deterministic seeds 42 / 1042),
-   per-group min/max → 4-bit asymmetric quant, store `(scale, min, nibbles)`.
+   per-256-element group, FWHT rotate with **production seeds 42 / 1042**
+   passed through `gen_fwht_signs` (LCG with `state * 1103515245 + 12345
+   & 0x7fffffff`, bit (state >> 16) & 1), per-group min/max → 4-bit
+   asymmetric quant, store `(scale, min, nibbles)`. Verified against
+   `crates/hipfire-quantize/src/main.rs:1530-1531` (the `gen_fwht_signs(42, 256)`
+   and `gen_fwht_signs(1042, 256)` calls used by all MQ format branches).
 3. Dequantize back to f32: per-group `weight = scale * nibble + min`,
-   inverse-FWHT.
-4. NRMSE = `sqrt(MSE / var(reference))` where `var` is over the same tensor.
+   inverse-FWHT (`signs1 * fwht256_raw(signs2 * x)`, self-inverse up to
+   sign placement).
+4. **NRMSE definition (explicit):** `NRMSE = sqrt(MSE) / sqrt(var(reference))`
+   where `MSE = mean((reference - dequantized)^2)` and
+   `var = mean((reference - mean(reference))^2)`. Equivalent to
+   `sqrt(MSE / var)` but written this way to make the units explicit.
+   Lower is better; 0 means perfect reconstruction.
+5. **Also report:** mean-cosine-similarity per tensor as a separate stat,
+   for direct comparison with the 2026-05-05 simulation results
+   (which used cos sim + MSE).
 
 Reported per (layer, projection, expert_index_or_dense). Dense projections
 (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`,
@@ -84,17 +106,37 @@ all measured.
 
 Sample size: full tensor. No subsampling.
 
-### D2. Per-expert down_proj max
+**Note on production-matched seeds:** the inherited 2026-05-05
+`quant_recon_error.py` simulation used `0xCAFEBABE` with NumPy
+`default_rng` (PCG64), NOT production's seeds 42/1042 with the LCG.
+Those prior results are valid for inter-scheme comparison (relative
+ranking of MQ4G256 vs MQ4G64 vs sidecar etc.) but absolute MSE values
+differ from production. The new survey runner MUST use production seeds.
+
+### D2. Per-expert down_proj absmax + ratio statistics
 
 For each MoE layer × each expert × the down_proj weight tensor:
 
 1. Per-row absmax: `row_max[i] = max_j |W[i, j]|` over the K-axis.
-2. Global absmax across the tensor: `tensor_max = max_i row_max[i]`.
-3. Distribution stats: mean, p50, p90, p99, p99.9, max of `row_max[]`.
+2. Per-row median absmax: `row_med[i] = median_j |W[i, j]|`.
+3. Per-row tail ratio: `ratio[i] = row_max[i] / max(row_med[i], 1e-9)`.
+4. Tensor-level absmax: `tensor_max = max_i row_max[i]` (raw magnitude).
+5. Distribution stats on both `row_max[]` and `ratio[]`: mean, p50, p90,
+   p99, p99.9, max.
 
-Reported per (layer, expert). Output also includes the bf16 reference
-absmax for comparison with the post-MQ4 absmax (FWHT changes per-row absmax;
-the rotated absmax is what determines the quant scale).
+**Important: report BOTH absolute magnitude and ratio.** The 2026-05-05
+finding "down_proj p99 max ≈ 37M" was the **absmax/median ratio** per
+`per_row_absmax_median()` in `expert_absmax_stats.py:124`, not absolute
+weight magnitude. A ratio of 37M means one row has its absmax 37 million
+times its median absmax (one extreme outlier). Actual absmax magnitudes
+in transformer weights are typically O(0.1-10). The ratio is the
+quant-relevant signal because it determines how badly per-row absmax
+quant compresses the bulk distribution. Report both so neither is lost.
+
+Reported per (layer, expert). Output also includes:
+- Pre-FWHT absmax (= reference per-row absmax).
+- Post-FWHT absmax (= what the quant scale actually has to fit).
+The pre/post comparison is D4.
 
 Per arXiv 2507.23279 the SE signature is `down_proj output max` which is
 weight × activation. The activation half is D3 below; D2 captures the
@@ -116,19 +158,48 @@ For MoE models, also record per-expert routing frequency (which experts
 were selected) per layer, so we can attribute D3#4 outliers to specific
 experts.
 
-Calibration set: 32 prompts from the existing `benchmarks/calib/` corpus
-(blended Hermes + Aureth + agentic, ~512 tokens each). Same prompts across
-all 5 models for cross-model comparability.
+Calibration set: **derived in 1A** since no `benchmarks/calib/blended-32prompts.jsonl`
+exists in tree (only `calib-1m.txt`, `calib-5m.txt`, and `profiles/`).
+Source plan:
+
+1. 7 prompts from `docs/investigations/2026-05-05-qwen36-a3b-mq4-fragility/`
+   prompt matrix (`agent_prompt`, `sheep`, `capital`, `code_simple`,
+   `code_complex`, `prose`, `math`, `code_review`).
+2. 25 additional prompts sampled from `benchmarks/calib/calib-1m.txt`
+   (token-shuffled to ~512 tokens each).
+3. Committed as `docs/investigations/2026-05-06-moe-quant-cliff-survey/calibration_corpus.jsonl`
+   with md5 recorded in summary. Same byte-identical prompts across all
+   models for cross-model comparability.
 
 Output: per (layer, channel, hook_point) → absmax value, plus per-expert
 hit count for MoE.
 
 Forward pass dtype: bf16 (matches reference). Implementation: HuggingFace
-`transformers` with manual forward hooks. Tensor-parallel via
-`device_map="auto"` for 122B; whole-model on one GPU for the four small/mid
-models. Loaded weights are bf16 from safetensors directly (NOT MQ4
-dequantized — we want the reference activation distribution, not the
-post-quant one).
+`transformers` with manual forward hooks; whole-model on one GPU for each
+of the four primary models. Loaded weights are bf16 from safetensors
+directly (NOT MQ4 dequantized — we want the reference activation
+distribution, not the post-quant one).
+
+**Environment requirement:** transformers + torch (ROCm wheel) installed
+on hiptrx. Verified 2026-05-06: hiptrx has neither package installed. Phase
+1A unit-test step pauses until env setup completes:
+
+```bash
+ssh hiptrx 'pip install --user transformers safetensors ml_dtypes accelerate \
+  torch --index-url https://download.pytorch.org/whl/rocm6.2'
+```
+
+Adjust the rocm wheel URL to match hiptrx's actual ROCm version (7.2.2
+per memory). If no matching wheel exists, fall back to building torch
+from source against the system ROCm install, OR run D3 on k9lin (single
+gfx1100 GPU) with serial per-model execution and accept the GPU-occupancy
+loss for D3 only.
+
+**Compatibility note:** stock transformers may not yet have classes for
+`Qwen3_5MoeForCausalLM` / `Qwen3_5MoeForConditionalGeneration` (the
+Qwen3.5/3.6 MoE config classes). Check at unit-test time. If unsupported,
+use `trust_remote_code=True` with the model's bundled `modeling_*.py`,
+which Qwen ships in their HF repos.
 
 ### D4. FWHT pre/post NRMSE comparison
 
@@ -168,9 +239,13 @@ Each per-layer JSONL record:
     "row_max_mean": 0.412,
     "row_max_p50": 0.401,
     "row_max_p99": 1.83,
-    "row_max_p99_9": 4.71,
-    "row_max_max": 37123456.0,
-    "tensor_max": 37123456.0
+    "row_max_max": 4.71,
+    "tensor_max": 4.71,
+    "row_med_mean": 1.04e-7,
+    "ratio_mean": 8.4e3,
+    "ratio_p50": 6.2e3,
+    "ratio_p99": 9.2e5,
+    "ratio_max": 3.7e7
   },
   "d3": null,
   "d4": {
@@ -201,8 +276,9 @@ Per-model summary written to `summary.json`:
     {
       "layer": 17,
       "expert": 42,
-      "criterion": "d2_row_max_max > 3*sigma_global",
-      "value": 12345678.0,
+      "criterion": "d2_ratio_p99 > 3*sigma_global_ratio_p99",
+      "ratio_p99": 1.2e7,
+      "absmax_p99": 0.84,
       "z_score": 8.4
     }
   ],
@@ -216,6 +292,14 @@ Per-model summary written to `summary.json`:
 Matches the 2026-05-05 scripts and avoids reimplementing bf16 readers.
 GPU work uses transformers' built-in CUDA/HIP backend (transformers picks
 HIP automatically on ROCm builds of PyTorch).
+
+**Shared FWHT helpers** in `quant_ops.py` codify the production seeds
+(42, 1042) and the LCG sign generator from
+`crates/hipfire-quantize/src/main.rs:430-436`. Any future quant simulation
+imports from this module rather than re-deriving signs. The 2026-05-05
+`quant_recon_error.py` is left as-is (history of the prior simulation);
+its `0xCAFEBABE` seeds are documented as simulation-only in 01's "Note
+on production-matched seeds" above.
 
 **Layout:**
 
@@ -238,7 +322,7 @@ scripts/quant-survey/
 
 ```
 survey_runner.py \
-  --model qwen3.5-9b | qwen3.5-27b | qwen3.5-a3b | qwen3.6-a3b | qwen3.5-122b-a10b \
+  --model qwen3.5-9b | qwen3.5-27b | qwen3.5-a3b | qwen3.6-a3b \
   --hf-cache ~/.cache/huggingface/hub \
   --output-dir /tmp/hiptrx-survey/runs/<model>/ \
   --gpu 0 \
@@ -299,17 +383,21 @@ Each process gets exclusive ownership of its GPU. CPU cores are shared
 System RAM: 4 × ~30 GB peak per worker = ~120 GB, fits in 125 GB. If we
 hit pressure, reduce concurrency to 2 at a time.
 
-Round 2 (122B-A10B, sharded):
+Round 2 (122B-A10B): **deferred** until model is downloaded to hiptrx
+AND a memory plan exists for D3 (current ceiling: 250 GB total addressable
+vs 244 GB at bf16 + overhead). Two viable paths if Phase 2 results on
+the four primary models warrant the cost:
 
-```bash
-HIP_VISIBLE_DEVICES=0,1,2,3 numactl --cpunodebind=0 --membind=0 \
-  python scripts/quant-survey/survey_runner.py --model qwen3.5-122b-a10b \
-    --gpu auto --output-dir /tmp/hiptrx-survey/runs/qwen3.5-122b-a10b/
-```
+- **Weight-only:** D1/D2/D4 streamed layer-by-layer from safetensors,
+  CPU-only. Works at any model size. Skip D3 for 122B; rely on smaller-
+  model D3 for the activation half of the SE signature.
+- **Activation-only via int8 load:** transformers `load_in_8bit=True`
+  (bitsandbytes-rocm) drops bf16 to int8, ~120 GB. Fits across 4× 32 GB
+  VRAM. But activations differ from bf16 reference; D3 results would be
+  int8-conditioned, not bf16-conditioned. Document the difference if used.
 
-For 122B activation hooks (D3), use `device_map="auto"` so transformers
-shards the model across all 4 GPUs. For weight diagnostics (D1, D2, D4),
-stream layer-by-layer from safetensors on CPU; no GPU needed for those.
+Decision deferred to a Phase 1B follow-up after the four primary models
+complete.
 
 GPU monitoring throughout:
 
@@ -324,26 +412,35 @@ done &
 
 Before declaring Phase 1B done, the following must pass:
 
-1. **Per-layer NRMSE on 3.6-A3B matches recon doc.** The recon (2026-05-05)
+1. **Per-layer NRMSE on 3.6-A3B matches recon doc.** The 2026-05-05 recon
    identified layers 10, 20, 35 as having the worst-tailed down_proj rows
    (`max_rows=64` worst-tailed sample per expert). The survey's per-tensor
    NRMSE on those layers' down_proj should be visibly worse than the median
    (top decile). If not, the survey runner has a bug.
-2. **Mean cosine similarity ≥ 0.991** on D1 across all schemes. This
-   reproduces the 2026-05-05 sidecar simulation result. NRMSE values in the
-   `1e-6` to `1e-7` range per element.
+2. **Mean cosine similarity ≥ 0.991** on D1 across all four primary models.
+   This reproduces the 2026-05-05 sidecar simulation result direction.
+   Note: absolute NRMSE/MSE values will differ from 2026-05-05 because
+   that script used `0xCAFEBABE` seeds, not production 42/1042. The
+   survey uses production. So a re-derivation is expected; the
+   ≥ 0.991 cos sim direction should still hold.
 3. **Dense models have no MoE-specific tensors.** D2 and D3#4 (down_proj
    output max) should report 0 expert tensors and 1 dense down_proj per
    layer for 3.5-9B / 3.5-27B.
-4. **122B has 8× experts per layer.** Sanity-check `n_experts_per_layer`
-   in the summary against the model config. Expected ~256 experts × ~62
-   layers (verify against config.json).
+4. **D2 ratio statistics include 37M-class outliers on A3B down_proj.**
+   The 2026-05-05 ratio result (`p99_ratio_max_across_layers ≈ 37M` for
+   down_proj on both 3.5-A3B and 3.6-A3B) should reproduce. If absent,
+   either the runner has a bug or the prior result was an artifact of
+   the simulation's seeds (unlikely since `expert_absmax_stats.py` is
+   bf16-direct, doesn't apply FWHT).
 
 ## Cross-cutting concerns
 
 - **Statistical rigor:** every reported stat carries `n` (sample size).
   Outlier classification uses explicit threshold in the summary
-  (default: `> 3σ from per-model median on either D1 NRMSE or D2 row_max_max`).
+  (default: `> 3σ from per-model median on either D1 NRMSE or D2 ratio_p99`).
+  Note: D2 outliers are classified on the **ratio** (absmax/median),
+  not raw absmax — the ratio is what determines per-row quant scale
+  damage to the bulk distribution.
 - **No pre-judging:** the runner emits all data; classification is in
   the synthesis (02). The runner does not say "expert X is a Super Expert."
 - **Reproducibility:** FWHT seeds (42, 1042) match `gen_fwht_signs` in

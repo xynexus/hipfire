@@ -1,6 +1,20 @@
 """
 Reconstruction-error sweep for down_proj on Qwen3.6-A3B.
 
+NOTE (2026-05-06 audit, see ../2026-05-06-moe-quant-cliff-survey/INVESTIGATION-LOG.md):
+This script uses FWHT signs derived from `numpy.random.default_rng(0xCAFEBABE)`
+(see make_signs() below). Production hipfire-quantize uses LCG-generated
+signs with seeds 42 and 1042 (see crates/hipfire-quantize/src/main.rs:1530).
+The two sign tables are NOT bit-identical, so absolute MSE values from this
+script DO NOT match production MQ4 reconstruction error. Inter-scheme
+relative ranking (e.g. "MQ6G256 has 17.6x lower MSE than MQ4G256") IS
+preserved because all schemes use the same simulation signs.
+
+For production-matched per-tensor NRMSE, use scripts/quant-survey/
+(authored on branch survey/moe-quant-cliff-2026-05-06).
+
+Original script body unchanged below for historical fidelity.
+
 For a sampled set of expert rows from the worst-tailed layers, compare:
   1. MQ4G256-FWHT (current): per-256-group, FWHT-rotated, 4-bit asymm
   2. MQ4G64-FWHT: smaller group (256→64) — outliers contained to fewer neighbors
