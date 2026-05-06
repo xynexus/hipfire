@@ -692,3 +692,89 @@ between weight-side ratio_p99 ranking and activation-side absmax_max ranking
 is the corroboration that arXiv 2507.23279's hypothesis applies cleanly to
 this model family.
 
+
+## 2026-05-06 23:30 UTC — D3 v2 surveys complete + Phase 2 design pivots
+
+The full D3 v2 surveys (re-run) finished in 4 min sequential:
+- 9B: 16s
+- 3.5-27B: 33s (3 GPUs)
+- 3.6-27B: 33s (3 GPUs)
+- 3.5-A3B: 90s (4 GPUs, 10240 experts patched, 20276 records)
+- 3.6-A3B: 86s (4 GPUs, 10240 experts patched, ~20K records)
+
+3.6-27B weight-side D1+D2+D4 also completed (~20 min on Threadripper):
+263 records, 6 z>=3 outliers, max ratio_p99 ~20. Symmetric with 3.5
+dense controls. Dense pattern holds across both Qwen3.5 and Qwen3.6
+families.
+
+### D3 finding that pivots Phase 2
+
+Top per-expert absmax_max output side, both A3Bs:
+
+```
+3.5-A3B   3.6-A3B
+L39 e149   L39 e149   abs ~ 35.0
+L39 e200   L39 e200   abs ~ 26.5
+L39 e101   L39 e101   abs ~ 24.1
+L38 e103   L38 e103
+L38 e209   L38 e209
+...
+```
+
+19 / 20 of top-20 (layer, expert) pairs are concordant between 3.5-A3B
+and 3.6-A3B at layers 38 and 39 — even tighter than D2's 17/20 layer-0
+concordance. The activation-side cliff lives at the FINAL TWO LAYERS,
+not at layer 0 where D2 saw the weight-row ratio cliff.
+
+The 17 D2-derived SE candidates at layer 0 ALL have D3 absmax_max in the
+0.03-0.36 range — essentially normal. Only expert 253 (which was in the
+D2 union) has a marginally elevated D3 reading at layer 0 (~0.30 vs typical
+0.05-0.15) — and even that's two orders below the layer-39 SE peak of 35.
+
+### Two distinct phenomena
+
+Re-interpretation: D2 and D3 measure different things.
+- D2 weight ratio cliff at layer 0 = MQ4 quantization noise on extreme-tail
+  rows. Damage = output ACCURACY loss when input aligns with the outlier
+  column. Calibration-corpus inputs may not reliably align with those columns.
+- D3 absmax cliff at layer 38-39 = arXiv 2507.23279 Super Experts.
+  Damage if quantized = disrupts residual stream at the model's most
+  output-sensitive position.
+
+Both signatures are real and concordant across 3.5/3.6. They identify
+DIFFERENT pinning sets.
+
+### Phase 2 design amendment
+
+`03-super-expert-confirmation.md` amended (commit ac39791) BEFORE any
+Phase 2 PPL collection to test three pinning sets in parallel:
+- V3a: 17 D2-derived experts (layer 0 down_proj)
+- V3b: 19 D3-derived experts (layers 38-39 down_proj)
+- V3c: union (36 experts, ~0.03% of total weights)
+
+Same baselines (V1=All-MQ4, V2=All-Q8) and criterion (gap closure ≥ 80%,
+size overhead ≤ 2%). 30 runs total ~150 min on hiptrx.
+
+Once Phase 2 runs, the verdict by candidate set tells us which proxy is
+the right SE-detection algorithm for the Qwen3.5/3.6 MoE family:
+- V3b CONFIRMED → arXiv 2507.23279 SE applies cleanly (D3 = correct proxy)
+- V3a CONFIRMED → weight-tail-ratio is the cliff (D2 = correct, label
+  arXiv as misnamed for this family)
+- V3c only CONFIRMED → both signals additive and necessary
+- All REFUTED → cliff lives in a different proxy (router precision per
+  fivetide #171, attention outliers, or Hessian sensitivity ranking)
+
+### Pre-Phase 2 halt
+
+Per multi-session contract: HALT for kaden review before Phase 2 runs.
+The prior "halt before Phase 3" semantics extend here because Phase 2's
+design materially changed based on D3 evidence — the user should weigh
+in on whether to:
+
+1. Run Phase 2 as amended (5 variants × 3 trials × 2 models = 30 runs)
+2. Skip V3a (D2-only) since D3 strongly suggests it's wrong, save ~30 min
+3. Add a V3d (top-N D3 by absmax_max regardless of layer) to remove the
+   layer-38/39 cutoff bias
+4. Defer Phase 2 entirely and ship the D3 + D2 evidence as-is (the
+   different-failure-modes story is already a real finding)
+
