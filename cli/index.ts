@@ -595,6 +595,31 @@ import registryData from "./registry.json" with { type: "json" };
 const REGISTRY: Record<string, ModelEntry> = registryData.models as Record<string, ModelEntry>;
 const ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
 
+function uniquePaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of paths) {
+    const r = resolve(p);
+    if (seen.has(r)) continue;
+    seen.add(r);
+    out.push(r);
+  }
+  return out;
+}
+
+function modelSearchDirs(): string[] {
+  return uniquePaths([
+    MODELS_DIR,
+    // Source checkout used by developers and disposable test environments.
+    resolve(__dirname, "../models"),
+    // Installed update checkout lives under the XDG data dir.
+    join(HIPFIRE_DATA_DIR, "src", "models"),
+    // If the user starts `hipfire serve` from a checkout, preserve that
+    // workflow even when the installed CLI is running from ~/.local/lib.
+    join(process.cwd(), "models"),
+  ]);
+}
+
 function resolveModelTag(input: string): string {
   // Backward compat: old hfq4/hfq6 tags → hf4/hf6
   const normalized = input.replace(/-hfq(\d)/, "-hf$1").replace(/\.hfq$/, ".hf4");
@@ -1310,6 +1335,9 @@ async function serve(port: number) {
       await e.start();
       await e.send({ type: "ping" }); await e.recv();
     }
+  } else {
+    console.error(`[hipfire] default model '${defaultModel}' not found; will load on first request`);
+    console.error(`[hipfire] searched model dirs: ${modelSearchDirs().join(", ")}`);
   }
 
   let busy = false;
@@ -1465,7 +1493,15 @@ async function serve(port: number) {
         userPrompt = convParts.join("");
 
         const rawPath = findModel(body.model || "default");
-        if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
+        if (!rawPath) {
+          const requested = body.model || "default";
+          console.error(`[hipfire] model not found: ${requested}; searched: ${modelSearchDirs().join(", ")}`);
+          safeRelease();
+          return Response.json({
+            error: `model not found: ${requested}`,
+            searched: modelSearchDirs(),
+          }, { status: 404 });
+        }
         // Normalize to avoid spurious reloads when registry vs fuzzy search give different paths
         const path = resolve(rawPath);
 
@@ -2206,16 +2242,20 @@ function findModel(name: string): string | null {
   const alias = userAliases[name] || userAliases[resolveModelTag(name)];
   if (alias) {
     if (alias.local_path && existsSync(alias.local_path)) return resolve(alias.local_path);
-    const p = join(MODELS_DIR, alias.file);
-    if (existsSync(p)) return p;
+    for (const dir of modelSearchDirs()) {
+      const p = join(dir, alias.file);
+      if (existsSync(p)) return p;
+    }
   }
 
   // Resolve tag → filename
   const resolved = resolveModelTag(name);
   const entry = REGISTRY[resolved];
   if (entry) {
-    const p = join(MODELS_DIR, entry.file);
-    if (existsSync(p)) return p;
+    for (const dir of modelSearchDirs()) {
+      const p = join(dir, entry.file);
+      if (existsSync(p)) return p;
+    }
     // Backward compat: try old .hfq naming for the SAME quant level only
     // (only applies to .hf4 / .hf6 — .mq4 has no legacy alias)
     if (entry.file.endsWith(".hf4") || entry.file.endsWith(".hf6")) {
@@ -2225,8 +2265,10 @@ function findModel(name: string): string | null {
         ? [base + ".hfq6.hfq"]                              // HF6 → only try old hfq6
         : [base + ".q4.hfq", base + "-hfq4.hfq", base + ".hfq"];  // HF4 → only try old q4/hfq4
       for (const old of oldNames) {
-        const op = join(MODELS_DIR, old);
-        if (existsSync(op)) return op;
+        for (const dir of modelSearchDirs()) {
+          const op = join(dir, old);
+          if (existsSync(op)) return op;
+        }
       }
     }
   }
@@ -2272,9 +2314,8 @@ function findModel(name: string): string | null {
     return true;
   };
 
-  const dirs = [resolve(__dirname, "../models"), MODELS_DIR];
   const candidates: string[] = [];
-  for (const dir of dirs) {
+  for (const dir of modelSearchDirs()) {
     try {
       for (const f of readdirSync(dir)) {
         const full = join(dir, f);
@@ -2300,22 +2341,31 @@ function findModel(name: string): string | null {
 function listLocal() {
   const models: { name: string; tag: string; size: string }[] = [];
   const seen = new Set<string>();
-  for (const dir of [MODELS_DIR, resolve(__dirname, "../models")]) {
+  for (const dir of modelSearchDirs()) {
     let entries: string[];
     try { entries = readdirSync(dir); } catch { continue; }
     for (const f of entries) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq4") || f.endsWith(".mq6")) && !seen.has(f)) {
-        seen.add(f);
+      const full = join(dir, f);
+      const files = [full];
+      try {
+        if (statSync(full).isDirectory()) {
+          for (const sf of readdirSync(full)) files.push(join(full, sf));
+        }
+      } catch {}
+      for (const file of files) {
+        const name = basename(file);
+        if (!(name.endsWith(".hf4") || name.endsWith(".hf6") || name.endsWith(".hfq") || name.endsWith(".mq4") || name.endsWith(".mq6")) || seen.has(name)) continue;
+        seen.add(name);
         // statSync may throw on dangling symlinks or files removed mid-scan;
         // skip those individually instead of aborting the rest of the loop
         // (a previous try/catch wrapping the entire iteration ate everything
         // after the first stale symlink — see commit log for the bug story).
         try {
-          const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
+          const sz = (statSync(file).size / 1e9).toFixed(1);
           // Find matching registry tag (check new and old naming)
-          const fNorm = f.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4");
-          const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f || e.file === fNorm)?.[0] || "";
-          models.push({ name: f, tag, size: `${sz}GB` });
+          const fNorm = name.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4");
+          const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === name || e.file === fNorm)?.[0] || "";
+          models.push({ name, tag, size: `${sz}GB` });
         } catch {}
       }
     }

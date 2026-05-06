@@ -54,7 +54,7 @@ __pycache__/
 /tmp/
 
 # Generated validation reports
-benchmarks/results/quantization-*/
+benchmarks/results/
 
 # Local Claude agent state
 .claude/
