@@ -492,3 +492,84 @@ In-flight D1-only surveys (started 16:22 UTC at commit 43eb3de) will
 continue with D1 results only; D4 follow-up sweep when those complete.
 
 ---
+
+## 2026-05-06 17:00 UTC — Codex stop-time rounds 6+7 (resume corruption fix) + torch unblock
+
+Two more Codex stop-time flags addressed:
+
+**Round 6 (commit ceb566e)** — resume could silently corrupt or skip work
+in three modes: (1) diagnostic expansion on resume let the runner skip
+existing tensors that lacked newly-requested diagnostics, (2) different
+model in same output dir silently merged records, (3) errored records
+were marked "seen" so retries never happened. Fix: manifest.json
+written at first run carrying (model, repo, diagnostics, projections,
+fwht_seeds, runner_schema_version); resume runs validate the manifest
+and refuse to merge incompatible runs. Per-record coverage check skips
+ONLY if every requested diagnostic is present and not errored.
+
+**Round 7 (commit c5c5efb)** — pre-manifest dirs (per_tensor.jsonl
+exists, manifest.json doesn't) were treated as safe-resume bases by
+implicitly writing a fresh manifest from new args. Same corruption
+class, just with no manifest-mismatch to catch it. Fix: refuse with a
+clear error and three remediation options (fresh dir / delete legacy /
+hand-write a manifest if you KNOW the prior args).
+
+End-to-end test matrix on a fresh /tmp/ test dir:
+
+| TEST | Behavior |
+|------|----------|
+| 1: fresh d2 run                            | succeeds, manifest written |
+| 2: resume with same args                   | 2/2 records skipped at layer 0 (0.0s) |
+| 3: expand diagnostics d2 → d1,d2,d4        | REFUSED with clear error |
+| 4: switch model in same dir                | REFUSED with manifest-mismatch error |
+| 5: pre-manifest dir + new run              | REFUSED with 3-option remediation |
+
+Practical impact for the in-flight D1 surveys (started at 43eb3de
+before manifest landed): they'll finish with per_tensor.jsonl +
+summary.json but NO manifest.json. To run further diagnostics on
+those models I'll have to either point to a fresh dir or hand-write
+a manifest. That's the correct trade-off — silent merge would be
+exactly the bug class Codex flagged.
+
+**Torch + transformers ROCm unblock:**
+
+Initial install attempt failed:
+- pip wanted Python 3.11/3.12 wheels; hiptrx system Python is 3.14 (no
+  ROCm wheels yet for that)
+- I tried rocm6.2 (way old) instead of rocm7.2 (matches hiptrx's ROCm
+  7.2.2)
+- I used --index-url which excluded PyPI for transformers
+
+Fix path:
+1. Bootstrapped uv 0.11.9 to manage Python versions cleanly.
+2. uv created a Python 3.13 venv at ~/venv-torch on hiptrx.
+3. uv pip install torch transformers accelerate safetensors
+   --extra-index-url https://download.pytorch.org/whl/rocm7.2
+
+Result: torch 2.11.0+rocm7.2, transformers 5.8.0, triton-rocm 3.6.0.
+torch sees all 4 GPUs:
+
+  torch=2.11.0+rocm7.2
+  hip_version=7.2.26015  (matches ROCm 7.2.2 runtime)
+  cuda_avail=True
+  device_count=4
+  GPU0..GPU3: AMD Radeon Graphics
+
+Task #35 (set up hiptrx Python/torch env) → DONE.
+
+D3 (per-channel activation absmax via forward hooks) is now unblocked
+pending implementation. D3 needs each model loaded in bf16 reference
+precision; A3B at 35-36B params = 70-72 GB resident, tensor-shards
+across 4 R9700s (32 GB each = 128 GB aggregate VRAM) via
+device_map="auto". Phase 2 perplexity ablations also unblocked
+similarly.
+
+Rsync status:
+- 9B: complete (19.3 GB on hiptrx). Was the cleanly-finished one.
+- 27B: re-launched at 17:00 UTC because the original disown lost
+  the process (no log, no PID). 52 GB at ~200 MB/s tailnet = ~4 min wall.
+
+In-flight D1 surveys at 17:00 UTC: 3.5-A3B at layer 23/40 (~10 min
+remaining), 3.6-A3B at layer 18/40 (~12 min remaining).
+
+---
