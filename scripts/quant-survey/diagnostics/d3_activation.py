@@ -236,6 +236,174 @@ def detach_hooks(state: dict) -> None:
         h.remove()
 
 
+@dataclass
+class D3PerExpertAccumulator:
+    """Per-(layer_idx, expert_idx, side) running max of per-channel absmax
+    for the routed-experts down_proj path. Used by attach_moe_per_expert_hooks.
+    """
+    layer_idx: int
+    expert_idx: int
+    side: str  # "input" or "output"
+    n_channels: int
+    accum: Any = None
+    n_calls: int = 0
+    n_tokens_routed: int = 0  # total tokens this expert saw across all forwards
+
+    def update(self, abs_per_channel: Any, n_tokens: int) -> None:
+        if self.accum is None:
+            self.accum = abs_per_channel.clone()
+        else:
+            torch.maximum(self.accum, abs_per_channel, out=self.accum)
+        self.n_calls += 1
+        self.n_tokens_routed += n_tokens
+
+    def finalize_to_cpu(self) -> list[float]:
+        if self.accum is None:
+            return []
+        return self.accum.detach().to(dtype=torch.float32, device="cpu").tolist()
+
+
+def attach_moe_per_expert_hooks(model) -> dict:
+    """Monkey-patch every Qwen3_5MoeExperts (or class with matching shape) so
+    that on each forward pass, per-(layer, expert) input and output absmax
+    of the down_proj path are accumulated.
+
+    The patched forward is a structural copy of the original; it preserves
+    output exactness but adds two .update() calls per active expert per
+    forward. Reverted via detach_moe_per_expert_hooks().
+
+    Returns dict with:
+      'accumulators': dict[(layer_idx, expert_idx, side)] -> D3PerExpertAccumulator
+      'patched_modules': list of (module, original_forward) for unwind
+      'n_modules_patched': int
+      'n_experts_total': int
+    """
+    if not HAS_TORCH:
+        raise RuntimeError("D3 requires torch")
+
+    import re
+    accumulators: dict[tuple[int, int, str], D3PerExpertAccumulator] = {}
+    patched: list[tuple[Any, Any]] = []
+    n_experts_total = 0
+
+    def _make_wrapped_forward(layer_idx: int, num_experts: int, hidden_dim: int, intermediate_dim: int, act_fn, gate_up_proj, down_proj, original_forward, module):
+        # Closure over accumulators (dict shared across all patched modules)
+        def wrapped(hidden_states, top_k_index, top_k_weights):
+            import torch.nn as nn
+            import torch.nn.functional as F
+            final_hidden_states = torch.zeros_like(hidden_states)
+            with torch.no_grad():
+                expert_mask = F.one_hot(top_k_index, num_classes=num_experts)
+                expert_mask = expert_mask.permute(2, 1, 0)
+                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            for expert_idx in expert_hit:
+                expert_idx = expert_idx[0]
+                if expert_idx == num_experts:
+                    continue
+                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+                current_state = hidden_states[token_idx]
+                gate, up = F.linear(current_state, gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                current_hidden_states = act_fn(gate) * up
+                # CAPTURE: per-channel input to this expert's down_proj
+                with torch.no_grad():
+                    n_tok = current_hidden_states.shape[0]
+                    if n_tok > 0:
+                        per_ch_in = current_hidden_states.abs().reshape(-1, current_hidden_states.shape[-1]).max(dim=0).values
+                        in_key = (layer_idx, int(expert_idx), "input")
+                        if in_key not in accumulators:
+                            accumulators[in_key] = D3PerExpertAccumulator(layer_idx, int(expert_idx), "input", current_hidden_states.shape[-1])
+                        accumulators[in_key].update(per_ch_in, n_tok)
+                out = F.linear(current_hidden_states, down_proj[expert_idx])
+                # CAPTURE: per-channel output of this expert's down_proj
+                with torch.no_grad():
+                    if out.shape[0] > 0:
+                        per_ch_out = out.abs().reshape(-1, out.shape[-1]).max(dim=0).values
+                        out_key = (layer_idx, int(expert_idx), "output")
+                        if out_key not in accumulators:
+                            accumulators[out_key] = D3PerExpertAccumulator(layer_idx, int(expert_idx), "output", out.shape[-1])
+                        accumulators[out_key].update(per_ch_out, out.shape[0])
+                out = out * top_k_weights[token_idx, top_k_pos, None]
+                final_hidden_states.index_add_(0, token_idx, out.to(final_hidden_states.dtype))
+            return final_hidden_states
+        return wrapped
+
+    for name, module in model.named_modules():
+        # Match by class-name pattern (covers 3.5 and any 3.x sibling).
+        cls = type(module).__name__
+        if "MoeExperts" not in cls:
+            continue
+        # Verify the structure matches what we monkey-patch (3D gate_up_proj +
+        # 3D down_proj parameters). If a future architecture has different
+        # internals, refuse rather than silently patch a forward that won't
+        # match the original.
+        if not (hasattr(module, "gate_up_proj") and hasattr(module, "down_proj")
+                and hasattr(module, "act_fn") and hasattr(module, "num_experts")):
+            continue
+        gate_up = getattr(module, "gate_up_proj")
+        down = getattr(module, "down_proj")
+        if gate_up.dim() != 3 or down.dim() != 3:
+            continue
+        m = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+        if not m:
+            continue
+        layer_idx = int(m.group(1))
+        original_forward = module.forward
+        # types.MethodType so the wrapper sees `self` as expected
+        import types
+        wrapped = _make_wrapped_forward(
+            layer_idx, module.num_experts, module.hidden_dim, module.intermediate_dim,
+            module.act_fn, gate_up, down, original_forward, module,
+        )
+        module.forward = types.MethodType(lambda self, hs, tki, tkw, _w=wrapped: _w(hs, tki, tkw), module)
+        patched.append((module, original_forward))
+        n_experts_total += module.num_experts
+
+    return {
+        "accumulators": accumulators,
+        "patched_modules": patched,
+        "n_modules_patched": len(patched),
+        "n_experts_total": n_experts_total,
+    }
+
+
+def detach_moe_per_expert_hooks(state: dict) -> None:
+    """Restore original forwards for all monkey-patched MoeExperts modules."""
+    for module, original_forward in state["patched_modules"]:
+        module.forward = original_forward
+    state["patched_modules"].clear()
+
+
+def emit_per_expert_jsonl(
+    accumulators: dict[tuple[int, int, str], "D3PerExpertAccumulator"],
+    output_path: Path,
+    model_name: str,
+) -> int:
+    """Dump one record per (layer, expert, side) with per-channel absmax.
+    Returns number of records emitted.
+    """
+    n = 0
+    with open(output_path, "w") as f:
+        for (layer_idx, expert_idx, side), acc in sorted(accumulators.items()):
+            absmax = acc.finalize_to_cpu()
+            if not absmax:
+                continue
+            rec = {
+                "model": model_name,
+                "layer_idx": layer_idx,
+                "expert_idx": expert_idx,
+                "side": side,
+                "n_channels": len(absmax),
+                "n_calls": acc.n_calls,
+                "n_tokens_routed": acc.n_tokens_routed,
+                "absmax_max": float(max(absmax)),
+                "absmax_mean": float(sum(absmax) / len(absmax)),
+                "absmax": absmax,
+            }
+            f.write(json.dumps(rec) + "\n")
+            n += 1
+    return n
+
+
 def run_calibration(
     model,
     tokenizer,

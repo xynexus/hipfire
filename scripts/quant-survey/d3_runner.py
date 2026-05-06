@@ -56,6 +56,9 @@ from safetensors_reader import find_hf_snapshot, read_config  # noqa: E402
 from diagnostics.d3_activation import (  # noqa: E402
     attach_hooks,
     detach_hooks,
+    attach_moe_per_expert_hooks,
+    detach_moe_per_expert_hooks,
+    emit_per_expert_jsonl,
     run_calibration,
     emit_per_channel_jsonl,
 )
@@ -248,6 +251,15 @@ def main() -> int:
           f"({state['n_modules_shared_with_existing_acc']} shared via MoE-collapse)",
           file=sys.stderr)
 
+    # Per-expert MoE monkey-patch (silent no-op for dense models since they
+    # have no Qwen3_5MoeExperts module). For A3B, this captures
+    # per-(layer, expert, side) down_proj input + output absmax during
+    # the routed-experts loop — the activation-side counterpart of the
+    # weight-side D2 ratio cliff (already known from 02-survey-results.md).
+    moe_state = attach_moe_per_expert_hooks(model)
+    print(f"d3_runner: monkey-patched {moe_state['n_modules_patched']} MoE-experts "
+          f"modules ({moe_state['n_experts_total']} experts total)", file=sys.stderr)
+
     t_calib = time.time()
     try:
         prompts = [r["prompt"] for r in corpus]
@@ -258,15 +270,21 @@ def main() -> int:
             device=str(embed_device),
         )
     finally:
-        # ALWAYS detach hooks even on error so the model isn't left mutated.
+        # ALWAYS detach + un-patch even on error so the model isn't left mutated.
         detach_hooks(state)
+        detach_moe_per_expert_hooks(moe_state)
     elapsed_calib = time.time() - t_calib
     print(f"d3_runner: calibration {n_tokens} tokens in {elapsed_calib:.1f}s "
           f"({n_tokens / elapsed_calib:.1f} tok/s)", file=sys.stderr)
 
-    # Emit per-channel JSONL.
+    # Emit per-channel (Linear-hooked) and per-expert (MoE-patched) JSONL.
     n_records = emit_per_channel_jsonl(state["accumulators"], per_channel_path, args.model)
-    print(f"d3_runner: wrote {n_records} records to {per_channel_path}", file=sys.stderr)
+    print(f"d3_runner: wrote {n_records} per-channel records to {per_channel_path}", file=sys.stderr)
+    per_expert_path = output_dir / "per_expert.jsonl"
+    n_expert_records = 0
+    if moe_state["accumulators"]:
+        n_expert_records = emit_per_expert_jsonl(moe_state["accumulators"], per_expert_path, args.model)
+        print(f"d3_runner: wrote {n_expert_records} per-expert records to {per_expert_path}", file=sys.stderr)
 
     # Re-read the JSONL to build the summary (avoids holding everything in memory twice).
     records: list[dict[str, Any]] = []
@@ -280,6 +298,27 @@ def main() -> int:
     outliers = _classify_outliers(records, top_n=50)
     layers_seen = sorted({r["layer_idx"] for r in records})
     hook_points_seen = sorted({r["hook_point"] for r in records})
+
+    # Per-expert summary: top-N (layer, expert) by absmax_max (down_proj output side).
+    per_expert_outliers: list[dict[str, Any]] = []
+    if n_expert_records > 0:
+        # Re-read per_expert.jsonl for top-N selection (avoid keeping all in mem).
+        with open(per_expert_path) as f:
+            ex_records = [json.loads(line) for line in f if line.strip()]
+        # Sort by absmax_max within side="output" (the SE signal target).
+        out_recs = [r for r in ex_records if r["side"] == "output"]
+        out_recs.sort(key=lambda d: -d["absmax_max"])
+        per_expert_outliers = [
+            {
+                "layer_idx": r["layer_idx"],
+                "expert_idx": r["expert_idx"],
+                "side": r["side"],
+                "absmax_max": r["absmax_max"],
+                "absmax_mean": r["absmax_mean"],
+                "n_tokens_routed": r["n_tokens_routed"],
+            }
+            for r in out_recs[:50]
+        ]
 
     summary = {
         "manifest": manifest_now,
@@ -301,6 +340,12 @@ def main() -> int:
         "n_tokens_calibrated": n_tokens,
         "wall_time_calibration_seconds": round(elapsed_calib, 1),
         "outliers_top50_by_absmax_max": outliers,
+        "moe_per_expert": {
+            "n_modules_patched": moe_state["n_modules_patched"],
+            "n_experts_total": moe_state["n_experts_total"],
+            "n_records_emitted": n_expert_records,
+            "outliers_top50_by_absmax_max_output_side": per_expert_outliers,
+        },
     }
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
