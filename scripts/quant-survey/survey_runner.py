@@ -95,15 +95,20 @@ def _run_diagnostics_on_tensor(
     diagnostics: set[str],
     signs1: np.ndarray,
     signs2: np.ndarray,
-) -> dict[str, Any]:
+    seen_keys: set[tuple[str, int]] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     """Apply requested diagnostics to one TensorBatch. Handles both 2D
     dense projections and 3D-stacked MoE expert tensors (which are
     expanded into per-expert 2D records before D2 runs).
 
-    Returns a list of dicts (one per leaf tensor); the runner emits
-    each as a JSONL line.
+    If `seen_keys` is provided, skips experts whose (name, expert_idx)
+    is already in the set — the expensive MQ4 round-trip is NOT executed
+    for those. This is the resume path for kill-restart cycles.
+
+    Returns (records_emitted, n_skipped).
     """
     records = []
+    n_skipped = 0
     name = batch.ref.name
     layer_idx = batch.ref.layer_idx
     projection = batch.ref.projection
@@ -114,15 +119,20 @@ def _run_diagnostics_on_tensor(
         # Shape [n_experts, M, K]; emit one record per expert.
         n_experts = data.shape[0]
         for e in range(n_experts):
+            if seen_keys is not None and (name, e) in seen_keys:
+                n_skipped += 1
+                continue
             sub = data[e]  # 2D [M, K]
             rec = _run_one(name, layer_idx, e, projection, True, sub, diagnostics, signs1, signs2)
             records.append(rec)
     else:
         # Dense or per-expert 2D, OR 1D (norm/bias). Most diagnostics
         # require 2D for D2; the runner handles dimension-aware fallbacks.
+        if seen_keys is not None and (name, batch.ref.expert_idx) in seen_keys:
+            return records, 1
         rec = _run_one(name, layer_idx, batch.ref.expert_idx, projection, False, data, diagnostics, signs1, signs2)
         records.append(rec)
-    return records
+    return records, n_skipped
 
 
 def _run_one(
@@ -281,27 +291,54 @@ def main() -> int:
     per_tensor_path = output_dir / "per_tensor.jsonl"
     summary_path = output_dir / "summary.json"
 
+    # Resume support: read existing JSONL records (if any) into all_records
+    # and a "seen" set keyed by tensor (name, expert_idx). Process skips
+    # any tensor already in the set. Append-only file open for new records.
     all_records: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, int]] = set()
+    if per_tensor_path.exists():
+        with open(per_tensor_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # skip malformed last line if previous run was killed mid-write
+                all_records.append(rec)
+                seen_keys.add((rec["name"], rec.get("expert_idx", -1)))
+        if seen_keys:
+            print(f"survey_runner: resuming with {len(seen_keys)} existing records",
+                  file=sys.stderr)
+
     n_layers_seen = 0
     t_start = time.time()
 
-    with open(per_tensor_path, "w") as out_jsonl:
+    with open(per_tensor_path, "a") as out_jsonl:
         for layer_idx, batches in stream_layer_tensors(snapshot, projections=projections):
             if args.max_layers >= 0 and n_layers_seen >= args.max_layers:
                 break
             n_layers_seen += 1
             t_layer = time.time()
             n_records_layer = 0
+            n_skipped_layer = 0
             for batch in batches:
-                records = _run_diagnostics_on_tensor(batch, diagnostics, signs1, signs2)
+                records, n_skip = _run_diagnostics_on_tensor(
+                    batch, diagnostics, signs1, signs2, seen_keys=seen_keys)
+                n_skipped_layer += n_skip
                 for r in records:
+                    key = (r["name"], r.get("expert_idx", -1))
                     out_jsonl.write(json.dumps(r) + "\n")
+                    out_jsonl.flush()
                     all_records.append(r)
+                    seen_keys.add(key)
                     n_records_layer += 1
                 # Drop data ref so GC can reclaim before next batch.
                 batch.data = None
+            skip_msg = f" skipped={n_skipped_layer}" if n_skipped_layer else ""
             print(f"  layer={layer_idx:3d} batches={len(batches)} "
-                  f"records={n_records_layer} dt={time.time() - t_layer:.1f}s",
+                  f"records={n_records_layer}{skip_msg} dt={time.time() - t_layer:.1f}s",
                   file=sys.stderr)
 
     elapsed = time.time() - t_start
