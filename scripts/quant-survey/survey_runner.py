@@ -305,6 +305,26 @@ def main() -> int:
         "fwht_seeds": [PRODUCTION_SIGNS1_SEED, PRODUCTION_SIGNS2_SEED],
         "runner_schema_version": 1,
     }
+    # If per_tensor.jsonl exists but manifest.json does not, we cannot
+    # safely treat the existing records as a resume base — they may have
+    # been generated under different model/seeds/diagnostics/runner-version
+    # that the manifest was added to track. Refuse with a clear remediation.
+    if per_tensor_path.exists() and not manifest_path.exists():
+        raise SystemExit(
+            f"survey_runner: ERROR {per_tensor_path} exists but {manifest_path} does not. "
+            f"This dir was likely produced by a runner version before manifest validation "
+            f"(commit ceb566e or earlier). Treating the prior data as a safe resume base "
+            f"is unsafe — model/seeds/diagnostics could differ silently. Either:\n"
+            f"  (a) point --output-dir at a fresh path, OR\n"
+            f"  (b) move/delete {per_tensor_path} (and {summary_path} if present) and "
+            f"start fresh, OR\n"
+            f"  (c) if you are SURE the existing records were generated under exactly "
+            f"these args (--model={args.model}, --diagnostics={sorted(diagnostics)}, "
+            f"--projections={sorted(projections)}, FWHT seeds 42/1042), "
+            f"hand-write a manifest.json with those fields and the runner_schema_version=1 "
+            f"into {manifest_path}, then re-run."
+        )
+
     if manifest_path.exists():
         try:
             with open(manifest_path) as f:
