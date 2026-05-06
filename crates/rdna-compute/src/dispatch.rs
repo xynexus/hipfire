@@ -404,6 +404,26 @@ impl Gpu {
         if count == 0 {
             return Err(hip_bridge::HipError::new(0, "no GPU devices found"));
         }
+        if let Ok(mode) = std::env::var("HIPFIRE_HIP_WAIT") {
+            let mode_lc = mode.to_ascii_lowercase();
+            let flags = match mode_lc.as_str() {
+                "auto" => Some(0x00),
+                "spin" => Some(0x01),
+                "yield" => Some(0x02),
+                "block" | "blocking" | "blocking_sync" => Some(0x04),
+                "" => None,
+                other => {
+                    eprintln!(
+                        "WARNING: unknown HIPFIRE_HIP_WAIT={other:?}; expected auto|spin|yield|blocking"
+                    );
+                    None
+                }
+            };
+            if let Some(flags) = flags {
+                hip.set_device_flags(flags)?;
+                eprintln!("[hipfire] HIP wait mode: {mode_lc}");
+            }
+        }
         hip.set_device(0)?;
 
         let arch = hip.get_arch(0).unwrap_or_else(|_| "gfx1010".to_string());
