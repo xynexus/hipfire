@@ -285,6 +285,44 @@ def quantize_then_dequantize_mq4g256_fwht_vectorized(
     return recon.reshape(n_padded)[:n]
 
 
+def quantize_then_dequantize_q8g256(f32_data: np.ndarray) -> np.ndarray:
+    """Vectorized Q8G256 round-trip: 8-bit per element in 256-element groups,
+    per-group min/max scale. NO FWHT (8-bit headroom is sufficient — the
+    rotation was needed only for the 4-bit budget).
+
+    This is the All-Q8 "ceiling" precision used in Phase 2 ablation. A
+    weight tensor round-tripped through this function has the noise floor
+    set by 8-bit quant; on bf16 reference weights the resulting NRMSE is
+    typically ~0.001-0.005 — close enough to bf16 reference that
+    PPL_All-Q8 lands within ε of PPL_bf16.
+
+    Symmetric API with quantize_then_dequantize_mq4g256_fwht_vectorized
+    so both can be used interchangeably as round-trip operators in the
+    Phase 2 weight-replacement loop.
+    """
+    n = f32_data.shape[0]
+    n_padded = ((n + GROUP_SIZE - 1) // GROUP_SIZE) * GROUP_SIZE
+    n_groups = n_padded // GROUP_SIZE
+
+    padded = np.zeros(n_padded, dtype=np.float32)
+    padded[:n] = f32_data.astype(np.float32, copy=False)
+    grouped = padded.reshape(n_groups, GROUP_SIZE)
+
+    grp_min = grouped.min(axis=1)
+    grp_max = grouped.max(axis=1)
+    grp_range = grp_max - grp_min
+    safe = grp_range > 0
+    grp_scale = np.where(safe, grp_range / np.float32(255.0), np.float32(1.0))
+    grp_inv_scale = np.where(safe, np.float32(1.0) / grp_scale, np.float32(0.0))
+
+    centered = grouped - grp_min[:, None]
+    q = np.round(centered * grp_inv_scale[:, None] + np.float32(1e-6)).astype(np.int32)
+    np.clip(q, 0, 255, out=q)
+
+    deq = q.astype(np.float32) * grp_scale[:, None] + grp_min[:, None]
+    return deq.reshape(n_padded)[:n]
+
+
 def _benchmark_vectorized() -> int:
     """Compare scalar vs vectorized on a moderately large tensor."""
     import time
