@@ -216,11 +216,22 @@ impl Gpus {
         self.output_device
     }
 
-    /// Async cross-device copy. Enqueues `hipMemcpyPeerAsync` on the src
-    /// device's active stream (or null if unset) and records a completion
-    /// event the caller awaits via `wait_boundary` before issuing the next
-    /// dispatch on `dst_dev`. HIP transparently host-stages when peer
-    /// access is unavailable; correctness holds either way.
+    /// Async cross-device copy. Two transport paths:
+    ///
+    /// 1. `peer_access_enabled = true` — `hipMemcpyPeerAsync` on src's active
+    ///    stream, completion event recorded and awaited by `wait_boundary`.
+    ///    Direct GPU↔GPU over the peer-access fabric (PCIe BAR, XGMI, etc.).
+    ///    Standard fast path for homogeneous dGPU pairs.
+    ///
+    /// 2. `peer_access_enabled = false` — explicit host-staged
+    ///    `dtoh` → `htod` through a thread-local `Vec<u8>` (see
+    ///    `boundary_copy_host_staged`). Required when the HIP runtime can't
+    ///    transparently host-stage on its own — empirically this is the
+    ///    iGPU↔eGPU case on hipx (Strix Halo gfx1151 + 9070 XT gfx1201 over
+    ///    USB4): `hipMemcpyPeerAsync` segfaults rather than falling back.
+    ///    Isolated 2026-05-06 via AMD_LOG_LEVEL=3 trace; the call enters the
+    ///    runtime's peer path and never returns. Returns `completion: None`
+    ///    since the staged path is fully synchronous on the calling thread.
     pub fn boundary_copy(
         &self,
         src_dev: usize,
@@ -244,6 +255,9 @@ impl Gpus {
                     self.devices.len(),
                 ),
             ));
+        }
+        if !self.peer_access_enabled {
+            return self.boundary_copy_host_staged(src_dev, dst_dev, src, dst, n_bytes);
         }
         let src_gpu = &self.devices[src_dev];
         src_gpu.bind_thread()?;
@@ -272,6 +286,46 @@ impl Gpus {
                 Ok(BoundaryEvent { dst_dev, completion: None })
             }
         }
+    }
+
+    /// Host-staged `boundary_copy` fallback for topologies where
+    /// `hipMemcpyPeer` can't be used (cross-arch, iGPU↔eGPU, USB4-attached
+    /// dGPU without P2P fabric). Synchronous on the calling thread:
+    /// `dtoh(src)` → `htod(dst)` through a thread-local `Vec<u8>` that
+    /// grows monotonically with the largest residual seen so far.
+    ///
+    /// Per-call overhead is two host-wire memcpys plus one allocation if the
+    /// thread-local buffer needs to grow. For Qwen3.5 9B with `dim=4096` and
+    /// FP16 residual the boundary payload is ~32 KiB / token; for 27B with
+    /// `dim=5120` it's ~40 KiB. Negligible vs the per-layer GEMM cost.
+    /// Future optimization: pinned host buffer + `dtoh_async` / `htod_async`
+    /// with stream events to overlap with the next layer's prefill.
+    fn boundary_copy_host_staged(
+        &self,
+        src_dev: usize,
+        dst_dev: usize,
+        src: &DeviceBuffer,
+        dst: &DeviceBuffer,
+        n_bytes: usize,
+    ) -> HipResult<BoundaryEvent> {
+        thread_local! {
+            static STAGE_BUF: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(Vec::new());
+        }
+        let src_gpu = &self.devices[src_dev];
+        let dst_gpu = &self.devices[dst_dev];
+        STAGE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            if buf.len() < n_bytes {
+                buf.resize(n_bytes, 0u8);
+            }
+            let slice = &mut buf[..n_bytes];
+            src_gpu.bind_thread()?;
+            src_gpu.hip.memcpy_dtoh(slice, src)?;
+            dst_gpu.bind_thread()?;
+            dst_gpu.hip.memcpy_htod(dst, slice)?;
+            Ok(BoundaryEvent { dst_dev, completion: None })
+        })
     }
 
     /// Stream-event handoff: makes dst's active stream (or null) wait on
@@ -383,17 +437,33 @@ fn preflight_vram(devices: &[Gpu]) -> HipResult<()> {
         return Ok(());
     }
     let arch0 = devices[0].arch.clone();
+    let allow_mixed_arch = std::env::var("HIPFIRE_ALLOW_MIXED_ARCH")
+        .ok()
+        .as_deref()
+        == Some("1");
     let mut frees = Vec::with_capacity(devices.len());
     for d in devices {
         if d.arch != arch0 {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "preflight_vram: arch mismatch — dev 0 is {arch0}, dev {} is {}. \
-                     Mixed-arch is not supported in v1.",
-                    d.device_id, d.arch,
-                ),
-            ));
+            if !allow_mixed_arch {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "preflight_vram: arch mismatch — dev 0 is {arch0}, dev {} is {}. \
+                         Mixed-arch is not supported by default. Override with \
+                         HIPFIRE_ALLOW_MIXED_ARCH=1 (boundary_copy will host-stage \
+                         since peer-access fabric won't span arches; per-token decode \
+                         will lose pp=1 byte-equivalence due to per-arch wmma \
+                         rounding differences).",
+                        d.device_id, d.arch,
+                    ),
+                ));
+            }
+            eprintln!(
+                "WARN: arch mismatch — dev 0 is {arch0}, dev {} is {} \
+                 (HIPFIRE_ALLOW_MIXED_ARCH=1 set). Continuing with host-staged \
+                 boundary_copy; pp=1 byte-equivalence does not hold.",
+                d.device_id, d.arch,
+            );
         }
         d.bind_thread()?;
         let (free, _total) = d.hip.get_vram_info()?;
