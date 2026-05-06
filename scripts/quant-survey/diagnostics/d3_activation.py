@@ -119,8 +119,10 @@ def _classify_hook_point(name: str) -> tuple[int, str] | None:
     layer_idx = int(m.group(1))
     rest = m.group(2)
     # Collapse per-expert index — we record one entry per
-    # (layer, projection-class), summing absmax across experts.
-    rest = re.sub(r"\.experts\.\d+\.", ".experts.", rest)
+    # (layer, projection-class), max-merging absmax across experts.
+    # Matches BOTH 'mlp.experts.42.down_proj' (with prefix) and
+    # 'experts.42.down_proj' (no prefix, e.g. self-test mocks).
+    rest = re.sub(r"(^|\.)experts\.\d+\.", r"\1experts.", rest)
     return layer_idx, rest
 
 
@@ -138,6 +140,9 @@ def attach_hooks(model, projections_of_interest: set[str]) -> dict[str, dict]:
 
     accumulators: dict[tuple[int, str, str], D3Accumulator] = {}
     handles = []
+    n_modules_hooked = 0
+    n_modules_shared = 0  # count of modules that joined an existing accumulator
+    shape_warnings: list[str] = []
 
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear):
@@ -150,17 +155,63 @@ def attach_hooks(model, projections_of_interest: set[str]) -> dict[str, dict]:
         if not any(hook_point == p or hook_point.endswith("." + p) or hook_point == "self_attn." + p for p in projections_of_interest):
             continue
 
-        # Channels: input = in_features, output = out_features.
-        in_acc = D3Accumulator(layer_idx, hook_point + ".input", module.in_features)
-        out_acc = D3Accumulator(layer_idx, hook_point + ".output", module.out_features)
-        accumulators[(layer_idx, hook_point, "input")] = in_acc
-        accumulators[(layer_idx, hook_point, "output")] = out_acc
+        # Get-or-create accumulators per collapsed (layer, hook_point) key.
+        # Critical for MoE: the classifier collapses
+        # 'mlp.experts.42.down_proj' → 'mlp.experts.down_proj' for every
+        # expert 0..N-1, so all N experts MUST share the same accumulator
+        # instance. Earlier code overwrote the dict entry on each iteration,
+        # leaving experts 0..N-2's hooks pointing at orphan accumulators
+        # whose state never reached emit_per_channel_jsonl. Now each expert's
+        # hook registers against the same shared D3Accumulator and the
+        # max-merge across experts works as the docstring claims.
+        in_key = (layer_idx, hook_point, "input")
+        out_key = (layer_idx, hook_point, "output")
+
+        if in_key not in accumulators:
+            accumulators[in_key] = D3Accumulator(layer_idx, hook_point + ".input", module.in_features)
+        else:
+            # Sanity: all sibling experts should share the same in_features.
+            existing = accumulators[in_key]
+            if existing.n_channels != module.in_features:
+                shape_warnings.append(
+                    f"in_features mismatch at {name}: "
+                    f"existing accumulator n_channels={existing.n_channels} "
+                    f"vs module.in_features={module.in_features}"
+                )
+            n_modules_shared += 1
+
+        if out_key not in accumulators:
+            accumulators[out_key] = D3Accumulator(layer_idx, hook_point + ".output", module.out_features)
+        else:
+            existing = accumulators[out_key]
+            if existing.n_channels != module.out_features:
+                shape_warnings.append(
+                    f"out_features mismatch at {name}: "
+                    f"existing accumulator n_channels={existing.n_channels} "
+                    f"vs module.out_features={module.out_features}"
+                )
+
+        in_acc = accumulators[in_key]
+        out_acc = accumulators[out_key]
         handles.append(module.register_forward_pre_hook(_make_input_hook(in_acc)))
         handles.append(module.register_forward_hook(_make_output_hook(out_acc)))
+        n_modules_hooked += 1
+
+    if shape_warnings:
+        # Channel-shape mismatch among experts that classify to the same
+        # hook_point is a structural surprise — refuse to proceed silently.
+        raise ValueError(
+            "D3 attach_hooks: shape mismatch among experts that share a "
+            "collapsed hook_point. The accumulator's per-channel max would "
+            "be undefined. Refusing to attach hooks. Details:\n  " +
+            "\n  ".join(shape_warnings)
+        )
 
     return {
         "accumulators": accumulators,
         "handles": handles,
+        "n_modules_hooked": n_modules_hooked,
+        "n_modules_shared_with_existing_acc": n_modules_shared,
     }
 
 
@@ -280,6 +331,69 @@ def _self_test() -> int:
     n = emit_per_channel_jsonl(accs, out, "_mock")
     assert n == len(accs), f"expected {len(accs)} records, got {n}"
     print(f"[d3 self-test] emitted {n} records to {out}")
+
+    # ─── MoE collapse regression test ─────────────────────────────────
+    # Mock an MoE layer with 4 experts whose Linears all classify to the
+    # same hook_point. The earlier dict-overwrite bug meant only expert 3's
+    # hook reached the emitted record, silently dropping experts 0..2.
+    class _MoELayer(nn.Module):
+        def __init__(self, dim, n_experts):
+            super().__init__()
+            self.experts = nn.ModuleList([nn.ModuleDict({"down_proj": nn.Linear(dim, dim, bias=False)}) for _ in range(n_experts)])
+        def forward(self, x):
+            # Apply each expert in sequence with a different input outlier
+            # so we can detect whose hook got connected.
+            outs = []
+            for i, e in enumerate(self.experts):
+                xi = x.clone()
+                xi[0, 0, i] = 10.0 + i  # expert i sees a unique outlier in channel i
+                outs.append(e["down_proj"](xi))
+            return sum(outs)
+
+    class _MoEMock(nn.Module):
+        def __init__(self, dim, n_experts, n_layers):
+            super().__init__()
+            self.layers = nn.ModuleList([_MoELayer(dim, n_experts) for _ in range(n_layers)])
+        def forward(self, x):
+            for L in self.layers:
+                x = L(x)
+            return x
+
+    moe_dim = 16
+    moe_n_experts = 4
+    moe = _MoEMock(moe_dim, moe_n_experts, 1)
+    moe_state = attach_hooks(moe, {"experts.down_proj"})
+    moe_accs = moe_state["accumulators"]
+    # ONE accumulator-pair (input+output) per layer per collapsed hook_point.
+    assert len(moe_accs) == 2, f"expected 2 accumulators (1 layer × 1 hook_point × 2 sides), got {len(moe_accs)}"
+    assert moe_state["n_modules_hooked"] == moe_n_experts, \
+        f"expected to hook all {moe_n_experts} expert Linears, got {moe_state['n_modules_hooked']}"
+    assert moe_state["n_modules_shared_with_existing_acc"] == moe_n_experts - 1, \
+        f"expected experts 1..{moe_n_experts-1} to reuse existing accumulator, got {moe_state['n_modules_shared_with_existing_acc']}"
+
+    x = torch.randn(2, 4, moe_dim) * 0.01
+    with torch.no_grad():
+        _ = moe(x)
+    detach_hooks(moe_state)
+
+    in_acc = moe_accs[(0, "experts.down_proj", "input")]
+    in_arr = in_acc.finalize_to_cpu()
+    # Each expert should have written its outlier into channel i; max-merge
+    # across all experts should leave each channel 0..n-1 reflecting the
+    # corresponding outlier value (10+i). If only the LAST expert's hook
+    # was connected (the bug), only channel 3 would show ~13 and channels
+    # 0..2 would be ~0.01 (typical Gaussian background).
+    for i in range(moe_n_experts):
+        v = in_arr[i]
+        expected = 10.0 + i
+        assert v >= expected - 0.5, \
+            f"MoE collapse drop bug: expert {i} outlier missing in channel {i} " \
+            f"(got {v:.3f}, expected >= {expected - 0.5:.3f}). " \
+            f"Earlier-experts' hooks were silently disconnected from the emitted accumulator."
+    print(f"[d3 self-test moe] collapse merges all {moe_n_experts} experts: "
+          f"channels 0..{moe_n_experts-1} = {[round(in_arr[i], 1) for i in range(moe_n_experts)]}")
+    print(f"[d3 self-test moe] hooked {moe_state['n_modules_hooked']} modules into "
+          f"{len(moe_accs)} accumulators ({moe_state['n_modules_shared_with_existing_acc']} shared)")
     print("[d3 self-test] PASS")
     return 0
 
