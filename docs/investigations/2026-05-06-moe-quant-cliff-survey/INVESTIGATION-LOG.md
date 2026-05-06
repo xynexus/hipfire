@@ -275,3 +275,56 @@ State of scheduled work as of 15:30 UTC (authoritative):
   fix to 15:10's "Next" subsection.
 
 ---
+
+## 2026-05-06 16:00 UTC — Phase 1A iteration 1: quant_ops + safetensors_reader landed
+
+Code commit: `03faa59` on `survey/moe-quant-cliff-2026-05-06`. Two modules:
+
+- `scripts/quant-survey/quant_ops.py` (240 lines)
+  - `gen_fwht_signs(seed, n)`: ports the LCG sign generator from
+    `crates/hipfire-quantize/src/main.rs:430-436` line-for-line.
+    Verified deterministic: signs1[42] first 8 = `[1,1,1,1,-1,1,1,-1]`,
+    signs2[1042] first 8 = `[1,-1,-1,-1,-1,1,1,-1]`.
+    Sums (256): signs1=10, signs2=-6 (slight bias from LCG, expected).
+  - `cpu_fwht_256` / `inv_fwht_256`: production butterfly + 1/16 scale.
+    Round-trip max abs error 3.576e-07 on standard normal.
+  - `quantize_mq4g256_fwht` / `dequantize_mq4g256_fwht`: 136-byte block
+    format (4B scale + 4B min + 128B nibbles, lo-low/hi-high).
+  - `nrmse(ref, recon)`: explicit `sqrt(MSE) / sqrt(var(ref))`.
+  - `mean_cosine_similarity`: 2026-05-05 compatibility metric.
+  - Self-test PASS: MQ4 round-trip on 256-element row with one outlier
+    yields cos sim 0.995, NRMSE 0.097.
+
+- `scripts/quant-survey/safetensors_reader.py` (240 lines)
+  - bf16/f16/f32 aware cast (lifts from 2026-05-05's bf16 reinterpret).
+  - `find_hf_snapshot` + `list_safetensors_shards` handle both snapshot
+    naming conventions (`model-*` modern, `model.safetensors-*` legacy).
+  - `parse_tensor_name` -> `TensorRef` with layer_idx, expert_idx,
+    projection label, is_stacked_3d flag. 12-case parser self-test PASS
+    after fixing shared_expert.* precedence over generic projection match.
+  - `stream_tensors` / `stream_layer_tensors`: iterator API for
+    layer-by-layer streaming. Memory cost O(largest tensor).
+
+Smoke test against Qwen3.5-9B local cache:
+  - 4 safetensors shards, 775 tensors total.
+  - Dense 33-layer model (no MoE — confirmed via projection counts:
+    33 down_proj / 33 gate_proj / 33 up_proj / 9 each q/k/v/o_proj plus
+    other heads).
+  - Snapshot resolved at `c202236235762e1c871ad0ccb60c8ee5ba337b9a`.
+
+Tensor count / projection layout per model (from this smoke):
+
+| Model     | Total tensors | down_proj | gate_proj | up_proj |
+|-----------|---------------|-----------|-----------|---------|
+| 3.5-9B    | 775           | 33        | 33        | 33      |
+
+Other models pending env setup on hiptrx + rsync from k9lin (#35, #36).
+
+Next iteration: implement weight-side diagnostic modules
+(`d1_nrmse.py`, `d2_down_proj_max.py`, `d4_fwht.py`) under
+`scripts/quant-survey/diagnostics/`, plus `survey_runner.py` main entry
+that wires it all together. Calibration corpus derivation deferred until
+after D1/D2/D4 (those don't need a corpus). D3 implementation last
+because it depends on transformers + torch (task #35).
+
+---
