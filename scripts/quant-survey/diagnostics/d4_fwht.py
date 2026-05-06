@@ -33,7 +33,7 @@ from quant_ops import (  # noqa: E402
     GROUP_SIZE,
     PRODUCTION_SIGNS1_SEED,
     PRODUCTION_SIGNS2_SEED,
-    cpu_fwht_256,
+    cpu_fwht_256_batch,
     gen_fwht_signs,
 )
 
@@ -82,10 +82,15 @@ def run_d4(weights: np.ndarray,
            signs1: np.ndarray | None = None,
            signs2: np.ndarray | None = None) -> D4Record:
     """Compute D4 on a tensor of any shape. Flattens row-major, pads to
-    a multiple of 256 with zeros, processes per group.
+    a multiple of 256 with zeros, processes per group via the vectorized
+    batch FWHT path.
 
     The pad zeros land in their own (final) group; their ratio is 0/0,
     treated as 1.0 (no rotation effect on a zero block).
+
+    Vectorized: pre_max + rotated + post_max are all batch ops on
+    (n_groups, 256). For a 5.7M-element tensor this is ~0.5s vs 43s
+    for the scalar per-group Python loop.
     """
     if signs1 is None:
         signs1 = gen_fwht_signs(PRODUCTION_SIGNS1_SEED)
@@ -97,17 +102,13 @@ def run_d4(weights: np.ndarray,
     n_padded = ((n + GROUP_SIZE - 1) // GROUP_SIZE) * GROUP_SIZE
     n_groups = n_padded // GROUP_SIZE
 
-    pre_max = np.empty(n_groups, dtype=np.float32)
-    post_max = np.empty(n_groups, dtype=np.float32)
-
     padded = np.zeros(n_padded, dtype=np.float32)
     padded[:n] = flat
+    grouped = padded.reshape(n_groups, GROUP_SIZE)
 
-    for g in range(n_groups):
-        grp = padded[g * GROUP_SIZE:(g + 1) * GROUP_SIZE]
-        pre_max[g] = float(np.abs(grp).max())
-        rotated = cpu_fwht_256(grp, signs1, signs2)
-        post_max[g] = float(np.abs(rotated).max())
+    pre_max = np.abs(grouped).max(axis=1).astype(np.float32)
+    rotated = cpu_fwht_256_batch(grouped, signs1, signs2)
+    post_max = np.abs(rotated).max(axis=1).astype(np.float32)
 
     safe_pre = np.maximum(pre_max, np.float32(1e-9))
     ratio = post_max / safe_pre
