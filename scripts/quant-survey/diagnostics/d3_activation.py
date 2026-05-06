@@ -139,73 +139,89 @@ def attach_hooks(model, projections_of_interest: set[str]) -> dict[str, dict]:
         raise RuntimeError("D3 requires torch; install via uv pip + rocm7.2 index")
 
     accumulators: dict[tuple[int, str, str], D3Accumulator] = {}
-    handles = []
+    handles: list = []
     n_modules_hooked = 0
     n_modules_shared = 0  # count of modules that joined an existing accumulator
     shape_warnings: list[str] = []
 
-    for name, module in model.named_modules():
-        if not isinstance(module, torch.nn.Linear):
-            continue
-        cls = _classify_hook_point(name)
-        if cls is None:
-            continue
-        layer_idx, hook_point = cls
-        # Match against requested projections (suffix match).
-        if not any(hook_point == p or hook_point.endswith("." + p) or hook_point == "self_attn." + p for p in projections_of_interest):
-            continue
+    # Wrap the whole hook-registration loop in a try/except so any failure
+    # (shape-mismatch ValueError, register_forward_pre_hook OOM, etc.)
+    # unwinds the handles already installed on the caller's model. Without
+    # this, a partial failure would leave hooks attached pointing into
+    # accumulators that the caller never received, mutating model state on
+    # every subsequent forward pass.
+    try:
+        for name, module in model.named_modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            cls = _classify_hook_point(name)
+            if cls is None:
+                continue
+            layer_idx, hook_point = cls
+            # Match against requested projections (suffix match).
+            if not any(hook_point == p or hook_point.endswith("." + p) or hook_point == "self_attn." + p for p in projections_of_interest):
+                continue
 
-        # Get-or-create accumulators per collapsed (layer, hook_point) key.
-        # Critical for MoE: the classifier collapses
-        # 'mlp.experts.42.down_proj' → 'mlp.experts.down_proj' for every
-        # expert 0..N-1, so all N experts MUST share the same accumulator
-        # instance. Earlier code overwrote the dict entry on each iteration,
-        # leaving experts 0..N-2's hooks pointing at orphan accumulators
-        # whose state never reached emit_per_channel_jsonl. Now each expert's
-        # hook registers against the same shared D3Accumulator and the
-        # max-merge across experts works as the docstring claims.
-        in_key = (layer_idx, hook_point, "input")
-        out_key = (layer_idx, hook_point, "output")
+            # Get-or-create accumulators per collapsed (layer, hook_point) key.
+            # Critical for MoE: the classifier collapses
+            # 'mlp.experts.42.down_proj' → 'mlp.experts.down_proj' for every
+            # expert 0..N-1, so all N experts MUST share the same accumulator
+            # instance. Each expert's hook registers against the same shared
+            # D3Accumulator so the .update() max-merge spans all experts.
+            in_key = (layer_idx, hook_point, "input")
+            out_key = (layer_idx, hook_point, "output")
 
-        if in_key not in accumulators:
-            accumulators[in_key] = D3Accumulator(layer_idx, hook_point + ".input", module.in_features)
-        else:
-            # Sanity: all sibling experts should share the same in_features.
-            existing = accumulators[in_key]
-            if existing.n_channels != module.in_features:
-                shape_warnings.append(
-                    f"in_features mismatch at {name}: "
-                    f"existing accumulator n_channels={existing.n_channels} "
-                    f"vs module.in_features={module.in_features}"
-                )
-            n_modules_shared += 1
+            if in_key not in accumulators:
+                accumulators[in_key] = D3Accumulator(layer_idx, hook_point + ".input", module.in_features)
+            else:
+                # Sanity: all sibling experts should share the same in_features.
+                existing = accumulators[in_key]
+                if existing.n_channels != module.in_features:
+                    shape_warnings.append(
+                        f"in_features mismatch at {name}: "
+                        f"existing accumulator n_channels={existing.n_channels} "
+                        f"vs module.in_features={module.in_features}"
+                    )
+                n_modules_shared += 1
 
-        if out_key not in accumulators:
-            accumulators[out_key] = D3Accumulator(layer_idx, hook_point + ".output", module.out_features)
-        else:
-            existing = accumulators[out_key]
-            if existing.n_channels != module.out_features:
-                shape_warnings.append(
-                    f"out_features mismatch at {name}: "
-                    f"existing accumulator n_channels={existing.n_channels} "
-                    f"vs module.out_features={module.out_features}"
-                )
+            if out_key not in accumulators:
+                accumulators[out_key] = D3Accumulator(layer_idx, hook_point + ".output", module.out_features)
+            else:
+                existing = accumulators[out_key]
+                if existing.n_channels != module.out_features:
+                    shape_warnings.append(
+                        f"out_features mismatch at {name}: "
+                        f"existing accumulator n_channels={existing.n_channels} "
+                        f"vs module.out_features={module.out_features}"
+                    )
 
-        in_acc = accumulators[in_key]
-        out_acc = accumulators[out_key]
-        handles.append(module.register_forward_pre_hook(_make_input_hook(in_acc)))
-        handles.append(module.register_forward_hook(_make_output_hook(out_acc)))
-        n_modules_hooked += 1
+            in_acc = accumulators[in_key]
+            out_acc = accumulators[out_key]
+            handles.append(module.register_forward_pre_hook(_make_input_hook(in_acc)))
+            handles.append(module.register_forward_hook(_make_output_hook(out_acc)))
+            n_modules_hooked += 1
 
-    if shape_warnings:
-        # Channel-shape mismatch among experts that classify to the same
-        # hook_point is a structural surprise — refuse to proceed silently.
-        raise ValueError(
-            "D3 attach_hooks: shape mismatch among experts that share a "
-            "collapsed hook_point. The accumulator's per-channel max would "
-            "be undefined. Refusing to attach hooks. Details:\n  " +
-            "\n  ".join(shape_warnings)
-        )
+        if shape_warnings:
+            # Channel-shape mismatch among experts that classify to the same
+            # hook_point is a structural surprise — refuse to proceed silently.
+            raise ValueError(
+                "D3 attach_hooks: shape mismatch among experts that share a "
+                "collapsed hook_point. The accumulator's per-channel max would "
+                "be undefined. Refusing to attach hooks. Details:\n  " +
+                "\n  ".join(shape_warnings)
+            )
+    except BaseException:
+        # On ANY failure during attach (shape mismatch, OOM during hook
+        # registration, KeyboardInterrupt mid-loop), remove all hooks
+        # already installed before re-raising. Leaves the caller's model
+        # in the same state it was passed in.
+        for h in handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        handles.clear()
+        raise
 
     return {
         "accumulators": accumulators,
@@ -394,6 +410,50 @@ def _self_test() -> int:
           f"channels 0..{moe_n_experts-1} = {[round(in_arr[i], 1) for i in range(moe_n_experts)]}")
     print(f"[d3 self-test moe] hooked {moe_state['n_modules_hooked']} modules into "
           f"{len(moe_accs)} accumulators ({moe_state['n_modules_shared_with_existing_acc']} shared)")
+
+    # ─── Shape-mismatch cleanup test ──────────────────────────────────
+    # If sibling experts have mismatched shapes, attach_hooks must raise
+    # AND must leave no hooks attached to the caller's model. Otherwise
+    # the failed-but-still-installed hooks would mutate state on the
+    # next forward pass.
+    class _MoEMismatchLayer(nn.Module):
+        def __init__(self, dim_a, dim_b):
+            super().__init__()
+            self.experts = nn.ModuleList([
+                nn.ModuleDict({"down_proj": nn.Linear(dim_a, dim_a, bias=False)}),
+                nn.ModuleDict({"down_proj": nn.Linear(dim_b, dim_b, bias=False)}),  # different shape
+            ])
+
+    class _MoEMismatchMock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([_MoEMismatchLayer(8, 16)])
+
+    mismatch_model = _MoEMismatchMock()
+
+    # Count hooks BEFORE attach so we can verify cleanup fully unwinds.
+    def count_hooks(m):
+        total = 0
+        for sub in m.modules():
+            total += len(getattr(sub, "_forward_pre_hooks", {}))
+            total += len(getattr(sub, "_forward_hooks", {}))
+        return total
+
+    pre_count = count_hooks(mismatch_model)
+    raised = False
+    try:
+        attach_hooks(mismatch_model, {"experts.down_proj"})
+    except ValueError as e:
+        raised = True
+        assert "shape mismatch" in str(e).lower(), f"unexpected ValueError: {e}"
+    assert raised, "attach_hooks should have raised ValueError on shape mismatch"
+    post_count = count_hooks(mismatch_model)
+    assert post_count == pre_count, \
+        f"attach_hooks left {post_count - pre_count} stray hooks on the model after refusal " \
+        f"(pre={pre_count}, post={post_count}). The caller's model is contaminated."
+    print(f"[d3 self-test mismatch] refused on shape mismatch + cleaned up "
+          f"({pre_count} hooks before, {post_count} after — no leak)")
+
     print("[d3 self-test] PASS")
     return 0
 
