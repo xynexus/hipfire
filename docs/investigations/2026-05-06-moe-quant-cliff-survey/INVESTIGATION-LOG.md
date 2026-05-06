@@ -471,3 +471,24 @@ minute of wall time, both processes together saturate ~30 of 64 threads.
 Plus rsync. Threadripper is finally busy.
 
 ---
+
+## 2026-05-06 16:35 UTC — Codex stop-time round 5: D4 vectorized
+
+Codex flagged that survey_runner's default `--diagnostics d1,d2,d4`
+was still infeasible because D4 used the scalar per-group Python loop:
+~30s per A3B expert tensor, 21K tensors per model = days. Default
+config was a trap.
+
+Fix at commit 4444243: D4 now uses cpu_fwht_256_batch + NumPy vectorized
+absmax. 195ms per A3B expert tensor (~150x speedup vs scalar). Same
+theoretical bounds verified by self-test (single-outlier ratio 0.065,
+uniform-large ratio 2.625).
+
+Total combined D1+D2+D4 per tensor on hiptrx: ~660ms with BLAS
+multithreading. Full A3B sweep at this rate: ~4 hours wall per model,
+two parallel = 4 hours wall total. Fits within Phase 1B budget.
+
+In-flight D1-only surveys (started 16:22 UTC at commit 43eb3de) will
+continue with D1 results only; D4 follow-up sweep when those complete.
+
+---
