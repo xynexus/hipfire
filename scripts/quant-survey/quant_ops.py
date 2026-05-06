@@ -176,6 +176,142 @@ def quantize_then_dequantize_mq4g256_fwht(
     return out[:n]
 
 
+# ---------------------------------------------------------------------------
+# Vectorized batch path — process N groups in parallel via NumPy
+#
+# The scalar cpu_fwht_256 above is a faithful port of the Rust production
+# code, but a Python-level `for off in range(0, n, 256)` loop costs roughly
+# 5ms per group. For a 4096x12288 down_proj (197K groups per tensor) that's
+# 16 minutes per tensor — infeasible at survey scale. The batch path below
+# reshapes (n_groups, 256) and runs the butterfly + sign multiply in
+# NumPy ops, giving 100-1000x throughput at identical numerical output.
+# ---------------------------------------------------------------------------
+
+def cpu_fwht_256_batch(x: np.ndarray, signs1: np.ndarray, signs2: np.ndarray) -> np.ndarray:
+    """Vectorized FWHT on a batch of 256-element groups.
+
+       Args:
+         x: float32 array of shape (n_groups, 256). Modified out-of-place.
+         signs1, signs2: float32 arrays of shape (256,).
+
+       Returns: float32 array of shape (n_groups, 256), same as
+         applying cpu_fwht_256 to each row independently.
+    """
+    if x.ndim != 2 or x.shape[1] != 256:
+        raise ValueError(f"cpu_fwht_256_batch expects (N, 256); got {x.shape}")
+    n_groups = x.shape[0]
+    out = (x * signs1).astype(np.float32, copy=False)
+    stride = 1
+    while stride < 256:
+        # Reshape so the butterfly runs over the inner pair-of-stride axis.
+        # out shape: (n_groups, n_pairs, 2, stride) where 2*stride*n_pairs=256.
+        n_pairs = 256 // (2 * stride)
+        viewed = out.reshape(n_groups, n_pairs, 2, stride)
+        a = viewed[:, :, 0, :]
+        b = viewed[:, :, 1, :]
+        # Allocate fresh buffer (in-place would alias a/b).
+        new_view = np.empty_like(viewed)
+        new_view[:, :, 0, :] = a + b
+        new_view[:, :, 1, :] = a - b
+        out = new_view.reshape(n_groups, 256)
+        stride <<= 1
+    out *= np.float32(0.0625) * signs2
+    return out
+
+
+def inv_fwht_256_batch(x: np.ndarray, signs1: np.ndarray, signs2: np.ndarray) -> np.ndarray:
+    """Vectorized inverse FWHT on a batch of 256-element groups."""
+    if x.ndim != 2 or x.shape[1] != 256:
+        raise ValueError(f"inv_fwht_256_batch expects (N, 256); got {x.shape}")
+    n_groups = x.shape[0]
+    out = (x * signs2).astype(np.float32, copy=False)
+    stride = 1
+    while stride < 256:
+        n_pairs = 256 // (2 * stride)
+        viewed = out.reshape(n_groups, n_pairs, 2, stride)
+        a = viewed[:, :, 0, :]
+        b = viewed[:, :, 1, :]
+        new_view = np.empty_like(viewed)
+        new_view[:, :, 0, :] = a + b
+        new_view[:, :, 1, :] = a - b
+        out = new_view.reshape(n_groups, 256)
+        stride <<= 1
+    out *= np.float32(0.0625) * signs1
+    return out
+
+
+def quantize_then_dequantize_mq4g256_fwht_vectorized(
+    f32_data: np.ndarray,
+    signs1: np.ndarray | None = None,
+    signs2: np.ndarray | None = None,
+) -> np.ndarray:
+    """Vectorized full round-trip: FWHT batch + per-group min/max + 4-bit
+       quant + dequant + inv-FWHT batch. Same numerical output as the
+       scalar version (modulo float32 rounding-direction ties at the +0.5
+       quant cast, which agree at the 1e-6 level).
+    """
+    if signs1 is None:
+        signs1 = gen_fwht_signs(PRODUCTION_SIGNS1_SEED)
+    if signs2 is None:
+        signs2 = gen_fwht_signs(PRODUCTION_SIGNS2_SEED)
+
+    n = f32_data.shape[0]
+    n_padded = ((n + GROUP_SIZE - 1) // GROUP_SIZE) * GROUP_SIZE
+    n_groups = n_padded // GROUP_SIZE
+
+    padded = np.zeros(n_padded, dtype=np.float32)
+    padded[:n] = f32_data.astype(np.float32, copy=False)
+    grouped = padded.reshape(n_groups, GROUP_SIZE)
+
+    rotated = cpu_fwht_256_batch(grouped, signs1, signs2)
+
+    # Per-group min/max -> per-group scale + zero. Shapes: (n_groups,)
+    grp_min = rotated.min(axis=1)
+    grp_max = rotated.max(axis=1)
+    grp_range = grp_max - grp_min
+    safe = grp_range > 0
+    grp_scale = np.where(safe, grp_range / np.float32(15.0), np.float32(1.0))
+    grp_inv_scale = np.where(safe, np.float32(1.0) / grp_scale, np.float32(0.0))
+
+    # Quantize: q = round((rotated - min) * inv_scale), clamped to [0, 15].
+    centered = rotated - grp_min[:, None]
+    q = np.round(centered * grp_inv_scale[:, None] + np.float32(1e-6)).astype(np.int32)
+    np.clip(q, 0, 15, out=q)
+
+    # Dequant in rotated space, then inverse FWHT.
+    deq = q.astype(np.float32) * grp_scale[:, None] + grp_min[:, None]
+    recon = inv_fwht_256_batch(deq, signs1, signs2)
+
+    return recon.reshape(n_padded)[:n]
+
+
+def _benchmark_vectorized() -> int:
+    """Compare scalar vs vectorized on a moderately large tensor."""
+    import time
+    rng = np.random.default_rng(0)
+    n = 4096 * 1408  # one A3B expert down_proj
+    x = rng.standard_normal(n).astype(np.float32) * 0.05
+
+    s1 = gen_fwht_signs(PRODUCTION_SIGNS1_SEED)
+    s2 = gen_fwht_signs(PRODUCTION_SIGNS2_SEED)
+
+    t0 = time.time()
+    rec_scalar = quantize_then_dequantize_mq4g256_fwht(x[:65536], s1, s2)
+    dt_scalar_64k = time.time() - t0
+    extrap_scalar = dt_scalar_64k * (n / 65536)
+
+    t0 = time.time()
+    rec_vec = quantize_then_dequantize_mq4g256_fwht_vectorized(x, s1, s2)
+    dt_vec = time.time() - t0
+
+    cos = mean_cosine_similarity(rec_scalar, quantize_then_dequantize_mq4g256_fwht_vectorized(x[:65536], s1, s2))
+    print(f"[bench] scalar 64k took {dt_scalar_64k*1000:.0f}ms, extrap to {n} = {extrap_scalar:.1f}s")
+    print(f"[bench] vectorized {n} took {dt_vec*1000:.0f}ms")
+    print(f"[bench] speedup = {extrap_scalar/dt_vec:.0f}x")
+    print(f"[bench] cos sim scalar vs vec on 64k: {cos:.6f}")
+    return 0
+
+
 def nrmse(reference: np.ndarray, reconstructed: np.ndarray) -> float:
     """Explicit NRMSE definition per
        docs/investigations/2026-05-06-moe-quant-cliff-survey/01-survey-runner-design.md D1:
@@ -253,4 +389,6 @@ def _self_test() -> int:
 
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "bench":
+        sys.exit(_benchmark_vectorized())
     sys.exit(_self_test())

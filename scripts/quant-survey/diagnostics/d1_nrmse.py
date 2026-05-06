@@ -28,7 +28,7 @@ from quant_ops import (  # noqa: E402
     PRODUCTION_SIGNS1_SEED,
     PRODUCTION_SIGNS2_SEED,
     gen_fwht_signs,
-    quantize_then_dequantize_mq4g256_fwht,
+    quantize_then_dequantize_mq4g256_fwht_vectorized as _qd_vectorized,
     nrmse,
     mean_cosine_similarity,
 )
@@ -65,7 +65,7 @@ def run_d1(weights: np.ndarray,
         signs2 = gen_fwht_signs(PRODUCTION_SIGNS2_SEED)
 
     flat = np.ascontiguousarray(weights, dtype=np.float32).reshape(-1)
-    recon = quantize_then_dequantize_mq4g256_fwht(flat, signs1, signs2)
+    recon = _qd_vectorized(flat, signs1, signs2)
     n = flat.shape[0]
 
     return D1Record(
