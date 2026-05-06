@@ -573,3 +573,122 @@ In-flight D1 surveys at 17:00 UTC: 3.5-A3B at layer 23/40 (~10 min
 remaining), 3.6-A3B at layer 18/40 (~12 min remaining).
 
 ---
+
+## 2026-05-06 18:43-19:24 UTC — Phase 1B execution complete + 1C synthesis
+
+Per-model walltime:
+- qwen3.5-9b   D1+D2+D4: 6:15
+- qwen3.5-27b  D1+D2+D4: 22:29
+- qwen3.5-a3b  D1+D2+D4: 52:44
+- qwen3.6-a3b  D1+D2+D4: 52:54
+
+Wall load on hiptrx peaked ~80, CPU 83 °C. Dense GPUs idle (weight-side
+is CPU/numpy-bound).
+
+Outlier classification (z>=3 on D2 ratio_p99 MAD-based):
+- 9B: 9 outliers, max ratio_p99 4.0e1
+- 27B: 8 outliers, max ratio_p99 3.0e1
+- 3.5-A3B: 3,213 z≥3 (~15% of 21,497 records — MAD threshold over-fires
+  at A3B scale because too many tensors sit at similar elevated ratios;
+  top-N-by-raw-ratio is the synthesis lens). Top-20 ratio_p99 = 6.88e7.
+- 3.6-A3B: 3,189 z≥3 of 21,241 records. Top-20 ratio_p99 = 6.84e7.
+
+The dense and A3B numbers differ by **6 orders of magnitude** in
+ratio_p99 — three orders below the dense baseline floor would already be
+"normal"; A3B sits at +6OM above. The cliff is real, MoE-specific, and
+not 3.6-specific (the 3.5-A3B and 3.6-A3B numbers are within 1.5% of
+each other on every metric).
+
+Cross-model SE expert concordance: 17 / 20 top-20 SE candidate IDs are
+SHARED between 3.5-A3B and 3.6-A3B at layer 0 down_proj. The set
+`{3, 8, 42, 49, 70, 115, 119, 132, 164, 167, 190, 195, 203, 225, 237, 239, 253}`
+is structurally preserved — same training corpus + similar init →
+same experts allocate themselves to the same feature axes that produce
+the extreme tail.
+
+`02-survey-results.md` written, committed 01ee6d8, replied to fivetide
+on issue #171 with cross-evidence framed as additive to the router-Q8 patch.
+Branch `survey/moe-quant-cliff-2026-05-06` at `01ee6d8` after the synthesis
+push.
+
+## 2026-05-06 22:55 UTC — Phase 1B-bis: D3 v1 authoring + execution
+
+After compaction, picked up the D3 runner work per the handoff:
+
+1. Authored `scripts/quant-survey/build_calibration_corpus.py` and
+   `calibration_corpus.jsonl` (32 records: 7 from issue #171 reproducer
+   matrix + 25 sampled chunks from `benchmarks/calib/calib-1m.txt`,
+   md5 c1879341... source). Output md5 `97e56780f7bc6f64d8c8e7f3593f4f0e`.
+   Deterministic seed=20260506; rerun verifies bit-exact.
+2. Authored `scripts/quant-survey/d3_runner.py` — wraps
+   diagnostics/d3_activation.py's `attach_hooks()` over a transformers
+   `AutoModelForCausalLM(device_map="auto")` model + the calibration
+   corpus. Manifest validation mirrors `survey_runner.py` (refuses
+   resume into mismatched dirs).
+3. Smoke-tested on 9B + 2 prompts: 8.4s model load, 128 modules hooked,
+   164 tokens calibrated in 4.0s, 256 records emitted. Top-down_proj
+   absmax=270 at L31. Pass.
+4. Added Qwen3.6-27B to the registry in both `d3_runner.py` and
+   `survey_runner.py` (dense control for 3.6 family — symmetric with
+   3.5-9B and 3.5-27B). Rsync'd 52 GB from k9lin → hiptrx in background
+   while the dense surveys ran.
+5. Sequential D3 queue ran 4/5 models successfully:
+   - 9B: 8.4s load, 12.5s calib, 256 records
+   - 3.5-27B: needed 3 GPUs (OOMed on 2 due to per-GPU ~27 GiB tight fit
+     after PyTorch overhead), 256 modules hooked, 12.5s calib, 512 records,
+     top L63 mlp.down_proj absmax=676
+   - 3.6-27B: 11.9s calib, 512 records, top L63 mlp.down_proj absmax=660
+   - 3.5-A3B: 13.5s calib, 320 records — but **only mlp.shared_expert.* +
+     self_attn.* captured. The routed experts at mlp.experts.X.down_proj
+     were silently NOT hooked.**
+   - 3.6-A3B: same gap as 3.5-A3B.
+
+The gap: transformers' Qwen3.5-MoE architecture stores all 256 routed
+experts as a single fused module `mlp.experts` (class `Qwen3_5MoeExperts`)
+with 3D `gate_up_proj` + `down_proj` parameters, not as a `ModuleList`
+of `nn.Linear` per expert. The d3_activation classifier filtered on
+`isinstance(module, torch.nn.Linear)` so the fused module was skipped.
+The shared_expert (single 3-Linear MLP, ALWAYS active per token) is
+ALL we captured for the MoE A3Bs — exactly the path that does NOT
+carry the SE signal.
+
+## 2026-05-06 23:08 UTC — D3 v2: per-expert via Qwen3_5MoeExperts.forward patch
+
+To capture the SE activation signal we monkey-patch
+`Qwen3_5MoeExperts.forward` (and any class with matching shape — covers
+3.6 sibling architectures too) with a structural copy of the original
+forward that retains exact output but inserts per-(layer, expert, side)
+input/output absmax accumulators on the routed-experts down_proj.
+
+Detection: walks `model.named_modules()`, matches by class-name pattern
+"MoeExperts" + verifies the gate_up_proj/down_proj 3D shape + presence
+of `act_fn`, `num_experts`, `hidden_dim`, `intermediate_dim`. Patched
+forwards are stored alongside originals; `detach_moe_per_expert_hooks()`
+restores them — symmetric with `detach_hooks()`.
+
+Dense models (9B / 27B / 3.x-27B): silent no-op (no MoeExperts module
+matches).
+
+Smoke test on 3.5-A3B + 2 prompts:
+- 40 MoE-experts modules patched (one per layer) covering 10,240 experts
+  (40 layers × 256 experts/layer)
+- 12,794 per-expert records emitted (covers experts that were actually
+  routed during the 2 prompts × 128 token calibration)
+- Per-channel records still emitted for shared_expert + self_attn paths
+- Calibration walltime 6.6s for 164 tokens (vs 4.0s in v1 — ~65% slower
+  due to monkeypatch overhead; acceptable)
+- Top-N per-expert absmax landed at **layers 38-39** (deepest), 5-13
+  tokens routed each, absmax_max ~10-12. Layer 0 not yet covered with
+  only 2 prompts at 128 tokens — the calibration corpus + full max_seq_len
+  is required to route enough tokens through layer 0's SE candidates.
+
+Re-running all 4 D3 surveys with v2 enabled. Sequential queue:
+9B (1 GPU) → 3.5-27B (3 GPUs) → 3.6-27B (3 GPUs) → 3.5-A3B (4 GPUs) →
+3.6-A3B (4 GPUs). Estimated ~30 min walltime.
+
+After v2 surveys complete, the per-expert outlier list will be cross-checked
+against the 17 D2-ratio SE candidates in `02-survey-results.md`. Concordance
+between weight-side ratio_p99 ranking and activation-side absmax_max ranking
+is the corroboration that arXiv 2507.23279's hypothesis applies cleanly to
+this model family.
+
