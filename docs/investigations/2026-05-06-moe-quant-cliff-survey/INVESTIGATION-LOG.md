@@ -394,3 +394,80 @@ Next: same goal as before — diagnostics modules + main entry — now
 unblocked by a working bf16 read path.
 
 ---
+
+## 2026-05-06 16:25 UTC — Phase 1A iteration 3: diagnostics + runner + actual survey on hiptrx
+
+Two iterations of code authoring finally produced the executable Phase 1B.
+
+**Code committed (43eb3de):**
+- `diagnostics/d1_nrmse.py`: per-tensor NRMSE + mean cosine similarity,
+  using vectorized MQ4G256-FWHT round-trip from quant_ops. Self-test PASS.
+- `diagnostics/d2_down_proj_max.py`: per-row absmax + median + ratio
+  statistics. Outlier classification on ratio_p99 z-score using MAD
+  scale. Self-test PASS including 3D rejection.
+- `diagnostics/d4_fwht.py`: per-256-group FWHT pre/post absmax with
+  reduction ratio. Self-test confirms theoretical bounds (single-outlier
+  group rotates to ratio ~1/16, uniform-large rotates to ratio ~16x).
+- `survey_runner.py`: CLI + per-tensor JSONL emit + per-model summary +
+  outlier classification. Handles 2D dense and 3D-stacked MoE expert
+  tensors (slices on leading expert axis).
+- `quant_ops.py` vectorized FWHT batch path: `cpu_fwht_256_batch` /
+  `inv_fwht_256_batch` / `quantize_then_dequantize_mq4g256_fwht_vectorized`.
+  Bench on 5.7M-element tensor: 95x speedup vs scalar (459ms vs 43.4s
+  extrapolated). cos sim 1.000000. D1 now uses the vectorized path.
+
+**Phase 1B Round 1 partial: D2 survey on the 2 MoE models hiptrx already
+had cached.** Launched parallel survey_runner processes on hiptrx
+(Threadripper 9970X 32-core / 64-thread, single-NUMA, 122 GB RAM).
+Both completed in ~5 min wall:
+
+  qwen3.5-a3b: 21,497 tensor records, 40 layers, 4:50 wall
+  qwen3.6-a3b: 21,241 tensor records, 40 layers, 5:11 wall
+
+**Top SE candidates at layer 0 down_proj (z-score on ratio_p99,
+MAD-based, robust to extreme tails):**
+
+  rank | 3.5-A3B            | 3.6-A3B
+  -----|--------------------|------------------
+   1   | expert  42 (6.88e7)| expert  42 (6.84e7)
+   2   | expert 119 (6.10e7)| expert 119 (5.90e7)
+   3   | expert 195 (5.51e7)| expert 195 (5.31e7)
+   4   | expert 190 (5.48e7)| expert 190 (5.29e7)
+   5   | expert 239 (5.38e7)| expert 239 (5.19e7)
+   6   | expert 132 (5.27e7)| expert 253 (5.05e7)
+   7   | expert   8 (5.21e7)| expert 203 (5.04e7)
+   8   | expert 203 (5.16e7)| expert   8 (5.01e7)
+   9   | expert 225 (5.14e7)| expert 225 (4.98e7)
+  10   | expert 253 (5.06e7)| expert 164 (4.97e7)
+
+**9 of 10 expert IDs overlap between 3.5 and 3.6.** The pathology is
+preserved across model versions, consistent with both models inheriting
+the same training-data-driven feature axes that early layers learned
+to allocate to specific experts.
+
+absmax_max for these top experts is small (~0.07-0.13 in raw bf16
+magnitude) — these are NOT large-weight experts. The signal is the
+ratio: tail rows have absmax 50M-69M times their median absmax. The
+2026-05-05 finding "37M ratio" was consistent in shape; the production
+seeds 42/1042 produce slightly higher tail ratios than 0xCAFEBABE did.
+
+Threshold note: `outlier_count_z3 = 3,213` for 3.5-A3B and 3,189 for
+3.6-A3B (15% of all tensors). The MAD-based z>=3 cutoff is too sensitive
+when many tensors share similar ratio profiles. Synthesis (02-doc) will
+top-N filter to the actual SE candidates, not z>=3 across the whole
+distribution.
+
+**Phase 1B continues:** D1 surveys (vectorized MQ4 round-trip) launched
+on both A3B models in parallel; ETA ~20 min wall. 9B and 27B rsync
+from k9lin to hiptrx in progress. Once those land, D2+D1 on those four
+total. D4 (FWHT pre/post) uses scalar Python loop currently — needs
+vectorization in next iteration before running at full scale.
+
+Box utilization observation: when only D2 was running, hiptrx was
+~97% idle (single-threaded NumPy on per-row stats). Once D1 vectorized
+batch FWHT kicked in, NumPy/BLAS multithreading actually engages —
+each survey process accumulates ~15-cpu-cores-worth of CPU time per
+minute of wall time, both processes together saturate ~30 of 64 threads.
+Plus rsync. Threadripper is finally busy.
+
+---
