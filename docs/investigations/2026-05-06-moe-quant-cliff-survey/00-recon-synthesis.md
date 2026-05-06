@@ -1,5 +1,35 @@
 # 2026-05-06 — MoE Quant Cliff Survey: Recon Synthesis
 
+> **DEPRECATED PREMISE (audited 2026-05-06 14:55 UTC).** This document was
+> written before the audit and rests on two false framings:
+>
+> 1. **"37M-magnitude tail outliers"** is wrong. The `expert_absmax_stats.py:124`
+>    stat is a per-row `absmax / median` RATIO, not absolute weight magnitude.
+>    Actual absmax magnitudes in transformer weights are O(0.1-10). A 37M
+>    ratio means one row has its absmax 37 million times its median — which
+>    is the per-row tail-heaviness signal, not the SE paper's activation
+>    output magnitude signal.
+> 2. The downstream chain ("AWQ + Super-Expert mixed precision is the cure")
+>    was reasoned forward from premise (1). Per the 2026-05-05 simulation
+>    (`quant_recon_results.json`), per-element MQ4G256-FWHT cosine similarity
+>    is ≥ 0.991 across all schemes including the current production one,
+>    and outlier-isolation sidecar variants do NOT beat MQ6G256 at sensible
+>    byte budgets. So the "weight quant noise" cure path is empirically weaker
+>    than the recon claimed.
+>
+> What survives from this doc: the recon-agent reports on existing infra,
+> Q4_K format spec, and outlier-isolation literature. What does NOT survive:
+> the synthesis paragraphs and the priority ranking that pre-judged Super-Expert
+> as the right cure. The contributor finding in #171 (router precision is the
+> cliff for the agent prompt) supersedes the synthesis chain entirely.
+>
+> The **survey runs anyway** under the contract's "observations are observations"
+> rule. Phase 1 measures the four diagnostics independent of the synthesis
+> here; Phase 2 ablates against pre-registered criteria.
+>
+> See `INVESTIGATION-LOG.md` 14:55 UTC entry for the full audit, and
+> `01-survey-runner-design.md` for the corrected design.
+
 ## Origin
 
 Issue #171 (Qwen3.6-A3B MQ4 incoherence) confirmed that hipfire's MoE Q4 cliff is
