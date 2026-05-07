@@ -312,6 +312,16 @@ struct LoadedModel {
     model_path: String,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
+    /// Hetero PP+DFlash (PRD v1.2): when `HIPFIRE_DFLASH_DRAFTER_DEVICE=N` is
+    /// set at load time, the drafter's weights + scratch live on this dedicated
+    /// `Gpu` instance (bound to HIP device N) instead of sharing the daemon's
+    /// main `gpu`. None means single-Gpu DFlash (drafter shares VRAM with
+    /// target). The cross-card spec-decode coordination loop in
+    /// `spec_step_dflash` (PR3 of the PRD) routes per-cycle ops between
+    /// `gpu` (target side) and this handle (drafter side); when None, both
+    /// sides resolve to the daemon's main `gpu` and behavior is byte-for-byte
+    /// identical to the prior single-Gpu path.
+    dflash_drafter_gpu: Option<rdna_compute::Gpu>,
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -611,7 +621,55 @@ fn main() {
                     }
                 }
 
-                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, pp, &mut gpu) {
+                // Hetero PP+DFlash drafter device pinning (PRD v1.2 PR2).
+                // HIPFIRE_DFLASH_DRAFTER_DEVICE=N opens a dedicated `Gpu`
+                // bound to HIP device N for the drafter's weights + scratch
+                // (sized ~877 MB for the 2B drafter targeting 27B). Only
+                // honored when a draft model is being loaded; ignored
+                // otherwise so it's harmless to leave set across non-DFlash
+                // sessions. Failure to open the requested device is a hard
+                // error — emit "error" and skip the load so the operator
+                // gets a structured signal instead of a daemon panic on
+                // first generate.
+                let drafter_gpu_owned: Option<rdna_compute::Gpu> = if draft_path.is_some() {
+                    match std::env::var("HIPFIRE_DFLASH_DRAFTER_DEVICE")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(spec) => match spec.parse::<i32>() {
+                            Ok(id) => match rdna_compute::Gpu::init_with_device(id) {
+                                Ok(g) => {
+                                    eprintln!(
+                                        "[hipfire-daemon] DFlash drafter pinned to HIP device {} (gfx={}, dedicated Gpu instance)",
+                                        id, g.arch
+                                    );
+                                    Some(g)
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(stdout,
+                                        r#"{{"type":"error","message":"HIPFIRE_DFLASH_DRAFTER_DEVICE={} failed to initialize: {} (code {})"}}"#,
+                                        id, e.message.replace('"', "'"), e.code,
+                                    );
+                                    let _ = stdout.flush();
+                                    continue;
+                                }
+                            },
+                            Err(_) => {
+                                let _ = writeln!(stdout,
+                                    r#"{{"type":"error","message":"HIPFIRE_DFLASH_DRAFTER_DEVICE='{}' is not a non-negative integer"}}"#,
+                                    spec.replace('"', "'"),
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
+                        },
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+
+                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, pp, &mut gpu, drafter_gpu_owned) {
                     Ok(m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -1076,14 +1134,28 @@ fn main() {
     }
 }
 
-fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+fn load_model(
+    path: &str,
+    max_seq: usize,
+    draft_path: Option<&str>,
+    kv_mode_override: Option<&str>,
+    cask: &CaskConfig,
+    pp: usize,
+    gpu: &mut rdna_compute::Gpu,
+    // Hetero PP+DFlash drafter device pinning (PRD v1.2 PR2).
+    // `Some(g)` = drafter weights/scratch live on the dedicated `g` Gpu;
+    // None = drafter shares VRAM with target on the daemon's main `gpu`
+    // (single-Gpu, byte-for-byte identical to prior behavior). Threaded
+    // by-value so load_model can return ownership inside `LoadedModel.dflash_drafter_gpu`.
+    mut drafter_gpu_owned: Option<rdna_compute::Gpu>,
+) -> Result<LoadedModel, String> {
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
         // the "load" event handler so the operator gets a structured error
         // before any HFQ open / weight allocation. By the time we get here
         // with pp>1, draft_path is None and cask.sidecar is None.
         let _ = (draft_path, cask);
-        return load_model_pp(path, max_seq, kv_mode_override, pp, gpu);
+        return load_model_pp(path, max_seq, kv_mode_override, pp, gpu, drafter_gpu_owned);
     }
     // Per-load kv_mode (sent in load message params) overrides the env var.
     // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
@@ -1360,7 +1432,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             // `max_seq` so eviction's smaller buffer caps VRAM: a 128K-advertised
             // model with physical_cap=896 allocates an 896-slot ring, not 128K.
             // Without eviction, physical_cap == max_seq so the behavior matches.
-            match load_dflash_state(dp, physical_cap, &config, &dn, gpu) {
+            match load_dflash_state(dp, physical_cap, &config, &dn, gpu, drafter_gpu_owned.as_mut()) {
                 Ok(state) => {
                     eprintln!(
                         "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
@@ -1388,6 +1460,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash,
+            dflash_drafter_gpu: drafter_gpu_owned,
         })
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
@@ -1415,6 +1488,11 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
+            // Qwen3/LLaMA never carries DFlash; if the operator set
+            // HIPFIRE_DFLASH_DRAFTER_DEVICE for a model that doesn't
+            // support DFlash, we still hand the owned drafter Gpu back
+            // through `LoadedModel` so `unload_model` can drop it cleanly.
+            dflash_drafter_gpu: drafter_gpu_owned,
         })
     }
 }
@@ -1432,6 +1510,14 @@ fn load_model_pp(
     kv_mode_override: Option<&str>,
     pp: usize,
     _gpu: &mut rdna_compute::Gpu,
+    // pp>1 + drafter pinning is deferred (PRD v1.2 PR3 follow-on); the
+    // refusal at the upstream load handler still gates DFlash on pp>1
+    // unless `HIPFIRE_PP_DFLASH=1` is set, but this load path itself
+    // does not yet wire DFlash state. Threaded for parity with `load_model`
+    // so the daemon call sites are uniform; the owned Gpu (if any) is
+    // simply parked on `LoadedModel.dflash_drafter_gpu` for `unload_model`
+    // to clean up.
+    drafter_gpu_owned: Option<rdna_compute::Gpu>,
 ) -> Result<LoadedModel, String> {
     let kv_mode = kv_mode_override
         .filter(|s| !s.is_empty())
@@ -1543,6 +1629,7 @@ fn load_model_pp(
         conversation_tokens: Vec::new(),
         model_path: path.to_string(),
         dflash: None,
+        dflash_drafter_gpu: drafter_gpu_owned,
     })
 }
 
@@ -1597,7 +1684,7 @@ fn screen_weights_qwen35(weights: &qwen35::Qwen35Weights, gpu: &mut rdna_compute
     (n_safe, n_unsafe)
 }
 
-fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // Multi-GPU branch (Stage 7 of #58). Frees per-device tensors through the
     // Gpus orchestrator, then invalidates per-device caches so the next load
     // can't inherit stale verdicts at recycled device addresses. Order
@@ -1625,9 +1712,33 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // leak until daemon exit if the caller cycles load/unload mid-session.
     // Acceptable for the daemon since unload is rare and the weights are the
     // bulk of the VRAM anyway.
+    //
+    // Hetero PP+DFlash (PRD v1.2): when `dflash_drafter_gpu` is set, the
+    // draft weights + scratch live on that dedicated Gpu instead of the
+    // daemon's main one — free them against `dflash_drafter_gpu` so the
+    // free_tensor calls land on the right device's pool. When None, fall
+    // through to `gpu` (single-Gpu DFlash, prior behavior).
     if let Some(df) = m.dflash {
-        df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
+        let drafter_handle: &mut rdna_compute::Gpu = match m.dflash_drafter_gpu.as_mut() {
+            Some(d) => d,
+            None => &mut *gpu,
+        };
+        df.draft_weights.free_gpu(drafter_handle);
+        df.draft_scratch.free_gpu(drafter_handle);
+    }
+    // Drop the dedicated drafter Gpu (if any) AFTER its allocations have
+    // been released. Drop on `Gpu` invalidates caches + drains the pool;
+    // the borrow needed to be released first.
+    if let Some(mut drafter_gpu) = m.dflash_drafter_gpu {
+        drafter_gpu.invalidate_weight_caches();
+        drafter_gpu.invalidate_graph_state();
+        drafter_gpu.drain_pool();
+        // Owned `Gpu` drops here — its underlying HIP context is not
+        // explicitly destroyed (no dtor); HIP cleans up at process exit.
+        // Acceptable since unload is rare; future could add an explicit
+        // hipDeviceReset here if VRAM pressure becomes an issue across
+        // load/unload cycles.
+        drop(drafter_gpu);
     }
     // Free eviction context (centers + scratch tensors) if active.
     if let Some(ev) = m.eviction { ev.free_gpu(gpu); }
@@ -1662,14 +1773,34 @@ fn load_dflash_state(
     ctx_capacity: usize,
     target_config: &qwen35::Qwen35Config,
     target_dn: &DeltaNetState,
+    // Target side: hidden ring buffer, DN snapshots, gdn_tape, verify_scratch,
+    // ddtree state — all live alongside the target weights/KV.
     gpu: &mut rdna_compute::Gpu,
+    // Drafter side: weights + scratch buffers. `Some(d)` pins them to a
+    // dedicated `Gpu` instance (HIPFIRE_DFLASH_DRAFTER_DEVICE=N); None
+    // routes them to `gpu` for byte-for-byte parity with the prior
+    // single-Gpu DFlash path.
+    drafter_gpu: Option<&mut rdna_compute::Gpu>,
 ) -> Result<DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;
-    let draft_weights = DflashWeights::load(gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
-    let draft_scratch = DflashScratch::new_with_mq(
-        gpu, &draft_config, draft_config.block_size, ctx_capacity, draft_weights.has_mq,
-    ).map_err(|e| format!("draft scratch: {e}"))?;
+    // Drafter-side allocations: weights + activation scratch. Reborrow `gpu`
+    // when no dedicated drafter Gpu — preserves byte-for-byte single-Gpu
+    // behavior when HIPFIRE_DFLASH_DRAFTER_DEVICE is unset. The drafter
+    // borrow is scoped to this block so target-side allocs below can
+    // reclaim the &mut reference cleanly.
+    let (draft_weights, draft_scratch) = {
+        let drafter_handle: &mut rdna_compute::Gpu = match drafter_gpu {
+            Some(d) => d,
+            None => &mut *gpu,
+        };
+        let dw = DflashWeights::load(drafter_handle, &hfq, &draft_config)
+            .map_err(|e| format!("load weights: {e}"))?;
+        let ds = DflashScratch::new_with_mq(
+            drafter_handle, &draft_config, draft_config.block_size, ctx_capacity, dw.has_mq,
+        ).map_err(|e| format!("draft scratch: {e}"))?;
+        (dw, ds)
+    };
 
     // Hidden ring: one row per target-layer selected by the draft config,
     // captured during each target forward. Sized so the whole context plus
@@ -1880,6 +2011,21 @@ fn generate_dflash(
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
         ModelSlotConfig, Phase2Snapshots, SpecStats,
     };
+
+    // Hetero PP+DFlash drafter device pinning (PRD v1.2): the load-side
+    // foundation is shipped (drafter weights/scratch land on the dedicated
+    // Gpu set by HIPFIRE_DFLASH_DRAFTER_DEVICE), but the cross-card
+    // spec-decode coordination loop (PR-A step 2: spec_step_dflash dual-Gpu
+    // signature + per-cycle staging) is NOT yet shipped. Refuse here with
+    // a clear error rather than dispatching kernels against
+    // wrong-device buffers and crashing.
+    if m.dflash_drafter_gpu.is_some() {
+        let _ = writeln!(stdout,
+            r#"{{"type":"error","id":"{}","message":"HIPFIRE_DFLASH_DRAFTER_DEVICE is set but the cross-card spec-decode loop is not yet implemented (PR-A step 2 of docs/plans/hetero-pflash-dflash.prd). Drafter weights are loaded on the dedicated device but generation still requires the spec_step_dflash dual-Gpu refactor. Unset the env to fall back to single-Gpu DFlash."}}"#,
+            id);
+        let _ = stdout.flush();
+        return;
+    }
 
     // Tokenize with ChatML wrapping (identical to the AR path). System prompt
     // is always prepended because this fast path is single-turn.

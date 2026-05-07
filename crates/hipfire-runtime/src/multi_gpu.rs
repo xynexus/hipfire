@@ -279,7 +279,10 @@ impl Gpus {
     /// `BoundaryEvent` and destroys the underlying HIP event regardless
     /// of the wait result. If `completion` is `None` (sync copy already
     /// serialized on host), returns immediately without touching HIP.
-    pub fn wait_boundary(&self, mut evt: BoundaryEvent) -> HipResult<()> {
+    pub fn wait_boundary(&self, evt: BoundaryEvent) -> HipResult<()> {
+        // dst_dev is an index into self.devices; resolve and delegate to the
+        // shared free-function form so the cross-card path (which has no
+        // owning Gpus) can reuse the same wait machinery.
         if evt.dst_dev >= self.devices.len() {
             return Err(HipError::new(
                 0,
@@ -290,22 +293,82 @@ impl Gpus {
                 ),
             ));
         }
-        let Some(event) = evt.completion.take() else {
-            return Ok(());
-        };
         let dst_gpu = &self.devices[evt.dst_dev];
-        dst_gpu.bind_thread()?;
-        let wait_result = if let Some(stream) = dst_gpu.active_stream.as_ref() {
-            dst_gpu.hip.stream_wait_event(stream, &event)
-        } else {
-            // No dst stream: host-block on the event so the next null-stream
-            // dispatch on dst is ordered after the peer copy.
-            dst_gpu.hip.event_synchronize(&event)
-        };
-        let destroy_result = dst_gpu.hip.event_destroy(event);
-        wait_result.and(destroy_result)
+        cross_card_wait(dst_gpu, evt)
     }
+}
 
+/// Async cross-card copy between two free-standing `Gpu` instances that do
+/// NOT live in a shared `Gpus` orchestrator (the hetero PP+DFlash case where
+/// the daemon's main `gpu` holds the target and `LoadedModel.dflash_drafter_gpu`
+/// holds the drafter). Mirrors `Gpus::boundary_copy` exactly: enqueues
+/// `hipMemcpyPeerAsync` on `src_gpu`'s active stream when one is set,
+/// records a completion event for `cross_card_wait`; falls through to sync
+/// `hipMemcpyPeer` (which HIP transparently host-stages on non-peer fabric)
+/// otherwise. Correctness holds either way; only ordering w.r.t. dst-side
+/// dispatches differs.
+///
+/// `BoundaryEvent::dst_dev` is set to `usize::MAX` since there is no
+/// `Gpus`-relative index — `cross_card_wait` ignores the field and the
+/// caller passes `dst_gpu` directly.
+pub fn cross_card_copy(
+    src_gpu: &Gpu,
+    dst_gpu: &Gpu,
+    src: &DeviceBuffer,
+    dst: &DeviceBuffer,
+    n_bytes: usize,
+) -> HipResult<BoundaryEvent> {
+    if src_gpu.device_id == dst_gpu.device_id {
+        return Err(HipError::new(
+            0,
+            "cross_card_copy: src and dst share device_id (use memcpy_dtod instead)",
+        ));
+    }
+    src_gpu.bind_thread()?;
+    let src_dev_id = src_gpu.device_id;
+    let dst_dev_id = dst_gpu.device_id;
+    match src_gpu.active_stream.as_ref() {
+        Some(stream) => {
+            src_gpu.hip.memcpy_peer_async(
+                dst, dst_dev_id, src, src_dev_id, n_bytes, stream,
+            )?;
+            let event = src_gpu.hip.event_create()?;
+            match src_gpu.hip.event_record(&event, Some(stream)) {
+                Ok(()) => Ok(BoundaryEvent { dst_dev: usize::MAX, completion: Some(event) }),
+                Err(e) => {
+                    let _ = src_gpu.hip.event_destroy(event);
+                    Err(e)
+                }
+            }
+        }
+        None => {
+            src_gpu.hip.memcpy_peer(dst, dst_dev_id, src, src_dev_id, n_bytes)?;
+            Ok(BoundaryEvent { dst_dev: usize::MAX, completion: None })
+        }
+    }
+}
+
+/// Free-function form of `Gpus::wait_boundary` for the cross-card path.
+/// Takes the destination `Gpu` directly so callers without a `Gpus`
+/// orchestrator can still pair `cross_card_copy` with a wait. Consumes
+/// the `BoundaryEvent` and destroys the underlying HIP event.
+pub fn cross_card_wait(dst_gpu: &Gpu, mut evt: BoundaryEvent) -> HipResult<()> {
+    let Some(event) = evt.completion.take() else {
+        return Ok(());
+    };
+    dst_gpu.bind_thread()?;
+    let wait_result = if let Some(stream) = dst_gpu.active_stream.as_ref() {
+        dst_gpu.hip.stream_wait_event(stream, &event)
+    } else {
+        // No dst stream: host-block on the event so the next null-stream
+        // dispatch on dst is ordered after the peer copy.
+        dst_gpu.hip.event_synchronize(&event)
+    };
+    let destroy_result = dst_gpu.hip.event_destroy(event);
+    wait_result.and(destroy_result)
+}
+
+impl Gpus {
     fn from_parts(
         devices: Vec<Gpu>,
         per_device: Vec<usize>,
