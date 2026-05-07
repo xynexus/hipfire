@@ -2293,6 +2293,12 @@ pub fn scatter_hidden_block_to_interleaved(
     block_size: usize,
     n_rows: usize,
 ) -> HipResult<()> {
+    // Hetero-PP correctness: drafter `Gpu::init_with_device(N)` leaves
+    // HIP's thread-local current_device set to the drafter. Sync
+    // `hipMemcpyDtoD` below resolves through that thread-local, not
+    // through the buffer's owning device, so we re-bind the target
+    // before issuing any same-card D2D. Solo path is a no-op.
+    gpu.bind_thread()?;
     assert!(n_rows <= block_size, "scatter: n_rows {n_rows} > block_size {block_size}");
     let num_extract = hidden_rb.extract_layers.len();
     let hidden = hidden_rb.hidden_dim;
