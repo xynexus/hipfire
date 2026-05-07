@@ -67,6 +67,16 @@ fn main() {
     let mut ctx_slice: Option<usize> = None;
     let mut kv_mode_str = String::from("q8");
     let mut block_size_override: Option<usize> = None;
+    // --drafter-device N opts the demo into the hetero PP+DFlash path
+    // (PRD v1.2 PR-A): target on the default `Gpu::init()` device,
+    // drafter weights + scratch + draft_forward dispatched on a
+    // dedicated `Gpu::init_with_device(N)` instance. Cross-card
+    // staging at phases 2/5/9 of `spec_step_dflash` is fully internal
+    // (the body refactor in commit ad235e5). Mirrors the daemon's
+    // HIPFIRE_DFLASH_DRAFTER_DEVICE=N env var.
+    //
+    // None (default) = single-Gpu DFlash, byte-identical to master.
+    let mut drafter_device: Option<i32> = None;
     let mut temp: f32 = 0.0;
     let mut seed: u64 = 42;
     let mut repeat_penalty: f32 = 1.0;
@@ -316,6 +326,10 @@ fn main() {
                 chatml = false;
                 i += 1;
             }
+            "--drafter-device" => {
+                drafter_device = Some(args[i + 1].parse().expect("--drafter-device expects an integer HIP device index"));
+                i += 2;
+            }
             "--ar-baseline" => {
                 ar_baseline = true;
                 i += 1;
@@ -372,7 +386,7 @@ fn main() {
 
     // ── Init GPU ──────────────────────────────────────────────────────
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    eprintln!("gpu: {}", gpu.arch);
+    eprintln!("gpu (target): {}", gpu.arch);
     let vram_report = |hip: &hip_bridge::HipRuntime, label: &str| {
         if let Ok((free, total)) = hip.get_vram_info() {
             let used_gb = (total - free) as f64 / 1e9;
@@ -380,7 +394,20 @@ fn main() {
             eprintln!("VRAM @ {label}: used {used_gb:.2} GB, free {free_gb:.2} GB");
         }
     };
-    vram_report(&gpu.hip, "init");
+    vram_report(&gpu.hip, "target init");
+
+    // Drafter on a dedicated device (hetero PP+DFlash, PRD v1.2 PR-A).
+    // None preserves the single-Gpu byte-identical path.
+    let mut drafter_gpu_opt: Option<rdna_compute::Gpu> = match drafter_device {
+        Some(idx) => {
+            let g = rdna_compute::Gpu::init_with_device(idx)
+                .expect("drafter Gpu::init_with_device");
+            eprintln!("drafter pinned to HIP[{idx}]: {} (dedicated Gpu instance)", g.arch);
+            vram_report(&g.hip, "drafter init");
+            Some(g)
+        }
+        None => None,
+    };
 
     // ── Load draft ────────────────────────────────────────────────────
     let draft_hfq = HfqFile::open(Path::new(&draft_path)).expect("open draft");
@@ -426,9 +453,19 @@ fn main() {
     vram_report(&gpu.hip, "after target load");
 
     let t0 = Instant::now();
-    let draft_weights = DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg).expect("load draft");
+    // In hetero mode, draft weights live on the drafter Gpu (matches
+    // the daemon's load_dflash_state path). Single-Gpu mode loads onto
+    // target — byte-identical to master.
+    let draft_weights = match drafter_gpu_opt.as_mut() {
+        Some(d) => DflashWeights::load(d, &draft_hfq, &draft_cfg).expect("load draft (drafter)"),
+        None => DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg).expect("load draft"),
+    };
     eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
-    vram_report(&gpu.hip, "after draft load");
+    if let Some(ref d) = drafter_gpu_opt {
+        vram_report(&d.hip, "after draft load (drafter)");
+    } else {
+        vram_report(&gpu.hip, "after draft load");
+    }
 
     // Adaptive-B scratch sizing: the draft was trained at a specific
     // block_size; going past it is out-of-distribution for its positional
@@ -463,9 +500,16 @@ fn main() {
             draft_scratch_b, draft_cfg.block_size,
         );
     }
-    let mut draft_scratch = DflashScratch::new_with_mq(
-        &mut gpu, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
-    ).expect("alloc draft scratch");
+    // Draft scratch lives on the same device as draft weights — drafter
+    // in hetero mode, target otherwise.
+    let mut draft_scratch = match drafter_gpu_opt.as_mut() {
+        Some(d) => DflashScratch::new_with_mq(
+            d, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
+        ).expect("alloc draft scratch (drafter)"),
+        None => DflashScratch::new_with_mq(
+            &mut gpu, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
+        ).expect("alloc draft scratch"),
+    };
     if draft_weights.has_mq {
         eprintln!("draft: MQ4 weights detected, FWHT rotation scratch enabled");
     }
@@ -1209,7 +1253,7 @@ fn main() {
         } else {
             speculative::spec_step_dflash(
                 &mut gpu,
-                None,                                  // single-Gpu demo: no hetero drafter
+                drafter_gpu_opt.as_mut(),              // None=single-Gpu, Some=hetero drafter pin
                 &mut target,
                 &draft_weights,
                 &draft_cfg,
