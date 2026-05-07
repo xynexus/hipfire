@@ -698,19 +698,29 @@ impl Gpu {
             // The cache is observe-only in PR1 — every classify() call
             // falls through to the legacy launch path. See gemv_graph_cache.rs.
             gemv_graph_cache: if gemv_graph_enabled() {
-                eprintln!("[gemv-graph] HIPFIRE_GEMV_GRAPH=1: per-shape cache enabled (PR1: observe-only)");
+                eprintln!("[gemv-graph] HIPFIRE_GEMV_GRAPH=1: per-shape cache enabled (PR2: capture+replay for gemv_hfq4g256 family)");
                 Some(crate::gemv_graph_cache::GemvGraphCache::new())
             } else {
                 None
             },
-        }).map(|mut gpu| {
+        }).and_then(|mut gpu| {
             if gpu.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
+            }
+            // PR2 of the per-shape hipGraph cache: capture requires an
+            // explicit stream. If the user enabled the cache but no
+            // active_stream is set up, create one here so production
+            // decode (which doesn't otherwise touch active_stream) can
+            // route through the cache. Idempotent if a stream already
+            // exists (e.g. set by HIPFIRE_GRAPH=1 path).
+            if gpu.gemv_graph_cache.is_some() && gpu.active_stream.is_none() {
+                gpu.active_stream = Some(gpu.hip.stream_create()?);
+                eprintln!("[gemv-graph] PR2: created active_stream for cache routing");
             }
             // Auto-init rocBLAS on CDNA3 so the batched-prefill MFMA path is
             // available out of the box. No-op on consumer arches.
             gpu.try_init_rocblas();
-            gpu
+            Ok(gpu)
         })
     }
 
@@ -1136,7 +1146,19 @@ impl Gpu {
         }
     }
 
-    /// PR2 of the per-shape hipGraph cache. Plain `gemv_hfq4g256` only.
+    /// PR2 of the per-shape hipGraph cache.
+    ///
+    /// Restricted to the `gemv_hfq4g256` family (plain `gemv_hfq4g256`,
+    /// `_wide`, `_multirow_r{2,4,8}`). All four kernels share the same
+    /// kernarg signature `(const char* A, const float* x, float* y,
+    /// int M, int K)` and the cache key collapses them all to family
+    /// `"gemv_hfq4g256"` (per `GemvGraphCache::family_of`). The captured
+    /// graph records the actual `hipFunction_t`, so replay routes to
+    /// the right variant; only the cache key is variant-agnostic.
+    ///
+    /// Fused families (`fused_qkv_hfq4g256`, `fused_qkvza_hfq4g256`,
+    /// `fused_gate_up_hfq4g256`) are NOT cached in PR2 — they need a
+    /// different kernarg layout / offset table. PR3 picks those up.
     ///
     /// Returns:
     /// - `Ok(true)` if the cache handled this call (replay or capture).
@@ -1150,7 +1172,7 @@ impl Gpu {
     /// - `!self.force_blob_path` (diagnostic flag);
     /// - `self.active_stream.is_some()` (capture requires an explicit stream).
     ///
-    /// Kernarg layout for `gemv_hfq4g256` (32 bytes):
+    /// Kernarg layout for the gemv_hfq4g256 family (32 bytes):
     /// ```text
     ///   off  0..8   : a_ptr (device pointer)
     ///   off  8..16  : x_ptr (device pointer)
@@ -1171,10 +1193,17 @@ impl Gpu {
         m: i32,
         k: i32,
     ) -> HipResult<bool> {
-        // Restricted to plain "gemv_hfq4g256" only for PR2. _wide and
-        // multirow variants stay on legacy launch — PR3 is the place to
-        // extend.
-        if func_name != "gemv_hfq4g256" {
+        // Whitelist the gemv_hfq4g256 family for PR2. Fused families
+        // are PR3.
+        let in_family = matches!(
+            func_name,
+            "gemv_hfq4g256"
+                | "gemv_hfq4g256_wide"
+                | "gemv_hfq4g256_multirow_r2"
+                | "gemv_hfq4g256_multirow_r4"
+                | "gemv_hfq4g256_multirow_r8"
+        );
+        if !in_family {
             return Ok(false);
         }
         if self.capture_mode || self.force_blob_path {
@@ -3020,19 +3049,40 @@ impl Gpu {
             };
             self.ensure_kernel(mr_name, mr_src, func_name)?;
             let grid = ((m as u32) + grid_div - 1) / grid_div;
-            self.launch_maybe_blob(
+            // PR2 graph-cache route — multirow variants share the
+            // gemv_hfq4g256 family kernarg layout.
+            let handled = self.try_dispatch_gemv_hfq4g256_via_graph_cache(
                 func_name,
-                [grid, 1, 1], [32, 1, 1], 0, &mut params,
-                blob_builder,
-            )
+                [grid, 1, 1], [32, 1, 1], 0,
+                a_ptr, x_ptr, y_ptr, m_val, k_val,
+            )?;
+            if handled {
+                Ok(())
+            } else {
+                self.launch_maybe_blob(
+                    func_name,
+                    [grid, 1, 1], [32, 1, 1], 0, &mut params,
+                    blob_builder,
+                )
+            }
         } else if use_wide {
             self.ensure_kernel("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC, "gemv_hfq4g256_wide")?;
             let grid = ((m + 1) / 2) as u32;
-            self.launch_maybe_blob(
+            // PR2 graph-cache route — _wide shares the family kernarg layout.
+            let handled = self.try_dispatch_gemv_hfq4g256_via_graph_cache(
                 "gemv_hfq4g256_wide",
-                [grid, 1, 1], [64, 1, 1], 0, &mut params,
-                blob_builder,
-            )
+                [grid, 1, 1], [64, 1, 1], 0,
+                a_ptr, x_ptr, y_ptr, m_val, k_val,
+            )?;
+            if handled {
+                Ok(())
+            } else {
+                self.launch_maybe_blob(
+                    "gemv_hfq4g256_wide",
+                    [grid, 1, 1], [64, 1, 1], 0, &mut params,
+                    blob_builder,
+                )
+            }
         } else {
             // PR2 of the per-shape hipGraph cache: route plain
             // `gemv_hfq4g256` through capture/replay when enabled.

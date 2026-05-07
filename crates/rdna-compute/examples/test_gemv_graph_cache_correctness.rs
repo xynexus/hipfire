@@ -91,15 +91,33 @@ fn main() {
         y_pool.push(gpu.zeros(&[M], DType::F32).expect("alloc y"));
     }
 
-    // Generate the call schedule: 100 calls, each picking (x_idx, y_idx).
-    // Deterministic RNG so the two runs (disabled / enabled) issue the
-    // same sequence of (x, y) selections.
+    // Generate the call schedule. PR2 of the cache uses a "snapshot
+    // kernargs at capture / strict-match at replay / evict + recapture
+    // on drift" policy — HIP 7.x graph capture snapshots kernarg blob
+    // contents and there is no public bridge FFI for in-place node
+    // update. To exercise BOTH the steady-state replay path AND the
+    // drift / evict / recapture path, we do:
+    //
+    //   - Phase A (50 calls): same (x_idx=0, y_idx=0) every call.
+    //     Hits the cache cleanly: 1 fallthrough (counter=1), 1 capture
+    //     (counter=2), 48 replays. ≈ 96% hit rate.
+    //
+    //   - Phase B (50 calls): rotate (x_idx, y_idx) per call.
+    //     Drift → evict → fallthrough → recapture cycle. Tests the
+    //     correctness of the eviction path.
+    //
+    // Both phases are deterministic so the two runs (disabled / enabled)
+    // see the same (xi, yi) sequence.
     let mut rng_state: u64 = 0xDEAD_BEEF_C0DE_FACE;
     let schedule: Vec<(usize, usize)> = (0..N_CALLS)
-        .map(|_| {
-            let xi = (lcg_next(&mut rng_state) >> 33) as usize % N_BUFFER_SLOTS;
-            let yi = (lcg_next(&mut rng_state) >> 33) as usize % N_BUFFER_SLOTS;
-            (xi, yi)
+        .map(|i| {
+            if i < N_CALLS / 2 {
+                (0, 0)
+            } else {
+                let xi = (lcg_next(&mut rng_state) >> 33) as usize % N_BUFFER_SLOTS;
+                let yi = (lcg_next(&mut rng_state) >> 33) as usize % N_BUFFER_SLOTS;
+                (xi, yi)
+            }
         })
         .collect();
 

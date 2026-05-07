@@ -208,8 +208,9 @@ impl GemvGraphEntry {
             HIP_LAUNCH_PARAM_END,
         ]);
 
-        // Begin capture, do the launch (the captured side-effect IS this
-        // call's compute), end capture.
+        // Begin capture, RECORD the launch (in mode=Global the launch is
+        // recorded but NOT executed — see HIP/CUDA stream-capture docs),
+        // end capture.
         hip.stream_begin_capture(stream, 0)?; // hipStreamCaptureModeGlobal
         let extra_ptr = extra.as_ptr() as *mut *mut c_void;
         // SAFETY: extra is Box-stable for the entry's lifetime; kernarg /
@@ -224,6 +225,12 @@ impl GemvGraphEntry {
         let graph = hip.stream_end_capture(stream)?;
         let exec = hip.graph_instantiate(&graph)?;
 
+        // The capture phase only RECORDS the launch — it does NOT
+        // execute it. Issue an immediate graph_launch so this call's
+        // caller sees the compute side-effect (y filled) the same way
+        // it would on the legacy launch path.
+        hip.graph_launch(&exec, stream)?;
+
         Ok(Self {
             exec: Some(exec),
             graph: Some(graph),
@@ -237,56 +244,79 @@ impl GemvGraphEntry {
         })
     }
 
-    /// Replay the cached graph on `stream` with new pointer / scalar
-    /// values rewritten into the kernarg blob.
+    /// Check whether the entry's cached kernarg blob already matches the
+    /// caller's current ptrs/scalars. If so, replay is a pure no-arg
+    /// hipGraphLaunch and produces the correct output.
     ///
-    /// `ptrs.len()` must match `self.ptr_offsets.len()`; same for
-    /// `scalars` and `self.scalar_offsets`.
-    pub(crate) fn replay(
-        &mut self,
-        hip: &HipRuntime,
+    /// HIP graph capture snapshots kernarg blob CONTENTS into the kernel
+    /// node at instantiate time. There is no documented stable mechanism
+    /// in HIP 7.x to update kernel-node parameters of an instantiated
+    /// graph from the user-side `extra` blob without `hipGraphExecKernel
+    /// NodeSetParams` (not exposed in the bridge yet). So in PR2 we treat
+    /// the cached entry as VALID only when current kernargs equal the
+    /// snapshot. On mismatch the caller is expected to evict + recapture.
+    pub(crate) fn kernargs_match(
+        &self,
         ptrs: &[*mut c_void],
         scalars: &[u64],
-        stream: &Stream,
-    ) -> HipResult<()> {
+    ) -> bool {
         debug_assert_eq!(ptrs.len(), self.ptr_offsets.len(),
             "ptr count mismatch");
         debug_assert_eq!(scalars.len(), self.scalar_offsets.len(),
             "scalar count mismatch");
 
-        // Rewrite pointer slots
         for (i, &off) in self.ptr_offsets.iter().enumerate() {
-            let bytes = (ptrs[i] as usize).to_ne_bytes();
-            self.kernarg[off..off + 8].copy_from_slice(&bytes);
-        }
-
-        // Rewrite scalar slots according to type
-        for (i, &(off, ty)) in self.scalar_offsets.iter().enumerate() {
-            let v = scalars[i];
-            match ty {
-                ScalarTy::I32 => {
-                    let bytes = (v as i32).to_ne_bytes();
-                    self.kernarg[off..off + 4].copy_from_slice(&bytes);
-                }
-                ScalarTy::U32 => {
-                    let bytes = (v as u32).to_ne_bytes();
-                    self.kernarg[off..off + 4].copy_from_slice(&bytes);
-                }
-                ScalarTy::F32 => {
-                    let bytes = f32::from_bits(v as u32).to_ne_bytes();
-                    self.kernarg[off..off + 4].copy_from_slice(&bytes);
-                }
-                ScalarTy::I64 => {
-                    let bytes = (v as i64).to_ne_bytes();
-                    self.kernarg[off..off + 8].copy_from_slice(&bytes);
-                }
-                ScalarTy::U64 => {
-                    let bytes = v.to_ne_bytes();
-                    self.kernarg[off..off + 8].copy_from_slice(&bytes);
-                }
+            let mut got = [0u8; 8];
+            got.copy_from_slice(&self.kernarg[off..off + 8]);
+            if got != (ptrs[i] as usize).to_ne_bytes() {
+                return false;
             }
         }
 
+        for (i, &(off, ty)) in self.scalar_offsets.iter().enumerate() {
+            let v = scalars[i];
+            let matches = match ty {
+                ScalarTy::I32 => {
+                    let mut got = [0u8; 4];
+                    got.copy_from_slice(&self.kernarg[off..off + 4]);
+                    got == (v as i32).to_ne_bytes()
+                }
+                ScalarTy::U32 => {
+                    let mut got = [0u8; 4];
+                    got.copy_from_slice(&self.kernarg[off..off + 4]);
+                    got == (v as u32).to_ne_bytes()
+                }
+                ScalarTy::F32 => {
+                    let mut got = [0u8; 4];
+                    got.copy_from_slice(&self.kernarg[off..off + 4]);
+                    got == f32::from_bits(v as u32).to_ne_bytes()
+                }
+                ScalarTy::I64 => {
+                    let mut got = [0u8; 8];
+                    got.copy_from_slice(&self.kernarg[off..off + 8]);
+                    got == (v as i64).to_ne_bytes()
+                }
+                ScalarTy::U64 => {
+                    let mut got = [0u8; 8];
+                    got.copy_from_slice(&self.kernarg[off..off + 8]);
+                    got == v.to_ne_bytes()
+                }
+            };
+            if !matches {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Replay the cached graph on `stream`. Only valid when
+    /// `kernargs_match()` returns true — caller is responsible for
+    /// gating the call.
+    pub(crate) fn replay(
+        &mut self,
+        hip: &HipRuntime,
+        stream: &Stream,
+    ) -> HipResult<()> {
         let exec = self.exec.as_ref().expect("entry exec dropped");
         hip.graph_launch(exec, stream)?;
         self.replays = self.replays.saturating_add(1);
@@ -460,21 +490,34 @@ impl GemvGraphCache {
 
     /// Look up + dispatch.
     ///
-    /// **Hit path:** rewrite pointer/scalar slots in the cached kernarg
-    /// blob, hipGraphLaunch, return `Replayed`.
+    /// **Hit path:** if the cached kernargs match the caller's current
+    /// ptrs/scalars, hipGraphLaunch the cached exec → `Replayed`. If
+    /// they don't match (caller switched buffers since capture), evict
+    /// the entry and treat this call as a fresh miss — the entry will
+    /// be recaptured when the miss counter reaches the threshold again.
     ///
     /// **Miss path:**
     /// 1. If miss-count < `min_amortize_replays`: increment counter,
     ///    return `Fallthrough` so the caller runs the legacy sequential
     ///    launch.
     /// 2. If miss-count >= `min_amortize_replays`: capture the graph
-    ///    (the capture runs this call's compute as its side-effect),
+    ///    (`hipStreamBeginCapture` records the launch but does NOT
+    ///    execute it; we follow with an immediate `hipGraphLaunch` so
+    ///    the call's compute side-effect is visible to the caller),
     ///    install the entry, return `Captured` so the caller skips the
     ///    legacy launch.
     ///
     /// **Stream affinity:** if `stream_raw` differs from the cache's
-    /// `captured_stream`, the entire cache is invalidated and this call
-    /// becomes a fresh miss.
+    /// `captured_stream`, the entire cache is invalidated.
+    ///
+    /// **Why no rewrite-in-place?** HIP 7.x snapshots kernarg blob
+    /// CONTENTS into the kernel node at `hipGraphInstantiate`. Mutating
+    /// the user-side blob has no effect on the executable graph without
+    /// calling `hipGraphExecKernelNodeSetParams` (not currently exposed
+    /// in the bridge). Production decode hits the same (a, x, y)
+    /// scratch-buffer slots every step, so kernargs are stable and the
+    /// strict-match policy is hit-rate-equivalent. PR4 may add the
+    /// node-update FFI for unstable-pointer regimes.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch(
         &mut self,
@@ -496,17 +539,30 @@ impl GemvGraphCache {
         // Stream-affinity check — if stream changed, drop everything.
         match self.captured_stream {
             Some(s) if s != stream_raw => {
-                // Stream changed under us. Invalidate the whole cache.
                 self.clear(hip);
             }
             _ => {}
         }
 
-        // Hit path
+        // Hit path: replay only if kernargs match the snapshot. If they
+        // don't match the caller switched buffers; evict and treat as a
+        // fresh miss.
         if let Some(entry) = self.entries.get_mut(shape) {
-            entry.replay(hip, ptrs, scalars, stream)?;
-            self.stats.hits = self.stats.hits.saturating_add(1);
-            return Ok(DispatchOutcome::Replayed);
+            if entry.kernargs_match(ptrs, scalars) {
+                entry.replay(hip, stream)?;
+                self.stats.hits = self.stats.hits.saturating_add(1);
+                return Ok(DispatchOutcome::Replayed);
+            }
+            // Kernarg drift — evict and fall through to miss path so
+            // we recapture for the new ptrs.
+            let mut evicted = self.entries.remove(shape).unwrap();
+            if let Some(exec) = evicted.exec.take() {
+                let _ = hip.graph_exec_destroy(exec);
+            }
+            if let Some(graph) = evicted.graph.take() {
+                let _ = hip.graph_destroy(graph);
+            }
+            self.stats.evictions = self.stats.evictions.saturating_add(1);
         }
 
         // Miss path
@@ -521,8 +577,8 @@ impl GemvGraphCache {
         }
 
         // Counter reached threshold: capture on this call. The captured
-        // launch IS this call's compute, so the caller MUST NOT also run
-        // sequential.
+        // launch records the kernarg snapshot; the immediate
+        // `hipGraphLaunch` inside `capture()` runs this call's compute.
         let entry = GemvGraphEntry::capture(
             hip,
             func,

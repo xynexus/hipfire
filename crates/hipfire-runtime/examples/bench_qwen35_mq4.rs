@@ -273,4 +273,8 @@ fn main() {
         model_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
     eprintln!();
     eprintln!("SUMMARY  gen_tok_s={gen_tok_s:.1}  bw_gib_s={bw_gbps:.1}  prefill_tok_s={prefill_tok_s:.1}  avg_ms={avg_ms:.2}  p50_ms={p50_ms:.2}");
+
+    if let Some(stats) = gpu.gemv_graph_stats() {
+        eprintln!("[gemv-graph] {stats}");
+    }
 }
