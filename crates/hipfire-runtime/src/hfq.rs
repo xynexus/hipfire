@@ -426,6 +426,15 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
         }
+        19 => { // MG4-G256 — Magnum-Gemma 4-bit. SAME binary layout as MQ4-G256
+            // (136 B/group, FWHT-rotated 4-bit), differs ONLY in calibration
+            // (percentile-clip [P02, P98] instead of true min..max). The dequant
+            // kernel doesn't see calibration, so we alias MG4G256 → MQ4G256 at
+            // load time and the GEMV path is byte-identical. See
+            // `quantize_mg4g256` in hipfire-quantize/src/main.rs.
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
+        }
         1 => { // F16 — dequant to F32 for F32 GEMV
             let f32_data: Vec<f32> = data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
