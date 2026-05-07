@@ -254,7 +254,8 @@ def apply_variant(model, variant: str) -> dict[str, int]:
             s1_t, s2_t = signs_on(device)
 
             if _is_moe_3d_expert_tensor(name) and p.dim() == 3:
-                layer_idx = _layer_idx_of(name) or -1
+                _li = _layer_idx_of(name)
+                layer_idx = _li if _li is not None else -1
                 is_down = ".mlp.experts.down_proj" in name
                 n_experts, n_rows, n_cols = p.shape
                 pinned_set = (
