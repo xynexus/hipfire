@@ -655,12 +655,14 @@ fn main() {
 
     eprintln!();
 
-    // Phase 2: weight-dependent kernel-isolated battery. Triggered by
-    // VERIFY_MODEL=path-to-.mq4. Skipped if not set.
+    // Phase 2 + 3: load model ONCE (Phase 2 reads weights for kernel-isolated
+    // tests; Phase 3 reuses for the e2e forward). Loading twice would OOM at
+    // 17.4 GB/load on 34 GB cards.
     let mut p2_pass = 0usize;
     let mut p2_fail = 0usize;
     let mut p2_first_fail: Option<i32> = None;
     let model_env = std::env::var("VERIFY_MODEL").ok();
+    let mut loaded: Option<(Gemma4Config, Gemma4Weights)> = None;
     if let Some(model_path) = model_env.as_deref() {
         eprintln!("─── Phase 2: weight-dependent kernels (rmsnorm / proj / o_proj / mlp) ─");
         eprintln!("    model: {}", model_path);
@@ -673,9 +675,8 @@ fn main() {
         eprintln!("    config: dim={}, n_layers={}, n_heads={}, sliding_hd={}, full_hd={}",
                   config.dim, config.n_layers, config.n_heads,
                   config.sliding_head_dim, config.full_head_dim);
-        eprintln!("    loading weights...");
+        eprintln!("    loading weights (single load shared by Phase 2 + 3)...");
         let weights = gemma4::load_weights(&hfq, &config, &mut gpu).expect("load weights");
-        let _ = &weights as *const Gemma4Weights;  // borrow for lifetime
         eprintln!("    loaded {} layers", weights.layers.len());
 
         for layer_idx in 0..n_layers_dump.min(weights.layers.len() as i32) {
@@ -694,6 +695,7 @@ fn main() {
             if p2_fail > 0 && halt_on_fail { break; }
         }
         eprintln!();
+        loaded = Some((config, weights));
     } else {
         eprintln!("─── Phase 2: weight-dependent kernels (rmsnorm / proj / attn / o_proj) ─");
         eprintln!("    SKIPPED — set VERIFY_MODEL=/path/to/gemma-4-31b.mq4 to enable.");
@@ -709,8 +711,8 @@ fn main() {
     //
     // Triggered when both VERIFY_MODEL is set (model loaded) AND the manifest
     // carries input_ids + a final_logits.safetensors capture. Otherwise skipped.
-    let mut p3_status: Option<(f32, f32, usize, bool)> = None;  // (nrmse, max_e, n_vocab, pass)
-    if let Some(model_path) = model_env.as_deref() {
+    let mut p3_status: Option<(f32, f32, usize, bool)> = None;
+    if let Some((config, weights)) = loaded {
         let logits_path = ref_dir.join("final_logits.safetensors");
         let manifest_path = ref_dir.join("manifest.json");
         let m2: Manifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap())
@@ -719,32 +721,20 @@ fn main() {
             eprintln!("─── Phase 3: end-to-end final-logits NRMSE ─────────────────────────────");
             eprintln!("    SKIPPED — final_logits.safetensors missing in {}", ref_dir.display());
             eprintln!();
+            weights.free_gpu(&mut gpu);
         } else if m2.input_ids.is_empty() || m2.input_ids[0].is_empty() {
             eprintln!("─── Phase 3: end-to-end final-logits NRMSE ─────────────────────────────");
             eprintln!("    SKIPPED — manifest has no input_ids[0]; older dump format?");
             eprintln!();
+            weights.free_gpu(&mut gpu);
         } else {
             eprintln!("─── Phase 3: end-to-end final-logits NRMSE ─────────────────────────────");
-            // Re-open + re-load: cleanest path is to re-parse the model again so
-            // we have a fresh `weights` (Phase 2 left ownership inside its scope
-            // intentionally — we'd otherwise need to refactor the lifetime
-            // dance). Quick on hiptrx: ~10s for the second load.
-            let hfq = HfqFile::open(Path::new(model_path)).expect("re-open model");
-            let config = gemma4::config_from_hfq(&hfq).expect("re-read config");
-            eprintln!("    re-loading weights for forward pass...");
-            let weights = gemma4::load_weights(&hfq, &config, &mut gpu).expect("load weights phase3");
-
-            // KV caches: asym3 quant on BOTH sliding and full. Full-attn hd=512
-            // routes to the new kernels (D2.5-1/2/3). T tokens fit easily; size
-            // the cache to T+8 for paranoia.
+            // Reuse Phase 2's loaded weights (no second load — would OOM at 17.4 GB).
             let n_sliding = config.layer_types.iter().filter(|&&t| t == LayerType::Sliding).count();
             let n_full = config.layer_types.iter().filter(|&&t| t == LayerType::Full).count();
             let n_tokens = m2.input_ids[0].len();
             let kv_seq_p3 = (n_tokens + 8).max(64);
-            // The Gemma4Scratch cos/sin tables and flash_partials are sized off
-            // HIPFIRE_KV_SEQ — for Phase 3 we only need a few tokens of room,
-            // but we don't override the env so it uses the default 32k. Cheap.
-            eprintln!("    allocating KV caches (asym3) at {} positions, sliding+full hd=512 path live...", kv_seq_p3);
+            eprintln!("    allocating KV caches (asym3) at {} positions, full layers route hd=512...", kv_seq_p3);
             let mut kv_sliding = KvCache::new_gpu_asym3(
                 &mut gpu, n_sliding, config.sliding_n_kv_heads,
                 config.sliding_head_dim, kv_seq_p3,
@@ -758,8 +748,8 @@ fn main() {
             gemma4::init_scratch_constants(&mut gpu, &scratch, config.full_head_dim)
                 .expect("init scratch constants");
 
-            // Run forward token by token over the manifest's input_ids.
-            eprintln!("    forwarding {} tokens through full dispatch chain...", n_tokens);
+            // Forward token by token. final scratch.logits = next-token distribution.
+            eprintln!("    forwarding {} tokens through full dispatch chain (incl. hd=512 attention)...", n_tokens);
             for (pos, tok_i64) in m2.input_ids[0].iter().copied().enumerate() {
                 let tok = tok_i64 as u32;
                 gemma4::forward_scratch(
@@ -769,7 +759,7 @@ fn main() {
             }
             let actual_logits = gpu.download_f32(&scratch.logits).expect("download logits");
 
-            // Reference final_logits: PyTorch returns [1, T, vocab].
+            // Reference final_logits: PyTorch returns [1, T, vocab]. Take last position.
             let (ref_shape, ref_logits_full) = load_safetensors_as_f32(&logits_path)
                 .expect("load reference final_logits");
             let vocab = config.vocab_size;
@@ -780,16 +770,8 @@ fn main() {
             let last_pos = t_total - 1;
             let start = last_pos * vocab;
             let ref_last = &ref_logits_full[start..start + vocab];
-
-            // Hipfire's logits buffer holds vocab elements (single-token decode).
             let hipfire_last = &actual_logits[..vocab];
             let res = compare_f32(hipfire_last, ref_last);
-            // Logits are post-softcap and PyTorch + hipfire both apply it; bf16
-            // storage of intermediate activations introduces ~5e-3 cumulative
-            // error at the chain's tail (60 layers × o_proj-side bf16 cast).
-            // Use proj_threshold (1.5e-1 default, 5e-3 with --PROJ_THRESHOLD=5e-3
-            // when running against the dequant reference) since this is the
-            // result of a quantized weights * bf16 activations chain.
             let pass = res.nrmse < proj_threshold;
             print_diag(
                 &format!("final logits @ pos {} (vocab={})", last_pos, vocab),
@@ -797,7 +779,6 @@ fn main() {
             );
             p3_status = Some((res.nrmse, res.max_abs_err, vocab, pass));
 
-            // Free the resources we allocated.
             kv_sliding.free_gpu(&mut gpu);
             kv_full.free_gpu(&mut gpu);
             scratch.free_gpu(&mut gpu);
