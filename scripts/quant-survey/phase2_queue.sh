@@ -28,8 +28,11 @@ run_one() {
   local outdir=$RUNS_DIR/phase2-$model
   local log=$LOG_DIR/phase2-${model}-${variant}-t${trial}.log
   local results=$outdir/phase2_results.jsonl
-  # Skip if this (variant, trial) already has a result line.
-  if [ -f "$results" ] && grep -q "\"variant\":\"$variant\",\"trial\":$trial," "$results"; then
+  # Skip if this (variant, trial) already has a result line. Use jq to
+  # avoid JSON whitespace fragility (json.dumps emits "key": "val" with
+  # spaces; a literal grep would miss that).
+  if [ -f "$results" ] && jq -e --arg v "$variant" --argjson t "$trial" \
+        'select(.variant==$v and .trial==$t)' "$results" >/dev/null 2>&1; then
     echo "[phase2-queue] $(date) SKIP $model $variant trial=$trial (already in results)"
     return 0
   fi
