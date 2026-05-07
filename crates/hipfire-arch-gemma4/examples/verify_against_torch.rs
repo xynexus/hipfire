@@ -777,6 +777,32 @@ fn main() {
                 &format!("final logits @ pos {} (vocab={})", last_pos, vocab),
                 &res, proj_threshold, hipfire_last, ref_last,
             );
+
+            // Argmax / top-5 comparison: semantic correctness signal even if
+            // per-element NRMSE is dominated by KV-cache quantization noise
+            // (the cache stores 3-bit-rotated K and Q8 V, so cumulative
+            // attention error appears at the logit tail even when projections
+            // pass at bf16 floor).
+            fn top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+                let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+                indexed.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
+                let mut top = indexed[..k].to_vec();
+                top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                top
+            }
+            let actual_top5 = top_k(hipfire_last, 5);
+            let ref_top5 = top_k(ref_last, 5);
+            eprintln!("        hipfire top-5 ids:  {:?}",
+                      actual_top5.iter().map(|(i, _)| i).collect::<Vec<_>>());
+            eprintln!("        ref     top-5 ids:  {:?}",
+                      ref_top5.iter().map(|(i, _)| i).collect::<Vec<_>>());
+            let argmax_match = actual_top5[0].0 == ref_top5[0].0;
+            let top5_overlap = actual_top5.iter()
+                .filter(|(i, _)| ref_top5.iter().any(|(j, _)| i == j))
+                .count();
+            eprintln!("        argmax match: {}  /  top-5 overlap: {}/5",
+                      if argmax_match { "YES ✓" } else { "no" }, top5_overlap);
+
             p3_status = Some((res.nrmse, res.max_abs_err, vocab, pass));
 
             kv_sliding.free_gpu(&mut gpu);
