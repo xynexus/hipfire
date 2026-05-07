@@ -377,6 +377,12 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
         13 => DType::MQ4G256,
         14 => DType::MQ8G256,
         15 => DType::MQ6G256,
+        17 => DType::MQ3G256,
+        18 => DType::MQ2G256,
+        // MG4-G256 — Magnum-Gemma 4-bit. Same binary layout as MQ4G256 (136 B/group),
+        // differs only in calibration policy at quant time. Alias to MQ4G256 so the
+        // existing GEMV path handles it without a kernel change.
+        19 => DType::MQ4G256,
         qt => return Err(hip_bridge::HipError::new(
             0, &format!("unsupported quant_type {qt} for {name}"),
         )),
