@@ -1,0 +1,536 @@
+# HFP4 — RDNA-native microscaling FP4 quant format
+
+**Status:** proposal (2026-05-06)
+**Driver:** the 2026-05-06 MoE quant-cliff survey (`docs/investigations/2026-05-06-moe-quant-cliff-survey/`) closed with a clean REFUTED verdict on per-expert Q8 pinning — three different proxy candidate sets (D2 weight-tail at layer 0, D3 activation-magnitude at layers 38-39, D2∪D3 union) all close <3% of the ~5% PPL gap between MQ4G256 and All-Q8 on Qwen3.5/3.6-A3B. The cliff is broadly distributed across all 10,240 routed experts × 40 layers — there is no small set of pathological experts to pin. Better encoding density at the format level is the next lever.
+
+This PRD specifies HFP4 (4-bit microscaling FP) and HFP8 (8-bit sibling) as the format-level response: NVFP4-equivalent block-floating-point quant for RDNA, generalized across gfx1010 → gfx1201 (and forward to gfx1300 / aie2p as those land).
+
+## Rationale
+
+### What Phase 2 told us
+
+The MQ4G256 cliff on Qwen3.5/3.6-A3B is **structural, not localizable**. Per `04-phase2-results-synthesis.md`:
+
+| Variant | 3.5-A3B mean PPL | 3.6-A3B mean PPL |
+|---|---:|---:|
+| V1 (All-MQ4 baseline) | 7.4496 | 7.4607 |
+| V2 (All-Q8 ceiling) | 7.0785 | 7.1653 |
+| V3a (17 D2 layer-0 experts pinned at Q8) | 7.4410 (2.3% closure) | 7.4621 (−0.5%) |
+| V3b (19 D3 layer-38/39 experts pinned at Q8) | 7.4499 (−0.1%) | 7.4603 (+0.1%) |
+| V3c (36 D2∪D3 union pinned at Q8) | 7.4410 (2.3%) | 7.4615 (−0.3%) |
+
+Every candidate set REFUTED. MAD-based outlier ranking and direct activation-magnitude ranking both fail to identify a small high-leverage subset — because each of the 10,240 experts contributes ~0.01% of the total quantization damage at MQ4. The cure has to be applied uniformly across the model, which means the format itself has to encode 4-bit weights with less damage than `min/max-bucket linear quant + FWHT rotation`.
+
+### What MQ4G256+FWHT actually does, and where it leaks
+
+Per `crates/hipfire-quantize/src/main.rs:442-480`:
+- Per-256-element group: apply two-stage FWHT rotation (signs1@seed=42, signs2@seed=1042) to equalize outliers across the group.
+- Affine 4-bit quant: `min_val` and `scale = (max - min) / 15` per group, packed two values per byte.
+- Block layout: 8 bytes header (`f32 scale, f32 min`) + 128 bytes packed nibbles = **136 bytes per 256 elements = 4.25 bits/elem**.
+
+FWHT spreads outliers across the group, but the 4-bit grid is still 16 evenly-spaced buckets in the rotated domain. When the rotated-domain distribution is heavy-tailed (which is what the survey documents for the broadly-distributed MoE experts), the 14 inner buckets cover a thin slice of the rotated mass and the two edge buckets carry the bulk of the tail. Effective signal precision per element drops below the bit budget would suggest.
+
+### Why FP4 (E2M1) wins where INT4+FWHT loses
+
+A microscaling FP4 grid is **logarithmic** in magnitude inside each block: 8 unique values clustered near zero, 8 at the larger end. For a heavy-tailed rotated-domain distribution, log-spacing matches the empirical CDF much better than linear-spacing. NVFP4 (Nvidia's MX-FP4 variant, post-2025 Blackwell) and the OCP-MX-FP4 spec both choose E2M1 + per-block FP8 scale for exactly this reason — and the published Llama-405B / Mixtral PPL results show the format closes most of the FP16↔INT4 gap at the same bit budget.
+
+We have no evidence yet that this carries to MQ4G256+FWHT's specific failure mode on Qwen3.5/3.6-A3B. The Phase 1 (weight-only) milestone of this PRD generates that evidence cheaply (~CPU side, no kernel-engineering cost). If Phase 1 PPL beats MQ4G256+FWHT meaningfully, Phase 2 (kernel) ships. If not, the format is killed and we go to GPTQ/AWQ instead (per Phase 2 synthesis recommendation).
+
+### Cross-arch generalization is the wedge
+
+NVFP4 is a Blackwell moat — Nvidia ships the format only where their Tensor Cores have native FP4 paths. AMD has shipped FP8 wmma on RDNA4 (gfx1200/1201) but no consumer-facing quant format that uses it at frontier scale. HFP4 closes that gap, AND extends to gfx1100/1151 (FP16 wmma fallback) and gfx1010 (no wmma; packed-FP16 dequant on SIMD32). One format, every RDNA generation hipfire targets — that's the shape NVFP4 deliberately doesn't have.
+
+Per CLAUDE.md "Portability matters" rule: every decision must consider all RDNA generations. HFP4 is designed bandwidth-first (storage = 4 bits/elem on every arch); the wmma compute path is best-effort per arch.
+
+## Format spec — HFP4
+
+### Storage layout (block size 32)
+
+| Field | Bits | Notes |
+|---|---:|---|
+| Per-tensor outer scale | 32 (f32) | One value per tensor; outside block payload |
+| Per-block scale | 8 (FP8 E4M3) | One per 32-element block |
+| Per-element value | 4 (FP4 E2M1) | 32 values per block, 16 bytes |
+
+**E2M1 layout per element:**
+- Bit 3: sign
+- Bits 2-1: exponent (2 bits, biased)
+- Bit 0: mantissa (1 implicit + 1 explicit bit → 2 mantissa bits effective)
+
+E2M1 representable set (per OCP MX-FP4 / NVFP4 spec):
+`{±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}` — 16 values total (incl. duplicate −0).
+
+**Per-block bytes:** 32 × 4 / 8 = 16 bytes payload + 1 byte FP8 scale = **17 bytes per 32 elements = 4.25 bits/elem**.
+
+This matches MQ4G256+FWHT's 4.25 bits/elem (136B/256 = 4.25b/elem) **exactly**. No size cost relative to current MQ4 baseline.
+
+### Block size choice — 32 vs 16 vs 256
+
+We choose **32**, against MQ4G256's 256. Three reasons:
+
+1. **WMMA K-tile alignment.** All gfx12 wmma instructions are K=16 or K=32. RDNA3 fp16 wmma is K=16. Block size 32 means one wmma K-step crosses at most two FP4 blocks → register-resident dequant fits in one inner loop iteration without LDS round-trip. Block size 256 would require 8-step partial accumulators in dequant LUT before consumption.
+2. **Per-block scale overhead.** 32-elem block × 1 FP8 byte = 8/32 = 0.25 b/elem. A 16-elem block would be 8/16 = 0.5 b/elem (4.5 b/elem total — bigger than MQ4 baseline). A 256-elem block would be 8/256 = 0.03 b/elem (4.03 b/elem — better size, but distribution-fit is worse: one scale across 256 heavy-tailed values forces wider denormal rounding).
+3. **NVFP4 / OCP-MX-FP4 prior art** uses block size 32 with FP8 per-block scale. Prior-art compatibility makes published PPL numbers transferable; we don't have to re-do calibration sweeps from scratch.
+
+### Per-block scale — E4M3 vs E5M2
+
+We choose **E4M3** for the per-block scale.
+
+- E4M3 dynamic range: ~2⁻⁹ to 2⁸ (≈ 5×10⁻³ to 256). Mantissa: 3 bits.
+- E5M2 dynamic range: ~2⁻¹⁶ to 2¹⁵ (≈ 1.5×10⁻⁵ to 32k). Mantissa: 2 bits.
+
+For block-scaled FP4 weights, the scale represents the **largest absolute value in the block divided by max(E2M1) = 6**. Pre-tensor-scale normalization brings this into ~10⁻¹ to 10¹ for typical bf16 weights. E4M3's range comfortably covers this; the extra mantissa bit gives ~2× tighter quantization of the scale itself, which compounds across all values in the block. NVFP4 also picks E4M3 for the per-block scale; OCP MX uses E8M0 (a power-of-two-only scale, 1 byte). We pick E4M3 over E8M0 for the same reason — MX's coarser scale gives up the heavy-tail fit advantage we need to beat MQ4G256.
+
+Open question: validate empirically that the FP8-scale mantissa bit difference is detectable in PPL. Likely yes from NVFP4 ablations; confirm with Phase 1's NRMSE study.
+
+### Per-tensor outer scale (FP32)
+
+One f32 stored adjacent to the per-block scales. Lets per-block scales stay in a normalized range, avoiding the E4M3 underflow boundary on tensors with very small absolute weights (e.g. embeddings in some archs) and overflow on tensors with extreme outliers.
+
+Cost: 4 bytes per tensor → negligible at billion-param scale.
+
+### Memory layout — scales-first vs interleaved
+
+**Choice: scales-first.** Store the FP8 per-block scales contiguously at the top of the tensor blob, then the FP4 packed values below.
+
+```
+┌────────────────────────────┐
+│ outer_scale (f32, 4 bytes) │
+├────────────────────────────┤
+│ scales[0..n_blocks]        │  n_blocks bytes (FP8 E4M3, one per 32-elem block)
+├────────────────────────────┤
+│ values[0..n_blocks]        │  n_blocks * 16 bytes (packed E2M1 nibbles)
+└────────────────────────────┘
+```
+
+Rationale:
+- GEMV decode-time pattern is "load entire row of weights, dequant inline, MAC against x." Scales contiguous = one coalesced f8 load per row chunk, then nibble-dequant 16-byte stride.
+- WMMA prefill pattern is "tile of K rows × M cols into LDS, wmma." Scales-first lets us prefetch all K scales for a tile before the inner K loop. With interleaved scales, the inner loop has to skip-stride to pick up scale bytes — bad memory access pattern on every arch.
+- HFQ4G256 uses interleaved (scale and zero-point at front of each 136-byte block); MQ4G256 inherits that. Scales-first is a cleaner break that the new GEMM tilings can be designed against.
+- Trade-off: random-access dequant (e.g. per-token expert routing where one block is loaded once) is slightly worse with scales-first because the scale and value live in different cache lines. For MoE expert dispatch this is the dominant pattern; we mitigate by ensuring the (scale, value) pair fits in two consecutive 64-byte cache-line fetches.
+
+(Alternative considered: interleaved per-block — `[scale, 16B values]` repeated. Rejected because GEMM tilings dominate prefill, and the inner-K iteration cost of strided scale loads is higher than the savings on MoE dispatch.)
+
+## Format spec — HFP8
+
+The Q8 sibling to HFP4. Used wherever today's `is_q8_tensor()` test (`crates/hipfire-quantize/src/main.rs:1137`) currently routes to Q8F16 — attention projections, embeddings, lm_head, MoE router (`mlp.gate.weight`), shared-expert gate.
+
+### Two competing designs
+
+**Design A — block-FP8 (mirrors HFP4 layout):**
+- Per-block scale: FP8 E4M3, one per 32-elem block, 1 byte
+- Per-element: FP8 E4M3 (mantissa 3, exponent 4)
+- Per-tensor outer scale: f32
+- Total: 8 + 8/32 = **8.25 bits/elem**
+- Compute path: load FP8 → dequant to FP16 inline (or use native FP8 wmma on gfx12) → MAC
+
+**Design B — pure FP8 (no per-block scale):**
+- Per-element: FP8 E4M3
+- Per-tensor outer scale only: f32
+- Total: **8 bits/elem**
+- Compute path: native FP8 wmma on gfx12 (zero in-kernel dequant), or FP8→FP16 cast on RDNA3
+- Trade-off: gives up the per-block fit advantage that justified per-block scaling for FP4. At 8 bits, the E4M3 grid is fine enough that block-scale doesn't add much.
+
+### Choice — Design B (pure FP8) for HFP8
+
+Two reasons:
+
+1. **gfx12 wmma fp8 is type-symmetric.** Per `feedback_gfx12_wmma_builtin_gotchas` memory entry and `kernels/src/gemm_*_wmma.gfx12.hip`, the gfx12 fp8 wmma path is `wmma_f32_16x16x16_fp8_fp8_w32`. Pure FP8 storage feeds this directly — no in-kernel dequant. Block-FP8 storage forces an FP16 cast in registers, which closes most of the FP8 perf advantage (per `project_gfx12_fp8_bench_2026_05_04.md` — three FP8 attempts already null-resulted at the kernel-shape level).
+2. **The Q8 tensors are precision-sensitive but NOT outlier-heavy.** The router gate, attention projections, embeddings — these are all densely-distributed (no fat tails like down_proj). Pure FP8 E4M3's 7-bit-equivalent precision is sufficient; per-block scaling buys nothing on these tensors. NVFP4's MX-FP8 sibling (used by NVIDIA for the "non-FP4" tensors in their stack) is also pure FP8 with no per-block scale.
+
+### HFP8 layout
+
+```
+┌─────────────────────────┐
+│ outer_scale (f32, 4 B)  │
+├─────────────────────────┤
+│ values[0..n_elements]   │  n_elements bytes (FP8 E4M3)
+└─────────────────────────┘
+```
+
+Per-tensor outer scale absorbs the dynamic-range mismatch between bf16-weight magnitudes and FP8's [2⁻⁹, 2⁸] window. No per-block scale storage cost, just 4 bytes of outer scale per tensor.
+
+### E4M3 vs E5M2 for HFP8
+
+E4M3. Same reasoning as the per-block scale of HFP4: more mantissa for the value range that weights actually inhabit, at acceptable dynamic range. E5M2's wider dynamic range is for activations (where occasional 10⁴ excursions exist on layer-39 Super Experts per the survey D3 data); for weights, the range advantage is wasted.
+
+If HFP8 ever ships for activations / KV cache, that path uses E5M2 — but that's a future PRD, not this one.
+
+## Hardware support matrix
+
+The format ships **storage-uniform** across all arches; the compute path differs.
+
+| Arch | gfx ID | Native FP8 wmma? | Native FP4 wmma? | HFP4 path | HFP8 path |
+|---|---|:---:|:---:|---|---|
+| RDNA 1 | gfx1010 | no | no | dequant→fp16, packed-fp16 dot | dequant→fp16, packed-fp16 dot |
+| GCN5 / Vega | gfx906 | no | no | dequant→fp16, packed-fp16 dot | dequant→fp16, packed-fp16 dot |
+| MI100 | gfx908 | no | no | dequant→fp16, mfma fp16 K=16 | dequant→fp16, mfma fp16 K=16 |
+| MI250 / MI210 | gfx90a | no | no | dequant→fp16, mfma fp16 K=16 | dequant→fp16, mfma fp16 K=16 |
+| CDNA3 / MI300 | gfx942 | yes (mfma) | no | dequant→fp8, mfma fp8_fp8 | direct fp8 mfma |
+| RDNA 3 | gfx1100/1101 | no | no | dequant→fp16, wmma fp16 K=16 | dequant→fp16, wmma fp16 K=16 |
+| RDNA 3.5 | gfx1151 | no | no | dequant→fp16, wmma fp16 K=16 | dequant→fp16, wmma fp16 K=16 |
+| RDNA 4 | gfx1200/1201 | yes (wmma) | no (closest is iu4 K=32) | dequant→fp8, wmma fp8_fp8 K=16 | direct fp8 wmma K=16 |
+| AIE-2P | aie2p | n/a (NPU AIE2) | n/a | NPU bypass: i8 GEMM lane (see `kernels/aie2p/`) | NPU bypass |
+
+### What "no native FP4" means for gfx12
+
+gfx12 has **`v_wmma_i32_16x16x32_iu4`** (the iu4 K=32 wmma probed at PR #140) but not a true FP4 wmma. The iu4 path forces both A and B to int4, which destroys the fp16-trained model quality (per `project_gfx12_iu4_breakthrough_2026_05_04.md` — destructive on FP16-trained models, opt-in only).
+
+For HFP4 on gfx12 we explicitly do **NOT** use iu4 wmma. The path is:
+1. Load FP4 nibbles from VRAM (4 bits/elem on the wire — full bandwidth win).
+2. Decode-LUT to FP8 in registers (16-entry LUT keyed by E2M1 sign+exp+mantissa = 4 bits → FP8 E4M3 byte).
+3. Apply per-block FP8 scale (FP8 × FP8 → FP16 in registers).
+4. Issue `wmma_f32_16x16x16_fp8_fp8_w32_gfx12` against the activation tile.
+
+This gives storage = 4 bits/elem (matches MQ4 bandwidth), compute = native FP8 wmma (≈ 2× FP16 throughput on paper). The bandwidth saving is the dominant lever; the compute is gravy.
+
+### What "no native FP8" means for gfx1100 / gfx1151 / gfx1010
+
+For HFP4 on RDNA3/3.5/1: load FP4 nibbles → dequant directly to FP16 via 16-entry LUT (skip the FP8 intermediate) → wmma_f32_16x16x16_f16 (gfx1100/1151) or packed-fp16 dot product on simd32 (gfx1010, no wmma). Storage win is the same 4 bits/elem.
+
+The LUT-to-FP16 path costs ~2 ops/elem (LUT lookup + multiply by per-block scale) — well under the bandwidth-bound budget at decode time. Verification of dispatch overhead per arch is in Phase 2's kernel-fit work.
+
+## Kernel-fit notes
+
+### Dequant kernel design
+
+A single `dequant_hfp4_to_fp16.hip` (mirrors `kernels/src/dequant_hfq4g256_to_f16.hip`) parameterized over block size at the JIT level. Output bf16 OR fp16 via template arg. One block of 32 dequants per workgroup; LUT loaded into LDS once per workgroup launch (16 fp16 entries × 2 bytes = 32 bytes — trivial).
+
+Pseudocode:
+```
+__global__ dequant_hfp4_to_fp16(
+    const uint8_t* values,    // packed nibbles
+    const uint8_t* scales,    // FP8 E4M3 per block
+    float outer_scale,
+    half* out,
+    int n_elem
+) {
+    __shared__ half lut[16];
+    if (tid < 16) lut[tid] = e2m1_to_fp16(tid);  // build E2M1 → FP16 LUT
+    __syncthreads();
+
+    int block_id = ...;
+    half block_scale = e4m3_to_fp16(scales[block_id]) * outer_scale;
+    int v_off = block_id * 16 + (tid % 16);   // 16 bytes per block
+    uint8_t pair = values[v_off];
+    half lo = lut[pair & 0xF] * block_scale;
+    half hi = lut[(pair >> 4) & 0xF] * block_scale;
+    out[block_id * 32 + 2 * (tid % 16)]     = lo;
+    out[block_id * 32 + 2 * (tid % 16) + 1] = hi;
+}
+```
+
+### GEMV path (decode hot loop)
+
+Mirror the HFQ4G256 GEMV pattern: dequant-on-fly in registers, no LDS round-trip.
+
+- Load 16 packed bytes (one block of 32 weights) per work-item.
+- LUT lookup into 16-entry FP16 table to get 32 dequantized weights in registers.
+- Multiply by block scale (single FP16 mul broadcast across the block).
+- MAC against the 32 corresponding x activations (also in registers — x is small at decode batch=1).
+
+Per-arch optimization knobs:
+- gfx1100/gfx1151 (RDNA3, RDNA 3.5): wave64 MAC reductions (already in `kernels/src/fused_gate_up_hfq4g256_wave64.hip`); scale broadcast via `__shfl_xor`.
+- gfx1201 (RDNA4): same as gfx1100 plus dp4a-style packed-FP16 mul-accum (already in `kernels/src/fused_gate_up_hfq4g256_wave64_dp4a.hip` for HFQ4 — port to HFP4).
+- gfx1010 (RDNA1): wave32, no wave64; LUT in LDS instead of registers (RDNA1 has fewer VGPRs).
+- gfx942 (CDNA3): wave64 + register-preallocate the LUT; same dispatch shape as HFQ4 wave64 port.
+
+### GEMM/prefill path
+
+Tile-based: load K-tile of weights into LDS as **dequantized FP16** (K=16 or K=32 to match wmma K), then issue wmma. Per-tile:
+
+1. Workgroup loads K × M packed FP4 + per-block FP8 scales from VRAM into shared registers.
+2. Dequant via LUT into a K × M bf16/fp16 LDS tile (using all threads in the workgroup; 32 elements per block per thread).
+3. Wait at LDS barrier.
+4. Inner-K loop: wmma against the activation tile (already in LDS from a parallel load path).
+
+Per-arch fast paths:
+- gfx12 with native FP8 wmma: skip the dequant-to-fp16 step — keep the dequanted values as FP8 in registers, issue `wmma_fp8_fp8`. This is the lever that the vision doc calls out: storage FP4 + compute FP8 + accumulator F32.
+- gfx942 with mfma fp8: same fused path on CDNA3 — `mfma_f32_16x16x32_fp8_fp8`.
+- gfx1100/gfx1151: dequant to fp16, wmma fp16. Bandwidth win still applies (4 bits/elem on wire vs 16 bits/elem for FP16 baseline = 4× bandwidth-equivalent decode).
+
+### Existing format-zoo integration points
+
+The format slots into the existing zoo at:
+
+- `crates/hipfire-quantize/src/main.rs:1010-1030` — add `HFP4_E2M1_B32 = 19` and `HFP8_E4M3 = 20` to `enum QuantType`.
+- `crates/hipfire-quantize/src/main.rs:1137` — `is_q8_tensor()` becomes `is_hfp8_tensor()` for the HFP path; same selector logic, different default.
+- `crates/hipfire-quantize/src/main.rs:2073` — add `else if use_hfp4 { ... quantize_hfp4(&f32_data) ... }` branch in the format dispatch.
+- `crates/rdna-compute/src/dispatch.rs:289-311` — add `HFP4_E2M1_B32` and `HFP8_E4M3` to `enum DType` with sizes 1 byte (byte-level addressing, like all the existing block-quant types).
+- New quant fns in `crates/hipfire-quantize/src/main.rs` adjacent to existing `quantize_mq4g256` / `quantize_hfq4g256` (around line 580):
+  - `fn quantize_hfp4_e2m1_b32(f32_data: &[f32]) -> Vec<u8>` — emit outer-scale + scales-block + values-block.
+  - `fn quantize_hfp8_e4m3(f32_data: &[f32]) -> Vec<u8>` — emit outer-scale + values.
+  - `fn fp32_to_e4m3(x: f32) -> u8` and `fn e4m3_to_f32(b: u8) -> f32` helpers.
+  - `fn fp32_to_e2m1(x: f32) -> u8` and `fn e2m1_to_f32(n: u8) -> f32` helpers (4-bit values; pack two per byte).
+
+## Validation plan
+
+Each rollout-phase ship gate is a measurable threshold on one of these instruments. No phase ships without its gate cleared.
+
+### Round-trip NRMSE study
+
+Per-tensor NRMSE = √MSE / √var(ref) on the same `phase2_eval_corpus.jsonl` slice that the survey ran. Compare HFP4 vs MQ4G256+FWHT on bit-identical f32 inputs.
+
+- Reference: `crates/hipfire-quantize/src/main.rs:442-480` (current MQ4G256+FWHT) — already vectorized for the survey's D1 NRMSE measurement.
+- New: HFP4 round-trip — quantize bf16/f32 → HFP4 bytes → dequantize back to f32, NRMSE vs original.
+- Tensors covered: routed-expert `down_proj` (the survey's pathology surface), the broader weight zoo (q/k/v/o, gate/up, lm_head, embed) for control.
+- **Ship gate (Phase 1):** mean NRMSE on routed-expert weights ≤ MQ4G256+FWHT's NRMSE on the same tensors. Median within ±5% of the MQ4 baseline (allow ties on dense-distributed tensors; the win has to come from the heavy-tail tensors).
+
+### Perplexity comparison
+
+Run V_baseline (current `--format mq4`) vs V_HFP4 (new `--format hfp4`) on:
+- `scripts/quant-survey/phase2_eval_corpus.jsonl` (100 records, general-domain wikitext slice; matches Phase 2's pre-registered eval).
+- `scripts/quant-survey/phase2_eval_corpus_agentic.jsonl` (86 records, agentic prompts including #171 reproducer).
+
+PPL measured with the same fixed-prefix evaluation harness Phase 2 used (`scripts/quant-survey/phase2_runner.py` after the d7866f6 layer-0 falsy-int fix).
+
+Models in the matrix:
+- Qwen3.5-9B (dense control)
+- Qwen3.5-A3B (the survey model — primary)
+- Qwen3.6-A3B (cross-model concordance check — primary)
+- Qwen3.5-27B (dense long-tail check)
+
+**Ship gate (Phase 1):** on Qwen3.5-A3B + Qwen3.6-A3B,
+  - HFP4 PPL closes ≥ 50% of the All-Q8 → All-MQ4 gap (~0.18 PPL on 3.5-A3B, ~0.15 on 3.6-A3B).
+  - On dense models (9B / 27B), HFP4 PPL within ±0.5% of the MQ4G256 baseline (no regression).
+
+If HFP4 closes ≥ 80% of the gap, fast-track Phase 2.
+
+### Coherence battery
+
+`./scripts/coherence-gate.sh` against the fixed prompt set, plus `./scripts/coherence-gate-dflash.sh` if any dflash code path is touched. Hard fail on panics, zero tokens, timeouts.
+
+The byte-identical generation criterion does NOT apply (HFP4 is intentionally a different number than MQ4G256). Reviewers eyeball each model in the report for fluency, on-topic, no verbatim loops.
+
+**Ship gate (any phase):** all models in matrix produce coherent multi-paragraph output on every coherence prompt. No token-attractors, no n-gram loops triggered, no premature EOS.
+
+### Issue #171 reproducer
+
+The `agent_prompt` from #171 (200-word agentic prompt that triggers attractor on 3.6-A3B at MQ4) — run on V_baseline and V_HFP4. Must NOT regress; ideally cures the attractor.
+
+**Ship gate (Phase 1):** V_HFP4 on 3.6-A3B does not exhibit the #171 token-attractor. If V_HFP4 attractor-loops here while V_baseline doesn't, format ships only with a documented kill of #171 path on this format.
+
+### Speed gate (Phase 2 onward)
+
+Per `docs/methodology/perf-benchmarking.md`. Ship gate on speed:
+- Phase 2 GEMV-only: HFP4 decode tok/s within ±2% of MQ4G256 GEMV decode tok/s on each arch in the matrix (same model, same prompt md5).
+- Phase 3 GEMM/prefill: HFP4 prefill tok/s ≥ MQ4G256 prefill tok/s on each arch. On gfx12 with native FP8 wmma path, target +20% prefill.
+
+## Rollout phases
+
+PRs are sized so each one is independently revertable, ships behind a `--format hfp4` opt-in flag (no default change until Phase 4), and changes nothing observable when the new format isn't selected.
+
+### Phase 1 — weight-only HFP4 (CPU quant + on-load dequant)
+
+**Ship: validate format quality at zero kernel-engineering cost.**
+
+Scope:
+- Add `quantize_hfp4_e2m1_b32` and `quantize_hfp8_e4m3` in `crates/hipfire-quantize/src/main.rs`.
+- Add `--format hfp4` flag (treats Q8-side via HFP8, MQ4-side via HFP4).
+- Add `QuantType::HFP4_E2M1_B32` and `QuantType::HFP8_E4M3` to the on-disk `.hfq` enum (`crates/hipfire-quantize/src/main.rs:1010-1030`).
+- Add `DType::HFP4_E2M1_B32` and `DType::HFP8_E4M3` in `crates/rdna-compute/src/dispatch.rs:289` with size = 1 byte.
+- **On-load dequant**: in `crates/hipfire-runtime/src/hfq.rs` weight-load path, when reading HFP4/HFP8 tensors, dequantize on CPU to bf16 and upload as bf16. No new kernels yet — engine sees bf16 weights at runtime.
+
+Validation:
+- NRMSE study on phase2 corpora (Q3.5/3.6-A3B routed experts).
+- PPL comparison on phase2_eval_corpus.jsonl + phase2_eval_corpus_agentic.jsonl across the four-model matrix.
+- Coherence gate.
+- Issue #171 reproducer on Q3.6-A3B.
+
+**Ship gate (Phase 1):**
+- NRMSE on routed-expert weights ≤ MQ4G256+FWHT's NRMSE.
+- HFP4 PPL closes ≥ 50% of the All-Q8 ↔ All-MQ4 gap on both A3B models (~0.18 PPL on 3.5-A3B, ~0.15 on 3.6-A3B).
+- Dense-model PPL within ±0.5% of MQ4 baseline.
+- Coherence-gate clean.
+- #171 attractor not regressed.
+
+Estimated effort: 2-3 weeks (CPU quant code + on-load dequant + run the eval matrix; no GPU kernel work).
+
+### Phase 2 — HIP dequant kernel + per-block GEMV
+
+**Ship: real perf at decode.**
+
+Scope:
+- New `kernels/src/dequant_hfp4_to_fp16.hip` (and FP8 variant on gfx12).
+- New `kernels/src/gemv_hfp4_b32.hip` — decode-time GEMV, dequant-on-fly in registers. Mirror `kernels/src/fused_gate_up_hfq4g256.hip` and its wave64 / dp4a variants.
+- Per-arch wave64 / wave32 / LDS-LUT variants as listed in "Kernel-fit notes" above.
+- Wire HFP4/HFP8 dispatch in `crates/rdna-compute/src/dispatch.rs` and per-arch GEMV selectors in the runtime crate.
+- Replace Phase 1's on-load dequant with on-demand register-resident dequant.
+
+Validation:
+- Speed gate per arch (decode tok/s within ±2% of MQ4G256).
+- PPL non-regression vs Phase 1's on-load dequant (same numbers, since only the kernel changed).
+- Coherence gate.
+
+**Ship gate (Phase 2):**
+- Decode tok/s within ±2% of MQ4G256 on each arch in the speed-baseline matrix.
+- PPL identical (within numerical noise) to Phase 1.
+- Coherence-gate clean.
+
+Estimated effort: 4-6 weeks (one kernel × N arches × wave64/wave32/dp4a variants + the speed-bench loop).
+
+### Phase 3 — fused FP8/FP4 wmma GEMM for prefill on gfx12 / gfx942
+
+**Ship: squeeze the last 30-40% perf out of native FP8 wmma.**
+
+Scope:
+- New `kernels/src/gemm_hfp4_residual_wmma.gfx12.hip` — storage-FP4 → register-FP8 → wmma_fp8_fp8_w32_gfx12. Mirror `kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip`.
+- CDNA3 / mfma counterpart: `kernels/src/gemm_hfp4_residual_mfma.gfx942.hip`.
+- gfx1100/gfx1151 path uses Phase 2's dequant-to-fp16 + wmma fp16; no new kernel needed (just use the prefill GEMM dispatch).
+
+Validation:
+- Prefill speed-gate: gfx12 / gfx942 prefill tok/s ≥ +20% vs MQ4G256 baseline.
+- gfx1100/gfx1151 prefill tok/s ≥ MQ4 baseline (no regression — bandwidth win matches but no compute win since no native FP8 wmma).
+- Coherence-gate clean.
+
+**Ship gate (Phase 3):**
+- gfx12 prefill tok/s ≥ +20% vs MQ4G256 (the FP8-compute lever justifies the kernel work).
+- gfx942 prefill tok/s ≥ +15% vs MQ4G256.
+- gfx1100/gfx1151 ≥ 0% (no regression).
+- Coherence-gate clean.
+
+Estimated effort: 6-8 weeks (wmma kernel work historically takes 3-4 weeks per arch — see `project_gfx12_fp8_bench_2026_05_04.md` for prior FP8 attempt difficulty curve).
+
+### Phase 4 — HFP8 sibling rolled in; replaces Q8F16 for routers/embed
+
+**Ship: `--format hfp4` becomes the default for new model conversions; Q8F16 deprecated.**
+
+Scope:
+- Update `is_q8_tensor()` selector to dispatch to `is_hfp8_tensor()` (same logic, different format target).
+- Remove the on-load dequant path entirely — HFP4/HFP8 are first-class formats end-to-end.
+- Migration: existing `.mq4.hfq` files keep working (no breaking change); new conversions default to `--format hfp4`.
+
+Validation:
+- Speed-gate clean at the matrix level.
+- Coherence-gate clean.
+- Documentation: `docs/methodology/quant-formats.md` updated.
+
+Estimated effort: 2 weeks (mostly plumbing + docs).
+
+## Open questions
+
+### Is OCP-MX-FP4 the same as NVFP4?
+
+**Mostly yes, with one wrinkle.** OCP MX-FP4 (Open Compute Project Microscaling Specification v1.0, ratified Sep 2023, published by AMD/NVIDIA/Microsoft/Meta/Intel/Qualcomm/etc.) defines E2M1 + per-block scale, but the per-block scale is **E8M0** (powers-of-two only, 1 byte). NVFP4 (NVIDIA Blackwell, Mar 2024) defines E2M1 + per-block **E4M3** scale.
+
+E4M3 (3 mantissa bits, 4 exponent bits) gives ~8× finer scale precision than E8M0 (0 mantissa, 8 exponent). For heavy-tailed distributions, this matters — NVIDIA's published Llama-3-405B PPL numbers show NVFP4 closing the FP16 gap further than MX-FP4.
+
+**Decision: HFP4 follows NVFP4 (E4M3 per-block scale).** OCP MX-FP4 compatibility is a non-goal — we don't have to consume MX-FP4 weights from external pipelines. Going further: if Phase 1's PPL ablation shows E8M0 is sufficient (~no statistical difference), revisit and switch to E8M0 for the marginal storage win (1B/block stays the same — no actual size win, scratch that).
+
+Cite: OCP MX spec v1.0 — https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+NVFP4 reference: NVIDIA Blackwell whitepaper, March 2024.
+
+### Does AMD's gfx12 fp8 wmma support both E4M3 and E5M2 transparently?
+
+**Likely separate intrinsics, not transparent.** The gfx12 wmma builtins are `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` (E4M3) and `__builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12` (E5M2 / "bf8" in AMD nomenclature) per the LLVM AMDGPU backend. Mixed E4M3 × E5M2 is `wmma_fp8_bf8` and `wmma_bf8_fp8` — four distinct opcodes total.
+
+For HFP4-on-gfx12, weights and activations are both E4M3 by design (vision doc explicitly chose `wmma_fp8_fp8`). No mixed-format paths in scope.
+
+**Action item for Phase 3:** confirm by ISA dump / lld build of a probe kernel before designing the prefill GEMM. Same pattern as the gfx12 iu4/iu8 probe at PR #140 (`feat/probe-gfx12-wmma-iu4-k32`).
+
+### Memory layout interaction with DLB+wave64 on CDNA3
+
+CDNA3's wave64 + double-LDS-buffer (DLB) prefill kernels (per `project_rocblas_mfma_validation` memory entry) want **K-major contiguous weight loads**. Scales-first layout puts the per-block FP8 scales contiguous and separate from the values; the inner-K iteration has to interleave a scale-load (1B per 32 elements = small) with a values-load (16B per 32 elements). At wave64 × DLB, the scale load is a single coalesced 64-byte per-CU per-tile fetch — very cheap. No expected interaction issue, but need a smoke-perf bench in Phase 2 on MI300X to confirm.
+
+If it's a problem, fallback layout is "interleaved": `[1B scale, 16B values]` repeated, which restores scale-locality at the cost of strided GEMV scale loads.
+
+### E8M0 vs E4M3 per-block scale ablation
+
+Phase 1 should run a small ablation: HFP4 with E4M3 scale vs HFP4 with E8M0 scale on a single A3B model. If PPL difference is below noise, switch to E8M0 for OCP-MX compat (and faster scale-load — log2 dequant is a single shift). If E4M3 wins, lock E4M3 and document.
+
+### Small-model headroom
+
+Phase 1 PPL on Qwen3.5-9B is a control: dense models historically don't show the MoE cliff. If HFP4 ALSO no-ops on 9B (PPL identical to MQ4), that's expected. If HFP4 WINS on 9B too, we have a stronger case for making it default (Phase 4 acceleration).
+
+If HFP4 LOSES on 9B (regression > 0.5%), that's a kill signal — format design is bad on densely-distributed tensors and the FP4 grid hurts where MQ4 was fine.
+
+## Rejection / kill criteria
+
+The format does NOT ship if:
+
+1. **Phase 1 PPL fails the gap-closure gate.** If V_HFP4 closes < 30% of the MQ4 ↔ Q8 gap on either A3B model, kill. Phase 2 synthesis already named GPTQ/AWQ as the alternative path; pivot there.
+2. **Phase 1 dense-model regression > 0.5%.** If HFP4 hurts Qwen3.5-9B or Qwen3.5-27B PPL by more than 0.5% relative to MQ4G256, kill. Format design is fundamentally wrong for densely-distributed tensors.
+3. **Phase 1 coherence-gate fail.** If any model in the matrix produces token-attractors or n-gram loops on HFP4 that don't exist on MQ4, kill.
+4. **Phase 2 GEMV speed regression > 5%.** If on-demand dequant kernel costs more than 5% decode tok/s vs MQ4 GEMV on any arch, the format ships at Phase 1 (CPU dequant + bf16 upload) only — the `.hfq` files are valid storage but the GPU runtime doesn't use them at scale. This is a soft kill; format isn't dead but the perf story is.
+5. **Phase 3 gfx12 fused FP8 wmma fails to deliver +20% prefill.** Same precedent as the FP8 GEMM null results in `project_gfx12_fp8_bench_2026_05_04.md` — three attempts already null-resulted. If a fourth attempt also fails, ship at Phase 2 (decode-only win) and document gfx12 FP8 wmma as a closed door.
+6. **#171 attractor regression.** If V_HFP4 reproduces or worsens the #171 token-attractor on Q3.6-A3B that V_baseline doesn't, kill.
+7. **Cross-arch portability fails.** If HFP4 ships on gfx12 only and the gfx1100/gfx1151/gfx1010 paths don't get the same bandwidth win, the format is "RDNA4 moat" instead of "cross-arch wedge" — ship as a gated flag, NOT as default. Per the user's vision-doc framing, cross-arch generalization is the wedge versus NVFP4-on-Blackwell-only; without it, the value prop collapses.
+
+## Implementation effort estimate
+
+| Phase | Scope | Estimate | Risk |
+|---|---|---|---|
+| Phase 1 | CPU quant + on-load dequant + eval matrix | 2-3 weeks | low (no kernel work, all eval) |
+| Phase 2 | HIP dequant kernel + per-block GEMV per arch | 4-6 weeks | medium (per-arch tuning per past HFQ4 history) |
+| Phase 3 | Fused FP8/FP4 wmma GEMM for gfx12+gfx942 | 6-8 weeks | high (FP8 wmma history null-resulted three times) |
+| Phase 4 | HFP8 sibling roll-in + default flip | 2 weeks | low (plumbing) |
+
+**Total: 14-19 weeks (3.5-5 months) for full rollout.**
+
+Phase 1 alone (~3 weeks) gates the entire program. If the PPL evidence isn't there, Phases 2-4 don't start. This is the cheap-eval-first design that Phase 2 of the survey explicitly recommended over more per-expert pinning work.
+
+## Out of scope
+
+- **HFP4 for activations / KV cache.** Phase 5+ work; would require a different format-design ablation (E5M2 dynamic range matters for activations; not for weights).
+- **HFP4 for training (forward+backward).** Inference only for this PRD. NVFP4 has documented training recipes; that's a separate PRD if/when hipfire's training path lands.
+- **GPTQ / AWQ integration.** Per Phase 2 synthesis, these are the alternative path if HFP4 fails the gate. Not in this PRD's scope; would be a parallel PRD.
+- **OCP MX-FP4 / MX-FP8 export compatibility.** No external pipelines consume hipfire's `.hfq` files; bidirectional MX compat isn't needed. If a future tooling reason emerges, add an MX-export sidecar.
+- **iu4 K=32 wmma on gfx12.** Per `project_gfx12_iu4_breakthrough_2026_05_04.md` — destructive on FP16-trained models, opt-in only, NOT used for HFP4. Stays as a separate experimental flag.
+- **Sub-4-bit formats (HFP3, HFP2).** Phase 5+ work. The MQ3G256 / MQ2G256 zoo already exists; if HFP4 wins, the 3-bit / 2-bit FP variants follow the same template, but separate PRD.
+- **Aie2p NPU integration.** The NPU is i8 (per `kernels/aie2p/`, `matmul_i8_512_32c` and `matmul_i8_1024_32c`); HFP4/HFP8 are floating-point formats and don't map cleanly. NPU stays on i8 for the foreseeable future.
+
+## Sequencing notes
+
+- Phase 1 is shippable independently and gates everything else. Start there.
+- Phase 2 depends on Phase 1 ship-gate clean.
+- Phase 3 depends on Phase 2 ship-gate clean (need the GEMV path proven before touching prefill).
+- Phase 4 depends on Phase 3 ship-gate clean (no point flipping default until prefill is on the new format).
+- HFP8 (Phase 4) could in principle run parallel to Phases 2-3 if eng capacity allows. The router/embed Q8 surface is small (~1% of model bytes); HFP8 perf doesn't matter much, but quality has to clear coherence-gate.
+- All four phases sequence on a single branch (`feat/hfp4-format`) with one PR per phase. Each PR is its own ship-gate checkpoint.
+
+## Risks
+
+- **NVFP4 calibration recipe doesn't transfer.** NVFP4's published numbers are on Llama-405B and Mixtral, not Qwen3.5/3.6 MoE. Phase 1 NRMSE + PPL is the empirical check; if calibration is required (PTQ on a corpus, like AWQ), the scope grows by ~2-4 weeks. Mitigation: start Phase 1 with naive round-trip; add PTQ calibration as Phase 1.5 if the naive number falls short.
+- **gfx12 FP8 wmma underperforms.** Three prior attempts at gfx12 FP8 wmma null-resulted (per `project_gfx12_fp8_bench_2026_05_04.md`). The HFP4 storage win is independent of the compute path, but Phase 3 is exposed to the same risk. Mitigation: ship Phase 2 (decode-only win) standalone; treat Phase 3 as upside, not required.
+- **Per-arch dequant kernel proliferation.** The format requires N kernels (one per arch × wave-mode), similar to HFQ4G256's current zoo. Mitigation: parameterize via JIT template args (block size, output dtype, wave mode, dp4a on/off); aim for ≤ 4 source files total.
+- **HFP4 vs MQ4G256+FWHT statistical noise.** A 0.05 PPL win is plausibly within noise on the eval corpus. Mitigation: run 3 trials per variant per model (matching Phase 2's 3-trial bit-identity check); report mean ± stddev. Treat <5σ wins as inconclusive, not ship gates.
+- **Cross-arch generalization fails on gfx1010.** RDNA1 has fewer VGPRs and no wmma at all. The dequant-to-fp16 path may run out of VGPRs and spill. Mitigation: include gfx1010 in Phase 2 speed-gate. If it spills, fall back to LDS-LUT variant; if even that loses, document gfx1010 as "format supported, perf parity only" and do not ship as default for gfx1010.
+
+## Appendix — comparison table to existing format zoo
+
+| Format | Bits/elem | Block size | Per-block scale | Outer scale | Layout | Native wmma | gfx1010 | gfx1100 | gfx12 | gfx942 |
+|---|---:|---:|---|---|---|---|:---:|:---:|:---:|:---:|
+| F16 | 16 | n/a | n/a | n/a | dense | yes | n/a | fp16 | fp16 | fp16 mfma |
+| Q8F16 | 8.25 | 32 | f16 | n/a | block-affine | no | dq→fp16 | dq→fp16 | dq→fp16 | dq→fp16 |
+| HFQ4G256 | 4.25 | 256 | f32+f32 | n/a | interleaved | no (dequant) | dq→fp16 | dq→fp16 | dq→fp16 (or iu4 opt-in) | dq→fp16 |
+| HFQ6G256 | 6.25 | 256 | f32+f32 | n/a | interleaved | no | dq→fp16 | dq→fp16 | dq→fp16 | dq→fp16 |
+| MQ4G256 (FWHT) | 4.25 | 256 | f32+f32 | n/a | interleaved | no | dq→fp16 | dq→fp16 | dq→fp16 | dq→fp16 |
+| MQ8G256 | 8.06 | 256 | f32+f32 | n/a | interleaved | no | dq→fp16 | dp4a | dp4a | mfma int8 |
+| **HFP4 (proposed)** | **4.25** | **32** | **fp8 E4M3** | **f32 / tensor** | **scales-first** | **fp8 wmma (gfx12, gfx942)** | dq→fp16 | dq→fp16 | wmma fp8_fp8 | mfma fp8_fp8 |
+| **HFP8 (proposed)** | **8.0** | **n/a** | **n/a** | **f32 / tensor** | **dense** | **fp8 wmma (gfx12, gfx942)** | dq→fp16 | dq→fp16 | wmma fp8_fp8 | mfma fp8_fp8 |
+
+Two observations from the comparison:
+1. HFP4 matches MQ4G256 bits/elem **exactly** (4.25). No size cost.
+2. HFP4 is the **only** format in the zoo with a native wmma path on gfx12 (via the FP8 cast). Every other format dequants to FP16 in registers before issuing wmma. This is the perf wedge that justifies Phase 3.
+
+## Cross-reference
+
+- `docs/investigations/2026-05-06-moe-quant-cliff-survey/04-phase2-results-synthesis.md` — empirical evidence motivating this PRD
+- `docs/investigations/2026-05-06-moe-quant-cliff-survey/02-survey-results.md` — D2 + D3 survey findings, broad-distribution evidence
+- `docs/plans/engine-modularization.prd` — PRD style/structure mirrored here
+- `docs/plans/mq-sub4bit-prd.md` — adjacent format work (MQ3 / MQ2 sub-4-bit zoo)
+- `crates/hipfire-quantize/src/main.rs:442-480` — current MQ4G256+FWHT impl, the baseline this PRD measures against
+- `crates/hipfire-quantize/src/main.rs:1010-1030` — `enum QuantType` integration point
+- `crates/hipfire-quantize/src/main.rs:1137` — `is_q8_tensor()` selector, becomes `is_hfp8_tensor()` for HFP path
+- `crates/hipfire-quantize/src/main.rs:2073` — format dispatch branch (add `else if use_hfp4 { ... }`)
+- `crates/rdna-compute/src/dispatch.rs:289-311` — `enum DType` integration point
+- `kernels/src/dequant_hfq4g256_to_f16.hip` — model for the new `dequant_hfp4_to_fp16.hip`
+- `kernels/src/fused_gate_up_hfq4g256_wave64.hip` — model for the new HFP4 GEMV wave64 variant
+- `kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip` — model for the gfx12 fused FP8 prefill GEMM
+- `scripts/quant-survey/phase2_eval_corpus.jsonl` — Phase 1 PPL eval corpus (100 records)
+- `scripts/quant-survey/phase2_eval_corpus_agentic.jsonl` — agentic prompt PPL eval corpus (86 records)
+- `scripts/quant-survey/phase2_runner.py` — eval harness (post-d7866f6 layer-0 fix)
+- arXiv 2507.23279 — "Super Experts in MoE" (motivating paper for D3, REFUTED on Qwen family per Phase 2)
+- GitHub issue #171 — fivetide's router-Q8 finding, attractor reproducer
+- OCP Microscaling Formats spec v1.0 — https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+- NVIDIA Blackwell whitepaper (March 2024) — NVFP4 reference
