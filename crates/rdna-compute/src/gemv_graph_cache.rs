@@ -2,14 +2,27 @@
 //!
 //! See `docs/plans/gemv-graph-cache.prd` for the full design.
 //!
-//! **PR2 (this file):** capture-on-second-call / replay-on-third-call for
+//! **PR2:** capture-on-second-call / replay-on-third-call for
 //! `gemv_hfq4g256` (plain) only. The cache stores Box-allocated
 //! `kernarg`, `kernarg_len`, and `extra[5]` arrays per shape so HIP graph
 //! capture can record stable pointers (see PoC at
 //! `crates/hsa-bridge/examples/hip_graph_gemv_poc.rs:524-555`).
 //!
-//! **PR3:** extend to fused_qkv / fused_qkvza / fused_gate_up.
-//! **PR4:** stream-affinity invalidation + LRU bound.
+//! **PR3 (this file):** extend the same strict-match-or-evict cache to the
+//! four fused kernel families that drive the production decode hot path:
+//!   - `gemv_hfq4g256_residual` (wo / w_down projections, ~24 calls/step on 9B)
+//!   - `fused_qkv_hfq4g256` (FA layer preamble, 6 calls/step on 0.8B)
+//!   - `fused_qkvza_hfq4g256` (LA layer preamble, ~18 calls/step on 0.8B)
+//!   - `fused_gate_up_hfq4g256` (MLP preamble, ~24 calls/step)
+//!
+//! Per-family kernarg byte layout is encoded in `family_layout()` below
+//! and consumed by the per-family `Gpu::try_dispatch_*_via_graph_cache`
+//! wrappers in `dispatch.rs`. The `dispatch()` entry point is already
+//! family-agnostic — only the wrapper that builds the kernarg blob and
+//! shape needs to change per family.
+//!
+//! **PR4:** stream-affinity invalidation + LRU bound + node-update FFI
+//! (escapes the strict-match-or-evict ceiling for unstable-pointer regimes).
 
 use hip_bridge::{Function, HipResult, HipRuntime, Stream};
 use std::collections::HashMap;
@@ -428,6 +441,8 @@ impl GemvGraphCache {
     ///
     /// Variant collapse rules:
     /// - `gemv_hfq4g256` / `_wide` / `_multirow_r{2,4,8}` → `"gemv_hfq4g256"`
+    /// - `gemv_hfq4g256_residual` / `_wave64` / `_wave64_prefetch` /
+    ///   `_multirow_r{2,4,8}` → `"gemv_hfq4g256_residual"`
     /// - `fused_qkv_hfq4g256` / `_wave64` / `_wave64_dp4a` → `"fused_qkv_hfq4g256"`
     /// - `fused_qkvza_hfq4g256` / `_wave64` / `_wave64_dp4a` → `"fused_qkvza_hfq4g256"`
     /// - `fused_gate_up_hfq4g256` / `_wave64` / `_wave64_dp4a` → `"fused_gate_up_hfq4g256"`
@@ -438,6 +453,11 @@ impl GemvGraphCache {
             Some("fused_qkvza_hfq4g256")
         } else if func_name.starts_with("fused_gate_up_hfq4g256") {
             Some("fused_gate_up_hfq4g256")
+        } else if func_name.starts_with("gemv_hfq4g256_residual") {
+            // Note: must come BEFORE the plain gemv_hfq4g256 prefix check
+            // so that `gemv_hfq4g256_residual_wave64` etc. classify into
+            // the residual family rather than collapsing into plain gemv.
+            Some("gemv_hfq4g256_residual")
         } else if func_name == "gemv_hfq4g256"
             || func_name == "gemv_hfq4g256_wide"
             || func_name == "gemv_hfq4g256_multirow_r2"
@@ -456,6 +476,7 @@ impl GemvGraphCache {
         let family = Self::family_of(func_name)?;
         let expected_arity = match family {
             "gemv_hfq4g256" => 1,
+            "gemv_hfq4g256_residual" => 1,
             "fused_gate_up_hfq4g256" => 2,
             "fused_qkv_hfq4g256" => 3,
             "fused_qkvza_hfq4g256" => 4,
@@ -469,6 +490,120 @@ impl GemvGraphCache {
             m_tuple: MTuple::from_slice(m_tuple),
             k,
         })
+    }
+
+    /// Per-family kernarg layout descriptor. PR3 adds the four fused
+    /// families to the table; the byte offsets are derived from
+    /// `KernargBlob::push_ptr` (8-byte natural align) and `push_i32`
+    /// (4-byte natural align), and from the source-of-truth kernarg
+    /// build sites in `dispatch.rs`.
+    ///
+    /// Returns `(kernarg_size, ptr_offsets, scalar_offsets)`. All four
+    /// families have only `i32` scalars, so the scalar tail is uniform
+    /// `ScalarTy::I32` per slot.
+    ///
+    /// **`gemv_hfq4g256` family** — 3 ptrs + 2 i32, 32 bytes:
+    /// ```text
+    ///   off  0..8   : a_ptr
+    ///   off  8..16  : x_ptr
+    ///   off 16..24  : y_ptr
+    ///   off 24..28  : m
+    ///   off 28..32  : k
+    /// ```
+    ///
+    /// **`gemv_hfq4g256_residual` family** — 3 ptrs + 2 i32, 32 bytes:
+    /// Same layout as plain `gemv_hfq4g256`. `y` is read-modify-write
+    /// (residual add) instead of write-only — does not affect kernarg
+    /// layout. Wave64 / multi-row variants share this layout.
+    ///
+    /// **`fused_qkv_hfq4g256` family** — 7 ptrs + 4 i32, 72 bytes:
+    /// ```text
+    ///   off  0..8   : a_q
+    ///   off  8..16  : a_k
+    ///   off 16..24  : a_v
+    ///   off 24..32  : x (raw or pre-quantized scratch ptr — both stable)
+    ///   off 32..40  : y_q
+    ///   off 40..48  : y_k
+    ///   off 48..56  : y_v
+    ///   off 56..60  : q_m
+    ///   off 60..64  : k_m
+    ///   off 64..68  : v_m
+    ///   off 68..72  : k
+    /// ```
+    ///
+    /// **`fused_qkvza_hfq4g256` family** — 9 ptrs + 5 i32, 92 bytes:
+    /// ```text
+    ///   off  0..8   : a_qkv
+    ///   off  8..16  : a_z
+    ///   off 16..24  : a_beta
+    ///   off 24..32  : a_alpha
+    ///   off 32..40  : x (raw or pre-quantized scratch ptr — both stable)
+    ///   off 40..48  : y_qkv
+    ///   off 48..56  : y_z
+    ///   off 56..64  : y_beta
+    ///   off 64..72  : y_alpha
+    ///   off 72..76  : qkv_m
+    ///   off 76..80  : z_m
+    ///   off 80..84  : beta_m
+    ///   off 84..88  : alpha_m
+    ///   off 88..92  : k
+    /// ```
+    ///
+    /// **`fused_gate_up_hfq4g256` family** — 5 ptrs + 3 i32, 52 bytes:
+    /// ```text
+    ///   off  0..8   : a_gate
+    ///   off  8..16  : a_up
+    ///   off 16..24  : x (raw or pre-quantized scratch ptr — both stable)
+    ///   off 24..32  : y_gate
+    ///   off 32..40  : y_up
+    ///   off 40..44  : gate_m
+    ///   off 44..48  : up_m
+    ///   off 48..52  : k
+    /// ```
+    pub fn family_layout(family: &str) -> Option<(usize, Vec<usize>, Vec<(usize, ScalarTy)>)> {
+        match family {
+            "gemv_hfq4g256" => Some((
+                32,
+                vec![0, 8, 16],
+                vec![(24, ScalarTy::I32), (28, ScalarTy::I32)],
+            )),
+            "gemv_hfq4g256_residual" => Some((
+                32,
+                vec![0, 8, 16],
+                vec![(24, ScalarTy::I32), (28, ScalarTy::I32)],
+            )),
+            "fused_qkv_hfq4g256" => Some((
+                72,
+                vec![0, 8, 16, 24, 32, 40, 48],
+                vec![
+                    (56, ScalarTy::I32),
+                    (60, ScalarTy::I32),
+                    (64, ScalarTy::I32),
+                    (68, ScalarTy::I32),
+                ],
+            )),
+            "fused_qkvza_hfq4g256" => Some((
+                92,
+                vec![0, 8, 16, 24, 32, 40, 48, 56, 64],
+                vec![
+                    (72, ScalarTy::I32),
+                    (76, ScalarTy::I32),
+                    (80, ScalarTy::I32),
+                    (84, ScalarTy::I32),
+                    (88, ScalarTy::I32),
+                ],
+            )),
+            "fused_gate_up_hfq4g256" => Some((
+                52,
+                vec![0, 8, 16, 24, 32],
+                vec![
+                    (40, ScalarTy::I32),
+                    (44, ScalarTy::I32),
+                    (48, ScalarTy::I32),
+                ],
+            )),
+            _ => None,
+        }
     }
 
     /// Drop and destroy all cached graphs. Idempotent.
@@ -721,6 +856,87 @@ mod tests {
 
         let c = GemvGraphCache::classify("gemv_hfq4g256", &[1024], 1024).unwrap();
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn family_of_residual_variants() {
+        // PR3: residual family must collapse all wave64 / multirow / prefetch variants.
+        assert_eq!(
+            GemvGraphCache::family_of("gemv_hfq4g256_residual"),
+            Some("gemv_hfq4g256_residual")
+        );
+        assert_eq!(
+            GemvGraphCache::family_of("gemv_hfq4g256_residual_wave64"),
+            Some("gemv_hfq4g256_residual")
+        );
+        assert_eq!(
+            GemvGraphCache::family_of("gemv_hfq4g256_residual_wave64_prefetch"),
+            Some("gemv_hfq4g256_residual")
+        );
+        assert_eq!(
+            GemvGraphCache::family_of("gemv_hfq4g256_residual_multirow_r2"),
+            Some("gemv_hfq4g256_residual")
+        );
+        assert_eq!(
+            GemvGraphCache::family_of("gemv_hfq4g256_residual_multirow_r4"),
+            Some("gemv_hfq4g256_residual")
+        );
+        assert_eq!(
+            GemvGraphCache::family_of("gemv_hfq4g256_residual_multirow_r8"),
+            Some("gemv_hfq4g256_residual")
+        );
+
+        // Residual must NOT collapse into plain gemv.
+        assert_ne!(
+            GemvGraphCache::family_of("gemv_hfq4g256_residual"),
+            Some("gemv_hfq4g256"),
+        );
+    }
+
+    #[test]
+    fn family_layout_table_matches_kernarg_abi() {
+        // PR3: layout table is the canonical kernarg-byte map. Verify it
+        // matches the hand-written kernarg buffers in dispatch.rs.
+
+        // Plain gemv: 3 ptrs at 0/8/16, 2 i32 at 24/28, total 32.
+        let (sz, p, s) = GemvGraphCache::family_layout("gemv_hfq4g256").unwrap();
+        assert_eq!(sz, 32);
+        assert_eq!(p, vec![0, 8, 16]);
+        assert_eq!(s, vec![(24, ScalarTy::I32), (28, ScalarTy::I32)]);
+
+        // Residual: identical to plain (only y semantics differ).
+        let (sz, p, s) = GemvGraphCache::family_layout("gemv_hfq4g256_residual").unwrap();
+        assert_eq!(sz, 32);
+        assert_eq!(p, vec![0, 8, 16]);
+        assert_eq!(s, vec![(24, ScalarTy::I32), (28, ScalarTy::I32)]);
+
+        // fused_qkv: 7 ptrs + 4 i32, total 72.
+        let (sz, p, s) = GemvGraphCache::family_layout("fused_qkv_hfq4g256").unwrap();
+        assert_eq!(sz, 72);
+        assert_eq!(p, vec![0, 8, 16, 24, 32, 40, 48]);
+        assert_eq!(s.len(), 4);
+        assert_eq!(s[0].0, 56);
+        assert_eq!(s[3].0, 68);
+
+        // fused_qkvza: 9 ptrs + 5 i32, total 92.
+        let (sz, p, s) = GemvGraphCache::family_layout("fused_qkvza_hfq4g256").unwrap();
+        assert_eq!(sz, 92);
+        assert_eq!(p, vec![0, 8, 16, 24, 32, 40, 48, 56, 64]);
+        assert_eq!(s.len(), 5);
+        assert_eq!(s[0].0, 72);
+        assert_eq!(s[4].0, 88);
+
+        // fused_gate_up: 5 ptrs + 3 i32, total 52.
+        let (sz, p, s) = GemvGraphCache::family_layout("fused_gate_up_hfq4g256").unwrap();
+        assert_eq!(sz, 52);
+        assert_eq!(p, vec![0, 8, 16, 24, 32]);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0].0, 40);
+        assert_eq!(s[2].0, 48);
+
+        // Unknown family → None.
+        assert!(GemvGraphCache::family_layout("rmsnorm").is_none());
+        assert!(GemvGraphCache::family_layout("").is_none());
     }
 
     #[test]

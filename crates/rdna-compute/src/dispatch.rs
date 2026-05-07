@@ -698,7 +698,7 @@ impl Gpu {
             // The cache is observe-only in PR1 — every classify() call
             // falls through to the legacy launch path. See gemv_graph_cache.rs.
             gemv_graph_cache: if gemv_graph_enabled() {
-                eprintln!("[gemv-graph] HIPFIRE_GEMV_GRAPH=1: per-shape cache enabled (PR2: capture+replay for gemv_hfq4g256 family)");
+                eprintln!("[gemv-graph] HIPFIRE_GEMV_GRAPH=1: per-shape cache enabled (PR3: capture+replay for gemv_hfq4g256 / gemv_hfq4g256_residual / fused_qkv / fused_qkvza / fused_gate_up)");
                 Some(crate::gemv_graph_cache::GemvGraphCache::new())
             } else {
                 None
@@ -1157,8 +1157,11 @@ impl Gpu {
     /// the right variant; only the cache key is variant-agnostic.
     ///
     /// Fused families (`fused_qkv_hfq4g256`, `fused_qkvza_hfq4g256`,
-    /// `fused_gate_up_hfq4g256`) are NOT cached in PR2 — they need a
-    /// different kernarg layout / offset table. PR3 picks those up.
+    /// `fused_gate_up_hfq4g256`) and the residual variant
+    /// (`gemv_hfq4g256_residual`) are wired into the same cache by PR3
+    /// via family-specific wrappers (see `try_dispatch_*_via_graph_cache`
+    /// below). They share the `cache.dispatch()` core via
+    /// `route_through_gemv_graph_cache()`.
     ///
     /// Returns:
     /// - `Ok(true)` if the cache handled this call (replay or capture).
@@ -1281,6 +1284,333 @@ impl Gpu {
             | crate::gemv_graph_cache::DispatchOutcome::Captured => Ok(true),
             crate::gemv_graph_cache::DispatchOutcome::Fallthrough => Ok(false),
         }
+    }
+
+    /// Internal helper shared by all PR3 family wrappers. Performs the
+    /// `gemv_graph_cache.is_some()` / capture-mode / stream gating, looks
+    /// up the function and stream by reference, and routes the call into
+    /// `cache.dispatch()`. The kernarg byte buffer + ptr/scalar arrays
+    /// are built by the family-specific caller and passed in here.
+    ///
+    /// Returns:
+    /// - `Ok(true)`  when the cache handled the call (replay or capture).
+    ///   The caller MUST NOT also run the legacy launch path.
+    /// - `Ok(false)` when the caller should run the legacy launch path
+    ///   (cache disabled, capture mode, no active stream, or first miss).
+    /// - `Err(_)` on HIP error during capture/replay.
+    #[allow(clippy::too_many_arguments)]
+    fn route_through_gemv_graph_cache(
+        &mut self,
+        func_name: &'static str,
+        m_tuple: &[u32],
+        k: u32,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        kernarg_bytes: &[u8],
+        ptr_offsets: &[usize],
+        scalar_offsets: &[(usize, crate::gemv_graph_cache::ScalarTy)],
+        ptrs: &[*mut std::ffi::c_void],
+        scalars: &[u64],
+    ) -> HipResult<bool> {
+        if self.capture_mode || self.force_blob_path {
+            return Ok(false);
+        }
+        if self.gemv_graph_cache.is_none() {
+            return Ok(false);
+        }
+        if self.active_stream.is_none() {
+            // Per-shape cache requires an explicit stream for begin/end
+            // capture. Init code creates one when HIPFIRE_GEMV_GRAPH=1.
+            return Ok(false);
+        }
+
+        let shape = match crate::gemv_graph_cache::GemvGraphCache::classify(
+            func_name, m_tuple, k,
+        ) {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        let func = match self.functions.get(func_name) {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let func_handle_addr =
+            unsafe { *(func as *const hip_bridge::Function as *const usize) };
+        let stream = self.active_stream.as_ref().unwrap();
+        let stream_raw: *mut std::ffi::c_void =
+            unsafe { *(stream as *const hip_bridge::Stream as *const *mut std::ffi::c_void) };
+
+        let cache = self.gemv_graph_cache.as_mut().unwrap();
+        let outcome = cache.dispatch(
+            &self.hip,
+            &shape,
+            func,
+            func_handle_addr,
+            grid,
+            block,
+            shared_mem,
+            kernarg_bytes,
+            ptr_offsets,
+            scalar_offsets,
+            ptrs,
+            scalars,
+            stream,
+            stream_raw,
+        )?;
+
+        match outcome {
+            crate::gemv_graph_cache::DispatchOutcome::Replayed
+            | crate::gemv_graph_cache::DispatchOutcome::Captured => Ok(true),
+            crate::gemv_graph_cache::DispatchOutcome::Fallthrough => Ok(false),
+        }
+    }
+
+    /// PR3 of the per-shape hipGraph cache: `gemv_hfq4g256_residual`.
+    ///
+    /// Same kernarg layout as plain `gemv_hfq4g256` (`a`, `x`, `y`, `m`,
+    /// `k` — 32 bytes). The y semantics differ at the kernel level
+    /// (read-modify-write residual add vs overwrite), but the kernarg
+    /// ABI is identical, so the same offset table applies.
+    ///
+    /// Whitelist: `gemv_hfq4g256_residual`, `_wave64`, `_wave64_prefetch`,
+    /// `_multirow_r{2,4,8}`. The captured graph routes to whichever
+    /// `hipFunction_t` was passed in at capture time.
+    #[allow(clippy::too_many_arguments)]
+    fn try_dispatch_gemv_hfq4g256_residual_via_graph_cache(
+        &mut self,
+        func_name: &'static str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        a_ptr: *mut std::ffi::c_void,
+        x_ptr: *mut std::ffi::c_void,
+        y_ptr: *mut std::ffi::c_void,
+        m: i32,
+        k: i32,
+    ) -> HipResult<bool> {
+        // Whitelist the residual family for PR3.
+        if crate::gemv_graph_cache::GemvGraphCache::family_of(func_name)
+            != Some("gemv_hfq4g256_residual")
+        {
+            return Ok(false);
+        }
+
+        let mut kernarg = [0u8; 32];
+        kernarg[0..8].copy_from_slice(&(a_ptr as usize).to_ne_bytes());
+        kernarg[8..16].copy_from_slice(&(x_ptr as usize).to_ne_bytes());
+        kernarg[16..24].copy_from_slice(&(y_ptr as usize).to_ne_bytes());
+        kernarg[24..28].copy_from_slice(&m.to_ne_bytes());
+        kernarg[28..32].copy_from_slice(&k.to_ne_bytes());
+
+        let (_sz, ptr_offsets, scalar_offsets) =
+            crate::gemv_graph_cache::GemvGraphCache::family_layout(
+                "gemv_hfq4g256_residual",
+            ).expect("residual family layout");
+
+        let ptrs: [*mut std::ffi::c_void; 3] = [a_ptr, x_ptr, y_ptr];
+        let scalars: [u64; 2] = [m as u32 as u64, k as u32 as u64];
+        self.route_through_gemv_graph_cache(
+            func_name,
+            &[m as u32],
+            k as u32,
+            grid, block, shared_mem,
+            &kernarg, &ptr_offsets, &scalar_offsets,
+            &ptrs, &scalars,
+        )
+    }
+
+    /// PR3 of the per-shape hipGraph cache: `fused_qkv_hfq4g256`.
+    ///
+    /// 7 ptrs + 4 i32 in 72 bytes — see `family_layout()` for the byte
+    /// map. Both `_wave64` and `_wave64_dp4a` share the same kernarg ABI
+    /// (the dp4a path swaps `x` for a pre-quantized scratch pointer that
+    /// is itself stable across decode steps; the cache treats both as
+    /// the same family).
+    #[allow(clippy::too_many_arguments)]
+    fn try_dispatch_fused_qkv_hfq4g256_via_graph_cache(
+        &mut self,
+        func_name: &'static str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        aq_ptr: *mut std::ffi::c_void,
+        ak_ptr: *mut std::ffi::c_void,
+        av_ptr: *mut std::ffi::c_void,
+        x_ptr: *mut std::ffi::c_void,
+        yq_ptr: *mut std::ffi::c_void,
+        yk_ptr: *mut std::ffi::c_void,
+        yv_ptr: *mut std::ffi::c_void,
+        q_m: i32, k_m: i32, v_m: i32, k: i32,
+    ) -> HipResult<bool> {
+        if crate::gemv_graph_cache::GemvGraphCache::family_of(func_name)
+            != Some("fused_qkv_hfq4g256")
+        {
+            return Ok(false);
+        }
+
+        let mut kernarg = [0u8; 72];
+        kernarg[0..8].copy_from_slice(&(aq_ptr as usize).to_ne_bytes());
+        kernarg[8..16].copy_from_slice(&(ak_ptr as usize).to_ne_bytes());
+        kernarg[16..24].copy_from_slice(&(av_ptr as usize).to_ne_bytes());
+        kernarg[24..32].copy_from_slice(&(x_ptr as usize).to_ne_bytes());
+        kernarg[32..40].copy_from_slice(&(yq_ptr as usize).to_ne_bytes());
+        kernarg[40..48].copy_from_slice(&(yk_ptr as usize).to_ne_bytes());
+        kernarg[48..56].copy_from_slice(&(yv_ptr as usize).to_ne_bytes());
+        kernarg[56..60].copy_from_slice(&q_m.to_ne_bytes());
+        kernarg[60..64].copy_from_slice(&k_m.to_ne_bytes());
+        kernarg[64..68].copy_from_slice(&v_m.to_ne_bytes());
+        kernarg[68..72].copy_from_slice(&k.to_ne_bytes());
+
+        let (_sz, ptr_offsets, scalar_offsets) =
+            crate::gemv_graph_cache::GemvGraphCache::family_layout(
+                "fused_qkv_hfq4g256",
+            ).expect("fused_qkv layout");
+
+        let ptrs: [*mut std::ffi::c_void; 7] =
+            [aq_ptr, ak_ptr, av_ptr, x_ptr, yq_ptr, yk_ptr, yv_ptr];
+        let scalars: [u64; 4] = [
+            q_m as u32 as u64,
+            k_m as u32 as u64,
+            v_m as u32 as u64,
+            k as u32 as u64,
+        ];
+        self.route_through_gemv_graph_cache(
+            func_name,
+            &[q_m as u32, k_m as u32, v_m as u32],
+            k as u32,
+            grid, block, shared_mem,
+            &kernarg, &ptr_offsets, &scalar_offsets,
+            &ptrs, &scalars,
+        )
+    }
+
+    /// PR3 of the per-shape hipGraph cache: `fused_qkvza_hfq4g256`.
+    ///
+    /// 9 ptrs + 5 i32 in 92 bytes. M-tuple is `(qkv_m, z_m, beta_m,
+    /// alpha_m)` — the unique LA preamble shape. See `family_layout()`
+    /// for the byte map.
+    #[allow(clippy::too_many_arguments)]
+    fn try_dispatch_fused_qkvza_hfq4g256_via_graph_cache(
+        &mut self,
+        func_name: &'static str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        aqkv_ptr: *mut std::ffi::c_void,
+        az_ptr: *mut std::ffi::c_void,
+        ab_ptr: *mut std::ffi::c_void,
+        aa_ptr: *mut std::ffi::c_void,
+        x_ptr: *mut std::ffi::c_void,
+        yqkv_ptr: *mut std::ffi::c_void,
+        yz_ptr: *mut std::ffi::c_void,
+        yb_ptr: *mut std::ffi::c_void,
+        ya_ptr: *mut std::ffi::c_void,
+        qkv_m: i32, z_m: i32, beta_m: i32, alpha_m: i32, k: i32,
+    ) -> HipResult<bool> {
+        if crate::gemv_graph_cache::GemvGraphCache::family_of(func_name)
+            != Some("fused_qkvza_hfq4g256")
+        {
+            return Ok(false);
+        }
+
+        let mut kernarg = [0u8; 92];
+        kernarg[0..8].copy_from_slice(&(aqkv_ptr as usize).to_ne_bytes());
+        kernarg[8..16].copy_from_slice(&(az_ptr as usize).to_ne_bytes());
+        kernarg[16..24].copy_from_slice(&(ab_ptr as usize).to_ne_bytes());
+        kernarg[24..32].copy_from_slice(&(aa_ptr as usize).to_ne_bytes());
+        kernarg[32..40].copy_from_slice(&(x_ptr as usize).to_ne_bytes());
+        kernarg[40..48].copy_from_slice(&(yqkv_ptr as usize).to_ne_bytes());
+        kernarg[48..56].copy_from_slice(&(yz_ptr as usize).to_ne_bytes());
+        kernarg[56..64].copy_from_slice(&(yb_ptr as usize).to_ne_bytes());
+        kernarg[64..72].copy_from_slice(&(ya_ptr as usize).to_ne_bytes());
+        kernarg[72..76].copy_from_slice(&qkv_m.to_ne_bytes());
+        kernarg[76..80].copy_from_slice(&z_m.to_ne_bytes());
+        kernarg[80..84].copy_from_slice(&beta_m.to_ne_bytes());
+        kernarg[84..88].copy_from_slice(&alpha_m.to_ne_bytes());
+        kernarg[88..92].copy_from_slice(&k.to_ne_bytes());
+
+        let (_sz, ptr_offsets, scalar_offsets) =
+            crate::gemv_graph_cache::GemvGraphCache::family_layout(
+                "fused_qkvza_hfq4g256",
+            ).expect("fused_qkvza layout");
+
+        let ptrs: [*mut std::ffi::c_void; 9] = [
+            aqkv_ptr, az_ptr, ab_ptr, aa_ptr,
+            x_ptr,
+            yqkv_ptr, yz_ptr, yb_ptr, ya_ptr,
+        ];
+        let scalars: [u64; 5] = [
+            qkv_m as u32 as u64,
+            z_m as u32 as u64,
+            beta_m as u32 as u64,
+            alpha_m as u32 as u64,
+            k as u32 as u64,
+        ];
+        self.route_through_gemv_graph_cache(
+            func_name,
+            &[qkv_m as u32, z_m as u32, beta_m as u32, alpha_m as u32],
+            k as u32,
+            grid, block, shared_mem,
+            &kernarg, &ptr_offsets, &scalar_offsets,
+            &ptrs, &scalars,
+        )
+    }
+
+    /// PR3 of the per-shape hipGraph cache: `fused_gate_up_hfq4g256`.
+    ///
+    /// 5 ptrs + 3 i32 in 52 bytes. M-tuple is `(gate_m, up_m)`. See
+    /// `family_layout()` for the byte map.
+    #[allow(clippy::too_many_arguments)]
+    fn try_dispatch_fused_gate_up_hfq4g256_via_graph_cache(
+        &mut self,
+        func_name: &'static str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        ag_ptr: *mut std::ffi::c_void,
+        au_ptr: *mut std::ffi::c_void,
+        x_ptr: *mut std::ffi::c_void,
+        yg_ptr: *mut std::ffi::c_void,
+        yu_ptr: *mut std::ffi::c_void,
+        gate_m: i32, up_m: i32, k: i32,
+    ) -> HipResult<bool> {
+        if crate::gemv_graph_cache::GemvGraphCache::family_of(func_name)
+            != Some("fused_gate_up_hfq4g256")
+        {
+            return Ok(false);
+        }
+
+        let mut kernarg = [0u8; 52];
+        kernarg[0..8].copy_from_slice(&(ag_ptr as usize).to_ne_bytes());
+        kernarg[8..16].copy_from_slice(&(au_ptr as usize).to_ne_bytes());
+        kernarg[16..24].copy_from_slice(&(x_ptr as usize).to_ne_bytes());
+        kernarg[24..32].copy_from_slice(&(yg_ptr as usize).to_ne_bytes());
+        kernarg[32..40].copy_from_slice(&(yu_ptr as usize).to_ne_bytes());
+        kernarg[40..44].copy_from_slice(&gate_m.to_ne_bytes());
+        kernarg[44..48].copy_from_slice(&up_m.to_ne_bytes());
+        kernarg[48..52].copy_from_slice(&k.to_ne_bytes());
+
+        let (_sz, ptr_offsets, scalar_offsets) =
+            crate::gemv_graph_cache::GemvGraphCache::family_layout(
+                "fused_gate_up_hfq4g256",
+            ).expect("fused_gate_up layout");
+
+        let ptrs: [*mut std::ffi::c_void; 5] = [ag_ptr, au_ptr, x_ptr, yg_ptr, yu_ptr];
+        let scalars: [u64; 3] = [
+            gate_m as u32 as u64,
+            up_m as u32 as u64,
+            k as u32 as u64,
+        ];
+        self.route_through_gemv_graph_cache(
+            func_name,
+            &[gate_m as u32, up_m as u32],
+            k as u32,
+            grid, block, shared_mem,
+            &kernarg, &ptr_offsets, &scalar_offsets,
+            &ptrs, &scalars,
+        )
     }
 
     /// Destroy all cached GEMV graphs. Called from invalidation hooks
@@ -3158,18 +3488,32 @@ impl Gpu {
                   + crate::profile::gemv_hfq4g256_bytes(k_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(v_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_hfq4g256_dp4a", bytes);
-        let result = self.launch_maybe_blob(
+        // PR3 graph-cache route. The dp4a variant shares the kernarg ABI
+        // with the non-dp4a wave64 path (only `x` is a pre-quantized
+        // scratch ptr — itself stable across decode steps).
+        let handled = self.try_dispatch_fused_qkv_hfq4g256_via_graph_cache(
             "fused_qkv_hfq4g256_wave64_dp4a",
-            [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av); b.push_ptr(xq);
-                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
-                b.push_i32(q_m_val); b.push_i32(k_m_val);
-                b.push_i32(v_m_val); b.push_i32(k_val);
-                b
-            },
-        );
+            [(total + 1) / 2, 1, 1], [64, 1, 1], 0,
+            aq as *mut c_void, ak as *mut c_void, av as *mut c_void, xq as *mut c_void,
+            yq as *mut c_void, yk as *mut c_void, yv as *mut c_void,
+            q_m_val, k_m_val, v_m_val, k_val,
+        )?;
+        let result = if handled {
+            Ok(())
+        } else {
+            self.launch_maybe_blob(
+                "fused_qkv_hfq4g256_wave64_dp4a",
+                [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av); b.push_ptr(xq);
+                    b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                    b.push_i32(q_m_val); b.push_i32(k_m_val);
+                    b.push_i32(v_m_val); b.push_i32(k_val);
+                    b
+                },
+            )
+        };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -3244,17 +3588,31 @@ impl Gpu {
                   + crate::profile::gemv_hfq4g256_bytes(k_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(v_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_hfq4g256", bytes);
-        let result = self.launch_maybe_blob(
-            func_name, [grid_x, 1, 1], block, 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av); b.push_ptr(xp);
-                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
-                b.push_i32(q_m_val); b.push_i32(k_m_val);
-                b.push_i32(v_m_val); b.push_i32(k_val);
-                b
-            },
-        );
+        // PR3 graph-cache route. The wave64 / non-wave64 variants share
+        // the kernarg ABI; family classification collapses them to
+        // `"fused_qkv_hfq4g256"`.
+        let handled = self.try_dispatch_fused_qkv_hfq4g256_via_graph_cache(
+            func_name,
+            [grid_x, 1, 1], block, 0,
+            aq as *mut c_void, ak as *mut c_void, av as *mut c_void, xp as *mut c_void,
+            yq as *mut c_void, yk as *mut c_void, yv as *mut c_void,
+            q_m_val, k_m_val, v_m_val, k_val,
+        )?;
+        let result = if handled {
+            Ok(())
+        } else {
+            self.launch_maybe_blob(
+                func_name, [grid_x, 1, 1], block, 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av); b.push_ptr(xp);
+                    b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                    b.push_i32(q_m_val); b.push_i32(k_m_val);
+                    b.push_i32(v_m_val); b.push_i32(k_val);
+                    b
+                },
+            )
+        };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -3341,17 +3699,32 @@ impl Gpu {
             &b_m_i as *const _ as *mut c_void, &a_m_i as *const _ as *mut c_void,
             &k_i as *const _ as *mut c_void,
         ];
-        let result = self.launch_maybe_blob(
-            func_name, grid, block, 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
-                b.push_ptr(xp); b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
-                b.push_i32(q_m_i); b.push_i32(z_m_i); b.push_i32(b_m_i); b.push_i32(a_m_i);
-                b.push_i32(k_i);
-                b
-            },
-        );
+        // PR3 graph-cache route. wave64 / non-wave64 variants share the
+        // kernarg ABI; family classification collapses to
+        // `"fused_qkvza_hfq4g256"`.
+        let handled = self.try_dispatch_fused_qkvza_hfq4g256_via_graph_cache(
+            func_name,
+            grid, block, 0,
+            aq as *mut c_void, az as *mut c_void, ab as *mut c_void, aa as *mut c_void,
+            xp as *mut c_void,
+            yq as *mut c_void, yz as *mut c_void, yb as *mut c_void, ya as *mut c_void,
+            q_m_i, z_m_i, b_m_i, a_m_i, k_i,
+        )?;
+        let result = if handled {
+            Ok(())
+        } else {
+            self.launch_maybe_blob(
+                func_name, grid, block, 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
+                    b.push_ptr(xp); b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+                    b.push_i32(q_m_i); b.push_i32(z_m_i); b.push_i32(b_m_i); b.push_i32(a_m_i);
+                    b.push_i32(k_i);
+                    b
+                },
+            )
+        };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -3408,19 +3781,33 @@ impl Gpu {
             &b_m_i as *const _ as *mut c_void, &a_m_i as *const _ as *mut c_void,
             &k_i as *const _ as *mut c_void,
         ];
-        let result = self.launch_maybe_blob(
+        // PR3 graph-cache route. dp4a shares the kernarg ABI with the
+        // non-dp4a wave64 path; `xq` is a stable pre-quantized scratch.
+        let handled = self.try_dispatch_fused_qkvza_hfq4g256_via_graph_cache(
             "fused_qkvza_hfq4g256_wave64_dp4a",
-            [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
-                b.push_ptr(xq);
-                b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
-                b.push_i32(q_m_i); b.push_i32(z_m_i); b.push_i32(b_m_i); b.push_i32(a_m_i);
-                b.push_i32(k_i);
-                b
-            },
-        );
+            [(total + 1) / 2, 1, 1], [64, 1, 1], 0,
+            aq as *mut c_void, az as *mut c_void, ab as *mut c_void, aa as *mut c_void,
+            xq as *mut c_void,
+            yq as *mut c_void, yz as *mut c_void, yb as *mut c_void, ya as *mut c_void,
+            q_m_i, z_m_i, b_m_i, a_m_i, k_i,
+        )?;
+        let result = if handled {
+            Ok(())
+        } else {
+            self.launch_maybe_blob(
+                "fused_qkvza_hfq4g256_wave64_dp4a",
+                [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
+                    b.push_ptr(xq);
+                    b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+                    b.push_i32(q_m_i); b.push_i32(z_m_i); b.push_i32(b_m_i); b.push_i32(a_m_i);
+                    b.push_i32(k_i);
+                    b
+                },
+            )
+        };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -5708,16 +6095,27 @@ impl Gpu {
             };
             self.ensure_kernel(kname, ksrc, kname)?;
             let grid = ((m as u32) + 1) / 2;
-            self.launch_maybe_blob(
+            // PR3 graph-cache route — wave64 / prefetch share the residual
+            // family kernarg layout.
+            let handled = self.try_dispatch_gemv_hfq4g256_residual_via_graph_cache(
                 kname,
-                [grid, 1, 1], [64, 1, 1], 0, &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
-                    b.push_i32(m_val); b.push_i32(k_val);
-                    b
-                },
-            )
+                [grid, 1, 1], [64, 1, 1], 0,
+                a_ptr, x_ptr, y_ptr, m_val, k_val,
+            )?;
+            if handled {
+                Ok(())
+            } else {
+                self.launch_maybe_blob(
+                    kname,
+                    [grid, 1, 1], [64, 1, 1], 0, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
+                )
+            }
         } else if use_multirow {
             let (func_name, grid_div) = match rows {
                 2 => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
@@ -5731,26 +6129,47 @@ impl Gpu {
                 func_name,
             )?;
             let grid = ((m as u32) + grid_div - 1) / grid_div;
-            self.launch_maybe_blob(
+            // PR3 graph-cache route — multirow variants share the residual
+            // family kernarg layout.
+            let handled = self.try_dispatch_gemv_hfq4g256_residual_via_graph_cache(
                 func_name,
-                [grid, 1, 1], [32, 1, 1], 0, &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
-                    b.push_i32(m_val); b.push_i32(k_val);
-                    b
-                },
-            )
+                [grid, 1, 1], [32, 1, 1], 0,
+                a_ptr, x_ptr, y_ptr, m_val, k_val,
+            )?;
+            if handled {
+                Ok(())
+            } else {
+                self.launch_maybe_blob(
+                    func_name,
+                    [grid, 1, 1], [32, 1, 1], 0, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
+                )
+            }
         } else {
-            self.launch_maybe_blob(
-                "gemv_hfq4g256_residual", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
-                    b.push_i32(m_val); b.push_i32(k_val);
-                    b
-                },
-            )
+            // PR3 graph-cache route — plain residual variant.
+            let handled = self.try_dispatch_gemv_hfq4g256_residual_via_graph_cache(
+                "gemv_hfq4g256_residual",
+                [m as u32, 1, 1], [32, 1, 1], 0,
+                a_ptr, x_ptr, y_ptr, m_val, k_val,
+            )?;
+            if handled {
+                Ok(())
+            } else {
+                self.launch_maybe_blob(
+                    "gemv_hfq4g256_residual", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
+                )
+            }
         };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
@@ -10558,16 +10977,30 @@ impl Gpu {
             &yu as *const _ as *mut c_void, &gm as *const _ as *mut c_void,
             &um as *const _ as *mut c_void, &kv as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
-            func_name, [grid_x, 1, 1], block, 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xp);
-                b.push_ptr(yg); b.push_ptr(yu);
-                b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
-                b
-            },
-        )
+        // PR3 graph-cache route. wave64 / non-wave64 variants share the
+        // kernarg ABI; family classification collapses to
+        // `"fused_gate_up_hfq4g256"`.
+        let handled = self.try_dispatch_fused_gate_up_hfq4g256_via_graph_cache(
+            func_name,
+            [grid_x, 1, 1], block, 0,
+            ag as *mut c_void, au as *mut c_void, xp as *mut c_void,
+            yg as *mut c_void, yu as *mut c_void,
+            gm, um, kv,
+        )?;
+        if handled {
+            Ok(())
+        } else {
+            self.launch_maybe_blob(
+                func_name, [grid_x, 1, 1], block, 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xp);
+                    b.push_ptr(yg); b.push_ptr(yu);
+                    b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
+                    b
+                },
+            )
+        }
     }
 
     /// dp4a-port of fused_gate_up_hfq4g256 for gfx906. Pre-quantizes
@@ -10612,17 +11045,30 @@ impl Gpu {
             &um as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
+        // PR3 graph-cache route. dp4a shares the kernarg ABI with the
+        // non-dp4a wave64 path; `xq` is a stable pre-quantized scratch.
+        let handled = self.try_dispatch_fused_gate_up_hfq4g256_via_graph_cache(
             "fused_gate_up_hfq4g256_wave64_dp4a",
-            [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xq);
-                b.push_ptr(yg); b.push_ptr(yu);
-                b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
-                b
-            },
-        )
+            [(total + 1) / 2, 1, 1], [64, 1, 1], 0,
+            ag as *mut c_void, au as *mut c_void, xq as *mut c_void,
+            yg as *mut c_void, yu as *mut c_void,
+            gm, um, kv,
+        )?;
+        if handled {
+            Ok(())
+        } else {
+            self.launch_maybe_blob(
+                "fused_gate_up_hfq4g256_wave64_dp4a",
+                [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xq);
+                    b.push_ptr(yg); b.push_ptr(yu);
+                    b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
+                    b
+                },
+            )
+        }
     }
 
     /// Write KV to HFQ4 co-located block (72 bytes per head: scale+zero+nibbles).
