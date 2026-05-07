@@ -15,6 +15,7 @@
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::multi_gpu;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hip_bridge::{DeviceBuffer, HipResult};
@@ -1064,6 +1065,18 @@ pub struct VerifyScratch {
     /// constructor — `forward_prefill_batch` then falls back to allocating
     /// its own scratch.
     pub prefill_batch: Option<qwen35::PrefillBatchScratch>,
+    /// Cross-card staging on target_gpu for hetero PP+DFlash (PRD v1.2 PR-A).
+    /// Phase 2 of `spec_step_dflash` writes B target embeddings here, then
+    /// `cross_card_copy_at`s them to `draft_scratch.x` on the drafter device.
+    /// Shape `[max_n × dim]` f32 = same footprint as `final_hidden`.
+    /// Unused (still allocated) on the homogeneous single-Gpu path.
+    pub embd_staging: GpuTensor,
+    /// Cross-card staging on target_gpu for hetero PP+DFlash (PRD v1.2 PR-A).
+    /// Phase 5 of `spec_step_dflash` ships drafter hidden rows
+    /// `draft_scratch.x[h..]` into this buffer, then runs target's lm_head
+    /// GEMM against it. Shape `[max_n × dim]` f32. Unused on the homogeneous
+    /// path; the GEMM reads `draft_scratch.x` directly there.
+    pub draft_hidden_staging: GpuTensor,
 }
 
 impl VerifyScratch {
@@ -1084,6 +1097,8 @@ impl VerifyScratch {
             rot: gpu.alloc_tensor(&[max_n * hidden_k], rdna_compute::DType::F32)?,
             argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
             prefill_batch: None,
+            embd_staging: gpu.alloc_tensor(&[max_n * dim], rdna_compute::DType::F32)?,
+            draft_hidden_staging: gpu.alloc_tensor(&[max_n * dim], rdna_compute::DType::F32)?,
         })
     }
 
@@ -1110,6 +1125,8 @@ impl VerifyScratch {
         let _ = gpu.free_tensor(self.logits);
         let _ = gpu.free_tensor(self.rot);
         let _ = gpu.free_tensor(self.argmax);
+        let _ = gpu.free_tensor(self.embd_staging);
+        let _ = gpu.free_tensor(self.draft_hidden_staging);
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
         }
@@ -2272,6 +2289,61 @@ pub fn scatter_hidden_block_to_interleaved(
     Ok(())
 }
 
+/// Cross-card variant of [`scatter_hidden_block_to_interleaved`] for the
+/// hetero PP+DFlash path (PRD v1.2 PR-A): `hidden_rb` lives on
+/// `target_gpu`, `dst` lives on `drafter_gpu`. Each per-(row, extract)
+/// copy goes through `multi_gpu::cross_card_copy_at` (sync-host-staged on
+/// non-peer fabric, peer-async otherwise) instead of the same-device
+/// `memcpy_dtod_at` used in the homogeneous helper. Each call's event is
+/// waited on `drafter_gpu` so the next cycle's `draft_forward` (which
+/// reads `dst`) sees the writes; events are also destroyed in the wait so
+/// no HIP event handles leak.
+///
+/// Per-cycle cost at typical 27B shapes (ne=5, B=16, hidden=5120):
+/// ~80 × 20 KB = ~1.6 MB across the cross-card fabric. At USB4 v2's
+/// ~10 GB/s effective sustained host-stage bandwidth, ~160 µs per cycle —
+/// well within the <1% / 30 ms-target budget the PRD anchors against.
+pub fn scatter_hidden_block_to_interleaved_cross_card(
+    target_gpu: &Gpu,
+    drafter_gpu: &Gpu,
+    hidden_rb: &HiddenStateRingBuffer,
+    dst: &GpuTensor,
+    dst_row_offset: usize,
+    block_size: usize,
+    n_rows: usize,
+) -> HipResult<()> {
+    assert!(n_rows <= block_size, "scatter_cross_card: n_rows {n_rows} > block_size {block_size}");
+    let num_extract = hidden_rb.extract_layers.len();
+    let hidden = hidden_rb.hidden_dim;
+    let max_pos = hidden_rb.max_positions;
+    let head = hidden_rb.head;
+    let written = hidden_rb.written;
+    assert!(block_size <= written, "scatter_cross_card: block_size {block_size} > written {written}");
+    let row_bytes = hidden * 4;
+    let start_slot = (head + max_pos - block_size) % max_pos;
+
+    for r in 0..n_rows {
+        let slot = (start_slot + r) % max_pos;
+        let dst_row = dst_row_offset + r;
+        let dst_row_base_bytes = dst_row * num_extract * row_bytes;
+        for ext in 0..num_extract {
+            let src_offset_bytes = slot * row_bytes;
+            let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
+            let evt = multi_gpu::cross_card_copy_at(
+                target_gpu,
+                drafter_gpu,
+                &hidden_rb.layer_bufs[ext].buf,
+                src_offset_bytes,
+                &dst.buf,
+                dst_offset_bytes,
+                row_bytes,
+            )?;
+            multi_gpu::cross_card_wait(drafter_gpu, evt)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn download_hidden_block(
     gpu: &Gpu,
     hidden_rb: &HiddenStateRingBuffer,
@@ -2383,6 +2455,7 @@ pub fn download_hidden_block(
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_dflash(
     gpu: &mut Gpu,
+    drafter_gpu_opt: Option<&mut Gpu>,
     target: &mut ModelSlot,
     draft_weights: &DflashWeights,
     draft_cfg: &DflashConfig,
@@ -2405,6 +2478,17 @@ pub fn spec_step_dflash(
     repeat_penalty: f32,
     repeat_window: usize,
 ) -> HipResult<SpecStepResult> {
+    // Hetero PP+DFlash (PRD v1.2 PR-A): when `drafter_gpu_opt` is `Some`,
+    // `gpu` is the target device and `drafter_gpu_opt` holds the dedicated
+    // drafter device (HIPFIRE_DFLASH_DRAFTER_DEVICE=N at load time). All
+    // drafter-side work (DflashWeights, DflashScratch, draft_forward) runs
+    // on `drafter_gpu_opt`; everything else (target.weights, hidden_rb,
+    // target_snap, verify_scratch, gdn_tape, KV cache) stays on `gpu`.
+    // Phases 2 / 5 / 9 stage the cross-card transfers via `verify_scratch`
+    // staging buffers + `multi_gpu::cross_card_copy_at`. Single-Gpu callers
+    // pass `None` and hit the byte-identical fast paths.
+    let mut drafter_gpu_opt = drafter_gpu_opt;
+    let hetero = drafter_gpu_opt.is_some();
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
     // doing adaptive-B based on rolling τ can shrink to save per-iter cost.
@@ -2425,9 +2509,16 @@ pub fn spec_step_dflash(
     // Ensure active_stream is set before any draft/verify work so memset_async
     // and stream-ordered launches have a non-null stream to ride on. Without
     // this, the lm_head pre-zero memsets in dispatch.rs:4475/4545 fall through
-    // to the sync hipMemset path (~46 hot calls/cycle on 27B).
+    // to the sync hipMemset path (~46 hot calls/cycle on 27B). Mirror the
+    // initialization onto the drafter device in hetero mode so its
+    // stream-ordered draft_forward dispatches don't silently fall back.
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+    if let Some(d) = drafter_gpu_opt.as_deref_mut() {
+        if d.active_stream.is_none() {
+            d.active_stream = Some(d.hip.stream_create()?);
+        }
     }
 
     assert!(b >= 2, "dflash block size must be ≥ 2");
@@ -2506,22 +2597,64 @@ pub fn spec_step_dflash(
     // into draft_scratch.x on GPU (no host round-trip). Target and draft
     // share the same Gpu, so the embedding lookup can target the draft's
     // scratch buffer. Avoids 16 × D2H + one H2D per iter (~1 ms saved).
-    for (i, &tok) in block.iter().enumerate() {
-        let dst = draft_scratch.x.sub_offset(i * h, h);
-        match target.weights.embd_format {
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
+    //
+    // Hetero (PRD v1.2 PR-A): target.weights.token_embd lives on `gpu`
+    // and `draft_scratch.x` lives on `drafter_gpu_opt`. Look up into
+    // `verify_scratch.embd_staging` on target_gpu first, then ship the
+    // B contiguous rows cross-card to `draft_scratch.x` on the drafter.
+    // ~327 KB / cycle at B=16, h=5120 — fits in the cross-card budget.
+    if hetero {
+        for (i, &tok) in block.iter().enumerate() {
+            let dst = verify_scratch.embd_staging.sub_offset(i * h, h);
+            match target.weights.embd_format {
+                hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
+                    gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
+                    gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
+                    gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::F32 => {
+                    gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
+                }
+                _ => panic!("dflash: unsupported target embedding format for noise lookup"),
             }
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
+        }
+        // Cross-card ship the B embedding rows into draft_scratch.x on
+        // the drafter. Single peer-async copy on `gpu`'s active_stream;
+        // drafter waits before the upcoming draft_forward.
+        let drafter = drafter_gpu_opt.as_deref().expect("hetero implies Some");
+        let n_bytes = b * h * 4;
+        let evt = multi_gpu::cross_card_copy_at(
+            gpu,
+            drafter,
+            &verify_scratch.embd_staging.buf,
+            0,
+            &draft_scratch.x.buf,
+            0,
+            n_bytes,
+        )?;
+        multi_gpu::cross_card_wait(drafter, evt)?;
+    } else {
+        for (i, &tok) in block.iter().enumerate() {
+            let dst = draft_scratch.x.sub_offset(i * h, h);
+            match target.weights.embd_format {
+                hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
+                    gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
+                    gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
+                    gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::F32 => {
+                    gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
+                }
+                _ => panic!("dflash: unsupported target embedding format for noise lookup"),
             }
-            hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::F32 => {
-                gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
-            }
-            _ => panic!("dflash: unsupported target embedding format for noise lookup"),
         }
     }
 
@@ -2588,19 +2721,35 @@ pub fn spec_step_dflash(
 
     // ── 4. draft_forward ────────────────────────────────────────────────
     // noise_embedding = None: we wrote embeddings directly into
-    // draft_scratch.x above via D2D (no host round-trip).
-    dflash::draft_forward(
-        gpu,
-        draft_weights,
-        draft_cfg,
-        None,
-        th_arg,
-        &positions_q,
-        &positions_k,
-        b,
-        effective_ctx_len,
-        draft_scratch,
-    )?;
+    // draft_scratch.x above (D2D in homogeneous, cross-card in hetero).
+    // In hetero, this dispatches against the dedicated drafter device;
+    // draft_weights and draft_scratch already live there from load time.
+    match drafter_gpu_opt.as_deref_mut() {
+        Some(drafter) => dflash::draft_forward(
+            drafter,
+            draft_weights,
+            draft_cfg,
+            None,
+            th_arg,
+            &positions_q,
+            &positions_k,
+            b,
+            effective_ctx_len,
+            draft_scratch,
+        )?,
+        None => dflash::draft_forward(
+            gpu,
+            draft_weights,
+            draft_cfg,
+            None,
+            th_arg,
+            &positions_q,
+            &positions_k,
+            b,
+            effective_ctx_len,
+            draft_scratch,
+        )?,
+    }
 
     // ── 5. Apply target.lm_head to draft hidden positions 1..B ──────────
     // Fast path: a single batched GEMM against target.weights.output over
@@ -2627,10 +2776,33 @@ pub fn spec_step_dflash(
         // verify uses. Draft calls this BEFORE verify in the cycle, so
         // there's no aliasing. The verify call overwrites these buffers
         // afterward. Avoids 2-3 hipMalloc/Free pairs per cycle.
+        //
+        // Hetero (PRD v1.2 PR-A): draft_scratch.x lives on the drafter
+        // device but target.weights.output lives on `gpu`. Cross-card
+        // ship the (B-1) drafter hidden rows into
+        // verify_scratch.draft_hidden_staging on `gpu`, then run the
+        // lm_head GEMM against the staging buffer. ~307 KB / cycle at
+        // B=16, h=5120.
         let batch = b - 1;
         assert!(batch <= verify_scratch.max_n,
             "verify_scratch max_n {} < draft batch {}", verify_scratch.max_n, batch);
-        let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
+        let hidden_rows = if hetero {
+            let drafter = drafter_gpu_opt.as_deref().expect("hetero implies Some");
+            let n_bytes = batch * h * 4;
+            let evt = multi_gpu::cross_card_copy_at(
+                drafter,
+                gpu,
+                &draft_scratch.x.buf,
+                h * 4,                                       // skip block[0] (the seed)
+                &verify_scratch.draft_hidden_staging.buf,
+                0,
+                n_bytes,
+            )?;
+            multi_gpu::cross_card_wait(gpu, evt)?;
+            verify_scratch.draft_hidden_staging.sub_offset(0, batch * h)
+        } else {
+            draft_scratch.x.sub_offset(h, batch * h)
+        };
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
 
         match w_out.gpu_dtype {
@@ -2712,7 +2884,23 @@ pub fn spec_step_dflash(
             }
         }
     } else {
-        // Fallback: per-row weight_gemv loop.
+        // Fallback: per-row weight_gemv loop. Used only for lm_head dtypes
+        // outside the batched-gemm coverage above (HFQ4G256/MQ4G256/MQ3G256
+        // /Q8_0). In hetero mode `draft_scratch.x` lives on the drafter
+        // device while `target.weights.output` and `target.scratch.logits`
+        // live on `gpu`; dispatching the per-row GEMV against `gpu` with a
+        // drafter-side buffer would touch wrong-device memory. Refuse
+        // cleanly instead — the production target dtypes hit the batched
+        // path above.
+        if hetero {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "spec_step_dflash hetero: per-row weight_gemv fallback path is not \
+                 supported on the cross-card spec-decode loop. Production target \
+                 lm_head dtypes (HFQ4G256/MQ4G256/MQ3G256/Q8_0) hit the batched \
+                 path; this fallback fires only for unsupported dtypes.",
+            ));
+        }
         for i in 1..b {
             let hidden_row = draft_scratch.x.sub_offset(i * h, h);
             llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
@@ -3057,14 +3245,35 @@ pub fn spec_step_dflash(
         // `rows_to_keep` (= accept+1) of those. Pass block_size=b so the
         // scatter function aligns to the verify-block origin, not the
         // ring tail.
-        scatter_hidden_block_to_interleaved(
-            gpu,
-            hidden_rb,
-            &draft_scratch.target_hidden,
-            position,
-            b,
-            rows_to_keep,
-        )?;
+        //
+        // Hetero (PRD v1.2 PR-A): hidden_rb lives on `gpu`, but
+        // `draft_scratch.target_hidden` lives on the drafter device.
+        // Use the cross-card variant — it issues the same per-(row, ext)
+        // copies through `cross_card_copy_at` instead of in-device
+        // `memcpy_dtod_at`. Per-cycle ~820 KB at typical 27B shapes.
+        match drafter_gpu_opt.as_deref() {
+            Some(drafter) => {
+                scatter_hidden_block_to_interleaved_cross_card(
+                    gpu,
+                    drafter,
+                    hidden_rb,
+                    &draft_scratch.target_hidden,
+                    position,
+                    b,
+                    rows_to_keep,
+                )?;
+            }
+            None => {
+                scatter_hidden_block_to_interleaved(
+                    gpu,
+                    hidden_rb,
+                    &draft_scratch.target_hidden,
+                    position,
+                    b,
+                    rows_to_keep,
+                )?;
+            }
+        }
         // Keep draft_forward's incremental-upload tracker in sync so any future
         // ctx_slice=Some call in the same session doesn't try to re-upload what
         // GPU already has; and so the assertion-in-draft path stays coherent.

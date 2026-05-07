@@ -17,48 +17,31 @@ Load-side foundation. Default codepath byte-identical to master.
 - `multi_gpu::cross_card_copy` + `cross_card_wait`: free-function form for two free-standing `Gpu` refs (no shared `Gpus`).
 - `generate_dflash` refuses with a clear error when `dflash_drafter_gpu.is_some()` (spec-step refactor not shipped).
 
-### Commit 2 — `feat(hetero-dflash): offset-aware peer copy primitives + cross_card_copy_at`
+### Commit 2 — `feat(hetero-dflash): offset-aware peer copy primitives + cross_card_copy_at` (`e86c105`)
 
 - `hip-bridge::ffi::HipRuntime::memcpy_peer_at` + `memcpy_peer_at_async`: byte-offset-aware peer copies for sub-slicing without intermediate `DeviceBuffer`s.
 - `multi_gpu::cross_card_copy_at`: free-function form of offset-aware peer copy with the same async-stream-vs-sync-host-staged decision tree as `cross_card_copy`.
 
 These are the primitives the spec-step body refactor (next commit) will use to ship sub-slices of `draft_scratch.x`, the embedding lookup output, and `hidden_rb` slots between target and drafter cards.
 
-## What remains (Step 2: spec_step_dflash body refactor)
+### Commit 3 — `feat(hetero-dflash): spec_step_dflash dual-Gpu body refactor (PR-A step 2)`
 
-The substantive engineering. ~150-200 LOC across `crates/hipfire-arch-qwen35/src/speculative.rs` + `crates/hipfire-runtime/examples/daemon.rs` + helpers.
+Generation-side surgery. Default codepath (single-Gpu DFlash, env unset) byte-identical to master; hetero path opt-in via `HIPFIRE_DFLASH_DRAFTER_DEVICE=N`.
 
-### Surface
+- `spec_step_dflash` signature gains `drafter_gpu_opt: Option<&mut Gpu>` as the second parameter (immediately after the target `gpu`).
+- `VerifyScratch` gains two cross-card staging buffers on `target_gpu`: `embd_staging` ([max_n × dim] f32) and `draft_hidden_staging` ([max_n × dim] f32) — ~800 KB at 27B max_n=20, dim=5120. Allocated unconditionally; unused on the homogeneous path.
+- Phase 2 hetero branch: write B target embeddings into `embd_staging` on `gpu`, single `cross_card_copy_at` of B × hidden f32 (~327 KB) into `draft_scratch.x` on the drafter, drafter-side `cross_card_wait`. Homogeneous branch unchanged (D2D into draft_scratch.x).
+- Phase 4 routes `dflash::draft_forward` to the drafter Gpu via match on `drafter_gpu_opt.as_deref_mut()`. Same body, same arguments — no signature change in `draft_forward`.
+- Phase 5 hetero branch: cross-card-ship `draft_scratch.x[h..h+(B-1)*h]` (drafter) into `draft_hidden_staging` (target), then run target's lm_head GEMM (HFQ4G256 / MQ4G256 / MQ3G256 / Q8_0) against the staging buffer. Per-row `weight_gemv` fallback path now refuses cleanly under hetero (would dispatch wrong-device buffers; production target dtypes hit the batched path).
+- Phase 9 dispatches the new `scatter_hidden_block_to_interleaved_cross_card` helper when hetero — same semantics as the existing per-(row, ext) D2D scatter, but each copy goes through `cross_card_copy_at` + `cross_card_wait`.
+- `daemon.rs::generate_dflash` drops the load-time refusal added in commit 1 and threads `m.dflash_drafter_gpu.as_mut()` into `spec_step_dflash`. Disjoint-field borrows let `df = m.dflash.as_mut().unwrap()` and `m.dflash_drafter_gpu.as_mut()` coexist on the same call.
+- `dflash_spec_demo.rs` (single-Gpu example) passes `None` and is byte-identical to master at runtime.
 
-1. **`DflashState` (or `DflashScratch`) extension**: lazy-allocate two staging buffers on target_gpu when `drafter_gpu.is_some()`:
-   - `embd_staging_target: GpuTensor` — `[B × hidden]` floats. Phase 2 writes embeddings here, then ships cross-card to `draft_scratch.x` on drafter_gpu.
-   - `draft_hidden_staging_target: GpuTensor` — `[(B-1) × hidden]` floats. Phase 5 cross-card-ships drafter hidden output here, then runs target's lm_head GEMM against it.
+Workspace cargo check clean. Diff: `crates/hipfire-arch-qwen35/src/speculative.rs` +259, `daemon.rs` +14/-12, `dflash_spec_demo.rs` +1.
 
-2. **`spec_step_dflash` signature** (`speculative.rs:2384`):
-   ```rust
-   pub fn spec_step_dflash(
-       target_gpu: &mut Gpu,
-       drafter_gpu: &mut Gpu,        // NEW — same as target_gpu when same-device-id
-       target: &mut ModelSlot,
-       draft_weights: &DflashWeights,
-       // ... same as before
-   ) -> HipResult<SpecStepResult>
-   ```
-   Internal: `let same_device = target_gpu.device_id == drafter_gpu.device_id;` drives the fast-path-vs-staging-path bifurcation per phase.
+## What remains (Step 3: smoke + bench on hipx)
 
-3. **Phase 2 (embedding lookup, lines ~2505-2526)**: when hetero, write embeddings to `embd_staging_target` on target_gpu, then `cross_card_copy_at` to `draft_scratch.x` on drafter_gpu.
-
-4. **Phase 4 (`dflash::draft_forward`, line 2592)**: pass `drafter_gpu` instead of `gpu`. The function body is purely drafter-side; just rename the parameter.
-
-5. **Phase 5 (draft lm_head, lines ~2638-2742)**: when hetero, `cross_card_copy_at` `draft_scratch.x[h..]` from drafter_gpu → `draft_hidden_staging_target` on target_gpu. Run lm_head GEMM on target_gpu against the staging buffer.
-
-6. **Phase 6 (`verify_dflash_block`, line ~2823)**: target-side helper, just rename `gpu` → `target_gpu` parameter inside `verify_dflash_block_inner` (lines 1854-2193).
-
-7. **Phase 9 (`scatter_hidden_block_to_interleaved`, line 3060)**: when hetero, the existing function (which does N×ne D2D copies on a single Gpu) needs a cross-card variant that does the same copies via `cross_card_copy_at` from `hidden_rb.layer_bufs[ext]` (target_gpu) → `draft_scratch.target_hidden` (drafter_gpu).
-
-8. **Phase 10 (target_snap restore + tape replay)**: target-side, rename only.
-
-9. **`generate_dflash` (`daemon.rs:1998`)**: drop the refusal added in commit 1; pass `m.dflash_drafter_gpu.as_mut().unwrap_or(/* reborrow gpu */)` as the `drafter_gpu` argument.
+The plumbing is in place. Step 3 is empirical: the cross-card path now needs to be exercised on the real `hipx` rig (gfx1151 target + gfx1010 drafter) to confirm correctness, coherence, and the ≥1.25× perf anchor.
 
 ### Cross-card op count per cycle
 
@@ -100,11 +83,10 @@ unset HIPFIRE_DFLASH_DRAFTER_DEVICE
 # Expect: ~27.0 tok/s
 ```
 
-## Continuation options
+## Continuation options for Step 3
 
-- **Same-session push**: continue the body refactor here. Costs ~150-200 LOC of careful surgery in `speculative.rs`; cross-card buffer placement at three phase boundaries.
-- **Fresh session**: pick up with this doc + the pushed branch. Full context budget for the surgery.
-- **Codex rescue**: hand the body refactor to Codex with this doc + `09-per-card-prefill-rates.md` + `10-gfx1151-solo-dflash-27b.md` as context. Two-phase plan (refactor → smoke on hipx) is well-bounded for delegation.
+- **hipx run**: ssh to hipx, `git fetch && git checkout feat/hetero-pp-dflash`, follow the test path above. First verify `HIPFIRE_DFLASH_DRAFTER_DEVICE` unset reproduces the Exp #10 anchor (~27.0 tok/s solo), then enable it and look for ≥33.75 tok/s + clean coherence.
+- **Codex rescue**: if the smoke trips up on a wrong-device-buffer panic or stream-ordering bug, hand the trace to Codex with this doc as context. The cross-card phases (2 / 5 / 9) are the most likely failure surface; the rest is byte-identical to master.
 
 ## References
 
@@ -112,4 +94,5 @@ unset HIPFIRE_DFLASH_DRAFTER_DEVICE
 - Empirical anchors: `docs/investigations/2026-05-07-rdna1-perf-research/09-per-card-prefill-rates.md` (5.07× WMMA prefill), `10-gfx1151-solo-dflash-27b.md` (1.84× solo, 27.0 tok/s)
 - Smoke status (PR1 of PRD): `docs/investigations/2026-05-07-rdna1-perf-research/11-hetero-dflash-smoke-status.md`
 - Foundation commit: `f47cdfd` `feat(hetero-dflash): drafter device pinning + cross-card helpers (PR-A foundation)`
+- Step-1.5 commit: `e86c105` `feat(hetero-dflash): offset-aware peer copy primitives + progress doc`
 - Plan: `~/.claude/plans/read-the-prd-v1-2-immutable-minsky.md`

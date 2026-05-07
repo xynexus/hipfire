@@ -2012,20 +2012,14 @@ fn generate_dflash(
         ModelSlotConfig, Phase2Snapshots, SpecStats,
     };
 
-    // Hetero PP+DFlash drafter device pinning (PRD v1.2): the load-side
-    // foundation is shipped (drafter weights/scratch land on the dedicated
-    // Gpu set by HIPFIRE_DFLASH_DRAFTER_DEVICE), but the cross-card
-    // spec-decode coordination loop (PR-A step 2: spec_step_dflash dual-Gpu
-    // signature + per-cycle staging) is NOT yet shipped. Refuse here with
-    // a clear error rather than dispatching kernels against
-    // wrong-device buffers and crashing.
-    if m.dflash_drafter_gpu.is_some() {
-        let _ = writeln!(stdout,
-            r#"{{"type":"error","id":"{}","message":"HIPFIRE_DFLASH_DRAFTER_DEVICE is set but the cross-card spec-decode loop is not yet implemented (PR-A step 2 of docs/plans/hetero-pflash-dflash.prd). Drafter weights are loaded on the dedicated device but generation still requires the spec_step_dflash dual-Gpu refactor. Unset the env to fall back to single-Gpu DFlash."}}"#,
-            id);
-        let _ = stdout.flush();
-        return;
-    }
+    // Hetero PP+DFlash drafter device pinning (PRD v1.2 PR-A): when
+    // `m.dflash_drafter_gpu` is `Some`, `spec_step_dflash` runs the
+    // cross-card spec-decode loop with the drafter on the dedicated
+    // device (HIPFIRE_DFLASH_DRAFTER_DEVICE=N). Per-cycle phases 2/4/5/9
+    // stage the cross-card transfers through `verify_scratch` staging
+    // buffers + `multi_gpu::cross_card_copy_at`. Default behavior unchanged
+    // when the env is unset (drafter_gpu=None → byte-identical single-Gpu
+    // path).
 
     // Tokenize with ChatML wrapping (identical to the AR path). System prompt
     // is always prepended because this fast path is single-turn.
@@ -2302,7 +2296,9 @@ fn generate_dflash(
             }
         } else {
             spec_step_dflash(
-                gpu, &mut target, &df.draft_weights, &df.draft_config,
+                gpu,
+                m.dflash_drafter_gpu.as_mut(),
+                &mut target, &df.draft_weights, &df.draft_config,
                 &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
                 &mut df.target_snap, &df.verify_scratch,
                 position, seed_token,

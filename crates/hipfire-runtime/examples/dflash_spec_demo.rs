@@ -1209,6 +1209,7 @@ fn main() {
         } else {
             speculative::spec_step_dflash(
                 &mut gpu,
+                None,                                  // single-Gpu demo: no hetero drafter
                 &mut target,
                 &draft_weights,
                 &draft_cfg,
