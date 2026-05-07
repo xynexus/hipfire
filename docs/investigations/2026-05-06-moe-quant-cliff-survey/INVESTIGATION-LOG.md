@@ -808,3 +808,21 @@ the "PPL on wikitext was the wrong metric" interpretation.
 
 Per the multi-session contract: HALT for kaden review before any Phase 3.
 
+
+## 2026-05-07 02:35 UTC — Resolution: PR #180 merged + re-quant + HF distribution
+
+Phase A complete:
+- A1 ✅ PR #180 merged (admin-rebase, master HEAD `ee1be8a`)
+- A2 ✅ Patched hipfire-quantize built on hiptrx
+- A3 ✅ Re-quanted 3.5/3.6-A3B at MQ4 (~16-21s each on Threadripper 9970X)
+- A4 ✅ Re-quanted 3.5/3.6-A3B at MQ3 (~22-38s each)
+- A5 ✅ Validated against #171 agent_prompt reproducer:
+  - 3.5-A3B post-fix: 0.558 unique-ratio, clean
+  - 3.6-A3B post-fix: 0.853 unique-ratio + self-EOS — CLIFF FIXED
+- A6 ✅ Created schuttdev/hipfire-qwen3.5-35b-a3b on HF; uploaded READMEs
+  for both 3.5/3.6-A3B repos. Binary uploads (76 GB total) in flight.
+- A7 ✅ This entry; resolution documented in `04-phase2-results-synthesis.md`.
+
+Survey branch closes here. Phase B (HFP4 PRD + gemma4 intake) and
+Phase C (canonicalize arch-intake) continue.
+

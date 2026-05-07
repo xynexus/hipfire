@@ -187,3 +187,71 @@ sets after seeing PPL data.
 - `INVESTIGATION-LOG.md` — append-only timeline
 - arXiv 2507.23279 — "Super Experts in MoE" (paper claim does not generalize cleanly to Qwen3.5/3.6 family per our test)
 - GitHub issue #171 — fivetide's router-Q8 finding (orthogonal surface, untested by Phase 2)
+
+## Resolution — 2026-05-07
+
+The cliff that motivated this survey is **fixed in production by
+[PR #180](https://github.com/Kaden-Schutt/hipfire/pull/180)** (fivetide), merged to
+master at `ee1be8a`. The fix wires `is_q8_tensor` consultation into the
+`use_mq4g256` quantization path so `mlp.gate.weight` and
+`mlp.shared_expert_gate.weight` are pinned at Q8F16 instead of MQ4 —
+exactly the surface our survey did NOT test (we kept those tensors at
+bf16 reference in V1/V2/V3 SKIP_PATTERNS, which over-estimated the
+"All-MQ4" baseline relative to real production).
+
+### Empirical validation (2026-05-07 02:34 UTC, hiptrx R9700)
+
+Re-quantized 3.5-A3B and 3.6-A3B with the patched binary, ran the
+[issue #171 agent_prompt reproducer](../2026-05-05-qwen36-a3b-mq4-fragility/repro_failing.jsonl)
+through both:
+
+| model | tokens | unique-word ratio | verdict |
+|---|---|---:|---|
+| 3.5-A3B (post-fix) | 792 | 0.558 | clean head, tail attractor near 800-token cap |
+| 3.6-A3B (post-fix) | 747 | **0.853** | clean + self-EOS at `<\|im_end\|>` |
+
+3.6-A3B post-fix vastly outperforms fivetide's reported pre-fix 14% on
+his code-review prompt (and matches/exceeds the 46% fivetide reported
+post-fix on that same prompt). The cliff is gone.
+
+### Why our Phase 2 missed this
+
+Our V1-V3 variants quantized everything except `mlp.gate.weight` and
+`shared_expert_gate.weight` (left at bf16 in `SKIP_PATTERNS`). That's
+why V1's PPL (7.4496 on wikitext, 12.46 on agentic) was already in a
+"clean" regime — the broken router was never present in our test.
+Production `.mq4` files BEFORE fivetide's fix had MQ4 router; we'd have
+needed `V_prod` (which we set up but cancelled before running) to
+measure the actual broken state.
+
+The survey's contribution stands as a **methodology contribution +
+negative result**: per-tensor pinning by D2/D3 SE-set proxies refutes
+the arXiv 2507.23279 SE hypothesis on the Qwen3.5/3.6 family. The
+*real* cure was at a different surface (the router gate) which fivetide
+identified independently and we missed by skipping it from our test.
+
+### Distribution updates
+
+New `.mq4` and `.mq3` files for both 3.5-A3B and 3.6-A3B uploaded to
+HF:
+- [schuttdev/hipfire-qwen3.5-35b-a3b](https://huggingface.co/schuttdev/hipfire-qwen3.5-35b-a3b)
+- [schuttdev/hipfire-qwen3.6-35b-a3b](https://huggingface.co/schuttdev/hipfire-qwen3.6-35b-a3b)
+
+Old `.mq4` is replaced; the prior `.mq4.hermes.triattn.bin` sidecar is
+calibrated against the broken-router weights and is currently
+deprecated pending re-calibration.
+
+### Tasks closed
+
+- #24: Land contributor's Q8 router default fix → DONE (PR #180 merged)
+- #25: Re-quantize 3.5/3.6-A3B with router-Q8 default → DONE (uploaded to HF)
+- #44: Run Phase 2 SE ablations → DONE (REFUTED, this doc)
+
+### Open follow-ups
+
+- Re-calibrate `.mq4.hermes.triattn.bin` against the new weights
+  (Aureth-corpus → CASK sidecar pipeline)
+- HFP4 / HFP8 format work for the broad-distribution residual cliff
+  (see `docs/plans/hfp4-format.prd`)
+- gemma4 architecture port (gemma4 branch in flight)
+
