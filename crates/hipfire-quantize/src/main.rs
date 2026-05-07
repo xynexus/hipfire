@@ -479,6 +479,98 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
+/// Magnum-Gemma 4-bit (MG4G256): same binary layout as MQ4G256 (136 B/group),
+/// engine treats it as MQ4G256 at dequant time. The ONLY difference is
+/// calibration:
+///
+/// MQ4G256 picks per-block scale from true min..max of the post-FWHT block.
+/// On Gemma 4 31B that allocates the codebook range to the post-FWHT
+/// distribution's tails (~3σ each side), leaving only ~0.4σ per bin for the
+/// bulk where ~95% of mass lives. The per-element error compounds through
+/// 60 layers under Gemma 4's learned `layer_scalar` per-layer gain (see
+/// modeling_gemma4.py L228 — empirically, layer-scalar amplifies residual
+/// noise) and collapses attention into a single-token attractor (' .' from
+/// step 2 onwards on gemma-4-31B). MQ4 stays coherent on Qwen3.5 because
+/// Qwen has no equivalent per-layer scalar.
+///
+/// MG4G256 fix: clip to [P02, P98] of the rotated block before binarizing.
+/// Bulk gets ~30% better resolution per bin; ~4% of values saturate at
+/// codebook edges (intentional — FWHT had already redistributed those tails).
+///
+/// File-format identity:
+///   - 136 bytes/group, same scale|min|nibbles layout as MQ4G256
+///   - `quantize_mg4g256` produces files with `QuantType::MG4G256 = 19`
+///   - The hipfire engine reads `MG4G256` and dispatches the existing
+///     `gemv_mq4g256_with_rotate` kernel unchanged
+///   - HF distribution: `.mq4` extension; the QuantType byte is the
+///     source of truth for calibration variant
+fn quantize_mg4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    use rayon::prelude::*;
+    let group_size = 256;
+    let block_bytes = 136;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    // Per-block parallelism: each 256-element block produces a disjoint
+    // 136-byte output region; FWHT signs1/signs2 are read-only refs.
+    output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_block)| {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+
+        // FWHT rotation — same signs1/signs2 as MQ4. The rotation cancels
+        // at GEMV time via x-side rotation, so MG4 reads back through the
+        // exact same kernel path as MQ4.
+        cpu_fwht_256(&mut group, signs1, signs2);
+
+        // Percentile-clip calibration. P02 and P98 of 256 samples = 5th and
+        // 250th when sorted (by simple count). select_nth_unstable is O(n)
+        // average — no full sort needed. Use a copy so the unsorted `group`
+        // stays available for the post-clip quantization step.
+        let mut sorted = group;
+        sorted.select_nth_unstable_by(5, |a, b| a.partial_cmp(b).unwrap());
+        let p02 = sorted[5];
+        sorted.select_nth_unstable_by(250, |a, b| a.partial_cmp(b).unwrap());
+        let p98 = sorted[250];
+
+        // Degenerate (~all-zero) block: fall back to true min..max so we
+        // don't divide by zero. In practice this only fires on padding
+        // tails of the last incomplete block.
+        let (lo, hi) = if (p98 - p02).abs() < 1e-12 {
+            let mn = group.iter().cloned().fold(f32::INFINITY, f32::min);
+            let mx = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            (mn, mx)
+        } else {
+            (p02, p98)
+        };
+
+        let range = hi - lo;
+        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        out_block[0..4].copy_from_slice(&scale.to_le_bytes());
+        out_block[4..8].copy_from_slice(&lo.to_le_bytes());
+
+        for i in 0..128 {
+            // Saturating quantization: values outside [lo, hi] get clamped to
+            // the codebook edges (0 or 15). For percentile-clipped calibration
+            // this is by-design — the top and bottom ~2% of FWHT-rotated values
+            // were chosen as the saturation boundary.
+            let lo_v = group[2 * i];
+            let hi_v = group[2 * i + 1];
+            let lo_q = (((lo_v - lo) * inv_scale + 0.5).max(0.0).min(15.0)) as u8;
+            let hi_q = (((hi_v - lo) * inv_scale + 0.5).max(0.0).min(15.0)) as u8;
+            out_block[8 + i] = lo_q | (hi_q << 4);
+        }
+    });
+
+    output
+}
+
 /// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
 /// Same binary format as HFQ6-G256 (200 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
@@ -1027,6 +1119,15 @@ enum QuantType {
     BF16 = 16,     // Original BF16 weights (zero precision loss for vision)
     MQ3G256 = 17,  // MagnumQuant: FWHT-rotated HFQ3-G256 (3-bit, 104 B/group)
     MQ2G256 = 18,  // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
+    MG4G256 = 19,  // Magnum-Gemma 4-bit: same MQ4 binary (136 B/group), engine
+                   // dequant is MQ4-identical. Differs only in calibration —
+                   // percentile-clip [P02, P98] of the post-FWHT block instead
+                   // of true min..max. Designed for Gemma 4 where the per-layer
+                   // learned `layer_scalar` gain compounds MQ4 tail
+                   // bin-allocation error into a single-token attractor; MG4's
+                   // bulk-bin resolution (~30% better) restores coherence.
+                   // Externally distributed as `.mq4` — `QuantType` byte is
+                   // the source of truth for calibration variant.
 }
 
 struct HfqTensor {
@@ -1504,6 +1605,11 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
         "llama" => 0,
         "qwen3" | "qwen2" => 1,
         "qwen3moe" => 6,
+        // Gemma 4 family: hybrid sliding-window + full attention, dense
+        // (gemma-4-31B) or MoE (gemma-4-26B-A4B). The forward path is
+        // structurally distinct from llama/qwen and lives in
+        // `crates/hipfire-arch-gemma4/`; arch_id=7 routes to it.
+        "gemma4" | "gemma" => 7,
         other => {
             eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
             0
@@ -1690,7 +1796,29 @@ fn main() {
     let use_q4k_all = format == "q4k";
     let use_q4k_q8embed = format == "q4k-q8embed";
     let use_mq8g256 = format == "mq8" || format == "mq8g256";
-    let use_mq4g256 = format == "mq4" || format == "mq4g256" || format == "magnum";
+    // MG4G256 — Magnum-Gemma 4-bit. Same MQ4 binary, different calibration
+    // (percentile-clip [P02, P98] of post-FWHT block vs true min..max).
+    // Engine treats `MG4G256 = 19` as MQ4G256 at dequant time — kernel
+    // transparent. See `quantize_mg4g256` for the algorithm and the design
+    // rationale (Gemma 4 layer_scalar interaction with MQ4 tail-allocated
+    // codebook bins).
+    let use_mg4g256_explicit = format == "mg4" || format == "mg4g256";
+    // Auto-promote `--format mq4` → MG4 for Gemma 4 family. MQ4's true
+    // min..max calibration produces a single-token `' .'` attractor on
+    // gemma-4-31B from step 2 onwards (verified empirically pre-modular).
+    // Surface a stderr warning so the operator sees the upgrade.
+    let auto_mg4 = (format == "mq4" || format == "mq4g256" || format == "magnum")
+        && arch_id == 7;
+    if auto_mg4 {
+        eprintln!("  Gemma 4 detected — auto-promoting --format mq4 → mg4 (calibration variant). \
+                   Pass --format mg4 explicitly to silence this notice.");
+    }
+    let use_mg4g256 = use_mg4g256_explicit || auto_mg4;
+    // mq4g256 stays *false* when MG4 is in effect — the dispatch chain
+    // below reads `use_mg4g256` first so the file gets the right
+    // `QuantType` byte.
+    let use_mq4g256 = (format == "mq4" || format == "mq4g256" || format == "magnum")
+        && !auto_mg4;
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
     let use_hfq3g128 = format == "hfq3g128" || format == "hfq3" || format == "hf3"; // default HF3 = G128
@@ -1786,10 +1914,16 @@ fn main() {
         // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
         // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
         "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
+        // Gemma 4 family (gemma-4-31B dense, gemma-4-26B-A4B MoE,
+        // gemma-4-E2B/E4B Any-to-Any): hybrid sliding-window + full attention
+        // (5:1 ratio on most layers), sandwich RMSNorm, partial halved RoPE,
+        // logit softcap. arch_id=7 routes to crates/hipfire-arch-gemma4/.
+        "gemma4" | "gemma" => 7,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
     eprintln!("Architecture: {arch_str} (id={arch_id})");
     let is_moe = arch_id == 6;
+    let is_gemma4 = arch_id == 7;
     if is_moe {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
     }
@@ -2066,6 +2200,29 @@ fn main() {
                     // Fallback to Q8 for non-256-aligned
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                }
+            } else if use_mg4g256 && is_embed {
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_mg4g256 {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 256 == 0 {
+                    // Same FWHT signs as MQ4 — engine treats MG4 as MQ4 at
+                    // dequant time; the rotation is GEMV-cancellable.
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mg4g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MG4G256, 256u32, "MG4G256")
+                } else {
+                    // Fallback to MQ4 (true min..max) on non-256-aligned tails.
+                    // Acceptable because (a) percentile-clip needs 256 samples
+                    // for stable P02/P98, and (b) non-aligned dims are rare on
+                    // Gemma 4 (head_dim=256/512, hidden=5376, intermediate=21504
+                    // are all 256-aligned).
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256, 256u32, "MQ4G256(non-256-aligned MG4 fallback)")
                 }
             } else if use_mq4g256 && is_embed {
                 let q = quantize_q8f16(&f32_data);
