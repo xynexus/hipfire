@@ -11467,6 +11467,24 @@ impl Gpu {
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
         let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
 
+        // Guard against partials overflow. The kernel computes per-tile offsets
+        // as `(h * max_tiles + tile_id) * (2 + head_dim)`, so any caller whose
+        // `max_seq` translates to more tiles than the partials buffer can hold
+        // will silently corrupt past the end. For hd=512 this stride is 514,
+        // so the headroom is half what hd=256 callers see — failure surfaces
+        // first on Gemma 4 full layers. Bail loud here.
+        let required_partials = n_heads * max_tiles * (2 + head_dim);
+        if partials.numel() < required_partials {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "attention_flash_asym3_window: partials too small — have {} floats, need {} \
+                 (n_heads={} max_tiles={} stride={} from max_seq={} head_dim={}). \
+                 Resize the per-arch scratch (HIPFIRE_KV_SEQ for Gemma 4) or reduce \
+                 kv_cache.max_seq.",
+                partials.numel(), required_partials,
+                n_heads, max_tiles, 2 + head_dim, max_seq, head_dim
+            )));
+        }
+
         let (kernel_name, kernel_src) = match head_dim {
             256 => ("attention_flash_asym3_tile", kernels::ATTENTION_FLASH_ASYM3_TILE_SRC),
             512 => ("attention_flash_asym3_tile_hd512", kernels::ATTENTION_FLASH_ASYM3_TILE_HD512_SRC),

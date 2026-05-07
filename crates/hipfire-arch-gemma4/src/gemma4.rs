@@ -636,24 +636,31 @@ impl Gemma4Scratch {
         let sample_buf = gpu.zeros(&[2], DType::F32)?;
         let repeat_buf = gpu.zeros(&[1024], DType::F32)?;
 
-        // Flash partials sizing. Assumes max_seq <= 32768 (typical daemon max).
-        // Per-head × max_tiles × (2 + head_dim).
-        // Sized for FULL attn (larger head_dim=512, larger max_tiles).
-        const MAX_CTX_DEFAULT: usize = 32768;
+        // Flash partials sizing. Per-head × max_tiles × (2 + head_dim) floats.
+        // Sized for FULL attn (head_dim=512 stride 514, vs sliding 256 stride 258);
+        // sliding-layer dispatches use part of the buffer, full-layer dispatches
+        // use all of it. Override with HIPFIRE_KV_SEQ to support contexts beyond
+        // 32k (Gemma 4 supports up to 128k natively); the daemon must keep
+        // kv_cache.max_seq <= this value or dispatch will return a loud Err
+        // (see runtime guard in attention_flash_asym3_window). 32k is the
+        // hipfire-wide default that matches Qwen3.5 / 3.6 production max.
+        const FALLBACK_KV_SEQ: usize = 32768;
         const TILE_SIZE: usize = 128;
-        let max_tiles_full = (MAX_CTX_DEFAULT + TILE_SIZE - 1) / TILE_SIZE;
+        let max_kv_seq: usize = std::env::var("HIPFIRE_KV_SEQ")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 128 && n <= 524_288)
+            .unwrap_or(FALLBACK_KV_SEQ);
+        let max_tiles_full = (max_kv_seq + TILE_SIZE - 1) / TILE_SIZE;
         let flash_partials_sz = config.n_heads * max_tiles_full * (2 + config.full_head_dim);
         let flash_partials = gpu.zeros(&[flash_partials_sz], DType::F32)?;
 
-        // RoPE tables. The actual sin/cos values are computed host-side and
-        // uploaded once per model load. For now allocate and zero; the loader
-        // will populate them.
-        // Size: max_seq * head_dim (enough for every (position, rotary_dim) pair).
-        // TODO: make max_seq configurable — using 32k default.
-        let sliding_cos = gpu.zeros(&[MAX_CTX_DEFAULT * config.sliding_head_dim], DType::F32)?;
-        let sliding_sin = gpu.zeros(&[MAX_CTX_DEFAULT * config.sliding_head_dim], DType::F32)?;
-        let full_cos = gpu.zeros(&[MAX_CTX_DEFAULT * config.full_head_dim], DType::F32)?;
-        let full_sin = gpu.zeros(&[MAX_CTX_DEFAULT * config.full_head_dim], DType::F32)?;
+        // RoPE tables. Same max_kv_seq cap so a single env override scales
+        // partials + tables together. The loader populates these per-model.
+        let sliding_cos = gpu.zeros(&[max_kv_seq * config.sliding_head_dim], DType::F32)?;
+        let sliding_sin = gpu.zeros(&[max_kv_seq * config.sliding_head_dim], DType::F32)?;
+        let full_cos = gpu.zeros(&[max_kv_seq * config.full_head_dim], DType::F32)?;
+        let full_sin = gpu.zeros(&[max_kv_seq * config.full_head_dim], DType::F32)?;
 
         // v_norm ones — populated on first use in the forward pass.
         // (Allocated to the full head_dim because only full-attn layers
