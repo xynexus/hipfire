@@ -72,18 +72,41 @@ D3_PIN_SET: set[tuple[int, int]] = {
 
 UNION_PIN_SET = D2_PIN_SET | D3_PIN_SET
 
-# Skip these tensor name patterns when applying quant.
-SKIP_PATTERNS = (
+# Tensor-name substrings that get promoted to Q8 in router-fix variants.
+# Same shape as fivetide's #171 Q8-router patch / hipfire-quantize's
+# `is_q8_tensor` (main.rs:1150-1151) — except those don't currently fire
+# in the mq4g256 path. V4 simulates "main.rs gets fixed to consult
+# is_q8_tensor in the mq4g256 branch."
+ROUTER_Q8_NAMES = ("mlp.gate.weight", "mlp.shared_expert_gate")
+
+
+# Skip these tensor name patterns when applying quant. The default skip
+# set leaves router/shared_expert_gate at bf16 reference (the original
+# Phase 2 V1/V2/V3 design — slightly over-optimistic baseline since real
+# production .mq4 has the router at MQ4). The "include_router" flag
+# below lets V_prod / V4 route through the normal quant path so we can
+# directly measure the router-precision effect.
+SKIP_PATTERNS_DEFAULT = (
     "norm",         # all RMSNorm weights
     "embed_tokens",
     "lm_head",
-    "mlp.gate.weight",     # MoE router (small)
-    "shared_expert_gate",  # shared-expert binary gate
+    "mlp.gate.weight",     # MoE router (small) — kept at bf16 in V1/V2/V3
+    "shared_expert_gate",  # shared-expert binary gate — kept at bf16 in V1/V2/V3
+)
+SKIP_PATTERNS_INCLUDE_ROUTER = (
+    "norm",
+    "embed_tokens",
+    "lm_head",
 )
 
 
-def _should_skip(name: str) -> bool:
-    return any(p in name for p in SKIP_PATTERNS)
+def _should_skip(name: str, include_router: bool = False) -> bool:
+    patterns = SKIP_PATTERNS_INCLUDE_ROUTER if include_router else SKIP_PATTERNS_DEFAULT
+    return any(p in name for p in patterns)
+
+
+def _matches_router_q8(name: str) -> bool:
+    return any(p in name for p in ROUTER_Q8_NAMES)
 
 
 def _is_moe_3d_expert_tensor(name: str) -> bool:
@@ -206,18 +229,44 @@ def apply_variant(model, variant: str) -> dict[str, int]:
     if variant == "V1":
         pin_set: set[tuple[int, int]] = set()
         all_q8 = False
+        include_router = False
+        router_q8 = False
     elif variant == "V2":
         pin_set = set()
         all_q8 = True
+        include_router = False
+        router_q8 = False
     elif variant == "V3a":
         pin_set = D2_PIN_SET
         all_q8 = False
+        include_router = False
+        router_q8 = False
     elif variant == "V3b":
         pin_set = D3_PIN_SET
         all_q8 = False
+        include_router = False
+        router_q8 = False
     elif variant == "V3c":
         pin_set = UNION_PIN_SET
         all_q8 = False
+        include_router = False
+        router_q8 = False
+    elif variant == "V_prod":
+        # Mirrors real .mq4 production: router and shared_expert_gate are
+        # quantized at MQ4 like every other 2D weight. Removes the
+        # bf16-router headroom that V1 has accidentally been giving us.
+        pin_set = set()
+        all_q8 = False
+        include_router = True
+        router_q8 = False
+    elif variant == "V4":
+        # fivetide's #171 router-Q8 fix: V_prod with mlp.gate.weight +
+        # shared_expert_gate promoted to Q8. Direct test of what
+        # main.rs:1150-1151 would do once wired into the mq4g256 path.
+        pin_set = set()
+        all_q8 = False
+        include_router = True
+        router_q8 = True
     else:
         raise ValueError(f"unknown variant {variant!r}")
 
@@ -242,12 +291,15 @@ def apply_variant(model, variant: str) -> dict[str, int]:
 
     with torch.no_grad():
         for i, (name, p) in enumerate(model.named_parameters()):
-            if _should_skip(name):
+            if _should_skip(name, include_router=include_router):
                 counts["skipped"] += 1
                 continue
             if p.dim() < 2:
                 counts["skipped"] += 1
                 continue
+            # Per-name Q8 promotion (router-fix variants). Applies to
+            # the small 2D router/shared_expert_gate weights only.
+            force_q8_by_name = router_q8 and _matches_router_q8(name)
 
             orig_dtype = p.dtype
             device = p.device
@@ -292,9 +344,10 @@ def apply_variant(model, variant: str) -> dict[str, int]:
                 if n_cols % GROUP_SIZE != 0:
                     counts["skipped"] += 1
                     continue
-                rt = _torch_quant_2d(p, q8=all_q8, signs1_t=s1_t, signs2_t=s2_t)
+                use_q8 = all_q8 or force_q8_by_name
+                rt = _torch_quant_2d(p, q8=use_q8, signs1_t=s1_t, signs2_t=s2_t)
                 p.data.copy_(rt.to(dtype=orig_dtype))
-                if all_q8:
+                if use_q8:
                     counts["q8"] += 1
                 else:
                     counts["q4"] += 1
@@ -348,7 +401,8 @@ def compute_perplexity(model, tokenizer, eval_records, max_seq_len: int, device)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, choices=list(MODEL_REGISTRY.keys()))
-    ap.add_argument("--variant", required=True, choices=["V1", "V2", "V3a", "V3b", "V3c"])
+    ap.add_argument("--variant", required=True,
+                    choices=["V1", "V2", "V3a", "V3b", "V3c", "V_prod", "V4"])
     ap.add_argument("--trial", type=int, required=True)
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--hf-cache", default=str(Path.home() / ".cache/huggingface/hub"))
