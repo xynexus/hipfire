@@ -348,6 +348,56 @@ pub fn cross_card_copy(
     }
 }
 
+/// Offset-aware variant of `cross_card_copy`. Ships `n_bytes` from
+/// `src + src_offset` (on `src_gpu`) to `dst + dst_offset` (on `dst_gpu`).
+/// Used by the cross-card spec-decode path to ship sub-slices of larger
+/// buffers (per-row hidden, embedding rows, ring-buffer slots) without
+/// allocating intermediate sub-slice `DeviceBuffer`s.
+pub fn cross_card_copy_at(
+    src_gpu: &Gpu,
+    dst_gpu: &Gpu,
+    src: &DeviceBuffer,
+    src_offset: usize,
+    dst: &DeviceBuffer,
+    dst_offset: usize,
+    n_bytes: usize,
+) -> HipResult<BoundaryEvent> {
+    if src_gpu.device_id == dst_gpu.device_id {
+        return Err(HipError::new(
+            0,
+            "cross_card_copy_at: src and dst share device_id (use memcpy_dtod_at instead)",
+        ));
+    }
+    src_gpu.bind_thread()?;
+    let src_dev_id = src_gpu.device_id;
+    let dst_dev_id = dst_gpu.device_id;
+    match src_gpu.active_stream.as_ref() {
+        Some(stream) => {
+            src_gpu.hip.memcpy_peer_at_async(
+                dst, dst_offset, dst_dev_id,
+                src, src_offset, src_dev_id,
+                n_bytes, stream,
+            )?;
+            let event = src_gpu.hip.event_create()?;
+            match src_gpu.hip.event_record(&event, Some(stream)) {
+                Ok(()) => Ok(BoundaryEvent { dst_dev: usize::MAX, completion: Some(event) }),
+                Err(e) => {
+                    let _ = src_gpu.hip.event_destroy(event);
+                    Err(e)
+                }
+            }
+        }
+        None => {
+            src_gpu.hip.memcpy_peer_at(
+                dst, dst_offset, dst_dev_id,
+                src, src_offset, src_dev_id,
+                n_bytes,
+            )?;
+            Ok(BoundaryEvent { dst_dev: usize::MAX, completion: None })
+        }
+    }
+}
+
 /// Free-function form of `Gpus::wait_boundary` for the cross-card path.
 /// Takes the destination `Gpu` directly so callers without a `Gpus`
 /// orchestrator can still pair `cross_card_copy` with a wait. Consumes

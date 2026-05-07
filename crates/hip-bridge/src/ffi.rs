@@ -454,6 +454,67 @@ impl HipRuntime {
         self.check(code, "hipMemcpyPeerAsync")
     }
 
+    /// Offset-aware sync peer copy. Used by the cross-card spec-decode
+    /// path to ship sub-slices of larger buffers (per-row hidden block,
+    /// embedding rows, ring-buffer slots) between two free-standing `Gpu`
+    /// instances without sub-slicing `DeviceBuffer`s.
+    pub fn memcpy_peer_at(
+        &self,
+        dst: &DeviceBuffer,
+        dst_offset: usize,
+        dst_device: i32,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        src_device: i32,
+        size: usize,
+    ) -> HipResult<()> {
+        assert!(
+            dst_offset + size <= dst.size(),
+            "dst_offset ({dst_offset}) + size ({size}) exceeds dst ({})", dst.size()
+        );
+        assert!(
+            src_offset + size <= src.size(),
+            "src_offset ({src_offset}) + size ({size}) exceeds src ({})", src.size()
+        );
+        let dst_ptr = unsafe { (dst.as_ptr() as *mut u8).add(dst_offset) as *mut c_void };
+        let src_ptr = unsafe { (src.as_ptr() as *const u8).add(src_offset) as *const c_void };
+        let code = unsafe {
+            (self.fn_memcpy_peer)(dst_ptr, dst_device, src_ptr, src_device, size)
+        };
+        self.check(code, "hipMemcpyPeer@offset")
+    }
+
+    /// Offset-aware async peer copy. Stream must belong to one of the
+    /// two devices involved.
+    pub fn memcpy_peer_at_async(
+        &self,
+        dst: &DeviceBuffer,
+        dst_offset: usize,
+        dst_device: i32,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        src_device: i32,
+        size: usize,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert!(
+            dst_offset + size <= dst.size(),
+            "dst_offset ({dst_offset}) + size ({size}) exceeds dst ({})", dst.size()
+        );
+        assert!(
+            src_offset + size <= src.size(),
+            "src_offset ({src_offset}) + size ({size}) exceeds src ({})", src.size()
+        );
+        let dst_ptr = unsafe { (dst.as_ptr() as *mut u8).add(dst_offset) as *mut c_void };
+        let src_ptr = unsafe { (src.as_ptr() as *const u8).add(src_offset) as *const c_void };
+        let code = unsafe {
+            (self.fn_memcpy_peer_async)(
+                dst_ptr, dst_device, src_ptr, src_device, size, stream.0,
+            )
+        };
+        self.check(code, "hipMemcpyPeerAsync@offset")
+    }
+
     pub fn pointer_get_attributes(&self, buf: &DeviceBuffer) -> HipResult<HipPointerAttribute> {
         let mut attr = HipPointerAttribute::default();
         let code = unsafe { (self.fn_pointer_get_attributes)(&mut attr, buf.as_ptr()) };
