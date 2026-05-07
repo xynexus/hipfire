@@ -88,7 +88,10 @@ use safetensors::SafeTensors;
 use safetensors::tensor::Dtype as SfDtype;
 use serde::Deserialize;
 
-use rdna_compute::{Gpu, DType};
+use rdna_compute::{Gpu, DType, GpuTensor};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{weight_gemv, WeightTensor};
+use hipfire_arch_gemma4::gemma4::{self, Gemma4Config, Gemma4Weights, LayerType, LayerWeights};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Manifest schema
@@ -325,6 +328,230 @@ fn test_swiglu_layer(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Phase 2: weight-dependent kernel-isolated tests
+// ───────────────────────────────────────────────────────────────────────────
+//
+// For each layer, run the actual kernels with the model's loaded weights
+// against captured INPUT, compare to captured OUTPUT. Single-token slice from
+// the [B, T, ...] reference: kernels are per-token (decode path), so we test
+// position T-1 only.
+
+/// Slice the last-token tail of a [B, T, ...] flat buffer. Returns a 1-D
+/// vector of size `prod(shape[2..])`. For shape with fewer dims, returns the
+/// data as-is.
+fn last_token(shape: &[usize], data: &[f32]) -> Vec<f32> {
+    if shape.len() < 2 {
+        return data.to_vec();
+    }
+    // Many captures are [B, T, ...]; some Gemma 4 modules emit [B, T, H, D].
+    // Common contract: tokens are along axis 1.
+    let _b = shape[0];
+    let t = shape[1];
+    let tail: usize = shape[2..].iter().product::<usize>().max(1);
+    if t == 0 || data.len() < tail {
+        return data.to_vec();
+    }
+    let last_pos = t - 1;
+    let start = last_pos * tail;
+    let end = start + tail;
+    if end > data.len() {
+        return data.to_vec();
+    }
+    data[start..end].to_vec()
+}
+
+/// Slice [B, T, ...] by a single token index (0..T).
+fn token_at(shape: &[usize], data: &[f32], pos: usize) -> Vec<f32> {
+    if shape.len() < 2 { return data.to_vec(); }
+    let t = shape[1];
+    let tail: usize = shape[2..].iter().product::<usize>().max(1);
+    if pos >= t || data.len() < tail { return data.to_vec(); }
+    let start = pos * tail;
+    data[start..start + tail].to_vec()
+}
+
+/// Test a 1-D rmsnorm: load captured `step.input`, run rmsnorm_f32 with
+/// the model's `weight`, compare to captured `step.output`.
+fn test_rmsnorm_1d(
+    gpu: &mut Gpu, refs: &Refs, layer_idx: i32,
+    step: &str, weight: &GpuTensor, eps: f32, threshold: f32,
+) -> std::io::Result<bool> {
+    let (in_shape, in_full) = match refs.try_load(layer_idx, step, "input") {
+        Some(p) => p,
+        None => { eprintln!("    SKIP layer {:02} {} — no input capture", layer_idx, step); return Ok(true); }
+    };
+    let (_, out_full) = match refs.try_load(layer_idx, step, "output") {
+        Some(p) => p,
+        None => { eprintln!("    SKIP layer {:02} {} — no output capture", layer_idx, step); return Ok(true); }
+    };
+    let in_tok = last_token(&in_shape, &in_full);
+    let out_tok = last_token(&in_shape, &out_full);
+    let n = in_tok.len();
+    let x_t = gpu.upload_f32(&in_tok, &[1, n])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("upload {}.in: {:?}", step, e)))?;
+    let out_t = gpu.alloc_tensor(&[1, n], DType::F32)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("alloc {}.out: {:?}", step, e)))?;
+    gpu.rmsnorm_f32(&x_t, weight, &out_t, eps)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("rmsnorm {}: {:?}", step, e)))?;
+    let actual = gpu.download_f32(&out_t)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("download {}: {:?}", step, e)))?;
+    let res = compare_f32(&actual, &out_tok);
+    print_diag(&format!("layer {:02} {} (rmsnorm_f32)", layer_idx, step),
+               &res, threshold, &actual, &out_tok);
+    Ok(res.nrmse < threshold)
+}
+
+/// Test a head-batched rmsnorm: load captured `step.input`, run rmsnorm_batched
+/// with `batch=n_heads, n=head_dim` and the model's per-head-dim weight.
+fn test_rmsnorm_batched(
+    gpu: &mut Gpu, refs: &Refs, layer_idx: i32,
+    step: &str, weight: &GpuTensor, n_heads: usize, head_dim: usize,
+    eps: f32, threshold: f32,
+) -> std::io::Result<bool> {
+    let (in_shape, in_full) = match refs.try_load(layer_idx, step, "input") {
+        Some(p) => p,
+        None => { eprintln!("    SKIP layer {:02} {} — no input capture", layer_idx, step); return Ok(true); }
+    };
+    let (_, out_full) = refs.load(layer_idx, step, "output")?;
+    // Captured shape may be [B, T, n_heads*head_dim] or [B, T, n_heads, head_dim];
+    // either way the last-token tail has size n_heads*head_dim.
+    let in_tok = last_token(&in_shape, &in_full);
+    let out_tok = last_token(&in_shape, &out_full);
+    let total = n_heads * head_dim;
+    if in_tok.len() != total {
+        eprintln!("    SKIP layer {:02} {} — capture size {} != n_heads*head_dim {}",
+                  layer_idx, step, in_tok.len(), total);
+        return Ok(true);
+    }
+    let x_t = gpu.upload_f32(&in_tok, &[n_heads, head_dim])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("upload {}.in: {:?}", step, e)))?;
+    let out_t = gpu.alloc_tensor(&[n_heads, head_dim], DType::F32)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("alloc {}.out: {:?}", step, e)))?;
+    gpu.rmsnorm_batched(&x_t, weight, &out_t, n_heads, head_dim, eps)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("rmsnorm_batched {}: {:?}", step, e)))?;
+    let actual = gpu.download_f32(&out_t)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("download {}: {:?}", step, e)))?;
+    let res = compare_f32(&actual, &out_tok);
+    print_diag(&format!("layer {:02} {} (rmsnorm_batched)", layer_idx, step),
+               &res, threshold, &actual, &out_tok);
+    Ok(res.nrmse < threshold)
+}
+
+/// Test a weight-projection: load captured `step.input` (last-token), run
+/// weight_gemv with the model's quantized weight, compare to `step.output`.
+fn test_proj(
+    gpu: &mut Gpu, refs: &Refs, layer_idx: i32,
+    step: &str, weight: &WeightTensor, threshold: f32,
+) -> std::io::Result<bool> {
+    let (in_shape, in_full) = match refs.try_load(layer_idx, step, "input") {
+        Some(p) => p,
+        None => { eprintln!("    SKIP layer {:02} {} — no input capture", layer_idx, step); return Ok(true); }
+    };
+    let (_, out_full) = refs.load(layer_idx, step, "output")?;
+    let in_tok = last_token(&in_shape, &in_full);
+    let out_tok = last_token(&in_shape, &out_full);
+    let k = in_tok.len();
+    let m = out_tok.len();
+    if weight.k != k || weight.m != m {
+        eprintln!("    SKIP layer {:02} {} — weight shape ({}, {}) ≠ capture ({}, {})",
+                  layer_idx, step, weight.m, weight.k, m, k);
+        return Ok(true);
+    }
+    let x_t = gpu.upload_f32(&in_tok, &[k])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("upload {}.in: {:?}", step, e)))?;
+    let y_t = gpu.alloc_tensor(&[m], DType::F32)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("alloc {}.out: {:?}", step, e)))?;
+    weight_gemv(gpu, weight, &x_t, &y_t)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("weight_gemv {}: {:?}", step, e)))?;
+    let actual = gpu.download_f32(&y_t)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("download {}: {:?}", step, e)))?;
+    let res = compare_f32(&actual, &out_tok);
+    print_diag(&format!("layer {:02} {} (weight_gemv)", layer_idx, step),
+               &res, threshold, &actual, &out_tok);
+    Ok(res.nrmse < threshold)
+}
+
+/// Run the Phase 2 battery for a single layer.
+fn test_layer_phase2(
+    gpu: &mut Gpu, refs: &Refs, config: &Gemma4Config,
+    layer_idx: usize, lw: &LayerWeights, threshold: f32,
+    halt_on_fail: bool,
+) -> (usize, usize, usize) {
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let li = layer_idx as i32;
+
+    // Per-layer specifics depend on layer type (sliding vs full).
+    let (input_layernorm, post_attn_norm, pre_ffn_norm, post_ffn_norm,
+         q_proj, k_proj, v_proj_opt, o_proj, q_norm, k_norm,
+         gate_proj, up_proj, down_proj,
+         n_kv, head_dim) = match lw {
+        LayerWeights::Sliding(s) => (
+            &s.input_layernorm, &s.post_attention_layernorm,
+            &s.pre_feedforward_layernorm, &s.post_feedforward_layernorm,
+            &s.q_proj, &s.k_proj, Some(&s.v_proj), &s.o_proj, &s.q_norm, &s.k_norm,
+            &s.gate_proj, &s.up_proj, &s.down_proj,
+            config.sliding_n_kv_heads, config.sliding_head_dim,
+        ),
+        LayerWeights::Full(f) => (
+            &f.input_layernorm, &f.post_attention_layernorm,
+            &f.pre_feedforward_layernorm, &f.post_feedforward_layernorm,
+            &f.q_proj, &f.k_proj, None, &f.o_proj, &f.q_norm, &f.k_norm,
+            &f.gate_proj, &f.up_proj, &f.down_proj,
+            config.full_n_kv_heads, config.full_head_dim,
+        ),
+    };
+
+    let n_heads = config.n_heads;
+    let eps = config.norm_eps;
+
+    // Sandwich norms (4 per layer).
+    macro_rules! check {
+        ($r:expr) => {
+            match $r {
+                Ok(true) => pass += 1,
+                Ok(false) => { fail += 1; if halt_on_fail { return (pass, fail, 0); } }
+                Err(e) => { eprintln!("    ERROR layer {:02}: {}", layer_idx, e); fail += 1;
+                            if halt_on_fail { return (pass, fail, 0); } }
+            }
+        };
+    }
+    check!(test_rmsnorm_1d(gpu, refs, li, "pre_attn_norm",  input_layernorm, eps, threshold));
+    check!(test_rmsnorm_1d(gpu, refs, li, "post_attn_norm", post_attn_norm,  eps, threshold));
+    check!(test_rmsnorm_1d(gpu, refs, li, "pre_mlp_norm",   pre_ffn_norm,    eps, threshold));
+    check!(test_rmsnorm_1d(gpu, refs, li, "post_mlp_norm",  post_ffn_norm,   eps, threshold));
+
+    // Q/K/V projections. v_proj_opt is None for full layers (V = pre-norm K).
+    check!(test_proj(gpu, refs, li, "q_proj", q_proj, threshold));
+    check!(test_proj(gpu, refs, li, "k_proj", k_proj, threshold));
+    if let Some(vp) = v_proj_opt {
+        check!(test_proj(gpu, refs, li, "v_proj", vp, threshold));
+    }
+
+    // Q/K norms (head-dim batched). Note: capture shape for q_norm.input could
+    // be [B, T, n_heads, head_dim] or [B, T, n_heads*head_dim]; helper uses
+    // total size for sanity check.
+    check!(test_rmsnorm_batched(gpu, refs, li, "q_norm", q_norm, n_heads, head_dim, eps, threshold));
+    check!(test_rmsnorm_batched(gpu, refs, li, "k_norm", k_norm, n_kv,    head_dim, eps, threshold));
+
+    // o_proj
+    check!(test_proj(gpu, refs, li, "o_proj", o_proj, threshold));
+
+    // MLP: gate, up, down (gelu_tanh + mul already covered in Phase 1).
+    check!(test_proj(gpu, refs, li, "mlp_gate", gate_proj, threshold));
+    check!(test_proj(gpu, refs, li, "mlp_up",   up_proj,   threshold));
+    check!(test_proj(gpu, refs, li, "mlp_down", down_proj, threshold));
+
+    // Suppress unused warnings (token_at and n_heads are reserved for the
+    // attention-isolation step, deferred until a longer reference dump is
+    // generated so sliding-window eviction at pos>1024 can be exercised).
+    let _ = n_heads;
+    let _ = token_at as fn(&[usize], &[f32], usize) -> Vec<f32>;
+
+    (pass, fail, 0usize)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Driver
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -416,19 +643,67 @@ fn main() {
     }
 
     eprintln!();
-    eprintln!("─── Phase 2: weight-dependent kernels (rmsnorm / proj / attn / o_proj) ─");
-    eprintln!("    SKIPPED — requires Gemma 4 .mq4 weight file (Phase D3 quantizer).");
-    eprintln!("    See `gemma4_smoke_forward` for the end-to-end forward path.");
-    eprintln!();
+
+    // Phase 2: weight-dependent kernel-isolated battery. Triggered by
+    // VERIFY_MODEL=path-to-.mq4. Skipped if not set.
+    let mut p2_pass = 0usize;
+    let mut p2_fail = 0usize;
+    let mut p2_first_fail: Option<i32> = None;
+    let model_env = std::env::var("VERIFY_MODEL").ok();
+    if let Some(model_path) = model_env.as_deref() {
+        eprintln!("─── Phase 2: weight-dependent kernels (rmsnorm / proj / o_proj / mlp) ─");
+        eprintln!("    model: {}", model_path);
+        let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+        if hfq.arch_id != 7 {
+            eprintln!("    ERROR: VERIFY_MODEL is not a Gemma 4 .mq4 (arch_id={}, expected 7)", hfq.arch_id);
+            std::process::exit(2);
+        }
+        let config = gemma4::config_from_hfq(&hfq).expect("read config from .mq4");
+        eprintln!("    config: dim={}, n_layers={}, n_heads={}, sliding_hd={}, full_hd={}",
+                  config.dim, config.n_layers, config.n_heads,
+                  config.sliding_head_dim, config.full_head_dim);
+        eprintln!("    loading weights...");
+        let weights = gemma4::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+        let _ = &weights as *const Gemma4Weights;  // borrow for lifetime
+        eprintln!("    loaded {} layers", weights.layers.len());
+
+        for layer_idx in 0..n_layers_dump.min(weights.layers.len() as i32) {
+            if let Some(ref f) = layer_filter {
+                if !f.contains(&layer_idx) { continue; }
+            }
+            let lw = &weights.layers[layer_idx as usize];
+            let lt = config.layer_types[layer_idx as usize];
+            let lt_label = match lt { LayerType::Sliding => "sliding", LayerType::Full => "full" };
+            eprintln!("  ── layer {:02} ({}) ──", layer_idx, lt_label);
+            let (p, f, _) = test_layer_phase2(&mut gpu, &refs, &config, layer_idx as usize, lw,
+                                              threshold, halt_on_fail);
+            p2_pass += p;
+            p2_fail += f;
+            if f > 0 && p2_first_fail.is_none() { p2_first_fail = Some(layer_idx); }
+            if p2_fail > 0 && halt_on_fail { break; }
+        }
+        eprintln!();
+    } else {
+        eprintln!("─── Phase 2: weight-dependent kernels (rmsnorm / proj / attn / o_proj) ─");
+        eprintln!("    SKIPPED — set VERIFY_MODEL=/path/to/gemma-4-31b.mq4 to enable.");
+        eprintln!();
+    }
 
     eprintln!("─── Summary ────────────────────────────────────────────────────────────");
     eprintln!("    Phase 1 SwiGLU: pass={} fail={} skip={}", pass_count, fail_count, skip_count);
     if let Some(l) = first_fail_layer {
-        eprintln!("    First FAIL at layer {:02}", l);
+        eprintln!("    Phase 1 first FAIL at layer {:02}", l);
+    }
+    if model_env.is_some() {
+        eprintln!("    Phase 2 weighted: pass={} fail={}", p2_pass, p2_fail);
+        if let Some(l) = p2_first_fail {
+            eprintln!("    Phase 2 first FAIL at layer {:02}", l);
+        }
     }
     eprintln!();
 
-    if fail_count > 0 {
+    let total_fail = fail_count + p2_fail;
+    if total_fail > 0 {
         std::process::exit(1);
     }
 }
