@@ -34,11 +34,29 @@ from collections import Counter
 from pathlib import Path
 
 
+def _load_config_dict(model_id: str) -> dict:
+    """Load config.json as a plain dict. Tries transformers AutoConfig
+    first (handles config_class quirks); falls back to reading config.json
+    directly via HfFileSystem when AutoConfig doesn't recognize model_type
+    yet (the "transformers too old for this arch" case that --shapes-only
+    is specifically meant to handle).
+    """
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+        return cfg.to_dict()
+    except Exception as e:
+        print(f"# AutoConfig failed ({type(e).__name__}); reading config.json via HF filesystem",
+              file=sys.stderr)
+        from huggingface_hub import HfFileSystem
+        fs = HfFileSystem()
+        with fs.open(f"{model_id}/config.json", "rb") as fh:
+            return json.loads(fh.read())
+
+
 def emit_config(model_id: str) -> dict:
     """Pull the raw config.json and surface the keys an arch port cares about."""
-    from transformers import AutoConfig
-    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
-    blob = cfg.to_dict()
+    blob = _load_config_dict(model_id)
     # text_config indirection (Gemma 4, Qwen3.5-VL)
     if "text_config" in blob and isinstance(blob["text_config"], dict):
         text = blob["text_config"]
@@ -125,28 +143,101 @@ def emit_module_classes(model_id: str) -> dict:
 
 
 def emit_weight_inventory(model_id: str) -> list[dict]:
-    """Use safetensors metadata to list weight names + dtypes + shapes
-    without loading parameters."""
+    """List weight names + dtypes + shapes from safetensors HEADER only —
+    NO tensor data downloaded.
+
+    Uses `huggingface_hub.parse_safetensors_file_metadata`, which fetches
+    only the first ~few KB of each shard (the JSON header) via a Range
+    request. For a 35B model that's ~kB total instead of GB.
+
+    Falls back to `HfApi().get_safetensors_metadata` (single roll-up call)
+    on huggingface_hub versions that expose it.
+    """
+    from huggingface_hub import HfApi
+    api = HfApi()
+
+    # Preferred: one-shot metadata (modern hf hub).
+    if hasattr(api, "get_safetensors_metadata"):
+        try:
+            meta = api.get_safetensors_metadata(model_id)
+            out: list[dict] = []
+            # `meta.weight_map` maps tensor-name → shard filename.
+            wmap = getattr(meta, "weight_map", {}) or {}
+            # `meta.files_metadata` maps shard filename → SafetensorsFileMetadata
+            files_meta = getattr(meta, "files_metadata", {}) or {}
+            seen = set()
+            for shard_name, file_meta in files_meta.items():
+                tensors = getattr(file_meta, "tensors", {}) or {}
+                for name, t in tensors.items():
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    out.append({
+                        "name": name,
+                        "dtype": getattr(t, "dtype", None),
+                        "shape": list(getattr(t, "shape", []) or []),
+                        "shard": shard_name,
+                    })
+            if out:
+                return out
+            # If files_metadata was empty for some reason, fall through.
+        except Exception as e:
+            print(f"# get_safetensors_metadata failed ({e}); falling back to per-file parse",
+                  file=sys.stderr)
+
+    # Fallback: per-file header parse via parse_safetensors_file_metadata.
     from huggingface_hub import HfFileSystem
-    import safetensors
+    try:
+        from huggingface_hub import parse_safetensors_file_metadata
+    except ImportError:
+        # Older hf hub (<0.20) doesn't have it; we have to read the
+        # header ourselves via a Range request through HfFileSystem.
+        parse_safetensors_file_metadata = None  # type: ignore
+
     fs = HfFileSystem()
-    repo = f"{model_id}"
     files = [
-        f for f in fs.ls(repo, detail=False)
+        f.removeprefix(f"{model_id}/")
+        for f in fs.ls(model_id, detail=False)
         if f.endswith(".safetensors") and "index" not in f
     ]
-    out: list[dict] = []
-    for f in files:
-        with fs.open(f, "rb") as fh:
-            with safetensors.safe_open(fh, framework="pt") as st:
-                for k in st.keys():
-                    t = st.get_tensor(k)
-                    out.append({
-                        "name": k,
-                        "dtype": str(t.dtype),
-                        "shape": list(t.shape),
-                        "shard": Path(f).name,
-                    })
+    if not files:
+        # Some repos list .safetensors only via the index — fall back to
+        # the index file's weight_map.
+        try:
+            with fs.open(f"{model_id}/model.safetensors.index.json", "rb") as fh:
+                idx = json.loads(fh.read())
+            shard_names = sorted(set(idx.get("weight_map", {}).values()))
+            files = list(shard_names)
+        except Exception:
+            pass
+
+    out = []
+    for shard in files:
+        if parse_safetensors_file_metadata is not None:
+            file_meta = parse_safetensors_file_metadata(model_id, shard)
+            tensors = getattr(file_meta, "tensors", {}) or {}
+            for name, t in tensors.items():
+                out.append({
+                    "name": name,
+                    "dtype": getattr(t, "dtype", None),
+                    "shape": list(getattr(t, "shape", []) or []),
+                    "shard": shard,
+                })
+        else:
+            # Manual header read: u64 LE size + JSON.
+            import struct
+            with fs.open(f"{model_id}/{shard}", "rb") as fh:
+                hdr_size = struct.unpack("<Q", fh.read(8))[0]
+                hdr = json.loads(fh.read(hdr_size))
+            for name, t in hdr.items():
+                if name == "__metadata__":
+                    continue
+                out.append({
+                    "name": name,
+                    "dtype": t.get("dtype"),
+                    "shape": list(t.get("shape", [])),
+                    "shard": shard,
+                })
     return out
 
 
