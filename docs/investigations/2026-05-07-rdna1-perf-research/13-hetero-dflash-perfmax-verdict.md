@@ -172,13 +172,33 @@ use. Probably tracked as a separate hardware issue on hipx.
   null result.** Replacing 60 small per-(row, ext) peer copies with
   one same-device D2D scatter + one large peer copy moved decode by
   -0.5% to -0.4% — within run-to-run noise. This rules out per-call
-  HIP launch overhead as the bottleneck. The fabric throughput
-  (~64 MB/s effective hipx iGPU↔eGPU peer) is genuinely the binding
-  constraint at this rig. Same data volume, same wall time, whether
-  shipped as 60 small copies or 1 large coalesced one.
-- PR 5 cycle pipelining (deferred). With the per-call overhead path
-  ruled out, pipelining is the only remaining lever to move
-  cross-card cost off the critical path on this fabric.
+  HIP launch overhead as the bottleneck.
+- ~~Pinned-host bounce buffer~~ → **shipped (commit `c59dd97`),
+  measurable +3.3% on gfx1030 hetero.** Replacing `hipMemcpyPeer`'s
+  implicit unpinned-bounce-buffer fallback with explicit
+  `hipMemcpyDtoHAsync` + `hipMemcpyHtoDAsync` legs through a
+  `hipHostMalloc(MAPPED|PORTABLE)` buffer:
+  - gfx1010: 60.28 → 60.93 (+1.1%)
+  - gfx1030: 72.29 → 74.71 (+3.3%) → **91% of solo, was 88%**
+  - τ=10.45 unchanged across all configs.
+
+  Real improvement, but did not crack solo. Per-cycle cross-card
+  cost dropped from ~18 ms to ~15 ms, not the projected ~0.3 ms.
+  TB tunnel latency-per-copy on hipx's iGPU↔eGPU pair appears to
+  exceed pure fabric bandwidth as the bottleneck — or the HIP
+  driver's "pinned host" path on this topology still routes
+  through some host-staged code path that doesn't fully exploit
+  the eGPU's native DMA engine. Worth a `rocprof` / `roctracer`
+  investigation if pursuing further.
+- **Quant-on-the-wire (FP32→FP16 compress + decompress kernels)** —
+  the next kernel-level lever. Cuts cross-card bytes 2×; if
+  cross-card cost scales linearly with bytes (it should now that
+  pinned bounce is in place), hetero gfx1030 projects to ~78 tok/s
+  = 95% of solo. Still under but very close. Some τ-validation
+  risk from FP16 round-trip on hidden states.
+- PR 5 cycle pipelining (deferred). Stacking pipelining over
+  pinned-host + FP16 quant on the wire is the path to plausibly
+  cracking solo on this fabric.
 
 ## References
 
