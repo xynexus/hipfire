@@ -797,6 +797,32 @@ pub fn forward_scratch(
 /// Gemma 4 attention uses `scaling=1.0` in HF (see modeling_gemma4.py line 1143).
 /// Our flash kernels bake in `scale = 1/sqrt(head_dim)`; we compensate by
 /// pre-scaling Q by sqrt(head_dim) so the effective scale is 1.0.
+// SHIP-BLOCKING TODO (2026-05-07, Codex review):
+//
+// The 4 attention_flash_*_window dispatch sites in this function call the
+// kernels modified by commit b608c5f (sliding-window arg threaded through 7
+// attention_flash_*.hip files). Static review of the kernel diff is clean —
+// the per-position out_of_window predicate writes -1e30 to scores which
+// collapses correctly through Phase B/C/D, the early-tile-skip writes
+// {-1e30, 0, zeros} to partials so the reduce stage sees no contribution,
+// all 32 lanes participate in __shfl_xor reductions to avoid warp divergence,
+// and Qwen 3.5/3.6 byte-identical via the window_size=0 short-circuit.
+//
+// HOWEVER: NO RUNTIME CORRECTNESS CHECK has been performed against the
+// PyTorch bf16 reference dump. The verifier example (verify_against_torch.rs)
+// 60/60 PASS is on SwiGLU only — it does not yet exercise these dispatch
+// sites. Until extended to load model weights and validate per-layer
+// attention NRMSE, the sliding-window correctness is paper-only.
+//
+// Action items for the next session:
+//   1. Extend verify_against_torch.rs Phase 2 (weight-dependent tests) with
+//      per-layer attention NRMSE: feed captured q/k/v + o_proj reference,
+//      call attention_flash_asym3_window with window_size = sliding_window,
+//      diff against captured self_attn_block.output. NRMSE < 5e-3 required.
+//   2. Run on hiptrx with /tmp/gemma4-ref/ + ~/.hipfire/models/gemma-4-31b.mq4
+//      (D3 produced this).
+//   3. If NRMSE fails, isolate further (rope_partial_halved on q/k separately,
+//      then KV cache write, then attention).
 fn sliding_layer_decode(
     gpu: &mut Gpu,
     config: &Gemma4Config,
@@ -1001,18 +1027,39 @@ fn full_layer_decode(
     gpu.rope_partial_halved_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
         n_heads, n_kv, head_dim, n_rot_pairs, config.full_rope_theta)?;
 
+    // SHIP-BLOCKING TODO (2026-05-07, Codex review):
+    //
     // KV cache write + attention. Full-attn layers REQUIRE the FP32 KV path:
     // the quantized flash kernels (asym3/asym4/asym2/q8) all hard-code a
     // `32 threads × N dims` layout where N∈{4,8}, covering at most 256 dims.
     // Gemma 4's global_head_dim=512 would silently truncate every head.
-    // Plain attention_f32 processes arbitrary head_dim correctly, and full
-    // layers never need sliding-window (window_size guard lives in the flash
-    // kernels only). daemon.rs forces this cache to FP32 at load time.
+    //
+    // The defensive Err() below preserves correctness (no silent truncation),
+    // but production hipfire defaults to quant KV — so a Gemma 4 31B run with
+    // default settings hard-fails here. Operator must explicitly opt into
+    // FP32 KV (4× memory) for now.
+    //
+    // Unblock path (next session):
+    //   - Port attention_flash_asym3_tile_hd512.hip from origin/gemma4
+    //     (per docs/investigations/2026-05-07-gemma4-arch-intake/forward-path-spec.md
+    //     — gemma-only kernel for hd=512 with the 32×16 thread tile shape).
+    //   - Add asym2/asym4/q8 hd=512 siblings if those KV modes are required.
+    //   - Add a dispatch.rs branch on head_dim that routes hd=256 to existing
+    //     kernels and hd=512 to the new ones.
+    //   - Validate via the same per-layer NRMSE harness as the sliding-window
+    //     check (extension of verify_against_torch.rs Phase 2).
+    //
+    // Plain attention_f32 (the FP32 fallback below) processes arbitrary
+    // head_dim correctly via different geometry, and full layers never need
+    // sliding-window (window_size guard lives in the flash kernels only).
+    // daemon.rs SHOULD force this cache to FP32 at load time when arch_id=7
+    // and any layer is full-attn — D4 wiring will land that.
     if kv_cache.quantized {
         return Err(hip_bridge::HipError::new(
             0,
             "gemma4 full-attn layer requires FP32 KV cache (quantized flash kernels \
-             truncate head_dim>256); allocate via KvCache::new_gpu",
+             truncate head_dim>256); allocate via KvCache::new_gpu. \
+             Ship-blocking: see attention_flash_asym3_tile_hd512.hip TODO in gemma4.rs.",
         ));
     }
     let kv_dim = n_kv * head_dim;
