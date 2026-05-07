@@ -15,27 +15,15 @@
 //!   HIPFIRE_SMOKE_KV_SEQ=512  — per-cache max seq (full layers)
 //!                                (sliding cache is capped at sliding_window=1024)
 //!
-//! 2026-05-07 (post-rebase) GATE: this example is currently
-//! `#[cfg(any())]` — never compiled — because the gemma4 forward path
-//! calls `attention_flash_*` with a sliding-window arg the master
-//! kernels and dispatchers don't yet have. See arch-report.md
-//! "Remaining gaps" §1. Once the sliding-window kernel diff from
-//! commit dc7617c is forward-ported on top of the current master
-//! kernels (gfx906 wave64 prefetch / dp4a) and the dispatch
-//! signatures updated, change `#[cfg(any())]` to `#[cfg(unix)]`
-//! (or remove the guard) and run.
+//! 2026-05-07 (post-rebase): sliding-window kernel diff has been
+//! forward-ported (kernels/src/attention_flash_*_tile{,_batched}.hip
+//! gained a trailing `int window_size` arg, with `0 == full causal`
+//! preserving Qwen3.5/3.6 byte-identical behavior). The matching
+//! dispatch helpers `attention_flash_{q8_0,asym2,asym3,asym4}_window`
+//! are now live on `Gpu`; the gemma4 forward calls those directly.
+//! Smoke gate is open.
 
-#[cfg(not(any()))]
 fn main() {
-    eprintln!(
-        "gemma4_smoke_forward is gated off until the sliding-window kernel diff \
-         is forward-ported. See docs/investigations/2026-05-07-gemma4-arch-intake/arch-report.md \
-         §Remaining-gaps."
-    );
-}
-
-#[cfg(any())]
-fn smoke_main() {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_gemma4::gemma4::{self, Gemma4Scratch};
     use hipfire_runtime::llama::{self, KvCache};

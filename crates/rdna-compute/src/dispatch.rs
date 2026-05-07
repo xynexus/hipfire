@@ -10817,6 +10817,20 @@ impl Gpu {
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.attention_flash_q8_0_window(
+            q, k_cache, v_cache, out, pos_buf, seq_len_hint,
+            n_heads, n_kv_heads, head_dim, max_seq, partials, 0,
+        )
+    }
+
+    /// Sliding-window variant of `attention_flash_q8_0`. `window_size == 0`
+    /// is identical to the full-causal path. Used by Gemma 4 sliding layers.
+    pub fn attention_flash_q8_0_window(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        partials: &GpuTensor, window_size: u32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
         // Graph-safe: use max_tiles so the grid is position-independent.
@@ -10842,6 +10856,7 @@ impl Gpu {
             let nh = n_heads as i32; let nkv = n_kv_heads as i32;
             let hd = head_dim as i32; let ms = max_seq as i32;
             let sc = scale; let ts = TILE_SIZE as i32;
+            let ws = window_size as i32;
             let grid = [n_heads as u32, launch_tiles as u32, 1];
             let shared = ((TILE_SIZE + head_dim) * 4) as u32;
             let mut params: Vec<*mut c_void> = vec![
@@ -10851,6 +10866,7 @@ impl Gpu {
                 &nkv as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
                 &ms as *const _ as *mut c_void, &sc as *const _ as *mut c_void,
                 &ts as *const _ as *mut c_void,
+                &ws as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 "attention_flash_q8_0_tile", grid, [32, 1, 1], shared, &mut params,
@@ -10859,7 +10875,7 @@ impl Gpu {
                     b.push_ptr(q_ptr); b.push_ptr(k_ptr); b.push_ptr(v_ptr);
                     b.push_ptr(p_ptr); b.push_ptr(pos_ptr);
                     b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
-                    b.push_f32(sc); b.push_i32(ts);
+                    b.push_f32(sc); b.push_i32(ts); b.push_i32(ws);
                     b
                 },
             )?;
@@ -11072,6 +11088,11 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        // Sliding-window lookback for Gemma 4 hybrid attention. 0 = full
+        // causal (preserves Qwen 3.5 / 3.6 byte-identical behavior). Tree
+        // mode + sliding is currently disjoint; the kernels guard against
+        // both being active simultaneously.
+        window_size: u32,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
@@ -11115,6 +11136,7 @@ impl Gpu {
                 let sc = scale; let ts = TILE_SIZE as i32;
                 let mt = max_tiles as i32; let bo = offset as i32;
                 let bs = block_start as i32; let bc = block_cols as i32;
+                let ws = window_size as i32;
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -11134,6 +11156,7 @@ impl Gpu {
                     &bo as *const _ as *mut c_void,
                     &bs as *const _ as *mut c_void,
                     &bc as *const _ as *mut c_void,
+                    &ws as *const _ as *mut c_void,
                 ];
                 self.launch_maybe_blob(
                     tile_func_name,
@@ -11148,7 +11171,7 @@ impl Gpu {
                         b.push_ptr(ct_ptr); b.push_ptr(st_ptr); b.push_ptr(bias_ptr);
                         b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
                         b.push_f32(sc); b.push_i32(ts); b.push_i32(mt); b.push_i32(bo);
-                        b.push_i32(bs); b.push_i32(bc);
+                        b.push_i32(bs); b.push_i32(bc); b.push_i32(ws);
                         b
                     },
                 )?;
@@ -11275,6 +11298,7 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
+            0, // window_size: full causal (Qwen 3.5 / 3.6)
         )
     }
 
@@ -11296,6 +11320,7 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             None, 0, 0,
+            0, // window_size: full causal (Qwen 3.5 / 3.6)
         )
     }
 
@@ -11397,6 +11422,7 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
+            0, // window_size: full causal (Qwen 3.5 / 3.6)
         )
     }
 
@@ -11408,6 +11434,21 @@ impl Gpu {
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.attention_flash_asym3_window(
+            q, k_cache, v_cache, out, pos_buf, cos_theta, sin_theta,
+            seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, 0,
+        )
+    }
+
+    /// Sliding-window variant of `attention_flash_asym3`. `window_size == 0`
+    /// is identical to the full-causal path. Used by Gemma 4 sliding layers.
+    pub fn attention_flash_asym3_window(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        partials: &GpuTensor, window_size: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -11434,6 +11475,7 @@ impl Gpu {
             let mut hd = head_dim as i32; let mut ms = max_seq as i32;
             let mut sc = scale; let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut ws = window_size as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -11449,6 +11491,7 @@ impl Gpu {
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut ws as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(
@@ -11546,6 +11589,21 @@ impl Gpu {
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.attention_flash_asym4_window(
+            q, k_cache, v_cache, out, pos_buf, cos_theta, sin_theta,
+            seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, 0,
+        )
+    }
+
+    /// Sliding-window variant of `attention_flash_asym4`. `window_size == 0`
+    /// is identical to the full-causal path. Used by Gemma 4 sliding layers.
+    pub fn attention_flash_asym4_window(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        partials: &GpuTensor, window_size: u32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
@@ -11572,6 +11630,7 @@ impl Gpu {
             let mut hd = head_dim as i32; let mut ms = max_seq as i32;
             let mut sc = scale; let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut ws = window_size as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -11587,6 +11646,7 @@ impl Gpu {
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut ws as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(
@@ -11642,6 +11702,21 @@ impl Gpu {
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.attention_flash_asym2_window(
+            q, k_cache, v_cache, out, pos_buf, cos_theta, sin_theta,
+            seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, 0,
+        )
+    }
+
+    /// Sliding-window variant of `attention_flash_asym2`. `window_size == 0`
+    /// is identical to the full-causal path. Used by Gemma 4 sliding layers.
+    pub fn attention_flash_asym2_window(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        partials: &GpuTensor, window_size: u32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
@@ -11667,6 +11742,7 @@ impl Gpu {
             let mut hd = head_dim as i32; let mut ms = max_seq as i32;
             let mut sc = scale; let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut ws = window_size as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -11682,6 +11758,7 @@ impl Gpu {
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut ws as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(

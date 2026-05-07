@@ -844,24 +844,12 @@ fn sliding_layer_decode(
         gpu.kv_cache_write_asym3_fused(
             &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        gpu.attention_flash_asym3(
+        gpu.attention_flash_asym3_window(
             &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
-            // TODO(gemma4-sliding-window-kernel): master's
-            // attention_flash_asym{2,3,4} / attention_flash_q8_0
-            // dispatchers currently lack the trailing window_size: u32
-            // arg that the gemma4 branch (commit dc7617c) added. The
-            // kernels themselves were extended on the gemma4 branch
-            // (kernels/src/attention_flash_*_tile{,_batched}.hip) to
-            // mask out keys at offset (cur_pos - window_size) and
-            // earlier; that diff needs to be ported on top of the
-            // current master kernels (which include the gfx906 wave64
-            // residual-prefetch + dp4a work that gemma4 does not see)
-            // and the matching dispatch signature change. Until then,
-            // sliding-window layers are NON-FUNCTIONAL on Gemma 4.
-            // config.sliding_window as u32,
+            config.sliding_window as u32,
         )?;
     } else if kv_cache.quant_asym4 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -869,24 +857,12 @@ fn sliding_layer_decode(
         gpu.kv_cache_write_asym4_fused(
             &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        gpu.attention_flash_asym4(
+        gpu.attention_flash_asym4_window(
             &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
-            // TODO(gemma4-sliding-window-kernel): master's
-            // attention_flash_asym{2,3,4} / attention_flash_q8_0
-            // dispatchers currently lack the trailing window_size: u32
-            // arg that the gemma4 branch (commit dc7617c) added. The
-            // kernels themselves were extended on the gemma4 branch
-            // (kernels/src/attention_flash_*_tile{,_batched}.hip) to
-            // mask out keys at offset (cur_pos - window_size) and
-            // earlier; that diff needs to be ported on top of the
-            // current master kernels (which include the gfx906 wave64
-            // residual-prefetch + dp4a work that gemma4 does not see)
-            // and the matching dispatch signature change. Until then,
-            // sliding-window layers are NON-FUNCTIONAL on Gemma 4.
-            // config.sliding_window as u32,
+            config.sliding_window as u32,
         )?;
     } else if kv_cache.quant_asym2 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -894,46 +870,22 @@ fn sliding_layer_decode(
         gpu.kv_cache_write_asym2_fused(
             &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        gpu.attention_flash_asym2(
+        gpu.attention_flash_asym2_window(
             &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
-            // TODO(gemma4-sliding-window-kernel): master's
-            // attention_flash_asym{2,3,4} / attention_flash_q8_0
-            // dispatchers currently lack the trailing window_size: u32
-            // arg that the gemma4 branch (commit dc7617c) added. The
-            // kernels themselves were extended on the gemma4 branch
-            // (kernels/src/attention_flash_*_tile{,_batched}.hip) to
-            // mask out keys at offset (cur_pos - window_size) and
-            // earlier; that diff needs to be ported on top of the
-            // current master kernels (which include the gfx906 wave64
-            // residual-prefetch + dp4a work that gemma4 does not see)
-            // and the matching dispatch signature change. Until then,
-            // sliding-window layers are NON-FUNCTIONAL on Gemma 4.
-            // config.sliding_window as u32,
+            config.sliding_window as u32,
         )?;
     } else if kv_cache.quant_q8 {
         gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim)?;
         gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim)?;
-        gpu.attention_flash_q8_0(
+        gpu.attention_flash_q8_0_window(
             &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.attn_out, &scratch.pos_buf, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
-            // TODO(gemma4-sliding-window-kernel): master's
-            // attention_flash_asym{2,3,4} / attention_flash_q8_0
-            // dispatchers currently lack the trailing window_size: u32
-            // arg that the gemma4 branch (commit dc7617c) added. The
-            // kernels themselves were extended on the gemma4 branch
-            // (kernels/src/attention_flash_*_tile{,_batched}.hip) to
-            // mask out keys at offset (cur_pos - window_size) and
-            // earlier; that diff needs to be ported on top of the
-            // current master kernels (which include the gfx906 wave64
-            // residual-prefetch + dp4a work that gemma4 does not see)
-            // and the matching dispatch signature change. Until then,
-            // sliding-window layers are NON-FUNCTIONAL on Gemma 4.
-            // config.sliding_window as u32,
+            config.sliding_window as u32,
         )?;
     } else {
         // Plain FP32 KV path (kvf16 / kvfp32).

@@ -30,7 +30,9 @@ __global__ void attention_flash_asym4_tile(
     int max_seq,
     float scale_attn,
     int tile_size,
-    int max_tiles
+    int max_tiles,
+    // Sliding-window lookback (Gemma 4). 0 = no window / full causal.
+    int window_size
 ) {
     const int seq_len = pos_buf[0] + 1;
     const int h = blockIdx.x;
@@ -45,6 +47,19 @@ __global__ void attention_flash_asym4_tile(
     const int kv_h = h / kv_group;
     const int tid = threadIdx.x;
     const int n_halves = head_dim / 128;  // 1 for hd=128, 2 for hd=256
+    const int t_lo = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    if (window_size > 0 && tile_end <= t_lo) {
+        float* p = partials + (h * max_tiles + tile_id) * (2 + head_dim);
+        if (tid == 0) { p[0] = -1e30f; p[1] = 0.0f; }
+        for (int half = 0; half < n_halves; half++) {
+            const int d_base = half * 128 + tid * 4;
+            p[2 + d_base + 0] = 0.0f;
+            p[2 + d_base + 1] = 0.0f;
+            p[2 + d_base + 2] = 0.0f;
+            p[2 + d_base + 3] = 0.0f;
+        }
+        return;
+    }
 
     // ── K geometry (givens4 layout) ─────────────────────────────────
     const int k_bytes_per_head = 4 + head_dim / 2;        // 68 (hd128) / 132 (hd256)
@@ -80,21 +95,24 @@ __global__ void attention_flash_asym4_tile(
     // ═══ Phase A: Q·K dot products (K in rotated 4-bit space) ═══
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
+        const bool out_of_window = (window_size > 0) && (t < t_lo);
         float partial = 0.0f;
-        for (int half = 0; half < n_halves; half++) {
-            // Nibble offset: 4 (cnorm) + half * 64 + tid * 2.
-            unsigned short pk = *(const unsigned short*)(kb + 4 + half * 64 + tid * 2);
-            partial += mq[half * 4 + 0] * (cnorm * TURBO_C4[(pk)       & 0xF])
-                     + mq[half * 4 + 1] * (cnorm * TURBO_C4[(pk >> 4)  & 0xF])
-                     + mq[half * 4 + 2] * (cnorm * TURBO_C4[(pk >> 8)  & 0xF])
-                     + mq[half * 4 + 3] * (cnorm * TURBO_C4[(pk >> 12) & 0xF]);
+        if (!out_of_window) {
+            const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+            float cnorm = *(const float*)kb;
+            for (int half = 0; half < n_halves; half++) {
+                // Nibble offset: 4 (cnorm) + half * 64 + tid * 2.
+                unsigned short pk = *(const unsigned short*)(kb + 4 + half * 64 + tid * 2);
+                partial += mq[half * 4 + 0] * (cnorm * TURBO_C4[(pk)       & 0xF])
+                         + mq[half * 4 + 1] * (cnorm * TURBO_C4[(pk >> 4)  & 0xF])
+                         + mq[half * 4 + 2] * (cnorm * TURBO_C4[(pk >> 8)  & 0xF])
+                         + mq[half * 4 + 3] * (cnorm * TURBO_C4[(pk >> 12) & 0xF]);
+            }
         }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0)
-            scores[t_local] = partial * scale_attn;
+            scores[t_local] = out_of_window ? -1e30f : (partial * scale_attn);
     }
     __syncthreads();
 

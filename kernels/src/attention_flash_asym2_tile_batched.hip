@@ -24,7 +24,9 @@ __global__ void attention_flash_asym2_tile_batched(
     int max_tiles,
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
-    int block_cols                             // ignored when tree_bias == nullptr
+    int block_cols,                            // ignored when tree_bias == nullptr
+    // Sliding-window lookback (Gemma 4). 0 = no window / full causal.
+    int window_size
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -44,6 +46,21 @@ __global__ void attention_flash_asym2_tile_batched(
     const int kv_h = h / kv_group;
     const int q_dim = n_heads * head_dim;
     const int n_halves = head_dim / 128;
+    const bool sliding = (window_size > 0) && !tree_mode;
+    const int t_lo = sliding ? max(0, seq_len - window_size) : 0;
+    if (sliding && tile_end <= t_lo) {
+        float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                            + tile_id * (2 + head_dim);
+        if (tid == 0) { p[0] = -1e30f; p[1] = 0.0f; }
+        for (int half = 0; half < n_halves; half++) {
+            const int d_base = half * 128 + tid * 4;
+            p[2 + d_base + 0] = 0.0f;
+            p[2 + d_base + 1] = 0.0f;
+            p[2 + d_base + 2] = 0.0f;
+            p[2 + d_base + 3] = 0.0f;
+        }
+        return;
+    }
 
     const int k_bytes_per_head = 4 + head_dim / 4;
     const int k_bytes_per_pos  = n_kv_heads * k_bytes_per_head;
@@ -76,20 +93,23 @@ __global__ void attention_flash_asym2_tile_batched(
     // Phase A: Q·K (2-bit K)
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
+        const bool out_of_window = sliding && (t < t_lo);
         float partial = 0.0f;
-        for (int half = 0; half < n_halves; half++) {
-            unsigned char packed = kb[4 + half * 32 + tid];
-            partial += mq[half * 4 + 0] * (cnorm * TURBO_C2[(packed)      & 0x3])
-                     + mq[half * 4 + 1] * (cnorm * TURBO_C2[(packed >> 2) & 0x3])
-                     + mq[half * 4 + 2] * (cnorm * TURBO_C2[(packed >> 4) & 0x3])
-                     + mq[half * 4 + 3] * (cnorm * TURBO_C2[(packed >> 6) & 0x3]);
+        if (!out_of_window) {
+            const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+            float cnorm = *(const float*)kb;
+            for (int half = 0; half < n_halves; half++) {
+                unsigned char packed = kb[4 + half * 32 + tid];
+                partial += mq[half * 4 + 0] * (cnorm * TURBO_C2[(packed)      & 0x3])
+                         + mq[half * 4 + 1] * (cnorm * TURBO_C2[(packed >> 2) & 0x3])
+                         + mq[half * 4 + 2] * (cnorm * TURBO_C2[(packed >> 4) & 0x3])
+                         + mq[half * 4 + 3] * (cnorm * TURBO_C2[(packed >> 6) & 0x3]);
+            }
         }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0) {
-            float s = partial * scale_attn;
+            float s = out_of_window ? -1e30f : (partial * scale_attn);
             if (tree_mode && t >= block_start) {
                 s += tree_bias[global_bid * block_cols + (t - block_start)];
             }
