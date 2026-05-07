@@ -112,6 +112,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-gemma4"
+version = "0.1.20"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-llama"
 version = "0.1.20"
 dependencies = [

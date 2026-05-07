@@ -843,6 +843,19 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str = include_str!("../../../kernels/sr
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str = include_str!("../../../kernels/src/rope_partial_interleaved_batched.hip");
 
+/// Partial RoPE using HuggingFace `rotate_half` pairing convention
+/// (pair i = dim i paired with dim i+head_dim/2). Used by Gemma 4 full-
+/// attention layers (proportional partial RoPE: only first
+/// `n_rot_pairs = partial_rotary_factor * head_dim / 2` pairs rotate;
+/// remainder are NoPE pass-through). NOT compatible with the interleaved
+/// (2i, 2i+1) convention used by Qwen3.5 — see source comments.
+pub const ROPE_PARTIAL_HALVED_SRC: &str = include_str!("../../../kernels/src/rope_partial_halved.hip");
+
+/// Final-logit soft-capping `tanh(x / cap) * cap`, in-place over the flat
+/// logits vector. Gemma 2 / 3 / 4 final-logit softcap (cap=30 on Gemma 4).
+/// Gemma 4 has NO per-attention-layer softcap (unlike Gemma 2).
+pub const LOGIT_SOFTCAP_SRC: &str = include_str!("../../../kernels/src/logit_softcap.hip");
+
 
 /// 1D causal depthwise convolution (kernel_size=4) with persistent ring buffer state.
 /// For decode: one token at a time. conv_state: [n_channels × 3] ring buffer.

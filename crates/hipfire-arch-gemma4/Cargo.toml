@@ -1,0 +1,18 @@
+[package]
+name = "hipfire-arch-gemma4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Gemma 4 architecture (hybrid sliding+full attention, dense FFN) for hipfire"
+
+# Gemma 4 is a dense hybrid (sliding-window + full attention alternation),
+# NOT a DeltaNet hybrid. It does not need the `deltanet` feature gate.
+# It does, however, need new dispatches (rope_partial_halved, logit_softcap)
+# which live in rdna-compute / kernels and are unconditionally available.
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
