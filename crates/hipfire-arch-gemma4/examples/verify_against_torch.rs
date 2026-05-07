@@ -412,11 +412,11 @@ fn test_rmsnorm_batched(
         Some(p) => p,
         None => { eprintln!("    SKIP layer {:02} {} — no input capture", layer_idx, step); return Ok(true); }
     };
-    let (_, out_full) = refs.load(layer_idx, step, "output")?;
+    let (out_shape, out_full) = refs.load(layer_idx, step, "output")?;
     // Captured shape may be [B, T, n_heads*head_dim] or [B, T, n_heads, head_dim];
     // either way the last-token tail has size n_heads*head_dim.
     let in_tok = last_token(&in_shape, &in_full);
-    let out_tok = last_token(&in_shape, &out_full);
+    let out_tok = last_token(&out_shape, &out_full);
     let total = n_heads * head_dim;
     if in_tok.len() != total {
         eprintln!("    SKIP layer {:02} {} — capture size {} != n_heads*head_dim {}",
@@ -447,9 +447,9 @@ fn test_proj(
         Some(p) => p,
         None => { eprintln!("    SKIP layer {:02} {} — no input capture", layer_idx, step); return Ok(true); }
     };
-    let (_, out_full) = refs.load(layer_idx, step, "output")?;
+    let (out_shape, out_full) = refs.load(layer_idx, step, "output")?;
     let in_tok = last_token(&in_shape, &in_full);
-    let out_tok = last_token(&in_shape, &out_full);
+    let out_tok = last_token(&out_shape, &out_full);
     let k = in_tok.len();
     let m = out_tok.len();
     if weight.k != k || weight.m != m {
