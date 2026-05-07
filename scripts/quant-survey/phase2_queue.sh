@@ -27,6 +27,12 @@ run_one() {
   local trial=$3
   local outdir=$RUNS_DIR/phase2-$model
   local log=$LOG_DIR/phase2-${model}-${variant}-t${trial}.log
+  local results=$outdir/phase2_results.jsonl
+  # Skip if this (variant, trial) already has a result line.
+  if [ -f "$results" ] && grep -q "\"variant\":\"$variant\",\"trial\":$trial," "$results"; then
+    echo "[phase2-queue] $(date) SKIP $model $variant trial=$trial (already in results)"
+    return 0
+  fi
   echo "[phase2-queue] $(date) starting $model $variant trial=$trial"
   HIP_VISIBLE_DEVICES=0,1,2,3 python3 scripts/quant-survey/phase2_runner.py \
     --model "$model" \
