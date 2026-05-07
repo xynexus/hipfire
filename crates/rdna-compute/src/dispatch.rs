@@ -45,6 +45,26 @@ fn gemv_rows_override() -> Option<u32> {
 /// Default-on for gfx906 only. Override with HIPFIRE_GEMV_DP4A={0,1}.
 /// fused_qkv / fused_qkvza ports are pending; same lever, same
 /// estimated +1-2 % per kernel.
+/// Per-shape hipGraph cache opt-in. Off by default; enable with
+/// `HIPFIRE_GEMV_GRAPH=1`. When set, `Gpu::init` allocates an empty
+/// `GemvGraphCache` on `self.gemv_graph_cache`. PR1 of the cache is
+/// observe-only — every `launch_maybe_blob` call into a recognized
+/// GEMV family bumps `stats.misses` and falls through to the legacy
+/// launch path. PR2 starts capturing/replaying for `gemv_hfq4g256`.
+///
+/// See `docs/plans/gemv-graph-cache.prd` for design + perf evidence
+/// (PoC: +22-32% per shape on RX 5700 XT decode, PRD section 1).
+fn gemv_graph_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_GEMV_GRAPH")
+            .ok()
+            .as_deref()
+            .map(|v| matches!(v, "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    })
+}
+
 fn gemv_dp4a_enabled(arch: &str) -> bool {
     static CACHE: OnceLock<Option<bool>> = OnceLock::new();
     let override_ = *CACHE.get_or_init(|| {
@@ -467,6 +487,23 @@ pub struct Gpu {
     /// Only populated on CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
+
+    /// Per-shape hipGraph cache for decode-path GEMVs. `Some(_)` only
+    /// when `HIPFIRE_GEMV_GRAPH=1` was set at process start.
+    ///
+    /// **PR1 (current): observe-only.** `launch_maybe_blob` classifies
+    /// each call but always falls through to the legacy launch path;
+    /// `cache.stats.misses` accumulates so we can see the decode call
+    /// rate without affecting behavior.
+    ///
+    /// **PR2:** capture-on-second-call / replay-on-third-call for
+    /// `gemv_hfq4g256` (plain) only.
+    /// **PR3:** extend to fused families.
+    /// **PR4:** stream-affinity invalidation, LRU bound, multi-GPU.
+    ///
+    /// See `docs/plans/gemv-graph-cache.prd` and
+    /// `crates/rdna-compute/src/gemv_graph_cache.rs`.
+    pub gemv_graph_cache: Option<crate::gemv_graph_cache::GemvGraphCache>,
 }
 
 impl Gpu {
@@ -657,6 +694,15 @@ impl Gpu {
             replay_capturing_n: None,
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            // PR1: allocate empty cache when HIPFIRE_GEMV_GRAPH=1 is set.
+            // The cache is observe-only in PR1 — every classify() call
+            // falls through to the legacy launch path. See gemv_graph_cache.rs.
+            gemv_graph_cache: if gemv_graph_enabled() {
+                eprintln!("[gemv-graph] HIPFIRE_GEMV_GRAPH=1: per-shape cache enabled (PR1: observe-only)");
+                Some(crate::gemv_graph_cache::GemvGraphCache::new())
+            } else {
+                None
+            },
         }).map(|mut gpu| {
             if gpu.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
@@ -1058,6 +1104,35 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        // PR1 of the per-shape hipGraph cache: observe only.
+        //
+        // We can recover an arity-1 best-effort `m_tuple` from the launch
+        // grid (M is roughly grid[0] for the plain `gemv_hfq4g256` family),
+        // but K isn't recoverable from grid+block alone. PR2 will plumb
+        // (m_tuple, k) through from the per-kernel dispatch sites
+        // (`gemv_hfq4g256`, `fused_qkv_hfq4g256`, …) and call
+        // `cache.dispatch()` *there* to actually replay graphs. PR1's
+        // job is to verify the field/classifier wires up clean and to
+        // measure miss rate via `cache.stats`.
+        //
+        // The current `cache.dispatch()` always returns Fallthrough, so
+        // this block is invisible at runtime and the legacy launch path
+        // below is unchanged. Skip the cache entirely under graph capture
+        // (`capture_mode`) to avoid nesting captures (see PRD §6).
+        if !self.capture_mode {
+            if let Some(cache) = self.gemv_graph_cache.as_mut() {
+                if let Some(shape) = crate::gemv_graph_cache::GemvGraphCache::classify(
+                    func_name,
+                    &[grid[0]],
+                    0,
+                ) {
+                    let _ = cache.dispatch(&shape);
+                    // PR1: dispatch always returns Fallthrough. PR2 will
+                    // early-return here when an entry replays.
+                }
+            }
+        }
+
         if self.capture_mode || self.force_blob_path {
             let mut blob = blob_builder();
             // Pad tail to 16-byte alignment — some kernel struct layouts that
