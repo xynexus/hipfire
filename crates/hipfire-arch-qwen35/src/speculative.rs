@@ -1077,6 +1077,15 @@ pub struct VerifyScratch {
     /// GEMM against it. Shape `[max_n × dim]` f32. Unused on the homogeneous
     /// path; the GEMM reads `draft_scratch.x` directly there.
     pub draft_hidden_staging: GpuTensor,
+    /// Cross-card staging on target_gpu for Phase 9's `target_hidden`
+    /// scatter (PRD v1.2 PR-A coalesced variant). Holds the interleaved
+    /// `[max_n × num_extract × hidden]` f32 block produced by the
+    /// same-device scatter from `hidden_rb.layer_bufs`, before a single
+    /// peer copy ships it to the drafter's `draft_scratch.target_hidden`.
+    /// Replaces the prior per-(row, ext) cross_card_copy_at loop (~80 calls
+    /// per cycle at 27B) with one D2D scatter + one peer copy. Unused on
+    /// the homogeneous path.
+    pub hidden_scatter_staging: GpuTensor,
 }
 
 impl VerifyScratch {
@@ -1086,6 +1095,8 @@ impl VerifyScratch {
         dim: usize,
         vocab: usize,
         hidden_k: usize,
+        num_extract: usize,
+        draft_hidden: usize,
     ) -> HipResult<Self> {
         Ok(Self {
             max_n,
@@ -1099,6 +1110,10 @@ impl VerifyScratch {
             prefill_batch: None,
             embd_staging: gpu.alloc_tensor(&[max_n * dim], rdna_compute::DType::F32)?,
             draft_hidden_staging: gpu.alloc_tensor(&[max_n * dim], rdna_compute::DType::F32)?,
+            hidden_scatter_staging: gpu.alloc_tensor(
+                &[max_n * num_extract * draft_hidden],
+                rdna_compute::DType::F32,
+            )?,
         })
     }
 
@@ -1113,9 +1128,11 @@ impl VerifyScratch {
         dim: usize,
         vocab: usize,
         hidden_k: usize,
+        num_extract: usize,
+        draft_hidden: usize,
         config: &qwen35::Qwen35Config,
     ) -> HipResult<Self> {
-        let mut s = Self::new(gpu, max_n, dim, vocab, hidden_k)?;
+        let mut s = Self::new(gpu, max_n, dim, vocab, hidden_k, num_extract, draft_hidden)?;
         s.prefill_batch = Some(qwen35::PrefillBatchScratch::new(gpu, config, max_n)?);
         Ok(s)
     }
@@ -1127,6 +1144,7 @@ impl VerifyScratch {
         let _ = gpu.free_tensor(self.argmax);
         let _ = gpu.free_tensor(self.embd_staging);
         let _ = gpu.free_tensor(self.draft_hidden_staging);
+        let _ = gpu.free_tensor(self.hidden_scatter_staging);
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
         }
@@ -2291,22 +2309,25 @@ pub fn scatter_hidden_block_to_interleaved(
 
 /// Cross-card variant of [`scatter_hidden_block_to_interleaved`] for the
 /// hetero PP+DFlash path (PRD v1.2 PR-A): `hidden_rb` lives on
-/// `target_gpu`, `dst` lives on `drafter_gpu`. Each per-(row, extract)
-/// copy goes through `multi_gpu::cross_card_copy_at` (sync-host-staged on
-/// non-peer fabric, peer-async otherwise) instead of the same-device
-/// `memcpy_dtod_at` used in the homogeneous helper. Each call's event is
-/// waited on `drafter_gpu` so the next cycle's `draft_forward` (which
-/// reads `dst`) sees the writes; events are also destroyed in the wait so
-/// no HIP event handles leak.
+/// `target_gpu`, `dst` lives on `drafter_gpu`.
 ///
-/// Per-cycle cost at typical 27B shapes (ne=5, B=16, hidden=5120):
-/// ~80 × 20 KB = ~1.6 MB across the cross-card fabric. At USB4 v2's
-/// ~10 GB/s effective sustained host-stage bandwidth, ~160 µs per cycle —
-/// well within the <1% / 30 ms-target budget the PRD anchors against.
+/// Coalesced shape: same-device D2D scatter into `staging` on
+/// `target_gpu` (cheap — same kernel, ~µs per row), then ONE
+/// `cross_card_copy_at` peer copy of the whole
+/// `n_rows × num_extract × hidden × 4` byte block. Replaces the prior
+/// per-(row, ext) cross-card loop (~80 calls per cycle at 27B), saving
+/// per-call HIP launch overhead × 80 and reducing the cross-card stream
+/// dependency chain to a single event.
+///
+/// Per-cycle cost at typical 27B shapes (ne=5, B=16, hidden=5120,
+/// rows_to_keep=12): ~1.2 MB shipped in one peer copy. The target-side
+/// staging buffer (~1.6 MB max) is allocated once at VerifyScratch
+/// construction.
 pub fn scatter_hidden_block_to_interleaved_cross_card(
     target_gpu: &Gpu,
     drafter_gpu: &Gpu,
     hidden_rb: &HiddenStateRingBuffer,
+    staging: &GpuTensor,
     dst: &GpuTensor,
     dst_row_offset: usize,
     block_size: usize,
@@ -2315,32 +2336,34 @@ pub fn scatter_hidden_block_to_interleaved_cross_card(
     assert!(n_rows <= block_size, "scatter_cross_card: n_rows {n_rows} > block_size {block_size}");
     let num_extract = hidden_rb.extract_layers.len();
     let hidden = hidden_rb.hidden_dim;
-    let max_pos = hidden_rb.max_positions;
-    let head = hidden_rb.head;
-    let written = hidden_rb.written;
-    assert!(block_size <= written, "scatter_cross_card: block_size {block_size} > written {written}");
     let row_bytes = hidden * 4;
-    let start_slot = (head + max_pos - block_size) % max_pos;
 
-    for r in 0..n_rows {
-        let slot = (start_slot + r) % max_pos;
-        let dst_row = dst_row_offset + r;
-        let dst_row_base_bytes = dst_row * num_extract * row_bytes;
-        for ext in 0..num_extract {
-            let src_offset_bytes = slot * row_bytes;
-            let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
-            let evt = multi_gpu::cross_card_copy_at(
-                target_gpu,
-                drafter_gpu,
-                &hidden_rb.layer_bufs[ext].buf,
-                src_offset_bytes,
-                &dst.buf,
-                dst_offset_bytes,
-                row_bytes,
-            )?;
-            multi_gpu::cross_card_wait(drafter_gpu, evt)?;
-        }
-    }
+    // Step 1: same-device D2D scatter into `staging` on target_gpu.
+    // Writes contiguous rows starting at staging row 0 (independent of
+    // `dst_row_offset`, which addresses the drafter-side dst layout).
+    scatter_hidden_block_to_interleaved(
+        target_gpu,
+        hidden_rb,
+        staging,
+        /* dst_row_offset = */ 0,
+        block_size,
+        n_rows,
+    )?;
+
+    // Step 2: single peer copy of the staged rows from target → drafter.
+    let n_bytes = n_rows * num_extract * row_bytes;
+    let dst_offset_bytes = dst_row_offset * num_extract * row_bytes;
+    let evt = multi_gpu::cross_card_copy_at(
+        target_gpu,
+        drafter_gpu,
+        &staging.buf,
+        0,
+        &dst.buf,
+        dst_offset_bytes,
+        n_bytes,
+    )?;
+    multi_gpu::cross_card_wait(drafter_gpu, evt)?;
+
     Ok(())
 }
 
@@ -3265,6 +3288,7 @@ pub fn spec_step_dflash(
                     gpu,
                     drafter,
                     hidden_rb,
+                    &verify_scratch.hidden_scatter_staging,
                     &draft_scratch.target_hidden,
                     position,
                     b,

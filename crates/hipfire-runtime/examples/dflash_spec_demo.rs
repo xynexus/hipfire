@@ -628,6 +628,8 @@ fn main() {
         target.config.dim,
         target.config.vocab_size,
         target.weights.output.k,
+        draft_cfg.num_extract(),
+        draft_cfg.hidden,
         &target.config,
     ).expect("alloc verify scratch");
     let mut target_hidden_host: Vec<f32> =

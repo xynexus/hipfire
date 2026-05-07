@@ -1870,6 +1870,8 @@ fn load_dflash_state(
         target_config.dim,
         target_config.vocab_size,
         target_config.dim,
+        draft_config.num_extract(),
+        draft_config.hidden,
         target_config,
     ).map_err(|e| format!("verify_scratch: {e}"))?;
 
