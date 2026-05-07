@@ -285,6 +285,88 @@ def quantize_then_dequantize_mq4g256_fwht_vectorized(
     return recon.reshape(n_padded)[:n]
 
 
+def quantize_then_dequantize_mq4g256_fwht_2d(
+    f32_data_2d: np.ndarray,
+    signs1: np.ndarray | None = None,
+    signs2: np.ndarray | None = None,
+) -> np.ndarray:
+    """2D-vectorized MQ4G256+FWHT round-trip. Treats every row's columns
+    as independent groups of 256 — same layout as
+    quantize_then_dequantize_mq4g256_fwht_vectorized but processes ALL
+    rows in a single batched FWHT call. Critical for Phase 2 weight
+    mutation walltime: the per-row Python loop costs tens of minutes
+    per A3B model; this version runs in seconds.
+
+    Requires f32_data_2d.shape[1] % 256 == 0. Returns same shape.
+    """
+    if signs1 is None:
+        signs1 = gen_fwht_signs(PRODUCTION_SIGNS1_SEED)
+    if signs2 is None:
+        signs2 = gen_fwht_signs(PRODUCTION_SIGNS2_SEED)
+
+    n_rows, n_cols = f32_data_2d.shape
+    if n_cols % GROUP_SIZE != 0:
+        # Fall back to per-row path (handles padding cleanly).
+        out = np.empty_like(f32_data_2d, dtype=np.float32)
+        for r in range(n_rows):
+            out[r] = quantize_then_dequantize_mq4g256_fwht_vectorized(
+                f32_data_2d[r], signs1, signs2)
+        return out
+
+    n_groups_per_row = n_cols // GROUP_SIZE
+    n_total_groups = n_rows * n_groups_per_row
+
+    # Reshape into [n_total_groups, GROUP_SIZE] for batched FWHT.
+    grouped = f32_data_2d.reshape(n_total_groups, GROUP_SIZE).astype(np.float32, copy=False)
+    rotated = cpu_fwht_256_batch(grouped, signs1, signs2)
+
+    grp_min = rotated.min(axis=1)
+    grp_max = rotated.max(axis=1)
+    grp_range = grp_max - grp_min
+    safe = grp_range > 0
+    grp_scale = np.where(safe, grp_range / np.float32(15.0), np.float32(1.0))
+    grp_inv_scale = np.where(safe, np.float32(1.0) / grp_scale, np.float32(0.0))
+
+    centered = rotated - grp_min[:, None]
+    q = np.round(centered * grp_inv_scale[:, None] + np.float32(1e-6)).astype(np.int32)
+    np.clip(q, 0, 15, out=q)
+
+    deq = q.astype(np.float32) * grp_scale[:, None] + grp_min[:, None]
+    recon = inv_fwht_256_batch(deq, signs1, signs2)
+    return recon.reshape(n_rows, n_cols)
+
+
+def quantize_then_dequantize_q8g256_2d(f32_data_2d: np.ndarray) -> np.ndarray:
+    """2D-vectorized Q8G256 round-trip. No FWHT. Treats every row's
+    columns as independent groups of 256. Returns same shape.
+    Symmetric with quantize_then_dequantize_mq4g256_fwht_2d.
+    """
+    n_rows, n_cols = f32_data_2d.shape
+    if n_cols % GROUP_SIZE != 0:
+        out = np.empty_like(f32_data_2d, dtype=np.float32)
+        for r in range(n_rows):
+            out[r] = quantize_then_dequantize_q8g256(f32_data_2d[r])
+        return out
+
+    n_groups_per_row = n_cols // GROUP_SIZE
+    n_total_groups = n_rows * n_groups_per_row
+    grouped = f32_data_2d.reshape(n_total_groups, GROUP_SIZE).astype(np.float32, copy=False)
+
+    grp_min = grouped.min(axis=1)
+    grp_max = grouped.max(axis=1)
+    grp_range = grp_max - grp_min
+    safe = grp_range > 0
+    grp_scale = np.where(safe, grp_range / np.float32(255.0), np.float32(1.0))
+    grp_inv_scale = np.where(safe, np.float32(1.0) / grp_scale, np.float32(0.0))
+
+    centered = grouped - grp_min[:, None]
+    q = np.round(centered * grp_inv_scale[:, None] + np.float32(1e-6)).astype(np.int32)
+    np.clip(q, 0, 255, out=q)
+
+    deq = q.astype(np.float32) * grp_scale[:, None] + grp_min[:, None]
+    return deq.reshape(n_rows, n_cols)
+
+
 def quantize_then_dequantize_q8g256(f32_data: np.ndarray) -> np.ndarray:
     """Vectorized Q8G256 round-trip: 8-bit per element in 256-element groups,
     per-group min/max scale. NO FWHT (8-bit headroom is sufficient — the

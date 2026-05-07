@@ -45,11 +45,10 @@ _THIS = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS))
 
 from quant_ops import (  # noqa: E402
-    quantize_then_dequantize_mq4g256_fwht_vectorized,
-    quantize_then_dequantize_q8g256,
     PRODUCTION_SIGNS1_SEED,
     PRODUCTION_SIGNS2_SEED,
     gen_fwht_signs,
+    GROUP_SIZE,
 )
 
 
@@ -103,44 +102,87 @@ def _is_down_proj(name: str) -> bool:
     return name.endswith(".down_proj") or name.endswith(".down_proj.weight")
 
 
-def _quant_2d(arr_f32: np.ndarray, q8: bool, signs1, signs2) -> np.ndarray:
-    """Round-trip a 2D weight tensor. Quant is per-row groups of 256 along
-    the LAST axis (consistent with hipfire-quantize's per-row group layout).
+def _torch_fwht_256_batch(x, signs1_t, signs2_t, inverse: bool = False):
+    """In-place-style FWHT on shape [..., 256] using torch ops on whatever
+    device x lives on. `signs1_t`, `signs2_t` are torch tensors of shape
+    [256] on the same device as x. Returns a new tensor (one allocation).
+
+    Matches the numpy cpu_fwht_256_batch numerically (within fp32 reduction
+    order; we don't claim bit-exactness because torch reductions on GPU
+    use deterministic-but-different orderings than numpy).
     """
-    n_rows, n_cols = arr_f32.shape
-    out = np.empty_like(arr_f32)
-    for r in range(n_rows):
-        if q8:
-            out[r] = quantize_then_dequantize_q8g256(arr_f32[r])
-        else:
-            out[r] = quantize_then_dequantize_mq4g256_fwht_vectorized(arr_f32[r], signs1, signs2)
-    return out
+    import torch
+    if inverse:
+        out = x * signs2_t
+    else:
+        out = x * signs1_t
+    out_shape = out.shape
+    n_groups = out.numel() // 256
+    out = out.reshape(n_groups, 256).contiguous()
+    stride = 1
+    while stride < 256:
+        n_pairs = 256 // (2 * stride)
+        viewed = out.reshape(n_groups, n_pairs, 2, stride)
+        a = viewed[:, :, 0, :]
+        b = viewed[:, :, 1, :]
+        new_a = a + b
+        new_b = a - b
+        out = torch.stack((new_a, new_b), dim=2).reshape(n_groups, 256)
+        stride <<= 1
+    out = out * (0.0625 * (signs1_t if inverse else signs2_t))
+    return out.reshape(out_shape)
 
 
-def _quant_3d_expert(arr_f32: np.ndarray, layer_idx: int, is_down_proj: bool,
-                     pin_set: set[tuple[int, int]], signs1, signs2) -> np.ndarray:
-    """Round-trip a 3D MoE expert tensor [n_experts, M, K]. Per-expert
-    quant choice: if (layer, expert) is in pin_set AND this is a
-    down_proj tensor, use Q8; else MQ4G256+FWHT.
+def _torch_quant_2d(arr, q8: bool, signs1_t, signs2_t):
+    """Round-trip a 2D tensor on whatever device it lives on. Q4: per-group
+    256-element FWHT + min/max/round/dequant + inv-FWHT. Q8: per-group
+    256-element min/max/round/dequant. No FWHT for Q8.
 
-    Per arXiv 2507.23279 SE definition, only down_proj is the pinning
-    target. gate_up_proj is always MQ4 in V3 variants.
+    arr is [n_rows, n_cols] with n_cols % 256 == 0 (pad-handled by caller
+    if needed).
     """
-    n_experts = arr_f32.shape[0]
-    out = np.empty_like(arr_f32)
-    for e in range(n_experts):
-        pin_q8 = is_down_proj and ((layer_idx, e) in pin_set)
-        out[e] = _quant_2d(arr_f32[e], q8=pin_q8, signs1=signs1, signs2=signs2)
-    return out
+    import torch
+    n_rows, n_cols = arr.shape
+    n_groups_per_row = n_cols // GROUP_SIZE
+    n_total_groups = n_rows * n_groups_per_row
+    grouped = arr.reshape(n_total_groups, GROUP_SIZE).contiguous().to(dtype=torch.float32)
+
+    if q8:
+        rotated = grouped
+        levels = 255.0
+    else:
+        rotated = _torch_fwht_256_batch(grouped, signs1_t, signs2_t, inverse=False)
+        levels = 15.0
+
+    grp_min = rotated.amin(dim=1)
+    grp_max = rotated.amax(dim=1)
+    grp_range = grp_max - grp_min
+    safe = grp_range > 0
+    grp_scale = torch.where(safe, grp_range / levels, torch.ones_like(grp_range))
+    grp_inv_scale = torch.where(safe, 1.0 / grp_scale, torch.zeros_like(grp_scale))
+
+    centered = rotated - grp_min[:, None]
+    q = torch.round(centered * grp_inv_scale[:, None] + 1e-6).to(dtype=torch.int32)
+    q = torch.clamp(q, 0, int(levels))
+
+    deq = q.to(dtype=torch.float32) * grp_scale[:, None] + grp_min[:, None]
+    if q8:
+        recon = deq
+    else:
+        recon = _torch_fwht_256_batch(deq, signs1_t, signs2_t, inverse=True)
+    return recon.reshape(n_rows, n_cols)
 
 
 def apply_variant(model, variant: str) -> dict[str, int]:
-    """Walk every parameter, apply the variant's quant plan in-place via
-    .data.copy_(round_tripped). Returns counts of {q4, q8, skipped}.
+    """Walk every parameter, apply the variant's quant plan in-place on the
+    parameter's home device via torch ops. NO CPU round-trip — keeps
+    everything on the R9700 GPUs that already hold the model. Returns
+    counts of {q4, q8, skipped, moe_3d}.
 
-    Memory: each tensor is moved to CPU as float32 for round-trip, then
-    cast back to bf16 and copied to its original device. Peak overhead
-    is ~one tensor's worth of f32 + the output buffer.
+    The FWHT signs are generated once via numpy (LCG seeded by production
+    seeds 42 / 1042), then copied to torch tensors on each device as
+    needed. Quant proceeds entirely in fp32 GPU compute and writes back
+    to the parameter's original dtype.
     """
     import torch
 
@@ -162,68 +204,90 @@ def apply_variant(model, variant: str) -> dict[str, int]:
     else:
         raise ValueError(f"unknown variant {variant!r}")
 
-    signs1 = gen_fwht_signs(PRODUCTION_SIGNS1_SEED)
-    signs2 = gen_fwht_signs(PRODUCTION_SIGNS2_SEED)
+    # Pre-build sign tables on CPU once; they're tiny (1KB each).
+    signs1_np = gen_fwht_signs(PRODUCTION_SIGNS1_SEED)
+    signs2_np = gen_fwht_signs(PRODUCTION_SIGNS2_SEED)
+    # Cache per-device torch copies so we don't re-upload per-tensor.
+    signs_cache: dict[str, tuple] = {}
+
+    def signs_on(device):
+        key = str(device)
+        if key not in signs_cache:
+            s1 = torch.from_numpy(signs1_np).to(device=device, dtype=torch.float32)
+            s2 = torch.from_numpy(signs2_np).to(device=device, dtype=torch.float32)
+            signs_cache[key] = (s1, s2)
+        return signs_cache[key]
 
     counts = {"q4": 0, "q8": 0, "skipped": 0, "moe_3d": 0}
     t0 = time.time()
     n_params = sum(1 for _ in model.named_parameters())
     print(f"phase2: applying variant {variant} ({n_params} parameters)", file=sys.stderr)
 
-    for i, (name, p) in enumerate(model.named_parameters()):
-        if _should_skip(name):
-            counts["skipped"] += 1
-            continue
-        if p.dim() < 2:
-            counts["skipped"] += 1
-            continue
+    with torch.no_grad():
+        for i, (name, p) in enumerate(model.named_parameters()):
+            if _should_skip(name):
+                counts["skipped"] += 1
+                continue
+            if p.dim() < 2:
+                counts["skipped"] += 1
+                continue
 
-        orig_device = p.device
-        orig_dtype = p.dtype
-        arr_f32 = p.detach().to(dtype=torch.float32, device="cpu").numpy()
+            orig_dtype = p.dtype
+            device = p.device
+            s1_t, s2_t = signs_on(device)
 
-        if _is_moe_3d_expert_tensor(name) and arr_f32.ndim == 3:
-            layer_idx = _layer_idx_of(name) or -1
-            is_down = ".mlp.experts.down_proj" in name
-            if all_q8:
-                # V2: Q8 everywhere — every expert slice gets Q8.
-                out = np.empty_like(arr_f32)
-                for e in range(arr_f32.shape[0]):
-                    rows = arr_f32[e]
-                    out_e = np.empty_like(rows)
-                    for r in range(rows.shape[0]):
-                        out_e[r] = quantize_then_dequantize_q8g256(rows[r])
-                    out[e] = out_e
-                counts["q8"] += arr_f32.shape[0]
+            if _is_moe_3d_expert_tensor(name) and p.dim() == 3:
+                layer_idx = _layer_idx_of(name) or -1
+                is_down = ".mlp.experts.down_proj" in name
+                n_experts, n_rows, n_cols = p.shape
+
+                if all_q8:
+                    rt = _torch_quant_2d(p.reshape(-1, n_cols), q8=True,
+                                         signs1_t=s1_t, signs2_t=s2_t)
+                    p.data.copy_(rt.reshape(n_experts, n_rows, n_cols).to(dtype=orig_dtype))
+                    counts["q8"] += n_experts
+                else:
+                    pinned_idx = (
+                        [e for e in range(n_experts) if is_down and (layer_idx, e) in pin_set]
+                        if is_down else []
+                    )
+                    if pinned_idx:
+                        # Quant pinned experts at Q8.
+                        pinned_t = p[pinned_idx].reshape(-1, n_cols)
+                        rt_p = _torch_quant_2d(pinned_t, q8=True,
+                                               signs1_t=s1_t, signs2_t=s2_t)
+                        rt_p = rt_p.reshape(len(pinned_idx), n_rows, n_cols).to(dtype=orig_dtype)
+                        p.data[pinned_idx] = rt_p
+                    other_idx = [e for e in range(n_experts) if e not in set(pinned_idx)]
+                    if other_idx:
+                        other_t = p[other_idx].reshape(-1, n_cols)
+                        rt_o = _torch_quant_2d(other_t, q8=False,
+                                               signs1_t=s1_t, signs2_t=s2_t)
+                        rt_o = rt_o.reshape(len(other_idx), n_rows, n_cols).to(dtype=orig_dtype)
+                        p.data[other_idx] = rt_o
+                    counts["q8"] += len(pinned_idx)
+                    counts["q4"] += len(other_idx)
+                counts["moe_3d"] += 1
+            elif p.dim() == 2:
+                n_rows, n_cols = p.shape
+                if n_cols % GROUP_SIZE != 0:
+                    counts["skipped"] += 1
+                    continue
+                rt = _torch_quant_2d(p, q8=all_q8, signs1_t=s1_t, signs2_t=s2_t)
+                p.data.copy_(rt.to(dtype=orig_dtype))
+                if all_q8:
+                    counts["q8"] += 1
+                else:
+                    counts["q4"] += 1
             else:
-                out = _quant_3d_expert(arr_f32, layer_idx, is_down, pin_set, signs1, signs2)
-                pinned = sum(1 for e in range(arr_f32.shape[0]) if is_down and (layer_idx, e) in pin_set)
-                counts["q8"] += pinned
-                counts["q4"] += arr_f32.shape[0] - pinned
-            counts["moe_3d"] += 1
-        elif arr_f32.ndim == 2:
-            q8 = all_q8
-            out = _quant_2d(arr_f32, q8=q8, signs1=signs1, signs2=signs2)
-            if q8:
-                counts["q8"] += 1
-            else:
-                counts["q4"] += 1
-        else:
-            counts["skipped"] += 1
-            continue
+                counts["skipped"] += 1
+                continue
 
-        # Cast back + copy to original device.
-        import torch
-        out_t = torch.from_numpy(out.astype(np.float32))
-        out_t = out_t.to(dtype=orig_dtype, device=orig_device)
-        with torch.no_grad():
-            p.data.copy_(out_t)
-        del out_t, out, arr_f32
-
-        if (i + 1) % 50 == 0 or i == n_params - 1:
-            dt = time.time() - t0
-            print(f"  param {i+1}/{n_params}  q4={counts['q4']} q8={counts['q8']} "
-                  f"skipped={counts['skipped']} dt={dt:.1f}s", file=sys.stderr)
+            if (i + 1) % 50 == 0 or i == n_params - 1:
+                dt = time.time() - t0
+                print(f"  param {i+1}/{n_params}  q4={counts['q4']} q8={counts['q8']} "
+                      f"skipped={counts['skipped']} moe_3d={counts['moe_3d']} dt={dt:.1f}s",
+                      file=sys.stderr)
 
     return counts
 
