@@ -438,7 +438,10 @@ fn test_rmsnorm_batched(
 }
 
 /// Test a weight-projection: load captured `step.input` (last-token), run
-/// weight_gemv with the model's quantized weight, compare to `step.output`.
+/// weight_gemv with the model's QUANTIZED weight, compare to bf16 reference's
+/// FULL-precision weight output. NRMSE here is dominated by 4-bit quantization
+/// noise (~5-12% empirical for MQ4-class GEMV on Gemma 4 31B, depending on
+/// weight statistics) — NOT bf16-noise-floor 5e-3. Use proj_threshold here.
 fn test_proj(
     gpu: &mut Gpu, refs: &Refs, layer_idx: i32,
     step: &str, weight: &WeightTensor, threshold: f32,
@@ -474,7 +477,7 @@ fn test_proj(
 /// Run the Phase 2 battery for a single layer.
 fn test_layer_phase2(
     gpu: &mut Gpu, refs: &Refs, config: &Gemma4Config,
-    layer_idx: usize, lw: &LayerWeights, threshold: f32,
+    layer_idx: usize, lw: &LayerWeights, threshold: f32, proj_threshold: f32,
     halt_on_fail: bool,
 ) -> (usize, usize, usize) {
     let mut pass = 0usize;
@@ -522,10 +525,10 @@ fn test_layer_phase2(
     check!(test_rmsnorm_1d(gpu, refs, li, "post_mlp_norm",  post_ffn_norm,   eps, threshold));
 
     // Q/K/V projections. v_proj_opt is None for full layers (V = pre-norm K).
-    check!(test_proj(gpu, refs, li, "q_proj", q_proj, threshold));
-    check!(test_proj(gpu, refs, li, "k_proj", k_proj, threshold));
+    check!(test_proj(gpu, refs, li, "q_proj", q_proj, proj_threshold));
+    check!(test_proj(gpu, refs, li, "k_proj", k_proj, proj_threshold));
     if let Some(vp) = v_proj_opt {
-        check!(test_proj(gpu, refs, li, "v_proj", vp, threshold));
+        check!(test_proj(gpu, refs, li, "v_proj", vp, proj_threshold));
     }
 
     // Q/K norms (head-dim batched). Note: capture shape for q_norm.input could
@@ -535,12 +538,12 @@ fn test_layer_phase2(
     check!(test_rmsnorm_batched(gpu, refs, li, "k_norm", k_norm, n_kv,    head_dim, eps, threshold));
 
     // o_proj
-    check!(test_proj(gpu, refs, li, "o_proj", o_proj, threshold));
+    check!(test_proj(gpu, refs, li, "o_proj", o_proj, proj_threshold));
 
     // MLP: gate, up, down (gelu_tanh + mul already covered in Phase 1).
-    check!(test_proj(gpu, refs, li, "mlp_gate", gate_proj, threshold));
-    check!(test_proj(gpu, refs, li, "mlp_up",   up_proj,   threshold));
-    check!(test_proj(gpu, refs, li, "mlp_down", down_proj, threshold));
+    check!(test_proj(gpu, refs, li, "mlp_gate", gate_proj, proj_threshold));
+    check!(test_proj(gpu, refs, li, "mlp_up",   up_proj,   proj_threshold));
+    check!(test_proj(gpu, refs, li, "mlp_down", down_proj, proj_threshold));
 
     // Suppress unused warnings (token_at and n_heads are reserved for the
     // attention-isolation step, deferred until a longer reference dump is
@@ -597,8 +600,14 @@ fn main() {
     // in fp32.
     let threshold: f32 = std::env::var("VERIFY_THRESHOLD")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(5e-3);
+    // Quantized projections compare hipfire's MQ4-class GEMV against the bf16
+    // reference; the dominant error is 4-bit quantization noise (5-12% NRMSE
+    // empirically on Gemma 4 31B), NOT bf16 noise floor. Override with
+    // VERIFY_PROJ_THRESHOLD if needed.
+    let proj_threshold: f32 = std::env::var("VERIFY_PROJ_THRESHOLD")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(1.5e-1);
     let halt_on_fail = std::env::var("VERIFY_HALT_ON_FAIL").ok().as_deref() == Some("1");
-    eprintln!("  threshold  : {:.2e}", threshold);
+    eprintln!("  threshold  : {:.2e} (norms)  /  {:.2e} (proj — quant noise)", threshold, proj_threshold);
     if let Some(ref f) = layer_filter {
         eprintln!("  filter     : layers {:?}", f);
     }
@@ -676,7 +685,7 @@ fn main() {
             let lt_label = match lt { LayerType::Sliding => "sliding", LayerType::Full => "full" };
             eprintln!("  ── layer {:02} ({}) ──", layer_idx, lt_label);
             let (p, f, _) = test_layer_phase2(&mut gpu, &refs, &config, layer_idx as usize, lw,
-                                              threshold, halt_on_fail);
+                                              threshold, proj_threshold, halt_on_fail);
             p2_pass += p;
             p2_fail += f;
             if f > 0 && p2_first_fail.is_none() { p2_first_fail = Some(layer_idx); }
