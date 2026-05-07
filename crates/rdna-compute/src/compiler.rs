@@ -79,16 +79,23 @@ pub struct KernelCompiler {
 
 impl KernelCompiler {
     pub fn new(arch: &str) -> HipResult<Self> {
-        // Cache (hot path) defaults to $CWD/.hipfire_kernels so parallel
-        // worktrees/agents on the same machine don't clobber each other's
-        // JIT'd .hsaco blobs. /tmp was shared state: two daemons from
-        // different git states wrote the same {name}.hsaco path and
-        // thrashed each other's hash sidecars. $CWD isolation fixes that.
+        // Cache (hot path) defaults to $CWD/.hipfire_kernels/<arch> so:
+        //   (a) parallel worktrees/agents on the same machine don't
+        //       clobber each other's JIT'd .hsaco blobs ($CWD isolation —
+        //       the original /tmp shared-state regression);
+        //   (b) two `Gpu` instances on different archs in the SAME
+        //       process (hetero PP+DFlash drafter device pinning, PRD
+        //       v1.2 PR-A) don't race on the runtime-compile output
+        //       path. Without arch suffix, drafter (gfx1010) overwrites
+        //       target's (gfx1151) `.hsaco` and the next target-side
+        //       hipModuleLoad fails with `device kernel image is invalid (200)`.
         // End-user / CI can pin the old location back via
-        // HIPFIRE_KERNEL_CACHE=/tmp/hipfire_kernels if tmpfs speed matters.
-        let cache_dir = std::env::var_os("HIPFIRE_KERNEL_CACHE")
+        // HIPFIRE_KERNEL_CACHE=/tmp/hipfire_kernels if tmpfs speed matters
+        // (the per-arch suffix is appended even to the override).
+        let cache_root = std::env::var_os("HIPFIRE_KERNEL_CACHE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".hipfire_kernels"));
+        let cache_dir = cache_root.join(arch);
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to create cache dir: {e}"))
         })?;
@@ -115,7 +122,10 @@ impl KernelCompiler {
         // (or with stale hash) to avoid churn when both locations agree.
         // `hipfire update` wipes BOTH /tmp and the install dir, so after an
         // update + restart we get a fully-fresh re-seed.
-        let hot_dir = cache_dir.join(arch);
+        //
+        // `cache_dir` already includes the arch suffix (see constructor
+        // header), so the hot path == `cache_dir` itself; no second join.
+        let hot_dir = cache_dir.clone();
         if let Some(ref cold) = precompiled_dir {
             if let Err(e) = seed_hot_from_cold(cold, &hot_dir) {
                 eprintln!("  hot-path seed failed ({e}) — falling back to install dir reads");
