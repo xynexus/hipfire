@@ -10840,6 +10840,18 @@ impl Gpu {
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
         let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
 
+        // Partials capacity guard — see attention_flash_asym3_window for rationale.
+        let required_partials = n_heads * max_tiles * (2 + head_dim);
+        if partials.numel() < required_partials {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "attention_flash_q8_0_window: partials too small — have {} floats, need {} \
+                 (n_heads={} max_tiles={} stride={} from max_seq={} head_dim={}). \
+                 Resize per-arch scratch or reduce kv_cache.max_seq.",
+                partials.numel(), required_partials,
+                n_heads, max_tiles, 2 + head_dim, max_seq, head_dim
+            )));
+        }
+
         // ── Tile kernel ──
         self.ensure_kernel(
             "attention_flash_q8_0_tile",
@@ -11642,6 +11654,18 @@ impl Gpu {
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
         let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
 
+        // Partials capacity guard — see attention_flash_asym3_window for rationale.
+        let required_partials = n_heads * max_tiles * (2 + head_dim);
+        if partials.numel() < required_partials {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "attention_flash_asym4_window: partials too small — have {} floats, need {} \
+                 (n_heads={} max_tiles={} stride={} from max_seq={} head_dim={}). \
+                 Resize per-arch scratch or reduce kv_cache.max_seq.",
+                partials.numel(), required_partials,
+                n_heads, max_tiles, 2 + head_dim, max_seq, head_dim
+            )));
+        }
+
         // Tile kernel
         self.ensure_givens4_kernel(
             "attention_flash_asym4_tile",
@@ -11754,6 +11778,18 @@ impl Gpu {
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
         let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
+
+        // Partials capacity guard — see attention_flash_asym3_window for rationale.
+        let required_partials = n_heads * max_tiles * (2 + head_dim);
+        if partials.numel() < required_partials {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "attention_flash_asym2_window: partials too small — have {} floats, need {} \
+                 (n_heads={} max_tiles={} stride={} from max_seq={} head_dim={}). \
+                 Resize per-arch scratch or reduce kv_cache.max_seq.",
+                partials.numel(), required_partials,
+                n_heads, max_tiles, 2 + head_dim, max_seq, head_dim
+            )));
+        }
 
         self.ensure_givens4_kernel(
             "attention_flash_asym2_tile",
