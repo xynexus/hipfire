@@ -18,7 +18,7 @@ use hipfire_runtime::llama::{self, KvCache};
 use hipfire_runtime::multi_gpu;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hipfire_runtime::tokenizer::Tokenizer;
-use hip_bridge::{DeviceBuffer, HipResult};
+use hip_bridge::{DeviceBuffer, HipResult, PinnedHostBuffer};
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1086,6 +1086,19 @@ pub struct VerifyScratch {
     /// per cycle at 27B) with one D2D scatter + one peer copy. Unused on
     /// the homogeneous path.
     pub hidden_scatter_staging: GpuTensor,
+    /// Pinned-host-mapped bounce buffer for the hetero PP+DFlash
+    /// cross-card transfers (PRD v1.2 PR-A pinned-host fast path).
+    /// Replaces `hipMemcpyPeer`'s implicit unpinned-bounce-buffer route
+    /// (~64 MB/s effective on hipx iGPU↔eGPU per `peer_smoke`) with two
+    /// explicit DMA legs through this pinned buffer, each at the eGPU's
+    /// hardware-native rate (~5 GB/s TB3). Sized to the largest cross-
+    /// card payload — the Phase 9 hidden scatter at
+    /// `max_n × num_extract × draft_hidden × 4` bytes — reused for the
+    /// smaller Phase 2 / Phase 5 transfers within the cycle.
+    /// Allocated unconditionally in `VerifyScratch::new`; ~1.6 MB max
+    /// at 27B (max_n=16, ne=5, hidden=5120). Unused on the homogeneous
+    /// path.
+    pub xcard_pinned: PinnedHostBuffer,
 }
 
 impl VerifyScratch {
@@ -1114,6 +1127,7 @@ impl VerifyScratch {
                 &[max_n * num_extract * draft_hidden],
                 rdna_compute::DType::F32,
             )?,
+            xcard_pinned: gpu.hip.host_malloc(max_n * num_extract * draft_hidden * 4)?,
         })
     }
 
@@ -1145,6 +1159,7 @@ impl VerifyScratch {
         let _ = gpu.free_tensor(self.embd_staging);
         let _ = gpu.free_tensor(self.draft_hidden_staging);
         let _ = gpu.free_tensor(self.hidden_scatter_staging);
+        let _ = gpu.hip.host_free(self.xcard_pinned);
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
         }
@@ -2311,23 +2326,26 @@ pub fn scatter_hidden_block_to_interleaved(
 /// hetero PP+DFlash path (PRD v1.2 PR-A): `hidden_rb` lives on
 /// `target_gpu`, `dst` lives on `drafter_gpu`.
 ///
-/// Coalesced shape: same-device D2D scatter into `staging` on
-/// `target_gpu` (cheap — same kernel, ~µs per row), then ONE
-/// `cross_card_copy_at` peer copy of the whole
-/// `n_rows × num_extract × hidden × 4` byte block. Replaces the prior
-/// per-(row, ext) cross-card loop (~80 calls per cycle at 27B), saving
-/// per-call HIP launch overhead × 80 and reducing the cross-card stream
-/// dependency chain to a single event.
+/// Coalesced + pinned-host path: same-device D2D scatter into `staging`
+/// on `target_gpu` (cheap — same kernel, ~µs per row), then a single
+/// pinned-host-mediated cross-card copy of the whole
+/// `n_rows × num_extract × hidden × 4` byte block via
+/// [`multi_gpu::cross_card_copy_via_pinned`]. Replaces the prior
+/// per-(row, ext) cross-card loop (~80 calls per cycle at 27B) AND the
+/// `hipMemcpyPeer` bounce-buffer fallback that capped throughput at
+/// ~64 MB/s on hipx iGPU↔eGPU.
 ///
 /// Per-cycle cost at typical 27B shapes (ne=5, B=16, hidden=5120,
-/// rows_to_keep=12): ~1.2 MB shipped in one peer copy. The target-side
-/// staging buffer (~1.6 MB max) is allocated once at VerifyScratch
-/// construction.
+/// rows_to_keep=12): ~1.2 MB shipped via pinned-host DMA. The target-
+/// side `staging` GpuTensor (~1.6 MB max) is allocated once at
+/// VerifyScratch construction; the pinned host bounce buffer
+/// (`xcard_pinned`) is also a VerifyScratch field.
 pub fn scatter_hidden_block_to_interleaved_cross_card(
     target_gpu: &Gpu,
     drafter_gpu: &Gpu,
     hidden_rb: &HiddenStateRingBuffer,
     staging: &GpuTensor,
+    pinned: &PinnedHostBuffer,
     dst: &GpuTensor,
     dst_row_offset: usize,
     block_size: usize,
@@ -2350,19 +2368,19 @@ pub fn scatter_hidden_block_to_interleaved_cross_card(
         n_rows,
     )?;
 
-    // Step 2: single peer copy of the staged rows from target → drafter.
+    // Step 2: pinned-host-mediated cross-card copy of the staged rows.
     let n_bytes = n_rows * num_extract * row_bytes;
     let dst_offset_bytes = dst_row_offset * num_extract * row_bytes;
-    let evt = multi_gpu::cross_card_copy_at(
+    multi_gpu::cross_card_copy_via_pinned(
         target_gpu,
         drafter_gpu,
+        pinned,
         &staging.buf,
         0,
         &dst.buf,
         dst_offset_bytes,
         n_bytes,
     )?;
-    multi_gpu::cross_card_wait(drafter_gpu, evt)?;
 
     Ok(())
 }
@@ -2654,20 +2672,24 @@ pub fn spec_step_dflash(
             }
         }
         // Cross-card ship the B embedding rows into draft_scratch.x on
-        // the drafter. Single peer-async copy on `gpu`'s active_stream;
-        // drafter waits before the upcoming draft_forward.
+        // the drafter. Goes through the pinned-host fast path (PRD
+        // v1.2 PR-A): D2H from `embd_staging` to verify_scratch's
+        // pinned bounce, then H2D from pinned to drafter's
+        // `draft_scratch.x`. Replaces `hipMemcpyPeer`'s ~64 MB/s
+        // bounce-buffer fallback on hipx iGPU↔eGPU with two
+        // hardware-native DMA legs.
         let drafter = drafter_gpu_opt.as_deref().expect("hetero implies Some");
         let n_bytes = b * h * 4;
-        let evt = multi_gpu::cross_card_copy_at(
+        multi_gpu::cross_card_copy_via_pinned(
             gpu,
             drafter,
+            &verify_scratch.xcard_pinned,
             &verify_scratch.embd_staging.buf,
             0,
             &draft_scratch.x.buf,
             0,
             n_bytes,
         )?;
-        multi_gpu::cross_card_wait(drafter, evt)?;
     } else {
         for (i, &tok) in block.iter().enumerate() {
             let dst = draft_scratch.x.sub_offset(i * h, h);
@@ -2820,16 +2842,20 @@ pub fn spec_step_dflash(
         let hidden_rows = if hetero {
             let drafter = drafter_gpu_opt.as_deref().expect("hetero implies Some");
             let n_bytes = batch * h * 4;
-            let evt = multi_gpu::cross_card_copy_at(
+            // Drafter D2H into pinned bounce, then target H2D into the
+            // staging buffer the lm_head GEMM consumes. Pinned-host
+            // fast path bypasses `hipMemcpyPeer`'s bounce-buffer
+            // fallback for the iGPU↔eGPU return direction.
+            multi_gpu::cross_card_copy_via_pinned(
                 drafter,
                 gpu,
+                &verify_scratch.xcard_pinned,
                 &draft_scratch.x.buf,
                 h * 4,                                       // skip block[0] (the seed)
                 &verify_scratch.draft_hidden_staging.buf,
                 0,
                 n_bytes,
             )?;
-            multi_gpu::cross_card_wait(gpu, evt)?;
             verify_scratch.draft_hidden_staging.sub_offset(0, batch * h)
         } else {
             draft_scratch.x.sub_offset(h, batch * h)
@@ -3289,6 +3315,7 @@ pub fn spec_step_dflash(
                     drafter,
                     hidden_rb,
                     &verify_scratch.hidden_scatter_staging,
+                    &verify_scratch.xcard_pinned,
                     &draft_scratch.target_hidden,
                     position,
                     b,

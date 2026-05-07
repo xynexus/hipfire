@@ -17,7 +17,7 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 use hip_bridge::{
-    DeviceBuffer, Event, HipError, HipResult,
+    DeviceBuffer, Event, HipError, HipResult, PinnedHostBuffer,
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
 use rdna_compute::{Gpu, GpuTensor};
@@ -396,6 +396,101 @@ pub fn cross_card_copy_at(
             Ok(BoundaryEvent { dst_dev: usize::MAX, completion: None })
         }
     }
+}
+
+/// Pinned-host-staged cross-card copy. Bypasses HIP's `hipMemcpyPeer`
+/// bounce-buffer fallback by ping-ponging through a caller-owned
+/// `PinnedHostBuffer`, which lets the driver use direct-DMA paths on
+/// both legs:
+///
+/// 1. `src_gpu`'s active stream `hipMemcpyDtoHAsync(pinned, src+src_offset)` —
+///    DMA from src device VRAM into the pinned host buffer (or, when
+///    src is an iGPU on UMA hardware, an effectively in-place
+///    system-RAM-to-system-RAM copy).
+/// 2. `src_gpu` host-blocks on its stream so the pinned buffer is
+///    fully populated before the H2D leg launches.
+/// 3. `dst_gpu`'s active stream `hipMemcpyHtoDAsync(dst+dst_offset, pinned)` —
+///    DMA from pinned host into dst device VRAM.
+/// 4. `dst_gpu` host-blocks on its stream so the helper's contract
+///    matches the synchronous semantics of `cross_card_copy +
+///    cross_card_wait`.
+///
+/// Why this is faster on Strix Halo iGPU↔eGPU (gfx1151 + gfx1010 over
+/// Thunderbolt): `hipMemcpyPeer` between non-truly-peer-capable
+/// devices falls through to a HIP-internal bounce-buffer path that
+/// runs at ~64 MB/s on hipx (per `peer_smoke`). The pinned-host route
+/// uses the eGPU's DMA engine over TB at hardware-native rates and
+/// the iGPU side is a system-RAM-to-system-RAM copy. Per-cycle
+/// 1.5 MB cross-card budget at ~5 GB/s (TB3 hardware ceiling) →
+/// ~0.3 ms vs ~23 ms on the bounce-buffer path.
+///
+/// The pinned buffer must be ≥ `n_bytes` and is mutated in place;
+/// callers reusing it across cycles must ensure no other async op is
+/// in flight against it (the host-block on `src_gpu` ensures the D2H
+/// is complete before this fn returns; the host-block on `dst_gpu`
+/// likewise for the H2D).
+pub fn cross_card_copy_via_pinned(
+    src_gpu: &Gpu,
+    dst_gpu: &Gpu,
+    pinned: &PinnedHostBuffer,
+    src: &DeviceBuffer,
+    src_offset: usize,
+    dst: &DeviceBuffer,
+    dst_offset: usize,
+    n_bytes: usize,
+) -> HipResult<()> {
+    if src_gpu.device_id == dst_gpu.device_id {
+        return Err(HipError::new(
+            0,
+            "cross_card_copy_via_pinned: src and dst share device_id (use memcpy_dtod_at instead)",
+        ));
+    }
+    if pinned.size() < n_bytes {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "cross_card_copy_via_pinned: pinned buffer is {} bytes, need {}",
+                pinned.size(), n_bytes,
+            ),
+        ));
+    }
+
+    // Pinned host memory is by definition shared with GPU async memcpy
+    // engines on both sides; the Rust `&mut [u8]` we hand to
+    // `memcpy_dtoh_async_at` represents host-side staging that the GPU
+    // will mutate, not a unique CPU borrow. The host-block on
+    // `stream_synchronize` after each leg makes the sequential D2H→H2D
+    // story sound: leg 2 only starts reading after leg 1 has fully
+    // populated the buffer. Constructing the mutable slice from an
+    // immutable `&PinnedHostBuffer` reference here mirrors the way HIP
+    // host-pinned buffers are actually used in C++ (raw pointer + size,
+    // shared with the device side).
+    let host_ptr = pinned.as_mut_ptr() as *mut u8;
+    // SAFETY: pinned host memory is page-locked, lives for the lifetime
+    // of `pinned`, and the host-block + sequential leg ordering below
+    // ensures no concurrent access to the same bytes.
+    let host_slice: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host_ptr, n_bytes) };
+
+    // Leg 1: src_gpu D2H into pinned host.
+    src_gpu.bind_thread()?;
+    let src_stream = src_gpu.active_stream.as_ref().ok_or_else(|| HipError::new(
+        0,
+        "cross_card_copy_via_pinned: src_gpu has no active_stream — caller must initialize one",
+    ))?;
+    src_gpu.hip.memcpy_dtoh_async_at(host_slice, src, src_offset, src_stream)?;
+    src_gpu.hip.stream_synchronize(src_stream)?;
+
+    // Leg 2: dst_gpu H2D from pinned host.
+    dst_gpu.bind_thread()?;
+    let dst_stream = dst_gpu.active_stream.as_ref().ok_or_else(|| HipError::new(
+        0,
+        "cross_card_copy_via_pinned: dst_gpu has no active_stream — caller must initialize one",
+    ))?;
+    let host_slice_ro: &[u8] = unsafe { std::slice::from_raw_parts(host_ptr as *const u8, n_bytes) };
+    dst_gpu.hip.memcpy_htod_async_at(dst, dst_offset, host_slice_ro, dst_stream)?;
+    dst_gpu.hip.stream_synchronize(dst_stream)?;
+
+    Ok(())
 }
 
 /// Free-function form of `Gpus::wait_boundary` for the cross-card path.
