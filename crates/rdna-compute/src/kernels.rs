@@ -731,6 +731,14 @@ pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str = include_str!("../../../
 pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 
+// asym3 head_dim=512 variants (Gemma 4 full-attention layers, global_head_dim=512).
+// Each thread covers 16 dims (= 2 chunks of 8) so a single 32-thread warp still
+// handles a 512-dim head with no cross-warp reduce. Mirror layout in writer +
+// reader; dispatch picks by head_dim {256, 512}.
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512_batched.hip");
+pub const ATTENTION_FLASH_ASYM3_TILE_HD512_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym3_tile_hd512.hip");
+
 /// TriAttention scoring on Q8 post-RoPE K cache (arXiv:2604.04921).
 pub const TRIATTN_SCORE_Q8_SRC: &str = include_str!("../../../kernels/src/triattn_score_q8.hip");
 

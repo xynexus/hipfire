@@ -10984,7 +10984,8 @@ impl Gpu {
 
     /// Fused K+V write for asym3: K at 3-bit rotated (RotorQuant "planar3"), V at Q8_0.
     /// Best-quality rotated K per RotorQuant paper. Head geometry: 32 threads × 8
-    /// values = 256 dims single-pass. 100 bytes/head for hd=256.
+    /// values = 256 dims single-pass. 100 bytes/head for hd=256, 196 B/head for hd=512.
+    /// hd=512 (Gemma 4 full layers) uses a 16-dim/thread variant; other sizes panic.
     pub fn kv_cache_write_asym3_fused(
         &mut self, k_dst: &GpuTensor, v_dst: &GpuTensor,
         k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
@@ -10992,13 +10993,16 @@ impl Gpu {
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_givens4_kernel(
-            "kv_cache_write_asym_k_givens3",
-            kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC,
-            "kv_cache_write_asym_k_givens3",
-        )?;
+        let (kernel_name, kernel_src) = match head_dim {
+            256 => ("kv_cache_write_asym_k_givens3", kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC),
+            512 => ("kv_cache_write_asym_k_givens3_hd512", kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC),
+            _ => return Err(hip_bridge::HipError::new(0, &format!(
+                "kv_cache_write_asym3_fused: unsupported head_dim={} (only 256, 512)", head_dim
+            ))),
+        };
+        self.ensure_givens4_kernel(kernel_name, kernel_src, kernel_name)?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens3"];
+            let func = &self.functions[kernel_name];
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
             let mut pp = pos_buf.as_ptr();
@@ -11325,7 +11329,9 @@ impl Gpu {
     }
 
     /// Batched K+V write for asym3 — processes N positions in one launch.
-    /// K-only givens3 write (batched) + Q8_0 V write (batched).
+    /// K-only givens3 write (batched) + Q8_0 V write (batched). hd=512 routes to
+    /// the 16-dim/thread variant (Gemma 4 full layers, batched-prefill bug fix
+    /// origin/gemma4 f724be6).
     pub fn kv_cache_write_asym3_batched(
         &mut self,
         k_dst: &GpuTensor, v_dst: &GpuTensor,
@@ -11334,12 +11340,15 @@ impl Gpu {
         n_kv_heads: usize, head_dim: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // K: batched 3-bit rotated write.
-        self.ensure_givens4_kernel(
-            "kv_cache_write_asym_k_givens3_batched",
-            kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC,
-            "kv_cache_write_asym_k_givens3_batched",
-        )?;
+        // K: batched 3-bit rotated write — branch by head_dim.
+        let (kernel_name, kernel_src) = match head_dim {
+            256 => ("kv_cache_write_asym_k_givens3_batched", kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC),
+            512 => ("kv_cache_write_asym_k_givens3_hd512_batched", kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC),
+            _ => return Err(hip_bridge::HipError::new(0, &format!(
+                "kv_cache_write_asym3_batched: unsupported head_dim={} (only 256, 512)", head_dim
+            ))),
+        };
+        self.ensure_givens4_kernel(kernel_name, kernel_src, kernel_name)?;
         {
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
@@ -11361,7 +11370,7 @@ impl Gpu {
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
             self.launch_maybe_blob(
-                "kv_cache_write_asym_k_givens3_batched",
+                kernel_name,
                 [n_kv_heads as u32, batch_size as u32, 1],
                 [32, 1, 1],
                 shared_mem,
@@ -11442,7 +11451,9 @@ impl Gpu {
     }
 
     /// Sliding-window variant of `attention_flash_asym3`. `window_size == 0`
-    /// is identical to the full-causal path. Used by Gemma 4 sliding layers.
+    /// is identical to the full-causal path. Used by Gemma 4 sliding layers
+    /// (head_dim=256) AND full layers (head_dim=512, dispatches the 16-dim/
+    /// thread variant — origin/gemma4 6f5cb8b).
     pub fn attention_flash_asym3_window(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
         out: &GpuTensor, pos_buf: &DeviceBuffer,
@@ -11456,13 +11467,16 @@ impl Gpu {
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
         let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
 
-        self.ensure_givens4_kernel(
-            "attention_flash_asym3_tile",
-            kernels::ATTENTION_FLASH_ASYM3_TILE_SRC,
-            "attention_flash_asym3_tile",
-        )?;
+        let (kernel_name, kernel_src) = match head_dim {
+            256 => ("attention_flash_asym3_tile", kernels::ATTENTION_FLASH_ASYM3_TILE_SRC),
+            512 => ("attention_flash_asym3_tile_hd512", kernels::ATTENTION_FLASH_ASYM3_TILE_HD512_SRC),
+            _ => return Err(hip_bridge::HipError::new(0, &format!(
+                "attention_flash_asym3_window: unsupported head_dim={} (only 256, 512)", head_dim
+            ))),
+        };
+        self.ensure_givens4_kernel(kernel_name, kernel_src, kernel_name)?;
         {
-            let func = &self.functions["attention_flash_asym3_tile"];
+            let func = &self.functions[kernel_name];
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let mut q_ptr = q.buf.as_ptr();
             let mut k_ptr = k_cache.buf.as_ptr();
@@ -14621,6 +14635,15 @@ impl Gpu {
                             assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC)));
                 specs.push(("attention_flash_asym_reduce_batched",
                             kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+                // hd=512 variants for Gemma 4 full layers (global_head_dim=512).
+                // Precompiled even on non-Gemma archs: kernel cache keying is by
+                // name + arch so this just adds 3 entries; runtime dispatch picks.
+                specs.push(("kv_cache_write_asym_k_givens3_hd512",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC)));
+                specs.push(("kv_cache_write_asym_k_givens3_hd512_batched",
+                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC)));
+                specs.push(("attention_flash_asym3_tile_hd512",
+                            assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_HD512_SRC)));
             }
             "asym2" => {
                 specs.push(("kv_cache_write_asym_k_givens2",
