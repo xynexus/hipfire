@@ -851,6 +851,48 @@ impl HipRuntime {
         self.check(code, "hipModuleLaunchKernel(extra blob)")
     }
 
+    /// Launch a kernel using a caller-supplied `extra` array pointer.
+    ///
+    /// This is the lowest-level extra-path launch — the caller has already
+    /// built a Box-stable `[*mut c_void; 5]` array containing
+    /// `[BUFFER_POINTER, blob_ptr, BUFFER_SIZE, &blob_len, END]` and just
+    /// hands its address in. Used by the per-shape graph cache, which
+    /// retains the extra/blob/blob_len Boxes for the captured graph's
+    /// lifetime so HIP graph capture can record stable pointers.
+    ///
+    /// # Safety
+    /// `extra` must point to a 5-slot `*mut c_void` array with the layout
+    /// described above. The pointed-to kernarg blob and length cell must
+    /// outlive any captured graph that records this launch. Layout of the
+    /// kernarg blob must match the kernel signature.
+    pub unsafe fn launch_kernel_with_extra(
+        &self,
+        func: &Function,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: Option<&Stream>,
+        extra: *mut *mut c_void,
+    ) -> HipResult<()> {
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let t = std::time::Instant::now();
+        let code = (self.fn_module_launch_kernel)(
+            func.0,
+            grid[0],
+            grid[1],
+            grid[2],
+            block[0],
+            block[1],
+            block[2],
+            shared_mem,
+            stream_raw,
+            ptr::null_mut(), // kernelParams = null (we use extra)
+            extra,
+        );
+        crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        self.check(code, "hipModuleLaunchKernel(extra ptr)")
+    }
+
     // ── Events ──────────────────────────────────────────────────
 
     pub fn event_create(&self) -> HipResult<Event> {

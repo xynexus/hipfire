@@ -1104,34 +1104,12 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
-        // PR1 of the per-shape hipGraph cache: observe only.
-        //
-        // We can recover an arity-1 best-effort `m_tuple` from the launch
-        // grid (M is roughly grid[0] for the plain `gemv_hfq4g256` family),
-        // but K isn't recoverable from grid+block alone. PR2 will plumb
-        // (m_tuple, k) through from the per-kernel dispatch sites
-        // (`gemv_hfq4g256`, `fused_qkv_hfq4g256`, …) and call
-        // `cache.dispatch()` *there* to actually replay graphs. PR1's
-        // job is to verify the field/classifier wires up clean and to
-        // measure miss rate via `cache.stats`.
-        //
-        // The current `cache.dispatch()` always returns Fallthrough, so
-        // this block is invisible at runtime and the legacy launch path
-        // below is unchanged. Skip the cache entirely under graph capture
-        // (`capture_mode`) to avoid nesting captures (see PRD §6).
-        if !self.capture_mode {
-            if let Some(cache) = self.gemv_graph_cache.as_mut() {
-                if let Some(shape) = crate::gemv_graph_cache::GemvGraphCache::classify(
-                    func_name,
-                    &[grid[0]],
-                    0,
-                ) {
-                    let _ = cache.dispatch(&shape);
-                    // PR1: dispatch always returns Fallthrough. PR2 will
-                    // early-return here when an entry replays.
-                }
-            }
-        }
+        // PR1 of the per-shape hipGraph cache wired observe-only into this
+        // helper, but the actual capture/replay routing happens at the
+        // per-kernel dispatch sites (currently only `gemv_hfq4g256` plain
+        // — see `try_dispatch_gemv_hfq4g256_via_graph_cache`). The miss
+        // counter that used to live here is removed — counting moved into
+        // the cache itself.
 
         if self.capture_mode || self.force_blob_path {
             let mut blob = blob_builder();
@@ -1155,6 +1133,165 @@ impl Gpu {
             unsafe {
                 self.hip.launch_kernel(func, grid, block, shared_mem, stream, params)
             }
+        }
+    }
+
+    /// PR2 of the per-shape hipGraph cache. Plain `gemv_hfq4g256` only.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the cache handled this call (replay or capture).
+    ///   Caller MUST NOT also run `launch_maybe_blob`.
+    /// - `Ok(false)` if the caller should run the legacy launch path.
+    /// - `Err(_)` if HIP returned an error during capture/replay.
+    ///
+    /// Conditions for routing through the cache (else `Ok(false)`):
+    /// - cache is `Some` (i.e. `HIPFIRE_GEMV_GRAPH=1` was set at init);
+    /// - `!self.capture_mode` (don't nest captures — PRD §6);
+    /// - `!self.force_blob_path` (diagnostic flag);
+    /// - `self.active_stream.is_some()` (capture requires an explicit stream).
+    ///
+    /// Kernarg layout for `gemv_hfq4g256` (32 bytes):
+    /// ```text
+    ///   off  0..8   : a_ptr (device pointer)
+    ///   off  8..16  : x_ptr (device pointer)
+    ///   off 16..24  : y_ptr (device pointer)
+    ///   off 24..28  : m as i32
+    ///   off 28..32  : k as i32
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    fn try_dispatch_gemv_hfq4g256_via_graph_cache(
+        &mut self,
+        func_name: &'static str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        a_ptr: *mut std::ffi::c_void,
+        x_ptr: *mut std::ffi::c_void,
+        y_ptr: *mut std::ffi::c_void,
+        m: i32,
+        k: i32,
+    ) -> HipResult<bool> {
+        // Restricted to plain "gemv_hfq4g256" only for PR2. _wide and
+        // multirow variants stay on legacy launch — PR3 is the place to
+        // extend.
+        if func_name != "gemv_hfq4g256" {
+            return Ok(false);
+        }
+        if self.capture_mode || self.force_blob_path {
+            return Ok(false);
+        }
+        if self.gemv_graph_cache.is_none() {
+            return Ok(false);
+        }
+        if self.active_stream.is_none() {
+            // The cache requires an explicit stream for begin/end capture.
+            return Ok(false);
+        }
+
+        // Build the kernarg byte buffer for capture (mirrors what
+        // `KernargBlob::push_ptr * 3 + push_i32 * 2` would produce, but
+        // we lay it out directly so we can also publish the offset table).
+        let mut kernarg = [0u8; 32];
+        kernarg[0..8].copy_from_slice(&(a_ptr as usize).to_ne_bytes());
+        kernarg[8..16].copy_from_slice(&(x_ptr as usize).to_ne_bytes());
+        kernarg[16..24].copy_from_slice(&(y_ptr as usize).to_ne_bytes());
+        kernarg[24..28].copy_from_slice(&m.to_ne_bytes());
+        kernarg[28..32].copy_from_slice(&k.to_ne_bytes());
+        let ptr_offsets: [usize; 3] = [0, 8, 16];
+        let scalar_offsets: [(usize, crate::gemv_graph_cache::ScalarTy); 2] = [
+            (24, crate::gemv_graph_cache::ScalarTy::I32),
+            (28, crate::gemv_graph_cache::ScalarTy::I32),
+        ];
+        let ptrs: [*mut std::ffi::c_void; 3] = [a_ptr, x_ptr, y_ptr];
+        let scalars: [u64; 2] = [m as u32 as u64, k as u32 as u64];
+
+        let shape = match crate::gemv_graph_cache::GemvGraphCache::classify(
+            func_name,
+            &[m as u32],
+            k as u32,
+        ) {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        // Re-borrow fields disjointly so we can pass &self.hip + the
+        // function + stream into the cache without conflicting with the
+        // mut-borrow of `self.gemv_graph_cache`.
+        let func = match self.functions.get(func_name) {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let func_handle_addr =
+            unsafe { *(func as *const hip_bridge::Function as *const usize) };
+        let stream = self.active_stream.as_ref().unwrap();
+        // Stream raw pointer for stream-affinity check. Stream is a newtype
+        // over *mut c_void; deref the first 8 bytes.
+        let stream_raw: *mut std::ffi::c_void =
+            unsafe { *(stream as *const hip_bridge::Stream as *const *mut std::ffi::c_void) };
+
+        let cache = self.gemv_graph_cache.as_mut().unwrap();
+        let outcome = cache.dispatch(
+            &self.hip,
+            &shape,
+            func,
+            func_handle_addr,
+            grid,
+            block,
+            shared_mem,
+            &kernarg,
+            &ptr_offsets,
+            &scalar_offsets,
+            &ptrs,
+            &scalars,
+            stream,
+            stream_raw,
+        )?;
+
+        match outcome {
+            crate::gemv_graph_cache::DispatchOutcome::Replayed
+            | crate::gemv_graph_cache::DispatchOutcome::Captured => Ok(true),
+            crate::gemv_graph_cache::DispatchOutcome::Fallthrough => Ok(false),
+        }
+    }
+
+    /// Destroy all cached GEMV graphs. Called from invalidation hooks
+    /// (e.g. on stream change, or before kernel recompile).
+    pub fn gemv_graph_destroy_all(&mut self) {
+        self.bind_thread_or_warn();
+        if let Some(cache) = self.gemv_graph_cache.as_mut() {
+            cache.clear(&self.hip);
+        }
+    }
+
+    /// Read-only access to GEMV graph stats (None if cache not enabled).
+    pub fn gemv_graph_stats(&self) -> Option<crate::gemv_graph_cache::GemvGraphStats> {
+        self.gemv_graph_cache.as_ref().map(|c| c.stats.clone())
+    }
+
+    /// Enable the GEMV graph cache at runtime, bypassing the env-var gate.
+    /// Used by correctness tests that need both `enabled` and `disabled`
+    /// runs in a single process (the env-var path is OnceLock-cached and
+    /// can't be flipped after first read).
+    ///
+    /// Idempotent: if the cache already exists, this is a no-op. Requires
+    /// an active stream — sets one up if `active_stream.is_none()`.
+    pub fn enable_gemv_graph_cache_for_test(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.gemv_graph_cache.is_none() {
+            self.gemv_graph_cache = Some(crate::gemv_graph_cache::GemvGraphCache::new());
+        }
+        if self.active_stream.is_none() {
+            // Capture requires an explicit stream.
+            self.active_stream = Some(self.hip.stream_create()?);
+        }
+        Ok(())
+    }
+
+    /// Disable + destroy the GEMV graph cache. Used by correctness tests.
+    pub fn disable_gemv_graph_cache_for_test(&mut self) {
+        self.bind_thread_or_warn();
+        if let Some(mut cache) = self.gemv_graph_cache.take() {
+            cache.clear(&self.hip);
         }
     }
 
@@ -2897,11 +3034,24 @@ impl Gpu {
                 blob_builder,
             )
         } else {
-            self.launch_maybe_blob(
+            // PR2 of the per-shape hipGraph cache: route plain
+            // `gemv_hfq4g256` through capture/replay when enabled.
+            // Returns Ok(true) when the cache handled the call (no need
+            // to also run the legacy launch); Ok(false) → fall through.
+            let handled = self.try_dispatch_gemv_hfq4g256_via_graph_cache(
                 "gemv_hfq4g256",
-                [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
-                blob_builder,
-            )
+                [m as u32, 1, 1], [32, 1, 1], 0,
+                a_ptr, x_ptr, y_ptr, m_val, k_val,
+            )?;
+            if handled {
+                Ok(())
+            } else {
+                self.launch_maybe_blob(
+                    "gemv_hfq4g256",
+                    [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+                    blob_builder,
+                )
+            }
         };
         if let Some(t) = timer { t.finish(&self.hip); }
         result

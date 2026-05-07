@@ -10,5 +10,8 @@ pub mod profiler;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{DType, Gpu, GpuTensor};
-pub use gemv_graph_cache::{GemvGraphCache, GemvGraphStats, GemvShape};
+pub use gemv_graph_cache::{
+    DispatchOutcome as GemvGraphDispatchOutcome, GemvGraphCache, GemvGraphStats, GemvShape,
+    ScalarTy as GemvGraphScalarTy,
+};
 pub use kernels::GEMV_SRC;
