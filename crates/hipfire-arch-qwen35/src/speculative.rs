@@ -2517,6 +2517,14 @@ pub fn spec_step_dflash(
     }
     if let Some(d) = drafter_gpu_opt.as_deref_mut() {
         if d.active_stream.is_none() {
+            // hipStreamCreate creates the stream on the current HIP device.
+            // After prefill the calling thread is still bound to `gpu`'s
+            // device, so without binding to the drafter first the stream
+            // would belong to the target — and any drafter kernel launch
+            // would fail with `hipModuleLaunchKernel: invalid resource
+            // handle (400)`. bind_thread() switches the thread to drafter
+            // before the create.
+            d.bind_thread()?;
             d.active_stream = Some(d.hip.stream_create()?);
         }
     }
