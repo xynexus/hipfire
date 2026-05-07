@@ -778,3 +778,33 @@ in on whether to:
 4. Defer Phase 2 entirely and ship the D3 + D2 evidence as-is (the
    different-failure-modes story is already a real finding)
 
+
+## 2026-05-07 01:08 UTC — Phase 2 ablation complete: SE hypothesis REFUTED
+
+30 runs (5 variants × 3 trials × 2 A3B models) completed on hiptrx
+4× R9700. Walltime ~50 min after the layer-0 falsy-int fix at d7866f6
+(early V3a runs had to be discarded — `_layer_idx_of(name) or -1`
+returned -1 when layer was 0, masking all D2 pin checks; trivially
+fixed with `_li if _li is not None else -1`).
+
+Headline:
+- 3.5-A3B: V3a 2.33% / V3b -0.09% / V3c 2.31% gap closure
+- 3.6-A3B: V3a -0.48% / V3b +0.11% / V3c -0.29% gap closure
+
+All six (model, variant) combinations are < 3% gap closure → REFUTED
+under the pre-registered ≥80% CONFIRM / ≥30% PARTIAL threshold.
+
+The MQ4 → Q8 quality gap (0.371 PPL on 3.5-A3B, 0.295 on 3.6-A3B,
+~5% relative on both) is broadly distributed across all 10,240 routed
+experts × 40 layers. Pinning 17/19/36 of them at Q8 recovers nothing
+meaningful. The arXiv 2507.23279 SE-pinning structure does not
+generalize cleanly to Qwen3.5/3.6 MoE under MQ4G256.
+
+Synthesis at `04-phase2-results-synthesis.md`. Path forward
+recommendations land tasks #24/#25 (fivetide's router-Q8 patch on a
+different surface entirely) as the immediate next move; coherence-style
+eval on the same Phase 2 variants is the cheap follow-up to confirm/refute
+the "PPL on wikitext was the wrong metric" interpretation.
+
+Per the multi-session contract: HALT for kaden review before any Phase 3.
+
