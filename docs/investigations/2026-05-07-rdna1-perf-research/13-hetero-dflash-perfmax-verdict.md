@@ -168,11 +168,17 @@ use. Probably tracked as a separate hardware issue on hipx.
 - Investigate `HIP[2]` segfault (separate from this PRD).
 - Run the same sweep at 70B target to test the "doesn't fit on
   solo gfx1151" case where hetero's value is clearer.
-- Phase 9 hidden scatter does 80 small per-row peer copies; coalescing
-  them into a single contiguous staging-buffer write + one peer copy
-  could halve the per-cycle peer latency cost. Worth a kernel-level
-  optimization PR.
-- PR 5 cycle pipelining (deferred).
+- ~~Phase 9 hidden scatter coalescing~~ → **shipped (commit `f50121f`),
+  null result.** Replacing 60 small per-(row, ext) peer copies with
+  one same-device D2D scatter + one large peer copy moved decode by
+  -0.5% to -0.4% — within run-to-run noise. This rules out per-call
+  HIP launch overhead as the bottleneck. The fabric throughput
+  (~64 MB/s effective hipx iGPU↔eGPU peer) is genuinely the binding
+  constraint at this rig. Same data volume, same wall time, whether
+  shipped as 60 small copies or 1 large coalesced one.
+- PR 5 cycle pipelining (deferred). With the per-call overhead path
+  ruled out, pipelining is the only remaining lever to move
+  cross-card cost off the critical path on this fabric.
 
 ## References
 
