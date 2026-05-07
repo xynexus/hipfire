@@ -52,8 +52,20 @@
 //!
 //! Optional env:
 //!   VERIFY_LAYERS=0,1,2  — comma-separated layer indices (default: all)
-//!   VERIFY_THRESHOLD=1e-3 — NRMSE pass threshold (default: 1e-3)
+//!   VERIFY_THRESHOLD=5e-3 — NRMSE pass threshold (default: 5e-3, bf16 noise floor)
 //!   VERIFY_HALT_ON_FAIL=1 — stop at first FAIL (default: continue, summarize)
+//!
+//! ─── Why 5e-3 default ───────────────────────────────────────────────────────
+//!
+//! The reference dump captures activations as **bfloat16** (7 mantissa bits),
+//! so each tensor element has up to ~3.9e-3 relative quantization noise.
+//! When hipfire computes the same op in fp32 and we compare to the bf16
+//! reference cast back to f32, the resulting NRMSE bottoms out at 1-3e-3 even
+//! when the kernel is bit-perfect. 5e-3 is a conservative pass band; the only
+//! kernel bugs that can hide under this threshold are those that introduce
+//! < 1 bf16 ULP of additional error per element, which empirically don't
+//! affect downstream argmax. To tighten further, regenerate the dump in fp32
+//! and lower this to 1e-4.
 //!
 //! ─── Future work ────────────────────────────────────────────────────────────
 //!
@@ -353,8 +365,11 @@ fn main() {
     eprintln!();
 
     let layer_filter = parse_layer_filter();
+    // Default 5e-3 = bf16 mantissa noise floor (see header docs). Override
+    // with VERIFY_THRESHOLD=1e-4 if/when the reference dump is regenerated
+    // in fp32.
     let threshold: f32 = std::env::var("VERIFY_THRESHOLD")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(1e-3);
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(5e-3);
     let halt_on_fail = std::env::var("VERIFY_HALT_ON_FAIL").ok().as_deref() == Some("1");
     eprintln!("  threshold  : {:.2e}", threshold);
     if let Some(ref f) = layer_filter {
