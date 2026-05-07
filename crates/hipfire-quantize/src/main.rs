@@ -1802,23 +1802,14 @@ fn main() {
     // transparent. See `quantize_mg4g256` for the algorithm and the design
     // rationale (Gemma 4 layer_scalar interaction with MQ4 tail-allocated
     // codebook bins).
+    //
+    // The full auto-promote-on-arch_id=7 reconciliation lives AFTER arch_id
+    // is parsed (search "auto_mg4" near the safetensors arch_id branch).
+    // Here we only initialize the explicit-flag form; the mutable bindings
+    // get adjusted once arch_id is known.
     let use_mg4g256_explicit = format == "mg4" || format == "mg4g256";
-    // Auto-promote `--format mq4` → MG4 for Gemma 4 family. MQ4's true
-    // min..max calibration produces a single-token `' .'` attractor on
-    // gemma-4-31B from step 2 onwards (verified empirically pre-modular).
-    // Surface a stderr warning so the operator sees the upgrade.
-    let auto_mg4 = (format == "mq4" || format == "mq4g256" || format == "magnum")
-        && arch_id == 7;
-    if auto_mg4 {
-        eprintln!("  Gemma 4 detected — auto-promoting --format mq4 → mg4 (calibration variant). \
-                   Pass --format mg4 explicitly to silence this notice.");
-    }
-    let use_mg4g256 = use_mg4g256_explicit || auto_mg4;
-    // mq4g256 stays *false* when MG4 is in effect — the dispatch chain
-    // below reads `use_mg4g256` first so the file gets the right
-    // `QuantType` byte.
-    let use_mq4g256 = (format == "mq4" || format == "mq4g256" || format == "magnum")
-        && !auto_mg4;
+    let mut use_mg4g256 = use_mg4g256_explicit;
+    let mut use_mq4g256 = format == "mq4" || format == "mq4g256" || format == "magnum";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
     let use_hfq3g128 = format == "hfq3g128" || format == "hfq3" || format == "hf3"; // default HF3 = G128
@@ -1926,6 +1917,19 @@ fn main() {
     let is_gemma4 = arch_id == 7;
     if is_moe {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
+    }
+
+    // Auto-promote `--format mq4` → MG4 for Gemma 4 family. MQ4's true
+    // min..max calibration produces a single-token `' .'` attractor on
+    // gemma-4-31B from step 2 onwards (verified empirically pre-modular).
+    // Surface a stderr warning so the operator sees the upgrade. Pass
+    // `--format mg4` explicitly to silence the notice.
+    if is_gemma4 && use_mq4g256 && !use_mg4g256_explicit {
+        eprintln!("  Gemma 4 detected — auto-promoting --format mq4 → mg4 \
+                   (calibration variant; same .mq4 binary). Pass --format mg4 \
+                   explicitly to silence this notice.");
+        use_mg4g256 = true;
+        use_mq4g256 = false;
     }
 
     // Read tokenizer if present
