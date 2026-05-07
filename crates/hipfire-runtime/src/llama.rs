@@ -2893,7 +2893,13 @@ impl KvCache {
         gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize,
         max_seq_len: usize, physical_cap: usize,
     ) -> HipResult<Self> {
-        assert!(head_dim == 256, "asym3 currently requires head_dim=256 (Qwen 3.5)");
+        // hd=256: Qwen 3.5 + Gemma 4 sliding layers.
+        // hd=512: Gemma 4 full layers (D2.5 — kv_cache_write_asym_k_givens3_hd512
+        // + attention_flash_asym3_tile_hd512 in rdna-compute/dispatch.rs mirror
+        // the hd=256 byte layout, so the cache geometry below (k_bph = 4 +
+        // 3*head_dim/8, v_bpp = n_kv * head_dim/32 * 34) scales correctly).
+        assert!(head_dim == 256 || head_dim == 512,
+            "asym3 supports head_dim ∈ {{256, 512}}; got {head_dim}");
         assert!(head_dim % 32 == 0);
         assert!(physical_cap > 0 && physical_cap <= max_seq_len,
             "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]");
@@ -3239,7 +3245,13 @@ impl KvCache {
         max_seq_len: usize,
         physical_cap: usize,
     ) -> HipResult<Self> {
-        assert!(head_dim == 256, "asym3 currently requires head_dim=256 (Qwen 3.5)");
+        // hd=256: Qwen 3.5 + Gemma 4 sliding layers.
+        // hd=512: Gemma 4 full layers (D2.5 — kv_cache_write_asym_k_givens3_hd512
+        // + attention_flash_asym3_tile_hd512 in rdna-compute/dispatch.rs mirror
+        // the hd=256 byte layout, so the cache geometry below (k_bph = 4 +
+        // 3*head_dim/8, v_bpp = n_kv * head_dim/32 * 34) scales correctly).
+        assert!(head_dim == 256 || head_dim == 512,
+            "asym3 supports head_dim ∈ {{256, 512}}; got {head_dim}");
         assert!(head_dim % 32 == 0);
         assert!(physical_cap > 0 && physical_cap <= max_seq_len);
         let kv_dim = n_kv_heads * head_dim;
