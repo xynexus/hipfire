@@ -16,3 +16,10 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# verify_against_torch example reads the PyTorch reference activation
+# dump (per-layer .safetensors files emitted by
+# scripts/quant-survey/dump_reference_activations.py).
+safetensors = "0.7"
+memmap2 = "0.9"

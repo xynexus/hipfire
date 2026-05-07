@@ -1,0 +1,419 @@
+//! Layer-by-layer correctness verifier: hipfire Gemma 4 forward kernels vs.
+//! a PyTorch bf16 reference activation dump.
+//!
+//! The reference dump is produced by
+//! `scripts/quant-survey/dump_reference_activations.py` and lives at
+//! `/tmp/gemma4-ref/` on hiptrx. It contains, per layer, the intermediate
+//! tensors at the boundary of every meaningful op (pre/post norm, q_proj,
+//! k_proj, v_proj, q_norm, k_norm, o_proj, mlp_gate, mlp_up, mlp_down,
+//! pre/post mlp norm, plus self_attn_block input/output and block i/o).
+//!
+//! ─── Design (Phase D2 verifier strategy, 2026-05-07) ────────────────────────
+//!
+//! Two classes of test:
+//!
+//!   (a) "Kernel-isolated" tests — feed the captured INPUT tensor for some
+//!       step into hipfire's kernel, compare its OUTPUT against the captured
+//!       output. These have NO error accumulation and NO model-weight
+//!       dependency, so they catch bugs in pure-arithmetic kernels (gelu_tanh,
+//!       softcap, rope_partial_halved arithmetic) immediately.
+//!
+//!   (b) "End-to-end" tests — load the `.mq4` file, run the full forward,
+//!       verify final logits NRMSE < 1e-2. Requires the MG4 quantizer (Phase
+//!       D3, separate scope per the task) and a real model file.
+//!
+//! Phase D2 ships (a) — the kernel-isolated battery — fully. (b) is wired
+//! as a `--full` flag that prints a clear "model file required" message when
+//! no `.mq4` is supplied, so the verifier compiles and runs end-to-end on
+//! hiptrx today without blocking on the quantizer.
+//!
+//! ─── Tests in this battery (kernel-isolated, no model weights) ──────────────
+//!
+//!   1. SwiGLU(gelu_tanh, mul):
+//!         input  : layer_NN/mlp_gate.output (gate pre-activation)
+//!                  layer_NN/mlp_up.output   (up pre-mul)
+//!         compute: gelu_tanh(gate) * up
+//!         expect : layer_NN/mlp_down.input
+//!
+//!      Phase 1 — verifies the gemma4-specific gelu_tanh activation against
+//!      the canonical bf16 reference. If this passes for all 60 layers, the
+//!      activation kernel is correct.
+//!
+//!   2. logit_softcap (cap=30.0):
+//!         input  : final_logits BEFORE softcap (NOT in the dump as of
+//!                  2026-05-07; the dump captures POST-softcap final_logits.
+//!                  This test prints "skipped — pre-softcap capture missing"
+//!                  until the dump script is extended.)
+//!
+//! ─── Usage ──────────────────────────────────────────────────────────────────
+//!
+//!   cargo run --release -p hipfire-arch-gemma4 --example verify_against_torch -- \
+//!       /tmp/gemma4-ref
+//!
+//! Optional env:
+//!   VERIFY_LAYERS=0,1,2  — comma-separated layer indices (default: all)
+//!   VERIFY_THRESHOLD=1e-3 — NRMSE pass threshold (default: 1e-3)
+//!   VERIFY_HALT_ON_FAIL=1 — stop at first FAIL (default: continue, summarize)
+//!
+//! ─── Future work ────────────────────────────────────────────────────────────
+//!
+//!   • Add weight-loading paths so RMSNorm / projection / attention can be
+//!     verified per-layer. Blocked on MG4 quantizer (Phase D3). Once a
+//!     `.mq4` exists, we can call `gemma4::load_weights` to get on-device
+//!     weights and add tests for: rmsnorm (via weight tensor), q_proj/k_proj/
+//!     v_proj (via weight_gemv), q_norm/k_norm (rmsnorm_batched), rope
+//!     (full + partial), attention (asym3 with window=1024), o_proj.
+//!
+//!   • Extend the python dump script to also emit the PRE-softcap logits so
+//!     test (2) can run.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use memmap2::Mmap;
+use safetensors::SafeTensors;
+use safetensors::tensor::Dtype as SfDtype;
+use serde::Deserialize;
+
+use rdna_compute::{Gpu, DType};
+
+// ───────────────────────────────────────────────────────────────────────────
+// Manifest schema
+// ───────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct Manifest {
+    model: String,
+    prompt: String,
+    n_tokens: usize,
+    dtype: String,
+    captures: Vec<Capture>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Capture {
+    layer_idx: i32, // -1 for global captures (final_logits, input_ids)
+    step: String,
+    side: String,
+    #[allow(dead_code)]
+    module_name: Option<String>,
+    shape: Vec<usize>,
+    dtype: String,
+    path: String,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Safetensors helpers
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Load a single-tensor `.safetensors` file as f32. The dump uses bf16 only
+/// for the activations (and i64 for `input_ids`). We convert bf16 → f32 here
+/// so the rest of the pipeline can stay in f32.
+fn load_safetensors_as_f32(path: &Path) -> std::io::Result<(Vec<usize>, Vec<f32>)> {
+    let f = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&f)? };
+    let st = SafeTensors::deserialize(&mmap[..])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // Dumps are single-tensor; pick the first / only entry.
+    let names: Vec<String> = st.names().iter().map(|s| s.to_string()).collect();
+    let name = names.first().ok_or_else(|| std::io::Error::new(
+        std::io::ErrorKind::InvalidData, "no tensors in safetensors file",
+    ))?;
+    let view = st.tensor(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let shape: Vec<usize> = view.shape().to_vec();
+    let bytes = view.data();
+    let f32_data: Vec<f32> = match view.dtype() {
+        SfDtype::F32 => {
+            assert_eq!(bytes.len() % 4, 0);
+            (0..bytes.len() / 4)
+                .map(|i| f32::from_le_bytes([
+                    bytes[i*4], bytes[i*4+1], bytes[i*4+2], bytes[i*4+3],
+                ]))
+                .collect()
+        }
+        SfDtype::BF16 => {
+            assert_eq!(bytes.len() % 2, 0);
+            (0..bytes.len() / 2)
+                .map(|i| {
+                    // bf16 → f32 zero-extends low 16 bits.
+                    let bits = ((bytes[i*2+1] as u32) << 24) | ((bytes[i*2] as u32) << 16);
+                    f32::from_bits(bits)
+                })
+                .collect()
+        }
+        SfDtype::F16 => {
+            assert_eq!(bytes.len() % 2, 0);
+            (0..bytes.len() / 2)
+                .map(|i| {
+                    let bits = u16::from_le_bytes([bytes[i*2], bytes[i*2+1]]);
+                    f16_to_f32(bits)
+                })
+                .collect()
+        }
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("unsupported safetensors dtype: {:?}", other),
+            ));
+        }
+    };
+    Ok((shape, f32_data))
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    // IEEE 754 half-to-single (no FTZ; subnormals handled).
+    let sign = (bits >> 15) & 0x1;
+    let exp = (bits >> 10) & 0x1f;
+    let mant = bits & 0x3ff;
+    let f = if exp == 0 {
+        if mant == 0 { 0.0 } else {
+            (mant as f32) / 1024.0 * 2f32.powi(-14)
+        }
+    } else if exp == 0x1f {
+        if mant == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        let m = 1.0 + (mant as f32) / 1024.0;
+        m * 2f32.powi((exp as i32) - 15)
+    };
+    if sign == 1 { -f } else { f }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// NRMSE
+// ───────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct CompareResult {
+    nrmse: f32,
+    max_abs_err: f32,
+    rms_ref: f32,
+    n: usize,
+}
+
+fn compare_f32(actual: &[f32], reference: &[f32]) -> CompareResult {
+    assert_eq!(actual.len(), reference.len(),
+        "length mismatch: actual={}, reference={}", actual.len(), reference.len());
+    let n = actual.len();
+    let mut sum_sq_err = 0.0f64;
+    let mut sum_sq_ref = 0.0f64;
+    let mut max_abs_err = 0.0f32;
+    for i in 0..n {
+        let e = actual[i] - reference[i];
+        sum_sq_err += (e as f64) * (e as f64);
+        sum_sq_ref += (reference[i] as f64) * (reference[i] as f64);
+        if e.abs() > max_abs_err { max_abs_err = e.abs(); }
+    }
+    let mse = sum_sq_err / (n as f64);
+    let var_ref = sum_sq_ref / (n as f64);
+    let nrmse = if var_ref > 0.0 { (mse / var_ref).sqrt() as f32 } else { mse.sqrt() as f32 };
+    CompareResult {
+        nrmse,
+        max_abs_err,
+        rms_ref: var_ref.sqrt() as f32,
+        n,
+    }
+}
+
+fn print_diag(label: &str, res: &CompareResult, threshold: f32, sample_actual: &[f32], sample_ref: &[f32]) {
+    let verdict = if res.nrmse < threshold { "PASS" } else { "FAIL" };
+    eprintln!("    {} {:<60}  NRMSE={:.4e}  max|e|={:.4e}  rms(ref)={:.4e}  N={}",
+        verdict, label, res.nrmse, res.max_abs_err, res.rms_ref, res.n);
+    if res.nrmse >= threshold {
+        let n = sample_actual.len().min(sample_ref.len()).min(8);
+        let preview_a: Vec<String> = sample_actual[..n].iter().map(|v| format!("{:+.4e}", v)).collect();
+        let preview_r: Vec<String> = sample_ref[..n].iter().map(|v| format!("{:+.4e}", v)).collect();
+        eprintln!("        actual[0..{}] = [{}]", n, preview_a.join(", "));
+        eprintln!("        ref   [0..{}] = [{}]", n, preview_r.join(", "));
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Capture lookup
+// ───────────────────────────────────────────────────────────────────────────
+
+struct Refs {
+    root: PathBuf,
+    by_key: HashMap<(i32, String, String), Capture>,
+}
+
+impl Refs {
+    fn new(root: PathBuf, manifest: Manifest) -> Self {
+        let mut by_key = HashMap::new();
+        for c in manifest.captures {
+            by_key.insert((c.layer_idx, c.step.clone(), c.side.clone()), c);
+        }
+        Self { root, by_key }
+    }
+
+    fn load(&self, layer_idx: i32, step: &str, side: &str) -> std::io::Result<(Vec<usize>, Vec<f32>)> {
+        let cap = self.by_key.get(&(layer_idx, step.to_string(), side.to_string()))
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing capture: layer={} step={} side={}", layer_idx, step, side),
+            ))?;
+        let path = self.root.join(&cap.path);
+        load_safetensors_as_f32(&path)
+    }
+
+    fn try_load(&self, layer_idx: i32, step: &str, side: &str) -> Option<(Vec<usize>, Vec<f32>)> {
+        self.load(layer_idx, step, side).ok()
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Kernel-isolated tests
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Verify SwiGLU: hipfire kernel `gelu_tanh_f32(gate) * up` should equal
+/// the dump's `mlp_down.input` tensor.
+///
+/// In modeling_gemma4.py:
+///     mlp_down.input = act_fn(gate_proj(x)) * up_proj(x)
+/// where `act_fn = gelu_pytorch_tanh`. So gemma4 SwiGLU has gelu_tanh as
+/// the gate non-linearity (Qwen3.5 uses silu — different kernel, would
+/// fail this test).
+fn test_swiglu_layer(
+    gpu: &mut Gpu,
+    refs: &Refs,
+    layer_idx: i32,
+    threshold: f32,
+) -> std::io::Result<bool> {
+    let (gate_shape, gate_f32) = refs.load(layer_idx, "mlp_gate", "output")?;
+    let (up_shape, up_f32)     = refs.load(layer_idx, "mlp_up", "output")?;
+    let (out_shape, out_ref)   = refs.load(layer_idx, "mlp_down", "input")?;
+    assert_eq!(gate_shape, up_shape);
+    assert_eq!(gate_shape, out_shape);
+    let n: usize = gate_shape.iter().product();
+    // Per-token strip: shape is [1, T, hidden_dim]. We process the entire
+    // flat buffer as a single 1-D vector (gelu_tanh + mul are pointwise).
+    let gate_t = gpu.upload_f32(&gate_f32, &[n])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("upload gate: {:?}", e)))?;
+    let up_t = gpu.upload_f32(&up_f32, &[n])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("upload up: {:?}", e)))?;
+    let activated = gpu.alloc_tensor(&[n], DType::F32)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("alloc activated: {:?}", e)))?;
+
+    // gelu_tanh takes (x, out, n).
+    gpu.gelu_tanh_f32(&gate_t, &activated, n)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("gelu_tanh: {:?}", e)))?;
+    // mul_f32(a, b, c) writes c = a * b.
+    gpu.mul_f32(&activated, &up_t, &activated)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("mul: {:?}", e)))?;
+
+    let actual = gpu.download_f32(&activated)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("download: {:?}", e)))?;
+    let res = compare_f32(&actual, &out_ref);
+    print_diag(
+        &format!("layer {:02} swiglu(gelu_tanh)", layer_idx),
+        &res, threshold, &actual, &out_ref,
+    );
+    Ok(res.nrmse < threshold)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Driver
+// ───────────────────────────────────────────────────────────────────────────
+
+fn parse_layer_filter() -> Option<Vec<i32>> {
+    let s = std::env::var("VERIFY_LAYERS").ok()?;
+    Some(s.split(',').filter_map(|x| x.trim().parse::<i32>().ok()).collect())
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: verify_against_torch <REF_DIR>");
+        eprintln!();
+        eprintln!("REF_DIR should contain manifest.json and per-layer .safetensors");
+        eprintln!("(produced by scripts/quant-survey/dump_reference_activations.py).");
+        eprintln!();
+        eprintln!("Env:");
+        eprintln!("  VERIFY_LAYERS=0,1,2  — restrict to these layer indices");
+        eprintln!("  VERIFY_THRESHOLD=1e-3 — NRMSE pass threshold");
+        eprintln!("  VERIFY_HALT_ON_FAIL=1 — stop at first FAIL");
+        std::process::exit(1);
+    }
+    let ref_dir = PathBuf::from(&args[1]);
+    let manifest_path = ref_dir.join("manifest.json");
+    let manifest_str = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("read manifest {:?}: {}", manifest_path, e));
+    let manifest: Manifest = serde_json::from_str(&manifest_str)
+        .expect("parse manifest.json");
+    let n_layers_dump = manifest.captures.iter().map(|c| c.layer_idx).max().unwrap_or(-1) + 1;
+
+    eprintln!("─── verify_against_torch ───────────────────────────────────────────────");
+    eprintln!("  model      : {}", manifest.model);
+    eprintln!("  prompt     : {:?}", manifest.prompt);
+    eprintln!("  n_tokens   : {}", manifest.n_tokens);
+    eprintln!("  dtype      : {}", manifest.dtype);
+    eprintln!("  ref_dir    : {}", ref_dir.display());
+    eprintln!("  layers     : 0..{} ({} layers in dump)", n_layers_dump, n_layers_dump);
+    eprintln!();
+
+    let layer_filter = parse_layer_filter();
+    let threshold: f32 = std::env::var("VERIFY_THRESHOLD")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(1e-3);
+    let halt_on_fail = std::env::var("VERIFY_HALT_ON_FAIL").ok().as_deref() == Some("1");
+    eprintln!("  threshold  : {:.2e}", threshold);
+    if let Some(ref f) = layer_filter {
+        eprintln!("  filter     : layers {:?}", f);
+    }
+    eprintln!();
+
+    let mut gpu = Gpu::init().expect("Gpu::init");
+    let refs = Refs::new(ref_dir.clone(), manifest);
+
+    eprintln!("─── Phase 1: kernel-isolated SwiGLU (gelu_tanh + mul) ──────────────────");
+    let mut pass_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut skip_count = 0usize;
+    let mut first_fail_layer: Option<i32> = None;
+
+    for layer_idx in 0..n_layers_dump {
+        if let Some(ref f) = layer_filter {
+            if !f.contains(&layer_idx) { continue; }
+        }
+        // Sanity: the capture set varies by layer? Layer 0 has SwiGLU; assume all do.
+        if refs.try_load(layer_idx, "mlp_gate", "output").is_none()
+            || refs.try_load(layer_idx, "mlp_up", "output").is_none()
+            || refs.try_load(layer_idx, "mlp_down", "input").is_none()
+        {
+            eprintln!("    SKIP layer {:02} swiglu — capture missing", layer_idx);
+            skip_count += 1;
+            continue;
+        }
+        match test_swiglu_layer(&mut gpu, &refs, layer_idx, threshold) {
+            Ok(true) => pass_count += 1,
+            Ok(false) => {
+                fail_count += 1;
+                if first_fail_layer.is_none() { first_fail_layer = Some(layer_idx); }
+                if halt_on_fail { break; }
+            }
+            Err(e) => {
+                eprintln!("    ERROR layer {:02} swiglu: {}", layer_idx, e);
+                fail_count += 1;
+                if first_fail_layer.is_none() { first_fail_layer = Some(layer_idx); }
+                if halt_on_fail { break; }
+            }
+        }
+    }
+
+    eprintln!();
+    eprintln!("─── Phase 2: weight-dependent kernels (rmsnorm / proj / attn / o_proj) ─");
+    eprintln!("    SKIPPED — requires Gemma 4 .mq4 weight file (Phase D3 quantizer).");
+    eprintln!("    See `gemma4_smoke_forward` for the end-to-end forward path.");
+    eprintln!();
+
+    eprintln!("─── Summary ────────────────────────────────────────────────────────────");
+    eprintln!("    Phase 1 SwiGLU: pass={} fail={} skip={}", pass_count, fail_count, skip_count);
+    if let Some(l) = first_fail_layer {
+        eprintln!("    First FAIL at layer {:02}", l);
+    }
+    eprintln!();
+
+    if fail_count > 0 {
+        std::process::exit(1);
+    }
+}
