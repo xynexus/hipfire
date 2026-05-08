@@ -747,3 +747,38 @@ Specifically:
 - hiptrx perf bench: 6 runs (3 OFF + 3 ON) — median Δ +1.59%.
 - Coherence-gate-dflash --fast PASS on local gfx1010 (5700 XT) at probe HEAD.
 
+## 2026-05-08 confirmation: gfx1201 anchors hold, no kernel-tuning gap to chase
+
+A subagent-reported hiptrx solo of 153 tok/s prompted a "is gfx1201 underperforming
+gfx1100's 250?" investigation. Resolution: same-config-or-it-doesn't-count.
+
+Three runs on hiptrx (HEAD `eccf06ce`, binary May 8 10:19, JIT cache 92 entries warm):
+
+| config | rig | tok/s (median) | τ | matches anchor |
+|---|---|---:|---:|---|
+| `--max 256 --no-chatml --kv-mode asym3` + DPM=10 (merge_sort canonical) | hiptrx R9700 | **192.6** | 13.27 | gfx1201.txt 192.69 within 0.05% |
+| `--max 120 --no-chatml --kv-mode asym3` + DPM=10 (lru canonical) | hiptrx R9700 | **137.83** | 9.50 | gfx1201.txt 138.02 within 0.14% |
+
+The "153" subagent number reproduced as `--max 120` lru without DPM warmup
+(151.03 tok/s, +9% above the cold-DPM-suppressed lru anchor due to fabric-ceiling
+session having pre-warmed). Compared to gfx1100 (7900 XTX) lmx canonical:
+
+| arch | rig | merge_sort canonical tok/s | τ |
+|---|---|---:|---:|
+| gfx1100 | localmaxxing 7900 XTX | 250.0 | 13.18 |
+| **gfx1201** | **hiptrx R9700** | **192.6** | **13.27** |
+| ratio | | **77%** | (gap is published baseline, not regression) |
+
+The 23% gap is the existing arch-tier characteristic (less-tuned multi-row gemv
+kernels on gfx1201 than gfx1100); pursuing it is a multi-week kernel-tuning project,
+not a "fix this session" finding. The fabric-ceiling section's `153.02 / 148.49 =
+97.04%` math uses lru `--max 120` consistently and is correct — the absolute number
+161 is also the correct lru anchor at HEAD eccf06ce (not 138.02; the 2026-05-04
+gfx1201.txt anchor is stale by ~10% due to perf commits since 06296cf).
+
+Mandatory bench-comparison rule reinforced: cite prompt md5 + `--max` value + DPM
+warmup + `--kv-mode` flag (even if it's the default) on every cross-host claim.
+See `feedback_hiptrx_153_vs_lmx_250_investigation_2026_05_08.md` for the full
+investigation log.
+
+
