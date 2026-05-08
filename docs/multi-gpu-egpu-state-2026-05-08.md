@@ -123,6 +123,63 @@ straps) FIRST, before reaching for `setpci`. Software levers run
 downstream of the adapter's link-training behavior and cannot
 override what the adapter has already negotiated at the physical layer.
 
+##### Post CLKRQ#/PSU FORCE ON reboot — partial topology change, host bottleneck confirmed silicon-locked (witnessed 2026-05-08)
+
+User flipped both adapter jumpers (CLKRQ# AUTO→FORCE ON, PSU PWR AUTO→
+FORCE ON) and rebooted hipx. Re-probe witnessed:
+
+| Endpoint | LnkCap | Pre-flip LnkSta | Post-flip LnkSta | Δ |
+|---|---|---|---|---|
+| `00:02.4` (host root port) | gen4 ×1 (16 GT/s ×1) | gen1 ×1 (2.5 GT/s ×1) | gen1 ×1 (2.5 GT/s ×1) | **null** |
+| `63:00.0` (switch upstream → host) | gen5 ×16 (32 GT/s ×16) | gen1 ×1 (downgraded) | gen1 ×1 (downgraded), `EqualizationComplete+ EqualizationPhase1+` | **null on speed/width**, equalization now reports complete |
+| `64:00.0` (switch downstream → card) | gen5 ×16 | gen5 ×16 | gen5 ×16 | unchanged |
+| `65:00.0` (9070 XT card)** | gen5 ×16 | gen5 ×16 | gen5 ×16 | unchanged |
+
+**Card BDF shifted** `66:00.0` → `65:00.0` because the adapter PCIe
+switch (Subsystem: Tul Corporation / PowerColor Device 1478) now
+enumerates as `63:00.0`/`64:00.0` and pushes the card-bus number down
+one. Pre-flip the `lspci -tv` chain went `00:02.4 → 66:00.0` direct;
+post-flip it goes `00:02.4 → 63:00.0 → 64:00.0 → 65:00.0`. The
+adapter's switch silicon is correctly enumerated by the host now;
+**that** is the topology change CLKRQ#/PSU FORCE ON delivered.
+
+**The bandwidth ceiling did not move.** The trained `LnkSta` on the
+host-side leg (`63:00.0` ↔ `00:02.4`) is identical to pre-flip:
+`Speed 2.5GT/s (downgraded), Width x1 (downgraded)`. Effective ceiling
+remains ~250 MB/s = ~2 Gb/s for the M.2-direct path. amdgpu binds
+clean at `0000:65:00.0` (Navi 48, 64 CU, Using BACO for runtime pm,
+no MES/discovery errors). Card is functional for steady-state decode
+where weights are VRAM-resident.
+
+**Silicon-budget side is now confirmed.** Host root port `00:02.4`
+LnkCap is gen4 ×1 (16 GT/s × 1) — the physical lane budget allocated
+to this M.2 slot is one PCIe lane wide, capped at gen4. The adapter's
+switch silicon and card train fully gen5 ×16 internally; the bottleneck
+is upstream of the adapter PCB, in Strix Halo's lane-allocation. The
+training settles at gen1 even though both endpoints (root port + switch
+upstream) advertise higher speeds, with `EqualizationComplete+
+EqualizationPhase1+` post-flip — i.e. equalization successfully
+completed but the speed negotiation still falls back to 2.5 GT/s. The
+remaining gap (gen1 vs gen4 the LnkCap allows) is likely SI margin in
+the M.2 ribbon / PCB at high speeds with the 16-lane switch hanging
+off it; not recoverable without different cabling or a different host
+slot.
+
+**OCuLink direct PCIe slot path remains the only fabric upgrade path
+on hipx for this card.** Width is Strix-Halo-lane-budget-locked at ×1,
+and even the gen4 ceiling the LnkCap allows is unreachable in the
+current M.2 → switch → card configuration. Setpci levers, jumper
+config, and BIOS toggles are all exhausted; the next try worth doing
+on this card is the OCuLink riser when it ships.
+
+**Verdict: NULL on bandwidth recovery, PARTIAL on topology.** Adapter
+switch enumeration improved, equalization signals improved, but
+trained `LnkSta` on the binding leg is identical. No need to rerun
+`peer_smoke` or `dflash_spec_demo` — bandwidth ceiling unchanged from
+the entry's pre-flip kernel-smoke result (81.23 tok/s decode at 5-token
+horizon, ~250 MB/s host-to-card, see memory entry
+`feedback_9070xt_m2_egpu_hipx_smoke_2026_05_08`).
+
 ### hiptrx — Threadripper 9970X + 4× R9700
 
 | Slot | Card | Arch | VRAM | Fabric | Notes |
