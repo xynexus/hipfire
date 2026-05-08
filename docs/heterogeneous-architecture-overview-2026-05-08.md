@@ -197,21 +197,68 @@ drafter, NIAH 3.5k-token prompt.
 - Decode 52 tok/s unchanged (BW-bound)
 - 27B + PFlash blocked on 2× 8.6 GB drafter VRAM ceiling
 
-### hiptrx PP=4 cluster (4× R9700, 2026-05-08)
+### hiptrx PP=4 cluster (4× R9700, 2026-05-08) — PP IS THE WRONG SHAPE for this hardware
 
 27B target layer-split [16,16,16,16] across all 4 R9700s, peer_access=true.
 
-- **PP=4 27B + 27B-DFlash decode:** 33.5 tok/s (4-run median, single
-  daemon load, prompt md5 reproducible)
+- **PP=4 27B + 27B-DFlash decode:** 33.5 tok/s (4-run median)
 - **vs solo R9700:** 5.8× slower (194 → 33.5)
-- PP=4 boundary copy cost dominates: 3 cross-card layer-band transfers
-  per cycle + KV cache distributed across cards
-- Predraft (PR 5 speculative prefetch) does NOT activate on PP=N>1 —
-  generate_multi path bypasses spec_step_dflash's pipeline_mode
-  entirely, per docs/plans/hetero-pflash-dflash.prd PR2-4 documented
-  as "not yet implemented"
+
+**Important:** this number is NOT a measurement of "what the 4× R9700
+cluster can do." It's a measurement of **pipeline-parallel being the
+wrong shape for hiptrx-class hardware running a target that fits on
+one card.**
+
+PP requires sequential dependency between layer bands — only one card
+is active at a time per layer (cards 0→1→2→3 wait on the prior one's
+output). For decode (per-token forward pass), the per-card BW-saturation
+isn't relieved by adding cards under PP. You add cards but they idle
+3/4 of the time, while paying boundary-copy cost on every transition.
+The cluster runs SLOWER than a single card.
+
+**TENSOR PARALLELISM (TP) is the right shape for this hardware** and
+hipfire doesn't have it today. TP splits each layer's tensors
+(attention heads, FFN intermediate dim, lm_head vocab) across cards
+in parallel. With peer_access on PCIe gen5 ×16, all-reduce after each
+layer is fast (~few ms for a 5120-dim hidden state across 4 cards).
+For BW-bound decode kernels:
+- Each card does 1/4 the GEMM work
+- Per-card BW demand drops by 4×
+- All 4 cards work concurrently on every layer
+- Expected speedup: 3-3.5× over solo R9700 (~600 tok/s on canonical
+  27B-DFlash if implemented), bounded by all-reduce overhead
+
+**Status:** TP is documented as PP roadmap follow-up
+(`docs/plans/multi-gpu-pp.md` says Stages 1-9 implemented = PP only,
+TP listed as future). Hiptrx-class workstation hardware (4 cards,
+peer_access, fast fabric) is exactly the configuration that needs
+TP. Until TP lands, the 4× R9700 cluster's compute is severely
+under-utilized for any workload that fits on a single card.
+
+**The PR 5 speculative prefetch does NOT activate on PP=N>1** —
+generate_multi path bypasses spec_step_dflash's pipeline_mode
+entirely, per `docs/plans/hetero-pflash-dflash.prd` PR2-4 documented
+as "not yet implemented." But this is a side detail — the headline
+issue is that PP itself is the wrong shape, not whether PR 5 reaches it.
 
 ## 6. PR 5 path_d.md ladder — final verdict (2026-05-08)
+
+**TL;DR: this is a NEGATIVE RESULT.** The full path_d.md §D3b speculative
+prefetch was implemented end-to-end, the implementation is correct
+(coherence-gate PASS, tokens bit-identical, τ invariant), but the
+canonical bench shows -1.7% regression on hipx iGPU and **-7.16%
+regression on the hiptrx workstation R9700**. A -7% regression is
+a -7% regression. The feature does NOT help and should NOT be enabled
+in production. Default OFF preserves byte-identical existing path —
+that's the correct disposition.
+
+The "ship the implementation correctness as scaffolding for future
+work" framing is only useful IF a future hardware/silicon configuration
+plausibly inverts the BW-saturation pattern. On every silicon tier we
+have today (RDNA1, RDNA3.5 iGPU, RDNA4 R9700), the workload is
+BW-saturated and the prefetch contends rather than overlaps. The
+infrastructure is preserved on-branch as **definitive empirical record
+of the failed experiment**, not as something to enable.
 
 Shipped through `feat/hetero-pp-dflash` HEAD `777f2962` over 9 commits:
 
@@ -418,10 +465,30 @@ Empirical guidance from the campaign:
   UMA — only path to 122B-A10B + 35B-A3B at full max_seq
 
 ### Multi-GPU PP for VRAM-bound large models
-- **PP=4 across 4× R9700:** 33.5 tok/s on 27B-DFlash. PP boundary cost
-  dominates; not the right shape for fitting cluster.
+- **PP makes sense ONLY when the target doesn't fit on one card.**
+  For models that fit solo, PP just adds boundary-copy overhead
+  without using the extra cards (sequential dependency).
+- **PP=4 across 4× R9700:** 33.5 tok/s on 27B-DFlash — but this is
+  PP being the wrong shape for hardware where the target fits solo,
+  not a measurement of cluster ceiling. **Hiptrx-class hardware needs
+  TP, not PP, for workloads that fit on one card.**
 - **PP=2/PP=3 mixed-arch:** validated cleanly via host-staged
   boundary copy. Mixed-arch tolerance via `HIPFIRE_ALLOW_MIXED_ARCH=1`.
+  Right shape when target is too big for one card (122B-A10B,
+  arbitrary-large) — sequential dependency is the price of memory
+  capacity, not a perf goal.
+
+### Multi-GPU TP (Tensor Parallelism) — the missing piece for workstation clusters
+- **Not implemented today.** Hipfire's multi-GPU plumbing is
+  PP-only per `docs/plans/multi-gpu-pp.md` (Stages 1-9 = PP). TP
+  is a roadmap follow-up.
+- **Right shape for hiptrx-class hardware** (4× peer-access PCIe
+  gen5 ×16). Splits per-layer tensor dimensions across cards →
+  4× concurrent compute + per-card BW demand divided by 4.
+- **Expected lift on canonical 27B+DFlash on hiptrx 4× R9700:**
+  3-3.5× solo (~600 tok/s if implemented), bounded by all-reduce
+  overhead. This is the actually-promising lever for hiptrx-class
+  silicon — not kernel tuning, not speculative prefetch.
 
 ### Hetero (target-on-big + drafter-on-small) as a perf lever
 - **Tier-aware split is empirically the right shape**: WMMA card for
@@ -432,22 +499,37 @@ Empirical guidance from the campaign:
 - **The only fabric variable that moves the needle is PCIe gen at host
   root.** Width within same gen = noise.
 
-## 11. What's open (not in current scope)
+## 11. What's open (not in current scope) — ranked by expected ROI
 
-- **Cross-card predraft for hetero**: ~100-150 LOC, uses
-  hipExternalSemaphore_t IPC for cross-device events. Predicted to
-  also regress per the BW-contention pattern but worth testing if
-  hetero predraft is the only remaining reachable signal.
-- **PP=N>1 + DFlash speculative prefetch** (hetero-pflash-dflash PRD
-  PR2-4): cross-card spec-decode with predraft on the drafter device.
-  generate_multi integration. Multi-day work.
-- **gfx1201 kernel fusion to reduce launch count** (per `feat/gfx1201-kernel-tuning`
-  profile recommendation): 867 launches/token; 30% reduction
-  potentially > any single-kernel optimization. Multi-day work,
-  needs new PRD.
-- **OCuLink direct slot path** (user has connector ordered): predicted
-  modest lift over current gen1 paths (~+3-5pp toward 97% hiptrx-class)
-  since gap is compute-bound.
+### High ROI (genuinely promising):
+
+1. **Tensor Parallelism (TP) for hiptrx-class hardware.** Right shape
+   for 4× peer-access PCIe gen5 ×16. Expected 3-3.5× lift over solo
+   R9700 on canonical 27B+DFlash (~600 tok/s if implemented).
+   The biggest unrealized lever for workstation clusters today.
+   Not implemented; PP-only roadmap (`docs/plans/multi-gpu-pp.md`).
+   **Multi-week scope:** all-reduce primitive on top of multi_gpu's
+   peer_copy infrastructure, per-layer tensor-split arithmetic
+   (heads / FFN intermediate / lm_head vocab), end-of-layer reduce.
+2. **gfx1201 kernel fusion to reduce launch count** (per
+   `feat/gfx1201-kernel-tuning` profile recommendation): 867
+   launches/token on 27B AR; 30% reduction potentially > any
+   single-kernel optimization. Multi-day work, needs new PRD.
+
+### Lower ROI (tested or predicted-null):
+
+3. **Cross-card predraft for hetero**: ~100-150 LOC, hipExternalSemaphore_t
+   IPC for cross-device events. Predicted to also regress per the
+   BW-contention pattern (same root cause as the -7% R9700 result).
+   Probably not worth the engineering.
+4. **PP=N>1 + DFlash speculative prefetch** (hetero-pflash-dflash PRD
+   PR2-4): cross-card spec-decode integration with generate_multi.
+   PP itself is wrong shape for fits-on-one-card workloads, so
+   only useful for too-big-for-one-card targets (122B-A10B class).
+   And in that regime it'd inherit the same BW-contention pattern.
+5. **OCuLink direct slot path** (user has connector ordered): predicted
+   modest lift over current gen1 paths (~+3-5pp toward 97% hiptrx-class)
+   since gap is compute-bound. Low expected delta.
 
 ## 12. Source-doc cross-reference
 
@@ -495,12 +577,14 @@ Topic-keyed entries in `~/.claude/projects/-home-kaden-ClaudeCode-autorocm-hipfi
    ceiling.
 3. **Hetero composition:** WMMA-prefill-tier + RDNA1/2-decode-tier
    wins both solo configs simultaneously. Ship asymmetric.
-4. **PP scaling:** -1.8% PP=2 overhead 9B RDNA1 host-staged. PP=4
-   boundary cost is 5-6× the per-card decode time for dense decode.
-   Mixed-arch PP works.
-5. **Speculative prefetch:** correctly implemented across the path_d.md
-   ladder; perf null-to-negative on BW-saturated workloads. Closes
-   the PR 5 chapter.
+4. **Multi-GPU shape matters:** PP only fits memory-bound deployments
+   (target too big for one card). For workloads that fit on one card,
+   PP wastes cards on sequential dependency; TP is the right shape.
+   Hipfire has PP, not TP — biggest unrealized lever for workstation
+   clusters.
+5. **Speculative prefetch:** -1.7% iGPU / -7.16% R9700. Implementation
+   correct, feature is a NEGATIVE result, default OFF. Don't enable.
+   Closes PR 5 chapter as failed-experiment.
 6. **Plug discipline:** ROCR enumeration drifts with plug topology;
    always read the GPU line as ground truth.
 
