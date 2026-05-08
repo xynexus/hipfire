@@ -105,5 +105,7 @@ bench/coherence-results/
 .gm/prd.paused.yml
 .gm/rs-learn.db-shm
 .gm/rs-learn.db-wal
+.gm/imported-claude-md-*.md
+.gm/gm-fired-this-turn
 # tracked: .gm/rs-learn.db, .gm/code-search/, AGENTS.md, .gm/prd.yml
 # <<< gm managed
