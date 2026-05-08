@@ -2455,6 +2455,51 @@ pub fn scatter_hidden_block_to_interleaved_on_stream(
     Ok(())
 }
 
+/// Path D3b: stream-async scatter that reads from `hidden_rb.staging_bufs`
+/// (contiguous, written by the verify forward) instead of `layer_bufs` (the
+/// ring, written by the subsequent commit). Lets commit-staging-to-ring
+/// run on `verify_stream` concurrent with this scatter on `draft_stream`
+/// without a data dependency between them — both READ staging while
+/// writing to disjoint destinations (ring vs draft_scratch.target_hidden).
+///
+/// `n_rows` selects the prefix of the staged block to scatter (typically
+/// `accept_len + 1` from the calling cycle). The staged rows are at
+/// `staging_bufs[ext][0..max_batch]`; the verify forward wrote rows
+/// `[0..b]` so any `n_rows ≤ b` is valid.
+pub fn scatter_hidden_block_from_staging_on_stream(
+    gpu: &Gpu,
+    hidden_rb: &HiddenStateRingBuffer,
+    dst: &GpuTensor,
+    dst_row_offset: usize,
+    n_rows: usize,
+    stream: &hip_bridge::Stream,
+) -> HipResult<()> {
+    gpu.bind_thread()?;
+    assert!(n_rows <= hidden_rb.max_batch,
+        "scatter_from_staging: n_rows {n_rows} > max_batch {}", hidden_rb.max_batch);
+    let num_extract = hidden_rb.extract_layers.len();
+    let hidden = hidden_rb.hidden_dim;
+    let row_bytes = hidden * 4;
+
+    for r in 0..n_rows {
+        let dst_row = dst_row_offset + r;
+        let dst_row_base_bytes = dst_row * num_extract * row_bytes;
+        for ext in 0..num_extract {
+            let src_offset_bytes = r * row_bytes;
+            let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
+            gpu.hip.memcpy_dtod_async_at(
+                &dst.buf,
+                dst_offset_bytes,
+                &hidden_rb.staging_bufs[ext].buf,
+                src_offset_bytes,
+                row_bytes,
+                stream,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Cross-card variant of [`scatter_hidden_block_to_interleaved`] for the
 /// hetero PP+DFlash path (PRD v1.2 PR-A): `hidden_rb` lives on
 /// `target_gpu`, `dst` lives on `drafter_gpu`.
@@ -2799,6 +2844,27 @@ pub fn spec_step_dflash(
         .as_deref()
         == Some("1");
     let mut probe_event: Option<hip_bridge::Event> = None;
+
+    // Path D3b: pipeline_mode routes verify's commit_staging_to_ring onto
+    // the verify stream and Phase-9 scatter onto a dedicated draft_stream
+    // (reading from the contiguous post-forward staging instead of the
+    // ring) so the two D2D copy chains can hit different SDMA queues
+    // concurrently. Solo mode only — hetero already pays the cross-card
+    // pinned-host bounce on its own stream chain (PRD v1.2 PR-A) and
+    // doesn't benefit from same-device draft_stream reuse. PLD bypass
+    // (no Phase 4 draft) and ctx_slice CPU shadow path also skip
+    // pipelining since neither writes hidden_rb.staging through the
+    // graph-eligible verify path that this commit/scatter restructure
+    // depends on.
+    //
+    // Bypass conditions match path_d.md §D3b warnings + this codebase's
+    // realities: hetero, PLD, ctx_slice, cycle 0 (probe_event is None ⇒
+    // implicit). The flag here is computed; later branches read it.
+    let pipeline_mode =
+        pipeline_probe_on && pld_spine.is_none() && !hetero && ctx_slice.is_none();
+    if pipeline_mode {
+        gpu.init_pipeline_streams()?;
+    }
 
     if let Some(pld) = pld_spine {
         // PLD spine path: drafted tokens come from context-suffix match.
@@ -3289,12 +3355,51 @@ pub fn spec_step_dflash(
         gpu.hip.device_synchronize()?;
     }
     let t_verify_start = std::time::Instant::now();
-    let verify_out = verify_dflash_block(
-        gpu, target, &block, position, hidden_rb,
-        gdn_tape_opt.as_deref_mut(),
-        use_temp_sampling || host_path_active,  // full target logits needed for rejection sampling, RP, or n-gram block
-        verify_scratch,
-    )?;
+    // Path D3b: pipelined branch defers the internal commit so we can
+    // record post_verify_evt between the verify forward and the commit,
+    // then drive commit_staging_to_ring_on_stream + scatter_from_staging
+    // on separate streams. The scatter is rerouted in Phase 9.
+    let mut post_verify_evt: Option<hip_bridge::Event> = None;
+    let verify_out = if pipeline_mode {
+        let out = verify_dflash_block_no_commit(
+            gpu, target, &block, position, hidden_rb,
+            gdn_tape_opt.as_deref_mut(),
+            use_temp_sampling || host_path_active,
+            verify_scratch,
+        )?;
+        // gpu.active_stream is guaranteed Some at this point — the
+        // function's preflight at line ~2597 forces it before any draft
+        // or verify work. Verify_dflash_block_inner also sets it inside
+        // the graph-eligible path. Pipeline_mode without a stream is
+        // unreachable.
+        let stream = gpu.active_stream.as_ref().expect(
+            "pipeline_mode requires gpu.active_stream — preflight should have set it"
+        );
+        // Record the event on verify_stream BEFORE issuing the commit.
+        // The kernel that wrote staging is already on this stream so it
+        // is naturally ordered ahead of the commit's reads of staging.
+        let evt = gpu.hip.event_create()?;
+        gpu.hip.event_record(&evt, Some(stream))?;
+        // Drive the commit on verify_stream via the stream-async variant.
+        // Re-borrow `stream` per call since `commit_staging_to_ring_on_stream`
+        // takes &mut Gpu — Rust's borrow checker requires this dance.
+        let stream_for_commit = gpu.active_stream.as_ref().unwrap() as *const _;
+        // SAFETY: we hold &mut gpu but commit_staging_to_ring_on_stream
+        // doesn't reassign gpu.active_stream. The pointer remains valid
+        // for the call's duration. This sidesteps the simultaneous &mut
+        // gpu + & gpu.active_stream borrow conflict.
+        let stream_ref: &hip_bridge::Stream = unsafe { &*stream_for_commit };
+        hidden_rb.commit_staging_to_ring_on_stream(gpu, b, stream_ref)?;
+        post_verify_evt = Some(evt);
+        out
+    } else {
+        verify_dflash_block(
+            gpu, target, &block, position, hidden_rb,
+            gdn_tape_opt.as_deref_mut(),
+            use_temp_sampling || host_path_active,
+            verify_scratch,
+        )?
+    };
 
     if phase_on {
         gpu.hip.device_synchronize()?;
@@ -3547,14 +3652,55 @@ pub fn spec_step_dflash(
                 )?;
             }
             None => {
-                scatter_hidden_block_to_interleaved(
-                    gpu,
-                    hidden_rb,
-                    &draft_scratch.target_hidden,
-                    position,
-                    b,
-                    rows_to_keep,
-                )?;
+                if pipeline_mode {
+                    // Path D3b: scatter from STAGING (contiguous, no ring
+                    // wrap) on draft_stream, waiting on post_verify_evt
+                    // so the read happens after verify's forward kernel
+                    // wrote staging but in parallel with the commit's
+                    // staging→ring writes (which target a disjoint
+                    // destination — layer_bufs vs draft_scratch.target_hidden).
+                    // SDMA on RDNA3+ schedules the two D2D chains on
+                    // separate queues when issued on separate streams.
+                    //
+                    // gpu.draft_stream is Some — pipeline_mode required
+                    // init_pipeline_streams to succeed at cycle entry,
+                    // which is gated by HIPFIRE_DFLASH_PIPELINE=1.
+                    let draft_stream_ptr = gpu.draft_stream.as_ref()
+                        .expect("pipeline_mode requires draft_stream") as *const _;
+                    // SAFETY: holding &mut gpu, but neither stream_wait_event
+                    // nor scatter mutate gpu.draft_stream. Pointer valid for
+                    // both calls' duration.
+                    let draft_stream: &hip_bridge::Stream = unsafe { &*draft_stream_ptr };
+                    if let Some(evt) = post_verify_evt.as_ref() {
+                        gpu.hip.stream_wait_event(draft_stream, evt)?;
+                    }
+                    scatter_hidden_block_from_staging_on_stream(
+                        gpu,
+                        hidden_rb,
+                        &draft_scratch.target_hidden,
+                        position,
+                        rows_to_keep,
+                        draft_stream,
+                    )?;
+                    // Sync draft_stream before the next cycle's draft_forward
+                    // reads draft_scratch.target_hidden. Async events into
+                    // the next cycle's draft are the path_d.md design but
+                    // require modifying draft_forward to insert
+                    // stream_wait_event — deferred. End-of-cycle sync here
+                    // is correctness-preserving + zero-regression at default
+                    // and pipelined modes; the stream concurrency win is
+                    // bounded by the smaller of (commit, scatter) durations.
+                    gpu.hip.stream_synchronize(draft_stream)?;
+                } else {
+                    scatter_hidden_block_to_interleaved(
+                        gpu,
+                        hidden_rb,
+                        &draft_scratch.target_hidden,
+                        position,
+                        b,
+                        rows_to_keep,
+                    )?;
+                }
             }
         }
         // Keep draft_forward's incremental-upload tracker in sync so any future
@@ -3654,6 +3800,13 @@ pub fn spec_step_dflash(
             Some(drafter) => drafter.hip.event_destroy(evt)?,
             None => gpu.hip.event_destroy(evt)?,
         }
+    }
+    // Path D3b: destroy the verify-side post-forward event allocated for
+    // the pipelined commit/scatter ordering. Solo-only — gpu owns the
+    // event. Per-cycle alloc+destroy mirrors probe_event's pattern; the
+    // full path_d.md ladder pools events across cycles.
+    if let Some(evt) = post_verify_evt {
+        gpu.hip.event_destroy(evt)?;
     }
 
     Ok(SpecStepResult {
