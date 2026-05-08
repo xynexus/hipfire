@@ -430,7 +430,7 @@ Phase 2 (production wiring + HIPFIRE_GFX12_MMQ env-gate) and Phase 3 (per-shape 
 
 `rocblas_arch_eligible()` correctly gates rocBLAS to gfx940/941/942 only. gfx12 never reaches rocBLAS in either decode (GEMV) or prefill (gemm_*_wmma_gfx12) paths. Fixed one inconsistency at `gemm_gate_up_hfq4g256` (hardcoded `cdna3 = matches!(...)` → `self.rocblas_arch_eligible()`). rocBLAS calls per token on 27B decode = 0 on gfx1201.
 
-### Residual scan: gemv_hfq4g256_{plain,residual}.gfx1201.hip wired at 67229bc4
+### Residual scan: gemv_hfq4g256_{plain,residual}.gfx1201.hip — wired then REVERTED
 
 Surfaced after the original PRD drained: `gemv_hfq4g256.gfx1201.hip` (2x unroll + s_prefetch_data) had been in tree but DEAD — no const decl in kernels.rs, dispatch arm at `gemv_hfq4g256_for_arch` commented out as `// "gfx1200" | "gfx1201" => ...,`. gfx1201 silently fell through to the gfx1010 cross-arch baseline. Wired both that file and a new 4-accumulator quad-unroll `gemv_hfq4g256_residual.gfx1201.hip` (per-quad `__builtin_amdgcn_s_prefetch_data` at offset +544 bytes / 4 groups ahead) into `gemv_hfq4g256_for_arch` + `gemv_hfq4g256_residual_for_arch` for gfx1200/gfx1201 via new module names `gemv_hfq4g256_rdna4` + `gemv_hfq4g256_residual_rdna4`. Entry-point map at dispatch.rs:14747 already covers the new module names via `n.starts_with("gemv_hfq4g256_rdna")`.
 
@@ -440,6 +440,8 @@ Witnessed bench on hiptrx R9700 (3 fresh runs, DPM_WARMUP=10-15):
 - 27B DFlash merge_sort: 191.43 tok/s τ=13.273 invariant (vs 191.51 = -0.04% noise).
 
 Coherence-gate PASS at 67229bc4. Null verdict — same BW-saturated ceiling as multirow null. Cold-start Run 1 showed 9B prefill=86.9 tok/s (DPM cold-start artifact); Runs 2-3 with same env recovered to 1388-1392; reported median-of-3 per CLAUDE.md prefill rule.
+
+**REVERTED at b5451bd9** per user directive "mild regression -> revert" (2026-05-08). The 9B AR -1.4% delta (101.4 -> 99.9-100.2) was within the ±2% session-noise envelope but real and consistent across 3 fresh runs. Revert removed `gemv_hfq4g256_residual.gfx1201.hip` (new file) + the kernels.rs const decls (`GEMV_HFQ4G256_GFX1201_SRC`, `GEMV_HFQ4G256_RESIDUAL_GFX1201_SRC`) + the gfx1200/gfx1201 arms in `gemv_hfq4g256_for_arch` + `gemv_hfq4g256_residual_for_arch`. The previously-dead `gemv_hfq4g256.gfx1201.hip` source remains in tree (predates this session) but returns to its unwired state. Post-revert bench on hiptrx R9700 (3 fresh runs): 9B AR 101.7 / 101.4 / 101.4 tok/s = median 101.4 (= baseline restored); 27B AR 35.8 (identical); 27B DFlash merge_sort 191.81 τ=13.2727 (within noise of 191.5 baseline). Coherence-gate PASS at b5451bd9. Lesson: prefetch-hint variants on BW-saturated decode-tier GEMV are anti-gm — even null perf without regression is worth nothing if the cost is a small but real session-noise-level delta. Don't re-attempt without first decisively beating the cross-arch baseline in micro-bench.
 
 ### Items 2/3/4-Phase-2-3/6 — DEFERRED with witnessed verdicts (long-form PRD authoritative)
 
