@@ -78,6 +78,19 @@ Delta: **-1.7% at env=1 — env-1 strictly slower 3/3 runs.** 100%
 predraft hit rate (10/10 cycles after cycle 0). Coherence-gate-dflash
 --fast PASS.
 
+#### Note on hiptrx R9700 test scope
+
+The R9700 test uses a **single** R9700 (target + drafter both on one card)
+because pipeline_mode in `spec_step_dflash` is single-GPU. PP=4 across
+the four R9700s in hiptrx is a separate code path (`generate_multi` in
+the daemon) and is currently bypassed by pipeline_mode entirely. To
+exercise predraft on a multi-GPU PP=4 setup would require integrating
+the speculative-prefetch logic into the PP boundary copies — a separate
+engineering piece not in this PR's scope.
+
+Single-R9700 is also the cleaner test of the BW-saturation hypothesis:
+no cross-card transfer noise to confound the kernel-contention measurement.
+
 #### hiptrx solo R9700 (gfx1201 target + gfx1201 drafter, merge_sort max=256, DPM_WARMUP=10)
 
 | Run | env=0 | env=1 |
