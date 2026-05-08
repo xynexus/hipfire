@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased — gfx1201 kernel-tuning campaign (2026-05-08)
+
+Branch `feat/gfx1201-kernel-tuning` (PRD `docs/plans/gfx1201-kernel-tuning.prd.md`).
+Witnessed silicon results on hiptrx (4x R9700, gfx1201).
+
+- **rocBLAS audit** (`7b71453`): Confirmed `rocblas_arch_eligible()` correctly
+  gates rocBLAS to gfx940/941/942 (CDNA3) only; gfx1200/1201 never reach
+  rocBLAS in either decode or prefill paths under default config. Fixed one
+  hardcoded `cdna3 = matches!(...)` site at `gemm_gate_up_hfq4g256` so the
+  `HIPFIRE_ROCBLAS_ALL_ARCHS=1` smoke-path covers gate_up identically to qkv.
+  rocBLAS calls per token on 27B decode = 0 on gfx1201.
+- **gfx12 HFQ4-G256 MMQ residual GEMM kernel** (`07a17c4`): Phase 1 port from
+  research/iu4-activation-calibration. Uses
+  `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12` + 8-row-block acc layout.
+  Numerically equivalent to FP16-WMMA reference on R9700 (max abs err 0.00146,
+  within Q8_1 tolerance). Direct-call only; production wiring deferred to
+  Phase 2.
+- **gfx1201 multi-row GEMV port** (`ea69403` + `7398cb6`): Body byte-identical
+  to gfx1100 (arch-neutral FP32 FMA + `__shfl_down`). Witnessed null on AR and
+  DFlash decode: R=1/R=2/R=4 within 0.1% on both 9B (101.4 tok/s) and 27B
+  (35.8 tok/s); DFlash 27B merge_sort R=1 191.5 / R=2 191.4 / R=4 191.3,
+  tau=13.27 invariant. PRD's "RDNA4 turns the gfx11 negative into a positive"
+  hypothesis empirically falsified — bandwidth-saturated at ~500 GiB/s.
+  Ships opt-in via `HIPFIRE_GEMV_ROWS={2,4,8}`. Mid-session regression bug
+  fixed in `7398cb6`: adding gfx1200/gfx1201 to the `use_wide` exclusion
+  collapsed 9B prefill 1262 -> 33.6 tok/s; default rows=1 needs the wide
+  kernel.
+- **27B AR per-kernel profile** (`docs/perf-checkpoints/2026-05-08-gfx1201-27b-ar-profile.md`):
+  Witnessed bottleneck data. Top-3 hot kernels: `gemv_hfq4g256_residual` 36.3%
+  / `fused_qkvza_hfq4g256` 18.3% / `fused_rmsnorm_mq_rotate` 10.9%
+  (compute-bound). Justifies PRD Item 2 (fused_qkv/qkvza gfx1201 port) at
+  23.7% combined kernel time; Item 3 (fused_gate_up) absent from AR profile
+  — needs separate prefill/draft profile.
+- **PRD updated** (`39a670f4`): Items 1, 4 Phase 1, 5 closed with witnessed
+  verdicts. Items 2/3 require profile-bottleneck-justification before
+  scaffolding. Item 4 Phase 2/3 + Item 6 remain multi-week scope.
+
 ## v0.1.20 — engine modularization
 
 The `crates/engine/` monolith is split into a runtime crate plus
