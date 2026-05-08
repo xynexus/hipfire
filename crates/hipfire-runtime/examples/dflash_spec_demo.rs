@@ -521,6 +521,32 @@ fn main() {
         target.config.vocab_size, draft_cfg.vocab_size
     );
 
+    // ── Check hidden-dim compatibility ────────────────────────────────
+    // The draft was trained against a target of a specific hidden_dim;
+    // its cross-attention weights and DflashScratch.target_hidden buffer
+    // are sized for [max_ctx_len × num_extract × draft_cfg.hidden] f32.
+    // If the runtime target has a different hidden_dim, the seed-from-
+    // prompt scatter writes target.config.dim-sized rows into a buffer
+    // expecting draft_cfg.hidden-sized rows, and the assertion in
+    // hip-bridge memcpy_dtod_at fires deep inside scatter_hidden_block_
+    // to_interleaved with a confusing message. Catch the mismatch up
+    // front so users see a clear "wrong pair" error.
+    assert_eq!(
+        target.config.dim, draft_cfg.hidden,
+        "incompatible target/draft pair: target hidden_dim ({}) != draft trained hidden ({}). \
+         The DFlash draft was trained against a target of a different size. \
+         Use a draft trained for this target (e.g. 27B target needs 27B-trained DFlash).",
+        target.config.dim, draft_cfg.hidden
+    );
+    // Same story for num_extract: hidden_rb and target_hidden are laid out
+    // [L × num_extract × hidden]; mismatched ne also rips the row stride.
+    let target_extract_layers = draft_cfg.num_extract();
+    assert!(
+        target_extract_layers <= target.config.n_layers,
+        "incompatible target/draft pair: draft expects {} extract layers but target has only {}",
+        target_extract_layers, target.config.n_layers
+    );
+
     let tokenizer: Tokenizer = target.load_tokenizer().expect("target tokenizer");
     if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
         tokenizer.dump_prompt_heat(&prompt);
