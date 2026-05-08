@@ -1,0 +1,150 @@
+# gfx1201 (RDNA4 / R9700) kernel-tuning PRD
+# Branch: feat/gfx1201-kernel-tuning off origin/master 85678ede
+# Long-form: docs/plans/gfx1201-kernel-tuning.prd.md
+# Goal: gfx1201 R9700 hits >=250 tok/s on canonical 27B merge_sort
+#       (currently 192.6, 77% of gfx1100's 250.3)
+
+- id: multirow-gemv-gfx1201
+  subject: Port multi-row GEMV (gemv_hfq4g256_multirow_r2 family) to gfx1201
+  status: pending
+  description: |
+    Mirror gfx1100 multirow GEMV implementation to gfx1201 with gfx12 wmma
+    operand shapes (<8 x fp16>), _gfx12 builtin suffix, 8-row-block acc readout.
+    Files: gemv_hfq4g256_multirow_r2.gfx1201.hip and the multirow family.
+  effort: large
+  category: feature
+  route_family: execution
+  load: 0.85
+  failure_modes: [execution-acc-layout-silent-corrupt, execution-operand-pack-stride]
+  route_fit: unexamined
+  authorization: weak_prior
+  blocking: []
+  blockedBy: []
+  acceptance:
+    - gemv_hfq4g256_multirow_r2.gfx1201.hip and family compile clean
+    - Max abs error vs fp32 reference < 1e-3 across 100 random shapes
+    - 27B mq4 merge_sort decode tok/s exceeds current 192.6 baseline
+    - tau-invariance 13.27 +/- 0.5 holds
+    - tests/speed-baselines/gfx1201.txt updated with new anchor
+    - scripts/coherence-gate.sh PASS
+    - scripts/coherence-gate-dflash.sh PASS
+    - Bench log records prompt md5 + --max + DPM warmup + --kv-mode
+  edge_cases:
+    - acc layout silent-corrupt class (validate against fp32 every shape)
+    - _gfx12 suffix mandatory else Cannot select intrinsic
+    - operand pack <16 x fp16> reuse from gfx11 yields wrong K accumulation
+
+- id: fused-qkv-qkvza-gfx1201
+  subject: Port fused QKV / QKVZA family to gfx1201
+  status: pending
+  description: |
+    fused_qkv*.gfx1201.hip family. Acc-layout port, builtin suffix,
+    operand-pack stride update. On the attention path so acc-layout
+    mistakes silently corrupt logits.
+  effort: large
+  category: feature
+  route_family: execution
+  load: 0.85
+  failure_modes: [execution-acc-layout-silent-corrupt, observability-logit-corruption-undetected]
+  route_fit: unexamined
+  authorization: weak_prior
+  blocking: []
+  blockedBy: []
+  acceptance:
+    - fused_qkv*.gfx1201.hip compiles clean
+    - Max abs error vs fp32 reference < 1e-3 across 100 random shapes
+    - 27B mq4 merge_sort decode tok/s exceeds prior baseline
+    - DFlash coherence gate PASS (logit-corruption guard)
+    - tests/speed-baselines/gfx1201.txt updated
+    - scripts/coherence-gate.sh PASS
+    - Bench log records prompt md5 + --max + DPM warmup + --kv-mode
+
+- id: fused-gate-up-gfx1201
+  subject: Port fused gate+up + swiglu_residual to gfx1201
+  status: pending
+  description: |
+    fused_gate_up*.gfx1201.hip + swiglu_residual gfx12. Closes the FFN
+    family on RDNA4.
+  effort: medium
+  category: feature
+  route_family: execution
+  load: 0.75
+  failure_modes: [execution-acc-layout-silent-corrupt]
+  route_fit: unexamined
+  authorization: weak_prior
+  blocking: []
+  blockedBy: []
+  acceptance:
+    - fused_gate_up*.gfx1201.hip + swiglu_residual gfx12 compile clean
+    - Max abs error vs fp32 reference < 1e-3 across 100 random shapes
+    - 27B mq4 merge_sort decode tok/s exceeds prior baseline
+    - DFlash coherence gate PASS
+    - tests/speed-baselines/gfx1201.txt updated
+    - scripts/coherence-gate.sh PASS
+    - Bench log records prompt md5 + --max + DPM warmup + --kv-mode
+
+- id: mmq-tile-autotune-gfx1201
+  subject: MMQ workgroup-tile auto-tune for gfx1201
+  status: pending
+  description: |
+    Per-shape MMQ_X selector for gfx1201 (currently uniform MMQ_X=8;
+    gfx1100 uses MMQ_X=8 for 9B and MMQ_X=16 for 27B). Under-utilizes
+    RDNA4 wavefront occupancy on 27B.
+  effort: small
+  category: refactor
+  route_family: execution
+  load: 0.4
+  failure_modes: [execution-vgpr-pressure-blowup]
+  route_fit: weak_prior
+  authorization: weak_prior
+  blocking: []
+  blockedBy: []
+  acceptance:
+    - MMQ dispatcher selects MMQ_X per shape on gfx1201
+    - Bit-exact regression on tests/speed-baselines/gfx1201.txt 27B prefill row
+    - 27B mq4 merge_sort decode tok/s >= prior baseline + 1%
+    - scripts/coherence-gate.sh PASS
+
+- id: rocblas-gfx12-audit
+  subject: Audit hipfire decode path for rocBLAS-on-gfx12 leakage
+  status: pending
+  description: |
+    Confirm hipfire's decode path is gating rocBLAS on gfx1201, or that
+    gfx12 fallback codepath has same 5.6x prefill regression. Fix gating
+    if leaky. Reference feedback_rocblas_gfx12_regresses.md.
+  effort: small
+  category: bug
+  route_family: boundary
+  load: 0.5
+  failure_modes: [boundary-rocblas-fallback-leak, observability-untraced-dispatch]
+  route_fit: weak_prior
+  authorization: weak_prior
+  blocking: []
+  blockedBy: []
+  acceptance:
+    - rocBLAS calls per token on 27B decode = 0 (traced via dispatcher source)
+    - rocblas_arch_eligible NOT extended to gfx12
+    - Decision logged in PRD items.completed (gating present OR fix shipped)
+    - scripts/coherence-gate.sh PASS
+
+- id: lloyd-mq-batched-prefill-gfx1201
+  subject: Port Lloyd-MQ3 / Lloyd-MQ2 batched-prefill kernels to gfx1201
+  status: pending
+  description: |
+    Lloyd-MQ kernels are B=1 only on gfx1201 per mq-lloyd-batched-prefill-followup.
+    Port batched-prefill. Orthogonal quality lever (lower-bpw quant feasibility).
+  effort: large
+  category: feature
+  route_family: execution
+  load: 0.6
+  failure_modes: [execution-acc-layout-silent-corrupt, representation-quant-precision-cliff]
+  route_fit: unexamined
+  authorization: weak_prior
+  blocking: []
+  blockedBy: []
+  acceptance:
+    - Lloyd-MQ3 + Lloyd-MQ2 batched-prefill kernels on gfx1201 compile clean
+    - Quality gate (coherence-gate.sh) PASS at MQ3/MQ2
+    - Speed-gate update for new kernels
+    - Lloyd-MQ-specific acceptance criteria from mq-lloyd-batched-prefill-followup met
+    - DFlash coherence gate PASS
