@@ -36,6 +36,20 @@ Witnessed silicon results on hiptrx (4x R9700, gfx1201).
 - **PRD updated** (`39a670f4`): Items 1, 4 Phase 1, 5 closed with witnessed
   verdicts. Items 2/3 require profile-bottleneck-justification before
   scaffolding. Item 4 Phase 2/3 + Item 6 remain multi-week scope.
+- **gfx1201 plain + residual GEMV wired** (`67229bc4`): Surfaced as
+  in-spirit residual after the original PRD drained. Found pre-existing
+  dead code: `gemv_hfq4g256.gfx1201.hip` (2x unroll + s_prefetch_data)
+  was in tree but never wired — no kernels.rs const, dispatch arm at
+  `gemv_hfq4g256_for_arch` commented out. Wired both that and a new
+  4-accumulator quad-unroll `gemv_hfq4g256_residual.gfx1201.hip` with
+  per-quad prefetch hint targeting offset +544 bytes. Witnessed bench
+  on hiptrx R9700 (3 fresh runs, DPM_WARMUP=10-15): 9B AR 99.9-100.2
+  vs 101.4 baseline (-1.4% noise); 27B AR 35.8 (identical); 27B DFlash
+  merge_sort 191.43 vs 191.51 (-0.04% noise, τ=13.273 invariant).
+  Coherence-gate PASS on commit 67229bc4. Null verdict — same BW-bound
+  ceiling as multirow null. Cold-start Run 1 showed 9B prefill=86.9
+  tok/s (DPM cold-start artifact, not regression — Runs 2-3 recovered
+  to 1388-1392); reported median-of-3 per CLAUDE.md prefill rule.
 
 ## v0.1.20 — engine modularization
 
