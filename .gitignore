@@ -90,3 +90,20 @@ research/
 .codeinsight+research/
 
 bench/coherence-results/
+# >>> gm managed (do not edit between markers)
+.gm-stop-verified
+.gm/prd-state.json
+.gm/rslearn-counter.json
+.gm/git-block-counter.json
+.gm/learning-state.md
+.gm/trajectory-drafts/
+.gm/ingest-drafts/
+.gm/needs-gm
+.gm/lastskill
+.gm/turn-state.json
+.gm/no-memorize-this-turn
+.gm/prd.paused.yml
+.gm/rs-learn.db-shm
+.gm/rs-learn.db-wal
+# tracked: .gm/rs-learn.db, .gm/code-search/, AGENTS.md, .gm/prd.yml
+# <<< gm managed
