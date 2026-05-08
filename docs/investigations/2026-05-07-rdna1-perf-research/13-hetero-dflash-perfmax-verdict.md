@@ -190,6 +190,32 @@ cross-card cost isn't BW-bound on this fabric.
   cards), the cross-card cycle budget could project well below the
   30 ms target.
 
+## PFlash + DFlash compose result (2026-05-08, commit 366710d)
+
+PRD v1.2 PR 4 closed: `generate_dflash` now threads `PflashState` and
+`PflashConfig` so long prompts can be compressed before the target
+prefill. Bench on hipx TB5 5700 XT drafter + NIAH 16k:
+
+| Metric | hetero | hetero+PFlash | Δ |
+|---|---:|---:|---:|
+| `prefill_tokens` | 10879 | 5512 (kept 5504/10871 = 50.6%) | -49% |
+| target prefill_ms | 48483 | 21136 | -56% |
+| PFlash score_ms | 0 | 4970 | new line item |
+| **True TTFT** (score + prefill) | 48483 | 26106 | **-46%** |
+| `decode_tok_s` | 4.6 | 7.3 | +59% (smaller KV) |
+| `tau` | 2.75 | 2.81 | invariant |
+
+Decode lift comes from compressed prompt → smaller target KV →
+cheaper attention per spec-decode cycle, not from any cross-card
+cost change. τ invariance proves PFlash compression preserves enough
+context that the drafter's predictions still align with the target's
+greedy.
+
+PFlash + DFlash compose was previously bypassed by an explicit
+`pflash_bypass dflash_decode_active` gate at the daemon entry; that
+gate is now removed and PFlash's own bypass reasons (ModeOff,
+ToolCall, ShortPrompt, etc.) surface as on the AR path.
+
 ## Follow-ups
 
 - Investigate `HIP[2]` segfault (separate from this PRD).
