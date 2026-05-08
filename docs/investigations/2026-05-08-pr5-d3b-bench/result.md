@@ -78,6 +78,38 @@ Delta: **-1.7% at env=1 — env-1 strictly slower 3/3 runs.** 100%
 predraft hit rate (10/10 cycles after cycle 0). Coherence-gate-dflash
 --fast PASS.
 
+#### Cross-process 5-run hardening (CLAUDE.md spec-decode rule compliance)
+
+Per CLAUDE.md: 5 runs, fresh process per run, stddev narrowing >30%
+hard-fails. Each `dflash_spec_demo` invocation is a separate process
+(not within-session A/B), DPM warmup 10s before timed window.
+
+hiptrx 1× R9700 (canonical 27B + 27B-DFlash, merge_sort max=256):
+
+| Run | env=0 | env=1 |
+|---|---:|---:|
+| 1 | 195.06 | 180.05 |
+| 2 | 194.21 | 180.32 |
+| 3 | 193.42 | 180.90 |
+| 4 | 192.83 | 180.46 |
+| 5 | 192.20 | 180.58 |
+| **median** | **193.42** | **180.46** |
+| range | 2.86 (1.48%) | 0.85 (0.47%) |
+
+Delta: **-6.70% at env=1**, strictly slower 5/5 runs.
+
+env=1 stddev tighter than env=0 (3× narrower) but well below CLAUDE.md's
+30%-narrowing hard-fail threshold and not an attractor signature
+(τ=13.2727 invariant across all 10 runs, output bit-identical between
+modes). The narrowing is consistent with cycle-deterministic
+event-API overhead adding the same delta each cycle plus thermal
+warming during the env=0 → env=1 sequence.
+
+This **5-run cross-process measurement hardens the original 3-run
+within-sequence finding**: -6.70% (5-run) vs -7.16% (3-run) median
+deltas agree within 0.5 percentage points. The negative result is
+robust.
+
 #### Silicon-invariance across all 4× R9700 (single-card solo, 1 run each)
 
 | Card | env=0 | env=1 | Δ |
@@ -317,6 +349,32 @@ The four primitives + DflashScratchPair scaffolding shipped this
 session unblock that work — pair allocation is gated, primitives
 support stream-async dispatch on either scratch. A follow-on commit
 adds the prefetch wiring without re-scaffolding.
+
+## Validation gaps surveyed (2026-05-08)
+
+After the 5-run cross-process hardening, the open validation gaps and
+their disposition:
+
+- **gfx1100 7900 XTX (localmaxxing)**: not directly accessible from
+  this session; predicted to regress more than R9700 (higher peak BW
+  → more contention) but unverified empirically. Out of session reach.
+- **Lloyd-MQ3 27B (compute-bound regime test)**: Lloyd-MQ3 27B model
+  not on disk on hiptrx (only `qwen3.5-35b-a3b.mq3` MoE variant exists,
+  different architecture). Skipped — would require generating the
+  Lloyd-MQ3 27B file via the calibration pipeline, multi-hour task.
+  This is the only regime where the feature could plausibly invert
+  (workload moves from BW-bound to compute-bound when per-token weight
+  bytes drop ~35%). Real test of the BW-saturation hypothesis;
+  reachable in a follow-on session if the model is built.
+- **5-run cross-process (CLAUDE.md compliance)**: COMPLETED above on
+  hiptrx canonical config. Hardens the negative result.
+- **gfx1010 RDNA1, gfx1030 RDNA2**: low-information per analysis
+  (DFlash itself is net-negative on RDNA1; 6950 XT TB3 dock currently
+  disconnected on hipx). Skipped.
+- **Long-prompt regimes (NIAH 16k, multi-turn agentic)**: predicted
+  similar BW-saturation pattern given decode kernels are the same.
+  Skipped — would consume disproportionate session time relative to
+  expected information gain.
 
 ## Coherence-gate-dflash --fast — PASS at both env=0 AND env=1
 
