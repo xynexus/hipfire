@@ -207,20 +207,8 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 // v4: dp4a-packed    — launch_bounds(32,16), dp4a intrinsics, factored scale/zero
 // v5: cache-aggressive — launch_bounds(32,16), 2x unroll, packed loads, factored math
 pub const GEMV_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip");
-// gfx12 (RDNA4) sister of GEMV_HFQ4G256_SRC: 2x group unroll +
-// __builtin_amdgcn_s_prefetch_data hints. Wired into
-// gemv_hfq4g256_for_arch for gfx1200/gfx1201.
-pub const GEMV_HFQ4G256_GFX1201_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1201.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
-// gfx12 (RDNA4) sister of GEMV_HFQ4G256_RESIDUAL_SRC: 4-accumulator
-// quad-unroll (byte-equivalent with cross-arch reference) + per-quad
-// __builtin_amdgcn_s_prefetch_data hint targeting offset +544 bytes
-// (4 groups ahead) to amortize HFQ4 weight fetches across L2. Profile
-// at docs/perf-checkpoints/2026-05-08-gfx1201-27b-ar-profile.md flags
-// gemv_hfq4g256_residual as the #1 hot kernel on 27B AR (36.3% of
-// kernel time, 492 GiB/s = 77% R9700 peak; ~23% headroom).
-pub const GEMV_HFQ4G256_RESIDUAL_GFX1201_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1201.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64_prefetch.hip");
 
@@ -564,9 +552,8 @@ pub fn gemv_hfq4g256_for_arch(arch: &str) -> (&'static str, &'static str) {
         "gfx1100" | "gfx1101" | "gfx1102" => {
             (GEMV_HFQ4G256_GFX1100_SRC, "gemv_hfq4g256_rdna3")
         }
-        "gfx1200" | "gfx1201" => {
-            (GEMV_HFQ4G256_GFX1201_SRC, "gemv_hfq4g256_rdna4")
-        }
+        // RDNA4 variants (existing)
+        // "gfx1200" | "gfx1201" => ...,
         _ => (GEMV_HFQ4G256_SRC, "gemv_hfq4g256"), // gfx1010 baseline
     }
 }
@@ -578,9 +565,6 @@ pub fn gemv_hfq4g256_residual_for_arch(arch: &str) -> (&'static str, &'static st
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" => {
             (GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC, "gemv_hfq4g256_residual_rdna3")
-        }
-        "gfx1200" | "gfx1201" => {
-            (GEMV_HFQ4G256_RESIDUAL_GFX1201_SRC, "gemv_hfq4g256_residual_rdna4")
         }
         _ => (GEMV_HFQ4G256_RESIDUAL_SRC, "gemv_hfq4g256_residual"),
     }
