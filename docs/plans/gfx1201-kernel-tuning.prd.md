@@ -82,7 +82,15 @@ Additional levers established this cycle:
 - **iu8 MMQ +10% on 9B prefill is the gfx12 ceiling currently shipped**
   on prefill side; decode path is unported.
 
-## 4. Items — ranked by ROI, highest first
+## 4. Items — original PRD ranking (with witnessed verdicts inline)
+
+> **Status (2026-05-08, end of session):** `.gm/prd.yml` emptied. Items 1, 4
+> Phase 1, and 5 SHIPPED on this branch. Items 2, 3, 4 Phase 2/3, and 6 are
+> deferred to next-session work — the witnessed verdicts below explain why
+> each is **not reachable as currently scoped**, and what would unblock it.
+> Future work should re-PRD against the witnessed bottleneck profile in
+> `docs/perf-checkpoints/2026-05-08-gfx1201-27b-ar-profile.md` rather than
+> the original ROI ranking.
 
 ### Item 1 — Multi-row GEMV gfx1201 port (highest ROI)
 - **Files:** `gemv_hfq4g256_multirow_r2.gfx1201.hip` and the multirow
@@ -98,7 +106,7 @@ Additional levers established this cycle:
   merge_sort tok/s ≥ current + lift; τ-invariance 13.27 ± 0.5; max
   abs error vs fp32 reference < 1e-3 across 100 random shapes.
 
-### Item 2 — Fused QKV / QKVZA gfx1201
+### Item 2 — Fused QKV / QKVZA gfx1201 — DEFERRED (PRD misframe)
 - **Files:** `fused_qkv*.gfx1201.hip` — full family. Acc-layout port,
   builtin suffix, operand-pack stride update.
 - **Effort:** 3–5 days.
@@ -107,14 +115,34 @@ Additional levers established this cycle:
 - **Validation:** same gates as Item 1 + DFlash coherence gate
   (`scripts/coherence-gate-dflash.sh`) must pass — QKV is on the
   attention path and an acc-layout mistake silent-corrupts logits.
+- **2026-05-08 verdict:** PRD misframed. The fused_qkv / fused_qkvza
+  kernels are NOT WMMA — they are non-WMMA decode-tier fused GEMVs
+  with arch-neutral FP32 FMA inner loops. The kernel headers explicitly
+  say "Arch coverage: works on every RDNA generation (gfx1010 / gfx1013
+  / gfx1030 / gfx1100+)". gfx1201 is ALREADY using these kernels; they
+  precompile unconditionally per dispatch.rs:14497. The "Acc-layout
+  port + builtin suffix + operand-pack stride update" guidance applies
+  to WMMA kernels only and doesn't fit this family. Witnessed bottleneck
+  profile (perf-checkpoints/2026-05-08-gfx1201-27b-ar-profile.md) shows
+  fused_qkvza at 512 GiB/s = 80% of R9700's ~640 GiB/s peak on 27B AR —
+  bandwidth-saturated. Real next-session work for this family is a
+  **gfx12-specific OPTIMIZATION** (more unroll using gfx12's larger VGPR
+  budget, DPP-based weight unpack, etc.) gated on a measurement showing
+  headroom, not a blind body-identical port. **Re-PRD as a research
+  task, not a port task.**
 
-### Item 3 — Fused gate+up gfx1201
+### Item 3 — Fused gate+up gfx1201 — DEFERRED (insufficient witness)
 - **Files:** `fused_gate_up*.gfx1201.hip` + `swiglu_residual` gfx12.
 - **Effort:** 2–4 days.
 - **Lift estimate:** closes the FFN family, +3–5% on 27B decode.
 - **Validation:** same gates as Item 2.
+- **2026-05-08 verdict:** Same misframe class as Item 2 (non-WMMA
+  arch-neutral cross-arch kernel). Plus the AR profile didn't even
+  surface fused_gate_up in the top-10 — its hot-path role on gfx1201
+  is unclear. Justification requires a separate prefill or draft-side
+  profile before any port work. **Re-PRD post-profile.**
 
-### Item 4 — MMQ workgroup-tile auto-tune for gfx1201
+### Item 4 — MMQ workgroup-tile auto-tune for gfx1201 — Phase 1 SHIPPED, Phase 2/3 DEFERRED
 - **Files:** MMQ dispatcher + per-shape tile selector. gfx1100 uses
   `MMQ_X=8` for 9B and `MMQ_X=16` for 27B; gfx1201 currently uses
   uniform `MMQ_X=8` per memory `project_gfx12_mmq_bench_2026_05_04`
@@ -123,8 +151,19 @@ Additional levers established this cycle:
 - **Lift estimate:** +1–3% per shape, free.
 - **Validation:** speed-gate update + bit-exact regression on
   `tests/speed-baselines/gfx1201.txt` 27B prefill row.
+- **2026-05-08 verdict:** PRD's "1 day" estimate was wrong. Witnessed:
+  the gfx12 MMQ kernel itself didn't exist on master (was on
+  research/iu4-activation-calibration only). Phase 1 SHIPPED at
+  `07a17c4` — kernel + dispatch + correctness test PASS on R9700.
+  Phase 2 alone (~1-2 hr — production wiring through `should_use_mmq`)
+  is not safe to ship without Phase 3 because per memory
+  `project_gfx12_mmq_bench_2026_05_04` the kernel REGRESSES 4B (-19%)
+  and 27B (-8%) at uniform MMQ_X=128. Phase 3 (per-shape MMQ_X
+  workgroup-tile variants — `_x64` / `_x32`) is multi-week. Real
+  total scope: 1-2 weeks. Direct-call kernel is shipped and accessible
+  for testing; production-flip blocked on Phase 3.
 
-### Item 5 — rocBLAS-on-gfx12 audit
+### Item 5 — rocBLAS-on-gfx12 audit — SHIPPED at `7b71453`
 - **Goal:** confirm hipfire's decode path is gating rocBLAS on
   gfx1201, or that its gfx12 fallback codepath has same 5.6×
   regression cliff seen on prefill (memory
@@ -136,7 +175,7 @@ Additional levers established this cycle:
 - **Validation:** trace dispatcher source; rocBLAS calls per token on
   27B decode = 0.
 
-### Item 6 — Lloyd-MQ kernels gfx1201 (lowest priority of the six)
+### Item 6 — Lloyd-MQ kernels gfx1201 — DEFERRED (multi-week, lowest priority)
 - **Files:** Lloyd-MQ3 / Lloyd-MQ2 batched-prefill ports per memory
   `mq-lloyd-batched-prefill-followup`. Currently B=1 only on
   gfx1201.
