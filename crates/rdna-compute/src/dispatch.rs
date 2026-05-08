@@ -555,6 +555,69 @@ impl Gpu {
         Ok(())
     }
 
+    /// Path D0c + D1: idempotent draft-stream initializer. Creates
+    /// `self.draft_stream` when `HIPFIRE_DFLASH_PIPELINE=1` is set and the
+    /// field is currently `None`. Runs a one-pass DPM warmup against the
+    /// new stream so cycle 1 is not the first to hit DPM throttling.
+    /// `init_pipeline_streams` is no-op (returns Ok) when the env is unset
+    /// — preserves byte-exact-at-default for every existing caller.
+    pub fn init_pipeline_streams(&mut self) -> HipResult<()> {
+        if self.draft_stream.is_some() {
+            return Ok(());
+        }
+        if std::env::var("HIPFIRE_DFLASH_PIPELINE").ok().as_deref() != Some("1") {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        let s = self.hip.stream_create()?;
+        self.draft_stream = Some(s);
+        Ok(())
+    }
+
+    /// Path D1: cleanup hook for the long-running daemon. Called from
+    /// `unload_model` so model swaps don't leak streams. Idempotent.
+    pub fn destroy_pipeline_streams(&mut self) {
+        self.bind_thread_or_warn();
+        if let Some(s) = self.draft_stream.take() {
+            let _ = self.hip.stream_destroy(s);
+        }
+        if let Some(s) = self.verify_stream.take() {
+            let _ = self.hip.stream_destroy(s);
+        }
+    }
+
+    /// Path D0c: temporarily route this Gpu's dispatches onto `draft_stream`.
+    /// Swaps `active_stream <-> draft_stream` and returns the prior
+    /// `active_stream` value, which the caller MUST hand back via
+    /// `exit_draft_stream`. No-op (returns `(None, false)`) when
+    /// `draft_stream` is None — pipelining disabled.
+    ///
+    /// Why a swap rather than a stream_override parameter threaded through
+    /// every dispatch callee: same effect, far smaller surface area, and
+    /// cannot be partially propagated. Existing callers read
+    /// `gpu.active_stream` for stream-async dispatch — re-pointing it
+    /// reroutes EVERY dispatch in the call chain without per-call edits.
+    pub fn enter_draft_stream(&mut self) -> (Option<hip_bridge::Stream>, bool) {
+        if self.draft_stream.is_none() {
+            return (None, false);
+        }
+        let saved = self.active_stream.take();
+        self.active_stream = self.draft_stream.take();
+        (saved, true)
+    }
+
+    /// Path D0c: counterpart to [`enter_draft_stream`]. Restores the
+    /// original `active_stream` and stows the draft stream back into
+    /// `draft_stream`. Caller passes `(saved, swapped)` from the
+    /// matching `enter_draft_stream` return value.
+    pub fn exit_draft_stream(&mut self, saved: Option<hip_bridge::Stream>, swapped: bool) {
+        if !swapped {
+            return;
+        }
+        self.draft_stream = self.active_stream.take();
+        self.active_stream = saved;
+    }
+
     pub fn init() -> HipResult<Self> {
         Self::init_with_device(0)
     }

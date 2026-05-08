@@ -1387,6 +1387,51 @@ impl HiddenStateRingBuffer {
         Ok(())
     }
 
+    /// Path D0a: stream-async variant of `commit_staging_to_ring`.
+    /// Same scatter geometry, but uses `memcpy_dtod_async_at` on the supplied
+    /// stream and skips the `stream_synchronize` pre-flight. The caller is
+    /// responsible for ordering writes against the consumer via HIP events
+    /// (path_d.md §D3b: pre_commit_evt records the verify forward's last
+    /// staging write before this commit runs on `verify_stream`).
+    pub fn commit_staging_to_ring_on_stream(
+        &mut self,
+        gpu: &mut Gpu,
+        n: usize,
+        stream: &hip_bridge::Stream,
+    ) -> HipResult<()> {
+        let row_bytes = self.hidden_dim * 4;
+        let head = self.head;
+        let max_pos = self.max_positions;
+
+        for ei in 0..self.layer_bufs.len() {
+            if head + n <= max_pos {
+                gpu.hip.memcpy_dtod_async_at(
+                    &self.layer_bufs[ei].buf, head * row_bytes,
+                    &self.staging_bufs[ei].buf, 0,
+                    n * row_bytes,
+                    stream,
+                )?;
+            } else {
+                let first = max_pos - head;
+                gpu.hip.memcpy_dtod_async_at(
+                    &self.layer_bufs[ei].buf, head * row_bytes,
+                    &self.staging_bufs[ei].buf, 0,
+                    first * row_bytes,
+                    stream,
+                )?;
+                gpu.hip.memcpy_dtod_async_at(
+                    &self.layer_bufs[ei].buf, 0,
+                    &self.staging_bufs[ei].buf, first * row_bytes,
+                    (n - first) * row_bytes,
+                    stream,
+                )?;
+            }
+        }
+        self.head = (head + n) % max_pos;
+        self.written += n;
+        Ok(())
+    }
+
     /// Reset to empty (head=0, written=0). GPU buffers are not zeroed; stale
     /// data is simply unreadable because `written < max_positions`.
     pub fn reset(&mut self) {
@@ -1867,7 +1912,31 @@ pub fn verify_dflash_block(
 ) -> HipResult<DflashVerifyOutput> {
     verify_dflash_block_inner(
         gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits, None,
-        verify_scratch,
+        verify_scratch, false,
+    )
+}
+
+/// Path D3a: variant of [`verify_dflash_block`] that returns BEFORE
+/// `hidden_rb.commit_staging_to_ring`. Pipelined orchestration (D3b)
+/// uses this so it can record `pre_commit_evt` between the verify
+/// forward and the commit, then run the commit on a chosen stream
+/// via `commit_staging_to_ring_on_stream`. Caller is responsible for
+/// the final commit; failing to commit leaves the staging buffer's
+/// rows un-scattered into the ring (visible as missing recent
+/// hidden states on the next draft).
+pub fn verify_dflash_block_no_commit(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    gdn_tape: Option<&mut GdnTape>,
+    want_full_logits: bool,
+    verify_scratch: &VerifyScratch,
+) -> HipResult<DflashVerifyOutput> {
+    verify_dflash_block_inner(
+        gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits, None,
+        verify_scratch, true,
     )
 }
 
@@ -1897,7 +1966,7 @@ pub fn verify_dflash_block_tree(
     verify_dflash_block_inner(
         gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits,
         Some(tree_verify),
-        verify_scratch,
+        verify_scratch, false,
     )
 }
 
@@ -1911,6 +1980,7 @@ fn verify_dflash_block_inner(
     want_full_logits: bool,
     tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
     verify_scratch: &VerifyScratch,
+    skip_internal_commit: bool,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
@@ -2103,7 +2173,11 @@ fn verify_dflash_block_inner(
     // those rows at the current head and advances head by b. Under the
     // graph path we manually drive this because the non-graph chunk loop
     // (forward_prefill_batch_with_pbs) that usually calls it was bypassed.
-    if verify_graph_ok && batch_result.is_ok() {
+    //
+    // Path D3a: when `skip_internal_commit=true`, the pipelined orchestrator
+    // commits explicitly on its chosen stream after recording pre_commit_evt
+    // — see verify_dflash_block_no_commit + path_d.md §D3b.
+    if verify_graph_ok && batch_result.is_ok() && !skip_internal_commit {
         hidden_rb.commit_staging_to_ring(gpu, b)?;
     }
     // Tree mode at topk>1 REQUIRES this sync. Without it τ degrades badly
@@ -2322,6 +2396,59 @@ pub fn scatter_hidden_block_to_interleaved(
                 &hidden_rb.layer_bufs[ext].buf,
                 src_offset_bytes,
                 row_bytes,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Path D0b: stream-async scatter that uses a caller-supplied
+/// `head_snapshot` instead of `hidden_rb.head`. Decouples the read
+/// from live state so the draft side can scatter from a stable
+/// position while verify advances head on a different stream
+/// (path_d.md §2.1: snap = ring head/written taken before any
+/// verify-leg work). Issues `memcpy_dtod_async_at` on the supplied
+/// stream — caller orders against verify's commit via HIP events.
+///
+/// `head_snapshot` is the captured `hidden_rb.head` at cycle entry.
+/// `block_size` and the snap-anchored `start_slot` together address
+/// the same B rows that the synchronous variant would read at the
+/// time of the snapshot. Caller must guarantee that the
+/// `block_size` rows ending at `head_snapshot` are actually present
+/// in the ring (path_d.md §2.1 covers this with `target_hidden_abs_positions`
+/// snapshot + CASK eviction deferral).
+pub fn scatter_hidden_block_to_interleaved_on_stream(
+    gpu: &Gpu,
+    hidden_rb: &HiddenStateRingBuffer,
+    dst: &GpuTensor,
+    dst_row_offset: usize,
+    block_size: usize,
+    n_rows: usize,
+    head_snapshot: usize,
+    stream: &hip_bridge::Stream,
+) -> HipResult<()> {
+    gpu.bind_thread()?;
+    assert!(n_rows <= block_size, "scatter_on_stream: n_rows {n_rows} > block_size {block_size}");
+    let num_extract = hidden_rb.extract_layers.len();
+    let hidden = hidden_rb.hidden_dim;
+    let max_pos = hidden_rb.max_positions;
+    let row_bytes = hidden * 4;
+    let start_slot = (head_snapshot + max_pos - block_size) % max_pos;
+
+    for r in 0..n_rows {
+        let slot = (start_slot + r) % max_pos;
+        let dst_row = dst_row_offset + r;
+        let dst_row_base_bytes = dst_row * num_extract * row_bytes;
+        for ext in 0..num_extract {
+            let src_offset_bytes = slot * row_bytes;
+            let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
+            gpu.hip.memcpy_dtod_async_at(
+                &dst.buf,
+                dst_offset_bytes,
+                &hidden_rb.layer_bufs[ext].buf,
+                src_offset_bytes,
+                row_bytes,
+                stream,
             )?;
         }
     }
