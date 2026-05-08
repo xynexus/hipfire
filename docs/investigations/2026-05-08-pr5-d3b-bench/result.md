@@ -35,6 +35,8 @@ Delta: **-0.24% at env=1** (event-API overhead, no overlap).
 
 ## Decode tok/s — 27B target + 27B-DFlash draft (canonical)
 
+### Minimal D3b (4661d3ce — end-of-cycle stream_synchronize)
+
 | Run | env=0 | env=1 |
 |-----|------:|------:|
 | 1   | 82.23 | 83.49 |
@@ -42,11 +44,94 @@ Delta: **-0.24% at env=1** (event-API overhead, no overlap).
 | 3   | 83.42 | 83.33 |
 | **median** | **83.42** | **83.49** |
 
-Delta: **+0.08% at env=1 — within noise.** env=0 first-run is colder
-(82.23) and the env=1 runs are tighter (range 0.18 vs env=0 range 1.53).
-No statistical signal of regression or win on the canonical config —
-the few-µs/cycle event-API overhead at env=1 is balanced by SDMA-queue
-overlap of commit + scatter at 27B's larger context.
+Delta: **+0.08% at env=1 — within noise.**
+
+### Cross-cycle async (cdf077cb — sync replaced with pending_scatter_evt)
+
+| Run | env=0 | env=1 |
+|-----|------:|------:|
+| 1   | 83.74 | 83.49 |
+| 2   | 83.52 | 83.42 |
+| 3   | 83.65 | 83.36 |
+| **median** | **83.65** | **83.42** |
+
+Delta: **-0.27% at env=1 — env-1 strictly slower 3/3 runs but bounded
+by event-API overhead.** Coherence-gate-dflash --fast PASS.
+
+## What the cross-cycle async did NOT deliver
+
+The cross-cycle async eliminates the CPU-blocking
+`stream_synchronize(draft_stream)` at end of the pipelined Phase 9 — the
+scatter now overlaps with Phase 10 (DeltaNet rewind + KV state
+advancement) on `verify_stream` AND the caller's inter-cycle CPU work.
+The next cycle blocks on the queue side via `stream_wait_event`, not
+the CPU side.
+
+But measured perf is still within noise of env=0. Why:
+
+1. The Phase 9 scatter at canonical config is small. With τ≈10.6 and
+   `accept_len + 1` averaging ~2 rows, it's ~2 rows × 5 layers ×
+   5120 hidden × 4 B = ~205 KB per cycle. At ~640 GiB/s SDMA peak the
+   scatter takes well under a millisecond — there's not enough work
+   to hide.
+
+2. Phase 10's verify_stream work is also small (~ms). The two streams
+   COULD overlap but the critical-path saving is bounded by the smaller
+   of (scatter, phase 10) durations — both fit in the few-ms range.
+
+3. ROCm dispatches on hipx iGPU may serialize SDMA copies regardless
+   of stream affinity (untested — would need rocprof to confirm).
+
+4. The path_d.md projected 5-15% lift assumes the BIG overlap:
+   speculative draft N+1 launched on draft_stream during cycle N's
+   verify forward. That overlaps a ~10-20 ms `draft_forward` with
+   the ~30-60 ms `verify_dflash_block` — a far larger win than
+   the few-ms scatter overlap.
+
+## The real lift requires speculative draft prefetch
+
+Per path_d.md §D3b's full design, cycle N's spec_step_dflash should
+ALSO launch cycle N+1's draft_forward speculatively on draft_stream,
+using `pair.current()` for the prefetch scratch and the bonus_token
+from cycle N's verify as the seed. Cycle N+1 then skips Phase 4
+entirely and consumes the prefetched block.
+
+Implementing this requires:
+
+1. **Threading `DflashScratchPair` into `spec_step_dflash`'s API.**
+   Today it takes `&mut DflashScratch` directly; the speculative
+   prefetch needs the pair so cycle N+1's draft writes don't race
+   cycle N's reads. Either change the signature (invasive across
+   callers) or stash the pair on `Gpu` (smaller surface).
+
+2. **Caching the pre-drafted block on the pair.** Includes
+   `Vec<u32> drafted` (B-1 token IDs), `Vec<f32> draft_probs_at_drafted`,
+   `Vec<Vec<f32>> draft_softmaxes` (for temp>0), expected position
+   and B at draft time.
+
+3. **Cycle entry: detect prefetch hit/miss.** If the cached predraft's
+   position matches the current cycle's expected position, use it and
+   skip Phase 1-4. Otherwise (PLD bypass next cycle, env toggled
+   mid-run, accept_count diverged from prefetch assumption), discard
+   and run Phase 4 inline. Emit pf_hit_rate telemetry.
+
+4. **Mispredicted-acceptance handling.** The prefetch assumes
+   `accept_len = B-1` (full acceptance). Real τ < B-1 means some of
+   the prefetched block tokens point at the wrong position. Either
+   re-draft inline on miss (simpler, loses the lift on those cycles)
+   or design partial-prefetch reuse (complex).
+
+5. **Adaptive bypass on tau-debt** (path_d.md §D4). 3 cycles of
+   `rolling_tau < expected_pipelined_floor` deactivates the prefetch
+   path for the rest of the request and frees `pair.b`.
+
+Estimated total scope: 200-400 LOC, 1-2 days of focused work +
+coherence-gate-dflash + 5-run bench validation per CLAUDE.md.
+
+The four primitives + DflashScratchPair scaffolding shipped this
+session unblock that work — pair allocation is gated, primitives
+support stream-async dispatch on either scratch. A follow-on commit
+adds the prefetch wiring without re-scaffolding.
 
 ## Coherence-gate-dflash --fast — PASS at both env=0 AND env=1
 
