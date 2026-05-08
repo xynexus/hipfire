@@ -399,3 +399,24 @@ Cold load: target 9.0s on iGPU (system DDR5), draft 0.6s on gen1×1 (~150 MB at 
 **Verdict: M.2 gen1×1 hetero loses only 7.3% vs solo, BETTER than TB5 hetero (lost 10.5% on a different config but same latency-dominated regime). Per-call latency is the governing variable, not headline BW. PCIe-native µs latency floor on gen1×1 beats TB tunnel ms latency despite the BW handicap.**
 
 Prior "M.2 hetero is dead" / "structurally capped" framing fully retracted. Steady-state decode runs on on-card GDDR6 (~640 GB/s); the gen1×1 link only carries small per-cycle xcard transfers (KB-scale), not weights/KV.
+
+## Phase 9 coalesce A/B on M.2 gen1×1 — null result (2026-05-08)
+
+To test whether per-call HIP runtime launch overhead is a meaningful fraction of cross-card cost on PCIe-native µs-latency fabric (vs TB ms-latency where the coalesce was already null), re-bench Phase 9 coalesce ON vs OFF on hipx M.2 hetero:
+
+| Path | Median tok/s | τ |
+|---|---:|---:|
+| Coalesced (default, commit f50121f) | 97.91 | 13.27 |
+| `HIPFIRE_HETERO_NO_COALESCE=1` (per-row peer copies) | 97.44 | 13.27 |
+| Δ | **+0.47 tok/s (+0.48%)** | invariant |
+
+Within run noise. **Phase 9 launch overhead is not the bottleneck on M.2 gen1×1 either** — same regime as TB5. ROCm 7.2's burst-mode launch pipelining is amortizing per-call HIP runtime overhead away; coalescing into one big peer copy + same-card scatter doesn't help.
+
+Kills the "graph capture / kernel batching can lift hetero meaningfully" lever class on this codebase / ROCm 7.2 stack. The 7.34% gap-to-solo on M.2 hetero is **drafter compute + verify-side overhead, not cross-card launch cost.**
+
+Lever updates:
+- **hipGraph for xcard sequence**: ~~projected +3-5%~~ → **expected null** (same family as coalesce)
+- **Coalesce Phase 2 + 5**: ~~projected +2-5%~~ → **expected null** (same mechanism as Phase 9)
+- **hipMemcpyBatchAsync**: ~~projected +3-5%~~ → **expected null**
+- **PR 5 cycle pipelining**: still real (overlaps work, doesn't reduce launches) — only remaining decode-side lever
+- **FP16-on-the-wire**: latency-dominated regime confirmed, halving bytes barely matters → ~0%
