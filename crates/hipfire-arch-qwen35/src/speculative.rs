@@ -2362,6 +2362,41 @@ pub fn scatter_hidden_block_to_interleaved_cross_card(
     let hidden = hidden_rb.hidden_dim;
     let row_bytes = hidden * 4;
 
+    // HIPFIRE_HETERO_NO_COALESCE=1 forces the per-(row, ext) fallback so we
+    // can A/B the f50121f coalesce on a given fabric. The coalesce was null
+    // on TB5 (fabric-bound); on faster fabrics with lower per-call latency
+    // floor (PCIe gen1+) the per-call HIP launch overhead may become the
+    // larger fraction and the coalesce wins. Default OFF — coalesced path
+    // is the production default.
+    if std::env::var("HIPFIRE_HETERO_NO_COALESCE").ok().as_deref() == Some("1") {
+        let max_pos = hidden_rb.max_positions;
+        let head = hidden_rb.head;
+        let written = hidden_rb.written;
+        assert!(block_size <= written,
+            "scatter_cross_card no-coalesce: block_size {block_size} > written {written}");
+        let start_slot = (head + max_pos - block_size) % max_pos;
+        for r in 0..n_rows {
+            let slot = (start_slot + r) % max_pos;
+            let dst_row = dst_row_offset + r;
+            let dst_row_base_bytes = dst_row * num_extract * row_bytes;
+            for ext in 0..num_extract {
+                let src_offset_bytes = slot * row_bytes;
+                let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
+                let evt = multi_gpu::cross_card_copy_at(
+                    target_gpu,
+                    drafter_gpu,
+                    &hidden_rb.layer_bufs[ext].buf,
+                    src_offset_bytes,
+                    &dst.buf,
+                    dst_offset_bytes,
+                    row_bytes,
+                )?;
+                multi_gpu::cross_card_wait(drafter_gpu, evt)?;
+            }
+        }
+        return Ok(());
+    }
+
     // Step 1: same-device D2D scatter into `staging` on target_gpu.
     // Writes contiguous rows starting at staging row 0 (independent of
     // `dst_row_offset`, which addresses the drafter-side dst layout).
