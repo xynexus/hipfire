@@ -382,3 +382,20 @@ Primary sources for this snapshot, all available via `exec:recall`:
 - `project_hiptrx_worktree_and_gfx12_isa_2026_05_03` — gfx12 ISA
   inventory, biggest unused levers.
 
+
+## M.2 hetero PP empirical witness — 2026-05-08 (RETRACTS prior null verdict)
+
+After CLKRQ#/PSU FORCE ON, the M.2 9070 XT eGPU runs hetero PP with the 27B target on gfx1151 iGPU. Witnessed at HEAD `eccf06ce`:
+
+| Config | Decode tok/s (med, n=3) | τ | Solo % |
+|---|---:|---:|---:|
+| Solo gfx1151 (merge_sort, max=256, asym3, DPM warmup) | **105.67** | 13.27 | 100.0% |
+| Hetero gfx1151 + 9070 XT drafter (gen1×1, M.2) | **97.91** | 13.27 | **92.66%** |
+
+Cold load: target 9.0s on iGPU (system DDR5), draft 0.6s on gen1×1 (~150 MB at ~250 MB/s — matches expected link BW for one-time drafter upload).
+
+τ bit-identical to hiptrx PCIe gen5 ×16 hetero at the same canonical config — drafter predictions correct, link gen does not affect spec-decode quality.
+
+**Verdict: M.2 gen1×1 hetero loses only 7.3% vs solo, BETTER than TB5 hetero (lost 10.5% on a different config but same latency-dominated regime). Per-call latency is the governing variable, not headline BW. PCIe-native µs latency floor on gen1×1 beats TB tunnel ms latency despite the BW handicap.**
+
+Prior "M.2 hetero is dead" / "structurally capped" framing fully retracted. Steady-state decode runs on on-card GDDR6 (~640 GB/s); the gen1×1 link only carries small per-cycle xcard transfers (KB-scale), not weights/KV.
