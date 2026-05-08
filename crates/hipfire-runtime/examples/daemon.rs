@@ -2140,7 +2140,28 @@ fn generate_dflash(
     }
     // Prime the draft's GPU target_hidden buffer from the prompt rows so the
     // first spec step can skip the CPU→GPU upload of the whole context.
-    if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
+    //
+    // Hetero path (drafter on a different device): scatter_hidden_block_to_
+    // interleaved would be a cross-device hipMemcpyDeviceToDevice (src on
+    // target hidden_rb, dst on drafter target_hidden), which routes through
+    // HIP's broken P2P path and crashes inside libamdhip64.so on
+    // TB5+gfx1010 (asymmetric peer access). target_hidden_host is already
+    // populated by seed_target_hidden_from_prompt; upload directly via H2D
+    // from the drafter to sidestep cross-device D2D entirely. Mirrors
+    // dflash_spec_demo's commit 9ba0b87 fix.
+    if let Some(d) = m.dflash_drafter_gpu.as_mut() {
+        if let Err(e) = d.bind_thread().and_then(|_| {
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    df.target_hidden_host.as_ptr() as *const u8,
+                    df.target_hidden_host.len() * 4,
+                )
+            };
+            d.hip.memcpy_htod(&df.draft_scratch.target_hidden.buf, bytes)
+        }) {
+            eprintln!("[dflash] hetero seed H2D failed: {e} — falling back to per-cycle upload");
+        }
+    } else if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
         gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
         0, prompt_tokens.len(), prompt_tokens.len(),
     ) {
