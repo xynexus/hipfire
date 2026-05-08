@@ -1,5 +1,14 @@
 # Multi-GPU + eGPU state across arches — 2026-05-08 snapshot
 
+> **SUPERSEDED 2026-05-08 (late session):** integrated and extended in
+> `docs/heterogeneous-architecture-overview-2026-05-08.md` — the
+> single-doc synthesis that covers all eGPU/native PCIe/M.2 + RDNA1
+> through RDNA4 + TB3/TB5/M.2/PCIe gen1×4/PCIe gen5×16 fabric findings
+> + the full PR 5 path_d.md ladder (D0a through speculative prefetch)
+> bench across hipx iGPU + hiptrx 1×R9700 + 4×R9700 silicon-invariance
+> + PP=4 cluster baseline. This file remains as a mid-session snapshot
+> reference; the overview is the active synthesis.
+
 Branch: `feat/hetero-pp-dflash`. Captures the full empirical position after PR-A
 foundation + PR 4 (PFlash+DFlash compose) + PR 5 (probe-scoped event sync)
 across hipx (Strix Halo iGPU + 4-eGPU rig), hiptrx (4× R9700 PCIe gen5), and
