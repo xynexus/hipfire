@@ -31,6 +31,60 @@ serializing handle creation; the underlying HIP/amdgpu race is unresolved
 (memory entry `project_hetero_dflash_pra_session_2026_05_07`). TB3 paths and
 gfx1201 cold-plug are clean on both ports.
 
+#### M.2-direct slot — silicon-locked to ×1, retimer/SI gates speed at gen1
+
+A separate 9070 XT was probed on hipx via an M.2-to-PCIe-with-Navi-10-XL-switch
+adapter (the second M.2 slot, BIOS label `ssd1`, root port `00:02.4`). After
+SR-IOV and `ssd1` were both enabled in BIOS:
+
+| Endpoint | Capability | Trained state |
+|---|---|---|
+| `00:02.4` (host root port) | gen4 ×1 (`Speed 16GT/s, Width x1`) | gen1 ×1 (`Speed 2.5GT/s, Width x1`) |
+| `63:00.0` (Navi 10 XL switch upstream) | gen5 ×16 (`Speed 32GT/s, Width x16`) | gen1 ×1 (`Speed 2.5GT/s (downgraded)`) |
+| `64:00.0` (switch downstream → card) | gen5 ×16 | gen5 ×16 |
+| `65:00.0` (9070 XT card) | gen5 ×16 | gen5 ×16 |
+
+**Width is silicon-locked to ×1** at the host root port — SR-IOV/`ssd1` BIOS
+toggles cannot widen this; the second M.2 slot is wired ×1 by Strix Halo's
+16-lane PCIe budget allocation (×4 NVMe + 2× ×1 NIC + ×1 WiFi + ×1 second
+M.2 + 4-lane ×16 OCuLink/eGPU), confirmed by the lspci `LnkCap: Width x1`
+field and the Strix Halo PCIe lane breakdown documented across vendor sources
+(VideoCardz, ServeTheHome, ultrabookreview).
+
+**Speed is gated at gen1 by the adapter's retimer/SI**, not by silicon. Root
+port supports gen4 ×1 (sibling NICs trained at 16GT/s ×1 cleanly). Tried
+levers, all null — link still 2.5GT/s ×1:
+
+- Lever A — `setpci -s 63:00.0 CAP_EXP+10.w=20:20` (retrain bit on switch
+  upstream): no change.
+- Lever B — force target speed via `LnkCtl2` on root port `00:02.4`,
+  drop to gen1 then ramp to gen4 with retrain between each step: link
+  re-trained back to gen1.
+- Lever C — disable ASPM on all three nodes (`echo performance >
+  /sys/module/pcie_aspm/parameters/policy`, then clear LnkCtl bits 0–1
+  on `63:00.0`/`64:00.0`/`65:00.0`) followed by retrain: no change.
+- Lever D — PCI remove + rescan (`echo 1 > /sys/bus/pci/devices/0000:65:00.0/remove`
+  then `echo 1 > /sys/bus/pci/rescan`): card re-enumerated, link re-trained
+  to gen1.
+- Lever F (research): cross-referenced reports show `setpci` is reliable for
+  protocol-fallback (force lower) but unreliable for fixing physical-layer
+  training failures with retimer/switch chips in the path
+  ([Arch eGPU bandwidth thread](https://bbs.archlinux.org/viewtopic.php?id=295045),
+  [TI PCIe retrain FAQ](https://e2e.ti.com/support/processors-group/processors/f/processors-forum/1553181/faq-am68-am67-j722s-j721s2-j784s4-tda4vm-tda4vl-tda4vh-dra821-how-to-retrain-pcie-link-speed-between-gen1-2-5gt-s-gen2-5-0gt-s-and-gen3-8-0gt-s-speeds)).
+  Strix Halo wiki documents stable gen4 ×4 only via M.2-to-OCuLink adapter
+  ([M2OC-3 + Sixunited AXB35](https://strixhalo.wiki/Guides/External_GPU)) —
+  no working setpci recovery for the M.2-with-switch-chip topology has been
+  reported. `amdgpu pcie_gen_cap=0x80000` modprobe option is documented but
+  reported as ineffective for the host-side cap.
+
+**Conclusion — fabric tier on hipx is an OCuLink hardware swap, not a
+software lever.** The M.2-direct slot maxes at gen4 ×1 (~1.97 GB/s peak)
+even when fully recovered, and the present adapter caps that at gen1 ×1
+(~250 MB/s). For peer drafter / hetero PP cross-card BW, OCuLink-direct
+adapters (gen4 ×4, ~7.88 GB/s peak) win 4×–32× over either state of the
+current M.2-with-switch path. Recovery sequence not documented because
+no software recovery was witnessed.
+
 ### hiptrx — Threadripper 9970X + 4× R9700
 
 | Slot | Card | Arch | VRAM | Fabric | Notes |
