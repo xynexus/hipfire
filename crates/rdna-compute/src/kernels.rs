@@ -344,6 +344,16 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../k
 // the Strix Halo prefill gap vs llama.cpp (#60); also wins ~+20% on gfx1100
 // at pp≥256.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.hip");
+// gfx12 (RDNA4) port of the HFQ4-G256 MMQ residual GEMM. Sister of
+// GEMM_HFQ4G256_RESIDUAL_MMQ_SRC — same 128×128 MMQ tile recipe, Q8_1
+// activation pre-quant, scale/zero correction at sub-block granularity.
+// Differences vs RDNA3: __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12
+// (with the _gfx12 suffix), int32x2 per-lane operands (8 INT8 = K-half),
+// 2 WMMA calls per Q8_1 sub-block (one per K=16 sub-tile), and 8-row-block
+// acc layout (lane l, slot j → C[8*(l>>4) + j][l & 0xF]). Exposes
+// `quantize_q8_1_mmq_ds4_gfx12` + `gemm_hfq4g256_residual_mmq_gfx12`;
+// _full_add / _full_set boundary-elided variants are RDNA3-only for now.
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx12.hip");
 // gfx906 MMQ kernel (see docs/plans/gfx906-mmq-prd.md and
 // docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md).
 // Topology: nwarps=4, runtime-dispatched mmq_x ∈ {8,16,24,32,40,48,56,64},

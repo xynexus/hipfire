@@ -152,6 +152,13 @@ fn has_wmma_f16_gfx12(arch: &str) -> bool {
     arch.starts_with("gfx12")
 }
 
+/// Whether this arch is RDNA4 (gfx1200, gfx1201, R9700/9070-series).
+/// Used to route MMQ + WMMA call sites that need the `_gfx12` builtin
+/// suffix and 8-row-block acc layout.
+fn is_gfx12(arch: &str) -> bool {
+    matches!(arch, "gfx1200" | "gfx1201")
+}
+
 /// Gates the wave64 FP16 hybrid prefill path. gfx906 (Vega 20, MI50) is the
 /// only arch with measured data: +90% prefill on Qwen 3.5 9B (74 → 141 tk/s).
 /// gfx908 (CDNA1, MI100) shares __hfma2 + wave64 and would code-correctly
@@ -6867,6 +6874,12 @@ impl Gpu {
 
     /// Experimental llama.cpp-style MMQ residual GEMM for HFQ4-G256.
     /// Opt-in only via `HIPFIRE_WO_MMQ=1` while the tiled path is validated.
+    ///
+    /// gfx12 (RDNA4) routes to the sister kernel
+    /// `gemm_hfq4g256_residual_mmq.gfx12.hip` which uses the `_gfx12`-suffixed
+    /// iu8 K=16 WMMA builtin and the 8-row-block acc layout. The gfx12 sister
+    /// ships only the basic `_residual_mmq` variant — boundary-elided
+    /// `_full_add` / `_full_set` variants are RDNA3-only for now.
     pub fn gemm_hfq4g256_residual_mmq(
         &mut self,
         a_raw: &GpuTensor,
@@ -6878,16 +6891,25 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
-            "gemm_hfq4g256_residual_mmq_full_add"
+        let (module_name, src, kernel_name) = if is_gfx12(&self.arch) {
+            (
+                "gemm_hfq4g256_residual_mmq_gfx12",
+                kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC,
+                "gemm_hfq4g256_residual_mmq_gfx12",
+            )
         } else {
-            "gemm_hfq4g256_residual_mmq"
+            let name = if m % 128 == 0 && batch_size % 128 == 0 {
+                "gemm_hfq4g256_residual_mmq_full_add"
+            } else {
+                "gemm_hfq4g256_residual_mmq"
+            };
+            (
+                "gemm_hfq4g256_residual_mmq",
+                kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
+                name,
+            )
         };
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
-            kernel_name,
-        )?;
+        self.ensure_kernel(module_name, src, kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
