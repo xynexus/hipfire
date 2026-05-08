@@ -4318,8 +4318,10 @@ impl Gpu {
         // the gate/up FP16 shadows. rocBLAS launch overhead is small compared
         // to the GEMM work at prefill batches, so fusing into a single
         // concatenated matrix isn't worth the extra kernel code tonight.
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        if cdna3
+        // Routes through `rocblas_arch_eligible()` so the
+        // `HIPFIRE_ROCBLAS_ALL_ARCHS=1` smoke-path covers gate_up identically
+        // to qkv (gfx12 audit, 2026-05-08).
+        if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
             && !self.capture_mode
