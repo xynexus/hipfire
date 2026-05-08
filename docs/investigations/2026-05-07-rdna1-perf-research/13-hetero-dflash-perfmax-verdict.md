@@ -433,4 +433,58 @@ before retiring them. Until then, both stay env-gated default-OFF.
 - PLD + n-gram daemon activation: commit `e84cc31`
 - PLD + n-gram ON-path bench: this section, ad-hoc harness `/tmp/canonical_daemon_raw_bench.py` on hipx
 - PRD: `docs/plans/hetero-pflash-dflash.prd`
+
+## 4-arch drafter sweep (2026-05-08, 3-of-4 cards online)
+
+Re-anchored solo plus three live drafters on the same hipx session, same
+canonical bench config (27B mq4 target, 9B drafter, `--max 120
+--no-chatml`, prompt md5 `df5dedc8040ce70ba55080c4548e6024`,
+`prompt_normalize=true`), 3 runs per config, branch
+`feat/hetero-pp-dflash` HEAD `48af96a5`. The 6950 XT TB3 dock was
+unavailable this turn; its row is cited from the 2026-05-07 same-doc
+results table for completeness, awaiting same-session re-bench.
+
+| Config | min | median | max | % solo | τ |
+|---|---:|---:|---:|---:|---:|
+| Solo gfx1151 (re-anchor) | 82.16 | **82.21** | 82.35 | 100.0% | 10.4545 |
+| Hetero 5700 XT TB3 (RDNA1, HIP=3) | 60.88 | **61.19** | 61.42 | 74.4% | 10.4545 |
+| Hetero 9070 XT TB5 (RDNA4 17 GB, HIP=1) | 73.87 | **74.19** | 74.40 | 90.2% | 10.4545 |
+| Hetero R9700 TB5 (RDNA4 34 GB, HIP=2) | 73.31 | **73.60** | 73.80 | 89.5% | 10.4545 |
+| Hetero 6950 XT TB3 (RDNA2) — cited 2026-05-07 | — | 72.57 | — | 88.3% | 10.4545 |
+
+### Invariants
+
+- Solo re-anchor 82.21 vs prior 82.18 = 0.04% drift — session trustworthy.
+- `τ = 10.4545` on every one of 12 timed runs — zero drift across cards.
+- Decoded text byte-identical across all 4 working configs (coherent
+  Python LRU cache completion).
+- `accept_rate=0.6970`, `cycles=11`, `committed=137`, `accepted=115`
+  identical across configs — same draft/target trajectory regardless of
+  which physical card runs the drafter forward.
+- HIP enum equals ROCR enum this session: `0=gfx1151`, `1=9070`,
+  `2=R9700`, `3=5700 XT`.
+
+### Hypothesis verdict
+
+**Bandwidth saturates per-cycle drafter forwards on TB5; fabric latency
+dominates.** R9700 (34 GB, ~960 GB/s, 2× the 9070 XT CU count) and
+9070 XT (17 GB, ~640 GB/s) land 0.59 tok/s apart — well below the
+~5 tok/s threshold a BW-dominated workload would produce on this
+~50 % BW gap. The R9700's bandwidth advantage buys nothing at this
+prompt shape and drafter weight footprint.
+
+R9700 plateaus at 89.5 % of solo, statistically indistinguishable from
+the 6950 XT's 88.3 % (both within ~1 % of the same ceiling). The
+TB3 → TB5 fabric upgrade also produces no measurable lift on RDNA4 vs
+RDNA2 hetero — the two best drafters land within noise of each other
+despite the fabric difference. RDNA1 5700 XT at 74.4 % reflects a
+roughly additional 15 % draft-forward compute deficit on top of the
+shared ~10.5 % fabric ceiling — RDNA1 is genuinely slower per-forward,
+not fabric-blocked.
+
+PR 5 (drafter-side pipelining / dispatch overlap) is the only remaining
+lever to close the structural 10.5 % break-solo gap on this prompt.
+Nothing in the drafter card hierarchy buys back the per-cycle fabric
+latency on this fabric; only overlapping the draft forward with the
+target verify can.
 - Empirical anchors session: `09-per-card-prefill-rates.md`, `10-gfx1151-solo-dflash-27b.md`
