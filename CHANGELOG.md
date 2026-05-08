@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### feat(hetero-dflash): PR 5 path_d.md ladder D0a → speculative prefetch — NEGATIVE RESULT, default OFF
+
+Implemented the full `docs/plans/path_d.md` §D3b speculative draft prefetch
+through the primitives (D0a/D0b/D0c stream-async + draft-stream switch,
+D1 init_pipeline_streams, D2 DflashScratchPair, D3a skip_internal_commit)
+into a complete inter-cycle prefetch where cycle N's tail launches cycle
+N+1's draft_forward + lm_head + argmax download speculatively on
+`draft_stream`, and cycle N+1 takes the cached drafted and skips Phases
+2-5 entirely.
+
+**Implementation is correct.** Coherence-gate-dflash --fast PASS at env=1
+across canonical 27B prose + code battery. Tokens bit-identical between
+env=0 and env=1 in every config tested. τ invariant. 100% predraft
+hit rate where the eligibility gate passes (greedy + non-PLD + non-RP +
+non-ngram-block + supported lm_head dtype).
+
+**Feature is a NEGATIVE result.** Multi-host bench across all hipfire
+production silicon tiers:
+
+  hipx iGPU solo (gfx1151)   env=0 83.62  env=1 82.18  -1.7%
+  hiptrx 1× R9700 solo       env=0 194.03 env=1 180.13 **-7.16%**
+  hiptrx 4× R9700 per-card   env=0 194.58±0.24% env=1 181.21±0.20% mean -6.87%
+  hipx hetero (predraft bypassed)         env=0 79.10 env=1 79.34 +0.30% noise
+
+A 7% regression on canonical workstation hardware is a 7% regression.
+Implementation correctness does not redeem feature correctness. The
+projected 5-15% lift was BW-saturation-naive: at 77-91% peak BW on
+canonical 27B+DFlash decode, concurrent draft_stream + verify_stream
+contend for the same memory bus rather than overlapping.
+
+**Default OFF preserves byte-identical existing path.** The
+`HIPFIRE_DFLASH_PIPELINE=1` opt-in is documented as a failed-experiment
+opt-in for empirical comparison only. Do not enable in production.
+
+**Closes the path_d.md PR 5 chapter as failed-experiment.** The
+infrastructure (PredraftedBlock, pending_predraft, DflashScratchPair,
+stream-async primitives) remains on-branch as definitive empirical
+record of the attempt. Re-enabling requires a hardware/silicon
+configuration that inverts the BW-saturation pattern (lower-bpw quants
+that move the workload from BW-bound to compute-bound, OR silicon
+significantly above R9700's ~640 GB/s peak). Predicted null-to-negative
+on every other hipfire-target hardware until then.
+
+The actually-promising next levers (per
+`docs/heterogeneous-architecture-overview-2026-05-08.md` §11):
+- **Tensor Parallelism (TP)** for hiptrx-class workstation clusters —
+  expected 3-3.5× lift over solo R9700 on canonical 27B+DFlash
+  (~600 tok/s if implemented, vs 194 solo / 33.5 PP=4). Hipfire is
+  PP-only today; TP is the missing piece.
+- **gfx1201 kernel fusion to reduce launch count** — 867 launches/token
+  on 27B AR; 30% reduction potentially > any single-kernel optimization.
+
 ### feat(hetero-dflash): PR 5 probe-scoped event scaffolding (env-gated, no-op in sequential)
 
 Adds `HIPFIRE_DFLASH_PIPELINE=1` env-gate to `spec_step_dflash` that wires
