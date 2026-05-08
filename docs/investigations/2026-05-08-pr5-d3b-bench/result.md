@@ -65,6 +65,8 @@ download speculatively on draft_stream. Cycle N+1 entry takes the
 cache, waits the predraft event, skips Phases 2-5, and uses the
 cached drafted directly.
 
+#### hipx iGPU SOLO (gfx1151 target + gfx1151 drafter, lru max=120)
+
 | Run | env=0 | env=1 |
 |-----|------:|------:|
 | 1   | 83.73 | 82.27 |
@@ -72,21 +74,50 @@ cached drafted directly.
 | 3   | 83.45 | 82.09 |
 | **median** | **83.62** | **82.18** |
 
-Delta: **-1.7% at env=1 — env-1 strictly slower 3/3 runs.** Coherence-gate-
-dflash --fast PASS. Predraft hit rate 100% (10/10 cycles after cycle 0):
-```
-[predraft] hit pos=235 seed=303 b=16
-[predraft] hit pos=248 seed=1734 b=16
-... 10 hits per run, all matched expected_(position,seed,b) ...
-```
+Delta: **-1.7% at env=1 — env-1 strictly slower 3/3 runs.** 100%
+predraft hit rate (10/10 cycles after cycle 0). Coherence-gate-dflash
+--fast PASS.
 
-Tokens bit-identical between env=0 and env=1; τ=10.6364 invariant.
+#### hiptrx solo R9700 (gfx1201 target + gfx1201 drafter, merge_sort max=256, DPM_WARMUP=10)
+
+| Run | env=0 | env=1 |
+|-----|------:|------:|
+| 1   | 195.24 | 180.45 |
+| 2   | 194.03 | 180.13 |
+| 3   | 193.23 | 179.83 |
+| **median** | **194.03** | **180.13** |
+
+Delta: **-7.16% at env=1 — env-1 strictly slower 3/3 runs.** Larger
+regression than hipx iGPU because R9700 runs the same hot kernels
+closer to its peak BW (~640 GB/s) than the iGPU does to its peak
+(~256 GB/s effective on UMA). Predraft contention with verify on the
+same memory bus is more punishing on higher-peak-BW silicon.
+
+#### hipx HETERO (target=gfx1151 iGPU + drafter=gfx1201 9070 XT direct PCIe gen1×4, lru max=120)
+
+| Run | env=0 | env=1 |
+|-----|------:|------:|
+| 1   | 79.02 | 79.47 |
+| 2   | 79.27 | 79.20 |
+| 3   | 79.10 | 79.34 |
+| **median** | **79.10** | **79.34** |
+
+Delta: **+0.30% at env=1 — within noise.** Predraft is bypassed in
+hetero mode (the `pipeline_mode = ... && !hetero` guard) so env=1
+only triggers the probe-scoped event scaffolding — essentially no-op.
+The hetero baseline (79 tok/s) is ~5% slower than solo iGPU (83
+tok/s) due to cross-card embedding-lookup + draft-hidden transfers
+each cycle.
+
+Tokens bit-identical between env=0 and env=1 across all three
+configurations; τ invariant in every run.
 
 ## Why speculative prefetch didn't deliver
 
-The implementation is correct — 100% hit rate, every cycle's drafted
-matches what cycle N+1 would have computed inline. But measured perf
-regressed -1.7%. Diagnosed:
+The implementation is correct — 100% hit rate where it activates,
+every cycle's drafted matches what cycle N+1 would have computed
+inline. But measured perf regressed across BOTH solo configurations
+(-1.7% on hipx iGPU, -7.16% on hiptrx R9700). Diagnosed:
 
 1. **GPU memory bandwidth contention** (path_d.md §D3b risk analysis,
    "Bandwidth contention erodes overlap"). The 27B + 27B-DFlash
@@ -124,19 +155,46 @@ because it's the largest possible kernel-batching parallelism. It still
 nulls. Confidence rises that the canonical decode hot path is fully
 BW-bound and no kernel-level parallelism trick can extract more.
 
+## What hetero would need to participate
+
+Pipeline_mode is currently solo-only. To enable speculative prefetch in
+hetero would require:
+
+- Cross-card events (target_gpu records draft_done_evt; drafter waits
+  via `hipStreamWaitEvent` on its own stream — supported via
+  `hipExternalSemaphore_t` IPC OR direct event handle on same-host
+  multi-GPU)
+- Multi-stream cross-card scatter (predraft Phase 2 embedding lookup
+  needs target weights → cross-card transfer to drafter; predraft
+  Phase 5 needs drafter hidden → cross-card transfer to target)
+- Re-use the existing `cross_card_copy_via_pinned` path for the
+  cross-card legs — but on draft_stream rather than null stream
+
+Estimated effort: 100-150 LOC. Given the solo-mode regression on
+both hipx iGPU and R9700, hetero predraft is likely to ALSO regress —
+adding the cross-card transfer stalls during the speculative phase
+when the verify path doesn't need that bandwidth. Don't ship without
+re-evaluating the BW-saturation hypothesis.
+
 ## Default-OFF rationale (unchanged)
 
 `HIPFIRE_DFLASH_PIPELINE=1` opt-in. At default, every existing call
 site flows through the byte-identical sequential path. The cumulative
--0.27% (cross-cycle async) → -1.7% (speculative prefetch) regression
-at env=1 is invisible to production users.
+-0.27% (cross-cycle async) → -1.7%/-7.16% (speculative prefetch
+solo) regression at env=1 is invisible to production users.
 
-The path_d.md projected 5-15% lift was BW-saturation-naive; the actual
-ceiling on 27B + 27B-DFlash on hipx iGPU + R9700 is ~83 tok/s, achieved
-by the sequential path. To go above this requires (a) a model with
-lower per-token BW demand (smaller weights / lower-bpw quant), or
-(b) hardware with significantly higher peak BW than R9700/iGPU's
-~640 GiB/s.
+The path_d.md projected 5-15% lift was BW-saturation-naive; the
+actual ceilings empirically established this session:
+
+| Host           | Config                     | Peak tok/s |
+|---|---|---:|
+| hipx iGPU      | 27B + 27B-DFlash solo     | 83.62 (env=0) |
+| hipx hetero    | iGPU + 9070 XT direct gen1×4 | 79.10 (env=0) |
+| hiptrx R9700   | 27B + 27B-DFlash solo merge_sort | 194.03 (env=0) |
+
+Exceeding these requires (a) lower per-token BW demand (smaller
+weights / lower-bpw quant — Lloyd-MQ3, Lloyd-MQ2 are existing levers),
+or (b) hardware with peak BW significantly above R9700's ~640 GiB/s.
 
 ## What the cross-cycle async did NOT deliver
 
