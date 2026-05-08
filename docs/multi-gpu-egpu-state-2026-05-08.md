@@ -420,3 +420,44 @@ Lever updates:
 - **hipMemcpyBatchAsync**: ~~projected +3-5%~~ → **expected null**
 - **PR 5 cycle pipelining**: still real (overlaps work, doesn't reduce launches) — only remaining decode-side lever
 - **FP16-on-the-wire**: latency-dominated regime confirmed, halving bytes barely matters → ~0%
+
+## Direct PCIe gen1×4 hetero on hipx — 9070 XT via riser (2026-05-08)
+
+User plugged 9070 XT into a direct PCIe slot via riser. End-to-end LnkSta:
+- Card itself: gen5 ×16
+- Adapter switch (`65:00.0`): gen5 ×16
+- Adapter upstream port (`64:00.0`): gen1 ×4 (downgraded from gen5×16 cap)
+- **Host root port `00:03.1`: gen1 ×4** (capped at 16 GT/s ×4 in LnkCap; trains gen1 ×4)
+
+Same gen as M.2 gen1×1 path, but 4× the width → ~1 GB/s effective vs M.2's 250 MB/s.
+
+### Bench (3 runs, merge_sort canonical)
+
+| Run | tok/s | τ |
+|---:|---:|---:|
+| 1 | 98.42 | 13.27 |
+| 2 | 98.62 | 13.27 |
+| 3 | 98.74 | 13.27 |
+| Median | **98.62** | 13.27 |
+
+Cold load drafter: **0.18s** (vs M.2 gen1×1 0.59s — 3.3× faster, matches 4× width gain with some retimer loss).
+
+### Comparison
+
+| Path | LnkSta | Drafter cold | Decode tok/s | % of solo |
+|---|---|---:|---:|---:|
+| Solo gfx1151 | — | — | 105.67 | 100.0% |
+| **PCIe direct gen1×4** | gen1 ×4 | 0.18s | 98.62 | **93.33%** |
+| M.2 gen1×1 (coalesced) | gen1 ×1 | 0.59s | 97.91 | 92.66% |
+| M.2 gen1×1 (no-coalesce) | gen1 ×1 | 0.59s | 97.44 | 92.21% |
+
+### Verdict
+
+**Width upgrade ×1 → ×4 is null on decode (+0.72%).** Same gen → same latency floor → same per-cycle xcard cost in steady-state. The 4× width only helps cold load (one-time drafter upload).
+
+Confirms the 7.3% gap-to-solo on this codebase is **compute-bound** (drafter forward + verify-side), NOT fabric-bound. PCIe gen at the host root is the only fabric variable that moves the needle (gen1 → gen5 on hiptrx is +4 percentage points). Width is irrelevant in steady-state hetero spec-decode.
+
+Lever consequences:
+- ~~Plug into faster-width slot on hipx~~: null (only width changes, gen1 is the wall)
+- **PR 5 cycle pipelining**: only remaining decode-side lever (overlaps drafter compute with target verify)
+- Hipx M.2 gen1×1 stays the production-recommended hetero plug for hipx — direct PCIe gives no decode benefit, costs riser overhead, gains 0.4s on cold load (irrelevant)
