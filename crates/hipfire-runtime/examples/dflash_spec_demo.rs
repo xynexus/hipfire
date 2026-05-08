@@ -650,15 +650,36 @@ fn main() {
     // draft_scratch.target_hidden on GPU. This primes the GPU-resident
     // path in spec_step_dflash (ctx_slice=None) so it doesn't need to
     // round-trip target_hidden through the CPU shadow each cycle.
-    speculative::scatter_hidden_block_to_interleaved(
-        &gpu,
-        &hidden_rb,
-        &draft_scratch.target_hidden,
-        0,
-        prompt_tokens.len(), // block_size: seed wrote prompt_len contiguous slots
-        prompt_tokens.len(), // n_rows:     keep all of them
-    )
-    .expect("seed scatter");
+    //
+    // Hetero path (drafter on a different device): the same-card scatter
+    // would be a cross-device hipMemcpyDeviceToDevice (src on target, dst
+    // on drafter), which routes through HIP's broken P2P path and
+    // crashes inside libamdhip64.so on TB5+gfx1010 (asymmetric peer
+    // access). target_hidden_host already holds the seeded rows from
+    // seed_target_hidden_from_prompt, so an H2D upload from the drafter
+    // sidesteps cross-device D2D entirely.
+    if let Some(d) = drafter_gpu_opt.as_mut() {
+        d.bind_thread().expect("bind drafter for seed H2D");
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                target_hidden_host.as_ptr() as *const u8,
+                target_hidden_host.len() * 4,
+            )
+        };
+        d.hip
+            .memcpy_htod(&draft_scratch.target_hidden.buf, bytes)
+            .expect("seed H2D to drafter target_hidden");
+    } else {
+        speculative::scatter_hidden_block_to_interleaved(
+            &gpu,
+            &hidden_rb,
+            &draft_scratch.target_hidden,
+            0,
+            prompt_tokens.len(), // block_size: seed wrote prompt_len contiguous slots
+            prompt_tokens.len(), // n_rows:     keep all of them
+        )
+        .expect("seed scatter");
+    }
     draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
     // Seed per-row absolute positions for the draft's cross-attention RoPE.
     // Pre-eviction these match [0..prompt_len) exactly, so FlashCASK-free runs
