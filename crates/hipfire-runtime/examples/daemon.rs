@@ -824,6 +824,13 @@ fn main() {
                 // / enable_thinking knobs no-ops on the wire.
                 let max_think_tokens = msg.get("max_think_tokens")
                     .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                // raw=true bypasses ChatML wrapping (no system tag, no
+                // assistant role tag, no <think> opener). Mirrors
+                // dflash_spec_demo's --no-chatml flag. Useful for
+                // canonical benches and one-shot completion where the
+                // post-trained reasoning-mode default would tank τ.
+                // Defaults false (existing chat behavior).
+                let raw = msg.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
 
                 if image.is_some() && m.vision_config.is_some() {
                     generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
@@ -890,6 +897,7 @@ fn main() {
                         budget_alert_at_tok, &budget_alert_text, max_think_tokens,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
+                        raw,
                     );
                 }
             }
@@ -2010,6 +2018,7 @@ fn generate_dflash(
     pflash_alpha: Option<f32>,
     pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
     pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
+    raw: bool,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -2090,12 +2099,15 @@ fn generate_dflash(
 
     // Wrap with ChatML scaffold. q_tokens is either raw or PFlash-compressed
     // user content; the scaffold + system + assistant prefix are unchanged.
+    // raw=true (per-request) bypasses the scaffold and emits q_tokens
+    // verbatim — used for canonical benches where the model's
+    // post-trained <think> default would collapse τ.
     let prompt_tokens = hipfire_runtime::prompt_frame::ChatFrame {
         tokenizer,
         system: system_prompt,
         user: "", // unused: q_tokens passed via build_with_user_tokens
         assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        raw: false,
+        raw,
     }
     .build_with_user_tokens(&q_tokens);
 
@@ -2544,6 +2556,7 @@ fn generate_multi(
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
+    raw: bool,
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -2650,7 +2663,7 @@ fn generate_multi(
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "",
         assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        raw: false,
+        raw,
     }
     .build_with_user_tokens(&q_tokens);
 
@@ -2944,7 +2957,7 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, raw: bool) {
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
@@ -2953,6 +2966,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
             temp, top_p, max_tokens, repeat_penalty, repeat_window,
             budget_alert_at_tok, budget_alert_text, max_think_tokens,
+            raw,
         );
         return;
     }
@@ -2976,6 +2990,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             dflash_alpha,
             pflash_state,
             pflash_cfg,
+            raw,
         );
         // Silence unused-variable warnings for the params we didn't need.
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text);
@@ -3162,7 +3177,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
         assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        raw: false,
+        raw,
     }
     .build_with_user_tokens(&q_tokens);
 

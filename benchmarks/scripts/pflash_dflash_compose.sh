@@ -66,7 +66,7 @@ esac
 LOAD_JSON=$(jq -nc --arg model "$TARGET" --argjson params "$LOAD_PARAMS" \
     '{type:"load",model:$model,params:$params}')
 GEN_JSON=$(jq -nc --arg prompt "$PROMPT" \
-    '{type:"generate",id:"r1",prompt:$prompt,temperature:0.0,max_tokens:60}')
+    '{type:"generate",id:"r1",prompt:$prompt,temperature:0.0,max_tokens:60,raw:true}')
 
 echo "=== config: $CONFIG ===" >&2
 echo "=== HIPFIRE_DFLASH_DRAFTER_DEVICE: ${HIPFIRE_DFLASH_DRAFTER_DEVICE:-unset} ===" >&2
