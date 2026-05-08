@@ -78,6 +78,50 @@ Delta: **-1.7% at env=1 — env-1 strictly slower 3/3 runs.** 100%
 predraft hit rate (10/10 cycles after cycle 0). Coherence-gate-dflash
 --fast PASS.
 
+#### MQ3 (uniform 3-bit) 5-run on hiptrx — BW-saturation hypothesis test (REINFORCED)
+
+Test of "lower-bpw quants move workload from BW-bound to compute-bound,
+where predraft might invert the negative result." MQ3 has 19% lower
+per-token weight bytes than MQ4 (3.25 bpw vs 4 bpw + per-block scale
+overhead).
+
+Models: `qwen3.5-27b.mq3` (11.8 GB) + `qwen35-27b-dflash-mq3.hfq`
+(703 MB) — both downloaded from `schuttdev/hipfire-qwen3.5-27b` HF repo.
+Predraft eligibility extended to MQ3G256 / HFQ3G256 lm_head dispatch
+at commit `080c5b48`.
+
+Hiptrx 1× R9700, canonical merge_sort max=256, DPM_WARMUP=10:
+
+| Run | env=0 | env=1 |
+|---|---:|---:|
+| 1 | 212.81 | 196.98 |
+| 2 | 216.12 | 196.85 |
+| 3 | 214.94 | 196.59 |
+| 4 | 214.47 | 196.58 |
+| 5 | 214.04 | 197.13 |
+| **median** | **214.47** | **196.85** |
+| range | 3.31 (1.55%) | 0.55 (0.28%) |
+
+Delta: **-8.21% at env=1**, strictly slower 5/5 runs. Predraft hits
+12/cycle (perfect). τ=11.0000 invariant 10/10 runs.
+
+**The BW-saturation hypothesis is REINFORCED, not inverted.** The MQ3
+regression (-8.21%) is deeper than MQ4's (-7.16% at 5-run / -6.70%
+hardened). Two reinforcing mechanisms:
+
+1. **Lower acceptance**: MQ3 yields τ=11.0 vs MQ4's τ=13.27 (lower
+   draft-target argmax alignment per cycle on the 3-bit quant). Same
+   output → more cycles → more event-API overhead per output token.
+2. **BW relief is illusory at this scale**: while per-token weight
+   bytes drop ~19%, the verify step still saturates SDMA + memory
+   subsystem. Predraft contention takes a bigger relative chunk
+   because verify is shorter.
+
+This was the only experimental regime that could plausibly have
+inverted the verdict. It deepened it instead. The negative-result
+disposition (default OFF, do not enable) is now empirically robust
+across MQ4 (uniform 4-bit) AND MQ3 (uniform 3-bit) at 27B on R9700.
+
 #### Cross-process 5-run hardening (CLAUDE.md spec-decode rule compliance)
 
 Per CLAUDE.md: 5 runs, fresh process per run, stddev narrowing >30%
