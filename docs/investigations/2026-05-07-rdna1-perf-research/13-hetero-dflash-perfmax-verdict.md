@@ -365,6 +365,61 @@ solo + 10.27 hetero — invariant vs the pre-activation path. Empirical
 perf evaluation of the wired levers is left to a follow-up bench
 session; this commit is a wiring landing, not a perf claim.
 
+### ON-path bench (canonical LRU short prompt, daemon raw=true, 2026-05-08)
+
+Same canonical prompt (md5 `df5dedc8040ce70ba55080c4548e6024`, 232 tok),
+same daemon binary (commit `c2dcf4a`, md5 `4712ce885e8c9aac104a4fdc664d5348`),
+same 27B mq4 target + DFlash drafter, max_tokens=120, temp=0.0,
+`raw=true`, kv_mode=asym3, max_seq=4096. Solo = drafter on gfx1151;
+hetero = drafter on `HIP[1]` gfx1010 #1 via TB. OFF baseline carried
+forward from the previous section: solo 77.7 / 10.27, hetero 57.4 / 10.27.
+
+| Config | decode tok/s | τ | cycles | pld_hits | Δ tok/s vs OFF | Δ τ vs OFF |
+|---|---:|---:|---:|---:|---:|---:|
+| solo PLD-only (`HIPFIRE_DAEMON_PLD=1`) | 72.4 | 9.33 | 12 | 1 | -6.8% | -0.94 |
+| solo NGRAM-only (`HIPFIRE_DAEMON_NGRAM=1`) | 47.9 | 5.61 | 18 | 0 | -38% | -4.66 |
+| solo BOTH-on | 46.2 | 5.63 | 19 | 2 | -41% | -4.64 |
+| hetero PLD-only | 54.7 | 9.33 | 12 | 1 | -4.7% | -0.94 |
+| hetero NGRAM-only | 35.9 | 5.61 | 18 | 0 | -37% | -4.66 |
+| hetero BOTH-on | 35.2 | 5.63 | 19 | 2 | -39% | -4.64 |
+
+τ is bit-identical between solo and hetero in every row (9.33 / 9.33,
+5.61 / 5.61, 5.63 / 5.63), confirming the wiring preserves cross-card
+draft/target alignment under the new accept paths the same way the
+PR-A refactor preserves it under the original DFlash path. Decoded
+text was inspected on every run — clean Python LRU-cache code
+completion, no attractor or single-token loop signature.
+
+**Verdict, PLD on this prompt:** *net-negative*. ~1-2 spine hits per
+generation, modest ~5% decode penalty, τ slips outside the
+pre-registered ±0.5 envelope (9.33 vs 10.27). The bypass-mode spine
+the matcher proposes is honored by `spec_step_dflash` (the cycle
+count goes up by 1, exactly matching the one extra "free" cycle the
+spine creates), but the spine continuation drives one less-confident
+draft–target alignment per generation. Default OFF stays correct.
+
+**Verdict, NGRAM on this prompt:** *strongly net-negative*. Cycles
+jump 11 → 18, τ collapses 10.27 → 5.61, decode tok/s drops 38%. The
+bigram cache at `min_count=3` fires aggressively on the LRU code's
+repetitive identifier sequences (`self.`, `node.`, `self._`, etc.)
+and the override replaces higher-quality drafter predictions with
+lower-quality bigram continuations. Override correctness is intact —
+output is coherent and finishes the LRU implementation — but spec
+acceptance is starved. Default OFF stays correct.
+
+**Verdict, BOTH-on:** *dominated by NGRAM*. PLD's 2 hits don't
+recover the floor that NGRAM sets; the composition is essentially
+NGRAM's regression with PLD's small cycle delta layered on top.
+
+**Caveat — workload sensitivity:** these conclusions are pinned to
+the canonical 27B LRU short prompt (highly repetitive Python code,
+high in-distribution τ on the bare DFlash path). The bigram override
+that hurts here may help on prompts where the drafter is *worse*
+than the bigram (e.g. long OOD prompts where the verdict's NIAH
+sweep already showed τ=2.53 on bare DFlash). The PRD-relevant
+follow-up is to bench both levers on a low-baseline-τ workload
+before retiring them. Until then, both stay env-gated default-OFF.
+
 ## References
 
 - Body refactor: commit `ad235e5` `feat(hetero-dflash): spec_step_dflash dual-Gpu body refactor (PR-A step 2)`
@@ -376,5 +431,6 @@ session; this commit is a wiring landing, not a perf claim.
 - raw=true daemon flag: commit `b77cf72`
 - bench script `pflash_dflash_compose.sh` AR/AR+PF configs: commit `1a7ad25`
 - PLD + n-gram daemon activation: commit `e84cc31`
+- PLD + n-gram ON-path bench: this section, ad-hoc harness `/tmp/canonical_daemon_raw_bench.py` on hipx
 - PRD: `docs/plans/hetero-pflash-dflash.prd`
 - Empirical anchors session: `09-per-card-prefill-rates.md`, `10-gfx1151-solo-dflash-27b.md`
