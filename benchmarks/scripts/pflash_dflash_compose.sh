@@ -83,13 +83,15 @@ echo "=== log: $LOG ===" >&2
 # Send load → wait loaded → send generate → read until done.
 {
     echo "$LOAD_JSON"
-    # Wait briefly for load (large model takes ~10-15s), then send generate.
-    sleep 18
+    # Wait for target load (~30s for 27B) + DFlash drafter (~1s) + PFlash
+    # drafter (~30s with first-run JIT compile of gemm_hfq4g256_residual_mmq).
+    # Extend on cold cache; warm cache cuts to ~5s.
+    sleep 90
     echo "$GEN_JSON"
-    sleep 60
+    sleep 120
     echo '{"type":"unload"}'
-    sleep 1
-} | timeout 240 ./target/release/examples/daemon 2>"$LOG.stderr" | tee "$LOG" | \
+    sleep 2
+} | timeout 360 ./target/release/examples/daemon 2>"$LOG.stderr" | tee "$LOG" | \
     while IFS= read -r line; do
         case "$line" in
             *'"type":"loaded"'*)    echo "[LOADED]    $line" >&2 ;;
