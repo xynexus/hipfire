@@ -3799,7 +3799,10 @@ pub fn spec_step_dflash(
             && pld_spine.is_none()
             && matches!(
                 target.weights.output.gpu_dtype,
-                rdna_compute::DType::MQ4G256 | rdna_compute::DType::HFQ4G256
+                rdna_compute::DType::MQ4G256
+                    | rdna_compute::DType::HFQ4G256
+                    | rdna_compute::DType::MQ3G256
+                    | rdna_compute::DType::HFQ3G256
             )
             && matches!(
                 target.weights.embd_format,
@@ -3884,6 +3887,23 @@ pub fn spec_step_dflash(
                         rdna_compute::DType::HFQ4G256 => {
                             let predraft_x_tail = draft_scratch.x.sub_offset(h, next_batch * h);
                             gpu.gemm_hfq4g256_batched_lmhead(
+                                &w_out.buf, &predraft_x_tail, &logits_batch, w_out.m, w_out.k, next_batch,
+                            ).is_ok()
+                        }
+                        rdna_compute::DType::MQ3G256 => {
+                            if next_batch * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k {
+                                let rot = verify_scratch.rot.sub_offset(0, next_batch * w_out.k);
+                                let predraft_x_tail = draft_scratch.x.sub_offset(h, next_batch * h);
+                                gpu.rotate_x_mq_batched(&predraft_x_tail, &rot, w_out.k, next_batch)
+                                    .and_then(|_| gpu.gemm_hfq3g256_batched_lmhead(
+                                        &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, next_batch,
+                                    ))
+                                    .is_ok()
+                            } else { false }
+                        }
+                        rdna_compute::DType::HFQ3G256 => {
+                            let predraft_x_tail = draft_scratch.x.sub_offset(h, next_batch * h);
+                            gpu.gemm_hfq3g256_batched_lmhead(
                                 &w_out.buf, &predraft_x_tail, &logits_batch, w_out.m, w_out.k, next_batch,
                             ).is_ok()
                         }
