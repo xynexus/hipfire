@@ -602,3 +602,148 @@ workload at all.
 - Branch + HEAD: `feat/hetero-pp-dflash` @ `101f008`
 - Binaries: `/home/kaden/hipfire/target/release/examples/{dflash_spec_demo,peer_smoke}` (2026-05-08 09:37 UTC build)
 
+## PR 5 probe-scoped bench (2026-05-08, hiptrx)
+
+Implementation at commit `eccf06c`. The probe wires
+`hip_bridge::Event` scaffolding around Phase 4 (drafter forward) in
+`spec_step_dflash`: `event_create + event_record` on the drafter stream
+after `dflash::draft_forward`, `stream_wait_event` on the target stream
+before the Phase 5 lm_head GEMM, `event_destroy` at function exit.
+Gated by `HIPFIRE_DFLASH_PIPELINE=1` (default OFF).
+
+### Probe scope rationale (divergence from continuation step 4)
+
+The continuation prompt for this session described step 4 as a
+**speculative drafter launch** at the end of cycle N (using cycle N's
+posterior bonus as cycle N+1's seed) with a per-slot in-flight event +
+seed_token cache, allowing cycle N+1's draft work to overlap cycle
+N+1's verify forward.
+
+**That path is not safe in the current cycle structure.** Per
+`docs/plans/path_d.md` D3b explicit warning ("In the pipelined path,
+both legs would write the same buffers concurrently — a flat data
+race"), the speculative draft and the verify both write to shared
+`draft_scratch` state (logits / rot / target_hidden / hidden / etc.)
+without the `DflashScratchPair` from D1. Running it would either drift
+τ on small prompts (race-induced numerical mismatch in the seed flow)
+or appear correct by accident on prompts where the race window doesn't
+materialize.
+
+**Honest probe = no-op overhead measurement.** In the current
+sequential cycle structure, the inserted `stream_wait_event` is
+semantically a no-op: solo path the drafter and target share
+`gpu.active_stream` so the wait completes immediately; hetero path
+`cross_card_copy_via_pinned` host-blocks on the drafter stream at the
+start of Phase 5 anyway. The probe therefore measures (1) τ-invariance
+under the new code path (acceptance gate), and (2) per-cycle overhead
+of `event_create + event_record + stream_wait_event + event_destroy`.
+
+This does NOT validate path_d.md PR 5 itself — that requires the
+D0/D1/D2/D3a prereqs which restructure the cycle for actual draft↔verify
+overlap. The probe answers the narrower question: "does the event
+scaffolding alone, without cycle restructuring, recover anything?"
+
+### τ-invariance validation (hipx, canonical LRU prompt)
+
+Same canonical prompt (md5 `df5dedc8040ce70ba55080c4548e6024`, 232 tok),
+same daemon binary, 27B mq4 + qwen35-27b-dflash-mq4 drafter, max=120
+--no-chatml, kv_mode=asym3.
+
+| Config | τ | tok/s | Decoded text |
+|---|---:|---:|---|
+| solo OFF | 10.4545 | 82.36 | coherent Python LRU code |
+| solo ON | 10.4545 | 82.05 | coherent Python LRU code, byte-identical token stream |
+| hetero OFF (drafter HIP[1] gfx1010) | 10.4545 | 74.33 | coherent Python LRU code |
+| hetero ON (drafter HIP[1] gfx1010) | 10.4545 | 75.41 | coherent Python LRU code, byte-identical token stream |
+
+τ is **bit-identical** across all four configurations. Decoded text
+is identical 127-token sequences (DFlash tokens hash matches across
+ON/OFF on both solo and hetero). First-128 unique-token-ratio passes
+the coherence-gate-dflash thresholds. The probe is τ-invariant.
+
+### Performance (hiptrx 2× R9700 hetero, --drafter-device 1)
+
+3 runs ON + 3 runs OFF, same canonical prompt.
+
+| Run | OFF tok/s | ON tok/s |
+|---|---:|---:|
+| 1 | 148.45 | 151.17 |
+| 2 | 148.73 | 150.90 |
+| 3 | 148.61 | 150.97 |
+| **median** | **148.61** | **150.97** |
+| min | 148.45 | 150.90 |
+| max | 148.73 | 151.17 |
+| τ | 10.4545 (invariant) | 10.4545 (invariant) |
+
+**Δ = +2.36 tok/s median = +1.59% ON vs OFF.** The ON range
+(150.90–151.17) is non-overlapping with the OFF range (148.45–148.73)
+— a real positive signal, not session noise. OFF range tightness
+(0.19%) and ON range tightness (0.18%) are deterministic-spec-decode
+typical.
+
+### Verdict — recovers (small, structurally surprising)
+
+The probe-scoped slice produces a small but measurable **+1.59% gain**
+on hiptrx hetero R9700+R9700, contrary to the "pure no-op overhead"
+theoretical expectation. The expected result was either zero recovery
+(no-op interpretation correct) or a small regression (event-API
+overhead exceeds any incidental scheduling effect).
+
+Possible mechanisms (not yet validated — would need profiler / kernel
+trace to disambiguate):
+
+1. **Scheduling alignment.** The explicit event sync between drafter
+   stream and target stream gives the HIP runtime an explicit
+   dependency edge that may unlock more aggressive overlap of
+   subsequent kernel issues than the implicit
+   `cross_card_copy_via_pinned` host-block does. Even though the wait
+   itself is no-op, the runtime's view of the dependency graph
+   changes.
+2. **Cache effects.** The additional ~6 lines of host code on the
+   ON path may shift instruction cache layout in a way that
+   incidentally favors the next hot path. Plausible explanation for
+   small unstable wins on cycles ≤ 12 (this run had 11 cycles).
+3. **Compiler-level reordering.** The new `Option<Event>` binding may
+   nudge the compiler into a register allocation that makes the
+   per-cycle dispatch loop slightly cheaper.
+
+None of these are pipelining recovery in the path_d.md sense. The
++1.59% does NOT validate the full path_d.md ladder; it validates the
+event-scaffolding plumbing as correctness-safe and shows a benign-
+positive incidental side effect.
+
+### Recommendation
+
+The probe answers the empirical question: PR 5 alone (without D0-D3a)
+gives a **small positive** on hiptrx, not the deferred null result
+expected. This makes the full path_d.md ladder **mildly worth pursuing**
+on hetero hardware where the prereqs (D1 dual scratch, D3b cycle
+restructure) are already justified by the +1.59% incidental gain. On
+solo hipx the probe is within ±0.5% noise (82.36 → 82.05) — no signal,
+matching the theoretical no-op prediction.
+
+Specifically:
+
+- **Keep** the env-gated probe shipped (HIPFIRE_DFLASH_PIPELINE=1) for
+  hetero deployments — costs nothing on default-OFF, gives ~1.5% on
+  hetero R9700+R9700.
+- **Defer** the full D0-D3a path_d.md ladder unless headline tok/s on
+  hetero is the binding objective — incremental returns above the
+  +1.59% probe gain are not yet quantified, and the engineering cost
+  is multi-week (DflashScratchPair memory tax + cycle restructure +
+  τ-invariance debugging).
+- **Investigate** the +1.59% mechanism via rocprof / hipscope on a
+  follow-up before committing to the full ladder — knowing whether
+  it's scheduling alignment or cache effects shapes how D3b is
+  designed.
+
+### Bench artifacts
+
+- Probe commit: `feat/hetero-pp-dflash` @ `eccf06c`
+- Code change: `crates/hipfire-arch-qwen35/src/speculative.rs` ~70 LOC
+  added between Phase 4 (line ~2811) and end-of-fn return (line ~3492),
+  all under `if pipeline_probe_on { ... }` and `if let Some(evt) = probe_event { ... }` blocks.
+- hipx τ validation: 4 runs (solo OFF/ON, hetero OFF/ON) — all τ=10.4545.
+- hiptrx perf bench: 6 runs (3 OFF + 3 ON) — median Δ +1.59%.
+- Coherence-gate-dflash --fast PASS on local gfx1010 (5700 XT) at probe HEAD.
+
