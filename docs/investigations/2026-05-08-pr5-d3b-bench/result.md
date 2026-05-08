@@ -58,6 +58,86 @@ Delta: **+0.08% at env=1 — within noise.**
 Delta: **-0.27% at env=1 — env-1 strictly slower 3/3 runs but bounded
 by event-API overhead.** Coherence-gate-dflash --fast PASS.
 
+### Speculative prefetch (be7a9a2f — full path_d.md §D3b design)
+
+Cycle N tail launches cycle N+1's draft_forward + lm_head + argmax
+download speculatively on draft_stream. Cycle N+1 entry takes the
+cache, waits the predraft event, skips Phases 2-5, and uses the
+cached drafted directly.
+
+| Run | env=0 | env=1 |
+|-----|------:|------:|
+| 1   | 83.73 | 82.27 |
+| 2   | 83.62 | 82.18 |
+| 3   | 83.45 | 82.09 |
+| **median** | **83.62** | **82.18** |
+
+Delta: **-1.7% at env=1 — env-1 strictly slower 3/3 runs.** Coherence-gate-
+dflash --fast PASS. Predraft hit rate 100% (10/10 cycles after cycle 0):
+```
+[predraft] hit pos=235 seed=303 b=16
+[predraft] hit pos=248 seed=1734 b=16
+... 10 hits per run, all matched expected_(position,seed,b) ...
+```
+
+Tokens bit-identical between env=0 and env=1; τ=10.6364 invariant.
+
+## Why speculative prefetch didn't deliver
+
+The implementation is correct — 100% hit rate, every cycle's drafted
+matches what cycle N+1 would have computed inline. But measured perf
+regressed -1.7%. Diagnosed:
+
+1. **GPU memory bandwidth contention** (path_d.md §D3b risk analysis,
+   "Bandwidth contention erodes overlap"). The 27B + 27B-DFlash
+   decode hot kernels run at 491-585 GiB/s effective on R9700 / Strix
+   Halo iGPU — 77-91% of peak. Adding draft_stream work in parallel
+   doesn't unlock a second BW lane; both streams compete for the same
+   memory bus.
+
+2. **Compute-unit contention.** Phase 4-5 work on draft_stream uses
+   the same SMs/CUs as Phase 7 verify on verify_stream. ROCm's scheduler
+   serializes at the wave level when CU occupancy is saturated, which
+   on 27B decode it usually is.
+
+3. **Event-API + state-management overhead.** The cache check + event
+   create/record/wait/destroy at every cycle adds ~µs of CPU + HSA
+   queue work. Without compensating GPU-side overlap, this is a small
+   net cost.
+
+The empirical finding: **the full path_d.md §D3b speculative prefetch
+correctly skips cycle N+1's Phases 2-5 — but the GPU work that gets
+"saved" was already saturating the BW bus, and putting it on a
+parallel stream just creates contention, not concurrency.**
+
+This matches the larger pattern across this session and prior:
+
+- Phase 9 coalesce A/B null on TB5 + M.2 gen1×1 + direct PCIe gen1×4
+  (different fabrics, same null result — fabric/bus saturated).
+- Multi-row GEMV gfx1201 port NULL on R9700 (BW-saturated kernel).
+- Memory entry `project_hetero_session_2026_05_08_compaction.md`:
+  "Graph capture / kernel batching lever class is dead on this
+  codebase + ROCm 7.2."
+
+The speculative prefetch is the strongest counter-test of this pattern
+because it's the largest possible kernel-batching parallelism. It still
+nulls. Confidence rises that the canonical decode hot path is fully
+BW-bound and no kernel-level parallelism trick can extract more.
+
+## Default-OFF rationale (unchanged)
+
+`HIPFIRE_DFLASH_PIPELINE=1` opt-in. At default, every existing call
+site flows through the byte-identical sequential path. The cumulative
+-0.27% (cross-cycle async) → -1.7% (speculative prefetch) regression
+at env=1 is invisible to production users.
+
+The path_d.md projected 5-15% lift was BW-saturation-naive; the actual
+ceiling on 27B + 27B-DFlash on hipx iGPU + R9700 is ~83 tok/s, achieved
+by the sequential path. To go above this requires (a) a model with
+lower per-token BW demand (smaller weights / lower-bpw quant), or
+(b) hardware with significantly higher peak BW than R9700/iGPU's
+~640 GiB/s.
+
 ## What the cross-cycle async did NOT deliver
 
 The cross-cycle async eliminates the CPU-blocking
