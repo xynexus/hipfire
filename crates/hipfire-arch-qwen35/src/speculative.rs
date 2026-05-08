@@ -2627,6 +2627,17 @@ pub fn spec_step_dflash(
         && std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1");
     let host_path_active = rp_active || ngram_block_active;
 
+    // PR 5 probe-scoped event scaffolding: declared at outer scope so the
+    // assignment after Phase 4 (inside the DFlash-else branch) and the
+    // destroy at function end can both reach it. PLD bypass leaves
+    // `probe_event = None`, which is correct — no Phase 4 draft work to
+    // record an event against.
+    let pipeline_probe_on = std::env::var("HIPFIRE_DFLASH_PIPELINE")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let mut probe_event: Option<hip_bridge::Event> = None;
+
     if let Some(pld) = pld_spine {
         // PLD spine path: drafted tokens come from context-suffix match.
         // At temp>0, draft "probability" at each PLD token is 1.0 — PLD is
@@ -2810,6 +2821,40 @@ pub fn spec_step_dflash(
         )?,
     }
 
+    // ── 4.5. PR 5 probe-scoped event scaffolding (HIPFIRE_DFLASH_PIPELINE=1) ──
+    // Per docs/plans/path_d.md PR 5: insert HIP event_record on the drafter
+    // stream after Phase 4 and stream_wait_event on the target stream before
+    // Phase 5 lm_head GEMM. In the current sequential cycle structure this is
+    // SEMANTICALLY A NO-OP: solo path the drafter and target share
+    // gpu.active_stream so the wait completes immediately; hetero path the
+    // existing `cross_card_copy_via_pinned` host-blocks on the drafter stream
+    // at the start of Phase 5 anyway. Probe purpose: measure the per-cycle
+    // cost of event_create+record+wait+destroy and validate τ-invariance —
+    // the smallest faithful test that PR 5 alone (without the D0-D3a path_d.md
+    // prereqs that restructure the cycle for actual draft↔verify overlap) can
+    // recover any tok/s. DIVERGES from continuation-prompt step 4 (speculative
+    // launch with seed_token cache): that path would race against shared
+    // draft_scratch in the absence of DflashScratchPair from D1, per
+    // path_d.md D3b explicit warning ("In the pipelined path, both legs would
+    // write the same buffers concurrently — a flat data race"). The honest
+    // probe answer is the no-op overhead measurement.
+    //
+    // `probe_event` is declared at outer scope (above the PLD-else split at
+    // ~line 2650 via a mut binding pattern below) so the event_destroy at
+    // function-end can see it. We assign here only on the DFlash draft branch
+    // because PLD bypass skips Phase 4 entirely — there's no draft work to
+    // record an event against.
+    if pipeline_probe_on {
+        // Record the event on whichever Gpu actually ran draft_forward.
+        let (gpu_for_event, stream_for_event) = match drafter_gpu_opt.as_deref() {
+            Some(drafter) => (drafter, drafter.active_stream.as_ref()),
+            None => (&*gpu, gpu.active_stream.as_ref()),
+        };
+        let evt = gpu_for_event.hip.event_create()?;
+        gpu_for_event.hip.event_record(&evt, stream_for_event)?;
+        probe_event = Some(evt);
+    }
+
     // ── 5. Apply target.lm_head to draft hidden positions 1..B ──────────
     // Fast path: a single batched GEMM against target.weights.output over
     // (B-1) hidden rows at once. Drops lm_head from ~40 ms (B-1 serial
@@ -2845,6 +2890,17 @@ pub fn spec_step_dflash(
         let batch = b - 1;
         assert!(batch <= verify_scratch.max_n,
             "verify_scratch max_n {} < draft batch {}", verify_scratch.max_n, batch);
+        // PR 5 probe: target stream waits on drafter's draft_done event before
+        // consuming draft hidden state in lm_head. Solo path: same stream waits
+        // on its own event (no-op). Hetero path: cross_card_copy_via_pinned
+        // below already host-blocks on drafter, so this wait is also a no-op.
+        // The probe measures the per-cycle event API overhead, not pipelining
+        // recovery (which requires the path_d.md D0-D3a cycle restructure).
+        if let Some(evt) = probe_event.as_ref() {
+            if let Some(target_stream) = gpu.active_stream.as_ref() {
+                gpu.hip.stream_wait_event(target_stream, evt)?;
+            }
+        }
         let hidden_rows = if hetero {
             let drafter = drafter_gpu_opt.as_deref().expect("hetero implies Some");
             let n_bytes = batch * h * 4;
@@ -3426,6 +3482,17 @@ pub fn spec_step_dflash(
     }
     let _ = (t_phase, t_draft_end, t_verify_start, t_verify_end,
              t_accept_end, t_scatter_end, t_restore_end);
+
+    // PR 5 probe: destroy the per-cycle event on the Gpu that created it.
+    // Per-cycle create+destroy is wasteful but matches the probe's "smallest
+    // faithful" scope — the full path_d.md ladder allocates one event per
+    // pair (or session) and reuses across cycles.
+    if let Some(evt) = probe_event {
+        match drafter_gpu_opt.as_deref() {
+            Some(drafter) => drafter.hip.event_destroy(evt)?,
+            None => gpu.hip.event_destroy(evt)?,
+        }
+    }
 
     Ok(SpecStepResult {
         accepted: accept_len,
