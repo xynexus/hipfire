@@ -3107,14 +3107,15 @@ impl Gpu {
         // See gemv_rows_default() for the measurement data that motivates
         // the per-arch defaults.
         let rdna3 = matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
+        let rdna4 = is_gfx12(self.arch.as_str());
         let rows = gemv_rows_override().unwrap_or_else(|| gemv_rows_default(self.arch.as_str()));
         let use_multirow = rows > 1;
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
-        // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
+        // Other non-RDNA3/RDNA4 archs: use wide kernel (2 rows/block) for large M.
         let use_wide = !use_multirow
             && m >= 64
-            && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031" | "gfx1100" | "gfx1101" | "gfx1102");
+            && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031" | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1200" | "gfx1201");
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256", bytes);
@@ -3125,7 +3126,9 @@ impl Gpu {
                 8 => ("gemv_hfq4g256_multirow_r8", 8u32),
                 _ => unreachable!(),
             };
-            let (mr_name, mr_src) = if rdna3 {
+            let (mr_name, mr_src) = if rdna4 {
+                ("gemv_hfq4g256_multirow_rdna4", kernels::GEMV_HFQ4G256_MULTIROW_GFX1201_SRC)
+            } else if rdna3 {
                 ("gemv_hfq4g256_multirow_rdna3", kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC)
             } else {
                 ("gemv_hfq4g256_multirow_default", kernels::GEMV_HFQ4G256_MULTIROW_SRC)
@@ -5778,11 +5781,18 @@ impl Gpu {
                 8 => ("gemv_hfq4g256_residual_multirow_r8", 8u32),
                 _ => unreachable!(),
             };
-            self.ensure_kernel(
-                "gemv_hfq4g256_residual_multirow_rdna3",
-                kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC,
-                func_name,
-            )?;
+            let (mr_name, mr_src) = if is_gfx12(self.arch.as_str()) {
+                (
+                    "gemv_hfq4g256_residual_multirow_rdna4",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1201_SRC,
+                )
+            } else {
+                (
+                    "gemv_hfq4g256_residual_multirow_rdna3",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC,
+                )
+            };
+            self.ensure_kernel(mr_name, mr_src, func_name)?;
             let grid = ((m as u32) + grid_div - 1) / grid_div;
             self.launch_maybe_blob(
                 func_name,
@@ -14566,6 +14576,20 @@ impl Gpu {
                     specs.push(("gemv_hfq4g256_residual_multirow_rdna3",
                                 kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC.to_string()));
                 }
+                // gfx12 (RDNA4) multi-row GEMV — same opt-in env. Distinct
+                // module names from the gfx1100 variants so kernel-cache hashes
+                // don't collide. PRD Item 1: hypothesis is that RDNA4's larger
+                // VGPR budget per CU + improved wave scheduler turn the gfx11
+                // negative result into a positive. To be measured. Default
+                // path stays single-row until silicon shows otherwise.
+                if matches!(self.arch.as_str(), "gfx1200" | "gfx1201")
+                    && gemv_rows_override().unwrap_or(1) > 1
+                {
+                    specs.push(("gemv_hfq4g256_multirow_rdna4",
+                                kernels::GEMV_HFQ4G256_MULTIROW_GFX1201_SRC.to_string()));
+                    specs.push(("gemv_hfq4g256_residual_multirow_rdna4",
+                                kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1201_SRC.to_string()));
+                }
             }
             "mq4" => {
                 // MQ4 = FWHT-rotated HFQ4-G256 — default format for current registry.
@@ -14719,13 +14743,15 @@ impl Gpu {
                 // Arch-variant HFQ4 GEMV modules all expose the same symbol.
                 n if n.starts_with("gemv_hfq4g256_rdna") => vec!["gemv_hfq4g256"],
                 n if n.starts_with("gemv_hfq4g256_gfx") => vec!["gemv_hfq4g256"],
-                // Multi-row RDNA3 modules expose three entry points per .hsaco
-                "gemv_hfq4g256_multirow_rdna3" => vec![
+                // Multi-row RDNA3/RDNA4 modules expose three entry points per .hsaco
+                "gemv_hfq4g256_multirow_rdna3"
+                | "gemv_hfq4g256_multirow_rdna4" => vec![
                     "gemv_hfq4g256_multirow_r2",
                     "gemv_hfq4g256_multirow_r4",
                     "gemv_hfq4g256_multirow_r8",
                 ],
-                "gemv_hfq4g256_residual_multirow_rdna3" => vec![
+                "gemv_hfq4g256_residual_multirow_rdna3"
+                | "gemv_hfq4g256_residual_multirow_rdna4" => vec![
                     "gemv_hfq4g256_residual_multirow_r2",
                     "gemv_hfq4g256_residual_multirow_r4",
                     "gemv_hfq4g256_residual_multirow_r8",

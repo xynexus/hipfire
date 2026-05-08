@@ -487,6 +487,12 @@ pub const GEMM_GATE_UP_HFQ6G256_WMMA_GFX12_SRC: &str = include_str!("../../../ke
 pub const GEMV_HFQ4G256_MULTIROW_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_multirow.gfx1100.hip");
 pub const GEMV_HFQ4G256_MULTIROW_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip");
+// gfx12 (RDNA4) sister of the multirow variants. Body is byte-identical to
+// the gfx1100 file (only arch-neutral FP32 FMA + __shfl_down + bit_cast);
+// the separate const lets the dispatcher pick a different module name on
+// gfx1200/gfx1201 so kernel-cache hashes don't collide with gfx1100.
+pub const GEMV_HFQ4G256_MULTIROW_GFX1201_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_multirow.gfx1201.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1201_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1201.hip");
 
 // 4-way fused HFQ4-G256 projection for Qwen3.5 DeltaNet LA preamble:
 // wqkv + wz + w_beta + w_alpha in a single launch. Same 4x-unroll inner
