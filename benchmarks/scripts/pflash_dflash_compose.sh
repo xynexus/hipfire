@@ -57,6 +57,26 @@ case "$CONFIG" in
               prefill_min_keep:1024,
               prefill_profile:true}')
         ;;
+    ar)
+        # Plain AR on full prompt — no DFlash, no PFlash. Decode rate
+        # baseline for the long-context workload.
+        unset HIPFIRE_DFLASH_DRAFTER_DEVICE 2>/dev/null || true
+        LOAD_PARAMS=$(jq -nc '{max_seq:18000,kv_mode:"asym3"}')
+        ;;
+    ar+pf)
+        # AR + PFlash: prompt compressed, AR decode on smaller KV.
+        # Compares directly to hetero+pf to show whether spec-decode
+        # actually wins on this workload.
+        unset HIPFIRE_DFLASH_DRAFTER_DEVICE 2>/dev/null || true
+        LOAD_PARAMS=$(jq -nc --arg pfd "$PFLASH_DRAFT" \
+            '{max_seq:18000,kv_mode:"asym3",
+              prefill_compression:"always",
+              prefill_drafter:$pfd,
+              prefill_threshold:4096,
+              prefill_keep_ratio:0.5,
+              prefill_min_keep:1024,
+              prefill_profile:true}')
+        ;;
     *)
         echo "unknown config: $CONFIG" >&2
         exit 1
