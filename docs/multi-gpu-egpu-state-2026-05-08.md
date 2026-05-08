@@ -31,7 +31,7 @@ serializing handle creation; the underlying HIP/amdgpu race is unresolved
 (memory entry `project_hetero_dflash_pra_session_2026_05_07`). TB3 paths and
 gfx1201 cold-plug are clean on both ports.
 
-#### M.2-direct slot — silicon-locked to ×1, retimer/SI gates speed at gen1
+#### M.2-direct slot — width silicon-locked to ×1; speed gen1 cause unresolved (RETRACTED 2026-05-08: adapter PCB jumpers were missed)
 
 A separate 9070 XT was probed on hipx via an M.2-to-PCIe-with-Navi-10-XL-switch
 adapter (the second M.2 slot, BIOS label `ssd1`, root port `00:02.4`). After
@@ -49,11 +49,11 @@ toggles cannot widen this; the second M.2 slot is wired ×1 by Strix Halo's
 16-lane PCIe budget allocation (×4 NVMe + 2× ×1 NIC + ×1 WiFi + ×1 second
 M.2 + 4-lane ×16 OCuLink/eGPU), confirmed by the lspci `LnkCap: Width x1`
 field and the Strix Halo PCIe lane breakdown documented across vendor sources
-(VideoCardz, ServeTheHome, ultrabookreview).
+(VideoCardz, ServeTheHome, ultrabookreview). This finding stands.
 
-**Speed is gated at gen1 by the adapter's retimer/SI**, not by silicon. Root
+**Speed is stuck at gen1; root cause is NOT yet established.** Root
 port supports gen4 ×1 (sibling NICs trained at 16GT/s ×1 cleanly). Tried
-levers, all null — link still 2.5GT/s ×1:
+software levers, all null — link still 2.5GT/s ×1:
 
 - Lever A — `setpci -s 63:00.0 CAP_EXP+10.w=20:20` (retrain bit on switch
   upstream): no change.
@@ -77,13 +77,51 @@ levers, all null — link still 2.5GT/s ×1:
   reported. `amdgpu pcie_gen_cap=0x80000` modprobe option is documented but
   reported as ineffective for the host-side cap.
 
-**Conclusion — fabric tier on hipx is an OCuLink hardware swap, not a
-software lever.** The M.2-direct slot maxes at gen4 ×1 (~1.97 GB/s peak)
-even when fully recovered, and the present adapter caps that at gen1 ×1
-(~250 MB/s). For peer drafter / hetero PP cross-card BW, OCuLink-direct
-adapters (gen4 ×4, ~7.88 GB/s peak) win 4×–32× over either state of the
-current M.2-with-switch path. Recovery sequence not documented because
-no software recovery was witnessed.
+These four software levers are downstream of link-training negotiation;
+they cannot fix what the link layer has already settled at gen1. They
+are correctly recorded as null, but they do not establish that gen1 is
+silicon-locked.
+
+##### Missing from investigation — adapter PCB hardware jumpers (pending witness)
+
+The prior framing on this slot ("silicon-locked, no software lever can
+fix it") was wrong because the upstream investigation never enumerated
+the M.2-to-PCIe adapter board's own physical jumpers. Two are present
+on the adapter PCB and both can affect link training **before software
+sees the link**:
+
+- **CLKRQ# (AUTO / FORCE ON)** — controls whether the M.2 host's PCIe
+  reference clock is gated by the endpoint's CLKRQ# request line.
+  AUTO honors the host-handshake protocol; on Strix Halo's reduced-
+  sideband second M.2 slot the CLKRQ# line may not be wired through
+  reliably, in which case REFCLK delivery to the adapter is unstable
+  during link bring-up and the link falls back to gen1 at the speed
+  retrain step (gen3+ requires a clean REFCLK to negotiate). FORCE ON
+  delivers REFCLK unconditionally, bypassing the host-side CLKRQ#
+  handshake.
+- **PSU PWR (AUTO / FORCE ON)** — controls whether the adapter waits
+  for a host GPIO/power-good signal before delivering 12 V from the
+  external eGPU PSU to the GPU. AUTO waits for a host signal that
+  may not be wired through M.2 form-factor pinout; FORCE ON powers
+  the GPU from the eGPU PSU regardless. If AUTO is causing a partial
+  power-up sequence, the link may train at the most permissive (gen1)
+  state and never re-train upward.
+
+User is testing both jumpers in FORCE ON next. **Result pending.** This
+section will be updated when the test reports back. Until then:
+
+- Width-locked-to-×1 conclusion: **confirmed**, stands.
+- Gen1-speed root cause: **unresolved**. Candidates remaining: (a)
+  CLKRQ# AUTO REFCLK gating, (b) PSU PWR AUTO sequencing, (c)
+  retimer/SI in the M.2 ribbon, (d) some combination. Software levers
+  exhausted.
+- "Silicon-locked" terminal framing: **retracted**.
+
+Generalized lesson for adapter-mediated PCIe paths: enumerate adapter
+PCB hardware jumpers (CLKRQ#, PSU PWR, DC-IN selection, link-speed
+straps) FIRST, before reaching for `setpci`. Software levers run
+downstream of the adapter's link-training behavior and cannot
+override what the adapter has already negotiated at the physical layer.
 
 ### hiptrx — Threadripper 9970X + 4× R9700
 
