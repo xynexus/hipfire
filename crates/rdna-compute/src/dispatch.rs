@@ -341,6 +341,15 @@ pub struct Gpu {
     /// — Phase A is a non-behavioral scaffold.
     pub draft_stream: Option<hip_bridge::Stream>,
     pub verify_stream: Option<hip_bridge::Stream>,
+    /// Path D3b cross-cycle async: scatter_done_evt recorded on
+    /// `draft_stream` at end of cycle N's pipelined Phase 9. Cycle N+1's
+    /// `spec_step_dflash` entry takes this event and stream_wait_event's
+    /// it on the verify stream so the next draft_forward sees the scatter
+    /// result without a CPU-blocking stream_synchronize. Replaces the
+    /// minimal-D3b end-of-cycle sync with queue-side ordering. Cleaned up
+    /// on `destroy_pipeline_streams` (model unload) for the final-cycle
+    /// case.
+    pub pending_scatter_evt: Option<hip_bridge::Event>,
     /// MagnumQuant FWHT signs (256 floats each) + rotation scratch buffer.
     pub mq_signs1: Option<GpuTensor>,
     pub mq_signs2: Option<GpuTensor>,
@@ -576,8 +585,13 @@ impl Gpu {
 
     /// Path D1: cleanup hook for the long-running daemon. Called from
     /// `unload_model` so model swaps don't leak streams. Idempotent.
+    /// Also drains a `pending_scatter_evt` left over from a final
+    /// pipelined cycle whose successor never came (end-of-generation).
     pub fn destroy_pipeline_streams(&mut self) {
         self.bind_thread_or_warn();
+        if let Some(evt) = self.pending_scatter_evt.take() {
+            let _ = self.hip.event_destroy(evt);
+        }
         if let Some(s) = self.draft_stream.take() {
             let _ = self.hip.stream_destroy(s);
         }
@@ -683,6 +697,7 @@ impl Gpu {
             active_stream: None,
             draft_stream: None,
             verify_stream: None,
+            pending_scatter_evt: None,
             mq_signs1: None,
             mq_signs2: None,
             mq_x_rot: None,

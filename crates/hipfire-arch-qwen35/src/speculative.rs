@@ -2783,6 +2783,20 @@ pub fn spec_step_dflash(
         }
     }
 
+    // Path D3b cross-cycle async: if the previous cycle ran the pipelined
+    // branch and stashed a scatter_done_evt in `gpu.pending_scatter_evt`,
+    // wait it on verify_stream NOW so the upcoming draft_forward sees a
+    // consistent draft_scratch.target_hidden. Queue-side wait — does NOT
+    // block the CPU. Replaces the prior end-of-cycle stream_synchronize
+    // (which forced CPU-side serialization). Solo-only — hetero never
+    // populates this field.
+    if let Some(evt) = gpu.pending_scatter_evt.take() {
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.stream_wait_event(stream, &evt)?;
+        }
+        gpu.hip.event_destroy(evt)?;
+    }
+
     assert!(b >= 2, "dflash block size must be ≥ 2");
     // `target_hidden_host` is only authoritative on the ctx_slice=Some path,
     // where it backs the CPU slice handed to draft_forward. On the default
@@ -3682,15 +3696,21 @@ pub fn spec_step_dflash(
                         rows_to_keep,
                         draft_stream,
                     )?;
-                    // Sync draft_stream before the next cycle's draft_forward
-                    // reads draft_scratch.target_hidden. Async events into
-                    // the next cycle's draft are the path_d.md design but
-                    // require modifying draft_forward to insert
-                    // stream_wait_event — deferred. End-of-cycle sync here
-                    // is correctness-preserving + zero-regression at default
-                    // and pipelined modes; the stream concurrency win is
-                    // bounded by the smaller of (commit, scatter) durations.
-                    gpu.hip.stream_synchronize(draft_stream)?;
+                    // Path D3b cross-cycle async: record scatter_done_evt
+                    // on draft_stream and stash on gpu.pending_scatter_evt
+                    // for the next cycle's spec_step entry to wait. This
+                    // replaces the previous end-of-cycle CPU-blocking
+                    // stream_synchronize — the scatter now overlaps with
+                    // Phase 10 (DeltaNet rewind + KV update) on
+                    // verify_stream and the caller's inter-cycle CPU work.
+                    let scatter_done_evt = gpu.hip.event_create()?;
+                    gpu.hip.event_record(&scatter_done_evt, Some(draft_stream))?;
+                    // Drop any prior pending_scatter_evt (defensive — should
+                    // be None here because the cycle entry consumed it).
+                    if let Some(stale) = gpu.pending_scatter_evt.take() {
+                        let _ = gpu.hip.event_destroy(stale);
+                    }
+                    gpu.pending_scatter_evt = Some(scatter_done_evt);
                 } else {
                     scatter_hidden_block_to_interleaved(
                         gpu,
