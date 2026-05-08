@@ -2008,6 +2008,8 @@ fn generate_dflash(
     max_think_tokens: usize,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
+    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -2023,17 +2025,79 @@ fn generate_dflash(
     // when the env is unset (drafter_gpu=None → byte-identical single-Gpu
     // path).
 
-    // Tokenize with ChatML wrapping (identical to the AR path). System prompt
-    // is always prepended because this fast path is single-turn.
+    // Tokenize the user prompt raw first so PFlash can score/compress it
+    // before the ChatML scaffold is wrapped around it. This matches the AR
+    // path at lines 2525-2591 — PFlash compresses the user content, then
+    // build_with_user_tokens reframes the compressed list. When PFlash is
+    // off / unavailable, q_tokens == raw_q_tokens and the result is
+    // byte-identical to the previous ChatFrame::build() path.
     let tokenizer = m.tokenizer.as_ref().unwrap();
+    let raw_q_tokens: Vec<u32> = tokenizer.encode(prompt);
+
+    // PFlash + DFlash composition (PRD v1.2 PR 4). Mirrors AR's
+    // RequestKind detection so tool-call prompts skip compression.
+    let request_kind = match tokenizer.special_token_id("<tool_call>") {
+        Some(tid) => {
+            let in_user = raw_q_tokens.iter().any(|&t| t == tid);
+            let in_system = system_prompt
+                .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
+                .unwrap_or(false);
+            if in_user || in_system {
+                hipfire_arch_qwen35::pflash::RequestKind::ToolCall
+            } else {
+                hipfire_arch_qwen35::pflash::RequestKind::Text
+            }
+        }
+        None => hipfire_arch_qwen35::pflash::RequestKind::Text,
+    };
+    let q_tokens: Vec<u32> = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
+        match hipfire_arch_qwen35::pflash::maybe_compress_prompt(
+            gpu, state, cfg, &raw_q_tokens, request_kind, &[],
+        ) {
+            Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
+                let _ = writeln!(stdout,
+                    r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"total_ms":{}}}"#,
+                    id, cp.source_tokens, cp.kept_tokens,
+                    cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
+                    cp.source_md5, cp.compressed_md5,
+                    cp.timings.score_ms, cp.timings.total_ms,
+                );
+                let _ = stdout.flush();
+                cp.token_ids
+            }
+            Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
+                if !matches!(reason, hipfire_arch_qwen35::pflash::BypassReason::ModeOff) {
+                    let _ = writeln!(stdout,
+                        r#"{{"type":"pflash_bypass","id":"{}","reason":"{}"}}"#,
+                        id, reason.as_str().replace('"', "'"),
+                    );
+                    let _ = stdout.flush();
+                }
+                raw_q_tokens
+            }
+            Err(e) => {
+                let _ = writeln!(stdout,
+                    r#"{{"type":"pflash_error","id":"{}","reason":"{}"}}"#,
+                    id, e.to_string().replace('"', "'"),
+                );
+                let _ = stdout.flush();
+                raw_q_tokens
+            }
+        }
+    } else {
+        raw_q_tokens
+    };
+
+    // Wrap with ChatML scaffold. q_tokens is either raw or PFlash-compressed
+    // user content; the scaffold + system + assistant prefix are unchanged.
     let prompt_tokens = hipfire_runtime::prompt_frame::ChatFrame {
         tokenizer,
         system: system_prompt,
-        user: prompt,
+        user: "", // unused: q_tokens passed via build_with_user_tokens
         assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
         raw: false,
     }
-    .build();
+    .build_with_user_tokens(&q_tokens);
 
     // `im_end_token` is still needed downstream for the EOS check.
     let im_end = tokenizer.encode("<|im_end|>");
@@ -2896,33 +2960,25 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
     if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) {
-        // PFlash + DFlash decode path is not yet wired -- the DFlash spec
-        // loop builds its own prompt token stream internally, so the
-        // generate() PFlash block below never runs. Surface this loud so
-        // an operator who set prefill_compression != off sees a clear
-        // bypass event instead of silently getting full-prefill behavior
-        // they didn't ask for. Compression-on-DFlash lands in a future
-        // phase that threads PflashState through generate_dflash().
-        let mut dflash_bypass_reason: Option<&'static str> = None;
+        // PFlash + DFlash composition (PRD v1.2 PR 4): thread PflashState
+        // and PflashConfig through generate_dflash so the spec-decode
+        // path can call maybe_compress_prompt before seeding target KV.
+        // dflash_bypass_reason is surfaced in the final "done" event for
+        // observability (None when PFlash actually compressed, Some(reason)
+        // when it bypassed). dflash_alpha mirrors the AR path's behavior.
         let dflash_alpha = pflash_cfg.as_ref().map(|c| c.alpha);
-        if let Some(cfg) = pflash_cfg.as_ref() {
-            if cfg.mode != hipfire_arch_qwen35::pflash::PflashMode::Off {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"pflash_bypass","id":"{}","reason":"dflash_decode_active (pflash compression on the DFlash path is a follow-up; set dflash_mode=off to compress with AR decode)"}}"#,
-                    id,
-                );
-                let _ = stdout.flush();
-                dflash_bypass_reason = Some("dflash_decode_active");
-            }
-        }
         // max_think_tokens is now enforced inside generate_dflash (it
-        // mirrors the AR path's <think>/</think> counter). The "ignored
-        // on DFlash" warning that used to live here is gone -- the cap
-        // is real on both paths now.
-        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, dflash_bypass_reason, dflash_alpha);
+        // mirrors the AR path's <think>/</think> counter).
+        generate_dflash(
+            m, gpu, stdout, id, prompt, system_prompt, max_tokens,
+            max_think_tokens,
+            None,        // dflash_bypass_reason: emitted from inside generate_dflash now
+            dflash_alpha,
+            pflash_state,
+            pflash_cfg,
+        );
         // Silence unused-variable warnings for the params we didn't need.
-        let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
+        let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text);
         return;
     }
 
