@@ -50,6 +50,19 @@ Witnessed silicon results on hiptrx (4x R9700, gfx1201).
   ceiling as multirow null. Cold-start Run 1 showed 9B prefill=86.9
   tok/s (DPM cold-start artifact, not regression — Runs 2-3 recovered
   to 1388-1392); reported median-of-3 per CLAUDE.md prefill rule.
+- **REVERTED 67229bc4** (`b5451bd9`): User directive "mild regression ->
+  revert" applied. Although the 9B AR -1.4% delta was within the ±2%
+  session-noise envelope, it was real and consistent across 3 fresh
+  runs. Revert removes `gemv_hfq4g256_residual.gfx1201.hip` (new file)
+  + the kernels.rs const decls (`GEMV_HFQ4G256_GFX1201_SRC`,
+  `GEMV_HFQ4G256_RESIDUAL_GFX1201_SRC`) + the gfx1200/gfx1201 arms in
+  `gemv_hfq4g256_for_arch` and `gemv_hfq4g256_residual_for_arch`.
+  The previously-dead `gemv_hfq4g256.gfx1201.hip` source remains in
+  tree (predates this session) but returns to its unwired state.
+  Post-revert bench on hiptrx R9700 (3 fresh runs):
+  9B AR 101.7 / 101.4 / 101.4 tok/s = median 101.4 (= baseline);
+  27B AR 35.8 (identical); 27B DFlash merge_sort 191.81 τ=13.2727
+  (within noise of 191.5 baseline). Coherence-gate PASS at b5451bd9.
 
 ## v0.1.20 — engine modularization
 
