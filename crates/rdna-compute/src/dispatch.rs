@@ -322,6 +322,28 @@ impl DType {
     }
 }
 
+/// Path D3b speculative prefetch cache. Holds cycle N+1's pre-drafted
+/// token list + the event the next cycle waits before reading
+/// `draft_scratch.x` (which the predraft populated on `draft_stream`).
+pub struct PredraftedBlock {
+    /// Predicted tokens for positions 1..B of cycle N+1's block. Length
+    /// = expected_b - 1. Concatenated to the seed_token to form the full
+    /// block when the next cycle hits.
+    pub predictions: Vec<u32>,
+    /// Position cycle N+1 is expected to start at (= cycle_N_position +
+    /// accept_len + 1). Mismatch → MISS, discard cache.
+    pub expected_position: usize,
+    /// Bonus token from cycle N's verify (= cycle N+1's seed_token).
+    /// Mismatch → MISS (rare; means RP/ngram_block changed bonus).
+    pub expected_seed_token: u32,
+    /// Block size used for the predraft. Mismatch (adaptive-B changed B) → MISS.
+    pub expected_b: usize,
+    /// Recorded on draft_stream after the predraft's lm_head + argmax
+    /// download finished. Cycle N+1's verify_stream waits this event
+    /// before reading draft_scratch.x.
+    pub event: hip_bridge::Event,
+}
+
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 pub struct Gpu {
     pub hip: HipRuntime,
@@ -350,6 +372,14 @@ pub struct Gpu {
     /// on `destroy_pipeline_streams` (model unload) for the final-cycle
     /// case.
     pub pending_scatter_evt: Option<hip_bridge::Event>,
+    /// Path D3b speculative prefetch: cycle N tail launches cycle N+1's
+    /// draft_forward + target lm_head + argmax download on `draft_stream`,
+    /// caches the result here. Cycle N+1's spec_step entry consumes it
+    /// (if expected_position + expected_seed_token + expected_b match the
+    /// new cycle's actuals) and skips Phases 2-5, saving ~10-30 ms per
+    /// cycle on canonical 27B. Greedy-mode + non-PLD + no-RP + no-ngram-
+    /// block only. Cleaned up on model unload.
+    pub pending_predraft: Option<PredraftedBlock>,
     /// MagnumQuant FWHT signs (256 floats each) + rotation scratch buffer.
     pub mq_signs1: Option<GpuTensor>,
     pub mq_signs2: Option<GpuTensor>,
@@ -585,12 +615,16 @@ impl Gpu {
 
     /// Path D1: cleanup hook for the long-running daemon. Called from
     /// `unload_model` so model swaps don't leak streams. Idempotent.
-    /// Also drains a `pending_scatter_evt` left over from a final
-    /// pipelined cycle whose successor never came (end-of-generation).
+    /// Also drains `pending_scatter_evt` and `pending_predraft` left
+    /// over from a final pipelined cycle whose successor never came
+    /// (end-of-generation).
     pub fn destroy_pipeline_streams(&mut self) {
         self.bind_thread_or_warn();
         if let Some(evt) = self.pending_scatter_evt.take() {
             let _ = self.hip.event_destroy(evt);
+        }
+        if let Some(pd) = self.pending_predraft.take() {
+            let _ = self.hip.event_destroy(pd.event);
         }
         if let Some(s) = self.draft_stream.take() {
             let _ = self.hip.stream_destroy(s);
@@ -698,6 +732,7 @@ impl Gpu {
             draft_stream: None,
             verify_stream: None,
             pending_scatter_evt: None,
+            pending_predraft: None,
             mq_signs1: None,
             mq_signs2: None,
             mq_x_rot: None,

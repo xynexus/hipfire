@@ -2797,6 +2797,30 @@ pub fn spec_step_dflash(
         gpu.hip.event_destroy(evt)?;
     }
 
+    // Path D3b speculative prefetch: take any pending predraft from the
+    // previous cycle's tail. Hit if expected_(position, seed_token, b)
+    // match the new cycle's actuals. On hit, predraft_predictions is the
+    // (B-1)-token list to use as drafted, and the predraft_done event
+    // orders verify_stream's read of draft_scratch.x against the
+    // predraft's writes on draft_stream. On miss, discard the cache and
+    // run Phase 2-5 inline.
+    let mut predraft_hit = false;
+    let mut predraft_predictions: Vec<u32> = Vec::new();
+    if let Some(pd) = gpu.pending_predraft.take() {
+        let match_ok = pd.expected_position == position
+            && pd.expected_seed_token == seed_token
+            && pd.expected_b == b
+            && pd.predictions.len() == b - 1;
+        if match_ok {
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.stream_wait_event(stream, &pd.event)?;
+            }
+            predraft_predictions = pd.predictions;
+            predraft_hit = true;
+        }
+        gpu.hip.event_destroy(pd.event)?;
+    }
+
     assert!(b >= 2, "dflash block size must be ≥ 2");
     // `target_hidden_host` is only authoritative on the ctx_slice=Some path,
     // where it backs the CPU slice handed to draft_forward. On the default
@@ -2900,6 +2924,22 @@ pub fn spec_step_dflash(
                 draft_probs_at_drafted.push(1.0);
             }
         }
+    } else if predraft_hit {
+        // Path D3b speculative prefetch hit: cycle N's tail already ran
+        // Phase 2-5 (embedding lookup → draft_forward → target lm_head →
+        // argmax download) on `draft_stream` for cycle N+1's predicted
+        // (position, seed_token, b). The predraft_done event was waited
+        // at cycle entry so draft_scratch.x is consistent on
+        // verify_stream. Skip the entire DFlash draft chain — drafted
+        // gets the cached predictions, and `block[1..b]` will be filled
+        // from drafted at the unconditional loop below the PLD-else
+        // split. No softmaxes/probs needed: predraft is greedy-only by
+        // construction (eligibility check at launch enforces temp==0
+        // && !rp_active && !ngram_block_active).
+        for &tok in &predraft_predictions {
+            drafted.push(tok);
+        }
+        eprintln!("[predraft] hit pos={} seed={} b={}", position, seed_token, b);
     } else {
     // ── 2. noise_embedding = target.embed_tokens(block) written directly
     // into draft_scratch.x on GPU (no host round-trip). Target and draft
@@ -3736,6 +3776,169 @@ pub fn spec_step_dflash(
             draft_scratch
                 .target_hidden_abs_positions
                 .push(position as i32 + p as i32 + co);
+        }
+
+        // ── Path D3b speculative prefetch: launch cycle N+1's draft on
+        // draft_stream now that target_hidden + abs_positions are up to
+        // date. Eligibility:
+        //   - pipeline_mode (solo only — already guarantees not hetero)
+        //   - greedy + no RP + no ngram_block (deterministic seed_token)
+        //   - drafter_gpu_opt is None (solo) — implied by pipeline_mode
+        //   - lm_head dtype = MQ4G256 (canonical 27B mq4) + Q8_0 embed
+        //     (broaden later — see predraft_eligible block).
+        //
+        // The predraft writes draft_scratch.x and verify_scratch.logits/argmax
+        // on draft_stream concurrently with Phase 10's target_snap.restore_to
+        // and tape_replay on verify_stream — disjoint buffers, no race.
+        // Cycle N+1's spec_step entry waits the predraft event before any
+        // verify-stream read of draft_scratch.x.
+        let predraft_eligible = pipeline_mode
+            && !use_temp_sampling
+            && !rp_active
+            && !ngram_block_active
+            && pld_spine.is_none()
+            && matches!(
+                target.weights.output.gpu_dtype,
+                rdna_compute::DType::MQ4G256 | rdna_compute::DType::HFQ4G256
+            )
+            && matches!(
+                target.weights.embd_format,
+                hipfire_runtime::llama::EmbeddingFormat::Q8_0
+                    | hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
+            );
+
+        if predraft_eligible {
+            let next_position = position + accept_len + 1;
+            let next_seed = bonus_token;
+            let next_b = b;
+            let next_batch = next_b - 1;
+
+            // Switch active_stream → draft_stream; all dispatches that
+            // follow read gpu.active_stream and route to draft_stream.
+            let (saved, swapped) = gpu.enter_draft_stream();
+            if swapped {
+                let mut next_block: Vec<u32> = vec![mask_token; next_b];
+                next_block[0] = next_seed;
+
+                // Phase 2: embedding lookup for next_block into draft_scratch.x
+                for (i, &tok) in next_block.iter().enumerate() {
+                    let dst = draft_scratch.x.sub_offset(i * h, h);
+                    match target.weights.embd_format {
+                        hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
+                            gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+                        }
+                        hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
+                            gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
+                        }
+                        _ => unreachable!("predraft_eligible filters to Q8_0/HFQ4G256"),
+                    }
+                }
+
+                // Phase 3: positions for next cycle. abs_positions has just
+                // been updated to include accepted rows from cycle N, so it
+                // is the correct base for next cycle's positions_k.
+                let next_effective_ctx = draft_scratch.target_hidden_abs_positions.len();
+                let next_positions_q: Vec<i32> = ((next_position as i32 + co)
+                    ..(next_position as i32 + next_b as i32 + co))
+                    .collect();
+                let mut next_positions_k: Vec<i32> = Vec::with_capacity(next_effective_ctx + next_b);
+                next_positions_k.extend_from_slice(&draft_scratch.target_hidden_abs_positions);
+                for p in 0..next_b {
+                    next_positions_k.push(next_position as i32 + p as i32 + co);
+                }
+
+                // Phase 4: draft_forward on draft_stream (active_stream is
+                // routed there). target_hidden=None → reads GPU resident
+                // draft_scratch.target_hidden which the cycle-N scatter
+                // just populated.
+                let predraft_result = dflash::draft_forward(
+                    gpu,
+                    draft_weights,
+                    draft_cfg,
+                    None,
+                    None,
+                    &next_positions_q,
+                    &next_positions_k,
+                    next_b,
+                    next_effective_ctx,
+                    draft_scratch,
+                );
+
+                if predraft_result.is_ok() && next_batch <= verify_scratch.max_n {
+                    // Phase 5: target lm_head against the (next_b - 1)
+                    // last hidden positions. Match Phase-5 dispatch.
+                    let logits_batch = verify_scratch.logits.sub_offset(0, next_batch * vocab);
+                    let w_out = &target.weights.output;
+                    let phase5_ok = match w_out.gpu_dtype {
+                        rdna_compute::DType::MQ4G256 => {
+                            if next_batch * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k {
+                                let rot = verify_scratch.rot.sub_offset(0, next_batch * w_out.k);
+                                let predraft_x_tail = draft_scratch.x.sub_offset(h, next_batch * h);
+                                gpu.rotate_x_mq_batched(&predraft_x_tail, &rot, w_out.k, next_batch)
+                                    .and_then(|_| gpu.gemm_hfq4g256_batched_lmhead(
+                                        &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, next_batch,
+                                    ))
+                                    .is_ok()
+                            } else { false }
+                        }
+                        rdna_compute::DType::HFQ4G256 => {
+                            let predraft_x_tail = draft_scratch.x.sub_offset(h, next_batch * h);
+                            gpu.gemm_hfq4g256_batched_lmhead(
+                                &w_out.buf, &predraft_x_tail, &logits_batch, w_out.m, w_out.k, next_batch,
+                            ).is_ok()
+                        }
+                        _ => false,
+                    };
+
+                    if phase5_ok {
+                        // GPU-side batched argmax + sync download to host.
+                        // memcpy_dtoh is sync — it blocks the CPU until the
+                        // entire chain completes on draft_stream. The GPU
+                        // work overlapped with Phase 10 on verify_stream;
+                        // the CPU sync at the very end of the predraft
+                        // chain is acceptable (Phase 10 is short).
+                        let argmax_buf = verify_scratch.argmax.sub_offset(0, next_batch);
+                        let argmax_ok = gpu.argmax_f32_batched(
+                            &logits_batch, &argmax_buf, vocab, next_batch,
+                        ).is_ok();
+                        if argmax_ok {
+                            let mut host_idx = vec![0i32; next_batch];
+                            let bytes: &mut [u8] = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    host_idx.as_mut_ptr() as *mut u8, next_batch * 4)
+                            };
+                            let dl_ok = gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf).is_ok();
+                            if dl_ok {
+                                let predictions: Vec<u32> = host_idx.iter().map(|&x| x as u32).collect();
+                                // Record predraft_done_evt on draft_stream.
+                                if let Ok(evt) = gpu.hip.event_create() {
+                                    let stream_for_evt = gpu.active_stream.as_ref()
+                                        .map(|s| s as *const _);
+                                    let evt_ok = if let Some(sptr) = stream_for_evt {
+                                        let sref: &hip_bridge::Stream = unsafe { &*sptr };
+                                        gpu.hip.event_record(&evt, Some(sref)).is_ok()
+                                    } else { false };
+                                    if evt_ok {
+                                        if let Some(stale) = gpu.pending_predraft.take() {
+                                            let _ = gpu.hip.event_destroy(stale.event);
+                                        }
+                                        gpu.pending_predraft = Some(rdna_compute::PredraftedBlock {
+                                            predictions,
+                                            expected_position: next_position,
+                                            expected_seed_token: next_seed,
+                                            expected_b: next_b,
+                                            event: evt,
+                                        });
+                                    } else {
+                                        let _ = gpu.hip.event_destroy(evt);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            gpu.exit_draft_stream(saved, swapped);
         }
     }
 
