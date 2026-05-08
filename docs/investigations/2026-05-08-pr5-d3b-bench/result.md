@@ -93,18 +93,37 @@ R9700 individually replicates the env=1 regression to within 0.3%
 of the others. Confirms the BW-saturation diagnosis is a property
 of the gfx1201 silicon + workload, not a single-card anomaly.
 
-#### Note on hiptrx R9700 test scope
+#### hiptrx PP=4 cluster (27B layer-split 16/16/16/16 across 4× R9700, daemon mode)
 
-The R9700 test uses a **single** R9700 (target + drafter both on one card)
-because pipeline_mode in `spec_step_dflash` is single-GPU. PP=4 across
-the four R9700s in hiptrx is a separate code path (`generate_multi` in
-the daemon) and is currently bypassed by pipeline_mode entirely. To
-exercise predraft on a multi-GPU PP=4 setup would require integrating
-the speculative-prefetch logic into the PP boundary copies — a separate
-engineering piece not in this PR's scope.
+Daemon load: `pp:4 + draft:qwen35-27b-dflash-mq4.hfq + kv_mode:asym3 + max_seq:2080`,
+`HIPFIRE_PP_DFLASH=1` to lift the PP=N>1 + DFlash refusal. Layers
+distributed `[0..16, 16..32, 32..48, 48..64]` across devices `[0,1,2,3]`,
+output_device=3, peer_access=true.
 
-Single-R9700 is also the cleaner test of the BW-saturation hypothesis:
-no cross-card transfer noise to confound the kernel-contention measurement.
+| Run (env=0, single daemon load) | tok_s | decode_tok_s |
+|---|---:|---:|
+| r1 (cold first req) | 33.3 | 33.8 |
+| r2 | 33.0 | 33.5 |
+| r3 | 32.8 | 33.5 |
+| r4 | 32.6 | 33.4 |
+
+Decode median ≈ **33.5 tok/s** — about 5.8× slower than single-card
+solo R9700 (194 tok/s) due to per-cycle PP boundary-copy cost
+(3 cross-card layer-band transfers × every step + KV state
+distributed across cards).
+
+PP=4 doesn't go through `spec_step_dflash`'s `pipeline_mode` —
+the multi-GPU forward path lives in `generate_multi` and uses
+`forward_pp_batch` / boundary_copy. The PP=N>1 DFlash path is
+documented as PR2-4 of the hetero-pflash-dflash PRD ("not yet
+implemented — the load message will accept but generate will not
+run cross-card spec-decode"). Predraft therefore can't activate
+on PP=4 today; env=1 is bypassed at the same gate that bypasses
+hetero.
+
+The single-R9700 solo result (194 → 180 tok/s = -7.16% with
+predraft active) is the cleaner test of the BW-saturation
+hypothesis on gfx1201 silicon — no PP boundary transfer noise.
 
 #### hiptrx solo R9700 (gfx1201 target + gfx1201 drafter, merge_sort max=256, DPM_WARMUP=10)
 
