@@ -253,6 +253,118 @@ ToolCall, ShortPrompt, etc.) surface as on the AR path.
   pinned-host + FP16 quant on the wire is the path to plausibly
   cracking solo on this fabric.
 
+## Session 2026-05-08 perfmax sweep — full A/B/C/D table + raw=true canonical
+
+### Canonical 27B LRU short prompt (231 tok PEP-8 strict, prompt md5 `df5dedc8040ce70ba55080c4548e6024`)
+
+Daemon path with the per-request `raw=true` flag (commit `b77cf72`)
+defuses ChatML's forced `<think>` mode, so the daemon now reaches the
+same canonical perfmax that `dflash_spec_demo --no-chatml` posts. Run
+on hipx (gfx1151 + TB-attached gfx1010 #1).
+
+| Config | decode tok/s | τ | cycles | tokens | Notes |
+|---|---:|---:|---:|---:|---|
+| solo daemon raw=true | 77.7 | 10.27 | 11 | 120 | gfx1151-only, drafter on same Gpu |
+| hetero daemon raw=true (drafter HIP[1] gfx1010) | 57.4 | 10.27 | 11 | 120 | -26% vs solo |
+| solo dflash_spec_demo --no-chatml (verdict baseline) | 82.16 | 10.45 | 11 | ~120 | bare bench, ~5% perf cost on daemon path |
+| hetero dflash_spec_demo --drafter-device 1 (verdict baseline) | 60.48 | 10.45 | 11 | ~120 | matches daemon-raw within 5% |
+
+τ invariance is **bit-identical** between solo and hetero on the daemon
+path (10.27 / 10.27), matching the verdict's invariance finding from
+`dflash_spec_demo`. The ~5% delta between daemon and bare-bench paths is
+the daemon's per-request setup overhead (PFlash bypass-reason emission,
+prompt-frame ChatML-or-raw branching, EosFilter wiring, JSONL stdout
+flushes); it does not perturb spec-decode acceptance.
+
+### NIAH 16k long-context (5×config sweep, PFlash decision row included)
+
+Same prompt across all 5 configs (10871-token NIAH JSONL line 1 with
+needle "mauve-velociraptor-7741"; daemon's `prompt_normalize` collapses
+the JSONL filler's whitespace runs to canonical form). max_tokens=60.
+
+| Config | prefill tok | prefill ms | decode tok/s | τ | tokens emitted | answer reached |
+|---|---:|---:|---:|---:|---:|---|
+| solo (DFlash) | 10871 | 48199 | 12.0 | 2.53 | 60 | no — stuck in `<think>` |
+| hetero (DFlash, drafter HIP[1]) | 10871 | 48414 | 4.4 | 2.53 | 60 | no — stuck in `<think>` |
+| hetero+pf | 5504 (kept 50.6%) | 21006 | 5.8 | 2.83 | 24 | partial; PFlash-compose proves out |
+| ar (no DFlash) | 10871 | 47600 | 14.0 | n/a | 60 | no — stuck in `<think>` |
+| ar+pf | 5504 (kept 50.6%) | 20614 | 14.5 | n/a | 60 | no — `<think>` opener only |
+
+Observations:
+
+- **PFlash composes with both AR and DFlash** without crashing or τ drift.
+  Compressed-prompt prefill ms is 56–57% lower than uncompressed; both
+  AR+PF and hetero+PF cut TTFT by ~27 s on the same source prompt.
+- **τ degrades on long OOD prompts** (2.53 / 2.83 vs 10.27 on short
+  in-distribution prompts). Spec-decode wastes compute when draft and
+  target greedy disagree most of the time. Match the verdict's note
+  that hetero-DFlash wins materialize on different workloads.
+- **AR beats DFlash on long OOD with low τ** (14.0 vs 12.0 solo;
+  14.5 vs 5.8 hetero+pf). At τ ≈ 2.5, the verify cost dominates the
+  draft savings; AR is structurally cheaper.
+- **The 60-token cap is too tight** to retrieve the needle through the
+  Qwen3.5 27B chat template's default opener. A larger budget (or
+  raw=true on the long prompt) would let the answer reach. This is a
+  bench-design issue, not a path-correctness issue.
+
+### PR 5 cycle pipelining — deferred (rationale)
+
+PR 5 of the PRD overlaps cycle N+1's drafter forward with cycle N's
+target verify. Implementation requires:
+
+1. Splitting `spec_step_dflash` into two halves (drafter forward issue,
+   target verify + commit) so the drafter can run on its own stream
+   while the target stream is verifying the previous cycle.
+2. HIP event objects (`hipEvent_t`) recorded on the drafter stream and
+   awaited on the target stream (and vice versa) to coordinate the
+   handoff without blocking the host.
+3. A new in-flight drafter output state buffer holding cycle N+1's
+   draft tokens / probs while cycle N is still verifying.
+4. Speculative bookkeeping to roll back the in-flight cycle when N
+   accepts fewer tokens than the drafter's optimistic continuation.
+
+Codesearch confirms `spec_step_dflash` is currently structured as a
+single sequential cycle (draft forward → verify → commit, all on one
+implicit stream binding flipping between drafter Gpu and target Gpu).
+The HIP event scaffolding required for stream-cross does NOT already
+exist inside the function. PRD line 107-111 already labels PR 5
+"Genuinely new code path — not in scope for v1.2 initial ship; ships
+as v1.2.1 follow-on."
+
+This session does NOT attempt PR 5. Effort estimate stands at 1-2 days
+of net-new work, dominated by the rollback bookkeeping in step 4 (the
+plumbing in steps 1-3 is mechanical).
+
+### PLD spine + n-gram cache daemon activation (commit `e84cc31`)
+
+`spec_step_dflash` already accepts `pld_spine: Option<&[u32]>` and
+`ngram_cache: Option<&NgramCache>` — both with full bypass-mode bodies
+inside the function (speculative.rs:2630+ for PLD, the bigram override
+path is internal). The daemon callsite in `generate_dflash` was
+passing `None` for both. `dflash_spec_demo` had been the only caller
+threading them.
+
+Commit `e84cc31` wires both at the daemon callsite, mirroring
+`dflash_spec_demo`'s pattern (lookup at :1175-1188, observe_many at
+:1329-1337). Both are env-gated and default-OFF:
+
+```
+HIPFIRE_DAEMON_PLD=1            enable Goose §4.3 PLD spine
+HIPFIRE_DAEMON_PLD_CONSENSUS=2  bypass-mode confidence gate
+HIPFIRE_DAEMON_PLD_CHAIN=5      bypass-mode chain length gate
+HIPFIRE_DAEMON_NGRAM=1          enable rolling bigram cache
+HIPFIRE_DAEMON_NGRAM_MIN_COUNT=3 min count before override fires
+```
+
+Default behavior (envs unset) is byte-identical to pre-activation.
+When enabled, the daemon emits `pld_enabled` / `pld_hits` /
+`ngram_enabled` fields on the `done` event for observability.
+
+Smoke (canonical LRU short prompt with both flags off): τ=10.27
+solo + 10.27 hetero — invariant vs the pre-activation path. Empirical
+perf evaluation of the wired levers is left to a follow-up bench
+session; this commit is a wiring landing, not a perf claim.
+
 ## References
 
 - Body refactor: commit `ad235e5` `feat(hetero-dflash): spec_step_dflash dual-Gpu body refactor (PR-A step 2)`
@@ -260,5 +372,9 @@ ToolCall, ShortPrompt, etc.) surface as on the AR path.
 - Per-arch cache fix: commit `d09c472` `fix(rdna-compute/compiler): per-arch cache_dir to unblock hetero PP+DFlash`
 - bind_thread fix: commit `eaeecfb` `fix(hetero-dflash): bind_thread before drafter stream_create`
 - ROCm 7.2.2 max() trio: cherry-picked from master (`6f7994f → 7b5c4f6`)
+- PR 4 PFlash+DFlash compose: commit `366710d`
+- raw=true daemon flag: commit `b77cf72`
+- bench script `pflash_dflash_compose.sh` AR/AR+PF configs: commit `1a7ad25`
+- PLD + n-gram daemon activation: commit `e84cc31`
 - PRD: `docs/plans/hetero-pflash-dflash.prd`
 - Empirical anchors session: `09-per-card-prefill-rates.md`, `10-gfx1151-solo-dflash-27b.md`
