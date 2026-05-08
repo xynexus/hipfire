@@ -3,6 +3,22 @@
 Branch: `feat/gfx1201-kernel-tuning` off `origin/master` (`85678ede`).
 Worktree: `.worktrees/gfx1201-kernel-tuning/`.
 
+**Session log (2026-05-08, hiptrx silicon):**
+- **Item 5 SHIPPED** (`7b71453`): rocBLAS gfx12-leak audit. Verdict: `rocblas_arch_eligible()` correctly gates rocBLAS to gfx940/941/942 (CDNA3) only; gfx1200/1201 never reach rocBLAS in either decode (GEMV) or prefill (gemm_*_wmma_gfx12) paths. Fixed one inconsistency at `gemm_gate_up_hfq4g256` (hardcoded `cdna3 = matches!(...)` → `self.rocblas_arch_eligible()`) so `HIPFIRE_ROCBLAS_ALL_ARCHS=1` smoke covers gate_up identically to qkv. rocBLAS calls per token on 27B decode = 0 on gfx1201.
+- **Item 4 Phase 1 SHIPPED** (`07a17c40`): gfx12 HFQ4-G256 MMQ residual GEMM kernel + dispatch wiring + correctness test. Surgically extracted from research/iu4-activation-calibration without iu4/FP8 contamination. Builds + loads cleanly on gfx1201 (build_check), numerically equivalent to FP16-WMMA reference on R9700 (max abs err 0.00146, mean 0.000223, 0/25507 samples > 5% rel-err — well within Q8_1 tolerance). Direct-call only — production paths NOT yet wired (see Item 4 Phase 2/3).
+- **Item 1 SHIPPED with NULL verdict** (`ea69403` + `7398cb6`): gfx1201 multi-row GEMV port (gemv_hfq4g256_multirow.gfx1201.hip + residual sister). Body byte-identical to gfx1100 source (kernel uses arch-neutral FP32 FMA + __shfl_down + __builtin_bit_cast — no _gfx12 suffix, no acc-layout adaptation needed). Witnessed bench on hiptrx R9700 (DPM warmup 10s):
+  - 9B mq4 AR: R=1 101.4 / R=2 101.3 / R=4 101.4 tok/s — within 0.1%
+  - 27B mq4 AR: R=1 35.8 / R=2 35.8 / R=4 35.8 tok/s — identical
+  - **27B mq4 DFlash merge_sort (PRD target metric)**: R=1 191.51 / R=2 191.42 / R=4 191.28 tok/s, τ=13.273 invariant — within 0.12%, **R=1 matches PRD anchor 192.6 within 0.6% silicon variance**.
+  - Both archs effective BW ~500 GiB/s on AR — bandwidth-saturated. Multirow register-reuse cannot unlock more on RDNA4 (parity with gfx1100's negative; the PRD hypothesis "RDNA4's larger VGPR budget turns the gfx11 negative into a positive" is **falsified empirically**).
+  - Kernel ships opt-in default-off via `HIPFIRE_GEMV_ROWS={2,4,8}`. Default rows=1 unchanged.
+  - **One regression bug fixed mid-session** (`7398cb6`): the multirow commit also added gfx1200/gfx1201 to the `use_wide` exclusion list, intending the default path to be single-row. This regressed 9B prefill from anchor 1262 tok/s to 33.6 tok/s (38× slowdown) because gfx1201 default rows=1 needs the wide kernel (m≥64, 2 rows/block, 64 threads/block) — single-row is decode-only on this arch. **Rule: never add gfx1200/gfx1201 to the use_wide exclusion in `gemv_hfq4g256` dispatch.**
+- **Coherence-gate PASS on hiptrx** post-fix.
+
+**PRD premise re-examination:** per memory `feedback_hiptrx_153_vs_lmx_250_investigation_2026_05_08`, "real gfx1201/gfx1100 ratio on canonical merge_sort = 77% (gap is published arch-tier characteristic, not a flag/kernel bug)." Combined with the multirow null verdict on DFlash 27B (the actual target metric), the kernel-tier path to ≥250 tok/s is plausibly unreachable on R9700 silicon. Items 2 (fused QKV) and 3 (fused gate_up) face the same BW-saturation ceiling as Item 1 unless they unlock a fundamentally different bottleneck (e.g., launch-overhead amortization, not register reuse). Recommend Items 2-3 be gated on a per-kernel profile pass (rocprof) showing where the 192.6 vs 250 gap actually lives — if the kernel is BW-bound, no kernel-isa work will close it.
+
+---
+
 ## 1. Goal
 
 Close the gfx1100 → gfx1201 perf gap on hipfire's decode hot path. Target:

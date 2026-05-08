@@ -4,36 +4,6 @@
 # Goal: gfx1201 R9700 hits >=250 tok/s on canonical 27B merge_sort
 #       (currently 192.6, 77% of gfx1100's 250.3)
 
-- id: multirow-gemv-gfx1201
-  subject: Port multi-row GEMV (gemv_hfq4g256_multirow_r2 family) to gfx1201
-  status: pending
-  description: |
-    Mirror gfx1100 multirow GEMV implementation to gfx1201 with gfx12 wmma
-    operand shapes (<8 x fp16>), _gfx12 builtin suffix, 8-row-block acc readout.
-    Files: gemv_hfq4g256_multirow_r2.gfx1201.hip and the multirow family.
-  effort: large
-  category: feature
-  route_family: execution
-  load: 0.85
-  failure_modes: [execution-acc-layout-silent-corrupt, execution-operand-pack-stride]
-  route_fit: unexamined
-  authorization: weak_prior
-  blocking: []
-  blockedBy: []
-  acceptance:
-    - gemv_hfq4g256_multirow_r2.gfx1201.hip and family compile clean
-    - Max abs error vs fp32 reference < 1e-3 across 100 random shapes
-    - 27B mq4 merge_sort decode tok/s exceeds current 192.6 baseline
-    - tau-invariance 13.27 +/- 0.5 holds
-    - tests/speed-baselines/gfx1201.txt updated with new anchor
-    - scripts/coherence-gate.sh PASS
-    - scripts/coherence-gate-dflash.sh PASS
-    - Bench log records prompt md5 + --max + DPM warmup + --kv-mode
-  edge_cases:
-    - acc layout silent-corrupt class (validate against fp32 every shape)
-    - _gfx12 suffix mandatory else Cannot select intrinsic
-    - operand pack <16 x fp16> reuse from gfx11 yields wrong K accumulation
-
 - id: fused-qkv-qkvza-gfx1201
   subject: Port fused QKV / QKVZA family to gfx1201
   status: pending
@@ -84,47 +54,33 @@
     - Bench log records prompt md5 + --max + DPM warmup + --kv-mode
 
 - id: mmq-tile-autotune-gfx1201
-  subject: MMQ workgroup-tile auto-tune for gfx1201
+  subject: gfx12 MMQ phase 2/3 — production wiring + per-shape MMQ_X variants
   status: pending
   description: |
-    Per-shape MMQ_X selector for gfx1201 (currently uniform MMQ_X=8;
-    gfx1100 uses MMQ_X=8 for 9B and MMQ_X=16 for 27B). Under-utilizes
-    RDNA4 wavefront occupancy on 27B.
-  effort: small
-  category: refactor
-  route_family: execution
-  load: 0.4
-  failure_modes: [execution-vgpr-pressure-blowup]
-  route_fit: weak_prior
-  authorization: weak_prior
-  blocking: []
-  blockedBy: []
-  acceptance:
-    - MMQ dispatcher selects MMQ_X per shape on gfx1201
-    - Bit-exact regression on tests/speed-baselines/gfx1201.txt 27B prefill row
-    - 27B mq4 merge_sort decode tok/s >= prior baseline + 1%
-    - scripts/coherence-gate.sh PASS
+    PHASE 1 SHIPPED at 07a17c40 (2026-05-08): kernel + dispatch wiring +
+    correctness test passing on gfx1201 (max abs err 0.00146 < 0.1 Q8_1
+    tolerance). Direct-call only — production paths NOT yet wired.
 
-- id: rocblas-gfx12-audit
-  subject: Audit hipfire decode path for rocBLAS-on-gfx12 leakage
-  status: pending
-  description: |
-    Confirm hipfire's decode path is gating rocBLAS on gfx1201, or that
-    gfx12 fallback codepath has same 5.6x prefill regression. Fix gating
-    if leaky. Reference feedback_rocblas_gfx12_regresses.md.
-  effort: small
-  category: bug
-  route_family: boundary
-  load: 0.5
-  failure_modes: [boundary-rocblas-fallback-leak, observability-untraced-dispatch]
+    PHASE 2 (~1-2 hrs reach): HIPFIRE_GFX12_MMQ env-gate + production
+    routing through should_use_mmq + bypass mmq_screen_weight on gfx12.
+
+    PHASE 3 (multi-week per memory project_gfx12_mmq_bench_2026_05_04):
+    per-shape MMQ_X workgroup-tile variants (_x64, _x32) so the selector
+    wins on 9B (+10%) without regressing 4B (-19%) or 27B (-8%) at
+    MMQ_X=128. Workgroup-tile shape adapt is the highest-leverage fix.
+  effort: large
+  category: feature
+  route_family: execution
+  load: 0.6
+  failure_modes: [execution-vgpr-pressure-blowup, representation-quant-precision-cliff]
   route_fit: weak_prior
   authorization: weak_prior
   blocking: []
   blockedBy: []
   acceptance:
-    - rocBLAS calls per token on 27B decode = 0 (traced via dispatcher source)
-    - rocblas_arch_eligible NOT extended to gfx12
-    - Decision logged in PRD items.completed (gating present OR fix shipped)
+    - Phase 2 - HIPFIRE_GFX12_MMQ=1 routes 9B prefill through MMQ; 4B/27B fall through to FP16 WMMA
+    - Phase 3 - per-shape MMQ_X selector with _x64 / _x32 workgroup-tile variants
+    - Bit-exact regression on tests/speed-baselines/gfx1201.txt 27B prefill row
     - scripts/coherence-gate.sh PASS
 
 - id: lloyd-mq-batched-prefill-gfx1201

@@ -401,7 +401,36 @@ For dataclass benches:
 
 ---
 
-## 8 · Open questions agents can investigate
+## 9 · gfx1201 kernel-tuning campaign (2026-05-08 session)
+
+### Item 1 (COMPLETE, HYPOTHESIS FALSIFIED)
+
+**gfx1201 multirow GEMV AR-decode NULL result (2026-05-08)**
+
+Tested multirow rows={1,2,4} on hiptrx R9700 gfx1201 via bench_qwen35_mq4 + 10s DPM warmup:
+- 9B mq4 AR: 101.4 / 101.3 / 101.4 tok/s (parity within 0.1%)
+- 27B mq4 AR: 35.8 / 35.8 / 35.8 tok/s (identical)
+- Effective BW ~500 GiB/s on both = **saturated, no headroom**
+
+Replicates gfx1100 pattern: R=1 121 / R=2 120 / R=4 116 / R=8 109 tok/s (multirow regresses). RDNA4's larger VGPR budget + scheduler improvements did NOT reverse the multirow-negative into positive. Both archs are BW-bound on AR decode.
+
+**Conclusion:** PRD's "+15-25% on 27B decode" was wrong by order of magnitude. Multirow cannot unlock additional throughput on gfx1201 for AR-mode shapes.
+
+Shipped: commits ea69403 + 7398cb6. Kernel files byte-identical to gfx1100 multirow. Dispatcher wires opt-in via `HIPFIRE_GEMV_ROWS={2,4,8}`; default rows=1 unchanged.
+
+**CRITICAL: use_wide exclusion bug fixed in 7398cb6.** gfx1201 default rows=1 prefill REQUIRES wide kernel (m>=64, 2 rows/block, 64 threads/block). Single-row path is decode-only. Never add gfx1200/gfx1201 to use_wide exclusion — caused 1262 → 33.6 tok/s prefill regression (~30 min outage).
+
+### Items 2-4 (DEFERRED, gfx1201-only levers)
+
+Real 27B closure path for 192.6 → 250 tok/s target (+29%):
+- **Item 2:** fused-QKV gfx1201 port (WMMA-native wide dispatch)
+- **Item 3:** fused gate_up gfx1201 port (WMMA-native wide dispatch)
+- **Item 4:** workgroup-tile MMQ variants (mmq_screen cache interaction)
+- Alternative: DFlash-path-specific tuning (already pending PR 5 pipelining work)
+
+---
+
+## 10 · Open questions agents can investigate
 
 If you want to actively contribute findings, these are open:
 
@@ -419,7 +448,7 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-05-02 (v0.1.9-alpha — MQ3 production-ready: K4
+*Last updated: 2026-05-08 (gfx1201 kernel-tuning Item 1: multirow hypothesis
 decode, WMMA prefill family, DFlash cross-quant matrix, gfx12 port,
 cache-invalidation lifecycle, defensive parseToolCalls (#111 stopgap),
 gfx906 + gfx1152 arch gating, speed-gate DPM warmup). When this doc
