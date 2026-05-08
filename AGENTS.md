@@ -420,13 +420,38 @@ Shipped: commits ea69403 + 7398cb6. Kernel files byte-identical to gfx1100 multi
 
 **CRITICAL: use_wide exclusion bug fixed in 7398cb6.** gfx1201 default rows=1 prefill REQUIRES wide kernel (m>=64, 2 rows/block, 64 threads/block). Single-row path is decode-only. Never add gfx1200/gfx1201 to use_wide exclusion — caused 1262 → 33.6 tok/s prefill regression (~30 min outage).
 
-### Items 2-4 (DEFERRED, gfx1201-only levers)
+### Item 4 Phase 1 (gfx12 MMQ kernel) SHIPPED at 07a17c40
 
-Real 27B closure path for 192.6 → 250 tok/s target (+29%):
-- **Item 2:** fused-QKV gfx1201 port (WMMA-native wide dispatch)
-- **Item 3:** fused gate_up gfx1201 port (WMMA-native wide dispatch)
-- **Item 4:** workgroup-tile MMQ variants (mmq_screen cache interaction)
-- Alternative: DFlash-path-specific tuning (already pending PR 5 pipelining work)
+Surgically extracted `gemm_hfq4g256_residual_mmq.gfx12.hip` from research/iu4-activation-calibration (commits 5757283/0ca6ace4/d75605b7) without iu4/FP8 contamination. Uses `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12` (the unsuffixed builtin compiles but won't lower) + 8-row-block acc layout. Numerically equivalent to FP16-WMMA reference on R9700 (max abs err 0.00146 < Q8_1 tolerance). Direct-call only; NOT wired through `should_use_mmq` for production.
+
+Phase 2 (production wiring + HIPFIRE_GFX12_MMQ env-gate) and Phase 3 (per-shape MMQ_X workgroup-tile variants — `_x64`/`_x32`) are deferred. Phase 2 alone causes 4B (-19%) and 27B (-8%) regressions per memory `project_gfx12_mmq_bench_2026_05_04`; Phase 3 is multi-week.
+
+### Item 5 (rocBLAS audit) SHIPPED at 7b714532
+
+`rocblas_arch_eligible()` correctly gates rocBLAS to gfx940/941/942 only. gfx12 never reaches rocBLAS in either decode (GEMV) or prefill (gemm_*_wmma_gfx12) paths. Fixed one inconsistency at `gemm_gate_up_hfq4g256` (hardcoded `cdna3 = matches!(...)` → `self.rocblas_arch_eligible()`). rocBLAS calls per token on 27B decode = 0 on gfx1201.
+
+### Residual scan: gemv_hfq4g256_{plain,residual}.gfx1201.hip wired at 67229bc4
+
+Surfaced after the original PRD drained: `gemv_hfq4g256.gfx1201.hip` (2x unroll + s_prefetch_data) had been in tree but DEAD — no const decl in kernels.rs, dispatch arm at `gemv_hfq4g256_for_arch` commented out as `// "gfx1200" | "gfx1201" => ...,`. gfx1201 silently fell through to the gfx1010 cross-arch baseline. Wired both that file and a new 4-accumulator quad-unroll `gemv_hfq4g256_residual.gfx1201.hip` (per-quad `__builtin_amdgcn_s_prefetch_data` at offset +544 bytes / 4 groups ahead) into `gemv_hfq4g256_for_arch` + `gemv_hfq4g256_residual_for_arch` for gfx1200/gfx1201 via new module names `gemv_hfq4g256_rdna4` + `gemv_hfq4g256_residual_rdna4`. Entry-point map at dispatch.rs:14747 already covers the new module names via `n.starts_with("gemv_hfq4g256_rdna")`.
+
+Witnessed bench on hiptrx R9700 (3 fresh runs, DPM_WARMUP=10-15):
+- 9B mq4 AR: 99.9–100.2 tok/s decode (-1.2% to -1.4% vs 101.4 baseline, within ±2% session-noise envelope per CLAUDE.md). Prefill 1388-1392 (vs 1403.9 = -0.8% noise).
+- 27B mq4 AR: 35.8 tok/s (identical to baseline).
+- 27B DFlash merge_sort: 191.43 tok/s τ=13.273 invariant (vs 191.51 = -0.04% noise).
+
+Coherence-gate PASS at 67229bc4. Null verdict — same BW-saturated ceiling as multirow null. Cold-start Run 1 showed 9B prefill=86.9 tok/s (DPM cold-start artifact); Runs 2-3 with same env recovered to 1388-1392; reported median-of-3 per CLAUDE.md prefill rule.
+
+### Items 2/3/4-Phase-2-3/6 — DEFERRED with witnessed verdicts (long-form PRD authoritative)
+
+Per `docs/plans/gfx1201-kernel-tuning.prd.md`:
+- **Item 2 (fused QKV/QKVZA gfx1201):** PRD MISFRAMED. The `fused_qkv_*` and `fused_qkvza_*` kernels are non-WMMA cross-arch with arch-neutral FP32 FMA inner loops — kernel headers explicitly say "Arch coverage: works on every RDNA generation". Already running on gfx12 via the cross-arch path. Witnessed profile shows 80% peak BW = bandwidth-saturated; real next-session work is gfx12-specific OPTIMIZATION research (more unroll using larger VGPR budget, DPP), not a body-identical port. Re-PRD as research, not port.
+- **Item 3 (fused gate_up gfx1201):** Same misframe class as Item 2. Plus the AR profile didn't surface fused_gate_up in top-10 — its hot-path role on gfx1201 is unclear. Re-PRD post a separate prefill or draft-side profile.
+- **Item 4 Phase 2/3:** Phase 2 alone causes 4B (-19%) / 27B (-8%) regressions; Phase 3 (per-shape MMQ_X variants) is multi-week.
+- **Item 6 (Lloyd-MQ batched-prefill gfx1201):** multi-week per memory `mq-lloyd-batched-prefill-followup`.
+
+### PRD goal re-examination (load-bearing for next session)
+
+Per memory `feedback_hiptrx_153_vs_lmx_250_investigation` + this session's BW-saturation evidence on multirow + residual-scan single-row prefetch null + 80% peak-BW saturation on the next-best optimization candidates: the original PRD's 192.6 → 250 tok/s target (+29% on 27B merge_sort) appears **silicon-tier-bound**, not closeable through kernel ports. The witnessed-bottleneck profile flags **launch-overhead reduction** (867 launches/token, 54% of profile-mode wall) as the highest-ROI lever — entirely outside the original PRD scope. Recommend next session re-PRD against the witnessed bottleneck rather than the original ROI ranking.
 
 ---
 
