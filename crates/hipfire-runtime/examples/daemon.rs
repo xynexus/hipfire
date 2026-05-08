@@ -2323,6 +2323,55 @@ fn generate_dflash(
 
     let mut rng_state: u64 = 0x13579BDFu64;
 
+    // PLD spine + n-gram cache activation (PRD v1.2 follow-on, 2026-05-08).
+    // Both are env-gated and default-OFF — when unset, daemon decodes
+    // byte-identically to the pre-activation path. Mirrors dflash_spec_demo's
+    // wiring (lookup logic at dflash_spec_demo.rs:1170-1200, observe_many at
+    // :1329-1337). The bypass-mode path inside spec_step_dflash already
+    // handles `Some(spine)` correctly (speculative.rs:2630+).
+    //
+    // HIPFIRE_DAEMON_PLD=1 enables PldMatcher (Goose §4.3 bypass mode):
+    // suffix self-match against (prompt + emitted) → spine continuation
+    // skips the DFlash forward when consensus + chain length pass.
+    //   HIPFIRE_DAEMON_PLD_CONSENSUS  default 2 (paper)
+    //   HIPFIRE_DAEMON_PLD_CHAIN      default 5 (conservative; paper uses 8)
+    //
+    // HIPFIRE_DAEMON_NGRAM=1 enables NgramCache (rolling bigram → next):
+    // populated from prompt + each cycle's committed window; used inside
+    // spec_step_dflash as a "free second opinion" override on top of DFlash.
+    //   HIPFIRE_DAEMON_NGRAM_MIN_COUNT default 3
+    let pld_enabled = std::env::var("HIPFIRE_DAEMON_PLD").ok().as_deref() == Some("1");
+    let pld_min_consensus: usize = std::env::var("HIPFIRE_DAEMON_PLD_CONSENSUS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let pld_min_chain: usize = std::env::var("HIPFIRE_DAEMON_PLD_CHAIN")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let pld_matcher = if pld_enabled {
+        let m = speculative::PldMatcher::new();
+        eprintln!(
+            "[daemon-dflash] pld: enabled (ngrams={:?}, min_extract={}, max_extract={}, consensus_gate={}, chain_gate={})",
+            m.ngram_lens, m.min_extract, m.max_extract, pld_min_consensus, pld_min_chain,
+        );
+        Some(m)
+    } else {
+        None
+    };
+    let mut pld_hits: usize = 0;
+
+    let ngram_enabled = std::env::var("HIPFIRE_DAEMON_NGRAM").ok().as_deref() == Some("1");
+    let ngram_min_count: u32 = std::env::var("HIPFIRE_DAEMON_NGRAM_MIN_COUNT")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let mut ngram_cache = if ngram_enabled {
+        let mut c = speculative::NgramCache::new(ngram_min_count);
+        c.observe_many(&prompt_tokens);
+        eprintln!(
+            "[daemon-dflash] ngram: enabled (min_count={}, seeded with {} prompt tokens)",
+            ngram_min_count, prompt_tokens.len(),
+        );
+        Some(c)
+    } else {
+        None
+    };
+
     // Resolve `HIPFIRE_DDTREE_PATH_C` ONCE before the decode loop. The
     // previous version re-read the env-var on every spec cycle which
     // is microseconds of waste on a hot path. Validate eagerly: invalid
@@ -2394,6 +2443,34 @@ fn generate_dflash(
                 )
             }
         } else {
+            // PLD lookup: build context = prompt ++ emitted (everything
+            // committed so far). The matcher predicts what follows the
+            // suffix, so the context must end at seed_token. At cycle
+            // K≥1, emitted's last entry is the prior bonus (== current
+            // seed_token), so we usually skip the explicit push; at cycle
+            // 0 (emitted == [first_token] == seed_token) ditto. This
+            // mirrors dflash_spec_demo.rs:1175-1188.
+            let pld_match = pld_matcher.as_ref().and_then(|matcher| {
+                let mut ctx: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + emitted.len() + 1);
+                ctx.extend_from_slice(&prompt_tokens);
+                ctx.extend_from_slice(&emitted);
+                if ctx.last() != Some(&seed_token) {
+                    ctx.push(seed_token);
+                }
+                matcher.lookup(&ctx)
+            });
+            // Goose §4.3 bypass-mode confidence gate.
+            let pld_spine: Option<&[u32]> = pld_match.as_ref().and_then(|pm| {
+                if pm.consensus >= pld_min_consensus && pm.tokens.len() >= pld_min_chain {
+                    Some(pm.tokens.as_slice())
+                } else {
+                    None
+                }
+            });
+            let used_pld = pld_spine.is_some();
+            if used_pld {
+                pld_hits += 1;
+            }
             spec_step_dflash(
                 gpu,
                 m.dflash_drafter_gpu.as_mut(),
@@ -2406,10 +2483,10 @@ fn generate_dflash(
                 0.0_f32,                   // temperature
                 &mut rng_state,
                 None,                      // block_size override
-                None,                      // ngram_cache
+                ngram_cache.as_ref(),      // bigram override (None when ngram disabled)
                 &emitted,
                 0.0_f32,                   // cactus_delta
-                None,                      // pld_spine
+                pld_spine,                 // PLD bypass spine (None when disabled or below gate)
                 1.0_f32,                   // repeat_penalty (off)
                 0,                         // repeat_window
             )
@@ -2423,6 +2500,19 @@ fn generate_dflash(
             }
         };
         stats.record(&step);
+
+        // Populate n-gram cache from newly committed tokens. step.committed
+        // is [seed, accepted draft tokens, bonus]; record consecutive triples
+        // including the join with prior context (last 2 of emitted before
+        // this cycle's commits land). Mirrors dflash_spec_demo.rs:1329-1337.
+        if let Some(ref mut ng) = ngram_cache {
+            let tail_len = emitted.len().min(2);
+            let mut window: Vec<u32> = Vec::with_capacity(tail_len + step.committed.len());
+            window.extend_from_slice(&emitted[emitted.len() - tail_len..]);
+            window.extend_from_slice(&step.committed);
+            ng.observe_many(&window);
+        }
+
         let committed_tail: Vec<u32> = step.committed.iter().skip(1).copied().collect();
 
         let mut hit_eos = false;
@@ -2519,12 +2609,22 @@ fn generate_dflash(
         ),
         _ => String::new(),
     };
+    // PLD / n-gram observability fields. Empty when both are off so the
+    // baseline `done` shape is unchanged for non-opt-in clients.
+    let pld_ngram_field = if pld_enabled || ngram_enabled {
+        format!(
+            r#","pld_enabled":{},"pld_hits":{},"ngram_enabled":{}"#,
+            pld_enabled, pld_hits, ngram_enabled,
+        )
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}{}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}{}{}}}"#,
         id, generated, tok_s, prompt_tokens.len(),
         prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
-        tau, stats.cycles, pflash_done_field,
+        tau, stats.cycles, pflash_done_field, pld_ngram_field,
     );
     let _ = stdout.flush();
 }
