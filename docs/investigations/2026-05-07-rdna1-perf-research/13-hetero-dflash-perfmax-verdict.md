@@ -55,7 +55,7 @@ canonical-bench-pinned via md5 `df5dedc8040ce70ba55080c4548e6024`.
 |---|---:|---:|---:|---|
 | Solo gfx1151 (canonical) | **82.16** | 10.45 | 120.39 | baseline |
 | Drafter HIP[1] gfx1010 #1 | 60.48 | 10.45 | 140.64 | -26% vs solo |
-| Drafter HIP[2] gfx1010 #2 | — | — | — | SEGFAULT (unrelated, see below) |
+| Drafter HIP[2] gfx1010 #2 (TB5) | 61.27 | 10.4545 | 152.42 | -25% vs solo (post H2D-seed fix, commit 9ba0b87) |
 | Drafter HIP[3] gfx1030 (6950 XT) | **72.57** | 10.45 | 139.39 | -12% vs solo |
 
 5-run medians not collected; single-run on each. Numbers are
@@ -120,20 +120,47 @@ gfx1151 alone, so cross-card work is pure overhead here. The
 hetero win materializes on configs where solo can't run at all,
 not on configs where solo fits.
 
-### gfx1010 #2 segfault
+### gfx1010 #2 (TB5) segfault — root-caused and fixed (2026-05-08)
 
-`HIP[2]` (second 5700 XT) segfaulted during target prefill — same
-target weights, same kernels as `HIP[1]` and `HIP[3]` runs that
-both worked. Logs show target loaded successfully (15.76 GB on
-gfx1151), drafter loaded successfully (1.14 GB on gfx1010 #2),
-prompt tokenized (231 tokens), and the segfault hit during
-`seeding target_hidden from prompt` — which runs on the *target*
-device, not the drafter.
+The TB5-attached 5700 XT segfaulted during prompt seeding. Root cause:
+the `scatter_hidden_block_to_interleaved` call at the end of prefill
+issued `hipMemcpyDeviceToDevice` from `hidden_rb` (target gfx1151) into
+`draft_scratch.target_hidden` (drafter card). HIP routes cross-device
+D2D through its P2P path. ROCm 7.2.2's libamdhip64.so crashes inside
+that path when the two devices report **asymmetric peer access** —
+specifically the TB5+gfx1010 topology shows `can 0→1: false / 1→0:
+true` while TB3-attached cards (`HIP[1]` gfx1010 #1 and `HIP[3]`
+gfx1030) report bidirectional `true` and don't crash.
 
-Likely a host/PCIe topology quirk specific to the second 5700 XT's
-slot. Not blocking this verdict (we have 2/3 cards working) but
-worth investigating before relying on `HIP[2]` for any production
-use. Probably tracked as a separate hardware issue on hipx.
+Diagnostic chain:
+- `peer_smoke` SIGSEGV at `hipMemcpyPeer` in libamdhip64.so address
+  `0x6636da8`.
+- `dflash_spec_demo --drafter-device 1` (TB5 path on 2026-05-08)
+  SIGSEGV at the *same* libamdhip64.so address from `memcpy_dtod_at`
+  inside `scatter_hidden_block_to_interleaved`.
+- `bind_thread()` before the D2D (commit `75a998a`) does NOT prevent
+  the crash — the bug isn't thread-local current_device confusion;
+  the runtime's P2P dispatch path crashes regardless.
+- `AMD_LOG_LEVEL=3` log: `hipMemcpy ( 0x770003a00000, 0x76ffffc00000,
+  20480, hipMemcpyDeviceToDevice )` was the last call before the
+  segfault. dst pointer (`0x770003a*`) was on the drafter; src
+  (`0x76fff*`) was on the target.
+
+Fix (commit `9ba0b87`): `target_hidden_host` is already populated by
+`seed_target_hidden_from_prompt`, so when `--drafter-device` is set,
+upload it via H2D directly to the drafter's `target_hidden.buf`. One
+H2D leg per prompt (one-time at start), no P2P, no peer enable, no
+SDMA path. Solo path is unchanged.
+
+Result: TB5 5700 XT #2 now produces decode 61.27 tok/s with τ=10.4545
+**bit-identical** to TB3 5700 XT #1 (60.48 / 10.45) and to solo
+(82.16 / 10.45). The H2D-seed swap preserves draft/target alignment
+exactly.
+
+The TB5 fabric's higher BW (80 Gb/s × 2 lanes vs TB3 ~40 Gb/s) doesn't
+deliver a perf advantage at this workload — within run noise of TB3
+5700 XT. Confirms the verdict's per-call-latency-dominated finding:
+cross-card cost isn't BW-bound on this fabric.
 
 ## What this proves
 
