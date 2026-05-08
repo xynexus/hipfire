@@ -78,6 +78,21 @@ Delta: **-1.7% at env=1 — env-1 strictly slower 3/3 runs.** 100%
 predraft hit rate (10/10 cycles after cycle 0). Coherence-gate-dflash
 --fast PASS.
 
+#### Silicon-invariance across all 4× R9700 (single-card solo, 1 run each)
+
+| Card | env=0 | env=1 | Δ |
+|---|---:|---:|---:|
+| R9700 #0 | 194.15 | 180.96 | -6.79% |
+| R9700 #1 | 194.83 | 181.68 | -6.75% |
+| R9700 #2 | 194.26 | 180.91 | -6.87% |
+| R9700 #3 | 195.08 | 181.30 | -7.06% |
+| **mean** | **194.58 (±0.24%)** | **181.21 (±0.20%)** | **-6.87%** |
+
+The regression is silicon-invariant across the 4-card cluster. Each
+R9700 individually replicates the env=1 regression to within 0.3%
+of the others. Confirms the BW-saturation diagnosis is a property
+of the gfx1201 silicon + workload, not a single-card anomaly.
+
 #### Note on hiptrx R9700 test scope
 
 The R9700 test uses a **single** R9700 (target + drafter both on one card)
