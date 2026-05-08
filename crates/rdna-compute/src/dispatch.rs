@@ -3112,10 +3112,13 @@ impl Gpu {
         let use_multirow = rows > 1;
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
-        // Other non-RDNA3/RDNA4 archs: use wide kernel (2 rows/block) for large M.
+        // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
+        // gfx1200/gfx1201 are NOT excluded — empirically gfx1201 default
+        // (m>=64, rows=1) hits prefill 1262 tok/s on 9B via the wide path;
+        // forcing single-row regresses 38x (witnessed 2026-05-08, ea69403).
         let use_wide = !use_multirow
             && m >= 64
-            && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031" | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1200" | "gfx1201");
+            && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031" | "gfx1100" | "gfx1101" | "gfx1102");
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256", bytes);
