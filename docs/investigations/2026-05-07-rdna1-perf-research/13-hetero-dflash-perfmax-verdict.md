@@ -488,3 +488,117 @@ Nothing in the drafter card hierarchy buys back the per-cycle fabric
 latency on this fabric; only overlapping the draft forward with the
 target verify can.
 - Empirical anchors session: `09-per-card-prefill-rates.md`, `10-gfx1151-solo-dflash-27b.md`
+
+## Hiptrx fabric-ceiling bench (PCIe gen5 ×16, same-arch R9700+R9700)
+
+**Date:** 2026-05-08
+**Rig:** hiptrx (Threadripper 9970X + 4× R9700 on direct PCIe gen5 ×16, no Thunderbolt)
+**Branch:** `feat/hetero-pp-dflash` HEAD `101f008`
+**Question:** does direct PCIe gen5 ×16 (no TB tunnel) lift hetero past hipx's
+~89.5% ceiling, or is the break-solo gap fabric-independent?
+
+### Method
+
+Same canonical bench as hipx 4-arch sweep — 27B mq4 target, DFlash drafter,
+`--max 120 --no-chatml`, prompt md5 `df5dedc8040ce70ba55080c4548e6024`,
+`prompt_normalize=true`. 3 timed runs per config after `--max 5` JIT
+warmup. Solo isolates one R9700 via `HIP_VISIBLE_DEVICES=0`; hetero uses
+`--drafter-device 1`.
+
+`peer_smoke` confirmed 4× gfx1201 at 34.1 GB VRAM each. Symmetric peer
+access (`0→1: true`, `1→0: true`). 1 MB peer copy primitive: 69.4 MB/s
+(near-identical to hipx TB5's 64 MB/s — peer copy at this size is
+launch-latency-bound, not fabric-BW-bound).
+
+### Results
+
+| Config | min | median | max | % solo | τ |
+|---|---:|---:|---:|---:|---:|
+| Solo R9700 (gfx1201, HIP_VISIBLE_DEVICES=0) | 151.55 | **153.02** | 153.16 | 100.0% | 10.4545 |
+| Hetero R9700+R9700 (target HIP[0], drafter HIP[1]) | 148.40 | **148.49** | 148.54 | **97.04%** | 10.4545 |
+
+### Invariants
+
+- τ = 10.4545 on every one of 6 timed runs — bit-identical to hipx canonical.
+- `cycles=11, committed=137, accepted=115, accept_rate=0.697` identical
+  across solo and hetero — same draft/target trajectory regardless of
+  staging path.
+- Decoded text byte-identical between solo and hetero (coherent Python
+  LRU cache completion).
+- Run-to-run noise: solo range 1.6 tok/s (1.1%), hetero range 0.14 tok/s
+  (0.09%) — deterministic, both within noise of each other's medians.
+
+### Hipx vs hiptrx comparison
+
+| Rig | Fabric | Solo (target+draft) | Hetero (best ratio) | Gap |
+|---|---|---:|---:|---:|
+| hipx | TB5 (gfx1151 host + R9700 eGPU) | 82.21 (gfx1151) | 73.60 (R9700 drafter) | **10.5%** |
+| hipx | TB3 (gfx1151 host + 6950 XT eGPU) | 82.21 | 72.57 (gfx1030 drafter, cited) | 11.7% |
+| hipx | TB5 (gfx1151 host + 9070 XT eGPU) | 82.21 | 74.19 (9070 drafter) | 9.8% |
+| hiptrx | **PCIe gen5 ×16** (R9700 ↔ R9700) | 153.02 (R9700) | 148.49 (R9700 drafter) | **2.96%** |
+
+R9700 solo on PCIe gen5 ×16 is 153.02 tok/s — about 1.86× hipx solo
+gfx1151's 82.21 tok/s, reflecting the BW gap (R9700 ~960 GB/s vs gfx1151
+iGPU ~250 GB/s). Hetero on hiptrx delivers 148.49 tok/s (97.04% of solo),
+a ~7.5 percentage-point lift over hipx's hetero ceiling.
+
+### Verdict — fabric was the wall on hipx
+
+Direct PCIe gen5 ×16 closes ~75% of the structural break-solo gap that
+TB-tunneled paths leave open (10.5% → 2.96%). The remaining ~3% gap is
+the per-cycle dual-stream coordination overhead inside
+`spec_step_dflash` itself: one stream for the drafter forward, one for
+the target verify, with implicit synchronization at phases 2/5/9. PR 5
+(cycle pipelining — overlap drafter cycle N+1 with target verify cycle N
+via `hipEvent_t` cross-stream waits) is the lever that targets exactly
+that ~3% on this fabric.
+
+**Implication for PR 5 sequencing:** on hipx PR 5 closes ~3% of a 10.5%
+gap; on hiptrx PR 5 closes ~3% of a 3% gap and **plausibly cracks
+solo**. The break-solo demo lives on hiptrx-class fabric, not on
+TB-tunneled hipx. PR 5 effort estimate (1-2 days, dominated by rollback
+bookkeeping for in-flight cycles) is unchanged.
+
+**Implication for hipx tuning:** further fabric-side levers
+(quant-on-the-wire FP32→FP16 compress, additional pinned-host /
+launch-batching) on hipx have a fabric ceiling at ~10% gap that no
+amount of code change clears as long as TB tunnel latency dominates
+per-call. Per-call overhead, not aggregate BW, is the binding term —
+matching the verdict's earlier per-call-latency-dominated finding from
+the gfx1010-vs-gfx1030 ablation (synthetic peer BW didn't predict
+hetero perf rank).
+
+**Implication for v1.2 PRD anchor:** the pre-registered ≥1.25× target
+projects against hetero ≥191.3 tok/s on hiptrx (1.25× of 153.02). PR 5
+overlap math: at τ=10.45, draft-forward time per cycle is the
+binding term; full overlap removes one drafter forward latency per
+cycle. Whether this projects to ≥191 tok/s depends on the drafter/
+target compute ratio per cycle, which a follow-up bench can probe.
+The 27B target chosen here fits comfortably in 34 GB VRAM, so this
+demo doesn't yet exercise the "model doesn't fit on solo" win the
+PRD targets — that case calls for the 70B / 122B-A10B target sweep
+on hiptrx where R9700 solo OOMs and PP=2 R9700+R9700 enables the
+workload at all.
+
+### What this proves
+
+- **Hetero DFlash is fabric-bound, not code-bound, in the break-solo
+  regime.** PR-A correctness composes the same way on hiptrx PCIe gen5
+  as on hipx TB5 (τ identical, accept rate identical, cycle structure
+  identical). The cross-card cost differs because the fabric differs.
+- **The 89-90% hipx ceiling is not a structural ceiling.** A different
+  fabric reaches 97%. The structural ceiling under sequential
+  cross-card spec-decode is ~3% (PR 5 territory).
+- **Per-call HIP launch latency is the binding term on TB.** PCIe gen5
+  ×16 doesn't eliminate per-call overhead (peer_smoke 1 MB copy is
+  still 69 MB/s), but it removes the TB tunnel's per-leg latency tax
+  on the larger phase 5/9 transfers that dominate the per-cycle
+  budget.
+
+### Bench artifacts
+
+- Solo log: `/tmp/hiptrx_solo_3runs.log` on hiptrx
+- Hetero log: `/tmp/hiptrx_hetero_3runs.log` on hiptrx
+- Branch + HEAD: `feat/hetero-pp-dflash` @ `101f008`
+- Binaries: `/home/kaden/hipfire/target/release/examples/{dflash_spec_demo,peer_smoke}` (2026-05-08 09:37 UTC build)
+
