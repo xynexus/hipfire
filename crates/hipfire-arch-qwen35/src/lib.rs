@@ -28,6 +28,8 @@ pub mod speculative;
 #[cfg(feature = "deltanet")]
 pub mod pflash;
 #[cfg(feature = "deltanet")]
+pub mod mtp_probe;
+#[cfg(feature = "deltanet")]
 pub mod arch;
 
 #[cfg(feature = "deltanet")]
