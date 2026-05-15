@@ -32,6 +32,8 @@ pub mod mtp_probe;
 #[cfg(feature = "deltanet")]
 pub mod mtp_head;
 #[cfg(feature = "deltanet")]
+pub mod mtp_spec;
+#[cfg(feature = "deltanet")]
 pub mod arch;
 
 #[cfg(feature = "deltanet")]
