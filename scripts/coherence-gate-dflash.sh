@@ -264,7 +264,7 @@ for entry in "${tests[@]}"; do
     timeout "$CASE_TIMEOUT" "$EXE" \
         --target "$TARGET_27B" --draft "$DRAFT_27B" \
         --prompt "$prompt" --max "$max_tok" --ctx 2048 \
-        --kv-mode asym3 --no-chatml \
+        --kv-mode "${HIPFIRE_GATE_KV_MODE:-asym3}" --no-chatml \
         "${extra[@]}" \
         > "$out_file" 2>&1
     ec=$?
