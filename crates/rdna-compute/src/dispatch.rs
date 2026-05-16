@@ -1301,6 +1301,67 @@ impl Gpu {
         Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
     }
 
+    /// Public F32→F16 conversion with caller-provided destination. Unlike
+    /// `ensure_fp16_x` (which uses an internal scratch and pointer-equality
+    /// cache), this writes into `dst` directly — used by the DFlash F16
+    /// `target_hidden` pipeline (Phase 2, 2026-05-16) to convert staging
+    /// rows on commit.
+    pub fn convert_f32_to_f16_to(
+        &mut self,
+        src: &hip_bridge::DeviceBuffer,
+        dst: &hip_bridge::DeviceBuffer,
+        n_elems: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("convert_f32_to_f16", kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC, "convert_f32_to_f16")?;
+        let mut in_ptr = src.as_ptr();
+        let mut out_ptr = dst.as_ptr();
+        let mut n_val = n_elems as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut in_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid = ((n_elems + 255) / 256) as u32;
+        self.launch_maybe_blob(
+            "convert_f32_to_f16", [grid, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(in_ptr); b.push_ptr(out_ptr); b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
+    /// F16→F32 widening conversion with caller-provided source/destination.
+    /// Dual of `convert_f32_to_f16_to`. Used by the DFlash F16 `target_hidden`
+    /// pipeline to widen the per-cycle delta slice for the FC GEMM
+    /// (which still expects F32 input).
+    pub fn convert_f16_to_f32_to(
+        &mut self,
+        src: &hip_bridge::DeviceBuffer,
+        dst: &hip_bridge::DeviceBuffer,
+        n_elems: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("convert_f16_to_f32", kernels::CONVERT_F16_F32_SRC, "convert_f16_to_f32")?;
+        let mut in_ptr = src.as_ptr();
+        let mut out_ptr = dst.as_ptr();
+        let mut n_val = n_elems as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut in_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid = ((n_elems + 255) / 256) as u32;
+        self.launch_maybe_blob(
+            "convert_f16_to_f32", [grid, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(in_ptr); b.push_ptr(out_ptr); b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
     /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`
     /// (an F32 GpuTensor). Returns the FP8 device pointer. gfx12 only —
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16

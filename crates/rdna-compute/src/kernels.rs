@@ -474,6 +474,13 @@ pub const GEMM_HFQ4G256_RESIDUAL_FP16_WAVE64_SRC: &str = include_str!("../../../
 // 2× throughput over FP32 on all RDNA. Same grid/block layout.
 pub const GEMM_HFQ4G256_RESIDUAL_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_fp16.hip");
 
+// FP16↔FP32 widening conversion kernel — used by the DFlash F16 target_hidden
+// pipeline (Phase 2, 2026-05-16) to widen per-cycle delta slices before the
+// FC GEMM consumes them as F32. Sibling of convert_f32_to_f16 (embedded in
+// the FP16 GEMM source above); kept in its own file so the conversion kernel
+// isn't tied to a particular GEMM blob.
+pub const CONVERT_F16_F32_SRC: &str = include_str!("../../../kernels/src/convert_f16_f32.hip");
+
 // WMMA variant: gfx1100+ only. Uses __builtin_amdgcn_wmma_f32_16x16x16_f16_w32
 // for 16×16 tiled matrix multiply. Same FP16 X input, FP32 Y output.
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.hip");

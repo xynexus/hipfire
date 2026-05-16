@@ -1129,18 +1129,20 @@ impl VerifyScratch {
 pub struct HiddenStateRingBuffer {
     /// Non-owning alias to `DflashScratch.target_hidden`. Shape interpretation:
     /// `[max_positions, num_extract, hidden_dim]` f32, position-major
-    /// (slot stride = `num_extract * hidden_dim * 4` bytes; within a slot the
-    /// per-extract rows are contiguous).
+    /// (slot stride = `num_extract * hidden_dim * 2` bytes post-Phase 2;
+    /// within a slot the per-extract rows are contiguous).
     ///
     /// All writers (`write_at_head`, `write_rows_at_head`,
     /// `commit_staging_to_ring`) scatter into this buffer at offset
-    /// `(slot * num_extract + extract_idx) * hidden_dim * 4` bytes. The
-    /// downstream FC GEMM in `DFlash::draft_forward` reads contiguous
-    /// `delta * num_extract * hidden_dim` floats starting at
-    /// `position * num_extract * hidden_dim` — the same layout this ring
-    /// writes into. Eliminates the duplicate per-extract `layer_bufs` storage
+    /// `(slot * num_extract + extract_idx) * hidden_dim * 2` bytes (F16
+    /// element stride; Phase 2 2026-05-16 narrowed the canonical store from
+    /// F32 to F16). The downstream FC GEMM in `DFlash::draft_forward` widens
+    /// the per-cycle delta slice back to F32 via convert_f16_to_f32 before
+    /// dispatch. Eliminates the duplicate per-extract `layer_bufs` storage
     /// that previously cost `num_extract × max_positions × hidden_dim × 4`
-    /// bytes (~6.4 GB at ctx=64K, hidden=5120, num_extract=5).
+    /// bytes (~6.4 GB at ctx=64K, hidden=5120, num_extract=5), and the
+    /// F16 narrowing halves the survivor's footprint (~3.3 GB more at
+    /// ctx=64K).
     ///
     /// SAFETY: the alias's underlying allocation lives in `DflashScratch`. The
     /// ring buffer's lifetime MUST be a subset of the DflashScratch's. The
@@ -1160,6 +1162,18 @@ pub struct HiddenStateRingBuffer {
     /// into `target_hidden` at the current head (outside the captured region,
     /// head-aware).
     pub staging_bufs: Vec<GpuTensor>,
+    /// F16 conversion scratch shared across extract layers, shape
+    /// `[max_batch × hidden_dim]` F16. Used by writers to narrow F32 source
+    /// rows to F16 before scattering into `target_hidden`. A single shared
+    /// buffer is safe because writers serialize per-extract within a single
+    /// commit/write call.
+    pub convert_scratch_f16: GpuTensor,
+    /// F32 scratch shared across extract layers, shape
+    /// `[max_batch × num_extract × hidden_dim]` F32. Used by
+    /// `download_hidden_block` to widen F16 target_hidden slices to F32
+    /// before D2H, in chunks of up to `max_batch` slots. Sized for the
+    /// largest single chunk a downloader needs.
+    pub download_scratch_f32: GpuTensor,
     /// Max rows a single staging write can hold — sized to the maximum batch
     /// the caller ever passes to `write_rows_to_staging`. For DFlash verify
     /// this is `budget + 1`.
@@ -1190,7 +1204,7 @@ impl HiddenStateRingBuffer {
         let needed = max_positions * num_extract * hidden_dim;
         assert!(
             target_hidden_alias.numel() >= needed,
-            "HiddenStateRingBuffer::new: target_hidden alias has {} f32 elems, need ≥ {} \
+            "HiddenStateRingBuffer::new: target_hidden alias has {} elems, need ≥ {} \
              (max_positions={} × num_extract={} × hidden_dim={})",
             target_hidden_alias.numel(), needed, max_positions, num_extract, hidden_dim,
         );
@@ -1198,6 +1212,12 @@ impl HiddenStateRingBuffer {
         for _ in 0..num_extract {
             staging_bufs.push(gpu.alloc_tensor(&[max_batch * hidden_dim], rdna_compute::DType::F32)?);
         }
+        let convert_scratch_f16 =
+            gpu.alloc_tensor(&[max_batch * hidden_dim], rdna_compute::DType::F16)?;
+        let download_scratch_f32 = gpu.alloc_tensor(
+            &[max_batch * num_extract * hidden_dim],
+            rdna_compute::DType::F32,
+        )?;
         Ok(Self {
             target_hidden: target_hidden_alias,
             extract_layers,
@@ -1206,6 +1226,8 @@ impl HiddenStateRingBuffer {
             head: 0,
             written: 0,
             staging_bufs,
+            convert_scratch_f16,
+            download_scratch_f32,
             max_batch,
         })
     }
@@ -1225,28 +1247,32 @@ impl HiddenStateRingBuffer {
         self.extract_layers.iter().position(|&l| l == target_layer_idx)
     }
 
-    /// Copy `x` (shape `[hidden_dim]`) into `target_hidden` at the slot
-    /// `(head, extract_idx)`. Call once per extracted layer per forward pass,
-    /// then `advance_head()` at the end of the forward to move to the next slot.
+    /// Copy `x` (shape `[hidden_dim]` F32) into F16 `target_hidden` at the
+    /// slot `(head, extract_idx)`. F32→F16 conversion lands in
+    /// `convert_scratch_f16` first, then a single dtod memcpy places the
+    /// F16 row at the right slot. Call once per extracted layer per forward
+    /// pass, then `advance_head()` at the end of the forward.
     ///
-    /// Destination byte offset: `(head * num_extract + extract_idx) * hidden_dim * 4`.
+    /// Destination byte offset: `(head * num_extract + extract_idx) * hidden_dim * 2`
+    /// (F16 element stride).
     pub fn write_at_head(
         &self,
         gpu: &mut Gpu,
         extract_idx: usize,
         x: &GpuTensor,
     ) -> HipResult<()> {
-        let row_bytes = self.hidden_dim * 4;
+        let row_bytes_f16 = self.hidden_dim * 2;
         let num_extract = self.num_extract();
         debug_assert!(extract_idx < num_extract,
             "write_at_head: extract_idx {} >= num_extract {}", extract_idx, num_extract);
-        let offset = (self.head * num_extract + extract_idx) * row_bytes;
+        gpu.convert_f32_to_f16_to(&x.buf, &self.convert_scratch_f16.buf, self.hidden_dim)?;
+        let offset = (self.head * num_extract + extract_idx) * row_bytes_f16;
         gpu.hip.memcpy_dtod_at(
             &self.target_hidden.buf,
             offset,
-            &x.buf,
+            &self.convert_scratch_f16.buf,
             0,
-            row_bytes,
+            row_bytes_f16,
         )
     }
 
@@ -1266,15 +1292,15 @@ impl HiddenStateRingBuffer {
         self.written += n;
     }
 
-    /// Copy `n` contiguous rows from `src` (shape `[n × hidden_dim]` row-major)
-    /// into `target_hidden` at slots `[head..head+n)` for the given
-    /// `extract_idx`. Handles the ring-buffer wrap. Call once per extracted
-    /// layer per batched forward, then advance the head by `n` via
-    /// `advance_head_by(n)` at the end.
+    /// Copy `n` contiguous rows from `src` (shape `[n × hidden_dim]` F32
+    /// row-major) into F16 `target_hidden` at slots `[head..head+n)` for the
+    /// given `extract_idx`. F32→F16 conversion of the full `n × hidden_dim`
+    /// chunk lands in `convert_scratch_f16` first, then per-row dtod copies
+    /// scatter into the strided destination. Handles ring-buffer wrap.
+    /// Caller advances the head by `n` via `advance_head_by(n)` at the end.
     ///
-    /// Destination is strided across the interleaved `[slot, num_extract, hidden]`
-    /// layout: per-slot stride is `num_extract * hidden_dim * 4` bytes.
-    /// Each of the `n` rows is a single `hidden_dim * 4`-byte dtod copy.
+    /// Destination per-slot stride is `num_extract * hidden_dim * 2` bytes
+    /// (F16 element stride; Phase 2 narrowing).
     pub fn write_rows_at_head(
         &self,
         gpu: &mut Gpu,
@@ -1282,42 +1308,48 @@ impl HiddenStateRingBuffer {
         src: &GpuTensor,
         n: usize,
     ) -> HipResult<()> {
-        let row_bytes = self.hidden_dim * 4;
+        let row_bytes_f16 = self.hidden_dim * 2;
         let num_extract = self.num_extract();
         debug_assert!(extract_idx < num_extract);
-        let slot_bytes = num_extract * row_bytes;
-        let layer_off = extract_idx * row_bytes;
+        debug_assert!(n <= self.max_batch,
+            "write_rows_at_head: n {} > max_batch {} (convert scratch capacity)",
+            n, self.max_batch);
+        let slot_bytes = num_extract * row_bytes_f16;
+        let layer_off = extract_idx * row_bytes_f16;
         let head = self.head;
         let max_pos = self.max_positions;
-        // No wrap.
+        // Narrow F32 src → F16 scratch in a single kernel call, then scatter.
+        gpu.convert_f32_to_f16_to(
+            &src.buf, &self.convert_scratch_f16.buf, n * self.hidden_dim,
+        )?;
         if head + n <= max_pos {
             for r in 0..n {
                 let dst_off = (head + r) * slot_bytes + layer_off;
-                let src_off = r * row_bytes;
+                let src_off = r * row_bytes_f16;
                 gpu.hip.memcpy_dtod_at(
                     &self.target_hidden.buf, dst_off,
-                    &src.buf, src_off,
-                    row_bytes,
+                    &self.convert_scratch_f16.buf, src_off,
+                    row_bytes_f16,
                 )?;
             }
         } else {
             let first = max_pos - head;
             for r in 0..first {
                 let dst_off = (head + r) * slot_bytes + layer_off;
-                let src_off = r * row_bytes;
+                let src_off = r * row_bytes_f16;
                 gpu.hip.memcpy_dtod_at(
                     &self.target_hidden.buf, dst_off,
-                    &src.buf, src_off,
-                    row_bytes,
+                    &self.convert_scratch_f16.buf, src_off,
+                    row_bytes_f16,
                 )?;
             }
             for r in first..n {
                 let dst_off = (r - first) * slot_bytes + layer_off;
-                let src_off = r * row_bytes;
+                let src_off = r * row_bytes_f16;
                 gpu.hip.memcpy_dtod_at(
                     &self.target_hidden.buf, dst_off,
-                    &src.buf, src_off,
-                    row_bytes,
+                    &self.convert_scratch_f16.buf, src_off,
+                    row_bytes_f16,
                 )?;
             }
         }
@@ -1378,11 +1410,14 @@ impl HiddenStateRingBuffer {
     /// rest of the engine relies on for ordering with null-stream consumers
     /// (e.g. the draft forward's D2H of hidden rows after this commit).
     pub fn commit_staging_to_ring(&mut self, gpu: &mut Gpu, n: usize) -> HipResult<()> {
-        let row_bytes = self.hidden_dim * 4;
+        let row_bytes_f16 = self.hidden_dim * 2;
         let num_extract = self.num_extract();
-        let slot_bytes = num_extract * row_bytes;
+        let slot_bytes = num_extract * row_bytes_f16;
         let head = self.head;
         let max_pos = self.max_positions;
+        debug_assert!(n <= self.max_batch,
+            "commit_staging_to_ring: n {} > max_batch {} (convert scratch capacity)",
+            n, self.max_batch);
 
         // If running under an explicit stream (graph capture path), wait
         // for the captured writes to complete before the scatter so we
@@ -1391,37 +1426,46 @@ impl HiddenStateRingBuffer {
             gpu.hip.stream_synchronize(stream)?;
         }
 
+        // For each extract layer: narrow staging F32 → convert_scratch_f16 in
+        // one kernel call, then scatter the F16 rows into target_hidden's
+        // interleaved [slot, num_extract, hidden] layout. Convert scratch is
+        // shared across extracts; per-ext sequential ordering is safe because
+        // the scatter is fully ordered by stream/null-stream semantics.
         for ei in 0..num_extract {
-            let layer_off = ei * row_bytes;
-            let staging_buf = &self.staging_bufs[ei].buf;
+            let layer_off = ei * row_bytes_f16;
+            gpu.convert_f32_to_f16_to(
+                &self.staging_bufs[ei].buf,
+                &self.convert_scratch_f16.buf,
+                n * self.hidden_dim,
+            )?;
             if head + n <= max_pos {
                 for r in 0..n {
                     let dst_off = (head + r) * slot_bytes + layer_off;
-                    let src_off = r * row_bytes;
+                    let src_off = r * row_bytes_f16;
                     gpu.hip.memcpy_dtod_at(
                         &self.target_hidden.buf, dst_off,
-                        staging_buf, src_off,
-                        row_bytes,
+                        &self.convert_scratch_f16.buf, src_off,
+                        row_bytes_f16,
                     )?;
                 }
             } else {
                 let first = max_pos - head;
                 for r in 0..first {
                     let dst_off = (head + r) * slot_bytes + layer_off;
-                    let src_off = r * row_bytes;
+                    let src_off = r * row_bytes_f16;
                     gpu.hip.memcpy_dtod_at(
                         &self.target_hidden.buf, dst_off,
-                        staging_buf, src_off,
-                        row_bytes,
+                        &self.convert_scratch_f16.buf, src_off,
+                        row_bytes_f16,
                     )?;
                 }
                 for r in first..n {
                     let dst_off = (r - first) * slot_bytes + layer_off;
-                    let src_off = r * row_bytes;
+                    let src_off = r * row_bytes_f16;
                     gpu.hip.memcpy_dtod_at(
                         &self.target_hidden.buf, dst_off,
-                        staging_buf, src_off,
-                        row_bytes,
+                        &self.convert_scratch_f16.buf, src_off,
+                        row_bytes_f16,
                     )?;
                 }
             }
@@ -2373,7 +2417,11 @@ pub fn scatter_hidden_block_to_interleaved(
     let head = hidden_rb.head;
     let written = hidden_rb.written;
     assert!(block_size <= written, "scatter: block_size {block_size} > written {written}");
-    let slot_bytes = num_extract * hidden * 4;
+    // Phase 2 (2026-05-16): target_hidden is F16, so slot stride is
+    // num_extract * hidden * 2 bytes (not 4). The fallback path uses dtype
+    // size to keep correct for any future dtype change.
+    let elem_bytes = hidden_rb.target_hidden.dtype.size();
+    let slot_bytes = num_extract * hidden * elem_bytes;
     let start_slot = (head + max_pos - block_size) % max_pos;
 
     // Phase 1 collapse (2026-05-16): after `HiddenStateRingBuffer` now writes
@@ -2410,7 +2458,7 @@ pub fn scatter_hidden_block_to_interleaved(
 }
 
 pub fn download_hidden_block(
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     hidden_rb: &HiddenStateRingBuffer,
     b: usize,
 ) -> HipResult<Vec<f32>> {
@@ -2426,34 +2474,66 @@ pub fn download_hidden_block(
     assert!(b <= written, "verify must have written at least B rows to ring buffer");
     let head = hidden_rb.head;
     let start_slot = (head + max_pos - b) % max_pos;
-    let slot_bytes = num_extract * hidden * 4;
+    let slot_bytes_f16 = num_extract * hidden * 2;
+    let slot_floats = num_extract * hidden;
+    let slot_bytes_f32 = slot_floats * 4;
 
-    // Target_hidden's [slot, num_extract, hidden] layout already matches the
-    // caller's expected `[b × num_extract × hidden]` per-position interleaved
-    // output. One (or two, on ring wrap) contiguous D2H copies suffice; no
-    // host-side rearrangement needed. Previously this routine did
-    // `num_extract` separate D2Hs of size `b × hidden × 4` (one per
-    // extract-layer ring) and reshaped on the host.
+    // Phase 2 (2026-05-16): target_hidden is F16 on GPU but the host vec is
+    // F32. Widen on the GPU into `download_scratch_f32` in chunks of up to
+    // `max_batch` slots, then D2H each chunk into the right host offset.
+    // The widening kernel is a single convert per chunk on a contiguous
+    // F16 → F32 region; D2H is one contiguous host write per chunk.
+    let max_chunk = hidden_rb.max_batch;
     let mut out = vec![0f32; b * num_extract * hidden];
+
+    // Process the (potentially wrapping) source range as up to two
+    // contiguous segments. For each segment, walk in chunks of `max_chunk`
+    // slots, widen F16 → F32, then memcpy_dtoh into `out`.
+    let mut emit_segment = |gpu: &mut Gpu,
+                            src_slot: usize,
+                            seg_rows: usize,
+                            out_row_off: usize|
+     -> HipResult<()> {
+        let mut row = 0;
+        while row < seg_rows {
+            let n = std::cmp::min(max_chunk, seg_rows - row);
+            // Source: F16 view into target_hidden at slot (src_slot + row).
+            // sub_offset uses the tensor's dtype (F16 → 2 bytes/elem) for
+            // the byte offset, so passing element offset is correct.
+            let src_view = hidden_rb
+                .target_hidden
+                .sub_offset((src_slot + row) * slot_floats, n * slot_floats);
+            // Dst: F32 scratch view sized to the chunk.
+            let scratch_view = hidden_rb
+                .download_scratch_f32
+                .sub_offset(0, n * slot_floats);
+            // Convert n × slot_floats F16 → F32 contiguous.
+            gpu.convert_f16_to_f32_to(
+                &src_view.buf,
+                &scratch_view.buf,
+                n * slot_floats,
+            )?;
+            // D2H the F32 widened chunk into the output vec.
+            let dst_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (out.as_mut_ptr().add((out_row_off + row) * slot_floats))
+                        as *mut u8,
+                    n * slot_bytes_f32,
+                )
+            };
+            gpu.hip.memcpy_dtoh(dst_bytes, &scratch_view.buf)?;
+            row += n;
+        }
+        Ok(())
+    };
+
     if start_slot + b <= max_pos {
-        let dst_bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, b * slot_bytes)
-        };
-        gpu.hip.memcpy_dtoh_at(dst_bytes, &hidden_rb.target_hidden.buf, start_slot * slot_bytes)?;
+        emit_segment(gpu, start_slot, b, 0)?;
     } else {
         let first_rows = max_pos - start_slot;
         let second_rows = b - first_rows;
-        let dst_first: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, first_rows * slot_bytes)
-        };
-        gpu.hip.memcpy_dtoh_at(dst_first, &hidden_rb.target_hidden.buf, start_slot * slot_bytes)?;
-        let dst_second: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(
-                (out.as_mut_ptr() as *mut u8).add(first_rows * slot_bytes),
-                second_rows * slot_bytes,
-            )
-        };
-        gpu.hip.memcpy_dtoh_at(dst_second, &hidden_rb.target_hidden.buf, 0)?;
+        emit_segment(gpu, start_slot, first_rows, 0)?;
+        emit_segment(gpu, 0, second_rows, first_rows)?;
     }
 
     debug_assert_eq!(out.len(), b * num_extract * hidden);
