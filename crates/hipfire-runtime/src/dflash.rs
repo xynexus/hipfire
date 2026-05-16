@@ -366,6 +366,15 @@ pub struct DflashScratch {
     /// convert_f32_to_f16 → target_hidden_proj.
     pub target_hidden_proj_f32_chunk: GpuTensor,
 
+    /// F32 chunk-output scratch for per-layer wk/wv GEMMs (B2,
+    /// 2026-05-16). Sized to `MQ_X_ROT_CHUNK_ROWS × kv_dim` F32 (~5 MB
+    /// at kv_dim=1280). Per chunk per layer: wk writes F32 here →
+    /// k_norm rmsnorm in place → convert_f32_to_f16 narrows into the
+    /// F16 `k_ctx_cached[li]` slot. Reused immediately afterward for
+    /// the V path (wv → narrow to F16 v_ctx_cached[li]); the K F16
+    /// payload is already in the cache by then so the overwrite is safe.
+    pub kv_f32_chunk: GpuTensor,
+
     // Concatenated K/V (L + B rows).
     pub k_cat: GpuTensor,                // [L + B, kv_dim]
     pub v_cat: GpuTensor,                // [L + B, kv_dim]
@@ -489,14 +498,17 @@ impl DflashScratch {
         };
 
         // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K, pre-rope).
-        // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
-        // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
-        // = 128 MB. Trivial vs 24 GB VRAM.
+        // Phase 2 / B2 (2026-05-16): stored as **F16** — halves per-cache
+        // VRAM. Per-layer size at l × kvd × 2 bytes; for Qwen3.5 27B
+        // drafter (5 layers, kvd=1280) that is 5 × l × 1280 × 2 × 2 (K+V)
+        // = 25.6 KB/pos, ~1.65 GB at ctx=64K (was 3.3 GB F32). Concat into
+        // F32 k_cat / v_cat widens via convert_f16_to_f32_to (one kernel per
+        // layer per cycle, cost dominated by F16 read bandwidth).
         let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
         let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
-            k_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
-            v_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+            k_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F16)?);
+            v_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F16)?);
         }
 
         Ok(DflashScratch {
@@ -548,6 +560,13 @@ impl DflashScratch {
             // narrows into the F16 `target_hidden_proj` at the chunk offset.
             target_hidden_proj_f32_chunk: gpu.alloc_tensor(
                 &[MQ_X_ROT_CHUNK_ROWS * h], DType::F32,
+            )?,
+            // F32 chunk-output scratch for per-layer wk/wv (B2). Sized
+            // MQ_X_ROT_CHUNK_ROWS × kvd F32 (~5 MB at kvd=1280). Shared
+            // between K and V — each cycle K narrows to F16 cache before V
+            // overwrites the scratch.
+            kv_f32_chunk: gpu.alloc_tensor(
+                &[MQ_X_ROT_CHUNK_ROWS * kvd], DType::F32,
             )?,
             k_ctx:              gpu.alloc_tensor(&[l * kvd], DType::F32)?,
             v_ctx:              gpu.alloc_tensor(&[l * kvd], DType::F32)?,
@@ -628,6 +647,7 @@ impl DflashScratch {
         let _ = gpu.free_tensor(self.target_hidden_proj);
         let _ = gpu.free_tensor(self.target_hidden_delta_f32);
         let _ = gpu.free_tensor(self.target_hidden_proj_f32_chunk);
+        let _ = gpu.free_tensor(self.kv_f32_chunk);
         let _ = gpu.free_tensor(self.k_ctx);
         let _ = gpu.free_tensor(self.v_ctx);
         let _ = gpu.free_tensor(self.k_cat);
@@ -1083,14 +1103,23 @@ pub fn draft_forward(
         let k_cache_layer = &scratch.k_ctx_cached[li];
         let v_cache_layer = &scratch.v_ctx_cached[li];
         if delta > 0 {
-            // B1 widening: target_hidden_proj is F16 storage but wk/wv GEMM
-            // (and its rotate_x_mq pre-pass) expect F32 input. Widen each
-            // chunk of `delta` rows into a sub-region of
-            // `target_hidden_delta_f32` (first `MQ_X_ROT_CHUNK_ROWS × h`
-            // floats — 1/ne of that buffer's total capacity). Chunked at
-            // MQ_X_ROT_CHUNK_ROWS to match gemm_dispatch's internal rotation
-            // chunking. Steady-state delta is small (≤ b), so most cycles
-            // run a single chunk per layer.
+            // B1 + B2 widening (Phase 2, 2026-05-16): target_hidden_proj AND
+            // k_ctx_cached / v_ctx_cached are F16 storage; the wk/wv GEMM
+            // (and its rotate_x_mq pre-pass + rmsnorm_batched) expect F32.
+            //
+            // Per chunk of `delta` rows:
+            //   1. Widen target_hidden_proj F16 → F32 (target_hidden_delta_f32
+            //      sub-region: the first `MQ_X_ROT_CHUNK_ROWS × h` floats).
+            //   2. wk: F32 input → F32 output in kv_f32_chunk (sized MQ_X_ROT_CHUNK_ROWS × kvd).
+            //   3. k_norm rmsnorm on the F32 wk output (in-place).
+            //   4. Narrow F32 → F16 into k_ctx_cached[li] at chunk offset.
+            //   5. wv: F32 input → F32 output in kv_f32_chunk (overwrites K's
+            //      data, safe — K is already in cache).
+            //   6. Narrow F32 → F16 into v_ctx_cached[li] at chunk offset.
+            //
+            // Steady-state delta is small (≤ b), so most cycles run a single
+            // chunk per layer. First-call (delta=l) takes ceil(l / chunk_rows)
+            // chunks per layer.
             let dst_offset_elems = cached_rows * kvd;
             let chunk_rows = MQ_X_ROT_CHUNK_ROWS;
             let mut row = 0;
@@ -1108,23 +1137,40 @@ pub fn draft_forward(
                     &thp_chunk_f32.buf,
                     n * h,
                 )?;
-                let k_slot_chunk = k_cache_layer
-                    .sub_offset(dst_offset_elems + row * kvd, n * kvd);
-                let v_slot_chunk = v_cache_layer
-                    .sub_offset(dst_offset_elems + row * kvd, n * kvd);
+
+                let kv_chunk_f32 = scratch.kv_f32_chunk.sub_offset(0, n * kvd);
+
+                // K path: wk → F32 chunk → k_norm → narrow to F16 k_cache slot.
                 gemm_dispatch(
-                    gpu, &thp_chunk_f32, &layer.wk, &k_slot_chunk, n,
+                    gpu, &thp_chunk_f32, &layer.wk, &kv_chunk_f32, n,
                     scratch.mq_x_rot.as_ref(),
                 )?;
+                gpu.rmsnorm_batched(
+                    &kv_chunk_f32, &layer.k_norm, &kv_chunk_f32,
+                    n * cfg.n_kv_heads, hd, eps,
+                )?;
+                let k_slot_chunk_f16 = k_cache_layer
+                    .sub_offset(dst_offset_elems + row * kvd, n * kvd);
+                gpu.convert_f32_to_f16_to(
+                    &kv_chunk_f32.buf,
+                    &k_slot_chunk_f16.buf,
+                    n * kvd,
+                )?;
+
+                // V path: wv → F32 chunk (overwrite) → narrow to F16 v_cache slot.
                 gemm_dispatch(
-                    gpu, &thp_chunk_f32, &layer.wv, &v_slot_chunk, n,
+                    gpu, &thp_chunk_f32, &layer.wv, &kv_chunk_f32, n,
                     scratch.mq_x_rot.as_ref(),
+                )?;
+                let v_slot_chunk_f16 = v_cache_layer
+                    .sub_offset(dst_offset_elems + row * kvd, n * kvd);
+                gpu.convert_f32_to_f16_to(
+                    &kv_chunk_f32.buf,
+                    &v_slot_chunk_f16.buf,
+                    n * kvd,
                 )?;
                 row += n;
             }
-            // Per-head RMSNorm on K delta rows only. batch = delta × n_kv_heads.
-            let k_slot = k_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
-            gpu.rmsnorm_batched(&k_slot, &layer.k_norm, &k_slot, delta * cfg.n_kv_heads, hd, eps)?;
         }
 
         if let Some(t) = t0 {
@@ -1138,12 +1184,22 @@ pub fn draft_forward(
         // Concat K = [K_ctx_cached | K_noise] → k_cat [L + B, kv_dim].
         // The cached K prefix is already post-k_norm (applied incrementally
         // above); the noise tail still needs k_norm applied below.
-        let ctx_bytes   = (l * kvd) * 4;
+        //
+        // Phase 2 / B2 (2026-05-16): k_cache_layer / v_cache_layer are F16
+        // storage; widen to F32 k_cat / v_cat via convert_f16_to_f32_to
+        // (one kernel per cache per layer per cycle — cost dominated by
+        // F16 read bandwidth, ~equal to the prior dtod memcpy at the F16
+        // → F32 byte-rate). Noise tail stays F32 and is memcpy'd in
+        // afterward at offset `ctx_bytes` of the F32 k_cat / v_cat.
+        let ctx_floats = l * kvd;
         let noise_bytes = (b * kvd) * 4;
-        gpu.hip.memcpy_dtod_at(&scratch.k_cat.buf, 0,          &k_cache_layer.buf,   0, ctx_bytes)?;
-        gpu.hip.memcpy_dtod_at(&scratch.k_cat.buf, ctx_bytes,  &scratch.k_noise.buf, 0, noise_bytes)?;
-        gpu.hip.memcpy_dtod_at(&scratch.v_cat.buf, 0,          &v_cache_layer.buf,   0, ctx_bytes)?;
-        gpu.hip.memcpy_dtod_at(&scratch.v_cat.buf, ctx_bytes,  &scratch.v_noise.buf, 0, noise_bytes)?;
+        let ctx_bytes_f32 = ctx_floats * 4;
+        let k_cat_ctx = scratch.k_cat.sub_offset(0, ctx_floats);
+        let v_cat_ctx = scratch.v_cat.sub_offset(0, ctx_floats);
+        gpu.convert_f16_to_f32_to(&k_cache_layer.buf, &k_cat_ctx.buf, ctx_floats)?;
+        gpu.convert_f16_to_f32_to(&v_cache_layer.buf, &v_cat_ctx.buf, ctx_floats)?;
+        gpu.hip.memcpy_dtod_at(&scratch.k_cat.buf, ctx_bytes_f32, &scratch.k_noise.buf, 0, noise_bytes)?;
+        gpu.hip.memcpy_dtod_at(&scratch.v_cat.buf, ctx_bytes_f32, &scratch.v_noise.buf, 0, noise_bytes)?;
 
         // Per-head RMSNorm on Q: each of B*n_heads rows, size head_dim,
         // weight [head_dim].
