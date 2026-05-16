@@ -44,9 +44,21 @@ fn main() {
     let sc = llama::SamplingConfig::text_thinking();
 
     // Optional hidden-state ring buffer for Phase 3 overhead measurement.
+    // Post-Phase 1 collapse (2026-05-16): the ring shares its persistent
+    // storage with a target_hidden tensor owned by `DflashScratch` in
+    // production. This bench has no DFlash drafter and so allocates a
+    // throwaway tensor sized to match the ring's [max_positions, num_extract,
+    // hidden] layout. The tensor leaks at bench exit — fine for a one-shot
+    // measurement.
     let mut hidden_rb = if with_extract {
+        let ne_bench = 5usize;
+        let max_pos_bench = 32usize;
+        let th = gpu.alloc_tensor(
+            &[max_pos_bench * ne_bench * config.dim],
+            rdna_compute::DType::F32,
+        ).unwrap();
         Some(hipfire_arch_qwen35::speculative::HiddenStateRingBuffer::new(
-            &mut gpu, config.n_layers, 5, config.dim, 32, 32,
+            &mut gpu, th, config.n_layers, ne_bench, config.dim, max_pos_bench, 32,
         ).unwrap())
     } else {
         None

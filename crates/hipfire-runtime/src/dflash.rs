@@ -489,7 +489,16 @@ impl DflashScratch {
             residual_attn: gpu.alloc_tensor(&[b * h], DType::F32)?,
             residual_ffn:  gpu.alloc_tensor(&[b * h], DType::F32)?,
 
-            target_hidden:      gpu.alloc_tensor(&[l * ne * h], DType::F32)?,
+            // target_hidden carries `block_size` rows of write-only headroom
+            // beyond `l` to absorb speculative verify writes when the model
+            // position approaches the ctx ceiling. The downstream FC GEMM
+            // only ever reads up to `ctx_len ≤ l` rows; the extra `b` rows
+            // are scratch for the ring buffer's speculative slots. Required
+            // after Phase 1 collapse (2026-05-16): `HiddenStateRingBuffer`
+            // writes directly into this buffer at slot `(head + r) * ne * h`
+            // where `head` can reach `l + b - 1` mid-verify. See callers'
+            // construction: hidden_rb.max_positions = ctx_capacity + b.
+            target_hidden:      gpu.alloc_tensor(&[tot * ne * h], DType::F32)?,
             target_hidden_proj: gpu.alloc_tensor(&[l * h], DType::F32)?,
             k_ctx:              gpu.alloc_tensor(&[l * kvd], DType::F32)?,
             v_ctx:              gpu.alloc_tensor(&[l * kvd], DType::F32)?,
@@ -507,6 +516,27 @@ impl DflashScratch {
             v_ctx_cached,
             draft_ctx_cached_rows: 0,
         })
+    }
+
+    /// Return a non-owning alias view of `target_hidden` suitable for use as
+    /// the backing store of a `HiddenStateRingBuffer`. After Phase 1 collapse
+    /// (2026-05-16), the ring buffer no longer allocates its own
+    /// `[num_extract][max_positions, hidden]` per-extract layer buffers — it
+    /// writes hidden-state extractions directly into this shared interleaved
+    /// `[max_ctx_len, num_extract, hidden]` storage. Eliminates ~6.4 GB of
+    /// duplicate VRAM at ctx=64K (`hidden=5120`, `num_extract=5`).
+    ///
+    /// SAFETY: the returned `GpuTensor` references the same device pointer as
+    /// `self.target_hidden`. It is a view — DO NOT free it. The alias must not
+    /// outlive `self`; in production both `DflashScratch` and the consuming
+    /// `HiddenStateRingBuffer` live in the same outer struct
+    /// (`daemon::DflashState`) and are dropped together at session teardown.
+    pub fn target_hidden_alias(&self) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { self.target_hidden.buf.alias() },
+            shape: self.target_hidden.shape.clone(),
+            dtype: self.target_hidden.dtype,
+        }
     }
 
     /// Reset the incremental-upload tracker for target_hidden. Call this

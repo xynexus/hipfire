@@ -1891,10 +1891,13 @@ fn load_dflash_state(
 
     // Hidden ring: one row per target-layer selected by the draft config,
     // captured during each target forward. Sized so the whole context plus
-    // one block fits without aliasing. Cheap (< 100 MB) next to the draft
-    // weights themselves.
+    // one block fits without aliasing. After Phase 1 collapse (2026-05-16),
+    // the ring shares its persistent storage with `draft_scratch.target_hidden`
+    // (single canonical buffer, no per-extract duplicate) — eliminates
+    // ~6.4 GB at ctx=64K on 27B.
     let hidden_rb = HiddenStateRingBuffer::new(
         gpu,
+        draft_scratch.target_hidden_alias(),
         target_config.n_layers,
         draft_config.num_extract(),
         draft_config.hidden,

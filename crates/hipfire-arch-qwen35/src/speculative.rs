@@ -1127,8 +1127,28 @@ impl VerifyScratch {
 }
 
 pub struct HiddenStateRingBuffer {
-    pub layer_bufs: Vec<GpuTensor>,
+    /// Non-owning alias to `DflashScratch.target_hidden`. Shape interpretation:
+    /// `[max_positions, num_extract, hidden_dim]` f32, position-major
+    /// (slot stride = `num_extract * hidden_dim * 4` bytes; within a slot the
+    /// per-extract rows are contiguous).
+    ///
+    /// All writers (`write_at_head`, `write_rows_at_head`,
+    /// `commit_staging_to_ring`) scatter into this buffer at offset
+    /// `(slot * num_extract + extract_idx) * hidden_dim * 4` bytes. The
+    /// downstream FC GEMM in `DFlash::draft_forward` reads contiguous
+    /// `delta * num_extract * hidden_dim` floats starting at
+    /// `position * num_extract * hidden_dim` — the same layout this ring
+    /// writes into. Eliminates the duplicate per-extract `layer_bufs` storage
+    /// that previously cost `num_extract × max_positions × hidden_dim × 4`
+    /// bytes (~6.4 GB at ctx=64K, hidden=5120, num_extract=5).
+    ///
+    /// SAFETY: the alias's underlying allocation lives in `DflashScratch`. The
+    /// ring buffer's lifetime MUST be a subset of the DflashScratch's. The
+    /// ring buffer does NOT free this tensor on drop.
+    pub target_hidden: GpuTensor,
     pub extract_layers: Vec<usize>,
+    /// Logical slot count: the ring's head wraps at this value. Must be ≤
+    /// `target_hidden.shape[0]` (the alias's first-dim capacity in slots).
     pub max_positions: usize,
     pub hidden_dim: usize,
     pub head: usize,
@@ -1136,8 +1156,9 @@ pub struct HiddenStateRingBuffer {
     /// Per-extract-layer staging buffer, shape `[max_batch × hidden_dim]`.
     /// Captured kernels (verify forward) write here with FIXED offsets so
     /// their captured pointers don't bake in a per-cycle `head`. After the
-    /// graph returns, `commit_staging_to_ring` scatters staging → `layer_bufs`
-    /// at the current head (outside the captured region, head-aware).
+    /// graph returns, `commit_staging_to_ring` scatters staging directly
+    /// into `target_hidden` at the current head (outside the captured region,
+    /// head-aware).
     pub staging_bufs: Vec<GpuTensor>,
     /// Max rows a single staging write can hold — sized to the maximum batch
     /// the caller ever passes to `write_rows_to_staging`. For DFlash verify
@@ -1148,10 +1169,17 @@ pub struct HiddenStateRingBuffer {
 impl HiddenStateRingBuffer {
     /// Allocate GPU ring buffer for `num_extract` target layers.
     ///
+    /// `target_hidden_alias` is a non-owning view onto the canonical
+    /// `[max_positions, num_extract, hidden_dim]` storage owned by
+    /// `DflashScratch`. Construct via `DflashScratch::target_hidden_alias()`.
+    /// The caller is responsible for ensuring `target_hidden_alias` outlives
+    /// the returned ring buffer.
+    ///
     /// `max_batch` sizes the staging buffers used by the graph-capture path.
     /// Typical value for DFlash verify is `budget + 1`.
     pub fn new(
         gpu: &mut Gpu,
+        target_hidden_alias: GpuTensor,
         num_target_layers: usize,
         num_extract: usize,
         hidden_dim: usize,
@@ -1159,14 +1187,19 @@ impl HiddenStateRingBuffer {
         max_batch: usize,
     ) -> HipResult<Self> {
         let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
-        let mut layer_bufs = Vec::with_capacity(num_extract);
+        let needed = max_positions * num_extract * hidden_dim;
+        assert!(
+            target_hidden_alias.numel() >= needed,
+            "HiddenStateRingBuffer::new: target_hidden alias has {} f32 elems, need ≥ {} \
+             (max_positions={} × num_extract={} × hidden_dim={})",
+            target_hidden_alias.numel(), needed, max_positions, num_extract, hidden_dim,
+        );
         let mut staging_bufs = Vec::with_capacity(num_extract);
         for _ in 0..num_extract {
-            layer_bufs.push(gpu.alloc_tensor(&[max_positions * hidden_dim], rdna_compute::DType::F32)?);
             staging_bufs.push(gpu.alloc_tensor(&[max_batch * hidden_dim], rdna_compute::DType::F32)?);
         }
         Ok(Self {
-            layer_bufs,
+            target_hidden: target_hidden_alias,
             extract_layers,
             max_positions,
             hidden_dim,
@@ -1177,6 +1210,14 @@ impl HiddenStateRingBuffer {
         })
     }
 
+    /// Returns the number of distinct target-side extract layers this ring buffer
+    /// captures (equal to `extract_layers.len()`). Used by writer offset math
+    /// and downstream interleaved-layout consumers.
+    #[inline]
+    pub fn num_extract(&self) -> usize {
+        self.extract_layers.len()
+    }
+
     /// If `target_layer_idx` matches one of the extraction layers, return the
     /// index into `layer_bufs`/`extract_layers` for that layer. Otherwise None.
     #[inline]
@@ -1184,23 +1225,28 @@ impl HiddenStateRingBuffer {
         self.extract_layers.iter().position(|&l| l == target_layer_idx)
     }
 
-    /// Copy `x` (shape `[hidden_dim]`) into the ring buffer slot for the given
-    /// extraction layer at the CURRENT head position. Call once per extracted
-    /// layer per forward pass, then `advance_head()` at the end of the forward
-    /// to move to the next slot.
+    /// Copy `x` (shape `[hidden_dim]`) into `target_hidden` at the slot
+    /// `(head, extract_idx)`. Call once per extracted layer per forward pass,
+    /// then `advance_head()` at the end of the forward to move to the next slot.
+    ///
+    /// Destination byte offset: `(head * num_extract + extract_idx) * hidden_dim * 4`.
     pub fn write_at_head(
         &self,
         gpu: &mut Gpu,
         extract_idx: usize,
         x: &GpuTensor,
     ) -> HipResult<()> {
-        let offset = self.head * self.hidden_dim * 4;
+        let row_bytes = self.hidden_dim * 4;
+        let num_extract = self.num_extract();
+        debug_assert!(extract_idx < num_extract,
+            "write_at_head: extract_idx {} >= num_extract {}", extract_idx, num_extract);
+        let offset = (self.head * num_extract + extract_idx) * row_bytes;
         gpu.hip.memcpy_dtod_at(
-            &self.layer_bufs[extract_idx].buf,
+            &self.target_hidden.buf,
             offset,
             &x.buf,
             0,
-            self.hidden_dim * 4,
+            row_bytes,
         )
     }
 
@@ -1221,11 +1267,14 @@ impl HiddenStateRingBuffer {
     }
 
     /// Copy `n` contiguous rows from `src` (shape `[n × hidden_dim]` row-major)
-    /// into the ring buffer slot for the given extraction layer, starting at
-    /// the CURRENT head position. Handles the ring-buffer wrap: if head + n
-    /// exceeds max_positions, the write splits into a head→end + 0→tail pair.
-    /// Call this once per extracted layer per batched forward, then advance
-    /// the head by `n` via `advance_head_by(n)` at the end.
+    /// into `target_hidden` at slots `[head..head+n)` for the given
+    /// `extract_idx`. Handles the ring-buffer wrap. Call once per extracted
+    /// layer per batched forward, then advance the head by `n` via
+    /// `advance_head_by(n)` at the end.
+    ///
+    /// Destination is strided across the interleaved `[slot, num_extract, hidden]`
+    /// layout: per-slot stride is `num_extract * hidden_dim * 4` bytes.
+    /// Each of the `n` rows is a single `hidden_dim * 4`-byte dtod copy.
     pub fn write_rows_at_head(
         &self,
         gpu: &mut Gpu,
@@ -1234,32 +1283,43 @@ impl HiddenStateRingBuffer {
         n: usize,
     ) -> HipResult<()> {
         let row_bytes = self.hidden_dim * 4;
+        let num_extract = self.num_extract();
+        debug_assert!(extract_idx < num_extract);
+        let slot_bytes = num_extract * row_bytes;
+        let layer_off = extract_idx * row_bytes;
         let head = self.head;
         let max_pos = self.max_positions;
+        // No wrap.
         if head + n <= max_pos {
-            gpu.hip.memcpy_dtod_at(
-                &self.layer_bufs[extract_idx].buf,
-                head * row_bytes,
-                &src.buf,
-                0,
-                n * row_bytes,
-            )?;
+            for r in 0..n {
+                let dst_off = (head + r) * slot_bytes + layer_off;
+                let src_off = r * row_bytes;
+                gpu.hip.memcpy_dtod_at(
+                    &self.target_hidden.buf, dst_off,
+                    &src.buf, src_off,
+                    row_bytes,
+                )?;
+            }
         } else {
             let first = max_pos - head;
-            gpu.hip.memcpy_dtod_at(
-                &self.layer_bufs[extract_idx].buf,
-                head * row_bytes,
-                &src.buf,
-                0,
-                first * row_bytes,
-            )?;
-            gpu.hip.memcpy_dtod_at(
-                &self.layer_bufs[extract_idx].buf,
-                0,
-                &src.buf,
-                first * row_bytes,
-                (n - first) * row_bytes,
-            )?;
+            for r in 0..first {
+                let dst_off = (head + r) * slot_bytes + layer_off;
+                let src_off = r * row_bytes;
+                gpu.hip.memcpy_dtod_at(
+                    &self.target_hidden.buf, dst_off,
+                    &src.buf, src_off,
+                    row_bytes,
+                )?;
+            }
+            for r in first..n {
+                let dst_off = (r - first) * slot_bytes + layer_off;
+                let src_off = r * row_bytes;
+                gpu.hip.memcpy_dtod_at(
+                    &self.target_hidden.buf, dst_off,
+                    &src.buf, src_off,
+                    row_bytes,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1298,11 +1358,19 @@ impl HiddenStateRingBuffer {
         }
     }
 
-    /// Scatter staging buffers into `layer_bufs` at the current head, handling
-    /// ring wrap, then advance the head by `n`. Must be called AFTER the
-    /// forward (outside any captured region) — uses the current `head` to
-    /// compute destination offsets, which would be baked wrong in a replayed
-    /// graph.
+    /// Scatter staging buffers directly into `target_hidden` at slots
+    /// `[head..head+n)` for each extract layer, handling ring wrap, then
+    /// advance the head by `n`. Must be called AFTER the forward (outside any
+    /// captured region) — uses the current `head` to compute destination
+    /// offsets, which would be baked wrong in a replayed graph.
+    ///
+    /// Performs `num_extract × n` single-row dtod copies (one per
+    /// (extract, slot) pair). Cost is bounded by launch overhead × `ne × n`
+    /// — for ne=5, n=32 (DFlash verify block) that's 160 small launches on
+    /// 7900 XTX (~800 µs); equivalent to the prior path that did
+    /// `ne` big copies into `layer_bufs` followed by
+    /// `scatter_hidden_block_to_interleaved` doing the same 160 small
+    /// copies to `target_hidden`.
     ///
     /// When `gpu.active_stream` is Some, we first sync the stream (so the
     /// captured forward's staging writes are complete) then use sync D2D
@@ -1311,6 +1379,8 @@ impl HiddenStateRingBuffer {
     /// (e.g. the draft forward's D2H of hidden rows after this commit).
     pub fn commit_staging_to_ring(&mut self, gpu: &mut Gpu, n: usize) -> HipResult<()> {
         let row_bytes = self.hidden_dim * 4;
+        let num_extract = self.num_extract();
+        let slot_bytes = num_extract * row_bytes;
         let head = self.head;
         let max_pos = self.max_positions;
 
@@ -1321,25 +1391,39 @@ impl HiddenStateRingBuffer {
             gpu.hip.stream_synchronize(stream)?;
         }
 
-        for ei in 0..self.layer_bufs.len() {
+        for ei in 0..num_extract {
+            let layer_off = ei * row_bytes;
+            let staging_buf = &self.staging_bufs[ei].buf;
             if head + n <= max_pos {
-                gpu.hip.memcpy_dtod_at(
-                    &self.layer_bufs[ei].buf, head * row_bytes,
-                    &self.staging_bufs[ei].buf, 0,
-                    n * row_bytes,
-                )?;
+                for r in 0..n {
+                    let dst_off = (head + r) * slot_bytes + layer_off;
+                    let src_off = r * row_bytes;
+                    gpu.hip.memcpy_dtod_at(
+                        &self.target_hidden.buf, dst_off,
+                        staging_buf, src_off,
+                        row_bytes,
+                    )?;
+                }
             } else {
                 let first = max_pos - head;
-                gpu.hip.memcpy_dtod_at(
-                    &self.layer_bufs[ei].buf, head * row_bytes,
-                    &self.staging_bufs[ei].buf, 0,
-                    first * row_bytes,
-                )?;
-                gpu.hip.memcpy_dtod_at(
-                    &self.layer_bufs[ei].buf, 0,
-                    &self.staging_bufs[ei].buf, first * row_bytes,
-                    (n - first) * row_bytes,
-                )?;
+                for r in 0..first {
+                    let dst_off = (head + r) * slot_bytes + layer_off;
+                    let src_off = r * row_bytes;
+                    gpu.hip.memcpy_dtod_at(
+                        &self.target_hidden.buf, dst_off,
+                        staging_buf, src_off,
+                        row_bytes,
+                    )?;
+                }
+                for r in first..n {
+                    let dst_off = (r - first) * slot_bytes + layer_off;
+                    let src_off = r * row_bytes;
+                    gpu.hip.memcpy_dtod_at(
+                        &self.target_hidden.buf, dst_off,
+                        staging_buf, src_off,
+                        row_bytes,
+                    )?;
+                }
             }
         }
         self.head = (head + n) % max_pos;
@@ -2283,30 +2367,44 @@ pub fn scatter_hidden_block_to_interleaved(
     n_rows: usize,
 ) -> HipResult<()> {
     assert!(n_rows <= block_size, "scatter: n_rows {n_rows} > block_size {block_size}");
-    let num_extract = hidden_rb.extract_layers.len();
+    let num_extract = hidden_rb.num_extract();
     let hidden = hidden_rb.hidden_dim;
     let max_pos = hidden_rb.max_positions;
     let head = hidden_rb.head;
     let written = hidden_rb.written;
     assert!(block_size <= written, "scatter: block_size {block_size} > written {written}");
-    let row_bytes = hidden * 4;
+    let slot_bytes = num_extract * hidden * 4;
     let start_slot = (head + max_pos - block_size) % max_pos;
 
+    // Phase 1 collapse (2026-05-16): after `HiddenStateRingBuffer` now writes
+    // directly into `DflashScratch.target_hidden`, the common-case scatter
+    // where `dst == &draft_scratch.target_hidden` AND `dst_row_offset` aligns
+    // with `start_slot` is a complete NO-OP — the data is already at the right
+    // place. The fallback below handles two residual cases that still need a
+    // real D2D copy:
+    //   (a) `dst` points to a DIFFERENT GPU tensor (no current production
+    //       caller does this, but kept for ABI compat).
+    //   (b) `dst_row_offset != start_slot` — the ring's head has drifted from
+    //       the abs-pos the caller wants to write to (e.g. after a TriAttn
+    //       eviction compaction). Each slot pair (src_slot, dst_row) gets a
+    //       single dtod copy of the full interleaved `num_extract × hidden`
+    //       row instead of `num_extract` separate per-extract rows.
+    let dst_is_target_hidden = dst.buf.as_ptr() == hidden_rb.target_hidden.buf.as_ptr();
+    if dst_is_target_hidden && dst_row_offset == start_slot {
+        return Ok(());
+    }
     for r in 0..n_rows {
         let slot = (start_slot + r) % max_pos;
         let dst_row = dst_row_offset + r;
-        let dst_row_base_bytes = dst_row * num_extract * row_bytes;
-        for ext in 0..num_extract {
-            let src_offset_bytes = slot * row_bytes;
-            let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
-            gpu.hip.memcpy_dtod_at(
-                &dst.buf,
-                dst_offset_bytes,
-                &hidden_rb.layer_bufs[ext].buf,
-                src_offset_bytes,
-                row_bytes,
-            )?;
-        }
+        let src_off = slot * slot_bytes;
+        let dst_off = dst_row * slot_bytes;
+        gpu.hip.memcpy_dtod_at(
+            &dst.buf,
+            dst_off,
+            &hidden_rb.target_hidden.buf,
+            src_off,
+            slot_bytes,
+        )?;
     }
     Ok(())
 }
@@ -2316,7 +2414,7 @@ pub fn download_hidden_block(
     hidden_rb: &HiddenStateRingBuffer,
     b: usize,
 ) -> HipResult<Vec<f32>> {
-    let num_extract = hidden_rb.extract_layers.len();
+    let num_extract = hidden_rb.num_extract();
     let hidden = hidden_rb.hidden_dim;
     let max_pos = hidden_rb.max_positions;
     let written = hidden_rb.written;
@@ -2328,55 +2426,34 @@ pub fn download_hidden_block(
     assert!(b <= written, "verify must have written at least B rows to ring buffer");
     let head = hidden_rb.head;
     let start_slot = (head + max_pos - b) % max_pos;
-    let row_bytes = hidden * 4;
+    let slot_bytes = num_extract * hidden * 4;
 
-    // Per layer, download only the B needed rows (not the full ring).
-    // If start_slot + b <= max_pos: one contiguous segment.
-    // Otherwise: two segments (head→end + 0→tail).
-    //
-    // Each layer's B-row slice lands at [ext × b × hidden] in layer_data_flat.
-    let mut layer_data_flat = vec![0f32; num_extract * b * hidden];
-    for ext in 0..num_extract {
-        let src_buf = &hidden_rb.layer_bufs[ext].buf;
-        let dst_offset_floats = ext * b * hidden;
-        if start_slot + b <= max_pos {
-            // Single contiguous copy.
-            let dst_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    layer_data_flat.as_mut_ptr().add(dst_offset_floats) as *mut u8,
-                    b * row_bytes,
-                )
-            };
-            gpu.hip.memcpy_dtoh_at(dst_bytes, src_buf, start_slot * row_bytes)?;
-        } else {
-            // Two-segment ring wrap: tail of buffer, then head.
-            let first_rows = max_pos - start_slot;
-            let second_rows = b - first_rows;
-            let dst_first_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    layer_data_flat.as_mut_ptr().add(dst_offset_floats) as *mut u8,
-                    first_rows * row_bytes,
-                )
-            };
-            gpu.hip.memcpy_dtoh_at(dst_first_bytes, src_buf, start_slot * row_bytes)?;
-            let dst_second_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    layer_data_flat.as_mut_ptr().add(dst_offset_floats + first_rows * hidden) as *mut u8,
-                    second_rows * row_bytes,
-                )
-            };
-            gpu.hip.memcpy_dtoh_at(dst_second_bytes, src_buf, 0)?;
-        }
-    }
-
-    // Rearrange into per-position-then-per-extract-layer order.
-    // layer_data_flat is [ext × b × hidden]; we want [b × ext × hidden].
-    let mut out: Vec<f32> = Vec::with_capacity(b * num_extract * hidden);
-    for pi in 0..b {
-        for ext in 0..num_extract {
-            let src_off = (ext * b + pi) * hidden;
-            out.extend_from_slice(&layer_data_flat[src_off..src_off + hidden]);
-        }
+    // Target_hidden's [slot, num_extract, hidden] layout already matches the
+    // caller's expected `[b × num_extract × hidden]` per-position interleaved
+    // output. One (or two, on ring wrap) contiguous D2H copies suffice; no
+    // host-side rearrangement needed. Previously this routine did
+    // `num_extract` separate D2Hs of size `b × hidden × 4` (one per
+    // extract-layer ring) and reshaped on the host.
+    let mut out = vec![0f32; b * num_extract * hidden];
+    if start_slot + b <= max_pos {
+        let dst_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, b * slot_bytes)
+        };
+        gpu.hip.memcpy_dtoh_at(dst_bytes, &hidden_rb.target_hidden.buf, start_slot * slot_bytes)?;
+    } else {
+        let first_rows = max_pos - start_slot;
+        let second_rows = b - first_rows;
+        let dst_first: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, first_rows * slot_bytes)
+        };
+        gpu.hip.memcpy_dtoh_at(dst_first, &hidden_rb.target_hidden.buf, start_slot * slot_bytes)?;
+        let dst_second: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                (out.as_mut_ptr() as *mut u8).add(first_rows * slot_bytes),
+                second_rows * slot_bytes,
+            )
+        };
+        gpu.hip.memcpy_dtoh_at(dst_second, &hidden_rb.target_hidden.buf, 0)?;
     }
 
     debug_assert_eq!(out.len(), b * num_extract * hidden);

@@ -516,6 +516,7 @@ fn main() {
     let hrb_max_block = draft_scratch_b;
     let mut hidden_rb = HiddenStateRingBuffer::new(
         &mut gpu,
+        draft_scratch.target_hidden_alias(),
         target.config.n_layers,
         draft_cfg.num_extract(),
         draft_cfg.hidden,
