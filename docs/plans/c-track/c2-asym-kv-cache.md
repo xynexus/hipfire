@@ -52,7 +52,12 @@ path on master). Reuses existing asym3 dequant kernel infrastructure.
 
 ## Watch out for
 
-- **Quality risk is real** but **the memory's τ=4.71 baseline number is wrong**: a 2026-05-16 bisect found Roman-empire q8 prose τ at ~1.0-1.2 on EVERY commit from master through HEAD across max=120/192/300. The original memo's "0.88 → 4.71" figures aren't reproducible. **Don't use τ > 4.0 as a stop-the-bus gate.** Instead, compare to master at the same max length on the byte-exact prompt — your baseline is ~1.15 not ~4.71. The DRAFT cache is internal-only (not the cross-attention input from target), so precision drift here may behave differently from target-side KV quantization. Run all 4 short coherence cases (asym3 + q8) as the primary validation; long-prose τ comparison is informational, not a hard gate.
+- **Quality risk is real**: asym3 on the TARGET KV (master path,
+  PR #261) is known to tank DFlash drafter prose τ (per memory
+  `project_dflash_net_loss_on_prose_2026_05_15`). The DRAFT cache
+  is internal-only (not cross-attention input from target), so
+  precision drift here may behave differently. **Run all 4 short
+  + 2 long-prose coherence cases before claiming green.**
 - **Per-cycle write overhead**: asym3 quantize is more compute
   per byte than F16 narrow. Expect a small per-cycle perf hit;
   measure with the canonical bench.
@@ -85,8 +90,8 @@ path on master). Reuses existing asym3 dequant kernel infrastructure.
 | Canonical bench | `dflash_spec_demo ... --max 256 --kv-mode asym3 --no-chatml` | τ=13.2727 ±5 % each step (NOT byte-exact; quantize introduces drift) |
 | Coherence gate asym3 (canonical) | `HIPFIRE_FORCE_SPEC_GATE=1 ./scripts/coherence-gate-dflash.sh` | no hard errors |
 | Coherence gate q8 | `HIPFIRE_FORCE_SPEC_GATE=1 HIPFIRE_GATE_KV_MODE=q8 ./scripts/coherence-gate-dflash.sh` | no hard errors |
-| Long-prose 1 | run with 800-tok prose prompt, max=300, asym3 | τ stays within ±15% of master at same prompt/length |
-| Long-prose 2 | same with q8 | τ stays within ±15% of master at same prompt/length (master ≈ 1.15 on Roman-empire q8 — don't use 4.71) |
+| Long-prose 1 | run with 800-tok prose prompt, max=300, asym3 | τ stays > 0.5 (prose pre-existing weakness) |
+| Long-prose 2 | same with q8 | τ stays > 4.0 (q8 is the prose-friendly mode) |
 | Ctx bisect | as in coordination doc | ceiling lifts ≥6K on 24GB (or ≥10K on hiptrx) |
 
 ## Done criteria
@@ -94,7 +99,7 @@ path on master). Reuses existing asym3 dequant kernel infrastructure.
 - [ ] Each substep gate-clean
 - [ ] Coherence gate "no hard errors" on asym3 + q8 short + long-prose
 - [ ] τ on canonical drops by < 5 % cumulative
-- [ ] Long-prose τ on q8 stays within ±15% of master baseline at same prompt+max-length (master Roman-empire q8 is actually ~1.15, NOT 4.71 — original memory was wrong)
+- [ ] Long-prose τ on q8 stays > 4.0 (per memory: pre-C2 baseline ~4.71)
 - [ ] Net VRAM saved at ctx=64K ≥ 0.6 GB measured
 
 ## Handoff prompt

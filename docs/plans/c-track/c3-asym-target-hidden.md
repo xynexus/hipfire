@@ -119,8 +119,8 @@ if prose τ collapses.
 | Coherence gate asym3 (canonical) | `HIPFIRE_FORCE_SPEC_GATE=1 ./scripts/coherence-gate-dflash.sh` | no hard errors |
 | Coherence gate q8 | `HIPFIRE_FORCE_SPEC_GATE=1 HIPFIRE_GATE_KV_MODE=q8 ./scripts/coherence-gate-dflash.sh` | no hard errors |
 | Long-prose 1 (Roman empire, 800 tok) | asym3 | τ > 0.5 |
-| Long-prose 2 (Roman empire, 800 tok) | q8 | τ within ±20% of master baseline (master Roman-empire q8 ≈ 1.15, NOT 4.71 — earlier memo wrong) |
-| Long-prose 3 (different prose prompt) | q8 | τ within ±20% of master baseline (master Roman-empire q8 ≈ 1.15, NOT 4.71 — earlier memo wrong) |
+| Long-prose 2 (Roman empire, 800 tok) | q8 | τ > 4.0 |
+| Long-prose 3 (different prose prompt) | q8 | τ > 4.0 |
 | Long-context (32K prefix) | --ctx 32768 --max 100 asym3 | τ > 5, no attractor |
 | Ctx bisect | as in coordination doc | ceiling lifts ≥18K on 24 GB |
 
@@ -129,7 +129,7 @@ if prose τ collapses.
 - [ ] Each substep gate-clean
 - [ ] Coherence gate "no hard errors" on asym3 + q8 + 3 long-prose battery
 - [ ] τ on canonical drops by < 10 % cumulative
-- [ ] Prose τ on q8 stays within ±20% of master baseline at same prompt+max-length (master Roman-empire q8 ≈ 1.15, NOT 4.71 — earlier memo wrong)
+- [ ] Prose τ on q8 stays > 4.0 (pre-C3 baseline ~4.71)
 - [ ] Net VRAM saved at ctx=64K ≥ 2.0 GB measured
 - [ ] If asym3 fails coherence: ship asym4 fallback with ~1.5 GB saved
 
