@@ -65,7 +65,7 @@ if [ ! -f "$DRAFT_27B" ] && [ -f "$MODELS_DIR/qwen35-27b-dflash-mq4.hfq" ]; then
 fi
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-dflash-$(date +%Y%m%d-%H%M%S).md}"
 CASE_TIMEOUT="${HIPFIRE_COHERENCE_TIMEOUT:-240}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+LOCK_SCRIPT="${LOCK_SCRIPT-./scripts/gpu-lock.sh}"
 
 # ── Rebuild dflash_spec_demo if any relevant source is newer ──────────────
 rebuild=0

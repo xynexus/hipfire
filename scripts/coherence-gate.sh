@@ -39,7 +39,7 @@ done
 EXE="./target/release/examples/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-$(date +%Y%m%d-%H%M%S).md}"
-LOCK_SCRIPT="./scripts/gpu-lock.sh"
+LOCK_SCRIPT="${LOCK_SCRIPT-./scripts/gpu-lock.sh}"
 
 # ── Rebuild daemon if any relevant source is newer than the binary ────────
 rebuild=0
