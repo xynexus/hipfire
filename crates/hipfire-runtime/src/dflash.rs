@@ -344,14 +344,27 @@ pub struct DflashScratch {
     // HiddenStateRingBuffer writers narrow F32 → F16 at staging-commit time
     // via `convert_f32_to_f16` so the canonical store stays F16.
     pub target_hidden: GpuTensor,        // [L, num_extract × hidden] F16
-    pub target_hidden_proj: GpuTensor,   // [L, hidden]
+    /// `target_hidden_proj` is stored as **F16** post-Phase 2 / B1 (2026-05-16).
+    /// Saves L × hidden × 2 bytes (~660 MB at ctx=64K hidden=5120). The fc
+    /// GEMM still writes F32 into `target_hidden_proj_f32_chunk` and a
+    /// convert_f32_to_f16 kernel narrows the chunk into this buffer
+    /// post-rmsnorm. The per-layer wk/wv inputs widen F16 chunks back to
+    /// F32 in `target_hidden_delta_f32` (reused — chunk windows of size H
+    /// fit within the larger NE×H windows that path was sized for).
+    pub target_hidden_proj: GpuTensor,   // [L, hidden] F16
     pub k_ctx: GpuTensor,                // [L, kv_dim]
     pub v_ctx: GpuTensor,                // [L, kv_dim]
 
-    // F32 widening scratch for the FC GEMM. Sized to `max_block × ne × hidden`
-    // F32 — the per-cycle delta of fresh target_hidden rows the FC needs to
-    // project. Far smaller than the full target_hidden (max_block ≪ max_ctx).
+    // F32 widening scratch for the FC GEMM. Sized to `MQ_X_ROT_CHUNK_ROWS ×
+    // ne × hidden` F32 — the per-cycle delta of fresh target_hidden rows the
+    // FC needs to project. Far smaller than the full target_hidden.
     pub target_hidden_delta_f32: GpuTensor,
+
+    /// F32 scratch holding the fc GEMM's chunked output before it's narrowed
+    /// to F16 in `target_hidden_proj`. Sized to `MQ_X_ROT_CHUNK_ROWS × hidden`
+    /// F32 (~20 MB at hidden=5120). Per chunk: fc → this scratch → rmsnorm →
+    /// convert_f32_to_f16 → target_hidden_proj.
+    pub target_hidden_proj_f32_chunk: GpuTensor,
 
     // Concatenated K/V (L + B rows).
     pub k_cat: GpuTensor,                // [L + B, kv_dim]
@@ -516,16 +529,25 @@ impl DflashScratch {
             // Phase 2 dtype change: stored as F16 (was F32). Halves the buffer
             // — the largest per-ctx VRAM contributor in DflashScratch.
             target_hidden:      gpu.alloc_tensor(&[tot * ne * h], DType::F16)?,
-            target_hidden_proj: gpu.alloc_tensor(&[l * h], DType::F32)?,
+            target_hidden_proj: gpu.alloc_tensor(&[l * h], DType::F16)?,
             // F32 widening scratch for the FC GEMM. Sized to
             // `MQ_X_ROT_CHUNK_ROWS × ne × h` F32 (~100 MB at hidden=5120,
             // ne=5) — aligned with `mq_x_rot`'s rotation-chunk row count so
             // the FC dispatch can widen-then-rotate one chunk at a time on
             // first-call prefixes. Steady-state delta is `accept_len + 1`
             // (≤ b ≪ chunk_rows), so only the first `b × ne × h` floats are
-            // actually touched per cycle.
+            // actually touched per cycle. Also reused by the per-layer wk/wv
+            // path (B1) to widen `MQ_X_ROT_CHUNK_ROWS × h` of F16
+            // target_hidden_proj back to F32 — that's 1/ne of this scratch.
             target_hidden_delta_f32: gpu.alloc_tensor(
                 &[MQ_X_ROT_CHUNK_ROWS * ne * h], DType::F32,
+            )?,
+            // F32 chunk-output scratch for the fc GEMM. Sized to
+            // `MQ_X_ROT_CHUNK_ROWS × h` F32 (~20 MB at hidden=5120). Per
+            // chunk: fc writes F32 here → rmsnorm in place → convert_f32_to_f16
+            // narrows into the F16 `target_hidden_proj` at the chunk offset.
+            target_hidden_proj_f32_chunk: gpu.alloc_tensor(
+                &[MQ_X_ROT_CHUNK_ROWS * h], DType::F32,
             )?,
             k_ctx:              gpu.alloc_tensor(&[l * kvd], DType::F32)?,
             v_ctx:              gpu.alloc_tensor(&[l * kvd], DType::F32)?,
@@ -605,6 +627,7 @@ impl DflashScratch {
         let _ = gpu.free_tensor(self.target_hidden);
         let _ = gpu.free_tensor(self.target_hidden_proj);
         let _ = gpu.free_tensor(self.target_hidden_delta_f32);
+        let _ = gpu.free_tensor(self.target_hidden_proj_f32_chunk);
         let _ = gpu.free_tensor(self.k_ctx);
         let _ = gpu.free_tensor(self.v_ctx);
         let _ = gpu.free_tensor(self.k_cat);
@@ -929,15 +952,16 @@ pub fn draft_forward(
     let cached_rows = scratch.draft_ctx_cached_rows;
     let delta = l.saturating_sub(cached_rows);
     if delta > 0 {
-        // F16 target_hidden (Phase 2, 2026-05-16): widen the per-cycle delta
-        // slice to F32 in `target_hidden_delta_f32` before dispatching the FC
-        // GEMM, which still expects F32 input (and routes through
-        // rotate_x_mq_batched for MQ4 weights — that kernel is F32-only).
+        // F16 target_hidden + F16 target_hidden_proj (Phase 2 / B3+B1, 2026-05-16):
+        //   Per chunk:
+        //     1. Widen F16 target_hidden chunk → F32 (target_hidden_delta_f32)
+        //     2. fc GEMM (F32 in, F32 out) → target_hidden_proj_f32_chunk
+        //     3. rmsnorm on the F32 chunk (in-place)
+        //     4. Narrow F32 chunk → F16 target_hidden_proj at the right offset
         //
-        // Chunked at `MQ_X_ROT_CHUNK_ROWS` to bound the widening scratch.
-        // Steady-state `delta = accept_len + 1` is always ≤ b ≪ chunk size,
-        // so 99 % of calls are a single chunk. First-call (`delta = l`) takes
-        // ceil(l / chunk_rows) widening + GEMM passes.
+        // Chunked at `MQ_X_ROT_CHUNK_ROWS` to bound both widening and output
+        // scratches. Steady-state `delta = accept_len + 1` is always ≤ b ≪
+        // chunk size, so 99 % of calls are a single chunk.
         let chunk_rows = MQ_X_ROT_CHUNK_ROWS;
         let mut row = 0;
         while row < delta {
@@ -957,24 +981,32 @@ pub fn draft_forward(
                 n * ne * h,
             )?;
 
-            let thp_slice = scratch
-                .target_hidden_proj
-                .sub_offset(dst_offset_elems, n * h);
+            let thp_chunk_f32 = scratch
+                .target_hidden_proj_f32_chunk
+                .sub_offset(0, n * h);
             gemm_dispatch(
                 gpu,
                 &widened_chunk,
                 &weights.fc,
-                &thp_slice,
+                &thp_chunk_f32,
                 n,
                 scratch.mq_x_rot.as_ref(),
             )?;
             gpu.rmsnorm_batched(
-                &thp_slice,
+                &thp_chunk_f32,
                 &weights.hidden_norm,
-                &thp_slice,
+                &thp_chunk_f32,
                 n,
                 h,
                 eps,
+            )?;
+            let thp_f16_slot = scratch
+                .target_hidden_proj
+                .sub_offset(dst_offset_elems, n * h);
+            gpu.convert_f32_to_f16_to(
+                &thp_chunk_f32.buf,
+                &thp_f16_slot.buf,
+                n * h,
             )?;
             row += n;
         }
@@ -1051,14 +1083,47 @@ pub fn draft_forward(
         let k_cache_layer = &scratch.k_ctx_cached[li];
         let v_cache_layer = &scratch.v_ctx_cached[li];
         if delta > 0 {
-            let src_offset_elems = cached_rows * h;
+            // B1 widening: target_hidden_proj is F16 storage but wk/wv GEMM
+            // (and its rotate_x_mq pre-pass) expect F32 input. Widen each
+            // chunk of `delta` rows into a sub-region of
+            // `target_hidden_delta_f32` (first `MQ_X_ROT_CHUNK_ROWS × h`
+            // floats — 1/ne of that buffer's total capacity). Chunked at
+            // MQ_X_ROT_CHUNK_ROWS to match gemm_dispatch's internal rotation
+            // chunking. Steady-state delta is small (≤ b), so most cycles
+            // run a single chunk per layer.
             let dst_offset_elems = cached_rows * kvd;
-            let thp_slice = scratch.target_hidden_proj.sub_offset(src_offset_elems, delta * h);
-            let k_slot = k_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
-            let v_slot = v_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
-            gemm_dispatch(gpu, &thp_slice, &layer.wk, &k_slot, delta, scratch.mq_x_rot.as_ref())?;
-            gemm_dispatch(gpu, &thp_slice, &layer.wv, &v_slot, delta, scratch.mq_x_rot.as_ref())?;
+            let chunk_rows = MQ_X_ROT_CHUNK_ROWS;
+            let mut row = 0;
+            while row < delta {
+                let n = std::cmp::min(chunk_rows, delta - row);
+                let src_off = (cached_rows + row) * h;
+                let thp_chunk_f16 = scratch
+                    .target_hidden_proj
+                    .sub_offset(src_off, n * h);
+                let thp_chunk_f32 = scratch
+                    .target_hidden_delta_f32
+                    .sub_offset(0, n * h);
+                gpu.convert_f16_to_f32_to(
+                    &thp_chunk_f16.buf,
+                    &thp_chunk_f32.buf,
+                    n * h,
+                )?;
+                let k_slot_chunk = k_cache_layer
+                    .sub_offset(dst_offset_elems + row * kvd, n * kvd);
+                let v_slot_chunk = v_cache_layer
+                    .sub_offset(dst_offset_elems + row * kvd, n * kvd);
+                gemm_dispatch(
+                    gpu, &thp_chunk_f32, &layer.wk, &k_slot_chunk, n,
+                    scratch.mq_x_rot.as_ref(),
+                )?;
+                gemm_dispatch(
+                    gpu, &thp_chunk_f32, &layer.wv, &v_slot_chunk, n,
+                    scratch.mq_x_rot.as_ref(),
+                )?;
+                row += n;
+            }
             // Per-head RMSNorm on K delta rows only. batch = delta × n_kv_heads.
+            let k_slot = k_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
             gpu.rmsnorm_batched(&k_slot, &layer.k_norm, &k_slot, delta * cfg.n_kv_heads, hd, eps)?;
         }
 
