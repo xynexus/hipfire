@@ -193,6 +193,25 @@ fn is_fp8_wmma_enabled() -> bool {
 /// FP16 WMMA on the production prefill bench can lower it later.
 const FP8_WMMA_MIN_BATCH: usize = 1024;
 
+// AR-forward hipGraph policy (2026-05-15, after `<think>\n!!!!!` attractor
+// debug on Qwen3.5-27B mq4 gfx1100):
+//
+//   - `ar_forward_kernel_dirty`: true on init / after kernel module change.
+//     Forces direct dispatch on the very first call so any inline JIT or
+//     lazy hipMalloc happens outside a captured region.
+//   - `ar_forward_replay_enabled`: true only after the caller has signalled
+//     `end_decode_turn()` AND a capture exists AND kernels are not dirty.
+//     Until then, every forward call captures a fresh graph and launches it
+//     (correct output per call; cheaper than full direct on amortization).
+//
+// Why caller-driven commit instead of auto-enable: empirically, captured
+// graphs on this codebase + ROCm 7.2.2 sometimes snapshot stale kernarg
+// state mid-decode, producing a token-0 attractor on every replay. Gating
+// replay until a FULL decode turn completes via the captured-launch path
+// gives the captured graph the longest possible runway to be invalidated
+// by JIT recompilation; if a turn finishes coherently with capture+launch,
+// the same graph is more likely to replay coherently on the next turn.
+
 /// Minimum output dimension M at which the FP8-dot4 decode GEMV path
 /// is enabled. Below this, the fallback wins or ties on gfx1201
 /// (measured 0.92-1.03× on wo M=2048 K=2048 vs 1.17-1.21× on FFN
@@ -561,12 +580,16 @@ pub struct Gpu {
 
     /// AR `forward_scratch` (single-token decode) capture warmup flag.
     /// First call with `HIPFIRE_GRAPH=1` runs direct so kernel JIT and lazy
-    /// scratch allocations (MQ signs/x_rot/x_q8, FP16 shadow, kernel modules)
-    /// happen outside any captured region. Capturing the first call hits
-    /// `hipMalloc not permitted under stream capture`. Set after the first
-    /// direct run; the next call captures the graph for replay. Mirrors
-    /// `verify_warmed_up` but uses a scalar flag (no per-B keying).
-    pub ar_forward_warmed_up: bool,
+    /// AR-forward hipGraph capture/replay state. See block comment near
+    /// AR_FORWARD_WARMUP_CALLS in this file for policy.
+    /// True on init / after any kernel-module change. The next AR forward
+    /// runs direct (no capture) so inline JIT / lazy hipMalloc don't trip
+    /// `hipMalloc not permitted under stream capture`.
+    pub ar_forward_kernel_dirty: bool,
+    /// True after `end_decode_turn()` commits a capture (kernels clean,
+    /// graph_exec exists). Replay path enabled for next decode turn until
+    /// reset by kernel reload.
+    pub ar_forward_replay_enabled: bool,
 
     /// Per-B cache of captured verify-forward graphs. Each entry owns its
     /// graph + exec + the kernarg blobs that graph captured pointers into.
@@ -807,7 +830,8 @@ impl Gpu {
             captured_graph: None,
             graph_verify_n: None,
             graph_verify_warmup: 0,
-            ar_forward_warmed_up: false,
+            ar_forward_kernel_dirty: true,
+            ar_forward_replay_enabled: false,
             verify_graph_cache: HashMap::new(),
             verify_warmed_up: HashSet::new(),
             verify_capturing_b: None,
@@ -995,6 +1019,42 @@ impl Gpu {
         self.hip.graph_launch(exec, stream)
     }
 
+    /// Caller signals end of a decode turn (EOS or max_tokens reached). If a
+    /// captured graph exists and kernels are clean, replay is enabled for the
+    /// next decode turn. Per the AR-forward hipGraph policy: "at least one
+    /// captured full turn must run before replay can be enabled."
+    /// No-op if no capture exists (e.g., turn ran fully direct because kernels
+    /// were dirty or graph was disabled by the caller).
+    pub fn end_decode_turn(&mut self) {
+        if !self.ar_forward_kernel_dirty && self.graph_exec.is_some() {
+            self.ar_forward_replay_enabled = true;
+        }
+    }
+
+    /// Drop the currently captured graph (if any) without touching kernel /
+    /// replay state. Used by the capture+launch hot-path to free the previous
+    /// per-call capture before recording a fresh one — bare `graph_destroy()`
+    /// would also mark kernels dirty + disable replay, which is wrong here.
+    pub fn drop_captured_graph(&mut self) {
+        self.bind_thread_or_warn();
+        if let Some(exec) = self.graph_exec.take() {
+            let _ = self.hip.graph_exec_destroy(exec);
+        }
+        if let Some(graph) = self.captured_graph.take() {
+            let _ = self.hip.graph_destroy(graph);
+        }
+        self.capture_blobs.clear();
+    }
+
+    /// Caller signals a kernel-module change (model load, dtype switch, etc).
+    /// Forces the next AR forward call to dispatch direct (no capture) so any
+    /// inline JIT / lazy hipMalloc happens outside a captured region. Replay
+    /// stays disabled until a fresh full turn completes via `end_decode_turn`.
+    pub fn mark_kernels_dirty(&mut self) {
+        self.ar_forward_kernel_dirty = true;
+        self.ar_forward_replay_enabled = false;
+    }
+
     /// Destroy the captured graph and free all retained kernarg blobs.
     pub fn graph_destroy(&mut self) {
         self.bind_thread_or_warn();
@@ -1007,14 +1067,13 @@ impl Gpu {
         self.capture_blobs.clear();
         self.graph_verify_n = None;
         self.graph_verify_warmup = 0;
-        // Without this, model swap leaves the flag stuck on `true`. The
-        // forward path in qwen35::forward_scratch then jumps straight from
-        // graph_exec.is_none() into capture mode on the new model's first
-        // AR forward call, before kernel JIT / scratch allocations have
-        // happened against the new tensors. That trips
-        // "hipMalloc not permitted under stream capture" the same way
-        // verify_warmed_up does for the DFlash verify path.
-        self.ar_forward_warmed_up = false;
+        // Without this, model swap leaves replay enabled, so forward_scratch
+        // jumps straight to graph_launch on the new model's stale captured
+        // graph (whose kernel pointers reference the OLD model's weights).
+        // Mark kernels dirty so the next call goes direct and skips capture
+        // until JIT/scratch settles for the new model.
+        self.ar_forward_kernel_dirty = true;
+        self.ar_forward_replay_enabled = false;
     }
 
     // ── Per-B verify-forward graph cache ─────────────────────────────────

@@ -67,6 +67,31 @@ fn f16_lm_head_mode_from_env() -> F16LmHeadMode {
 /// is `None`, LA layers fall back to the linear path (byte-exact with
 /// DFlash at topk=1; approximation at topk>1 — used by pre-Phase-3
 /// callers that haven't been rewritten).
+
+/// Override the embedding for a single batch slot after the embedding-lookup
+/// kernel runs but before the layer loop. Used by the Qualcomm-style MTP
+/// probe (mtp_probe.rs) to inject mask-token embeddings whose values come
+/// from prompt-mean rather than the embedding table.
+///
+/// Default callers pass `None`; passing `Some(_)` triggers a single
+/// host-to-device memcpy into `pbs.x_batch.buf` at byte offset
+/// `slot * config.dim * 4` AFTER the embedding-lookup kernel populates
+/// the batched-x scratch and BEFORE the first layer reads it.
+///
+/// Constraints:
+///   - `slot < tokens.len()` of the call (asserted)
+///   - `embed.len() == config.dim` (asserted)
+///   - The override is applied unconditionally to whichever chunk's range
+///     contains `slot`. Multi-chunk callers MUST size the prefill batch
+///     scratch to keep their target slot in chunk 0, or pass the override
+///     only on the chunk where `slot < chunk_n`. (For the MTP probe the
+///     entire mask block fits in one chunk by construction.)
+#[derive(Clone, Copy)]
+pub struct MaskEmbedOverride<'a> {
+    pub slot: usize,
+    pub embed: &'a [f32],
+}
+
 #[derive(Clone, Copy)]
 pub struct TreeVerifyCtx<'a> {
     pub positions: &'a [i32],
@@ -3112,18 +3137,20 @@ pub fn forward_scratch(
     //   - MoE configs: always direct unless HIPFIRE_GRAPH_MOE=1; the
     //     graph path numerically drifts after ~30-50 tokens on MoE
     //     (see surrounding comment block for repro).
-    // Explicit HIPFIRE_GRAPH=0 always wins (kill switch).
-    let graph_override = *GRAPH_OVERRIDE_ENV.get_or_init(|| {
-        match std::env::var("HIPFIRE_GRAPH").ok().as_deref() {
-            Some("0") => Some(false),
-            Some("1") => Some(true),
-            _ => None,
-        }
-    });
-    let graph_arch_default =
-        gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
-    let graph_enabled = graph_override.unwrap_or(graph_arch_default);
-    let use_graph = graph_enabled && (config.num_experts == 0 || allow_moe);
+    // AR-forward hipGraph DISABLED (2026-05-15). Empirically on ROCm 7.2.2 +
+    // gfx11 + Qwen3.5-27B mq4, both replay AND capture+launch produce a
+    // token-0 attractor outside very narrow conditions:
+    //   - Capture+launch at position 2 (after 1 direct warmup) → `!!!!!`
+    //   - Capture+launch at position 4 (after 3 direct warmups) → correct
+    //   - Replay of a working capture (any position) → `!!!!!` from pos+1 on
+    // The kernarg-snapshot bug isn't fixable by warmup tuning OR caller-driven
+    // commit gating (`end_decode_turn()`); both fail empirically. Until ROCm
+    // 7.2.2's hipGraph capture/replay is debugged, AR forward is direct-only.
+    // Policy infrastructure (`ar_forward_kernel_dirty`, `ar_forward_replay_enabled`,
+    // `end_decode_turn()`, `drop_captured_graph()`) is preserved on Gpu so the
+    // path can be flipped on once the underlying bug is fixed.
+    let use_graph = false;
+    let _ = (allow_moe, gpu.ar_forward_replay_enabled);  // suppress unused-field warnings
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
@@ -3134,54 +3161,37 @@ pub fn forward_scratch(
         _ => panic!("unsupported embedding format"),
     }
 
-    // Compact offset (TriAttention eviction) breaks graph capture/replay:
-    // during replay, stream_write_value32 updates pos_buf but the captured
-    // H2D copy of (pos + compact_offset) inside FA layers overwrites it,
-    // causing RoPE to read stale positions. Fall back to direct execution.
-    let no_compact = kv_cache.compact_offset == 0;
-
-    if use_graph && gpu.graph_exec.is_some() && no_compact {
-        // ── Graph replay path ──
-        // Update pos_buf on the device via stream write (no host→device copy).
-        let stream = gpu.active_stream.as_ref().unwrap();
-        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+    let pos_i32 = pos as i32;
+    if use_graph && gpu.ar_forward_replay_enabled && gpu.graph_exec.is_some() {
+        // ── Replay path: caller has signalled end_decode_turn() since the
+        // last capture AND kernels are not dirty. Cheapest path. ──
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         gpu.graph_launch()?;
-    } else if use_graph && gpu.graph_exec.is_none() && no_compact {
-        let pos_i32 = pos as i32;
-        if !gpu.ar_forward_warmed_up {
-            // ── Warmup: run direct so kernel JIT and lazy scratch
-            // allocations (MQ signs/x_rot/x_q8, FP16 shadow, kernel module
-            // load) happen outside any captured region. Capturing the first
-            // call hits "hipMalloc not permitted under stream capture" — the
-            // same trap `verify_warmed_up` solves for the verify path. The
-            // next call will capture. (See bench_qwen35_mq4 / forward_prefill_batch
-            // for the production warmup path.)
-            gpu.ar_forward_warmed_up = true;
-            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-            forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
-        } else {
-            // ── First post-warmup call: capture the forward pass as a graph ──
-            // Ensure we have an explicit stream for capture.
-            if gpu.active_stream.is_none() {
-                gpu.active_stream = Some(gpu.hip.stream_create()?);
-            }
-            // Write pos_buf before capture (this write is NOT in the graph)
-            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-            gpu.begin_graph_capture()?;
-            forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
-            gpu.end_graph_capture()?;
-            // hipStreamCaptureModeGlobal RECORDS kernels — they do not execute
-            // during capture. Launch the freshly-instantiated graph once so
-            // this pos's forward actually runs (KV write, state advance,
-            // logits update). Same pattern as the verify path's
-            // begin_verify_graph_capture / end_verify_graph_capture /
-            // verify_graph_launch sequence.
-            gpu.graph_launch()?;
-            eprintln!("[hipGraph] captured {} blobs, instantiated", gpu.capture_blobs.len());
+    } else if use_graph && gpu.ar_forward_kernel_dirty {
+        // ── Direct path (kernel-dirty): kernels are dirty (init or post-
+        // model-load). Capture would trip "hipMalloc not permitted under
+        // stream capture" on the first inline JIT. Mark clean after a
+        // successful direct dispatch so subsequent calls can capture. ──
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        gpu.ar_forward_kernel_dirty = false;
+    } else if use_graph {
+        // ── Capture + launch: kernels are clean but caller has not committed
+        // a replay yet (or graph_exec is None). Drop any prior captured graph,
+        // record a fresh one, and launch it for this forward's output. After
+        // the caller signals end_decode_turn(), the most recent capture is
+        // promoted to the replay graph for the next decode turn. ──
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        gpu.drop_captured_graph();
+        gpu.begin_graph_capture()?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        gpu.end_graph_capture()?;
+        gpu.graph_launch()?;
     } else {
-        // ── Direct path (no graph) ──
-        let pos_i32 = pos as i32;
+        // ── Direct path (graph not eligible: arch / MoE config) ──
         gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
     }
@@ -3656,6 +3666,7 @@ pub fn forward_prefill_batch_single_chunk_captured(
         gdn_tape, 0, tree_verify,
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
         None, // band: full-stack single-GPU path
+        None, // mask_override: captured-prefill caller does not use the MTP probe hook
     )
 }
 
@@ -3676,6 +3687,7 @@ pub fn forward_prefill_batch(
     forward_prefill_batch_with_pbs(
         gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
         hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, scratch.prefill_batch.as_ref(),
+        None, // mask_override: MTP probe is the only consumer; default callers don't override
     )
 }
 
@@ -3702,6 +3714,7 @@ pub fn forward_prefill_batch_with_pbs(
     mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
 ) -> HipResult<()> {
     // Threshold below which the batching overhead isn't worth the alloc +
     // per-layer dispatch. Single-token prefill obviously should not take
@@ -3866,6 +3879,18 @@ pub fn forward_prefill_batch_with_pbs(
             "tree-verify mode requires the batched-FA-eligible prefill path; \
              kv quant + FA weight dtypes do not match on this model",
         );
+        // mask_override has nowhere to land on the per-token forward_scratch
+        // fallback (it operates on `scratch.x`, not the batched `pbs.x_batch`,
+        // and there's no shared "post-embed, pre-layer" hook). The MTP probe
+        // is the only consumer today and runs on MQ4-quantized models that
+        // always satisfy `eligible`, so hard-error rather than silently
+        // ignoring the override.
+        assert!(
+            mask_override.is_none(),
+            "MaskEmbedOverride requires the batched prefill path, but this \
+             model fell through to the per-token fallback (likely non-MQ4 \
+             weights, dn_state quant != Q8, or HIPFIRE_PREFILL_BATCHED=0).",
+        );
         // Fallback: per-token loop, byte-identical to decode. If hidden
         // extraction is requested, use the with_hidden variant so the ring
         // buffer still gets populated correctly (each call advances head by 1).
@@ -3940,12 +3965,36 @@ pub fn forward_prefill_batch_with_pbs(
             // Tree-verify was asserted to fit in one chunk above, so passing
             // the whole ctx through unconditionally is safe.
             let tv_for_chunk = tree_verify.as_ref().copied();
+            // Apply mask_override only to the chunk that actually contains
+            // its target slot, and rebase the slot index to chunk-local
+            // coordinates. Out-of-range slots panic (caller error).
+            let mo_for_chunk = mask_override.and_then(|ovr| {
+                if ovr.slot >= chunk_start && ovr.slot < chunk_end {
+                    Some(MaskEmbedOverride {
+                        slot: ovr.slot - chunk_start,
+                        embed: ovr.embed,
+                    })
+                } else {
+                    None
+                }
+            });
+            // Sanity: if caller provided an override, it MUST land in some
+            // chunk. Detect "fell off the end" at the last chunk boundary.
+            if mask_override.is_some() && chunk_end == n {
+                let landed_anywhere = mask_override.unwrap().slot < n;
+                assert!(
+                    landed_anywhere,
+                    "MaskEmbedOverride.slot ({}) is out of range for tokens.len() ({})",
+                    mask_override.unwrap().slot, n,
+                );
+            }
             forward_prefill_chunk(
                 gpu, weights, config, chunk, start_pos + chunk_start,
                 kv_cache, dn_state, scratch, pbs, hidden_rb.as_deref(),
                 pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
                 false, // pre_uploaded: default path uploads inside
                 None,  // band: full-stack single-GPU path
+                mo_for_chunk,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -4320,6 +4369,7 @@ fn forward_prefill_chunk(
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
     band: Option<&PrefillBandCtx<'_>>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -4393,6 +4443,39 @@ fn forward_prefill_chunk(
                 _ => panic!("unsupported embedding format"),
             }
             gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
+        }
+    }
+
+    // ── 1a. Apply MaskEmbedOverride (MTP probe hook) ─────────────────────
+    //
+    // Overwrite a single batch slot's embedding row in `pbs.x_batch` after
+    // the embedding-lookup kernel populated it but BEFORE the layer loop
+    // (or any subsequent kernel) reads it. The Qualcomm MTP probe uses this
+    // to replace the embedding-table value at a "mask token" position with
+    // a prompt-mean vector. Default callers pass `None` → zero overhead.
+    //
+    // Multi-GPU band-mode: skip on non-first bands; pbs.x_batch already
+    // holds the peer-copied activation from the previous band, so an
+    // override applied at band 0 has already propagated through the layer
+    // stack on that device — re-applying here would clobber the partial
+    // forward state.
+    if do_embed {
+        if let Some(ovr) = mask_override {
+            assert!(
+                ovr.slot < n,
+                "MaskEmbedOverride.slot ({}) must be < n ({})",
+                ovr.slot, n,
+            );
+            assert_eq!(
+                ovr.embed.len(), dim,
+                "MaskEmbedOverride.embed.len() ({}) must equal config.dim ({})",
+                ovr.embed.len(), dim,
+            );
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(ovr.embed.as_ptr() as *const u8, dim * 4)
+            };
+            let offset = ovr.slot * dim_row_bytes;
+            gpu.hip.memcpy_htod_offset(&pbs.x_batch.buf, offset, bytes)?;
         }
     }
 
@@ -8116,6 +8199,7 @@ pub fn forward_prefill_batch_multi(
                         None, // tree_verify: pp=1 only
                         false, // pre_uploaded
                         Some(&band_ctx),
+                        None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
                     )?;
                 }
 
