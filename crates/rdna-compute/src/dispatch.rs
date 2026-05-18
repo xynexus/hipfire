@@ -6511,11 +6511,14 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_qkvza_hfp4g32_wmma",
-            kernels::GEMM_QKVZA_HFP4G32_WMMA_SRC,
-            "gemm_qkvza_hfp4g32_wmma",
-        )?;
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_qkvza_hfp4g32_gfx1030", kernels::GEMM_QKVZA_HFP4G32_GFX1030_SRC)
+        } else {
+            ("gemm_qkvza_hfp4g32_wmma", kernels::GEMM_QKVZA_HFP4G32_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_qkv.buf.as_ptr();
@@ -6562,9 +6565,9 @@ impl Gpu {
                   + crate::profile::gemv_hfp4g32_bytes(alpha_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfp4g32_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkvza_hfp4g32_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -7435,11 +7438,14 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_qkv_hfp4g32_wmma",
-            kernels::GEMM_QKV_HFP4G32_WMMA_SRC,
-            "gemm_qkv_hfp4g32_wmma",
-        )?;
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_qkv_hfp4g32_gfx1030", kernels::GEMM_QKV_HFP4G32_GFX1030_SRC)
+        } else {
+            ("gemm_qkv_hfp4g32_wmma", kernels::GEMM_QKV_HFP4G32_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_q.buf.as_ptr();
@@ -7479,9 +7485,9 @@ impl Gpu {
                   + crate::profile::gemv_hfp4g32_bytes(v_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfp4g32_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkv_hfp4g32_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -7685,11 +7691,14 @@ impl Gpu {
         m: usize, k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_hfp4g32_residual_wmma",
-            kernels::GEMM_HFP4G32_RESIDUAL_WMMA_SRC,
-            "gemm_hfp4g32_residual_wmma",
-        )?;
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_hfp4g32_residual_gfx1030", kernels::GEMM_HFP4G32_RESIDUAL_GFX1030_SRC)
+        } else {
+            ("gemm_hfp4g32_residual_wmma", kernels::GEMM_HFP4G32_RESIDUAL_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut ap = a.buf.as_ptr();
@@ -7714,9 +7723,9 @@ impl Gpu {
         let bytes = crate::profile::gemv_hfp4g32_bytes(m, k)
                   + batch_size * k * 2
                   + batch_size * m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfp4g32_residual_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_hfp4g32_residual_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -7813,11 +7822,14 @@ impl Gpu {
         k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_gate_up_hfp4g32_wmma",
-            kernels::GEMM_GATE_UP_HFP4G32_WMMA_SRC,
-            "gemm_gate_up_hfp4g32_wmma",
-        )?;
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_gate_up_hfp4g32_gfx1030", kernels::GEMM_GATE_UP_HFP4G32_GFX1030_SRC)
+        } else {
+            ("gemm_gate_up_hfp4g32_wmma", kernels::GEMM_GATE_UP_HFP4G32_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut ag = a_gate.buf.as_ptr();
@@ -7850,9 +7862,9 @@ impl Gpu {
                   + crate::profile::gemv_hfp4g32_bytes(up_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfp4g32_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_gate_up_hfp4g32_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,

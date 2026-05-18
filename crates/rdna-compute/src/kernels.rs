@@ -635,6 +635,19 @@ pub const GEMM_GATE_UP_HFQ6G256_GFX1030_SRC: &str = include_str!("../../../kerne
 pub const GEMM_QKV_HFQ6G256_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256.gfx1030.hip");
 pub const GEMM_QKVZA_HFQ6G256_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256.gfx1030.hip");
 pub const GEMM_HFQ6G256_RESIDUAL_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual.gfx1030.hip");
+/// HFP4-G32 prefill GEMM family for gfx1030 (RDNA2, no WMMA). Same
+/// scalar-FMA LDS-shared-A strategy as the Q8_0 siblings, but the
+/// per-row layout is HFP4G32: 16-B header (FP16 row_scale_a) + (K/32)
+/// blocks × 17 B (1 B UE8M0 exponent + 16 B = 32 packed FP4-E2M1
+/// nibbles). Dequant chain: row_scale * 2^(block_e - 127) *
+/// E2M1_LUT[nibble]. Each LDS K-tile of 16 covers half a 32-element
+/// HFP4 block. HFP4G32 is marked deprecated (feedback_mfp_hfp_dead)
+/// but these four kernels exist for coverage of the gfx1100 surface
+/// on RDNA2 hosts.
+pub const GEMM_GATE_UP_HFP4G32_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfp4g32.gfx1030.hip");
+pub const GEMM_QKV_HFP4G32_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfp4g32.gfx1030.hip");
+pub const GEMM_QKVZA_HFP4G32_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfp4g32.gfx1030.hip");
+pub const GEMM_HFP4G32_RESIDUAL_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual.gfx1030.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
