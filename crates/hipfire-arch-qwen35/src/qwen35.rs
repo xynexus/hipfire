@@ -4044,13 +4044,19 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     //   - gfx12 (gfx1200/1201): wave32 WMMA via the `_w32_gfx12` builtin
     //     with K4 unroll + half8_t lane-split, runtime-validated through
     //     the existing HFQ3 dispatch fork (gemm_*_hfq3g256_wmma_gfx12).
-    // gfx10 RDNA1+2 / gfx906 GCN5 / gfx94x CDNA3 lack a ported MQ3 WMMA
-    // kernel; they stay on the per-token forward_scratch fallback
-    // (correct, just slower).
+    // gfx10 RDNA1 / gfx906 GCN5 / gfx94x CDNA3 lack a ported MQ3 kernel;
+    // they stay on the per-token forward_scratch fallback (correct, just
+    // slower).
+    //   - gfx1030 (RDNA2): scalar-FMA siblings via LDS-shared dequantized
+    //     A — see kernels/src/gemm_*_hfq3g256.gfx1030.hip. No WMMA on Navi
+    //     21, but the four prefill families (qkv / qkvza / gate_up /
+    //     residual) all dispatch correctly through the per-kernel arch
+    //     branches in dispatch.rs (feat/gfx1030-tuning, 2026-05-18).
     let mq3_uniform_with_wmma = matches!(dt, DType::MQ3G256)
         && matches!(arch,
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
             | "gfx1200" | "gfx1201"
+            | "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036"
         );
 
     // HFP4G32 / MFP4G32 (v2 #2 batched WMMA prefill): same arch gate as

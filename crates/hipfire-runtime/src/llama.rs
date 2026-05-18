@@ -1389,15 +1389,21 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     if always_ok {
         return true;
     }
-    // HFP4G32 / MFP4G32 + MQ3G256 require WMMA. Same arch gate as MQ3.
-    let wmma_only = matches!(dt,
-        DType::MQ3G256 | DType::HFP4G32 | DType::MFP4G32
-    )
-        && matches!(arch,
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
-            | "gfx1200" | "gfx1201"
-        );
-    wmma_only
+    // HFP4G32 / MFP4G32 + MQ3G256: WMMA family on gfx11/12; MQ3G256 also
+    // works on gfx1030 (RDNA2) via the scalar-FMA siblings at
+    // kernels/src/gemm_*_hfq3g256.gfx1030.hip (feat/gfx1030-tuning,
+    // 2026-05-18). HFP4G32 / MFP4G32 still need WMMA — gfx1030 ports of
+    // those kernels are unimplemented.
+    let wmma_arches = matches!(arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        | "gfx1200" | "gfx1201"
+    );
+    let mq3_extra_arches = matches!(arch,
+        "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036"
+    );
+    let mq3_ok = matches!(dt, DType::MQ3G256) && (wmma_arches || mq3_extra_arches);
+    let fp4_ok = matches!(dt, DType::HFP4G32 | DType::MFP4G32) && wmma_arches;
+    mq3_ok || fp4_ok
 }
 
 /// Per-call scratch for `forward_prefill_batch`. Holds [N × ...] working
