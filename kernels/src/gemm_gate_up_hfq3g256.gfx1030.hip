@@ -8,15 +8,16 @@
 //
 // Strategy: each block holds the 16×16 dequantized FP16 A tile in LDS
 // so lanes can share weights across the wave (WMMA does this implicitly
-// via the matrix unit). Inner product is scalar FP32 FMA. Throughput is
-// ~4-8× below WMMA, but ~10× above per-token forward_scratch fallback at
-// typical spec-decode batch sizes (B ≥ 8). Compiles on every gfx10xx
-// arch, but only dispatched on gfx1030/1031 (RDNA1 gfx1010 routes
-// through per-token forward_scratch — its 8 GiB VRAM can't run 27B
-// anyway).
+// via the matrix unit). Inner product uses `__builtin_amdgcn_fdot2`
+// (maps to `v_dot2_f32_f16` on gfx1030+) for 2× FP16 FMA throughput vs
+// pure scalar FP32 FMA — does 2 FP16 multiplies + FP32 accumulate per
+// instruction. v1 of this kernel used scalar FP32 FMA throughout; v2
+// (current) halves the inner-loop instruction count.
 //
 // Block: 32 threads (1 wave32). Grid: [ceil((gate_m+up_m)/16), ceil(N/16)].
 // LDS: 512 bytes (16×16 FP16).
+
+typedef _Float16 __attribute__((ext_vector_type(2))) half2_t;
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemm_gate_up_hfq3g256_gfx1030(
@@ -114,18 +115,22 @@ extern "C" __global__ void gemm_gate_up_hfq3g256_gfx1030(
 
             // All 32 lanes: load 16-K-element FP16 X vector for our col,
             // accumulate 8 dot products in FP32 against the 8 LDS rows.
-            _Float16 x_local[16];
+            // Load 16 FP16 X elements as 8 packed half2 pairs.
+            half2_t x_pairs[8];
             #pragma unroll
-            for (int kk = 0; kk < 16; kk++) {
-                x_local[kk] = x_base[k_off + kk];
+            for (int p = 0; p < 8; p++) {
+                x_pairs[p] = *(const half2_t*)(x_base + k_off + p * 2);
             }
+            // 8 output rows × 8 fdot2 calls = 64 FMAs/thread/K-tile via
+            // v_dot2_f32_f16 (vs 128 scalar f32 FMAs in v1 — 2× throughput).
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 int out_row_in_tile = 2 * j + (tid >> 4);
+                const _Float16* a_row = &lds_a[out_row_in_tile][0];
                 #pragma unroll
-                for (int kk = 0; kk < 16; kk++) {
-                    acc[j] += (float)(lds_a[out_row_in_tile][kk])
-                            * (float)(x_local[kk]);
+                for (int p = 0; p < 8; p++) {
+                    half2_t a_pair = *(const half2_t*)(a_row + p * 2);
+                    acc[j] = __builtin_amdgcn_fdot2(a_pair, x_pairs[p], acc[j], false);
                 }
             }
             __syncthreads();

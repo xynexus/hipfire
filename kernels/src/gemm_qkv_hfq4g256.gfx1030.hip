@@ -6,6 +6,9 @@
 // output layout (acc[j] = C[2*j + (tid>>4)][tid & 15]), without WMMA.
 // 136 B/group stride, 4-bit nibble unpack — see
 // gemm_gate_up_hfq4g256.gfx1030.hip header for the template comments.
+// fdot2 inner product for 2× FP16 FMA throughput on gfx1030+.
+
+typedef _Float16 __attribute__((ext_vector_type(2))) half2_t;
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemm_qkv_hfq4g256_gfx1030(
@@ -73,18 +76,19 @@ extern "C" __global__ void gemm_qkv_hfq4g256_gfx1030(
             }
             __syncthreads();
 
-            _Float16 x_local[16];
+            half2_t x_pairs[8];
             #pragma unroll
-            for (int kk = 0; kk < 16; kk++) {
-                x_local[kk] = x_base[k_off + kk];
+            for (int p = 0; p < 8; p++) {
+                x_pairs[p] = *(const half2_t*)(x_base + k_off + p * 2);
             }
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 int out_row_in_tile = 2 * j + (tid >> 4);
+                const _Float16* a_row = &lds_a[out_row_in_tile][0];
                 #pragma unroll
-                for (int kk = 0; kk < 16; kk++) {
-                    acc[j] += (float)(lds_a[out_row_in_tile][kk])
-                            * (float)(x_local[kk]);
+                for (int p = 0; p < 8; p++) {
+                    half2_t a_pair = *(const half2_t*)(a_row + p * 2);
+                    acc[j] = __builtin_amdgcn_fdot2(a_pair, x_pairs[p], acc[j], false);
                 }
             }
             __syncthreads();

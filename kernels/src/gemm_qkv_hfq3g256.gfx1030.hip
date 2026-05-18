@@ -9,6 +9,11 @@
 // Differences from gate_up:
 //   - 3 output projections (Q_m + K_m + V_m total rows)
 //   - row routing across A_q / A_k / A_v based on global row range
+//
+// Uses __builtin_amdgcn_fdot2 (v_dot2_f32_f16 on gfx1030+) for 2× FP16
+// FMA throughput vs scalar FP32 FMA.
+
+typedef _Float16 __attribute__((ext_vector_type(2))) half2_t;
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemm_qkv_hfq3g256_gfx1030(
@@ -95,18 +100,19 @@ extern "C" __global__ void gemm_qkv_hfq3g256_gfx1030(
             }
             __syncthreads();
 
-            _Float16 x_local[16];
+            half2_t x_pairs[8];
             #pragma unroll
-            for (int kk = 0; kk < 16; kk++) {
-                x_local[kk] = x_base[k_off + kk];
+            for (int p = 0; p < 8; p++) {
+                x_pairs[p] = *(const half2_t*)(x_base + k_off + p * 2);
             }
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 int out_row_in_tile = 2 * j + (tid >> 4);
+                const _Float16* a_row = &lds_a[out_row_in_tile][0];
                 #pragma unroll
-                for (int kk = 0; kk < 16; kk++) {
-                    acc[j] += (float)(lds_a[out_row_in_tile][kk])
-                            * (float)(x_local[kk]);
+                for (int p = 0; p < 8; p++) {
+                    half2_t a_pair = *(const half2_t*)(a_row + p * 2);
+                    acc[j] = __builtin_amdgcn_fdot2(a_pair, x_pairs[p], acc[j], false);
                 }
             }
             __syncthreads();
