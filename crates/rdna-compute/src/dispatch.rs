@@ -6661,7 +6661,15 @@ impl Gpu {
                 y_qkv, y_z, y_beta, y_alpha,
                 qkv_m, z_m, beta_m, alpha_m, k, batch_size);
         }
-        self.ensure_kernel("gemm_qkvza_hfq3g256_wmma", kernels::GEMM_QKVZA_HFQ3G256_WMMA_SRC, "gemm_qkvza_hfq3g256_wmma")?;
+        // RDNA2 (Navi 21+): scalar-FMA sibling, same kernarg layout as WMMA.
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_qkvza_hfq3g256_gfx1030", kernels::GEMM_QKVZA_HFQ3G256_GFX1030_SRC)
+        } else {
+            ("gemm_qkvza_hfq3g256_wmma", kernels::GEMM_QKVZA_HFQ3G256_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_qkv.buf.as_ptr();
@@ -6707,9 +6715,9 @@ impl Gpu {
         let bytes = weight_bytes
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq3g256_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkvza_hfq3g256_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,

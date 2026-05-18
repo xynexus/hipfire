@@ -18,11 +18,13 @@ fn main() {
         total as f64 / 1e9
     });
 
-    let supported = matches!(arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
+    let supported = matches!(arch.as_str(),
+        "gfx1100" | "gfx1101" | "gfx1102"
+        | "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
     if !supported {
         eprintln!(
-            "SKIP: gemm_qkvza_hfq3g256_wmma is the gfx11 K2 variant. \
-             Current arch: {arch}. (gfx12 K4 variant: follow-up commit.)"
+            "SKIP: gemm_qkvza_hfq3g256_wmma is the gfx11 K2 variant + gfx1030 \
+             RDNA2 sibling. Current arch: {arch}."
         );
         std::process::exit(0);
     }
