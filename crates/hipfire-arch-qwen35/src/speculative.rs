@@ -1977,7 +1977,13 @@ fn verify_dflash_block_inner(
             target.weights.embd_format,
             hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 | hipfire_runtime::llama::EmbeddingFormat::Q8_0,
         )
-        && verify_scratch.prefill_batch.is_some();
+        && verify_scratch.prefill_batch.is_some()
+        // MQ3 dense weights need gfx11/12 WMMA kernels for the captured
+        // prefill path; on gfx10xx / gfx906 / gfx94x route through the
+        // non-captured forward_prefill_batch_with_pbs which falls back to
+        // per-token forward_scratch. Without this filter the captured path
+        // would load-and-panic mid-decode on RDNA2.
+        && qwen35::captured_prefill_eligible(&target.weights, gpu.arch.as_str());
 
     // Per-cycle timing for verify-graph A/B diagnostic
     // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the

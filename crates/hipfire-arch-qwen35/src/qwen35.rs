@@ -3983,6 +3983,51 @@ pub fn forward_prefill_batch_with_pbs(
 // the gemm_*_mq3g256_lloyd_wmma family on gfx11 (always-on) and on
 // gfx12 (opt-in via HIPFIRE_LLOYD_GFX12=1). MQ2G256Lloyd / MQ4G256Lloyd
 // remain unwired here — MQ4-Lloyd lands separately in issue #182.
+
+/// Returns true if the captured-prefill entry point
+/// (`forward_prefill_batch_single_chunk_captured`) can dispatch safely for
+/// this (weights, arch) combination. False means the caller must route
+/// through the non-captured `forward_prefill_batch[_with_pbs]` path, which
+/// falls back to per-token `forward_scratch` for archs lacking the gfx11
+/// wave32 WMMA family. Mirrors the in-function refusal at qwen35.rs:3506+,
+/// so any caller can pre-check eligibility and bypass the captured path
+/// rather than load-and-panic.
+pub fn captured_prefill_eligible(weights: &Qwen35Weights, arch: &str) -> bool {
+    let arch_has_wmma = matches!(arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        | "gfx1200" | "gfx1201"
+    );
+    if arch_has_wmma {
+        return true;
+    }
+    let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
+    let mq3_in_dense = weights.layers.iter().any(|lw| match lw {
+        LayerWeights::DeltaNet(l) =>
+            is_mq3_any(l.wqkv.gpu_dtype)
+                || is_mq3_any(l.wz.gpu_dtype)
+                || is_mq3_any(l.w_beta.gpu_dtype)
+                || is_mq3_any(l.w_alpha.gpu_dtype)
+                || is_mq3_any(l.wo.gpu_dtype)
+                || is_mq3_any(l.w_gate.gpu_dtype)
+                || is_mq3_any(l.w_up.gpu_dtype)
+                || is_mq3_any(l.w_down.gpu_dtype),
+        LayerWeights::FullAttn(l) =>
+            is_mq3_any(l.wq.gpu_dtype)
+                || is_mq3_any(l.wk.gpu_dtype)
+                || is_mq3_any(l.wv.gpu_dtype)
+                || is_mq3_any(l.wo.gpu_dtype)
+                || is_mq3_any(l.w_gate.gpu_dtype)
+                || is_mq3_any(l.w_up.gpu_dtype)
+                || is_mq3_any(l.w_down.gpu_dtype),
+        // MoE+MQ3 is refused by both captured and non-captured paths
+        // (stride mismatch with HFQ4-layout MoE batched branches) — those
+        // refusals stay in-function. This helper only filters the case
+        // where the non-captured fallback can recover.
+        _ => false,
+    });
+    !mq3_in_dense
+}
+
 fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(dt,
         DType::MQ4G256 | DType::HFQ4G256
