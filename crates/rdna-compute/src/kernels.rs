@@ -594,6 +594,16 @@ pub const GEMM_QKVZA_HFQ3G256_GFX1030_SRC: &str = include_str!("../../../kernels
 /// Sister of GEMM_HFQ3G256_RESIDUAL_WMMA_SRC; Y += A·x via scalar FP32
 /// FMA + LDS-shared dequantized A. Used by attn_out + ffn_down.
 pub const GEMM_HFQ3G256_RESIDUAL_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual.gfx1030.hip");
+/// HFQ4-G256 prefill GEMM family for gfx1030 (RDNA2, no WMMA). Same
+/// scalar-FMA strategy as the HFQ3 siblings; the only differences are
+/// the per-group stride (136 B vs 104 B) and the inner-tile unpack
+/// (4-bit nibble vs 3-bit cross-byte). MQ4 is the canonical quant
+/// format, so these four kernels are the highest-impact ports in the
+/// gfx1030 family.
+pub const GEMM_GATE_UP_HFQ4G256_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256.gfx1030.hip");
+pub const GEMM_QKV_HFQ4G256_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256.gfx1030.hip");
+pub const GEMM_QKVZA_HFQ4G256_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256.gfx1030.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual.gfx1030.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)

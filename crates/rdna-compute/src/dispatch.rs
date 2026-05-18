@@ -6366,7 +6366,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gemm_qkvza_hfq4g256_wmma", kernels::GEMM_QKVZA_HFQ4G256_WMMA_SRC, "gemm_qkvza_hfq4g256_wmma")?;
+        // RDNA2 (Navi 21+): scalar-FMA sibling, same kernarg layout as WMMA.
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_qkvza_hfq4g256_gfx1030", kernels::GEMM_QKVZA_HFQ4G256_GFX1030_SRC)
+        } else {
+            ("gemm_qkvza_hfq4g256_wmma", kernels::GEMM_QKVZA_HFQ4G256_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_qkv.buf.as_ptr();
@@ -6413,9 +6421,9 @@ impl Gpu {
                   + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkvza_hfq4g256_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -7027,7 +7035,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gemm_qkv_hfq4g256_wmma", kernels::GEMM_QKV_HFQ4G256_WMMA_SRC, "gemm_qkv_hfq4g256_wmma")?;
+        // RDNA2 (Navi 21+): scalar-FMA sibling, same kernarg layout as WMMA.
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_qkv_hfq4g256_gfx1030", kernels::GEMM_QKV_HFQ4G256_GFX1030_SRC)
+        } else {
+            ("gemm_qkv_hfq4g256_wmma", kernels::GEMM_QKV_HFQ4G256_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_q.buf.as_ptr();
@@ -7067,9 +7083,9 @@ impl Gpu {
                   + crate::profile::gemv_hfq4g256_bytes(v_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkv_hfq4g256_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -7898,15 +7914,22 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // RDNA2 (Navi 21+): scalar-FMA sibling, no WMMA / no ldsx variant.
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
         // HIPFIRE_GATE_UP_VARIANT=ldsx routes to the LDS-staged X variant
-        // (Gate 1 microbench, opt-in only, default off). See
-        // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
+        // (Gate 1 microbench, opt-in only, default off). gfx1030 ignores
+        // the override since no ldsx sibling exists there yet.
         let variant_override = std::env::var("HIPFIRE_GATE_UP_VARIANT").ok();
-        let (kernel_name, kernel_src) = match variant_override.as_deref() {
-            Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
-                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC),
-            _            => ("gemm_gate_up_hfq4g256_wmma",
-                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC),
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_gate_up_hfq4g256_gfx1030", kernels::GEMM_GATE_UP_HFQ4G256_GFX1030_SRC)
+        } else {
+            match variant_override.as_deref() {
+                Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
+                                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC),
+                _            => ("gemm_gate_up_hfq4g256_wmma",
+                                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC),
+            }
         };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
@@ -10095,6 +10118,64 @@ impl Gpu {
         result
     }
 
+    /// HFQ4-G256 single-output GEMM with fused residual add for gfx1030
+    /// (RDNA2, no WMMA). Scalar FP32 FMA via LDS-shared dequantized A.
+    pub fn gemm_hfq4g256_residual_gfx1030(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_hfq4g256_residual_gfx1030",
+            kernels::GEMM_HFQ4G256_RESIDUAL_GFX1030_SRC,
+            "gemm_hfq4g256_residual_gfx1030")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+                  + batch_size * k * 2
+                  + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm",
+            "gemm_hfq4g256_residual_gfx1030", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_residual_gfx1030",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// WMMA-accelerated batched HFQ4-G256 GEMM with residual add.
     /// gfx1100+ only. 16×16 output tiles via wave32 WMMA.
     /// Converts X to FP16, then uses __builtin_amdgcn_wmma_f32_16x16x16_f16_w32.
@@ -10108,6 +10189,13 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // RDNA2 (Navi 21+): route to the scalar-FMA gfx1030 sibling early —
+        // bypasses all the gfx11 variant logic (k2/k4/ksplit/mw16/etc).
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        if is_rdna2 {
+            return self.gemm_hfq4g256_residual_gfx1030(a_raw, x, y, m, k, batch_size);
+        }
         // Compile both kernels (convert + WMMA GEMM share the FP16 convert)
         // Kernel variant selection
         // MW16 path: dequant weights to FP16 per-call, then run no-dequant WMMA
