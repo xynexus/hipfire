@@ -614,6 +614,18 @@ pub const GEMM_GATE_UP_Q8_0_GFX1030_SRC: &str = include_str!("../../../kernels/s
 pub const GEMM_QKV_Q8_0_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_q8_0.gfx1030.hip");
 pub const GEMM_QKVZA_Q8_0_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_q8_0.gfx1030.hip");
 pub const GEMM_Q8_0_RESIDUAL_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_residual.gfx1030.hip");
+/// MQ3-Lloyd-G256 prefill GEMM family for gfx1030 (RDNA2, no WMMA).
+/// Sisters of the gemm_*_mq3g256_lloyd_wmma kernels. Same scalar-FMA
+/// LDS-shared-A strategy as the HFQ3 siblings, but the per-group stride
+/// is 112 B (16 B FP16 codebook of 8 entries + 96 B 3-bit indices, same
+/// cross-byte pack as HFQ3) and the inner dequant is a per-row codebook
+/// lookup (cb_lds[my_lds_row * 8 + q]) instead of HFQ3's affine sc*q+zp.
+/// LDS = 768 B (512 B lds_a + 256 B cb_lds), still well below RDNA2's
+/// 64 KB/CU budget.
+pub const GEMM_GATE_UP_MQ3G256_LLOYD_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq3g256_lloyd.gfx1030.hip");
+pub const GEMM_QKV_MQ3G256_LLOYD_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq3g256_lloyd.gfx1030.hip");
+pub const GEMM_QKVZA_MQ3G256_LLOYD_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq3g256_lloyd.gfx1030.hip");
+pub const GEMM_MQ3G256_LLOYD_RESIDUAL_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_mq3g256_lloyd_residual.gfx1030.hip");
 /// HFQ6-G256 prefill GEMM family for gfx1030 (RDNA2, no WMMA). Same
 /// scalar-FMA LDS-shared-A strategy as the HFQ3/HFQ4 siblings. Layout:
 /// 200 B/group (8 B FP32 scale+zero header + 192 B packed 6-bit weights).

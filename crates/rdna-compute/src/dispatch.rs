@@ -2416,7 +2416,17 @@ impl Gpu {
             return self.gemm_mq3g256_lloyd_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_for_arch(&self.arch);
+        // RDNA2 (Navi 21+) — no WMMA, route to the scalar-FMA gfx1030
+        // sibling. The gfx1030 kernel exports the same symbol name as the
+        // WMMA sister so the kernarg layout and dispatch path are
+        // byte-identical; only the underlying compiled source differs.
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (src, module) = if is_rdna2 {
+            (kernels::GEMM_MQ3G256_LLOYD_RESIDUAL_GFX1030_SRC, "gemm_mq3g256_lloyd_residual_gfx1030")
+        } else {
+            kernels::gemm_mq3g256_lloyd_residual_wmma_for_arch(&self.arch)
+        };
         self.ensure_kernel(module, src, "gemm_mq3g256_lloyd_residual_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -2546,7 +2556,15 @@ impl Gpu {
             );
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        // RDNA2 (Navi 21+) — no WMMA, route to scalar-FMA gfx1030 sibling.
+        // Same kernel symbol name as WMMA so launch path is byte-identical.
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (src, module) = if is_rdna2 {
+            (kernels::GEMM_QKVZA_MQ3G256_LLOYD_GFX1030_SRC, "gemm_qkvza_mq3g256_lloyd_gfx1030")
+        } else {
+            kernels::gemm_qkvza_mq3g256_lloyd_wmma_for_arch(&self.arch)
+        };
         self.ensure_kernel(module, src, "gemm_qkvza_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -2712,7 +2730,15 @@ impl Gpu {
             );
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        // RDNA2 (Navi 21+) — no WMMA, route to scalar-FMA gfx1030 sibling.
+        // Same kernel symbol name as WMMA so launch path is byte-identical.
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (src, module) = if is_rdna2 {
+            (kernels::GEMM_QKV_MQ3G256_LLOYD_GFX1030_SRC, "gemm_qkv_mq3g256_lloyd_gfx1030")
+        } else {
+            kernels::gemm_qkv_mq3g256_lloyd_wmma_for_arch(&self.arch)
+        };
         self.ensure_kernel(module, src, "gemm_qkv_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -2865,7 +2891,15 @@ impl Gpu {
             );
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        // RDNA2 (Navi 21+) — no WMMA, route to scalar-FMA gfx1030 sibling.
+        // Same kernel symbol name as WMMA so launch path is byte-identical.
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (src, module) = if is_rdna2 {
+            (kernels::GEMM_GATE_UP_MQ3G256_LLOYD_GFX1030_SRC, "gemm_gate_up_mq3g256_lloyd_gfx1030")
+        } else {
+            kernels::gemm_gate_up_mq3g256_lloyd_wmma_for_arch(&self.arch)
+        };
         self.ensure_kernel(module, src, "gemm_gate_up_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
