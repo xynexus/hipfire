@@ -604,6 +604,16 @@ pub const GEMM_GATE_UP_HFQ4G256_GFX1030_SRC: &str = include_str!("../../../kerne
 pub const GEMM_QKV_HFQ4G256_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256.gfx1030.hip");
 pub const GEMM_QKVZA_HFQ4G256_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256.gfx1030.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual.gfx1030.hip");
+/// Q8_0 prefill GEMM family for gfx1030 (RDNA2, no WMMA). Same scalar-FMA
+/// LDS-shared-A strategy as the HFQ3/HFQ4 siblings, but the storage
+/// layout is different: 32-element groups (vs 256), 34 B/group (FP16
+/// scale + 32 int8 weights, no zero-point). Each LDS K-tile of 16
+/// elements covers half a Q8 group, so the outer loop iterates K/16
+/// K-tiles (2 per Q8 group) instead of mapping 1-to-1 with groups.
+pub const GEMM_GATE_UP_Q8_0_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_q8_0.gfx1030.hip");
+pub const GEMM_QKV_Q8_0_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_q8_0.gfx1030.hip");
+pub const GEMM_QKVZA_Q8_0_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_q8_0.gfx1030.hip");
+pub const GEMM_Q8_0_RESIDUAL_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_residual.gfx1030.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)

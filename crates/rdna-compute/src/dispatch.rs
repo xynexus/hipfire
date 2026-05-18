@@ -13223,17 +13223,17 @@ impl Gpu {
                 qkv_m, z_m, beta_m, alpha_m, k, batch_size,
             );
         }
-        // Q8_0 packs 32 elements per block (34 bytes); the kernel iterates
-        // `K/32` blocks per row and silently drops any tail if K is not a
-        // multiple of 32. All current production shapes satisfy this; guard
-        // here to catch future shape regressions before they corrupt output.
         debug_assert_eq!(k % 32, 0, "gemm_qkvza_q8_0_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_qkvza_q8_0_wmma",
-            kernels::GEMM_QKVZA_Q8_0_WMMA_SRC,
-            "gemm_qkvza_q8_0_wmma",
-        )?;
+        // RDNA2 (Navi 21+): scalar-FMA sibling, same kernarg layout as WMMA.
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_qkvza_q8_0_gfx1030", kernels::GEMM_QKVZA_Q8_0_GFX1030_SRC)
+        } else {
+            ("gemm_qkvza_q8_0_wmma", kernels::GEMM_QKVZA_Q8_0_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut a_qkv_p = a_qkv.buf.as_ptr();
@@ -13277,9 +13277,9 @@ impl Gpu {
         let bytes = q8_bytes(qkv_m) + q8_bytes(z_m) + q8_bytes(beta_m) + q8_bytes(alpha_m)
                   + batch_size * k * 2
                   + batch_size * total_m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_q8_0_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkvza_q8_0_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -13316,11 +13316,14 @@ impl Gpu {
         }
         debug_assert_eq!(k % 32, 0, "gemm_gate_up_q8_0_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_gate_up_q8_0_wmma",
-            kernels::GEMM_GATE_UP_Q8_0_WMMA_SRC,
-            "gemm_gate_up_q8_0_wmma",
-        )?;
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_gate_up_q8_0_gfx1030", kernels::GEMM_GATE_UP_Q8_0_GFX1030_SRC)
+        } else {
+            ("gemm_gate_up_q8_0_wmma", kernels::GEMM_GATE_UP_Q8_0_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut a_g = a_gate.buf.as_ptr();
@@ -13352,9 +13355,9 @@ impl Gpu {
         let bytes = q8_bytes(gate_m) + q8_bytes(up_m)
                   + batch_size * k * 2
                   + batch_size * total_m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_q8_0_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_gate_up_q8_0_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -13390,11 +13393,14 @@ impl Gpu {
         }
         debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_q8_0_residual_wmma",
-            kernels::GEMM_Q8_0_RESIDUAL_WMMA_SRC,
-            "gemm_q8_0_residual_wmma",
-        )?;
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_q8_0_residual_gfx1030", kernels::GEMM_Q8_0_RESIDUAL_GFX1030_SRC)
+        } else {
+            ("gemm_q8_0_residual_wmma", kernels::GEMM_Q8_0_RESIDUAL_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut a_p = a.buf.as_ptr();
@@ -13418,9 +13424,9 @@ impl Gpu {
         let bytes = m * (k / 32) * 34
                   + batch_size * k * 2
                   + batch_size * m * 4 * 2; // residual read + write
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_residual_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_q8_0_residual_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -13456,11 +13462,14 @@ impl Gpu {
         }
         debug_assert_eq!(k % 32, 0, "gemm_qkv_q8_0_wmma: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_qkv_q8_0_wmma",
-            kernels::GEMM_QKV_Q8_0_WMMA_SRC,
-            "gemm_qkv_q8_0_wmma",
-        )?;
+        let is_rdna2 = matches!(self.arch.as_str(),
+            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let (kernel_name, kernel_src) = if is_rdna2 {
+            ("gemm_qkv_q8_0_gfx1030", kernels::GEMM_QKV_Q8_0_GFX1030_SRC)
+        } else {
+            ("gemm_qkv_q8_0_wmma", kernels::GEMM_QKV_Q8_0_WMMA_SRC)
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_q.buf.as_ptr();
@@ -13501,9 +13510,9 @@ impl Gpu {
         let bytes = q8_bytes(q_m) + q8_bytes(k_m) + q8_bytes(v_m)
                   + batch_size * k * 2
                   + batch_size * total_m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_q8_0_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkv_q8_0_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
