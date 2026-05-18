@@ -590,6 +590,10 @@ pub const GEMM_QKV_HFQ3G256_GFX1030_SRC: &str = include_str!("../../../kernels/s
 /// HFQ3-G256 4-way fused QKVZA GEMM for gfx1030 (DeltaNet LA preamble).
 /// Same scalar-FMA strategy as the gate_up/qkv siblings.
 pub const GEMM_QKVZA_HFQ3G256_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256.gfx1030.hip");
+/// HFQ3-G256 single-output GEMM with fused residual add for gfx1030.
+/// Sister of GEMM_HFQ3G256_RESIDUAL_WMMA_SRC; Y += A·x via scalar FP32
+/// FMA + LDS-shared dequantized A. Used by attn_out + ffn_down.
+pub const GEMM_HFQ3G256_RESIDUAL_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual.gfx1030.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
