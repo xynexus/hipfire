@@ -575,6 +575,14 @@ pub const GEMM_QKVZA_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kern
 pub const GEMM_QKV_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_HFQ3G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_wmma.gfx12.hip");
 pub const GEMM_HFQ3G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_wmma.gfx12.hip");
+/// HFQ3-G256 gate+up GEMM for gfx1030 (RDNA2, Navi 21+). Same contract
+/// and per-lane output layout as the gfx11 WMMA sister, implemented with
+/// LDS-shared dequantized A weights and scalar FP32 FMA inner products
+/// (Navi 21 lacks the gfx11 wave32 WMMA builtin). Throughput ~4-8× below
+/// WMMA, ~10× above per-token forward_scratch fallback. First of four
+/// MQ3 prefill families to be ported off WMMA (qkv / qkvza / residual
+/// pending).
+pub const GEMM_GATE_UP_HFQ3G256_GFX1030_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256.gfx1030.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
