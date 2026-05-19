@@ -1,0 +1,87 @@
+{
+  "baseline_model": null,
+  "candidate_model": null,
+  "captured_at_utc": "2026-05-19T02:33:28Z",
+  "dataset": null,
+  "engine": {
+    "captured_at_utc": "2026-05-19T02:33:28Z",
+    "env": {
+      "HIPFIRE_ROPE_INTERLEAVED_LEGACY": null
+    },
+    "fingerprint_id": "2f5484b0720b4804a281930a73cfe99ae124a45300f8ddb80c140d9c4f23c357",
+    "git": {
+      "branch": "codex/astrea-imatrix-expert-coverage",
+      "dirty": true,
+      "dirty_paths": [
+        "?? benchmarks/quality-baselines/results/2026-05-19-imatrix-9b/"
+      ],
+      "sha": "851ce5b2c1a878d57b6b38a42147da049212fb3f",
+      "short": "851ce5b"
+    },
+    "root": "/home/sadara/hipfire",
+    "rope_convention_default": "halfsplit",
+    "schema": "hipfire.astrea.engine_fingerprint.v0",
+    "source_hashes": {
+      "crates/hipfire-arch-qwen35/src/qwen35.rs": "f779246be1a08ac4a88b17800325681c76ac5f763c9dd594a189dae0a7e2c29d",
+      "crates/hipfire-runtime/examples/eval_hipfire.rs": "fac631d6e7e983bbc3373f59ea28f16e1f6c103efd521dbfaf2b20109caf3aa2",
+      "crates/rdna-compute/src/dispatch.rs": "90b6842e50330b33130d932fb6bbcedf2506d2d972e07f7844a52995c6db51bc",
+      "crates/rdna-compute/src/kernels.rs": "64a3b7b7dbf6cc36208324302568501978c35136689053630ed67a499a8a5c8b",
+      "kernels/src/rope_partial_halfsplit.hip": "ae138dc72ae0ad7e3217b82971b724938e31508f2d92a975c930ef665db66fa3",
+      "kernels/src/rope_partial_halfsplit_batched.hip": "419fda015e24d3abc0d533cef83e2a6138c91faabf72a25975739b8d7755cb00",
+      "kernels/src/rope_partial_interleaved.hip": "2d4dca0fa191b91f00c14f3c030d4673b0efaf70329733521e1a862386de84b7",
+      "kernels/src/rope_partial_interleaved_batched.hip": "efb9b063966933c0d8253bff24979f8794423167398cfb4d717f49b81c663de6"
+    }
+  },
+  "git": "851ce5b",
+  "host": "halo",
+  "next_step": "iterate calibration recipe or collect a better baseline",
+  "quality": {
+    "baseline": {
+      "above_floor_kld": 0.1947002286417181,
+      "arch": "local-c16",
+      "mean_kld": 0.34141567355110575,
+      "mean_kld_ci_hi": 0.45139362079131085,
+      "mean_kld_ci_lo": 0.25430548403772213,
+      "n_chunks": 16,
+      "notes": "",
+      "p99_kld": 18.92143300562912,
+      "ppl": 9.356853431520028,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b.mq4"
+    },
+    "candidate": {
+      "above_floor_kld": 12.703194801480192,
+      "arch": "local-c16",
+      "mean_kld": 12.84991024638958,
+      "mean_kld_ci_hi": 13.019368951593098,
+      "mean_kld_ci_lo": 12.674100773708696,
+      "n_chunks": 16,
+      "notes": "",
+      "p99_kld": 18.77389960448736,
+      "ppl": 2366379.426873933,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b-imatrix-scale.mfp4"
+    },
+    "floor": {
+      "arch": "local-c16",
+      "mean_kld": 0.14671544490938765,
+      "mean_kld_ci_hi": 0.22048821053673404,
+      "mean_kld_ci_lo": 0.0910113129100648,
+      "n_chunks": 16,
+      "notes": "",
+      "p99_kld": 14.870293897557382,
+      "ppl": 9.951125048584256,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b.mq6"
+    },
+    "kld_delta": 12.508494572838474,
+    "kld_recovered": -12.508494572838474,
+    "kld_recovered_pct": -64.24488897676774,
+    "ppl_delta": 2366370.0700205015,
+    "source": "benchmarks/quality-baselines/results/2026-05-19-imatrix-9b/result-data.json"
+  },
+  "reference_model": null,
+  "schema": "hipfire.astrea.metrics.v0",
+  "verdict": "no_quality_gain",
+  "weight": null
+}

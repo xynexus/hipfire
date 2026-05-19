@@ -1,0 +1,89 @@
+{
+  "baseline_model": null,
+  "candidate_model": null,
+  "captured_at_utc": "2026-05-19T04:49:15Z",
+  "dataset": null,
+  "engine": {
+    "captured_at_utc": "2026-05-19T04:49:15Z",
+    "env": {
+      "HIPFIRE_ROPE_INTERLEAVED_LEGACY": null
+    },
+    "fingerprint_id": "d8d82378959e10a1138529a148935752a257ee7c0ce2819b41e225bc8a6cd8a7",
+    "git": {
+      "branch": "codex/astrea-imatrix-expert-coverage",
+      "dirty": true,
+      "dirty_paths": [
+        "M scripts/astrea.py",
+        " M scripts/test_astrea.py",
+        "?? benchmarks/quality-baselines/results/2026-05-19-imatrix-9b/"
+      ],
+      "sha": "851ce5b2c1a878d57b6b38a42147da049212fb3f",
+      "short": "851ce5b"
+    },
+    "root": "/home/sadara/hipfire",
+    "rope_convention_default": "halfsplit",
+    "schema": "hipfire.astrea.engine_fingerprint.v0",
+    "source_hashes": {
+      "crates/hipfire-arch-qwen35/src/qwen35.rs": "f779246be1a08ac4a88b17800325681c76ac5f763c9dd594a189dae0a7e2c29d",
+      "crates/hipfire-runtime/examples/eval_hipfire.rs": "fac631d6e7e983bbc3373f59ea28f16e1f6c103efd521dbfaf2b20109caf3aa2",
+      "crates/rdna-compute/src/dispatch.rs": "90b6842e50330b33130d932fb6bbcedf2506d2d972e07f7844a52995c6db51bc",
+      "crates/rdna-compute/src/kernels.rs": "64a3b7b7dbf6cc36208324302568501978c35136689053630ed67a499a8a5c8b",
+      "kernels/src/rope_partial_halfsplit.hip": "ae138dc72ae0ad7e3217b82971b724938e31508f2d92a975c930ef665db66fa3",
+      "kernels/src/rope_partial_halfsplit_batched.hip": "419fda015e24d3abc0d533cef83e2a6138c91faabf72a25975739b8d7755cb00",
+      "kernels/src/rope_partial_interleaved.hip": "2d4dca0fa191b91f00c14f3c030d4673b0efaf70329733521e1a862386de84b7",
+      "kernels/src/rope_partial_interleaved_batched.hip": "efb9b063966933c0d8253bff24979f8794423167398cfb4d717f49b81c663de6"
+    }
+  },
+  "git": "851ce5b",
+  "host": "halo",
+  "next_step": "iterate calibration recipe or collect a better baseline",
+  "quality": {
+    "baseline": {
+      "above_floor_kld": 0.3137197227032473,
+      "arch": "local-c16",
+      "mean_kld": 0.4604351676126349,
+      "mean_kld_ci_hi": 0.5807931310711171,
+      "mean_kld_ci_lo": 0.3648820962488808,
+      "n_chunks": 16,
+      "notes": "",
+      "p99_kld": 19.08027758221392,
+      "ppl": 10.849197709020602,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b-base.mfp4"
+    },
+    "candidate": {
+      "above_floor_kld": 4.007268218058261,
+      "arch": "local-c16",
+      "mean_kld": 4.153983662967649,
+      "mean_kld_ci_hi": 4.323750557543647,
+      "mean_kld_ci_lo": 3.986527332059479,
+      "n_chunks": 16,
+      "notes": "",
+      "p99_kld": 15.203678974452309,
+      "ppl": 420.88621656242293,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b-joint-d.mfp4"
+    },
+    "floor": {
+      "arch": "local-c16",
+      "mean_kld": 0.14671544490938765,
+      "mean_kld_ci_hi": 0.22048821053673404,
+      "mean_kld_ci_lo": 0.0910113129100648,
+      "n_chunks": 16,
+      "notes": "",
+      "p99_kld": 14.870293897557382,
+      "ppl": 9.951125048584256,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b.mq6"
+    },
+    "kld_delta": 3.693548495355014,
+    "kld_recovered": -3.6935484953550137,
+    "kld_recovered_pct": -11.773402269798648,
+    "ppl_delta": 410.03701885340234,
+    "source": "benchmarks/quality-baselines/results/2026-05-19-imatrix-9b/result-data.json"
+  },
+  "reference_model": null,
+  "schema": "hipfire.astrea.metrics.v0",
+  "verdict": "no_quality_gain",
+  "weight": null
+}

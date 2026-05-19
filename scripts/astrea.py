@@ -58,6 +58,8 @@ SUPPORTED_FORMATS = {
 
 SUPPORTED_METHODS = {
     "awq",
+    "joint-d",
+    "mfp4-ls",
     "mq4-ls",
     "gptq",
     "mse",
@@ -95,6 +97,8 @@ DEFAULT_METHOD_STAGE = {
     "percentile": "scale_search",
     "imatrix": "scale_search",
     "imatrix-scale": "scale_search",
+    "mfp4-ls": "scale_search",
+    "joint-d": "transform",
     "awq": "activation_aware",
     "mq4-ls": "scale_search",
     "awq-probe": "activation_aware",
@@ -1140,36 +1144,36 @@ def weighted_abs_quantile_numpy(rows, importance, quantile):
     return sorted_abs[np.arange(rows.shape[0]), idx]
 
 
+def fwht_256_numpy_batched(values, signs_left, signs_right, *, chunk_segments=128):
+    input_shape = values.shape
+    flat = np.asarray(values, dtype=np.float32).reshape(-1, 256)
+    out = np.empty_like(flat, dtype=np.float32)
+    signs_left = np.asarray(signs_left, dtype=np.float32)
+    signs_right = np.asarray(signs_right, dtype=np.float32)
+    for start in range(0, flat.shape[0], chunk_segments):
+        end = min(start + chunk_segments, flat.shape[0])
+        x = flat[start:end].copy()
+        x *= signs_left
+        stride = 1
+        while stride < 256:
+            for i in range(0, 256, stride * 2):
+                a = x[:, i : i + stride].copy()
+                b = x[:, i + stride : i + 2 * stride].copy()
+                x[:, i : i + stride] = a + b
+                x[:, i + stride : i + 2 * stride] = a - b
+            stride <<= 1
+        x *= np.float32(0.0625)
+        x *= signs_right
+        out[start:end] = x
+    return out.reshape(input_shape)
+
+
 def fwht_256_numpy(values):
-    x = np.asarray(values, dtype=np.float32).reshape(-1, 256).copy()
-    x *= np.asarray(FWHT_SIGNS1, dtype=np.float32)
-    stride = 1
-    while stride < 256:
-        for i in range(0, 256, stride * 2):
-            a = x[:, i : i + stride].copy()
-            b = x[:, i + stride : i + 2 * stride].copy()
-            x[:, i : i + stride] = a + b
-            x[:, i + stride : i + 2 * stride] = a - b
-        stride <<= 1
-    x *= np.float32(0.0625)
-    x *= np.asarray(FWHT_SIGNS2, dtype=np.float32)
-    return x.reshape(values.shape)
+    return fwht_256_numpy_batched(values, FWHT_SIGNS1, FWHT_SIGNS2)
 
 
 def inverse_fwht_256_numpy(values):
-    x = np.asarray(values, dtype=np.float32).reshape(-1, 256).copy()
-    x *= np.asarray(FWHT_SIGNS2, dtype=np.float32)
-    stride = 1
-    while stride < 256:
-        for i in range(0, 256, stride * 2):
-            a = x[:, i : i + stride].copy()
-            b = x[:, i + stride : i + 2 * stride].copy()
-            x[:, i : i + stride] = a + b
-            x[:, i + stride : i + 2 * stride] = a - b
-        stride <<= 1
-    x *= np.float32(0.0625)
-    x *= np.asarray(FWHT_SIGNS1, dtype=np.float32)
-    return x.reshape(values.shape)
+    return fwht_256_numpy_batched(values, FWHT_SIGNS2, FWHT_SIGNS1)
 
 
 def clipped_rows_for_ratio(rows, clip_ratio):
@@ -1331,7 +1335,48 @@ def e2m1_round_numpy(values):
     return (idx + np.where(negative, 8, 0).astype(np.uint8)).astype(np.uint8)
 
 
-def quantize_mfp4g32_values_numpy(values, *, importance=None, clip_quantile=0.999):
+def mfp4_select_block_exponents_numpy(blocks, inv_row_scale, *, block_fit="minmax", exponent_offsets=(-2, -1, 0, 1, 2)):
+    m, n_blocks, block_width = blocks.shape
+    if block_width != 32:
+        raise ValueError(f"MFP4G32 blocks must have width 32, got {block_width}")
+    block_max_abs = np.max(np.abs(blocks), axis=2)
+    block_max_normalized = block_max_abs * inv_row_scale[:, None]
+    block_e = np.zeros((m, n_blocks), dtype=np.uint8)
+    mask = block_max_normalized > 0.0
+    if np.any(mask):
+        e = np.ceil(np.log2(block_max_normalized[mask] / 6.0)).astype(np.int32) + 127
+        block_e[mask] = np.clip(e, 0, 254).astype(np.uint8)
+    if block_fit == "minmax":
+        return block_e
+    if block_fit != "ls":
+        raise ValueError(f"unsupported MFP4 block fit mode: {block_fit}")
+
+    values_norm = blocks * inv_row_scale[:, None, None]
+    lut = np.asarray(E2M1_LUT, dtype=np.float32)
+    best_e = block_e.astype(np.int32)
+    best_err = np.full((m, n_blocks), np.inf, dtype=np.float32)
+    base_e = block_e.astype(np.int32)
+    for offset in exponent_offsets:
+        candidate_e = np.clip(base_e + int(offset), 0, 254).astype(np.int32)
+        candidate_scale = np.exp2(candidate_e - 127).astype(np.float32)
+        scaled = values_norm / candidate_scale[:, :, None]
+        nibbles = e2m1_round_numpy(scaled)
+        recon = lut[nibbles] * candidate_scale[:, :, None]
+        err = np.mean((recon - values_norm) ** 2, axis=2)
+        improve = err < best_err
+        best_err = np.where(improve, err, best_err)
+        best_e = np.where(improve, candidate_e, best_e)
+    return best_e.astype(np.uint8)
+
+
+def mfp4_quantized_rotated_blocks_numpy(
+    values,
+    *,
+    importance=None,
+    clip_quantile=0.999,
+    block_fit="minmax",
+    exponent_offsets=(-2, -1, 0, 1, 2),
+):
     if np is None:
         raise RuntimeError("numpy is required for the vectorized MFP4 path")
     rows = np.asarray(values, dtype=np.float32)
@@ -1349,12 +1394,42 @@ def quantize_mfp4g32_values_numpy(values, *, importance=None, clip_quantile=0.99
 
     rotated = fwht_256_numpy(rows.reshape(m, k // 256, 256)).reshape(m, k)
     n_blocks = k // 32
-    row_bytes = 16 + 17 * n_blocks
-    out = np.zeros((m, row_bytes), dtype=np.uint8)
 
     row_max_abs = np.max(np.abs(rotated), axis=1)
     row_scale = np.where(row_max_abs > 0.0, row_max_abs / 6.0, 1.0).astype(np.float32)
     inv_row_scale = np.where(row_max_abs > 0.0, 1.0 / row_scale, 0.0).astype(np.float32)
+    blocks = rotated.reshape(m, n_blocks, 32)
+    block_e = mfp4_select_block_exponents_numpy(
+        blocks,
+        inv_row_scale,
+        block_fit=block_fit,
+        exponent_offsets=exponent_offsets,
+    )
+    block_scale = np.exp2(block_e.astype(np.int32) - 127).astype(np.float32)
+    values_scaled = blocks * inv_row_scale[:, None, None] / block_scale[:, :, None]
+    nibbles = e2m1_round_numpy(values_scaled)
+    return nibbles, row_scale, block_e
+
+
+def quantize_mfp4g32_values_numpy(
+    values,
+    *,
+    importance=None,
+    clip_quantile=0.999,
+    block_fit="minmax",
+    exponent_offsets=(-2, -1, 0, 1, 2),
+):
+    nibbles, row_scale, block_e = mfp4_quantized_rotated_blocks_numpy(
+        values,
+        importance=importance,
+        clip_quantile=clip_quantile,
+        block_fit=block_fit,
+        exponent_offsets=exponent_offsets,
+    )
+    m, n_blocks, _ = nibbles.shape
+    row_bytes = 16 + 17 * n_blocks
+    out = np.zeros((m, row_bytes), dtype=np.uint8)
+
     row_scale_bits = f32_to_f16_bits_numpy(row_scale)
     out[:, 0] = (row_scale_bits & 0xFF).astype(np.uint8)
     out[:, 1] = (row_scale_bits >> 8).astype(np.uint8)
@@ -1362,23 +1437,27 @@ def quantize_mfp4g32_values_numpy(values, *, importance=None, clip_quantile=0.99
     out[:, 5] = (n_blocks >> 8) & 0xFF
     out[:, 6] = 0x05
 
-    blocks = rotated.reshape(m, n_blocks, 32)
-    block_max_abs = np.max(np.abs(blocks), axis=2)
-    block_max_normalized = block_max_abs * inv_row_scale[:, None]
-    block_e = np.zeros((m, n_blocks), dtype=np.uint8)
-    mask = block_max_normalized > 0.0
-    if np.any(mask):
-        e = np.ceil(np.log2(block_max_normalized[mask] / 6.0)).astype(np.int32) + 127
-        block_e[mask] = np.clip(e, 0, 254).astype(np.uint8)
-    block_scale = np.exp2(block_e.astype(np.int32) - 127).astype(np.float32)
-    values_scaled = blocks * inv_row_scale[:, None, None] / block_scale[:, :, None]
-    nibbles = e2m1_round_numpy(values_scaled)
     packed = nibbles[:, :, 0::2] | (nibbles[:, :, 1::2] << 4)
     for b in range(n_blocks):
         off = 16 + b * 17
         out[:, off] = block_e[:, b]
         out[:, off + 1 : off + 17] = packed[:, b, :]
     return out.tobytes()
+
+
+def dequantize_mfp4g32_from_values_numpy(values, *, block_fit="minmax", exponent_offsets=(-2, -1, 0, 1, 2)):
+    nibbles, row_scale, block_e = mfp4_quantized_rotated_blocks_numpy(
+        values,
+        importance=None,
+        clip_quantile=1.0,
+        block_fit=block_fit,
+        exponent_offsets=exponent_offsets,
+    )
+    m, n_blocks, _ = nibbles.shape
+    lut = np.asarray(E2M1_LUT, dtype=np.float32)
+    block_scale = np.exp2(block_e.astype(np.int32) - 127).astype(np.float32)
+    rotated = lut[nibbles] * row_scale[:, None, None] * block_scale[:, :, None]
+    return inverse_fwht_256_numpy(rotated.reshape(m, n_blocks // 8, 256)).reshape(m, n_blocks * 32)
 
 
 def quantize_q8f16_values(values):
@@ -1424,6 +1503,18 @@ def quantize_q8f16_values_numpy(values):
     out[:, 0] = (scale_bits & 0xFF).astype(np.uint8)
     out[:, 1] = (scale_bits >> 8).astype(np.uint8)
     out[:, 2:] = q.view(np.uint8)
+    return out.tobytes()
+
+
+def f16_values_bytes_numpy(values):
+    if np is None:
+        flat = [float(value) for value in values]
+        return b"".join(struct.pack("<H", f32_to_f16_bits(value)) for value in flat)
+    flat = np.asarray(values, dtype=np.float32).reshape(-1)
+    bits = f32_to_f16_bits_numpy(flat)
+    out = np.zeros((flat.size, 2), dtype=np.uint8)
+    out[:, 0] = (bits & 0xFF).astype(np.uint8)
+    out[:, 1] = (bits >> 8).astype(np.uint8)
     return out.tobytes()
 
 
@@ -1991,6 +2082,37 @@ def build_imatrix_scale_patch(task):
     }
 
 
+def build_mfp4_ls_patch(task):
+    item = task["item"]
+    hfq_name = item["hfq_name"]
+    k = item["shape"][1]
+    source_tensors = {hfq_name: task["source_tensor"]}
+    values_array = load_safetensors_array(source_tensors, hfq_name)
+    if values_array is None:
+        raise RuntimeError("numpy is required for MFP4 LS calibration")
+    if values_array.shape != (item["shape"][0], k):
+        raise ValueError(f"source shape mismatch for {hfq_name}")
+    packed = quantize_mfp4g32_values_numpy(
+        values_array,
+        importance=None,
+        clip_quantile=1.0,
+        block_fit="ls",
+    )
+    patch_path = Path(task["patch_path"])
+    patch_path.write_bytes(packed)
+    return {
+        "index": task["index"],
+        "patch_path": str(patch_path),
+        "mutation": {
+            "hfq_name": hfq_name,
+            "shape": item["shape"],
+            "data_offset": task["tensor_info"]["data_offset"],
+            "data_size": task["tensor_info"]["data_size"],
+            "block_fit": "ls",
+        },
+    }
+
+
 def run_patch_tasks(tasks, worker_fn, parallel_workers):
     if parallel_workers == 1:
         return [worker_fn(task) for task in tasks], "serial"
@@ -2079,6 +2201,235 @@ def write_imatrix_scale_candidate(
         "mutated_tensor_count": len(mutations),
         "parallel_workers": parallel_workers,
         "worker_mode": worker_mode,
+        "mutations": mutations,
+    }
+
+
+def write_mfp4_ls_candidate(
+    plan,
+    join,
+    source_tensors,
+    *,
+    max_tensors=None,
+    tensor_filter=None,
+    workers=1,
+):
+    if np is None:
+        raise RuntimeError("numpy is required for MFP4 LS calibration")
+    model = plan.get("model")
+    candidate = plan.get("output")
+    if not candidate:
+        raise ValueError("plan output is required when writing a candidate")
+    copy_candidate_file(model, candidate)
+    _, candidate_tensors = read_hfq_index(candidate, max_tensors=0)
+
+    selected = select_imatrix_scale_matches(join, max_tensors=max_tensors, tensor_filter=tensor_filter)
+    if not selected:
+        raise ValueError("no MFP4G32 tensors selected for MFP4 LS calibration")
+
+    patch_dir = Path(str(candidate) + ".patches")
+    shutil.rmtree(patch_dir, ignore_errors=True)
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    requested_workers = max(1, int(workers or 1))
+    parallel_workers = min(requested_workers, len(selected))
+    tasks = []
+    for index, item in enumerate(selected):
+        tensor_info = candidate_tensors[item["hfq_name"]]
+        tasks.append(
+            {
+                "index": index,
+                "item": item,
+                "tensor_info": tensor_info,
+                "source_tensor": source_tensors[item["hfq_name"]],
+                "patch_path": str(patch_dir / f"{index:04d}.bin"),
+            }
+        )
+
+    worker_mode = "serial"
+    try:
+        results, worker_mode = run_patch_tasks(tasks, build_mfp4_ls_patch, parallel_workers)
+
+        mutations = []
+        for result in results:
+            patch_hfq_tensor_from_file(
+                candidate,
+                candidate_tensors[result["mutation"]["hfq_name"]],
+                result["patch_path"],
+            )
+            mutations.append(result["mutation"])
+    except Exception:
+        shutil.rmtree(patch_dir, ignore_errors=True)
+        raise
+    shutil.rmtree(patch_dir, ignore_errors=True)
+
+    return {
+        "candidate": str(candidate),
+        "candidate_bytes": Path(candidate).stat().st_size,
+        "mutated_tensor_count": len(mutations),
+        "parallel_workers": parallel_workers,
+        "worker_mode": worker_mode,
+        "mutations": mutations,
+    }
+
+
+def joint_d_norm_for_name(name):
+    marker = ".layers."
+    if marker not in name:
+        return None
+    layer_prefix = name.rsplit(".", 2)[0]
+    if ".self_attn." in name:
+        if name.endswith((".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight")):
+            return name.split(".self_attn.", 1)[0] + ".input_layernorm.weight"
+        return None
+    if ".linear_attn." in name:
+        if name.endswith(
+            (
+                ".linear_attn.in_proj_qkv.weight",
+                ".linear_attn.in_proj_z.weight",
+                ".linear_attn.in_proj_a.weight",
+                ".linear_attn.in_proj_b.weight",
+            )
+        ):
+            return name.split(".linear_attn.", 1)[0] + ".input_layernorm.weight"
+        return None
+    if ".mlp." in name:
+        if name.endswith((".mlp.gate_proj.weight", ".mlp.up_proj.weight")):
+            return name.split(".mlp.", 1)[0] + ".post_attention_layernorm.weight"
+        return None
+    return None
+
+
+def select_joint_d_mfp4_matches(join, *, max_tensors=None, tensor_filter=None):
+    filters = [item.strip() for item in (tensor_filter or "").split(",") if item.strip()]
+    selected = []
+    for item in join["matches"]:
+        if not item.get("calibration_supported", True):
+            continue
+        if item["quant_type_name"] != "MFP4G32":
+            continue
+        if not joint_d_norm_for_name(item["hfq_name"]):
+            continue
+        if filters and not any(f in item["imatrix_name"] or f in item["hfq_name"] for f in filters):
+            continue
+        selected.append(item)
+        if max_tensors is not None and len(selected) >= max_tensors:
+            break
+    return selected
+
+
+def compute_joint_d_vector(items, source_tensors, *, alpha=0.5, min_scale=0.25, max_scale=4.0):
+    if np is None:
+        raise RuntimeError("numpy is required for joint-D smoothing")
+    k = int(items[0]["shape"][1])
+    col_max = np.zeros(k, dtype=np.float32)
+    for item in items:
+        hfq_name = item["hfq_name"]
+        values = load_safetensors_array(source_tensors, hfq_name)
+        if values is None:
+            raise RuntimeError("numpy is required for joint-D smoothing")
+        if values.shape[1] != k:
+            raise ValueError(f"joint-D K mismatch for {hfq_name}: {values.shape[1]} vs {k}")
+        col_max = np.maximum(col_max, np.max(np.abs(values), axis=0).astype(np.float32))
+    positive = col_max[col_max > 0.0]
+    if positive.size == 0:
+        return np.ones(k, dtype=np.float32), {"target": 1.0, "col_max_min": 0.0, "col_max_max": 0.0}
+    target = float(np.exp(np.mean(np.log(positive.astype(np.float64)))))
+    scale = np.ones(k, dtype=np.float32)
+    mask = col_max > 0.0
+    scale[mask] = np.power(target / col_max[mask], float(alpha)).astype(np.float32)
+    scale = np.clip(scale, float(min_scale), float(max_scale)).astype(np.float32)
+    return scale, {
+        "alpha": float(alpha),
+        "min_scale": float(min_scale),
+        "max_scale": float(max_scale),
+        "target": target,
+        "col_max_min": float(np.min(positive)),
+        "col_max_max": float(np.max(positive)),
+        "scale_min": float(np.min(scale)),
+        "scale_max": float(np.max(scale)),
+        "scale_mean": float(np.mean(scale)),
+    }
+
+
+def write_joint_d_mfp4_candidate(
+    plan,
+    join,
+    source_tensors,
+    *,
+    max_tensors=None,
+    tensor_filter=None,
+    workers=1,
+):
+    if np is None:
+        raise RuntimeError("numpy is required for joint-D smoothing")
+    model = plan.get("model")
+    candidate = plan.get("output")
+    if not candidate:
+        raise ValueError("plan output is required when writing a candidate")
+    copy_candidate_file(model, candidate)
+    _, candidate_tensors = read_hfq_index(candidate, max_tensors=0)
+
+    selected = select_joint_d_mfp4_matches(join, max_tensors=max_tensors, tensor_filter=tensor_filter)
+    if not selected:
+        raise ValueError("no MFP4G32 input-projection tensors selected for joint-D smoothing")
+
+    groups = {}
+    for item in selected:
+        groups.setdefault(joint_d_norm_for_name(item["hfq_name"]), []).append(item)
+
+    missing_norms = [name for name in groups if name not in source_tensors or name not in candidate_tensors]
+    if missing_norms:
+        raise ValueError(f"joint-D norm source/model tensors missing: {missing_norms[:8]}")
+
+    mutations = []
+    for norm_name, items in sorted(groups.items()):
+        scale, stats = compute_joint_d_vector(items, source_tensors)
+        norm_values = load_safetensors_array(source_tensors, norm_name)
+        if norm_values is None:
+            raise RuntimeError("numpy is required for joint-D smoothing")
+        norm_flat = np.asarray(norm_values, dtype=np.float32).reshape(-1)
+        if norm_flat.shape[0] != scale.shape[0]:
+            raise ValueError(f"joint-D norm shape mismatch for {norm_name}: {norm_flat.shape[0]} vs {scale.shape[0]}")
+        patched_norm = norm_flat / scale
+        norm_payload = f16_values_bytes_numpy(patched_norm)
+        patch_hfq_tensor(candidate, candidate_tensors[norm_name], norm_payload)
+        mutations.append(
+            {
+                "kind": "norm_inverse_d",
+                "hfq_name": norm_name,
+                "shape": candidate_tensors[norm_name]["shape"],
+                "data_offset": candidate_tensors[norm_name]["data_offset"],
+                "data_size": candidate_tensors[norm_name]["data_size"],
+                "joint_d": stats,
+            }
+        )
+
+        for item in items:
+            hfq_name = item["hfq_name"]
+            values = load_safetensors_array(source_tensors, hfq_name)
+            if values.shape != (item["shape"][0], item["shape"][1]):
+                raise ValueError(f"source shape mismatch for {hfq_name}: {values.shape} vs {item['shape']}")
+            smoothed = np.asarray(values, dtype=np.float32) * scale[None, :]
+            packed = quantize_mfp4g32_values_numpy(smoothed, importance=None, clip_quantile=1.0)
+            patch_hfq_tensor(candidate, candidate_tensors[hfq_name], packed)
+            mutations.append(
+                {
+                    "kind": "weight_times_d",
+                    "hfq_name": hfq_name,
+                    "norm_name": norm_name,
+                    "shape": item["shape"],
+                    "data_offset": candidate_tensors[hfq_name]["data_offset"],
+                    "data_size": candidate_tensors[hfq_name]["data_size"],
+                }
+            )
+
+    return {
+        "candidate": str(candidate),
+        "candidate_bytes": Path(candidate).stat().st_size,
+        "joint_d_group_count": len(groups),
+        "mutated_tensor_count": len(mutations),
+        "worker_mode": "serial",
+        "parallel_workers": 1,
         "mutations": mutations,
     }
 
@@ -2639,6 +2990,39 @@ def calibrate_plan(
                 result["missing_source_count"] = len(missing_source)
                 result["missing_source"] = missing_source[:32]
                 result["source_ready"] = source_ready
+                if write_candidate and source_ready and "mfp4-ls" in result["methods"] and "mfp4" in result["formats"]:
+                    mutation = write_mfp4_ls_candidate(
+                        plan,
+                        join,
+                        source_tensors,
+                        max_tensors=max_tensors,
+                        tensor_filter=tensor_filter,
+                        workers=workers,
+                    )
+                    result.update(mutation)
+                    result["status"] = "candidate_written"
+                    result["message"] = "wrote MFP4 LS candidate with same HFQ tensor byte ranges"
+                    result["next_step"] = "run KLD/PPL against BF16 before stacking imatrix-scale"
+                    return result
+                if (
+                    write_candidate
+                    and source_ready
+                    and "joint-d" in result["methods"]
+                    and "mfp4" in result["formats"]
+                ):
+                    mutation = write_joint_d_mfp4_candidate(
+                        plan,
+                        join,
+                        source_tensors,
+                        max_tensors=max_tensors,
+                        tensor_filter=tensor_filter,
+                        workers=workers,
+                    )
+                    result.update(mutation)
+                    result["status"] = "candidate_written"
+                    result["message"] = "wrote folded joint-D MFP4 candidate with inverse D folded into RMSNorm"
+                    result["next_step"] = "run KLD/PPL against BF16 before applying imatrix-scale"
+                    return result
                 if write_candidate and source_ready and "imatrix-scale" in result["methods"] and "mfp4" in result["formats"]:
                     mutation = write_imatrix_scale_candidate(
                         plan,

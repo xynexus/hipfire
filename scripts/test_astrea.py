@@ -129,6 +129,22 @@ class AstreaTests(unittest.TestCase):
         header = json.dumps(header_items, separators=(",", ":")).encode("utf-8")
         path.write_bytes(struct.pack("<Q", len(header)) + header + payload)
 
+    def write_f32_safetensors_raw(self, path, tensor_values):
+        header_items = {}
+        payload = bytearray()
+        for name, shape, values in tensor_values:
+            flat = [float(value) for value in values]
+            start = len(payload)
+            payload.extend(struct.pack(f"<{len(flat)}f", *flat))
+            end = len(payload)
+            header_items[name] = {
+                "dtype": "F32",
+                "shape": shape,
+                "data_offsets": [start, end],
+            }
+        header = json.dumps(header_items, separators=(",", ":")).encode("utf-8")
+        path.write_bytes(struct.pack("<Q", len(header)) + header + payload)
+
     def write_minimal_imatrix_gguf(self, path, logical_name, k):
         logical_names = logical_name if isinstance(logical_name, list) else [logical_name]
 
@@ -447,6 +463,50 @@ class AstreaTests(unittest.TestCase):
 
         self.assertEqual(fast, scalar)
 
+    def test_mfp4_ls_block_fit_does_not_increase_reconstruction_mse(self):
+        astrea = load_astrea()
+        if astrea.np is None:
+            self.skipTest("numpy is not installed")
+        np = astrea.np
+        values = np.asarray(
+            [
+                [
+                    math.sin(i * 0.137) * 0.8
+                    + math.cos(i * 0.071) * 0.2
+                    + (5.0 if i in (17, 93, 211) else 0.0)
+                    for i in range(256)
+                ],
+                [
+                    math.cos(i * 0.101) * 0.7
+                    - math.sin(i * 0.197) * 0.3
+                    - (4.0 if i in (41, 149) else 0.0)
+                    for i in range(256)
+                ],
+            ],
+            dtype=np.float32,
+        )
+
+        minmax = astrea.dequantize_mfp4g32_from_values_numpy(values, block_fit="minmax")
+        ls = astrea.dequantize_mfp4g32_from_values_numpy(values, block_fit="ls")
+
+        minmax_mse = float(np.mean((minmax - values) ** 2))
+        ls_mse = float(np.mean((ls - values) ** 2))
+        self.assertLessEqual(ls_mse, minmax_mse + 1.0e-7)
+
+    def test_numpy_fwht_is_batch_size_invariant(self):
+        astrea = load_astrea()
+        if astrea.np is None:
+            self.skipTest("numpy is not installed")
+        np = astrea.np
+        segment = np.asarray([math.sin(i * 0.173) + 0.25 * math.cos(i * 0.071) for i in range(256)], dtype=np.float32)
+
+        single = astrea.fwht_256_numpy(segment.reshape(1, 256))[0]
+        many = np.zeros((4096, 256), dtype=np.float32)
+        many[0] = segment
+        batched = astrea.fwht_256_numpy(many)[0]
+
+        self.assertLess(float(np.max(np.abs(single - batched))), 1.0e-6)
+
     def test_calibrate_write_candidate_patches_same_size_mfp4_tensor(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
@@ -556,6 +616,116 @@ class AstreaTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "candidate_written")
             self.assertEqual(result["mutated_tensor_count"], 2)
+
+    def test_calibrate_joint_d_mfp4_folds_inverse_scale_into_norm(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            model = root / "synthetic.mfp4"
+            imatrix = root / "imatrix.gguf"
+            plan = root / "plan.json"
+            candidate = root / "candidate.mfp4"
+            norm = "model.language_model.layers.0.post_attention_layernorm.weight"
+            gate = "model.language_model.layers.0.mlp.gate_proj.weight"
+            up = "model.language_model.layers.0.mlp.up_proj.weight"
+            row_bytes = 16 + 17 * 8
+            self.write_minimal_hfq(
+                model,
+                [
+                    (norm, 1, [256], 0, 512),
+                    (gate, 24, [1, 256], 32, row_bytes),
+                    (up, 24, [1, 256], 32, row_bytes),
+                ],
+            )
+            gate_values = [8.0 if i == 0 else 0.25 + i / 1024.0 for i in range(256)]
+            up_values = [0.125 + (255 - i) / 2048.0 for i in range(256)]
+            self.write_f32_safetensors_raw(
+                source_dir / "model-00001-of-00001.safetensors",
+                [
+                    (norm, [256], [1.0] * 256),
+                    (gate, [1, 256], gate_values),
+                    (up, [1, 256], up_values),
+                ],
+            )
+            self.write_minimal_imatrix_gguf(imatrix, ["blk.0.ffn_gate.weight", "blk.0.ffn_up.weight"], 256)
+            plan.write_text(
+                json.dumps(
+                    {
+                        "schema": "hipfire.astrea.plan.v0",
+                        "plan_id": "joint-d-smoke",
+                        "model": str(model),
+                        "source_dir": str(source_dir),
+                        "formats": ["mfp4"],
+                        "methods": ["joint-d"],
+                        "imatrix": str(imatrix),
+                        "output": str(candidate),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = astrea.calibrate_plan(str(plan), dry_run=False, write_candidate=True, workers=1)
+
+            self.assertEqual(result["status"], "candidate_written")
+            self.assertEqual(result["joint_d_group_count"], 1)
+            self.assertEqual(result["mutated_tensor_count"], 3)
+            _, tensor_map = astrea.read_hfq_index(candidate)
+            payload = candidate.read_bytes()[
+                tensor_map[norm]["data_offset"] : tensor_map[norm]["data_offset"] + tensor_map[norm]["data_size"]
+            ]
+            first_norm = struct.unpack("<e", payload[:2])[0]
+            self.assertNotEqual(first_norm, 0.0)
+            self.assertNotEqual(first_norm, 1.0)
+
+    def test_calibrate_mfp4_ls_writes_same_format_candidate(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            model = root / "synthetic.mfp4"
+            imatrix = root / "imatrix.gguf"
+            plan = root / "plan.json"
+            candidate = root / "candidate.mfp4"
+            tensor_name = "model.language_model.layers.0.mlp.gate_proj.weight"
+            row_bytes = 16 + 17 * 8
+            self.write_minimal_hfq(model, [(tensor_name, 24, [1, 256], 32, row_bytes)])
+            values = [math.sin(i * 0.137) + (4.0 if i == 17 else 0.0) for i in range(256)]
+            self.write_f32_safetensors_raw(
+                source_dir / "model-00001-of-00001.safetensors",
+                [(tensor_name, [1, 256], values)],
+            )
+            self.write_minimal_imatrix_gguf(imatrix, "blk.0.ffn_gate.weight", 256)
+            plan.write_text(
+                json.dumps(
+                    {
+                        "schema": "hipfire.astrea.plan.v0",
+                        "plan_id": "mfp4-ls-smoke",
+                        "model": str(model),
+                        "source_dir": str(source_dir),
+                        "formats": ["mfp4"],
+                        "methods": ["mfp4-ls"],
+                        "imatrix": str(imatrix),
+                        "output": str(candidate),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = astrea.calibrate_plan(str(plan), dry_run=False, write_candidate=True, workers=1)
+
+            self.assertEqual(result["status"], "candidate_written")
+            self.assertEqual(result["mutated_tensor_count"], 1)
+            self.assertEqual(candidate.stat().st_size, model.stat().st_size)
+            _, tensor_map = astrea.read_hfq_index(candidate)
+            patched = candidate.read_bytes()[
+                tensor_map[tensor_name]["data_offset"] : tensor_map[tensor_name]["data_offset"]
+                + tensor_map[tensor_name]["data_size"]
+            ]
+            self.assertEqual(patched[6], 0x05)
+            self.assertNotEqual(patched, b"\0" * len(patched))
 
     def test_parallel_write_candidate_matches_serial_bytes(self):
         astrea = load_astrea()
