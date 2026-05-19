@@ -243,13 +243,23 @@ fn is_dot2_gemv_enabled() -> bool {
 /// gfx908 (CDNA1, MI100) shares __hfma2 + wave64 and would code-correctly
 /// run the same kernels, but we have no perf data and MFMA likely wants a
 /// different optimum. MI100 owners can opt in for A/B testing via
-/// `HIPFIRE_GCN5_WAVE64_HYBRID=1`. CDNA3 (gfx94x) uses rocBLAS MFMA.
+/// `HIPFIRE_GCN5_WAVE64_HYBRID=1`. CDNA3 (gfx94x) defaults to rocBLAS MFMA,
+/// but `HIPFIRE_GFX942_NATIVE_LM_HEAD=1` opts gfx94x into the wave64 FP16
+/// hybrid path for small-batch verify GEMMs (B=3-4) where Tensile's
+/// 256×256×32 MFMA tile wastes 252/256 N-columns. See `rocblas_min_batch`
+/// doc comment for full rationale + Phase 0 rocprof evidence (2026-05-19).
 fn is_gcn5_wave64(arch: &str) -> bool {
     if arch == "gfx906" {
         return true;
     }
     if arch == "gfx908"
         && std::env::var("HIPFIRE_GCN5_WAVE64_HYBRID")
+            .map_or(false, |v| v == "1")
+    {
+        return true;
+    }
+    if matches!(arch, "gfx940" | "gfx941" | "gfx942")
+        && std::env::var("HIPFIRE_GFX942_NATIVE_LM_HEAD")
             .map_or(false, |v| v == "1")
     {
         return true;
@@ -1607,17 +1617,37 @@ impl Gpu {
     /// Kill-switch: `HIPFIRE_ROCBLAS_OFF=1` forces the threshold to usize::MAX,
     /// which disables the rocBLAS path entirely for A/B benchmarking against
     /// the hand-rolled GEMV baseline.
+    ///
+    /// **MI300x / gfx942 lm_head fix (Phase 1, 2026-05-19):** when
+    /// `HIPFIRE_GFX942_NATIVE_LM_HEAD=1`, the threshold is raised to 16 for
+    /// gfx94x archs. Phase 0 rocprof on MI300X showed batched verify GEMMs
+    /// (trunk verify at B=max_n+1=4, MTP-head batched lm_head at B=max_n=3)
+    /// were dispatching through the Tensile MFMA tile `MT256x256x32`, which
+    /// wastes 252/256 N-columns at B=4 (~98.4% idle MFMA lanes). Native
+    /// `gemm_hfq4g256_residual_wave64` handles B≤16 efficiently because each
+    /// block processes BATCH_TILE=8 batch elements without zero-padding the
+    /// remaining MFMA lanes. Phase 0 result: 58.7% of solo MTP decode was in
+    /// rocBLAS Tensile HSS GEMM (`Cijk_Alik_Bljk_HSS_*` family) at ~0.2-0.73
+    /// ms / call, vs native wave64 GEMM at ~0.02-0.06 ms / call (~10×
+    /// per-call faster).
     fn rocblas_min_batch(&self) -> usize {
-        static CACHE: OnceLock<usize> = OnceLock::new();
-        *CACHE.get_or_init(|| {
-            if std::env::var("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1") {
-                return usize::MAX;
-            }
-            std::env::var("HIPFIRE_ROCBLAS_MIN_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(4)
-        })
+        // Kill-switch (highest priority).
+        if std::env::var("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1") {
+            return usize::MAX;
+        }
+        // Explicit override.
+        if let Some(v) = std::env::var("HIPFIRE_ROCBLAS_MIN_BATCH").ok().and_then(|s| s.parse::<usize>().ok()) {
+            return v;
+        }
+        // Opt-in gfx94x native-lm_head path: raise threshold to 16 so
+        // small-batch verify (B=3-4) and MTP-head batched lm_head (B=3)
+        // route to native wave64 GEMM family. See doc comment above.
+        if std::env::var("HIPFIRE_GFX942_NATIVE_LM_HEAD").ok().as_deref() == Some("1")
+            && matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
+        {
+            return 16;
+        }
+        4
     }
 
     /// Pre-compile a batch of kernels in parallel (hipcc), then load modules + functions.
