@@ -905,7 +905,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         // pread_buf borrow, but the weight bytes have already been
         // uploaded to GPU (owned by `wt.buf`) so the borrow no longer
         // matters.
-        if matches!(wt.gpu_dtype, DType::MQ4G256) {
+        if matches!(wt.gpu_dtype, DType::MQ4G256 | DType::MQ6G256) {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
@@ -917,7 +917,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
             .or_else(|| hfq.tensor_data(name))
             .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
         let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
-        if matches!(wt.gpu_dtype, DType::MQ4G256) {
+        if matches!(wt.gpu_dtype, DType::MQ4G256 | DType::MQ6G256) {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
