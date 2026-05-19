@@ -219,6 +219,21 @@ fn is_dot2_gemv_enabled() -> bool {
     })
 }
 
+/// Experimental MQ4 x I4 dot8 decode path for RDNA3.5 APUs.
+///
+/// This intentionally changes activation precision, so it is never part of
+/// the default MQ4 path. `HIPFIRE_MQ4_I4_DOT8=1` enables it only on gfx1150
+/// and gfx1151, where the packed 4-bit dot machinery is the target.
+pub fn mq4_i4_dot8_enabled(arch: &str) -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    let requested = *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_MQ4_I4_DOT8").map_or(false, |v| {
+            matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON")
+        })
+    });
+    requested && matches!(arch, "gfx1150" | "gfx1151")
+}
+
 /// Gates the wave64 FP16 hybrid prefill path. gfx906 (Vega 20, MI50) is the
 /// only arch with measured data: +90% prefill on Qwen 3.5 9B (74 → 141 tk/s).
 /// gfx908 (CDNA1, MI100) shares __hfma2 + wave64 and would code-correctly
@@ -421,6 +436,8 @@ pub struct Gpu {
     pub mq_x_rot: Option<GpuTensor>,  // scratch for rotated x, sized to max K
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,   // INT8 quantized rotated x for dp4a
     pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
+    pub mq_x_i4: Option<hip_bridge::DeviceBuffer>, // packed signed i4 rotated x for MQ4 dot8
+    pub mq_x_i4_sums: Option<hip_bridge::DeviceBuffer>, // per-group i32 sum(a_i) for zero correction
     /// FP16 scratch buffer for prefill X conversion. Sized to max(batch_size × K) × 2 bytes.
     fp16_x_scratch: Option<hip_bridge::DeviceBuffer>,
     fp16_x_scratch_bytes: usize,
@@ -711,6 +728,8 @@ impl Gpu {
             mq_x_rot: None,
             mq_x_q8: None,
             mq_x_scales: None,
+            mq_x_i4: None,
+            mq_x_i4_sums: None,
             fp16_x_scratch: None,
             fp16_x_scratch_bytes: 0,
             fp16_x_source_ptr: std::ptr::null_mut(),
@@ -3105,11 +3124,15 @@ impl Gpu {
         let x_rot = self.alloc_tensor(&[32768], DType::F32)?;
         let x_q8 = self.hip.malloc(32768)?;  // INT8 buffer for dp4a
         let x_scales = self.hip.malloc(128 * 4)?; // up to 128 groups × f32
+        let x_i4 = self.hip.malloc(32768 / 2)?; // eight signed i4 activations per u32
+        let x_i4_sums = self.hip.malloc(128 * 4)?; // up to 128 groups × i32
         self.mq_signs1 = Some(s1t);
         self.mq_signs2 = Some(s2t);
         self.mq_x_rot = Some(x_rot);
         self.mq_x_q8 = Some(x_q8);
         self.mq_x_scales = Some(x_scales);
+        self.mq_x_i4 = Some(x_i4);
+        self.mq_x_i4_sums = Some(x_i4_sums);
         Ok(())
     }
 
@@ -3596,7 +3619,139 @@ impl Gpu {
         &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if mq4_i4_dot8_enabled(&self.arch) {
+            return self.gemv_mq4g256_i4_dot8_prerotated(a_raw, x_rot, y, m, k);
+        }
         self.gemv_hfq4g256(a_raw, x_rot, y, m, k)
+    }
+
+    fn pack_mq4_i4_x(&mut self, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
+        assert!(k % 256 == 0, "mq4 i4 dot8 requires K%256==0, got K={}", k);
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_i4_dot8_gfx115x",
+            kernels::GEMV_HFQ4G256_I4_DOT8_GFX115X_SRC,
+            "mq4_pack_i4_x",
+        )?;
+
+        let xp = x_rot.buf.as_ptr();
+        let i4p = self.mq_x_i4.as_ref().unwrap().as_ptr();
+        let dxp = self.mq_x_scales.as_ref().unwrap().as_ptr();
+        let sump = self.mq_x_i4_sums.as_ref().unwrap().as_ptr();
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &i4p as *const _ as *mut c_void,
+            &dxp as *const _ as *mut c_void,
+            &sump as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let groups = (k / 256) as u32;
+        let bytes = k * 4 + k / 2 + (k / 256) * 8;
+        let timer = crate::profile::begin_timer(&self.hip, "quant", "mq4_pack_i4_x", bytes);
+        let result = self.launch_maybe_blob(
+            "mq4_pack_i4_x", [groups, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(i4p); b.push_ptr(dxp); b.push_ptr(sump);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Experimental MQ4 decode path: pack pre-rotated F32 activations to signed
+    /// i4 per MQ group, then run packed signed-i4 dot8 against shifted MQ4
+    /// nibbles. Gated by `HIPFIRE_MQ4_I4_DOT8=1` and gfx1150/gfx1151.
+    pub fn gemv_mq4g256_i4_dot8_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.pack_mq4_i4_x(x_rot, k)?;
+        self.gemv_mq4g256_i4_dot8_packed(a_raw, y, m, k, false)
+    }
+
+    pub fn gemv_mq4g256_residual_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        if mq4_i4_dot8_enabled(&self.arch) {
+            return self.gemv_mq4g256_i4_dot8_residual_prerotated(a_raw, x_rot, y, m, k);
+        }
+        self.gemv_hfq4g256_residual(a_raw, x_rot, y, m, k)
+    }
+
+    pub fn gemv_mq4g256_i4_dot8_residual_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.pack_mq4_i4_x(x_rot, k)?;
+        self.gemv_mq4g256_i4_dot8_packed(a_raw, y, m, k, true)
+    }
+
+    fn gemv_mq4g256_i4_dot8_packed(
+        &mut self,
+        a_raw: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_i4_dot8_gfx115x",
+            kernels::GEMV_HFQ4G256_I4_DOT8_GFX115X_SRC,
+            if residual { "gemv_hfq4g256_i4_dot8_residual" } else { "gemv_hfq4g256_i4_dot8" },
+        )?;
+
+        let ap = a_raw.buf.as_ptr();
+        let i4p = self.mq_x_i4.as_ref().unwrap().as_ptr();
+        let dxp = self.mq_x_scales.as_ref().unwrap().as_ptr();
+        let sump = self.mq_x_i4_sums.as_ref().unwrap().as_ptr();
+        let yp = y.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &i4p as *const _ as *mut c_void,
+            &dxp as *const _ as *mut c_void,
+            &sump as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+
+        let kernel = if residual { "gemv_hfq4g256_i4_dot8_residual" } else { "gemv_hfq4g256_i4_dot8" };
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + k / 2 + (k / 256) * 8
+            + if residual { m * 4 } else { 0 };
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel, [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap); b.push_ptr(i4p); b.push_ptr(dxp); b.push_ptr(sump);
+                b.push_ptr(yp);
+                b.push_i32(mv); b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// MFP4G32: rotate x once via FWHT, then HFP4G32 GEMV against rotated x.
@@ -17196,6 +17351,10 @@ impl Gpu {
                 let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC.to_string()));
+                if mq4_i4_dot8_enabled(&self.arch) {
+                    specs.push(("gemv_hfq4g256_i4_dot8_gfx115x",
+                                kernels::GEMV_HFQ4G256_I4_DOT8_GFX115X_SRC.to_string()));
+                }
                 specs.push(("fused_qkvza_hfq4g256",
                             kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string()));
                 specs.push(("fused_qkv_hfq4g256",

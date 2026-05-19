@@ -358,6 +358,7 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 pub const GEMV_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
+pub const GEMV_HFQ4G256_I4_DOT8_GFX115X_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_i4_dot8.gfx115x.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64_prefetch.hip");
 

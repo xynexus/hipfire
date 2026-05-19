@@ -3,6 +3,7 @@
 mod compiler;
 mod dispatch;
 mod kernels;
+mod mq4_i4_dot8;
 pub mod pool;
 pub mod profile;
 pub mod profiler;

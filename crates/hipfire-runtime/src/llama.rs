@@ -828,7 +828,7 @@ pub fn weight_gemv_residual(
                 dtype: DType::F32,
             };
             gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
-            gpu.gemv_hfq4g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
+            gpu.gemv_mq4g256_residual_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ3G256 => {
             // FWHT-rotate x into the shared mq_x_rot scratch, then dispatch
@@ -903,7 +903,7 @@ pub fn weight_gemv_swiglu_residual(
                 dtype: DType::F32,
             };
             gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
-            gpu.gemv_hfq4g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+            gpu.gemv_mq4g256_residual_prerotated(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
         DType::MQ3G256 => {
             // Same shape as MQ4: silu(gate)*up rotated through the FWHT into
