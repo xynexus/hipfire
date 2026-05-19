@@ -25,7 +25,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_arch_qwen35::mtp_compose::{self, MtpComposeState};
+    use hipfire_arch_qwen35::mtp_compose::{self, MtpChainMode, MtpComposeState};
     use hipfire_arch_qwen35::mtp_head;
     use hipfire_arch_qwen35::speculative::{
         self, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, ModelSlot, ModelSlotConfig,
@@ -52,6 +52,9 @@ fn main() {
     let mut mtp_k: usize = 2;
     let mut chatml: bool = true;
     let mut kv_mode_str = String::from("q8");
+    // MTP-chain mode: linear-chain (default, Task 11 behaviour) vs
+    // extended-verify (Phase 2 prototype — discrete-token chain).
+    let mut mtp_mode_str = String::from("linear-chain");
 
     let mut i = 1;
     while i < args.len() {
@@ -69,13 +72,15 @@ fn main() {
             "--no-chatml" => { chatml = false; i += 1; }
             "--chatml" => { chatml = true; i += 1; }
             "--kv-mode" => { kv_mode_str = args[i + 1].clone(); i += 2; }
+            "--mtp-mode" => { mtp_mode_str = args[i + 1].clone(); i += 2; }
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: dflash_mtp_demo --target <trunk.mq4> --drafter <drafter.hfq> \\\n\
                      \t--mtp-head <head.mtp> \\\n\
                      \t(--prompt \"...\" | --prompt-file <path>) \\\n\
                      \t[--max 120] [--temp 0] [--dflash-b 16] [--mtp-k 2] \\\n\
-                     \t[--ctx 4096] [--no-chatml] [--kv-mode q8]"
+                     \t[--ctx 4096] [--no-chatml] [--kv-mode q8] \\\n\
+                     \t[--mtp-mode linear-chain|extended-verify]"
                 );
                 std::process::exit(0);
             }
@@ -108,6 +113,15 @@ fn main() {
     }
     assert!(mtp_k >= 1 && mtp_k <= 8, "--mtp-k must be in [1,8]");
 
+    let mtp_mode = match mtp_mode_str.as_str() {
+        "linear-chain" | "linear" => MtpChainMode::LinearChain,
+        "extended-verify" | "extended" => MtpChainMode::ExtendedVerify,
+        other => {
+            eprintln!("error: unknown --mtp-mode {other}; expected linear-chain|extended-verify");
+            std::process::exit(2);
+        }
+    };
+
     let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt_raw).into_owned();
     let prompt_hash = prompt_md5(prompt.as_bytes());
 
@@ -116,7 +130,9 @@ fn main() {
     eprintln!("drafter:    {drafter_path}");
     eprintln!("mtp-head:   {mtp_path}");
     eprintln!("prompt md5: {prompt_hash}");
-    eprintln!("max={max_tokens} ctx={ctx_capacity} mtp_k={mtp_k} kv_mode={kv_mode_str} chatml={chatml}");
+    eprintln!(
+        "max={max_tokens} ctx={ctx_capacity} mtp_k={mtp_k} kv_mode={kv_mode_str} chatml={chatml} mtp_mode={mtp_mode:?}"
+    );
 
     // ── Init GPU + load drafter cfg ────────────────────────────────────
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
@@ -314,7 +330,7 @@ fn main() {
             break;
         }
 
-        let result = mtp_compose::spec_step_dflash_mtp(
+        let result = mtp_compose::spec_step_dflash_mtp_with_mode(
             &mut gpu,
             &mut target,
             &draft_weights,
@@ -330,7 +346,8 @@ fn main() {
             seed_token,
             Some(b),
             mtp_k,
-        ).expect("spec_step_dflash_mtp");
+            mtp_mode,
+        ).expect("spec_step_dflash_mtp_with_mode");
 
         cycles += 1;
         accept_dflash_total += result.accept_dflash;
@@ -380,6 +397,7 @@ fn main() {
     println!("prompt_tokens:        {}", prompt_tokens.len());
     println!("dflash_b:             {}", b);
     println!("mtp_k:                {}", mtp_k);
+    println!("mtp_mode:             {:?}", mtp_mode);
     println!("cycles:               {}", cycles);
     println!("committed_total:      {}", total_committed);
     println!("accept_dflash_total:  {}", accept_dflash_total);

@@ -161,14 +161,50 @@ pub struct MtpComposeResult {
     pub committed: Vec<u32>,
 }
 
+/// Selects how the K-step MTP chain is unrolled inside
+/// [`spec_step_dflash_mtp_with_mode`]. Both modes share the same outer
+/// pattern (DFlash drafter → MTP fanout → single trunk verify); they
+/// differ only in how step k>=1 of the MTP chain is conditioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtpChainMode {
+    /// Original Task 11 "linear-chain": step 0 uses drafter hidden +
+    /// drafted[B-1] (discrete token); steps 1..K-1 use the lossy
+    /// `next_token_embed=Some(prev_step_t_mtp_out)` substitution that
+    /// bypasses the embedding lookup. One batched lm_head at the end
+    /// produces all K candidates simultaneously.
+    ///
+    /// Pros: K block forwards + 1 batched lm_head (cheap fanout).
+    /// Cons: per the head's training distribution, post-FFN hiddens are
+    /// OOD as substitutes for `embed[token]`; downstream MTP candidates
+    /// diverge from trunk's accept set, so τ_mtp tends to zero in
+    /// practice (Phase 1 measured `accept_mtp_total=0` on MI300x).
+    LinearChain,
+
+    /// "MTP-extended verify": step 0 same as linear-chain (drafter hidden
+    /// + drafted[B-1]); steps 1..K-1 close the loop with a per-step
+    /// `lm_head + argmax`, then re-enter the block with the discrete
+    /// token and `next_token_embed=None` (standard embedding lookup).
+    ///
+    /// Pros: each step's input is in-distribution for the MTP head's
+    /// training — `embed[token]` ⊕ `prev_hidden`. Improves the chance
+    /// that step 1..K-1 candidates align with trunk's verify argmax.
+    /// Cons: K serial lm_head+argmax calls (~+0.5–2 ms per cycle) instead
+    /// of one batched call; cannot start step k+1 until step k's argmax
+    /// resolves.
+    ///
+    /// Trade-off: discrete-token chain raises τ_mtp (potentially),
+    /// at the cost of small extra serial latency. The bench is whether
+    /// the τ lift > latency tax for canonical workloads.
+    ExtendedVerify,
+}
+
 // ─── One spec step ───────────────────────────────────────────────────────
 
 /// One DFlash + MTP composition cycle. Greedy / temp=0 only.
 ///
-/// Mirrors the call surface of `spec_step_dflash` but uses a stripped-down
-/// arg list — caller uses this directly, not via the dflash demo's full
-/// adaptive-B + PLD + n-gram + repeat-penalty knobs (those compose later
-/// if MTP shows a win).
+/// Backwards-compat wrapper: equivalent to
+/// [`spec_step_dflash_mtp_with_mode`] with `mode = MtpChainMode::LinearChain`.
+/// New callers should prefer `_with_mode` and select explicitly.
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_dflash_mtp(
     gpu: &mut Gpu,
@@ -186,6 +222,39 @@ pub fn spec_step_dflash_mtp(
     seed_token: u32,
     dflash_b: Option<usize>,
     mtp_k: usize,
+) -> HipResult<MtpComposeResult> {
+    spec_step_dflash_mtp_with_mode(
+        gpu, target, draft_weights, draft_cfg, draft_scratch, hidden_rb,
+        target_snap, verify_scratch, gdn_tape, head, state, position,
+        seed_token, dflash_b, mtp_k, MtpChainMode::LinearChain,
+    )
+}
+
+/// One DFlash + MTP composition cycle with explicit MTP-chain mode select.
+/// Greedy / temp=0 only.
+///
+/// Mirrors the call surface of `spec_step_dflash` but uses a stripped-down
+/// arg list — caller uses this directly, not via the dflash demo's full
+/// adaptive-B + PLD + n-gram + repeat-penalty knobs (those compose later
+/// if MTP shows a win). See [`MtpChainMode`] for `mode` semantics.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_dflash_mtp_with_mode(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_snap: &mut DeltaNetSnapshot,
+    verify_scratch: &VerifyScratch,
+    gdn_tape: Option<&mut GdnTape>,
+    head: &Qwen35MtpHead,
+    state: &mut MtpComposeState,
+    position: usize,
+    seed_token: u32,
+    dflash_b: Option<usize>,
+    mtp_k: usize,
+    mode: MtpChainMode,
 ) -> HipResult<MtpComposeResult> {
     let trunk_weights: &Qwen35Weights = &target.weights;
     let dim = target.config.dim;
@@ -365,8 +434,15 @@ pub fn spec_step_dflash_mtp(
     // next_token for step 0 = drafted[B-1] (the drafter's argmax token at
     // that slot — what the drafter believes the next token is).
     //
-    // Steps 1..K-1: feature-only chain (same lossy pattern as
-    // mtp_head_apply_lm_head_batched + mtp_spec.rs Approach B).
+    // Steps 1..K-1: depends on `mode`:
+    //   * LinearChain   — feature-only chain (lossy substitution of post-FFN
+    //                     hidden for `embed[token]`). One batched lm_head at
+    //                     end of chain.
+    //   * ExtendedVerify — per-step `lm_head + argmax` produces a discrete
+    //                     token; that token's embedding feeds step k+1 via
+    //                     the standard table lookup. Each step adds a
+    //                     small serial lm_head+argmax tax, but the head
+    //                     stays IN-distribution.
     //
     // KV writes: step k writes MTP slot `position + b - 1 + k`. Bound check:
     // position + b - 1 + (K - 1) < kv.max_seq.
@@ -377,6 +453,12 @@ pub fn spec_step_dflash_mtp(
         "mtp_pos_base + mtp_k ({}) > mtp_kv.max_seq ({})",
         mtp_pos_base + mtp_k, state.mtp_kv.max_seq,
     );
+
+    // Pre-allocated per-step token list. Filled during the loop in
+    // ExtendedVerify mode; only [0] is populated in LinearChain mode
+    // (the rest come from the batched lm_head at the end).
+    let mut mtp_step_tokens: Vec<u32> = vec![0u32; mtp_k];
+    mtp_step_tokens[0] = drafted[b - 1]; // step 0's "input next_token"
 
     for k in 0..mtp_k {
         if k == 0 {
@@ -393,17 +475,41 @@ pub fn spec_step_dflash_mtp(
             )?;
         } else {
             let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-            mtp_head::mtp_head_forward_block_only(
-                gpu,
-                head,
-                &state.mtp_scratch,
-                &mut state.mtp_kv,
-                0,
-                &prev_row,
-                Some(&prev_row),
-                mtp_pos_base + k,
-                trunk_weights,
-            )?;
+            match mode {
+                MtpChainMode::LinearChain => {
+                    // Lossy feature-only chain: substitute prev t_mtp_out for
+                    // `embed[token]` via next_token_embed=Some(...).
+                    mtp_head::mtp_head_forward_block_only(
+                        gpu,
+                        head,
+                        &state.mtp_scratch,
+                        &mut state.mtp_kv,
+                        0,
+                        &prev_row,
+                        Some(&prev_row),
+                        mtp_pos_base + k,
+                        trunk_weights,
+                    )?;
+                }
+                MtpChainMode::ExtendedVerify => {
+                    // Discrete-token chain: feed previous step's argmax token
+                    // through the embedding table (next_token_embed=None) so
+                    // the head sees `embed[token]` + prev_hidden, which is
+                    // the training distribution.
+                    let prev_token = mtp_step_tokens[k - 1];
+                    mtp_head::mtp_head_forward_block_only(
+                        gpu,
+                        head,
+                        &state.mtp_scratch,
+                        &mut state.mtp_kv,
+                        prev_token,
+                        &prev_row,
+                        None,
+                        mtp_pos_base + k,
+                        trunk_weights,
+                    )?;
+                }
+            }
         }
         gpu.hip.memcpy_dtod_at(
             &state.mtp_t_outs.buf,
@@ -412,34 +518,78 @@ pub fn spec_step_dflash_mtp(
             0,
             dim_bytes,
         )?;
+
+        // ExtendedVerify: run a single-row lm_head + argmax IMMEDIATELY
+        // so the next step can use the discrete token. We reuse the same
+        // batched lm_head infra by treating the call as N=1.
+        //
+        // Skip on the last step — that argmax will be picked up by the
+        // batched lm_head pass below (LinearChain) or by the verify (we
+        // still need to fill mtp_step_tokens[k] for completeness).
+        if mode == MtpChainMode::ExtendedVerify {
+            let lm_tmp_view = state.mtp_lm_tmp.sub_offset(k * dim, dim);
+            let lm_rot_view = state.mtp_lm_rot.sub_offset(k * dim, dim);
+            let lm_logits_view = state.mtp_lm_logits.sub_offset(k * vocab, vocab);
+            let t_out_row = state.mtp_t_outs.sub_offset(k * dim, dim);
+            mtp_head::mtp_head_apply_lm_head_batched(
+                gpu,
+                head,
+                &trunk_weights.output,
+                &t_out_row,
+                &lm_tmp_view,
+                &lm_rot_view,
+                &lm_logits_view,
+                1,
+            )?;
+            let lm_argmax_view = state.mtp_lm_argmax.sub_offset(k, 1);
+            gpu.argmax_f32_batched(&lm_logits_view, &lm_argmax_view, vocab, 1)?;
+            let mut host_idx = [0i32; 1];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, 4)
+                };
+                gpu.hip.memcpy_dtoh(bytes, &lm_argmax_view.buf)?;
+            }
+            mtp_step_tokens[k] = host_idx[0] as u32;
+        }
     }
 
-    // ── 3. Batched MTP lm_head (K rows → K logits) ──────────────────────
-    let t_outs_view = state.mtp_t_outs.sub_offset(0, mtp_k * dim);
-    let lm_tmp_view = state.mtp_lm_tmp.sub_offset(0, mtp_k * dim);
-    let lm_rot_view = state.mtp_lm_rot.sub_offset(0, mtp_k * dim);
-    let lm_logits_view = state.mtp_lm_logits.sub_offset(0, mtp_k * vocab);
-    mtp_head::mtp_head_apply_lm_head_batched(
-        gpu,
-        head,
-        &trunk_weights.output,
-        &t_outs_view,
-        &lm_tmp_view,
-        &lm_rot_view,
-        &lm_logits_view,
-        mtp_k,
-    )?;
-
-    let lm_argmax_view = state.mtp_lm_argmax.sub_offset(0, mtp_k);
-    gpu.argmax_f32_batched(&lm_logits_view, &lm_argmax_view, vocab, mtp_k)?;
-    let mut argmax_host: Vec<i32> = vec![0; mtp_k];
-    {
-        let bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, mtp_k * 4)
-        };
-        gpu.hip.memcpy_dtoh(bytes, &lm_argmax_view.buf)?;
-    }
-    let mtp_candidates: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
+    // ── 3. MTP candidate tokens (K total) ────────────────────────────────
+    //
+    // LinearChain:   one batched lm_head over all K t_mtp_outs → K logits → K argmaxes.
+    // ExtendedVerify: each step already wrote its argmax into mtp_step_tokens during
+    //                 the chain loop; no additional lm_head pass needed.
+    let mtp_candidates: Vec<u32> = match mode {
+        MtpChainMode::LinearChain => {
+            let t_outs_view = state.mtp_t_outs.sub_offset(0, mtp_k * dim);
+            let lm_tmp_view = state.mtp_lm_tmp.sub_offset(0, mtp_k * dim);
+            let lm_rot_view = state.mtp_lm_rot.sub_offset(0, mtp_k * dim);
+            let lm_logits_view = state.mtp_lm_logits.sub_offset(0, mtp_k * vocab);
+            mtp_head::mtp_head_apply_lm_head_batched(
+                gpu,
+                head,
+                &trunk_weights.output,
+                &t_outs_view,
+                &lm_tmp_view,
+                &lm_rot_view,
+                &lm_logits_view,
+                mtp_k,
+            )?;
+            let lm_argmax_view = state.mtp_lm_argmax.sub_offset(0, mtp_k);
+            gpu.argmax_f32_batched(&lm_logits_view, &lm_argmax_view, vocab, mtp_k)?;
+            let mut argmax_host: Vec<i32> = vec![0; mtp_k];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, mtp_k * 4)
+                };
+                gpu.hip.memcpy_dtoh(bytes, &lm_argmax_view.buf)?;
+            }
+            argmax_host.into_iter().map(|x| x as u32).collect()
+        }
+        MtpChainMode::ExtendedVerify => {
+            mtp_step_tokens.clone()
+        }
+    };
 
     // ── 4. Composite verify chain: [seed, c_1..c_{B-1}, m_1..m_K] ────────
     let n_verify = b + mtp_k;
