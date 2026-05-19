@@ -7,7 +7,7 @@
 //
 // Activations are pre-rotated by the normal MQ4 rotation path, then packed per
 // 256-element group by mq4_pack_i4_x:
-//   dx      = max(abs(x_rot)) / 7
+//   dx      = clip(abs(x_rot)) / qmax   (default qmax=8 from dispatch)
 //   a_i     = clamp(round(x_rot_i / dx), -8, 7)
 //   sum_a_g = sum(a_i)
 //
@@ -32,7 +32,9 @@ __global__ void mq4_pack_i4_x(
     unsigned int* __restrict__ x_i4,
     float* __restrict__ x_dx,
     int* __restrict__ x_sum_a,
-    int K
+    int K,
+    float qmax,
+    float clip_rms
 ) {
     const int group = blockIdx.x;
     const int tid = threadIdx.x;
@@ -56,18 +58,28 @@ __global__ void mq4_pack_i4_x(
                               fmaxf(fabsf(v6), fabsf(v7))));
 
     __shared__ float s_amax[32];
+    __shared__ float s_sumsq[32];
     __shared__ int s_sum[32];
     s_amax[tid] = amax;
+    s_sumsq[tid] = v0*v0 + v1*v1 + v2*v2 + v3*v3 + v4*v4 + v5*v5 + v6*v6 + v7*v7;
     __syncthreads();
 
     for (int stride = 16; stride > 0; stride >>= 1) {
-        if (tid < stride) s_amax[tid] = fmaxf(s_amax[tid], s_amax[tid + stride]);
+        if (tid < stride) {
+            s_amax[tid] = fmaxf(s_amax[tid], s_amax[tid + stride]);
+            s_sumsq[tid] += s_sumsq[tid + stride];
+        }
         __syncthreads();
     }
 
-    const float group_amax = s_amax[0];
-    const float dx = group_amax > 0.0f ? group_amax * (1.0f / 7.0f) : 0.0f;
-    const float inv_dx = group_amax > 0.0f ? 7.0f / group_amax : 0.0f;
+    float group_amax = s_amax[0];
+    if (clip_rms > 0.0f) {
+        float rms = sqrtf(s_sumsq[0] * (1.0f / 256.0f));
+        group_amax = fminf(group_amax, clip_rms * rms);
+    }
+    qmax = fminf(fmaxf(qmax, 1.0f), 8.0f);
+    const float dx = group_amax > 0.0f ? group_amax / qmax : 0.0f;
+    const float inv_dx = group_amax > 0.0f ? qmax / group_amax : 0.0f;
 
     int a0 = clamp_i4(__float2int_rn(v0 * inv_dx));
     int a1 = clamp_i4(__float2int_rn(v1 * inv_dx));

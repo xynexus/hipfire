@@ -219,19 +219,75 @@ fn is_dot2_gemv_enabled() -> bool {
     })
 }
 
-/// Experimental MQ4 x I4 dot8 decode path for RDNA3.5 APUs.
-///
-/// This intentionally changes activation precision, so it is never part of
-/// the default MQ4 path. `HIPFIRE_MQ4_I4_DOT8=1` enables it only on gfx1150
-/// and gfx1151, where the packed 4-bit dot machinery is the target.
-pub fn mq4_i4_dot8_enabled(arch: &str) -> bool {
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name).ok().and_then(|v| match v.as_str() {
+        "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
+        "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
+        _ => None,
+    })
+}
+
+fn mq4_i4_dot8_supported(arch: &str) -> bool {
+    matches!(arch, "gfx1150" | "gfx1151")
+}
+
+fn mq4_i4_dot8_global_enabled(arch: &str) -> bool {
     static GATE: OnceLock<bool> = OnceLock::new();
-    let requested = *GATE.get_or_init(|| {
-        std::env::var("HIPFIRE_MQ4_I4_DOT8").map_or(false, |v| {
-            matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON")
-        })
-    });
-    requested && matches!(arch, "gfx1150" | "gfx1151")
+    mq4_i4_dot8_supported(arch)
+        && *GATE.get_or_init(|| env_bool("HIPFIRE_MQ4_I4_DOT8").unwrap_or(false))
+}
+
+fn mq4_i4_dot8_named_enabled(arch: &str, name: &'static str, fallback: bool) -> bool {
+    if !mq4_i4_dot8_supported(arch) {
+        return false;
+    }
+    env_bool(name).unwrap_or(fallback)
+}
+
+pub fn mq4_i4_dot8_gemv_enabled(arch: &str) -> bool {
+    mq4_i4_dot8_named_enabled(arch, "HIPFIRE_MQ4_I4_DOT8_GEMV", mq4_i4_dot8_global_enabled(arch))
+}
+
+pub fn mq4_i4_dot8_residual_enabled(arch: &str) -> bool {
+    mq4_i4_dot8_named_enabled(
+        arch,
+        "HIPFIRE_MQ4_I4_DOT8_RESIDUAL",
+        mq4_i4_dot8_global_enabled(arch),
+    )
+}
+
+pub fn mq4_i4_dot8_wo_enabled(arch: &str) -> bool {
+    mq4_i4_dot8_named_enabled(arch, "HIPFIRE_MQ4_I4_DOT8_WO", mq4_i4_dot8_residual_enabled(arch))
+}
+
+pub fn mq4_i4_dot8_down_enabled(arch: &str) -> bool {
+    mq4_i4_dot8_named_enabled(
+        arch,
+        "HIPFIRE_MQ4_I4_DOT8_DOWN",
+        mq4_i4_dot8_residual_enabled(arch),
+    )
+}
+
+fn mq4_i4_qmax() -> f32 {
+    static QMAX: OnceLock<f32> = OnceLock::new();
+    *QMAX.get_or_init(|| {
+        std::env::var("HIPFIRE_MQ4_I4_QMAX")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| *v > 0.0 && *v <= 8.0)
+            .unwrap_or(8.0)
+    })
+}
+
+fn mq4_i4_clip_rms() -> f32 {
+    static CLIP: OnceLock<f32> = OnceLock::new();
+    *CLIP.get_or_init(|| {
+        std::env::var("HIPFIRE_MQ4_I4_CLIP_RMS")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| *v >= 0.0)
+            .unwrap_or(0.0)
+    })
 }
 
 /// Gates the wave64 FP16 hybrid prefill path. gfx906 (Vega 20, MI50) is the
@@ -3619,7 +3675,7 @@ impl Gpu {
         &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if mq4_i4_dot8_enabled(&self.arch) {
+        if mq4_i4_dot8_gemv_enabled(&self.arch) {
             return self.gemv_mq4g256_i4_dot8_prerotated(a_raw, x_rot, y, m, k);
         }
         self.gemv_hfq4g256(a_raw, x_rot, y, m, k)
@@ -3640,12 +3696,16 @@ impl Gpu {
         let dxp = self.mq_x_scales.as_ref().unwrap().as_ptr();
         let sump = self.mq_x_i4_sums.as_ref().unwrap().as_ptr();
         let kv = k as i32;
+        let qmax = mq4_i4_qmax();
+        let clip_rms = mq4_i4_clip_rms();
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &i4p as *const _ as *mut c_void,
             &dxp as *const _ as *mut c_void,
             &sump as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
+            &qmax as *const _ as *mut c_void,
+            &clip_rms as *const _ as *mut c_void,
         ];
         let groups = (k / 256) as u32;
         let bytes = k * 4 + k / 2 + (k / 256) * 8;
@@ -3656,6 +3716,8 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(xp); b.push_ptr(i4p); b.push_ptr(dxp); b.push_ptr(sump);
                 b.push_i32(kv);
+                b.push_f32(qmax);
+                b.push_f32(clip_rms);
                 b
             },
         );
@@ -3686,7 +3748,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        if mq4_i4_dot8_enabled(&self.arch) {
+        if mq4_i4_dot8_residual_enabled(&self.arch) {
             return self.gemv_mq4g256_i4_dot8_residual_prerotated(a_raw, x_rot, y, m, k);
         }
         self.gemv_hfq4g256_residual(a_raw, x_rot, y, m, k)
@@ -17351,7 +17413,10 @@ impl Gpu {
                 let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC.to_string()));
-                if mq4_i4_dot8_enabled(&self.arch) {
+                if mq4_i4_dot8_global_enabled(&self.arch)
+                    || mq4_i4_dot8_gemv_enabled(&self.arch)
+                    || mq4_i4_dot8_residual_enabled(&self.arch)
+                {
                     specs.push(("gemv_hfq4g256_i4_dot8_gfx115x",
                                 kernels::GEMV_HFQ4G256_I4_DOT8_GFX115X_SRC.to_string()));
                 }

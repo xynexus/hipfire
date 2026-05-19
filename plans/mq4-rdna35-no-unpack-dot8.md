@@ -27,6 +27,24 @@ Reference basis: AMD RDNA3.5 exposes packed 4-bit integer dot machinery such as 
 - Quality gates: KLD/perplexity slice first, then `./scripts/coherence-gate-dflash.sh`.
 - Perf gates: report decode tok/s, kernel time, and activation-pack overhead separately; only keep the path if end-to-end speed wins after quantization cost.
 
+## Prototype Knobs
+
+- `HIPFIRE_MQ4_I4_DOT8=1`: broad opt-in for the experimental gfx1150/gfx1151 path.
+- `HIPFIRE_MQ4_I4_DOT8_GEMV=1`: enable only non-residual MQ4 GEMV sites that route through `gemv_mq4g256_prerotated`.
+- `HIPFIRE_MQ4_I4_DOT8_RESIDUAL=1`: enable residual MQ4 sites as a group.
+- `HIPFIRE_MQ4_I4_DOT8_WO=1`: enable only attention-output residual (`wo`) sites.
+- `HIPFIRE_MQ4_I4_DOT8_DOWN=1`: enable only FFN down-projection residual (`w_down`) sites.
+- `HIPFIRE_MQ4_I4_QMAX=<float>`: activation i4 scale divisor, default 8 after first 0.8B PPL sweep.
+- `HIPFIRE_MQ4_I4_CLIP_RMS=<float>`: optional per-group RMS clip multiplier before packing; unset or 0 disables clipping.
+
+## First Quality Findings
+
+- Raw `qmax=7` produced a clear PPL regression on `qwen3.5-0.8b.mq4`.
+- `qmax=8` was the best first-pass setting on the 2048-token Wikitext slice.
+- Projection isolation showed both `wo` and `w_down` can hurt individually at 2048 tokens, while combined residual routing with `qmax=8` measured better than baseline on the first slice; this needs a broader KLD/PPL matrix before treating it as a real quality win.
+- RMS clipping at 3-4x RMS hurt the 512-token slice and is not a promising default.
+- The prototype is coherent under the short DFlash/DDTree gate, but decode throughput is still slower because activation packing is a separate launch.
+
 ## Assumptions
 
 - "No unpack" means no explicit software expansion of MQ4 weight nibbles into byte or FP lanes; the dot instruction's internal interpretation of packed u4 is acceptable.
