@@ -529,6 +529,11 @@ fn main() {
                 };
                 let kv_mode_override = msg.get("params").and_then(|p| p.get("kv_mode")).and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
+                // dn_quant: "q8" (fast, MoE-unsafe past ~200 tokens) or "fp32" / "f32"
+                // (safe, ~50× slower MoE prefill). Default = auto: FP32 for MoE,
+                // Q8 for dense.
+                let dn_quant_override = msg.get("params").and_then(|p| p.get("dn_quant")).and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()).map(|s| s.to_string());
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
                 // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
@@ -663,7 +668,7 @@ fn main() {
                     }
                 }
 
-                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, pp, &mut gpu) {
+                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), dn_quant_override.as_deref(), &cask, pp, &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -1300,7 +1305,7 @@ fn resolve_chat_template(
     hfq.chat_template()
 }
 
-fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, dn_quant_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
         // the "load" event handler so the operator gets a structured error
@@ -1517,6 +1522,13 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             "asym3" | "turbo3" | "turbo" | "auto" | "" => {
                 llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
+            "fwht4" => {
+                llama::KvCache::new_gpu_fwht4_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+            }
+            "fwht3" => {
+                let is_kv_layer = vec![true; config.n_layers];
+                llama::KvCache::new_gpu_fwht3_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+            }
             other => {
                 eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
                 llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
@@ -1524,13 +1536,41 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         };
         // MoE models (num_experts > 0) have ~10x smaller hidden-state
         // magnitudes than dense models, making Q8 DeltaNet state quantization
-        // error proportionally larger. Use FP32 state to avoid cumulative
-        // drift that degenerates output after ~200 tokens.
-        let dn_quant = if config.num_experts > 0 {
-            eprintln!("  DeltaNet state: FP32 (MoE model — Q8 drift mitigation)");
-            hipfire_arch_qwen35::qwen35::StateQuant::FP32
-        } else {
-            hipfire_arch_qwen35::qwen35::StateQuant::Q8
+        // error proportionally larger. Default to FP32 for MoE to avoid
+        // cumulative drift that degenerates output after ~200 tokens.
+        //
+        // `params.dn_quant` overrides the auto-policy: "q8" or "fp32" / "f32".
+        // The Q8 path is ~50× faster for MoE prefill (rocprofv3 + Q8 WMMA GEMM
+        // dispatch path lights up ~2900 tok/s on R9700/A3B vs ~56 with FP32)
+        // but loses output coherence after ~200 generated tokens on MoE.
+        // Operators who want raw throughput numbers or who only generate
+        // short outputs can opt in via `params.dn_quant = "q8"`.
+        let dn_quant = match dn_quant_override.map(|s| s.to_lowercase()).as_deref() {
+            Some("q8") => {
+                eprintln!("  DeltaNet state: Q8 (operator-selected — fast; may drift after ~200 tokens on MoE)");
+                hipfire_arch_qwen35::qwen35::StateQuant::Q8
+            }
+            Some("fp32") | Some("f32") => {
+                eprintln!("  DeltaNet state: FP32 (operator-selected)");
+                hipfire_arch_qwen35::qwen35::StateQuant::FP32
+            }
+            Some(other) => {
+                eprintln!("  DeltaNet state: unrecognized dn_quant='{}'; falling back to auto", other);
+                if config.num_experts > 0 {
+                    eprintln!("  DeltaNet state: FP32 (auto — MoE Q8 drift mitigation)");
+                    hipfire_arch_qwen35::qwen35::StateQuant::FP32
+                } else {
+                    hipfire_arch_qwen35::qwen35::StateQuant::Q8
+                }
+            }
+            None => {
+                if config.num_experts > 0 {
+                    eprintln!("  DeltaNet state: FP32 (auto — MoE Q8 drift mitigation)");
+                    hipfire_arch_qwen35::qwen35::StateQuant::FP32
+                } else {
+                    hipfire_arch_qwen35::qwen35::StateQuant::Q8
+                }
+            }
         };
         let dn = DeltaNetState::new_with_quant(gpu, &config, dn_quant).map_err(|e| format!("{e}"))?;
         // Flash partials size with physical_cap (bounds the max_tiles the
