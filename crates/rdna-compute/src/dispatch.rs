@@ -1639,13 +1639,17 @@ impl Gpu {
         if let Some(v) = std::env::var("HIPFIRE_ROCBLAS_MIN_BATCH").ok().and_then(|s| s.parse::<usize>().ok()) {
             return v;
         }
-        // Opt-in gfx94x native-lm_head path: raise threshold to 16 so
-        // small-batch verify (B=3-4) and MTP-head batched lm_head (B=3)
-        // route to native wave64 GEMM family. See doc comment above.
+        // Opt-in gfx94x native-lm_head path: raise threshold to 32. Phase 1
+        // first lifted 4 -> 16 (rescuing per-token MTP at B=3-4). Phase A
+        // sweep (2026-05-19) found B=17 DFlash verify still loses at 16:
+        // native wave64 wins +170% prefill / +14% decode on dflash_spec_demo.
+        // Sweep at 32/64/128 all equivalent; 32 is the smallest crossover
+        // value, and Tensile still takes over at prefill=256 (1303 vs 424
+        // native). See docs/investigations/2026-05-19-mtp-mi300x-phase-a/.
         if std::env::var("HIPFIRE_GFX942_NATIVE_LM_HEAD").ok().as_deref() == Some("1")
             && matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
         {
-            return 16;
+            return 32;
         }
         4
     }
