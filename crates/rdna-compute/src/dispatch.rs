@@ -19951,6 +19951,68 @@ impl Gpu {
         )
     }
 
+    /// Accumulate `H += xᵀ x` on a 2D BF16 activation tile via MFMA.
+    ///
+    /// `x` is `[batch, K]` BF16 row-major (passed as `DType::F16`-tagged tensor).
+    /// `h` is `[K, K]` FP32 — read-modify-written. Each WG owns a unique
+    /// (m_tile, n_tile) of `H`, so within a single call there are no
+    /// inter-WG races; across calls the host serializes via the stream.
+    ///
+    /// **gfx942-only.** Uses `__builtin_amdgcn_mfma_f32_16x16x16bf16_1k`.
+    /// Caller is responsible for arch dispatch; this function does not
+    /// gate on `self.arch`.
+    pub fn hessian_outer_product_bf16(
+        &mut self,
+        x: &GpuTensor,
+        h: &mut GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hessian_outer_product",
+            kernels::HESSIAN_OUTER_PRODUCT_SRC,
+            "hessian_outer_product_bf16",
+        )?;
+
+        assert!(x.shape.len() >= 2, "hessian_outer_product_bf16: x must be at least 2D");
+        let k_dim = *x.shape.last().expect("hessian_outer_product_bf16: x must have K dim");
+        let batch: usize = x.shape[..x.shape.len() - 1].iter().product();
+        assert_eq!(
+            h.shape, vec![k_dim, k_dim],
+            "hessian_outer_product_bf16: h must be [K, K] matching x's last dim",
+        );
+        assert_eq!(h.dtype, DType::F32, "hessian_outer_product_bf16: h must be FP32");
+
+        let mut x_ptr = x.buf.as_ptr();
+        let mut h_ptr = h.buf.as_ptr();
+        let mut batch_i = batch as i32;
+        let mut k_i = k_dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut h_ptr as *mut _ as *mut c_void,
+            &mut batch_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+        ];
+
+        let block: u32 = 256;
+        let tile: u32 = 32;
+        let grid_x: u32 = ((k_dim as u32) + tile - 1) / tile;
+        let grid_y: u32 = grid_x;
+
+        self.launch_maybe_blob(
+            "hessian_outer_product_bf16",
+            [grid_x, grid_y, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(h_ptr);
+                b.push_i32(batch_i);
+                b.push_i32(k_i);
+                b
+            },
+        )
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Kernel profiler
     // ═══════════════════════════════════════════════════════════════════════════

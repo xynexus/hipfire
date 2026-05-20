@@ -1559,3 +1559,9 @@ pub const PFLASH_SCORE_Q8_KV_SRC: &str = include_str!("../../../kernels/src/pfla
 /// Cross-arch (no MFMA dependency). Phase 2 of the hipfire-native AWQ
 /// calibration path. See `kernels/src/sumsq_reduce.hip` for layout.
 pub const SUMSQ_REDUCE_SRC: &str = include_str!("../../../kernels/src/sumsq_reduce.hip");
+
+/// Hessian outer-product accumulator over BF16 activations.
+/// `H += xᵀ x` via `__builtin_amdgcn_mfma_f32_16x16x16bf16_1k` on gfx942.
+/// Phase 2 of the hipfire-native GPTQ calibration path. See
+/// `kernels/src/hessian_outer_product.gfx942.hip` for the MFMA layout.
+pub const HESSIAN_OUTER_PRODUCT_SRC: &str = include_str!("../../../kernels/src/hessian_outer_product.gfx942.hip");
