@@ -28,6 +28,20 @@ use std::sync::OnceLock;
 // derive per-channel `RMS_act` for the smoothing-quant scale.
 static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
+// Per-expert imatrix lookup populated alongside IMATRIX for MoE models. Keyed
+// by `(canonical_HF_safetensors_name, expert_idx)`. Two population paths:
+//   1. GGUF imatrix with multi-mat tensors (legacy llama.cpp format): the
+//      multi-mat tensor `blk.{L}.<slot>_exps.weight.in_sum2` of shape
+//      `[K, n_experts]` is split into per-expert F32 vectors keyed by the
+//      derived HF-canonical safetensors name
+//      (`model.language_model.layers.{L}.mlp.experts.{X}.{slot}.weight`).
+//   2. IMQ format (hipfire-native, subagent B's per-expert emit path): per-
+//      expert tensors already carry their `.experts.{X}.` segment in the
+//      canonical HF name; we parse the expert index from the name suffix.
+//
+// Consumed by the MoE quantize loop's per-expert AWQ + GPTQ branch (phase3c).
+static MOE_IMATRIX: OnceLock<HashMap<(String, u32), Vec<f32>>> = OnceLock::new();
+
 // Phase A Stage A — AWQ (Activation-aware Weight Quantization, Lin et al
 // 2023). When AWQ_ALPHA is set (via --awq [<alpha>=0.55]), each linear-layer
 // weight gets per-input-channel pre-scaling applied BEFORE the standard
@@ -1039,6 +1053,80 @@ mod awq_tests {
         for &v in &s {
             assert!(v.is_finite() && v > 0.0, "scale {v} should be finite + positive");
         }
+    }
+
+    // ─── phase3c per-expert helpers ──────────────────────────────────────
+
+    #[test]
+    fn parse_expert_idx_recognizes_qwen3_moe() {
+        assert_eq!(
+            parse_expert_idx(
+                "model.language_model.layers.5.mlp.experts.42.gate_up_proj.weight"
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_expert_idx("model.layers.0.mlp.experts.0.down_proj.weight"),
+            Some(0)
+        );
+        // Highest valid u32 expert idx — bounded by num_experts in practice.
+        assert_eq!(
+            parse_expert_idx("model.layers.0.mlp.experts.255.up_proj.weight"),
+            Some(255)
+        );
+    }
+
+    #[test]
+    fn parse_expert_idx_returns_none_for_non_expert_tensors() {
+        // 3D parent (no expert index in name).
+        assert_eq!(
+            parse_expert_idx("model.language_model.layers.5.mlp.experts.gate_up_proj"),
+            None,
+        );
+        // Dense attention/FFN tensors.
+        assert_eq!(
+            parse_expert_idx("model.language_model.layers.5.self_attn.q_proj.weight"),
+            None,
+        );
+        assert_eq!(
+            parse_expert_idx("model.language_model.layers.5.mlp.shared_expert.down_proj.weight"),
+            None,
+        );
+        // Router (no per-expert slot).
+        assert_eq!(
+            parse_expert_idx("model.language_model.layers.5.mlp.gate.weight"),
+            None,
+        );
+        // Top-level tensors.
+        assert_eq!(parse_expert_idx("model.embed_tokens.weight"), None);
+    }
+
+    #[test]
+    fn ggml_exps_name_to_hf_parent_round_trips_expected_shapes() {
+        // `ffn_gate_exps` and `ffn_up_exps` both map to `gate_up_proj`
+        // (HF safetensors fuses gate+up into one 3D tensor).
+        assert_eq!(
+            ggml_exps_name_to_hf_parent("blk.5.ffn_gate_exps.weight").as_deref(),
+            Some("model.language_model.layers.5.mlp.experts.gate_up_proj"),
+        );
+        assert_eq!(
+            ggml_exps_name_to_hf_parent("blk.0.ffn_up_exps.weight").as_deref(),
+            Some("model.language_model.layers.0.mlp.experts.gate_up_proj"),
+        );
+        assert_eq!(
+            ggml_exps_name_to_hf_parent("blk.47.ffn_down_exps.weight").as_deref(),
+            Some("model.language_model.layers.47.mlp.experts.down_proj"),
+        );
+        // Unknown slot → None.
+        assert_eq!(
+            ggml_exps_name_to_hf_parent("blk.5.ffn_norm.weight"),
+            None,
+        );
+        // Non-blk prefix → None.
+        assert_eq!(
+            ggml_exps_name_to_hf_parent("output.weight"),
+            None,
+        );
     }
 }
 
@@ -2585,28 +2673,40 @@ fn safetensors_to_ggml_name(name: &str) -> Option<String> {
     Some(format!("blk.{layer_idx}.{translated}.weight"))
 }
 
-/// Load an llama.cpp-compatible imatrix GGUF file and build a lookup
-/// keyed by ggml-style tensor name. The GGUF stores per-linear-layer
-/// pairs:
-///   {name}.in_sum2     F32[k, n_mat]   sum of squared activations per channel
-///   {name}.counts      F32[1, n_mat]   token count contributing per matrix
-///
-/// For non-MoE models n_mat=1; the [k] vector goes into the map directly.
-/// For MoE we'd need per-expert handling — out of scope for Step 5a
-/// (Qwen3.5 dense + Qwen3.6 dense are the first cohort targets; A3B MoE
-/// is deferred to a future iteration that handles n_mat > 1).
-///
-/// Returns `HashMap<ggml_name, Vec<f32>>` with the .in_sum2 values keyed by
-/// the BASE tensor name (the ".in_sum2" suffix stripped).
+/// Result of `load_imatrix` — dense tensors keyed by name, plus a per-expert
+/// table keyed by `(canonical_HF_name, expert_idx)` for MoE models. The
+/// caller drains these into the global `IMATRIX` / `MOE_IMATRIX` OnceLocks.
+struct LoadedImatrix {
+    /// Dense per-tensor entries (the original `load_imatrix` return shape).
+    /// Keys: ggml-style names (GGUF path) or HF-canonical names (IMQ path).
+    dense: HashMap<String, Vec<f32>>,
+    /// Per-expert entries. Keys: `(HF-canonical safetensors name, expert_idx)`.
+    /// Populated either by:
+    /// - Splitting GGUF multi-mat `[K, n_experts]` tensors (legacy llama.cpp).
+    /// - Detecting per-expert HF-canonical names (`.mlp.experts.{N}.`) in
+    ///   either IMQ or GGUF and rebinding them to this map (so the dense
+    ///   table isn't polluted with per-expert keys).
+    per_expert: HashMap<(String, u32), Vec<f32>>,
+}
+
+/// Load an imatrix file and split it into a dense table + a per-expert
+/// table for MoE models. The dense path serves AWQ + GPTQ on standard
+/// 2D linear weights; the per-expert path serves the MoE 3D-stacked
+/// expert quantize loop (phase3c).
 ///
 /// File-format dispatch is by magic on the first 4 bytes:
 ///   - `"IMQ\0"` → hipfire-native `.imq` (see [`imq_reader::load_imq`]).
-///     Keys are HF safetensors canonical names; the consumer-site
-///     [`imatrix_weights_for`] is responsible for any name translation.
-///   - `"GGUF"` → legacy GGUF imatrix (this function's original body).
-///     Keys are ggml-style names produced by llama-imatrix.
+///     Keys are HF safetensors canonical names; per-expert entries (subagent
+///     B's emit path) are detected by `parse_expert_idx` and routed to
+///     `per_expert`.
+///   - `"GGUF"` → legacy GGUF imatrix.
+///     - Non-MoE tensors keyed by ggml-style names go into `dense`.
+///     - Multi-mat tensors `[K, n_experts]` are split into per-expert
+///       columns. The ggml→HF parent mapping is handled by
+///       `ggml_exps_name_to_hf_parent`; unmapped multi-mat names are
+///       logged once and skipped.
 ///   - anything else → eprint + exit(1).
-fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
+fn load_imatrix(path: &Path) -> LoadedImatrix {
     // Peek the 4-byte magic before deciding which loader to use. Keep
     // open/read errors symmetric with the existing GGUF path (eprint +
     // exit) so callers don't have to grow a new error type.
@@ -2634,12 +2734,25 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
             eprintln!("error: imatrix file contains no usable entries");
             std::process::exit(1);
         }
+        // Split into dense + per-expert by detecting `.mlp.experts.{N}.` in
+        // the HF-canonical name. Subagent B's MoE collector emits one IMQ
+        // entry per routed expert, so n_experts entries appear here.
+        let mut dense: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut per_expert: HashMap<(String, u32), Vec<f32>> = HashMap::new();
+        for (name, values) in map.into_iter() {
+            if let Some(idx) = parse_expert_idx(&name) {
+                per_expert.insert((name, idx), values);
+            } else {
+                dense.insert(name, values);
+            }
+        }
         eprintln!(
-            "imatrix: loaded {} entries from {} (IMQ format, HF-canonical names)",
-            map.len(),
+            "imatrix: loaded {} dense + {} per-expert entries from {} (IMQ format, HF-canonical names)",
+            dense.len(),
+            per_expert.len(),
             path.display(),
         );
-        return map;
+        return LoadedImatrix { dense, per_expert };
     }
     if &magic != b"GGUF" {
         eprintln!(
@@ -2656,8 +2769,11 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
     });
 
     let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut per_expert: HashMap<(String, u32), Vec<f32>> = HashMap::new();
     let mut total_entries = 0usize;
-    let mut skipped_moe = 0usize;
+    let mut moe_multi_mat_entries = 0usize;
+    let mut moe_split_experts = 0usize;
+    let mut unmapped_moe_multi_mat: Vec<String> = Vec::new();
     for t in &gguf.tensors {
         let name = match t.name.strip_suffix(".in_sum2") {
             Some(n) => n.to_string(),
@@ -2668,11 +2784,43 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
                 t.name, t.dtype);
             continue;
         }
-        // Shape is [k] (1D) for non-MoE; [k, n_mat] for MoE. Skip multi-mat
-        // tensors with a warning — Step 5a doesn't handle them yet.
+        // Shape is [k] (1D) for non-MoE; [k, n_mat] for MoE multi-mat
+        // (legacy llama.cpp format). Hipfire's own GGUF emit produces
+        // 1D per-expert entries instead (see calibration.rs:264 docstring).
         let n_mat = if t.shape.len() >= 2 { t.shape[1] } else { 1 };
         if n_mat != 1 {
-            skipped_moe += 1;
+            // Multi-mat MoE: split into per-expert F32 columns and key
+            // by the derived HF-canonical safetensors name.
+            moe_multi_mat_entries += 1;
+            let k = t.shape[0];
+            let data = gguf.tensor_data(t);
+            let Some(hf_parent) = ggml_exps_name_to_hf_parent(&name) else {
+                unmapped_moe_multi_mat.push(name.clone());
+                continue;
+            };
+            // Split parent into `<root_with_experts>` + `<base>` so we can
+            // build per-expert keys `<root_with_experts><idx>.<base>.weight`.
+            // `mlp.experts.` is the marker; root_with_experts ends in that
+            // trailing dot, base is the slot name (e.g. `gate_up_proj`).
+            let split_pos = hf_parent.find("mlp.experts.")
+                .map(|p| p + "mlp.experts.".len())
+                .unwrap_or(hf_parent.len());
+            let (root_with_experts, base_seg) = hf_parent.as_str().split_at(split_pos);
+            for col in 0..n_mat {
+                let mut values = Vec::with_capacity(k);
+                // GGUF tensors are column-major laid out: data[col * k + row].
+                let base_off = col * k * 4;
+                for i in 0..k {
+                    let off = base_off + i * 4;
+                    let v = f32::from_le_bytes([
+                        data[off], data[off + 1], data[off + 2], data[off + 3],
+                    ]);
+                    values.push(v);
+                }
+                let per_expert_name = format!("{root_with_experts}{col}.{base_seg}.weight");
+                per_expert.insert((per_expert_name, col as u32), values);
+                moe_split_experts += 1;
+            }
             continue;
         }
         let k = t.shape[0];
@@ -2685,21 +2833,49 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
             let v = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
             values.push(v);
         }
-        map.insert(name, values);
-        total_entries += 1;
+        // Hipfire-own emit path: the canonical safetensors name is the
+        // tensor name directly (e.g. `model.language_model.layers.5.mlp.
+        // experts.42.gate_up_proj.weight`). Detect the per-expert form via
+        // `parse_expert_idx` and route to the per-expert map. Otherwise
+        // store under the original key (ggml or HF — caller dispatches).
+        if let Some(idx) = parse_expert_idx(&name) {
+            per_expert.insert((name, idx), values);
+        } else {
+            map.insert(name, values);
+            total_entries += 1;
+        }
     }
 
-    eprintln!(
-        "imatrix: loaded {} entries from {} ({} MoE multi-matrix entries skipped — Step 5a is dense-only)",
-        total_entries,
-        path.display(),
-        skipped_moe,
-    );
-    if total_entries == 0 {
+    if !unmapped_moe_multi_mat.is_empty() {
+        eprintln!(
+            "warning: skipping {} GGUF multi-mat MoE imatrix entries with unmapped names (e.g. {:?}); \
+             these tensors fall back to flat MQ4 (no AWQ/GPTQ per-expert calibration)",
+            unmapped_moe_multi_mat.len(),
+            unmapped_moe_multi_mat.first().map(|s| s.as_str()).unwrap_or(""),
+        );
+    }
+    if moe_multi_mat_entries > 0 {
+        eprintln!(
+            "imatrix: loaded {} dense + {} per-expert entries from {} ({} GGUF multi-mat tensors → {} per-expert columns)",
+            map.len(),
+            per_expert.len(),
+            path.display(),
+            moe_multi_mat_entries,
+            moe_split_experts,
+        );
+    } else {
+        eprintln!(
+            "imatrix: loaded {} dense + {} per-expert entries from {}",
+            map.len(),
+            per_expert.len(),
+            path.display(),
+        );
+    }
+    if total_entries == 0 && per_expert.is_empty() {
         eprintln!("error: imatrix file contains no usable .in_sum2 entries");
         std::process::exit(1);
     }
-    map
+    LoadedImatrix { dense: map, per_expert }
 }
 
 /// Look up imatrix per-channel weights for a given safetensors tensor name.
@@ -2712,6 +2888,91 @@ fn imatrix_weights_for(safetensors_name: &str) -> Option<&'static [f32]> {
     let im = IMATRIX.get()?;
     let ggml_name = safetensors_to_ggml_name(safetensors_name)?;
     im.get(&ggml_name).map(|v| v.as_slice())
+}
+
+/// Parse the routed-expert index from a per-expert tensor name. Returns
+/// `Some(idx)` for names matching `....mlp.experts.{N}.{base}.weight`
+/// (Qwen3-MoE / DeepSeek convention) and `None` for any other tensor.
+///
+/// LOCAL re-implementation of `crate::calibration::parse_expert_idx`
+/// (subagent B's work). Kept here so phase3c can build in parallel with
+/// the subagent-B branch; once both land, replace this with the
+/// `hipfire-runtime::calibration::parse_expert_idx` import.
+///
+/// Examples:
+/// - `model.language_model.layers.5.mlp.experts.42.gate_up_proj.weight` → `Some(42)`
+/// - `model.layers.0.mlp.experts.0.down_proj.weight` → `Some(0)`
+/// - `model.language_model.layers.5.mlp.experts.gate_up_proj` (3D parent) → `None`
+/// - `model.language_model.layers.5.self_attn.q_proj.weight` → `None`
+fn parse_expert_idx(name: &str) -> Option<u32> {
+    // Find ".mlp.experts." substring. Anchored on the dot so it doesn't
+    // accidentally match "shared_experts" or other suffix variants.
+    let marker = ".mlp.experts.";
+    let after = name.find(marker)?;
+    let rest = &name[after + marker.len()..];
+    // rest looks like "42.gate_up_proj.weight" or
+    // "0.down_proj.weight" — split on the FIRST dot to isolate the index.
+    let dot = rest.find('.')?;
+    let idx_str = &rest[..dot];
+    // Reject names where this slot is non-numeric (e.g. the 3D parent
+    // `...mlp.experts.gate_up_proj` returns `gate_up_proj` here).
+    idx_str.parse::<u32>().ok()
+}
+
+/// Look up per-expert imatrix data by `(canonical_safetensors_name, expert_idx)`.
+/// Returns `None` if MOE_IMATRIX is unset, or no matching entry exists.
+///
+/// `parent_name` is the 3D parent path WITHOUT the expert index (e.g.
+/// `model.language_model.layers.5.mlp.experts.gate_up_proj`); this function
+/// constructs the per-expert HF-canonical name
+/// (`{parent_root}.experts.{idx}.{base}.weight`) and looks up the
+/// MOE_IMATRIX HashMap under it.
+fn imatrix_weights_for_expert(parent_name: &str, expert_idx: u32) -> Option<&'static [f32]> {
+    let im = MOE_IMATRIX.get()?;
+    // Build the per-expert HF safetensors name by splitting the parent at
+    // `experts.` and inserting the expert index. The 3D parent looks like
+    // `<root>.mlp.experts.<base>` (no `.weight` suffix); the per-expert
+    // safetensors name is `<root>.mlp.experts.<idx>.<base>.weight`.
+    let marker = "mlp.experts.";
+    let pos = parent_name.find(marker)?;
+    let split = pos + marker.len();
+    let (root_with_experts, base) = parent_name.split_at(split);
+    let per_expert = format!("{root_with_experts}{expert_idx}.{base}.weight");
+    im.get(&(per_expert, expert_idx)).map(|v| v.as_slice())
+}
+
+/// Map a llama.cpp ggml-style MoE multi-mat tensor name back to the HF
+/// safetensors-canonical 3D parent path (matching the shape that the
+/// `mlp.experts.` quantize branch sees in `name`). Returns `None` for
+/// any name that isn't a recognized MoE multi-mat tensor.
+///
+/// Examples:
+/// - `blk.5.ffn_gate_exps.weight` →
+///   `model.language_model.layers.5.mlp.experts.gate_up_proj`
+/// - `blk.5.ffn_down_exps.weight` →
+///   `model.language_model.layers.5.mlp.experts.down_proj`
+///
+/// Note: the gate+up fused tensor is `ffn_gate_exps` in llama.cpp's
+/// pre-fusion split but `gate_up_proj` in Qwen3-MoE's HF safetensors.
+/// This helper currently maps gate→gate_up_proj for Qwen3-MoE.
+fn ggml_exps_name_to_hf_parent(name: &str) -> Option<String> {
+    // Expected shape: `blk.{L}.{slot}.weight` where slot is one of the
+    // MoE multi-mat slots.
+    let rest = name.strip_prefix("blk.")?;
+    let dot = rest.find('.')?;
+    let layer_idx: u32 = rest[..dot].parse().ok()?;
+    let slot = rest[dot + 1..].strip_suffix(".weight")?;
+    let base = match slot {
+        // Qwen3-MoE / DeepSeek family: HF safetensors fuses gate+up into
+        // `gate_up_proj` (3D parent shape `[E, 2*I, H]`). llama.cpp splits
+        // them into separate `ffn_gate_exps` + `ffn_up_exps`. There's no
+        // 1:1 mapping; we report `gate_up_proj` for either and rely on the
+        // quantize loop deduping (calibrate-once, route-twice).
+        "ffn_gate_exps" | "ffn_up_exps" => "gate_up_proj",
+        "ffn_down_exps" => "down_proj",
+        _ => return None,
+    };
+    Some(format!("model.language_model.layers.{layer_idx}.mlp.experts.{base}"))
 }
 
 /// Compute AWQ per-channel scales `s[j]` for one linear-layer weight tensor.
@@ -3639,8 +3900,9 @@ fn main() {
             eprintln!("error: --imatrix path not found: {}", path.display());
             std::process::exit(1);
         }
-        let table = load_imatrix(path);
-        IMATRIX.set(table).expect("IMATRIX set twice — should not happen");
+        let loaded = load_imatrix(path);
+        IMATRIX.set(loaded.dense).expect("IMATRIX set twice — should not happen");
+        MOE_IMATRIX.set(loaded.per_expert).expect("MOE_IMATRIX set twice — should not happen");
         eprintln!("imatrix loaded from {}", path.display());
     }
 
@@ -3770,6 +4032,18 @@ fn main() {
     // Cache GPTQ tuning params for the MQ4G256 branch below.
     let gptq_initial_damp = gptq_damp;
     let gptq_max_damp_multiplier = gptq_max_damp;
+    // ── Phase 3c: per-expert AWQ+GPTQ opt-out ────────────────────────
+    // `--moe-skip-experts` reverts the routed-expert quantize loop to
+    // the pre-3c flat-MQ4 behavior (no per-expert AWQ pre-scaling, no
+    // per-expert Hessian lookup, no AWQ sidecar emission). Useful for
+    // A/B comparing 3c-quantized output vs the legacy dense-only-
+    // imatrix path. Default OFF: the 3c per-expert loop runs whenever
+    // --awq or --gptq is set AND per-expert imatrix / Hessian entries
+    // are present.
+    let moe_mq4_skip_flag = args.iter().any(|a| a == "--moe-skip-experts");
+    if moe_mq4_skip_flag {
+        eprintln!("--moe-skip-experts: routed-expert MoE tensors will use flat MQ4 (no per-expert AWQ/GPTQ)");
+    }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
     // short context, win at long context — see benchmarks/results/
@@ -4350,10 +4624,150 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
-            let mut new_tensors: Vec<HfqTensor> = (0..n_experts).into_par_iter().map(|x| {
+            // ── Phase 3c per-expert AWQ+GPTQ admission gate ─────────────
+            // Only the MQ4G256 base path is on the AWQ whitelist today
+            // (matches the dense path — `compute_awq_scales` integrates
+            // into `quantize_mq4g256` / `gptq_pipeline_mq4g256` only).
+            // Promotes, MQ6, HFQ6, HFQ4 fall through to flat quantize
+            // (no AWQ/GPTQ pre-scaling). Future work: add MR-GPTQ / FP4
+            // pre-scaling paths.
+            let moe_mq4_path = supports_g256 && expert_promote_fmt.is_none()
+                && !expert_mq6 && !expert_hfq6 && !expert_hfq4;
+            let moe_skip_experts = moe_mq4_skip_flag;
+            // M-dim / K-dim of the per-expert 2D weight slice.
+            // gate_up_proj: M = 2 * moe_intermediate, K = hidden.
+            // down_proj:    M = hidden, K = moe_intermediate.
+            let m_dim = inner_shape[0] as usize;
+            let k_dim = inner_shape[1] as usize;
+            let awq_alpha = AWQ_ALPHA.get().copied();
+            let awq_formula_autoawq = AWQ_FORMULA.get().copied().unwrap_or(false);
+            let parent_for_lookup = parent.to_string();
+            let mut new_tensors_pairs: Vec<(HfqTensor, Option<HfqTensor>)>
+                = (0..n_experts).into_par_iter().map(|x| {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
+                // ── Per-expert MQ4G256 AWQ + GPTQ branch ────────────────
+                // Mirrors the dense MQ4G256 path (main.rs ~4880-4940) but
+                // looks up per-expert imatrix + Hessian by `(parent, x)`.
+                // Falls through to the existing flat dispatch on:
+                // - --moe-skip-experts (legacy A/B comparison mode)
+                // - non-MQ4G256 expert format (promotes, MQ6, HFQ6, HFQ4)
+                // - no per-expert imatrix (no AWQ pre-scaling) AND no Hessian
+                //   (no GPTQ): degrades cleanly to plain MQ4G256 packing,
+                //   so we still take this branch and label MQ4 below.
+                let mut awq_sidecar_scales: Option<Vec<f32>> = None;
+                if moe_mq4_path && !moe_skip_experts {
+                    let per_expert_im = imatrix_weights_for_expert(&parent_for_lookup, x as u32);
+                    // Step 1: AWQ pre-scaling (if eligible + enabled).
+                    // AWQ eligibility for MoE expert tensors: gate_up_proj is
+                    // an F1 input-side projection (already on `awq_eligible`).
+                    // down_proj is F2 output-side; honor `awq_eligible` rules.
+                    let per_expert_name = format!("{parent_for_lookup}{x}.{base_owned}.weight");
+                    let (working_weights, awq_scales_for_pipeline_f64) =
+                        if let (Some(alpha), Some(im_weights)) = (awq_alpha, per_expert_im) {
+                            if awq_eligible(&per_expert_name) {
+                                debug_assert_eq!(
+                                    im_weights.len(), k_dim,
+                                    "imatrix length ({}) != K dim ({}) for {} expert {}",
+                                    im_weights.len(), k_dim, parent_for_lookup, x,
+                                );
+                                let scales = if awq_formula_autoawq {
+                                    let w_rms = compute_weight_rms_per_input(&f32_slice, m_dim, k_dim);
+                                    compute_awq_scales_autoawq(im_weights, &w_rms, alpha)
+                                } else {
+                                    compute_awq_scales(im_weights, alpha)
+                                };
+                                awq_sidecar_scales = Some(scales.clone());
+                                let mut scaled = f32_slice.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                let scales_f64: Vec<f64> = scales.iter().map(|&v| v as f64).collect();
+                                (scaled, scales_f64)
+                            } else {
+                                (f32_slice.clone(), vec![1.0_f64; k_dim])
+                            }
+                        } else {
+                            (f32_slice.clone(), vec![1.0_f64; k_dim])
+                        };
+
+                    // Step 2: GPTQ (if --gptq + per-expert Hessian) or plain pack.
+                    let q = if let Some(sc) = GPTQ_HESSIAN.get() {
+                        // Try two Hessian key conventions to be robust to
+                        // whatever subagent A picks:
+                        //   (A) 3D-parent name + integer expert_idx — the
+                        //       "name=parent, idx=integer" convention most
+                        //       consistent with the (name, expert_idx)
+                        //       compound key.
+                        //   (B) Per-expert name + expert_idx — for collectors
+                        //       that flatten the index into the name.
+                        //   (C) Per-expert name + expert_idx=0 — degenerate
+                        //       fallback for collectors that don't carry
+                        //       expert_idx as an integer.
+                        let parent_key = parent_for_lookup.strip_suffix('.')
+                            .unwrap_or(&parent_for_lookup);
+                        let parent_no_weight = format!("{parent_key}.{base_owned}");
+                        let per_expert_no_weight = format!("{parent_for_lookup}{x}.{base_owned}");
+                        let href_opt = sc.get(&parent_no_weight, x as u32)
+                            .or_else(|| sc.get(&per_expert_no_weight, x as u32))
+                            .or_else(|| sc.get(&per_expert_no_weight, 0));
+                        if let Some(href) = href_opt {
+                            if href.k != k_dim {
+                                eprintln!(
+                                    "warning: GPTQ MoE {parent_for_lookup}{x}.{base_owned}: \
+                                     Hessian K={} != tensor K={k_dim}; falling back to plain MQ4",
+                                    href.k
+                                );
+                                quantize_mq4g256(&working_weights, &signs1, &signs2)
+                            } else {
+                                let h_unrot_f32: Vec<f32> = href.iter_f64().map(|v| v as f32).collect();
+                                #[cfg(feature = "gptq-hip")]
+                                let gptq_solver_ref = GPTQ_SOLVER.get().and_then(|opt| opt.as_ref());
+                                #[cfg(not(feature = "gptq-hip"))]
+                                let gptq_solver_ref: Option<&gptq::GptqHipSolver> = None;
+                                let tag = format!("{parent_for_lookup}{x}.{base_owned}");
+                                match gptq::gptq_pipeline_mq4g256(
+                                    &working_weights, m_dim, k_dim,
+                                    &h_unrot_f32, &awq_scales_for_pipeline_f64,
+                                    &signs1, &signs2,
+                                    gptq_initial_damp, gptq_max_damp_multiplier,
+                                    &tag,
+                                    gptq_solver_ref,
+                                ) {
+                                    Ok(packed) => packed,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "warning: GPTQ MoE failed for {tag}: {e}; falling back to plain MQ4",
+                                        );
+                                        quantize_mq4g256(&working_weights, &signs1, &signs2)
+                                    }
+                                }
+                            }
+                        } else {
+                            quantize_mq4g256(&working_weights, &signs1, &signs2)
+                        }
+                    } else {
+                        quantize_mq4g256(&working_weights, &signs1, &signs2)
+                    };
+
+                    let main_tensor = HfqTensor {
+                        name: format!("{parent_for_lookup}{x}.{base_owned}.weight"),
+                        quant_type: QuantType::MQ4G256,
+                        shape: inner_shape_clone.clone(),
+                        group_size: 256,
+                        data: q,
+                        spilled_len: 0,
+                    };
+                    let sidecar_tensor = awq_sidecar_scales.as_ref().map(|scales| HfqTensor {
+                        name: format!("{parent_for_lookup}{x}.{base_owned}.awq_scale.weight"),
+                        quant_type: QuantType::F16,
+                        shape: vec![scales.len() as u32],
+                        group_size: 0,
+                        data: awq_scales_to_f16_bytes(scales),
+                        spilled_len: 0,
+                    });
+                    return (main_tensor, sidecar_tensor);
+                }
+                // ── Fallthrough: existing per-expert flat dispatch ──────
                 let (quantized, qt, gs) = if let Some(fmt) = expert_promote_fmt {
                     // Promoted: dispatch on the carried Promote(<fmt>) target.
                     // Non-256-aligned promoted tensors fall to HFQ4G128 (same as
@@ -4425,14 +4839,17 @@ fn main() {
                     let q = quantize_hfq4g128(&f32_slice);
                     (q, QuantType::HFQ4G128, 128u32)
                 };
-                HfqTensor {
-                    name: format!("{parent_owned}{x}.{base_owned}.weight"),
-                    quant_type: qt,
-                    shape: inner_shape_clone.clone(),
-                    group_size: gs,
-                    data: quantized,
-                    spilled_len: 0,
-                }
+                (
+                    HfqTensor {
+                        name: format!("{parent_owned}{x}.{base_owned}.weight"),
+                        quant_type: qt,
+                        shape: inner_shape_clone.clone(),
+                        group_size: gs,
+                        data: quantized,
+                        spilled_len: 0,
+                    },
+                    None,
+                )
             }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
@@ -4443,10 +4860,38 @@ fn main() {
               else if expert_hfq4 { "HFQ4G256" }
               else if supports_g256 { "MQ4G256" }
               else { "HFQ4G128" };
-            let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
-            eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
+            let n_awq_sidecars = new_tensors_pairs.iter().filter(|p| p.1.is_some()).count();
+            let bytes_per = new_tensors_pairs.first().map(|p| p.0.data.len()).unwrap_or(0);
+            // Phase 3c: report whether per-expert AWQ / GPTQ ran. Mirrors
+            // the brief's directive to surface "X MoE multi-matrix entries:
+            // AWQ pre-scaled per-expert, GPTQ pre-quant per-expert" in
+            // place of the legacy "skipped" line.
+            let awq_gptq_note = if moe_mq4_path && !moe_mq4_skip_flag {
+                let awq_label = if awq_alpha.is_some() { "AWQ" } else { "" };
+                let gptq_label = if GPTQ_HESSIAN.get().is_some() { "GPTQ" } else { "" };
+                match (awq_label, gptq_label) {
+                    ("", "") => String::new(),
+                    ("AWQ", "") => format!(" [AWQ per-expert × {}]", n_awq_sidecars),
+                    ("", "GPTQ") => " [GPTQ per-expert]".to_string(),
+                    ("AWQ", "GPTQ") => format!(" [AWQ × {} + GPTQ per-expert]", n_awq_sidecars),
+                    _ => String::new(),
+                }
+            } else if moe_mq4_skip_flag {
+                " [--moe-skip-experts: flat MQ4]".to_string()
+            } else {
+                String::new()
+            };
+            eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel){awq_gptq_note}",
                 inner_shape, bytes_per as f64 / 1024.0);
-            hfq_tensors.append(&mut new_tensors);
+            // Flatten the (main, optional sidecar) pairs into HfqTensor flat
+            // list. Main first, sidecar (if any) immediately after — same
+            // ordering convention as the dense path (main.rs:5183-5193).
+            for (main, sidecar) in new_tensors_pairs.drain(..) {
+                hfq_tensors.push(main);
+                if let Some(sc) = sidecar {
+                    hfq_tensors.push(sc);
+                }
+            }
             // Drop source pages and spill quantized data after each expert batch.
             st_files[*file_idx].drop_tensor_pages(name);
             if let Some(ref mut s) = spill {
