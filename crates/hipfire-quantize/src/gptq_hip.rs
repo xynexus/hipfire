@@ -482,6 +482,7 @@ unsafe fn load_kernel(
 
 // Kernel source strings — embedded at compile time.
 const KSRC_QUANTIZE_MQ4_COLUMN: &str = include_str!("../../../kernels/src/gptq_quantize_mq4_column_f64.gfx942.hip");
+const KSRC_OBS_WITHIN_BLOCK_RANK1: &str = include_str!("../../../kernels/src/gptq_obs_within_block_rank1_f64.gfx942.hip");
 
 /// Launch the Phase 2A quantize-column kernel.
 ///
@@ -561,6 +562,94 @@ pub unsafe fn quantize_mq4_column_hip(
     );
     if code != HIP_SUCCESS {
         return Err(format!("hipModuleLaunchKernel quantize_mq4_column_f64 returned {code}"));
+    }
+    Ok(())
+}
+
+/// Launch the Phase 2B within-block rank-1 update kernel.
+///
+/// Applies the OBS rank-1 update for the current step to the remaining
+/// columns inside the current block. See kernel doc + plan §3 Kernel 2.
+///
+/// `d_u` is the K×K upper-Cholesky factor in COLUMN-major device layout
+/// (post-dgeam from Phase D). `d_perm` is the K-length WEIGHT-mode
+/// actorder permutation as i32 (K=12288 fits comfortably in i32).
+///
+/// No-op when `step + 1 >= block_end` (last step in the block has no
+/// within-block tail).
+///
+/// # Safety
+/// All pointers must be valid device buffers of the documented shapes.
+pub unsafe fn gptq_obs_within_block_hip(
+    solver: &RocSolver,
+    d_w_residual: *mut c_void,
+    d_err_block: *const c_void,
+    d_u: *const c_void,
+    d_perm: *const c_void,
+    step: i32,
+    block_start: i32,
+    block_end: i32,
+    k_dim: i32,
+    m_dim: i32,
+    b_dim: i32,
+) -> Result<(), String> {
+    {
+        let mut guard = solver.obs_modules.lock().map_err(|e| format!("module lock: {e}"))?;
+        if guard.within_block_rank1.is_none() {
+            let h = load_kernel(
+                solver,
+                "gptq_obs_within_block_rank1_f64",
+                KSRC_OBS_WITHIN_BLOCK_RANK1,
+                "gptq_obs_within_block_rank1_f64",
+            )?;
+            guard.within_block_rank1 = Some(h);
+        }
+    }
+
+    let remaining = block_end - step - 1;
+    if remaining <= 0 { return Ok(()); }
+    let grid_x = ((m_dim as u32) + 63) / 64;
+    if grid_x == 0 { return Ok(()); }
+
+    let mut p_wres = d_w_residual;
+    let mut p_err  = d_err_block;
+    let mut p_u    = d_u;
+    let mut p_perm = d_perm;
+    let mut p_step = step;
+    let mut p_bs   = block_start;
+    let mut p_be   = block_end;
+    let mut p_kdim = k_dim;
+    let mut p_mdim = m_dim;
+    let mut p_bdim = b_dim;
+
+    let mut params: [*mut c_void; 10] = [
+        &mut p_wres as *mut _ as *mut c_void,
+        &mut p_err  as *mut _ as *mut c_void,
+        &mut p_u    as *mut _ as *mut c_void,
+        &mut p_perm as *mut _ as *mut c_void,
+        &mut p_step as *mut _ as *mut c_void,
+        &mut p_bs   as *mut _ as *mut c_void,
+        &mut p_be   as *mut _ as *mut c_void,
+        &mut p_kdim as *mut _ as *mut c_void,
+        &mut p_mdim as *mut _ as *mut c_void,
+        &mut p_bdim as *mut _ as *mut c_void,
+    ];
+
+    let guard = solver.obs_modules.lock().map_err(|e| format!("module lock: {e}"))?;
+    let function = guard.within_block_rank1.as_ref().unwrap().function;
+    drop(guard);
+
+    let code = (solver.fn_hip_module_launch_kernel)(
+        function,
+        grid_x, remaining as u32, 1,
+        64, 1, 1,
+        0,
+        std::ptr::null_mut(),
+        params.as_mut_ptr(),
+        std::ptr::null_mut(),
+    );
+    if code != HIP_SUCCESS {
+        return Err(format!("hipModuleLaunchKernel gptq_obs_within_block_rank1_f64 returned {code}"));
     }
     Ok(())
 }
@@ -830,6 +919,201 @@ mod phase2_tests {
             // sanity.
             assert!(max_q_err < 1e-6, "max_q_err {max_q_err} >= 1e-6");
             assert!(max_e_err < 1e-6, "max_e_err {max_e_err} >= 1e-6");
+        }
+    }
+
+    /// Pack U (faer Mat<f64>) into the COLUMN-major device layout produced
+    /// by Phase D's dgeam. flat[col*K + row] = U[row, col]. Off-diagonal
+    /// (row > col) entries are zero (upper-tri).
+    fn pack_u_column_major(u: &Mat<f64>) -> Vec<f64> {
+        let k = u.nrows();
+        let mut out = vec![0.0_f64; k * k];
+        for col in 0..k {
+            for row in 0..=col {
+                out[col * k + row] = u[(row, col)];
+            }
+        }
+        out
+    }
+
+    /// CPU reference for the Phase 2B kernel: apply within-block rank-1
+    /// updates for ONE step to all next_step in (step+1)..block_end.
+    fn cpu_within_block_rank1_reference(
+        w_res: &mut [f64],
+        err_block: &[f64],
+        u: &Mat<f64>,
+        perm: &[usize],
+        step: usize,
+        block_start: usize,
+        block_end: usize,
+        m: usize,
+        k: usize,
+        b: usize,
+    ) {
+        for row in 0..m {
+            let err = err_block[row * b + (step - block_start)];
+            if err == 0.0 { continue; }
+            for next_step in (step + 1)..block_end {
+                let u_sn = u[(step, next_step)];
+                if u_sn == 0.0 { continue; }
+                let kk_orig = perm[next_step];
+                w_res[row * k + kk_orig] -= err * u_sn;
+            }
+        }
+    }
+
+    #[test]
+    fn phase2b_within_block_rank1_parity() {
+        if std::env::var("HIPFIRE_SKIP_GPU_TESTS").is_ok() {
+            eprintln!("skip: HIPFIRE_SKIP_GPU_TESTS set");
+            return;
+        }
+        let solver = match RocSolver::load() {
+            Ok(s) => s,
+            Err(e) => { eprintln!("skip: RocSolver::load failed ({e})"); return; }
+        };
+
+        // Use a small block size (B=8) for testability; the kernel does
+        // not care about the value of B beyond pointer arithmetic.
+        let m = 16;
+        let k = 256;
+        let b = 8;
+        let block_start = 0;
+        let block_end = b;
+        let step = 2;
+
+        // Build deterministic synthetic state.
+        let mut w_res = vec![0.0_f64; m * k];
+        for r in 0..m { for c in 0..k {
+            w_res[r * k + c] = ((r * 7 + c * 11) as f64).sin() * 0.3;
+        }}
+
+        // Random-ish but deterministic err_block (only column `step - block_start` matters).
+        let mut err_block = vec![0.0_f64; m * b];
+        for r in 0..m {
+            err_block[r * b + (step - block_start)] = ((r as f64) * 0.13 + 0.5).cos() * 0.05;
+        }
+
+        // Identity permutation for simplicity.
+        let perm: Vec<usize> = (0..k).collect();
+
+        // Synthetic upper-tri U with non-zero off-diagonals for next_step in (step+1)..block_end.
+        let mut u_mat: Mat<f64> = Mat::zeros(k, k);
+        for row in 0..k { for col in row..k {
+            u_mat[(row, col)] = ((row * 3 + col) as f64).cos() * 0.07 + 0.001;
+        }}
+
+        // CPU reference.
+        let mut cpu_w_res = w_res.clone();
+        cpu_within_block_rank1_reference(
+            &mut cpu_w_res, &err_block, &u_mat, &perm,
+            step, block_start, block_end, m, k, b,
+        );
+
+        // GPU path.
+        let w_bytes   = m * k * std::mem::size_of::<f64>();
+        let err_bytes = m * b * std::mem::size_of::<f64>();
+        let u_bytes   = k * k * std::mem::size_of::<f64>();
+        let perm_bytes = k * std::mem::size_of::<i32>();
+
+        unsafe {
+            let d_w = dev_alloc(&solver, w_bytes).expect("alloc w");
+            let d_err = dev_alloc(&solver, err_bytes).expect("alloc err");
+            let d_u = dev_alloc(&solver, u_bytes).expect("alloc u");
+            let d_perm = dev_alloc(&solver, perm_bytes).expect("alloc perm");
+
+            h2d(&solver, d_w, w_res.as_ptr() as *const u8, w_bytes).expect("h2d w");
+            h2d(&solver, d_err, err_block.as_ptr() as *const u8, err_bytes).expect("h2d err");
+            let u_col_major = pack_u_column_major(&u_mat);
+            h2d(&solver, d_u, u_col_major.as_ptr() as *const u8, u_bytes).expect("h2d u");
+            let perm_i32: Vec<i32> = perm.iter().map(|&v| v as i32).collect();
+            h2d(&solver, d_perm, perm_i32.as_ptr() as *const u8, perm_bytes).expect("h2d perm");
+
+            gptq_obs_within_block_hip(
+                &solver,
+                d_w, d_err, d_u, d_perm,
+                step as i32, block_start as i32, block_end as i32,
+                k as i32, m as i32, b as i32,
+            ).expect("launch within_block_rank1");
+            dev_sync(&solver).expect("sync");
+
+            let mut gpu_w_res = vec![0.0_f64; m * k];
+            d2h(&solver, gpu_w_res.as_mut_ptr() as *mut u8, d_w, w_bytes).expect("d2h w");
+
+            dev_free(&solver, d_w);
+            dev_free(&solver, d_err);
+            dev_free(&solver, d_u);
+            dev_free(&solver, d_perm);
+
+            let mut max_err = 0.0_f64;
+            for i in 0..(m * k) {
+                let e = (cpu_w_res[i] - gpu_w_res[i]).abs();
+                if e > max_err { max_err = e; }
+            }
+            assert!(max_err < 1e-12, "max_err {max_err} >= 1e-12");
+        }
+    }
+
+    /// Edge case: step == block_end - 1 (last in block) — the kernel
+    /// should be a no-op since there are no remaining columns in-block.
+    #[test]
+    fn phase2b_last_in_block_is_noop() {
+        if std::env::var("HIPFIRE_SKIP_GPU_TESTS").is_ok() {
+            eprintln!("skip: HIPFIRE_SKIP_GPU_TESTS set");
+            return;
+        }
+        let solver = match RocSolver::load() {
+            Ok(s) => s,
+            Err(e) => { eprintln!("skip: RocSolver::load failed ({e})"); return; }
+        };
+
+        let m = 8;
+        let k = 256;
+        let b = 8;
+        let block_start = 0;
+        let block_end = b;
+        let step = block_end - 1; // last step in block
+
+        let w_res = vec![1.5_f64; m * k];
+        let err_block = vec![0.1_f64; m * b];
+        let perm_i32: Vec<i32> = (0..k as i32).collect();
+        let u_col_major = vec![0.5_f64; k * k];
+
+        let w_bytes = m * k * std::mem::size_of::<f64>();
+        let err_bytes = m * b * std::mem::size_of::<f64>();
+        let u_bytes = k * k * std::mem::size_of::<f64>();
+        let perm_bytes = k * std::mem::size_of::<i32>();
+
+        unsafe {
+            let d_w = dev_alloc(&solver, w_bytes).expect("alloc w");
+            let d_err = dev_alloc(&solver, err_bytes).expect("alloc err");
+            let d_u = dev_alloc(&solver, u_bytes).expect("alloc u");
+            let d_perm = dev_alloc(&solver, perm_bytes).expect("alloc perm");
+
+            h2d(&solver, d_w, w_res.as_ptr() as *const u8, w_bytes).expect("h2d w");
+            h2d(&solver, d_err, err_block.as_ptr() as *const u8, err_bytes).expect("h2d err");
+            h2d(&solver, d_u, u_col_major.as_ptr() as *const u8, u_bytes).expect("h2d u");
+            h2d(&solver, d_perm, perm_i32.as_ptr() as *const u8, perm_bytes).expect("h2d perm");
+
+            gptq_obs_within_block_hip(
+                &solver,
+                d_w, d_err, d_u, d_perm,
+                step as i32, block_start as i32, block_end as i32,
+                k as i32, m as i32, b as i32,
+            ).expect("launch within_block_rank1");
+            dev_sync(&solver).expect("sync");
+
+            let mut gpu_w_res = vec![0.0_f64; m * k];
+            d2h(&solver, gpu_w_res.as_mut_ptr() as *mut u8, d_w, w_bytes).expect("d2h w");
+
+            dev_free(&solver, d_w);
+            dev_free(&solver, d_err);
+            dev_free(&solver, d_u);
+            dev_free(&solver, d_perm);
+
+            for i in 0..(m * k) {
+                assert_eq!(gpu_w_res[i], 1.5, "noop violation at {i}: got {}", gpu_w_res[i]);
+            }
         }
     }
 }
