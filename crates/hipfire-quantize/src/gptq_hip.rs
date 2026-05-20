@@ -102,6 +102,7 @@ struct ObsModules {
     quantize_mq4_column: Option<KernelHandle>,
     within_block_rank1: Option<KernelHandle>,
     block_apply_mfma: Option<KernelHandle>,
+    block_apply_mfma_bf16: Option<KernelHandle>,
 }
 
 struct KernelHandle {
@@ -171,6 +172,7 @@ impl Drop for RocSolver {
                     mods.quantize_mq4_column.take(),
                     mods.within_block_rank1.take(),
                     mods.block_apply_mfma.take(),
+                    mods.block_apply_mfma_bf16.take(),
                 ] {
                     if let Some(KernelHandle { module, .. }) = slot {
                         if !module.is_null() {
@@ -674,6 +676,7 @@ unsafe fn load_kernel(
 const KSRC_QUANTIZE_MQ4_COLUMN: &str = include_str!("../../../kernels/src/gptq_quantize_mq4_column_f64.gfx942.hip");
 const KSRC_OBS_WITHIN_BLOCK_RANK1: &str = include_str!("../../../kernels/src/gptq_obs_within_block_rank1_f64.gfx942.hip");
 const KSRC_OBS_BLOCK_APPLY_MFMA: &str = include_str!("../../../kernels/src/gptq_obs_block_apply_mfma_f64.gfx942.hip");
+const KSRC_OBS_BLOCK_APPLY_MFMA_BF16: &str = include_str!("../../../kernels/src/gptq_obs_block_apply_mfma_bf16.gfx942.hip");
 
 /// Launch the Phase 2A quantize-column kernel.
 ///
@@ -933,6 +936,95 @@ pub unsafe fn gptq_obs_block_apply_mfma_hip(
     );
     if code != HIP_SUCCESS {
         return Err(format!("hipModuleLaunchKernel gptq_obs_block_apply_mfma_f64 returned {code}"));
+    }
+    Ok(())
+}
+
+/// Launch the Phase 2C-BF16 block-apply MFMA GEMM kernel (cast-trick variant).
+///
+/// Same call surface as [`gptq_obs_block_apply_mfma_hip`] — buffers are F64
+/// in host memory and HBM. The kernel casts F64 -> F32 -> BF16 at MFMA-feed
+/// time and casts the F32 accumulator back to F64 at the subtract-store.
+///
+/// Per plan §6 the numerical contract is: codeword divergence rate < 0.1%
+/// vs the F64 sibling on real Hessians. The throughput win is the BF16/F64
+/// MFMA throughput ratio on gfx942 (~7x).
+///
+/// Wired in `gptq_column_sequential_hip` via the `HIPFIRE_GPTQ_HIP_OBS_BF16`
+/// env var (see that function's doc-comment).
+///
+/// # Safety
+/// All pointers must be valid device buffers of the documented shapes.
+pub unsafe fn gptq_obs_block_apply_mfma_bf16_hip(
+    solver: &RocSolver,
+    d_w_residual: *mut c_void,
+    d_err_block: *const c_void,
+    d_u: *const c_void,
+    d_perm: *const c_void,
+    block_start: i32,
+    block_end: i32,
+    k_dim: i32,
+    m_dim: i32,
+    b_dim: i32,
+) -> Result<(), String> {
+    {
+        let mut guard = solver.obs_modules.lock().map_err(|e| format!("module lock: {e}"))?;
+        if guard.block_apply_mfma_bf16.is_none() {
+            let h = load_kernel(
+                solver,
+                "gptq_obs_block_apply_mfma_bf16",
+                KSRC_OBS_BLOCK_APPLY_MFMA_BF16,
+                "gptq_obs_block_apply_mfma_bf16",
+            )?;
+            guard.block_apply_mfma_bf16 = Some(h);
+        }
+    }
+
+    let n_remaining = k_dim - block_end;
+    if n_remaining <= 0 || m_dim <= 0 { return Ok(()); }
+
+    let grid_x = ((m_dim as u32) + 31) / 32;
+    let grid_y = ((n_remaining as u32) + 15) / 16;
+
+    let mut p_w     = d_w_residual;
+    let mut p_err   = d_err_block;
+    let mut p_u     = d_u;
+    let mut p_perm  = d_perm;
+    let mut p_bs    = block_start;
+    let mut p_be    = block_end;
+    let mut p_kdim  = k_dim;
+    let mut p_mdim  = m_dim;
+    let mut p_bdim  = b_dim;
+    let mut p_nrem  = n_remaining;
+
+    let mut params: [*mut c_void; 10] = [
+        &mut p_w    as *mut _ as *mut c_void,
+        &mut p_err  as *mut _ as *mut c_void,
+        &mut p_u    as *mut _ as *mut c_void,
+        &mut p_perm as *mut _ as *mut c_void,
+        &mut p_bs   as *mut _ as *mut c_void,
+        &mut p_be   as *mut _ as *mut c_void,
+        &mut p_kdim as *mut _ as *mut c_void,
+        &mut p_mdim as *mut _ as *mut c_void,
+        &mut p_bdim as *mut _ as *mut c_void,
+        &mut p_nrem as *mut _ as *mut c_void,
+    ];
+
+    let guard = solver.obs_modules.lock().map_err(|e| format!("module lock: {e}"))?;
+    let function = guard.block_apply_mfma_bf16.as_ref().unwrap().function;
+    drop(guard);
+
+    let code = (solver.fn_hip_module_launch_kernel)(
+        function,
+        grid_x, grid_y, 1,
+        128, 1, 1,
+        0,
+        std::ptr::null_mut(),
+        params.as_mut_ptr(),
+        std::ptr::null_mut(),
+    );
+    if code != HIP_SUCCESS {
+        return Err(format!("hipModuleLaunchKernel gptq_obs_block_apply_mfma_bf16 returned {code}"));
     }
     Ok(())
 }
