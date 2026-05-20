@@ -343,17 +343,18 @@ pub fn load_bf16_model(gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16> 
                 )
             })?;
 
+            // Real-world BF16 models are mixed-precision: main weight
+            // matrices in BF16, but norms / biases / DeltaNet scalars
+            // (A_log, dt_bias) commonly ship as F32 or F16. Skip
+            // non-BF16 tensors quietly — calibration only needs the
+            // BF16 linear-layer weights anyway (the GEMMs we wrap with
+            // capture hooks). Norms etc. don't go through gemm_bf16.
             if meta.dtype != "BF16" {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "tensor {} in {} has dtype {} (expected BF16); \
-                         calibration requires BF16 source-of-truth weights",
-                        name,
-                        shard_path.display(),
-                        meta.dtype
-                    ),
-                ));
+                eprintln!(
+                    "  skipping non-BF16 tensor {} (dtype={})",
+                    name, meta.dtype
+                );
+                continue;
             }
 
             let numel: usize = meta.shape.iter().product();
