@@ -401,6 +401,15 @@ pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../..
 /// variant scales by an on-device sigmoid gate (no D2H sync).
 pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip");
 
+/// HFQ6/MQ6-G256 batched GEMV with fused sigmoid-scaled residual:
+///   y_batch[bid,row] += sigmoid(c_batch[bid]) * (A[row] · x_batch[bid]).
+/// HFQ6 analogue of `gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched` —
+/// unlocks the batched MoE-FFN shared-expert `down` projection for the
+/// AWQ-style mixed-precision path where shared.down is MQ6 (storage-
+/// compatible with HFQ6G256, 200 B / group of 256).
+pub const GEMV_HFQ6G256_RESIDUAL_SIGMOID_SCALED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_residual_sigmoid_scaled.hip");
+
 /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in one
 /// launch. Grid.y is the expert rank (0..7); each block selects its
 /// expert's weight base from the W0..W7 kernarg array and runs the
@@ -544,6 +553,36 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
 /// `HIPFIRE_MOE_GROUPED_M2=1`.
 pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_M2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_m2.gfx12.hip");
+
+/// HFQ6/MQ6 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC for AWQ MoE
+/// experts. Same WMMA tile geometry + grouped dispatch contract; differs
+/// only in the 200 B/group HFQ6 dequant inner loop (4 B scale + 4 B zero
+/// + 192 B packed 6-bit). The kernel is dtype-agnostic between HFQ6 and
+/// MQ6 — MQ6G256 uses the identical 200 B layout and the caller applies
+/// the FWHT rotation to X before dispatch, same convention as MQ4/HFQ4.
+/// **gfx12 (RDNA4) only.** Unblocks AWQ A3B prefill (~50% of experts MQ6).
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx12.hip");
+
+/// M-direction 2×1 reg-blocked sister of GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// Each warp covers a 32-row × 16-slot output tile (vs 16×16 in v1); per
+/// K-substep 2 A-dequants + 1 B-load → 2 WMMAs (vs 1+1+1 in v1). Halves X-gather
+/// BW per output element. Same kernarg layout + BLOCK_M=16 slot stride
+/// (expert-boundary contract unchanged). Lever from `wmma_kernels_optimized.hpp`
+/// extending the HFQ4 m2 trick to BW-bound HFQ6 (where the dequant
+/// serialization that falsified HFQ4-m2 is hidden behind memory waits).
+/// Gated on `HIPFIRE_MOE_HFQ6_V2=1` (default off).
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_v2.gfx12.hip");
+
+/// gfx12 (RDNA4) HFQ3/MQ3 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// Same WMMA tile geometry + expert_tile_ids sentinel pattern + kernarg
+/// layout; differs in dequant (HFQ3-G256 = 104 B/group, 8 × 3-bit chunks
+/// packed across 24 bits per 3-byte slice). Same FWHT-rotated 3-bit
+/// storage applies to MQ3G256 — the kernel handles both buffers (rotation
+/// is applied by the caller, matching the MQ4/HFQ4 dispatch convention).
+pub const GEMM_HFQ3G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq3g256_moe_grouped_wmma.gfx12.hip");
 
 /// Non-residual WMMA Q8_0 GEMM (gfx12). Direct write to Y[N, M] without
 /// reading prior values (= rather than +=). Drop-in replacement for the
@@ -721,6 +760,13 @@ pub const GEMM_GATE_UP_HFP4G32_WMMA_GFX12_SRC: &str = include_str!("../../../ker
 pub const GEMM_QKVZA_HFP4G32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfp4g32_wmma.hip");
 pub const GEMM_QKVZA_HFP4G32_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfp4g32_wmma.gfx12.hip");
 
+// HFP4-G32 grouped-WMMA-GEMM for MoE prefill on gfx12. Sister of the
+// HFQ4 grouped variant — same tile geometry / expert_tile_ids sentinel
+// pattern, with HFP4G32's 18 B/group dequant (1 B UE8M0 + 16 B packed
+// FP4 + LUT) and the G32 inner loop. MFP4G32 shares storage with HFP4G32.
+pub const GEMM_HFP4G32_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfp4g32_moe_grouped_wmma.gfx12.hip");
+
 // Batched 4-way fused HFQ4-G256 GEMM (LA preamble: wqkv + wz + w_beta + w_alpha).
 // Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the LA layer projection.
@@ -771,6 +817,11 @@ pub const GEMM_GATE_UP_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/
 pub const GEMM_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual.hip");
 pub const GEMM_HFQ6G256_RESIDUAL_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_fp16.hip");
 pub const GEMM_HFQ6G256_RESIDUAL_WMMA_K2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_wmma_k2.hip");
+// gfx12 (RDNA4) sister of GEMM_HFQ6G256_RESIDUAL_WMMA_K2_SRC. Pure composition
+// of validated patterns — hfq6 dequant (gemm_qkv_hfq6g256_wmma.gfx12.hip) +
+// fused residual `+=` (gemm_q8_0_residual_wmma.gfx12.hip).
+pub const GEMM_HFQ6G256_RESIDUAL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_residual_wmma.gfx12.hip");
 pub const GEMM_QKVZA_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256.hip");
 pub const GEMM_QKVZA_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_fp16.hip");
 pub const GEMM_QKVZA_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_dot2.hip");
