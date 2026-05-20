@@ -228,16 +228,49 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     let partial_rotary_factor = tc.get("partial_rotary_factor")
         .or_else(|| rope_params.and_then(|r| r.get("partial_rotary_factor")))
         .and_then(|v| v.as_f64()).unwrap_or(0.25) as f32;
+    // ── M-RoPE (`qwen35.rope.dimension_sections`) note ────────────────────
+    //
+    // Qwen3.5-VL .hfq files (and dense Qwen3.5 GGUFs with mrope) carry a
+    // `qwen35.rope.dimension_sections=[T, H, W, E]` array (e.g. [11,11,10,0]
+    // for 0.8B-VL). That field is INTENTIONALLY not threaded through Config
+    // here because the production forward path is text-only.
+    //
+    // For TEXT-ONLY inference the IMROPE algorithm degenerates EXACTLY to
+    // standard 1D partial-rotary half-split RoPE:
+    //   - position_ids for T/H/W/E all equal the token position,
+    //   - so theta_base = pos[T|H|W|E] * theta_scale^(i0/2) is invariant
+    //     to which sector branch the IMROPE kernel takes.
+    // The existing `gpu.rope_partial_interleaved_f32` (which dispatches the
+    // halfsplit kernel by default since 2026-05-12) produces byte-identical
+    // output to the multimodal kernel under that condition. Verified
+    // numerically against ggml-cuda/rope.cu's rope_multi (is_imrope=true)
+    // and HF `transformers/qwen3_5/modeling_qwen3_5.py:227-262`.
+    //
+    // When vision/video tokens are added, this Config will need a
+    // `mrope_sections: [u32; 4]` field and the RoPE dispatch sites in
+    // forward_* will need to switch on `is_text_only_batch ? halfsplit
+    // : imrope`. Out of scope for the current text-only forward.
 
     let eos_token = tc.get("eos_token_id").and_then(|v| v.as_u64()).unwrap_or(248044) as u32;
 
     // Linear-attention (DeltaNet / SSM) dims. The HF Qwen3.5 dense config
     // names these `linear_num_*` / `linear_*_head_dim`; the llama.cpp GGUF
-    // converter for Qwen3.5-VL stashes them under `qwen35.ssm.*` instead.
+    // converter for Qwen3.5-VL stashes them under `qwen35.ssm.*` — per the
+    // converter mapping at convert_hf_to_gguf.py:4763-4766:
+    //   qwen35.ssm.group_count     = linear_num_KEY_heads (NOT value heads)
+    //   qwen35.ssm.time_step_rank  = linear_num_value_heads
+    //   qwen35.ssm.inner_size      = linear_value_head_dim * linear_num_value_heads
+    //
+    // We probe `time_step_rank` first for `num_value_heads` and fall back to
+    // `group_count` only when neither HF nor `time_step_rank` is available
+    // (preserves the legacy behavior on existing 0.8B/9B/27B/A3B .hfq files
+    // where both fields equal 16 anyway, so the disambiguation is a no-op).
     let linear_num_value_heads = tc.get("linear_num_value_heads").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| gguf_u("qwen35.ssm.time_step_rank"))
         .or_else(|| gguf_u("qwen35.ssm.group_count"))
         .unwrap_or(16);
     let linear_num_key_heads = tc.get("linear_num_key_heads").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| gguf_u("qwen35.ssm.group_count"))
         .unwrap_or(linear_num_value_heads);
     // For VL: head_dim = inner_size / group_count = 2048 / 16 = 128 (matches HF).
     let ssm_inner_size = gguf_u("qwen35.ssm.inner_size");
@@ -945,7 +978,56 @@ fn resolve_tensor_vec<'a>(hfq: &'a HfqFile, name: &str)
     None
 }
 
-/// Load norm weight for Qwen3.5: stored as offset from 1.0 (output = x * (1 + weight))
+/// Returns `true` if the .hfq came from llama.cpp's `convert_hf_to_gguf.py`
+/// (the Qwen3NextModel / Qwen3_5TextModel / Qwen3_5MoeTextModel converters
+/// already bake `+1` into every `*norm.weight` at conversion time — except
+/// `linear_attn.norm.weight`). When this returns `true`, `load_norm_weight`
+/// MUST NOT add another `+1.0` or the bake doubles to `2 + w`.
+///
+/// Detection signal: presence of any `qwen35.*` GGUF key (only written by
+/// the qwen35 family converter). Safetensors-direct .hfq files from
+/// `hipfire-quantize convert <hf_dir>` carry only `architecture`/`config`/
+/// `tokenizer` and no `gguf_meta` at all (see `crates/hipfire-quantize/
+/// src/main.rs` ~line 3960), so they return `false` here and the load-time
+/// bake still runs.
+fn norm_weight_prebaked(hfq: &HfqFile) -> bool {
+    norm_weight_prebaked_from_meta(&hfq.metadata_json)
+}
+
+/// Plain-string version of `norm_weight_prebaked` for unit testing. Inspects
+/// the metadata JSON for the presence of `gguf_meta.qwen35.block_count`,
+/// which is the marker that llama.cpp's converter wrote this .hfq's source
+/// GGUF (and therefore already pre-baked `+1` into all `*norm.weight`).
+fn norm_weight_prebaked_from_meta(metadata_json: &str) -> bool {
+    let meta: serde_json::Value = match serde_json::from_str(metadata_json) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // Any qwen35.* key under gguf_meta is exclusive to the GGUF converter
+    // path. We probe the canonical block_count rather than the layer-types
+    // fallback so the signal works on Qwen3.5 dense GGUF .hfq variants too
+    // (those don't set full_attention_interval).
+    meta.get("gguf_meta")
+        .and_then(|gm| gm.get("qwen35.block_count"))
+        .is_some()
+}
+
+/// Load norm weight for Qwen3.5: stored as offset from 1.0 (output = x * (1 + weight)).
+///
+/// Two storage conventions exist for the same logical tensor:
+///   - Safetensors-direct (hipfire-quantize from HF safetensors): the raw
+///     `w` from `nn.Parameter(torch.ones(...))` is stored — values are
+///     typically near zero (post-training drift around the 0 init). We
+///     must add `+1.0` here so the kernel sees `(1 + w)`.
+///   - GGUF-derived (llama.cpp's `convert_hf_to_gguf.py` Qwen3NextModel
+///     pipeline → hipfire-quantize from GGUF): the converter pre-bakes
+///     `data + 1` at conversion time — values are centered near 1. Adding
+///     `+1.0` here a second time would produce `(1 + w) + 1 = 2 + w`,
+///     scaling every RMSNorm output by ~2× across the whole stack and
+///     producing the observed KLD≈11 on Qwen3.5-VL .hfq files.
+///
+/// The two conventions are distinguished by the `gguf_meta.qwen35.*` keys
+/// (only the GGUF path stamps them) — see `norm_weight_prebaked`.
 fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
     let (info, data) = resolve_tensor_vec(hfq, &full_name)
@@ -957,8 +1039,14 @@ fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
         _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
     };
-    // Qwen3.5 RMSNorm: output = x * rsqrt(var+eps) * (1 + weight)
-    for v in &mut f32_data { *v += 1.0; }
+    // Qwen3.5 RMSNorm: output = x * rsqrt(var+eps) * (1 + weight). The `+1`
+    // either lives in the stored weight (llama.cpp converter) or in this
+    // load-time bake (safetensors-direct) — never both. The gguf_meta probe
+    // distinguishes the two source paths (see `norm_weight_prebaked_from_meta`).
+    let prebaked = norm_weight_prebaked(hfq);
+    if !prebaked {
+        for v in &mut f32_data { *v += 1.0; }
+    }
     gpu.upload_f32(&f32_data, shape)
 }
 
@@ -1605,13 +1693,20 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     drop(embd_data); // free source buffer before loading more tensors
 
     eprintln!("  loading output_norm...");
-    // GemmaRMSNorm storage convention is uniform across the Qwen3.5+ family:
-    // safetensors store raw `w` (init from zero, can train to any magnitude),
-    // engines apply `(1 + w)` at runtime. Hipfire's `load_norm_weight` bakes
-    // `+= 1.0` at load time so the kernel can stay plain `x * w * rms` —
-    // mathematically equivalent to vLLM's runtime `weight + 1.0` and
-    // llama.cpp's GGUF-conversion-time bake. See
-    // docs/plans/qwen35-moe-rmsnorm-fix.md for the concrete arithmetic trace.
+    // GemmaRMSNorm storage convention across the Qwen3.5+ family — the
+    // canonical math is `out = x * rsqrt(var+eps) * (1 + w)` where `w` is
+    // the raw, post-training-drift weight (init from zero in
+    // `nn.Parameter(torch.ones)` after subtracting the implicit `+1`).
+    // Hipfire's kernel always sees `(1 + w)` — pre-baked by either:
+    //   - `load_norm_weight` (safetensors path: hipfire-quantize raw HF →
+    //     .hfq) adds `+1` at load time; OR
+    //   - llama.cpp's `convert_hf_to_gguf.py::Qwen3NextModel.modify_tensors`
+    //     adds `+1` to every `*norm.weight` (except linear_attn.norm.weight)
+    //     at conversion time, so the GGUF-derived .hfq carries the pre-baked
+    //     value and `load_norm_weight` skips its own bake (gated on
+    //     `norm_weight_prebaked` — see that fn).
+    // See docs/plans/qwen35-moe-rmsnorm-fix.md for the concrete arithmetic
+    // trace + the Qwen3.5-VL bug that this gate fixes (KLD≈11 → ~0.3).
     //
     // The earlier `if config.num_experts > 0` fork (commit 1e01c0b) skipped
     // the `+= 1.0` bake on MoE final norms to silence a `<think>` infinite-
@@ -8541,5 +8636,62 @@ mod tests {
     #[test]
     fn f16_lm_head_mode_unknown_falls_back_to_native() {
         assert_eq!(parse_f16_lm_head_mode(Some("surprise")), F16LmHeadMode::Native);
+    }
+
+    /// Safetensors-direct .hfq from `hipfire-quantize convert <hf_dir>` —
+    /// no `gguf_meta` key. The load-time `+= 1.0` bake MUST still run.
+    #[test]
+    fn norm_weight_prebake_skips_safetensors_hfq() {
+        let meta = serde_json::json!({
+            "architecture": "qwen35",
+            "config": { "hidden_size": 1024, "num_hidden_layers": 24 },
+            "tokenizer": "{}",
+        }).to_string();
+        assert!(!norm_weight_prebaked_from_meta(&meta));
+    }
+
+    /// GGUF-derived .hfq from `hipfire-quantize convert <bf16.gguf>` —
+    /// llama.cpp's converter has already pre-baked `+1` into all
+    /// `*norm.weight` tensors. The load-time bake MUST NOT add another `+1`
+    /// or norms scale by ~2× (KLD≈11 instead of ~0.3).
+    #[test]
+    fn norm_weight_prebake_triggers_on_gguf_hfq() {
+        let meta = serde_json::json!({
+            "architecture": "qwen35",
+            "config": { "hidden_size": 1024 },
+            "gguf_meta": {
+                "general.architecture": "qwen35",
+                "qwen35.block_count": 24,
+                "qwen35.embedding_length": 1024,
+                "qwen35.full_attention_interval": 4,
+                "qwen35.rope.dimension_sections": [11, 11, 10, 0],
+            },
+        }).to_string();
+        assert!(norm_weight_prebaked_from_meta(&meta));
+    }
+
+    /// Defensive: a malformed / non-JSON `metadata_json` must fall back to
+    /// the safetensors-default (load-time bake on) so loaders don't silently
+    /// under-scale norms on a partially-corrupt file.
+    #[test]
+    fn norm_weight_prebake_falls_back_on_invalid_json() {
+        assert!(!norm_weight_prebaked_from_meta("not json"));
+        assert!(!norm_weight_prebaked_from_meta(""));
+    }
+
+    /// Edge case: `gguf_meta` is present but doesn't carry the qwen35.*
+    /// keys (e.g. a non-qwen35 model wrapped via the GGUF path). We do NOT
+    /// skip the bake — only the qwen35.* converter writes pre-baked norms.
+    #[test]
+    fn norm_weight_prebake_requires_qwen35_keys() {
+        let meta = serde_json::json!({
+            "architecture": "qwen35",
+            "config": {},
+            "gguf_meta": {
+                "general.architecture": "llama",
+                "llama.block_count": 32,
+            },
+        }).to_string();
+        assert!(!norm_weight_prebaked_from_meta(&meta));
     }
 }
