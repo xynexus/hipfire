@@ -1096,6 +1096,29 @@ unsafe fn dev_sync(solver: &RocSolver) -> Result<(), String> {
 ///
 /// Returns the effective damping value (after adaptive escalation in the
 /// Cholesky step).
+///
+/// ── Env-var gating ──
+///
+///   `HIPFIRE_GPTQ_HIP_OBS=1`       (outer, in gptq.rs)  — enables this
+///                                  GPU OBS orchestrator at all (default
+///                                  off → CPU path).
+///   `HIPFIRE_GPTQ_HIP_OBS_BF16=1`  (inner, this function) — switches the
+///                                  Phase 2C rank-B GEMM (Kernel 3) from
+///                                  F64 MFMA to the BF16 cast-trick MFMA
+///                                  variant. Kernel 1 (quantize_mq4_column)
+///                                  and Kernel 2 (within_block_rank1) stay
+///                                  F64; only the BLAS-3 cross-block GEMM
+///                                  switches precision.
+///
+///   Matrix of behaviors:
+///     outer off, inner off  →  CPU path (default)
+///     outer ON,  inner off  →  GPU OBS, F64 MFMA Kernel 3 (Phase 2D shipped)
+///     outer ON,  inner ON   →  GPU OBS, BF16 cast-trick Kernel 3 (this commit)
+///     outer off, inner ON   →  CPU path (inner is a no-op without outer)
+///
+///   Per plan §6 the BF16 path is opt-in pending real-tensor codeword
+///   divergence validation on droplet hardware. Default-flip discussion
+///   deferred per feedback_pr_gating_policy.md.
 pub fn gptq_column_sequential_hip(
     solver: &RocSolver,
     weights_flat: &mut [f64],
@@ -1111,6 +1134,12 @@ pub fn gptq_column_sequential_hip(
     assert_eq!(h_target.nrows(), k_dim);
     assert_eq!(h_target.ncols(), k_dim);
     assert_eq!(frozen_grids.len(), (m * k_dim) / 256, "frozen_grids count mismatch");
+
+    // Inner opt-in: BF16 cast-trick variant of the Phase 2C rank-B GEMM.
+    // Captured once at the start of the call so the per-block branch is a
+    // plain bool check instead of a syscall. See the doc-comment above for
+    // the full env-var matrix.
+    let use_bf16_block_apply = std::env::var("HIPFIRE_GPTQ_HIP_OBS_BF16").is_ok();
 
     // ── Step 1: CPU actorder (same as gptq.rs:803-804) ──
     let h_diag: Vec<f64> = (0..k_dim).map(|i| h_target[(i, i)]).collect();
@@ -1261,13 +1290,25 @@ pub fn gptq_column_sequential_hip(
             }
 
             // Phase B: cross-block rank-B MFMA GEMM (Phase 2C kernel).
+            // F64 path is the default; HIPFIRE_GPTQ_HIP_OBS_BF16=1 swaps in
+            // the BF16 cast-trick variant for the ~7x MFMA throughput gain.
             if block_end < k_dim {
-                if let Err(_) = gptq_obs_block_apply_mfma_hip(
-                    solver,
-                    d_w_residual, d_err_block, gpu_u.d_u, d_perm,
-                    block_start as i32, block_end as i32,
-                    k_dim as i32, m as i32, cur_b as i32,
-                ) {
+                let res = if use_bf16_block_apply {
+                    gptq_obs_block_apply_mfma_bf16_hip(
+                        solver,
+                        d_w_residual, d_err_block, gpu_u.d_u, d_perm,
+                        block_start as i32, block_end as i32,
+                        k_dim as i32, m as i32, cur_b as i32,
+                    )
+                } else {
+                    gptq_obs_block_apply_mfma_hip(
+                        solver,
+                        d_w_residual, d_err_block, gpu_u.d_u, d_perm,
+                        block_start as i32, block_end as i32,
+                        k_dim as i32, m as i32, cur_b as i32,
+                    )
+                };
+                if res.is_err() {
                     cleanup(solver); return Err(to_chol_err(effective_damp));
                 }
             }
