@@ -310,6 +310,7 @@ pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src
 pub const RMSNORM_REDUCE_GFX942_SRC: &str = include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
 pub const ROTATE_WITH_RMS_GFX942_SRC: &str = include_str!("../../../kernels/src/rotate_with_rms.gfx942.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MFMA_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v2.gfx942.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
 
 /// HFP4-G32 GEMV — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale).
