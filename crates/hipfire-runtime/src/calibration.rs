@@ -866,6 +866,72 @@ mod tests {
         assert!(!coll.should_capture("lm_head.weight"));
     }
 
+    /// MoE per-expert tensors (`.mlp.experts.N.{gate|up|down}_proj.weight`)
+    /// are admitted under the same suffix-match rule that admits the
+    /// dense MLP tensors. `is_gptq_target` and `should_capture` both
+    /// match on the last `.`-separated segment after stripping
+    /// `.weight`, so per-expert tensors carry no special case.
+    #[test]
+    fn imatrix_should_capture_moe_per_expert() {
+        let coll = ImatrixCollector::new(false);
+        // Per-expert MLPs (Qwen3.5-A3B / Astrea).
+        assert!(coll.should_capture(
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+        ));
+        assert!(coll.should_capture(
+            "model.language_model.layers.0.mlp.experts.0.up_proj.weight"
+        ));
+        assert!(coll.should_capture(
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight"
+        ));
+        assert!(coll.should_capture(
+            "model.language_model.layers.5.mlp.experts.23.gate_proj.weight"
+        ));
+        assert!(coll.should_capture(
+            "model.language_model.layers.10.mlp.experts.127.down_proj.weight"
+        ));
+        // Shared expert (no expert idx — single per-layer shared FFN)
+        // is admitted by the same suffix rule.
+        assert!(coll.should_capture(
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"
+        ));
+        assert!(coll.should_capture(
+            "model.language_model.layers.0.mlp.shared_expert.down_proj.weight"
+        ));
+    }
+
+    /// `is_gptq_target` admits MoE per-expert tensors under the same
+    /// suffix-match rule that admits dense MLP tensors.
+    #[test]
+    fn hessian_whitelist_admits_moe_per_expert() {
+        assert!(is_gptq_target(
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+        ));
+        assert!(is_gptq_target(
+            "model.language_model.layers.0.mlp.experts.0.up_proj.weight"
+        ));
+        assert!(is_gptq_target(
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight"
+        ));
+        assert!(is_gptq_target(
+            "model.language_model.layers.7.mlp.experts.42.gate_proj.weight"
+        ));
+        // Shared expert MLPs admitted under the same suffix rule.
+        assert!(is_gptq_target(
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"
+        ));
+        // Per-layer router (mlp.gate.weight) admitted.
+        assert!(is_gptq_target("model.language_model.layers.0.mlp.gate.weight"));
+        // `shared_expert_gate` (scalar gate, not a Linear) is NOT in
+        // the whitelist — last segment `shared_expert_gate` doesn't
+        // match any target. Hessian collector skips it; that's
+        // correct because the scalar gate is kept at Q8 in the
+        // production quantizer and doesn't need a K×K Hessian.
+        assert!(!is_gptq_target(
+            "model.language_model.layers.0.mlp.shared_expert_gate.weight"
+        ));
+    }
+
     /// With `process_output=true`, `lm_head` / `output` are admitted; norms
     /// still rejected.
     #[test]
