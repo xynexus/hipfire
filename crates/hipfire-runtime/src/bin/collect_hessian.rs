@@ -276,20 +276,17 @@ fn run(args: &Args) -> Result<(), String> {
 
     // 7. Write HFHS-v1 output via subagent B's writer.
     eprintln!("[7/7] writing HFHS-v1 binary to {}...", args.output.display());
-    // TODO(subagent-B): wire `hfhs_writer::write_hfhs(&args.output, &entries)`
-    // HFHS-v1 byte-layout per `scripts/collect_hessian.py:25-43`:
-    //
-    //   magic "HFHS" + u32 version=1 + u32 n_tensors
-    //   per-tensor: u32 name_len + name + u32 k + u64 n_tokens + k*k F32 row-major
-    //
-    // The Tier 2 Python path writes this format unchanged; subagent-B's
-    // Rust writer must produce byte-identical output so
-    // `crates/hipfire-quantize/src/hessian_io.rs` reads it without changes.
-    let _ = &entries;
-    Err(format!(
-        "[7/7] HFHS writer not yet wired — subagent-B owns \
-         `hfhs_writer::write_hfhs(&output, &entries)`. \
-         Drained {} entries are ready to write.",
-        entries.len()
-    ))
+    let writer_entries: Vec<hipfire_quantize::hfhs_writer::HessianEntry> = entries
+        .into_iter()
+        .map(|e| hipfire_quantize::hfhs_writer::HessianEntry {
+            name: e.name,
+            expert_idx: 0,
+            k: e.k as u32,
+            h: e.h,
+        })
+        .collect();
+    hipfire_quantize::hfhs_writer::write_hfhs(&args.output, &writer_entries)
+        .map_err(|e| format!("write_hfhs failed: {e}"))?;
+    eprintln!("[7/7] wrote {} entries to {}", writer_entries.len(), args.output.display());
+    Ok(())
 }

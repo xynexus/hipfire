@@ -700,6 +700,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-atlas",
  "hipfire-detect",
+ "hipfire-quantize",
  "libc",
  "memmap2",
  "minijinja",

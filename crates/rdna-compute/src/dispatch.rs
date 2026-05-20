@@ -589,20 +589,15 @@ impl DType {
 pub trait ActivationCapture: Send + Sync {
     /// Called by linear-layer dispatch arms when calibration is active.
     ///
+    /// `gpu`         — exclusive borrow of the current Gpu instance.
+    ///                 Impls may allocate, launch kernels, etc.
     /// `tensor_name` — canonical .hfq / GGUF tensor name.
-    /// `input_ptr`   — device pointer to the input activation tensor.
-    /// `numel`       — number of elements at `input_ptr` (NOT bytes).
-    /// `dtype`       — element type of the captured activation.
-    /// `shape`       — full activation shape (e.g. `[batch, K]` for the
-    ///                 input of a `[K, M]` linear). Borrowed; do NOT
-    ///                 retain past the call.
+    /// `input`       — device tensor for the activation.
     fn capture(
         &self,
+        gpu: &mut Gpu,
         tensor_name: &str,
-        input_ptr: *const c_void,
-        numel: usize,
-        dtype: DType,
-        shape: &[usize],
+        input: &GpuTensor,
     );
 }
 
@@ -891,13 +886,7 @@ impl Gpu {
         // Cloning the Arc keeps lifetime safe across the FFI callback.
         let handler = self.capture_handler.as_ref().unwrap().clone();
         let name = self.current_linear_name.take().unwrap();
-        handler.capture(
-            name.as_str(),
-            x.buf.as_ptr() as *const c_void,
-            x.numel(),
-            x.dtype,
-            x.shape.as_slice(),
-        );
+        handler.capture(self, name.as_str(), x);
     }
 
     /// Drive the GPU to full DPM perf level before a perf-sensitive measurement.

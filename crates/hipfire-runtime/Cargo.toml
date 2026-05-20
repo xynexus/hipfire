@@ -49,6 +49,7 @@ arch-llama = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+hipfire-quantize = { path = "../hipfire-quantize" }
 memmap2 = "0.9"
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }

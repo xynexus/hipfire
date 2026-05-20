@@ -220,16 +220,40 @@ impl ImatrixCollector {
 impl ActivationCapture for ImatrixCollector {
     fn capture(
         &self,
+        gpu: &mut Gpu,
         tensor_name: &str,
-        input_ptr: *const c_void,
-        numel: usize,
-        dtype: DType,
-        shape: &[usize],
+        input: &GpuTensor,
     ) {
         if !self.should_capture(tensor_name) {
             return;
         }
-        let _ = (input_ptr, numel, dtype, shape);
+        let k = match input.shape.last() {
+            Some(k) => *k,
+            None => return,
+        };
+        let n_rows = input.numel() / k;
+        let mut accs = match self.accumulators.lock() {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        if !accs.contains_key(tensor_name) {
+            let acc = match gpu.zeros(&[k], DType::F32) {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            accs.insert(tensor_name.to_string(), ImatrixAccum { acc, n_tokens: 0, k });
+        }
+        let accum = accs.get_mut(tensor_name).unwrap();
+        // sumsq_reduce_bf16 needs a GPU scalar for n_tokens (writes into it).
+        // We track host-side n_tokens separately; the GPU scalar is a throwaway.
+        let mut n_scratch = match gpu.zeros(&[1], DType::F32) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if let Err(_) = gpu.sumsq_reduce_bf16(input, &mut accum.acc, &mut n_scratch) {
+            return;
+        }
+        accum.n_tokens = accum.n_tokens.saturating_add(n_rows as u64);
         // TODO(subagent-A): wire `gpu.sumsq_reduce_bf16(input_ptr, numel, dtype, shape,
         //                                               accumulator_ptr, k)` here.
         //
@@ -349,28 +373,34 @@ impl Default for HessianCollector {
 impl ActivationCapture for HessianCollector {
     fn capture(
         &self,
+        gpu: &mut Gpu,
         tensor_name: &str,
-        input_ptr: *const c_void,
-        numel: usize,
-        dtype: DType,
-        shape: &[usize],
+        input: &GpuTensor,
     ) {
         if !is_gptq_target(tensor_name) {
             return;
         }
-        let _ = (input_ptr, numel, dtype, shape);
-        // TODO(subagent-A): wire `gpu.hessian_outer_product_bf16(input_ptr, numel,
-        //                                                        dtype, shape,
-        //                                                        accumulator_ptr, k)`
-        //
-        // Same first-touch + per-call dispatch flow as `ImatrixCollector::capture`,
-        // but with a K×K F32 accumulator instead of a length-K vector. See the
-        // detailed flow comment in `ImatrixCollector::capture`.
-        //
-        // Pre-allocation strategy: walk the loaded BF16 trunk after
-        // `load_bf16_model` returns, filter by `is_gptq_target`, allocate a
-        // K×K F32 zero tensor for each in the driver before installing the
-        // collector. Avoids needing `&mut Gpu` access from `capture(&self, ...)`.
+        let k = match input.shape.last() {
+            Some(k) => *k,
+            None => return,
+        };
+        let n_rows = input.numel() / k;
+        let mut accs = match self.accumulators.lock() {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        if !accs.contains_key(tensor_name) {
+            let h = match gpu.zeros(&[k, k], DType::F32) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            accs.insert(tensor_name.to_string(), HessianAccum { h, n_tokens: 0, k });
+        }
+        let accum = accs.get_mut(tensor_name).unwrap();
+        if let Err(_) = gpu.hessian_outer_product_bf16(input, &mut accum.h) {
+            return;
+        }
+        accum.n_tokens = accum.n_tokens.saturating_add(n_rows as u64);
     }
 }
 

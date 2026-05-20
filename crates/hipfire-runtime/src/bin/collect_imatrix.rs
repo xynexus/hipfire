@@ -265,18 +265,19 @@ fn run(args: &Args) -> Result<(), String> {
 
     // 7. Write GGUF imatrix output via subagent B's writer.
     eprintln!("[7/7] writing GGUF imatrix to {}...", args.output.display());
-    // TODO(subagent-B): wire `gguf_imatrix_writer::write_gguf_imatrix(&args.output,
-    //                                                                 &entries,
-    //                                                                 Some("calibration"))`
-    // The dataset name "calibration" matches the convention used by
-    // llama-imatrix --output-format gguf (it embeds the source file name;
-    // here we use the generic "calibration" so downstream tooling that
-    // keys on dataset != "wikitext" doesn't false-trigger).
-    let _ = &entries;
-    Err(format!(
-        "[7/7] GGUF writer not yet wired — subagent-B owns \
-         `gguf_imatrix_writer::write_gguf_imatrix(&output, &entries, Some(\"calibration\"))`. \
-         Drained {} entries are ready to write.",
-        entries.len()
-    ))
+    let writer_entries: Vec<hipfire_quantize::gguf_imatrix_writer::ImatrixEntry> = entries
+        .into_iter()
+        .map(|e| hipfire_quantize::gguf_imatrix_writer::ImatrixEntry {
+            name: e.name,
+            in_sum2: e.in_sum2,
+            counts: e.counts.first().copied().unwrap_or(0.0),
+        })
+        .collect();
+    hipfire_quantize::gguf_imatrix_writer::write_gguf_imatrix(
+        &args.output,
+        &writer_entries,
+        Some("calibration"),
+    ).map_err(|e| format!("write_gguf_imatrix failed: {e}"))?;
+    eprintln!("[7/7] wrote {} entries to {}", writer_entries.len(), args.output.display());
+    Ok(())
 }
