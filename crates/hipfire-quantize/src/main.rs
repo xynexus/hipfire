@@ -9,6 +9,8 @@
 mod gguf_imatrix_writer;
 mod gguf_input;
 mod gptq;
+#[cfg(feature = "gptq-hip")]
+mod gptq_hip;
 mod hessian_io;
 mod imq_reader;
 mod imq_writer;

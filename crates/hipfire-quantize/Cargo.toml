@@ -3,6 +3,15 @@ name = "hipfire-quantize"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Opt-in GPU Cholesky for GPTQ via rocSOLVER (FP64). Drops the dominant
+# O(K^3) work from a 20-core CPU pass onto MI300x compute, projected
+# 10-30x wall-clock speedup at K=12288 (see docs/plans/gptq-hip-port.md).
+# Requires librocsolver + librocblas + libamdhip64 to be discoverable at
+# runtime; non-CDNA arches fall through to CPU automatically (rationale
+# in plan risk §1).
+gptq-hip = ["dep:libloading"]
+
 [dependencies]
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
@@ -13,6 +22,10 @@ rayon = "1"
 # Chosen over nalgebra / ndarray-linalg because it has no BLAS/LAPACK dep
 # and competitive FP64 dense performance.
 faer = "0.24"
+# Optional FFI loader for rocSOLVER / rocBLAS / libamdhip64. Only pulled
+# in by the `gptq-hip` feature so default builds keep working without
+# a HIP installation.
+libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
