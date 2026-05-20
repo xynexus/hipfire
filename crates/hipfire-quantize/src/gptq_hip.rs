@@ -483,6 +483,7 @@ unsafe fn load_kernel(
 // Kernel source strings — embedded at compile time.
 const KSRC_QUANTIZE_MQ4_COLUMN: &str = include_str!("../../../kernels/src/gptq_quantize_mq4_column_f64.gfx942.hip");
 const KSRC_OBS_WITHIN_BLOCK_RANK1: &str = include_str!("../../../kernels/src/gptq_obs_within_block_rank1_f64.gfx942.hip");
+const KSRC_OBS_BLOCK_APPLY_MFMA: &str = include_str!("../../../kernels/src/gptq_obs_block_apply_mfma_f64.gfx942.hip");
 
 /// Launch the Phase 2A quantize-column kernel.
 ///
@@ -650,6 +651,98 @@ pub unsafe fn gptq_obs_within_block_hip(
     );
     if code != HIP_SUCCESS {
         return Err(format!("hipModuleLaunchKernel gptq_obs_within_block_rank1_f64 returned {code}"));
+    }
+    Ok(())
+}
+
+/// Launch the Phase 2C block-apply MFMA F64 GEMM kernel.
+///
+/// Computes the cross-block rank-B propagation:
+///     W_residual[:, perm[block_end..K]] -= err_block @ U_submatrix
+/// via 16×16 FP64 MFMA tiles. See kernel doc + plan §3 Kernel 3.
+///
+/// `b_dim` is the actual block size for this block (= block_end -
+/// block_start), bounded by B=128. The last block of K may be smaller
+/// when K is not a multiple of B; in that case the kernel masks out
+/// out-of-range k_inner indices.
+///
+/// `d_u` is the K×K upper-Cholesky factor in column-major layout
+/// (post-dgeam, same as Phase 2B).
+///
+/// No-op when `block_end >= k_dim` (no remaining columns to propagate to).
+///
+/// # Safety
+/// All pointers must be valid device buffers of the documented shapes.
+pub unsafe fn gptq_obs_block_apply_mfma_hip(
+    solver: &RocSolver,
+    d_w_residual: *mut c_void,
+    d_err_block: *const c_void,
+    d_u: *const c_void,
+    d_perm: *const c_void,
+    block_start: i32,
+    block_end: i32,
+    k_dim: i32,
+    m_dim: i32,
+    b_dim: i32,
+) -> Result<(), String> {
+    {
+        let mut guard = solver.obs_modules.lock().map_err(|e| format!("module lock: {e}"))?;
+        if guard.block_apply_mfma.is_none() {
+            let h = load_kernel(
+                solver,
+                "gptq_obs_block_apply_mfma_f64",
+                KSRC_OBS_BLOCK_APPLY_MFMA,
+                "gptq_obs_block_apply_mfma_f64",
+            )?;
+            guard.block_apply_mfma = Some(h);
+        }
+    }
+
+    let n_remaining = k_dim - block_end;
+    if n_remaining <= 0 || m_dim <= 0 { return Ok(()); }
+
+    let grid_x = ((m_dim as u32) + 31) / 32;
+    let grid_y = ((n_remaining as u32) + 15) / 16;
+
+    let mut p_w     = d_w_residual;
+    let mut p_err   = d_err_block;
+    let mut p_u     = d_u;
+    let mut p_perm  = d_perm;
+    let mut p_bs    = block_start;
+    let mut p_be    = block_end;
+    let mut p_kdim  = k_dim;
+    let mut p_mdim  = m_dim;
+    let mut p_bdim  = b_dim;
+    let mut p_nrem  = n_remaining;
+
+    let mut params: [*mut c_void; 10] = [
+        &mut p_w    as *mut _ as *mut c_void,
+        &mut p_err  as *mut _ as *mut c_void,
+        &mut p_u    as *mut _ as *mut c_void,
+        &mut p_perm as *mut _ as *mut c_void,
+        &mut p_bs   as *mut _ as *mut c_void,
+        &mut p_be   as *mut _ as *mut c_void,
+        &mut p_kdim as *mut _ as *mut c_void,
+        &mut p_mdim as *mut _ as *mut c_void,
+        &mut p_bdim as *mut _ as *mut c_void,
+        &mut p_nrem as *mut _ as *mut c_void,
+    ];
+
+    let guard = solver.obs_modules.lock().map_err(|e| format!("module lock: {e}"))?;
+    let function = guard.block_apply_mfma.as_ref().unwrap().function;
+    drop(guard);
+
+    let code = (solver.fn_hip_module_launch_kernel)(
+        function,
+        grid_x, grid_y, 1,
+        128, 1, 1,
+        0,
+        std::ptr::null_mut(),
+        params.as_mut_ptr(),
+        std::ptr::null_mut(),
+    );
+    if code != HIP_SUCCESS {
+        return Err(format!("hipModuleLaunchKernel gptq_obs_block_apply_mfma_f64 returned {code}"));
     }
     Ok(())
 }
@@ -1114,6 +1207,133 @@ mod phase2_tests {
             for i in 0..(m * k) {
                 assert_eq!(gpu_w_res[i], 1.5, "noop violation at {i}: got {}", gpu_w_res[i]);
             }
+        }
+    }
+
+    /// CPU reference for the Phase 2C kernel: apply the rank-B GEMM
+    /// W[:, perm[block_end..K]] -= err_block @ U_submatrix.
+    fn cpu_block_apply_reference(
+        w_res: &mut [f64],
+        err_block: &[f64],
+        u: &Mat<f64>,
+        perm: &[usize],
+        block_start: usize,
+        block_end: usize,
+        m: usize,
+        k: usize,
+        b_dim: usize,
+    ) {
+        for row in 0..m {
+            for j in 0..(k - block_end) {
+                let mut sum = 0.0_f64;
+                for i in 0..b_dim {
+                    let kk = block_start + i;
+                    let ll = block_end + j;
+                    if kk > ll { continue; }              // upper-tri: U[kk, ll] valid only when kk <= ll
+                    sum += err_block[row * b_dim + i] * u[(kk, ll)];
+                }
+                let col_orig = perm[block_end + j];
+                w_res[row * k + col_orig] -= sum;
+            }
+        }
+    }
+
+    #[test]
+    fn phase2c_block_apply_mfma_parity() {
+        if std::env::var("HIPFIRE_SKIP_GPU_TESTS").is_ok() {
+            eprintln!("skip: HIPFIRE_SKIP_GPU_TESTS set");
+            return;
+        }
+        let solver = match RocSolver::load() {
+            Ok(s) => s,
+            Err(e) => { eprintln!("skip: RocSolver::load failed ({e})"); return; }
+        };
+
+        // Synthetic small case: M=128, K=256, B=128.
+        // block_start=0, block_end=128 → n_remaining=128 (cols [128..256]).
+        let m = 128;
+        let k = 256;
+        let b_dim = 128;
+        let block_start = 0;
+        let block_end = 128;
+
+        // Synthetic W (deterministic).
+        let mut w_res = vec![0.0_f64; m * k];
+        for r in 0..m { for c in 0..k {
+            w_res[r * k + c] = ((r as f64) * 0.011 - (c as f64) * 0.0073).sin();
+        }}
+
+        // Synthetic err_block.
+        let mut err_block = vec![0.0_f64; m * b_dim];
+        for r in 0..m { for i in 0..b_dim {
+            err_block[r * b_dim + i] = (((r + i * 3) as f64) * 0.017).cos() * 0.02;
+        }}
+
+        // Identity perm.
+        let perm: Vec<usize> = (0..k).collect();
+
+        // Synthetic upper-tri U.
+        let mut u_mat: Mat<f64> = Mat::zeros(k, k);
+        for row in 0..k { for col in row..k {
+            u_mat[(row, col)] = ((row * 5 + col * 7) as f64).sin() * 0.03 + 0.0005;
+        }}
+
+        // CPU reference.
+        let mut cpu_w_res = w_res.clone();
+        cpu_block_apply_reference(
+            &mut cpu_w_res, &err_block, &u_mat, &perm,
+            block_start, block_end, m, k, b_dim,
+        );
+
+        // GPU path.
+        let w_bytes   = m * k * std::mem::size_of::<f64>();
+        let err_bytes = m * b_dim * std::mem::size_of::<f64>();
+        let u_bytes   = k * k * std::mem::size_of::<f64>();
+        let perm_bytes = k * std::mem::size_of::<i32>();
+
+        unsafe {
+            let d_w = dev_alloc(&solver, w_bytes).expect("alloc w");
+            let d_err = dev_alloc(&solver, err_bytes).expect("alloc err");
+            let d_u = dev_alloc(&solver, u_bytes).expect("alloc u");
+            let d_perm = dev_alloc(&solver, perm_bytes).expect("alloc perm");
+
+            h2d(&solver, d_w, w_res.as_ptr() as *const u8, w_bytes).expect("h2d w");
+            h2d(&solver, d_err, err_block.as_ptr() as *const u8, err_bytes).expect("h2d err");
+            let u_col_major = pack_u_column_major(&u_mat);
+            h2d(&solver, d_u, u_col_major.as_ptr() as *const u8, u_bytes).expect("h2d u");
+            let perm_i32: Vec<i32> = perm.iter().map(|&v| v as i32).collect();
+            h2d(&solver, d_perm, perm_i32.as_ptr() as *const u8, perm_bytes).expect("h2d perm");
+
+            gptq_obs_block_apply_mfma_hip(
+                &solver,
+                d_w, d_err, d_u, d_perm,
+                block_start as i32, block_end as i32,
+                k as i32, m as i32, b_dim as i32,
+            ).expect("launch block_apply_mfma");
+            dev_sync(&solver).expect("sync");
+
+            let mut gpu_w_res = vec![0.0_f64; m * k];
+            d2h(&solver, gpu_w_res.as_mut_ptr() as *mut u8, d_w, w_bytes).expect("d2h w");
+
+            dev_free(&solver, d_w);
+            dev_free(&solver, d_err);
+            dev_free(&solver, d_u);
+            dev_free(&solver, d_perm);
+
+            let mut max_err = 0.0_f64;
+            let mut max_at = (0usize, 0usize);
+            for r in 0..m {
+                for c in 0..k {
+                    let e = (cpu_w_res[r * k + c] - gpu_w_res[r * k + c]).abs();
+                    if e > max_err { max_err = e; max_at = (r, c); }
+                }
+            }
+            // FP64 MFMA on gfx942 is bit-exact for compatible operands;
+            // tolerance 1e-10 absolute is the same gate Phase D uses.
+            assert!(
+                max_err < 1e-10,
+                "max_err {max_err} >= 1e-10 at (r={}, c={})", max_at.0, max_at.1,
+            );
         }
     }
 }
