@@ -11,6 +11,7 @@
 
 pub mod arch;
 pub mod bf16_loader;
+pub mod calibration;
 pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
