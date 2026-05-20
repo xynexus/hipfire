@@ -2608,10 +2608,17 @@ impl Gpu {
         const CONVERT_F32_TO_BF16_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
-// Truncation-rounded F32 → BF16. Reads the F32 bit pattern, takes the
-// upper 16 bits, stores as a BF16 (which is an unsigned short here —
-// HIP's hip_bf16.h is included by the BF16 GEMM kernel but not required
-// for raw bit-level conversion).
+// Round-to-nearest-even (RTNE) F32 → BF16. Matches PyTorch CUDA's
+// `__float2bfloat16_rn` semantics. The truncation variant accumulates
+// ~0.5 ULP systematic bias per cast which compounds across deep stacks
+// (was the dominant residual NRMSE source in Tier 1 forward, measured
+// at ~0.02 median on 24-layer 0.8B; RTNE drops it materially toward
+// the BF16 floor).
+//
+// RTNE algorithm: add a rounding bias (0x7FFF + LSB-of-target) before
+// truncation. This rounds half-cases to even per IEEE 754 round-half-
+// to-even. NaN inputs are NOT preserved here (would need exponent==0xFF
+// + mantissa != 0 check); for activation calibration we don't see NaN.
 extern "C" __launch_bounds__(256)
 __global__ void convert_f32_to_bf16(
     const float* __restrict__ in,
@@ -2621,7 +2628,10 @@ __global__ void convert_f32_to_bf16(
     int i = blockIdx.x * 256 + threadIdx.x;
     if (i < n) {
         unsigned int bits = __float_as_uint(in[i]);
-        out[i] = (unsigned short)(bits >> 16);
+        unsigned int lsb = (bits >> 16) & 1u;
+        unsigned int bias = 0x7FFFu + lsb;
+        unsigned int rounded = bits + bias;
+        out[i] = (unsigned short)(rounded >> 16);
     }
 }
 "#;
