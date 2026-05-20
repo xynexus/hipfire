@@ -1,0 +1,34 @@
+calibration-mix-v1 build (seed=1024)
+===========================
+target: 2,097,152 tokens (2.00M)
+output: /home/kaden/ClaudeCode/autorocm/hipfire/.claude/worktrees/agent-a16d8b7781c781e4c/benchmarks/quality-baselines/slice/calibration-mix-v1.txt
+
+[1/4] wiki bucket
+  wiki: clipped to 2,410,934 B at byte 2410934 (target 2,411,724)
+
+[?] loading hermes parquet rows
+  hermes: loaded 8000 rows total
+
+[2/4] tool-call bucket
+  tool: seeded with 6 fixtures (9,566 B)
+  tool: pulled 13 hermes rows
+  tool: added 28 synthesized round-trips (1,499,497 B total)
+  tool: final 1,499,497 B
+
+[3/4] chat bucket
+  chat: pulled 154 hermes rows (tool_call stripped) -> 2,762,153 B
+  chat: added 19 synthesized exchanges -> 2,786,471 B
+  chat: final 2,786,471 B
+
+[4/4] code bucket
+  code: pulled 35 Python files (630,079 B)
+  code: pulled 40 Rust files (461,520 B)
+  code: pulled 45 HIP kernels (277,434 B)
+  code: topped up with extra Rust to cover shortfall (421,994 B added)
+  code: total 1,791,027 B (py 630,079 / rs 883,514 / hip 277,434; 35.2/49.3/15.5%)
+  code: final 1,791,027 B
+
+chunks pre-shuffle: wiki=5331 chat=1970 code=4378 tool=356
+
+wrote /home/kaden/ClaudeCode/autorocm/hipfire/.claude/worktrees/agent-a16d8b7781c781e4c/benchmarks/quality-baselines/slice/calibration-mix-v1.txt
+  size: 8,522,861 bytes (8.13 MB)
