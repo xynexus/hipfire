@@ -2596,6 +2596,123 @@ impl Gpu {
         }
     }
 
+    /// FP32 → BF16 conversion kernel. Bulk-converts `n` elements from
+    /// an F32 source buffer into a BF16 destination buffer.
+    ///
+    /// Used by the Tier 1 BF16 forward path (`bf16_forward.rs`) to
+    /// convert GEMM outputs (FP32) back into the BF16 format that the
+    /// next layer's linear projection expects as input.
+    ///
+    /// Rounding mode is truncation (top 16 bits of the F32 bit pattern),
+    /// matching how PyTorch's `tensor.to(torch.bfloat16)` behaves with
+    /// the default rounding mode. The calibration pipeline tolerates
+    /// the ~7-bit mantissa truncation since the captured Σx² / Hessian
+    /// statistics are aggregate moments insensitive to per-element
+    /// truncation noise.
+    pub fn convert_f32_to_bf16(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const CONVERT_F32_TO_BF16_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Truncation-rounded F32 → BF16. Reads the F32 bit pattern, takes the
+// upper 16 bits, stores as a BF16 (which is an unsigned short here —
+// HIP's hip_bf16.h is included by the BF16 GEMM kernel but not required
+// for raw bit-level conversion).
+extern "C" __launch_bounds__(256)
+__global__ void convert_f32_to_bf16(
+    const float* __restrict__ in,
+    unsigned short* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) {
+        unsigned int bits = __float_as_uint(in[i]);
+        out[i] = (unsigned short)(bits >> 16);
+    }
+}
+"#;
+        self.ensure_kernel("convert_f32_to_bf16", CONVERT_F32_TO_BF16_SRC, "convert_f32_to_bf16")?;
+        let func = &self.functions["convert_f32_to_bf16"];
+        let mut in_ptr = src.buf.as_ptr();
+        let mut out_ptr = dst.buf.as_ptr();
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut in_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid = ((n + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// BF16 → FP32 conversion kernel. Bulk-converts `n` elements from
+    /// a BF16 source buffer into an F32 destination buffer.
+    ///
+    /// Used by the Tier 1 BF16 forward path (`bf16_forward.rs`) to
+    /// produce an F32 view of a BF16 hidden state for embedding
+    /// lookup, elementwise math, and final lm_head computation.
+    pub fn convert_bf16_to_f32(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const CONVERT_BF16_TO_F32_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// BF16 → F32 by shifting the 16-bit bf16 pattern into the upper 16 bits
+// of a u32 and reinterpreting as float. Lossless (BF16 ⊆ F32).
+extern "C" __launch_bounds__(256)
+__global__ void convert_bf16_to_f32(
+    const unsigned short* __restrict__ in,
+    float* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) {
+        unsigned int bits = ((unsigned int)in[i]) << 16;
+        out[i] = __uint_as_float(bits);
+    }
+}
+"#;
+        self.ensure_kernel("convert_bf16_to_f32", CONVERT_BF16_TO_F32_SRC, "convert_bf16_to_f32")?;
+        let func = &self.functions["convert_bf16_to_f32"];
+        let mut in_ptr = src.buf.as_ptr();
+        let mut out_ptr = dst.buf.as_ptr();
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut in_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid = ((n + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// HFQ2-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq2g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;

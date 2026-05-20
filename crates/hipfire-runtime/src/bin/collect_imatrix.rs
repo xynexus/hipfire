@@ -40,6 +40,7 @@
 //! crate accepts a clap workspace-dep. Matched the imatrix_collect.rs
 //! example style for now to keep the workspace dep graph clean.
 
+use hipfire_runtime::bf16_forward;
 use hipfire_runtime::bf16_loader;
 use hipfire_runtime::calibration::{tokenize_corpus, ImatrixCollector};
 use rdna_compute::Gpu;
@@ -230,24 +231,20 @@ fn run(args: &Args) -> Result<(), String> {
         let start = seq_idx * args.n_ctx;
         let end = start + args.n_ctx;
         let chunk = &tokens[start..end];
-        let _ = chunk;
-        // TODO(subagent-C): wire `forward_prefill_bf16(&mut gpu, &trunk, chunk)`
-        // here. Reference shape (per orchestrator dispatch):
-        //
-        //     bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk)
-        //         .map_err(|e| format!("bf16 prefill failed: {e}"))?;
-        //
-        // The forward pass dispatches one linear-layer GEMM at a time; each
-        // GEMM site fires `gpu.capture_handler.as_ref().map(|h| h.capture(...))`,
-        // which routes into ImatrixCollector::capture. The collector
-        // accumulates per-channel Σ x² in a K-sized F32 GPU buffer per
-        // tensor name. n_tokens is incremented per call.
-        return Err(format!(
-            "[5/7] forward pass not yet wired — subagent-C owns \
-             `bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk)`. \
-             Until then, this binary stops here at seq_idx={} (out of {}).",
-            seq_idx, actual_sequences
-        ));
+        // BF16 prefill forward — fires per-linear capture hooks. Each
+        // `gpu.gemm_bf16` site routes (input_ptr, dtype=BF16, shape) into
+        // ImatrixCollector::capture via `gpu.capture_handler`. The
+        // collector accumulates per-channel Σ x² in a K-sized F32 GPU
+        // buffer per tensor name; n_tokens advances per sequence.
+        bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk)
+            .map_err(|e| format!("bf16 prefill failed at seq_idx={seq_idx}: {e}"))?;
+        if seq_idx % 8 == 0 {
+            eprintln!(
+                "[5/7] processed sequence {}/{}",
+                seq_idx + 1,
+                actual_sequences
+            );
+        }
     }
 
     // 6. Drain collector.

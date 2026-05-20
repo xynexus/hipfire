@@ -44,6 +44,7 @@
 //!     [--n-sequences 128] [--ctx-len 2048] [--n-passes 1]
 //! ```
 
+use hipfire_runtime::bf16_forward;
 use hipfire_runtime::bf16_loader;
 use hipfire_runtime::calibration::{tokenize_corpus, HessianCollector};
 use rdna_compute::Gpu;
@@ -243,27 +244,24 @@ fn run(args: &Args) -> Result<(), String> {
             let start = seq_idx * args.ctx_len;
             let end = start + args.ctx_len;
             let chunk = &tokens[start..end];
-            let _ = chunk;
-            // TODO(subagent-C): wire `forward_prefill_bf16(&mut gpu, &trunk, chunk)`
-            // here. Reference shape (per orchestrator dispatch):
-            //
-            //     bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk)
-            //         .map_err(|e| format!("bf16 prefill failed: {e}"))?;
-            //
-            // The forward pass dispatches one linear-layer GEMM at a time;
-            // each GEMM site fires `gpu.capture_handler.as_ref().map(|h|
-            // h.capture(...))`, which routes into HessianCollector::capture.
+            // BF16 prefill forward — fires per-linear capture hooks. Each
+            // `gpu.gemm_bf16` site routes (input_ptr, dtype=BF16, shape)
+            // into HessianCollector::capture via `gpu.capture_handler`.
             // The collector accumulates `Σ x · xᵀ` in a K×K F32 GPU
-            // buffer per tensor name.
-            return Err(format!(
-                "[5/7] forward pass not yet wired — subagent-C owns \
-                 `bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk)`. \
-                 Until then, this binary stops here at pass={}/{}, seq_idx={}/{}.",
-                pass + 1,
-                args.n_passes,
-                seq_idx + 1,
-                actual_sequences
-            ));
+            // buffer per tensor name (only for `is_gptq_target` tensors).
+            bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk)
+                .map_err(|e| format!(
+                    "bf16 prefill failed at pass={pass} seq_idx={seq_idx}: {e}"
+                ))?;
+            if seq_idx % 8 == 0 {
+                eprintln!(
+                    "[5/7] pass {}/{}, sequence {}/{}",
+                    pass + 1,
+                    args.n_passes,
+                    seq_idx + 1,
+                    actual_sequences
+                );
+            }
         }
     }
 
