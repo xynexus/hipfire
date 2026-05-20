@@ -346,8 +346,12 @@ pub fn forward_prefill_bf16(
         // ffn_out_bf16 = bf16(ffn_out)
         // h += ffn_out_bf16
         let h_view = view_2d(&h, seq_len, dim);
-        let ffn_out_bf16 = forward_mlp_layer(gpu, trunk, &h_view, &p, seq_len, dim)
-            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        let ffn_out_bf16 = if layer_is_moe(trunk, &p) {
+            forward_moe_layer_bf16(gpu, trunk, &h_view, &p, seq_len, dim)
+        } else {
+            forward_mlp_layer(gpu, trunk, &h_view, &p, seq_len, dim)
+        }
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
         bf16_add_inplace(gpu, &h, &ffn_out_bf16, seq_len * dim)?;
         gpu.free_tensor(ffn_out_bf16)?;
     }
@@ -2108,6 +2112,375 @@ fn forward_mlp_layer(
     gpu.free_tensor(ffn_out_f32).map_err(|e| e.to_string())?;
 
     Ok(ffn_out_bf16)
+}
+
+/// Detect whether a layer at prefix `p` uses MoE routing.
+///
+/// Probes for `{p}.mlp.gate.weight` — the per-layer router GEMM
+/// present on Qwen3-MoE and Qwen3.6-A3B but absent on dense Qwen3.5.
+/// Dense layers expose `{p}.mlp.gate_proj.weight` (note the `_proj`
+/// suffix); the router weight is a distinct tensor without it.
+fn layer_is_moe(trunk: &TrunkBF16, p: &str) -> bool {
+    trunk.tensors.contains_key(&format!("{p}.mlp.gate.weight"))
+}
+
+/// Host-side top-K + softmax + (optional) renorm over `router_logits`.
+///
+/// Mirrors `gpu.moe_softmax_topk_renorm_k8` on the host so we can drive
+/// per-expert dispatch from CPU without writing a GPU scatter kernel.
+/// Per token: softmax over experts, pick K largest, optionally renorm
+/// so the K selected sum to 1.0. Qwen3-MoE family defaults to
+/// `norm_topk_prob = true`.
+fn host_topk_softmax_renorm(
+    router_logits: &[f32],
+    seq_len: usize,
+    num_experts: usize,
+    k_top: usize,
+    norm_topk_prob: bool,
+) -> (Vec<u32>, Vec<f32>) {
+    let mut indices = vec![0u32; seq_len * k_top];
+    let mut weights = vec![0f32; seq_len * k_top];
+    for t in 0..seq_len {
+        let row = &router_logits[t * num_experts..(t + 1) * num_experts];
+        let max_l = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f32> = row.iter().map(|&x| (x - max_l).exp()).collect();
+        let sum_p: f32 = probs.iter().sum();
+        if sum_p > 0.0 {
+            for p in probs.iter_mut() {
+                *p /= sum_p;
+            }
+        }
+        let mut ranked: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+        ranked.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let topk_sum: f32 = ranked[..k_top].iter().map(|&(_, w)| w).sum();
+        for k in 0..k_top {
+            let (idx, w) = ranked[k];
+            indices[t * k_top + k] = idx as u32;
+            weights[t * k_top + k] = if norm_topk_prob && topk_sum > 0.0 {
+                w / topk_sum
+            } else {
+                w
+            };
+        }
+    }
+    (indices, weights)
+}
+
+/// Forward through a single MoE FFN layer for Tier 1 BF16 calibration.
+///
+/// Mirrors the Qwen3-MoE / Qwen3.6-A3B forward (see qwen35.rs
+/// `MoeFfnWeights` for tensor layout). For each token t and its
+/// top-K=8 selected experts:
+///   ffn(t) = sum_k topk_weights[t, k] * expert_k(h_norm[t])
+/// where `expert_k(x) = down(silu(gate(x)) * up(x))`. The shared
+/// expert (always-on, A3B & Qwen3-MoE-base) adds its output unweighted
+/// to ffn(t). `shared_expert_gate` (scalar-per-token modulator) is
+/// approximated as 1.0 in v1.
+///
+/// Capture-name convention (matches Phase 3b's `parse_expert_idx`):
+///   {p}.mlp.gate.weight                            — router GEMM
+///   {p}.mlp.experts.<E>.gate_proj.weight           — expert E gate
+///   {p}.mlp.experts.<E>.up_proj.weight             — expert E up
+///   {p}.mlp.experts.<E>.down_proj.weight           — expert E down
+///   {p}.mlp.shared_expert.gate_proj.weight         — shared gate
+///   {p}.mlp.shared_expert.up_proj.weight           — shared up
+///   {p}.mlp.shared_expert.down_proj.weight         — shared down
+///
+/// Routing is computed CPU-side from F32-downloaded router logits;
+/// per-expert gather/scatter goes through host buffers (download
+/// h_norm once, build h_e per expert, upload as F32, cast to BF16 on
+/// device; scatter via CPU accumulation in `combined_cpu`). This is
+/// O(num_experts) D2H+H2D bouncing per layer — not the production
+/// inference path's structure, but correct and adequate for Tier 1's
+/// one-time-per-model calibration budget. A future optimization is a
+/// pair of GPU gather + weighted-scatter kernels.
+fn forward_moe_layer_bf16(
+    gpu: &mut Gpu,
+    trunk: &TrunkBF16,
+    h: &GpuTensor,
+    p: &str,
+    seq_len: usize,
+    dim: usize,
+) -> Result<GpuTensor, String> {
+    const K_TOP: usize = 8;
+
+    let w_router = get(trunk, &format!("{p}.mlp.gate.weight"))?;
+    let num_experts = w_router.shape[0];
+    if w_router.shape[1] != dim {
+        return Err(format!(
+            "{p}.mlp.gate K={} doesn't match trunk dim={dim}",
+            w_router.shape[1]
+        ));
+    }
+
+    // Pre-norm via post_attention_layernorm (cast-trick rmsnorm).
+    let norm_name = format!("{p}.post_attention_layernorm.weight");
+    let h_norm_scratch = apply_pre_norm_or_fallback(gpu, trunk, h, &norm_name, seq_len, dim)?;
+
+    // Router GEMM (capture fires under `{p}.mlp.gate.weight`).
+    let router_logits_f32 = gpu
+        .alloc_tensor(&[seq_len * num_experts], DType::F32)
+        .map_err(|e| e.to_string())?;
+    gpu.set_capture_name(Some(format!("{p}.mlp.gate.weight")));
+    gpu.gemm_bf16(
+        h_norm_scratch.as_ref(),
+        &w_router.tensor,
+        &mut to_2d(router_logits_f32.clone_view(), seq_len, num_experts),
+        num_experts,
+        dim,
+        seq_len,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Pull router logits to host, do top-K + softmax + renorm.
+    let router_logits_cpu = gpu
+        .download_f32(&router_logits_f32)
+        .map_err(|e| e.to_string())?;
+    gpu.free_tensor(router_logits_f32)
+        .map_err(|e| e.to_string())?;
+
+    let (topk_indices, topk_weights) =
+        host_topk_softmax_renorm(&router_logits_cpu, seq_len, num_experts, K_TOP, true);
+
+    // Cast-trick: convert h_norm BF16 -> F32, download for per-expert gather.
+    let h_norm_f32 = gpu
+        .alloc_tensor(&[seq_len * dim], DType::F32)
+        .map_err(|e| e.to_string())?;
+    gpu.convert_bf16_to_f32(h_norm_scratch.as_ref(), &h_norm_f32, seq_len * dim)
+        .map_err(|e| e.to_string())?;
+    let h_norm_cpu = gpu.download_f32(&h_norm_f32).map_err(|e| e.to_string())?;
+    gpu.free_tensor(h_norm_f32).map_err(|e| e.to_string())?;
+
+    // Build per-expert token list: expert_to_tokens[e] = Vec<(token_idx, weight)>.
+    let mut expert_to_tokens: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_experts];
+    for t in 0..seq_len {
+        for k in 0..K_TOP {
+            let e = topk_indices[t * K_TOP + k] as usize;
+            let w = topk_weights[t * K_TOP + k];
+            expert_to_tokens[e].push((t, w));
+        }
+    }
+
+    // CPU accumulator for the combined FFN output.
+    let mut combined_cpu = vec![0f32; seq_len * dim];
+
+    // Per-routed-expert dispatch: gather, 3 GEMMs with captures, weighted
+    // scatter-add into combined_cpu.
+    for e in 0..num_experts {
+        let tokens_for_e = &expert_to_tokens[e];
+        if tokens_for_e.is_empty() {
+            continue;
+        }
+        let n_e = tokens_for_e.len();
+
+        let w_gate = get(trunk, &format!("{p}.mlp.experts.{e}.gate_proj.weight"))?;
+        let w_up = get(trunk, &format!("{p}.mlp.experts.{e}.up_proj.weight"))?;
+        let w_down = get(trunk, &format!("{p}.mlp.experts.{e}.down_proj.weight"))?;
+        let moe_intermediate = w_gate.shape[0];
+        if w_up.shape[0] != moe_intermediate {
+            return Err(format!(
+                "{p}.mlp.experts.{e}: gate M={moe_intermediate} but up M={}",
+                w_up.shape[0]
+            ));
+        }
+        if w_down.shape[1] != moe_intermediate {
+            return Err(format!(
+                "{p}.mlp.experts.{e}.down_proj K={} doesn't match moe_intermediate={moe_intermediate}",
+                w_down.shape[1]
+            ));
+        }
+
+        // Build h_e on CPU: [n_e, dim] F32 indexed from h_norm_cpu.
+        let mut h_e_f32: Vec<f32> = Vec::with_capacity(n_e * dim);
+        for &(t, _w) in tokens_for_e {
+            h_e_f32.extend_from_slice(&h_norm_cpu[t * dim..(t + 1) * dim]);
+        }
+
+        // Upload + cast to BF16 on device.
+        let h_e_f32_gpu = gpu
+            .upload_f32(&h_e_f32, &[n_e * dim])
+            .map_err(|e| e.to_string())?;
+        let h_e_bf16 = gpu
+            .alloc_tensor(&[n_e, dim], DType::BF16)
+            .map_err(|e| e.to_string())?;
+        gpu.convert_f32_to_bf16(&h_e_f32_gpu, &h_e_bf16, n_e * dim)
+            .map_err(|e| e.to_string())?;
+        gpu.free_tensor(h_e_f32_gpu).map_err(|e| e.to_string())?;
+
+        // GEMM gate: h_e_bf16 @ w_gate.T -> F32 [n_e, moe_intermediate]
+        let gate_e_f32 = gpu
+            .alloc_tensor(&[n_e * moe_intermediate], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.set_capture_name(Some(format!("{p}.mlp.experts.{e}.gate_proj.weight")));
+        gpu.gemm_bf16(
+            &h_e_bf16,
+            &w_gate.tensor,
+            &mut to_2d(gate_e_f32.clone_view(), n_e, moe_intermediate),
+            moe_intermediate,
+            dim,
+            n_e,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // GEMM up: h_e_bf16 @ w_up.T -> F32 [n_e, moe_intermediate]
+        let up_e_f32 = gpu
+            .alloc_tensor(&[n_e * moe_intermediate], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.set_capture_name(Some(format!("{p}.mlp.experts.{e}.up_proj.weight")));
+        gpu.gemm_bf16(
+            &h_e_bf16,
+            &w_up.tensor,
+            &mut to_2d(up_e_f32.clone_view(), n_e, moe_intermediate),
+            moe_intermediate,
+            dim,
+            n_e,
+        )
+        .map_err(|e| e.to_string())?;
+        gpu.free_tensor(h_e_bf16).map_err(|e| e.to_string())?;
+
+        // ffn_inner_f32 = silu(gate_e) * up_e
+        let ffn_inner_f32 = gpu
+            .alloc_tensor(&[n_e * moe_intermediate], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.silu_mul_f32(&gate_e_f32, &up_e_f32, &ffn_inner_f32)
+            .map_err(|e| e.to_string())?;
+        gpu.free_tensor(gate_e_f32).map_err(|e| e.to_string())?;
+        gpu.free_tensor(up_e_f32).map_err(|e| e.to_string())?;
+
+        // Cast ffn_inner to BF16 for down GEMM.
+        let ffn_inner_bf16 = gpu
+            .alloc_tensor(&[n_e * moe_intermediate], DType::BF16)
+            .map_err(|e| e.to_string())?;
+        gpu.convert_f32_to_bf16(&ffn_inner_f32, &ffn_inner_bf16, n_e * moe_intermediate)
+            .map_err(|e| e.to_string())?;
+        gpu.free_tensor(ffn_inner_f32).map_err(|e| e.to_string())?;
+
+        // GEMM down: ffn_inner_bf16 @ w_down.T -> F32 [n_e, dim]
+        let ffn_out_e_f32 = gpu
+            .alloc_tensor(&[n_e * dim], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.set_capture_name(Some(format!("{p}.mlp.experts.{e}.down_proj.weight")));
+        let ffn_inner_view = view_2d(&ffn_inner_bf16, n_e, moe_intermediate);
+        gpu.gemm_bf16(
+            &ffn_inner_view,
+            &w_down.tensor,
+            &mut to_2d(ffn_out_e_f32.clone_view(), n_e, dim),
+            dim,
+            moe_intermediate,
+            n_e,
+        )
+        .map_err(|e| e.to_string())?;
+        gpu.free_tensor(ffn_inner_bf16).map_err(|e| e.to_string())?;
+
+        // Download ffn_out_e and weighted-scatter into combined_cpu.
+        let ffn_out_e_cpu = gpu.download_f32(&ffn_out_e_f32).map_err(|e| e.to_string())?;
+        gpu.free_tensor(ffn_out_e_f32).map_err(|e| e.to_string())?;
+        for (i, &(t, w_t)) in tokens_for_e.iter().enumerate() {
+            let dst = &mut combined_cpu[t * dim..(t + 1) * dim];
+            let src = &ffn_out_e_cpu[i * dim..(i + 1) * dim];
+            for d in 0..dim {
+                dst[d] += w_t * src[d];
+            }
+        }
+    }
+
+    // Shared expert: always-on (A3B + Qwen3-MoE-base). Adds output to
+    // combined_cpu unweighted; `shared_expert_gate` modulator approximated
+    // as 1.0 in v1 (scalar-per-token; affects downstream layer feedthrough
+    // but not the captured X^T X for the shared expert's three linears).
+    let sh_gate_name = format!("{p}.mlp.shared_expert.gate_proj.weight");
+    if trunk.tensors.contains_key(&sh_gate_name) {
+        let w_gate_sh = get(trunk, &sh_gate_name)?;
+        let w_up_sh = get(trunk, &format!("{p}.mlp.shared_expert.up_proj.weight"))?;
+        let w_down_sh = get(trunk, &format!("{p}.mlp.shared_expert.down_proj.weight"))?;
+        let sh_intermediate = w_gate_sh.shape[0];
+
+        let gate_sh_f32 = gpu
+            .alloc_tensor(&[seq_len * sh_intermediate], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.set_capture_name(Some(format!("{p}.mlp.shared_expert.gate_proj.weight")));
+        gpu.gemm_bf16(
+            h_norm_scratch.as_ref(),
+            &w_gate_sh.tensor,
+            &mut to_2d(gate_sh_f32.clone_view(), seq_len, sh_intermediate),
+            sh_intermediate,
+            dim,
+            seq_len,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let up_sh_f32 = gpu
+            .alloc_tensor(&[seq_len * sh_intermediate], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.set_capture_name(Some(format!("{p}.mlp.shared_expert.up_proj.weight")));
+        gpu.gemm_bf16(
+            h_norm_scratch.as_ref(),
+            &w_up_sh.tensor,
+            &mut to_2d(up_sh_f32.clone_view(), seq_len, sh_intermediate),
+            sh_intermediate,
+            dim,
+            seq_len,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let ffn_inner_sh_f32 = gpu
+            .alloc_tensor(&[seq_len * sh_intermediate], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.silu_mul_f32(&gate_sh_f32, &up_sh_f32, &ffn_inner_sh_f32)
+            .map_err(|e| e.to_string())?;
+        gpu.free_tensor(gate_sh_f32).map_err(|e| e.to_string())?;
+        gpu.free_tensor(up_sh_f32).map_err(|e| e.to_string())?;
+
+        let ffn_inner_sh_bf16 = gpu
+            .alloc_tensor(&[seq_len * sh_intermediate], DType::BF16)
+            .map_err(|e| e.to_string())?;
+        gpu.convert_f32_to_bf16(&ffn_inner_sh_f32, &ffn_inner_sh_bf16, seq_len * sh_intermediate)
+            .map_err(|e| e.to_string())?;
+        gpu.free_tensor(ffn_inner_sh_f32).map_err(|e| e.to_string())?;
+
+        let ffn_out_sh_f32 = gpu
+            .alloc_tensor(&[seq_len * dim], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.set_capture_name(Some(format!("{p}.mlp.shared_expert.down_proj.weight")));
+        let ffn_inner_sh_view = view_2d(&ffn_inner_sh_bf16, seq_len, sh_intermediate);
+        gpu.gemm_bf16(
+            &ffn_inner_sh_view,
+            &w_down_sh.tensor,
+            &mut to_2d(ffn_out_sh_f32.clone_view(), seq_len, dim),
+            dim,
+            sh_intermediate,
+            seq_len,
+        )
+        .map_err(|e| e.to_string())?;
+        gpu.free_tensor(ffn_inner_sh_bf16).map_err(|e| e.to_string())?;
+
+        let ffn_out_sh_cpu = gpu
+            .download_f32(&ffn_out_sh_f32)
+            .map_err(|e| e.to_string())?;
+        gpu.free_tensor(ffn_out_sh_f32).map_err(|e| e.to_string())?;
+        for i in 0..(seq_len * dim) {
+            combined_cpu[i] += ffn_out_sh_cpu[i];
+        }
+    }
+
+    h_norm_scratch
+        .drop_owned(gpu)
+        .map_err(|e| e.to_string())?;
+
+    // Upload combined back, cast to BF16, return.
+    let combined_f32 = gpu
+        .upload_f32(&combined_cpu, &[seq_len * dim])
+        .map_err(|e| e.to_string())?;
+    let combined_bf16 = gpu
+        .alloc_tensor(&[seq_len * dim], DType::BF16)
+        .map_err(|e| e.to_string())?;
+    gpu.convert_f32_to_bf16(&combined_f32, &combined_bf16, seq_len * dim)
+        .map_err(|e| e.to_string())?;
+    gpu.free_tensor(combined_f32).map_err(|e| e.to_string())?;
+
+    Ok(combined_bf16)
 }
 
 /// Helper to build a 2-D shaped view tensor from a 1-D allocation
