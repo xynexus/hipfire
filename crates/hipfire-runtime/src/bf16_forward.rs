@@ -30,30 +30,37 @@
 //!    warning) so older fixtures without norm tensors still produce
 //!    a forward pass.
 //!
-//! 2. **Attention math:**
+//! 2. **Attention math (B.2 + B.3, 2026-05-20):**
 //!    - DeltaNet: real gated delta-net recurrence via the existing
-//!      `gpu.gated_delta_net_f32` kernel through a cast-trick (B.2,
-//!      2026-05-20). The QKV projection's F32 output is split into
-//!      Q / K / V slices; the in_proj_a / in_proj_b projections feed a
-//!      simplified `fused_sigmoid_alpha_gate_f32_batched` (dummy
-//!      zero `A_log` / `dt_bias` since those F32 tensors aren't
-//!      loaded by `bf16_loader` and the spec forbids loader
-//!      extensions); QK gets L2-norm + Q scale; per-sequence recurrent
-//!      state initializes to zeros; the kernel writes `attn_out` in
-//!      F32 which is cast back to BF16 for `out_proj`. The conv1d
-//!      preamble, gated_norm + silu(z) post-multiply, and the proper
-//!      `A_log` / `dt_bias` are all calibration approximations — the
-//!      cast-trick produces an `out_proj` input distribution that is
-//!      structurally `state·Q` (the real DeltaNet output shape),
-//!      sufficient for the Σx² accumulator to see realistic scale and
-//!      moment-1 statistics. Calibration cost: post-recurrence norm /
+//!      `gpu.gated_delta_net_f32` kernel through a cast-trick (B.2).
+//!      The QKV projection's F32 output is split into Q / K / V slices;
+//!      the in_proj_a / in_proj_b projections feed a simplified
+//!      `fused_sigmoid_alpha_gate_f32_batched` (dummy zero `A_log` /
+//!      `dt_bias` since those F32 tensors aren't loaded by `bf16_loader`
+//!      and the spec forbids loader extensions); QK gets L2-norm + Q
+//!      scale; per-sequence recurrent state initializes to zeros; the
+//!      kernel writes `attn_out` in F32 which is cast back to BF16 for
+//!      `out_proj`. The conv1d preamble, gated_norm + silu(z) post-
+//!      multiply, and the proper `A_log` / `dt_bias` are all calibration
+//!      approximations — the cast-trick produces an `out_proj` input
+//!      distribution that is structurally `state·Q` (the real DeltaNet
+//!      output shape), sufficient for the Σx² accumulator to see
+//!      realistic scale + moment-1 statistics. Post-recurrence norm /
 //!      gate aren't applied, so `out_proj` activations may be slightly
 //!      mis-scaled (~constant factor across the channel dim).
-//!    - FullAttention: `attn_pre_o = v` (taking the V projection
-//!      directly). Skips q_norm / k_norm / RoPE / softmax / V·softmax.
-//!      Calibration cost: `o_proj` is calibrated on the V distribution
-//!      rather than `softmax(QK^T)·V`. Same correlation argument as
-//!      above.
+//!    - FullAttention: real `softmax(QK^T) · V` via the cast-trick (B.3).
+//!      Q / K / V are produced by `gemm_bf16` in F32; per-head q_norm
+//!      and k_norm are applied via `rmsnorm_batched` (BF16 weights are
+//!      F32-staged through the existing kernel); RoPE is applied
+//!      per-token using `rope_partial_interleaved_f32` (Qwen3.5
+//!      partial 25% × head_dim, rope_theta from config or default 10M);
+//!      causal flash attention runs per-token by calling
+//!      `attention_flash(q[t], k[0..=t], v[0..=t], seq_len = t + 1)`,
+//!      which gives correct causal masking without a dedicated mask
+//!      kernel. `o_proj`'s input is therefore the true attention output
+//!      rather than the V passthrough. The per-token loop is
+//!      O(seq_len^2) work; for typical calibration sequences
+//!      (n_ctx ≤ 2048) this is the cost of correctness.
 //!
 //! 3. **SiLU(gate) * up is computed in F32 then converted back to BF16.**
 //!    Standard SiLU math. No correctness shortcut; F32 → BF16 conversion
@@ -82,6 +89,8 @@
 
 use crate::bf16_loader::{Bf16Tensor, TrunkBF16};
 use hip_bridge::HipResult;
+#[cfg(feature = "deltanet")]
+use hip_bridge::DeviceBuffer;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// GemmaRMSNorm epsilon. Matches `crates/hipfire-arch-qwen35/src/qwen35.rs`
@@ -335,9 +344,13 @@ fn view_2d(t: &GpuTensor, batch: usize, k: usize) -> GpuTensor {
 
 /// Build a `[n]`-shaped 1-D view tensor over a sub-range of an existing
 /// buffer, starting at byte offset `byte_off`. Caller responsible for
-/// ensuring the range stays within the source buffer. Reserved for a
-/// future v2 of the forward path that wires per-head attention splits.
-#[allow(dead_code)]
+/// ensuring the range stays within the source buffer. Used by the
+/// per-token attention loop in `forward_full_attn_layer` to slice
+/// q/k/v rows out of the bulk seq_len-major tensors.
+///
+/// Gated on the `deltanet` feature because that path is the only
+/// caller (the non-deltanet passthrough doesn't slice per-token).
+#[cfg(feature = "deltanet")]
 fn view_subrange(t: &GpuTensor, byte_off: usize, n_elems: usize, dtype: DType) -> GpuTensor {
     let elem_size = dtype.size();
     let bytes = n_elems * elem_size;
@@ -1017,10 +1030,313 @@ fn forward_deltanet_layer(
     Ok(attn_out_bf16)
 }
 
+/// RoPE configuration for a trunk: `rope_theta` (base frequency) and
+/// `partial_rotary_factor` (fraction of head_dim that's rotated; Qwen3.5
+/// uses 0.25). Read from `<model_dir>/config.json` with the
+/// HuggingFace-equivalent defaults baked in. Mirrors the parsing in
+/// `crates/hipfire-arch-qwen35/src/qwen35.rs:172-176` so this calibration
+/// forward produces the same QK distribution as the production engine.
+///
+/// Only used by the `deltanet`-feature attention path; gated to avoid
+/// dead-code warnings in `--no-default-features` builds.
+#[cfg(feature = "deltanet")]
+struct RopeConfig {
+    rope_theta: f32,
+    partial_rotary_factor: f32,
+}
+
+#[cfg(feature = "deltanet")]
+impl RopeConfig {
+    /// Defaults match Qwen3.5: rope_theta=10M, partial 25%. These also
+    /// happen to be reasonable fallbacks for Qwen3.6 (same rope_theta;
+    /// 0.25 is overruled where the config exists, but produces a sane
+    /// calibration distribution otherwise).
+    fn default_qwen35() -> Self {
+        Self { rope_theta: 10_000_000.0, partial_rotary_factor: 0.25 }
+    }
+
+    /// Load from `<model_dir>/config.json`. Falls back to
+    /// `default_qwen35()` on any missing key / parse error. Mirrors the
+    /// `rope_scaling` / `rope_params` lookup at qwen35.rs:170-179.
+    fn from_model_dir(model_dir: &std::path::Path) -> Self {
+        let cfg = model_dir.join("config.json");
+        let Ok(bytes) = std::fs::read(&cfg) else {
+            return Self::default_qwen35();
+        };
+        let Ok(v): Result<serde_json::Value, _> = serde_json::from_slice(&bytes) else {
+            return Self::default_qwen35();
+        };
+        let tc = v
+            .get("text_config")
+            .and_then(|t| t.as_object())
+            .map(|m| serde_json::Value::Object(m.clone()))
+            .unwrap_or(v.clone());
+        let rope_params = tc.get("rope_scaling").and_then(|s| s.as_object());
+        let rope_theta = tc
+            .get("rope_theta")
+            .and_then(|x| x.as_f64())
+            .or_else(|| rope_params.and_then(|m| m.get("rope_theta")).and_then(|x| x.as_f64()))
+            .unwrap_or(10_000_000.0) as f32;
+        let partial_rotary_factor = tc
+            .get("partial_rotary_factor")
+            .and_then(|x| x.as_f64())
+            .or_else(|| {
+                rope_params
+                    .and_then(|m| m.get("partial_rotary_factor"))
+                    .and_then(|x| x.as_f64())
+            })
+            .unwrap_or(0.25) as f32;
+        Self { rope_theta, partial_rotary_factor }
+    }
+}
+
+/// Allocate a small DeviceBuffer (4 bytes) to hold a single i32 position
+/// for `rope_partial_interleaved_f32` calls. Returned buffer is owned by
+/// the caller; free with `gpu.hip.free(buf)`.
+///
+/// Only used by the `deltanet`-feature attention path; gated to avoid
+/// dead-code warnings in `--no-default-features` builds.
+#[cfg(feature = "deltanet")]
+fn alloc_pos_buf(gpu: &Gpu) -> HipResult<DeviceBuffer> {
+    gpu.hip.malloc(std::mem::size_of::<i32>())
+}
+
+/// Apply per-head rmsnorm to a [seq_len, n_heads, head_dim] tensor
+/// in-place via the `rmsnorm_batched` kernel. Each head's [head_dim]
+/// vector is normalized independently against `weight: [head_dim]`.
+/// Mirrors the q_norm / k_norm step in `hipfire-arch-qwen35::qwen35`.
+///
+/// If `weight` is `None` (norm tensor absent from trunk), this is a
+/// no-op — the function returns `Ok(())` and leaves the tensor as-is.
+/// Production Qwen3.5 / 3.6 always ships q_norm and k_norm; this
+/// fallback exists for unit-test fixtures and stripped trunks.
+///
+/// Only used by the `deltanet`-feature attention path; gated to avoid
+/// dead-code warnings in `--no-default-features` builds.
+#[cfg(feature = "deltanet")]
+fn per_head_rmsnorm_f32_inplace(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    weight: Option<&GpuTensor>,
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> HipResult<()> {
+    let Some(w) = weight else {
+        return Ok(());
+    };
+    // rmsnorm_batched supports `out == x` for in-place. Both tensors
+    // share the same buffer view; the kernel reads each row, computes
+    // the rms, writes the result. Safe because the per-row write
+    // happens after the row's reads complete (single-threaded
+    // semantics within a row).
+    //
+    // We allocate a scratch out tensor anyway to avoid relying on
+    // undocumented aliasing behavior — keep the kernel-contract clean.
+    let n_elems = seq_len * n_heads * head_dim;
+    let scratch = gpu.alloc_tensor(&[n_elems], DType::F32)?;
+    gpu.rmsnorm_batched(x, w, &scratch, seq_len * n_heads, head_dim, eps)?;
+    // Copy scratch back into x.
+    gpu.hip
+        .memcpy_dtod_at(&x.buf, 0, &scratch.buf, 0, n_elems * 4)?;
+    gpu.free_tensor(scratch)
+}
+
+/// Compute the real `attn_pre_o` for FullAttn calibration (cast-trick).
+///
+/// Inputs are the F32 Q / K / V projections (the outputs of `q_proj`,
+/// `k_proj`, `v_proj` GEMMs); the function applies per-head q_norm /
+/// k_norm, partial-RoPE per token, and causal attention via the
+/// existing `attention_flash` kernel. Returns a fresh BF16 tensor of
+/// shape `[seq_len, n_heads * head_dim]` ready to feed `o_proj`.
+///
+/// The Q / K / V tensors are freed by this helper before it returns
+/// so the caller doesn't have to (matches the original function's
+/// allocation lifetime).
+///
+/// `#[cfg(feature = "deltanet")]` because `rope_partial_interleaved_f32`
+/// lives behind the same feature gate in `rdna-compute`. The fallback
+/// at `compute_full_attn_pre_o_passthrough` keeps the lib compiling
+/// in `--no-default-features` builds.
+#[cfg(feature = "deltanet")]
+fn compute_full_attn_pre_o(
+    gpu: &mut Gpu,
+    trunk: &TrunkBF16,
+    q_f32: &GpuTensor,
+    k_f32: &GpuTensor,
+    v_f32: &GpuTensor,
+    q_norm_w: Option<&GpuTensor>,
+    k_norm_w: Option<&GpuTensor>,
+    seq_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    k_dim: usize,
+    v_dim: usize,
+    p: &str,
+) -> Result<GpuTensor, String> {
+    let q_dim = n_heads * head_dim;
+    let attn_pre_o_dim = n_heads * head_dim;
+
+    // q_norm / k_norm: per-head RMSNorm. No-op when weight absent.
+    per_head_rmsnorm_f32_inplace(gpu, q_f32, q_norm_w, seq_len, n_heads, head_dim, RMS_NORM_EPS)
+        .map_err(|e| e.to_string())?;
+    per_head_rmsnorm_f32_inplace(gpu, k_f32, k_norm_w, seq_len, n_kv_heads, head_dim, RMS_NORM_EPS)
+        .map_err(|e| e.to_string())?;
+
+    // RoPE config: pull rope_theta + partial_rotary_factor from
+    // <model_dir>/config.json, fall back to Qwen3.5 defaults.
+    let rope_cfg = RopeConfig::from_model_dir(&trunk.model_dir);
+    let n_rot_raw = (head_dim as f32 * rope_cfg.partial_rotary_factor).round() as usize;
+    // RoPE pairs (i, i + n_rot/2); n_rot must be even. Force it to be.
+    let n_rot = (n_rot_raw / 2) * 2;
+    if n_rot == 0 {
+        return Err(format!(
+            "{p}.self_attn: partial_rotary_factor={} × head_dim={head_dim} = 0 \
+             rotated dims (need at least 2)",
+            rope_cfg.partial_rotary_factor
+        ));
+    }
+
+    let pos_buf = alloc_pos_buf(gpu).map_err(|e| e.to_string())?;
+
+    // Partials scratch for attention_flash. The kernel uses chunks of
+    // 128 (or seq_len if smaller). Size for the worst case at
+    // t = seq_len - 1: ceil(seq_len / 128) chunks.
+    let max_chunks = ((seq_len + 127) / 128).max(1);
+    let partials = gpu
+        .alloc_tensor(&[n_heads * max_chunks * (2 + head_dim)], DType::F32)
+        .map_err(|e| e.to_string())?;
+
+    // Attention output (F32, [seq_len, n_heads * head_dim]).
+    let attn_pre_o_f32 = gpu
+        .alloc_tensor(&[seq_len * attn_pre_o_dim], DType::F32)
+        .map_err(|e| e.to_string())?;
+
+    for t in 0..seq_len {
+        // Per-token sub-views (non-owning; do NOT free).
+        let q_t = view_subrange(q_f32, t * q_dim * 4, q_dim, DType::F32);
+        let k_t = view_subrange(k_f32, t * k_dim * 4, k_dim, DType::F32);
+
+        // pos = t into pos_buf, then RoPE-rotate q_t and k_t in-place.
+        let pos_bytes = (t as i32).to_ne_bytes();
+        gpu.hip
+            .memcpy_htod(&pos_buf, &pos_bytes)
+            .map_err(|e| e.to_string())?;
+        gpu.rope_partial_interleaved_f32(
+            &q_t, &k_t, &pos_buf,
+            n_heads, n_kv_heads, head_dim, n_rot, rope_cfg.rope_theta,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Causal attention: pass seq_len = t + 1 so the kernel sees
+        // only positions 0..=t. K/V caches are token-major
+        // ([seq_len, n_kv_heads, head_dim]) — the same layout the
+        // kernel expects.
+        let k_prefix = view_subrange(k_f32, 0, (t + 1) * k_dim, DType::F32);
+        let v_prefix = view_subrange(v_f32, 0, (t + 1) * v_dim, DType::F32);
+        let out_t = view_subrange(
+            &attn_pre_o_f32,
+            t * attn_pre_o_dim * 4,
+            attn_pre_o_dim,
+            DType::F32,
+        );
+        gpu.attention_flash(
+            &q_t, &k_prefix, &v_prefix, &out_t, &partials,
+            t + 1, n_heads, n_kv_heads, head_dim, seq_len,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    // Free intermediates: partials + pos_buf + Q/K/V.
+    gpu.free_tensor(partials).map_err(|e| e.to_string())?;
+    gpu.hip.free(pos_buf).map_err(|e| e.to_string())?;
+
+    // Cast attn_pre_o_f32 → BF16. Caller takes ownership of the result.
+    let attn_pre_o_bf16 = gpu
+        .alloc_tensor(&[seq_len * attn_pre_o_dim], DType::BF16)
+        .map_err(|e| e.to_string())?;
+    gpu.convert_f32_to_bf16(&attn_pre_o_f32, &attn_pre_o_bf16, seq_len * attn_pre_o_dim)
+        .map_err(|e| e.to_string())?;
+    gpu.free_tensor(attn_pre_o_f32).map_err(|e| e.to_string())?;
+    Ok(attn_pre_o_bf16)
+}
+
+/// Non-deltanet fallback: passthrough V to o_proj input.
+///
+/// Used when the `deltanet` feature is off — `rope_partial_interleaved_f32`
+/// is not compiled into `rdna-compute` then, so the real attention math
+/// is not available. This matches the pre-B.3 calibration shortcut
+/// (V distribution into `o_proj` rather than `softmax(QK^T)·V`); the
+/// production calibration path (with default features) reaches the
+/// real-math branch.
+///
+/// Frees `v_f32` (and the caller has already freed q_f32 / k_f32? No —
+/// the caller hands all three to this helper / its sibling, and we own
+/// freeing v here. q/k are unused by passthrough — caller must free
+/// them separately. To keep the API symmetric we leave q/k freeing to
+/// the caller; the fallback path frees only v + does the cast.
+#[cfg(not(feature = "deltanet"))]
+#[allow(clippy::too_many_arguments)]
+fn compute_full_attn_pre_o_passthrough(
+    gpu: &mut Gpu,
+    v_f32: &GpuTensor,
+    seq_len: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    v_dim: usize,
+    attn_pre_o_dim: usize,
+) -> Result<GpuTensor, String> {
+    // Sanity: v_dim == n_kv_heads * head_dim.
+    debug_assert_eq!(v_dim, n_kv_heads * head_dim);
+
+    let v_bf16 = gpu
+        .alloc_tensor(&[seq_len * v_dim], DType::BF16)
+        .map_err(|e| e.to_string())?;
+    gpu.convert_f32_to_bf16(v_f32, &v_bf16, seq_len * v_dim)
+        .map_err(|e| e.to_string())?;
+
+    if attn_pre_o_dim == v_dim {
+        Ok(v_bf16)
+    } else {
+        // GQA expansion (zero-pad or truncate). For Qwen3.5 0.8B the
+        // canonical case is n_heads > n_kv_heads, so attn_pre_o_dim
+        // (= n_heads * head_dim) > v_dim and we zero-pad.
+        let target = gpu
+            .alloc_tensor(&[seq_len * attn_pre_o_dim], DType::BF16)
+            .map_err(|e| e.to_string())?;
+        gpu.hip
+            .memset(&target.buf, 0, seq_len * attn_pre_o_dim * 2)
+            .map_err(|e| e.to_string())?;
+        let copy_per_row = std::cmp::min(attn_pre_o_dim, v_dim);
+        for t in 0..seq_len {
+            let src_off = t * v_dim * 2;
+            let dst_off = t * attn_pre_o_dim * 2;
+            gpu.hip
+                .memcpy_dtod_at(
+                    &target.buf,
+                    dst_off,
+                    &v_bf16.buf,
+                    src_off,
+                    copy_per_row * 2,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        gpu.free_tensor(v_bf16).map_err(|e| e.to_string())?;
+        Ok(target)
+    }
+}
+
 /// Full-attention (self-attn) layer forward (calibration approximation).
 ///
 /// Fires the capture hook for `q_proj`, `k_proj`, `v_proj`, `o_proj`.
-/// `attn_pre_o = v` (calibration shortcut — see module docs).
+/// Implements the cast-trick attention path described in module docs:
+/// `attn_pre_o = softmax(QK^T / sqrt(d)) · V` in F32, then cast to BF16
+/// for `o_proj`. The cast-trick branch is gated on the `deltanet`
+/// feature (the underlying `rope_partial_interleaved_f32` is gated
+/// there in `rdna-compute`); non-deltanet builds keep the V-passthrough
+/// shortcut.
 fn forward_full_attn_layer(
     gpu: &mut Gpu,
     trunk: &TrunkBF16,
@@ -1038,13 +1354,75 @@ fn forward_full_attn_layer(
     let k_dim = wk.shape[0];
     let v_dim = wv.shape[0];
 
+    // ── Geometry: derive head_dim / n_heads / n_kv_heads ───────────────
+    //
+    // head_dim is the first dim of the q_norm tensor (Qwen3.5 always
+    // ships q_norm.weight as [head_dim] F32). If absent (stripped
+    // trunk / non-Qwen variant), fall back to a heuristic: q_dim
+    // divides into n_heads heads of equal head_dim; the typical
+    // head_dim across modern dense decoders is 64, 96, 128, or 256.
+    // We pick the largest divisor ≤ 256 that also divides into the
+    // hidden state cleanly. If that fails, we error out — the layer
+    // cannot run without a head_dim.
+    let q_norm_name = format!("{p}.self_attn.q_norm.weight");
+    let k_norm_name = format!("{p}.self_attn.k_norm.weight");
+    let q_norm_w = try_get_norm(trunk, &q_norm_name);
+    let k_norm_w = try_get_norm(trunk, &k_norm_name);
+
+    let head_dim = if let Some(w) = q_norm_w {
+        if w.shape.is_empty() {
+            return Err(format!(
+                "{q_norm_name}: empty shape, cannot derive head_dim"
+            ));
+        }
+        // q_norm is [head_dim] (1-D) or [1, head_dim] depending on
+        // loader convention; take the last non-trivial axis.
+        *w.shape.iter().rev().find(|&&d| d > 1).unwrap_or(&w.shape[w.shape.len() - 1])
+    } else {
+        // Fallback: try the canonical head_dim values in decreasing
+        // order until one divides q_dim, k_dim, and v_dim. Avoids a
+        // hard-coded value and works across model families.
+        let candidates = [256usize, 192, 128, 96, 64];
+        let pick = candidates
+            .iter()
+            .copied()
+            .find(|&d| q_dim % d == 0 && k_dim % d == 0 && v_dim % d == 0);
+        match pick {
+            Some(d) => d,
+            None => {
+                return Err(format!(
+                    "{p}.self_attn: cannot infer head_dim — q_norm absent and \
+                     q_dim={q_dim}/k_dim={k_dim}/v_dim={v_dim} not divisible by \
+                     any of {candidates:?}"
+                ));
+            }
+        }
+    };
+    if q_dim % head_dim != 0 || k_dim % head_dim != 0 || v_dim % head_dim != 0 {
+        return Err(format!(
+            "{p}.self_attn: head_dim={head_dim} does not divide one of \
+             q_dim={q_dim}/k_dim={k_dim}/v_dim={v_dim}"
+        ));
+    }
+    let n_heads = q_dim / head_dim;
+    let n_kv_heads = k_dim / head_dim;
+    if v_dim / head_dim != n_kv_heads {
+        return Err(format!(
+            "{p}.self_attn: k_dim={k_dim} → {n_kv_heads} KV heads, but \
+             v_dim={v_dim} → {} (must match for GQA)",
+            v_dim / head_dim,
+        ));
+    }
+
     // Pre-norm: GemmaRMSNorm over the entry hidden state. q/k/v see
     // normalized input; residual still adds attn_out to the
     // un-normalized `h` after this function returns.
     let norm_name = format!("{p}.input_layernorm.weight");
     let h_for_linears = apply_pre_norm_or_fallback(gpu, trunk, h, &norm_name, seq_len, dim)?;
 
-    // Q projection (calibration only — output unused beyond capture).
+    // Q projection: produce F32 [seq_len, q_dim]. We keep q_f32 alive
+    // through the attention math (it becomes the q vector input to
+    // attention_flash after q_norm + RoPE).
     let q_f32 = gpu
         .alloc_tensor(&[seq_len * q_dim], DType::F32)
         .map_err(|e| e.to_string())?;
@@ -1055,9 +1433,9 @@ fn forward_full_attn_layer(
         q_dim, wq.shape[1], seq_len,
     )
     .map_err(|e| e.to_string())?;
-    gpu.free_tensor(q_f32).map_err(|e| e.to_string())?;
 
-    // K projection (calibration only).
+    // K projection: produce F32 [seq_len, k_dim]. Kept alive through
+    // attention as the k_cache after k_norm + RoPE.
     let k_f32 = gpu
         .alloc_tensor(&[seq_len * k_dim], DType::F32)
         .map_err(|e| e.to_string())?;
@@ -1068,9 +1446,9 @@ fn forward_full_attn_layer(
         k_dim, wk.shape[1], seq_len,
     )
     .map_err(|e| e.to_string())?;
-    gpu.free_tensor(k_f32).map_err(|e| e.to_string())?;
 
-    // V projection. We keep this as the `attn_pre_o` for the o_proj.
+    // V projection: produce F32 [seq_len, v_dim]. No norm / RoPE on V.
+    // Kept alive through attention as the v_cache.
     let v_f32 = gpu
         .alloc_tensor(&[seq_len * v_dim], DType::F32)
         .map_err(|e| e.to_string())?;
@@ -1081,53 +1459,67 @@ fn forward_full_attn_layer(
         v_dim, wv.shape[1], seq_len,
     )
     .map_err(|e| e.to_string())?;
-    // h_for_linears is no longer needed; o_proj consumes V instead.
+    // h_for_linears is no longer needed; downstream consumes Q/K/V.
     h_for_linears.drop_owned(gpu).map_err(|e| e.to_string())?;
 
-    // Convert v_f32 → BF16 for o_proj. o_proj expects K = v_dim.
+    // ── Q-norm / K-norm + RoPE + causal attention ─────────────────────
+    //
+    // Compute the real `attn_pre_o = softmax(QK^T / sqrt(d)) · V` in
+    // F32 and cast to BF16. Production builds (with the `deltanet`
+    // feature, on by default in `hipfire-runtime`) reach
+    // `compute_full_attn_pre_o`. Non-deltanet builds fall back to the
+    // V passthrough (legacy shortcut) since `rope_partial_interleaved_f32`
+    // lives behind the same feature gate in `rdna-compute` — see
+    // crates/rdna-compute/src/dispatch.rs:18086. The fallback keeps the
+    // workspace compiling under `--no-default-features` at the cost of
+    // a calibration-quality regression on FullAttn `o_proj` (the
+    // pre-B.3 behavior).
+    let attn_pre_o_dim = n_heads * head_dim;
     let o_k = wo.shape[1];
-    if o_k != v_dim {
-        // Allow models where o_proj's K differs from v_dim by zero-padding
-        // or truncating. The Qwen3.5 model has q_proj output 2× wide
-        // (query+gate split) — but o_proj still operates on the
-        // post-attention-output `n_heads * head_dim` activations, which
-        // for GQA = v_dim. If they mismatch, fall back to the smaller.
-        // For the calibration v1, just zero-pad / truncate to o_k.
-    }
-    let v_bf16 = gpu
-        .alloc_tensor(&[seq_len * v_dim], DType::BF16)
-        .map_err(|e| e.to_string())?;
-    gpu.convert_f32_to_bf16(&v_f32, &v_bf16, seq_len * v_dim)
-        .map_err(|e| e.to_string())?;
-    gpu.free_tensor(v_f32).map_err(|e| e.to_string())?;
+    #[cfg(feature = "deltanet")]
+    let attn_pre_o_bf16 = compute_full_attn_pre_o(
+        gpu, trunk,
+        &q_f32, &k_f32, &v_f32,
+        q_norm_w, k_norm_w,
+        seq_len, n_heads, n_kv_heads, head_dim,
+        k_dim, v_dim,
+        p,
+    )?;
+    #[cfg(not(feature = "deltanet"))]
+    let attn_pre_o_bf16 = {
+        // Silence unused-binding warnings under no-default-features.
+        let _ = (q_norm_w, k_norm_w, k_dim, p, trunk);
+        compute_full_attn_pre_o_passthrough(
+            gpu, &v_f32,
+            seq_len, n_kv_heads, head_dim, v_dim, attn_pre_o_dim,
+        )?
+    };
 
-    // If o_k != v_dim, allocate a [seq_len, o_k] BF16 buffer and copy
-    // the per-row prefix or zero-pad.
-    let attn_pre_o = if o_k == v_dim {
-        v_bf16
+    // Free Q / K / V (helper consumed views, not ownership).
+    gpu.free_tensor(q_f32).map_err(|e| e.to_string())?;
+    gpu.free_tensor(k_f32).map_err(|e| e.to_string())?;
+    gpu.free_tensor(v_f32).map_err(|e| e.to_string())?;
+    let _ = q_dim;
+
+    let attn_pre_o = if o_k == attn_pre_o_dim {
+        attn_pre_o_bf16
     } else {
         let target = gpu
             .alloc_tensor(&[seq_len * o_k], DType::BF16)
             .map_err(|e| e.to_string())?;
-        // Zero-init for safety (zero-pad path).
+        // Zero-init (zero-pad path).
         gpu.hip
             .memset(&target.buf, 0, seq_len * o_k * 2)
             .map_err(|e| e.to_string())?;
-        let copy_per_row = std::cmp::min(o_k, v_dim);
+        let copy_per_row = std::cmp::min(o_k, attn_pre_o_dim);
         for t in 0..seq_len {
-            let src_off = t * v_dim * 2;
+            let src_off = t * attn_pre_o_dim * 2;
             let dst_off = t * o_k * 2;
             gpu.hip
-                .memcpy_dtod_at(
-                    &target.buf,
-                    dst_off,
-                    &v_bf16.buf,
-                    src_off,
-                    copy_per_row * 2,
-                )
+                .memcpy_dtod_at(&target.buf, dst_off, &attn_pre_o_bf16.buf, src_off, copy_per_row * 2)
                 .map_err(|e| e.to_string())?;
         }
-        gpu.free_tensor(v_bf16).map_err(|e| e.to_string())?;
+        gpu.free_tensor(attn_pre_o_bf16).map_err(|e| e.to_string())?;
         target
     };
 
