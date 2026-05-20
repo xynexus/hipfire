@@ -1141,6 +1141,13 @@ pub fn gptq_column_sequential_hip(
     // the full env-var matrix.
     let use_bf16_block_apply = std::env::var("HIPFIRE_GPTQ_HIP_OBS_BF16").is_ok();
 
+    // Pre-compute the real Hessian-diagonal mean for error diagnostics.
+    // Used in every `CholeskyError::SingularEvenWithMaxDamp` constructed
+    // below so failure logs print a useful sentinel instead of `0.0` —
+    // see docs/investigations/2026-05-20-gptq-hip-obs-9b-failure/README.md.
+    let diag_mean_for_err: f64 =
+        (0..k_dim).map(|i| h_target[(i, i)]).sum::<f64>() / k_dim as f64;
+
     // ── Step 1: CPU actorder (same as gptq.rs:803-804) ──
     let h_diag: Vec<f64> = (0..k_dim).map(|i| h_target[(i, i)]).collect();
     let perm = crate::gptq::weight_mode_actorder(&h_diag);
@@ -1150,31 +1157,36 @@ pub fn gptq_column_sequential_hip(
         solver, h_target, Some(&perm), initial_damp, max_damp_multiplier,
     )?;
 
-    // ── Step 3: Diagonal D2H (single batched copy of U[i, i] for all i) ──
+    // ── Step 3: Diagonal D2H (ONE bulk D2H of the full K×K F64 buffer) ──
     // U is column-major in d_u: U[i, i] at offset i*K + i (= (K+1)*i).
-    // Read the full column-major U strided diagonal in K mini-copies (8 B
-    // each). Plan §4 budget: K=12288 → ~60ms via per-step D2H, mitigated
-    // here by ONE D2H of the entire K×K buffer's diagonal via a strided
-    // memcpy. The HIP API doesn't have a strided memcpy, so we issue K
-    // single-double copies. At ~5µs/copy that's 60ms — acceptable for
-    // Phase 2 v1; future work can fuse to one chunked copy.
+    // The Phase 2 v1 shortcut was K sync hipMemcpy calls of 8 bytes each —
+    // K=4096 × ~5µs ≈ 20ms; K=12288 × ~5µs ≈ 60ms — and any one of those
+    // returning non-SUCCESS aborted the tensor with a misleading
+    // `diag_mean=0.0` warning (see docs/investigations/
+    // 2026-05-20-gptq-hip-obs-9b-failure/README.md). Replace with a single
+    // bulk D2H of the entire K×K U buffer (which we have to bring back for
+    // the host-side diagonal extract anyway), then index the diagonal
+    // host-side. ONE syscall, faster wall-clock, no K-fold per-call
+    // failure amplification.
     let b_dim = PHASE2_BLOCK_SIZE;
     let bytes_per_f64 = std::mem::size_of::<f64>();
     let u_diag: Vec<f64> = unsafe {
+        let u_bytes = k_dim * k_dim * bytes_per_f64;
+        let mut host_u: Vec<f64> = vec![0.0; k_dim * k_dim];
+        let code = (solver.fn_hip_memcpy)(
+            host_u.as_mut_ptr() as *mut c_void,
+            gpu_u.d_u as *const c_void,
+            u_bytes,
+            HIP_MEMCPY_DEVICE_TO_HOST,
+        );
+        if code != HIP_SUCCESS {
+            return Err(CholeskyError::SingularEvenWithMaxDamp {
+                max_damp: effective_damp, k: k_dim, diag_mean: diag_mean_for_err,
+            });
+        }
         let mut diag = vec![0.0_f64; k_dim];
         for i in 0..k_dim {
-            let src = (gpu_u.d_u as *const u8).add((i * k_dim + i) * bytes_per_f64);
-            let code = (solver.fn_hip_memcpy)(
-                diag.as_mut_ptr().add(i) as *mut c_void,
-                src as *const c_void,
-                bytes_per_f64,
-                HIP_MEMCPY_DEVICE_TO_HOST,
-            );
-            if code != HIP_SUCCESS {
-                return Err(CholeskyError::SingularEvenWithMaxDamp {
-                    max_damp: effective_damp, k: k_dim, diag_mean: 0.0,
-                });
-            }
+            diag[i] = host_u[i * k_dim + i];
         }
         diag
     };
@@ -1186,7 +1198,7 @@ pub fn gptq_column_sequential_hip(
     let perm_bytes = k_dim * std::mem::size_of::<i32>();
 
     let to_chol_err = |damp: f64| CholeskyError::SingularEvenWithMaxDamp {
-        max_damp: damp, k: k_dim, diag_mean: 0.0,
+        max_damp: damp, k: k_dim, diag_mean: diag_mean_for_err,
     };
 
     unsafe {
