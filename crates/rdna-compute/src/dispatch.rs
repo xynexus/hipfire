@@ -408,6 +408,16 @@ impl GpuTensor {
 pub enum DType {
     F32,
     F16,
+    // BF16 — 16-bit brain float (1-bit sign, 8-bit exp, 7-bit mantissa).
+    // Same byte width as F16 (2 B/element) but a different bit layout:
+    // BF16 has F32's exponent range with a truncated mantissa. Currently
+    // used only by the Tier 1 calibration loader (bf16_loader.rs) which
+    // mmaps HuggingFace safetensors and uploads weights verbatim. The
+    // matching GEMM dispatch lives in a sibling subagent's territory
+    // (gemm_bf16_mfma.gfx942.hip — MI300x only); on other archs the
+    // loader still allocates BF16 tensors but a downstream GEMM call
+    // will surface an "unsupported dtype" error.
+    BF16,
     Q4K,  // 144 bytes per 256 elements
     Q6K,  // 210 bytes per 256 elements
     Q8_0,      // 34 bytes per 32 elements
@@ -443,8 +453,51 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
+            DType::BF16 => 2,
             DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::HFP4G32 | DType::MFP4G32 | DType::Raw => 1, // byte-level
         }
+    }
+
+    /// Human-readable lowercase label for the dtype. Useful for log lines
+    /// and tracing — mirrors the `dtype` string a HuggingFace safetensors
+    /// header writes ("f32", "f16", "bf16") so loader code can round-trip
+    /// without a custom serializer.
+    pub fn label(self) -> &'static str {
+        match self {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+            DType::BF16 => "bf16",
+            DType::Q4K => "q4_k",
+            DType::Q6K => "q6_k",
+            DType::Q8_0 => "q8_0",
+            DType::Q4F16G64 => "q4f16g64",
+            DType::Q4F16G32 => "q4f16g32",
+            DType::Q8HFQ => "q8hfq",
+            DType::HFQ4G256 => "hfq4g256",
+            DType::HFQ4G128 => "hfq4g128",
+            DType::HFQ3G256 => "hfq3g256",
+            DType::HFQ3G128 => "hfq3g128",
+            DType::HFQ2G256 => "hfq2g256",
+            DType::HFQ2G128 => "hfq2g128",
+            DType::HFQ6G256 => "hfq6g256",
+            DType::MQ4G256 => "mq4g256",
+            DType::MQ6G256 => "mq6g256",
+            DType::MQ8G256 => "mq8g256",
+            DType::MQ3G256 => "mq3g256",
+            DType::MQ2G256 => "mq2g256",
+            DType::MQ2G256Lloyd => "mq2g256_lloyd",
+            DType::MQ3G256Lloyd => "mq3g256_lloyd",
+            DType::HFP4G32 => "hfp4g32",
+            DType::MFP4G32 => "mfp4g32",
+            DType::Raw => "raw",
+        }
+    }
+
+    /// Number of bytes per element. Alias for `size()` to match the
+    /// `DType::BF16` agent task spec — kept as a 1-liner so any code
+    /// the task gen called out can use either name.
+    pub fn size_bytes(self) -> usize {
+        self.size()
     }
 
     /// Whether a `WeightTensor` of this dtype should have the
