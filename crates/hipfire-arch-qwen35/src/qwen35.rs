@@ -150,47 +150,143 @@ pub struct Qwen35Config {
     pub vram_budget_bytes: u64,
 }
 
+/// Probe each layer's kind by checking which tensor names resolve. Used as
+/// a last-resort fallback when neither `text_config.layer_types` nor
+/// `gguf_meta.qwen35.full_attention_interval` is present in the .hfq
+/// metadata. Probing is cheap (one `find_tensor_info` per layer) — only the
+/// tensor index is consulted, no data is read.
+///
+/// Rule: a layer is `LinearAttention` if at least one of its DeltaNet/SSM
+/// projection slots resolves; otherwise it's assumed `FullAttention`.
+fn probe_layer_types(hfq: &HfqFile, n_layers: usize) -> Vec<LayerType> {
+    (0..n_layers).map(|i| {
+        // Canonical safetensors slot. Try each candidate via name_candidates so
+        // VL `attn_qkv.weight` and llama.cpp `blk.{i}.attn_qkv.weight` both
+        // count as LA evidence.
+        let canonical = format!("model.language_model.layers.{i}.linear_attn.in_proj_qkv.weight");
+        let is_la = name_candidates(&canonical)
+            .iter()
+            .any(|cand| hfq.find_tensor_info(cand).is_some());
+        if is_la { LayerType::LinearAttention } else { LayerType::FullAttention }
+    }).collect()
+}
+
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
     let config = meta.get("config")?;
     let tc = config.get("text_config").unwrap_or(config);
+    // GGUF-derived .hfq files (notably Qwen3.5-VL via llama.cpp converter)
+    // stash llama.cpp-style metadata under the `gguf_meta` key. When the
+    // standard HF `config.text_config.X` field is absent we read the
+    // qwen35.X fallback. Computed lazily so non-VL files take no overhead.
+    let gguf_meta = meta.get("gguf_meta");
+    let gguf_u = |k: &str| gguf_meta.and_then(|gm| gm.get(k)).and_then(|v| v.as_u64()).map(|v| v as usize);
+    let gguf_f = |k: &str| gguf_meta.and_then(|gm| gm.get(k)).and_then(|v| v.as_f64()).map(|v| v as f32);
 
-    let dim = tc.get("hidden_size")?.as_u64()? as usize;
-    let n_layers = tc.get("num_hidden_layers")?.as_u64()? as usize;
-    let n_heads = tc.get("num_attention_heads")?.as_u64()? as usize;
-    let n_kv_heads = tc.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(n_heads as u64) as usize;
-    let head_dim = tc.get("head_dim").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(dim / n_heads);
-    let vocab_size = tc.get("vocab_size")?.as_u64()? as usize;
+    let dim = tc.get("hidden_size").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| gguf_u("qwen35.embedding_length"))?;
+    let n_layers = tc.get("num_hidden_layers").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| gguf_u("qwen35.block_count"))?;
+    let n_heads = tc.get("num_attention_heads").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| gguf_u("qwen35.attention.head_count"))?;
+    let n_kv_heads = tc.get("num_key_value_heads").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| gguf_u("qwen35.attention.head_count_kv"))
+        .unwrap_or(n_heads);
+    let head_dim = tc.get("head_dim").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| gguf_u("qwen35.attention.key_length"))
+        .unwrap_or(dim / n_heads);
+    let vocab_size = tc.get("vocab_size").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| {
+            // GGUF doesn't always stash vocab_size in its own key; fall back to
+            // the embed_tokens weight shape (works for both .hfq variants).
+            hfq.find_tensor_info("model.language_model.embed_tokens.weight")
+                .or_else(|| hfq.find_tensor_info("model.embed_tokens.weight"))
+                .or_else(|| hfq.find_tensor_info("token_embd.weight"))
+                .and_then(|t| {
+                    // Shape is `[in, out]` or `[out, in]` depending on origin —
+                    // the larger of the two is always vocab_size (embed_tokens
+                    // is [vocab × dim] with vocab ≫ dim for all Qwen3.5 sizes).
+                    t.shape.iter().map(|&s| s as usize).max()
+                })
+        })?;
     // Dense FFN intermediate dim. MoE configs (qwen3_5_moe / A3B) replace this
     // with `moe_intermediate_size` and don't ship `intermediate_size`, so don't
     // hard-fail here — we still need to load the rest of the config to detect
     // is_moe and route accordingly.
-    let hidden_dim = tc.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let norm_eps = tc.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
+    let hidden_dim = tc.get("intermediate_size").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| gguf_u("qwen35.feed_forward_length"))
+        .unwrap_or(0);
+    let norm_eps = tc.get("rms_norm_eps").and_then(|v| v.as_f64()).map(|v| v as f32)
+        .or_else(|| gguf_f("qwen35.attention.layer_norm_rms_epsilon"))
+        .unwrap_or(1e-6);
 
     let rope_params = tc.get("rope_parameters");
-    let rope_theta = rope_params.and_then(|r| r.get("rope_theta")).and_then(|v| v.as_f64()).unwrap_or(10_000_000.0) as f32;
+    let rope_theta = rope_params.and_then(|r| r.get("rope_theta")).and_then(|v| v.as_f64()).map(|v| v as f32)
+        .or_else(|| tc.get("rope_theta").and_then(|v| v.as_f64()).map(|v| v as f32))
+        .or_else(|| gguf_f("qwen35.rope.freq_base"))
+        .unwrap_or(10_000_000.0);
     let partial_rotary_factor = tc.get("partial_rotary_factor")
         .or_else(|| rope_params.and_then(|r| r.get("partial_rotary_factor")))
         .and_then(|v| v.as_f64()).unwrap_or(0.25) as f32;
 
     let eos_token = tc.get("eos_token_id").and_then(|v| v.as_u64()).unwrap_or(248044) as u32;
 
-    let linear_num_key_heads = tc.get("linear_num_key_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
-    let linear_num_value_heads = tc.get("linear_num_value_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
-    let linear_key_head_dim = tc.get("linear_key_head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
-    let linear_value_head_dim = tc.get("linear_value_head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
-    let conv_kernel_dim = tc.get("linear_conv_kernel_dim").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+    // Linear-attention (DeltaNet / SSM) dims. The HF Qwen3.5 dense config
+    // names these `linear_num_*` / `linear_*_head_dim`; the llama.cpp GGUF
+    // converter for Qwen3.5-VL stashes them under `qwen35.ssm.*` instead.
+    let linear_num_value_heads = tc.get("linear_num_value_heads").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| gguf_u("qwen35.ssm.group_count"))
+        .unwrap_or(16);
+    let linear_num_key_heads = tc.get("linear_num_key_heads").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .unwrap_or(linear_num_value_heads);
+    // For VL: head_dim = inner_size / group_count = 2048 / 16 = 128 (matches HF).
+    let ssm_inner_size = gguf_u("qwen35.ssm.inner_size");
+    let derived_linear_head_dim = ssm_inner_size.map(|inner| inner / linear_num_value_heads);
+    let linear_value_head_dim = tc.get("linear_value_head_dim").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or(derived_linear_head_dim)
+        .unwrap_or(128);
+    let linear_key_head_dim = tc.get("linear_key_head_dim").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or(derived_linear_head_dim)
+        .unwrap_or(128);
+    let conv_kernel_dim = tc.get("linear_conv_kernel_dim").and_then(|v| v.as_u64()).map(|v| v as usize)
+        .or_else(|| gguf_u("qwen35.ssm.conv_kernel"))
+        .unwrap_or(4);
 
-    let layer_types: Vec<LayerType> = tc.get("layer_types")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().map(|v| {
-            match v.as_str().unwrap_or("full_attention") {
-                "linear_attention" => LayerType::LinearAttention,
-                _ => LayerType::FullAttention,
+    // ── Layer-type schedule ────────────────────────────────────────────
+    //
+    // Priority order:
+    //   1. Explicit `text_config.layer_types` array (HF-canonical, Qwen3.5
+    //      dense + Qwen3.5-VL HF configs).
+    //   2. `gguf_meta.qwen35.full_attention_interval` (llama.cpp's GGUF
+    //      converter for Qwen3.5-VL). Layer `k` is FullAttention iff
+    //      `k % interval == interval - 1` (every Nth layer, starting
+    //      from index N-1) — verified against the .hfq tensor index
+    //      layout (layers 3, 7, 11, 15, 19, 23 are FA on 0.8B-VL).
+    //   3. Per-layer tensor probing: if `layers.{k}.linear_attn.in_proj_qkv`
+    //      OR an alias resolves, the layer is LinearAttention; else
+    //      FullAttention. Last-resort fallback for hfq variants with
+    //      neither metadata field.
+    //   4. All-FullAttention default (dense Qwen3.5 / Qwen3.6 / Qwen3 fallback).
+    let layer_types: Vec<LayerType> = if let Some(arr) = tc.get("layer_types").and_then(|v| v.as_array()) {
+        arr.iter().map(|v| match v.as_str().unwrap_or("full_attention") {
+            "linear_attention" => LayerType::LinearAttention,
+            _ => LayerType::FullAttention,
+        }).collect()
+    } else if let Some(interval) = gguf_u("qwen35.full_attention_interval") {
+        // Pattern: every Nth layer (1-indexed → index `N-1, 2N-1, ...`) is FA.
+        (0..n_layers).map(|i| {
+            if interval > 0 && (i + 1) % interval == 0 {
+                LayerType::FullAttention
+            } else {
+                LayerType::LinearAttention
             }
-        }).collect())
-        .unwrap_or_else(|| vec![LayerType::FullAttention; n_layers]);
+        }).collect()
+    } else if probe_layer_types(hfq, n_layers).iter().any(|t| *t == LayerType::LinearAttention) {
+        // At least one LA layer detected — use probe results verbatim.
+        probe_layer_types(hfq, n_layers)
+    } else {
+        vec![LayerType::FullAttention; n_layers]
+    };
 
     // MoE config (zeros = dense fallback). Qwen3.5-MoE / A3B sets these.
     let num_experts = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -711,11 +807,149 @@ impl DeltaNetState {
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
+/// Build the list of alternative tensor names to try when looking up a
+/// Qwen3.5 weight. The "canonical" name is the safetensors-style name the
+/// hipfire reference quantize pipeline produces (e.g.
+/// `layers.5.linear_attn.in_proj_qkv.weight`); the alternatives cover
+/// .hfq variants that ship with different naming conventions:
+///
+///   - Qwen3.5-VL hfq from llama.cpp GGUF → hipfire-quantize: the
+///     `linear_attn.in_proj_qkv` slot becomes `attn_qkv`, the
+///     `post_attention_layernorm` becomes `post_attention_norm`, the SSM
+///     conv1d becomes `ssm_conv1d`, etc. See
+///     `crates/hipfire-quantize/src/main.rs::safetensors_to_ggml_name`
+///     (the inverse direction) for the canonical mapping.
+///   - llama.cpp GGUF-direct names: `blk.{N}.ssm_a`, `blk.{N}.ssm_dt.bias`
+///     (no `.weight` suffix, no `model.layers.` prefix). The hipfire-quantize
+///     pipeline writes a few of these in their raw GGUF-style form when the
+///     translator has no exact safetensors equivalent (see
+///     `gguf_to_safetensors_name`'s fall-through arm).
+///   - `model.language_model.` prefix variants for VL multi-modal trunks.
+///     This is already handled inside `HfqFile::resolve_idx` so it shows up
+///     once below per candidate.
+///
+/// Returns `Vec<String>` so each candidate is owned (the underlying lookup
+/// API takes `&str` so we just hand out borrows). First match wins.
+fn name_candidates(name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(4);
+    out.push(name.to_string());
+
+    // Try slot-name rewriting under the `layers.{N}.<slot>` pattern. The
+    // resolver in `HfqFile::resolve_idx` covers the `model.` / `model.language_model.`
+    // prefix variants, so we only need to enumerate slot aliases here.
+    if let Some((layer_idx, slot_and_suffix)) = split_layer_path(name) {
+        for alt_slot in slot_aliases(slot_and_suffix) {
+            out.push(format!("layers.{layer_idx}.{alt_slot}"));
+        }
+        // GGUF-direct `blk.{N}.<ggml_slot>` aliases — used for `A_log` and
+        // `dt_bias` which lose their `.weight` suffix on the GGUF side.
+        for alt in blk_aliases(layer_idx, slot_and_suffix) {
+            out.push(alt);
+        }
+    }
+
+    // embed_tokens: the same tensor goes by several names depending on
+    // pipeline origin. Try the GGUF-style `token_embd.weight` and the bare
+    // `model.embed_tokens.weight` (the resolver will also try the
+    // `model.language_model.embed_tokens.weight` variant on its own).
+    if name == "model.language_model.embed_tokens.weight" {
+        out.push("model.embed_tokens.weight".to_string());
+        out.push("token_embd.weight".to_string());
+    } else if name == "model.embed_tokens.weight" {
+        out.push("token_embd.weight".to_string());
+    }
+    // Final norm aliases: GGUF-direct `output_norm.weight` ↔ `model.norm.weight`.
+    if name == "norm.weight" || name == "model.norm.weight" {
+        out.push("output_norm.weight".to_string());
+    }
+    // lm_head aliases.
+    if name == "lm_head.weight" {
+        out.push("output.weight".to_string());
+    }
+
+    out
+}
+
+/// Split a name into `(layer_idx, slot_and_suffix)` if it matches the
+/// `<...>layers.{N}.<slot>` pattern; else `None`. `slot_and_suffix` is
+/// `<slot_path>.weight` or `<slot_path>` — we don't strip `.weight` here so
+/// the alias map can decide per-slot whether to keep it (see `slot_aliases`).
+fn split_layer_path(name: &str) -> Option<(usize, &str)> {
+    let after_layers_marker = name.rfind("layers.")?;
+    let rest = &name[after_layers_marker + "layers.".len()..];
+    let dot = rest.find('.')?;
+    let layer_idx: usize = rest[..dot].parse().ok()?;
+    Some((layer_idx, &rest[dot + 1..]))
+}
+
+/// Per-slot alias table for Qwen3.5 / Qwen3.5-VL hfq variants. The
+/// canonical name on the left is what `qwen35::load_weights` constructs;
+/// the alternatives on the right are what shows up in
+/// llama.cpp-GGUF-converted Qwen3.5-VL hfq files. Empty slice = no aliases.
+fn slot_aliases(slot_and_suffix: &str) -> &'static [&'static str] {
+    match slot_and_suffix {
+        // DeltaNet (linear_attention) projections — VL pipeline uses
+        // attn_qkv / attn_gate / ssm_alpha / ssm_beta / ssm_out / ssm_conv1d
+        // / ssm_norm in place of the linear_attn.X.weight family.
+        "linear_attn.in_proj_qkv.weight" => &["attn_qkv.weight"],
+        "linear_attn.in_proj_z.weight"   => &["attn_gate.weight"],
+        "linear_attn.in_proj_a.weight"   => &["ssm_alpha.weight"],
+        "linear_attn.in_proj_b.weight"   => &["ssm_beta.weight"],
+        "linear_attn.out_proj.weight"    => &["ssm_out.weight"],
+        "linear_attn.conv1d.weight"      => &["ssm_conv1d.weight"],
+        "linear_attn.norm.weight"        => &["ssm_norm.weight"],
+        // Post-attention norm: VL uses post_attention_norm (no _layer infix).
+        "post_attention_layernorm.weight" => &["post_attention_norm.weight"],
+        // A_log / dt_bias raw F32 tensors — VL pipeline drops `.weight` so the
+        // tensor lookup must accept both with-and-without the suffix. The
+        // blk.N.ssm_a alias is generated separately by `blk_aliases`.
+        "linear_attn.A_log" => &[],
+        "linear_attn.dt_bias" => &[],
+        _ => &[],
+    }
+}
+
+/// GGUF-direct `blk.{N}.X` aliases for slots that don't follow the
+/// `layers.{N}.{slot}.weight` naming convention on the GGUF source side.
+/// llama.cpp's Qwen3.5-VL converter writes `blk.0.ssm_a` / `blk.0.ssm_dt.bias`
+/// directly (no model./layers. prefix, no .weight suffix), and the
+/// hipfire-quantize translator passes those through unchanged.
+fn blk_aliases(layer_idx: usize, slot_and_suffix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    match slot_and_suffix {
+        "linear_attn.A_log" => {
+            out.push(format!("blk.{layer_idx}.ssm_a"));
+            out.push(format!("blk.{layer_idx}.ssm_a.weight"));
+        }
+        "linear_attn.dt_bias" => {
+            out.push(format!("blk.{layer_idx}.ssm_dt.bias"));
+            out.push(format!("blk.{layer_idx}.ssm_dt_bias"));
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Try each candidate name in order and return the first that resolves to
+/// a `Vec<u8>`-owning tensor. The owned `Vec<u8>` is the only return form
+/// that survives the borrow rules across both the unix pread and non-unix
+/// mmap paths.
+fn resolve_tensor_vec<'a>(hfq: &'a HfqFile, name: &str)
+    -> Option<(&'a hipfire_runtime::hfq::HfqTensorInfo, Vec<u8>)>
+{
+    for cand in name_candidates(name) {
+        if let Some(result) = hfq.tensor_data_vec(&cand) {
+            return Some(result);
+        }
+    }
+    None
+}
+
 /// Load norm weight for Qwen3.5: stored as offset from 1.0 (output = x * (1 + weight))
 fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data_vec(&full_name)
-        .or_else(|| hfq.tensor_data_vec(name))
+    let (info, data) = resolve_tensor_vec(hfq, &full_name)
+        .or_else(|| resolve_tensor_vec(hfq, name))
         .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
 
     let mut f32_data: Vec<f32> = match info.quant_type {
@@ -871,16 +1105,28 @@ fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<
 fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
     let full_name = format!("model.language_model.{name}");
     // Use pread path to avoid page cache buildup on unified-memory APUs.
+    // The candidate list (slot aliases + GGUF-direct blk.N.X names) is
+    // generated by `name_candidates` and tried in order. First match wins.
     #[cfg(unix)]
     {
-        let mut wt = if let Some((info, buf)) = hfq.tensor_data_pread(&full_name) {
-            let qt = info.quant_type;
-            load_weight_tensor_raw(gpu, qt, &buf, m, k)?
-        } else if let Some((info, buf)) = hfq.tensor_data_pread(name) {
-            let qt = info.quant_type;
-            load_weight_tensor_raw(gpu, qt, &buf, m, k)?
-        } else {
-            panic!("tensor not found: {name} or {full_name}");
+        let mut wt = {
+            let mut tried = Vec::new();
+            let mut found = None;
+            // Try every candidate for the full prefixed name first; HfqFile's
+            // resolver internally also tries the model./model.language_model.
+            // prefix swap so we don't enumerate those manually.
+            for cand in name_candidates(&full_name).into_iter().chain(name_candidates(name)) {
+                if tried.iter().any(|x: &String| x == &cand) { continue; }
+                tried.push(cand.clone());
+                if let Some((info, buf)) = hfq.tensor_data_pread(&cand) {
+                    let qt = info.quant_type;
+                    found = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k)?);
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| panic!(
+                "tensor not found: {name} or any of {tried:?}"
+            ))
         };
         // Phase A Stage A — populate awq_scale when the dtype is on
         // the AWQ allow-list (centralized at `DType::supports_awq_sidecar`).
@@ -895,10 +1141,19 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
     }
     #[cfg(not(unix))]
     {
-        let (info, data) = hfq.tensor_data(&full_name)
-            .or_else(|| hfq.tensor_data(name))
-            .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
-        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
+        let mut tried = Vec::new();
+        let mut found = None;
+        for cand in name_candidates(&full_name).into_iter().chain(name_candidates(name)) {
+            if tried.iter().any(|x: &String| x == &cand) { continue; }
+            tried.push(cand.clone());
+            if let Some((info, data)) = hfq.tensor_data(&cand) {
+                found = Some(load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?);
+                break;
+            }
+        }
+        let mut wt = found.unwrap_or_else(|| panic!(
+            "tensor not found: {name} or any of {tried:?}"
+        ));
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
@@ -910,8 +1165,8 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
 /// Load a tensor as F32 on GPU, handling any quant type by dequanting on CPU.
 fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data_vec(&full_name)
-        .or_else(|| hfq.tensor_data_vec(name))
+    let (info, data) = resolve_tensor_vec(hfq, &full_name)
+        .or_else(|| resolve_tensor_vec(hfq, name))
         .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
 
     let f32_data: Vec<f32> = match info.quant_type {
@@ -1321,8 +1576,15 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     hfq.drop_mmap();
 
     eprintln!("  loading token_embd...");
-    let (embd_meta, embd_data) = hfq.tensor_data_vec("model.language_model.embed_tokens.weight")
-        .expect("embed_tokens not found");
+    // Try the canonical safetensors name first; fall back to the bare
+    // `model.embed_tokens.weight` (Qwen3.5 dense pipeline) and the
+    // GGUF-direct `token_embd.weight` (llama.cpp converter). The
+    // resolver normalizes the `model.language_model.` prefix variants
+    // internally so we don't enumerate those here.
+    let (embd_meta, embd_data) = resolve_tensor_vec(hfq, "model.language_model.embed_tokens.weight")
+        .or_else(|| resolve_tensor_vec(hfq, "model.embed_tokens.weight"))
+        .or_else(|| resolve_tensor_vec(hfq, "token_embd.weight"))
+        .expect("embed_tokens not found (tried model.language_model.embed_tokens.weight, model.embed_tokens.weight, token_embd.weight)");
     let embd_qt = embd_meta.quant_type;
     let (token_embd, embd_fmt) = if embd_qt == 6 {
         eprintln!("    (HFQ4-G256 raw, {} MB)", embd_data.len() / 1_000_000);
@@ -1368,14 +1630,18 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
 
     // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens.
-    let lm_head_info = hfq.tensor_data_vec("lm_head.weight")
-        .or_else(|| hfq.tensor_data_vec("model.language_model.lm_head.weight"));
+    let lm_head_info = resolve_tensor_vec(hfq, "lm_head.weight")
+        .or_else(|| resolve_tensor_vec(hfq, "model.language_model.lm_head.weight"))
+        .or_else(|| resolve_tensor_vec(hfq, "output.weight"));
     let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, config.vocab_size, config.dim)?
     } else {
         eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
-        let (_, tied_data) = hfq.tensor_data_vec("model.language_model.embed_tokens.weight").unwrap();
+        let (_, tied_data) = resolve_tensor_vec(hfq, "model.language_model.embed_tokens.weight")
+            .or_else(|| resolve_tensor_vec(hfq, "model.embed_tokens.weight"))
+            .or_else(|| resolve_tensor_vec(hfq, "token_embd.weight"))
+            .expect("embed_tokens not found for tied lm_head");
         if embd_qt == 6 || embd_qt == 7 || embd_qt == 8 {
             let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
             let dtype = match embd_qt {
@@ -1576,9 +1842,15 @@ fn load_token_embd_into(
     gpu: &mut Gpu,
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
     eprintln!("  loading token_embd...");
-    let embd_info = hfq
-        .tensor_data("model.language_model.embed_tokens.weight")
-        .expect("embed_tokens not found");
+    // Try the canonical safetensors name first; fall back to bare
+    // `model.embed_tokens.weight` (Qwen3.5 dense) and `token_embd.weight`
+    // (llama.cpp GGUF-direct). `HfqFile::tensor_data` returns `&[u8]` so we
+    // need the mmap to still be live; the multi-GPU loader keeps it
+    // resident (unlike `load_weights` which drops mmap to halve UMA cost).
+    let embd_info = hfq.tensor_data("model.language_model.embed_tokens.weight")
+        .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
+        .or_else(|| hfq.tensor_data("token_embd.weight"))
+        .expect("embed_tokens not found (tried model.language_model.embed_tokens.weight, model.embed_tokens.weight, token_embd.weight)");
     Ok(if embd_info.0.quant_type == 6 {
         eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
         (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G256)
@@ -1613,14 +1885,16 @@ fn load_output_into(
 
     let lm_head_info = hfq
         .tensor_data("lm_head.weight")
-        .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"));
+        .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
+        .or_else(|| hfq.tensor_data("output.weight"));
     let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, lm_data, config.vocab_size, config.dim)?
     } else {
-        let embd_info = hfq
-            .tensor_data("model.language_model.embed_tokens.weight")
-            .expect("embed_tokens not found");
+        let embd_info = hfq.tensor_data("model.language_model.embed_tokens.weight")
+            .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
+            .or_else(|| hfq.tensor_data("token_embd.weight"))
+            .expect("embed_tokens not found for tied lm_head");
         eprintln!("  loading output (tied embeddings, qt={})...", embd_info.0.quant_type);
         let embd_data = embd_info.1;
         if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 || embd_info.0.quant_type == 8 {
