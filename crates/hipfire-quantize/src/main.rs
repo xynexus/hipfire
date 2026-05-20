@@ -2881,13 +2881,39 @@ fn load_imatrix(path: &Path) -> LoadedImatrix {
 /// Look up imatrix per-channel weights for a given safetensors tensor name.
 /// Returns `None` (caller falls back to non-imatrix-weighted quantization) if:
 ///   - --imatrix wasn't passed (IMATRIX not initialized), OR
-///   - the tensor name doesn't have a ggml-mapping (norms, small 1D, etc.), OR
-///   - the imatrix file doesn't carry this tensor (rare; usually means the
-///     tensor wasn't exercised by the calibration corpus).
+///   - neither the HF-canonical nor the ggml-converted name matches an
+///     entry in the imatrix HashMap.
+///
+/// The HashMap is populated by [`load_imatrix`] from whatever names the
+/// FILE uses:
+///   - IMQ format (hipfire-native)        → HF-canonical keys
+///   - GGUF imatrix (hipfire-native emit) → HF-canonical keys
+///   - GGUF imatrix (legacy llama.cpp)    → ggml-style keys
+///
+/// So the lookup tries HF-canonical first (matches the two hipfire emit
+/// paths), then falls back to ggml-style for legacy compatibility. The
+/// previous version only tried ggml-style, which silently missed every
+/// HF-named imatrix file and turned AWQ into an identity-scale no-op.
+/// See docs/investigations/2026-05-20-gptq-hip-obs-9b-failure/README.md.
 fn imatrix_weights_for(safetensors_name: &str) -> Option<&'static [f32]> {
     let im = IMATRIX.get()?;
+    imatrix_lookup(im, safetensors_name).map(|v| v.as_slice())
+}
+
+/// Pure (testable) helper for [`imatrix_weights_for`]. Tries the HF-
+/// canonical safetensors name first (the IMQ + hipfire-native GGUF emit
+/// case), then falls back to the ggml-converted name (legacy
+/// llama-imatrix output). Kept separate so the lookup contract can be
+/// unit-tested without exercising the process-wide `IMATRIX` `OnceLock`.
+fn imatrix_lookup<'a>(
+    map: &'a HashMap<String, Vec<f32>>,
+    safetensors_name: &str,
+) -> Option<&'a Vec<f32>> {
+    if let Some(v) = map.get(safetensors_name) {
+        return Some(v);
+    }
     let ggml_name = safetensors_to_ggml_name(safetensors_name)?;
-    im.get(&ggml_name).map(|v| v.as_slice())
+    map.get(&ggml_name)
 }
 
 /// Parse the routed-expert index from a per-expert tensor name. Returns
@@ -6244,5 +6270,83 @@ mod tests {
             kmap_resolve_mode("model.layers.0.mlp.gate_proj.weight", 40, false, 4, GgufFormat::Mq6),
             QuantLevel::Base
         );
+    }
+
+    /// Bug 2 regression test (see
+    /// `docs/investigations/2026-05-20-gptq-hip-obs-9b-failure/README.md`).
+    ///
+    /// `imatrix_lookup` must accept HF-canonical safetensors names as keys
+    /// (the IMQ + hipfire-native GGUF emit path) — the prior implementation
+    /// only tried the ggml-converted name and silently missed every
+    /// HF-named imatrix file, turning AWQ into an identity-scale no-op.
+    #[test]
+    fn imatrix_lookup_hf_canonical_hit() {
+        let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+        let hf_name = "model.language_model.layers.23.self_attn.q_proj.weight";
+        map.insert(hf_name.to_string(), vec![1.0, 2.0, 3.0, 4.0]);
+
+        let got = imatrix_lookup(&map, hf_name).expect("HF-canonical key must hit");
+        assert_eq!(got.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// Legacy llama-imatrix output uses ggml-style names (`blk.N.<slot>.weight`).
+    /// `imatrix_lookup` must still resolve those via the
+    /// `safetensors_to_ggml_name` fallback so existing GGUF imatrix files
+    /// from upstream tooling continue to work.
+    #[test]
+    fn imatrix_lookup_ggml_fallback_hit() {
+        let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+        // Legacy llama-imatrix names a per-layer attention output as
+        // `blk.{N}.attn_q.weight` — see safetensors_to_ggml_name for the
+        // full translation table.
+        let ggml_name = "blk.23.attn_q.weight";
+        map.insert(ggml_name.to_string(), vec![10.0, 20.0]);
+
+        let hf_name = "model.language_model.layers.23.self_attn.q_proj.weight";
+        let got = imatrix_lookup(&map, hf_name).expect("ggml fallback key must hit");
+        assert_eq!(got.as_slice(), &[10.0, 20.0]);
+    }
+
+    /// HF-canonical key takes precedence over ggml-style key when BOTH are
+    /// present in the same map (the no-collision-by-construction case is
+    /// the production reality, but the precedence guarantees readers get
+    /// the hipfire-native entry even in the pathological mixed case).
+    #[test]
+    fn imatrix_lookup_hf_canonical_wins_over_ggml() {
+        let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+        let hf_name = "model.language_model.layers.5.self_attn.k_proj.weight";
+        let ggml_name = "blk.5.attn_k.weight";
+        map.insert(hf_name.to_string(), vec![1.0]);
+        map.insert(ggml_name.to_string(), vec![99.0]);
+
+        let got = imatrix_lookup(&map, hf_name).expect("HF-canonical hit expected");
+        assert_eq!(
+            got.as_slice(),
+            &[1.0],
+            "HF-canonical must take precedence over ggml fallback"
+        );
+    }
+
+    /// Misses produce `None` (caller falls back to non-imatrix-weighted
+    /// quantization). Covers two miss modes:
+    ///   - the tensor has no ggml mapping (e.g. norms, biases) AND no HF
+    ///     entry — returns `None` regardless.
+    ///   - the tensor has a ggml mapping but neither HF nor ggml key is
+    ///     populated in the map — returns `None`.
+    #[test]
+    fn imatrix_lookup_miss_returns_none() {
+        let map: HashMap<String, Vec<f32>> = HashMap::new();
+        // Has a ggml mapping but map is empty.
+        assert!(imatrix_lookup(
+            &map,
+            "model.language_model.layers.0.self_attn.q_proj.weight"
+        )
+        .is_none());
+        // No ggml mapping (norm) AND no HF entry.
+        assert!(imatrix_lookup(
+            &map,
+            "model.language_model.layers.0.input_layernorm.weight"
+        )
+        .is_none());
     }
 }
