@@ -1660,6 +1660,110 @@ mod phase2_tests {
         }
     }
 
+    /// Phase 2F — end-to-end CPU vs GPU-OBS parity gate.
+    ///
+    /// Synthetic small case: M=64, K=256 (so K/B=2 blocks). Builds a
+    /// well-conditioned SPD Hessian, frozen MQ4 grids, and runs both
+    /// gptq_column_sequential (CPU reference) and
+    /// gptq_column_sequential_hip (GPU full-OBS path). Asserts:
+    ///   max_i |W_gpu[i] - W_cpu[i]| / max_i |W_cpu[i]| < 1e-6
+    ///
+    /// This is a loose tolerance for v1: the kernel uses FP32 scale +
+    /// min_val to match the on-disk MQ4G256 layout (the same FP32 cast
+    /// that gemm_hfq4g256 family kernels read at inference). Any
+    /// codeword that lands on a quantization-bin boundary will flip
+    /// between FP32 (GPU) and FP64 (CPU) grids — this is expected and
+    /// intentional. The 1e-6 tolerance allows for the FP32 cast plus
+    /// minor MFMA reordering effects.
+    ///
+    /// The Phase 3 byte-identity gate (per plan §6) requires the CPU
+    /// path to use FP32 grids too; that pre-quant alignment is out of
+    /// scope here (would require a CPU-side `quantize_mq4_element_f32_cast`
+    /// helper). For Phase 2F shipping the relative-1e-6 gate is the right
+    /// tradeoff.
+    #[test]
+    fn phase2f_end_to_end_parity() {
+        if std::env::var("HIPFIRE_SKIP_GPU_TESTS").is_ok() {
+            eprintln!("skip: HIPFIRE_SKIP_GPU_TESTS set");
+            return;
+        }
+        let solver = match RocSolver::load() {
+            Ok(s) => s,
+            Err(e) => { eprintln!("skip: RocSolver::load failed ({e})"); return; }
+        };
+
+        let m = 64;
+        let k = 256;
+
+        // Synthetic SPD H (well-conditioned).
+        let mut state: u64 = 0xdeadbeef_cafebabe;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+        };
+        let mut a: Mat<f64> = Mat::zeros(k, k);
+        for i in 0..k { for j in 0..k { a[(i, j)] = next(); } }
+        let mut h: Mat<f64> = Mat::zeros(k, k);
+        for i in 0..k {
+            for j in 0..k {
+                let mut s = 0.0_f64;
+                for l in 0..k { s += a[(l, i)] * a[(l, j)]; }
+                h[(i, j)] = s;
+            }
+            h[(i, i)] += 0.01;
+        }
+
+        // Synthetic W (deterministic).
+        let mut w_orig = vec![0.0_f64; m * k];
+        for r in 0..m { for c in 0..k {
+            w_orig[r * k + c] = ((r as f64 * 0.013).sin() + (c as f64 * 0.027).cos()) * 0.5;
+        }}
+
+        // Frozen grids — compute from pre-loop weights using the standard helper.
+        let grids = crate::gptq::compute_frozen_block_grids(&w_orig);
+
+        // CPU reference (gptq-hip env unset, no solver passed → CPU OBS).
+        let mut w_cpu = w_orig.clone();
+        let damp_cpu = crate::gptq::gptq_column_sequential(
+            &mut w_cpu, &h, m, k, &grids, 0.01, 1.0,
+            "test:phase2f:cpu",
+            None::<&crate::gptq::GptqHipSolver>,
+        ).expect("CPU OBS");
+
+        // GPU full-OBS path.
+        let mut w_gpu = w_orig.clone();
+        let damp_gpu = gptq_column_sequential_hip(
+            &solver, &mut w_gpu, &h, m, k, &grids, 0.01, 1.0,
+            "test:phase2f:gpu",
+        ).expect("GPU OBS");
+
+        // Damp value sanity (both should pick the same initial damp since
+        // the Hessian is well-conditioned).
+        let damp_rel = (damp_cpu - damp_gpu).abs() / damp_cpu.max(1e-30);
+        assert!(damp_rel < 1e-12, "damp mismatch: cpu={damp_cpu} gpu={damp_gpu}");
+
+        // Element-wise comparison.
+        let mut max_abs = 0.0_f64;
+        let mut max_cpu_abs = 0.0_f64;
+        let mut max_at = (0usize, 0usize);
+        for r in 0..m {
+            for c in 0..k {
+                let cpu = w_cpu[r * k + c];
+                let gpu = w_gpu[r * k + c];
+                let d = (cpu - gpu).abs();
+                if d > max_abs { max_abs = d; max_at = (r, c); }
+                if cpu.abs() > max_cpu_abs { max_cpu_abs = cpu.abs(); }
+            }
+        }
+        let rel = if max_cpu_abs > 0.0 { max_abs / max_cpu_abs } else { max_abs };
+        eprintln!(
+            "[phase2f] max_abs={max_abs:.3e} max_cpu={max_cpu_abs:.3e} rel={rel:.3e} at (r={}, c={})",
+            max_at.0, max_at.1,
+        );
+        // Loose gate per docstring rationale (FP32 scale cast in kernel).
+        assert!(rel < 1e-6, "phase2f rel-err {rel} >= 1e-6 (max_abs {max_abs})");
+    }
+
     #[test]
     fn phase2c_block_apply_mfma_parity() {
         if std::env::var("HIPFIRE_SKIP_GPU_TESTS").is_ok() {
