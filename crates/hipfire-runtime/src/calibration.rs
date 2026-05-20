@@ -48,6 +48,88 @@ use std::process::Command;
 use std::sync::Mutex;
 
 // ───────────────────────────────────────────────────────────────────────
+// Expert-index parsing (MoE per-expert capture key)
+// ───────────────────────────────────────────────────────────────────────
+
+/// Parse the per-expert index out of a tensor name and return
+/// `(canonical_name, expert_idx)`.
+///
+/// MoE models (Qwen3.5-A3B, Astrea) name per-expert weight tensors
+/// using the convention:
+///
+/// ```text
+/// model.language_model.layers.{LAYER}.mlp.experts.{EXPERT_IDX}.gate_proj.weight
+/// model.language_model.layers.{LAYER}.mlp.experts.{EXPERT_IDX}.up_proj.weight
+/// model.language_model.layers.{LAYER}.mlp.experts.{EXPERT_IDX}.down_proj.weight
+/// ```
+///
+/// For names containing the `.experts.<DIGITS>.` substring this returns
+/// `(full_name_with_literal_index, EXPERT_IDX)`. The canonical name
+/// preserves the literal expert index so the HFHS / GGUF writers emit
+/// the on-disk tensor name verbatim (downstream tools — Astrea,
+/// hipfire-quantize — locate per-expert imatrix / Hessian records by
+/// matching the literal tensor name).
+///
+/// For non-MoE names (no `.experts.<DIGITS>.` substring) the canonical
+/// name is the input unchanged and `expert_idx = 0`. This matches the
+/// HFHS-v1 binary layout (`hessian_io.rs::HessianRef::expert_idx`
+/// defaults to 0 for dense tensors).
+///
+/// Examples:
+///
+/// ```ignore
+/// assert_eq!(
+///     parse_expert_idx("model.layers.0.self_attn.q_proj.weight"),
+///     ("model.layers.0.self_attn.q_proj.weight".to_string(), 0),
+/// );
+/// assert_eq!(
+///     parse_expert_idx(
+///         "model.language_model.layers.5.mlp.experts.23.gate_proj.weight",
+///     ),
+///     (
+///         "model.language_model.layers.5.mlp.experts.23.gate_proj.weight".to_string(),
+///         23,
+///     ),
+/// );
+/// // Non-digit between `.experts.` and the next `.` does not match
+/// // (e.g. shared_expert is a separate path, not a per-expert key).
+/// assert_eq!(
+///     parse_expert_idx("model.layers.0.mlp.shared_expert.gate_proj.weight"),
+///     ("model.layers.0.mlp.shared_expert.gate_proj.weight".to_string(), 0),
+/// );
+/// ```
+///
+/// Implementation note: hand-rolled scan (no regex crate dep) to keep
+/// the `hipfire-runtime` workspace dep graph tight. Scans for the
+/// literal `.experts.` substring, then walks forward to read a
+/// `[0-9]+` run terminated by `.`. Returns `(name, 0)` on any
+/// non-match (including malformed `.experts.<non-digit>.`,
+/// `.experts.<digits><EOF>`, or overflow on a 10+ digit run).
+pub fn parse_expert_idx(full_name: &str) -> (String, u32) {
+    const MARKER: &str = ".experts.";
+    let Some(start) = full_name.find(MARKER) else {
+        return (full_name.to_string(), 0);
+    };
+    let digits_start = start + MARKER.len();
+    let bytes = full_name.as_bytes();
+    let mut cursor = digits_start;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+        cursor += 1;
+    }
+    // Must have at least one digit AND be terminated by `.` before EOF.
+    if cursor == digits_start || cursor >= bytes.len() || bytes[cursor] != b'.' {
+        return (full_name.to_string(), 0);
+    }
+    let digits = &full_name[digits_start..cursor];
+    // Parse the digit run as u32. Overflow → fall back to dense key
+    // (degenerate input; better than panicking).
+    let Ok(expert_idx) = digits.parse::<u32>() else {
+        return (full_name.to_string(), 0);
+    };
+    (full_name.to_string(), expert_idx)
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // Tokenizer driver
 // ───────────────────────────────────────────────────────────────────────
 
@@ -577,6 +659,132 @@ impl ActivationCapture for HessianCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────────────────────────────────────────────────────────────────
+    // parse_expert_idx — MoE per-expert key extraction
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Dense tensor names (no `.experts.<digits>.`): canonical name is
+    /// returned unchanged, expert_idx is 0.
+    #[test]
+    fn parse_expert_idx_dense() {
+        let (n, e) = parse_expert_idx("model.layers.0.self_attn.q_proj.weight");
+        assert_eq!(n, "model.layers.0.self_attn.q_proj.weight");
+        assert_eq!(e, 0);
+
+        let (n, e) = parse_expert_idx("model.layers.5.mlp.gate_proj.weight");
+        assert_eq!(n, "model.layers.5.mlp.gate_proj.weight");
+        assert_eq!(e, 0);
+
+        // MoE router gate — admitted by is_gptq_target but is not a
+        // per-expert tensor, so expert_idx stays 0.
+        let (n, e) = parse_expert_idx("model.layers.0.mlp.gate.weight");
+        assert_eq!(n, "model.layers.0.mlp.gate.weight");
+        assert_eq!(e, 0);
+
+        // Final norm / embed: no .experts. substring.
+        let (n, e) = parse_expert_idx("model.embed_tokens.weight");
+        assert_eq!(n, "model.embed_tokens.weight");
+        assert_eq!(e, 0);
+    }
+
+    /// Per-expert MoE name: canonical name retains the literal expert
+    /// index, expert_idx parses correctly.
+    #[test]
+    fn parse_expert_idx_moe() {
+        let (n, e) = parse_expert_idx(
+            "model.language_model.layers.5.mlp.experts.23.gate_proj.weight",
+        );
+        assert_eq!(
+            n,
+            "model.language_model.layers.5.mlp.experts.23.gate_proj.weight"
+        );
+        assert_eq!(e, 23);
+
+        let (n, e) = parse_expert_idx(
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+        );
+        assert_eq!(
+            n,
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+        );
+        assert_eq!(e, 0);
+
+        let (n, e) = parse_expert_idx(
+            "model.language_model.layers.10.mlp.experts.127.down_proj.weight",
+        );
+        assert_eq!(
+            n,
+            "model.language_model.layers.10.mlp.experts.127.down_proj.weight"
+        );
+        assert_eq!(e, 127);
+
+        let (n, e) = parse_expert_idx(
+            "model.language_model.layers.7.mlp.experts.42.up_proj.weight",
+        );
+        assert_eq!(
+            n,
+            "model.language_model.layers.7.mlp.experts.42.up_proj.weight"
+        );
+        assert_eq!(e, 42);
+
+        // Some HF dumps drop the `model.language_model.` prefix.
+        let (n, e) = parse_expert_idx("model.layers.3.mlp.experts.8.down_proj.weight");
+        assert_eq!(n, "model.layers.3.mlp.experts.8.down_proj.weight");
+        assert_eq!(e, 8);
+    }
+
+    /// `shared_expert` is NOT a per-expert key (no digits between
+    /// `.experts.` and `.`); the canonical name + expert_idx must
+    /// degrade gracefully to the dense-tensor case.
+    #[test]
+    fn parse_expert_idx_shared_expert_is_dense() {
+        let (n, e) = parse_expert_idx(
+            "model.language_model.layers.5.mlp.shared_expert.gate_proj.weight",
+        );
+        assert_eq!(
+            n,
+            "model.language_model.layers.5.mlp.shared_expert.gate_proj.weight"
+        );
+        assert_eq!(e, 0);
+
+        let (n, e) = parse_expert_idx(
+            "model.layers.5.mlp.shared_expert.down_proj.weight",
+        );
+        assert_eq!(n, "model.layers.5.mlp.shared_expert.down_proj.weight");
+        assert_eq!(e, 0);
+    }
+
+    /// Malformed expert-index runs (non-digits, missing terminator,
+    /// truncation at EOF) degrade to the dense-tensor case rather than
+    /// panicking.
+    #[test]
+    fn parse_expert_idx_malformed_falls_back_to_dense() {
+        // Non-digit immediately after `.experts.`
+        let (n, e) = parse_expert_idx("model.layers.0.mlp.experts.foo.gate_proj.weight");
+        assert_eq!(n, "model.layers.0.mlp.experts.foo.gate_proj.weight");
+        assert_eq!(e, 0);
+
+        // Digits but no terminating `.` (truncated EOF).
+        let (n, e) = parse_expert_idx("model.layers.0.mlp.experts.42");
+        assert_eq!(n, "model.layers.0.mlp.experts.42");
+        assert_eq!(e, 0);
+
+        // Digits followed by underscore (not `.`).
+        let (n, e) = parse_expert_idx("model.layers.0.mlp.experts.42_gate_proj.weight");
+        assert_eq!(n, "model.layers.0.mlp.experts.42_gate_proj.weight");
+        assert_eq!(e, 0);
+
+        // 11-digit number overflows u32 (max u32 = 10 digits). Falls
+        // back to dense rather than panicking.
+        let (n, e) =
+            parse_expert_idx("model.layers.0.mlp.experts.99999999999.gate_proj.weight");
+        assert_eq!(
+            n,
+            "model.layers.0.mlp.experts.99999999999.gate_proj.weight"
+        );
+        assert_eq!(e, 0);
+    }
 
     /// `should_capture` admits the obvious Linear tensors and rejects norms
     /// + embed by default; `lm_head` is admitted only with `process_output`.
