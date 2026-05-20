@@ -345,6 +345,196 @@ pub fn compute_damped_inv_cholesky_upper_hip(
     }
 }
 
+/// Phase 2 keep-on-device variant: same algorithm as
+/// `compute_damped_inv_cholesky_upper_hip` but transfers ownership of the
+/// device U buffer to the caller via `GpuU` instead of D2H-copying to a
+/// host `Mat<f64>`.
+///
+/// Used by `gptq_column_sequential_hip` so the OBS column loop can read U
+/// directly from device memory across all K serial steps + K/B GEMM
+/// flushes. Saves one round-trip 2× K²×8-byte H2D copy.
+///
+/// Layout: `GpuU::d_u` points to a K×K FP64 buffer in COLUMN-major (post-
+/// dgeam, upper-tri stored at d_u[col*K + row] for row<=col). Lower
+/// triangle is undefined (rocSOLVER does not zero it). Kernels must
+/// only read upper-tri entries.
+pub fn compute_damped_inv_cholesky_upper_hip_keep(
+    solver: &RocSolver,
+    h: &Mat<f64>,
+    perm: Option<&[usize]>,
+    initial_damp: f64,
+    max_damp_multiplier: f64,
+) -> Result<(GpuU, f64), CholeskyError> {
+    let k = h.nrows();
+    assert_eq!(k, h.ncols(), "H must be square");
+    if let Some(p) = perm { assert_eq!(p.len(), k, "perm length must equal K"); }
+
+    let mut host_a: Vec<f64> = vec![0.0; k * k];
+    let mut diag_mean = 0.0_f64;
+    for col in 0..k {
+        let src_col = perm.map(|p| p[col]).unwrap_or(col);
+        for row in 0..k {
+            let src_row = perm.map(|p| p[row]).unwrap_or(row);
+            host_a[col * k + row] = h[(src_row, src_col)];
+        }
+        diag_mean += host_a[col * k + col];
+    }
+    diag_mean /= k as f64;
+
+    if !diag_mean.is_finite() || diag_mean <= 0.0 {
+        return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: initial_damp, k, diag_mean });
+    }
+    let damp_cap = max_damp_multiplier * diag_mean;
+    let mut damp = initial_damp * diag_mean;
+
+    let bytes = k * k * std::mem::size_of::<f64>();
+    let mut d_a: *mut c_void = std::ptr::null_mut();
+    let mut d_h_inv: *mut c_void = std::ptr::null_mut();
+    let mut d_u: *mut c_void = std::ptr::null_mut();
+    let mut d_info: *mut c_void = std::ptr::null_mut();
+    let mut effective_damp = damp;
+
+    unsafe {
+        let oom = || CholeskyError::SingularEvenWithMaxDamp { max_damp: damp, k, diag_mean };
+        if (solver.fn_hip_malloc)(&mut d_a as *mut *mut c_void, bytes) != HIP_SUCCESS { return Err(oom()); }
+        if (solver.fn_hip_malloc)(&mut d_h_inv as *mut *mut c_void, bytes) != HIP_SUCCESS {
+            let _ = (solver.fn_hip_free)(d_a); return Err(oom());
+        }
+        if (solver.fn_hip_malloc)(&mut d_u as *mut *mut c_void, bytes) != HIP_SUCCESS {
+            let _ = (solver.fn_hip_free)(d_a); let _ = (solver.fn_hip_free)(d_h_inv); return Err(oom());
+        }
+        if (solver.fn_hip_malloc)(&mut d_info as *mut *mut c_void, std::mem::size_of::<c_int>()) != HIP_SUCCESS {
+            let _ = (solver.fn_hip_free)(d_a); let _ = (solver.fn_hip_free)(d_h_inv); let _ = (solver.fn_hip_free)(d_u); return Err(oom());
+        }
+
+        // ── Cleanup helpers ──
+        // On any error we free d_a, d_h_inv, d_u, d_info.
+        // On success we free d_a, d_h_inv, d_info but transfer d_u to GpuU.
+        let cleanup_all = |s: &RocSolver, du: *mut c_void| {
+            let _ = (s.fn_hip_free)(d_a);
+            let _ = (s.fn_hip_free)(d_h_inv);
+            let _ = (s.fn_hip_free)(du);
+            let _ = (s.fn_hip_free)(d_info);
+        };
+        let cleanup_keep_u = |s: &RocSolver| {
+            let _ = (s.fn_hip_free)(d_a);
+            let _ = (s.fn_hip_free)(d_h_inv);
+            let _ = (s.fn_hip_free)(d_info);
+        };
+
+        // Adaptive damp retry loop on first dpotrf.
+        loop {
+            for i in 0..k {
+                let src_i = perm.map(|p| p[i]).unwrap_or(i);
+                host_a[i * k + i] = h[(src_i, src_i)] + damp;
+            }
+            if (solver.fn_hip_memcpy)(d_a, host_a.as_ptr() as *const c_void, bytes, HIP_MEMCPY_HOST_TO_DEVICE) != HIP_SUCCESS {
+                cleanup_all(solver, d_u);
+                return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp, k, diag_mean });
+            }
+            let status = (solver.fn_rocsolver_dpotrf)(solver.handle(), ROCBLAS_FILL_LOWER, k as c_int, d_a as *mut c_double, k as c_int, d_info as *mut c_int);
+            if status != ROCBLAS_STATUS_SUCCESS {
+                cleanup_all(solver, d_u);
+                return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp, k, diag_mean });
+            }
+            let mut info_host: c_int = 0;
+            if (solver.fn_hip_memcpy)(&mut info_host as *mut c_int as *mut c_void, d_info, std::mem::size_of::<c_int>(), HIP_MEMCPY_DEVICE_TO_HOST) != HIP_SUCCESS {
+                cleanup_all(solver, d_u);
+                return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp, k, diag_mean });
+            }
+            if info_host == 0 {
+                effective_damp = damp;
+                break;
+            }
+            damp *= 10.0;
+            if damp > damp_cap {
+                cleanup_all(solver, d_u);
+                return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp_cap, k, diag_mean });
+            }
+        }
+
+        let mut info_host: c_int = 0;
+        let status = (solver.fn_rocsolver_dtrtri)(solver.handle(), ROCBLAS_FILL_LOWER, ROCBLAS_DIAG_NON_UNIT, k as c_int, d_a as *mut c_double, k as c_int, d_info as *mut c_int);
+        if status != ROCBLAS_STATUS_SUCCESS {
+            cleanup_all(solver, d_u);
+            return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
+        }
+        let _ = (solver.fn_hip_memcpy)(&mut info_host as *mut c_int as *mut c_void, d_info, std::mem::size_of::<c_int>(), HIP_MEMCPY_DEVICE_TO_HOST);
+        if info_host != 0 {
+            cleanup_all(solver, d_u);
+            return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
+        }
+
+        let alpha: c_double = 1.0;
+        let beta: c_double = 0.0;
+        let status = (solver.fn_rocblas_dsyrk)(solver.handle(), ROCBLAS_FILL_UPPER, ROCBLAS_OPERATION_TRANSPOSE, k as c_int, k as c_int, &alpha, d_a as *const c_double, k as c_int, &beta, d_h_inv as *mut c_double, k as c_int);
+        if status != ROCBLAS_STATUS_SUCCESS {
+            cleanup_all(solver, d_u);
+            return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
+        }
+
+        let status = (solver.fn_rocsolver_dpotrf)(solver.handle(), ROCBLAS_FILL_UPPER, k as c_int, d_h_inv as *mut c_double, k as c_int, d_info as *mut c_int);
+        if status != ROCBLAS_STATUS_SUCCESS {
+            cleanup_all(solver, d_u);
+            return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
+        }
+        let _ = (solver.fn_hip_memcpy)(&mut info_host as *mut c_int as *mut c_void, d_info, std::mem::size_of::<c_int>(), HIP_MEMCPY_DEVICE_TO_HOST);
+        if info_host != 0 {
+            cleanup_all(solver, d_u);
+            return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
+        }
+
+        let status = (solver.fn_rocblas_dgeam)(solver.handle(), ROCBLAS_OPERATION_TRANSPOSE, ROCBLAS_OPERATION_NONE, k as c_int, k as c_int, &alpha, d_h_inv as *const c_double, k as c_int, &beta, std::ptr::null(), k as c_int, d_u as *mut c_double, k as c_int);
+        if status != ROCBLAS_STATUS_SUCCESS {
+            cleanup_all(solver, d_u);
+            return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
+        }
+
+        let _ = (solver.fn_hip_device_sync)();
+
+        // Caller takes ownership of d_u via GpuU.
+        cleanup_keep_u(solver);
+
+        // Build the fn_hip_free pointer as a plain unsafe extern "C" fn
+        // value (no captured state) so GpuU's Drop can free without needing
+        // a reference to RocSolver.
+        let gpu_u = GpuU {
+            d_u,
+            k,
+            effective_damp,
+            fn_hip_free: solver.fn_hip_free,
+        };
+        Ok((gpu_u, effective_damp))
+    }
+}
+
+/// Owning handle for the device-resident upper-Cholesky factor U.
+///
+/// Lifetime contract: created by `compute_damped_inv_cholesky_upper_hip_keep`,
+/// freed automatically by `Drop`. Callers (Phase 2 OBS orchestrator) hold
+/// `GpuU` for the duration of the column-sequential loop; on either
+/// success or panic, U is freed deterministically.
+pub struct GpuU {
+    /// Device pointer to a K×K FP64 buffer in column-major layout (upper-tri
+    /// stored at d_u[col*K + row] for row<=col). Lower triangle undefined.
+    pub d_u: *mut c_void,
+    pub k: usize,
+    pub effective_damp: f64,
+    /// Bound at construction so Drop doesn't need a live RocSolver borrow.
+    fn_hip_free: FnHipFree,
+}
+
+unsafe impl Send for GpuU {}
+
+impl Drop for GpuU {
+    fn drop(&mut self) {
+        if !self.d_u.is_null() {
+            unsafe { let _ = (self.fn_hip_free)(self.d_u); }
+            self.d_u = std::ptr::null_mut();
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase 2 OBS kernel infrastructure
 //
@@ -792,6 +982,238 @@ unsafe fn dev_sync(solver: &RocSolver) -> Result<(), String> {
     let code = (solver.fn_hip_device_sync)();
     if code != HIP_SUCCESS { return Err(format!("hipDeviceSynchronize returned {code}")); }
     Ok(())
+}
+
+/// Phase 2D — GPU OBS column-sequential orchestrator.
+///
+/// Replaces the CPU loop in `gptq_column_sequential` (gptq.rs:860-915)
+/// with the paper §3.2 block-128 variant executed on gfx942:
+///   * WEIGHT-mode actorder on CPU (~50µs)
+///   * GPU Cholesky via rocSOLVER (`_keep` variant, U stays on device)
+///   * H2D copy of W + frozen grids + perm
+///   * Block loop:
+///       - For step in [block_start..block_end):
+///           * Phase 2A kernel: quantize column → emit err_col into d_err_block
+///           * Phase 2B kernel: within-block rank-1 update for remaining cols
+///       - Phase 2C kernel: cross-block rank-B MFMA GEMM
+///   * D2H copy of W_quant back to `weights_flat`
+///   * Auto-free of d_u (via GpuU::Drop) and all per-tensor buffers
+///
+/// Diagnostic [gptq-clamp] line is emitted as a post-D2H scan to keep
+/// pipeline log compatibility with the CPU path's line format.
+///
+/// Returns the effective damping value (after adaptive escalation in the
+/// Cholesky step).
+pub fn gptq_column_sequential_hip(
+    solver: &RocSolver,
+    weights_flat: &mut [f64],
+    h_target: &Mat<f64>,
+    m: usize,
+    k_dim: usize,
+    frozen_grids: &[crate::gptq::BlockGrid],
+    initial_damp: f64,
+    max_damp_multiplier: f64,
+    tensor_name: &str,
+) -> Result<f64, CholeskyError> {
+    assert_eq!(weights_flat.len(), m * k_dim, "weight shape mismatch");
+    assert_eq!(h_target.nrows(), k_dim);
+    assert_eq!(h_target.ncols(), k_dim);
+    assert_eq!(frozen_grids.len(), (m * k_dim) / 256, "frozen_grids count mismatch");
+
+    // ── Step 1: CPU actorder (same as gptq.rs:803-804) ──
+    let h_diag: Vec<f64> = (0..k_dim).map(|i| h_target[(i, i)]).collect();
+    let perm = crate::gptq::weight_mode_actorder(&h_diag);
+
+    // ── Step 2: GPU Cholesky (keep U on device) ──
+    let (gpu_u, effective_damp) = compute_damped_inv_cholesky_upper_hip_keep(
+        solver, h_target, Some(&perm), initial_damp, max_damp_multiplier,
+    )?;
+
+    // ── Step 3: Diagonal D2H (single batched copy of U[i, i] for all i) ──
+    // U is column-major in d_u: U[i, i] at offset i*K + i (= (K+1)*i).
+    // Read the full column-major U strided diagonal in K mini-copies (8 B
+    // each). Plan §4 budget: K=12288 → ~60ms via per-step D2H, mitigated
+    // here by ONE D2H of the entire K×K buffer's diagonal via a strided
+    // memcpy. The HIP API doesn't have a strided memcpy, so we issue K
+    // single-double copies. At ~5µs/copy that's 60ms — acceptable for
+    // Phase 2 v1; future work can fuse to one chunked copy.
+    let b_dim = PHASE2_BLOCK_SIZE;
+    let bytes_per_f64 = std::mem::size_of::<f64>();
+    let u_diag: Vec<f64> = unsafe {
+        let mut diag = vec![0.0_f64; k_dim];
+        for i in 0..k_dim {
+            let src = (gpu_u.d_u as *const u8).add((i * k_dim + i) * bytes_per_f64);
+            let code = (solver.fn_hip_memcpy)(
+                diag.as_mut_ptr().add(i) as *mut c_void,
+                src as *const c_void,
+                bytes_per_f64,
+                HIP_MEMCPY_DEVICE_TO_HOST,
+            );
+            if code != HIP_SUCCESS {
+                return Err(CholeskyError::SingularEvenWithMaxDamp {
+                    max_damp: effective_damp, k: k_dim, diag_mean: 0.0,
+                });
+            }
+        }
+        diag
+    };
+
+    // ── Step 4: H2D — W (twice, into residual + quant), grids, perm ──
+    let w_bytes    = m * k_dim * bytes_per_f64;
+    let err_bytes  = m * b_dim * bytes_per_f64;
+    let grid_bytes = frozen_grids.len() * std::mem::size_of::<PackedGrid>();
+    let perm_bytes = k_dim * std::mem::size_of::<i32>();
+
+    let to_chol_err = |damp: f64| CholeskyError::SingularEvenWithMaxDamp {
+        max_damp: damp, k: k_dim, diag_mean: 0.0,
+    };
+
+    unsafe {
+        let d_w_residual = match dev_alloc(solver, w_bytes) {
+            Ok(p) => p, Err(_) => return Err(to_chol_err(effective_damp)),
+        };
+        let d_w_quant = match dev_alloc(solver, w_bytes) {
+            Ok(p) => p,
+            Err(_) => { dev_free(solver, d_w_residual); return Err(to_chol_err(effective_damp)); }
+        };
+        let d_grids = match dev_alloc(solver, grid_bytes) {
+            Ok(p) => p,
+            Err(_) => {
+                dev_free(solver, d_w_residual); dev_free(solver, d_w_quant);
+                return Err(to_chol_err(effective_damp));
+            }
+        };
+        let d_err_block = match dev_alloc(solver, err_bytes) {
+            Ok(p) => p,
+            Err(_) => {
+                dev_free(solver, d_w_residual); dev_free(solver, d_w_quant); dev_free(solver, d_grids);
+                return Err(to_chol_err(effective_damp));
+            }
+        };
+        let d_perm = match dev_alloc(solver, perm_bytes) {
+            Ok(p) => p,
+            Err(_) => {
+                dev_free(solver, d_w_residual); dev_free(solver, d_w_quant);
+                dev_free(solver, d_grids); dev_free(solver, d_err_block);
+                return Err(to_chol_err(effective_damp));
+            }
+        };
+
+        // Wrap cleanup in a helper for the error paths below.
+        let cleanup = |s: &RocSolver| {
+            dev_free(s, d_w_residual);
+            dev_free(s, d_w_quant);
+            dev_free(s, d_grids);
+            dev_free(s, d_err_block);
+            dev_free(s, d_perm);
+        };
+
+        if h2d(solver, d_w_residual, weights_flat.as_ptr() as *const u8, w_bytes).is_err() {
+            cleanup(solver); return Err(to_chol_err(effective_damp));
+        }
+        if h2d(solver, d_w_quant, weights_flat.as_ptr() as *const u8, w_bytes).is_err() {
+            cleanup(solver); return Err(to_chol_err(effective_damp));
+        }
+        let packed = pack_grids(frozen_grids);
+        if h2d(solver, d_grids, packed.as_ptr() as *const u8, grid_bytes).is_err() {
+            cleanup(solver); return Err(to_chol_err(effective_damp));
+        }
+        let perm_i32: Vec<i32> = perm.iter().map(|&v| v as i32).collect();
+        if h2d(solver, d_perm, perm_i32.as_ptr() as *const u8, perm_bytes).is_err() {
+            cleanup(solver); return Err(to_chol_err(effective_damp));
+        }
+
+        // ── Step 5: Block loop ──
+        let mut block_start = 0usize;
+        while block_start < k_dim {
+            let block_end = (block_start + b_dim).min(k_dim);
+            let cur_b = block_end - block_start;
+
+            // Zero d_err_block at the start of each block.
+            if dev_memset_zero(solver, d_err_block, err_bytes).is_err() {
+                cleanup(solver); return Err(to_chol_err(effective_damp));
+            }
+
+            // Phase A: B serial within-block steps.
+            for step in block_start..block_end {
+                let u_ss = u_diag[step];
+                if u_ss <= 0.0 {
+                    // Defensive skip — mirrors the CPU path's gptq.rs:863-868
+                    // "U's diagonal entries are reciprocals of L's diagonal"
+                    // guard.
+                    continue;
+                }
+                let j_orig = perm[step] as i32;
+                let err_col_slot = (step - block_start) as i32;
+
+                // Phase 2A kernel: quantize column + emit err.
+                if let Err(_) = quantize_mq4_column_hip(
+                    solver,
+                    d_w_residual, d_w_quant, d_grids, d_err_block,
+                    j_orig, u_ss, k_dim as i32, m as i32, err_col_slot, b_dim as i32,
+                ) {
+                    cleanup(solver); return Err(to_chol_err(effective_damp));
+                }
+
+                // Phase 2B kernel: within-block rank-1 update.
+                if step + 1 < block_end {
+                    if let Err(_) = gptq_obs_within_block_hip(
+                        solver,
+                        d_w_residual, d_err_block, gpu_u.d_u, d_perm,
+                        step as i32, block_start as i32, block_end as i32,
+                        k_dim as i32, m as i32, b_dim as i32,
+                    ) {
+                        cleanup(solver); return Err(to_chol_err(effective_damp));
+                    }
+                }
+            }
+
+            // Phase B: cross-block rank-B MFMA GEMM (Phase 2C kernel).
+            if block_end < k_dim {
+                if let Err(_) = gptq_obs_block_apply_mfma_hip(
+                    solver,
+                    d_w_residual, d_err_block, gpu_u.d_u, d_perm,
+                    block_start as i32, block_end as i32,
+                    k_dim as i32, m as i32, cur_b as i32,
+                ) {
+                    cleanup(solver); return Err(to_chol_err(effective_damp));
+                }
+            }
+
+            block_start = block_end;
+        }
+
+        // Sync before D2H readback.
+        if dev_sync(solver).is_err() {
+            cleanup(solver); return Err(to_chol_err(effective_damp));
+        }
+
+        // ── Step 6: D2H W_quant ──
+        if d2h(solver, weights_flat.as_mut_ptr() as *mut u8, d_w_quant, w_bytes).is_err() {
+            cleanup(solver); return Err(to_chol_err(effective_damp));
+        }
+        cleanup(solver);
+    }
+
+    // gpu_u dropped here → d_u freed automatically.
+
+    // ── Step 7: Clamp diagnostic (post-D2H scan) ──
+    // The CPU path at gptq.rs:917-928 counts PRE-clamp indices (i.e., it
+    // can distinguish "value at min bin because of clamp-below" from "value
+    // at min bin because the input was within range"). The post-quant scan
+    // here cannot reproduce that distinction without re-running the OBS
+    // residual on the CPU. Emit a sentinel line so pipeline log readers see
+    // a consistent format; precise per-tensor clamp counts on the GPU path
+    // are deferred to Phase 3 (would require adding two atomic counters
+    // into the quantize_mq4_column_f64 kernel — straightforward but not
+    // wired in this commit).
+    let total = m * k_dim;
+    eprintln!(
+        "[gptq-clamp] {tensor_name} M={m} K={k_dim} elements={total} \
+         clamps=N/A (gpu-path; per-element clamp counters deferred to Phase 3)",
+    );
+
+    Ok(effective_damp)
 }
 
 #[cfg(test)]
