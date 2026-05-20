@@ -582,9 +582,16 @@ impl ActivationCapture for ImatrixCollector {
 /// PyTorch reference at `scripts/collect_hessian.py:213-222`.
 #[derive(Debug)]
 pub struct HessianEntry {
-    /// Canonical HF safetensors tensor key
-    /// (e.g. `model.layers.0.self_attn.q_proj.weight`).
+    /// Canonical HF safetensors tensor key, with the literal expert
+    /// index preserved for MoE per-expert tensors (e.g.
+    /// `model.layers.0.self_attn.q_proj.weight` or
+    /// `model.language_model.layers.5.mlp.experts.23.gate_proj.weight`).
     pub name: String,
+    /// Expert index for MoE per-expert tensors. `0` for dense tensors.
+    /// Feeds the `expert_idx` field of the HFHS-v1 binary record so
+    /// per-expert Hessians are addressable by `(name, expert_idx)`
+    /// downstream — see `hessian_io.rs::HessianRef::expert_idx`.
+    pub expert_idx: u32,
     /// K — input feature dimension.
     pub k: usize,
     /// Row-major K×K F32 outer-product accumulator (`Σ x · xᵀ`).
@@ -608,8 +615,14 @@ struct HessianAccum {
 /// whitelist (per `bf16_loader::is_gptq_target`) are accumulated —
 /// saves the K×K F32 allocation for norms / embed / lm_head which the
 /// quantizer never consumes.
+///
+/// Keyed by `(tensor_name, expert_idx)` so MoE per-expert tensors with
+/// the SAME suffix (e.g. `.experts.0.gate_proj.weight` vs
+/// `.experts.1.gate_proj.weight`) accumulate into distinct K×K
+/// Hessians. The canonical name preserves the literal expert index,
+/// matching the HFHS-v1 layout — see `parse_expert_idx`.
 pub struct HessianCollector {
-    accumulators: Mutex<HashMap<String, HessianAccum>>,
+    accumulators: Mutex<HashMap<(String, u32), HessianAccum>>,
 }
 
 impl HessianCollector {
@@ -627,18 +640,23 @@ impl HessianCollector {
             .lock()
             .map_err(|e| format!("HessianCollector mutex poisoned at drain: {e}"))?;
         let mut entries = Vec::with_capacity(acc_map.len());
-        for (name, accum) in acc_map.iter() {
+        for ((name, expert_idx), accum) in acc_map.iter() {
             let h = gpu
                 .download_f32(&accum.h)
                 .map_err(|e| format!("download_f32 failed for {name}: {e}"))?;
             entries.push(HessianEntry {
                 name: name.clone(),
+                expert_idx: *expert_idx,
                 k: accum.k,
                 h,
                 n_tokens: accum.n_tokens,
             });
         }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.expert_idx.cmp(&b.expert_idx))
+        });
         Ok(entries)
     }
 }
@@ -656,7 +674,16 @@ impl ActivationCapture for HessianCollector {
         tensor_name: &str,
         input: &GpuTensor,
     ) {
-        if !is_gptq_target(tensor_name) {
+        // Parse expert idx out of MoE per-expert names; the canonical
+        // key carries the literal expert idx in the name string so the
+        // HFHS-v1 writer emits per-expert records with both
+        // `name` (literal `.experts.<E>.`) and `expert_idx == E`.
+        let (canonical, expert_idx) = parse_expert_idx(tensor_name);
+        // `is_gptq_target` matches on the last `.`-separated segment
+        // (e.g. `gate_proj`), so MoE per-expert tensors with the
+        // expected suffix are admitted under the same whitelist
+        // without a per-expert special case.
+        if !is_gptq_target(&canonical) {
             return;
         }
         let k = match input.shape.last() {
@@ -668,14 +695,15 @@ impl ActivationCapture for HessianCollector {
             Ok(a) => a,
             Err(_) => return,
         };
-        if !accs.contains_key(tensor_name) {
+        let key = (canonical, expert_idx);
+        if !accs.contains_key(&key) {
             let h = match gpu.zeros(&[k, k], DType::F32) {
                 Ok(h) => h,
                 Err(_) => return,
             };
-            accs.insert(tensor_name.to_string(), HessianAccum { h, n_tokens: 0, k });
+            accs.insert(key.clone(), HessianAccum { h, n_tokens: 0, k });
         }
-        let accum = accs.get_mut(tensor_name).unwrap();
+        let accum = accs.get_mut(&key).unwrap();
         if let Err(_) = gpu.hessian_outer_product_bf16(input, &mut accum.h) {
             return;
         }
