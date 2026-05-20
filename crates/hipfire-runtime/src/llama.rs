@@ -566,6 +566,14 @@ pub fn weight_gemv(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
+    // Tier 1 activation capture (calibration-only hook). Fires the
+    // capture handler with the UNROTATED x before any FWHT / AWQ
+    // pre-scaling happens downstream. The hook clears
+    // `current_linear_name` on first fire, so the leaf dispatch
+    // method below won't double-capture even if its own dispatch arm
+    // is also instrumented. Production inference leaves
+    // `capture_handler == None`, so this is a single is_none() check.
+    gpu.try_capture_linear(x);
     match w.gpu_dtype {
         DType::F32 => gpu.gemv_f32(&w.buf, x, y),
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, 1),
@@ -913,6 +921,14 @@ pub fn weight_gemv_prerotated(
     x_rot: Option<&GpuTensor>,
     y: &GpuTensor,
 ) -> HipResult<()> {
+    // Tier 1 activation capture — fire BEFORE the dispatch, with the
+    // UNROTATED x (not x_rot). The calibration target is the algebraic
+    // input to the linear projection, which is x before any FWHT/AWQ
+    // pre-scaling. The dispatch arms below either take x_rot directly
+    // (MQ family — capture won't fire at the leaf since name is taken)
+    // or fall back to `weight_gemv` (which also fires; the leaf-
+    // method-already-took-name semantics prevent double-fire).
+    gpu.try_capture_linear(x);
     match w.gpu_dtype {
         DType::MQ4G256 => {
             if let Some(xr) = x_rot {
@@ -985,6 +1001,8 @@ pub fn weight_gemv_residual(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
+    // Tier 1 activation capture — see `weight_gemv` doc above.
+    gpu.try_capture_linear(x);
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
         DType::HFQ3G256 => gpu.gemv_hfq3g256_residual(&w.buf, x, y, w.m, w.k),
@@ -1088,6 +1106,22 @@ pub fn weight_gemv_swiglu_residual(
     ffn_hidden_scratch: &GpuTensor,
     x: &GpuTensor,
 ) -> HipResult<()> {
+    // Tier 1 activation capture for the down_proj linear.
+    //
+    // The algebraic input to the down projection is `silu(gate) * up`,
+    // which the non-MQ fallback path stores in `ffn_hidden_scratch`
+    // before dispatching. The MQ fused path does silu/mul + FWHT
+    // rotation in a single kernel and never materializes the
+    // pre-rotation `silu(gate) * up` value — so for MQ paths, the
+    // calibration target is approximated by `ffn_hidden_scratch` in
+    // its UNINITIALIZED state if the caller skipped the explicit
+    // silu_mul (mirrors what the production engine sees on its hot
+    // path). For BF16 Tier 1 calibration this is irrelevant because
+    // BF16 dispatch goes through the non-fused weight_gemv path that
+    // sets ffn_hidden_scratch before this call. Adding the capture
+    // call here completes coverage for the unfused codepath; the MQ
+    // fused arms below are calibration-incomplete by design.
+    gpu.try_capture_linear(ffn_hidden_scratch);
     match w_down.gpu_dtype {
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
@@ -1165,6 +1199,11 @@ pub fn weight_gemm(
     y: &GpuTensor,
     batch_size: usize,
 ) -> HipResult<()> {
+    // Tier 1 activation capture (calibration-only hook). See doc on
+    // `weight_gemv` above for the design rationale (capture x before
+    // any FWHT / AWQ rotation; single-fire via `try_capture_linear`'s
+    // take-the-name semantics).
+    gpu.try_capture_linear(x);
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
@@ -1254,8 +1293,11 @@ pub fn prefill_forward(
         gpu.rmsnorm_batched(&x_batch, &layer.attn_norm, &tmp_batch, batch, dim, config.norm_eps)?;
 
         // Batched QKV projections
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.q_proj.weight")));
         weight_gemm(gpu, &layer.wq, &tmp_batch, &q_batch, batch)?;
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.k_proj.weight")));
         weight_gemm(gpu, &layer.wk, &tmp_batch, &k_batch, batch)?;
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.v_proj.weight")));
         weight_gemm(gpu, &layer.wv, &tmp_batch, &v_batch, batch)?;
 
         // QK norm (per-position, per-head)
@@ -1294,6 +1336,7 @@ pub fn prefill_forward(
         )?;
 
         // Batched output projection
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.o_proj.weight")));
         weight_gemm(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
 
         // Batched residual add: x_batch += o_batch
@@ -1303,13 +1346,16 @@ pub fn prefill_forward(
         gpu.rmsnorm_batched(&x_batch, &layer.ffn_norm, &tmp_batch, batch, dim, config.norm_eps)?;
 
         // Batched FFN projections
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.gate_proj.weight")));
         weight_gemm(gpu, &layer.w_gate, &tmp_batch, &gate_batch, batch)?;
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.up_proj.weight")));
         weight_gemm(gpu, &layer.w_up, &tmp_batch, &up_batch, batch)?;
 
         // Batched SiLU * mul
         gpu.silu_mul_f32(&gate_batch, &up_batch, &ffn_hidden_batch)?;
 
         // Batched down projection
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.down_proj.weight")));
         weight_gemm(gpu, &layer.w_down, &ffn_hidden_batch, &ffn_out_batch, batch)?;
 
         // Batched residual
@@ -1333,6 +1379,7 @@ pub fn prefill_forward(
     gpu.rmsnorm_f32(&x_last, &weights.output_norm, &tmp, config.norm_eps)?;
 
     let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
+    gpu.set_capture_name(Some("lm_head.weight".to_string()));
     weight_gemv(gpu, &weights.output, &tmp, &logits)?;
 
     let logits_data = gpu.download_f32(&logits)?;
@@ -1587,6 +1634,7 @@ pub fn forward_prefill_batch(
     let last_off_bytes = (last_n - 1) * dim * 4;
     gpu.hip.memcpy_dtod_at(&scratch.x.buf, 0, &pbs.x_batch.buf, last_off_bytes, dim * 4)?;
     gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+    gpu.set_capture_name(Some("lm_head.weight".to_string()));
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
     if let Some(p) = own_pbs {
@@ -2318,8 +2366,11 @@ pub fn forward_scratch_layers(
         } else {
             // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
             let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.q_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.wq, &scratch.tmp, x_rot, &scratch.q)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.k_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.wk, &scratch.tmp, x_rot, &scratch.k)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.v_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.wv, &scratch.tmp, x_rot, &scratch.v)?;
         }
 
@@ -2381,6 +2432,7 @@ pub fn forward_scratch_layers(
             )?;
         }
 
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.o_proj.weight")));
         weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
 
@@ -2394,16 +2446,20 @@ pub fn forward_scratch_layers(
         } else {
             // Batch FWHT for MQ weights: w_gate/w_up share scratch.tmp.
             let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &scratch.tmp, &scratch.x_rot)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.gate_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.w_gate, &scratch.tmp, x_rot, &scratch.gate)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.up_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.w_up, &scratch.tmp, x_rot, &scratch.up)?;
         }
 
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.down_proj.weight")));
         weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
     }
 
     gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+    gpu.set_capture_name(Some("lm_head.weight".to_string()));
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
     // GPU-side sampling (includes sync readback — can't be in graph capture)
@@ -2458,8 +2514,11 @@ pub fn forward_early_exit(
         } else {
             // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
             let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.q_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.wq, &scratch.tmp, x_rot, &scratch.q)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.k_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.wk, &scratch.tmp, x_rot, &scratch.k)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.v_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.wv, &scratch.tmp, x_rot, &scratch.v)?;
         }
 
@@ -2491,6 +2550,7 @@ pub fn forward_early_exit(
             )?;
         }
 
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.o_proj.weight")));
         weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
 
@@ -2504,11 +2564,14 @@ pub fn forward_early_exit(
         } else {
             // Batch FWHT for MQ weights: w_gate/w_up share scratch.tmp.
             let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &scratch.tmp, &scratch.x_rot)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.gate_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.w_gate, &scratch.tmp, x_rot, &scratch.gate)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.up_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.w_up, &scratch.tmp, x_rot, &scratch.up)?;
         }
 
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.down_proj.weight")));
         weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
 
@@ -2516,6 +2579,7 @@ pub fn forward_early_exit(
         if checkpoint_layers.contains(&layer_idx) && exit_threshold > 0.0 {
             // Compute logits from intermediate hidden state
             gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+            gpu.set_capture_name(Some("lm_head.weight".to_string()));
             weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
             // GPU-side confidence check: compute max(softmax) on GPU, download 4 bytes
@@ -2539,6 +2603,7 @@ pub fn forward_early_exit(
 
     // No early exit — run full final norm + logits + sampling
     gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+    gpu.set_capture_name(Some("lm_head.weight".to_string()));
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     let (tok, rng) = gpu.sample_top_p(
         &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
@@ -2575,8 +2640,11 @@ pub fn forward_scratch_compute(
         } else {
             // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
             let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.q_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.wq, &scratch.tmp, x_rot, &scratch.q)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.k_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.wk, &scratch.tmp, x_rot, &scratch.k)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.v_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.wv, &scratch.tmp, x_rot, &scratch.v)?;
         }
 
@@ -2638,6 +2706,7 @@ pub fn forward_scratch_compute(
             )?;
         }
 
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.o_proj.weight")));
         weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
 
@@ -2651,16 +2720,20 @@ pub fn forward_scratch_compute(
         } else {
             // Batch FWHT for MQ weights: w_gate/w_up share scratch.tmp.
             let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &scratch.tmp, &scratch.x_rot)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.gate_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.w_gate, &scratch.tmp, x_rot, &scratch.gate)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.up_proj.weight")));
             weight_gemv_prerotated(gpu, &layer.w_up, &scratch.tmp, x_rot, &scratch.up)?;
         }
 
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.down_proj.weight")));
         weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
     }
 
     gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+    gpu.set_capture_name(Some("lm_head.weight".to_string()));
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     Ok(())
 }
@@ -2728,8 +2801,11 @@ pub fn forward(
                 layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
             )?;
         } else {
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.q_proj.weight")));
             weight_gemv(gpu, &layer.wq, &tmp, &q)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.k_proj.weight")));
             weight_gemv(gpu, &layer.wk, &tmp, &k)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.v_proj.weight")));
             weight_gemv(gpu, &layer.wv, &tmp, &v)?;
         }
 
@@ -2755,6 +2831,7 @@ pub fn forward(
             &attn_out, &pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
         )?;
         // Output projection: o = Wo * attn_out
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.o_proj.weight")));
         weight_gemv(gpu, &layer.wo, &attn_out, &o)?;
 
         // Residual: x += o (in-place)
@@ -2771,7 +2848,9 @@ pub fn forward(
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
             )?;
         } else {
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.gate_proj.weight")));
             weight_gemv(gpu, &layer.w_gate, &tmp, &gate)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.up_proj.weight")));
             weight_gemv(gpu, &layer.w_up, &tmp, &up)?;
         }
 
@@ -2779,6 +2858,7 @@ pub fn forward(
         gpu.silu_mul_f32(&gate, &up, &ffn_hidden)?;
 
         // Down projection
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.down_proj.weight")));
         weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
 
         // Residual: x += ffn_out (in-place)
@@ -2790,6 +2870,7 @@ pub fn forward(
 
     // Logits: output = output_weight * x
     let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
+    gpu.set_capture_name(Some("lm_head.weight".to_string()));
     weight_gemv(gpu, &weights.output, &tmp, &logits)?;
 
     let logits_data = gpu.download_f32(&logits)?;
@@ -2887,8 +2968,11 @@ fn forward_logits_gpu(
                 layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
             )?;
         } else {
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.q_proj.weight")));
             weight_gemv(gpu, &layer.wq, &tmp, &q)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.k_proj.weight")));
             weight_gemv(gpu, &layer.wk, &tmp, &k)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.v_proj.weight")));
             weight_gemv(gpu, &layer.wv, &tmp, &v)?;
         }
 
@@ -2911,6 +2995,7 @@ fn forward_logits_gpu(
             &attn_out, &pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
         )?;
 
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.o_proj.weight")));
         weight_gemv(gpu, &layer.wo, &attn_out, &o)?;
         gpu.add_inplace_f32(&x, &o)?;
 
@@ -2922,11 +3007,14 @@ fn forward_logits_gpu(
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
             )?;
         } else {
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.gate_proj.weight")));
             weight_gemv(gpu, &layer.w_gate, &tmp, &gate)?;
+            gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.up_proj.weight")));
             weight_gemv(gpu, &layer.w_up, &tmp, &up)?;
         }
 
         gpu.silu_mul_f32(&gate, &up, &ffn_hidden)?;
+        gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.down_proj.weight")));
         weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
         gpu.add_inplace_f32(&x, &ffn_out)?;
     }
@@ -2934,6 +3022,7 @@ fn forward_logits_gpu(
     gpu.rmsnorm_f32(&x, &weights.output_norm, &tmp, config.norm_eps)?;
 
     let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
+    gpu.set_capture_name(Some("lm_head.weight".to_string()));
     weight_gemv(gpu, &weights.output, &tmp, &logits)?;
 
     gpu.free_tensor(q)?;
