@@ -14,12 +14,21 @@
 //! is annotated below; downstream quantization tooling reads these as
 //! known-loose bounds on the calibration signal.
 //!
-//! 1. **RMSNorm skipped.** Instead of running rmsnorm before each
-//!    linear, the hidden state passes through unchanged. Calibration
-//!    cost: each linear sees raw post-residual values rather than
-//!    normalized ones. Since the magnitude bound from rmsnorm is well-
-//!    known (≈ √n), the downstream quantizer can re-apply a uniform
-//!    scaling factor offline if it wants normalized statistics.
+//! 1. **RMSNorm via F32 cast-trick.** Each linear's input is normalized
+//!    by the corresponding `*norm.weight` from `trunk.norms` before the
+//!    `gemm_bf16` is fired. The BF16 hidden state is upcast to F32,
+//!    passed through the existing `gpu.rmsnorm_batched` kernel, and
+//!    converted back to BF16 for the GEMM. Residual (`h += attn_out` /
+//!    `h += mlp_out`) is added to the ORIGINAL un-normalized `h`,
+//!    matching the pre-norm convention used by every modern
+//!    transformer arch in hipfire.
+//!
+//!    Norm weights are loaded with `+= 1.0` baked in (GemmaRMSNorm
+//!    convention) — see `bf16_loader::load_bf16_model`. If a norm
+//!    weight for a given layer is absent from `trunk.norms` the
+//!    forward falls back to the un-normalized hidden state (logs a
+//!    warning) so older fixtures without norm tensors still produce
+//!    a forward pass.
 //!
 //! 2. **Attention math is a passthrough.**
 //!    - DeltaNet: `attn_pre_o = first d_inner elements of qkv` (the
@@ -62,6 +71,13 @@
 use crate::bf16_loader::{Bf16Tensor, TrunkBF16};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// GemmaRMSNorm epsilon. Matches `crates/hipfire-arch-qwen35/src/qwen35.rs`
+/// (default 1e-6 when `config.json` lacks `rms_norm_eps`) and the
+/// HuggingFace Qwen3.5 / 3.6 reference. The Tier 1 calibration forward
+/// doesn't read `config.json` (would require parsing a per-arch shape),
+/// so we use this constant directly.
+const RMS_NORM_EPS: f32 = 1e-6;
 
 /// Per-layer detected attention type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +359,137 @@ fn bf16_add_inplace(
     Ok(())
 }
 
+/// Cast-trick RMSNorm for BF16 hidden states.
+///
+/// Computes `out_bf16[t, k] = h_bf16[t, k] / sqrt(mean_k(h²) + eps)
+/// * norm_weight[k]` using the F32 `rmsnorm_batched` kernel as the
+/// inner engine. Steps:
+///
+///   1. Upcast `h_bf16` to F32 scratch via `convert_bf16_to_f32`.
+///   2. Apply `gpu.rmsnorm_batched(h_f32, norm_weight, h_f32_out,
+///      batch, k, eps)`.
+///   3. Downcast `h_f32_out` to `out_bf16` via `convert_f32_to_bf16`.
+///
+/// The `norm_weight` MUST already have the GemmaRMSNorm `+= 1.0` bake
+/// applied (the loader does this in `bf16_loader::load_bf16_model`).
+/// The kernel computes plain `x * w * rms`; if the caller wants the
+/// `(1 + w) * rms` form, it's the loader's responsibility to bake.
+///
+/// `out_bf16` must be a caller-owned BF16 tensor of size `batch * k`.
+/// Can be the same buffer as the BF16 hidden state passed via
+/// `h_bf16` if the caller wants in-place behavior, but typical callers
+/// keep them separate so the original hidden state is preserved for
+/// the residual add.
+fn rmsnorm_bf16_via_f32(
+    gpu: &mut Gpu,
+    h_bf16: &GpuTensor,
+    norm_weight: &GpuTensor,
+    out_bf16: &GpuTensor,
+    batch: usize,
+    k: usize,
+    eps: f32,
+) -> HipResult<()> {
+    let n = batch * k;
+    // Two F32 scratches: input and output of the F32 rmsnorm. The
+    // pool inside `Gpu` reuses these between layers so allocation
+    // cost amortizes after the first call.
+    let h_f32 = gpu.alloc_tensor(&[batch, k], DType::F32)?;
+    let out_f32 = gpu.alloc_tensor(&[batch, k], DType::F32)?;
+    gpu.convert_bf16_to_f32(h_bf16, &h_f32, n)?;
+    gpu.rmsnorm_batched(&h_f32, norm_weight, &out_f32, batch, k, eps)?;
+    gpu.convert_f32_to_bf16(&out_f32, out_bf16, n)?;
+    gpu.free_tensor(h_f32)?;
+    gpu.free_tensor(out_f32)?;
+    Ok(())
+}
+
+/// Look up a norm weight in the trunk by name. Returns `None` when
+/// absent — the caller may decide to skip rmsnorm (falling back to
+/// the un-normalized hidden state) for fixtures that don't ship
+/// norm tensors.
+fn try_get_norm<'a>(trunk: &'a TrunkBF16, name: &str) -> Option<&'a GpuTensor> {
+    trunk.norms.get(name)
+}
+
+/// Either an owned scratch GpuTensor (we allocated `h_norm` and ran
+/// rmsnorm into it) or a non-owning view of an existing buffer (no
+/// norm weight available, we point back at the original `h`). The
+/// `drop_owned` method frees the allocation if we own it; for the
+/// view case it's a no-op.
+enum NormScratch {
+    Owned(GpuTensor),
+    /// View backing buffer is the original `h_view`. Stored as a
+    /// fresh `GpuTensor` carrying a borrowed pointer so callers can
+    /// pass `as_ref()` uniformly to `gemm_bf16`.
+    View(GpuTensor),
+}
+
+impl NormScratch {
+    fn as_ref(&self) -> &GpuTensor {
+        match self {
+            NormScratch::Owned(t) => t,
+            NormScratch::View(t) => t,
+        }
+    }
+
+    /// Free the underlying allocation if we own it. No-op for views.
+    fn drop_owned(self, gpu: &mut Gpu) -> HipResult<()> {
+        match self {
+            NormScratch::Owned(t) => gpu.free_tensor(t),
+            NormScratch::View(_) => Ok(()),
+        }
+    }
+}
+
+/// Apply pre-norm rmsnorm to `h` if `trunk.norms[norm_name]` exists.
+/// Falls back to a non-owning view of `h` (with a single warning
+/// printed) for fixtures that don't ship a norm tensor for this
+/// layer. In both cases the returned wrapper's `.as_ref()` is a
+/// `&GpuTensor` of shape `[seq_len, dim]` suitable to feed
+/// `gemm_bf16`.
+fn apply_pre_norm_or_fallback(
+    gpu: &mut Gpu,
+    trunk: &TrunkBF16,
+    h: &GpuTensor,
+    norm_name: &str,
+    seq_len: usize,
+    dim: usize,
+) -> Result<NormScratch, String> {
+    if let Some(w) = try_get_norm(trunk, norm_name) {
+        // Allocate the BF16 scratch with the logical [seq_len, dim]
+        // shape directly so downstream `gemm_bf16` reads the right
+        // strides without an extra `to_2d` wrap.
+        let h_norm = gpu
+            .alloc_tensor(&[seq_len, dim], DType::BF16)
+            .map_err(|e| e.to_string())?;
+        rmsnorm_bf16_via_f32(gpu, h, w, &h_norm, seq_len, dim, RMS_NORM_EPS)
+            .map_err(|e| e.to_string())?;
+        Ok(NormScratch::Owned(h_norm))
+    } else {
+        // Fixtures without norm tensors (e.g. unit-test stubs that
+        // ship only dense linears) hit this path. Warn ONCE per
+        // process so the log isn't flooded across 24 layers × N
+        // sequences. Production safetensors loads always have norms.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "  warning: norm weight `{}` absent from trunk.norms; \
+                 feeding un-normalized hidden state into layer's linears \
+                 (further occurrences suppressed)",
+                norm_name
+            );
+        }
+        // Non-owning view of `h` reshaped to [seq_len, dim].
+        let view = GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(h.buf.as_ptr(), seq_len * dim * 2) },
+            shape: vec![seq_len, dim],
+            dtype: DType::BF16,
+        };
+        Ok(NormScratch::View(view))
+    }
+}
+
 /// DeltaNet layer attention (calibration approximation).
 ///
 /// Fires the capture hook for `in_proj_qkv`, `in_proj_z`, `in_proj_a`,
@@ -368,6 +515,13 @@ fn forward_deltanet_layer(
     let wb = get(trunk, &format!("{p}.linear_attn.in_proj_b.weight"))?;
     let wo = get(trunk, &format!("{p}.linear_attn.out_proj.weight"))?;
 
+    // Pre-norm: GemmaRMSNorm over the entry hidden state. All four
+    // in_proj_* + (downstream) out_proj see the normalized input.
+    // Residual still adds attn_out to the un-normalized `h` after
+    // this function returns.
+    let norm_name = format!("{p}.input_layernorm.weight");
+    let h_for_linears = apply_pre_norm_or_fallback(gpu, trunk, h, &norm_name, seq_len, dim)?;
+
     // QKV projection: y = h * wqkv^T → [seq_len, qkv_dim]
     let qkv_dim = wqkv.shape[0];
     let qkv_k = wqkv.shape[1];
@@ -380,7 +534,8 @@ fn forward_deltanet_layer(
         .alloc_tensor(&[seq_len * qkv_dim], DType::F32)
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.linear_attn.in_proj_qkv.weight")));
-    gpu.gemm_bf16(h, &wqkv.tensor, &mut to_2d(qkv_f32.clone_view(), seq_len, qkv_dim),
+    gpu.gemm_bf16(h_for_linears.as_ref(), &wqkv.tensor,
+                  &mut to_2d(qkv_f32.clone_view(), seq_len, qkv_dim),
                   qkv_dim, qkv_k, seq_len)
         .map_err(|e| e.to_string())?;
 
@@ -391,7 +546,8 @@ fn forward_deltanet_layer(
         .alloc_tensor(&[seq_len * z_dim], DType::F32)
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.linear_attn.in_proj_z.weight")));
-    gpu.gemm_bf16(h, &wz.tensor, &mut to_2d(z_f32.clone_view(), seq_len, z_dim),
+    gpu.gemm_bf16(h_for_linears.as_ref(), &wz.tensor,
+                  &mut to_2d(z_f32.clone_view(), seq_len, z_dim),
                   z_dim, wz.shape[1], seq_len)
         .map_err(|e| e.to_string())?;
     gpu.free_tensor(z_f32).map_err(|e| e.to_string())?;
@@ -402,7 +558,8 @@ fn forward_deltanet_layer(
         .alloc_tensor(&[seq_len * a_dim], DType::F32)
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.linear_attn.in_proj_a.weight")));
-    gpu.gemm_bf16(h, &wa.tensor, &mut to_2d(a_f32.clone_view(), seq_len, a_dim),
+    gpu.gemm_bf16(h_for_linears.as_ref(), &wa.tensor,
+                  &mut to_2d(a_f32.clone_view(), seq_len, a_dim),
                   a_dim, wa.shape[1], seq_len)
         .map_err(|e| e.to_string())?;
     gpu.free_tensor(a_f32).map_err(|e| e.to_string())?;
@@ -413,10 +570,15 @@ fn forward_deltanet_layer(
         .alloc_tensor(&[seq_len * b_dim], DType::F32)
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.linear_attn.in_proj_b.weight")));
-    gpu.gemm_bf16(h, &wb.tensor, &mut to_2d(b_f32.clone_view(), seq_len, b_dim),
+    gpu.gemm_bf16(h_for_linears.as_ref(), &wb.tensor,
+                  &mut to_2d(b_f32.clone_view(), seq_len, b_dim),
                   b_dim, wb.shape[1], seq_len)
         .map_err(|e| e.to_string())?;
     gpu.free_tensor(b_f32).map_err(|e| e.to_string())?;
+    // h_for_linears scratch is no longer needed once all in_proj_*
+    // linears have been fired. Free before the out_proj which
+    // consumes a different (Q-chunk) tensor.
+    h_for_linears.drop_owned(gpu).map_err(|e| e.to_string())?;
 
     // Build `attn_pre_o` = first d_inner cols of qkv_f32 (the Q chunk),
     // converted to BF16. d_inner is determined by the out_proj's K dim
@@ -507,13 +669,19 @@ fn forward_full_attn_layer(
     let k_dim = wk.shape[0];
     let v_dim = wv.shape[0];
 
+    // Pre-norm: GemmaRMSNorm over the entry hidden state. q/k/v see
+    // normalized input; residual still adds attn_out to the
+    // un-normalized `h` after this function returns.
+    let norm_name = format!("{p}.input_layernorm.weight");
+    let h_for_linears = apply_pre_norm_or_fallback(gpu, trunk, h, &norm_name, seq_len, dim)?;
+
     // Q projection (calibration only — output unused beyond capture).
     let q_f32 = gpu
         .alloc_tensor(&[seq_len * q_dim], DType::F32)
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.self_attn.q_proj.weight")));
     gpu.gemm_bf16(
-        h, &wq.tensor,
+        h_for_linears.as_ref(), &wq.tensor,
         &mut to_2d(q_f32.clone_view(), seq_len, q_dim),
         q_dim, wq.shape[1], seq_len,
     )
@@ -526,7 +694,7 @@ fn forward_full_attn_layer(
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.self_attn.k_proj.weight")));
     gpu.gemm_bf16(
-        h, &wk.tensor,
+        h_for_linears.as_ref(), &wk.tensor,
         &mut to_2d(k_f32.clone_view(), seq_len, k_dim),
         k_dim, wk.shape[1], seq_len,
     )
@@ -539,11 +707,13 @@ fn forward_full_attn_layer(
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.self_attn.v_proj.weight")));
     gpu.gemm_bf16(
-        h, &wv.tensor,
+        h_for_linears.as_ref(), &wv.tensor,
         &mut to_2d(v_f32.clone_view(), seq_len, v_dim),
         v_dim, wv.shape[1], seq_len,
     )
     .map_err(|e| e.to_string())?;
+    // h_for_linears is no longer needed; o_proj consumes V instead.
+    h_for_linears.drop_owned(gpu).map_err(|e| e.to_string())?;
 
     // Convert v_f32 → BF16 for o_proj. o_proj expects K = v_dim.
     let o_k = wo.shape[1];
@@ -648,13 +818,20 @@ fn forward_mlp_layer(
         ));
     }
 
+    // Pre-norm: GemmaRMSNorm over the entry hidden state (post-attention).
+    // gate_proj and up_proj see normalized input. The MLP's residual
+    // (`h += ffn_out` in the outer loop) is added to the un-normalized
+    // `h` upstream of this function.
+    let norm_name = format!("{p}.post_attention_layernorm.weight");
+    let h_for_linears = apply_pre_norm_or_fallback(gpu, trunk, h, &norm_name, seq_len, dim)?;
+
     // gate = h * w_gate^T → F32 [seq_len, hidden_dim]
     let gate_f32 = gpu
         .alloc_tensor(&[seq_len * hidden_dim], DType::F32)
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.mlp.gate_proj.weight")));
     gpu.gemm_bf16(
-        h, &w_gate.tensor,
+        h_for_linears.as_ref(), &w_gate.tensor,
         &mut to_2d(gate_f32.clone_view(), seq_len, hidden_dim),
         hidden_dim, dim, seq_len,
     )
@@ -666,11 +843,13 @@ fn forward_mlp_layer(
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.mlp.up_proj.weight")));
     gpu.gemm_bf16(
-        h, &w_up.tensor,
+        h_for_linears.as_ref(), &w_up.tensor,
         &mut to_2d(up_f32.clone_view(), seq_len, hidden_dim),
         hidden_dim, dim, seq_len,
     )
     .map_err(|e| e.to_string())?;
+    // Free pre-norm scratch — down_proj's input is ffn_hidden, not h.
+    h_for_linears.drop_owned(gpu).map_err(|e| e.to_string())?;
 
     // ffn_hidden_f32 = silu(gate) * up. silu_mul_f32 expects 1-D tensors;
     // the shape doesn't matter for elementwise math.
@@ -767,6 +946,7 @@ mod tests {
         );
         let trunk = TrunkBF16 {
             tensors,
+            norms: HashMap::new(),
             model_dir: PathBuf::from("/tmp/test"),
             model_type: "qwen3".to_string(),
             total_bytes: 0,
@@ -795,6 +975,7 @@ mod tests {
         );
         let trunk = TrunkBF16 {
             tensors,
+            norms: HashMap::new(),
             model_dir: PathBuf::from("/tmp/test"),
             model_type: "qwen3".to_string(),
             total_bytes: 0,

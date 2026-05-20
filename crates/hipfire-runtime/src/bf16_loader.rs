@@ -199,8 +199,22 @@ pub struct Bf16Tensor {
 /// the same flat map; if memory becomes the bottleneck on large MoEs,
 /// Phase 2 can split into `trunk: HashMap<_>, experts: Vec<HashMap<_>>`.
 pub struct TrunkBF16 {
-    /// All loaded weight tensors keyed by canonical HF safetensors name.
+    /// All loaded BF16 weight tensors (Linear / projection / embedding)
+    /// keyed by canonical HF safetensors name. These are the tensors
+    /// that flow through `gemm_bf16` and fire the per-linear capture
+    /// hook.
     pub tensors: HashMap<String, Bf16Tensor>,
+    /// All loaded RMSNorm weights, as F32 GPU tensors keyed by
+    /// canonical HF safetensors name. Kept in a parallel map so the
+    /// `tensors` dict remains BF16-only.
+    ///
+    /// GemmaRMSNorm storage convention: HF safetensors store raw `w`
+    /// (init from zero), engines apply `(1 + w)`. The loader bakes the
+    /// `+= 1.0` at load time so the kernel can stay plain `x * w * rms`,
+    /// mirroring `hipfire-arch-qwen35::load_norm_weight`. Without this
+    /// bake the Tier 1 forward would systematically under-magnify
+    /// activations vs Tier 2 / production.
+    pub norms: HashMap<String, GpuTensor>,
     /// The model dir we loaded from (for log messages + tokenizer load).
     pub model_dir: PathBuf,
     /// Model architecture id from `config.json["model_type"]`
@@ -209,8 +223,28 @@ pub struct TrunkBF16 {
     /// the model dir has no `config.json` (e.g. unit-test fixtures).
     pub model_type: String,
     /// Total bytes allocated on device across all tensors (for the
-    /// log line at load time).
+    /// log line at load time). Sums BF16 + F32 (norms) allocations.
     pub total_bytes: usize,
+}
+
+/// Returns true if `name` is a (likely) RMSNorm weight tensor. Matches:
+///   - any tensor whose name ends with `norm.weight`, e.g.
+///     `model.layers.0.input_layernorm.weight`,
+///     `model.layers.0.post_attention_layernorm.weight`,
+///     `model.layers.0.self_attn.q_norm.weight`,
+///     `model.layers.0.self_attn.k_norm.weight`,
+///     `model.norm.weight`,
+///     `model.layers.0.linear_attn.norm.weight`.
+///
+/// This is intentionally a string-suffix test rather than a fixed
+/// allowlist: Qwen3.5 / 3.6 / Llama / Mistral all converge on the
+/// `*norm.weight` convention. If a future model variant ships norms
+/// under a different name pattern, extend this predicate.
+pub fn is_norm_tensor(name: &str) -> bool {
+    let bare = name.strip_suffix(".weight").unwrap_or(name);
+    bare.ends_with("norm")
+        || bare.ends_with("_norm")
+        || bare.ends_with(".norm")
 }
 
 /// Parse `<model_dir>/config.json["model_type"]`. Returns an empty
@@ -325,6 +359,7 @@ pub fn load_bf16_model(gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16> 
     }
 
     let mut tensors: HashMap<String, Bf16Tensor> = HashMap::new();
+    let mut norms: HashMap<String, GpuTensor> = HashMap::new();
     let mut total_bytes: usize = 0;
 
     for (shard_path, tensor_names) in by_shard {
@@ -343,12 +378,117 @@ pub fn load_bf16_model(gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16> 
                 )
             })?;
 
-            // Real-world BF16 models are mixed-precision: main weight
-            // matrices in BF16, but norms / biases / DeltaNet scalars
-            // (A_log, dt_bias) commonly ship as F32 or F16. Skip
-            // non-BF16 tensors quietly — calibration only needs the
-            // BF16 linear-layer weights anyway (the GEMMs we wrap with
-            // capture hooks). Norms etc. don't go through gemm_bf16.
+            let numel: usize = meta.shape.iter().product();
+            let is_norm = is_norm_tensor(&name);
+
+            // Routing for the three classes of weights we care about
+            // in the calibration forward pass:
+            //
+            //   - BF16 dense weights (Linear / projection / embedding):
+            //     loaded as `Bf16Tensor` into `tensors`. These flow
+            //     through `gemm_bf16` and fire the per-linear capture
+            //     hook.
+            //   - F32 / F16 / BF16 RMSNorm weights (`*norm.weight`):
+            //     decoded to F32 host buffer (with `+= 1.0` bake to
+            //     match GemmaRMSNorm convention), uploaded into
+            //     `norms` as a `DType::F32` GpuTensor. The Tier 1
+            //     forward wires these through `gpu.rmsnorm_batched`
+            //     wrapped by a small BF16 → F32 → BF16 cast.
+            //   - Anything else (biases, A_log, dt_bias, etc.) is
+            //     skipped with a warning. Calibration doesn't depend
+            //     on them; the captured Σx² / Hessian moments only
+            //     need the dense-weight inputs.
+            if is_norm {
+                // Decode source bytes → host Vec<f32>.
+                let f32_data: Vec<f32> = match meta.dtype.as_str() {
+                    "F32" => {
+                        let expected = numel * 4;
+                        if bytes.len() != expected {
+                            return Err(HipError::new(
+                                0,
+                                &format!(
+                                    "norm tensor {} F32 payload size mismatch: header says \
+                                     {} elements * 4B = {}, data_offsets give {}",
+                                    name, numel, expected, bytes.len(),
+                                ),
+                            ));
+                        }
+                        bytes
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    }
+                    "F16" => {
+                        let expected = numel * 2;
+                        if bytes.len() != expected {
+                            return Err(HipError::new(
+                                0,
+                                &format!(
+                                    "norm tensor {} F16 payload size mismatch: header says \
+                                     {} elements * 2B = {}, data_offsets give {}",
+                                    name, numel, expected, bytes.len(),
+                                ),
+                            ));
+                        }
+                        bytes
+                            .chunks_exact(2)
+                            .map(|c| {
+                                crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))
+                            })
+                            .collect()
+                    }
+                    "BF16" => {
+                        let expected = numel * 2;
+                        if bytes.len() != expected {
+                            return Err(HipError::new(
+                                0,
+                                &format!(
+                                    "norm tensor {} BF16 payload size mismatch: header says \
+                                     {} elements * 2B = {}, data_offsets give {}",
+                                    name, numel, expected, bytes.len(),
+                                ),
+                            ));
+                        }
+                        bytes
+                            .chunks_exact(2)
+                            .map(|c| {
+                                // BF16 → F32: pad low 16 bits with zero,
+                                // reinterpret. Lossless (BF16 ⊆ F32).
+                                let bits = (u16::from_le_bytes([c[0], c[1]]) as u32) << 16;
+                                f32::from_bits(bits)
+                            })
+                            .collect()
+                    }
+                    other => {
+                        eprintln!(
+                            "  skipping norm tensor {} (unsupported dtype={})",
+                            name, other
+                        );
+                        continue;
+                    }
+                };
+
+                // GemmaRMSNorm `+= 1.0` bake. Matches
+                // `hipfire-arch-qwen35::load_norm_weight` so the
+                // calibration forward sees the same effective norm
+                // magnitude that production loads. Without this bake
+                // the captured activations would be systematically
+                // under-magnified by `(stored_w)/(stored_w + 1)`.
+                let mut baked = f32_data;
+                for v in &mut baked {
+                    *v += 1.0;
+                }
+
+                let tensor = gpu.upload_f32(&baked, &meta.shape)?;
+                total_bytes += baked.len() * 4;
+                norms.insert(name, tensor);
+                continue;
+            }
+
+            // Non-norm tensors: only BF16 dense weights are loaded.
+            // Skip mixed-precision dtypes (F32 biases, etc.) — they
+            // don't gate calibration since `gemm_bf16` is the only
+            // capture site.
             if meta.dtype != "BF16" {
                 eprintln!(
                     "  skipping non-BF16 tensor {} (dtype={})",
@@ -357,7 +497,6 @@ pub fn load_bf16_model(gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16> 
                 continue;
             }
 
-            let numel: usize = meta.shape.iter().product();
             // BF16 is 2 bytes/element; sanity-check against the
             // safetensors byte range so a malformed header is caught
             // before we issue a memcpy that under/overruns the device
@@ -403,6 +542,7 @@ pub fn load_bf16_model(gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16> 
 
     Ok(TrunkBF16 {
         tensors,
+        norms,
         model_dir: model_dir.to_path_buf(),
         model_type,
         total_bytes,
@@ -474,6 +614,33 @@ mod tests {
         assert!(is_gptq_target("model.layers.0.linear_attn.in_proj_qkv.weight"));
         assert!(is_gptq_target("model.layers.0.linear_attn.in_proj_z.weight"));
         assert!(is_gptq_target("model.layers.0.linear_attn.out_proj.weight"));
+    }
+
+    #[test]
+    fn is_norm_tensor_recognizes_canonical_norms() {
+        // Layer-entry pre-attention norm (Qwen3.5 + 3.6 + Llama + Mistral).
+        assert!(is_norm_tensor("model.layers.0.input_layernorm.weight"));
+        assert!(is_norm_tensor(
+            "model.language_model.layers.0.input_layernorm.weight"
+        ));
+        // Pre-MLP norm.
+        assert!(is_norm_tensor("model.layers.0.post_attention_layernorm.weight"));
+        // Per-head q/k norms (Qwen3.5 FullAttn variants).
+        assert!(is_norm_tensor("model.layers.0.self_attn.q_norm.weight"));
+        assert!(is_norm_tensor("model.layers.0.self_attn.k_norm.weight"));
+        // Final-trunk norm.
+        assert!(is_norm_tensor("model.norm.weight"));
+        // DeltaNet gated output norm.
+        assert!(is_norm_tensor("model.layers.0.linear_attn.norm.weight"));
+    }
+
+    #[test]
+    fn is_norm_tensor_rejects_dense_weights_and_embeds() {
+        assert!(!is_norm_tensor("model.layers.0.self_attn.q_proj.weight"));
+        assert!(!is_norm_tensor("model.layers.0.mlp.gate_proj.weight"));
+        assert!(!is_norm_tensor("model.embed_tokens.weight"));
+        assert!(!is_norm_tensor("lm_head.weight"));
+        assert!(!is_norm_tensor("model.layers.0.linear_attn.in_proj_qkv.weight"));
     }
 
     // ─── Safetensors-parse unit tests ──────────────────────────────
