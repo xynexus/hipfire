@@ -16,3 +16,5 @@ pub mod gguf_imatrix_writer;
 pub mod gguf_input;
 pub mod hessian_io;
 pub mod hfhs_writer;
+pub mod imq_reader;
+pub mod imq_writer;

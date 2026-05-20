@@ -6,9 +6,12 @@
 //! `.gguf` file and produces a `.hfq` (HipFire Quantized) file with
 //! RDNA-native quantized weights.
 
+mod gguf_imatrix_writer;
 mod gguf_input;
 mod gptq;
 mod hessian_io;
+mod imq_reader;
+mod imq_writer;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -2562,7 +2565,57 @@ fn safetensors_to_ggml_name(name: &str) -> Option<String> {
 ///
 /// Returns `HashMap<ggml_name, Vec<f32>>` with the .in_sum2 values keyed by
 /// the BASE tensor name (the ".in_sum2" suffix stripped).
+///
+/// File-format dispatch is by magic on the first 4 bytes:
+///   - `"IMQ\0"` → hipfire-native `.imq` (see [`imq_reader::load_imq`]).
+///     Keys are HF safetensors canonical names; the consumer-site
+///     [`imatrix_weights_for`] is responsible for any name translation.
+///   - `"GGUF"` → legacy GGUF imatrix (this function's original body).
+///     Keys are ggml-style names produced by llama-imatrix.
+///   - anything else → eprint + exit(1).
 fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
+    // Peek the 4-byte magic before deciding which loader to use. Keep
+    // open/read errors symmetric with the existing GGUF path (eprint +
+    // exit) so callers don't have to grow a new error type.
+    let mut magic = [0u8; 4];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).unwrap_or_else(|e| {
+            eprintln!("error: failed to open imatrix file {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        if f.read_exact(&mut magic).is_err() {
+            eprintln!(
+                "error: imatrix file {} is shorter than 4 bytes (no magic)",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+    if &magic == b"IMQ\0" {
+        let map = imq_reader::load_imq(path).unwrap_or_else(|e| {
+            eprintln!("error: failed to parse IMQ imatrix {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        if map.is_empty() {
+            eprintln!("error: imatrix file contains no usable entries");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "imatrix: loaded {} entries from {} (IMQ format, HF-canonical names)",
+            map.len(),
+            path.display(),
+        );
+        return map;
+    }
+    if &magic != b"GGUF" {
+        eprintln!(
+            "error: imatrix file {} has unknown magic {:?}; expected \"IMQ\\0\" or \"GGUF\"",
+            path.display(),
+            magic
+        );
+        std::process::exit(1);
+    }
     use gguf_input::GgmlType;
     let gguf = gguf_input::GgufFile::open(path).unwrap_or_else(|e| {
         eprintln!("error: failed to open imatrix file {}: {e}", path.display());

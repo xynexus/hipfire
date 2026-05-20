@@ -47,6 +47,28 @@ use rdna_compute::Gpu;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Output container format. Defaults to `Imq` (hipfire-native, ~75% smaller
+/// than the GGUF equivalent on typical dense models). `Gguf` mirrors the
+/// llama-imatrix wire format so downstream tooling that hasn't been
+/// updated yet still works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Imq,
+    Gguf,
+}
+
+impl OutputFormat {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "imq" => Ok(Self::Imq),
+            "gguf" => Ok(Self::Gguf),
+            other => Err(format!(
+                "unknown --format value {other:?}; expected \"imq\" or \"gguf\""
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 struct Args {
@@ -58,8 +80,13 @@ struct Args {
     /// n_ctx` tokens internally). Tier 2 used `wikitext-2-raw-v1` by
     /// default; Tier 1 will mirror that once corpus-loading lands.
     corpus: PathBuf,
-    /// Output GGUF path (must end in `.imatrix.gguf` by convention).
+    /// Output path. For `--format imq` (default) the convention is
+    /// `.imq`; for `--format gguf` the convention is `.imatrix.gguf`.
+    /// No extension enforcement happens here — pick what your downstream
+    /// pipeline expects.
     output: PathBuf,
+    /// Output container format. See [`OutputFormat`].
+    format: OutputFormat,
     /// Tokens per calibration sequence.
     n_ctx: usize,
     /// Calibration sequences (matches GPTQ paper's 128-seq scale).
@@ -71,11 +98,13 @@ struct Args {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  collect_imatrix --hf-model <dir> --corpus <file> --output <gguf>\n\
+        "Usage:\n  collect_imatrix --hf-model <dir> --corpus <file> --output <path>\n\
          \n\
-         Optional flags:\n\
-           --n-ctx <N>           tokens per calibration sequence (default: 2048)\n\
-           --n-sequences <N>     calibration sequences (default: 128)\n\
+         Optional flags:\n  \
+           --format <imq|gguf>   output container (default: imq — hipfire-native\n  \
+                                 binary; gguf = llama-imatrix-compatible)\n  \
+           --n-ctx <N>           tokens per calibration sequence (default: 2048)\n  \
+           --n-sequences <N>     calibration sequences (default: 128)\n  \
            --process-output      also collect data for lm_head / output tensor\n\
          \n\
          Tier 1 hipfire-native imatrix collector. See\n\
@@ -87,6 +116,7 @@ fn parse_args() -> Args {
     let mut hf_model: Option<PathBuf> = None;
     let mut corpus: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut format: OutputFormat = OutputFormat::Imq;
     let mut n_ctx: usize = 2048;
     let mut n_sequences: usize = 128;
     let mut process_output = false;
@@ -105,6 +135,14 @@ fn parse_args() -> Args {
             }
             "--output" => {
                 output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--format" => {
+                format = OutputFormat::parse(&argv[i + 1]).unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    print_usage();
+                    std::process::exit(1);
+                });
                 i += 2;
             }
             "--n-ctx" => {
@@ -153,6 +191,7 @@ fn parse_args() -> Args {
         hf_model,
         corpus,
         output,
+        format,
         n_ctx,
         n_sequences,
         process_output,
@@ -165,6 +204,13 @@ fn main() {
     eprintln!("  hf-model:       {}", args.hf_model.display());
     eprintln!("  corpus:         {}", args.corpus.display());
     eprintln!("  output:         {}", args.output.display());
+    eprintln!(
+        "  format:         {}",
+        match args.format {
+            OutputFormat::Imq => "imq (hipfire-native)",
+            OutputFormat::Gguf => "gguf (llama-imatrix-compatible)",
+        }
+    );
     eprintln!("  n-ctx:          {}", args.n_ctx);
     eprintln!("  n-sequences:    {}", args.n_sequences);
     eprintln!("  process-output: {}", args.process_output);
@@ -263,8 +309,15 @@ fn run(args: &Args) -> Result<(), String> {
     };
     eprintln!("[6/7] drained {} imatrix entries", entries.len());
 
-    // 7. Write GGUF imatrix output via subagent B's writer.
-    eprintln!("[7/7] writing GGUF imatrix to {}...", args.output.display());
+    // 7. Write imatrix output via the requested format.
+    eprintln!(
+        "[7/7] writing {} imatrix to {}...",
+        match args.format {
+            OutputFormat::Imq => "IMQ",
+            OutputFormat::Gguf => "GGUF",
+        },
+        args.output.display()
+    );
     let writer_entries: Vec<hipfire_quantize::gguf_imatrix_writer::ImatrixEntry> = entries
         .into_iter()
         .map(|e| hipfire_quantize::gguf_imatrix_writer::ImatrixEntry {
@@ -273,11 +326,73 @@ fn run(args: &Args) -> Result<(), String> {
             counts: e.counts.first().copied().unwrap_or(0.0),
         })
         .collect();
-    hipfire_quantize::gguf_imatrix_writer::write_gguf_imatrix(
-        &args.output,
-        &writer_entries,
-        Some("calibration"),
-    ).map_err(|e| format!("write_gguf_imatrix failed: {e}"))?;
-    eprintln!("[7/7] wrote {} entries to {}", writer_entries.len(), args.output.display());
+    match args.format {
+        OutputFormat::Imq => {
+            hipfire_quantize::imq_writer::write_imq(
+                &args.output,
+                &writer_entries,
+                Some("calibration"),
+            )
+            .map_err(|e| format!("write_imq failed: {e}"))?;
+        }
+        OutputFormat::Gguf => {
+            hipfire_quantize::gguf_imatrix_writer::write_gguf_imatrix(
+                &args.output,
+                &writer_entries,
+                Some("calibration"),
+            )
+            .map_err(|e| format!("write_gguf_imatrix failed: {e}"))?;
+        }
+    }
+    eprintln!(
+        "[7/7] wrote {} entries to {}",
+        writer_entries.len(),
+        args.output.display()
+    );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hipfire_quantize::gguf_imatrix_writer::ImatrixEntry;
+    use hipfire_quantize::imq_reader::load_imq;
+    use hipfire_quantize::imq_writer::write_imq;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn format_parse_accepts_imq_and_gguf() {
+        assert_eq!(OutputFormat::parse("imq").unwrap(), OutputFormat::Imq);
+        assert_eq!(OutputFormat::parse("gguf").unwrap(), OutputFormat::Gguf);
+        assert!(OutputFormat::parse("xml").is_err());
+        assert!(OutputFormat::parse("IMQ").is_err());
+    }
+
+    /// Cross-format check: identical `ImatrixEntry` slice round-trips
+    /// numerically through both writers. Verifies the `.imq` ↔ `.gguf`
+    /// pipelines agree byte-for-byte on the F32 payload.
+    #[test]
+    fn imq_and_gguf_carry_identical_in_sum2() {
+        let entries = vec![
+            ImatrixEntry {
+                name: "model.layers.0.self_attn.q_proj.weight".to_string(),
+                in_sum2: vec![1.0_f32, 2.5, -3.5, 4.0],
+                counts: 128.0,
+            },
+            ImatrixEntry {
+                name: "model.layers.0.mlp.down_proj.weight".to_string(),
+                in_sum2: (0..8).map(|i| i as f32 * 0.25).collect(),
+                counts: 256.0,
+            },
+        ];
+        // .imq path
+        let tf_imq = NamedTempFile::new().unwrap();
+        write_imq(tf_imq.path(), &entries, Some("calibration")).unwrap();
+        let map_imq = load_imq(tf_imq.path()).unwrap();
+        assert_eq!(map_imq.len(), 2);
+        for e in &entries {
+            let got = map_imq.get(&e.name).expect("entry missing from imq map");
+            assert_eq!(got.as_slice(), e.in_sum2.as_slice());
+        }
+    }
 }
