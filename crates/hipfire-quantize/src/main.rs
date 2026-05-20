@@ -4032,6 +4032,18 @@ fn main() {
     // Cache GPTQ tuning params for the MQ4G256 branch below.
     let gptq_initial_damp = gptq_damp;
     let gptq_max_damp_multiplier = gptq_max_damp;
+    // ── Phase 3c: per-expert AWQ+GPTQ opt-out ────────────────────────
+    // `--moe-skip-experts` reverts the routed-expert quantize loop to
+    // the pre-3c flat-MQ4 behavior (no per-expert AWQ pre-scaling, no
+    // per-expert Hessian lookup, no AWQ sidecar emission). Useful for
+    // A/B comparing 3c-quantized output vs the legacy dense-only-
+    // imatrix path. Default OFF: the 3c per-expert loop runs whenever
+    // --awq or --gptq is set AND per-expert imatrix / Hessian entries
+    // are present.
+    let moe_mq4_skip_flag = args.iter().any(|a| a == "--moe-skip-experts");
+    if moe_mq4_skip_flag {
+        eprintln!("--moe-skip-experts: routed-expert MoE tensors will use flat MQ4 (no per-expert AWQ/GPTQ)");
+    }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
     // short context, win at long context — see benchmarks/results/
@@ -4612,10 +4624,150 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
-            let mut new_tensors: Vec<HfqTensor> = (0..n_experts).into_par_iter().map(|x| {
+            // ── Phase 3c per-expert AWQ+GPTQ admission gate ─────────────
+            // Only the MQ4G256 base path is on the AWQ whitelist today
+            // (matches the dense path — `compute_awq_scales` integrates
+            // into `quantize_mq4g256` / `gptq_pipeline_mq4g256` only).
+            // Promotes, MQ6, HFQ6, HFQ4 fall through to flat quantize
+            // (no AWQ/GPTQ pre-scaling). Future work: add MR-GPTQ / FP4
+            // pre-scaling paths.
+            let moe_mq4_path = supports_g256 && expert_promote_fmt.is_none()
+                && !expert_mq6 && !expert_hfq6 && !expert_hfq4;
+            let moe_skip_experts = moe_mq4_skip_flag;
+            // M-dim / K-dim of the per-expert 2D weight slice.
+            // gate_up_proj: M = 2 * moe_intermediate, K = hidden.
+            // down_proj:    M = hidden, K = moe_intermediate.
+            let m_dim = inner_shape[0] as usize;
+            let k_dim = inner_shape[1] as usize;
+            let awq_alpha = AWQ_ALPHA.get().copied();
+            let awq_formula_autoawq = AWQ_FORMULA.get().copied().unwrap_or(false);
+            let parent_for_lookup = parent.to_string();
+            let mut new_tensors_pairs: Vec<(HfqTensor, Option<HfqTensor>)>
+                = (0..n_experts).into_par_iter().map(|x| {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
+                // ── Per-expert MQ4G256 AWQ + GPTQ branch ────────────────
+                // Mirrors the dense MQ4G256 path (main.rs ~4880-4940) but
+                // looks up per-expert imatrix + Hessian by `(parent, x)`.
+                // Falls through to the existing flat dispatch on:
+                // - --moe-skip-experts (legacy A/B comparison mode)
+                // - non-MQ4G256 expert format (promotes, MQ6, HFQ6, HFQ4)
+                // - no per-expert imatrix (no AWQ pre-scaling) AND no Hessian
+                //   (no GPTQ): degrades cleanly to plain MQ4G256 packing,
+                //   so we still take this branch and label MQ4 below.
+                let mut awq_sidecar_scales: Option<Vec<f32>> = None;
+                if moe_mq4_path && !moe_skip_experts {
+                    let per_expert_im = imatrix_weights_for_expert(&parent_for_lookup, x as u32);
+                    // Step 1: AWQ pre-scaling (if eligible + enabled).
+                    // AWQ eligibility for MoE expert tensors: gate_up_proj is
+                    // an F1 input-side projection (already on `awq_eligible`).
+                    // down_proj is F2 output-side; honor `awq_eligible` rules.
+                    let per_expert_name = format!("{parent_for_lookup}{x}.{base_owned}.weight");
+                    let (working_weights, awq_scales_for_pipeline_f64) =
+                        if let (Some(alpha), Some(im_weights)) = (awq_alpha, per_expert_im) {
+                            if awq_eligible(&per_expert_name) {
+                                debug_assert_eq!(
+                                    im_weights.len(), k_dim,
+                                    "imatrix length ({}) != K dim ({}) for {} expert {}",
+                                    im_weights.len(), k_dim, parent_for_lookup, x,
+                                );
+                                let scales = if awq_formula_autoawq {
+                                    let w_rms = compute_weight_rms_per_input(&f32_slice, m_dim, k_dim);
+                                    compute_awq_scales_autoawq(im_weights, &w_rms, alpha)
+                                } else {
+                                    compute_awq_scales(im_weights, alpha)
+                                };
+                                awq_sidecar_scales = Some(scales.clone());
+                                let mut scaled = f32_slice.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                let scales_f64: Vec<f64> = scales.iter().map(|&v| v as f64).collect();
+                                (scaled, scales_f64)
+                            } else {
+                                (f32_slice.clone(), vec![1.0_f64; k_dim])
+                            }
+                        } else {
+                            (f32_slice.clone(), vec![1.0_f64; k_dim])
+                        };
+
+                    // Step 2: GPTQ (if --gptq + per-expert Hessian) or plain pack.
+                    let q = if let Some(sc) = GPTQ_HESSIAN.get() {
+                        // Try two Hessian key conventions to be robust to
+                        // whatever subagent A picks:
+                        //   (A) 3D-parent name + integer expert_idx — the
+                        //       "name=parent, idx=integer" convention most
+                        //       consistent with the (name, expert_idx)
+                        //       compound key.
+                        //   (B) Per-expert name + expert_idx — for collectors
+                        //       that flatten the index into the name.
+                        //   (C) Per-expert name + expert_idx=0 — degenerate
+                        //       fallback for collectors that don't carry
+                        //       expert_idx as an integer.
+                        let parent_key = parent_for_lookup.strip_suffix('.')
+                            .unwrap_or(&parent_for_lookup);
+                        let parent_no_weight = format!("{parent_key}.{base_owned}");
+                        let per_expert_no_weight = format!("{parent_for_lookup}{x}.{base_owned}");
+                        let href_opt = sc.get(&parent_no_weight, x as u32)
+                            .or_else(|| sc.get(&per_expert_no_weight, x as u32))
+                            .or_else(|| sc.get(&per_expert_no_weight, 0));
+                        if let Some(href) = href_opt {
+                            if href.k != k_dim {
+                                eprintln!(
+                                    "warning: GPTQ MoE {parent_for_lookup}{x}.{base_owned}: \
+                                     Hessian K={} != tensor K={k_dim}; falling back to plain MQ4",
+                                    href.k
+                                );
+                                quantize_mq4g256(&working_weights, &signs1, &signs2)
+                            } else {
+                                let h_unrot_f32: Vec<f32> = href.iter_f64().map(|v| v as f32).collect();
+                                #[cfg(feature = "gptq-hip")]
+                                let gptq_solver_ref = GPTQ_SOLVER.get().and_then(|opt| opt.as_ref());
+                                #[cfg(not(feature = "gptq-hip"))]
+                                let gptq_solver_ref: Option<&gptq::GptqHipSolver> = None;
+                                let tag = format!("{parent_for_lookup}{x}.{base_owned}");
+                                match gptq::gptq_pipeline_mq4g256(
+                                    &working_weights, m_dim, k_dim,
+                                    &h_unrot_f32, &awq_scales_for_pipeline_f64,
+                                    &signs1, &signs2,
+                                    gptq_initial_damp, gptq_max_damp_multiplier,
+                                    &tag,
+                                    gptq_solver_ref,
+                                ) {
+                                    Ok(packed) => packed,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "warning: GPTQ MoE failed for {tag}: {e}; falling back to plain MQ4",
+                                        );
+                                        quantize_mq4g256(&working_weights, &signs1, &signs2)
+                                    }
+                                }
+                            }
+                        } else {
+                            quantize_mq4g256(&working_weights, &signs1, &signs2)
+                        }
+                    } else {
+                        quantize_mq4g256(&working_weights, &signs1, &signs2)
+                    };
+
+                    let main_tensor = HfqTensor {
+                        name: format!("{parent_for_lookup}{x}.{base_owned}.weight"),
+                        quant_type: QuantType::MQ4G256,
+                        shape: inner_shape_clone.clone(),
+                        group_size: 256,
+                        data: q,
+                        spilled_len: 0,
+                    };
+                    let sidecar_tensor = awq_sidecar_scales.as_ref().map(|scales| HfqTensor {
+                        name: format!("{parent_for_lookup}{x}.{base_owned}.awq_scale.weight"),
+                        quant_type: QuantType::F16,
+                        shape: vec![scales.len() as u32],
+                        group_size: 0,
+                        data: awq_scales_to_f16_bytes(scales),
+                        spilled_len: 0,
+                    });
+                    return (main_tensor, sidecar_tensor);
+                }
+                // ── Fallthrough: existing per-expert flat dispatch ──────
                 let (quantized, qt, gs) = if let Some(fmt) = expert_promote_fmt {
                     // Promoted: dispatch on the carried Promote(<fmt>) target.
                     // Non-256-aligned promoted tensors fall to HFQ4G128 (same as
@@ -4687,14 +4839,17 @@ fn main() {
                     let q = quantize_hfq4g128(&f32_slice);
                     (q, QuantType::HFQ4G128, 128u32)
                 };
-                HfqTensor {
-                    name: format!("{parent_owned}{x}.{base_owned}.weight"),
-                    quant_type: qt,
-                    shape: inner_shape_clone.clone(),
-                    group_size: gs,
-                    data: quantized,
-                    spilled_len: 0,
-                }
+                (
+                    HfqTensor {
+                        name: format!("{parent_owned}{x}.{base_owned}.weight"),
+                        quant_type: qt,
+                        shape: inner_shape_clone.clone(),
+                        group_size: gs,
+                        data: quantized,
+                        spilled_len: 0,
+                    },
+                    None,
+                )
             }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
@@ -4705,10 +4860,38 @@ fn main() {
               else if expert_hfq4 { "HFQ4G256" }
               else if supports_g256 { "MQ4G256" }
               else { "HFQ4G128" };
-            let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
-            eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
+            let n_awq_sidecars = new_tensors_pairs.iter().filter(|p| p.1.is_some()).count();
+            let bytes_per = new_tensors_pairs.first().map(|p| p.0.data.len()).unwrap_or(0);
+            // Phase 3c: report whether per-expert AWQ / GPTQ ran. Mirrors
+            // the brief's directive to surface "X MoE multi-matrix entries:
+            // AWQ pre-scaled per-expert, GPTQ pre-quant per-expert" in
+            // place of the legacy "skipped" line.
+            let awq_gptq_note = if moe_mq4_path && !moe_mq4_skip_flag {
+                let awq_label = if awq_alpha.is_some() { "AWQ" } else { "" };
+                let gptq_label = if GPTQ_HESSIAN.get().is_some() { "GPTQ" } else { "" };
+                match (awq_label, gptq_label) {
+                    ("", "") => String::new(),
+                    ("AWQ", "") => format!(" [AWQ per-expert × {}]", n_awq_sidecars),
+                    ("", "GPTQ") => " [GPTQ per-expert]".to_string(),
+                    ("AWQ", "GPTQ") => format!(" [AWQ × {} + GPTQ per-expert]", n_awq_sidecars),
+                    _ => String::new(),
+                }
+            } else if moe_mq4_skip_flag {
+                " [--moe-skip-experts: flat MQ4]".to_string()
+            } else {
+                String::new()
+            };
+            eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel){awq_gptq_note}",
                 inner_shape, bytes_per as f64 / 1024.0);
-            hfq_tensors.append(&mut new_tensors);
+            // Flatten the (main, optional sidecar) pairs into HfqTensor flat
+            // list. Main first, sidecar (if any) immediately after — same
+            // ordering convention as the dense path (main.rs:5183-5193).
+            for (main, sidecar) in new_tensors_pairs.drain(..) {
+                hfq_tensors.push(main);
+                if let Some(sc) = sidecar {
+                    hfq_tensors.push(sc);
+                }
+            }
             // Drop source pages and spill quantized data after each expert batch.
             st_files[*file_idx].drop_tensor_pages(name);
             if let Some(ref mut s) = spill {
