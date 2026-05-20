@@ -43,6 +43,18 @@ use faer::linalg::solvers::{DenseSolveCore, Solve};
 use faer::{Mat, Side};
 use rayon::prelude::*;
 
+// ── GPU Cholesky solver type alias ─────────────────────────────────────
+// When the `gptq-hip` feature is on, callers can pass an opened
+// `RocSolver` to `gptq_pipeline_mq4g256` / `gptq_column_sequential` and
+// the FP64 Cholesky pipeline routes to rocSOLVER. When the feature is
+// off, the parameter is a zero-size stub so signatures stay uniform.
+#[cfg(not(feature = "gptq-hip"))]
+pub struct GptqHipSolverStub;
+#[cfg(not(feature = "gptq-hip"))]
+pub type GptqHipSolver = GptqHipSolverStub;
+#[cfg(feature = "gptq-hip")]
+pub type GptqHipSolver = crate::gptq_hip::RocSolver;
+
 /// Per-element asymmetric MQ4 quantize step.
 ///
 /// Mirrors the formula in `quantize_mq4g256` (main.rs:566-567):
@@ -626,6 +638,7 @@ pub fn gptq_pipeline_mq4g256(
     initial_damp: f64,
     max_damp_multiplier: f64,
     tensor_name: &str,
+    solver: Option<&GptqHipSolver>,
 ) -> Result<Vec<u8>, CholeskyError> {
     assert_eq!(weights_f32.len(), m * k);
     assert_eq!(h_unrot_f32.len(), k * k);
@@ -666,6 +679,7 @@ pub fn gptq_pipeline_mq4g256(
         initial_damp,
         max_damp_multiplier,
         tensor_name,
+        solver,
     )?;
 
     Ok(pack_mq4g256_from_rotated_f64(&weights, &frozen_grids))
@@ -775,6 +789,7 @@ pub fn gptq_column_sequential(
     initial_damp: f64,
     max_damp_multiplier: f64,
     tensor_name: &str,
+    solver: Option<&GptqHipSolver>,
 ) -> Result<f64, CholeskyError> {
     assert_eq!(weights_flat.len(), m * k_dim, "weight shape mismatch");
     assert_eq!(h_target.nrows(), k_dim);
@@ -798,9 +813,27 @@ pub fn gptq_column_sequential(
     // `U[j, k] / U[j, j] = H_inv[j, k] / H_inv[j, j]` for the residual
     // Schur-complement Hessian — exactly the textbook GPTQ correction.
     // See `compute_damped_inv_cholesky_upper` doc for the full math.
-    let (u, effective_damp) = compute_damped_inv_cholesky_upper(
-        h_target, Some(&perm), initial_damp, max_damp_multiplier,
-    )?;
+    let (u, effective_damp) = {
+        #[cfg(feature = "gptq-hip")]
+        {
+            if let Some(s) = solver {
+                crate::gptq_hip::compute_damped_inv_cholesky_upper_hip(
+                    s, h_target, Some(&perm), initial_damp, max_damp_multiplier,
+                )?
+            } else {
+                compute_damped_inv_cholesky_upper(
+                    h_target, Some(&perm), initial_damp, max_damp_multiplier,
+                )?
+            }
+        }
+        #[cfg(not(feature = "gptq-hip"))]
+        {
+            let _ = solver;
+            compute_damped_inv_cholesky_upper(
+                h_target, Some(&perm), initial_damp, max_damp_multiplier,
+            )?
+        }
+    };
 
     // Working copy of the post-quantize "residual" weights. We need to
     // keep the original values to compute the error for OBS propagation.
@@ -1079,7 +1112,7 @@ mod tests {
         let h = Mat::<f64>::identity(k, k);
 
         let mut weights = weights_orig.clone();
-        let damp = gptq_column_sequential(&mut weights, &h, m, k, &frozen, 0.0, 1.0, "test:identity_H").unwrap();
+        let damp = gptq_column_sequential(&mut weights, &h, m, k, &frozen, 0.0, 1.0, "test:identity_H", None::<&GptqHipSolver>).unwrap();
         // Identity H trivially Cholesky'd — effective damp lands on the
         // ε·diag_mean=ε floor from clamped_initial_damp, not literally 0.
         assert!(damp < 1e-14, "identity H damp should be at the ε floor, got {damp}");
@@ -1192,6 +1225,7 @@ mod tests {
         let gptq_packed = gptq_pipeline_mq4g256(
             &weights_f32, m, k, &h_unrot, &awq_scales, &signs1, &signs2, 1e-6, 1.0,
             "test:pipeline_identity",
+            None::<&GptqHipSolver>,
         )
         .expect("identity-H pipeline should not need damping");
 
@@ -1254,7 +1288,7 @@ mod tests {
 
         // GPTQ.
         let mut gptq = weights_orig.clone();
-        gptq_column_sequential(&mut gptq, &h, m, k, &frozen, 1e-6, 1.0, "test:improves_aw").unwrap();
+        gptq_column_sequential(&mut gptq, &h, m, k, &frozen, 1e-6, 1.0, "test:improves_aw", None::<&GptqHipSolver>).unwrap();
 
         // Activation-weighted error: sum over (i,j,k) of (w[i,j]-w_q[i,j]) * H[j,k] * (w[i,k]-w_q[i,k]).
         // Approximate via per-channel diagonal (the dominant term):

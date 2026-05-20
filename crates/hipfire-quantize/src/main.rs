@@ -84,6 +84,37 @@ static AWQ_SCOPE_F1: OnceLock<bool> = OnceLock::new();
 // payload after each tensor's Cholesky completes.
 static GPTQ_HESSIAN: OnceLock<hessian_io::HessianSidecar> = OnceLock::new();
 
+// rocSOLVER-backed FP64 Cholesky solver. Created once at startup if the
+// `gptq-hip` feature is on AND the GPU is CDNA AND rocSOLVER is loadable.
+// Threaded into `gptq::gptq_pipeline_mq4g256` as `Option<&RocSolver>`; when
+// None, the CPU faer Cholesky path runs unchanged.
+#[cfg(feature = "gptq-hip")]
+static GPTQ_SOLVER: OnceLock<Option<gptq_hip::RocSolver>> = OnceLock::new();
+
+#[cfg(feature = "gptq-hip")]
+fn detect_is_cdna() -> bool {
+    // Probe via rocminfo. CDNA arches (gfx906/908/90a/940/941/942) have
+    // 1:1 or 1:2 FP64:FP32 throughput; RDNA (gfx1100/1201) is 1:64 and the
+    // GPU Cholesky path is slower than 20-core CPU. Gate on this so consumer
+    // RDNA users transparently keep the CPU path.
+    let output = match std::process::Command::new("rocminfo").output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let s = String::from_utf8_lossy(&output.stdout);
+    s.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with("Name:")
+            && (l.contains("gfx906")
+                || l.contains("gfx908")
+                || l.contains("gfx90a")
+                || l.contains("gfx940")
+                || l.contains("gfx941")
+                || l.contains("gfx942"))
+    })
+}
+
+
 // `--lm-head-format <fmt>` override. Unset = default Q8 behavior (lm_head and
 // output force-quantized to Q8 by kmap_resolve_mode rule 2). When Some(<fmt>),
 // kmap_resolve_mode returns `QuantLevel::Override(<fmt>)` for lm_head /
@@ -3707,6 +3738,34 @@ fn main() {
             sc.n_tensors()
         );
         GPTQ_HESSIAN.set(sc).map_err(|_| "GPTQ_HESSIAN set twice").unwrap();
+
+        // ── GPU Cholesky solver init (gptq-hip feature only) ──────────
+        #[cfg(feature = "gptq-hip")]
+        {
+            let gptq_force_cpu = args.iter().any(|a| a == "--gptq-cpu");
+            if gptq_force_cpu {
+                eprintln!("[gptq] --gptq-cpu: CPU Cholesky forced");
+                GPTQ_SOLVER.set(None).ok();
+            } else {
+                let allow_all = std::env::var("HIPFIRE_GPTQ_HIP_ALL_ARCHS").is_ok();
+                let is_cdna = allow_all || detect_is_cdna();
+                if !is_cdna {
+                    eprintln!("[gptq-hip] non-CDNA arch detected; FP64 GPU path skipped (set HIPFIRE_GPTQ_HIP_ALL_ARCHS=1 to override)");
+                    GPTQ_SOLVER.set(None).ok();
+                } else {
+                    match gptq_hip::RocSolver::load() {
+                        Ok(s) => {
+                            eprintln!("[gptq-hip] rocSOLVER loaded; GPU Cholesky active");
+                            GPTQ_SOLVER.set(Some(s)).ok();
+                        }
+                        Err(e) => {
+                            eprintln!("[gptq-hip] unavailable ({e}); using CPU Cholesky");
+                            GPTQ_SOLVER.set(None).ok();
+                        }
+                    }
+                }
+            }
+        }
     }
     // Cache GPTQ tuning params for the MQ4G256 branch below.
     let gptq_initial_damp = gptq_damp;
@@ -4845,12 +4904,17 @@ fn main() {
                             } else {
                                 // FP32 view of the K×K Hessian (promoted to FP64 inside the pipeline).
                                 let h_unrot_f32: Vec<f32> = href.iter_f64().map(|v| v as f32).collect();
+                                #[cfg(feature = "gptq-hip")]
+                                let gptq_solver_ref = GPTQ_SOLVER.get().and_then(|opt| opt.as_ref());
+                                #[cfg(not(feature = "gptq-hip"))]
+                                let gptq_solver_ref: Option<&gptq::GptqHipSolver> = None;
                                 match gptq::gptq_pipeline_mq4g256(
                                     &working_weights, m_dim, k_dim,
                                     &h_unrot_f32, &awq_scales_for_pipeline_f64,
                                     &signs1, &signs2,
                                     gptq_initial_damp, gptq_max_damp_multiplier,
                                     h_key,
+                                    gptq_solver_ref,
                                 ) {
                                     Ok(packed) => packed,
                                     Err(e) => {
