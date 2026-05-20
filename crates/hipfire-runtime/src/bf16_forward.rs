@@ -72,9 +72,24 @@ enum LayerKind {
     FullAttn,
 }
 
+/// Detect language-model prefix on a trunk's tensor names.
+///
+/// Qwen3.5 dense text-only models use `model.*` prefix. Qwen3.6 VL
+/// variants (e.g. Qwen3.6-27B with a vision encoder) wrap the text
+/// trunk under `model.language_model.*`. Returns the prefix with the
+/// trailing dot included so callers can `format!("{}layers.{}", prefix, l)`.
+pub(crate) fn lm_prefix(trunk: &TrunkBF16) -> &'static str {
+    if trunk.tensors.contains_key("model.language_model.embed_tokens.weight") {
+        "model.language_model."
+    } else {
+        "model."
+    }
+}
+
 /// Detect the attention kind for a given layer by tensor presence.
 fn detect_layer_kind(trunk: &TrunkBF16, layer_idx: usize) -> LayerKind {
-    let probe_full = format!("model.layers.{layer_idx}.self_attn.q_proj.weight");
+    let prefix = lm_prefix(trunk);
+    let probe_full = format!("{prefix}layers.{layer_idx}.self_attn.q_proj.weight");
     if trunk.tensors.contains_key(&probe_full) {
         LayerKind::FullAttn
     } else {
@@ -82,17 +97,15 @@ fn detect_layer_kind(trunk: &TrunkBF16, layer_idx: usize) -> LayerKind {
     }
 }
 
-/// Count layers in the trunk by walking `model.layers.{L}.*` until a
+/// Count layers in the trunk by walking `{prefix}layers.{L}.*` until a
 /// layer index is absent. Used in lieu of a parsed `config.json` so
 /// the forward works on fixtures that ship only safetensors.
 fn count_layers(trunk: &TrunkBF16) -> usize {
+    let prefix = lm_prefix(trunk);
     let mut n = 0usize;
     loop {
-        // A layer is "present" if any of the canonical attention tensors
-        // for either kind exists. Probe DeltaNet first since it's the
-        // common case in Qwen3.5/3.6.
-        let probe_dn = format!("model.layers.{n}.linear_attn.in_proj_qkv.weight");
-        let probe_full = format!("model.layers.{n}.self_attn.q_proj.weight");
+        let probe_dn = format!("{prefix}layers.{n}.linear_attn.in_proj_qkv.weight");
+        let probe_full = format!("{prefix}layers.{n}.self_attn.q_proj.weight");
         if !trunk.tensors.contains_key(&probe_dn) && !trunk.tensors.contains_key(&probe_full) {
             break;
         }
@@ -147,12 +160,14 @@ pub fn forward_prefill_bf16(
     //
     // The embed_tokens row shape gives us `dim` cheaply without parsing
     // config.json. `[vocab, dim]` row-major; we want `dim`.
+    let prefix = lm_prefix(trunk);
+    let embed_key = format!("{prefix}embed_tokens.weight");
     let embed = trunk
         .tensors
-        .get("model.embed_tokens.weight")
+        .get(&embed_key)
         .ok_or_else(|| hip_bridge::HipError::new(
             0,
-            "bf16_forward: missing `model.embed_tokens.weight` in trunk",
+            &format!("bf16_forward: missing `{embed_key}` in trunk"),
         ))?;
     if embed.shape.len() != 2 {
         return Err(hip_bridge::HipError::new(
@@ -223,7 +238,7 @@ pub fn forward_prefill_bf16(
     // ── Per-layer loop ─────────────────────────────────────────────────
     for layer_idx in 0..n_layers {
         let kind = detect_layer_kind(trunk, layer_idx);
-        let p = format!("model.layers.{layer_idx}");
+        let p = format!("{prefix}layers.{layer_idx}");
 
         // Hidden state into this layer (h is currently the residual stream)
         // is used as the BF16 input to every linear in this layer. The
