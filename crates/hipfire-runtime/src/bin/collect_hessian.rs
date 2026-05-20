@@ -436,9 +436,17 @@ fn run(args: &Args) -> Result<(), String> {
                 .strip_suffix(".weight")
                 .map(|s| s.to_string())
                 .unwrap_or(e.name);
+            // Forward expert_idx from the collector through to the
+            // HFHS-v1 writer. Dense tensors get 0; MoE per-expert
+            // tensors carry the literal expert index parsed out of
+            // the dispatch-time tensor name (see
+            // `calibration::parse_expert_idx`). The canonical_name
+            // still contains the literal `.experts.<E>.` substring,
+            // so reader code that locates per-expert records by
+            // `(name, expert_idx)` finds them both ways.
             hipfire_quantize::hfhs_writer::HessianEntry {
                 name: canonical_name,
-                expert_idx: 0,
+                expert_idx: e.expert_idx,
                 k: e.k as u32,
                 h: h_avg,
             }

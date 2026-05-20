@@ -48,6 +48,88 @@ use std::process::Command;
 use std::sync::Mutex;
 
 // ───────────────────────────────────────────────────────────────────────
+// Expert-index parsing (MoE per-expert capture key)
+// ───────────────────────────────────────────────────────────────────────
+
+/// Parse the per-expert index out of a tensor name and return
+/// `(canonical_name, expert_idx)`.
+///
+/// MoE models (Qwen3.5-A3B, Astrea) name per-expert weight tensors
+/// using the convention:
+///
+/// ```text
+/// model.language_model.layers.{LAYER}.mlp.experts.{EXPERT_IDX}.gate_proj.weight
+/// model.language_model.layers.{LAYER}.mlp.experts.{EXPERT_IDX}.up_proj.weight
+/// model.language_model.layers.{LAYER}.mlp.experts.{EXPERT_IDX}.down_proj.weight
+/// ```
+///
+/// For names containing the `.experts.<DIGITS>.` substring this returns
+/// `(full_name_with_literal_index, EXPERT_IDX)`. The canonical name
+/// preserves the literal expert index so the HFHS / GGUF writers emit
+/// the on-disk tensor name verbatim (downstream tools — Astrea,
+/// hipfire-quantize — locate per-expert imatrix / Hessian records by
+/// matching the literal tensor name).
+///
+/// For non-MoE names (no `.experts.<DIGITS>.` substring) the canonical
+/// name is the input unchanged and `expert_idx = 0`. This matches the
+/// HFHS-v1 binary layout (`hessian_io.rs::HessianRef::expert_idx`
+/// defaults to 0 for dense tensors).
+///
+/// Examples:
+///
+/// ```ignore
+/// assert_eq!(
+///     parse_expert_idx("model.layers.0.self_attn.q_proj.weight"),
+///     ("model.layers.0.self_attn.q_proj.weight".to_string(), 0),
+/// );
+/// assert_eq!(
+///     parse_expert_idx(
+///         "model.language_model.layers.5.mlp.experts.23.gate_proj.weight",
+///     ),
+///     (
+///         "model.language_model.layers.5.mlp.experts.23.gate_proj.weight".to_string(),
+///         23,
+///     ),
+/// );
+/// // Non-digit between `.experts.` and the next `.` does not match
+/// // (e.g. shared_expert is a separate path, not a per-expert key).
+/// assert_eq!(
+///     parse_expert_idx("model.layers.0.mlp.shared_expert.gate_proj.weight"),
+///     ("model.layers.0.mlp.shared_expert.gate_proj.weight".to_string(), 0),
+/// );
+/// ```
+///
+/// Implementation note: hand-rolled scan (no regex crate dep) to keep
+/// the `hipfire-runtime` workspace dep graph tight. Scans for the
+/// literal `.experts.` substring, then walks forward to read a
+/// `[0-9]+` run terminated by `.`. Returns `(name, 0)` on any
+/// non-match (including malformed `.experts.<non-digit>.`,
+/// `.experts.<digits><EOF>`, or overflow on a 10+ digit run).
+pub fn parse_expert_idx(full_name: &str) -> (String, u32) {
+    const MARKER: &str = ".experts.";
+    let Some(start) = full_name.find(MARKER) else {
+        return (full_name.to_string(), 0);
+    };
+    let digits_start = start + MARKER.len();
+    let bytes = full_name.as_bytes();
+    let mut cursor = digits_start;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+        cursor += 1;
+    }
+    // Must have at least one digit AND be terminated by `.` before EOF.
+    if cursor == digits_start || cursor >= bytes.len() || bytes[cursor] != b'.' {
+        return (full_name.to_string(), 0);
+    }
+    let digits = &full_name[digits_start..cursor];
+    // Parse the digit run as u32. Overflow → fall back to dense key
+    // (degenerate input; better than panicking).
+    let Ok(expert_idx) = digits.parse::<u32>() else {
+        return (full_name.to_string(), 0);
+    };
+    (full_name.to_string(), expert_idx)
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // Tokenizer driver
 // ───────────────────────────────────────────────────────────────────────
 
@@ -266,9 +348,18 @@ fn parse_llama_tokenize_stdout(stdout: &str) -> Result<Vec<u32>, String> {
 /// `{name}.in_sum2` + `{name}.counts`.
 #[derive(Debug)]
 pub struct ImatrixEntry {
-    /// Canonical HF safetensors tensor key
-    /// (e.g. `model.layers.0.self_attn.q_proj.weight`).
+    /// Canonical HF safetensors tensor key, with the literal expert
+    /// index preserved for MoE per-expert tensors (e.g.
+    /// `model.layers.0.self_attn.q_proj.weight` or
+    /// `model.language_model.layers.5.mlp.experts.23.gate_proj.weight`).
     pub name: String,
+    /// Expert index for MoE per-expert tensors. `0` for dense tensors.
+    /// Mirrors the HFHS-v1 binary format's `expert_idx` field for
+    /// cross-format consistency (the GGUF imatrix writer keys by name
+    /// alone and ignores this field, but Astrea-style downstream tools
+    /// can still discover the per-expert index without re-parsing the
+    /// tensor name).
+    pub expert_idx: u32,
     /// Per-channel `Σ x²` — one F32 value per K (input dim).
     /// Length = K.
     pub in_sum2: Vec<f32>,
@@ -299,10 +390,18 @@ struct ImatrixAccum {
 /// `ActivationCapture::capture` trait method takes `&self`. The lock
 /// is held only across the on-GPU dispatch — no per-element work
 /// happens under the lock.
+///
+/// Keyed by `(tensor_name, expert_idx)` so MoE per-expert tensors with
+/// the SAME suffix (e.g. `.experts.0.gate_proj.weight` vs
+/// `.experts.1.gate_proj.weight`) accumulate into distinct entries.
+/// The canonical name preserves the literal expert index, matching the
+/// HFHS-v1 layout — see `parse_expert_idx` for the parsing convention.
 pub struct ImatrixCollector {
-    /// Per-tensor accumulators. Keyed by canonical tensor name (the
-    /// `tensor_name` arg passed to `capture`).
-    accumulators: Mutex<HashMap<String, ImatrixAccum>>,
+    /// Per-tensor accumulators. Keyed by `(canonical_tensor_name,
+    /// expert_idx)`. For dense tensors `expert_idx == 0`; for MoE
+    /// per-expert tensors `canonical_tensor_name` already contains the
+    /// literal `.experts.<E>.` substring + `expert_idx == E`.
+    accumulators: Mutex<HashMap<(String, u32), ImatrixAccum>>,
     /// When true, accumulate for `lm_head` / `output` tensors too.
     /// Mirrors llama-imatrix's `--process-output` flag.
     process_output: bool,
@@ -332,21 +431,29 @@ impl ImatrixCollector {
             .lock()
             .map_err(|e| format!("ImatrixCollector mutex poisoned at drain: {e}"))?;
         let mut entries = Vec::with_capacity(acc_map.len());
-        for (name, accum) in acc_map.iter() {
+        for ((name, expert_idx), accum) in acc_map.iter() {
             let in_sum2 = gpu
                 .download_f32(&accum.acc)
                 .map_err(|e| format!("download_f32 failed for {name}: {e}"))?;
             let counts = vec![accum.n_tokens as f32; accum.k];
             entries.push(ImatrixEntry {
                 name: name.clone(),
+                expert_idx: *expert_idx,
                 in_sum2,
                 counts,
             });
         }
-        // Sort by name for deterministic output ordering (the GGUF
-        // writer keys by name anyway, but downstream comparators
-        // appreciate stable ordering).
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        // Sort by (name, expert_idx) for deterministic output ordering
+        // (the GGUF writer keys by name anyway, but downstream
+        // comparators appreciate stable ordering — and per-expert
+        // tensors with the same suffix differ only by expert_idx in
+        // the canonical name string, so a plain name sort already
+        // groups them correctly).
+        entries.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.expert_idx.cmp(&b.expert_idx))
+        });
         Ok(entries)
     }
 
@@ -390,7 +497,12 @@ impl ActivationCapture for ImatrixCollector {
         tensor_name: &str,
         input: &GpuTensor,
     ) {
-        if !self.should_capture(tensor_name) {
+        // Parse expert index out of MoE per-expert names; the canonical
+        // key carries the literal expert idx in the name string so the
+        // GGUF writer emits it on-disk verbatim, and the separate
+        // `expert_idx` field feeds the HFHS-v1 per-expert layout.
+        let (canonical, expert_idx) = parse_expert_idx(tensor_name);
+        if !self.should_capture(&canonical) {
             return;
         }
         let k = match input.shape.last() {
@@ -402,14 +514,15 @@ impl ActivationCapture for ImatrixCollector {
             Ok(a) => a,
             Err(_) => return,
         };
-        if !accs.contains_key(tensor_name) {
+        let key = (canonical, expert_idx);
+        if !accs.contains_key(&key) {
             let acc = match gpu.zeros(&[k], DType::F32) {
                 Ok(a) => a,
                 Err(_) => return,
             };
-            accs.insert(tensor_name.to_string(), ImatrixAccum { acc, n_tokens: 0, k });
+            accs.insert(key.clone(), ImatrixAccum { acc, n_tokens: 0, k });
         }
-        let accum = accs.get_mut(tensor_name).unwrap();
+        let accum = accs.get_mut(&key).unwrap();
         // sumsq_reduce_bf16 needs a GPU scalar for n_tokens (writes into it).
         // We track host-side n_tokens separately; the GPU scalar is a throwaway.
         let mut n_scratch = match gpu.zeros(&[1], DType::F32) {
@@ -469,9 +582,16 @@ impl ActivationCapture for ImatrixCollector {
 /// PyTorch reference at `scripts/collect_hessian.py:213-222`.
 #[derive(Debug)]
 pub struct HessianEntry {
-    /// Canonical HF safetensors tensor key
-    /// (e.g. `model.layers.0.self_attn.q_proj.weight`).
+    /// Canonical HF safetensors tensor key, with the literal expert
+    /// index preserved for MoE per-expert tensors (e.g.
+    /// `model.layers.0.self_attn.q_proj.weight` or
+    /// `model.language_model.layers.5.mlp.experts.23.gate_proj.weight`).
     pub name: String,
+    /// Expert index for MoE per-expert tensors. `0` for dense tensors.
+    /// Feeds the `expert_idx` field of the HFHS-v1 binary record so
+    /// per-expert Hessians are addressable by `(name, expert_idx)`
+    /// downstream — see `hessian_io.rs::HessianRef::expert_idx`.
+    pub expert_idx: u32,
     /// K — input feature dimension.
     pub k: usize,
     /// Row-major K×K F32 outer-product accumulator (`Σ x · xᵀ`).
@@ -495,8 +615,14 @@ struct HessianAccum {
 /// whitelist (per `bf16_loader::is_gptq_target`) are accumulated —
 /// saves the K×K F32 allocation for norms / embed / lm_head which the
 /// quantizer never consumes.
+///
+/// Keyed by `(tensor_name, expert_idx)` so MoE per-expert tensors with
+/// the SAME suffix (e.g. `.experts.0.gate_proj.weight` vs
+/// `.experts.1.gate_proj.weight`) accumulate into distinct K×K
+/// Hessians. The canonical name preserves the literal expert index,
+/// matching the HFHS-v1 layout — see `parse_expert_idx`.
 pub struct HessianCollector {
-    accumulators: Mutex<HashMap<String, HessianAccum>>,
+    accumulators: Mutex<HashMap<(String, u32), HessianAccum>>,
 }
 
 impl HessianCollector {
@@ -514,18 +640,23 @@ impl HessianCollector {
             .lock()
             .map_err(|e| format!("HessianCollector mutex poisoned at drain: {e}"))?;
         let mut entries = Vec::with_capacity(acc_map.len());
-        for (name, accum) in acc_map.iter() {
+        for ((name, expert_idx), accum) in acc_map.iter() {
             let h = gpu
                 .download_f32(&accum.h)
                 .map_err(|e| format!("download_f32 failed for {name}: {e}"))?;
             entries.push(HessianEntry {
                 name: name.clone(),
+                expert_idx: *expert_idx,
                 k: accum.k,
                 h,
                 n_tokens: accum.n_tokens,
             });
         }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.expert_idx.cmp(&b.expert_idx))
+        });
         Ok(entries)
     }
 }
@@ -543,7 +674,16 @@ impl ActivationCapture for HessianCollector {
         tensor_name: &str,
         input: &GpuTensor,
     ) {
-        if !is_gptq_target(tensor_name) {
+        // Parse expert idx out of MoE per-expert names; the canonical
+        // key carries the literal expert idx in the name string so the
+        // HFHS-v1 writer emits per-expert records with both
+        // `name` (literal `.experts.<E>.`) and `expert_idx == E`.
+        let (canonical, expert_idx) = parse_expert_idx(tensor_name);
+        // `is_gptq_target` matches on the last `.`-separated segment
+        // (e.g. `gate_proj`), so MoE per-expert tensors with the
+        // expected suffix are admitted under the same whitelist
+        // without a per-expert special case.
+        if !is_gptq_target(&canonical) {
             return;
         }
         let k = match input.shape.last() {
@@ -555,14 +695,15 @@ impl ActivationCapture for HessianCollector {
             Ok(a) => a,
             Err(_) => return,
         };
-        if !accs.contains_key(tensor_name) {
+        let key = (canonical, expert_idx);
+        if !accs.contains_key(&key) {
             let h = match gpu.zeros(&[k, k], DType::F32) {
                 Ok(h) => h,
                 Err(_) => return,
             };
-            accs.insert(tensor_name.to_string(), HessianAccum { h, n_tokens: 0, k });
+            accs.insert(key.clone(), HessianAccum { h, n_tokens: 0, k });
         }
-        let accum = accs.get_mut(tensor_name).unwrap();
+        let accum = accs.get_mut(&key).unwrap();
         if let Err(_) = gpu.hessian_outer_product_bf16(input, &mut accum.h) {
             return;
         }
@@ -577,6 +718,132 @@ impl ActivationCapture for HessianCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────────────────────────────────────────────────────────────────
+    // parse_expert_idx — MoE per-expert key extraction
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Dense tensor names (no `.experts.<digits>.`): canonical name is
+    /// returned unchanged, expert_idx is 0.
+    #[test]
+    fn parse_expert_idx_dense() {
+        let (n, e) = parse_expert_idx("model.layers.0.self_attn.q_proj.weight");
+        assert_eq!(n, "model.layers.0.self_attn.q_proj.weight");
+        assert_eq!(e, 0);
+
+        let (n, e) = parse_expert_idx("model.layers.5.mlp.gate_proj.weight");
+        assert_eq!(n, "model.layers.5.mlp.gate_proj.weight");
+        assert_eq!(e, 0);
+
+        // MoE router gate — admitted by is_gptq_target but is not a
+        // per-expert tensor, so expert_idx stays 0.
+        let (n, e) = parse_expert_idx("model.layers.0.mlp.gate.weight");
+        assert_eq!(n, "model.layers.0.mlp.gate.weight");
+        assert_eq!(e, 0);
+
+        // Final norm / embed: no .experts. substring.
+        let (n, e) = parse_expert_idx("model.embed_tokens.weight");
+        assert_eq!(n, "model.embed_tokens.weight");
+        assert_eq!(e, 0);
+    }
+
+    /// Per-expert MoE name: canonical name retains the literal expert
+    /// index, expert_idx parses correctly.
+    #[test]
+    fn parse_expert_idx_moe() {
+        let (n, e) = parse_expert_idx(
+            "model.language_model.layers.5.mlp.experts.23.gate_proj.weight",
+        );
+        assert_eq!(
+            n,
+            "model.language_model.layers.5.mlp.experts.23.gate_proj.weight"
+        );
+        assert_eq!(e, 23);
+
+        let (n, e) = parse_expert_idx(
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+        );
+        assert_eq!(
+            n,
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+        );
+        assert_eq!(e, 0);
+
+        let (n, e) = parse_expert_idx(
+            "model.language_model.layers.10.mlp.experts.127.down_proj.weight",
+        );
+        assert_eq!(
+            n,
+            "model.language_model.layers.10.mlp.experts.127.down_proj.weight"
+        );
+        assert_eq!(e, 127);
+
+        let (n, e) = parse_expert_idx(
+            "model.language_model.layers.7.mlp.experts.42.up_proj.weight",
+        );
+        assert_eq!(
+            n,
+            "model.language_model.layers.7.mlp.experts.42.up_proj.weight"
+        );
+        assert_eq!(e, 42);
+
+        // Some HF dumps drop the `model.language_model.` prefix.
+        let (n, e) = parse_expert_idx("model.layers.3.mlp.experts.8.down_proj.weight");
+        assert_eq!(n, "model.layers.3.mlp.experts.8.down_proj.weight");
+        assert_eq!(e, 8);
+    }
+
+    /// `shared_expert` is NOT a per-expert key (no digits between
+    /// `.experts.` and `.`); the canonical name + expert_idx must
+    /// degrade gracefully to the dense-tensor case.
+    #[test]
+    fn parse_expert_idx_shared_expert_is_dense() {
+        let (n, e) = parse_expert_idx(
+            "model.language_model.layers.5.mlp.shared_expert.gate_proj.weight",
+        );
+        assert_eq!(
+            n,
+            "model.language_model.layers.5.mlp.shared_expert.gate_proj.weight"
+        );
+        assert_eq!(e, 0);
+
+        let (n, e) = parse_expert_idx(
+            "model.layers.5.mlp.shared_expert.down_proj.weight",
+        );
+        assert_eq!(n, "model.layers.5.mlp.shared_expert.down_proj.weight");
+        assert_eq!(e, 0);
+    }
+
+    /// Malformed expert-index runs (non-digits, missing terminator,
+    /// truncation at EOF) degrade to the dense-tensor case rather than
+    /// panicking.
+    #[test]
+    fn parse_expert_idx_malformed_falls_back_to_dense() {
+        // Non-digit immediately after `.experts.`
+        let (n, e) = parse_expert_idx("model.layers.0.mlp.experts.foo.gate_proj.weight");
+        assert_eq!(n, "model.layers.0.mlp.experts.foo.gate_proj.weight");
+        assert_eq!(e, 0);
+
+        // Digits but no terminating `.` (truncated EOF).
+        let (n, e) = parse_expert_idx("model.layers.0.mlp.experts.42");
+        assert_eq!(n, "model.layers.0.mlp.experts.42");
+        assert_eq!(e, 0);
+
+        // Digits followed by underscore (not `.`).
+        let (n, e) = parse_expert_idx("model.layers.0.mlp.experts.42_gate_proj.weight");
+        assert_eq!(n, "model.layers.0.mlp.experts.42_gate_proj.weight");
+        assert_eq!(e, 0);
+
+        // 11-digit number overflows u32 (max u32 = 10 digits). Falls
+        // back to dense rather than panicking.
+        let (n, e) =
+            parse_expert_idx("model.layers.0.mlp.experts.99999999999.gate_proj.weight");
+        assert_eq!(
+            n,
+            "model.layers.0.mlp.experts.99999999999.gate_proj.weight"
+        );
+        assert_eq!(e, 0);
+    }
 
     /// `should_capture` admits the obvious Linear tensors and rejects norms
     /// + embed by default; `lm_head` is admitted only with `process_output`.
@@ -597,6 +864,72 @@ mod tests {
         assert!(!coll.should_capture("model.norm.weight"));
         // lm_head rejected by default (matches llama-imatrix without --process-output).
         assert!(!coll.should_capture("lm_head.weight"));
+    }
+
+    /// MoE per-expert tensors (`.mlp.experts.N.{gate|up|down}_proj.weight`)
+    /// are admitted under the same suffix-match rule that admits the
+    /// dense MLP tensors. `is_gptq_target` and `should_capture` both
+    /// match on the last `.`-separated segment after stripping
+    /// `.weight`, so per-expert tensors carry no special case.
+    #[test]
+    fn imatrix_should_capture_moe_per_expert() {
+        let coll = ImatrixCollector::new(false);
+        // Per-expert MLPs (Qwen3.5-A3B / Astrea).
+        assert!(coll.should_capture(
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+        ));
+        assert!(coll.should_capture(
+            "model.language_model.layers.0.mlp.experts.0.up_proj.weight"
+        ));
+        assert!(coll.should_capture(
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight"
+        ));
+        assert!(coll.should_capture(
+            "model.language_model.layers.5.mlp.experts.23.gate_proj.weight"
+        ));
+        assert!(coll.should_capture(
+            "model.language_model.layers.10.mlp.experts.127.down_proj.weight"
+        ));
+        // Shared expert (no expert idx — single per-layer shared FFN)
+        // is admitted by the same suffix rule.
+        assert!(coll.should_capture(
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"
+        ));
+        assert!(coll.should_capture(
+            "model.language_model.layers.0.mlp.shared_expert.down_proj.weight"
+        ));
+    }
+
+    /// `is_gptq_target` admits MoE per-expert tensors under the same
+    /// suffix-match rule that admits dense MLP tensors.
+    #[test]
+    fn hessian_whitelist_admits_moe_per_expert() {
+        assert!(is_gptq_target(
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+        ));
+        assert!(is_gptq_target(
+            "model.language_model.layers.0.mlp.experts.0.up_proj.weight"
+        ));
+        assert!(is_gptq_target(
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight"
+        ));
+        assert!(is_gptq_target(
+            "model.language_model.layers.7.mlp.experts.42.gate_proj.weight"
+        ));
+        // Shared expert MLPs admitted under the same suffix rule.
+        assert!(is_gptq_target(
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"
+        ));
+        // Per-layer router (mlp.gate.weight) admitted.
+        assert!(is_gptq_target("model.language_model.layers.0.mlp.gate.weight"));
+        // `shared_expert_gate` (scalar gate, not a Linear) is NOT in
+        // the whitelist — last segment `shared_expert_gate` doesn't
+        // match any target. Hessian collector skips it; that's
+        // correct because the scalar gate is kept at Q8 in the
+        // production quantizer and doesn't need a K×K Hessian.
+        assert!(!is_gptq_target(
+            "model.language_model.layers.0.mlp.shared_expert_gate.weight"
+        ));
     }
 
     /// With `process_output=true`, `lm_head` / `output` are admitted; norms
