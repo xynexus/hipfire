@@ -72,11 +72,17 @@
 //!    `[dim]`, we use `hipMemcpy(d2d)` to copy 2*dim bytes from the
 //!    appropriate row offset. No upcast.
 //!
-//! 5. **lm_head is not computed.** The final logits are not needed by
-//!    calibration. We skip the final norm + lm_head matmul to save
-//!    work; the capture hook for `lm_head.weight` is not fired.
-//!    Downstream `--process-output` users would need a follow-up
-//!    extension to fire that one capture.
+//! 5. **lm_head is gated on `--process-output`.** When `process_output`
+//!    is false (default), the final norm + lm_head GEMM are skipped to
+//!    save one (typically vocab-sized) GEMM per sequence. When set
+//!    (matching `llama-imatrix --process-output`), the forward applies
+//!    the final RMSNorm (`{prefix}norm.weight` via the same
+//!    `rmsnorm_bf16_via_f32` cast-trick) and then dispatches
+//!    `gemm_bf16` against `lm_head.weight` (untied) or
+//!    `{prefix}embed_tokens.weight` (tied; Qwen3.5 dense default), so
+//!    the capture hook fires with the name `lm_head.weight`. The
+//!    logits output is discarded — calibration consumes only the
+//!    per-channel input statistics.
 //!
 //! ## Layer-pattern detection
 //!
@@ -181,12 +187,23 @@ fn try_get<'a>(trunk: &'a TrunkBF16, name: &str) -> Option<&'a Bf16Tensor> {
 /// on `gpu.capture_handler` can accumulate Σx² / Hessian moments. No
 /// logits are returned — the calibration pipeline does not consume them.
 ///
+/// When `process_output` is true (matching `llama-imatrix
+/// --process-output`), the forward also applies the final RMSNorm and
+/// fires one extra `gemm_bf16` against `lm_head.weight`. The capture
+/// hook sees the post-final-norm hidden state on the input side; the
+/// computed logits are discarded. The capture name is set to
+/// `lm_head.weight` regardless of whether the weight is tied to
+/// `embed_tokens` or a separate matrix — the downstream
+/// `safetensors_to_ggml_name` translation maps it to `output.weight`
+/// on the consumer side.
+///
 /// `gpu.arch` must be `gfx942` (MI300x). The BF16 GEMM is gfx942-only;
 /// `gpu.gemm_bf16` returns an explicit error on other archs.
 pub fn forward_prefill_bf16(
     gpu: &mut Gpu,
     trunk: &TrunkBF16,
     tokens: &[u32],
+    process_output: bool,
 ) -> HipResult<()> {
     if tokens.is_empty() {
         return Ok(());
@@ -323,8 +340,105 @@ pub fn forward_prefill_bf16(
         gpu.free_tensor(ffn_out_bf16)?;
     }
 
-    // We do not compute the final norm or lm_head — the calibration
-    // pipeline does not consume logits. Free the hidden state and return.
+    // ── Final norm + lm_head capture (gated on --process-output) ──────
+    //
+    // Mirrors `llama-imatrix --process-output`: applies the trunk-final
+    // RMSNorm and dispatches `gemm_bf16` against `lm_head.weight` so the
+    // capture hook fires with the post-final-norm hidden state as the
+    // input distribution. The computed logits are discarded — the
+    // calibration pipeline only consumes the per-channel input
+    // statistics. When `process_output == false` (default, matching
+    // llama-imatrix without the flag), this whole block is skipped and
+    // we free the hidden state immediately.
+    if process_output {
+        // 1. Resolve the final norm weight. Qwen3.5 dense stores this
+        //    as `model.norm.weight`; Qwen3.6 VL nests it under
+        //    `model.language_model.norm.weight`. `lm_prefix` resolved
+        //    the right one above.
+        let final_norm_name = format!("{prefix}norm.weight");
+        let final_norm = try_get_norm(trunk, &final_norm_name).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "bf16_forward: --process-output requires final norm `{}` \
+                     but the trunk has no such tensor in trunk.norms (norms count {})",
+                    final_norm_name,
+                    trunk.norms.len()
+                ),
+            )
+        })?;
+
+        // 2. Resolve the lm_head weight. Untied: `lm_head.weight` exists
+        //    as a top-level (no `model.` prefix) BF16 dense tensor in
+        //    `trunk.tensors`. Tied (Qwen3.5 0.8B): falls back to the
+        //    embed table at `{prefix}embed_tokens.weight`. The embed
+        //    table has the same `[vocab, dim]` row-major layout as
+        //    `lm_head.weight` would, so the GEMM dispatch is identical;
+        //    only the source pointer differs.
+        let lm_head = if let Some(t) = trunk.tensors.get("lm_head.weight") {
+            t
+        } else if let Some(t) = trunk.tensors.get(&format!("{prefix}lm_head.weight")) {
+            // Some Qwen3.6 VL variants prefix lm_head; handle them too.
+            t
+        } else {
+            // Tied case — reuse the embed table (it lives in
+            // `trunk.tensors` because the loader does not special-case
+            // `embed_tokens.weight` — it loads as a BF16 dense tensor).
+            trunk.tensors.get(&embed_key).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "bf16_forward: --process-output cannot resolve lm_head: \
+                         neither `lm_head.weight` nor `{}lm_head.weight` nor (tied) \
+                         `{}` is present in trunk.tensors (count={})",
+                        prefix, embed_key, trunk.tensors.len()
+                    ),
+                )
+            })?
+        };
+
+        // Sanity check: the lm_head weight must be 2-D `[vocab, dim]`.
+        if lm_head.shape.len() != 2 || lm_head.shape[1] != dim {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "bf16_forward: lm_head weight shape {:?} doesn't match expected \
+                     [vocab, dim={dim}]",
+                    lm_head.shape
+                ),
+            ));
+        }
+        let lm_vocab = lm_head.shape[0];
+
+        // 3. Apply the final RMSNorm via the B.1 cast-trick helper.
+        //    `h_norm` is a fresh BF16 [seq_len, dim] allocation; the
+        //    original `h` is preserved (not that we use it again after
+        //    this, but conceptually the residual stream is read-only at
+        //    this point).
+        let h_norm = gpu.alloc_tensor(&[seq_len, dim], DType::BF16)?;
+        rmsnorm_bf16_via_f32(gpu, &h, final_norm, &h_norm, seq_len, dim, RMS_NORM_EPS)?;
+
+        // 4. Fire the lm_head capture. F32 scratch sized
+        //    `[seq_len, lm_vocab]` — for 0.8B Qwen3.5 that's
+        //    `1024 × 151936 × 4B ≈ 622 MB`. The pool reuses across
+        //    sequences so the per-sequence cost is one allocation +
+        //    one GEMM. The output (logits) is discarded immediately.
+        let logits_scratch = gpu.alloc_tensor(&[seq_len * lm_vocab], DType::F32)?;
+        gpu.set_capture_name(Some("lm_head.weight".to_string()));
+        gpu.gemm_bf16(
+            &h_norm,
+            &lm_head.tensor,
+            &mut to_2d(logits_scratch.clone_view(), seq_len, lm_vocab),
+            lm_vocab,
+            dim,
+            seq_len,
+        )?;
+        gpu.set_capture_name(None);
+        gpu.free_tensor(logits_scratch)?;
+        gpu.free_tensor(h_norm)?;
+    }
+
+    // Free the hidden state and return.
     gpu.free_tensor(h)?;
     Ok(())
 }

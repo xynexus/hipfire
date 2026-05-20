@@ -281,8 +281,10 @@ fn run(args: &Args) -> Result<(), String> {
         // `gpu.gemm_bf16` site routes (input_ptr, dtype=BF16, shape) into
         // ImatrixCollector::capture via `gpu.capture_handler`. The
         // collector accumulates per-channel Σ x² in a K-sized F32 GPU
-        // buffer per tensor name; n_tokens advances per sequence.
-        bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk)
+        // buffer per tensor name; n_tokens advances per sequence. When
+        // `--process-output` is set we additionally apply the final norm
+        // and fire one more capture for `lm_head.weight`.
+        bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk, args.process_output)
             .map_err(|e| format!("bf16 prefill failed at seq_idx={seq_idx}: {e}"))?;
         if seq_idx % 8 == 0 {
             eprintln!(

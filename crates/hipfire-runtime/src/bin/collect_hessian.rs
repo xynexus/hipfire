@@ -249,7 +249,10 @@ fn run(args: &Args) -> Result<(), String> {
             // into HessianCollector::capture via `gpu.capture_handler`.
             // The collector accumulates `Σ x · xᵀ` in a K×K F32 GPU
             // buffer per tensor name (only for `is_gptq_target` tensors).
-            bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk)
+            // `process_output=false`: `is_gptq_target` rejects lm_head /
+            // output, so the extra final-norm + lm_head GEMM would just
+            // burn cycles for a capture that the collector then drops.
+            bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk, false)
                 .map_err(|e| format!(
                     "bf16 prefill failed at pass={pass} seq_idx={seq_idx}: {e}"
                 ))?;
