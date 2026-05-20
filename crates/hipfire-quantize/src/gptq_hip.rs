@@ -1423,6 +1423,145 @@ mod parity_tests {
         let err = max_upper_err(&u_cpu, &u_hip);
         assert!(err < 1e-8, "max_upper_err {err} >= 1e-8");
     }
+
+    /// Process-wide lock for tests that mutate `HIPFIRE_GPTQ_HIP_OBS*`
+    /// env vars. Rust's test harness runs in threads by default, and
+    /// `std::env::set_var` is process-global. Serializing across the two
+    /// env-var-dependent tests (F64 + BF16 OBS) prevents flakes when
+    /// `cargo test` runs without `--test-threads=1`.
+    static OBS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Recover the MQ4 codeword (0..15) from a dequantized weight value
+    /// using the FP32-cast scale + min_val (mirrors the kernel's path).
+    /// `q * scale + min_val` round-trips back to the integer codeword
+    /// exactly when scale > 0; clamp + round are applied for safety.
+    #[inline]
+    fn recover_mq4_codeword(w_quant: f64, scale_f32: f32, min_val_f32: f32) -> u8 {
+        if scale_f32 == 0.0 { return 0; }
+        let q = ((w_quant as f32 - min_val_f32) / scale_f32 + 0.5_f32).floor();
+        q.clamp(0.0, 15.0) as u8
+    }
+
+    /// Phase 2C-BF16 — codeword-divergence parity gate.
+    ///
+    /// Per plan §6, the BF16 cast-trick variant of the Phase 2C rank-B
+    /// GEMM is allowed to diverge from the F64 sibling on up to 0.1% of
+    /// the output MQ4 codewords. Most codewords land far from a bin
+    /// boundary so the BF16 mantissa truncation is absorbed by the
+    /// round-to-nearest at `(w - min_val) / scale + 0.5`; only weights
+    /// pre-quantize that sit within ~1 BF16-ULP of a bin boundary can
+    /// flip.
+    ///
+    /// Test setup:
+    ///   M=128, K=512  (4 blocks of B=128, 3 cross-block GEMM dispatches)
+    ///   Well-conditioned SPD H from `random_spd`
+    ///   Deterministic synthetic W with mixed signs + magnitudes
+    ///
+    /// Runs `gptq_column_sequential_hip` twice — once with the BF16
+    /// inner-opt-in OFF (F64 reference), once with it ON — and counts
+    /// the fraction of MQ4 codewords that differ.
+    ///
+    /// NOTE: Synthetic SPD H is uniform-ish and not representative of
+    /// real LLM Hessians (which are spikier). The 0.1% gate is plan §6's
+    /// ship-decision threshold for REAL Hessians; the synthetic case is
+    /// expected to come in well under that. Real-tensor data point is
+    /// produced by a separate user-side workstream on droplet hardware
+    /// (out of scope for this commit).
+    #[test]
+    fn parity_gate_obs_bf16_codeword_divergence() {
+        if std::env::var("HIPFIRE_SKIP_GPU_TESTS").is_ok() {
+            eprintln!("skip: HIPFIRE_SKIP_GPU_TESTS set");
+            return;
+        }
+        let solver = match RocSolver::load() {
+            Ok(s) => s,
+            Err(e) => { eprintln!("skip: RocSolver::load failed ({e})"); return; }
+        };
+
+        let m: usize = 128;
+        let k: usize = 512;
+
+        // SPD H (well-conditioned).
+        let h = random_spd(k, 12025);
+
+        // Synthetic W with mixed signs and a useful dynamic range so multiple
+        // grid bins are exercised within each 256-block.
+        let mut w_orig = vec![0.0_f64; m * k];
+        for r in 0..m {
+            for c in 0..k {
+                let v = ((r as f64) * 0.013 - (c as f64) * 0.027).sin() * 1.5
+                      + (((r as f64) + (c as f64)) * 0.0021).cos() * 0.5;
+                w_orig[r * k + c] = v;
+            }
+        }
+
+        // Frozen MQ4G256 grids (same pre-loop computation the production
+        // pipeline does).
+        let grids = crate::gptq::compute_frozen_block_grids(&w_orig);
+
+        // ── Run F64 OBS path (inner env var OFF) ──
+        let mut w_f64 = w_orig.clone();
+        let damp_f64 = {
+            let _guard = OBS_ENV_LOCK.lock().expect("env lock poisoned");
+            std::env::remove_var("HIPFIRE_GPTQ_HIP_OBS_BF16");
+            gptq_column_sequential_hip(
+                &solver, &mut w_f64, &h, m, k, &grids, 0.01, 1.0,
+                "test:bf16-codeword-divergence:f64",
+            ).expect("GPU OBS F64 path")
+        };
+
+        // ── Run BF16 OBS path (inner env var ON) ──
+        let mut w_bf16 = w_orig.clone();
+        let damp_bf16 = {
+            let _guard = OBS_ENV_LOCK.lock().expect("env lock poisoned");
+            std::env::set_var("HIPFIRE_GPTQ_HIP_OBS_BF16", "1");
+            let r = gptq_column_sequential_hip(
+                &solver, &mut w_bf16, &h, m, k, &grids, 0.01, 1.0,
+                "test:bf16-codeword-divergence:bf16",
+            );
+            std::env::remove_var("HIPFIRE_GPTQ_HIP_OBS_BF16");
+            r.expect("GPU OBS BF16 path")
+        };
+
+        // Damp value sanity (the BF16 swap only affects Kernel 3, not the
+        // Cholesky step that sets damp).
+        let damp_rel = (damp_f64 - damp_bf16).abs() / damp_f64.max(1e-30);
+        assert!(damp_rel < 1e-12, "damp mismatch: f64={damp_f64} bf16={damp_bf16}");
+
+        // ── Codeword-divergence count ──
+        let mut diff_count: usize = 0;
+        let mut max_abs_w: f64 = 0.0;
+        let total = m * k;
+        for r in 0..m {
+            for c in 0..k {
+                let idx = r * k + c;
+                let blk = idx / 256;
+                let g = grids[blk];
+                // The kernel narrows scale + min_val to FP32 to match the
+                // on-disk MQ4G256 layout; mirror that cast for codeword
+                // recovery from the F64 W_quant outputs.
+                let scale_f32 = g.scale as f32;
+                let min_val_f32 = g.min_val as f32;
+                let cw_f64 = recover_mq4_codeword(w_f64[idx], scale_f32, min_val_f32);
+                let cw_bf16 = recover_mq4_codeword(w_bf16[idx], scale_f32, min_val_f32);
+                if cw_f64 != cw_bf16 { diff_count += 1; }
+                let aw = w_f64[idx].abs();
+                if aw > max_abs_w { max_abs_w = aw; }
+            }
+        }
+        let divergence_rate = (diff_count as f64) / (total as f64);
+        eprintln!(
+            "[parity_gate_obs_bf16] M={m} K={k} total={total} diff={diff_count} \
+             divergence_rate={:.6e} max_abs_w={:.3e}",
+            divergence_rate, max_abs_w,
+        );
+
+        // Plan §6 contract: < 0.1% codeword divergence rate.
+        assert!(
+            divergence_rate < 0.001,
+            "BF16 codeword divergence {divergence_rate:.6e} >= 1e-3 (diff={diff_count}/{total})",
+        );
+    }
 }
 
 #[cfg(test)]
