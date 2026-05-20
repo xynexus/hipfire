@@ -1,24 +1,29 @@
 //! `collect_hessian` — Tier 1 hipfire-native Hessian collector for GPTQ.
 //!
-//! Foundation scaffold for the Hessian-collection binary that replaces
-//! the Tier 2 PyTorch wrapper at `scripts/collect_hessian.py`. When
-//! complete, this binary will:
+//! Tier 1 driver for the Hessian-collection pipeline that replaces the
+//! Tier 2 PyTorch wrapper at `scripts/collect_hessian.py`.
 //!
-//! 1. Load a BF16 HuggingFace model directly from `<dir>/*.safetensors`
-//!    via `engine::bf16_loader` (Task 4 scaffold in this same series).
-//! 2. Run hipfire's MFMA-direct forward path on the calibration corpus
-//!    through the new BF16 MFMA GEMM kernel
-//!    (`kernels/src/gemm_bf16_mfma.gfx942.hip`).
-//! 3. At each `nn.Linear`-equivalent dispatch site that matches the
-//!    GPTQ target list (mirrors `collect_hessian.py:80-92`), fire the
-//!    `ActivationCapture` hook (Task 3 trait in `rdna-compute::dispatch`)
-//!    to accumulate a per-tensor `H_t = (1/N) * Σ_t x_t · x_t^T`
-//!    outer-product Hessian on-GPU via a dedicated K×K rank-1-update
-//!    kernel (Phase 2, separate task).
-//! 4. Write per-tensor `K×K F32` blocks to a HFHS-v1 binary file
-//!    (Phase 2, separate task; byte-compatible with the existing format
-//!    documented in `scripts/collect_hessian.py:25-43`) so that
-//!    `crates/hipfire-quantize/src/hessian_io.rs` reads it unchanged.
+//! Pipeline:
+//!
+//! 1. Initialize the GPU (HIP runtime + kernel cache).
+//! 2. Load a BF16 HuggingFace model directly from `<dir>/*.safetensors`
+//!    via `bf16_loader::load_bf16_model`.
+//! 3. Install a `HessianCollector` on `gpu.capture_handler`. The
+//!    collector accumulates a per-tensor `H = Σ x · xᵀ` K×K F32 outer
+//!    product via subagent A's on-GPU rank-1-update kernel
+//!    (`gpu.hessian_outer_product_bf16`). Only tensors matching the
+//!    GPTQ target whitelist (`bf16_loader::is_gptq_target`) are
+//!    accumulated — saves K×K F32 for norms / embed / lm_head.
+//! 4. Tokenize the calibration corpus via `tokenize_corpus()` (uses the
+//!    HF `tokenizer.json` for parity with the production hipfire path).
+//! 5. Loop over `n_sequences` chunks of `ctx_len` tokens each (optionally
+//!    multiple passes); run the BF16 prefill forward pass through
+//!    subagent C's `forward_prefill_bf16` so the linear-layer dispatch
+//!    sites fire the capture hook.
+//! 6. Drain the collector to `Vec<HessianEntry>`.
+//! 7. Write the HFHS-v1 binary via subagent B's `hfhs_writer`,
+//!    byte-compatible with `scripts/collect_hessian.py` and consumed
+//!    by `crates/hipfire-quantize/src/hessian_io.rs`.
 //!
 //! Target speedup vs Tier 2: 20× (~8h → ~25min for a 27B-class model on
 //! MI300x). The Python path is currently bottlenecked on HF transformers
@@ -29,7 +34,7 @@
 //! Tier 1 keeps the outer-product accumulator on-GPU for the full
 //! calibration pass; final HFHS dump is the only host-side step.
 //!
-//! Usage (target CLI):
+//! Usage:
 //!
 //! ```ignore
 //! cargo run --release -p hipfire-runtime --bin collect_hessian -- \
@@ -38,12 +43,12 @@
 //!     --output      <path-to-out.hessian.bin> \
 //!     [--n-sequences 128] [--ctx-len 2048] [--n-passes 1]
 //! ```
-//!
-//! TODO: replace this stdlib-only arg parser with `clap` once the
-//! workspace accepts the dep. Matched the imatrix_collect.rs example
-//! style for now to keep the workspace dep graph clean.
 
+use hipfire_runtime::bf16_loader;
+use hipfire_runtime::calibration::{tokenize_corpus, HessianCollector};
+use rdna_compute::Gpu;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -165,7 +170,7 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
-    eprintln!("collect_hessian (Tier 1 — foundation scaffold)");
+    eprintln!("collect_hessian (Tier 1)");
     eprintln!("  hf-model:    {}", args.hf_model.display());
     eprintln!("  corpus:      {}", args.corpus.display());
     eprintln!("  output:      {}", args.output.display());
@@ -173,16 +178,120 @@ fn main() {
     eprintln!("  ctx-len:     {}", args.ctx_len);
     eprintln!("  n-passes:    {}", args.n_passes);
     eprintln!();
-    eprintln!("Implementation pending — this is the Phase 1 scaffold.");
-    eprintln!("Next deliverables (separate subagent tasks):");
-    eprintln!("  - BF16 safetensors loader → device tensors");
-    eprintln!("  - On-GPU K×K outer-product Hessian rank-1-update kernel");
-    eprintln!("  - ActivationCapture wiring at the GPTQ-target dispatch sites");
-    eprintln!("  - HFHS-v1 binary writer (matches scripts/collect_hessian.py)");
-    eprintln!();
-    unimplemented!(
-        "collect_hessian Tier 1 forward pass + outer-product Hessian + HFHS \
-         write not yet implemented. See `scripts/collect_hessian.py` for \
-         the Tier 2 PyTorch fallback."
+
+    if let Err(msg) = run(&args) {
+        eprintln!("collect_hessian: ERROR: {msg}");
+        std::process::exit(1);
+    }
+}
+
+fn run(args: &Args) -> Result<(), String> {
+    // 1. GPU init.
+    eprintln!("[1/7] initializing GPU...");
+    let mut gpu = Gpu::init().map_err(|e| format!("Gpu::init failed: {e}"))?;
+
+    // 2. BF16 model load (subagent D's load_bf16_model — currently
+    //    unimplemented!(); the binary stops here with a clear panic
+    //    message at the safetensors-parse TODO until D lands).
+    eprintln!("[2/7] loading BF16 model from {}...", args.hf_model.display());
+    let trunk = bf16_loader::load_bf16_model(&mut gpu, &args.hf_model)
+        .map_err(|e| format!("bf16_loader::load_bf16_model failed: {e}"))?;
+    eprintln!(
+        "[2/7] loaded trunk: {} tensors, model_type={}, {} bytes",
+        trunk.tensors.len(),
+        trunk.model_type,
+        trunk.total_bytes
     );
+
+    // 3. Install the Hessian capture handler.
+    eprintln!("[3/7] installing HessianCollector capture handler...");
+    let collector = Arc::new(HessianCollector::new());
+    gpu.capture_handler = Some(collector.clone());
+
+    // 4. Tokenize corpus.
+    eprintln!("[4/7] tokenizing corpus...");
+    let corpus_text = std::fs::read_to_string(&args.corpus)
+        .map_err(|e| format!("failed to read corpus at {}: {e}", args.corpus.display()))?;
+    let tokens = tokenize_corpus(&args.hf_model, &corpus_text)?;
+    eprintln!("[4/7] tokenized: {} tokens", tokens.len());
+
+    // 5. Loop over N passes × N sequences of ctx_len tokens each.
+    if tokens.len() < args.ctx_len {
+        return Err(format!(
+            "corpus has {} tokens but ctx_len={}; need at least one full sequence",
+            tokens.len(),
+            args.ctx_len
+        ));
+    }
+    let actual_sequences = std::cmp::min(args.n_sequences, tokens.len() / args.ctx_len);
+    if actual_sequences < args.n_sequences {
+        eprintln!(
+            "[5/7] WARNING: corpus only supplies {} sequences (requested {}); proceeding with {}",
+            actual_sequences, args.n_sequences, actual_sequences
+        );
+    }
+    eprintln!(
+        "[5/7] running BF16 forward over {} passes × {} sequences × {} tokens \
+         = {} total tokens...",
+        args.n_passes,
+        actual_sequences,
+        args.ctx_len,
+        args.n_passes * actual_sequences * args.ctx_len
+    );
+    for pass in 0..args.n_passes {
+        for seq_idx in 0..actual_sequences {
+            let start = seq_idx * args.ctx_len;
+            let end = start + args.ctx_len;
+            let chunk = &tokens[start..end];
+            let _ = chunk;
+            // TODO(subagent-C): wire `forward_prefill_bf16(&mut gpu, &trunk, chunk)`
+            // here. Reference shape (per orchestrator dispatch):
+            //
+            //     bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk)
+            //         .map_err(|e| format!("bf16 prefill failed: {e}"))?;
+            //
+            // The forward pass dispatches one linear-layer GEMM at a time;
+            // each GEMM site fires `gpu.capture_handler.as_ref().map(|h|
+            // h.capture(...))`, which routes into HessianCollector::capture.
+            // The collector accumulates `Σ x · xᵀ` in a K×K F32 GPU
+            // buffer per tensor name.
+            return Err(format!(
+                "[5/7] forward pass not yet wired — subagent-C owns \
+                 `bf16_forward::forward_prefill_bf16(&mut gpu, &trunk, chunk)`. \
+                 Until then, this binary stops here at pass={}/{}, seq_idx={}/{}.",
+                pass + 1,
+                args.n_passes,
+                seq_idx + 1,
+                actual_sequences
+            ));
+        }
+    }
+
+    // 6. Drain collector.
+    eprintln!("[6/7] draining HessianCollector...");
+    gpu.capture_handler = None;
+    let entries = match Arc::try_unwrap(collector) {
+        Ok(c) => c.drain(&gpu)?,
+        Err(arc) => arc.drain(&gpu)?,
+    };
+    eprintln!("[6/7] drained {} Hessian entries", entries.len());
+
+    // 7. Write HFHS-v1 output via subagent B's writer.
+    eprintln!("[7/7] writing HFHS-v1 binary to {}...", args.output.display());
+    // TODO(subagent-B): wire `hfhs_writer::write_hfhs(&args.output, &entries)`
+    // HFHS-v1 byte-layout per `scripts/collect_hessian.py:25-43`:
+    //
+    //   magic "HFHS" + u32 version=1 + u32 n_tensors
+    //   per-tensor: u32 name_len + name + u32 k + u64 n_tokens + k*k F32 row-major
+    //
+    // The Tier 2 Python path writes this format unchanged; subagent-B's
+    // Rust writer must produce byte-identical output so
+    // `crates/hipfire-quantize/src/hessian_io.rs` reads it without changes.
+    let _ = &entries;
+    Err(format!(
+        "[7/7] HFHS writer not yet wired — subagent-B owns \
+         `hfhs_writer::write_hfhs(&output, &entries)`. \
+         Drained {} entries are ready to write.",
+        entries.len()
+    ))
 }
