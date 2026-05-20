@@ -30,13 +30,25 @@
 //!    warning) so older fixtures without norm tensors still produce
 //!    a forward pass.
 //!
-//! 2. **Attention math is a passthrough.**
-//!    - DeltaNet: `attn_pre_o = first d_inner elements of qkv` (the
-//!      Q chunk). Skips the conv1d, gated delta-net recurrence, alpha
-//!      gate, and norm. Calibration cost: `out_proj` is calibrated on
-//!      a distribution that resembles Q rather than the actual gated
-//!      delta-net output. The two distributions are correlated
-//!      (same trunk hidden state feeds both) but not identical.
+//! 2. **Attention math:**
+//!    - DeltaNet: real gated delta-net recurrence via the existing
+//!      `gpu.gated_delta_net_f32` kernel through a cast-trick (B.2,
+//!      2026-05-20). The QKV projection's F32 output is split into
+//!      Q / K / V slices; the in_proj_a / in_proj_b projections feed a
+//!      simplified `fused_sigmoid_alpha_gate_f32_batched` (dummy
+//!      zero `A_log` / `dt_bias` since those F32 tensors aren't
+//!      loaded by `bf16_loader` and the spec forbids loader
+//!      extensions); QK gets L2-norm + Q scale; per-sequence recurrent
+//!      state initializes to zeros; the kernel writes `attn_out` in
+//!      F32 which is cast back to BF16 for `out_proj`. The conv1d
+//!      preamble, gated_norm + silu(z) post-multiply, and the proper
+//!      `A_log` / `dt_bias` are all calibration approximations — the
+//!      cast-trick produces an `out_proj` input distribution that is
+//!      structurally `state·Q` (the real DeltaNet output shape),
+//!      sufficient for the Σx² accumulator to see realistic scale and
+//!      moment-1 statistics. Calibration cost: post-recurrence norm /
+//!      gate aren't applied, so `out_proj` activations may be slightly
+//!      mis-scaled (~constant factor across the channel dim).
 //!    - FullAttention: `attn_pre_o = v` (taking the V projection
 //!      directly). Skips q_norm / k_norm / RoPE / softmax / V·softmax.
 //!      Calibration cost: `o_proj` is calibrated on the V distribution
@@ -490,16 +502,46 @@ fn apply_pre_norm_or_fallback(
     }
 }
 
-/// DeltaNet layer attention (calibration approximation).
+/// DeltaNet layer attention via real gated delta-net recurrence
+/// (B.2 cast-trick, 2026-05-20).
 ///
 /// Fires the capture hook for `in_proj_qkv`, `in_proj_z`, `in_proj_a`,
-/// `in_proj_b`, `out_proj` weights. Math is heavily simplified —
-/// `attn_pre_o = first d_inner cols of qkv` (the Q chunk). The
-/// `out_proj` weight thus sees a Q-distribution input rather than the
-/// true gated delta-net output. See module-level docs.
+/// `in_proj_b`, `out_proj`. The math runs in F32 through the existing
+/// `gpu.gated_delta_net_f32` kernel — no new HIP kernels introduced
+/// — by upcasting the BF16 hidden state via `gemm_bf16` (which already
+/// outputs F32), splitting QKV, applying `fused_sigmoid_alpha_gate`
+/// (with dummy zero `A_log` / `dt_bias` since the BF16 loader skips
+/// non-BF16 tensors), QK L2-norm + Q scale, optional GQA repeat,
+/// then the recurrence kernel. The F32 attention output is cast back
+/// to BF16 for `out_proj`.
+///
+/// Calibration approximations (relative to production deltanet):
+///   - conv1d preamble is skipped (raw QKV slices used as Q/K/V).
+///   - `A_log` and `dt_bias` are treated as zeros (the BF16 loader
+///     skips F32 auxiliary tensors). Effectively
+///     `alpha = -softplus(in_proj_a out)` rather than
+///     `alpha = softplus(in_proj_a out + dt_bias) * -exp(A_log)`.
+///   - The gated_norm post-multiply with `silu(z)` is skipped.
+///   - Recurrent state initializes to zeros at the start of each
+///     `forward_prefill_bf16` invocation (one sequence per call —
+///     multi-sequence batching is B.4's concern).
+///
+/// The kernel hardcodes `head_dim == 128` (`#define HD 128` in
+/// `gated_delta_net.hip`); we assert at runtime that the trunk's
+/// derived `head_dim` matches.
+///
+/// The cast-trick path uses `gated_delta_net_f32` /
+/// `fused_sigmoid_alpha_gate_f32_batched` /
+/// `fused_qk_l2_norm_scale_f32_batched` which are all
+/// `#[cfg(feature = "deltanet")]` on `rdna-compute`. When the
+/// `deltanet` feature is OFF (only happens in `--no-default-features`
+/// configurations), this function falls back to the pre-B.2 Q-chunk
+/// passthrough so the module still compiles. Production calibration
+/// runs always use default features → real recurrence.
 ///
 /// Returns a freshly-allocated `[seq_len, dim]` BF16 tensor that the
 /// caller must free.
+#[cfg(feature = "deltanet")]
 fn forward_deltanet_layer(
     gpu: &mut Gpu,
     trunk: &TrunkBF16,
@@ -515,14 +557,362 @@ fn forward_deltanet_layer(
     let wb = get(trunk, &format!("{p}.linear_attn.in_proj_b.weight"))?;
     let wo = get(trunk, &format!("{p}.linear_attn.out_proj.weight"))?;
 
-    // Pre-norm: GemmaRMSNorm over the entry hidden state. All four
-    // in_proj_* + (downstream) out_proj see the normalized input.
-    // Residual still adds attn_out to the un-normalized `h` after
-    // this function returns.
+    // ── Derive trunk geometry ──────────────────────────────────────────
+    //
+    // wqkv:  [qkv_dim, dim]              row-major, qkv_dim = 2*k_dim + d_inner
+    // wz:    [d_inner, dim]              d_inner = n_v_heads * head_dim
+    // wa:    [n_v_heads, dim]            alpha base
+    // wb:    [n_v_heads, dim]            beta base
+    // wo:    [dim, d_inner]              K-side of the residual projection
+    //
+    // For Qwen3.5 0.8B (defaults):
+    //   dim=1024, qkv_dim=6144, d_inner=2048, n_v_heads=16, head_dim=128,
+    //   k_dim=2048, n_k_heads=16  (no GQA repeat needed)
+    // For 27B-3.5/3.6:
+    //   dim=5120, n_v_heads=20, head_dim=128.
+    //
+    // The kernel `gated_delta_net.hip` hardcodes `#define HD 128`, so
+    // we assert head_dim==128 below and fail loudly if a future model
+    // ships a different DeltaNet head dim.
+    let qkv_dim = wqkv.shape[0];
+    let qkv_k = wqkv.shape[1];
+    if qkv_k != dim {
+        return Err(format!(
+            "{p}.linear_attn.in_proj_qkv: K={qkv_k} doesn't match dim={dim}"
+        ));
+    }
+    let d_inner = wo.shape[1];
+    if d_inner > qkv_dim {
+        return Err(format!(
+            "{p}.linear_attn.out_proj: d_inner={d_inner} > qkv_dim={qkv_dim}"
+        ));
+    }
+    let n_v_heads = wa.shape[0];
+    if wb.shape[0] != n_v_heads {
+        return Err(format!(
+            "{p}.linear_attn: in_proj_b M={} mismatches in_proj_a M={n_v_heads}",
+            wb.shape[0]
+        ));
+    }
+    if n_v_heads == 0 || d_inner % n_v_heads != 0 {
+        return Err(format!(
+            "{p}.linear_attn: bad geometry d_inner={d_inner} not divisible by n_v_heads={n_v_heads}"
+        ));
+    }
+    let head_dim = d_inner / n_v_heads;
+    // The kernel hardcodes HD=128. Refuse with a clean error rather
+    // than reading off the end of LDS at launch time.
+    if head_dim != 128 {
+        return Err(format!(
+            "{p}.linear_attn: gated_delta_net_f32 kernel requires head_dim=128 \
+             (got {head_dim}); future support requires updating gated_delta_net.hip's HD #define"
+        ));
+    }
+    let k_dim_total = qkv_dim
+        .checked_sub(d_inner)
+        .ok_or_else(|| format!(
+            "{p}.linear_attn: qkv_dim={qkv_dim} < d_inner={d_inner}"
+        ))?;
+    if k_dim_total % 2 != 0 {
+        return Err(format!(
+            "{p}.linear_attn: (qkv_dim - d_inner) = {k_dim_total} not even (Q+K halves)"
+        ));
+    }
+    let k_dim = k_dim_total / 2;
+    if k_dim % head_dim != 0 {
+        return Err(format!(
+            "{p}.linear_attn: k_dim={k_dim} not divisible by head_dim={head_dim} \
+             (assumes k_head_dim == v_head_dim for Qwen3.5)"
+        ));
+    }
+    let n_k_heads = k_dim / head_dim;
+
+    // ── Pre-norm: GemmaRMSNorm over the entry hidden state ─────────────
+    //
+    // All four in_proj_* linears see the normalized input. Residual
+    // still adds attn_out to the un-normalized `h` after this function
+    // returns.
     let norm_name = format!("{p}.input_layernorm.weight");
     let h_for_linears = apply_pre_norm_or_fallback(gpu, trunk, h, &norm_name, seq_len, dim)?;
 
-    // QKV projection: y = h * wqkv^T → [seq_len, qkv_dim]
+    // ── QKV projection: BF16 h → F32 [seq_len, qkv_dim] ────────────────
+    //
+    // Layout per token: [Q (k_dim) | K (k_dim) | V (d_inner)]. Matches
+    // production deltanet (qwen35.rs ~2410). The `gemm_bf16` kernel
+    // outputs F32 directly so no extra cast needed.
+    let qkv_f32 = gpu
+        .alloc_tensor(&[seq_len * qkv_dim], DType::F32)
+        .map_err(|e| e.to_string())?;
+    gpu.set_capture_name(Some(format!("{p}.linear_attn.in_proj_qkv.weight")));
+    gpu.gemm_bf16(
+        h_for_linears.as_ref(), &wqkv.tensor,
+        &mut to_2d(qkv_f32.clone_view(), seq_len, qkv_dim),
+        qkv_dim, qkv_k, seq_len,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // ── Z projection: fire capture hook then drop (math skipped) ───────
+    //
+    // Production uses Z in `gated_norm_f32(attn_out, z, ...) * silu(z)`
+    // after the recurrence. The cast-trick path skips gated_norm —
+    // calibration shortcut documented at module-level. We still need
+    // to fire `gemm_bf16` here so the `in_proj_z` capture hook accumulates
+    // Σx² over the right input distribution.
+    let z_f32 = gpu
+        .alloc_tensor(&[seq_len * d_inner], DType::F32)
+        .map_err(|e| e.to_string())?;
+    gpu.set_capture_name(Some(format!("{p}.linear_attn.in_proj_z.weight")));
+    gpu.gemm_bf16(
+        h_for_linears.as_ref(), &wz.tensor,
+        &mut to_2d(z_f32.clone_view(), seq_len, d_inner),
+        d_inner, wz.shape[1], seq_len,
+    )
+    .map_err(|e| e.to_string())?;
+    gpu.free_tensor(z_f32).map_err(|e| e.to_string())?;
+
+    // ── A projection (alpha base): F32 [seq_len, n_v_heads] ────────────
+    let alpha_f32 = gpu
+        .alloc_tensor(&[seq_len * n_v_heads], DType::F32)
+        .map_err(|e| e.to_string())?;
+    gpu.set_capture_name(Some(format!("{p}.linear_attn.in_proj_a.weight")));
+    gpu.gemm_bf16(
+        h_for_linears.as_ref(), &wa.tensor,
+        &mut to_2d(alpha_f32.clone_view(), seq_len, n_v_heads),
+        n_v_heads, wa.shape[1], seq_len,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // ── B projection (beta base): F32 [seq_len, n_v_heads] ─────────────
+    let beta_f32 = gpu
+        .alloc_tensor(&[seq_len * n_v_heads], DType::F32)
+        .map_err(|e| e.to_string())?;
+    gpu.set_capture_name(Some(format!("{p}.linear_attn.in_proj_b.weight")));
+    gpu.gemm_bf16(
+        h_for_linears.as_ref(), &wb.tensor,
+        &mut to_2d(beta_f32.clone_view(), seq_len, n_v_heads),
+        n_v_heads, wb.shape[1], seq_len,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Pre-norm scratch no longer needed — the recurrence consumes
+    // splits of qkv_f32 (already projected), not the BF16 input.
+    h_for_linears.drop_owned(gpu).map_err(|e| e.to_string())?;
+
+    // ── Gate / beta finalization: simplified path ──────────────────────
+    //
+    // Production: alpha_kernel = softplus(in_proj_a + dt_bias) * -exp(A_log)
+    //             beta_kernel  = sigmoid(in_proj_b)
+    // We approximate by feeding zero `dt_bias` / zero `A_log` (those F32
+    // tensors aren't loaded by `bf16_loader`). The kernel's downstream
+    // `expf(gate)` term then produces alpha ∈ (0, 1) as expected, just
+    // with a constant decay-rate offset relative to production. Beta is
+    // exact since it doesn't depend on the aux tensors.
+    let zero_aux = gpu
+        .zeros(&[n_v_heads], DType::F32)
+        .map_err(|e| e.to_string())?;
+    gpu.fused_sigmoid_alpha_gate_f32_batched(
+        &beta_f32, &alpha_f32, &zero_aux, &zero_aux, n_v_heads, seq_len,
+    )
+    .map_err(|e| e.to_string())?;
+    gpu.free_tensor(zero_aux).map_err(|e| e.to_string())?;
+
+    // ── Split qkv_f32 into Q / K / V slices ────────────────────────────
+    //
+    // qkv_f32 row layout: [Q (k_dim) | K (k_dim) | V (d_inner)] per token.
+    // Per-row memcpy is the simplest path (no new kernel, per spec). For
+    // a 0.8B forward at seq_len=2048 this is ~6k DtoD calls per layer —
+    // calibration runs offline so the overhead is acceptable. If this
+    // becomes a hot spot, a fused split kernel would amortize it.
+    let q_part = gpu
+        .alloc_tensor(&[seq_len * k_dim], DType::F32)
+        .map_err(|e| e.to_string())?;
+    let k_part = gpu
+        .alloc_tensor(&[seq_len * k_dim], DType::F32)
+        .map_err(|e| e.to_string())?;
+    let v_part = gpu
+        .alloc_tensor(&[seq_len * d_inner], DType::F32)
+        .map_err(|e| e.to_string())?;
+    for t in 0..seq_len {
+        let row_byte = t * qkv_dim * 4;
+        gpu.hip
+            .memcpy_dtod_at(
+                &q_part.buf, t * k_dim * 4,
+                &qkv_f32.buf, row_byte,
+                k_dim * 4,
+            )
+            .map_err(|e| e.to_string())?;
+        gpu.hip
+            .memcpy_dtod_at(
+                &k_part.buf, t * k_dim * 4,
+                &qkv_f32.buf, row_byte + k_dim * 4,
+                k_dim * 4,
+            )
+            .map_err(|e| e.to_string())?;
+        gpu.hip
+            .memcpy_dtod_at(
+                &v_part.buf, t * d_inner * 4,
+                &qkv_f32.buf, row_byte + 2 * k_dim * 4,
+                d_inner * 4,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    gpu.free_tensor(qkv_f32).map_err(|e| e.to_string())?;
+
+    // ── QK L2-norm + Q scale ───────────────────────────────────────────
+    //
+    // Matches production: each head of Q gets l2-normalized then scaled
+    // by 1/sqrt(head_dim); each head of K gets l2-normalized. Batched
+    // over seq_len.
+    let q_scale = 1.0f32 / (head_dim as f32).sqrt();
+    gpu.fused_qk_l2_norm_scale_f32_batched(
+        &q_part, &k_part, n_k_heads, head_dim, q_scale, RMS_NORM_EPS, seq_len,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // ── GQA repeat (if n_k_heads < n_v_heads) ──────────────────────────
+    //
+    // The gated_delta_net_f32 kernel expects q/k laid out per v_head
+    // (`[n_tokens × n_v_heads × head_dim]`). For Qwen3.5 0.8B
+    // n_k_heads == n_v_heads (no repeat); 4B/9B/27B may vary. Use the
+    // batched repeat_interleave to extend Q/K to v_heads in one launch.
+    let (q_gdn, k_gdn) = if n_k_heads < n_v_heads {
+        if n_v_heads % n_k_heads != 0 {
+            return Err(format!(
+                "{p}.linear_attn: n_v_heads={n_v_heads} not divisible by n_k_heads={n_k_heads} (GQA ratio)"
+            ));
+        }
+        let ratio = n_v_heads / n_k_heads;
+        let q_exp = gpu
+            .alloc_tensor(&[seq_len * d_inner], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let k_exp = gpu
+            .alloc_tensor(&[seq_len * d_inner], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.repeat_interleave_qk_f32_batched(
+            &q_part, &k_part, &q_exp, &k_exp,
+            n_k_heads, ratio, head_dim, seq_len,
+        )
+        .map_err(|e| e.to_string())?;
+        // Free the GQA source tensors — the expanded copies own the
+        // data the kernel will read.
+        gpu.free_tensor(q_part).map_err(|e| e.to_string())?;
+        gpu.free_tensor(k_part).map_err(|e| e.to_string())?;
+        (q_exp, k_exp)
+    } else {
+        // n_k_heads == n_v_heads: no repeat. Pass the existing buffers
+        // through to the recurrence kernel. (q_part / k_part are moved
+        // here.)
+        //
+        // n_k_heads > n_v_heads is structurally impossible for Qwen3.5
+        // GQA but defensively rejected: the geometry derivation above
+        // sets n_k_heads = k_dim / head_dim and the safetensors weight
+        // shapes would have to be malformed for this to fire.
+        if n_k_heads > n_v_heads {
+            gpu.free_tensor(q_part).map_err(|e| e.to_string())?;
+            gpu.free_tensor(k_part).map_err(|e| e.to_string())?;
+            gpu.free_tensor(alpha_f32).map_err(|e| e.to_string())?;
+            gpu.free_tensor(beta_f32).map_err(|e| e.to_string())?;
+            gpu.free_tensor(v_part).map_err(|e| e.to_string())?;
+            return Err(format!(
+                "{p}.linear_attn: unexpected n_k_heads={n_k_heads} > n_v_heads={n_v_heads}"
+            ));
+        }
+        (q_part, k_part)
+    };
+
+    // ── Allocate recurrent state (zeros) and attention output (F32) ────
+    //
+    // State shape: [n_v_heads, head_dim, head_dim] F32. Zero-init at the
+    // start of each forward (B.2 scope: single sequence per call;
+    // multi-sequence batching is B.4).
+    let state = gpu
+        .zeros(&[n_v_heads, head_dim, head_dim], DType::F32)
+        .map_err(|e| e.to_string())?;
+    let attn_out_f32 = gpu
+        .alloc_tensor(&[seq_len * d_inner], DType::F32)
+        .map_err(|e| e.to_string())?;
+
+    // ── Gated delta-net recurrence ─────────────────────────────────────
+    //
+    // The kernel processes all `seq_len` tokens in one launch (state
+    // held in LDS), advancing the recurrent state token-by-token.
+    gpu.gated_delta_net_f32(
+        &q_gdn, &k_gdn, &v_part,
+        &alpha_f32, &beta_f32,
+        &state, &attn_out_f32,
+        seq_len, n_v_heads, head_dim,
+    )
+    .map_err(|e| e.to_string())?;
+    gpu.free_tensor(q_gdn).map_err(|e| e.to_string())?;
+    gpu.free_tensor(k_gdn).map_err(|e| e.to_string())?;
+    gpu.free_tensor(v_part).map_err(|e| e.to_string())?;
+    gpu.free_tensor(alpha_f32).map_err(|e| e.to_string())?;
+    gpu.free_tensor(beta_f32).map_err(|e| e.to_string())?;
+    gpu.free_tensor(state).map_err(|e| e.to_string())?;
+
+    // ── Cast F32 attention output → BF16 for out_proj input ────────────
+    let attn_pre_o_bf16 = gpu
+        .alloc_tensor(&[seq_len * d_inner], DType::BF16)
+        .map_err(|e| e.to_string())?;
+    gpu.convert_f32_to_bf16(&attn_out_f32, &attn_pre_o_bf16, seq_len * d_inner)
+        .map_err(|e| e.to_string())?;
+    gpu.free_tensor(attn_out_f32).map_err(|e| e.to_string())?;
+
+    // ── out_proj: attn_pre_o · wo^T → F32 [seq_len, dim] ───────────────
+    let attn_out_proj_f32 = gpu
+        .alloc_tensor(&[seq_len * dim], DType::F32)
+        .map_err(|e| e.to_string())?;
+    gpu.set_capture_name(Some(format!("{p}.linear_attn.out_proj.weight")));
+    let attn_pre_o_view = view_2d(&attn_pre_o_bf16, seq_len, d_inner);
+    gpu.gemm_bf16(
+        &attn_pre_o_view, &wo.tensor,
+        &mut to_2d(attn_out_proj_f32.clone_view(), seq_len, dim),
+        dim, d_inner, seq_len,
+    )
+    .map_err(|e| e.to_string())?;
+    gpu.free_tensor(attn_pre_o_bf16).map_err(|e| e.to_string())?;
+
+    // ── Convert to BF16 for residual add upstream ──────────────────────
+    let attn_out_bf16 = gpu
+        .alloc_tensor(&[seq_len * dim], DType::BF16)
+        .map_err(|e| e.to_string())?;
+    gpu.convert_f32_to_bf16(&attn_out_proj_f32, &attn_out_bf16, seq_len * dim)
+        .map_err(|e| e.to_string())?;
+    gpu.free_tensor(attn_out_proj_f32).map_err(|e| e.to_string())?;
+
+    Ok(attn_out_bf16)
+}
+
+/// Non-deltanet fallback (compile-only path).
+///
+/// When the workspace is built with `--no-default-features` and the
+/// `deltanet` feature is disabled, the `gated_delta_net_f32` /
+/// `fused_sigmoid_alpha_gate_f32_batched` /
+/// `fused_qk_l2_norm_scale_f32_batched` dispatch entries on
+/// `rdna_compute::Gpu` aren't compiled. We fall back to the pre-B.2
+/// Q-chunk passthrough so the module still compiles — calibration
+/// quality is worse in this configuration but `collect_imatrix` is
+/// still functional. Production calibration ALWAYS uses default
+/// features (deltanet ON), so this path is purely a compile-time
+/// safety net.
+#[cfg(not(feature = "deltanet"))]
+fn forward_deltanet_layer(
+    gpu: &mut Gpu,
+    trunk: &TrunkBF16,
+    h: &GpuTensor,
+    p: &str,
+    seq_len: usize,
+    dim: usize,
+) -> Result<GpuTensor, String> {
+    let wqkv = get(trunk, &format!("{p}.linear_attn.in_proj_qkv.weight"))?;
+    let wz = get(trunk, &format!("{p}.linear_attn.in_proj_z.weight"))?;
+    let wa = get(trunk, &format!("{p}.linear_attn.in_proj_a.weight"))?;
+    let wb = get(trunk, &format!("{p}.linear_attn.in_proj_b.weight"))?;
+    let wo = get(trunk, &format!("{p}.linear_attn.out_proj.weight"))?;
+
+    let norm_name = format!("{p}.input_layernorm.weight");
+    let h_for_linears = apply_pre_norm_or_fallback(gpu, trunk, h, &norm_name, seq_len, dim)?;
+
     let qkv_dim = wqkv.shape[0];
     let qkv_k = wqkv.shape[1];
     if qkv_k != dim {
@@ -539,8 +929,6 @@ fn forward_deltanet_layer(
                   qkv_dim, qkv_k, seq_len)
         .map_err(|e| e.to_string())?;
 
-    // Z projection: gate vector. Calibration only — output unused
-    // (the gated norm is skipped).
     let z_dim = wz.shape[0];
     let z_f32 = gpu
         .alloc_tensor(&[seq_len * z_dim], DType::F32)
@@ -552,7 +940,6 @@ fn forward_deltanet_layer(
         .map_err(|e| e.to_string())?;
     gpu.free_tensor(z_f32).map_err(|e| e.to_string())?;
 
-    // A projection (alpha): calibration only.
     let a_dim = wa.shape[0];
     let a_f32 = gpu
         .alloc_tensor(&[seq_len * a_dim], DType::F32)
@@ -564,7 +951,6 @@ fn forward_deltanet_layer(
         .map_err(|e| e.to_string())?;
     gpu.free_tensor(a_f32).map_err(|e| e.to_string())?;
 
-    // B projection (beta): calibration only.
     let b_dim = wb.shape[0];
     let b_f32 = gpu
         .alloc_tensor(&[seq_len * b_dim], DType::F32)
@@ -575,14 +961,8 @@ fn forward_deltanet_layer(
                   b_dim, wb.shape[1], seq_len)
         .map_err(|e| e.to_string())?;
     gpu.free_tensor(b_f32).map_err(|e| e.to_string())?;
-    // h_for_linears scratch is no longer needed once all in_proj_*
-    // linears have been fired. Free before the out_proj which
-    // consumes a different (Q-chunk) tensor.
     h_for_linears.drop_owned(gpu).map_err(|e| e.to_string())?;
 
-    // Build `attn_pre_o` = first d_inner cols of qkv_f32 (the Q chunk),
-    // converted to BF16. d_inner is determined by the out_proj's K dim
-    // (out_proj: [dim, d_inner]).
     let d_inner = wo.shape[1];
     if d_inner > qkv_dim {
         return Err(format!(
@@ -590,54 +970,43 @@ fn forward_deltanet_layer(
         ));
     }
 
-    // Convert qkv_f32 (seq_len × qkv_dim) → BF16 attn_pre_o (seq_len × d_inner)
-    // by extracting the first d_inner cols per row.
+    // Q-chunk passthrough (calibration approximation when deltanet
+    // feature disabled — see module-level docs and pre-B.2 history).
     let attn_pre_o = gpu
         .alloc_tensor(&[seq_len * d_inner], DType::BF16)
         .map_err(|e| e.to_string())?;
-    // Convert all of qkv_f32 to BF16 first (in-place via scratch), then
-    // copy out the d_inner-col-prefix per row. Simpler: per-row dtod.
     let qkv_bf16 = gpu
         .alloc_tensor(&[seq_len * qkv_dim], DType::BF16)
         .map_err(|e| e.to_string())?;
     gpu.convert_f32_to_bf16(&qkv_f32, &qkv_bf16, seq_len * qkv_dim)
         .map_err(|e| e.to_string())?;
     gpu.free_tensor(qkv_f32).map_err(|e| e.to_string())?;
-    // Per-row copy: each row of qkv_bf16 has qkv_dim BF16 elements; we
-    // want the first d_inner elements into attn_pre_o.
     for t in 0..seq_len {
         let src_off = t * qkv_dim * 2;
         let dst_off = t * d_inner * 2;
         gpu.hip
             .memcpy_dtod_at(
-                &attn_pre_o.buf,
-                dst_off,
-                &qkv_bf16.buf,
-                src_off,
+                &attn_pre_o.buf, dst_off,
+                &qkv_bf16.buf, src_off,
                 d_inner * 2,
             )
             .map_err(|e| e.to_string())?;
     }
     gpu.free_tensor(qkv_bf16).map_err(|e| e.to_string())?;
 
-    // out_proj: attn_out_f32 = attn_pre_o * wo^T → [seq_len, dim]
     let attn_out_f32 = gpu
         .alloc_tensor(&[seq_len * dim], DType::F32)
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.linear_attn.out_proj.weight")));
     let attn_pre_o_view = view_2d(&attn_pre_o, seq_len, d_inner);
     gpu.gemm_bf16(
-        &attn_pre_o_view,
-        &wo.tensor,
+        &attn_pre_o_view, &wo.tensor,
         &mut to_2d(attn_out_f32.clone_view(), seq_len, dim),
-        dim,
-        d_inner,
-        seq_len,
+        dim, d_inner, seq_len,
     )
     .map_err(|e| e.to_string())?;
     gpu.free_tensor(attn_pre_o).map_err(|e| e.to_string())?;
 
-    // Convert to BF16 for residual add.
     let attn_out_bf16 = gpu
         .alloc_tensor(&[seq_len * dim], DType::BF16)
         .map_err(|e| e.to_string())?;
