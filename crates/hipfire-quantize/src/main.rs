@@ -28,6 +28,20 @@ use std::sync::OnceLock;
 // derive per-channel `RMS_act` for the smoothing-quant scale.
 static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
+// Per-expert imatrix lookup populated alongside IMATRIX for MoE models. Keyed
+// by `(canonical_HF_safetensors_name, expert_idx)`. Two population paths:
+//   1. GGUF imatrix with multi-mat tensors (legacy llama.cpp format): the
+//      multi-mat tensor `blk.{L}.<slot>_exps.weight.in_sum2` of shape
+//      `[K, n_experts]` is split into per-expert F32 vectors keyed by the
+//      derived HF-canonical safetensors name
+//      (`model.language_model.layers.{L}.mlp.experts.{X}.{slot}.weight`).
+//   2. IMQ format (hipfire-native, subagent B's per-expert emit path): per-
+//      expert tensors already carry their `.experts.{X}.` segment in the
+//      canonical HF name; we parse the expert index from the name suffix.
+//
+// Consumed by the MoE quantize loop's per-expert AWQ + GPTQ branch (phase3c).
+static MOE_IMATRIX: OnceLock<HashMap<(String, u32), Vec<f32>>> = OnceLock::new();
+
 // Phase A Stage A — AWQ (Activation-aware Weight Quantization, Lin et al
 // 2023). When AWQ_ALPHA is set (via --awq [<alpha>=0.55]), each linear-layer
 // weight gets per-input-channel pre-scaling applied BEFORE the standard
@@ -1039,6 +1053,80 @@ mod awq_tests {
         for &v in &s {
             assert!(v.is_finite() && v > 0.0, "scale {v} should be finite + positive");
         }
+    }
+
+    // ─── phase3c per-expert helpers ──────────────────────────────────────
+
+    #[test]
+    fn parse_expert_idx_recognizes_qwen3_moe() {
+        assert_eq!(
+            parse_expert_idx(
+                "model.language_model.layers.5.mlp.experts.42.gate_up_proj.weight"
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_expert_idx("model.layers.0.mlp.experts.0.down_proj.weight"),
+            Some(0)
+        );
+        // Highest valid u32 expert idx — bounded by num_experts in practice.
+        assert_eq!(
+            parse_expert_idx("model.layers.0.mlp.experts.255.up_proj.weight"),
+            Some(255)
+        );
+    }
+
+    #[test]
+    fn parse_expert_idx_returns_none_for_non_expert_tensors() {
+        // 3D parent (no expert index in name).
+        assert_eq!(
+            parse_expert_idx("model.language_model.layers.5.mlp.experts.gate_up_proj"),
+            None,
+        );
+        // Dense attention/FFN tensors.
+        assert_eq!(
+            parse_expert_idx("model.language_model.layers.5.self_attn.q_proj.weight"),
+            None,
+        );
+        assert_eq!(
+            parse_expert_idx("model.language_model.layers.5.mlp.shared_expert.down_proj.weight"),
+            None,
+        );
+        // Router (no per-expert slot).
+        assert_eq!(
+            parse_expert_idx("model.language_model.layers.5.mlp.gate.weight"),
+            None,
+        );
+        // Top-level tensors.
+        assert_eq!(parse_expert_idx("model.embed_tokens.weight"), None);
+    }
+
+    #[test]
+    fn ggml_exps_name_to_hf_parent_round_trips_expected_shapes() {
+        // `ffn_gate_exps` and `ffn_up_exps` both map to `gate_up_proj`
+        // (HF safetensors fuses gate+up into one 3D tensor).
+        assert_eq!(
+            ggml_exps_name_to_hf_parent("blk.5.ffn_gate_exps.weight").as_deref(),
+            Some("model.language_model.layers.5.mlp.experts.gate_up_proj"),
+        );
+        assert_eq!(
+            ggml_exps_name_to_hf_parent("blk.0.ffn_up_exps.weight").as_deref(),
+            Some("model.language_model.layers.0.mlp.experts.gate_up_proj"),
+        );
+        assert_eq!(
+            ggml_exps_name_to_hf_parent("blk.47.ffn_down_exps.weight").as_deref(),
+            Some("model.language_model.layers.47.mlp.experts.down_proj"),
+        );
+        // Unknown slot → None.
+        assert_eq!(
+            ggml_exps_name_to_hf_parent("blk.5.ffn_norm.weight"),
+            None,
+        );
+        // Non-blk prefix → None.
+        assert_eq!(
+            ggml_exps_name_to_hf_parent("output.weight"),
+            None,
+        );
     }
 }
 
@@ -2712,6 +2800,91 @@ fn imatrix_weights_for(safetensors_name: &str) -> Option<&'static [f32]> {
     let im = IMATRIX.get()?;
     let ggml_name = safetensors_to_ggml_name(safetensors_name)?;
     im.get(&ggml_name).map(|v| v.as_slice())
+}
+
+/// Parse the routed-expert index from a per-expert tensor name. Returns
+/// `Some(idx)` for names matching `....mlp.experts.{N}.{base}.weight`
+/// (Qwen3-MoE / DeepSeek convention) and `None` for any other tensor.
+///
+/// LOCAL re-implementation of `crate::calibration::parse_expert_idx`
+/// (subagent B's work). Kept here so phase3c can build in parallel with
+/// the subagent-B branch; once both land, replace this with the
+/// `hipfire-runtime::calibration::parse_expert_idx` import.
+///
+/// Examples:
+/// - `model.language_model.layers.5.mlp.experts.42.gate_up_proj.weight` → `Some(42)`
+/// - `model.layers.0.mlp.experts.0.down_proj.weight` → `Some(0)`
+/// - `model.language_model.layers.5.mlp.experts.gate_up_proj` (3D parent) → `None`
+/// - `model.language_model.layers.5.self_attn.q_proj.weight` → `None`
+fn parse_expert_idx(name: &str) -> Option<u32> {
+    // Find ".mlp.experts." substring. Anchored on the dot so it doesn't
+    // accidentally match "shared_experts" or other suffix variants.
+    let marker = ".mlp.experts.";
+    let after = name.find(marker)?;
+    let rest = &name[after + marker.len()..];
+    // rest looks like "42.gate_up_proj.weight" or
+    // "0.down_proj.weight" — split on the FIRST dot to isolate the index.
+    let dot = rest.find('.')?;
+    let idx_str = &rest[..dot];
+    // Reject names where this slot is non-numeric (e.g. the 3D parent
+    // `...mlp.experts.gate_up_proj` returns `gate_up_proj` here).
+    idx_str.parse::<u32>().ok()
+}
+
+/// Look up per-expert imatrix data by `(canonical_safetensors_name, expert_idx)`.
+/// Returns `None` if MOE_IMATRIX is unset, or no matching entry exists.
+///
+/// `parent_name` is the 3D parent path WITHOUT the expert index (e.g.
+/// `model.language_model.layers.5.mlp.experts.gate_up_proj`); this function
+/// constructs the per-expert HF-canonical name
+/// (`{parent_root}.experts.{idx}.{base}.weight`) and looks up the
+/// MOE_IMATRIX HashMap under it.
+fn imatrix_weights_for_expert(parent_name: &str, expert_idx: u32) -> Option<&'static [f32]> {
+    let im = MOE_IMATRIX.get()?;
+    // Build the per-expert HF safetensors name by splitting the parent at
+    // `experts.` and inserting the expert index. The 3D parent looks like
+    // `<root>.mlp.experts.<base>` (no `.weight` suffix); the per-expert
+    // safetensors name is `<root>.mlp.experts.<idx>.<base>.weight`.
+    let marker = "mlp.experts.";
+    let pos = parent_name.find(marker)?;
+    let split = pos + marker.len();
+    let (root_with_experts, base) = parent_name.split_at(split);
+    let per_expert = format!("{root_with_experts}{expert_idx}.{base}.weight");
+    im.get(&(per_expert, expert_idx)).map(|v| v.as_slice())
+}
+
+/// Map a llama.cpp ggml-style MoE multi-mat tensor name back to the HF
+/// safetensors-canonical 3D parent path (matching the shape that the
+/// `mlp.experts.` quantize branch sees in `name`). Returns `None` for
+/// any name that isn't a recognized MoE multi-mat tensor.
+///
+/// Examples:
+/// - `blk.5.ffn_gate_exps.weight` →
+///   `model.language_model.layers.5.mlp.experts.gate_up_proj`
+/// - `blk.5.ffn_down_exps.weight` →
+///   `model.language_model.layers.5.mlp.experts.down_proj`
+///
+/// Note: the gate+up fused tensor is `ffn_gate_exps` in llama.cpp's
+/// pre-fusion split but `gate_up_proj` in Qwen3-MoE's HF safetensors.
+/// This helper currently maps gate→gate_up_proj for Qwen3-MoE.
+fn ggml_exps_name_to_hf_parent(name: &str) -> Option<String> {
+    // Expected shape: `blk.{L}.{slot}.weight` where slot is one of the
+    // MoE multi-mat slots.
+    let rest = name.strip_prefix("blk.")?;
+    let dot = rest.find('.')?;
+    let layer_idx: u32 = rest[..dot].parse().ok()?;
+    let slot = rest[dot + 1..].strip_suffix(".weight")?;
+    let base = match slot {
+        // Qwen3-MoE / DeepSeek family: HF safetensors fuses gate+up into
+        // `gate_up_proj` (3D parent shape `[E, 2*I, H]`). llama.cpp splits
+        // them into separate `ffn_gate_exps` + `ffn_up_exps`. There's no
+        // 1:1 mapping; we report `gate_up_proj` for either and rely on the
+        // quantize loop deduping (calibrate-once, route-twice).
+        "ffn_gate_exps" | "ffn_up_exps" => "gate_up_proj",
+        "ffn_down_exps" => "down_proj",
+        _ => return None,
+    };
+    Some(format!("model.language_model.layers.{layer_idx}.mlp.experts.{base}"))
 }
 
 /// Compute AWQ per-channel scales `s[j]` for one linear-layer weight tensor.
