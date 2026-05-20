@@ -208,12 +208,22 @@ pub struct TrunkBF16 {
     /// canonical HF safetensors name. Kept in a parallel map so the
     /// `tensors` dict remains BF16-only.
     ///
-    /// GemmaRMSNorm storage convention: HF safetensors store raw `w`
-    /// (init from zero), engines apply `(1 + w)`. The loader bakes the
-    /// `+= 1.0` at load time so the kernel can stay plain `x * w * rms`,
-    /// mirroring `hipfire-arch-qwen35::load_norm_weight`. Without this
-    /// bake the Tier 1 forward would systematically under-magnify
-    /// activations vs Tier 2 / production.
+    /// Two storage conventions live here:
+    ///   - `Qwen3_5RMSNorm` (the canonical RMSNorm used for
+    ///     `input_layernorm`, `post_attention_layernorm`, `q_norm`,
+    ///     `k_norm`, and `model.norm` / `mtp.norm`): HF safetensors
+    ///     store the raw `w` (init from zero); the runtime computes
+    ///     `(1 + w) * h_norm`. The loader bakes the `+= 1.0` at load
+    ///     time so the kernel can stay plain `x * w * rms`.
+    ///   - `Qwen3_5RMSNormGated` (DeltaNet inner norm,
+    ///     `*.linear_attn.norm.weight`) and `nn.LayerNorm`
+    ///     (`*.visual.merger.norm.weight`): weights initialize to ONE,
+    ///     applied as `w * h_norm`. NO `+= 1.0` bake. See
+    ///     `is_gated_norm_tensor` for the gating predicate.
+    ///
+    /// Production qwen35.rs and the Tier 1 forward both treat these as
+    /// "already-baked" — caller can just `x * w_stored * rms` and get
+    /// the right magnitude.
     pub norms: HashMap<String, GpuTensor>,
     /// The model dir we loaded from (for log messages + tokenizer load).
     pub model_dir: PathBuf,
@@ -245,6 +255,39 @@ pub fn is_norm_tensor(name: &str) -> bool {
     bare.ends_with("norm")
         || bare.ends_with("_norm")
         || bare.ends_with(".norm")
+}
+
+/// Returns true if `name` refers to a "gated" / "init-from-one" norm whose
+/// weight is stored with the `1.0` offset ALREADY baked in (or is a
+/// LayerNorm, which has its own gamma initialized to 1). For these the
+/// loader MUST NOT apply the `+= 1.0` bake — doing so produces
+/// `(1 + (1 + w_raw)) = (2 + w_raw)` which roughly doubles the output
+/// magnitude at every position.
+///
+/// Concretely (Qwen3.5/3.6 VL):
+///   - `*.linear_attn.norm.weight`  → `Qwen3_5RMSNormGated` (init from 1,
+///     forward applies `w * h_norm`, NO `(1 + w)`).
+///   - `*.visual.merger.norm.weight` → `nn.LayerNorm` (gamma init from 1,
+///     forward applies `gamma * h_norm + beta`, NO `(1 + w)`).
+///
+/// Regular `Qwen3_5RMSNorm` (`input_layernorm`, `post_attention_layernorm`,
+/// `q_norm`, `k_norm`, `model.norm`, `mtp.norm`) is initialized FROM ZERO
+/// and applies `(1 + w) * h_norm` at runtime — those DO need the bake.
+pub fn is_gated_norm_tensor(name: &str) -> bool {
+    // Strip the `.weight` suffix once so we can pattern-match on the
+    // logical name regardless of the trailing `.weight`.
+    let bare = name.strip_suffix(".weight").unwrap_or(name);
+    // Qwen3.5/3.6 DeltaNet inner RMSNormGated. Matches both
+    // `*.linear_attn.norm` and the Qwen3.6 variant. Sub-path match
+    // (not suffix) because the name ends in `.norm` like other RMSNorms.
+    if bare.contains(".linear_attn.norm") {
+        return true;
+    }
+    // Vision merger uses nn.LayerNorm.
+    if bare.contains(".visual.merger.norm") || bare.contains(".visual.norm") {
+        return true;
+    }
+    false
 }
 
 /// Parse `<model_dir>/config.json["model_type"]`. Returns an empty
@@ -474,9 +517,21 @@ pub fn load_bf16_model(gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16> 
                 // magnitude that production loads. Without this bake
                 // the captured activations would be systematically
                 // under-magnified by `(stored_w)/(stored_w + 1)`.
+                //
+                // EXCEPTION: gated-norm tensors (Qwen3_5RMSNormGated +
+                // nn.LayerNorm in the vision merger) have their weights
+                // initialized to ONE and applied as `w * h_norm` — no
+                // `(1 + w)` runtime offset. Baking `+= 1.0` on those
+                // doubles the magnitude. The text-only calibration path
+                // doesn't currently exercise these (DeltaNet skips the
+                // gated_norm; vision merger isn't run for text input)
+                // but we honor the storage convention so future callers
+                // and the persisted norms map stay self-consistent.
                 let mut baked = f32_data;
-                for v in &mut baked {
-                    *v += 1.0;
+                if !is_gated_norm_tensor(&name) {
+                    for v in &mut baked {
+                        *v += 1.0;
+                    }
                 }
 
                 let tensor = gpu.upload_f32(&baked, &meta.shape)?;
@@ -641,6 +696,37 @@ mod tests {
         assert!(!is_norm_tensor("model.embed_tokens.weight"));
         assert!(!is_norm_tensor("lm_head.weight"));
         assert!(!is_norm_tensor("model.layers.0.linear_attn.in_proj_qkv.weight"));
+    }
+
+    #[test]
+    fn is_gated_norm_tensor_recognizes_qwen_gated_norms() {
+        // Qwen3_5RMSNormGated inside DeltaNet (`linear_attn.norm`).
+        // Init-from-one + applied as plain `w * h_norm`.
+        assert!(is_gated_norm_tensor(
+            "model.layers.0.linear_attn.norm.weight"
+        ));
+        assert!(is_gated_norm_tensor(
+            "model.language_model.layers.0.linear_attn.norm.weight"
+        ));
+        // Vision merger uses nn.LayerNorm (gamma init from one).
+        assert!(is_gated_norm_tensor(
+            "model.visual.merger.norm.weight"
+        ));
+    }
+
+    #[test]
+    fn is_gated_norm_tensor_rejects_standard_rmsnorms() {
+        // Standard Qwen3_5RMSNorm (init from zero, runtime applies (1+w)).
+        assert!(!is_gated_norm_tensor("model.layers.0.input_layernorm.weight"));
+        assert!(!is_gated_norm_tensor(
+            "model.layers.0.post_attention_layernorm.weight"
+        ));
+        assert!(!is_gated_norm_tensor("model.layers.0.self_attn.q_norm.weight"));
+        assert!(!is_gated_norm_tensor("model.layers.0.self_attn.k_norm.weight"));
+        assert!(!is_gated_norm_tensor("model.norm.weight"));
+        assert!(!is_gated_norm_tensor("mtp.norm.weight"));
+        // Sanity: dense weights aren't gated norms either.
+        assert!(!is_gated_norm_tensor("model.layers.0.self_attn.q_proj.weight"));
     }
 
     // ─── Safetensors-parse unit tests ──────────────────────────────

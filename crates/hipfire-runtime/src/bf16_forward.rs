@@ -1262,7 +1262,14 @@ fn per_head_rmsnorm_f32_inplace(
 /// feature gate in `rdna-compute`. The fallback at
 /// `compute_full_attn_pre_o_passthrough` keeps the lib compiling in
 /// `--no-default-features` builds.
+/// `gate_f32`: optional `[seq_len × n_heads × head_dim]` F32 gate tensor
+/// split out of the 2x-wide q_proj. When `Some`, the attention output is
+/// multiplied element-wise by `sigmoid(gate)` before the BF16 cast,
+/// matching `qwen35.rs:5566-5568 sigmoid_mul_f32(fa_attn_out, fa_gate)`
+/// and the HF `Qwen3_5Attention.forward` epilogue
+/// `attn_output * torch.sigmoid(gate)`.
 #[cfg(feature = "deltanet")]
+#[allow(clippy::too_many_arguments)]
 fn compute_full_attn_pre_o(
     gpu: &mut Gpu,
     trunk: &TrunkBF16,
@@ -1271,6 +1278,7 @@ fn compute_full_attn_pre_o(
     v_f32: &GpuTensor,
     q_norm_w: Option<&GpuTensor>,
     k_norm_w: Option<&GpuTensor>,
+    gate_f32: Option<&GpuTensor>,
     seq_len: usize,
     n_heads: usize,
     n_kv_heads: usize,
@@ -1427,7 +1435,20 @@ fn compute_full_attn_pre_o(
     gpu.free_tensor(v_cache).map_err(|e| e.to_string())?;
     gpu.free_tensor(positions).map_err(|e| e.to_string())?;
 
-    // ── 9. Cast attn_pre_o_f32 → BF16. Caller takes ownership of the result.
+    // ── 9. Apply sigmoid(gate) when present. Matches the production
+    //       epilogue at qwen35.rs:5566-5568 (which uses the same
+    //       `sigmoid_mul_f32` kernel) and HF `Qwen3_5Attention.forward`:
+    //       `attn_output = attn_output * torch.sigmoid(gate)`. Without
+    //       this step, the o_proj capture sees raw `softmax(QK^T) * V`
+    //       instead of the gated form, producing the NRMSE ~4.88
+    //       divergence observed on the PyTorch oracle baseline.
+    if let Some(gate_buf) = gate_f32 {
+        debug_assert_eq!(gate_buf.numel(), seq_len * attn_pre_o_dim);
+        gpu.sigmoid_mul_f32(&attn_pre_o_f32, gate_buf)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // ── 10. Cast attn_pre_o_f32 → BF16. Caller takes ownership of the result.
     let attn_pre_o_bf16 = gpu
         .alloc_tensor(&[seq_len * attn_pre_o_dim], DType::BF16)
         .map_err(|e| e.to_string())?;
@@ -1526,7 +1547,7 @@ fn forward_full_attn_layer(
     let wv = get(trunk, &format!("{p}.self_attn.v_proj.weight"))?;
     let wo = get(trunk, &format!("{p}.self_attn.o_proj.weight"))?;
 
-    let q_dim = wq.shape[0];
+    let q_full_dim = wq.shape[0];
     let k_dim = wk.shape[0];
     let v_dim = wv.shape[0];
 
@@ -1556,31 +1577,51 @@ fn forward_full_attn_layer(
         *w.shape.iter().rev().find(|&&d| d > 1).unwrap_or(&w.shape[w.shape.len() - 1])
     } else {
         // Fallback: try the canonical head_dim values in decreasing
-        // order until one divides q_dim, k_dim, and v_dim. Avoids a
+        // order until one divides q_full_dim, k_dim, and v_dim. Avoids a
         // hard-coded value and works across model families.
         let candidates = [256usize, 192, 128, 96, 64];
         let pick = candidates
             .iter()
             .copied()
-            .find(|&d| q_dim % d == 0 && k_dim % d == 0 && v_dim % d == 0);
+            .find(|&d| q_full_dim % d == 0 && k_dim % d == 0 && v_dim % d == 0);
         match pick {
             Some(d) => d,
             None => {
                 return Err(format!(
                     "{p}.self_attn: cannot infer head_dim — q_norm absent and \
-                     q_dim={q_dim}/k_dim={k_dim}/v_dim={v_dim} not divisible by \
+                     q_full_dim={q_full_dim}/k_dim={k_dim}/v_dim={v_dim} not divisible by \
                      any of {candidates:?}"
                 ));
             }
         }
     };
-    if q_dim % head_dim != 0 || k_dim % head_dim != 0 || v_dim % head_dim != 0 {
+    if q_full_dim % head_dim != 0 || k_dim % head_dim != 0 || v_dim % head_dim != 0 {
         return Err(format!(
             "{p}.self_attn: head_dim={head_dim} does not divide one of \
-             q_dim={q_dim}/k_dim={k_dim}/v_dim={v_dim}"
+             q_full_dim={q_full_dim}/k_dim={k_dim}/v_dim={v_dim}"
         ));
     }
-    let n_heads = q_dim / head_dim;
+    // ── Detect attn_output_gate (Qwen3.5/3.6) ──────────────────────────
+    //
+    // Qwen3_5Attention concatenates query AND a sigmoid gate along the
+    // last dim of q_proj. The HF view is
+    // `q_proj(h).view(*, n_heads, 2 * head_dim)` then `chunk(2, dim=-1)`.
+    // On disk that means the q_proj weight rows are interleaved per head
+    // as `[q_d0..d(head_dim-1), gate_d0..d(head_dim-1)]`. Detect by
+    // checking q_full_dim vs (n_kv_heads-derived n_heads × head_dim).
+    //
+    // Heuristic: when `q_full_dim == 2 × k_dim × (n_heads/n_kv_heads)`
+    // the gate is present. For Qwen3.5-0.8B (n_heads=8, n_kv_heads=2,
+    // head_dim=256): q_full_dim=4096, k_dim=512, ratio q/k = 8 = 2*4
+    // (gate doubles the per-kv-head count). We don't know n_heads a
+    // priori, so derive it from the SHAPE consistency check:
+    //   - if q_full_dim / head_dim equals an integer multiple of
+    //     (k_dim / head_dim) that is even → the gate doubles the per-
+    //     kv-head Q-head count.
+    //   - we then have n_heads = (q_full_dim / 2) / head_dim.
+    //
+    // Falls back to the non-gated layout when the shapes don't satisfy
+    // the 2x relationship (Llama, Mistral, dense Qwen2 etc.).
     let n_kv_heads = k_dim / head_dim;
     if v_dim / head_dim != n_kv_heads {
         return Err(format!(
@@ -1589,6 +1630,27 @@ fn forward_full_attn_layer(
             v_dim / head_dim,
         ));
     }
+    let raw_heads = q_full_dim / head_dim;
+    let (n_heads, has_gate) = if raw_heads % 2 == 0
+        && raw_heads / 2 >= n_kv_heads
+        && (raw_heads / 2) % n_kv_heads == 0
+        && q_full_dim == 2 * (raw_heads / 2) * head_dim
+        && wo.shape[1] == (raw_heads / 2) * head_dim
+    {
+        // o_proj's input dim equals the de-gated Q dim → confirms gate.
+        (raw_heads / 2, true)
+    } else if wo.shape[1] == raw_heads * head_dim {
+        // Standard (no gate): o_proj input dim equals raw Q dim.
+        (raw_heads, false)
+    } else {
+        return Err(format!(
+            "{p}.self_attn: cannot reconcile q_proj={q_full_dim} / k_proj={k_dim} \
+             / o_proj_k={} / head_dim={head_dim} into a standard or \
+             gated Qwen3.5/3.6 layout (raw_heads={raw_heads}, n_kv_heads={n_kv_heads})",
+            wo.shape[1],
+        ));
+    };
+    let q_dim = n_heads * head_dim;
 
     // Pre-norm: GemmaRMSNorm over the entry hidden state. q/k/v see
     // normalized input; residual still adds attn_out to the
@@ -1596,19 +1658,66 @@ fn forward_full_attn_layer(
     let norm_name = format!("{p}.input_layernorm.weight");
     let h_for_linears = apply_pre_norm_or_fallback(gpu, trunk, h, &norm_name, seq_len, dim)?;
 
-    // Q projection: produce F32 [seq_len, q_dim]. We keep q_f32 alive
-    // through the attention math (it becomes the q vector input to
-    // attention_flash after q_norm + RoPE).
-    let q_f32 = gpu
-        .alloc_tensor(&[seq_len * q_dim], DType::F32)
+    // Q projection: produce F32 [seq_len, q_full_dim]. When the gate is
+    // present, q_full_dim = 2 × n_heads × head_dim and the per-head
+    // layout is interleaved `[q_d0..d(head_dim-1), gate_d0..d(head_dim-1)]`
+    // (matches HF `q_proj(h).view(*, n_heads, 2*head_dim).chunk(2, dim=-1)`).
+    // We deinterleave into separate Q and gate buffers below so the
+    // downstream attention math sees the canonical
+    // `[seq_len × n_heads × head_dim]` Q shape, and the FA epilogue can
+    // apply `sigmoid(gate) * attn_out` before o_proj — matching
+    // qwen35.rs:5566-5568 `gpu.sigmoid_mul_f32(fa_attn_out, fa_gate)`.
+    let q_full_f32 = gpu
+        .alloc_tensor(&[seq_len * q_full_dim], DType::F32)
         .map_err(|e| e.to_string())?;
     gpu.set_capture_name(Some(format!("{p}.self_attn.q_proj.weight")));
     gpu.gemm_bf16(
         h_for_linears.as_ref(), &wq.tensor,
-        &mut to_2d(q_f32.clone_view(), seq_len, q_dim),
-        q_dim, wq.shape[1], seq_len,
+        &mut to_2d(q_full_f32.clone_view(), seq_len, q_full_dim),
+        q_full_dim, wq.shape[1], seq_len,
     )
     .map_err(|e| e.to_string())?;
+
+    // Split out Q and (optional) gate. For gated variants we use
+    // `deinterleave_f32_batched` (matches qwen35.rs:5300). For non-gated
+    // variants q_full_f32 IS the Q tensor — alias rather than copy.
+    let (q_f32, gate_f32_opt) = if has_gate {
+        #[cfg(feature = "deltanet")]
+        {
+            let q_buf = gpu
+                .alloc_tensor(&[seq_len * q_dim], DType::F32)
+                .map_err(|e| e.to_string())?;
+            let gate_buf = gpu
+                .alloc_tensor(&[seq_len * q_dim], DType::F32)
+                .map_err(|e| e.to_string())?;
+            gpu.deinterleave_f32_batched(
+                &q_full_f32, &q_buf, &gate_buf,
+                n_heads, head_dim, seq_len,
+            )
+            .map_err(|e| e.to_string())?;
+            gpu.free_tensor(q_full_f32).map_err(|e| e.to_string())?;
+            (q_buf, Some(gate_buf))
+        }
+        #[cfg(not(feature = "deltanet"))]
+        {
+            // No-deltanet builds don't have `deinterleave_f32_batched`
+            // (it lives behind the deltanet feature gate). Bail with a
+            // clear error rather than silently emitting wrong values:
+            // the passthrough fallback can't be expressed for the gated
+            // variant without writing a new kernel.
+            gpu.free_tensor(q_full_f32).map_err(|e| e.to_string())?;
+            h_for_linears.drop_owned(gpu).map_err(|e| e.to_string())?;
+            return Err(format!(
+                "{p}.self_attn: q_proj is gated (q_full_dim={q_full_dim} = 2*{q_dim}) \
+                 but the `deltanet` feature is disabled — \
+                 `deinterleave_f32_batched` is unavailable. Rebuild with \
+                 default features (or remove --no-default-features)."
+            ));
+        }
+    } else {
+        // Non-gated: q_full_f32 IS the Q tensor.
+        (q_full_f32, None)
+    };
 
     // K projection: produce F32 [seq_len, k_dim]. Kept alive through
     // attention as the k_cache after k_norm + RoPE.
@@ -1659,6 +1768,7 @@ fn forward_full_attn_layer(
         gpu, trunk,
         &q_f32, &k_f32, &v_f32,
         q_norm_w, k_norm_w,
+        gate_f32_opt.as_ref(),
         seq_len, n_heads, n_kv_heads, head_dim,
         k_dim, v_dim,
         p,
@@ -1666,7 +1776,7 @@ fn forward_full_attn_layer(
     #[cfg(not(feature = "deltanet"))]
     let attn_pre_o_bf16 = {
         // Silence unused-binding warnings under no-default-features.
-        let _ = (q_norm_w, k_norm_w, k_dim, p, trunk);
+        let _ = (q_norm_w, k_norm_w, k_dim, p, trunk, &gate_f32_opt);
         compute_full_attn_pre_o_passthrough(
             gpu, &v_f32,
             seq_len, n_kv_heads, head_dim, v_dim, attn_pre_o_dim,
@@ -1677,7 +1787,9 @@ fn forward_full_attn_layer(
     gpu.free_tensor(q_f32).map_err(|e| e.to_string())?;
     gpu.free_tensor(k_f32).map_err(|e| e.to_string())?;
     gpu.free_tensor(v_f32).map_err(|e| e.to_string())?;
-    let _ = q_dim;
+    if let Some(gate_buf) = gate_f32_opt {
+        gpu.free_tensor(gate_buf).map_err(|e| e.to_string())?;
+    }
 
     let attn_pre_o = if o_k == attn_pre_o_dim {
         attn_pre_o_bf16
