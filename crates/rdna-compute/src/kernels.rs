@@ -1551,3 +1551,11 @@ pub const REPEAT_INTERLEAVE_QK_BATCHED_SRC: &str = include_str!("../../../kernel
 /// mean K and cosine similarity vs the last position's K. Output: one
 /// f32 score per block. Phase 2.1 of #93.
 pub const PFLASH_SCORE_Q8_KV_SRC: &str = include_str!("../../../kernels/src/pflash_score_q8_kv.hip");
+
+// ─── Tier 1 BF16 calibration kernels (companion to gemm_bf16_mfma.gfx942.hip) ───
+
+/// Per-channel sum-of-squares reducer over BF16 activations.
+/// `acc[k] += Σ_t x[t,k]²`, with `n_tokens` bumped once per call.
+/// Cross-arch (no MFMA dependency). Phase 2 of the hipfire-native AWQ
+/// calibration path. See `kernels/src/sumsq_reduce.hip` for layout.
+pub const SUMSQ_REDUCE_SRC: &str = include_str!("../../../kernels/src/sumsq_reduce.hip");

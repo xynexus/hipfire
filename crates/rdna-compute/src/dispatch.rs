@@ -19879,6 +19879,79 @@ impl Gpu {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // Tier 1 BF16 calibration kernels
+    //
+    // Pair with the foundation BF16 GEMM (kernels/src/gemm_bf16_mfma.gfx942.hip)
+    // to provide on-GPU calibration data collection that replaces the Tier 2
+    // subprocess wrappers (llama.cpp llama-imatrix + PyTorch collect_hessian.py).
+    //
+    // BF16 tensors are passed via `GpuTensor` with `dtype = DType::F16` as a
+    // placeholder — the kernels read raw 16-bit lanes through `__bf16` and
+    // do not depend on the dtype tag. TODO: switch to `DType::BF16` once
+    // the variant is added (subagent D's territory).
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Compute per-channel Σx² and bump n_tokens, in-place += on `acc`.
+    ///
+    /// `x` is `[batch, K]` BF16 row-major (passed as `DType::F16`-tagged tensor).
+    /// `acc` is `[K]` FP32 — written via atomicAdd so repeated calls compose.
+    /// `n_tokens` is `[1]` FP32 scalar — bumped by `batch` each call.
+    ///
+    /// Caller is responsible for zeroing `acc` and `n_tokens` at the start
+    /// of a calibration pass. Cross-arch (no MFMA dependency); runs on any
+    /// gfx that supports `__bf16`.
+    pub fn sumsq_reduce_bf16(
+        &mut self,
+        x: &GpuTensor,
+        acc: &mut GpuTensor,
+        n_tokens: &mut GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("sumsq_reduce", kernels::SUMSQ_REDUCE_SRC, "sumsq_reduce_bf16")?;
+
+        // x.shape = [batch, K] — 1D acceptable too (treated as [1, numel]),
+        // but the calibration callers always pass [batch, K].
+        assert!(x.shape.len() >= 2, "sumsq_reduce_bf16: x must be at least 2D");
+        let k_dim = *x.shape.last().expect("sumsq_reduce_bf16: x must have K dim");
+        let batch: usize = x.shape[..x.shape.len() - 1].iter().product();
+        assert_eq!(acc.shape, vec![k_dim], "sumsq_reduce_bf16: acc must be [K]");
+        assert_eq!(acc.dtype, DType::F32, "sumsq_reduce_bf16: acc must be FP32");
+        assert_eq!(n_tokens.numel(), 1, "sumsq_reduce_bf16: n_tokens must be scalar [1]");
+        assert_eq!(n_tokens.dtype, DType::F32, "sumsq_reduce_bf16: n_tokens must be FP32");
+
+        let mut x_ptr = x.buf.as_ptr();
+        let mut acc_ptr = acc.buf.as_ptr();
+        let mut n_ptr = n_tokens.buf.as_ptr();
+        let mut batch_i = batch as i32;
+        let mut k_i = k_dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut acc_ptr as *mut _ as *mut c_void,
+            &mut n_ptr as *mut _ as *mut c_void,
+            &mut batch_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+        ];
+
+        let block: u32 = 256;
+        let grid: u32 = k_dim as u32; // one WG per output channel
+
+        self.launch_maybe_blob(
+            "sumsq_reduce_bf16",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(acc_ptr);
+                b.push_ptr(n_ptr);
+                b.push_i32(batch_i);
+                b.push_i32(k_i);
+                b
+            },
+        )
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // Kernel profiler
     // ═══════════════════════════════════════════════════════════════════════════
 
