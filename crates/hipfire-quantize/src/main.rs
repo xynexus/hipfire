@@ -2673,28 +2673,40 @@ fn safetensors_to_ggml_name(name: &str) -> Option<String> {
     Some(format!("blk.{layer_idx}.{translated}.weight"))
 }
 
-/// Load an llama.cpp-compatible imatrix GGUF file and build a lookup
-/// keyed by ggml-style tensor name. The GGUF stores per-linear-layer
-/// pairs:
-///   {name}.in_sum2     F32[k, n_mat]   sum of squared activations per channel
-///   {name}.counts      F32[1, n_mat]   token count contributing per matrix
-///
-/// For non-MoE models n_mat=1; the [k] vector goes into the map directly.
-/// For MoE we'd need per-expert handling — out of scope for Step 5a
-/// (Qwen3.5 dense + Qwen3.6 dense are the first cohort targets; A3B MoE
-/// is deferred to a future iteration that handles n_mat > 1).
-///
-/// Returns `HashMap<ggml_name, Vec<f32>>` with the .in_sum2 values keyed by
-/// the BASE tensor name (the ".in_sum2" suffix stripped).
+/// Result of `load_imatrix` — dense tensors keyed by name, plus a per-expert
+/// table keyed by `(canonical_HF_name, expert_idx)` for MoE models. The
+/// caller drains these into the global `IMATRIX` / `MOE_IMATRIX` OnceLocks.
+struct LoadedImatrix {
+    /// Dense per-tensor entries (the original `load_imatrix` return shape).
+    /// Keys: ggml-style names (GGUF path) or HF-canonical names (IMQ path).
+    dense: HashMap<String, Vec<f32>>,
+    /// Per-expert entries. Keys: `(HF-canonical safetensors name, expert_idx)`.
+    /// Populated either by:
+    /// - Splitting GGUF multi-mat `[K, n_experts]` tensors (legacy llama.cpp).
+    /// - Detecting per-expert HF-canonical names (`.mlp.experts.{N}.`) in
+    ///   either IMQ or GGUF and rebinding them to this map (so the dense
+    ///   table isn't polluted with per-expert keys).
+    per_expert: HashMap<(String, u32), Vec<f32>>,
+}
+
+/// Load an imatrix file and split it into a dense table + a per-expert
+/// table for MoE models. The dense path serves AWQ + GPTQ on standard
+/// 2D linear weights; the per-expert path serves the MoE 3D-stacked
+/// expert quantize loop (phase3c).
 ///
 /// File-format dispatch is by magic on the first 4 bytes:
 ///   - `"IMQ\0"` → hipfire-native `.imq` (see [`imq_reader::load_imq`]).
-///     Keys are HF safetensors canonical names; the consumer-site
-///     [`imatrix_weights_for`] is responsible for any name translation.
-///   - `"GGUF"` → legacy GGUF imatrix (this function's original body).
-///     Keys are ggml-style names produced by llama-imatrix.
+///     Keys are HF safetensors canonical names; per-expert entries (subagent
+///     B's emit path) are detected by `parse_expert_idx` and routed to
+///     `per_expert`.
+///   - `"GGUF"` → legacy GGUF imatrix.
+///     - Non-MoE tensors keyed by ggml-style names go into `dense`.
+///     - Multi-mat tensors `[K, n_experts]` are split into per-expert
+///       columns. The ggml→HF parent mapping is handled by
+///       `ggml_exps_name_to_hf_parent`; unmapped multi-mat names are
+///       logged once and skipped.
 ///   - anything else → eprint + exit(1).
-fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
+fn load_imatrix(path: &Path) -> LoadedImatrix {
     // Peek the 4-byte magic before deciding which loader to use. Keep
     // open/read errors symmetric with the existing GGUF path (eprint +
     // exit) so callers don't have to grow a new error type.
@@ -2722,12 +2734,25 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
             eprintln!("error: imatrix file contains no usable entries");
             std::process::exit(1);
         }
+        // Split into dense + per-expert by detecting `.mlp.experts.{N}.` in
+        // the HF-canonical name. Subagent B's MoE collector emits one IMQ
+        // entry per routed expert, so n_experts entries appear here.
+        let mut dense: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut per_expert: HashMap<(String, u32), Vec<f32>> = HashMap::new();
+        for (name, values) in map.into_iter() {
+            if let Some(idx) = parse_expert_idx(&name) {
+                per_expert.insert((name, idx), values);
+            } else {
+                dense.insert(name, values);
+            }
+        }
         eprintln!(
-            "imatrix: loaded {} entries from {} (IMQ format, HF-canonical names)",
-            map.len(),
+            "imatrix: loaded {} dense + {} per-expert entries from {} (IMQ format, HF-canonical names)",
+            dense.len(),
+            per_expert.len(),
             path.display(),
         );
-        return map;
+        return LoadedImatrix { dense, per_expert };
     }
     if &magic != b"GGUF" {
         eprintln!(
@@ -2744,8 +2769,11 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
     });
 
     let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut per_expert: HashMap<(String, u32), Vec<f32>> = HashMap::new();
     let mut total_entries = 0usize;
-    let mut skipped_moe = 0usize;
+    let mut moe_multi_mat_entries = 0usize;
+    let mut moe_split_experts = 0usize;
+    let mut unmapped_moe_multi_mat: Vec<String> = Vec::new();
     for t in &gguf.tensors {
         let name = match t.name.strip_suffix(".in_sum2") {
             Some(n) => n.to_string(),
@@ -2756,11 +2784,43 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
                 t.name, t.dtype);
             continue;
         }
-        // Shape is [k] (1D) for non-MoE; [k, n_mat] for MoE. Skip multi-mat
-        // tensors with a warning — Step 5a doesn't handle them yet.
+        // Shape is [k] (1D) for non-MoE; [k, n_mat] for MoE multi-mat
+        // (legacy llama.cpp format). Hipfire's own GGUF emit produces
+        // 1D per-expert entries instead (see calibration.rs:264 docstring).
         let n_mat = if t.shape.len() >= 2 { t.shape[1] } else { 1 };
         if n_mat != 1 {
-            skipped_moe += 1;
+            // Multi-mat MoE: split into per-expert F32 columns and key
+            // by the derived HF-canonical safetensors name.
+            moe_multi_mat_entries += 1;
+            let k = t.shape[0];
+            let data = gguf.tensor_data(t);
+            let Some(hf_parent) = ggml_exps_name_to_hf_parent(&name) else {
+                unmapped_moe_multi_mat.push(name.clone());
+                continue;
+            };
+            // Split parent into `<root_with_experts>` + `<base>` so we can
+            // build per-expert keys `<root_with_experts><idx>.<base>.weight`.
+            // `mlp.experts.` is the marker; root_with_experts ends in that
+            // trailing dot, base is the slot name (e.g. `gate_up_proj`).
+            let split_pos = hf_parent.find("mlp.experts.")
+                .map(|p| p + "mlp.experts.".len())
+                .unwrap_or(hf_parent.len());
+            let (root_with_experts, base_seg) = hf_parent.as_str().split_at(split_pos);
+            for col in 0..n_mat {
+                let mut values = Vec::with_capacity(k);
+                // GGUF tensors are column-major laid out: data[col * k + row].
+                let base_off = col * k * 4;
+                for i in 0..k {
+                    let off = base_off + i * 4;
+                    let v = f32::from_le_bytes([
+                        data[off], data[off + 1], data[off + 2], data[off + 3],
+                    ]);
+                    values.push(v);
+                }
+                let per_expert_name = format!("{root_with_experts}{col}.{base_seg}.weight");
+                per_expert.insert((per_expert_name, col as u32), values);
+                moe_split_experts += 1;
+            }
             continue;
         }
         let k = t.shape[0];
@@ -2773,21 +2833,49 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
             let v = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
             values.push(v);
         }
-        map.insert(name, values);
-        total_entries += 1;
+        // Hipfire-own emit path: the canonical safetensors name is the
+        // tensor name directly (e.g. `model.language_model.layers.5.mlp.
+        // experts.42.gate_up_proj.weight`). Detect the per-expert form via
+        // `parse_expert_idx` and route to the per-expert map. Otherwise
+        // store under the original key (ggml or HF — caller dispatches).
+        if let Some(idx) = parse_expert_idx(&name) {
+            per_expert.insert((name, idx), values);
+        } else {
+            map.insert(name, values);
+            total_entries += 1;
+        }
     }
 
-    eprintln!(
-        "imatrix: loaded {} entries from {} ({} MoE multi-matrix entries skipped — Step 5a is dense-only)",
-        total_entries,
-        path.display(),
-        skipped_moe,
-    );
-    if total_entries == 0 {
+    if !unmapped_moe_multi_mat.is_empty() {
+        eprintln!(
+            "warning: skipping {} GGUF multi-mat MoE imatrix entries with unmapped names (e.g. {:?}); \
+             these tensors fall back to flat MQ4 (no AWQ/GPTQ per-expert calibration)",
+            unmapped_moe_multi_mat.len(),
+            unmapped_moe_multi_mat.first().map(|s| s.as_str()).unwrap_or(""),
+        );
+    }
+    if moe_multi_mat_entries > 0 {
+        eprintln!(
+            "imatrix: loaded {} dense + {} per-expert entries from {} ({} GGUF multi-mat tensors → {} per-expert columns)",
+            map.len(),
+            per_expert.len(),
+            path.display(),
+            moe_multi_mat_entries,
+            moe_split_experts,
+        );
+    } else {
+        eprintln!(
+            "imatrix: loaded {} dense + {} per-expert entries from {}",
+            map.len(),
+            per_expert.len(),
+            path.display(),
+        );
+    }
+    if total_entries == 0 && per_expert.is_empty() {
         eprintln!("error: imatrix file contains no usable .in_sum2 entries");
         std::process::exit(1);
     }
-    map
+    LoadedImatrix { dense: map, per_expert }
 }
 
 /// Look up imatrix per-channel weights for a given safetensors tensor name.
@@ -3812,8 +3900,9 @@ fn main() {
             eprintln!("error: --imatrix path not found: {}", path.display());
             std::process::exit(1);
         }
-        let table = load_imatrix(path);
-        IMATRIX.set(table).expect("IMATRIX set twice — should not happen");
+        let loaded = load_imatrix(path);
+        IMATRIX.set(loaded.dense).expect("IMATRIX set twice — should not happen");
+        MOE_IMATRIX.set(loaded.per_expert).expect("MOE_IMATRIX set twice — should not happen");
         eprintln!("imatrix loaded from {}", path.display());
     }
 
