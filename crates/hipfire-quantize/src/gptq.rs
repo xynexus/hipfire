@@ -796,6 +796,28 @@ pub fn gptq_column_sequential(
     assert_eq!(h_target.ncols(), k_dim);
     assert_eq!(frozen_grids.len(), (m * k_dim) / 256);
 
+    // Phase 2E (gptq-hip-phase2-impl): full GPU OBS column-sequential path
+    // gated on `HIPFIRE_GPTQ_HIP_OBS=1`. When unset, falls through to the
+    // CPU Phase D path (GPU Cholesky only, OBS loop on CPU via rayon).
+    //
+    // Per plan §4: opt-in for Phase 2E + 2F validation; default-flip
+    // discussion deferred per feedback_pr_gating_policy.md ("selectable
+    // additions land freely; default-flip needs discussion"). The env
+    // var only takes effect when both (a) the `gptq-hip` feature is on,
+    // and (b) a solver was passed in (i.e. main.rs detected CDNA + loaded
+    // rocSOLVER). RDNA paths fall through transparently.
+    #[cfg(feature = "gptq-hip")]
+    {
+        if let Some(s) = solver {
+            if std::env::var("HIPFIRE_GPTQ_HIP_OBS").is_ok() {
+                return crate::gptq_hip::gptq_column_sequential_hip(
+                    s, weights_flat, h_target, m, k_dim, frozen_grids,
+                    initial_damp, max_damp_multiplier, tensor_name,
+                );
+            }
+        }
+    }
+
     // WEIGHT-mode actorder: sort columns by descending diag(H_target).
     // The Cholesky-direct upper factor U is computed on the PERMUTED
     // Hessian P^T H P; weights + frozen grids stay in original indexing
