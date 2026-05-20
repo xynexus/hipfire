@@ -31,23 +31,29 @@
 //!    a forward pass.
 //!
 //! 2. **Attention math (B.2 + B.3, 2026-05-20):**
-//!    - DeltaNet: real gated delta-net recurrence via the existing
-//!      `gpu.gated_delta_net_f32` kernel through a cast-trick (B.2).
-//!      The QKV projection's F32 output is split into Q / K / V slices;
-//!      the in_proj_a / in_proj_b projections feed a simplified
-//!      `fused_sigmoid_alpha_gate_f32_batched` (dummy zero `A_log` /
-//!      `dt_bias` since those F32 tensors aren't loaded by `bf16_loader`
-//!      and the spec forbids loader extensions); QK gets L2-norm + Q
-//!      scale; per-sequence recurrent state initializes to zeros; the
-//!      kernel writes `attn_out` in F32 which is cast back to BF16 for
-//!      `out_proj`. The conv1d preamble, gated_norm + silu(z) post-
-//!      multiply, and the proper `A_log` / `dt_bias` are all calibration
-//!      approximations — the cast-trick produces an `out_proj` input
-//!      distribution that is structurally `state·Q` (the real DeltaNet
-//!      output shape), sufficient for the Σx² accumulator to see
-//!      realistic scale + moment-1 statistics. Post-recurrence norm /
-//!      gate aren't applied, so `out_proj` activations may be slightly
-//!      mis-scaled (~constant factor across the channel dim).
+//!    - DeltaNet: **mirrors the production prefill path exactly** as of
+//!      the 2026-05-20 DeltaNet-full refactor. The pipeline is
+//!      `in_proj_qkv → conv1d+SiLU (depth-wise, kernel=4, causal) →
+//!      split Q/K/V → fused_qk_l2_norm_scale → optional GQA repeat →
+//!      gated_delta_net_f32 → gated_norm * silu(z) → out_proj`. The
+//!      in_proj_a / in_proj_b projections feed
+//!      `fused_sigmoid_alpha_gate_f32_batched` with the **real** `A_log`
+//!      and `dt_bias` tensors (loaded as F32 via the new
+//!      `is_ssm_aux_tensor` predicate in `bf16_loader`). The conv1d
+//!      preamble uses the production
+//!      `conv1d_silu_split_f32_n` kernel against the BF16-decoded
+//!      `conv1d.weight` (`[conv_dim * kernel_size]` flat, F32) with a
+//!      zero-initialized 3-element ring state. The post-recurrence
+//!      gated norm runs through `gated_norm_f32_batched` against the
+//!      F32 `linear_attn.norm.weight` (shape `[head_v_dim]`,
+//!      `Qwen3_5RMSNormGated` convention, NO `+= 1.0` bake — see
+//!      `is_gated_norm_tensor` for the bake-skip predicate). The
+//!      `silu(z)` post-multiply is folded into the same kernel
+//!      (`out = rms_norm(x, w) * silu(z)`), saving a separate launch
+//!      and matching HF's `Qwen3_5RMSNormGated.forward(h, gate=z)`
+//!      math byte-for-byte. `out_proj`'s input is therefore identical
+//!      in math (same kernels, same recurrence) to what the deployed
+//!      model produces at calibration time.
 //!    - FullAttention: **mirrors the production prefill path exactly**
 //!      (B.3 refactor, 2026-05-20). Q / K / V are produced by `gemm_bf16`
 //!      in F32; per-head q_norm / k_norm are applied via
@@ -613,42 +619,105 @@ fn apply_pre_norm_or_fallback(
     }
 }
 
-/// DeltaNet layer attention via real gated delta-net recurrence
-/// (B.2 cast-trick, 2026-05-20).
+/// Warn once-per-process when a DeltaNet SSM aux tensor is missing
+/// from the trunk. The two main causes are (a) an older safetensors
+/// dump that pre-dates the `is_ssm_aux_tensor` predicate in
+/// `bf16_loader` (rare, only fixture trunks built before 2026-05-20),
+/// and (b) a non-DeltaNet layer that landed on the DeltaNet branch by
+/// mistake (always a bug — flag loudly).
+///
+/// We only emit the warning when `missing` is true so the call sites
+/// can be unconditional (`warn_deltanet_missing(name,
+/// opt.is_none())`) without inflating dispatch overhead.
+fn warn_deltanet_missing(name: &str, missing: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if missing && !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "  warning: DeltaNet SSM aux tensor `{}` absent from trunk.norms; \
+             falling back to zero-fill / no-op approximation (matches pre-2026-05-20 \
+             B.2 calibration behaviour; further occurrences suppressed)",
+            name
+        );
+    }
+}
+
+/// DeltaNet layer attention via the full production gated delta-net
+/// recurrence (2026-05-20 DeltaNet-full refactor).
 ///
 /// Fires the capture hook for `in_proj_qkv`, `in_proj_z`, `in_proj_a`,
-/// `in_proj_b`, `out_proj`. The math runs in F32 through the existing
-/// `gpu.gated_delta_net_f32` kernel — no new HIP kernels introduced
-/// — by upcasting the BF16 hidden state via `gemm_bf16` (which already
-/// outputs F32), splitting QKV, applying `fused_sigmoid_alpha_gate`
-/// (with dummy zero `A_log` / `dt_bias` since the BF16 loader skips
-/// non-BF16 tensors), QK L2-norm + Q scale, optional GQA repeat,
-/// then the recurrence kernel. The F32 attention output is cast back
-/// to BF16 for `out_proj`.
+/// `in_proj_b`, `out_proj`. The math mirrors `forward_decode` /
+/// `forward_prefill_batch` in `crates/hipfire-arch-qwen35/src/qwen35.rs`
+/// step-for-step, just in F32 throughout (the cast-trick upcasts the
+/// BF16 hidden state via `gemm_bf16` which already outputs F32).
 ///
-/// Calibration approximations (relative to production deltanet):
-///   - conv1d preamble is skipped (raw QKV slices used as Q/K/V).
-///   - `A_log` and `dt_bias` are treated as zeros (the BF16 loader
-///     skips F32 auxiliary tensors). Effectively
-///     `alpha = -softplus(in_proj_a out)` rather than
-///     `alpha = softplus(in_proj_a out + dt_bias) * -exp(A_log)`.
-///   - The gated_norm post-multiply with `silu(z)` is skipped.
-///   - Recurrent state initializes to zeros at the start of each
-///     `forward_prefill_bf16` invocation (one sequence per call —
-///     multi-sequence batching is B.4's concern).
+/// Pipeline:
+///   1. RMSNorm-cast the BF16 hidden state to BF16 `h_for_linears`.
+///   2. `in_proj_qkv` → F32 `[seq_len, qkv_dim]`. Layout per token:
+///      `[Q (k_dim) | K (k_dim) | V (d_inner)]`.
+///   3. `in_proj_z` → F32 `[seq_len, d_inner]` (kept live for the
+///      gated norm at step 9).
+///   4. `in_proj_a` → F32 `[seq_len, n_v_heads]` (alpha base).
+///   5. `in_proj_b` → F32 `[seq_len, n_v_heads]` (beta base).
+///   6. `fused_sigmoid_alpha_gate_f32_batched(beta, alpha, dt_bias,
+///      a_log, n_v_heads, seq_len)`. With the SSM aux loader (#127
+///      follow-up), `dt_bias` and `a_log` are the real F32 tensors;
+///      the kernel computes
+///      `beta_i = sigmoid(beta_i)` and
+///      `alpha_i = -exp(a_log_h) * softplus(alpha_i + dt_bias_h)` —
+///      exactly matching HF's
+///      `g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)`.
+///   7. `conv1d_silu_split_f32_n` over the QKV F32 tensor. Depth-wise
+///      4-tap causal conv + SiLU per channel, ring-buffer state of
+///      size `(kernel - 1) * qkv_dim = 3 * qkv_dim` F32 zeros at start
+///      of each forward (one-sequence batching, B.4 concern for
+///      multi-sequence). Output goes directly into separate
+///      `q_part / k_part / v_part` F32 buffers, replacing the per-row
+///      memcpy split that the B.2 cast-trick used.
+///   8. `fused_qk_l2_norm_scale_f32_batched(q_part, k_part,
+///      n_k_heads, head_dim, 1/sqrt(head_dim), eps=1e-6, seq_len)`.
+///   9. Optional GQA repeat-interleave when `n_k_heads < n_v_heads`.
+///  10. `gated_delta_net_f32(q, k, v, alpha, beta, state=zeros,
+///      out, seq_len, n_v_heads, head_dim)`. Returns F32 `attn_out`.
+///  11. `gated_norm_f32_batched(attn_out, z, norm_weight, normed,
+///      n_v_heads, head_dim, eps=1e-6, seq_len)`. Computes
+///      `normed[t,h,k] = rms_norm(attn_out[t,h,:])[k] * norm_weight[k] *
+///      silu(z[t,h,k])` in one launch (matches HF
+///      `Qwen3_5RMSNormGated.forward(attn_out, gate=z)` byte-for-byte).
+///      The norm weight (`*.linear_attn.norm.weight`, F32 `[head_dim]`)
+///      is loaded with NO `+= 1.0` bake — see
+///      `bf16_loader::is_gated_norm_tensor`.
+///  12. Cast F32 `normed` → BF16 for `out_proj`.
+///  13. `out_proj`: BF16 `normed_bf16` · `wo^T` → F32 `[seq_len, dim]`.
+///  14. Cast F32 → BF16 and return.
+///
+/// SSM aux tensor lookups go through `try_get_norm` (which reads
+/// `trunk.norms`):
+///   - `<p>.linear_attn.A_log`           F32 `[n_v_heads]`
+///   - `<p>.linear_attn.dt_bias`         F32 `[n_v_heads]`
+///   - `<p>.linear_attn.conv1d.weight`   F32 `[conv_dim * kernel_size]`
+///   - `<p>.linear_attn.norm.weight`     F32 `[head_dim]`
+///
+/// If any of these are absent from the trunk (e.g. an older safetensors
+/// dump that pre-dates the SSM-aux loader), we fall back to dummy zeros
+/// for `A_log` / `dt_bias` and skip the conv1d / gated_norm steps —
+/// matches the pre-2026-05-20 B.2 approximation behaviour. A one-shot
+/// `warn_once` records the first missing tensor name so fixture-only
+/// runs don't flood the log.
 ///
 /// The kernel hardcodes `head_dim == 128` (`#define HD 128` in
 /// `gated_delta_net.hip`); we assert at runtime that the trunk's
 /// derived `head_dim` matches.
 ///
-/// The cast-trick path uses `gated_delta_net_f32` /
+/// The full path uses `gated_delta_net_f32` /
 /// `fused_sigmoid_alpha_gate_f32_batched` /
-/// `fused_qk_l2_norm_scale_f32_batched` which are all
-/// `#[cfg(feature = "deltanet")]` on `rdna-compute`. When the
-/// `deltanet` feature is OFF (only happens in `--no-default-features`
-/// configurations), this function falls back to the pre-B.2 Q-chunk
-/// passthrough so the module still compiles. Production calibration
-/// runs always use default features → real recurrence.
+/// `fused_qk_l2_norm_scale_f32_batched` / `conv1d_silu_split_f32_n` /
+/// `gated_norm_f32_batched` which are all `#[cfg(feature = "deltanet")]`
+/// on `rdna-compute`. When the `deltanet` feature is OFF (only happens
+/// in `--no-default-features` configurations), this function falls
+/// back to the pre-B.2 Q-chunk passthrough so the module still
+/// compiles. Production calibration runs always use default features →
+/// real recurrence.
 ///
 /// Returns a freshly-allocated `[seq_len, dim]` BF16 tensor that the
 /// caller must free.
@@ -762,12 +831,13 @@ fn forward_deltanet_layer(
     )
     .map_err(|e| e.to_string())?;
 
-    // ── Z projection: fire capture hook then drop (math skipped) ───────
+    // ── Z projection: F32 [seq_len, d_inner] (kept live for gated norm) ─
     //
     // Production uses Z in `gated_norm_f32(attn_out, z, ...) * silu(z)`
-    // after the recurrence. The cast-trick path skips gated_norm —
-    // calibration shortcut documented at module-level. We still need
-    // to fire `gemm_bf16` here so the `in_proj_z` capture hook accumulates
+    // after the recurrence. The DeltaNet-full path keeps `z_f32`
+    // allocated through to step 11 (gated_norm_f32_batched) so the
+    // post-recurrence silu(z) post-multiply runs against the real Z
+    // projection. Capture hook fires here so `in_proj_z` accumulates
     // Σx² over the right input distribution.
     let z_f32 = gpu
         .alloc_tensor(&[seq_len * d_inner], DType::F32)
@@ -779,7 +849,6 @@ fn forward_deltanet_layer(
         d_inner, wz.shape[1], seq_len,
     )
     .map_err(|e| e.to_string())?;
-    gpu.free_tensor(z_f32).map_err(|e| e.to_string())?;
 
     // ── A projection (alpha base): F32 [seq_len, n_v_heads] ────────────
     let alpha_f32 = gpu
@@ -809,31 +878,67 @@ fn forward_deltanet_layer(
     // splits of qkv_f32 (already projected), not the BF16 input.
     h_for_linears.drop_owned(gpu).map_err(|e| e.to_string())?;
 
-    // ── Gate / beta finalization: simplified path ──────────────────────
+    // ── Resolve SSM aux tensors (A_log, dt_bias, conv1d, gated norm) ──
+    //
+    // Look up the real F32 tensors loaded by `bf16_loader::load_bf16_model`
+    // via `is_ssm_aux_tensor`. Missing tensors are signalled to the
+    // forward path through `Option`s — older fixtures that pre-date the
+    // SSM-aux loader can still run with the pre-2026-05-20 B.2 zero-aux
+    // approximation. `warn_once` so a fixture run doesn't flood the log.
+    let a_log_name = format!("{p}.linear_attn.A_log");
+    let dt_bias_name = format!("{p}.linear_attn.dt_bias");
+    let conv_w_name = format!("{p}.linear_attn.conv1d.weight");
+    let gated_norm_name = format!("{p}.linear_attn.norm.weight");
+    let a_log_opt = try_get_norm(trunk, &a_log_name);
+    let dt_bias_opt = try_get_norm(trunk, &dt_bias_name);
+    let conv_w_opt = try_get_norm(trunk, &conv_w_name);
+    let gated_norm_opt = try_get_norm(trunk, &gated_norm_name);
+
+    // ── Gate / beta finalization (real A_log + dt_bias when available) ─
     //
     // Production: alpha_kernel = softplus(in_proj_a + dt_bias) * -exp(A_log)
     //             beta_kernel  = sigmoid(in_proj_b)
-    // We approximate by feeding zero `dt_bias` / zero `A_log` (those F32
-    // tensors aren't loaded by `bf16_loader`). The kernel's downstream
-    // `expf(gate)` term then produces alpha ∈ (0, 1) as expected, just
-    // with a constant decay-rate offset relative to production. Beta is
-    // exact since it doesn't depend on the aux tensors.
-    let zero_aux = gpu
-        .zeros(&[n_v_heads], DType::F32)
-        .map_err(|e| e.to_string())?;
+    // The SSM aux loader puts A_log and dt_bias into `trunk.norms` keyed
+    // by their canonical HF names. When either is missing (older fixtures),
+    // we fall back to a zero scratch tensor to preserve the B.2 behaviour.
+    let zero_aux = match (a_log_opt, dt_bias_opt) {
+        (Some(_), Some(_)) => None,
+        _ => {
+            warn_deltanet_missing(&a_log_name, a_log_opt.is_none());
+            warn_deltanet_missing(&dt_bias_name, dt_bias_opt.is_none());
+            Some(gpu.zeros(&[n_v_heads], DType::F32).map_err(|e| e.to_string())?)
+        }
+    };
+    let a_log_view = a_log_opt.unwrap_or_else(|| zero_aux.as_ref().unwrap());
+    let dt_bias_view = dt_bias_opt.unwrap_or_else(|| zero_aux.as_ref().unwrap());
     gpu.fused_sigmoid_alpha_gate_f32_batched(
-        &beta_f32, &alpha_f32, &zero_aux, &zero_aux, n_v_heads, seq_len,
+        &beta_f32, &alpha_f32, dt_bias_view, a_log_view, n_v_heads, seq_len,
     )
     .map_err(|e| e.to_string())?;
-    gpu.free_tensor(zero_aux).map_err(|e| e.to_string())?;
+    if let Some(z) = zero_aux {
+        gpu.free_tensor(z).map_err(|e| e.to_string())?;
+    }
 
-    // ── Split qkv_f32 into Q / K / V slices ────────────────────────────
+    // ── conv1d + SiLU + Q/K/V split ────────────────────────────────────
     //
-    // qkv_f32 row layout: [Q (k_dim) | K (k_dim) | V (d_inner)] per token.
-    // Per-row memcpy is the simplest path (no new kernel, per spec). For
-    // a 0.8B forward at seq_len=2048 this is ~6k DtoD calls per layer —
-    // calibration runs offline so the overhead is acceptable. If this
-    // becomes a hot spot, a fused split kernel would amortize it.
+    // Production runs `conv1d_silu_split_f32_n` (depth-wise 4-tap causal
+    // conv per channel followed by SiLU activation) which advances a
+    // ring-buffer state of size `(kernel-1) * qkv_dim = 3 * qkv_dim`
+    // F32 elements. For the calibration forward we re-initialize the
+    // state to zeros at every layer (one sequence per call — the spec
+    // explicitly notes "Recurrent state initializes to zeros at the
+    // start of each `forward_prefill_bf16` invocation").
+    //
+    // The kernel reads `input[t * n_channels + c]` (n_channels = 2*k_dim
+    // + d_inner = qkv_dim) and writes to separate Q/K/V buffers; this
+    // replaces the per-row memcpy split that the pre-2026-05-20 B.2
+    // path used.
+    //
+    // When `conv1d.weight` is absent (fixture trunks), fall back to the
+    // raw per-row memcpy split with NO conv math and NO SiLU. This is
+    // the pre-2026-05-20 B.2 calibration shortcut — the captured Σx²
+    // statistics will be biased toward the un-activated linear projection
+    // distribution, but the surrounding pipeline still runs.
     let q_part = gpu
         .alloc_tensor(&[seq_len * k_dim], DType::F32)
         .map_err(|e| e.to_string())?;
@@ -843,29 +948,45 @@ fn forward_deltanet_layer(
     let v_part = gpu
         .alloc_tensor(&[seq_len * d_inner], DType::F32)
         .map_err(|e| e.to_string())?;
-    for t in 0..seq_len {
-        let row_byte = t * qkv_dim * 4;
-        gpu.hip
-            .memcpy_dtod_at(
-                &q_part.buf, t * k_dim * 4,
-                &qkv_f32.buf, row_byte,
-                k_dim * 4,
-            )
+    if let Some(conv_w) = conv_w_opt {
+        // Production path: fused conv + SiLU + split.
+        let conv_state = gpu
+            .zeros(&[qkv_dim * 3], DType::F32)
             .map_err(|e| e.to_string())?;
-        gpu.hip
-            .memcpy_dtod_at(
-                &k_part.buf, t * k_dim * 4,
-                &qkv_f32.buf, row_byte + k_dim * 4,
-                k_dim * 4,
-            )
-            .map_err(|e| e.to_string())?;
-        gpu.hip
-            .memcpy_dtod_at(
-                &v_part.buf, t * d_inner * 4,
-                &qkv_f32.buf, row_byte + 2 * k_dim * 4,
-                d_inner * 4,
-            )
-            .map_err(|e| e.to_string())?;
+        gpu.conv1d_silu_split_f32_n(
+            &q_part, &k_part, &v_part,
+            &qkv_f32, conv_w, &conv_state,
+            k_dim, d_inner, seq_len,
+        )
+        .map_err(|e| e.to_string())?;
+        gpu.free_tensor(conv_state).map_err(|e| e.to_string())?;
+    } else {
+        // Fixture fallback: raw split (no conv1d weight available).
+        warn_deltanet_missing(&conv_w_name, true);
+        for t in 0..seq_len {
+            let row_byte = t * qkv_dim * 4;
+            gpu.hip
+                .memcpy_dtod_at(
+                    &q_part.buf, t * k_dim * 4,
+                    &qkv_f32.buf, row_byte,
+                    k_dim * 4,
+                )
+                .map_err(|e| e.to_string())?;
+            gpu.hip
+                .memcpy_dtod_at(
+                    &k_part.buf, t * k_dim * 4,
+                    &qkv_f32.buf, row_byte + k_dim * 4,
+                    k_dim * 4,
+                )
+                .map_err(|e| e.to_string())?;
+            gpu.hip
+                .memcpy_dtod_at(
+                    &v_part.buf, t * d_inner * 4,
+                    &qkv_f32.buf, row_byte + 2 * k_dim * 4,
+                    d_inner * 4,
+                )
+                .map_err(|e| e.to_string())?;
+        }
     }
     gpu.free_tensor(qkv_f32).map_err(|e| e.to_string())?;
 
@@ -961,13 +1082,57 @@ fn forward_deltanet_layer(
     gpu.free_tensor(beta_f32).map_err(|e| e.to_string())?;
     gpu.free_tensor(state).map_err(|e| e.to_string())?;
 
-    // ── Cast F32 attention output → BF16 for out_proj input ────────────
+    // ── Gated output norm: rmsnorm(attn_out, w) * silu(z) ─────────────
+    //
+    // Production runs `gated_norm_f32_batched`. The kernel:
+    //   1. Per-head RMSNorm on `attn_out` (mean of squares over the
+    //      `head_dim` axis, rsqrt, multiply).
+    //   2. Per-head multiply by `norm_weight[head_dim]` (init-from-one,
+    //      stored without `+= 1.0` bake — `is_gated_norm_tensor`).
+    //   3. Element-wise multiply by `silu(z)` (F32 silu).
+    // Grid `[n_v_heads, seq_len, 1]` with 32-wide reduction per head.
+    //
+    // When the gated-norm weight is absent (fixture trunks), we
+    // bypass the gated norm + silu(z) entirely — the un-normed
+    // recurrence output flows straight into out_proj. This matches the
+    // pre-2026-05-20 B.2 shortcut behaviour, which is the legacy
+    // calibration path for sandbox runs without the SSM-aux loader.
+    //
+    // `normed_f32` is `[seq_len, d_inner]` row-major (same shape as
+    // `attn_out_f32`); the kernel reads `attn_out`/`z`/writes `normed`
+    // in lock-step with no aliasing.
+    let normed_f32 = gpu
+        .alloc_tensor(&[seq_len * d_inner], DType::F32)
+        .map_err(|e| e.to_string())?;
+    if let Some(gated_norm_w) = gated_norm_opt {
+        gpu.gated_norm_f32_batched(
+            &attn_out_f32, &z_f32, gated_norm_w,
+            &normed_f32,
+            n_v_heads, head_dim, RMS_NORM_EPS, seq_len,
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        warn_deltanet_missing(&gated_norm_name, true);
+        // Bit-exact copy of attn_out_f32 into normed_f32 so the
+        // downstream BF16 cast + out_proj see the un-normed output.
+        gpu.hip
+            .memcpy_dtod_at(
+                &normed_f32.buf, 0,
+                &attn_out_f32.buf, 0,
+                seq_len * d_inner * 4,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    gpu.free_tensor(attn_out_f32).map_err(|e| e.to_string())?;
+    gpu.free_tensor(z_f32).map_err(|e| e.to_string())?;
+
+    // ── Cast F32 gated-norm output → BF16 for out_proj input ───────────
     let attn_pre_o_bf16 = gpu
         .alloc_tensor(&[seq_len * d_inner], DType::BF16)
         .map_err(|e| e.to_string())?;
-    gpu.convert_f32_to_bf16(&attn_out_f32, &attn_pre_o_bf16, seq_len * d_inner)
+    gpu.convert_f32_to_bf16(&normed_f32, &attn_pre_o_bf16, seq_len * d_inner)
         .map_err(|e| e.to_string())?;
-    gpu.free_tensor(attn_out_f32).map_err(|e| e.to_string())?;
+    gpu.free_tensor(normed_f32).map_err(|e| e.to_string())?;
 
     // ── out_proj: attn_pre_o · wo^T → F32 [seq_len, dim] ───────────────
     let attn_out_proj_f32 = gpu

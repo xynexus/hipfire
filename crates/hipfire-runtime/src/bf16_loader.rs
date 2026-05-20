@@ -257,6 +257,50 @@ pub fn is_norm_tensor(name: &str) -> bool {
         || bare.ends_with(".norm")
 }
 
+/// Returns true if `name` refers to a DeltaNet SSM auxiliary tensor that
+/// needs to be loaded as F32 alongside the BF16 dense weights:
+///
+///   - `*.linear_attn.A_log`    — F32 [n_v_heads], learnable log-decay base
+///   - `*.linear_attn.dt_bias`  — BF16 [n_v_heads] on disk; needs decode to F32
+///   - `*.linear_attn.conv1d.weight` — BF16 [conv_dim, 1, kernel_size] on
+///     disk; needs decode to F32 then flatten to [conv_dim * kernel_size]
+///
+/// These tensors feed the DeltaNet recurrence preamble (conv1d + SiLU)
+/// and the `fused_sigmoid_alpha_gate_f32_batched` kernel which expects
+/// `dt_bias` and `a_log` as F32 inputs.
+///
+/// Returned as a (predicate-true, role) pair so the caller can branch
+/// on the role to apply the right decode path:
+///   - `Some(SsmAuxRole::ALog)`     — already F32 on disk; load raw
+///   - `Some(SsmAuxRole::DtBias)`   — BF16/F16 on disk; decode to F32
+///   - `Some(SsmAuxRole::Conv1d)`   — BF16/F16 on disk; decode to F32
+///   - `None`                       — not an SSM aux tensor
+pub fn is_ssm_aux_tensor(name: &str) -> Option<SsmAuxRole> {
+    let bare = name.strip_suffix(".weight").unwrap_or(name);
+    if bare.ends_with(".linear_attn.A_log") {
+        Some(SsmAuxRole::ALog)
+    } else if bare.ends_with(".linear_attn.dt_bias") {
+        Some(SsmAuxRole::DtBias)
+    } else if bare.ends_with(".linear_attn.conv1d") {
+        Some(SsmAuxRole::Conv1d)
+    } else {
+        None
+    }
+}
+
+/// Role of a DeltaNet SSM auxiliary tensor — drives the decode path in
+/// `load_bf16_model`. See `is_ssm_aux_tensor` for the predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsmAuxRole {
+    /// `*.linear_attn.A_log` — F32 [n_v_heads] on disk.
+    ALog,
+    /// `*.linear_attn.dt_bias` — BF16/F16 [n_v_heads] on disk.
+    DtBias,
+    /// `*.linear_attn.conv1d.weight` — BF16/F16 [conv_dim, 1, kernel_size]
+    /// on disk; flattened to [conv_dim * kernel_size] on device.
+    Conv1d,
+}
+
 /// Returns true if `name` refers to a "gated" / "init-from-one" norm whose
 /// weight is stored with the `1.0` offset ALREADY baked in (or is a
 /// LayerNorm, which has its own gamma initialized to 1). For these the
@@ -423,8 +467,9 @@ pub fn load_bf16_model(gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16> 
 
             let numel: usize = meta.shape.iter().product();
             let is_norm = is_norm_tensor(&name);
+            let ssm_role = is_ssm_aux_tensor(&name);
 
-            // Routing for the three classes of weights we care about
+            // Routing for the four classes of weights we care about
             // in the calibration forward pass:
             //
             //   - BF16 dense weights (Linear / projection / embedding):
@@ -437,7 +482,14 @@ pub fn load_bf16_model(gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16> 
             //     `norms` as a `DType::F32` GpuTensor. The Tier 1
             //     forward wires these through `gpu.rmsnorm_batched`
             //     wrapped by a small BF16 → F32 → BF16 cast.
-            //   - Anything else (biases, A_log, dt_bias, etc.) is
+            //   - DeltaNet SSM aux tensors (`*.linear_attn.A_log`,
+            //     `*.linear_attn.dt_bias`, `*.linear_attn.conv1d.weight`):
+            //     decoded to F32 with NO bake (matches the production
+            //     `load_raw_f32` / `load_any_as_f32` path in qwen35.rs).
+            //     Stored in `norms` (the F32 map) keyed by canonical
+            //     HF name so the DeltaNet forward can look them up
+            //     via the same `trunk.norms.get(name)` helper.
+            //   - Anything else (biases, MTP heads, vision stack) is
             //     skipped with a warning. Calibration doesn't depend
             //     on them; the captured Σx² / Hessian moments only
             //     need the dense-weight inputs.
@@ -536,6 +588,109 @@ pub fn load_bf16_model(gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16> 
 
                 let tensor = gpu.upload_f32(&baked, &meta.shape)?;
                 total_bytes += baked.len() * 4;
+                norms.insert(name, tensor);
+                continue;
+            }
+
+            // DeltaNet SSM aux tensors: A_log, dt_bias, conv1d.weight.
+            // Decoded to F32 with NO bake. Stored in `norms` (the F32
+            // tensor map) so the DeltaNet forward can resolve them via
+            // the same lookup path as RMSNorm weights. The keys used are
+            // the bare HF safetensors names (e.g.
+            // `model.layers.0.linear_attn.A_log`,
+            // `model.layers.0.linear_attn.conv1d.weight`) — the forward
+            // builds these via the same `{p}.linear_attn.<role>` pattern
+            // that production qwen35.rs uses.
+            //
+            // Shapes on device:
+            //   - A_log:           [n_v_heads]
+            //   - dt_bias:         [n_v_heads]
+            //   - conv1d.weight:   [conv_dim * kernel_size] flattened
+            //     (HF stores [conv_dim, 1, kernel_size]; the conv1d HIP
+            //     kernel indexes `w[c*kernel + k]` so the flatten is
+            //     row-major contiguous).
+            if let Some(role) = ssm_role {
+                let f32_data: Vec<f32> = match meta.dtype.as_str() {
+                    "F32" => {
+                        let expected = numel * 4;
+                        if bytes.len() != expected {
+                            return Err(HipError::new(
+                                0,
+                                &format!(
+                                    "ssm aux tensor {} F32 payload size mismatch: header says \
+                                     {} elements * 4B = {}, data_offsets give {}",
+                                    name, numel, expected, bytes.len(),
+                                ),
+                            ));
+                        }
+                        bytes
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    }
+                    "F16" => {
+                        let expected = numel * 2;
+                        if bytes.len() != expected {
+                            return Err(HipError::new(
+                                0,
+                                &format!(
+                                    "ssm aux tensor {} F16 payload size mismatch: header says \
+                                     {} elements * 2B = {}, data_offsets give {}",
+                                    name, numel, expected, bytes.len(),
+                                ),
+                            ));
+                        }
+                        bytes
+                            .chunks_exact(2)
+                            .map(|c| {
+                                crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))
+                            })
+                            .collect()
+                    }
+                    "BF16" => {
+                        let expected = numel * 2;
+                        if bytes.len() != expected {
+                            return Err(HipError::new(
+                                0,
+                                &format!(
+                                    "ssm aux tensor {} BF16 payload size mismatch: header says \
+                                     {} elements * 2B = {}, data_offsets give {}",
+                                    name, numel, expected, bytes.len(),
+                                ),
+                            ));
+                        }
+                        bytes
+                            .chunks_exact(2)
+                            .map(|c| {
+                                let bits = (u16::from_le_bytes([c[0], c[1]]) as u32) << 16;
+                                f32::from_bits(bits)
+                            })
+                            .collect()
+                    }
+                    other => {
+                        eprintln!(
+                            "  skipping ssm aux tensor {} (unsupported dtype={})",
+                            name, other
+                        );
+                        continue;
+                    }
+                };
+
+                // For conv1d.weight we store as a flat [conv_dim *
+                // kernel_size] tensor (the on-disk shape is
+                // [conv_dim, 1, kernel_size]; numel matches the flat
+                // length). `upload_f32` uses the supplied shape for the
+                // GpuTensor wrapper; the conv1d HIP kernel only reads
+                // `weight[c * kernel + k]` linearly, so any 1-D shape
+                // that covers `numel` works. We use the bare 1-D shape
+                // so downstream callers don't get confused by a 3-D
+                // device tensor for a logically-flat buffer.
+                let device_shape: Vec<usize> = match role {
+                    SsmAuxRole::Conv1d => vec![numel],
+                    SsmAuxRole::ALog | SsmAuxRole::DtBias => meta.shape.clone(),
+                };
+                let tensor = gpu.upload_f32(&f32_data, &device_shape)?;
+                total_bytes += f32_data.len() * 4;
                 norms.insert(name, tensor);
                 continue;
             }
@@ -712,6 +867,47 @@ mod tests {
         assert!(is_gated_norm_tensor(
             "model.visual.merger.norm.weight"
         ));
+    }
+
+    #[test]
+    fn is_ssm_aux_tensor_recognizes_deltanet_aux() {
+        // F32 log-decay base — stored as F32 on disk in Qwen3.5/3.6.
+        assert_eq!(
+            is_ssm_aux_tensor("model.layers.0.linear_attn.A_log"),
+            Some(SsmAuxRole::ALog),
+        );
+        // BF16 time-step bias — needs decode to F32 on load.
+        assert_eq!(
+            is_ssm_aux_tensor("model.layers.0.linear_attn.dt_bias"),
+            Some(SsmAuxRole::DtBias),
+        );
+        // BF16 depth-wise conv1d weight — `[conv_dim, 1, kernel]` on
+        // disk, flattened to `[conv_dim * kernel]` on device.
+        assert_eq!(
+            is_ssm_aux_tensor("model.layers.0.linear_attn.conv1d.weight"),
+            Some(SsmAuxRole::Conv1d),
+        );
+        // Qwen3.6 VL nests under `model.language_model.layers.N.*`.
+        assert_eq!(
+            is_ssm_aux_tensor("model.language_model.layers.0.linear_attn.A_log"),
+            Some(SsmAuxRole::ALog),
+        );
+        assert_eq!(
+            is_ssm_aux_tensor("model.language_model.layers.0.linear_attn.conv1d.weight"),
+            Some(SsmAuxRole::Conv1d),
+        );
+    }
+
+    #[test]
+    fn is_ssm_aux_tensor_rejects_dense_and_norms() {
+        // Norms, dense weights, embeds all return None.
+        assert!(is_ssm_aux_tensor("model.layers.0.linear_attn.norm.weight").is_none());
+        assert!(is_ssm_aux_tensor("model.layers.0.linear_attn.in_proj_qkv.weight").is_none());
+        assert!(is_ssm_aux_tensor("model.layers.0.linear_attn.in_proj_a.weight").is_none());
+        assert!(is_ssm_aux_tensor("model.layers.0.linear_attn.out_proj.weight").is_none());
+        assert!(is_ssm_aux_tensor("model.layers.0.input_layernorm.weight").is_none());
+        assert!(is_ssm_aux_tensor("model.embed_tokens.weight").is_none());
+        assert!(is_ssm_aux_tensor("lm_head.weight").is_none());
     }
 
     #[test]
