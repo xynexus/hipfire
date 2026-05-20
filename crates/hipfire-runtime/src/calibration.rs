@@ -348,9 +348,18 @@ fn parse_llama_tokenize_stdout(stdout: &str) -> Result<Vec<u32>, String> {
 /// `{name}.in_sum2` + `{name}.counts`.
 #[derive(Debug)]
 pub struct ImatrixEntry {
-    /// Canonical HF safetensors tensor key
-    /// (e.g. `model.layers.0.self_attn.q_proj.weight`).
+    /// Canonical HF safetensors tensor key, with the literal expert
+    /// index preserved for MoE per-expert tensors (e.g.
+    /// `model.layers.0.self_attn.q_proj.weight` or
+    /// `model.language_model.layers.5.mlp.experts.23.gate_proj.weight`).
     pub name: String,
+    /// Expert index for MoE per-expert tensors. `0` for dense tensors.
+    /// Mirrors the HFHS-v1 binary format's `expert_idx` field for
+    /// cross-format consistency (the GGUF imatrix writer keys by name
+    /// alone and ignores this field, but Astrea-style downstream tools
+    /// can still discover the per-expert index without re-parsing the
+    /// tensor name).
+    pub expert_idx: u32,
     /// Per-channel `Σ x²` — one F32 value per K (input dim).
     /// Length = K.
     pub in_sum2: Vec<f32>,
@@ -381,10 +390,18 @@ struct ImatrixAccum {
 /// `ActivationCapture::capture` trait method takes `&self`. The lock
 /// is held only across the on-GPU dispatch — no per-element work
 /// happens under the lock.
+///
+/// Keyed by `(tensor_name, expert_idx)` so MoE per-expert tensors with
+/// the SAME suffix (e.g. `.experts.0.gate_proj.weight` vs
+/// `.experts.1.gate_proj.weight`) accumulate into distinct entries.
+/// The canonical name preserves the literal expert index, matching the
+/// HFHS-v1 layout — see `parse_expert_idx` for the parsing convention.
 pub struct ImatrixCollector {
-    /// Per-tensor accumulators. Keyed by canonical tensor name (the
-    /// `tensor_name` arg passed to `capture`).
-    accumulators: Mutex<HashMap<String, ImatrixAccum>>,
+    /// Per-tensor accumulators. Keyed by `(canonical_tensor_name,
+    /// expert_idx)`. For dense tensors `expert_idx == 0`; for MoE
+    /// per-expert tensors `canonical_tensor_name` already contains the
+    /// literal `.experts.<E>.` substring + `expert_idx == E`.
+    accumulators: Mutex<HashMap<(String, u32), ImatrixAccum>>,
     /// When true, accumulate for `lm_head` / `output` tensors too.
     /// Mirrors llama-imatrix's `--process-output` flag.
     process_output: bool,
@@ -414,21 +431,29 @@ impl ImatrixCollector {
             .lock()
             .map_err(|e| format!("ImatrixCollector mutex poisoned at drain: {e}"))?;
         let mut entries = Vec::with_capacity(acc_map.len());
-        for (name, accum) in acc_map.iter() {
+        for ((name, expert_idx), accum) in acc_map.iter() {
             let in_sum2 = gpu
                 .download_f32(&accum.acc)
                 .map_err(|e| format!("download_f32 failed for {name}: {e}"))?;
             let counts = vec![accum.n_tokens as f32; accum.k];
             entries.push(ImatrixEntry {
                 name: name.clone(),
+                expert_idx: *expert_idx,
                 in_sum2,
                 counts,
             });
         }
-        // Sort by name for deterministic output ordering (the GGUF
-        // writer keys by name anyway, but downstream comparators
-        // appreciate stable ordering).
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        // Sort by (name, expert_idx) for deterministic output ordering
+        // (the GGUF writer keys by name anyway, but downstream
+        // comparators appreciate stable ordering — and per-expert
+        // tensors with the same suffix differ only by expert_idx in
+        // the canonical name string, so a plain name sort already
+        // groups them correctly).
+        entries.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.expert_idx.cmp(&b.expert_idx))
+        });
         Ok(entries)
     }
 
@@ -472,7 +497,12 @@ impl ActivationCapture for ImatrixCollector {
         tensor_name: &str,
         input: &GpuTensor,
     ) {
-        if !self.should_capture(tensor_name) {
+        // Parse expert index out of MoE per-expert names; the canonical
+        // key carries the literal expert idx in the name string so the
+        // GGUF writer emits it on-disk verbatim, and the separate
+        // `expert_idx` field feeds the HFHS-v1 per-expert layout.
+        let (canonical, expert_idx) = parse_expert_idx(tensor_name);
+        if !self.should_capture(&canonical) {
             return;
         }
         let k = match input.shape.last() {
@@ -484,14 +514,15 @@ impl ActivationCapture for ImatrixCollector {
             Ok(a) => a,
             Err(_) => return,
         };
-        if !accs.contains_key(tensor_name) {
+        let key = (canonical, expert_idx);
+        if !accs.contains_key(&key) {
             let acc = match gpu.zeros(&[k], DType::F32) {
                 Ok(a) => a,
                 Err(_) => return,
             };
-            accs.insert(tensor_name.to_string(), ImatrixAccum { acc, n_tokens: 0, k });
+            accs.insert(key.clone(), ImatrixAccum { acc, n_tokens: 0, k });
         }
-        let accum = accs.get_mut(tensor_name).unwrap();
+        let accum = accs.get_mut(&key).unwrap();
         // sumsq_reduce_bf16 needs a GPU scalar for n_tokens (writes into it).
         // We track host-side n_tokens separately; the GPU scalar is a throwaway.
         let mut n_scratch = match gpu.zeros(&[1], DType::F32) {
