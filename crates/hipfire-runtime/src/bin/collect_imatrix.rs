@@ -42,7 +42,9 @@
 
 use hipfire_runtime::bf16_forward;
 use hipfire_runtime::bf16_loader;
-use hipfire_runtime::calibration::{tokenize_corpus, ImatrixCollector};
+use hipfire_runtime::calibration::{
+    tokenize_corpus, tokenize_corpus_via_llama_tokenize, ImatrixCollector,
+};
 use rdna_compute::Gpu;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -64,6 +66,31 @@ impl OutputFormat {
             "gguf" => Ok(Self::Gguf),
             other => Err(format!(
                 "unknown --format value {other:?}; expected \"imq\" or \"gguf\""
+            )),
+        }
+    }
+}
+
+/// Tokenizer source. The default `LlamaCpp` shells out to llama.cpp's
+/// `llama-tokenize` binary so the Tier 1 token stream is byte-identical
+/// with the Tier 2 `llama-imatrix` reference (Path D goal: per-tensor
+/// NRMSE ≤ 0.01). `Hipfire` falls back to hipfire's native BPE encoder
+/// for environments where `llama-tokenize` isn't available; downstream
+/// data won't be directly comparable with llama-imatrix output, but the
+/// pipeline remains internally consistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenizerKind {
+    Hipfire,
+    LlamaCpp,
+}
+
+impl TokenizerKind {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "hipfire" => Ok(Self::Hipfire),
+            "llama-cpp" | "llama.cpp" | "llamacpp" => Ok(Self::LlamaCpp),
+            other => Err(format!(
+                "unknown --tokenizer value {other:?}; expected \"hipfire\" or \"llama-cpp\""
             )),
         }
     }
@@ -94,18 +121,39 @@ struct Args {
     /// Also collect data for the `output` / `lm_head` tensor. Mirrors
     /// llama-imatrix's `--process-output` flag.
     process_output: bool,
+    /// Tokenizer source — see [`TokenizerKind`]. Defaults to `LlamaCpp`
+    /// (subprocess parity with llama-imatrix).
+    tokenizer: TokenizerKind,
+    /// Path to the `llama-tokenize` binary. Used when `tokenizer ==
+    /// LlamaCpp`. Defaults to `/workspace/llama.cpp/build/bin/llama-tokenize`
+    /// (MI300x calibration droplet layout); override with
+    /// `--llama-tokenize-bin <path>` when running elsewhere.
+    llama_tokenize_bin: PathBuf,
+    /// Path to the BF16 GGUF that carries the tokenizer metadata for the
+    /// model under calibration. **Required** when `tokenizer == LlamaCpp`.
+    /// Must be the matching GGUF (different families ship different BPE
+    /// pretokenizers; cross-family GGUFs will silently mis-tokenize).
+    bf16_gguf: Option<PathBuf>,
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  collect_imatrix --hf-model <dir> --corpus <file> --output <path>\n\
+        "Usage:\n  collect_imatrix --hf-model <dir> --corpus <file> --output <path> \\\n   \
+                          [--tokenizer llama-cpp --bf16-gguf <path>]\n\
          \n\
          Optional flags:\n  \
-           --format <imq|gguf>   output container (default: imq — hipfire-native\n  \
-                                 binary; gguf = llama-imatrix-compatible)\n  \
-           --n-ctx <N>           tokens per calibration sequence (default: 2048)\n  \
-           --n-sequences <N>     calibration sequences (default: 128)\n  \
-           --process-output      also collect data for lm_head / output tensor\n\
+           --format <imq|gguf>           output container (default: imq — hipfire-native\n  \
+                                         binary; gguf = llama-imatrix-compatible)\n  \
+           --n-ctx <N>                   tokens per calibration sequence (default: 2048)\n  \
+           --n-sequences <N>             calibration sequences (default: 128)\n  \
+           --process-output              also collect data for lm_head / output tensor\n  \
+           --tokenizer <hipfire|llama-cpp>\n  \
+                                         tokenizer source (default: llama-cpp — byte-parity\n  \
+                                         with llama-imatrix; hipfire = native BPE fallback)\n  \
+           --llama-tokenize-bin <path>   path to the llama-tokenize binary\n  \
+                                         (default: /workspace/llama.cpp/build/bin/llama-tokenize)\n  \
+           --bf16-gguf <path>            BF16 GGUF carrying the tokenizer metadata\n  \
+                                         (REQUIRED when --tokenizer llama-cpp)\n\
          \n\
          Tier 1 hipfire-native imatrix collector. See\n\
          docs/investigations/2026-05-19-tier1-bf16-mfma/ for the foundation POC."
@@ -120,6 +168,10 @@ fn parse_args() -> Args {
     let mut n_ctx: usize = 2048;
     let mut n_sequences: usize = 128;
     let mut process_output = false;
+    let mut tokenizer: TokenizerKind = TokenizerKind::LlamaCpp;
+    let mut llama_tokenize_bin: PathBuf =
+        PathBuf::from("/workspace/llama.cpp/build/bin/llama-tokenize");
+    let mut bf16_gguf: Option<PathBuf> = None;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -159,6 +211,22 @@ fn parse_args() -> Args {
                 process_output = true;
                 i += 1;
             }
+            "--tokenizer" => {
+                tokenizer = TokenizerKind::parse(&argv[i + 1]).unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    print_usage();
+                    std::process::exit(1);
+                });
+                i += 2;
+            }
+            "--llama-tokenize-bin" => {
+                llama_tokenize_bin = PathBuf::from(&argv[i + 1]);
+                i += 2;
+            }
+            "--bf16-gguf" => {
+                bf16_gguf = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -186,6 +254,17 @@ fn parse_args() -> Args {
         print_usage();
         std::process::exit(1);
     });
+    if tokenizer == TokenizerKind::LlamaCpp && bf16_gguf.is_none() {
+        eprintln!(
+            "error: --bf16-gguf is required when --tokenizer llama-cpp (the default).\n\
+             Pass either:\n  \
+               --bf16-gguf <path-to-bf16.gguf>            (recommended — byte-parity with llama-imatrix)\n  \
+             or:\n  \
+               --tokenizer hipfire                        (fallback to hipfire native BPE)"
+        );
+        print_usage();
+        std::process::exit(1);
+    }
 
     Args {
         hf_model,
@@ -195,6 +274,9 @@ fn parse_args() -> Args {
         n_ctx,
         n_sequences,
         process_output,
+        tokenizer,
+        llama_tokenize_bin,
+        bf16_gguf,
     }
 }
 
@@ -214,6 +296,22 @@ fn main() {
     eprintln!("  n-ctx:          {}", args.n_ctx);
     eprintln!("  n-sequences:    {}", args.n_sequences);
     eprintln!("  process-output: {}", args.process_output);
+    eprintln!(
+        "  tokenizer:      {}",
+        match args.tokenizer {
+            TokenizerKind::Hipfire => "hipfire (native BPE — NOT byte-parity with llama-imatrix)",
+            TokenizerKind::LlamaCpp => "llama-cpp (subprocess llama-tokenize for byte-parity)",
+        }
+    );
+    if args.tokenizer == TokenizerKind::LlamaCpp {
+        eprintln!(
+            "  llama-tokenize: {}",
+            args.llama_tokenize_bin.display()
+        );
+        if let Some(g) = &args.bf16_gguf {
+            eprintln!("  bf16-gguf:      {}", g.display());
+        }
+    }
     eprintln!();
 
     if let Err(msg) = run(&args) {
@@ -245,12 +343,40 @@ fn run(args: &Args) -> Result<(), String> {
     let collector = Arc::new(ImatrixCollector::new(args.process_output));
     gpu.capture_handler = Some(collector.clone());
 
-    // 4. Tokenize corpus.
-    eprintln!("[4/7] tokenizing corpus...");
-    let corpus_text = std::fs::read_to_string(&args.corpus)
-        .map_err(|e| format!("failed to read corpus at {}: {e}", args.corpus.display()))?;
-    let tokens = tokenize_corpus(&args.hf_model, &corpus_text)?;
-    eprintln!("[4/7] tokenized: {} tokens", tokens.len());
+    // 4. Tokenize corpus. Path D goal (per-tensor NRMSE ≤ 0.01) requires
+    //    byte-identical token stream with the Tier 2 llama-imatrix
+    //    reference, so the default routes through llama.cpp's
+    //    `llama-tokenize` binary. The `--tokenizer hipfire` fallback is
+    //    preserved for environments where llama-tokenize isn't available.
+    let tokens = match args.tokenizer {
+        TokenizerKind::LlamaCpp => {
+            let bf16_gguf = args.bf16_gguf.as_ref().ok_or_else(|| {
+                "internal error: --tokenizer llama-cpp reached run() with no \
+                 --bf16-gguf; the parse_args validator should have caught this"
+                    .to_string()
+            })?;
+            eprintln!(
+                "[4/7] tokenizing corpus via subprocess llama-tokenize ({}) for byte-parity with llama-imatrix...",
+                args.llama_tokenize_bin.display()
+            );
+            let toks = tokenize_corpus_via_llama_tokenize(
+                &args.llama_tokenize_bin,
+                bf16_gguf,
+                &args.corpus,
+            )?;
+            eprintln!("[4/7] tokenized via llama-tokenize: {} tokens", toks.len());
+            toks
+        }
+        TokenizerKind::Hipfire => {
+            eprintln!("[4/7] tokenizing corpus via hipfire native BPE (no llama-imatrix parity)...");
+            let corpus_text = std::fs::read_to_string(&args.corpus).map_err(|e| {
+                format!("failed to read corpus at {}: {e}", args.corpus.display())
+            })?;
+            let toks = tokenize_corpus(&args.hf_model, &corpus_text)?;
+            eprintln!("[4/7] tokenized via hipfire BPE: {} tokens", toks.len());
+            toks
+        }
+    };
 
     // 5. Loop over N sequences of ctx_len tokens each.
     let total_needed = args.n_sequences * args.n_ctx;

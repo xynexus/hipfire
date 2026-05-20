@@ -44,6 +44,7 @@ use rdna_compute::{ActivationCapture, DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Mutex;
 
 // ───────────────────────────────────────────────────────────────────────
@@ -83,6 +84,171 @@ pub fn tokenize_corpus(model_dir: &Path, corpus_text: &str) -> Result<Vec<u32>, 
         )
     })?;
     let ids = tokenizer.encode(corpus_text);
+    Ok(ids)
+}
+
+/// Tokenize via subprocess `llama-tokenize` for byte-parity with
+/// llama-imatrix / llama.cpp pipelines.
+///
+/// Path D (per-tensor NRMSE ≤ 0.01 vs the FAIR PyTorch oracle) requires
+/// the Tier 1 calibration token stream to be byte-identical with the
+/// Tier 2 `llama-imatrix` reference. llama.cpp's internal BPE disagrees
+/// with hipfire's HF-tokenizer.json encoder on ~46% of Qwen3 token
+/// positions (see `benchmarks/quality-baselines/harness/tokenizer_parity.py`),
+/// which floors per-tensor NRMSE at ~0.91 even with a numerically clean
+/// BF16 forward path.
+///
+/// To close that gap we shell out to llama.cpp's `llama-tokenize` binary
+/// directly, point it at a BF16 GGUF of the model (llama-tokenize loads
+/// GGUF metadata to select the right tokenizer), and parse its
+/// `[id1, id2, ...]` stdout into a flat `Vec<u32>` identical to what
+/// `llama-imatrix` would feed its forward pass.
+///
+/// # Arguments
+///
+/// * `llama_tokenize_bin` — path to the `llama-tokenize` binary
+///   (typically `<llama.cpp>/build/bin/llama-tokenize`).
+/// * `bf16_gguf_path` — BF16 GGUF that carries the tokenizer metadata
+///   for the model under calibration. **Must** be the matching converted
+///   model (different families ship different BPE pretokenizers).
+/// * `corpus_path` — path to the plain-text calibration corpus.
+///
+/// # CLI invocation
+///
+/// ```text
+/// llama-tokenize -m <bf16.gguf> -f <corpus.txt> --ids --log-disable --no-bos
+/// ```
+///
+/// On the MI300x calibration droplet this takes ~5s for a 10 MB / 2.4 M
+/// token wikitext-2 slice. The corpus is streamed through llama.cpp's
+/// own loader, not Rust — pass the corpus path through `-f` directly
+/// (no shell escaping needed for whitespace inside the file).
+///
+/// # stdout parsing
+///
+/// `--log-disable` typically silences load-info lines but some
+/// llama-tokenize versions still print model/tokenizer banner lines
+/// before the IDs. The parser walks lines, finds the first `[...]`
+/// bracketed line, strips the brackets, and parses comma-separated
+/// decimal integers into `Vec<u32>`. Lines without a leading `[` are
+/// ignored, so banner text never poisons the result. Empty `[]` is a
+/// valid empty corpus (returns an empty vector).
+///
+/// # Errors
+///
+/// Returns `Err(String)` if:
+/// - the binary can't be spawned (missing path / permission).
+/// - the subprocess exits with non-zero status (stderr is included in
+///   the message).
+/// - no `[...]` bracket line is found in stdout.
+/// - any individual ID fails to parse as `u32`.
+pub fn tokenize_corpus_via_llama_tokenize(
+    llama_tokenize_bin: &Path,
+    bf16_gguf_path: &Path,
+    corpus_path: &Path,
+) -> Result<Vec<u32>, String> {
+    let output = Command::new(llama_tokenize_bin)
+        .arg("-m")
+        .arg(bf16_gguf_path)
+        .arg("-f")
+        .arg(corpus_path)
+        .arg("--ids")
+        .arg("--log-disable")
+        .arg("--no-bos")
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to spawn llama-tokenize at {}: {e}",
+                llama_tokenize_bin.display()
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "llama-tokenize exited with status {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|e| {
+        format!("llama-tokenize stdout was not valid UTF-8: {e}")
+    })?;
+
+    parse_llama_tokenize_stdout(&stdout)
+}
+
+/// Parse `llama-tokenize --ids` stdout into `Vec<u32>`.
+///
+/// Looks for the first line that contains a `[...]` bracketed list of
+/// comma-separated integers and returns the parsed IDs. Lines before
+/// the bracket line (model banners, tokenizer info) are ignored.
+///
+/// Split out so the unit tests can exercise the parser against
+/// representative stdout fixtures without needing the actual binary.
+fn parse_llama_tokenize_stdout(stdout: &str) -> Result<Vec<u32>, String> {
+    // Walk lines; first one with a `[` is the IDs line. We also handle the
+    // edge case where the brackets span multiple lines (some llama.cpp
+    // builds line-wrap long lists) by concatenating from `[` to `]`.
+    let mut buf = String::new();
+    let mut in_brackets = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !in_brackets {
+            if let Some(open) = trimmed.find('[') {
+                in_brackets = true;
+                buf.push_str(&trimmed[open..]);
+                if trimmed.contains(']') {
+                    break;
+                }
+            }
+        } else {
+            buf.push(' ');
+            buf.push_str(trimmed);
+            if trimmed.contains(']') {
+                break;
+            }
+        }
+    }
+
+    if buf.is_empty() {
+        return Err(format!(
+            "llama-tokenize stdout had no `[...]` IDs line; full stdout was: {:?}",
+            stdout
+        ));
+    }
+
+    // Strip the outer `[` ... `]`.
+    let open = buf.find('[').ok_or_else(|| {
+        format!("internal parser error: opening bracket missing in {buf:?}")
+    })?;
+    let close = buf.rfind(']').ok_or_else(|| {
+        format!("llama-tokenize stdout lacks closing `]`; got {buf:?}")
+    })?;
+    if close <= open {
+        return Err(format!(
+            "llama-tokenize stdout has malformed brackets: {buf:?}"
+        ));
+    }
+    let inner = &buf[open + 1..close];
+
+    let inner_trim = inner.trim();
+    if inner_trim.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut ids = Vec::new();
+    for piece in inner_trim.split(',') {
+        let s = piece.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let id: u32 = s.parse().map_err(|e| {
+            format!("failed to parse llama-tokenize ID {s:?} as u32: {e}")
+        })?;
+        ids.push(id);
+    }
     Ok(ids)
 }
 
@@ -517,6 +683,79 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    /// Parser fixture: vanilla single-line `[id, id, ...]` stdout from
+    /// `llama-tokenize --ids --log-disable`. This is the dominant shape
+    /// on the MI300x calibration droplet (llama.cpp commit f3b9e91 +
+    /// build/bin/llama-tokenize, May 2026).
+    #[test]
+    fn parse_llama_tokenize_stdout_basic_ids() {
+        let stdout = "[283, 82224, 88, 4065, 63110, 14016, 283, 4558]\n";
+        let ids = parse_llama_tokenize_stdout(stdout).expect("basic parse");
+        assert_eq!(
+            ids,
+            vec![283_u32, 82224, 88, 4065, 63110, 14016, 283, 4558]
+        );
+    }
+
+    /// Parser fixture: stdout with banner / log lines BEFORE the IDs
+    /// line. Some llama.cpp builds still print "main: tokenizer XYZ"
+    /// even with `--log-disable`. The parser must skip non-bracket
+    /// lines and pick up the first `[...]` line cleanly.
+    #[test]
+    fn parse_llama_tokenize_stdout_skips_banner_lines() {
+        let stdout = "main: build = 9999 (deadbeef)\n\
+                      main: built with cc (Ubuntu) for x86_64-linux-gnu\n\
+                      llm_load_print_meta: model type     = qwen3\n\
+                      [1, 2, 3, 4, 5]\n";
+        let ids = parse_llama_tokenize_stdout(stdout).expect("banner-skip parse");
+        assert_eq!(ids, vec![1_u32, 2, 3, 4, 5]);
+    }
+
+    /// Parser fixture: empty corpus → empty `[]`. Should parse cleanly
+    /// to an empty `Vec<u32>`, not an error.
+    #[test]
+    fn parse_llama_tokenize_stdout_empty_brackets() {
+        let stdout = "[]\n";
+        let ids = parse_llama_tokenize_stdout(stdout).expect("empty parse");
+        assert!(ids.is_empty(), "[]` should yield zero IDs, got {ids:?}");
+    }
+
+    /// Parser fixture: a wrapped multi-line list. Some llama.cpp builds
+    /// hard-wrap long ID lists at ~80 cols; the parser must concatenate
+    /// from `[` to `]` across lines.
+    #[test]
+    fn parse_llama_tokenize_stdout_handles_multiline_list() {
+        let stdout = "[1, 2, 3,\n  4, 5, 6,\n  7, 8, 9]\n";
+        let ids = parse_llama_tokenize_stdout(stdout).expect("multiline parse");
+        assert_eq!(ids, vec![1_u32, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    /// Parser fixture: a malformed input with no `[...]` line at all
+    /// must surface a descriptive error (not silently produce empty).
+    #[test]
+    fn parse_llama_tokenize_stdout_missing_brackets_errors() {
+        let stdout = "main: something went wrong\nbut no IDs were ever printed\n";
+        let err = parse_llama_tokenize_stdout(stdout)
+            .expect_err("missing brackets must error, not return empty");
+        assert!(
+            err.contains("IDs line"),
+            "error should mention IDs line, got: {err}"
+        );
+    }
+
+    /// Parser fixture: a malformed integer inside `[...]` surfaces a
+    /// parse error referencing the offending token.
+    #[test]
+    fn parse_llama_tokenize_stdout_invalid_id_errors() {
+        let stdout = "[1, 2, banana, 4]\n";
+        let err = parse_llama_tokenize_stdout(stdout)
+            .expect_err("non-numeric ID must error");
+        assert!(
+            err.contains("banana"),
+            "error should reference the offending token, got: {err}"
+        );
     }
 
     /// `tokenize_corpus` surfaces a meaningful error when tokenizer.json
