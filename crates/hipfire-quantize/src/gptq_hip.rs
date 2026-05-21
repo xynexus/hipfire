@@ -1220,6 +1220,10 @@ pub fn gptq_column_sequential_hip(
             HIP_MEMCPY_DEVICE_TO_HOST,
         );
         if code != HIP_SUCCESS {
+            eprintln!(
+                "[gptq-hip-diag] step3 bulk D2H of d_u failed K={k_dim} u_bytes={u_bytes} effective_damp={:.6e} code={}",
+                effective_damp, code
+            );
             return Err(CholeskyError::SingularEvenWithMaxDamp {
                 max_damp: effective_damp, k: k_dim, diag_mean: diag_mean_for_err,
             });
@@ -1237,8 +1241,14 @@ pub fn gptq_column_sequential_hip(
     let grid_bytes = frozen_grids.len() * std::mem::size_of::<PackedGrid>();
     let perm_bytes = k_dim * std::mem::size_of::<i32>();
 
-    let to_chol_err = |damp: f64| CholeskyError::SingularEvenWithMaxDamp {
-        max_damp: damp, k: k_dim, diag_mean: diag_mean_for_err,
+    let to_chol_err = |damp: f64| {
+        eprintln!(
+            "[gptq-hip-diag] to_chol_err fired in gptq_column_sequential_hip K={k_dim} damp={:.6e} diag_mean={:.6e}",
+            damp, diag_mean_for_err
+        );
+        CholeskyError::SingularEvenWithMaxDamp {
+            max_damp: damp, k: k_dim, diag_mean: diag_mean_for_err,
+        }
     };
 
     unsafe {
