@@ -1364,8 +1364,9 @@ pub fn gptq_column_sequential_hip(
                         k_dim as i32, m as i32, cur_b as i32,
                     )
                 };
-                if res.is_err() {
-                    cleanup(solver); { eprintln!("[gptq-hip-diag] S12 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
+                if let Err(__e) = res {
+                    eprintln!("[gptq-hip-diag] S12 block_apply_mfma kernel-err: {__e} K={k_dim} m={m} bs={block_start} be={block_end} b_dim={b_dim} effective_damp={:.6e}", effective_damp);
+                    cleanup(solver); return Err(to_chol_err(effective_damp));
                 }
             }
 
