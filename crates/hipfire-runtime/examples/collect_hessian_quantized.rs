@@ -623,11 +623,26 @@ fn main() {
         }
 
         // 7. Normalize by n_tokens, strip trailing `.weight` from tensor
-        //    names (HFHS-v1 convention — see hessian_io.rs:242-243), and
-        //    write the HFHS-v1 binary. Same on-disk layout the BF16 bin
-        //    emits, so downstream consumers (hipfire-quantize iterative
-        //    GPTQ rounds 1+) read it without any flag.
+        //    names (HFHS-v1 convention — see hessian_io.rs:242-243),
+        //    rewrite `model.layers.X.<...>` → `model.language_model.layers.X.<...>`
+        //    to match the BF16 oracle's naming convention (bf16_forward.rs
+        //    emits the `language_model.` infix unconditionally — both for
+        //    Qwen3.5-VL and non-VL trunks), and write the HFHS-v1 binary.
+        //    Without the prefix rewrite, the v3 orchestrator's HFHS lookup
+        //    (hessian_io.rs:245, exact-string match) sees 0 shared tensors
+        //    between this quantized-model Hessian and the BF16 oracle one,
+        //    and silently falls back to the round-0 BF16 H for every
+        //    GPTQ-target tensor — defeating the purpose of v3 iterative
+        //    rounds.
+        //
+        //    The hipfire-quantize loader already has a
+        //    `model.language_model.` ↔ `model.` fallback resolution (see
+        //    `[[project_mi300x_rental_2026_05_18_delivery]]` memory), so
+        //    over-prefixing names that the .hfq stores without the infix
+        //    still resolves correctly downstream. Unconditional prepend
+        //    is safe.
         eprintln!("[7/7] writing HFHS-v1 binary to {}...", args.output.display());
+        let mut rename_count: usize = 0;
         let writer_entries: Vec<hipfire_quantize::hfhs_writer::HessianEntry> = entries
             .into_iter()
             .map(|e| {
@@ -637,11 +652,23 @@ fn main() {
                     1.0_f32 / (e.n_tokens as f32)
                 };
                 let h_avg: Vec<f32> = e.h.iter().map(|&v| v * inv_n).collect();
-                let canonical_name = e
+                // Strip trailing `.weight` (HFHS-v1 canonical form).
+                let stripped_name = e
                     .name
                     .strip_suffix(".weight")
                     .map(|s| s.to_string())
                     .unwrap_or(e.name);
+                // Prepend `model.language_model.` infix when the entry uses
+                // the bare `model.layers.` prefix and lacks `.language_model.`
+                // already. Matches the BF16 oracle's naming convention.
+                let canonical_name = if stripped_name.starts_with("model.layers.")
+                    && !stripped_name.contains(".language_model.")
+                {
+                    rename_count += 1;
+                    stripped_name.replacen("model.layers.", "model.language_model.layers.", 1)
+                } else {
+                    stripped_name
+                };
                 hipfire_quantize::hfhs_writer::HessianEntry {
                     name: canonical_name,
                     expert_idx: e.expert_idx,
@@ -650,6 +677,11 @@ fn main() {
                 }
             })
             .collect();
+        eprintln!(
+            "[7/7] renamed {} entries `model.layers.` → `model.language_model.layers.` \
+             (BF16-oracle naming convention)",
+            rename_count
+        );
         hipfire_quantize::hfhs_writer::write_hfhs(&args.output, &writer_entries)
             .map_err(|e| format!("write_hfhs failed: {e}"))?;
         eprintln!(
