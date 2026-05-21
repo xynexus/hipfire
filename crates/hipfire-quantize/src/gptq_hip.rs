@@ -432,16 +432,35 @@ pub fn compute_damped_inv_cholesky_upper_hip_keep(
             }
             if (solver.fn_hip_memcpy)(d_a, host_a.as_ptr() as *const c_void, bytes, HIP_MEMCPY_HOST_TO_DEVICE) != HIP_SUCCESS {
                 cleanup_all(solver, d_u);
+                eprintln!(
+                    "[gptq-hip-diag] H2D memcpy of damped H_eff failed at K={k} damp={damp:.6e}"
+                );
                 return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp, k, diag_mean });
             }
             let status = (solver.fn_rocsolver_dpotrf)(solver.handle(), ROCBLAS_FILL_LOWER, k as c_int, d_a as *mut c_double, k as c_int, d_info as *mut c_int);
             if status != ROCBLAS_STATUS_SUCCESS {
-                cleanup_all(solver, d_u);
-                return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp, k, diag_mean });
+                // RETRY on API-level error: bump damp, try again. K=12288
+                // path empirically hits this at first-iter damp=initial*
+                // diag_mean. Higher damp may resolve numerical sensitivity.
+                eprintln!(
+                    "[gptq-hip-diag] first dpotrf API error: status={status} K={k} damp={damp:.6e}; retrying with 10x damp"
+                );
+                damp *= 10.0;
+                if damp > damp_cap {
+                    cleanup_all(solver, d_u);
+                    eprintln!(
+                        "[gptq-hip-diag] first dpotrf exhausted retries: damp_cap={damp_cap:.6e} K={k} diag_mean={diag_mean:.6e}"
+                    );
+                    return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp_cap, k, diag_mean });
+                }
+                continue;
             }
             let mut info_host: c_int = 0;
             if (solver.fn_hip_memcpy)(&mut info_host as *mut c_int as *mut c_void, d_info, std::mem::size_of::<c_int>(), HIP_MEMCPY_DEVICE_TO_HOST) != HIP_SUCCESS {
                 cleanup_all(solver, d_u);
+                eprintln!(
+                    "[gptq-hip-diag] info-D2H memcpy after first dpotrf failed at K={k} damp={damp:.6e}"
+                );
                 return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp, k, diag_mean });
             }
             if info_host == 0 {
@@ -451,6 +470,9 @@ pub fn compute_damped_inv_cholesky_upper_hip_keep(
             damp *= 10.0;
             if damp > damp_cap {
                 cleanup_all(solver, d_u);
+                eprintln!(
+                    "[gptq-hip-diag] first dpotrf info_host={info_host} at K={k} damp_cap={damp_cap:.6e} diag_mean={diag_mean:.6e}"
+                );
                 return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp_cap, k, diag_mean });
             }
         }
@@ -459,11 +481,17 @@ pub fn compute_damped_inv_cholesky_upper_hip_keep(
         let status = (solver.fn_rocsolver_dtrtri)(solver.handle(), ROCBLAS_FILL_LOWER, ROCBLAS_DIAG_NON_UNIT, k as c_int, d_a as *mut c_double, k as c_int, d_info as *mut c_int);
         if status != ROCBLAS_STATUS_SUCCESS {
             cleanup_all(solver, d_u);
+            eprintln!(
+                "[gptq-hip-diag] dtrtri API error: status={status} K={k} effective_damp={effective_damp:.6e} diag_mean={diag_mean:.6e}"
+            );
             return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
         }
         let _ = (solver.fn_hip_memcpy)(&mut info_host as *mut c_int as *mut c_void, d_info, std::mem::size_of::<c_int>(), HIP_MEMCPY_DEVICE_TO_HOST);
         if info_host != 0 {
             cleanup_all(solver, d_u);
+            eprintln!(
+                "[gptq-hip-diag] dtrtri info_host={info_host} K={k} effective_damp={effective_damp:.6e}"
+            );
             return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
         }
 
@@ -472,23 +500,35 @@ pub fn compute_damped_inv_cholesky_upper_hip_keep(
         let status = (solver.fn_rocblas_dsyrk)(solver.handle(), ROCBLAS_FILL_UPPER, ROCBLAS_OPERATION_TRANSPOSE, k as c_int, k as c_int, &alpha, d_a as *const c_double, k as c_int, &beta, d_h_inv as *mut c_double, k as c_int);
         if status != ROCBLAS_STATUS_SUCCESS {
             cleanup_all(solver, d_u);
+            eprintln!(
+                "[gptq-hip-diag] dsyrk API error: status={status} K={k} effective_damp={effective_damp:.6e}"
+            );
             return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
         }
 
         let status = (solver.fn_rocsolver_dpotrf)(solver.handle(), ROCBLAS_FILL_UPPER, k as c_int, d_h_inv as *mut c_double, k as c_int, d_info as *mut c_int);
         if status != ROCBLAS_STATUS_SUCCESS {
             cleanup_all(solver, d_u);
+            eprintln!(
+                "[gptq-hip-diag] second dpotrf (upper, H_inv) API error: status={status} K={k} effective_damp={effective_damp:.6e}"
+            );
             return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
         }
         let _ = (solver.fn_hip_memcpy)(&mut info_host as *mut c_int as *mut c_void, d_info, std::mem::size_of::<c_int>(), HIP_MEMCPY_DEVICE_TO_HOST);
         if info_host != 0 {
             cleanup_all(solver, d_u);
+            eprintln!(
+                "[gptq-hip-diag] second dpotrf info_host={info_host} K={k} effective_damp={effective_damp:.6e}"
+            );
             return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
         }
 
         let status = (solver.fn_rocblas_dgeam)(solver.handle(), ROCBLAS_OPERATION_TRANSPOSE, ROCBLAS_OPERATION_NONE, k as c_int, k as c_int, &alpha, d_h_inv as *const c_double, k as c_int, &beta, std::ptr::null(), k as c_int, d_u as *mut c_double, k as c_int);
         if status != ROCBLAS_STATUS_SUCCESS {
             cleanup_all(solver, d_u);
+            eprintln!(
+                "[gptq-hip-diag] dgeam (U = H_inv^T) API error: status={status} K={k} effective_damp={effective_damp:.6e}"
+            );
             return Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: effective_damp, k, diag_mean });
         }
 
