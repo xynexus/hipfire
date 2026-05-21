@@ -2912,6 +2912,23 @@ fn imatrix_lookup<'a>(
     if let Some(v) = map.get(safetensors_name) {
         return Some(v);
     }
+    // VL <-> text-only prefix variants. Tier 1 forward inserts
+    // `model.language_model.` when the trunk contains that namespace
+    // (see bf16_forward.rs::lm_prefix). The quantize loop's output
+    // name on a text-only model is `model.X`, but the Hessian/imatrix
+    // keys may still carry `model.language_model.X`. Try both.
+    if let Some(stripped) = safetensors_name.strip_prefix("model.") {
+        let with_vl = format!("model.language_model.{stripped}");
+        if let Some(v) = map.get(&with_vl) {
+            return Some(v);
+        }
+    }
+    if let Some(without_vl) = safetensors_name.strip_prefix("model.language_model.") {
+        let without_vl_full = format!("model.{without_vl}");
+        if let Some(v) = map.get(&without_vl_full) {
+            return Some(v);
+        }
+    }
     let ggml_name = safetensors_to_ggml_name(safetensors_name)?;
     map.get(&ggml_name)
 }
@@ -5364,8 +5381,25 @@ fn main() {
                     let q = if let Some(sc) = GPTQ_HESSIAN.get() {
                         // Strip ".weight" to match collect_hessian.py's key
                         // convention (HFHS format spec §3.1).
-                        let h_key = name.strip_suffix(".weight").unwrap_or(name);
-                        if let Some(href) = sc.get(h_key, 0) {
+                        let h_key_base = name.strip_suffix(".weight").unwrap_or(name);
+                        // VL <-> text-only prefix variants — see
+                        // imatrix_lookup for the same fallback rationale.
+                        // Try as-is, then with/without `language_model.`.
+                        let h_lookup = sc.get(h_key_base, 0)
+                            .or_else(|| h_key_base
+                                .strip_prefix("model.")
+                                .and_then(|s| {
+                                    let k = format!("model.language_model.{s}");
+                                    sc.get(&k, 0)
+                                }))
+                            .or_else(|| h_key_base
+                                .strip_prefix("model.language_model.")
+                                .and_then(|s| {
+                                    let k = format!("model.{s}");
+                                    sc.get(&k, 0)
+                                }));
+                        let h_key = h_key_base; // keep for error messages
+                        if let Some(href) = h_lookup {
                             if href.k != k_dim {
                                 eprintln!(
                                     "warning: GPTQ {h_key}: Hessian K={} != tensor K={k_dim}; skipping GPTQ for this tensor",
