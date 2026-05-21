@@ -294,6 +294,17 @@ required-features = []
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
 
+# collect_hessian_quantized — Tier 1 iterative AWQ-aware-GPTQ v3 Hessian
+# collector. Drives the QUANTIZED forward pass (via .hfq + qwen35::
+# forward_prefill_batch) over a calibration corpus, captures K×K outer
+# products via `HessianCollector` on `gpu.capture_handler`, and writes an
+# HFHS-v1 sidecar consumed by `hipfire-quantize` round-2+ scale recompute.
+# Distinct from the BF16 path (`src/bin/collect_hessian.rs`) which loads a
+# safetensors trunk and runs `bf16_forward::forward_prefill_bf16`.
+[[example]]
+name = "collect_hessian_quantized"
+required-features = ["arch-qwen35", "deltanet"]
+
 # eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /
 # Qwen2 / Llama / Mistral / TinyLlama). Same HFKSEQ output as
 # eval_hipfire, but the forward path goes through

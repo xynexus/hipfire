@@ -623,12 +623,22 @@ struct HessianAccum {
 /// matching the HFHS-v1 layout — see `parse_expert_idx`.
 pub struct HessianCollector {
     accumulators: Mutex<HashMap<(String, u32), HessianAccum>>,
+    /// Lazy BF16 scratch buffer for F32→BF16 casts in production-path
+    /// captures. Tier 1 BF16 forward (`bf16_forward.rs`) feeds BF16
+    /// activations directly to `hessian_outer_product_bf16`; production
+    /// prefill (`llama::prefill_forward`, `qwen35::forward_prefill_batch`)
+    /// feeds F32. For F32 we cast into this scratch via RTNE
+    /// `convert_f32_to_bf16` before invoking the gfx942 MFMA kernel.
+    /// `usize` is the current allocation in elements; the buffer grows
+    /// on first capture seeing a larger input.
+    scratch_bf16: Mutex<Option<(GpuTensor, usize)>>,
 }
 
 impl HessianCollector {
     pub fn new() -> Self {
         Self {
             accumulators: Mutex::new(HashMap::new()),
+            scratch_bf16: Mutex::new(None),
         }
     }
 
@@ -691,6 +701,55 @@ impl ActivationCapture for HessianCollector {
             None => return,
         };
         let n_rows = input.numel() / k;
+        let numel = input.numel();
+
+        // Materialize a BF16-typed view of the input that the gfx942
+        // MFMA `hessian_outer_product_bf16` kernel can consume. BF16
+        // inputs (Tier 1 `bf16_forward`) alias directly. F32 inputs
+        // (production prefill / forward_scratch) are cast via RTNE
+        // `convert_f32_to_bf16` into the lazy `scratch_bf16` buffer.
+        // The scratch lock is held until after the kernel launch so
+        // the aliased buffer pointer stays valid.
+        let bf16_view: GpuTensor;
+        let mut _scratch_lock = None;
+        match input.dtype {
+            DType::BF16 => {
+                bf16_view = GpuTensor {
+                    buf: unsafe { input.buf.alias() },
+                    shape: input.shape.clone(),
+                    dtype: DType::BF16,
+                };
+            }
+            DType::F32 => {
+                let mut scratch = match self.scratch_bf16.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                let need_realloc =
+                    scratch.as_ref().map_or(true, |(_, c)| *c < numel);
+                if need_realloc {
+                    if let Some((old, _)) = scratch.take() {
+                        let _ = gpu.free_tensor(old);
+                    }
+                    let fresh = match gpu.alloc_tensor(&[numel], DType::BF16) {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
+                    *scratch = Some((fresh, numel));
+                }
+                bf16_view = GpuTensor {
+                    buf: unsafe { scratch.as_ref().unwrap().0.buf.alias() },
+                    shape: input.shape.clone(),
+                    dtype: DType::BF16,
+                };
+                if gpu.convert_f32_to_bf16(input, &bf16_view, numel).is_err() {
+                    return;
+                }
+                _scratch_lock = Some(scratch);
+            }
+            _ => return,
+        };
+
         let mut accs = match self.accumulators.lock() {
             Ok(a) => a,
             Err(_) => return,
@@ -704,7 +763,7 @@ impl ActivationCapture for HessianCollector {
             accs.insert(key.clone(), HessianAccum { h, n_tokens: 0, k });
         }
         let accum = accs.get_mut(&key).unwrap();
-        if let Err(_) = gpu.hessian_outer_product_bf16(input, &mut accum.h) {
+        if let Err(_) = gpu.hessian_outer_product_bf16(&bf16_view, &mut accum.h) {
             return;
         }
         accum.n_tokens = accum.n_tokens.saturating_add(n_rows as u64);
