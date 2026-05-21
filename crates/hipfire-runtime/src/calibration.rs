@@ -716,7 +716,7 @@ impl ActivationCapture for HessianCollector {
             DType::BF16 => {
                 bf16_view = GpuTensor {
                     buf: unsafe { input.buf.alias() },
-                    shape: input.shape.clone(),
+                    shape: vec![n_rows, k],
                     dtype: DType::BF16,
                 };
             }
@@ -739,7 +739,7 @@ impl ActivationCapture for HessianCollector {
                 }
                 bf16_view = GpuTensor {
                     buf: unsafe { scratch.as_ref().unwrap().0.buf.alias() },
-                    shape: input.shape.clone(),
+                    shape: vec![n_rows, k],
                     dtype: DType::BF16,
                 };
                 if gpu.convert_f32_to_bf16(input, &bf16_view, numel).is_err() {
