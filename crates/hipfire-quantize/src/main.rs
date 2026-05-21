@@ -2596,6 +2596,16 @@ fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
             "ffn_gate" => "mlp.gate_proj".to_string(),
             "ffn_up" => "mlp.up_proj".to_string(),
             "ffn_down" => "mlp.down_proj".to_string(),
+            // DeltaNet slots — Qwen3.5 linear-attn / Mamba-style SSM
+            // sub-block. The Tier 1 BF16 forward emits Hessian/imatrix
+            // entries with these HF-canonical names; without these arms,
+            // the .hfq output uses hipfire-internal names (`attn_qkv`
+            // etc.) and downstream lookups silently miss.
+            "attn_qkv" => "linear_attn.in_proj_qkv".to_string(),
+            "attn_gate" => "linear_attn.in_proj_z".to_string(),
+            "ssm_alpha" => "linear_attn.in_proj_a".to_string(),
+            "ssm_beta" => "linear_attn.in_proj_b".to_string(),
+            "ssm_out" => "linear_attn.out_proj".to_string(),
             other => return Some(format!("model.layers.{layer_idx}.{other}.weight")),
         };
         return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
