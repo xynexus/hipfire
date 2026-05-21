@@ -708,6 +708,7 @@ dependencies = [
  "minijinja-contrib",
  "rayon",
  "rdna-compute",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
