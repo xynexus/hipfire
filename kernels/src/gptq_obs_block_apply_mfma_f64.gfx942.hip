@@ -127,7 +127,7 @@ void gptq_obs_block_apply_mfma_f64(
         if (gn_remaining < n_remaining && gk_u < k_dim && gn_u < k_dim && k_idx < b_dim) {
             // Upper-tri: only valid when gk_u <= gn_u. Off-triangle is zero.
             if (gk_u <= gn_u) {
-                v = d_u[(long long)gn_u * (long long)k_dim + (long long)gk_u];
+                v = d_u[(long long)gk_u * (long long)k_dim + (long long)gn_u];
             }
         }
         lds_b[n_in_tile * b_dim + k_idx] = v;

@@ -55,7 +55,7 @@ void gptq_obs_within_block_rank1_f64(
     if (row >= m_dim) return;
 
     // U[step, next_step] — column-major: d_u[next_step * K + step].
-    double u_sn = d_u[(long long)next_step * (long long)k_dim + (long long)step];
+    double u_sn = d_u[(long long)step * (long long)k_dim + (long long)next_step];
     if (u_sn == 0.0) return;
 
     int err_slot = step - block_start;
