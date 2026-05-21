@@ -2362,7 +2362,9 @@ impl Gpu {
         // One block per row, 256 threads per block with shared memory reduction
         let block_size = 256u32.min(k as u32);
         let shared_mem = block_size * 4; // one float per thread
-        unsafe {
+        let bytes = (m as usize) * (k as usize) * 4 + (k as usize) * 4 + (m as usize) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_f32", bytes);
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, 1, 1],
@@ -2371,7 +2373,9 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
-        }
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// y = A_q4k * x (quantized matrix-vector multiply, A stored as Q4_K on GPU)
@@ -2443,7 +2447,9 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
         ];
 
-        self.launch_maybe_blob(
+        let bytes = crate::profile::gemv_hfq4g128_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g128", bytes);
+        let result = self.launch_maybe_blob(
             "gemv_hfq4g128",
             [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
             || {
@@ -2452,7 +2458,9 @@ impl Gpu {
                 b.push_i32(m_val); b.push_i32(k_val);
                 b
             },
-        )
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// ParoQuant Givens rotation: apply learned pairwise rotations + channel
@@ -2501,7 +2509,11 @@ impl Gpu {
 
         let smem = (cta_m * group_size * 4) as u32; // CTA_M * GROUP_SIZE * sizeof(float)
 
-        self.launch_maybe_blob(
+        // Bytes: read+write activation (2 × seq × dim × 4) + read pairs/theta/scales
+        // (krot × dim × 2 for pairs+theta packed, dim × 2 for scales).
+        let bytes = seq_len * hidden_dim * 4 * 2 + krot * hidden_dim * 2 + hidden_dim * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "rotate", "givens_rotate_f32", bytes);
+        let result = self.launch_maybe_blob(
             "givens_rotate_f32",
             [grid_x, groups_per_row, 1],
             [group_size / 2, 1, 1],
@@ -2514,7 +2526,9 @@ impl Gpu {
                 b.push_i32(seq_val); b.push_i32(dim_val); b.push_i32(krot_val);
                 b
             },
-        )
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Out-of-place Givens rotation. Reads `x_in`, writes rotated
@@ -2567,7 +2581,11 @@ impl Gpu {
 
         let smem = (cta_m * group_size * 4) as u32;
 
-        self.launch_maybe_blob(
+        // Bytes: read x_in (seq × dim × 4) + write x_out (seq × dim × 4)
+        // + read pairs/theta/scales (krot × dim × 2 + dim × 2).
+        let bytes = seq_len * hidden_dim * 4 * 2 + krot * hidden_dim * 2 + hidden_dim * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "rotate", "givens_rotate_to_f32", bytes);
+        let result = self.launch_maybe_blob(
             "givens_rotate_to_f32",
             [grid_x, groups_per_row, 1],
             [group_size / 2, 1, 1],
@@ -2580,7 +2598,9 @@ impl Gpu {
                 b.push_i32(seq_val); b.push_i32(dim_val); b.push_i32(krot_val);
                 b
             },
-        )
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
@@ -2638,7 +2658,13 @@ impl Gpu {
 
         let smem = (cta_m * group_size * 4) as u32;
 
-        self.launch_maybe_blob(
+        // Bytes: read gate (seq × dim × 4) + read up (seq × dim × 4) + write out
+        // (seq × dim × 4) + read pairs/theta/scales (krot × dim × 2 + dim × 2).
+        let bytes = seq_len * hidden_dim * 4 * 3 + krot * hidden_dim * 2 + hidden_dim * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "fused_silu_mul_givens_rotate_f32", bytes,
+        );
+        let result = self.launch_maybe_blob(
             "fused_silu_mul_givens_rotate_f32",
             [grid_x, groups_per_row, 1],
             [group_size / 2, 1, 1],
@@ -2651,7 +2677,9 @@ impl Gpu {
                 b.push_i32(seq_val); b.push_i32(dim_val); b.push_i32(krot_val);
                 b
             },
-        )
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
