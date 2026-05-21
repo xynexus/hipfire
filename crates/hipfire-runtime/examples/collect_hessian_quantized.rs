@@ -29,10 +29,18 @@
 //!    hipfire's native BPE encoder.
 //! 5. Loop over `n_passes × n_sequences` chunks of `ctx_len` tokens
 //!    each. Per-sequence: reset the DeltaNet recurrent state, then
-//!    `qwen35::forward_prefill_batch(..., start_pos=0, ...)`. Every
-//!    linear-projection dispatch site inside the forward pass fires
-//!    `gpu.try_capture_linear(x)`, which routes the input activation
-//!    into `HessianCollector::capture`.
+//!    iterate `qwen35::forward_scratch(..., token, pos, ...)` per
+//!    token in the chunk. Per-token `forward_scratch` calls
+//!    `forward_from_x_gpu`, which has `set_capture_name(...)` wired
+//!    at every linear projection (DeltaNet `in_proj_*`,
+//!    FullAttention `q/k/v/o_proj`, MLP `gate/up/down_proj`,
+//!    `lm_head`). The batched `forward_prefill_batch` path routes
+//!    through fused QKV / fused gate_up / FA3 kernels that skip
+//!    `set_capture_name`, so the capture handler never fires and
+//!    the HFHS sidecar ends up empty (0 entries). This bin trades
+//!    prefill throughput for capture coverage — much slower
+//!    (~5–10 ms/token on 0.8B, so ~30–60 min at 128×2048) but
+//!    correct.
 //! 6. Drain the collector to `Vec<HessianEntry>`.
 //! 7. Normalize each tensor's accumulator by its `n_tokens` count and
 //!    write the HFHS-v1 binary (`hipfire_quantize::hfhs_writer::write_hfhs`)
@@ -73,6 +81,7 @@ fn main() {
     use rdna_compute::Gpu;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Instant;
 
     // -----------------------------------------------------------------
     // Args
@@ -436,13 +445,20 @@ fn main() {
                 actual_sequences, args.n_sequences, actual_sequences
             );
         }
+        let total_tokens = args.n_passes * actual_sequences * args.ctx_len;
         eprintln!(
-            "[5/7] running prefill over {} passes × {} sequences × {} tokens \
+            "[5/7] running per-token forward over {} passes × {} sequences × {} tokens \
              = {} total tokens...",
             args.n_passes,
             actual_sequences,
             args.ctx_len,
-            args.n_passes * actual_sequences * args.ctx_len
+            total_tokens
+        );
+        eprintln!(
+            "[5/7] note: per-token forward_scratch (not batched prefill) so the capture\n  \
+             handler fires at every linear projection. Expect ~5–10 ms/token on 0.8B,\n  \
+             so a full 128×2048 sweep takes ~30–60 min — that's the price of correct\n  \
+             Hessian capture under quantization noise."
         );
 
         // KV cache + DeltaNet state + Qwen35Scratch. KvCache is sized
@@ -494,6 +510,8 @@ fn main() {
         let mut dn_state = DeltaNetState::new(&mut gpu, &config)
             .map_err(|e| format!("DeltaNetState::new failed: {e}"))?;
 
+        let t_loop_start = Instant::now();
+        let mut tokens_done: usize = 0;
         for pass in 0..args.n_passes {
             for seq_idx in 0..actual_sequences {
                 let start = seq_idx * args.ctx_len;
@@ -501,48 +519,81 @@ fn main() {
                 let chunk = &tokens[start..end];
 
                 // Reset DeltaNet recurrent state per sequence; KvCache
-                // overwrites from pos=0 each call (start_pos=0). This
-                // matches the per-chunk reset pattern in eval_hipfire.rs
-                // (line ~345) and collect_hessian.rs's per-seq fresh
-                // state.
+                // gets overwritten from pos=0 each call below (we pass
+                // pos=i so the first token of each new sequence lands
+                // at slot 0, overwriting the previous sequence's KV).
+                // Matches the per-chunk reset pattern in
+                // eval_hipfire.rs (line ~345).
                 dn_state.reset(&mut gpu);
 
-                // forward_prefill_batch — production prefill path. Every
-                // linear projection inside fires `gpu.try_capture_linear`
-                // which (now that capture_handler is installed) routes
-                // the input activation into HessianCollector::capture.
-                // hidden_rb / per_token_hidden_out / gdn_tape / tree_verify
-                // are all None — we don't need logits, hidden states, or
-                // tree-verify state for Hessian collection.
-                qwen35::forward_prefill_batch(
-                    &mut gpu,
-                    &weights,
-                    &config,
-                    chunk,
-                    0,
-                    &mut kv_cache,
-                    &mut dn_state,
-                    &scratch,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .map_err(|e| {
-                    format!("forward_prefill_batch failed at pass={pass} seq_idx={seq_idx}: {e}")
-                })?;
+                // Per-token forward_scratch — calls `forward_from_x_gpu`
+                // internally, which has `set_capture_name(...)` at every
+                // linear projection. The capture handler installed in
+                // step 3 fires at each call, accumulating the K×K
+                // outer-product into HessianCollector. We don't
+                // consume logits; `scratch.logits` gets overwritten
+                // each call, but its contents are irrelevant to
+                // Hessian capture.
+                //
+                // Why per-token (not batched): batched
+                // `forward_prefill_batch` routes through fused QKV /
+                // fused gate_up / FA3 kernels that skip
+                // `set_capture_name`. The capture handler never
+                // fires under that path, so the HFHS sidecar ends
+                // up with 0 entries. Per-token is slower but
+                // captures correctly.
+                for (i, &token) in chunk.iter().enumerate() {
+                    qwen35::forward_scratch(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        token,
+                        i,
+                        &mut kv_cache,
+                        &mut dn_state,
+                        &scratch,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "forward_scratch failed at pass={pass} seq_idx={seq_idx} \
+                             pos={i}: {e}"
+                        )
+                    })?;
+                    tokens_done += 1;
+                }
 
                 if seq_idx % 8 == 0 {
+                    let elapsed = t_loop_start.elapsed().as_secs_f64();
+                    let rate = (tokens_done as f64) / elapsed.max(1e-9);
+                    let pct =
+                        (tokens_done as f64) * 100.0 / (total_tokens as f64).max(1.0);
+                    let eta_s = if rate > 0.0 {
+                        (total_tokens.saturating_sub(tokens_done)) as f64 / rate
+                    } else {
+                        f64::INFINITY
+                    };
                     eprintln!(
-                        "[5/7] pass {}/{}, sequence {}/{}",
+                        "[5/7] pass {}/{}, sequence {}/{}  ({} tok done, \
+                         {:.1}%, {:.0} tok/s, ETA {:.0}s)",
                         pass + 1,
                         args.n_passes,
                         seq_idx + 1,
-                        actual_sequences
+                        actual_sequences,
+                        tokens_done,
+                        pct,
+                        rate,
+                        eta_s
                     );
                 }
             }
         }
+        let loop_elapsed = t_loop_start.elapsed().as_secs_f64();
+        eprintln!(
+            "[5/7] forward loop done: {} tokens in {:.1}s ({:.1} tok/s)",
+            tokens_done,
+            loop_elapsed,
+            (tokens_done as f64) / loop_elapsed.max(1e-9)
+        );
 
         // 6. Drain the collector.
         eprintln!("[6/7] draining HessianCollector...");
@@ -552,6 +603,24 @@ fn main() {
             Err(arc) => arc.drain(&gpu)?,
         };
         eprintln!("[6/7] drained {} Hessian entries", entries.len());
+
+        // Hard-abort if the capture handler never fired. This is the
+        // exact failure mode we just fixed (forward_prefill_batch
+        // doesn't call set_capture_name) — if the per-token
+        // forward_scratch path also produces 0 entries, something
+        // else is wrong upstream (capture wiring removed, handler
+        // not installed, etc.) and the downstream GPTQ rounds would
+        // silently consume a degenerate 24-byte HFHS file. Fail loud.
+        if entries.is_empty() {
+            eprintln!(
+                "collect_hessian_quantized: ERROR: HessianCollector drained 0 entries.\n  \
+                 The capture handler did not fire during forward. This usually means\n  \
+                 the forward path no longer calls set_capture_name at linear projections,\n  \
+                 or the capture_handler install in step 3 was bypassed.\n  \
+                 Refusing to write a 24-byte (header-only) HFHS file."
+            );
+            std::process::exit(2);
+        }
 
         // 7. Normalize by n_tokens, strip trailing `.weight` from tensor
         //    names (HFHS-v1 convention — see hessian_io.rs:242-243), and
