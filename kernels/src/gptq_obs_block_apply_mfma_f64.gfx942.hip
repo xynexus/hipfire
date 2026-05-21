@@ -18,7 +18,7 @@
 //
 // ── MFMA tile geometry ──
 //
-//   MFMA intrinsic   : __builtin_amdgcn_mfma_f64_16x16x4_f64
+//   MFMA intrinsic   : __builtin_amdgcn_mfma_f64_16x16x4f64
 //                      (16×16 FP64 output, K_inner=4 per call)
 //
 //   Per-wave output  : 16×16 (256 elements / 64 lanes = 4 doubles per lane,
@@ -168,7 +168,7 @@ void gptq_obs_block_apply_mfma_f64(
             b = lds_b[n_lane * b_dim + k_b];
         }
 
-        c_acc = __builtin_amdgcn_mfma_f64_16x16x4_f64(a, b, c_acc, 0, 0, 0);
+        c_acc = __builtin_amdgcn_mfma_f64_16x16x4f64(a, b, c_acc, 0, 0, 0);
     }
 
     // ─── Output write-back: subtract-accumulate into W_residual ───
