@@ -12,6 +12,8 @@
 //! separate crate root that continues to declare its private `mod`s for
 //! the quantizer's own use.
 
+pub mod awq_compute;
+pub mod awq_scales_io;
 pub mod gguf_imatrix_writer;
 pub mod gguf_input;
 pub mod hessian_io;

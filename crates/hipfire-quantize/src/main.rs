@@ -6,6 +6,7 @@
 //! `.gguf` file and produces a `.hfq` (HipFire Quantized) file with
 //! RDNA-native quantized weights.
 
+mod awq_scales_io;
 mod gguf_imatrix_writer;
 mod gguf_input;
 mod gptq;
@@ -85,6 +86,72 @@ static AWQ_FORMULA: OnceLock<bool> = OnceLock::new();  // true = autoawq formula
 // recipe and the production default. Opt into F2 via --awq-scope f2 or
 // HIPFIRE_AWQ_F1_ONLY=0 env-var override.
 static AWQ_SCOPE_F1: OnceLock<bool> = OnceLock::new();
+
+// AWQ scale override map populated by `--awq-scales <path>` (HFSC v1).
+// The orchestrator for AWQ-aware-GPTQ v3 (the iterative algorithm in
+// `scripts/mq4_masked_calib.py::run_iterative_awq_gptq`) computes damped
+// AWQ scales from the round-N Hessian and writes them to a sidecar; when
+// this OnceLock is populated, `compute_awq_scales_for_tensor` consults
+// this map first and only falls through to the imatrix-derived formula
+// when a tensor name is absent.
+//
+// Keyed by `(canonical_name, expert_idx)` where canonical_name is the HFQ
+// tensor name with `.weight` stripped (matches HFHS/HFSC convention).
+// expert_idx is 0 for dense tensors and the literal expert idx for MoE.
+static AWQ_SCALES_OVERRIDE: OnceLock<HashMap<(String, u32), Vec<f32>>> = OnceLock::new();
+
+/// Helper: compute AWQ scales for a tensor, consulting the override map
+/// first (round N+ of the iterative algorithm) before falling through to
+/// the per-tensor imatrix-derived formula. Mirrors the Python helper used
+/// by `scripts/mq4_masked_calib.py` round orchestration.
+///
+/// `expert_idx` is `0` for dense tensors and the literal expert index for
+/// MoE per-expert tensors.
+fn compute_awq_scales_for_tensor(
+    name: &str,
+    expert_idx: u32,
+    in_sum2: &[f32],
+    alpha: f32,
+) -> Vec<f32> {
+    if let Some(map) = AWQ_SCALES_OVERRIDE.get() {
+        let canonical = name.strip_suffix(".weight").unwrap_or(name).to_string();
+        if let Some(scales) = map.get(&(canonical, expert_idx)) {
+            debug_assert_eq!(
+                scales.len(), in_sum2.len(),
+                "override AWQ scale length ({}) != K ({}) for tensor {} expert {}",
+                scales.len(), in_sum2.len(), name, expert_idx,
+            );
+            return scales.clone();
+        }
+    }
+    compute_awq_scales(in_sum2, alpha)
+}
+
+/// Helper: same as `compute_awq_scales_for_tensor` but for the autoawq
+/// formula (alpha-weighted product of RMS_act and RMS_w). Override scales
+/// take precedence regardless of formula — the orchestrator computes them
+/// in a single canonical way (Python's `compute_awq_scales_from_hessian`)
+/// and round-to-round damping should be applied to the same formula.
+fn compute_awq_scales_autoawq_for_tensor(
+    name: &str,
+    expert_idx: u32,
+    in_sum2: &[f32],
+    w_rms: &[f32],
+    alpha: f32,
+) -> Vec<f32> {
+    if let Some(map) = AWQ_SCALES_OVERRIDE.get() {
+        let canonical = name.strip_suffix(".weight").unwrap_or(name).to_string();
+        if let Some(scales) = map.get(&(canonical, expert_idx)) {
+            debug_assert_eq!(
+                scales.len(), in_sum2.len(),
+                "override AWQ scale length ({}) != K ({}) for tensor {} expert {}",
+                scales.len(), in_sum2.len(), name, expert_idx,
+            );
+            return scales.clone();
+        }
+    }
+    compute_awq_scales_autoawq(in_sum2, w_rms, alpha)
+}
 
 // Phase A Stage B — GPTQ on MQ4G256. When `--gptq <hessian-path>` is set,
 // each MQ4G256 tensor goes through `gptq::gptq_pipeline_mq4g256` instead
@@ -4012,6 +4079,46 @@ fn main() {
         AWQ_SCOPE_F1.set(awq_scope == "f1").ok();
         let formula_label = if awq_formula == "autoawq" { "s[j]=(RMS_act[j])^alpha * (RMS_w[j])^(1-alpha)" } else { "s[j]=(RMS_act[j])^alpha" };
         eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, scope={awq_scope}, formula={awq_formula}: {formula_label}, geo-mean normalized to 1)");
+
+        // --awq-scales <path>: load per-tensor AWQ scale overrides from an
+        // HFSC v1 sidecar (the iterative AWQ+GPTQ orchestrator's round-N
+        // hand-off file). When set, `compute_awq_scales_for_tensor` returns
+        // the override scale for tensors present in the file, and falls
+        // through to the imatrix-derived `--awq-formula` calculation for
+        // tensors that are absent. This is the mechanism the iterate bin
+        // uses to inject round-N-1 damped scales into round N's quantize.
+        let awq_scales_path = args.iter().position(|a| a == "--awq-scales")
+            .and_then(|i| args.get(i + 1))
+            .map(std::path::PathBuf::from);
+        if let Some(path) = &awq_scales_path {
+            if !path.exists() {
+                eprintln!("error: --awq-scales path not found: {}", path.display());
+                std::process::exit(1);
+            }
+            let sc = match awq_scales_io::AwqScalesSidecar::open(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: failed to open --awq-scales sidecar {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            };
+            let n_loaded = sc.n_tensors();
+            let mut override_map: HashMap<(String, u32), Vec<f32>> = HashMap::with_capacity(n_loaded);
+            for (name, expert_idx) in sc.keys() {
+                if let Some(v) = sc.get(&name, expert_idx) {
+                    override_map.insert((name, expert_idx), v);
+                }
+            }
+            AWQ_SCALES_OVERRIDE
+                .set(override_map)
+                .map_err(|_| "AWQ_SCALES_OVERRIDE set twice").unwrap();
+            eprintln!(
+                "AWQ scale overrides loaded from {} ({} tensors) — \
+                 these take precedence over imatrix-derived scales for matching names",
+                path.display(),
+                n_loaded
+            );
+        }
     }
 
     // ── Phase A Stage B — GPTQ on MQ4G256 ─────────────────────────────
@@ -4727,9 +4834,9 @@ fn main() {
                                 );
                                 let scales = if awq_formula_autoawq {
                                     let w_rms = compute_weight_rms_per_input(&f32_slice, m_dim, k_dim);
-                                    compute_awq_scales_autoawq(im_weights, &w_rms, alpha)
+                                    compute_awq_scales_autoawq_for_tensor(&per_expert_name, x as u32, im_weights, &w_rms, alpha)
                                 } else {
-                                    compute_awq_scales(im_weights, alpha)
+                                    compute_awq_scales_for_tensor(&per_expert_name, x as u32, im_weights, alpha)
                                 };
                                 awq_sidecar_scales = Some(scales.clone());
                                 let mut scaled = f32_slice.clone();
@@ -5076,7 +5183,7 @@ fn main() {
                                 = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                             {
                                 if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    let scales = compute_awq_scales_for_tensor(name, 0, im_weights, alpha);
                                     awq_sidecar_scales = Some(scales.clone());
                                     let m_dim = meta.shape[0];
                                     let mut scaled = f32_data.clone();
@@ -5098,7 +5205,7 @@ fn main() {
                                 = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                             {
                                 if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    let scales = compute_awq_scales_for_tensor(name, 0, im_weights, alpha);
                                     awq_sidecar_scales = Some(scales.clone());
                                     let m_dim = meta.shape[0];
                                     let mut scaled = f32_data.clone();
@@ -5165,7 +5272,7 @@ fn main() {
                                 = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                             {
                                 if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    let scales = compute_awq_scales_for_tensor(name, 0, im_weights, alpha);
                                     awq_sidecar_scales = Some(scales.clone());
                                     let m_dim = meta.shape[0];
                                     let mut scaled = f32_data.clone();
@@ -5192,7 +5299,7 @@ fn main() {
                                 = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                             {
                                 if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    let scales = compute_awq_scales_for_tensor(name, 0, im_weights, alpha);
                                     awq_sidecar_scales = Some(scales.clone());
                                     let m_dim = meta.shape[0];
                                     let mut scaled = f32_data.clone();
@@ -5370,9 +5477,9 @@ fn main() {
                                     im_weights.len(), k_dim, name);
                                 let scales = if AWQ_FORMULA.get().copied().unwrap_or(false) {
                                     let w_rms = compute_weight_rms_per_input(&f32_data, m_dim, k_dim);
-                                    compute_awq_scales_autoawq(im_weights, &w_rms, alpha)
+                                    compute_awq_scales_autoawq_for_tensor(name, 0, im_weights, &w_rms, alpha)
                                 } else {
-                                    compute_awq_scales(im_weights, alpha)
+                                    compute_awq_scales_for_tensor(name, 0, im_weights, alpha)
                                 };
                                 awq_sidecar_scales = Some(scales.clone());
                                 let mut scaled = f32_data.clone();
