@@ -1241,14 +1241,8 @@ pub fn gptq_column_sequential_hip(
     let grid_bytes = frozen_grids.len() * std::mem::size_of::<PackedGrid>();
     let perm_bytes = k_dim * std::mem::size_of::<i32>();
 
-    let to_chol_err = |damp: f64| {
-        eprintln!(
-            "[gptq-hip-diag] to_chol_err fired in gptq_column_sequential_hip K={k_dim} damp={:.6e} diag_mean={:.6e}",
-            damp, diag_mean_for_err
-        );
-        CholeskyError::SingularEvenWithMaxDamp {
-            max_damp: damp, k: k_dim, diag_mean: diag_mean_for_err,
-        }
+    let to_chol_err = |damp: f64| CholeskyError::SingularEvenWithMaxDamp {
+        max_damp: damp, k: k_dim, diag_mean: diag_mean_for_err,
     };
 
     unsafe {
@@ -1257,20 +1251,20 @@ pub fn gptq_column_sequential_hip(
         };
         let d_w_quant = match dev_alloc(solver, w_bytes) {
             Ok(p) => p,
-            Err(_) => { dev_free(solver, d_w_residual); return Err(to_chol_err(effective_damp)); }
+            Err(_) => { dev_free(solver, d_w_residual); { eprintln!("[gptq-hip-diag] S1 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); } }
         };
         let d_grids = match dev_alloc(solver, grid_bytes) {
             Ok(p) => p,
             Err(_) => {
                 dev_free(solver, d_w_residual); dev_free(solver, d_w_quant);
-                return Err(to_chol_err(effective_damp));
+                { eprintln!("[gptq-hip-diag] S2 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
             }
         };
         let d_err_block = match dev_alloc(solver, err_bytes) {
             Ok(p) => p,
             Err(_) => {
                 dev_free(solver, d_w_residual); dev_free(solver, d_w_quant); dev_free(solver, d_grids);
-                return Err(to_chol_err(effective_damp));
+                { eprintln!("[gptq-hip-diag] S3 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
             }
         };
         let d_perm = match dev_alloc(solver, perm_bytes) {
@@ -1278,7 +1272,7 @@ pub fn gptq_column_sequential_hip(
             Err(_) => {
                 dev_free(solver, d_w_residual); dev_free(solver, d_w_quant);
                 dev_free(solver, d_grids); dev_free(solver, d_err_block);
-                return Err(to_chol_err(effective_damp));
+                { eprintln!("[gptq-hip-diag] S4 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
             }
         };
 
@@ -1292,18 +1286,18 @@ pub fn gptq_column_sequential_hip(
         };
 
         if h2d(solver, d_w_residual, weights_flat.as_ptr() as *const u8, w_bytes).is_err() {
-            cleanup(solver); return Err(to_chol_err(effective_damp));
+            cleanup(solver); { eprintln!("[gptq-hip-diag] S5 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
         }
         if h2d(solver, d_w_quant, weights_flat.as_ptr() as *const u8, w_bytes).is_err() {
-            cleanup(solver); return Err(to_chol_err(effective_damp));
+            cleanup(solver); { eprintln!("[gptq-hip-diag] S6 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
         }
         let packed = pack_grids(frozen_grids);
         if h2d(solver, d_grids, packed.as_ptr() as *const u8, grid_bytes).is_err() {
-            cleanup(solver); return Err(to_chol_err(effective_damp));
+            cleanup(solver); { eprintln!("[gptq-hip-diag] S7 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
         }
         let perm_i32: Vec<i32> = perm.iter().map(|&v| v as i32).collect();
         if h2d(solver, d_perm, perm_i32.as_ptr() as *const u8, perm_bytes).is_err() {
-            cleanup(solver); return Err(to_chol_err(effective_damp));
+            cleanup(solver); { eprintln!("[gptq-hip-diag] S8 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
         }
 
         // ── Step 5: Block loop ──
@@ -1314,7 +1308,7 @@ pub fn gptq_column_sequential_hip(
 
             // Zero d_err_block at the start of each block.
             if dev_memset_zero(solver, d_err_block, err_bytes).is_err() {
-                cleanup(solver); return Err(to_chol_err(effective_damp));
+                cleanup(solver); { eprintln!("[gptq-hip-diag] S9 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
             }
 
             // Phase A: B serial within-block steps.
@@ -1335,7 +1329,7 @@ pub fn gptq_column_sequential_hip(
                     d_w_residual, d_w_quant, d_grids, d_err_block,
                     j_orig, u_ss, k_dim as i32, m as i32, err_col_slot, b_dim as i32,
                 ) {
-                    cleanup(solver); return Err(to_chol_err(effective_damp));
+                    cleanup(solver); { eprintln!("[gptq-hip-diag] S10 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
                 }
 
                 // Phase 2B kernel: within-block rank-1 update.
@@ -1346,7 +1340,7 @@ pub fn gptq_column_sequential_hip(
                         step as i32, block_start as i32, block_end as i32,
                         k_dim as i32, m as i32, b_dim as i32,
                     ) {
-                        cleanup(solver); return Err(to_chol_err(effective_damp));
+                        cleanup(solver); { eprintln!("[gptq-hip-diag] S11 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
                     }
                 }
             }
@@ -1371,7 +1365,7 @@ pub fn gptq_column_sequential_hip(
                     )
                 };
                 if res.is_err() {
-                    cleanup(solver); return Err(to_chol_err(effective_damp));
+                    cleanup(solver); { eprintln!("[gptq-hip-diag] S12 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
                 }
             }
 
@@ -1380,12 +1374,12 @@ pub fn gptq_column_sequential_hip(
 
         // Sync before D2H readback.
         if dev_sync(solver).is_err() {
-            cleanup(solver); return Err(to_chol_err(effective_damp));
+            cleanup(solver); { eprintln!("[gptq-hip-diag] S13 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
         }
 
         // ── Step 6: D2H W_quant ──
         if d2h(solver, weights_flat.as_mut_ptr() as *mut u8, d_w_quant, w_bytes).is_err() {
-            cleanup(solver); return Err(to_chol_err(effective_damp));
+            cleanup(solver); { eprintln!("[gptq-hip-diag] S14 K={k_dim} effective_damp={:.6e}", effective_damp); return Err(to_chol_err(effective_damp)); }
         }
         cleanup(solver);
     }
