@@ -6797,7 +6797,25 @@ fn forward_scratch_layers(
                 let fused_la4_hfq6 = la4_same_dtype
                     && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
                     && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
-                if fused_la4_mq4 {
+                // Calibration override: when a Hessian/imatrix collector is
+                // installed on `gpu.capture_handler`, force the unfused per-
+                // projection path so `set_capture_name(...)` fires once per
+                // linear and the collector accumulates per-tensor moments.
+                // The fused QKVZA kernels skip set_capture_name entirely,
+                // which silently collapses calibration coverage from the
+                // ~8 GPTQ-target tensors/layer down to {out_proj, down_proj}.
+                // Production inference leaves capture_handler == None, so
+                // this is a single is_none() branch in the hot path.
+                if gpu.capture_handler.is_some() {
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.linear_attn.in_proj_qkv.weight")));
+                    weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.linear_attn.in_proj_z.weight")));
+                    weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.linear_attn.in_proj_b.weight")));
+                    weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.linear_attn.in_proj_a.weight")));
+                    weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                } else if fused_la4_mq4 {
                     // MQ4: x_rot is Some(rotated x); HF4: x_rot is None and
                     // s.tmp holds the plain rmsnormed x from the fallback path.
                     let eff_x = match x_rot {
@@ -6933,7 +6951,16 @@ fn forward_scratch_layers(
                 let fused_gu_hfq6 = same_dtype
                     && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
                     && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
-                if fused_gu_mq4 {
+                // Calibration override: force unfused gate/up path so the
+                // capture handler sees both mlp.gate_proj and mlp.up_proj.
+                // The fused gate+up kernels skip set_capture_name and would
+                // otherwise omit these tensors from the Hessian sidecar.
+                if gpu.capture_handler.is_some() {
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.gate_proj.weight")));
+                    weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.up_proj.weight")));
+                    weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+                } else if fused_gu_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
                         None => &s.tmp,
@@ -7004,7 +7031,18 @@ fn forward_scratch_layers(
                 let fused_fa3_hfq6 = fa3_same_dtype
                     && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
                     && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
-                if fused_fa3_mq4 {
+                // Calibration override: force unfused q/k/v path so the
+                // capture handler sees self_attn.{q,k,v}_proj. The fused
+                // QKV kernel skips set_capture_name and would otherwise
+                // omit these tensors from the Hessian sidecar.
+                if gpu.capture_handler.is_some() {
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.q_proj.weight")));
+                    weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.k_proj.weight")));
+                    weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.self_attn.v_proj.weight")));
+                    weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
+                } else if fused_fa3_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
                         None => &s.tmp,
@@ -7213,7 +7251,17 @@ fn forward_scratch_layers(
                 let fused_gu_hfq6 = same_dtype
                     && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
                     && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
-                if fused_gu_mq4 {
+                // Calibration override: force unfused gate/up path so the
+                // capture handler sees both mlp.gate_proj and mlp.up_proj
+                // for FullAttention layers. The fused gate+up kernel skips
+                // set_capture_name and would otherwise omit these tensors
+                // from the Hessian sidecar.
+                if gpu.capture_handler.is_some() {
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.gate_proj.weight")));
+                    weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                    gpu.set_capture_name(Some(format!("model.layers.{layer_idx}.mlp.up_proj.weight")));
+                    weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+                } else if fused_gu_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
                         None => &s.tmp,
