@@ -2139,16 +2139,47 @@ pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, g
     let output = {
         let (_, td) = source.tensor_data(&output_src_name)
             .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: output projection tensor {output_src_name}")))?;
-        // PARO lm_head: opt-in F16 storage on GPU via HIPFIRE_LM_HEAD_F16=native
-        // (default: f32). F16 storage + the gfx12 256-thread gemv_f16_x32 kernel
-        // halves the weight BW for the 28-percent lm_head slot. Set
-        // HIPFIRE_LM_HEAD_F16_X32_GFX12=1 alongside to route the dispatch.
-        match f16_lm_head_mode_from_env() {
-            F16LmHeadMode::Native => {
+        // PARO lm_head storage options (controlled by HIPFIRE_LM_HEAD_F16):
+        //   q8     — quantize F16 → Q8_0 (32-elem blocks, F16 scale + 32 i8).
+        //            ~4× BW reduction vs F32 / 2× vs F16. Uses existing
+        //            gemv_q8_0 dispatch. Coherence verified separately.
+        //   native — keep F16 on GPU (uses gemv_f16_x32_lmhead_gfx12).
+        //   f32    — legacy F32 expansion (default).
+        // The lm_head decode hot path reads vocab × dim per token (2 GB at
+        // F32 / 1 GB at F16 / 0.5 GB at Q8 on Qwen3.6 248k × 2048).
+        // Rocprof shows lm_head at 24-28 percent of decode GPU time.
+        match std::env::var("HIPFIRE_LM_HEAD_F16").as_deref() {
+            Ok("q8") => {
+                let mut q8_bytes: Vec<u8> = Vec::with_capacity(
+                    config.vocab_size * (config.dim / 32) * 34
+                );
+                let row_f16_bytes = config.dim * 2;
+                for row in 0..config.vocab_size {
+                    let row_data = &td[row * row_f16_bytes..(row + 1) * row_f16_bytes];
+                    let f32_row: Vec<f32> = row_data.chunks_exact(2)
+                        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                        .collect();
+                    for chunk in f32_row.chunks(32) {
+                        let amax = chunk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                        let d = amax / 127.0;
+                        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+                        let d_f16_bits = hipfire_runtime::llama::f32_to_f16(d);
+                        q8_bytes.extend_from_slice(&d_f16_bits.to_le_bytes());
+                        for &x in chunk {
+                            let q = (x * id).round() as i32;
+                            let q_i8 = q.clamp(-127, 127) as i8;
+                            q8_bytes.push(q_i8 as u8);
+                        }
+                    }
+                }
+                let buf = gpu.upload_raw(&q8_bytes, &[q8_bytes.len()])?;
+                WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
+            }
+            Ok("native") => {
                 let buf = gpu.upload_raw(td, &[config.vocab_size, config.dim])?;
                 WeightTensor { buf, gpu_dtype: DType::F16, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
             }
-            F16LmHeadMode::F32 => {
+            _ => {
                 let f: Vec<f32> = td.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
                 let bytes: &[u8] = unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
                 let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
