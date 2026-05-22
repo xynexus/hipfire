@@ -113,6 +113,11 @@ pub const GEMV_HFQ4G128_DOT2_GFX12_SRC: &str =
 /// under HIPFIRE_PARO_BATCHED=1).
 pub const GEMV_HFQ4G128_RESIDUAL_SIGMOID_SCALED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g128_residual_sigmoid_scaled.hip");
 
+/// PARO4-G128: ParoQuant-compatible rotated activation + W4 GEMV.
+/// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights,
+/// followed by shared pair-rotation metadata and channel scales.
+pub const GEMV_PARO4G128_SRC: &str = include_str!("../../../kernels/src/gemv_paro4g128.hip");
+
 
 /// HFQ4-G128 batched GEMM: same tiled approach as G256 but 72 bytes/group, 4 weights/thread.
 pub const GEMM_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g128.hip");
@@ -422,11 +427,15 @@ pub const GEMV_HFQ3G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/
 pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
 pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
+pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
+/// Lever 1 — RMSNorm + PARO4G128T per-group Givens rotation, fused into a single launch.
+/// Replaces the `rmsnorm_f32` + `paro4g128t_rotate` pair. Numerically equivalent within FP16.
+pub const FUSED_RMSNORM_PARO4G128T_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_paro4g128t_rotate.hip");
 pub const RMSNORM_REDUCE_GFX942_SRC: &str = include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
 pub const ROTATE_WITH_RMS_GFX942_SRC: &str = include_str!("../../../kernels/src/rotate_with_rms.gfx942.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MFMA_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma.gfx942.hip");
