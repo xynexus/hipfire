@@ -53,6 +53,13 @@ pub const GEMV_HFQ4G128_GFX12_SRC: &str =
 pub const FUSED_4WAY_F32_GEMV_GFX12_SRC: &str =
     include_str!("../../../kernels/src/fused_4way_f32_gemv.gfx12.hip");
 
+/// gfx12 (RDNA4) F32 fused shared_expert.down step for PARO decode.
+/// Combines silu_mul + gemv_f32 + sigmoid + scaled_add into one launch
+/// (4 → 1 = saves 3 launches per MoE layer). Mirrors MQ4's
+/// gemv_hfq4g256_residual_sigmoid_scaled_gpu pattern.
+pub const GEMV_F32_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_f32_silu_mul_residual_sigmoid_scaled.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible

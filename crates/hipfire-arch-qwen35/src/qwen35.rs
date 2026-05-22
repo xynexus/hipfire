@@ -2999,6 +2999,20 @@ fn moe_ffn_decode_impl(
             &ffn.shared_expert.down.buf, &x_rot_alias, x_residual, scalar_buf,
             ffn.shared_expert.down.m, ffn.shared_expert.down.k,
         )?;
+    } else if ffn.shared_expert.down.gpu_dtype == DType::F32
+        && (gpu.arch.starts_with("gfx1200") || gpu.arch.starts_with("gfx1201"))
+        && std::env::var("HIPFIRE_FUSED_F32_DOWN_SIGMOID_GFX12").as_deref() == Ok("1")
+    {
+        // PARO F32 shared_expert.down — fused silu_mul + gemv + sigmoid +
+        // scaled_add in one kernel. Saves 3 launches per MoE layer × 40 = 120
+        // launches/token. Mirrors MQ4's gemv_hfq4g256_residual_sigmoid_scaled
+        // pattern. Opt-in via HIPFIRE_FUSED_F32_DOWN_SIGMOID_GFX12=1.
+        gpu.gemv_f32_silu_mul_residual_sigmoid_scaled_gfx12(
+            &ffn.shared_expert.down.buf,
+            &shared_gate, &shared_up,
+            x_residual, scalar_buf,
+            ffn.shared_expert.down.m, ffn.shared_expert.down.k,
+        )?;
     } else {
         // Non-MQ fallback path still needs the separate sigmoid + scaled-add.
         gpu.sigmoid_f32(scalar_buf)?;

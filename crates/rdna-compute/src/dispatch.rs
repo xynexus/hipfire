@@ -2526,6 +2526,60 @@ impl Gpu {
         result
     }
 
+    /// gfx12 F32 fused shared_expert.down step for PARO decode. Combines
+    /// silu_mul + gemv_f32 + sigmoid + scaled_add into one launch. Mirrors
+    /// MQ4's fused_silu_mul_rotate + gemv_hfq4g256_residual_sigmoid_scaled
+    /// pattern. Saves 3 launches per MoE layer.
+    pub fn gemv_f32_silu_mul_residual_sigmoid_scaled_gfx12(
+        &mut self,
+        w_down: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        y_residual: &GpuTensor,
+        scalar: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_f32_silu_mul_residual_sigmoid_scaled_gfx12",
+            kernels::GEMV_F32_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC,
+            "gemv_f32_silu_mul_residual_sigmoid_scaled_gfx12",
+        )?;
+        let wp = w_down.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let up_p = up.buf.as_ptr();
+        let yp = y_residual.buf.as_ptr();
+        let sp = scalar.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &up_p as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let bytes = (m * k * 4) + (k * 4) * 2 + (m * 4) + 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_f32_silu_mul_residual_sigmoid_scaled_gfx12", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_f32_silu_mul_residual_sigmoid_scaled_gfx12",
+            [m as u32, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp); b.push_ptr(gp); b.push_ptr(up_p);
+                b.push_ptr(yp); b.push_ptr(sp);
+                b.push_i32(mv); b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// gfx12 4-way fused F32 GEMV for the PARO MoE gate-side preamble.
     /// Mirrors the MQ4 `fused_qkvza_hfq4g256` pattern. One launch handles
     /// router + shared_expert_gate + shared.gate + shared.up = 4 outputs
