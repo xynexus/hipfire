@@ -1771,6 +1771,14 @@ pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul
 pub const SIGMOID_SCALED_ADD_INPLACE_F32_SRC: &str =
     include_str!("../../../kernels/src/sigmoid_scaled_add_inplace_f32.hip");
 
+/// gfx12 (RDNA4) FP16 WMMA replacement for `gemm_f32_batched`. Same call
+/// contract (A/B/Y are F32); downcasts to F16 in-kernel per WMMA tile.
+/// Routes via HIPFIRE_GEMM_F32_WMMA_GFX12=1 (opt-in pending bench). For
+/// z-lab F32 shared_expert dispatch this addresses the 58.7% GPU time
+/// `gemm_f32_batched` consumes post-admit-fix.
+pub const GEMM_F32_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_wmma.gfx12.hip");
+
 /// Top-K=128 extraction over a logits vector. Lets the host sampler work
 /// on a 1 KB GPU-side candidate set instead of DtoH'ing the full 600 KB
 /// logits array. See kernel header for bit-exactness reasoning.

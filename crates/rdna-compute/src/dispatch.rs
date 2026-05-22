@@ -24749,6 +24749,18 @@ impl Gpu {
         m: usize, k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx12 (RDNA4) FP16 WMMA fast-path. Opt-in via HIPFIRE_GEMM_F32_WMMA_GFX12=1
+        // pending bench/coherence validation. rocprof on z-lab post-admit-fix
+        // shows this kernel = 58.7% of GPU time at 520 calls — closing this
+        // gap is the largest remaining lever for the F32 shared_expert path.
+        let use_wmma_gfx12 = (self.arch.starts_with("gfx1200") || self.arch.starts_with("gfx1201"))
+            && std::env::var("HIPFIRE_GEMM_F32_WMMA_GFX12").as_deref() == Ok("1")
+            && m >= 16 && m % 16 == 0
+            && n >= 16 && n % 16 == 0
+            && k >= 16 && k % 16 == 0;
+        if use_wmma_gfx12 {
+            return self.gemm_f32_wmma_gfx12(a, b, y, m, k, n);
+        }
         self.ensure_kernel("gemm_f32_batched", kernels::GEMM_F32_SRC, "gemm_f32_batched")?;
         let func = &self.functions["gemm_f32_batched"];
         let mut ap = a.buf.as_ptr();
@@ -24766,6 +24778,52 @@ impl Gpu {
             &mut ni as *mut _ as *mut c_void,
         ];
         unsafe { self.hip.launch_kernel(func, [m as u32, n as u32, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// gfx12 FP16 WMMA fast-path for `gemm_f32_batched`. Same call contract
+    /// (A/B/Y are F32); downcasts to F16 inline per WMMA tile. Caller must
+    /// have verified M, N, K all multiples of 16.
+    fn gemm_f32_wmma_gfx12(
+        &mut self, a: &GpuTensor, b: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemm_f32_wmma_gfx12",
+            kernels::GEMM_F32_WMMA_GFX12_SRC,
+            "gemm_f32_wmma_gfx12",
+        )?;
+        let ap = a.buf.as_ptr();
+        let bp = b.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let m_tiles = (m / 16) as u32;
+        let n_tiles = (n / 16) as u32;
+        let bytes = (m * k * 4) + (n * k * 4) + (m * n * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_f32_wmma_gfx12", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_f32_wmma_gfx12",
+            [m_tiles, n_tiles, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap); b.push_ptr(bp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
