@@ -116,7 +116,10 @@ fn main() {
         "asym2" | "turbo2" => KvCache::new_gpu_asym2(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
         ).unwrap(),
-        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|asym2)"),
+        "fwht3" => KvCache::new_gpu_fwht3_filtered(
+            &mut gpu, &vec![true; config.n_layers], config.n_kv_heads, config.head_dim, kv_seq,
+        ).unwrap(),
+        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|asym2|fwht3)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
