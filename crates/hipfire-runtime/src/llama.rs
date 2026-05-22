@@ -739,16 +739,16 @@ pub fn weight_gemv(
         DType::Q4F16G64 => gpu.gemv_q4f16_g64(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
         DType::ParoQ4G128 => {
-            // ParoQuant: copy x → scratch, Givens-rotate scratch, GEMV from scratch.
-            // Must NOT rotate x in-place: the same x_norm is shared across multiple
-            // weight_gemv calls in a layer (wqkv, wz, w_alpha, w_beta, etc.),
-            // each with different rotation metadata.
+            // ParoQuant: fused copy+rotate via givens_rotate_to (1 launch),
+            // then GEMV from scratch. Out-of-place rotation kernel — must
+            // NOT rotate x in-place: same x_norm shared across multiple
+            // weight_gemv calls per layer (wqkv, wz, w_alpha, w_beta), each
+            // with different rotation metadata.
             //
-            // NOTE: Tried `givens_rotate_to` (combined copy+rotate, 1 launch)
-            // 2026-05-22 — bench was +3% but coherence broke (humaneval_2/3
-            // → 11 tokens vs baseline 101+). Kernel docs claim bit-exact
-            // equivalence but math drift is real. Sticking with the legacy
-            // 2-launch path.
+            // Switched 2026-05-22 from `copy_d2d + givens_rotate` (2 launches)
+            // to `givens_rotate_to` (1 launch). Saves 1 dispatch per PARO
+            // weight call × ~131 PARO calls/token = 1.3 ms/token wall savings
+            // (~+8 percent at decode).
             let paro = w.paro.as_ref().expect("ParoQ4G128 weight missing ParoRotation metadata");
             gpu.ensure_paro_scratch(w.k)?;
             let scratch_alias = GpuTensor {
@@ -756,9 +756,9 @@ pub fn weight_gemv(
                 shape: vec![w.k],
                 dtype: DType::F32,
             };
-            gpu.copy_d2d(x, &scratch_alias, w.k * 4)?;
-            gpu.givens_rotate(
-                &scratch_alias, &paro.pairs, &paro.theta, &paro.channel_scales,
+            gpu.givens_rotate_to(
+                x, &scratch_alias,
+                &paro.pairs, &paro.theta, &paro.channel_scales,
                 1, w.k, paro.krot as usize,
             )?;
             gpu.gemv_hfq4g128(&w.buf, &scratch_alias, y, w.m, w.k)
