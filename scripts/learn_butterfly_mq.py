@@ -718,6 +718,99 @@ def run_butterfly_training(
 
 
 # ---------------------------------------------------------------------------
+# Direct KLD loss training (Phase 4c — proxy aligned with production metric).
+# ---------------------------------------------------------------------------
+
+def train_kld_loss(
+    *,
+    wrapped: dict[str, ButterflyResidualPseudoQuantLinear],
+    oracle: nn.Module,
+    student: nn.Module,
+    seqs: list[torch.Tensor],
+    device: torch.device,
+    n_epochs: int,
+    lr: float,
+    momentum: float,
+    weight_decay: float,
+    cosine_floor: float,
+    grad_clip: Optional[float],
+    log_interval: int,
+) -> list[dict]:
+    """Train all theta jointly with KL-divergence loss between oracle and
+    student logit distributions. The proxy IS the production metric — no
+    BRECQ-style approximation. Decisive test for whether the residual
+    butterfly form has the expressive power to reduce model KLD on MQ4G256.
+
+    Phase 4 (joint MSE) and Phase 4b (sequential MSE) both failed. This
+    eliminates the proxy mismatch class entirely.
+    """
+    params: list[nn.Parameter] = []
+    for w in wrapped.values():
+        w.set_optim()
+        for p in w.parameters():
+            if p.requires_grad:
+                params.append(p)
+    optimizer = torch.optim.SGD(
+        params, lr=lr, momentum=momentum, weight_decay=weight_decay,
+    )
+    total_steps = max(1, n_epochs * len(seqs))
+
+    def lr_lambda(step: int) -> float:
+        progress = min(1.0, step / total_steps)
+        return cosine_floor + 0.5 * (1.0 - cosine_floor) * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    print(f"  SGD-KLD: lr={lr:g} momentum={momentum} epochs={n_epochs} "
+          f"steps={total_steps} params={len(params)} "
+          f"elements={sum(p.numel() for p in params)}")
+
+    trace: list[dict] = []
+    for epoch in range(n_epochs):
+        epoch_start = time.time()
+        epoch_loss = 0.0
+        epoch_count = 0
+        for seq_idx, seq in enumerate(seqs):
+            input_ids = seq.unsqueeze(0).to(device)
+            with torch.no_grad():
+                oracle_logits = oracle(input_ids).logits.float()
+                log_p = F.log_softmax(oracle_logits, dim=-1).detach()
+                p = log_p.exp()
+            student_logits = student(input_ids).logits.float()
+            log_q = F.log_softmax(student_logits, dim=-1)
+            # Mean per-token KL(oracle || student).
+            kl = (p * (log_p - log_q)).sum(dim=-1).mean()
+
+            optimizer.zero_grad(set_to_none=True)
+            kl.backward()
+            if grad_clip is not None and grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(params, grad_clip)
+            optimizer.step()
+            scheduler.step()
+            epoch_loss += float(kl.detach())
+            epoch_count += 1
+
+            if (seq_idx + 1) % log_interval == 0:
+                running = epoch_loss / max(epoch_count, 1)
+                elapsed = time.time() - epoch_start
+                cur_lr = scheduler.get_last_lr()[0]
+                print(f"      epoch {epoch + 1}/{n_epochs} seq {seq_idx + 1}/{len(seqs)} "
+                      f"kld={float(kl.detach()):.6e} running={running:.6e} "
+                      f"lr={cur_lr:.3e} ({elapsed:.1f}s)")
+
+        mean_loss = epoch_loss / max(epoch_count, 1)
+        trace.append({
+            "epoch": epoch,
+            "mean_kld_loss": mean_loss,
+            "elapsed_s": time.time() - epoch_start,
+            "final_lr": scheduler.get_last_lr()[0],
+        })
+        print(f"      [epoch {epoch + 1}] mean_kld={mean_loss:.6e}  "
+              f"time={time.time() - epoch_start:.1f}s")
+
+    return trace
+
+
+# ---------------------------------------------------------------------------
 # Sequential per-tensor training (Phase 4b — paper's actual method).
 # ---------------------------------------------------------------------------
 
@@ -1037,6 +1130,10 @@ def main() -> None:
                          "tensor sees only these). 32 default to keep cache small.")
     ap.add_argument("--sequential-steps", type=int, default=100,
                     help="SGD steps per tensor in --sequential mode.")
+    ap.add_argument("--loss-kld", action="store_true",
+                    help="Use direct KL-divergence loss (oracle || student) "
+                         "instead of per-Linear MSE. Aligns proxy with "
+                         "production metric. Phase 4c (decisive test).")
     args = ap.parse_args()
 
     if args.self_test:
@@ -1145,7 +1242,22 @@ def main() -> None:
 
     print("\n[5/7] Training butterfly residuals ...")
     train_start = time.time()
-    if args.sequential:
+    if args.loss_kld:
+        trace = train_kld_loss(
+            wrapped=wrapped,
+            oracle=oracle,
+            student=student,
+            seqs=seqs,
+            device=device,
+            n_epochs=args.n_epochs,
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            cosine_floor=args.cosine_floor,
+            grad_clip=args.grad_clip,
+            log_interval=args.log_interval,
+        )
+    elif args.sequential:
         trace = train_sequential(
             wrapped=wrapped,
             oracle=oracle,
