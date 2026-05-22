@@ -93,13 +93,25 @@ Levers explored but not delivering:
   6-of-256 expert selection.
 - **k4 deeper-pipeline** on G128 — measured neutral. Pipeline depth
   capped by the 8 K-tiles per group.
+- **DeltaNet register-array variant** on gfx12 — wired the pre-existing
+  `gated_delta_net_q8.gfx1200.hip` (commit `afc88620`). Falsified at
+  -34 % on prefill: 4 waves/head vs baseline 32 waves/head = 8× less
+  parallelism. The kernel was designed for single-token decode where
+  baseline does per-token requant noise; the batched-seq prefill path
+  already avoids that noise, so register variant has no upside on this
+  axis. Opt-in via `HIPFIRE_GDN_Q8_GFX12_REGISTER=1` for decode-path
+  experimentation. Future work: split S across multiple WGs to recover
+  parallelism while keeping register hot-path.
 
 Levers untouched (estimated effort vs reward):
 - **hipGraph capture for prefill** — would collapse ~30k WG dispatches per
   layer into one graph replay. Could be +20-30 % on top of current. Complex
   (CASK-style state machine for routed MoE). 2-3 days.
-- **DeltaNet attention BW optimization** — 11.9 % of GPU time at suspiciously
-  low 53 GiB/s. Algorithm-specific work, deep DeltaNet expertise required.
+- **DeltaNet attention parallelism redesign** — 11.9 % of GPU time. The
+  register-array variant fix needs S split across multiple WGs to recover
+  the 8× parallelism lost in the single-WG-per-head pattern. Algorithm
+  work, deep DeltaNet expertise required. (Plain register port to gfx12
+  was tried at `afc88620` and falsified.)
 - **lm_head GEMV WMMA-ization** — 4.4 % at 2 calls / 7.3 ms total. Already
   at 523 GiB/s, probably near ceiling.
 - **F32→F16 pre-conversion cache in LDS** for gemm_f32_wmma — would
