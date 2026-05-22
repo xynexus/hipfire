@@ -412,9 +412,9 @@ fn main() {
     // (deferred-conversion mode removed with givens — asym modes are natively
     //  batched so there's no prefill/decode cache swap to measure.)
 
-    // Read logits to get a valid next token
-    let logits = gpu.download_f32(&scratch.logits).unwrap();
-    let mut next_token = llama::argmax(&logits);
+    // Lever 4: device-side argmax. Avoids CPU partial_cmp.unwrap() panic
+    // on NaN logits and saves a D2H download of the full vocab logits.
+    let mut next_token = gpu.argmax_f32(&scratch.logits, config.vocab_size).unwrap();
 
     // === WARMUP ===
     eprintln!("\n=== warmup ({warmup_len} tokens — untimed, lets JIT settle) ===");
@@ -426,8 +426,7 @@ fn main() {
             &mut gpu, &weights, &config, next_token, pos,
             &mut kv_cache, &mut dn_state, &scratch,
         ).expect("warmup forward failed");
-        let logits = gpu.download_f32(&scratch.logits).unwrap();
-        next_token = llama::argmax(&logits);
+        next_token = gpu.argmax_f32(&scratch.logits, config.vocab_size).unwrap();
     }
     let warmup_ms = t_warmup.elapsed().as_secs_f64() * 1000.0;
     eprintln!("  total: {warmup_ms:.1}ms  avg: {:.2}ms/tok", warmup_ms / warmup_len as f64);
@@ -461,10 +460,9 @@ fn main() {
             &mut gpu, &weights, &config, next_token, pos,
             &mut kv_cache, &mut dn_state, &scratch,
         ).expect("gen forward failed");
-        let logits = gpu.download_f32(&scratch.logits).unwrap();
+        next_token = gpu.argmax_f32(&scratch.logits, config.vocab_size).unwrap();
         let t_ms = t.elapsed().as_secs_f64() * 1000.0;
         per_token_ms.push(t_ms);
-        next_token = llama::argmax(&logits);
     }
     let gen_total_ms = t_gen_start.elapsed().as_secs_f64() * 1000.0;
     if do_profile_decode {
