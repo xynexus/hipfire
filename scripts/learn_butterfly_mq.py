@@ -335,6 +335,16 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
             requires_grad=False,
         )
 
+        # Option #9 (bias correction): learnable per-output-channel bias that
+        # absorbs the systematic quant error E[ε · x] left over after AWQ + FWHT
+        # + min-max RTN. Init zero so at step 0 the model output is unchanged.
+        # Gradient flows continuously (no STE) so this is a fast-converging
+        # lever orthogonal to the discrete sign tables.
+        self.bias_correction = nn.Parameter(
+            torch.zeros(m, dtype=torch.float32),
+            requires_grad=False,
+        )
+
         self.canonical_name = canonical_name
         self.k_in = k
         self.m_out = m
@@ -350,11 +360,17 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         w_scaled = self.weight.to(torch.float32) * s_safe.unsqueeze(0)
         w_q_dq = quantize_mq4g256_signs_ste(w_scaled, d1, d2)
         x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
-        return F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
+        y = F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
+        # Bias correction: continuous learnable offset on output channels.
+        # At init bias_correction is zero, so this is a no-op until enabled.
+        y = y + self.bias_correction.to(y.dtype).view(*[1] * (y.dim() - 1), -1)
+        return y
 
-    def set_optim(self) -> None:
+    def set_optim(self, include_bias: bool = False) -> None:
         self.d1_logits.requires_grad = True
         self.d2_logits.requires_grad = True
+        if include_bias:
+            self.bias_correction.requires_grad = True
 
     def baseline_sign_flips(self) -> tuple[int, int]:
         """How many entries have flipped sign vs the seed init (D1, D2)."""
@@ -887,6 +903,7 @@ def train_kld_loss(
     cosine_floor: float,
     grad_clip: Optional[float],
     log_interval: int,
+    bias_lr: Optional[float] = None,
 ) -> list[dict]:
     """Train all theta jointly with KL-divergence loss between oracle and
     student logit distributions. The proxy IS the production metric — no
@@ -895,16 +912,34 @@ def train_kld_loss(
 
     Phase 4 (joint MSE) and Phase 4b (sequential MSE) both failed. This
     eliminates the proxy mismatch class entirely.
+
+    If `bias_lr` is provided, also trains LearnableSignsPseudoQuantLinear's
+    bias_correction parameters at that LR (separate from sign-table LR).
     """
-    params: list[nn.Parameter] = []
+    include_bias = bias_lr is not None
+    sign_params: list[nn.Parameter] = []
+    bias_params: list[nn.Parameter] = []
     for w in wrapped.values():
-        w.set_optim()
-        for p in w.parameters():
+        if hasattr(w, "set_optim") and "include_bias" in w.set_optim.__code__.co_varnames:
+            w.set_optim(include_bias=include_bias)
+        else:
+            w.set_optim()
+        for n, p in w.named_parameters():
             if p.requires_grad:
-                params.append(p)
+                if "bias_correction" in n:
+                    bias_params.append(p)
+                else:
+                    sign_params.append(p)
+    param_groups: list[dict] = [{"params": sign_params, "lr": lr}]
+    if bias_params:
+        param_groups.append({"params": bias_params, "lr": bias_lr})
+        print(f"  SGD-KLD bias-correction: enabled, "
+              f"{len(bias_params)} bias params, "
+              f"{sum(p.numel() for p in bias_params)} elements at lr={bias_lr:g}")
     optimizer = torch.optim.SGD(
-        params, lr=lr, momentum=momentum, weight_decay=weight_decay,
+        param_groups, momentum=momentum, weight_decay=weight_decay,
     )
+    params = sign_params + bias_params  # for grad_clip / logging
     total_steps = max(1, n_epochs * len(seqs))
 
     def lr_lambda(step: int) -> float:
@@ -1290,6 +1325,12 @@ def main() -> None:
                     help="Phase 4d: learn per-tensor D1/D2 sign tables "
                          "instead of butterfly residual. Discrete ±1 via "
                          "sign-STE. Init at seeds 42/1042.")
+    ap.add_argument("--bias-correction", action="store_true",
+                    help="Option #9: also learn per-Linear bias correction "
+                         "in addition to D1/D2 signs. Requires --learnable-signs "
+                         "and --loss-kld (joint KLD training).")
+    ap.add_argument("--bias-lr", type=float, default=1e-3,
+                    help="LR for bias_correction params (separate group from signs).")
     args = ap.parse_args()
 
     if args.self_test:
@@ -1405,6 +1446,7 @@ def main() -> None:
     print("\n[5/7] Training butterfly residuals ...")
     train_start = time.time()
     if args.loss_kld:
+        bias_lr_arg = args.bias_lr if args.bias_correction else None
         trace = train_kld_loss(
             wrapped=wrapped,
             oracle=oracle,
@@ -1418,6 +1460,7 @@ def main() -> None:
             cosine_floor=args.cosine_floor,
             grad_clip=args.grad_clip,
             log_interval=args.log_interval,
+            bias_lr=bias_lr_arg,
         )
     elif args.sequential:
         trace = train_sequential(
@@ -1515,6 +1558,19 @@ def main() -> None:
         np.savez(npz_path, **npz_dict)
         print(f"      wrote {len(npz_dict) // 2} tensor pairs (D1+D2) → {npz_path} "
               f"({npz_path.stat().st_size / 1e3:.1f} KB)")
+
+        if args.bias_correction:
+            bias_path = args.output_dir / "bias_corrections.npz"
+            bias_dict: dict[str, np.ndarray] = {}
+            for mod_name, wrapper in sorted(wrapped.items()):
+                bias_dict[wrapper.canonical_name] = (
+                    wrapper.bias_correction.detach().cpu().numpy().astype(np.float32)
+                )
+            np.savez(bias_path, **bias_dict)
+            total_bias_elems = sum(v.size for v in bias_dict.values())
+            print(f"      wrote {len(bias_dict)} bias corrections → {bias_path} "
+                  f"({bias_path.stat().st_size / 1e3:.1f} KB, "
+                  f"{total_bias_elems} total F32 elements)")
     else:
         npz_path = args.output_dir / "butterfly_residuals.npz"
         npz_dict = {}
