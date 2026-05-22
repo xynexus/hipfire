@@ -5164,6 +5164,16 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
         std::env::var("HIPFIRE_PARO_BATCHED").as_deref() == Ok("1")
     });
     if admit_paro {
+        // NOTE (2026-05-22): z-lab/Qwen3.6-35B-A3B-PARO stores shared_expert
+        // weights as raw FP16 (NOT PARO-quantized) — only the routed experts
+        // get PARO calibration. Admitting z-lab into the batched path requires
+        // a full F32 dispatch arm for shared_expert.gate/up/down, including
+        // a new F32 sigmoid-scaled residual kernel that doesn't exist yet
+        // (see prefill_moe_ffn_body_batched match arms at ~line 5449). For
+        // now z-lab falls back to per-token; shisa-ai's all-PARO variant
+        // admits cleanly. Follow-up: implement F32 batched shared_expert
+        // dispatch (silu_mul_f32 + gemm_f32_batched + new F32 sigmoid-scaled
+        // residual kernel) to unlock z-lab into the WMMA-gfx12 fast path.
         let paro_ok = router_ok
             && shared_gate_ok
             && matches!(ffn.shared_expert.gate.gpu_dtype, DType::ParoQ4G128)
