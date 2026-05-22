@@ -240,6 +240,7 @@ canonical PARO checkpoint for gfx12 prefill.
 Full commit graph on `feat/lever-4-gpu-argmax-stability`:
 
 ```
+6b992b49  BF16-WMMA F32 GEMM variant — also breaks router (opt-in research)
 5a556225  shared_expert-only F32-WMMA — +102% z-lab AND clean coherence
 18f0ce81  FP16-WMMA gemm_f32_batched (broad opt-in; router-sensitive)
 d6e66cb7  fix F32 shared_expert output layout (silent corruption)
@@ -257,3 +258,38 @@ ce289429  perm_b32 nibble unpack (neutral, opt-in)
 f2e2c254  PARO Q4G128 MoE grouped MMQ port — +30× prefill
 dcf752dc  Lever 4 — bench_qwen35_mq4 GPU argmax (NaN fix)
 ```
+
+### BF16-WMMA followup (2026-05-22 late evening)
+
+Tried BF16 WMMA for the precision-sensitive F32 GEMM call sites (router
+etc.) on the hypothesis that BF16's 8-bit exponent (vs FP16's 5-bit)
+would preserve dynamic range and avoid the router top-K regression
+that broke broad-FP16-WMMA. **Falsified at the broad-opt-in level**:
+
+  Broad BF16-WMMA + shared_expert FP16-WMMA:
+    Perf:      3660 tok/s prefill (+17 % over per-call-site only)
+    Coherence: 11 / 11 / 120 tokens — same earlier-EOS pattern as broad FP16
+               (no hard attractors, but model gives much shorter answers
+               on humaneval_2/3 where shared-expert-only path emits 100+)
+
+BF16 preserves dynamic range but the 7-bit mantissa (vs 23 bits for F32)
+still flips top-K routing decisions on subtly balanced tokens. The
+router needs full F32 precision; both FP16 and BF16 broad-opt-ins
+cause earlier-EOS quality regression.
+
+**Production-canonical z-lab stack:** shared_expert FP16-WMMA + scalar
+F32 router = 3130 tok/s wall, 101/120/120 token output, 0 hard fails.
+
+Final session arc on z-lab A3B-PARO prefill (hiptrx/gfx1201, 4-run median):
+
+| Stage | tok/s | Speedup | Coherence |
+|---|---:|---|---|
+| Session start (admit broken) | 64 | 1× | per-token fallback |
+| + admit relax + F32 batched dispatch (f4681367) | 697 | 10.9× | 0 hard / 1 soft |
+| + HFQ4-WMMA-gfx12 (6c097ad5) | 1547 | 24.2× | 0 hard / 1 soft |
+| + shared_expert F32-WMMA (5a556225) | **3130** | **48.9×** | **0 hard / 1 soft (full output)** |
+| + broad BF16-WMMA (6b992b49) | 3660 | 57.2× | 0 hard / 1 soft (shorter output, opt-in) |
+
+3130 with full output is the production answer. 3660 is a +17% opt-in for
+contexts where shorter responses are acceptable (the model isn't broken,
+it just decides to EOS faster when the router precision drops).
