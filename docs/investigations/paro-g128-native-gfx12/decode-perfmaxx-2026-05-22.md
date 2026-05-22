@@ -116,6 +116,75 @@ remains the headline win. Decode lives in a fundamentally different
 optimization regime and the bounded levers I tried this session do not
 move the needle meaningfully.
 
+## Post-fail follow-up: gfx11 decode lever survey (2026-05-22 evening)
+
+User prompt after the initial fail report: "let's look at what decode
+levers we use on gfx11 that we do not use on gfx12 yet." Two structural
+patterns surfaced from the gfx11 kernel inventory:
+
+### 1. `fused_qkvza_hfq4g256` (MQ4 LA fused 4-way) → PARO F32 sister
+
+The MQ4 LA path uses one kernel launch for the 4 gate-side projections
+(router + shared_expert_gate + shared.gate + shared.up), claiming
+~8-12% cycle-time savings on gfx1100 from the launch reduction.
+
+I wrote `fused_4way_f32_gemv.gfx12.hip` — same routing pattern, F32
+weights and F32 X. Routes via `HIPFIRE_FUSED_4WAY_F32_GEMV_GFX12=1`
+when all 4 gate-side weights are F32 (z-lab/shisa PARO checkpoint
+case).
+
+Bench result (3-run median):
+
+  Baseline (post-prefill-perfmaxx stack):      62.6 tok/s
+  + fused 4-way F32 GEMV (this commit):        67.7 tok/s   **+8 %**
+
+**Real win.** Matches the MQ4 sister's documented savings.
+
+Stacking with `HIPFIRE_GRAPH_MOE=1` is bimodal (4/5 at 67-70, 1/5 at
+35) — the hipGraph capture occasionally falls into a fallback path
+with PARO. NOT recommended for production until the falback root cause
+is fixed.
+
+### 2. `gemv_hfq4g256.gfx1100.hip` 4-acc unroll → PARO G128 port
+
+The gfx1100 single-row GEMV uses 4 independent accumulators (acc0..acc3)
+for FMA pipeline depth, vs the single-acc baseline in
+`gemv_hfq4g128.hip`. I ported the pattern to
+`gemv_hfq4g128.gfx12.hip`.
+
+Bench: -2.5 % (60.9 vs 62.5). The compiler is apparently already
+pipelining the single-acc baseline on gfx12 — the explicit 4-acc gives
+no additional ILP. Kept opt-in via `HIPFIRE_GEMV_HFQ4G128_GFX12=1`.
+
+### 3. `gemv_hfq4g256_multirow.gfx1100.hip` → already-falsified pattern
+
+Inspecting this kernel's header revealed it was tried on gfx1100 and
+**documented as not-a-win** ("The single-row kernel is already near-
+bandwidth-optimal on large matrices and is launch-latency bound on
+small ones. Multi-row tiling reduces wave count per launch, which
+under-subscribes the wave scheduler without giving back enough
+register-reuse wins."). My earlier subwave and per-thread-rows multirow
+attempts on gfx12 hit the same wall (-23 % / -54 %). Not a missed
+lever.
+
+### Combined session result
+
+Decode arc on z-lab A3B-PARO (gfx1201, --gen 100, 3-run median):
+
+  Session start (post-prefill-perfmaxx baseline):  62.6 tok/s
+  + fused 4-way F32 GEMV (decode lever 1):         67.7 tok/s
+
+**Goal 100 tok/s: NOT MET. Gap 32.3 tok/s.**
+
+Bounded single-session ceiling for decode is the +8 % achieved. The
+remaining 32 tok/s requires either spec decode for PARO or a kernel
+fusion stack deeper than what fits in one session. The user's intuition
+about gfx11 levers was partially correct (the 4-way fused pattern was
+real and ported successfully) but did not yield 3× as the MQ4-on-gfx11
+data point suggested — the missing levers are about LAUNCH OVERHEAD
+reduction, which only converts to large gains when many fusion
+opportunities stack together.
+
 ## Files shipped (opt-in research)
 
 - `kernels/src/gemv_f32_multirow.gfx12.hip` — subwave multirow GEMV
