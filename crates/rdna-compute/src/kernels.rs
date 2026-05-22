@@ -1779,6 +1779,14 @@ pub const SIGMOID_SCALED_ADD_INPLACE_F32_SRC: &str =
 pub const GEMM_F32_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_f32_wmma.gfx12.hip");
 
+/// gfx12 (RDNA4) BF16 WMMA replacement for `gemm_f32_batched`. Same call
+/// contract as the FP16 sister, but downcasts to BF16 instead — preserves
+/// F32's 8-bit exponent range, only sacrificing mantissa precision.
+/// Suitable for precision-sensitive call sites (e.g. router) where FP16's
+/// clamped dynamic range broke top-K routing decisions.
+pub const GEMM_F32_WMMA_BF16_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_wmma_bf16.gfx12.hip");
+
 /// Top-K=128 extraction over a logits vector. Lets the host sampler work
 /// on a 1 KB GPU-side candidate set instead of DtoH'ing the full 600 KB
 /// logits array. See kernel header for bit-exactness reasoning.
