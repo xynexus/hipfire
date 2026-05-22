@@ -107,6 +107,12 @@ pub const GEMV_HFQ4G256_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
 pub const GEMV_HFQ4G128_DOT2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g128_dot2.gfx12.hip");
 
+/// gfx12 (RDNA4) HFQ4-G128 GEMV using __builtin_amdgcn_sdot4 (i8x4 → i32).
+/// Requires Q8_1 mmq pre-quantized X (144 B per 128-K block) via
+/// ensure_q8_1_mmq_x. 4 MACs per VALU vs dot2's 2.
+pub const GEMV_HFQ4G128_DP4A_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_dp4a.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible
