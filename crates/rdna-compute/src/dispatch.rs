@@ -20091,6 +20091,16 @@ impl Gpu {
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
     pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
         self.bind_thread()?;
+
+        // gfx12 multi-WG fast-path. Pass 1: chunk vocab across many WGs.
+        // Pass 2: single WG reduces partials. ~30-100× faster than the
+        // single-WG baseline on 248k-vocab Qwen3.6. Opt-in via
+        // HIPFIRE_ARGMAX_MULTIWG_GFX12=1.
+        let arch_gfx12 = self.arch.starts_with("gfx1200") || self.arch.starts_with("gfx1201");
+        if arch_gfx12 && std::env::var("HIPFIRE_ARGMAX_MULTIWG_GFX12").as_deref() == Ok("1") {
+            return self.argmax_f32_multiwg_gfx12(data, n);
+        }
+
         self.ensure_kernel("argmax_f32", kernels::ARGMAX_SRC, "argmax_f32")?;
         let func = &self.functions["argmax_f32"];
 
@@ -20119,6 +20129,78 @@ impl Gpu {
         };
         self.hip.memcpy_dtoh(result_bytes, &result_buf)?;
         self.hip.free(result_buf)?;
+        Ok(result[0] as u32)
+    }
+
+    /// gfx12 multi-WG argmax_f32 — two-stage reduction (pass1 partial, pass2 final).
+    fn argmax_f32_multiwg_gfx12(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
+        const CHUNK: usize = 2048;
+        let num_wgs = ((n + CHUNK - 1) / CHUNK) as u32;
+        self.ensure_kernel(
+            "argmax_f32_partial_gfx12",
+            kernels::ARGMAX_F32_MULTIWG_GFX12_SRC,
+            "argmax_f32_partial_gfx12",
+        )?;
+        self.ensure_kernel(
+            "argmax_f32_final_gfx12",
+            kernels::ARGMAX_F32_MULTIWG_GFX12_SRC,
+            "argmax_f32_final_gfx12",
+        )?;
+        let partial_vals_buf = self.hip.malloc((num_wgs as usize) * 4)?;
+        let partial_idxs_buf = self.hip.malloc((num_wgs as usize) * 4)?;
+        let result_buf = self.hip.malloc(4)?;
+        // Pass 1.
+        {
+            let dp = data.buf.as_ptr();
+            let pvp = partial_vals_buf.as_ptr();
+            let pip = partial_idxs_buf.as_ptr();
+            let nn = n as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &dp as *const _ as *mut c_void,
+                &pvp as *const _ as *mut c_void,
+                &pip as *const _ as *mut c_void,
+                &nn as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "argmax_f32_partial_gfx12",
+                [num_wgs, 1, 1], [256, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(dp); b.push_ptr(pvp); b.push_ptr(pip); b.push_i32(nn);
+                    b
+                },
+            )?;
+        }
+        // Pass 2.
+        {
+            let pvp = partial_vals_buf.as_ptr();
+            let pip = partial_idxs_buf.as_ptr();
+            let rp = result_buf.as_ptr();
+            let nw = num_wgs as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &pvp as *const _ as *mut c_void,
+                &pip as *const _ as *mut c_void,
+                &rp as *const _ as *mut c_void,
+                &nw as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "argmax_f32_final_gfx12",
+                [1, 1, 1], [256, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(pvp); b.push_ptr(pip); b.push_ptr(rp); b.push_i32(nw);
+                    b
+                },
+            )?;
+        }
+        let mut result = [0i32];
+        let result_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 4)
+        };
+        self.hip.memcpy_dtoh(result_bytes, &result_buf)?;
+        self.hip.free(result_buf)?;
+        self.hip.free(partial_vals_buf)?;
+        self.hip.free(partial_idxs_buf)?;
         Ok(result[0] as u32)
     }
 

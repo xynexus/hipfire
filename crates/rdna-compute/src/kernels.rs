@@ -2088,6 +2088,12 @@ pub const MAX_PROB_SRC: &str = include_str!("../../../kernels/src/max_prob.hip")
 /// GPU argmax: find index of maximum value.
 pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 
+/// gfx12 (RDNA4) multi-WG argmax_f32: pass-1 chunks vocab across many WGs;
+/// pass-2 reduces partials. 30-100× faster than single-WG baseline on
+/// 248k-vocab Qwen3.6 (~232 µs → ~5-10 µs expected).
+pub const ARGMAX_F32_MULTIWG_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/argmax_f32_multiwg.gfx12.hip");
+
 /// Batched argmax: one block per row, writes B indices with one kernel launch.
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
 pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");
