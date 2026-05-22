@@ -1183,15 +1183,42 @@ fn load_fp16_weight_from_source(
 ) -> HipResult<WeightTensor> {
     let (_, data) = source.tensor_data(name)
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-    // Decode path uses F16 weight (half BW vs F32 expansion). Default keep
-    // F32 storage for the historical contract; opt-in F16-keep via
-    // HIPFIRE_KEEP_F16_WEIGHTS=1 (covers shared_expert / router F32 GEMV
-    // sites which are 45.8 percent of decode GPU time on z-lab A3B-PARO).
-    let keep_f16 = std::env::var("HIPFIRE_KEEP_F16_WEIGHTS").as_deref() == Ok("1");
-    if keep_f16 {
-        // F16 storage: upload raw safetensors bytes directly (data is F16).
+    // Storage mode controlled by HIPFIRE_KEEP_F16_WEIGHTS:
+    //   "1" or "native" — keep F16 storage on GPU (DType::F16)
+    //   "q8"            — quantize F16 → Q8_0 at load (DType::Q8_0), 4× less BW
+    //                     than F32 storage. Used by fused_4way_q8 for PARO MoE
+    //                     gate-side (router/seg/gate/up).
+    //   else            — expand F16 → F32 (legacy default)
+    let mode = std::env::var("HIPFIRE_KEEP_F16_WEIGHTS").ok();
+    if matches!(mode.as_deref(), Some("1") | Some("native")) {
+        // F16 storage.
         let buf = gpu.upload_raw(data, &[m, k])?;
         return Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None });
+    }
+    if matches!(mode.as_deref(), Some("q8")) && (k % 32 == 0) {
+        // Q8_0 storage: 32-element blocks, F16 scale + 32 i8.
+        let mut q8_bytes: Vec<u8> = Vec::with_capacity(m * (k / 32) * 34);
+        let row_f16_bytes = k * 2;
+        for row in 0..m {
+            let row_bytes = &data[row * row_f16_bytes..(row + 1) * row_f16_bytes];
+            let f32_row: Vec<f32> = row_bytes.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            for chunk in f32_row.chunks(32) {
+                let amax = chunk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                let d = amax / 127.0;
+                let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+                let d_f16_bits = hipfire_runtime::llama::f32_to_f16(d);
+                q8_bytes.extend_from_slice(&d_f16_bits.to_le_bytes());
+                for &x in chunk {
+                    let q = (x * id).round() as i32;
+                    let q_i8 = q.clamp(-127, 127) as i8;
+                    q8_bytes.push(q_i8 as u8);
+                }
+            }
+        }
+        let buf = gpu.upload_raw(&q8_bytes, &[q8_bytes.len()])?;
+        return Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, paro: None, awq_scale: None });
     }
     let f32_data: Vec<f32> = data.chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -2995,20 +3022,35 @@ fn moe_ffn_decode_impl(
         // so the externally-computed `x_rot_local` is preserved for the
         // downstream indexed gate_up GEMV when routed_gate_up_mq4 is true.
         //
-        // PARO 4-way fused F32 GEMV fast-path: when all 4 gate-side weights
-        // are F32 (z-lab A3B-PARO), mirror the MQ4 fused_qkvza_hfq4g256
-        // pattern with a fused F32 kernel. Saves 3 launches × 40 layers
-        // per token of decode dispatch overhead. Opt-in via
-        // HIPFIRE_FUSED_4WAY_F32_GEMV_GFX12=1.
+        // PARO 4-way fused GEMV fast-paths:
+        //   Q8 variant: all 4 weights are Q8_0 (HIPFIRE_KEEP_F16_WEIGHTS=q8).
+        //     ~4× less BW per weight read vs F32.
+        //   F32 variant: all 4 weights are F32 (z-lab default).
+        // Both saves 3 launches × 40 layers per token of dispatch overhead.
         let arch_is_gfx12 = gpu.arch.starts_with("gfx1200") || gpu.arch.starts_with("gfx1201");
         let all_f32 = ffn.router.gpu_dtype == DType::F32
             && ffn.shared_expert_gate.gpu_dtype == DType::F32
             && ffn.shared_expert.gate.gpu_dtype == DType::F32
             && ffn.shared_expert.up.gpu_dtype == DType::F32;
-        let use_fused_f32 = arch_is_gfx12
-            && all_f32
+        let all_q8 = ffn.router.gpu_dtype == DType::Q8_0
+            && ffn.shared_expert_gate.gpu_dtype == DType::Q8_0
+            && ffn.shared_expert.gate.gpu_dtype == DType::Q8_0
+            && ffn.shared_expert.up.gpu_dtype == DType::Q8_0;
+        let use_fused_q8 = arch_is_gfx12 && all_q8
+            && std::env::var("HIPFIRE_FUSED_4WAY_Q8_GEMV_GFX12").as_deref() == Ok("1");
+        let use_fused_f32 = arch_is_gfx12 && all_f32
             && std::env::var("HIPFIRE_FUSED_4WAY_F32_GEMV_GFX12").as_deref() == Ok("1");
-        if use_fused_f32 {
+        if use_fused_q8 {
+            gpu.fused_4way_q8_0_gemv_gfx12(
+                &ffn.router.buf, &ffn.shared_expert_gate.buf,
+                &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
+                x_norm,
+                router_logits, scalar_buf, &shared_gate, &shared_up,
+                ffn.router.m, ffn.shared_expert_gate.m,
+                ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
+                ffn.router.k,
+            )?;
+        } else if use_fused_f32 {
             gpu.fused_4way_f32_gemv_gfx12(
                 &ffn.router.buf, &ffn.shared_expert_gate.buf,
                 &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
@@ -5305,6 +5347,10 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
         //     default expanded to F32 on upload (shared_expert dtype = F32);
         //     with HIPFIRE_KEEP_F16_WEIGHTS=1, kept as F16 for half BW on the
         //     decode-dominant gemv_f16 path (z-lab decode 45.8% in F32 GEMV).
+        // NOTE: Q8_0 shared_expert is accepted by the DECODE Q8 fused-4-way
+        // path but NOT by the batched-prefill dispatch arms. Keep admit
+        // restrictive so prefill correctly falls through to per-token for
+        // Q8 z-lab; decode independently routes through Q8 fused.
         let shared_dtype_ok = |dt: DType| matches!(dt, DType::ParoQ4G128 | DType::F32 | DType::F16);
         let paro_ok = router_ok
             && shared_gate_ok

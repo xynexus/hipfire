@@ -79,6 +79,11 @@ pub const GEMV_F16_X32_LMHEAD_GFX12_SRC: &str =
 pub const GEMV_HFQ4G128_MULTIROW_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g128_multirow.gfx12.hip");
 
+/// gfx12 (RDNA4) Q8_0-weighted 4-way fused GEMV. Mirror of fused_4way_f32
+/// but reads Q8_0 quantized router/seg/gate/up weights (4× less BW).
+pub const FUSED_4WAY_Q8_0_GEMV_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/fused_4way_q8_0_gemv.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible
