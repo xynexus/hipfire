@@ -199,3 +199,61 @@ dispatch overhead (hipGraph capture). All require structural redesign
 Full diagnostic walkthrough including .hsaco metadata for all 5
 variants: `docs/investigations/paro-g128-native-gfx12/ASYMPTOTE.md`
 (on `feat/lever-4-gpu-argmax-stability`).
+
+### Post-asymptote breakthrough (2026-05-22 evening)
+
+User pushback "how is mq4 3000 tok/s but paro is impossible" → rocprof
+revealed the **scalar `gemm_hfq4g128` kernel was 70% of GPU time** and
+**INVISIBLE to HIPFIRE_PROFILE** (no `begin_timer` wrapper). The same
+"hidden lever" pattern as 2026-05-19's q8_0_batched discovery. Four
+structural wins cascaded:
+
+1. **gfx12 FP16 WMMA port of gemm_hfq4g128** (commit `6c097ad5`):
+   +250% prefill on shisa A3B-PARO (760 → 2660 tok/s).
+2. **rocprof+atlas baked into HIPFIRE_PROFILE** (commit `4a9bcc2c`):
+   Methodology fix — `HIPFIRE_PROFILE=1` now auto-execs under
+   `rocprofv3`, so the next hidden-lever pattern can't recur.
+3. **F32 batched shared_expert dispatch** (commits `f4681367` +
+   `d6e66cb7`): Unlocked z-lab A3B-PARO into the batched path (was
+   admit-failing → per-token fallback at 64 tok/s). Initial layout
+   bug fixed at `d6e66cb7` (silent corruption masked by routed
+   experts).
+4. **Shared-expert F32-WMMA per-call-site** (commit `5a556225`):
+   Replaces scalar F32 GEMM with FP16-WMMA on gfx12 specifically for
+   shared_expert.gate/up/down. Router stays on scalar (precision-
+   sensitive).
+
+**Final z-lab A3B-PARO numbers on hiptrx/gfx1201:**
+
+| Stack | Prefill tok/s | Coherence (3 prompts) | Speedup |
+|---|---:|---|---|
+| baseline (admit broken → per-token) | 64 | n/a | 1× |
+| + admit relax + F32 dispatch | 697 | 0 hard / 1 soft | 10.9× |
+| + WMMA-gfx12 (HFQ4 path) | 1547 | 0 hard / 1 soft | 24.2× |
+| + shared_expert F32-WMMA | **3130** | **0 hard / 1 soft on all 3** | **48.9×** |
+
+**z-lab now BEATS shisa-A3B-PARO's 2660 tok/s ceiling** on this hardware
+AND delivers clean coherence on the exact prompt (humaneval_3) where
+shisa attractors. Net structural result: z-lab is the production-
+canonical PARO checkpoint for gfx12 prefill.
+
+Full commit graph on `feat/lever-4-gpu-argmax-stability`:
+
+```
+5a556225  shared_expert-only F32-WMMA — +102% z-lab AND clean coherence
+18f0ce81  FP16-WMMA gemm_f32_batched (broad opt-in; router-sensitive)
+d6e66cb7  fix F32 shared_expert output layout (silent corruption)
+f4681367  F32 shared_expert batched dispatch — unlocks z-lab
+a36f0915  attractor root-cause investigation (shisa calibration issue)
+4a9bcc2c  HIPFIRE_PROFILE=1 auto-execs under rocprofv3
+ca8816cb  fwht3 KV mode + coherence validation doc
+6c097ad5  FP16 WMMA non-grouped HFQ4G128 — +250% prefill
+9359fd9b  FP16 WMMA m2 variant — falsified (opt-in)
+a457fa34  FP16 WMMA G128 MoE grouped — +7.8% prefill
+6ad5a219  asymptote characterization (now superseded)
+ce289429  perm_b32 nibble unpack (neutral, opt-in)
+2a1961b9  m2 + m4 falsified (opt-in)
+6a08480c  k4 deeper-pipeline (neutral, opt-in)
+f2e2c254  PARO Q4G128 MoE grouped MMQ port — +30× prefill
+dcf752dc  Lever 4 — bench_qwen35_mq4 GPU argmax (NaN fix)
+```
