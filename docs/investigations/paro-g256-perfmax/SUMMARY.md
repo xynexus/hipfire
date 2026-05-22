@@ -167,10 +167,35 @@ Pushed to origin/feat/lever-4-gpu-argmax-stability. Ready to cherry-pick into PR
 ## Post-exit MMQ work (durable, on `feat/lever-4-gpu-argmax-stability`)
 
 ```
+6ad5a219  docs(paroquant-gfx12): asymptote characterization across 5 prefill + 2 decode variants
+ce289429  feat(paroquant-gfx12): vectorized perm_b32 nibble unpack (neutral, opt-in)
+2a1961b9  feat(paroquant-gfx12): G128-native m2 prefill + m4 decode (both falsified, opt-in)
 6a08480c  feat(paroquant-prefill): k4 deeper-pipeline PARO MMQ gfx12 (neutral, opt-in)
 f2e2c254  feat(paroquant-prefill): port PARO_Q4G128 MoE grouped MMQ to gfx12  +30× prefill
 dcf752dc  feat(paroquant-decode): Lever 4 — bench_qwen35_mq4 uses GPU argmax  (NaN panic fix)
 ```
 
-All three pushed to `origin/feat/lever-4-gpu-argmax-stability`. Ready to
+All pushed to `origin/feat/lever-4-gpu-argmax-stability`. Ready to
 cherry-pick into PR #319.
+
+### Asymptote characterization (2026-05-22, post-exit)
+
+Three orthogonal G128-native levers attempted post-exit (per user ask
+"create paro-optimal G128 kernels for gfx12 prefill AND decode"); all
+falsified or neutral. Final asymptote: **705 tok/s prefill / 59.5 tok/s
+decode** on shisa A3B-PARO at canonical bench config.
+
+| Lever | Axis tested | Result |
+|---|---|---|
+| m2 prefill | B-gather BW per output FLOP | -3.4% to -20.1% (VGPR occupancy regression) |
+| m4 decode | X-load BW per layer | -7.5% (LDS occupancy cap + L2 already absorbed X re-reads) |
+| perm prefill | scalar VALU (nibble unpack) | 0.0% (WMMA-throughput-bound, unpack hidden under WMMA latency) |
+
+Triangulated remaining bottleneck candidates: WMMA throughput cap,
+scale-FMA chain serialization, per-group sc/zp shuffle, or routed-MoE
+dispatch overhead (hipGraph capture). All require structural redesign
+(higher risk, lower confidence) and are out of scope for this session.
+
+Full diagnostic walkthrough including .hsaco metadata for all 5
+variants: `docs/investigations/paro-g128-native-gfx12/ASYMPTOTE.md`
+(on `feat/lever-4-gpu-argmax-stability`).
