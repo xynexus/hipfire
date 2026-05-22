@@ -2733,6 +2733,19 @@ impl Gpu {
         if use_mmq {
             return self.gemm_hfq4g128_mmq_gfx1151(a_raw, x, y, m, k, batch_size);
         }
+        // gfx12 (RDNA4) FP16 WMMA fast-path. Opt-in via HIPFIRE_HFQ4G128_WMMA_GFX12=1
+        // pending coherence-gate validation; default on flip planned once verified.
+        // rocprof attribution (2026-05-22) shows this kernel = 70% of PARO prefill
+        // GPU time on gfx1201; closing this gap is the largest single lever.
+        let use_wmma_gfx12 = (self.arch.starts_with("gfx1200") || self.arch.starts_with("gfx1201"))
+            && std::env::var("HIPFIRE_HFQ4G128_WMMA_GFX12").as_deref() == Ok("1")
+            && batch_size >= 16
+            && batch_size % 16 == 0
+            && m % 16 == 0
+            && k % 128 == 0;
+        if use_wmma_gfx12 {
+            return self.gemm_hfq4g128_wmma_gfx12(a_raw, x, y, m, k, batch_size);
+        }
         self.ensure_kernel("gemm_hfq4g128", kernels::GEMM_HFQ4G128_SRC, "gemm_hfq4g128")?;
         let func = &self.functions["gemm_hfq4g128"];
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -2753,6 +2766,54 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(func, [m as u32, batch_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
         }
+    }
+
+    /// gfx12 (RDNA4) FP16 WMMA dispatch helper for non-grouped HFQ4G128.
+    /// Mirrors `gemm_hfq4g128_mmq_gfx1151` but uses FP16 WMMA instead of
+    /// i8 MMQ (the MoE grouped GEMM gfx12 ports validated FP16 > i8 on
+    /// this arch). X is auto-converted to FP16 via ensure_fp16_x.
+    /// Caller must have verified M%16 == K%128 == N%16 == 0.
+    fn gemm_hfq4g128_wmma_gfx12(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        self.ensure_kernel(
+            "gemm_hfq4g128_wmma_gfx12",
+            kernels::GEMM_HFQ4G128_WMMA_GFX12_SRC,
+            "gemm_hfq4g128_wmma_gfx12",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_f16_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let bytes = (m * k / 2)              // HFQ4 weight (4 bits / elem)
+                  + (batch_size * k * 2)     // FP16 activation
+                  + (batch_size * m * 4);    // F32 output
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g128_wmma_gfx12", bytes);
+        let row_tiles = (m / 16) as u32;
+        let batch_tiles = (batch_size / 16) as u32;
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g128_wmma_gfx12",
+            [row_tiles, batch_tiles, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_f16_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// gfx1151 i8 MMQ dispatch helper for HFQ4-G128. Pre-quantizes X to

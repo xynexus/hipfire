@@ -652,6 +652,14 @@ pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_GFX12_SRC: &str =
 pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_M2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_wmma_m2.gfx12.hip");
 
+/// gfx12 (RDNA4) FP16 WMMA non-grouped port of `gemm_hfq4g128.hip`. The
+/// missing gfx12 sister of `gemm_hfq4g128_mmq.gfx1151.hip` — covers the
+/// LA wqkv/wz, FullAttn QKV/wo, and shared-expert gate/up/down dispatch
+/// sites which account for 70% of PARO prefill GPU time per rocprof
+/// (2026-05-22). Routes via `dispatch::gemm_hfq4g128` when arch is gfx12.
+pub const GEMM_HFQ4G128_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g128_wmma.gfx12.hip");
+
 /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
 /// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
 /// composition the ParoQuant MoE decode path used for the gate→down
