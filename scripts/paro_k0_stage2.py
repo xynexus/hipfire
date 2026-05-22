@@ -428,15 +428,29 @@ def load_calibration(
     ctx_len: int,
     tokenizer,
 ) -> list[torch.Tensor]:
+    """Tokenize only enough characters of the corpus to fill `n_sequences x
+    ctx_len` tokens. Slow tokenizers (HF Python fallback) can take many
+    minutes on a 2M+ token corpus; capping characters keeps cold runs fast.
+    """
     p = Path(corpus)
-    if p.is_file():
-        text = p.read_text()
-        all_tokens = tokenizer(text, return_tensors="pt").input_ids[0]
-    else:
+    if not p.is_file():
         raise SystemExit(f"corpus must be a text file path, got: {corpus}")
 
-    n_total = all_tokens.shape[0]
+    text = p.read_text()
     needed = n_sequences * ctx_len
+    # Most tokenizers average 3-4 chars/token; take 6x as a safe upper bound.
+    cap_chars = needed * 6
+    if len(text) > cap_chars:
+        text = text[:cap_chars]
+        print(f"  capped corpus to {cap_chars} chars (~{needed} tokens budget)",
+              file=sys.stderr)
+    print(f"  tokenizing {len(text)} chars ...", file=sys.stderr)
+    t0 = time.time()
+    all_tokens = tokenizer(text, return_tensors="pt").input_ids[0]
+    print(f"  tokenized {all_tokens.shape[0]} tokens in {time.time()-t0:.1f}s",
+          file=sys.stderr)
+
+    n_total = all_tokens.shape[0]
     if n_total < needed:
         print(f"  WARN: corpus has {n_total} tokens, need {needed} - clamping "
               f"to {n_total // ctx_len} sequences",
