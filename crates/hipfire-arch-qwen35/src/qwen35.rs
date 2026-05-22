@@ -5385,14 +5385,36 @@ fn prefill_moe_ffn_body_batched(
         // as F32 by load_fp16_weight_from_source). No Givens rotation — these
         // weights are stored un-rotated, so we just do plain F32 batched GEMM
         // against x_norm_batch.
+        //
+        // LAYOUT NOTE: shared_gate / shared_up are allocated [N × smi] (batch-
+        // major), matching what `gemm_hfq4g128`'s output convention produces
+        // (`y[batch * M + row]`). The native `gemm_f32_batched` writes
+        // `Y[m*N + n]` which is [M × N] (output-row-major) — WRONG layout for
+        // this consumer. Swap A↔B to flip output layout to [N × M]:
+        //
+        //   gemm_f32_batched(B, A, Y, N_caller, K, M_caller) writes Y[N × M]
+        //   because internally m_kernel iterates over caller's N, n_kernel
+        //   iterates over caller's M, and Y[m_kernel*N_kernel + n_kernel]
+        //   becomes Y[n_caller*M_caller + m_caller]  ==  Y[N × M] layout.
+        //
+        // Math is identical (commutative inside the dot product); only the
+        // output stride differs.
         DType::F32 => {
             gpu.gemm_f32_batched(
-                &ffn.shared_expert.gate.buf, &pbs.x_norm_batch, shared_gate,
-                ffn.shared_expert.gate.m, ffn.shared_expert.gate.k, n,
+                &pbs.x_norm_batch,                  // A_kernel = X [N × dim]
+                &ffn.shared_expert.gate.buf,        // B_kernel = W_gate [smi × dim]
+                shared_gate,                         // Y = [N × smi]
+                n,                                   // M_kernel = N_caller
+                ffn.shared_expert.gate.k,            // K = dim
+                ffn.shared_expert.gate.m,            // N_kernel = M_caller (smi)
             )?;
             gpu.gemm_f32_batched(
-                &ffn.shared_expert.up.buf, &pbs.x_norm_batch, shared_up,
-                ffn.shared_expert.up.m, ffn.shared_expert.up.k, n,
+                &pbs.x_norm_batch,
+                &ffn.shared_expert.up.buf,
+                shared_up,
+                n,
+                ffn.shared_expert.up.k,
+                ffn.shared_expert.up.m,
             )?;
         },
         other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
@@ -5474,19 +5496,26 @@ fn prefill_moe_ffn_body_batched(
             ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
         )?,
         // z-lab variant: F32 dense W_down. No fused kernel exists yet; do
-        // 2-step decomposition:
-        //   temp[N × dim] = W_down @ shared_rot[N × smi]    (gemm_f32_batched)
-        //   pbs.x_batch[i,j] += sigmoid(scalar[i]) × temp[i,j]    (new kernel)
-        // Uses pbs.x_rot_batch as scratch — its prior contents (rotation
-        // output from the PARO path) are dead at this point in the flow
-        // and the routed-experts step writes it fresh via givens_rotate_to
-        // before its own GEMM.
+        // 2-step decomposition. Same A↔B swap as the gate/up step to force
+        // output layout to [N × dim] (batch-major), matching pbs.x_batch
+        // and the sigmoid_scaled_add_inplace_f32 kernel's stride expectation.
+        //
+        //   temp[N × dim] = X[N × smi] @ W_down^T[smi × dim]   (swapped call)
+        //   pbs.x_batch[i,j] += sigmoid(scalar[i]) × temp[i,j]   (new kernel)
+        //
+        // shared_rot is laid out [N × smi] coming out of silu_mul_f32 (which is
+        // elementwise so preserves the [N × smi] layout established by the
+        // swapped gate/up gemm calls above). Uses pbs.x_rot_batch as scratch.
         DType::F32 => {
             let down_m = ffn.shared_expert.down.m;  // dim
             let down_k = ffn.shared_expert.down.k;  // smi
             gpu.gemm_f32_batched(
-                &ffn.shared_expert.down.buf, shared_rot, &pbs.x_rot_batch,
-                down_m, down_k, n,
+                shared_rot,                          // A_kernel = X [N × smi]
+                &ffn.shared_expert.down.buf,         // B_kernel = W_down [dim × smi]
+                &pbs.x_rot_batch,                    // Y = [N × dim]
+                n,                                   // M_kernel = N_caller
+                down_k,                              // K = smi
+                down_m,                              // N_kernel = dim
             )?;
             gpu.sigmoid_scaled_add_inplace_f32(
                 &pbs.x_batch, &pbs.x_rot_batch, shared_scalar,
