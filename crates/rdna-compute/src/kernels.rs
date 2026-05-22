@@ -31,6 +31,11 @@ pub const GEMV_Q4K_SRC: &str = include_str!("../../../kernels/src/gemv_q4k.hip")
 /// Minimal metadata → minimal VGPRs. Hypothesis: ≤32 VGPRs → max occupancy.
 pub const GEMV_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g128.hip");
 
+/// PARO4-G128: ParoQuant-compatible rotated activation + W4 GEMV.
+/// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights,
+/// followed by shared pair-rotation metadata and channel scales.
+pub const GEMV_PARO4G128_SRC: &str = include_str!("../../../kernels/src/gemv_paro4g128.hip");
+
 
 /// HFQ4-G128 batched GEMM: same tiled approach as G256 but 72 bytes/group, 4 weights/thread.
 pub const GEMM_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g128.hip");
