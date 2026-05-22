@@ -8759,12 +8759,23 @@ fn forward_scratch_layers(
                     // = 32/token. Routed via HIPFIRE_FUSED_2WAY_F32_SMALLM_GFX12=1.
                     let arch_is_gfx12 = gpu.arch.starts_with("gfx1200")
                         || gpu.arch.starts_with("gfx1201");
-                    let fuse_alpha_beta = arch_is_gfx12
+                    let fuse_alpha_beta_f32 = arch_is_gfx12
                         && layer.w_beta.gpu_dtype == DType::F32
                         && layer.w_alpha.gpu_dtype == DType::F32
                         && std::env::var("HIPFIRE_FUSED_2WAY_F32_SMALLM_GFX12").as_deref() == Ok("1");
-                    if fuse_alpha_beta {
+                    let fuse_alpha_beta_q8 = arch_is_gfx12
+                        && layer.w_beta.gpu_dtype == DType::Q8_0
+                        && layer.w_alpha.gpu_dtype == DType::Q8_0
+                        && std::env::var("HIPFIRE_FUSED_2WAY_F32_SMALLM_GFX12").as_deref() == Ok("1");
+                    if fuse_alpha_beta_f32 {
                         gpu.fused_2way_f32_gemv_smallm_gfx12(
+                            &layer.w_beta.buf, &layer.w_alpha.buf,
+                            &s.tmp,
+                            &s.dn_beta, &s.dn_alpha,
+                            layer.w_beta.m, layer.w_alpha.m, layer.w_beta.k,
+                        )?;
+                    } else if fuse_alpha_beta_q8 {
+                        gpu.fused_2way_q8_0_gemv_smallm_gfx12(
                             &layer.w_beta.buf, &layer.w_alpha.buf,
                             &s.tmp,
                             &s.dn_beta, &s.dn_alpha,
@@ -9237,12 +9248,23 @@ fn forward_scratch_layers(
                     // = 32/token. Routed via HIPFIRE_FUSED_2WAY_F32_SMALLM_GFX12=1.
                     let arch_is_gfx12 = gpu.arch.starts_with("gfx1200")
                         || gpu.arch.starts_with("gfx1201");
-                    let fuse_alpha_beta = arch_is_gfx12
+                    let fuse_alpha_beta_f32 = arch_is_gfx12
                         && layer.w_beta.gpu_dtype == DType::F32
                         && layer.w_alpha.gpu_dtype == DType::F32
                         && std::env::var("HIPFIRE_FUSED_2WAY_F32_SMALLM_GFX12").as_deref() == Ok("1");
-                    if fuse_alpha_beta {
+                    let fuse_alpha_beta_q8 = arch_is_gfx12
+                        && layer.w_beta.gpu_dtype == DType::Q8_0
+                        && layer.w_alpha.gpu_dtype == DType::Q8_0
+                        && std::env::var("HIPFIRE_FUSED_2WAY_F32_SMALLM_GFX12").as_deref() == Ok("1");
+                    if fuse_alpha_beta_f32 {
                         gpu.fused_2way_f32_gemv_smallm_gfx12(
+                            &layer.w_beta.buf, &layer.w_alpha.buf,
+                            &s.tmp,
+                            &s.dn_beta, &s.dn_alpha,
+                            layer.w_beta.m, layer.w_alpha.m, layer.w_beta.k,
+                        )?;
+                    } else if fuse_alpha_beta_q8 {
+                        gpu.fused_2way_q8_0_gemv_smallm_gfx12(
                             &layer.w_beta.buf, &layer.w_alpha.buf,
                             &s.tmp,
                             &s.dn_beta, &s.dn_alpha,
