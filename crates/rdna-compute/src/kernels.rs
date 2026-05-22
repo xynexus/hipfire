@@ -598,6 +598,14 @@ pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_K8_GFX1151_SRC: &str =
 pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq.gfx12.hip");
 
+/// gfx12 (RDNA4) i8 WMMA MMQ port of HFQ4G128 ParoQuant MoE grouped-GEMM,
+/// k4 (deeper-pipeline) variant: 8 WMMAs into 4 independent cacc accumulators
+/// before the per-sub-block scale FMAs resolve. Numerically equivalent to
+/// GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_GFX12_SRC modulo float summation order.
+/// Routes via HIPFIRE_MOE_PARO_I8_K4_GFX12=1 (opt-in).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_K4_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_k4.gfx12.hip");
+
 /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
 /// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
 /// composition the ParoQuant MoE decode path used for the gate→down

@@ -5562,11 +5562,19 @@ fn prefill_moe_ffn_body_batched(
                         2 * mi, gate_up_k, k_top, m_total, n,
                     )?;
                 } else if arch_is_gfx12 {
-                    gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx12(
-                        &ffn.expert_gate_up_ptrs, tile_ids, sorted,
-                        &pbs.x_rot_batch, y_gu_grouped,
-                        2 * mi, gate_up_k, k_top, m_total, n,
-                    )?;
+                    if std::env::var("HIPFIRE_MOE_PARO_I8_K4_GFX12").as_deref() == Ok("1") {
+                        gpu.gemm_paro_q4g128_moe_grouped_mmq_k4_gfx12(
+                            &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+                            &pbs.x_rot_batch, y_gu_grouped,
+                            2 * mi, gate_up_k, k_top, m_total, n,
+                        )?;
+                    } else {
+                        gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx12(
+                            &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+                            &pbs.x_rot_batch, y_gu_grouped,
+                            2 * mi, gate_up_k, k_top, m_total, n,
+                        )?;
+                    }
                 } else {
                     gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
                         &ffn.expert_gate_up_ptrs, tile_ids, sorted,
@@ -5711,11 +5719,19 @@ fn prefill_moe_ffn_body_batched(
                         down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
                     )?;
                 } else if arch_is_gfx12 {
-                    gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx12(
-                        &ffn.expert_down_ptrs, tile_ids, sorted,
-                        rot_batch, y_down_grouped,
-                        down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
-                    )?;
+                    if std::env::var("HIPFIRE_MOE_PARO_I8_K4_GFX12").as_deref() == Ok("1") {
+                        gpu.gemm_paro_q4g128_moe_grouped_mmq_k4_gfx12(
+                            &ffn.expert_down_ptrs, tile_ids, sorted,
+                            rot_batch, y_down_grouped,
+                            down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+                        )?;
+                    } else {
+                        gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx12(
+                            &ffn.expert_down_ptrs, tile_ids, sorted,
+                            rot_batch, y_down_grouped,
+                            down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+                        )?;
+                    }
                 } else {
                     gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
                         &ffn.expert_down_ptrs, tile_ids, sorted,
