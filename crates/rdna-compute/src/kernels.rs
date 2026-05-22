@@ -1763,6 +1763,14 @@ pub const FUSED_SIGMOID_ALPHA_GATE_SRC: &str = include_str!("../../../kernels/sr
 /// `sigmoid_f32(gate)` + `mul_f32(attn_out, gate, attn_out)`.
 pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul.hip");
 
+/// Y[i,j] += sigmoid(scalar[i]) * temp[i,j]. Completes the F32 shared_expert
+/// down step (`gemm_f32_batched` writes `temp`; this applies sigmoid scaling
+/// and accumulates into x_batch). Mirrors the residual-sigmoid-scaled fused
+/// kernels for HFQ4-quantized shared_expert, but for FP16-dense z-lab-style
+/// shared_expert weights.
+pub const SIGMOID_SCALED_ADD_INPLACE_F32_SRC: &str =
+    include_str!("../../../kernels/src/sigmoid_scaled_add_inplace_f32.hip");
+
 /// Top-K=128 extraction over a logits vector. Lets the host sampler work
 /// on a 1 KB GPU-side candidate set instead of DtoH'ing the full 600 KB
 /// logits array. See kernel header for bit-exactness reasoning.

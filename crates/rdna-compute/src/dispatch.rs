@@ -23481,6 +23481,57 @@ impl Gpu {
         result
     }
 
+    /// Y[i,j] += sigmoid(scalar[i]) * temp[i,j]. Completes the F32
+    /// shared_expert down step for the batched MoE path when shared_expert
+    /// is FP16 dense (z-lab/Qwen3.6-35B-A3B-PARO). `gemm_f32_batched`
+    /// writes `temp` first; this kernel applies sigmoid scaling and
+    /// accumulates into `y`. Mirrors the fused residual-sigmoid-scaled
+    /// pattern of the HFQ4 sister but for F32 weights.
+    pub fn sigmoid_scaled_add_inplace_f32(
+        &mut self,
+        y: &GpuTensor,         // [N × M] in/out accumulator
+        temp: &GpuTensor,      // [N × M] gemm output to fold in
+        scalar: &GpuTensor,    // [N] pre-sigmoid logits
+        n: usize, m: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "sigmoid_scaled_add_inplace_f32",
+            kernels::SIGMOID_SCALED_ADD_INPLACE_F32_SRC,
+            "sigmoid_scaled_add_inplace_f32",
+        )?;
+        let mut yp = y.buf.as_ptr();
+        let mut tp = temp.buf.as_ptr();
+        let mut sp = scalar.buf.as_ptr();
+        let mut n_val = n as i32;
+        let mut m_val = m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut yp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let m_tiles = ((m as u32) + block - 1) / block;
+        let bytes = (n * m * 4) * 3 + n * 4;  // y+temp read + y write + scalar
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "sigmoid_scaled_add_inplace_f32", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "sigmoid_scaled_add_inplace_f32",
+            [n as u32, m_tiles, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_i32(n_val); b.push_i32(m_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Top-K=1024 extraction over a logits vector. Populates an 8 KB
     /// buffer with [1024 × u32 indices | 1024 × f32 values]. One
     /// device→host copy pulls the whole thing. The host then runs its

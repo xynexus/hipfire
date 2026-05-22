@@ -5164,21 +5164,23 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
         std::env::var("HIPFIRE_PARO_BATCHED").as_deref() == Ok("1")
     });
     if admit_paro {
-        // NOTE (2026-05-22): z-lab/Qwen3.6-35B-A3B-PARO stores shared_expert
-        // weights as raw FP16 (NOT PARO-quantized) — only the routed experts
-        // get PARO calibration. Admitting z-lab into the batched path requires
-        // a full F32 dispatch arm for shared_expert.gate/up/down, including
-        // a new F32 sigmoid-scaled residual kernel that doesn't exist yet
-        // (see prefill_moe_ffn_body_batched match arms at ~line 5449). For
-        // now z-lab falls back to per-token; shisa-ai's all-PARO variant
-        // admits cleanly. Follow-up: implement F32 batched shared_expert
-        // dispatch (silu_mul_f32 + gemm_f32_batched + new F32 sigmoid-scaled
-        // residual kernel) to unlock z-lab into the WMMA-gfx12 fast path.
+        // Two PARO checkpoint families admit:
+        //   shisa-ai/Qwen3.6-35B-A3B-PARO-full4096-e5-packed: PARO-quantizes
+        //     ALL FFN weights including shared_expert. shared_expert dtype =
+        //     ParoQ4G128 throughout.
+        //   z-lab/Qwen3.6-35B-A3B-PARO: PARO-quantizes routed experts only;
+        //     shared_expert is dense FP16 (load_fp16_weight_from_source
+        //     expands to F32 on upload). shared_expert dtype = F32.
+        // Both are valid; the routed experts are what require the PARO
+        // calibration. Dispatch arms in prefill_moe_ffn_body_batched handle
+        // both ParoQ4G128 and F32 shared_expert (F32 path uses gemm_f32_batched
+        // + sigmoid_scaled_add_inplace_f32 instead of the fused HFQ4 kernel).
+        let shared_dtype_ok = |dt: DType| matches!(dt, DType::ParoQ4G128 | DType::F32);
         let paro_ok = router_ok
             && shared_gate_ok
-            && matches!(ffn.shared_expert.gate.gpu_dtype, DType::ParoQ4G128)
-            && matches!(ffn.shared_expert.up.gpu_dtype, DType::ParoQ4G128)
-            && matches!(ffn.shared_expert.down.gpu_dtype, DType::ParoQ4G128)
+            && shared_dtype_ok(ffn.shared_expert.gate.gpu_dtype)
+            && shared_dtype_ok(ffn.shared_expert.up.gpu_dtype)
+            && shared_dtype_ok(ffn.shared_expert.down.gpu_dtype)
             && ffn.experts.iter().all(|e|
                 e.gate_up.gpu_dtype == DType::ParoQ4G128 && e.down.gpu_dtype == DType::ParoQ4G128);
         if paro_ok {
@@ -5379,6 +5381,20 @@ fn prefill_moe_ffn_body_batched(
                 ffn.shared_expert.up.m, ffn.shared_expert.up.k, n,
             )?;
         },
+        // z-lab/Qwen3.6-35B-A3B-PARO ships shared_expert as raw FP16 (loaded
+        // as F32 by load_fp16_weight_from_source). No Givens rotation — these
+        // weights are stored un-rotated, so we just do plain F32 batched GEMM
+        // against x_norm_batch.
+        DType::F32 => {
+            gpu.gemm_f32_batched(
+                &ffn.shared_expert.gate.buf, &pbs.x_norm_batch, shared_gate,
+                ffn.shared_expert.gate.m, ffn.shared_expert.gate.k, n,
+            )?;
+            gpu.gemm_f32_batched(
+                &ffn.shared_expert.up.buf, &pbs.x_norm_batch, shared_up,
+                ffn.shared_expert.up.m, ffn.shared_expert.up.k, n,
+            )?;
+        },
         other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
                          — admit predicate should have rejected this layer"),
     }
@@ -5412,13 +5428,21 @@ fn prefill_moe_ffn_body_batched(
     // (pairs, theta, channel_scales, krot) tuple instead of the MQ4 FWHT
     // convention. Same shape: gate/up [N × smi] → shared_rot [N × smi].
     if paro_mode {
-        let paro_down = ffn.shared_expert.down.paro.as_ref()
-            .expect("ParoQ4G128 shared_expert.down missing paro metadata");
-        gpu.fused_silu_mul_givens_rotate_f32(
-            shared_gate, shared_up, shared_rot,
-            &paro_down.pairs, &paro_down.theta, &paro_down.channel_scales,
-            n, smi, paro_down.krot as usize,
-        )?;
+        // z-lab variant: F32 dense shared_expert.down has no Givens rotation,
+        // so do plain silu_mul without a rotation pre-pass. Routed experts are
+        // still PARO-quantized; paro_mode remains true overall, but the
+        // shared_expert path branches on its own dtype here.
+        if matches!(ffn.shared_expert.down.gpu_dtype, DType::F32) {
+            gpu.silu_mul_f32(shared_gate, shared_up, shared_rot)?;
+        } else {
+            let paro_down = ffn.shared_expert.down.paro.as_ref()
+                .expect("ParoQ4G128 shared_expert.down missing paro metadata");
+            gpu.fused_silu_mul_givens_rotate_f32(
+                shared_gate, shared_up, shared_rot,
+                &paro_down.pairs, &paro_down.theta, &paro_down.channel_scales,
+                n, smi, paro_down.krot as usize,
+            )?;
+        }
     } else {
         fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.shared_expert.down, shared_gate, shared_up, shared_rot, smi, n)?;
     }
@@ -5449,6 +5473,26 @@ fn prefill_moe_ffn_body_batched(
             &ffn.shared_expert.down.buf, shared_rot, &pbs.x_batch, shared_scalar,
             ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
         )?,
+        // z-lab variant: F32 dense W_down. No fused kernel exists yet; do
+        // 2-step decomposition:
+        //   temp[N × dim] = W_down @ shared_rot[N × smi]    (gemm_f32_batched)
+        //   pbs.x_batch[i,j] += sigmoid(scalar[i]) × temp[i,j]    (new kernel)
+        // Uses pbs.x_rot_batch as scratch — its prior contents (rotation
+        // output from the PARO path) are dead at this point in the flow
+        // and the routed-experts step writes it fresh via givens_rotate_to
+        // before its own GEMM.
+        DType::F32 => {
+            let down_m = ffn.shared_expert.down.m;  // dim
+            let down_k = ffn.shared_expert.down.k;  // smi
+            gpu.gemm_f32_batched(
+                &ffn.shared_expert.down.buf, shared_rot, &pbs.x_rot_batch,
+                down_m, down_k, n,
+            )?;
+            gpu.sigmoid_scaled_add_inplace_f32(
+                &pbs.x_batch, &pbs.x_rot_batch, shared_scalar,
+                n, down_m,
+            )?;
+        },
         other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.down dtype {other:?} \
                          — admit predicate should have rejected this layer"),
     }
