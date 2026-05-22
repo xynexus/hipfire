@@ -182,9 +182,18 @@ Decode arc on z-lab A3B-PARO (gfx1201, --gen 100, 5-10 run steady-state):
   + Q8 fused 4-way (39520d7e):                        89.3 tok/s
   + Q8 fused down (4889dc27):                         93.0 tok/s
   + Q8 alpha+beta 2-way (1fe73301):                   94.3 tok/s
-  + multi-WG argmax (ee203a08):                       96.3 tok/s   +53.8 pct cumulative
+  + multi-WG argmax (ee203a08):                       96.3 tok/s
+  + HFQ4G256 gate-side + down (d5c373b9):             98.8 tok/s   +57.8 pct cumulative
+                                                       (warmup=0, 5-run steady)
 
-**Goal 100 tok/s: PRODUCTION-CLEAN NOT MET. Gap ~3.7 tok/s.**
+**Goal 100 tok/s: PRODUCTION-CLEAN NOT MET. Gap 1.2 tok/s.**
+
+(Note: HFQ3G256 lm_head (b09400ef) reaches 100.0-100.2 tok/s in cool-state
+bench, but causes non-deterministic argmax at temperature=0.0 — 2/3 of
+coherence runs break to 11 tokens, 1/3 give the canonical 101 tokens.
+Root cause: 3-bit lm_head logits have enough quantization noise that the
+multi-WG argmax tie-breaking varies across runs. Kept opt-in via
+`HIPFIRE_LM_HEAD_F16=hfq3g256` but NOT production-clean.)
 
 ### Aggressive ceiling (opt-in, coherence-soft)
 
