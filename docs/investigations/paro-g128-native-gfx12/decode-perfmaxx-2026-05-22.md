@@ -193,7 +193,16 @@ bench, but causes non-deterministic argmax at temperature=0.0 — 2/3 of
 coherence runs break to 11 tokens, 1/3 give the canonical 101 tokens.
 Root cause: 3-bit lm_head logits have enough quantization noise that the
 multi-WG argmax tie-breaking varies across runs. Kept opt-in via
-`HIPFIRE_LM_HEAD_F16=hfq3g256` but NOT production-clean.)
+`HIPFIRE_LM_HEAD_F16=hfq3g256` but NOT production-clean.
+
+DO NOT pursue HFQ3 / MQ3 as lm_head direction. The non-determinism is
+the SYMPTOM, not the cause — 3-bit lm_head logits are fundamentally too
+lossy for the top-vocab argmax decision regardless of whether the
+argmax kernel is deterministic. Even a bit-exact deterministic 3-bit
+lm_head would drift on hard prompts. This is a precision floor, not a
+kernel-tuning issue. The right path past 98.8 is one of the structural
+pivots (spec decode, hipGraph_MoE root-cause fix, per-LA mega-kernel),
+not further lm_head bit-reduction.)
 
 ### Aggressive ceiling (opt-in, coherence-soft)
 
