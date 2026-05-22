@@ -318,14 +318,17 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
             channel_scales_init.detach().clone().to(torch.float32),
         )
 
-        # Init logits at seed-generated signs (±1 F32). At training step 0,
-        # sign(logits) reproduces FWHT_SIGNS1/2 exactly.
+        # Init logits at sign(seed) * 0.1 (small magnitude). sign(logits) =
+        # sign(seed) so FWHT reproduces current pipeline byte-equal at step 0.
+        # Smaller magnitude makes signs easier to flip during training (a
+        # single gradient step with lr~0.1-1.0 can cross zero).
+        init_scale = 0.1
         self.d1_logits = nn.Parameter(
-            FWHT_SIGNS1.clone().to(torch.float32),
+            FWHT_SIGNS1.clone().to(torch.float32) * init_scale,
             requires_grad=False,
         )
         self.d2_logits = nn.Parameter(
-            FWHT_SIGNS2.clone().to(torch.float32),
+            FWHT_SIGNS2.clone().to(torch.float32) * init_scale,
             requires_grad=False,
         )
 
@@ -1583,7 +1586,10 @@ def main() -> None:
     print(f"Next step: hipfire-quantize --input {args.model} \\")
     print(f"            --awq --awq-scales {hfsc_path} --awq-formula paper \\")
     print(f"            --awq-alpha {args.alpha} --awq-scope f1 \\")
-    print(f"            --butterfly-residual {hfbf_path}    # (Phase 8 wiring)")
+    if args.learnable_signs:
+        print(f"            --learned-signs {npz_path}  # (Phase 8 wiring)")
+    else:
+        print(f"            --butterfly-residual {hfbf_path}  # (Phase 8 wiring)")
 
 
 if __name__ == "__main__":
