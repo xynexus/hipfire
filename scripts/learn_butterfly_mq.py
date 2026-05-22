@@ -539,6 +539,37 @@ class OutputCapture:
         self.handles.clear()
 
 
+class IOCapture:
+    """Captures both inputs (via forward-pre hook) and outputs (via forward hook)
+    for sequential per-tensor training (Phase 4b)."""
+
+    def __init__(self) -> None:
+        self.inputs: dict[str, torch.Tensor] = {}
+        self.outputs: dict[str, torch.Tensor] = {}
+        self.handles: list = []
+
+    def attach(self, model: nn.Module, target_names: set[str]) -> None:
+        for n, m in model.named_modules():
+            if n in target_names:
+                # Pre-hook captures the Linear's input.
+                def _pre_hook(module, inputs, _name=n):
+                    self.inputs[_name] = inputs[0].detach()
+                # Forward hook captures the Linear's output.
+                def _hook(module, inputs, output, _name=n):
+                    self.outputs[_name] = output.detach()
+                self.handles.append(m.register_forward_pre_hook(_pre_hook))
+                self.handles.append(m.register_forward_hook(_hook))
+
+    def clear(self) -> None:
+        self.inputs.clear()
+        self.outputs.clear()
+
+    def detach(self) -> None:
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+
+
 # ---------------------------------------------------------------------------
 # Calibration corpus tokenization.
 # ---------------------------------------------------------------------------
@@ -683,6 +714,133 @@ def run_butterfly_training(
         print(f"      [epoch {epoch + 1}] mean_loss={mean_loss:.6e}  "
               f"time={time.time() - epoch_start:.1f}s")
 
+    return trace
+
+
+# ---------------------------------------------------------------------------
+# Sequential per-tensor training (Phase 4b — paper's actual method).
+# ---------------------------------------------------------------------------
+
+def train_sequential(
+    *,
+    wrapped: dict[str, ButterflyResidualPseudoQuantLinear],
+    oracle: nn.Module,
+    student: nn.Module,
+    seqs: list[torch.Tensor],
+    target_names: set[str],
+    device: torch.device,
+    n_calib_seqs: int,
+    n_steps_per_tensor: int,
+    lr: float,
+    momentum: float,
+    weight_decay: float,
+    cosine_floor: float,
+    grad_clip: Optional[float],
+    log_interval: int,
+) -> list[dict]:
+    """Layer-by-layer reconstruction (sequential, per-tensor).
+
+    Tests the joint-cancellation hypothesis. For each AWQ-F1 target Linear T:
+      1. Capture (input, output) pairs from the BF16 oracle on n_calib_seqs.
+      2. Train T.theta against cached pairs in isolation
+         (other thetas frozen, no joint gradient interactions).
+      3. Freeze T, move to next tensor in topological order.
+
+    This is the paper's BRECQ-style "layer-wise reconstruction". Joint SGD
+    on all 138 tensors at once (Phase 4) failed; this version isolates each
+    tensor's optimization to remove cross-tensor gradient cancellation.
+    """
+    use_seqs = seqs[: min(n_calib_seqs, len(seqs))]
+
+    # Step 1: capture oracle (input, output) pairs for all target Linears.
+    print(f"\n  [sequential 1/3] Caching oracle activations on {len(use_seqs)} seqs ...")
+    io_oracle = IOCapture()
+    io_oracle.attach(oracle, target_names)
+    cache_inputs: dict[str, list[torch.Tensor]] = {n: [] for n in target_names}
+    cache_outputs: dict[str, list[torch.Tensor]] = {n: [] for n in target_names}
+    t0 = time.time()
+    with torch.no_grad():
+        for seq_idx, seq in enumerate(use_seqs):
+            input_ids = seq.unsqueeze(0).to(device)
+            io_oracle.clear()
+            _ = oracle(input_ids)
+            for n in target_names:
+                cache_inputs[n].append(io_oracle.inputs[n].to("cpu").clone())
+                cache_outputs[n].append(io_oracle.outputs[n].to("cpu").clone())
+    io_oracle.detach()
+    print(f"      capture done in {time.time() - t0:.1f}s. "
+          f"Total cache: {sum(t.numel() * t.element_size() for tl in cache_inputs.values() for t in tl) / 1e9:.2f} GB inputs + "
+          f"{sum(t.numel() * t.element_size() for tl in cache_outputs.values() for t in tl) / 1e9:.2f} GB outputs (CPU)")
+
+    # Step 2: train each Linear's theta sequentially.
+    print(f"\n  [sequential 2/3] Training {len(target_names)} tensors x {n_steps_per_tensor} steps ...")
+    sorted_names = sorted(target_names)  # topological-ish (layer order)
+    trace: list[dict] = []
+    train_start = time.time()
+    for tensor_idx, name in enumerate(sorted_names):
+        wrapper = wrapped[name]
+        # Freeze all others; set just this one trainable.
+        for w in wrapped.values():
+            w.theta_residual.requires_grad = False
+        wrapper.theta_residual.requires_grad = True
+
+        params = [wrapper.theta_residual]
+        optimizer = torch.optim.SGD(
+            params, lr=lr, momentum=momentum, weight_decay=weight_decay,
+        )
+        def lr_lambda(step: int) -> float:
+            progress = min(1.0, step / max(1, n_steps_per_tensor))
+            return cosine_floor + 0.5 * (1.0 - cosine_floor) * (1.0 + math.cos(math.pi * progress))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        xs = cache_inputs[name]
+        ys = cache_outputs[name]
+        n_batches = len(xs)
+
+        losses: list[float] = []
+        for step in range(n_steps_per_tensor):
+            batch_idx = step % n_batches
+            x = xs[batch_idx].to(device)
+            y_target = ys[batch_idx].to(device)
+            y_q = wrapper(x).to(torch.float32)
+            loss = (y_q - y_target.to(torch.float32)).pow(2).mean()
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(params, grad_clip)
+            optimizer.step()
+            scheduler.step()
+            losses.append(float(loss.detach()))
+
+        # Re-freeze this tensor's theta now that training is done.
+        wrapper.theta_residual.requires_grad = False
+        # Drop cached activations for this tensor to free CPU RAM.
+        cache_inputs[name] = []
+        cache_outputs[name] = []
+
+        init_loss = losses[0] if losses else 0.0
+        final_loss = losses[-1] if losses else 0.0
+        theta_norm = float(wrapper.theta_residual.detach().norm())
+        trace.append({
+            "tensor_idx": tensor_idx,
+            "name": name,
+            "initial_loss": init_loss,
+            "final_loss": final_loss,
+            "theta_norm": theta_norm,
+            "rel_loss_drop": (init_loss - final_loss) / max(init_loss, 1e-12),
+        })
+
+        if (tensor_idx + 1) % log_interval == 0 or tensor_idx + 1 == len(sorted_names):
+            elapsed = time.time() - train_start
+            eta = elapsed * (len(sorted_names) - tensor_idx - 1) / max(tensor_idx + 1, 1)
+            print(f"      [{tensor_idx + 1}/{len(sorted_names)}] {name}: "
+                  f"loss {init_loss:.3e} → {final_loss:.3e} "
+                  f"(rel -{(init_loss - final_loss) / max(init_loss, 1e-12) * 100:.1f}%), "
+                  f"||theta||={theta_norm:.3e}  "
+                  f"({elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
+
+    print(f"\n      sequential training done in {time.time() - train_start:.1f}s")
     return trace
 
 
@@ -870,6 +1028,15 @@ def main() -> None:
                          "before AND after training. Phase 3 gate.")
     ap.add_argument("--smoke-eval-seqs", type=int, default=16,
                     help="Number of sequences for --smoke-eval KLD computation.")
+    ap.add_argument("--sequential", action="store_true",
+                    help="Use per-tensor sequential training (paper's actual "
+                         "layer-by-layer reconstruction). Tests the "
+                         "joint-cancellation hypothesis. Phase 4b.")
+    ap.add_argument("--sequential-calib-seqs", type=int, default=32,
+                    help="Sequences cached for sequential training (each "
+                         "tensor sees only these). 32 default to keep cache small.")
+    ap.add_argument("--sequential-steps", type=int, default=100,
+                    help="SGD steps per tensor in --sequential mode.")
     args = ap.parse_args()
 
     if args.self_test:
@@ -978,24 +1145,42 @@ def main() -> None:
 
     print("\n[5/7] Training butterfly residuals ...")
     train_start = time.time()
-    trace = run_butterfly_training(
-        wrapped=wrapped,
-        oracle=oracle,
-        student=student,
-        oracle_capture=oracle_capture,
-        student_capture=student_capture,
-        seqs=seqs,
-        target_names=target_names,
-        device=device,
-        n_epochs=args.n_epochs,
-        lr=args.lr,
-        momentum=args.momentum,
-        weight_decay=args.weight_decay,
-        cosine_floor=args.cosine_floor,
-        grad_clip=args.grad_clip,
-        l2_theta=args.l2_theta,
-        log_interval=args.log_interval,
-    )
+    if args.sequential:
+        trace = train_sequential(
+            wrapped=wrapped,
+            oracle=oracle,
+            student=student,
+            seqs=seqs,
+            target_names=target_names,
+            device=device,
+            n_calib_seqs=args.sequential_calib_seqs,
+            n_steps_per_tensor=args.sequential_steps,
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            cosine_floor=args.cosine_floor,
+            grad_clip=args.grad_clip,
+            log_interval=args.log_interval,
+        )
+    else:
+        trace = run_butterfly_training(
+            wrapped=wrapped,
+            oracle=oracle,
+            student=student,
+            oracle_capture=oracle_capture,
+            student_capture=student_capture,
+            seqs=seqs,
+            target_names=target_names,
+            device=device,
+            n_epochs=args.n_epochs,
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            cosine_floor=args.cosine_floor,
+            grad_clip=args.grad_clip,
+            l2_theta=args.l2_theta,
+            log_interval=args.log_interval,
+        )
     train_elapsed = time.time() - train_start
     print(f"\n      total train time: {train_elapsed:.1f}s")
 
