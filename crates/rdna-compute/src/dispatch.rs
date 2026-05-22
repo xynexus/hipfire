@@ -24037,6 +24037,20 @@ impl Gpu {
         n_tokens: usize, n_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx12 register-array fast-path (opt-in pending coherence validation).
+        // S held in VGPRs across recurrence vs LDS-tiled baseline. Numerically
+        // NOT bit-exact (F32 accumulated throughout, one requant at end vs
+        // per-token requant) but coherence-equivalent in early bench.
+        // Gate: HIPFIRE_GDN_Q8_GFX12_REGISTER=1.
+        let use_register_gfx12 = (self.arch.starts_with("gfx1200") || self.arch.starts_with("gfx1201"))
+            && std::env::var("HIPFIRE_GDN_Q8_GFX12_REGISTER").as_deref() == Ok("1")
+            && head_dim == 128;
+        if use_register_gfx12 {
+            return self.gated_delta_net_q8_gfx12_register(
+                q, k, v, gate, beta, s_q8, s_scales, output,
+                n_tokens, n_heads, head_dim,
+            );
+        }
         self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
@@ -24062,6 +24076,57 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8", bytes);
         let result = self.launch_maybe_blob(
             "gated_delta_net_q8", [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(gp); b.push_ptr(bp); b.push_ptr(sp);
+                b.push_ptr(scp); b.push_ptr(op);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx12 register-array fast-path for gated_delta_net_q8. Same kernarg
+    /// signature as the baseline; only the launch params differ (block 128
+    /// instead of 32, single n_tiles=1 since each block does all 128 rows).
+    #[cfg(feature = "deltanet")]
+    fn gated_delta_net_q8_gfx12_register(
+        &mut self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor,
+        gate: &GpuTensor, beta: &GpuTensor,
+        s_q8: &GpuTensor, s_scales: &GpuTensor, output: &GpuTensor,
+        n_tokens: usize, n_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gated_delta_net_q8_gfx12",
+            kernels::GATED_DELTA_NET_Q8_GFX12_SRC,
+            "gated_delta_net_q8_gfx12",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let sp = s_q8.buf.as_ptr();
+        let scp = s_scales.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void, &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void, &sp as *const _ as *mut c_void,
+            &scp as *const _ as *mut c_void, &op as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void, &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_q8_gfx12", [n_heads as u32, 1, 1], [128, 1, 1], 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
@@ -24108,6 +24173,19 @@ impl Gpu {
         head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx12 register-array fast-path — same kernel handles batched mode
+        // (kernel loops over n_tokens internally with S held in VGPRs).
+        // Gate: HIPFIRE_GDN_Q8_GFX12_REGISTER=1 (shared with single-token path).
+        let use_register_gfx12 = (self.arch.starts_with("gfx1200") || self.arch.starts_with("gfx1201"))
+            && std::env::var("HIPFIRE_GDN_Q8_GFX12_REGISTER").as_deref() == Ok("1")
+            && head_dim == 128;
+        if use_register_gfx12 {
+            return self.gated_delta_net_q8_gfx12_register(
+                q_batch, k_batch, v_batch, gate_batch, beta_batch,
+                s_q8, s_scales, output_batch,
+                n_tokens, n_heads, head_dim,
+            );
+        }
         self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
 
         let n_tiles = (128 / 4) as u32;

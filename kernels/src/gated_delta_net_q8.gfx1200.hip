@@ -8,11 +8,30 @@
 // 128 VGPRs for S + ~16 compute = 144 total. 1536/144 = 10 waves/SIMD.
 // S never touches memory during recurrence — pure ALU.
 // Dequant at start, requant at end. Inner loop is register-only.
+//
+// NUMERICAL NOTE: this kernel accumulates S in F32 across the entire
+// recurrence and requants only once at the end. The baseline
+// (`gated_delta_net_q8.hip`) requants per-token via LDS, introducing
+// stochastic rounding noise each step. Output here is NOT bit-exact
+// with the baseline; coherence-validated as no-attractor on
+// shisa/z-lab A3B-PARO before flipping default.
+//
+// === Wiring ===
+//
+// Kernel name renamed from `gated_delta_net_q8` to `..._gfx12` so this
+// can be dispatched alongside the LDS-tiled baseline (not as a #if
+// override). Routes via HIPFIRE_GDN_Q8_GFX12_REGISTER=1 (opt-in,
+// pending coherence + perf validation before default flip).
+//
+// rocprof attribution (2026-05-22) of the baseline kernel on z-lab
+// A3B-PARO post-WMMA-stack:  60 calls × 327 µs/call = 19.7 ms = 11.9 %
+// of GPU time. Register-array avoids the LDS S round-trip; expected
+// 2-3× kernel speedup → +5-10 % wall.
 
 #define HD 128
 
 extern "C" __launch_bounds__(128, 10)
-__global__ void gated_delta_net_q8(
+__global__ void gated_delta_net_q8_gfx12(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,

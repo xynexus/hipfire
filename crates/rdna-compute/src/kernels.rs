@@ -1849,6 +1849,16 @@ pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_d
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_Q8_SRC: &str = include_str!("../../../kernels/src/gated_delta_net_q8.hip");
 
+/// gfx12 (RDNA4) register-array variant of gated_delta_net_q8.
+/// S_local[128] held in VGPRs across the entire recurrence; LDS only
+/// used for k/q tile broadcast. F32 accumulated throughout, requanted
+/// once at end (numerically different from baseline's per-token requant).
+/// Routes via HIPFIRE_GDN_Q8_GFX12_REGISTER=1. rocprof attribution on
+/// post-WMMA z-lab pp256 shows the baseline kernel at 11.9% of GPU time.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_Q8_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_q8.gfx1200.hip");
+
 /// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
 /// to a caller-owned tape buffer, so sibling tokens read the parent's
 /// post-update state rather than the previous sibling's. Required for
