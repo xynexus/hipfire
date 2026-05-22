@@ -610,7 +610,19 @@ pub fn weight_gemv(
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::F32 => gpu.gemv_f32(&w.buf, x, y),
-        DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, 1),
+        DType::F16 => {
+            // gfx12 fast-path: 256-thread block F16-W × F32-X GEMV. Halves
+            // BW vs F32 storage. Specifically targets lm_head decode where
+            // the existing gemm_f16_batched_lmhead falls through to
+            // gemm_f16_tiled (32-thread WG, BW-starved at M=248k).
+            // Opt-in via HIPFIRE_LM_HEAD_F16_X32_GFX12=1.
+            let arch_gfx12 = gpu.arch.starts_with("gfx1200") || gpu.arch.starts_with("gfx1201");
+            if arch_gfx12 && std::env::var("HIPFIRE_LM_HEAD_F16_X32_GFX12").as_deref() == Ok("1") {
+                gpu.gemv_f16_x32_lmhead_gfx12(&w.buf, x, y, w.m, w.k)
+            } else {
+                gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, 1)
+            }
+        }
         DType::Q4K => gpu.gemv_q4k(&w.buf, x, y, w.m, w.k),
         DType::Q6K => gpu.gemv_q6k(&w.buf, x, y, w.m, w.k),
         DType::Q8_0 => gpu.gemv_q8_0(&w.buf, x, y, w.m, w.k),

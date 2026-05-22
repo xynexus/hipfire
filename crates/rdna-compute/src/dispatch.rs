@@ -2526,6 +2526,54 @@ impl Gpu {
         result
     }
 
+    /// gfx12 GEMV: F16 weight × F32 X → F32 Y, 256-thread block.
+    /// Specifically for lm_head decode path where weight can be stored as F16.
+    /// Halves BW vs gemv_f32. Routes via HIPFIRE_LM_HEAD_F16_X32_GFX12=1.
+    pub fn gemv_f16_x32_lmhead_gfx12(
+        &mut self, w_f16: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_f16_x32_lmhead_gfx12",
+            kernels::GEMV_F16_X32_LMHEAD_GFX12_SRC,
+            "gemv_f16_x32_lmhead_gfx12",
+        )?;
+        let wp = w_f16.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &alpha as *const _ as *mut c_void,
+            &beta as *const _ as *mut c_void,
+        ];
+        let bytes = (m * k * 2) + (k * 4) + (m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_f16_x32_lmhead_gfx12", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_f16_x32_lmhead_gfx12",
+            [m as u32, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp); b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(mv); b.push_i32(kv);
+                b.push_f32(alpha); b.push_f32(beta);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// gfx12 2-way fused F32 GEMV for small-M (LA layer alpha + beta).
     /// 256-thread blocks for BW saturation; 1 launch instead of 2.
     pub fn fused_2way_f32_gemv_smallm_gfx12(

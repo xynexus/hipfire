@@ -66,6 +66,13 @@ pub const GEMV_F32_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
 pub const FUSED_2WAY_F32_GEMV_SMALLM_GFX12_SRC: &str =
     include_str!("../../../kernels/src/fused_2way_f32_gemv_smallm.gfx12.hip");
 
+/// gfx12 (RDNA4) F16 weight × F32 X GEMV with 256-thread block — drop-in
+/// for gemv_f32 when weight storage is F16. Halves BW vs F32. Specifically
+/// targets the lm_head decode hot path (M=vocab, K=dim, batch=1) which
+/// rocprof shows as 28.4 percent of decode GPU time.
+pub const GEMV_F16_X32_LMHEAD_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_f16_x32_lmhead.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible

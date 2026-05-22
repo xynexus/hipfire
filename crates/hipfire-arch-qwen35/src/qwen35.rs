@@ -2139,10 +2139,22 @@ pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, g
     let output = {
         let (_, td) = source.tensor_data(&output_src_name)
             .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: output projection tensor {output_src_name}")))?;
-        let f: Vec<f32> = td.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
-        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
-        let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
+        // PARO lm_head: opt-in F16 storage on GPU via HIPFIRE_LM_HEAD_F16=native
+        // (default: f32). F16 storage + the gfx12 256-thread gemv_f16_x32 kernel
+        // halves the weight BW for the 28-percent lm_head slot. Set
+        // HIPFIRE_LM_HEAD_F16_X32_GFX12=1 alongside to route the dispatch.
+        match f16_lm_head_mode_from_env() {
+            F16LmHeadMode::Native => {
+                let buf = gpu.upload_raw(td, &[config.vocab_size, config.dim])?;
+                WeightTensor { buf, gpu_dtype: DType::F16, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
+            }
+            F16LmHeadMode::F32 => {
+                let f: Vec<f32> = td.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+                let bytes: &[u8] = unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
+                let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
+                WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
+            }
+        }
     };
 
     let mut layers = Vec::with_capacity(config.n_layers);
