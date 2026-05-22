@@ -3124,6 +3124,18 @@ fn moe_ffn_decode_impl(
             &ffn.shared_expert.down.buf, &x_rot_alias, x_residual, scalar_buf,
             ffn.shared_expert.down.m, ffn.shared_expert.down.k,
         )?;
+    } else if ffn.shared_expert.down.gpu_dtype == DType::Q8_0
+        && (gpu.arch.starts_with("gfx1200") || gpu.arch.starts_with("gfx1201"))
+        && std::env::var("HIPFIRE_FUSED_F32_DOWN_SIGMOID_GFX12").as_deref() == Ok("1")
+    {
+        // PARO Q8 shared_expert.down — fused Q8 silu_mul + gemv + sigmoid +
+        // scaled_add in one kernel. Mirror of F32 sister with Q8 weight reads.
+        gpu.gemv_q8_0_silu_mul_residual_sigmoid_scaled_gfx12(
+            &ffn.shared_expert.down.buf,
+            &shared_gate, &shared_up,
+            x_residual, scalar_buf,
+            ffn.shared_expert.down.m, ffn.shared_expert.down.k,
+        )?;
     } else if ffn.shared_expert.down.gpu_dtype == DType::F32
         && (gpu.arch.starts_with("gfx1200") || gpu.arch.starts_with("gfx1201"))
         && std::env::var("HIPFIRE_FUSED_F32_DOWN_SIGMOID_GFX12").as_deref() == Ok("1")

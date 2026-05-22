@@ -84,6 +84,11 @@ pub const GEMV_HFQ4G128_MULTIROW_GFX12_SRC: &str =
 pub const FUSED_4WAY_Q8_0_GEMV_GFX12_SRC: &str =
     include_str!("../../../kernels/src/fused_4way_q8_0_gemv.gfx12.hip");
 
+/// gfx12 (RDNA4) Q8_0 fused shared_expert.down step. Mirror of the F32 sister
+/// but reads Q8_0 weight. Recovers the F32 down fusion win at Q8 storage.
+pub const GEMV_Q8_0_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_silu_mul_residual_sigmoid_scaled.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible
