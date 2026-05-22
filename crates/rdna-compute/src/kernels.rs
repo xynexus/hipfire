@@ -622,6 +622,15 @@ pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_K4_GFX12_SRC: &str =
 pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_M2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_m2.gfx12.hip");
 
+/// gfx12 (RDNA4) k2-baseline structure with vectorized nibble unpack via
+/// `__builtin_amdgcn_perm` (v_perm_b32). Same grid + kernarg layout as the
+/// k2 sibling; only the inner-loop dequant pattern differs (4 instructions
+/// per pk32 vs 16 scalar shifts in k2). Disasm of k2 baseline shows 54
+/// v_lshrrev_b32 + 0 v_perm_b32 — the compiler did NOT auto-vectorize.
+/// Routes via HIPFIRE_MOE_PARO_I8_PERM_GFX12=1 (opt-in pending bench validation).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_PERM_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_perm.gfx12.hip");
+
 /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
 /// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
 /// composition the ParoQuant MoE decode path used for the gate→down
