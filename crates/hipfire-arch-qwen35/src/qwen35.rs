@@ -2149,6 +2149,46 @@ pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, g
         // F32 / 1 GB at F16 / 0.5 GB at Q8 on Qwen3.6 248k × 2048).
         // Rocprof shows lm_head at 24-28 percent of decode GPU time.
         match std::env::var("HIPFIRE_LM_HEAD_F16").as_deref() {
+            Ok("hfq4g256") => {
+                // HFQ4-G256: 256-elem groups × 136 bytes (F32 scale + F32 min
+                // + 128 nibble bytes). ~4× BW reduction vs F32, 2× vs Q8.
+                // Risk: more quant error than Q8 on logits — verify coherence.
+                let group_size = 256usize;
+                let block_bytes = 136usize;
+                let n = config.vocab_size * config.dim;
+                let n_blocks = n / group_size;
+                let mut out = vec![0u8; n_blocks * block_bytes];
+                let row_f16_bytes = config.dim * 2;
+                for row in 0..config.vocab_size {
+                    let row_bytes = &td[row * row_f16_bytes..(row + 1) * row_f16_bytes];
+                    let f32_row: Vec<f32> = row_bytes.chunks_exact(2)
+                        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                        .collect();
+                    let groups_per_row = config.dim / group_size;
+                    for g in 0..groups_per_row {
+                        let start = g * group_size;
+                        let group = &f32_row[start..start + group_size];
+                        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+                        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let range = max_val - min_val;
+                        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+                        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+                        let block_idx = row * groups_per_row + g;
+                        let off = block_idx * block_bytes;
+                        out[off..off + 4].copy_from_slice(&scale.to_le_bytes());
+                        out[off + 4..off + 8].copy_from_slice(&min_val.to_le_bytes());
+                        for i in 0..128 {
+                            let lo_val = group[2 * i];
+                            let hi_val = group[2 * i + 1];
+                            let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
+                            let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
+                            out[off + 8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+                        }
+                    }
+                }
+                let buf = gpu.upload_raw(&out, &[out.len()])?;
+                WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
+            }
             Ok("q8") => {
                 let mut q8_bytes: Vec<u8> = Vec::with_capacity(
                     config.vocab_size * (config.dim / 32) * 34
