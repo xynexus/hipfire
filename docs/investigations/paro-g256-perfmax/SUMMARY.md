@@ -129,10 +129,33 @@ Pushed to origin/feat/lever-4-gpu-argmax-stability. Ready to cherry-pick into PR
 
 ## Next-steps (not in this exit)
 
-- **i8 MMQ port to gfx12** — `gemm_hfq4g128_mmq.gfx1151.hip` and the PARO MoE
-  variants are gfx1151-only. Predicate flip + gfx1201 testing is a 4-8 hr
-  follow-up. Largest expected lift: A3B-PARO prefill on gfx1201 from 63.7 →
-  closer to gfx1151's 428.3 tok/s.
+- **i8 MMQ port to gfx12 — SHIPPED post-exit on `feat/lever-4-gpu-argmax-stability`**
+  - `f2e2c254`: `gemm_paro_q4g128_moe_grouped_mmq.gfx12.hip` (k2). A3B-PARO
+    prefill on gfx1201 22.9 → 702 tok/s (+30×) with `HIPFIRE_PARO_BATCHED=1`.
+    Also fixes a portability bug: the cross-arch `wmma_k2` fallback
+    fails to compile on gfx12 (uses gfx11-only `llvm.amdgcn.wmma.f32.16x16x16.f16`),
+    so this port is *required* for batched PARO prefill on RDNA4.
+  - `6a08480c`: `_k4.gfx12.hip` deeper-pipeline variant. **Neutral (-0.4%)** —
+    G128 has 1 Q8_1 mmq block per HFQ4 group (vs G256's 2), so the
+    per-sub-block FMA chain k4 amortizes is structurally half as long.
+    Kept opt-in via `HIPFIRE_MOE_PARO_I8_K4_GFX12=1`.
+- **G128-native optimal MMQ/WMMA variant — open, user-requested next**.
+  Rather than port more G256-shaped kernels, design a kernel specifically
+  for G128's layout. Hypothesis: G128's bottleneck is the per-sub-block
+  FMA chain reaching only 4 sub-blocks before each group boundary; the
+  fix is either (a) cross-group batching of the scale FMAs (defer FMA
+  resolution past the group boundary, gaining ILP at the cost of cacc
+  register pressure) or (b) a larger M-tile (16×32 or 32×16 output, mirror
+  the `_m2.gfx12.hip` pattern on the HFQ4G256 side). Target: ≥10% over
+  k2's 702 tok/s ⇒ ≥770 tok/s prefill on shisa A3B-PARO at --prefill 256.
+  Templates to study:
+  - `kernels/src/gemm_hfq4g256_moe_grouped_wmma_m2.gfx12.hip` (m2 tile pattern)
+  - `kernels/src/gemm_paro_q4g128_moe_grouped_mmq.gfx12.hip` (current k2 baseline)
+- **Remaining MQ4G256→PARO ports** for completeness:
+  - `gemm_paro_q4g128_moe_grouped_mmq.gfx11_dgpu.hip` (7900 XTX, hipx host)
+  - `gemm_paro_q4g128_moe_grouped_mmq_k4.gfx11_dgpu.hip`
+  - `gemm_paro_q4g128_moe_grouped_wmma.gfx12.hip` (FP16 alternative on gfx12)
+  - `gemm_paro_q4g128_moe_grouped_wmma_m2.gfx12.hip`
 - **F32 router/shared_gate quantization** (Björn's Lever 1) — biggest single
   decode lever (+8-15%), kept with Björn.
 - **F32 → FP16 activations** (Björn's Lever 2) — +10-15% predicted, kept with Björn.
@@ -140,3 +163,14 @@ Pushed to origin/feat/lever-4-gpu-argmax-stability. Ready to cherry-pick into PR
   numbers not exercised on hiptrx. GOAL.md soft target (not exit-gating).
 - **Phase 7 conditional ports** — gfx1100 + gfx1151 rebuilds + benches.
   Now unblocked by this asymptote certification.
+
+## Post-exit MMQ work (durable, on `feat/lever-4-gpu-argmax-stability`)
+
+```
+6a08480c  feat(paroquant-prefill): k4 deeper-pipeline PARO MMQ gfx12 (neutral, opt-in)
+f2e2c254  feat(paroquant-prefill): port PARO_Q4G128 MoE grouped MMQ to gfx12  +30× prefill
+dcf752dc  feat(paroquant-decode): Lever 4 — bench_qwen35_mq4 uses GPU argmax  (NaN panic fix)
+```
+
+All three pushed to `origin/feat/lever-4-gpu-argmax-stability`. Ready to
+cherry-pick into PR #319.
