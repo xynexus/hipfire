@@ -318,11 +318,14 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
             channel_scales_init.detach().clone().to(torch.float32),
         )
 
-        # Init logits at sign(seed) * 0.1 (small magnitude). sign(logits) =
-        # sign(seed) so FWHT reproduces current pipeline byte-equal at step 0.
-        # Smaller magnitude makes signs easier to flip during training (a
-        # single gradient step with lr~0.1-1.0 can cross zero).
-        init_scale = 0.1
+        # Init logits at sign(seed) * 0.001 (very small magnitude). sign(logits)
+        # = sign(seed) so FWHT reproduces current pipeline byte-equal at step 0.
+        # On real model + calib data the per-Linear MSE is small (~7e-3 vs
+        # random's 400+) so gradients are ~5 orders of magnitude smaller than
+        # my local test. Init must be small enough that cumulative grad×lr
+        # over a handful of steps can cross zero — 1e-3 init with grad~1e-4
+        # × lr=1.0 + momentum gets there in a few steps.
+        init_scale = 0.001
         self.d1_logits = nn.Parameter(
             FWHT_SIGNS1.clone().to(torch.float32) * init_scale,
             requires_grad=False,
