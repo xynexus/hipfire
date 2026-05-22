@@ -12638,6 +12638,77 @@ impl Gpu {
         result
     }
 
+    /// gfx12 (RDNA4) FP16 WMMA sister of `gemm_paro_q4g128_moe_grouped_wmma_k2`
+    /// — the missing G128 analog of `gemm_hfq4g256_moe_grouped_wmma_gfx12`.
+    /// Same kernarg layout as `gemm_paro_q4g128_moe_grouped_wmma_k2` (9 args:
+    /// no x_src_rows since x_f16 is row-indexed natively). Routes via
+    /// HIPFIRE_MOE_PARO_FP16_GFX12=1 (opt-in pending bench validation).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_paro_q4g128_moe_grouped_wmma_gfx12(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_paro_q4g128_moe_grouped_wmma_gfx12",
+            kernels::GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_GFX12_SRC,
+            "gemm_paro_q4g128_moe_grouped_wmma_gfx12",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq4g128_bytes(m, k));
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_paro_q4g128_moe_grouped_wmma_gfx12", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_paro_q4g128_moe_grouped_wmma_gfx12",
+            [row_tiles, slot_tiles, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// SGLang-style grouped-WMMA-GEMM for HFQ4G128 (ParoQuant) routed
     /// experts. Sister of `gemm_hfq4g256_moe_grouped_wmma_k2` with the
     /// 72 B/group HFQ4G128 stride. F32 x_src is auto-converted to F16

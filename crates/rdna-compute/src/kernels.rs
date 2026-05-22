@@ -631,6 +631,18 @@ pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_M2_GFX12_SRC: &str =
 pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_PERM_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_perm.gfx12.hip");
 
+/// gfx12 (RDNA4) FP16 WMMA port of HFQ4G128 (ParoQuant) MoE grouped-GEMM —
+/// the missing gfx12 sister of the cross-arch
+/// `gemm_paro_q4g128_moe_grouped_wmma_k2`. Mirrors the MQ4 G256 gfx12 FP16
+/// WMMA path (`gemm_hfq4g256_moe_grouped_wmma_gfx12`) on the G128 layout.
+/// This is the correct lever for PARO G128 on gfx12: MQ4's i8 MMQ variant
+/// on the same hardware measured -11.6% vs its FP16 WMMA sister
+/// (dispatch.rs:12538-12550), so the FP16 path should be the default for
+/// PARO too. Routes via HIPFIRE_MOE_PARO_FP16_GFX12=1 initially (opt-in
+/// pending bench validation).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_wmma.gfx12.hip");
+
 /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
 /// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
 /// composition the ParoQuant MoE decode path used for the gate→down
