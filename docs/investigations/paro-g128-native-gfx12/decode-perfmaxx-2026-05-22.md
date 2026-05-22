@@ -167,23 +167,75 @@ register-reuse wins."). My earlier subwave and per-thread-rows multirow
 attempts on gfx12 hit the same wall (-23 % / -54 %). Not a missed
 lever.
 
-### Combined session result
+### Combined session result (final stack)
 
-Decode arc on z-lab A3B-PARO (gfx1201, --gen 100, 3-run median):
+Decode arc on z-lab A3B-PARO (gfx1201, --gen 100, 5-run cool-warm):
 
-  Session start (post-prefill-perfmaxx baseline):  62.6 tok/s
-  + fused 4-way F32 GEMV (decode lever 1):         67.7 tok/s
+  Session start (post-prefill-perfmaxx baseline):     62.6 tok/s
+  + fused 4-way F32 GEMV (gate-side, d50aacf1):       67.7 tok/s   +8 pct
+  + F32 down fusion (d495edd0):                       69.4 tok/s
+  + alpha/beta 2-way (11e409c6):                      70.1 tok/s   +12 pct cumulative
+                                                       (66.5 warm-state)
 
-**Goal 100 tok/s: NOT MET. Gap 32.3 tok/s.**
+**Goal 100 tok/s: NOT MET. Gap ~30 tok/s.**
 
-Bounded single-session ceiling for decode is the +8 % achieved. The
-remaining 32 tok/s requires either spec decode for PARO or a kernel
-fusion stack deeper than what fits in one session. The user's intuition
-about gfx11 levers was partially correct (the 4-way fused pattern was
-real and ported successfully) but did not yield 3× as the MQ4-on-gfx11
-data point suggested — the missing levers are about LAUNCH OVERHEAD
-reduction, which only converts to large gains when many fusion
-opportunities stack together.
+Coherence verified clean throughout (101 / 120 / 120 tokens on
+humaneval_2/3/0, 0 hard fails — matches canonical baseline).
+
+### Falsified levers (kept opt-in or reverted)
+
+- `gemv_f32_multirow_gfx12` v1 (each thread × 8 rows): -54%, bad cache
+  pattern. Kept opt-in.
+- `gemv_f32_multirow_gfx12` v2 (subwave 4-lane/row): -23%, 1-wave WG
+  under-saturates BW. Kept opt-in.
+- `HIPFIRE_KEEP_F16_WEIGHTS=1` storage swap: -21%, dispatch overhead
+  outweighs F16 BW saving for small per-call work.
+- `HIPFIRE_GRAPH_MOE=1` hipGraph for PARO: bimodal (4/5 baseline-
+  matching, 1/5 capture-rebuild outlier). Net neutral, kept off.
+- `gemv_hfq4g128_gfx12` 4-acc port from gfx1100: -2.5%, gfx12 compiler
+  already pipelines single-acc.
+- `givens_rotate_to` (out-of-place fused copy+rotate): kernel docs
+  claim bit-exact but coherence breaks empirically. Reverted in llama.rs.
+- 4-way kernel reused for alpha/beta (M=16 each): -3%, wave32 under-
+  saturates at small M. Replaced with proper 256-thread 2-way smallm
+  kernel.
+
+### Architectural conclusion
+
+Decode is GPU-internal-dispatch-bound on this architecture for this
+model size. Each kernel call has ~20 µs of latency that's not host-side
+launch overhead (hipGraph proves this) — it's HSA-level dispatch +
+kernel initialization + small-WG inefficiency.
+
+The 100 tok/s goal requires either:
+
+1. **Spec decode for PARO** (admit z-lab into DFlash). Multi-day
+   project. Token-batched verify amortizes the per-token cost.
+2. **Per-LA-layer mega-kernel fusion**: rmsnorm + wqkv + wz + alpha +
+   beta + sigmoid + conv1d all in one kernel. Multi-day.
+
+Neither fits a single-session budget. The +12% gained here via 4 layered
+fusion levers (4-way gate-side, F32 down, 2-way alpha/beta, plus the
+opt-in giveaways) represents the bounded single-session ceiling.
+
+### gfx11 lever survey: structural patterns matter, magnitude doesn't transfer
+
+User's framing was "gfx11 has decode levers gfx12 doesn't yet." Survey
+findings:
+
+| gfx11 pattern | gfx12 port outcome |
+|---|---|
+| MQ4 `fused_qkvza_hfq4g256` (4-way LA fused) | Ported as F32 sister → +8% real |
+| `gemv_hfq4g256.gfx1100.hip` 4-acc unroll | Ported to G128 → -2.5% (compiler) |
+| `gemv_hfq4g256_multirow.gfx1100.hip` | Header documents as not-a-win on gfx1100 |
+| `fused_qkv_mq3g256_lloyd.gfx1100` | Not applicable (no MQ3 PARO) |
+| `gemv_hfp4g32_dot2.gfx11` | Not applicable (no HFP4 in PARO) |
+
+The 4-way fused pattern was the real missed lever (+8%). The "3×
+gfx11 vs gfx12 on MQ4 MoE" data point doesn't transfer to PARO because
+MQ4 has FWHT pre-rotation baked into weights (no per-call rotation
+overhead), while PARO requires per-weight Givens rotation that
+fundamentally limits launch-fusion gains.
 
 ## Files shipped (opt-in research)
 
