@@ -687,6 +687,37 @@ def run_butterfly_training(
 
 
 # ---------------------------------------------------------------------------
+# Logit-KLD smoke eval (Phase 3 gate).
+# ---------------------------------------------------------------------------
+
+def compute_logit_kld(
+    oracle: nn.Module,
+    student: nn.Module,
+    seqs: list[torch.Tensor],
+    device: torch.device,
+) -> float:
+    """Mean per-token KL(oracle || student) over the eval slice.
+
+    KLD = sum_v p(v) * (log p(v) - log q(v)) with p = softmax(oracle logits),
+    q = softmax(student logits). Averaged over all eval token positions.
+    """
+    total_kld = 0.0
+    total_tokens = 0
+    with torch.no_grad():
+        for seq in seqs:
+            input_ids = seq.unsqueeze(0).to(device)
+            logits_oracle = oracle(input_ids).logits.float()  # [1, T, V]
+            logits_student = student(input_ids).logits.float()
+            log_p = F.log_softmax(logits_oracle, dim=-1)
+            log_q = F.log_softmax(logits_student, dim=-1)
+            p = log_p.exp()
+            kl = (p * (log_p - log_q)).sum(dim=-1)  # [1, T]
+            total_kld += float(kl.sum())
+            total_tokens += int(kl.numel())
+    return total_kld / max(total_tokens, 1)
+
+
+# ---------------------------------------------------------------------------
 # Self-test (no real model required — random weights, single-Linear sanity).
 # ---------------------------------------------------------------------------
 
@@ -834,6 +865,11 @@ def main() -> None:
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
     ap.add_argument("--log-interval", type=int, default=8)
     ap.add_argument("--seed", type=int, default=12345)
+    ap.add_argument("--smoke-eval", action="store_true",
+                    help="Run logit-KLD smoke eval (baseline theta=0 vs trained) "
+                         "before AND after training. Phase 3 gate.")
+    ap.add_argument("--smoke-eval-seqs", type=int, default=16,
+                    help="Number of sequences for --smoke-eval KLD computation.")
     args = ap.parse_args()
 
     if args.self_test:
@@ -930,6 +966,16 @@ def main() -> None:
         n: float(w.theta_residual.detach().norm().cpu()) for n, w in wrapped.items()
     }
 
+    smoke_kld_baseline: Optional[float] = None
+    smoke_kld_trained: Optional[float] = None
+    if args.smoke_eval:
+        n_eval = max(1, args.smoke_eval_seqs)
+        print(f"\n[pre-train] Smoke eval baseline (theta=0): {n_eval} seqs × {args.ctx_len} ctx ...")
+        smoke_kld_baseline = compute_logit_kld(
+            oracle, student, seqs[:n_eval], device,
+        )
+        print(f"      baseline KLD (theta=0):  {smoke_kld_baseline:.6f}")
+
     print("\n[5/7] Training butterfly residuals ...")
     train_start = time.time()
     trace = run_butterfly_training(
@@ -966,6 +1012,21 @@ def main() -> None:
 
     oracle_capture.detach()
     student_capture.detach()
+
+    if args.smoke_eval:
+        n_eval = max(1, args.smoke_eval_seqs)
+        print(f"\n[post-train] Smoke eval (theta=trained): {n_eval} seqs × {args.ctx_len} ctx ...")
+        smoke_kld_trained = compute_logit_kld(
+            oracle, student, seqs[:n_eval], device,
+        )
+        print(f"      trained KLD:  {smoke_kld_trained:.6f}")
+        print(f"      baseline KLD: {smoke_kld_baseline:.6f}")
+        delta = smoke_kld_trained - smoke_kld_baseline
+        rel = delta / max(smoke_kld_baseline, 1e-12) * 100.0
+        print(f"      Δ:            {delta:+.6f}  ({rel:+.2f}%)")
+        passed = smoke_kld_trained < smoke_kld_baseline
+        print(f"      {'[PASS]' if passed else '[FAIL]'} smoke gate "
+              f"({'trained < baseline' if passed else 'trained ≥ baseline — STOP'})")
 
     print("\n[6/7] Exporting butterfly residuals + AWQ sidecar ...")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1027,6 +1088,12 @@ def main() -> None:
         "final_theta_norms": final_theta_norms,
         "dtype": args.dtype,
         "seed": args.seed,
+        "smoke_eval": {
+            "enabled": args.smoke_eval,
+            "n_eval_seqs": args.smoke_eval_seqs if args.smoke_eval else None,
+            "kld_baseline_theta_0": smoke_kld_baseline,
+            "kld_trained": smoke_kld_trained,
+        },
     }
     meta_path = args.output_dir / "butterfly_meta.json"
     with meta_path.open("w") as f:
