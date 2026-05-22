@@ -2526,6 +2526,66 @@ impl Gpu {
         result
     }
 
+    /// gfx12 2-way fused F32 GEMV for small-M (LA layer alpha + beta).
+    /// 256-thread blocks for BW saturation; 1 launch instead of 2.
+    pub fn fused_2way_f32_gemv_smallm_gfx12(
+        &mut self,
+        a_a: &GpuTensor,
+        a_b: &GpuTensor,
+        x: &GpuTensor,
+        y_a: &GpuTensor,
+        y_b: &GpuTensor,
+        m_a: usize, m_b: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_2way_f32_gemv_smallm",
+            kernels::FUSED_2WAY_F32_GEMV_SMALLM_GFX12_SRC,
+            "fused_2way_f32_gemv_smallm",
+        )?;
+        let ap_a = a_a.buf.as_ptr();
+        let ap_b = a_b.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp_a = y_a.buf.as_ptr();
+        let yp_b = y_b.buf.as_ptr();
+        let ma = m_a as i32;
+        let mb = m_b as i32;
+        let kv = k as i32;
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap_a as *const _ as *mut c_void,
+            &ap_b as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp_a as *const _ as *mut c_void,
+            &yp_b as *const _ as *mut c_void,
+            &ma as *const _ as *mut c_void,
+            &mb as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &alpha as *const _ as *mut c_void,
+            &beta as *const _ as *mut c_void,
+        ];
+        let total = (m_a + m_b) as u32;
+        let bytes = ((m_a + m_b) * k * 4) + (k * 4) + ((m_a + m_b) * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "fused_2way_f32_gemv_smallm", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "fused_2way_f32_gemv_smallm",
+            [total, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap_a); b.push_ptr(ap_b); b.push_ptr(xp);
+                b.push_ptr(yp_a); b.push_ptr(yp_b);
+                b.push_i32(ma); b.push_i32(mb); b.push_i32(kv);
+                b.push_f32(alpha); b.push_f32(beta);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// gfx12 F32 fused shared_expert.down step for PARO decode. Combines
     /// silu_mul + gemv_f32 + sigmoid + scaled_add into one launch. Mirrors
     /// MQ4's fused_silu_mul_rotate + gemv_hfq4g256_residual_sigmoid_scaled

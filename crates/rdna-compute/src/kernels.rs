@@ -60,6 +60,12 @@ pub const FUSED_4WAY_F32_GEMV_GFX12_SRC: &str =
 pub const GEMV_F32_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemv_f32_silu_mul_residual_sigmoid_scaled.gfx12.hip");
 
+/// gfx12 (RDNA4) 2-way fused F32 GEMV for small-M cases (alpha + beta in
+/// LA layers). Uses 256-thread blocks for BW saturation. 2 → 1 launch
+/// saves 32/token of dispatch overhead on z-lab A3B-PARO.
+pub const FUSED_2WAY_F32_GEMV_SMALLM_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/fused_2way_f32_gemv_smallm.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible

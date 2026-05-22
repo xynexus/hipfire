@@ -8613,8 +8613,26 @@ fn forward_scratch_layers(
                 } else {
                     weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
                     weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
-                    weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
-                    weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                    // F32 alpha/beta 2-way fusion: when both are F32 (PARO LA),
+                    // fuse into 1 launch. Saves 1 launch per LA × 32 LA layers
+                    // = 32/token. Routed via HIPFIRE_FUSED_2WAY_F32_SMALLM_GFX12=1.
+                    let arch_is_gfx12 = gpu.arch.starts_with("gfx1200")
+                        || gpu.arch.starts_with("gfx1201");
+                    let fuse_alpha_beta = arch_is_gfx12
+                        && layer.w_beta.gpu_dtype == DType::F32
+                        && layer.w_alpha.gpu_dtype == DType::F32
+                        && std::env::var("HIPFIRE_FUSED_2WAY_F32_SMALLM_GFX12").as_deref() == Ok("1");
+                    if fuse_alpha_beta {
+                        gpu.fused_2way_f32_gemv_smallm_gfx12(
+                            &layer.w_beta.buf, &layer.w_alpha.buf,
+                            &s.tmp,
+                            &s.dn_beta, &s.dn_alpha,
+                            layer.w_beta.m, layer.w_alpha.m, layer.w_beta.k,
+                        )?;
+                    } else {
+                        weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
+                        weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                    }
                 }
                 // Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are
                 // elementwise scalar transforms on independent buffers of size
@@ -9073,8 +9091,26 @@ fn forward_scratch_layers(
                 } else {
                     weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
                     weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
-                    weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
-                    weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                    // F32 alpha/beta 2-way fusion: when both are F32 (PARO LA),
+                    // fuse into 1 launch. Saves 1 launch per LA × 32 LA layers
+                    // = 32/token. Routed via HIPFIRE_FUSED_2WAY_F32_SMALLM_GFX12=1.
+                    let arch_is_gfx12 = gpu.arch.starts_with("gfx1200")
+                        || gpu.arch.starts_with("gfx1201");
+                    let fuse_alpha_beta = arch_is_gfx12
+                        && layer.w_beta.gpu_dtype == DType::F32
+                        && layer.w_alpha.gpu_dtype == DType::F32
+                        && std::env::var("HIPFIRE_FUSED_2WAY_F32_SMALLM_GFX12").as_deref() == Ok("1");
+                    if fuse_alpha_beta {
+                        gpu.fused_2way_f32_gemv_smallm_gfx12(
+                            &layer.w_beta.buf, &layer.w_alpha.buf,
+                            &s.tmp,
+                            &s.dn_beta, &s.dn_alpha,
+                            layer.w_beta.m, layer.w_alpha.m, layer.w_beta.k,
+                        )?;
+                    } else {
+                        weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
+                        weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                    }
                 }
                 gpu.fused_sigmoid_alpha_gate_f32(
                     &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
