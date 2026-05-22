@@ -219,6 +219,149 @@ def quantize_mq4g256_bfly_ste(
 # Pseudo-quantized Linear with frozen weight + frozen AWQ scales + learnable theta.
 # ---------------------------------------------------------------------------
 
+class SignSTE(torch.autograd.Function):
+    """Discrete sign function with straight-through estimator.
+
+    Forward: y = sign(x)  in {-1, 0, +1}, treated as ±1 for our use
+             (zero crossings are degenerate; we initialize at ±1 so this
+             rarely matters).
+    Backward: dL/dx = dL/dy  (identity passthrough).
+    """
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor) -> torch.Tensor:
+        # Strict ±1 (no zeros). At logits=0, push to +1.
+        return torch.where(logits >= 0.0, torch.ones_like(logits), -torch.ones_like(logits))
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        return grad_output
+
+
+def sign_ste(logits: torch.Tensor) -> torch.Tensor:
+    return SignSTE.apply(logits)
+
+
+def quantize_mq4g256_signs_ste(
+    w: torch.Tensor,
+    d1: torch.Tensor,
+    d2: torch.Tensor,
+) -> torch.Tensor:
+    """MQ4G256 round-trip with learnable D1/D2 sign tables.
+
+    d1, d2 are already STE'd ±1 tensors of shape [256]. They participate in
+    the FWHT exactly where the fixed seed-generated signs would have. Gradient
+    flows through d1, d2 via the sign STE.
+    """
+    assert w.dim() == 2
+    m, k = w.shape
+    assert k % N == 0, f"K={k} must be divisible by {N}"
+    n_groups = k // N
+
+    w_f32 = w.to(torch.float32)
+    w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), d1, d2)
+
+    with torch.no_grad():
+        min_val = w_fwht.min(dim=-1).values
+        max_val = w_fwht.max(dim=-1).values
+        rng = max_val - min_val
+        scale = torch.where(rng > 0.0, rng / 15.0, torch.ones_like(rng))
+        zero = min_val
+        inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
+        q = torch.clamp(
+            torch.round((w_fwht - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
+            0.0, 15.0,
+        )
+        dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
+        delta = dequant_rot - w_fwht
+    w_quant_rot = w_fwht + delta.detach()
+    w_dq = torch_inverse_fwht_256(w_quant_rot, d1, d2)
+    return w_dq.reshape(m, k).to(w.dtype)
+
+
+class LearnableSignsPseudoQuantLinear(nn.Module):
+    """MQ4G256 + AWQ + learnable D1/D2 sign tables (Phase 4d).
+
+    The FWHT structure (8 stride-doubling layers of 2x2 Hadamard butterflies)
+    stays fixed. Only the input diagonal D1 and output diagonal D2 are
+    learnable. Init: D1 = sign_table_seed_42, D2 = sign_table_seed_1042
+    (i.e., identical to current MQ4+AWQ pipeline at logits step 0).
+
+    Storage: per-tensor ±1 sign tables of length 256 each. Same kernel
+    signature as current FWHT path — only the sign table values differ.
+    Compared to butterfly residual (1024 angles per Linear), this has 512
+    discrete sign bits per Linear — half the parameter count, more global
+    influence on the rotation structure.
+    """
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        channel_scales_init: torch.Tensor,
+        canonical_name: str,
+    ) -> None:
+        super().__init__()
+        assert weight.dim() == 2
+        m, k = weight.shape
+        assert k % N == 0
+        assert channel_scales_init.shape == (k,)
+
+        self.register_buffer("weight", weight.detach().clone())
+        if bias is not None:
+            self.register_buffer("bias", bias.detach().clone())
+        else:
+            self.bias = None
+
+        self.register_buffer(
+            "channel_scales",
+            channel_scales_init.detach().clone().to(torch.float32),
+        )
+
+        # Init logits at seed-generated signs (±1 F32). At training step 0,
+        # sign(logits) reproduces FWHT_SIGNS1/2 exactly.
+        self.d1_logits = nn.Parameter(
+            FWHT_SIGNS1.clone().to(torch.float32),
+            requires_grad=False,
+        )
+        self.d2_logits = nn.Parameter(
+            FWHT_SIGNS2.clone().to(torch.float32),
+            requires_grad=False,
+        )
+
+        self.canonical_name = canonical_name
+        self.k_in = k
+        self.m_out = m
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s_safe = torch.clamp(self.channel_scales, min=1e-6).to(torch.float32)
+        w_dtype = self.weight.dtype
+
+        # STE-projected sign tables; backward flows through as identity.
+        d1 = sign_ste(self.d1_logits).view(1, N)
+        d2 = sign_ste(self.d2_logits).view(1, N)
+
+        w_scaled = self.weight.to(torch.float32) * s_safe.unsqueeze(0)
+        w_q_dq = quantize_mq4g256_signs_ste(w_scaled, d1, d2)
+        x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
+        return F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
+
+    def set_optim(self) -> None:
+        self.d1_logits.requires_grad = True
+        self.d2_logits.requires_grad = True
+
+    def baseline_sign_flips(self) -> tuple[int, int]:
+        """How many entries have flipped sign vs the seed init (D1, D2)."""
+        d1_init = FWHT_SIGNS1.to(self.d1_logits.device)
+        d2_init = FWHT_SIGNS2.to(self.d2_logits.device)
+        d1_now = (self.d1_logits >= 0.0).float() * 2.0 - 1.0
+        d2_now = (self.d2_logits >= 0.0).float() * 2.0 - 1.0
+        return (
+            int((d1_now != d1_init).sum()),
+            int((d2_now != d2_init).sum()),
+        )
+
+
 class ButterflyResidualPseudoQuantLinear(nn.Module):
     """MQ4G256 + AWQ + learnable butterfly residual.
 
@@ -449,13 +592,16 @@ def wrap_awq_targets(
     alpha: float,
     stored_keys: set[str],
     target_pattern: Optional[str],
-) -> dict[str, ButterflyResidualPseudoQuantLinear]:
+    wrapper_class=None,
+) -> dict[str, nn.Module]:
     """Wrap all AWQ-F1 Linears whose stored name matches `target_pattern`.
 
     Returns dict mod_name → wrapper.
     """
+    if wrapper_class is None:
+        wrapper_class = ButterflyResidualPseudoQuantLinear
     pat = re.compile(target_pattern) if target_pattern else None
-    wrapped: dict[str, ButterflyResidualPseudoQuantLinear] = {}
+    wrapped: dict[str, nn.Module] = {}
     skipped_no_imatrix = 0
     skipped_k_not_256 = 0
     skipped_pattern = 0
@@ -495,7 +641,7 @@ def wrap_awq_targets(
         weight = module.weight.detach().clone()
         bias = module.bias.detach().clone() if module.bias is not None else None
         device = module.weight.device
-        wrapper = ButterflyResidualPseudoQuantLinear(weight, bias, init_s, canonical)
+        wrapper = wrapper_class(weight, bias, init_s, canonical)
         wrapper = wrapper.to(device=device)
         _set_module(model, mod_name, wrapper)
         wrapped[mod_name] = wrapper
@@ -1134,6 +1280,10 @@ def main() -> None:
                     help="Use direct KL-divergence loss (oracle || student) "
                          "instead of per-Linear MSE. Aligns proxy with "
                          "production metric. Phase 4c (decisive test).")
+    ap.add_argument("--learnable-signs", action="store_true",
+                    help="Phase 4d: learn per-tensor D1/D2 sign tables "
+                         "instead of butterfly residual. Discrete ±1 via "
+                         "sign-STE. Init at seeds 42/1042.")
     args = ap.parse_args()
 
     if args.self_test:
@@ -1203,8 +1353,11 @@ def main() -> None:
     print(f"      imatrix tensors: {len(in_sum2_by_name)}")
     stored_keys = _safetensors_keys(args.model)
     print(f"      safetensors keys: {len(stored_keys)}")
+    wrapper_cls = LearnableSignsPseudoQuantLinear if args.learnable_signs else ButterflyResidualPseudoQuantLinear
+    print(f"      wrapper class: {wrapper_cls.__name__}")
     wrapped = wrap_awq_targets(
         student, in_sum2_by_name, args.alpha, stored_keys, args.target_pattern,
+        wrapper_class=wrapper_cls,
     )
     print(f"      wrap done in {time.time() - t0:.1f}s")
     if not wrapped:
@@ -1226,9 +1379,12 @@ def main() -> None:
 
     device = next(student.parameters()).device
 
-    initial_theta_norms = {
-        n: float(w.theta_residual.detach().norm().cpu()) for n, w in wrapped.items()
-    }
+    if args.learnable_signs:
+        initial_theta_norms = {n: 0.0 for n in wrapped}
+    else:
+        initial_theta_norms = {
+            n: float(w.theta_residual.detach().norm().cpu()) for n, w in wrapped.items()
+        }
 
     smoke_kld_baseline: Optional[float] = None
     smoke_kld_trained: Optional[float] = None
@@ -1296,16 +1452,30 @@ def main() -> None:
     train_elapsed = time.time() - train_start
     print(f"\n      total train time: {train_elapsed:.1f}s")
 
-    final_theta_norms = {
-        n: float(w.theta_residual.detach().norm().cpu()) for n, w in wrapped.items()
-    }
-    print("\n      theta-norm summary (first 8 tensors):")
-    for n in list(wrapped.keys())[:8]:
-        init_n = initial_theta_norms[n]
-        final_n = final_theta_norms[n]
-        # The plan warns: ||theta|| > π suggests rotations exceed half-turn.
-        warn = " (warn: > π)" if final_n > math.pi else ""
-        print(f"        {n}:   {init_n:.3e} → {final_n:.3e}{warn}")
+    if args.learnable_signs:
+        final_theta_norms = {}
+        sign_flips: dict[str, tuple[int, int]] = {}
+        for n, w in wrapped.items():
+            d1_flips, d2_flips = w.baseline_sign_flips()
+            sign_flips[n] = (d1_flips, d2_flips)
+            final_theta_norms[n] = float(d1_flips + d2_flips)
+        print("\n      sign-flip summary (first 8 tensors, out of 256 each for D1/D2):")
+        for n in list(wrapped.keys())[:8]:
+            d1f, d2f = sign_flips[n]
+            print(f"        {n}:   D1 flips {d1f}/256, D2 flips {d2f}/256")
+        total_d1 = sum(v[0] for v in sign_flips.values())
+        total_d2 = sum(v[1] for v in sign_flips.values())
+        print(f"      total flips across 138 tensors: D1 {total_d1}/{138 * 256}, D2 {total_d2}/{138 * 256}")
+    else:
+        final_theta_norms = {
+            n: float(w.theta_residual.detach().norm().cpu()) for n, w in wrapped.items()
+        }
+        print("\n      theta-norm summary (first 8 tensors):")
+        for n in list(wrapped.keys())[:8]:
+            init_n = initial_theta_norms[n]
+            final_n = final_theta_norms[n]
+            warn = " (warn: > π)" if final_n > math.pi else ""
+            print(f"        {n}:   {init_n:.3e} → {final_n:.3e}{warn}")
 
     oracle_capture.detach()
     student_capture.detach()
@@ -1328,27 +1498,39 @@ def main() -> None:
     print("\n[6/7] Exporting butterfly residuals + AWQ sidecar ...")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    npz_path = args.output_dir / "butterfly_residuals.npz"
-    npz_dict: dict[str, np.ndarray] = {}
-    for mod_name, wrapper in sorted(wrapped.items()):
-        npz_dict[wrapper.canonical_name] = wrapper.theta_residual.detach().cpu().numpy().astype(
-            np.float32,
-        )
-    np.savez(npz_path, **npz_dict)
-    print(f"      wrote {len(npz_dict)} residuals → {npz_path} "
-          f"({npz_path.stat().st_size / 1e6:.2f} MB)")
+    if args.learnable_signs:
+        npz_path = args.output_dir / "learnable_signs.npz"
+        npz_dict: dict[str, np.ndarray] = {}
+        for mod_name, wrapper in sorted(wrapped.items()):
+            d1 = (wrapper.d1_logits.detach() >= 0.0).cpu().numpy().astype(np.int8) * 2 - 1
+            d2 = (wrapper.d2_logits.detach() >= 0.0).cpu().numpy().astype(np.int8) * 2 - 1
+            npz_dict[f"{wrapper.canonical_name}.d1"] = d1
+            npz_dict[f"{wrapper.canonical_name}.d2"] = d2
+        np.savez(npz_path, **npz_dict)
+        print(f"      wrote {len(npz_dict) // 2} tensor pairs (D1+D2) → {npz_path} "
+              f"({npz_path.stat().st_size / 1e3:.1f} KB)")
+    else:
+        npz_path = args.output_dir / "butterfly_residuals.npz"
+        npz_dict = {}
+        for mod_name, wrapper in sorted(wrapped.items()):
+            npz_dict[wrapper.canonical_name] = wrapper.theta_residual.detach().cpu().numpy().astype(
+                np.float32,
+            )
+        np.savez(npz_path, **npz_dict)
+        print(f"      wrote {len(npz_dict)} residuals → {npz_path} "
+              f"({npz_path.stat().st_size / 1e6:.2f} MB)")
 
-    hfbf_path = args.output_dir / "butterfly_residuals.hfbf"
-    bfly_entries: list[tuple[str, int, np.ndarray]] = []
-    for mod_name, wrapper in sorted(wrapped.items()):
-        bfly_entries.append((
-            wrapper.canonical_name,
-            0,
-            wrapper.theta_residual.detach().cpu().numpy().astype(np.float32),
-        ))
-    write_hfbf(hfbf_path, bfly_entries)
-    print(f"      wrote {len(bfly_entries)} HFBF entries → {hfbf_path} "
-          f"({hfbf_path.stat().st_size / 1e3:.1f} KB)")
+        hfbf_path = args.output_dir / "butterfly_residuals.hfbf"
+        bfly_entries: list[tuple[str, int, np.ndarray]] = []
+        for mod_name, wrapper in sorted(wrapped.items()):
+            bfly_entries.append((
+                wrapper.canonical_name,
+                0,
+                wrapper.theta_residual.detach().cpu().numpy().astype(np.float32),
+            ))
+        write_hfbf(hfbf_path, bfly_entries)
+        print(f"      wrote {len(bfly_entries)} HFBF entries → {hfbf_path} "
+              f"({hfbf_path.stat().st_size / 1e3:.1f} KB)")
 
     hfsc_path = args.output_dir / "paper_awq_scales.hfsc"
     awq_entries: list[tuple[str, int, np.ndarray]] = []
