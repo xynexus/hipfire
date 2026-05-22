@@ -21,6 +21,14 @@ fn main() {
     use std::path::Path;
     use std::time::Instant;
 
+    // Methodology guard: when HIPFIRE_PROFILE=1 is set, force a rocprof+atlas
+    // rerun automatically so internal-profile blindspots ("hidden lever" pattern:
+    // 2026-05-19 q8_0_batched 65% missed, 2026-05-22 gemm_hfq4g128 70% missed)
+    // can't recur. Self-execs under rocprofv3 with HIPFIRE_ROCPROF_CSV pre-wired;
+    // the profile dump path picks up the CSV and prints the cross-check report.
+    // Opt out (e.g. rocprofv3 unavailable / broken): HIPFIRE_PROFILE_NO_ROCPROF=1.
+    maybe_self_exec_under_rocprof();
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N] [--emit-atlas <path.jsonl>]");
@@ -572,3 +580,89 @@ fn split_prefill_summary(prefill_len: usize, prefill_ms: f64, prefill_kernel_ms:
         String::new()
     }
 }
+
+/// When HIPFIRE_PROFILE=1 is set and we're not already running as a rocprof
+/// child, self-exec under rocprofv3 with HIPFIRE_ROCPROF_CSV pre-wired.
+/// This makes rocprof attribution automatic for any HIPFIRE_PROFILE=1 run
+/// so the internal serialized profile can't silently miss kernels that
+/// dispatch without a `profile::begin_timer` wrapper.
+///
+/// Opt-out: HIPFIRE_PROFILE_NO_ROCPROF=1 (e.g. rocprofv3 unavailable in CI).
+/// Recursion guard: HIPFIRE_ROCPROF_CHILD=1 is set on the child invocation.
+///
+/// History: this guard exists because the "hidden lever" pattern recurred
+/// (2026-05-19 q8_0_batched 65% missed by internal profile; 2026-05-22
+/// gemm_hfq4g128 70% missed). Each recurrence cost hours of investigation
+/// down the wrong optimization axis. Forcing rocprof attribution at the
+/// methodology layer eliminates the failure mode.
+#[cfg(feature = "deltanet")]
+fn maybe_self_exec_under_rocprof() {
+    use std::os::unix::process::CommandExt;
+
+    // Only fire when the user explicitly asked for profiling.
+    if std::env::var("HIPFIRE_PROFILE").as_deref() != Ok("1") {
+        return;
+    }
+    // Recursion guard: we're the rocprof child, run normally.
+    if std::env::var("HIPFIRE_ROCPROF_CHILD").as_deref() == Ok("1") {
+        return;
+    }
+    // Explicit opt-out (e.g. rocprofv3 unavailable, or user wants raw timing).
+    if std::env::var("HIPFIRE_PROFILE_NO_ROCPROF").as_deref() == Ok("1") {
+        eprintln!("[HIPFIRE_PROFILE] internal-only (HIPFIRE_PROFILE_NO_ROCPROF=1 set)");
+        eprintln!("[HIPFIRE_PROFILE] WARNING: internal serialized timer can miss kernels — see docs/methodology/rocprof-coverage.md");
+        return;
+    }
+
+    // Locate rocprofv3. If not on PATH, fall back to internal-only with a
+    // loud warning so the user knows attribution is incomplete.
+    let rocprofv3 = match std::process::Command::new("which").arg("rocprofv3").output() {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        _ => {
+            eprintln!("[HIPFIRE_PROFILE] rocprofv3 not on PATH; internal-only");
+            eprintln!("[HIPFIRE_PROFILE] WARNING: 'hidden lever' kernels may be invisible — install rocprofv3 or set HIPFIRE_PROFILE_NO_ROCPROF=1 to silence this warning");
+            return;
+        }
+    };
+
+    // Output dir per-process to avoid colliding parallel bench runs.
+    let pid = std::process::id();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let out_dir = format!("/tmp/hipfire-profile-{pid}-{timestamp}");
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("[HIPFIRE_PROFILE] failed to create {out_dir}: {e}; internal-only");
+        return;
+    }
+    let csv_path = format!("{out_dir}/trace_kernel_stats.csv");
+
+    eprintln!("[HIPFIRE_PROFILE] forced rocprofv3 attribution → {csv_path}");
+    eprintln!("[HIPFIRE_PROFILE] (opt-out: HIPFIRE_PROFILE_NO_ROCPROF=1)");
+
+    // Self-exec under rocprofv3, propagating all original args.
+    let argv: Vec<String> = std::env::args().collect();
+    let self_path = argv.first().cloned().unwrap_or_default();
+    let self_args = if argv.len() > 1 { &argv[1..] } else { &[] };
+
+    let err = std::process::Command::new(&rocprofv3)
+        .args([
+            "--kernel-trace", "--stats", "-S",
+            "-f", "csv", "-d", &out_dir, "-o", "trace",
+        ])
+        .arg("--")
+        .arg(&self_path)
+        .args(self_args)
+        .env("HIPFIRE_ROCPROF_CHILD", "1")
+        .env("HIPFIRE_ROCPROF_CSV", &csv_path)
+        .exec();
+    // exec() only returns on error.
+    eprintln!("[HIPFIRE_PROFILE] rocprofv3 exec failed ({err}); falling back to internal-only");
+}
+
+#[cfg(not(feature = "deltanet"))]
+#[allow(dead_code)]
+fn maybe_self_exec_under_rocprof() {}
