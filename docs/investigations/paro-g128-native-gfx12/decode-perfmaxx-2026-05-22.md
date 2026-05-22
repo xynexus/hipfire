@@ -180,9 +180,32 @@ Decode arc on z-lab A3B-PARO (gfx1201, --gen 100, 5-10 run steady-state):
   + givens_rotate_to (7477b03a):                      84.2 tok/s
   + HFQ4G256 lm_head (78aee489):                      87.4 tok/s   +39.6 pct cumulative
   + Q8 fused 4-way (39520d7e):                        89.3 tok/s
-  + Q8 fused down (4889dc27):                         93.0 tok/s   +48.6 pct cumulative
+  + Q8 fused down (4889dc27):                         93.0 tok/s
+  + Q8 alpha+beta 2-way (1fe73301):                   94.3 tok/s
+  + multi-WG argmax (ee203a08):                       96.3 tok/s   +53.8 pct cumulative
 
-**Goal 100 tok/s: NOT MET. Gap ~7.0 tok/s.**
+**Goal 100 tok/s: PRODUCTION-CLEAN NOT MET. Gap ~3.7 tok/s.**
+
+### Aggressive ceiling (opt-in, coherence-soft)
+
+Adding `HIPFIRE_GRAPH_MOE=1` on top of the above 11-win stack reaches
+**98.1-98.5 tok/s steady** (4/5 runs at gen=500 warmup=30 hit captured-
+graph perf; 1/5 falls to 45 tok/s due to capture rebuild). Trade-off:
+
+- humaneval_2/3 emit 11 tokens vs baseline 101/120 (early-EOS pattern).
+  Detectors show NO attractor/loop/special-leak — verdict WARN not FAIL.
+  Output is technically valid (model produces fewer tokens, possibly a
+  more-concise answer), but it's a behavior change.
+- 20% of runs experience a capture-rebuild fallback to ~45 tok/s.
+  Means a 5-run mean of (98+45+98+98+98)/5 = 87.4, which is BELOW the
+  production-clean 96.3.
+
+For a user who specifically wants max-token-throughput AND accepts that
+output may be shorter than the F32 reference, ship with
+`HIPFIRE_GRAPH_MOE=1` and the full Q8 stack — peak 98.5 tok/s.
+
+For coherence-preserving production: stay at 96.3 tok/s without
+hipGraph_MoE.
 
 Trade-off introduced by Q8 storage path: prefill drops to ~95 tok/s
 because Q8 shared_expert isn't accepted by the batched-prefill admit
