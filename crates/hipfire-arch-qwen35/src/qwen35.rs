@@ -1220,6 +1220,41 @@ fn load_fp16_weight_from_source(
         let buf = gpu.upload_raw(&q8_bytes, &[q8_bytes.len()])?;
         return Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, paro: None, awq_scale: None });
     }
+    if matches!(mode.as_deref(), Some("hfq4g256")) && (k % 256 == 0) {
+        // HFQ4G256 storage: 256-element groups × 136 bytes.
+        let group_size = 256usize;
+        let block_bytes = 136usize;
+        let n_blocks = m * (k / group_size);
+        let mut out = vec![0u8; n_blocks * block_bytes];
+        let row_f16_bytes = k * 2;
+        let groups_per_row = k / group_size;
+        for row in 0..m {
+            let row_bytes = &data[row * row_f16_bytes..(row + 1) * row_f16_bytes];
+            let f32_row: Vec<f32> = row_bytes.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            for g in 0..groups_per_row {
+                let start = g * group_size;
+                let group = &f32_row[start..start + group_size];
+                let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let range = max_val - min_val;
+                let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+                let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+                let block_idx = row * groups_per_row + g;
+                let off = block_idx * block_bytes;
+                out[off..off + 4].copy_from_slice(&scale.to_le_bytes());
+                out[off + 4..off + 8].copy_from_slice(&min_val.to_le_bytes());
+                for i in 0..128 {
+                    let lo = ((group[2 * i] - min_val) * inv_scale + 0.5) as u8;
+                    let hi = ((group[2 * i + 1] - min_val) * inv_scale + 0.5) as u8;
+                    out[off + 8 + i] = lo.min(15) | (hi.min(15) << 4);
+                }
+            }
+        }
+        let buf = gpu.upload_raw(&out, &[out.len()])?;
+        return Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None });
+    }
     let f32_data: Vec<f32> = data.chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
@@ -3036,11 +3071,27 @@ fn moe_ffn_decode_impl(
             && ffn.shared_expert_gate.gpu_dtype == DType::Q8_0
             && ffn.shared_expert.gate.gpu_dtype == DType::Q8_0
             && ffn.shared_expert.up.gpu_dtype == DType::Q8_0;
+        let all_hfq4g256 = ffn.router.gpu_dtype == DType::HFQ4G256
+            && ffn.shared_expert_gate.gpu_dtype == DType::HFQ4G256
+            && ffn.shared_expert.gate.gpu_dtype == DType::HFQ4G256
+            && ffn.shared_expert.up.gpu_dtype == DType::HFQ4G256;
+        let use_fused_hfq4 = arch_is_gfx12 && all_hfq4g256
+            && std::env::var("HIPFIRE_FUSED_4WAY_HFQ4G256_GEMV_GFX12").as_deref() == Ok("1");
         let use_fused_q8 = arch_is_gfx12 && all_q8
             && std::env::var("HIPFIRE_FUSED_4WAY_Q8_GEMV_GFX12").as_deref() == Ok("1");
         let use_fused_f32 = arch_is_gfx12 && all_f32
             && std::env::var("HIPFIRE_FUSED_4WAY_F32_GEMV_GFX12").as_deref() == Ok("1");
-        if use_fused_q8 {
+        if use_fused_hfq4 {
+            gpu.fused_4way_hfq4g256_gemv_gfx12(
+                &ffn.router.buf, &ffn.shared_expert_gate.buf,
+                &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
+                x_norm,
+                router_logits, scalar_buf, &shared_gate, &shared_up,
+                ffn.router.m, ffn.shared_expert_gate.m,
+                ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
+                ffn.router.k,
+            )?;
+        } else if use_fused_q8 {
             gpu.fused_4way_q8_0_gemv_gfx12(
                 &ffn.router.buf, &ffn.shared_expert_gate.buf,
                 &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
@@ -3122,6 +3173,17 @@ fn moe_ffn_decode_impl(
         fused_silu_mul_rotate_mq_for(gpu, &ffn.shared_expert.down, &shared_gate, &shared_up, &x_rot_alias, smi)?;
         gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
             &ffn.shared_expert.down.buf, &x_rot_alias, x_residual, scalar_buf,
+            ffn.shared_expert.down.m, ffn.shared_expert.down.k,
+        )?;
+    } else if ffn.shared_expert.down.gpu_dtype == DType::HFQ4G256
+        && (gpu.arch.starts_with("gfx1200") || gpu.arch.starts_with("gfx1201"))
+        && std::env::var("HIPFIRE_FUSED_F32_DOWN_SIGMOID_GFX12").as_deref() == Ok("1")
+    {
+        // PARO HFQ4G256 shared_expert.down — 4-bit weight, 2× less BW vs Q8.
+        gpu.gemv_hfq4g256_silu_mul_residual_sigmoid_scaled_gfx12(
+            &ffn.shared_expert.down.buf,
+            &shared_gate, &shared_up,
+            x_residual, scalar_buf,
             ffn.shared_expert.down.m, ffn.shared_expert.down.k,
         )?;
     } else if ffn.shared_expert.down.gpu_dtype == DType::Q8_0

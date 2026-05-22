@@ -93,6 +93,14 @@ pub const GEMV_Q8_0_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
 pub const FUSED_2WAY_Q8_0_GEMV_SMALLM_GFX12_SRC: &str =
     include_str!("../../../kernels/src/fused_2way_q8_0_gemv_smallm.gfx12.hip");
 
+/// gfx12 (RDNA4) HFQ4G256-weighted 4-way fused GEMV. 4-bit (2× less BW vs Q8).
+pub const FUSED_4WAY_HFQ4G256_GEMV_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/fused_4way_hfq4g256_gemv.gfx12.hip");
+
+/// gfx12 (RDNA4) HFQ4G256 fused shared_expert.down step. 4-bit weight (2× less BW vs Q8).
+pub const GEMV_HFQ4G256_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_silu_mul_residual_sigmoid_scaled.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible

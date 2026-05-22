@@ -2752,6 +2752,107 @@ impl Gpu {
         result
     }
 
+    /// gfx12 HFQ4G256-weighted 4-way fused GEMV (4-bit, 2× less BW vs Q8).
+    pub fn fused_4way_hfq4g256_gemv_gfx12(
+        &mut self,
+        a_router: &GpuTensor, a_seg: &GpuTensor, a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_router: &GpuTensor, y_seg: &GpuTensor, y_gate: &GpuTensor, y_up: &GpuTensor,
+        router_m: usize, seg_m: usize, gate_m: usize, up_m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_4way_hfq4g256_gemv_gfx12",
+            kernels::FUSED_4WAY_HFQ4G256_GEMV_GFX12_SRC,
+            "fused_4way_hfq4g256_gemv_gfx12",
+        )?;
+        let ap_r = a_router.buf.as_ptr();
+        let ap_s = a_seg.buf.as_ptr();
+        let ap_g = a_gate.buf.as_ptr();
+        let ap_u = a_up.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp_r = y_router.buf.as_ptr();
+        let yp_s = y_seg.buf.as_ptr();
+        let yp_g = y_gate.buf.as_ptr();
+        let yp_u = y_up.buf.as_ptr();
+        let rm = router_m as i32;
+        let sm = seg_m as i32;
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap_r as *const _ as *mut c_void, &ap_s as *const _ as *mut c_void,
+            &ap_g as *const _ as *mut c_void, &ap_u as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp_r as *const _ as *mut c_void, &yp_s as *const _ as *mut c_void,
+            &yp_g as *const _ as *mut c_void, &yp_u as *const _ as *mut c_void,
+            &rm as *const _ as *mut c_void, &sm as *const _ as *mut c_void,
+            &gm as *const _ as *mut c_void, &um as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let total = (router_m + seg_m + gate_m + up_m) as u32;
+        let bytes = ((router_m + seg_m + gate_m + up_m) * k * 136 / 256) + (k * 4) + ((router_m + seg_m + gate_m + up_m) * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "fused_4way_hfq4g256_gemv_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_4way_hfq4g256_gemv_gfx12",
+            [total, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap_r); b.push_ptr(ap_s); b.push_ptr(ap_g); b.push_ptr(ap_u);
+                b.push_ptr(xp);
+                b.push_ptr(yp_r); b.push_ptr(yp_s); b.push_ptr(yp_g); b.push_ptr(yp_u);
+                b.push_i32(rm); b.push_i32(sm); b.push_i32(gm); b.push_i32(um);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx12 HFQ4G256 fused shared_expert.down step (4-bit, 2× less BW vs Q8).
+    pub fn gemv_hfq4g256_silu_mul_residual_sigmoid_scaled_gfx12(
+        &mut self,
+        w_down: &GpuTensor, gate: &GpuTensor, up: &GpuTensor,
+        y_residual: &GpuTensor, scalar: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_silu_mul_residual_sigmoid_scaled_gfx12",
+            kernels::GEMV_HFQ4G256_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC,
+            "gemv_hfq4g256_silu_mul_residual_sigmoid_scaled_gfx12",
+        )?;
+        let wp = w_down.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let up_p = up.buf.as_ptr();
+        let yp = y_residual.buf.as_ptr();
+        let sp = scalar.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void, &gp as *const _ as *mut c_void,
+            &up_p as *const _ as *mut c_void, &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void, &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let bytes = (m * k * 136 / 256) + (k * 4) * 2 + (m * 4) + 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_silu_mul_residual_sigmoid_scaled_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_silu_mul_residual_sigmoid_scaled_gfx12",
+            [m as u32, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp); b.push_ptr(gp); b.push_ptr(up_p);
+                b.push_ptr(yp); b.push_ptr(sp);
+                b.push_i32(mv); b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// gfx12 Q8_0 fused shared_expert.down step. Mirror of F32 sister
     /// with Q8_0 weight reads (4× less BW).
     pub fn gemv_q8_0_silu_mul_residual_sigmoid_scaled_gfx12(
