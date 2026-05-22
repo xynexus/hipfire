@@ -199,8 +199,53 @@ revealed lm_head as 28.4% of decode time.
   this model's argmax routing on this prompt.
 - `HIPFIRE_KV_MODE=fwht3`: same coherence break pattern.
 - `HIPFIRE_KV_MODE=fwht4`: panics on this stack.
+- `HIPFIRE_GRAPH_MOE=1` (hipGraph for MoE): +3.3% bench (90.2 tok/s
+  steady at gen=500) — captures 1051 blobs cleanly. BUT breaks
+  coherence on humaneval_2/3 (11/11 vs 101/120 tokens), same early-EOS
+  pattern as broad-F16-WMMA. Detectors don't fire (WARN not FAIL — no
+  attractors/loops/leaks) so the output is technically valid, just
+  shorter. The atomicAdd-determinism fix on use_gpu_topk is documented
+  in qwen35.rs as "necessary first step, not sufficient" — there's still
+  a precision-drift source in the MoE+graph path.
 
-Production stays at `HIPFIRE_KV_MODE=q8`.
+Production stays at `HIPFIRE_KV_MODE=q8` and `HIPFIRE_GRAPH_MOE` unset.
+
+### Why 100 tok/s is structurally unreachable in bounded session work
+
+Decode rocprof at 87.4 tok/s shows:
+- ~9 ms/token of accounted GPU kernel work
+- ~2.4 ms/token of launch/dispatch overhead
+
+Wall is 11.44 ms / token. Cutting to 10 ms = 100 tok/s requires
+eliminating ~1.4 ms / token. That ENTIRELY lives in:
+
+1. **Launch overhead (~2.4 ms)** — only hipGraph can collapse this,
+   and hipGraph breaks coherence on this model.
+2. **Per-kernel BW reads** — most large weights already quantized
+   (router/seg/gate/up F32, alphas F32, lm_head HFQ4G256, PARO LA 4-bit).
+   Further quantization of router/F32 paths breaks coherence (per
+   broad-F16-WMMA experiment earlier in session).
+
+Every remaining lever I tried either:
+- Gives <2% wall (modest fusion attempts), OR
+- Breaks coherence (hipGraph_MoE, asym3/fwht3 KV, broad-F16-WMMA, Q8 router)
+
+The 100 tok/s goal requires structural pivots:
+
+1. **Spec decode for PARO** — admit z-lab into DFlash. Token-batched
+   verify amortizes per-token dispatch cost. Could 2-3× decode →
+   175-250 tok/s. Multi-day project.
+2. **Per-LA-layer mega-kernel** — fuse rmsnorm + wqkv_rotate + wqkv_gemv
+   + wz_rotate + wz_gemv + alpha + beta + sigmoid + conv1d into one
+   kernel. ~10 launches → 1. Multi-day, deep arch work.
+3. **hipGraph_MoE precision fix** — root-cause why MoE+graph causes
+   precision drift on use_gpu_topk path despite the atomicAdd fix.
+   Unknown effort; could be 1 day or 1 week.
+
+For comparison: vLLM/sglang typically report 60-80 tok/s on similar
+35B-A3B MoE models on RDNA3-class hardware. **87.4 tok/s at +40% over
+hipfire's own baseline is the practical kernel-level ceiling for
+coherence-clean batch=1 AR decode without speculation on this hardware.**
 
 Coherence verified clean throughout (101 / 120 / 120 tokens on
 humaneval_2/3/0, 0 hard fails — matches canonical baseline).
