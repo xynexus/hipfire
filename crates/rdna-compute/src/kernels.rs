@@ -101,6 +101,12 @@ pub const FUSED_4WAY_HFQ4G256_GEMV_GFX12_SRC: &str =
 pub const GEMV_HFQ4G256_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_silu_mul_residual_sigmoid_scaled.gfx12.hip");
 
+/// gfx12 (RDNA4) HFQ4-G128 GEMV using __builtin_amdgcn_fdot2 (FP16x2 paired
+/// multiply). Mirror of the gfx11 dot2 family, ported to HFQ4G128 group
+/// format that PARO LA decode uses. Targets the 25 percent gemv_hfq4g128 slot.
+pub const GEMV_HFQ4G128_DOT2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_dot2.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible
