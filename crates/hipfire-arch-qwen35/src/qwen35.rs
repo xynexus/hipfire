@@ -5400,22 +5400,49 @@ fn prefill_moe_ffn_body_batched(
         // Math is identical (commutative inside the dot product); only the
         // output stride differs.
         DType::F32 => {
-            gpu.gemm_f32_batched(
-                &pbs.x_norm_batch,                  // A_kernel = X [N × dim]
-                &ffn.shared_expert.gate.buf,        // B_kernel = W_gate [smi × dim]
-                shared_gate,                         // Y = [N × smi]
-                n,                                   // M_kernel = N_caller
-                ffn.shared_expert.gate.k,            // K = dim
-                ffn.shared_expert.gate.m,            // N_kernel = M_caller (smi)
-            )?;
-            gpu.gemm_f32_batched(
-                &pbs.x_norm_batch,
-                &ffn.shared_expert.up.buf,
-                shared_up,
-                n,
-                ffn.shared_expert.up.k,
-                ffn.shared_expert.up.m,
-            )?;
+            // Per-call-site WMMA opt-in: when HIPFIRE_F32_SHARED_EXPERT_WMMA_GFX12=1
+            // is set AND arch is gfx12 AND shapes align, route directly to the
+            // FP16-WMMA F32 GEMM. Bypasses the broad HIPFIRE_GEMM_F32_WMMA_GFX12
+            // which also affects the router (precision-sensitive). z-lab's
+            // shared_expert weights were F16 on disk, so the F16 downcast in
+            // the WMMA kernel is lossless to source storage.
+            let arch_is_gfx12 = gpu.arch.starts_with("gfx1200") || gpu.arch.starts_with("gfx1201");
+            let use_wmma = arch_is_gfx12
+                && std::env::var("HIPFIRE_F32_SHARED_EXPERT_WMMA_GFX12").as_deref() == Ok("1")
+                && n >= 16 && n % 16 == 0
+                && ffn.shared_expert.gate.k >= 16 && ffn.shared_expert.gate.k % 16 == 0
+                && ffn.shared_expert.gate.m >= 16 && ffn.shared_expert.gate.m % 16 == 0;
+            if use_wmma {
+                gpu.gemm_f32_wmma_gfx12(
+                    &pbs.x_norm_batch,                  // A = X [N × dim]
+                    &ffn.shared_expert.gate.buf,        // B = W_gate [smi × dim]
+                    shared_gate,                         // Y = [N × smi]
+                    n, ffn.shared_expert.gate.k, ffn.shared_expert.gate.m,
+                )?;
+                gpu.gemm_f32_wmma_gfx12(
+                    &pbs.x_norm_batch,
+                    &ffn.shared_expert.up.buf,
+                    shared_up,
+                    n, ffn.shared_expert.up.k, ffn.shared_expert.up.m,
+                )?;
+            } else {
+                gpu.gemm_f32_batched(
+                    &pbs.x_norm_batch,                  // A_kernel = X [N × dim]
+                    &ffn.shared_expert.gate.buf,        // B_kernel = W_gate [smi × dim]
+                    shared_gate,                         // Y = [N × smi]
+                    n,                                   // M_kernel = N_caller
+                    ffn.shared_expert.gate.k,            // K = dim
+                    ffn.shared_expert.gate.m,            // N_kernel = M_caller (smi)
+                )?;
+                gpu.gemm_f32_batched(
+                    &pbs.x_norm_batch,
+                    &ffn.shared_expert.up.buf,
+                    shared_up,
+                    n,
+                    ffn.shared_expert.up.k,
+                    ffn.shared_expert.up.m,
+                )?;
+            }
         },
         other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
                          — admit predicate should have rejected this layer"),
@@ -5509,14 +5536,23 @@ fn prefill_moe_ffn_body_batched(
         DType::F32 => {
             let down_m = ffn.shared_expert.down.m;  // dim
             let down_k = ffn.shared_expert.down.k;  // smi
-            gpu.gemm_f32_batched(
-                shared_rot,                          // A_kernel = X [N × smi]
-                &ffn.shared_expert.down.buf,         // B_kernel = W_down [dim × smi]
-                &pbs.x_rot_batch,                    // Y = [N × dim]
-                n,                                   // M_kernel = N_caller
-                down_k,                              // K = smi
-                down_m,                              // N_kernel = dim
-            )?;
+            let arch_is_gfx12 = gpu.arch.starts_with("gfx1200") || gpu.arch.starts_with("gfx1201");
+            let use_wmma = arch_is_gfx12
+                && std::env::var("HIPFIRE_F32_SHARED_EXPERT_WMMA_GFX12").as_deref() == Ok("1")
+                && n >= 16 && n % 16 == 0
+                && down_k >= 16 && down_k % 16 == 0
+                && down_m >= 16 && down_m % 16 == 0;
+            if use_wmma {
+                gpu.gemm_f32_wmma_gfx12(
+                    shared_rot, &ffn.shared_expert.down.buf, &pbs.x_rot_batch,
+                    n, down_k, down_m,
+                )?;
+            } else {
+                gpu.gemm_f32_batched(
+                    shared_rot, &ffn.shared_expert.down.buf, &pbs.x_rot_batch,
+                    n, down_k, down_m,
+                )?;
+            }
             gpu.sigmoid_scaled_add_inplace_f32(
                 &pbs.x_batch, &pbs.x_rot_batch, shared_scalar,
                 n, down_m,

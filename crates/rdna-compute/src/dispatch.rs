@@ -24782,8 +24782,13 @@ impl Gpu {
 
     /// gfx12 FP16 WMMA fast-path for `gemm_f32_batched`. Same call contract
     /// (A/B/Y are F32); downcasts to F16 inline per WMMA tile. Caller must
-    /// have verified M, N, K all multiples of 16.
-    fn gemm_f32_wmma_gfx12(
+    /// have verified M, N, K all multiples of 16. Public so call sites that
+    /// have validated their precision tolerance (e.g. shared_expert.gate/up/down
+    /// in z-lab F32 dispatch, where weights were F16-on-disk) can route here
+    /// directly without the broad HIPFIRE_GEMM_F32_WMMA_GFX12 env gate
+    /// (which auto-applies to ALL gemm_f32_batched sites including the
+    /// precision-sensitive router).
+    pub fn gemm_f32_wmma_gfx12(
         &mut self, a: &GpuTensor, b: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize, n: usize,
     ) -> HipResult<()> {
