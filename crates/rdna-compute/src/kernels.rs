@@ -8,6 +8,14 @@
 /// Uses shared memory reduction across wavefronts.
 pub const GEMV_SRC: &str = include_str!("../../../kernels/src/gemv.hip");
 
+/// gfx12 (RDNA4) wave32-optimized multirow GEMV: 8 rows per WG with
+/// LDS-cached X. Replaces gemv_f32 for the per-token decode call sites
+/// where M is a multiple of 8 (router, shared_expert F32 paths).
+/// Targets the 45.8% gemv_f32 attribution on z-lab A3B-PARO decode.
+/// Dynamic LDS: K × 4 bytes. Routes via HIPFIRE_GEMV_F32_MULTIROW_GFX12=1.
+pub const GEMV_F32_MULTIROW_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_f32_multirow.gfx12.hip");
+
 
 /// GEMV Q4_K: matrix-vector multiply with on-the-fly Q4_K dequantization.
 /// A is stored as Q4_K blocks (144 bytes per 256 elements).

@@ -1183,6 +1183,16 @@ fn load_fp16_weight_from_source(
 ) -> HipResult<WeightTensor> {
     let (_, data) = source.tensor_data(name)
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
+    // Decode path uses F16 weight (half BW vs F32 expansion). Default keep
+    // F32 storage for the historical contract; opt-in F16-keep via
+    // HIPFIRE_KEEP_F16_WEIGHTS=1 (covers shared_expert / router F32 GEMV
+    // sites which are 45.8 percent of decode GPU time on z-lab A3B-PARO).
+    let keep_f16 = std::env::var("HIPFIRE_KEEP_F16_WEIGHTS").as_deref() == Ok("1");
+    if keep_f16 {
+        // F16 storage: upload raw safetensors bytes directly (data is F16).
+        let buf = gpu.upload_raw(data, &[m, k])?;
+        return Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None });
+    }
     let f32_data: Vec<f32> = data.chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
@@ -5148,8 +5158,8 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
     // expanded to F32 on GPU; shared_expert_gate likewise. See
     // load_fp16_weight_from_source at qwen35.rs:1177). The dispatch arms in
     // prefill_moe_ffn_body_batched route F32 through gemm_f32_batched.
-    let router_ok = matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::Q8_0 | DType::F32);
-    let shared_gate_ok = matches!(ffn.shared_expert_gate.gpu_dtype, DType::MQ4G256 | DType::Q8_0 | DType::F32);
+    let router_ok = matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::Q8_0 | DType::F32 | DType::F16);
+    let shared_gate_ok = matches!(ffn.shared_expert_gate.gpu_dtype, DType::MQ4G256 | DType::Q8_0 | DType::F32 | DType::F16);
 
     // PARO env-gated admit (HIPFIRE_PARO_BATCHED=1). Unlocks the batched body
     // for shisa-Qwen3.6-A3B-PARO and similar ParoQuant checkpoints where the
@@ -5166,16 +5176,13 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
     if admit_paro {
         // Two PARO checkpoint families admit:
         //   shisa-ai/Qwen3.6-35B-A3B-PARO-full4096-e5-packed: PARO-quantizes
-        //     ALL FFN weights including shared_expert. shared_expert dtype =
-        //     ParoQ4G128 throughout.
+        //     ALL FFN weights including shared_expert.
         //   z-lab/Qwen3.6-35B-A3B-PARO: PARO-quantizes routed experts only;
-        //     shared_expert is dense FP16 (load_fp16_weight_from_source
-        //     expands to F32 on upload). shared_expert dtype = F32.
-        // Both are valid; the routed experts are what require the PARO
-        // calibration. Dispatch arms in prefill_moe_ffn_body_batched handle
-        // both ParoQ4G128 and F32 shared_expert (F32 path uses gemm_f32_batched
-        // + sigmoid_scaled_add_inplace_f32 instead of the fused HFQ4 kernel).
-        let shared_dtype_ok = |dt: DType| matches!(dt, DType::ParoQ4G128 | DType::F32);
+        //     shared_expert is dense F16 (load_fp16_weight_from_source). By
+        //     default expanded to F32 on upload (shared_expert dtype = F32);
+        //     with HIPFIRE_KEEP_F16_WEIGHTS=1, kept as F16 for half BW on the
+        //     decode-dominant gemv_f16 path (z-lab decode 45.8% in F32 GEMV).
+        let shared_dtype_ok = |dt: DType| matches!(dt, DType::ParoQ4G128 | DType::F32 | DType::F16);
         let paro_ok = router_ok
             && shared_gate_ok
             && shared_dtype_ok(ffn.shared_expert.gate.gpu_dtype)

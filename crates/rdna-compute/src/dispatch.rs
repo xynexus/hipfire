@@ -2333,6 +2333,20 @@ impl Gpu {
         y: &GpuTensor,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx12 wave32 multirow fast-path — FALSIFIED on decode (-23% subwave
+        // design, -54% multi-row-per-thread). Kernel is BW-limited per-row,
+        // not launch-overhead-limited per-call. Multirow reduces wave-count
+        // per WG (8× less BW utilization on subwave variant). Real lever is
+        // call-count reduction (fusion), not kernel-internal optimization.
+        // Kept as opt-in research artifact via HIPFIRE_GEMV_F32_MULTIROW_GFX12=1.
+        let m_align = a.shape[0];
+        let use_multirow = (self.arch.starts_with("gfx1200") || self.arch.starts_with("gfx1201"))
+            && std::env::var("HIPFIRE_GEMV_F32_MULTIROW_GFX12").as_deref() == Ok("1")
+            && m_align >= 8 && m_align % 8 == 0
+            && a.shape[1] >= 32 && a.shape[1] % 32 == 0;
+        if use_multirow {
+            return self.gemv_f32_multirow_gfx12(a, x, y);
+        }
         self.ensure_kernel("gemv", kernels::GEMV_SRC, "gemv_f32")?;
         let func = &self.functions["gemv_f32"];
 
@@ -2374,6 +2388,46 @@ impl Gpu {
                 &mut params,
             )
         };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx12 wave32 multirow gemv_f32 fast-path. 8 rows per WG sharing
+    /// LDS-cached X. Caller validated M % 8 == 0 and K % 32 == 0.
+    fn gemv_f32_multirow_gfx12(
+        &mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemv_f32_multirow_gfx12",
+            kernels::GEMV_F32_MULTIROW_GFX12_SRC,
+            "gemv_f32_multirow_gfx12",
+        )?;
+        let m = a.shape[0] as i32;
+        let k = a.shape[1] as i32;
+        let ap = a.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m as *const _ as *mut c_void,
+            &k as *const _ as *mut c_void,
+        ];
+        let row_tiles = ((a.shape[0] + 7) / 8) as u32;
+        let shmem_bytes = (a.shape[1] * 4) as u32; // K floats in LDS
+        let bytes = (a.shape[0] * a.shape[1] * 4) + (a.shape[1] * 4) + (a.shape[0] * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_f32_multirow_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_f32_multirow_gfx12",
+            [row_tiles, 1, 1], [32, 1, 1], shmem_bytes, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap); b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m); b.push_i32(k);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
