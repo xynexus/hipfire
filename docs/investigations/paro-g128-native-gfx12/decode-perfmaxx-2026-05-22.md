@@ -169,15 +169,38 @@ lever.
 
 ### Combined session result (final stack)
 
-Decode arc on z-lab A3B-PARO (gfx1201, --gen 100, 5-run cool-warm):
+Decode arc on z-lab A3B-PARO (gfx1201, --gen 100, 5-7 run steady-state):
 
   Session start (post-prefill-perfmaxx baseline):     62.6 tok/s
   + fused 4-way F32 GEMV (gate-side, d50aacf1):       67.7 tok/s   +8 pct
   + F32 down fusion (d495edd0):                       69.4 tok/s
-  + alpha/beta 2-way (11e409c6):                      70.1 tok/s   +12 pct cumulative
-                                                       (66.5 warm-state)
+  + alpha/beta 2-way (11e409c6):                      70.1 tok/s
+  + F16 lm_head 256-thread (acec1e71):                68.8 tok/s   (stable, no thermal drift)
+  + Q8 lm_head quantization (b83452d6):               81.5 tok/s   +30 pct cumulative
+  + givens_rotate_to (7477b03a):                      84.2 tok/s
+  + HFQ4G256 lm_head (78aee489):                      87.4 tok/s   +39.6 pct cumulative
 
-**Goal 100 tok/s: NOT MET. Gap ~30 tok/s.**
+**Goal 100 tok/s: NOT MET. Gap ~12.6 tok/s.**
+
+### Critical methodology win: decode-only rocprof
+
+User directive — "can you not rocprof decode only" — unlocked all the
+lm_head wins (Q8 → HFQ4G256 = +20% cumulative on lm_head alone). The
+mixed prefill+decode rocprof had hidden lm_head behind prefill kernels.
+Switching to `--prefill 1 --gen 500` isolated decode and immediately
+revealed lm_head as 28.4% of decode time.
+
+**Future decode work MUST use `--prefill 1 --gen 500` rocprof.**
+
+### Coherence-blocked levers (kept opt-in / reverted)
+
+- `HIPFIRE_KV_MODE=asym3`: +1.4% bench but humaneval_2 → 11 tokens
+  (early EOS). 3-bit asymmetric KV doesn't preserve enough precision for
+  this model's argmax routing on this prompt.
+- `HIPFIRE_KV_MODE=fwht3`: same coherence break pattern.
+- `HIPFIRE_KV_MODE=fwht4`: panics on this stack.
+
+Production stays at `HIPFIRE_KV_MODE=q8`.
 
 Coherence verified clean throughout (101 / 120 / 120 tokens on
 humaneval_2/3/0, 0 hard fails — matches canonical baseline).
