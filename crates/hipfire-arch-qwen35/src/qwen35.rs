@@ -5535,9 +5535,19 @@ fn prefill_moe_ffn_body_batched(
                 // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
                 // (clean decode, finite logits) + coherence-gate (MQ4 paths
                 // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
-                let use_paro_i8 = gpu.arch.starts_with("gfx1151")
+                // Routing for PARO MoE batched-prefill gate_up:
+                //   gfx1151:  i8 MMQ default-on, opt-out HIPFIRE_MOE_PARO_I8=0;
+                //             k8 deeper-pipe variant via HIPFIRE_MOE_PARO_I8_K8.
+                //   gfx12:    i8 MMQ ALWAYS (no opt-out) — gfx12 cannot compile the
+                //             gfx11-only wmma_k2 fallback (uses
+                //             llvm.amdgcn.wmma.f32.16x16x16.f16, absent on RDNA4).
+                //   gfx11/dgpu: cross-arch wmma_k2 FP16 WMMA.
+                let arch_is_gfx1151 = gpu.arch.starts_with("gfx1151");
+                let arch_is_gfx12 = gpu.arch.starts_with("gfx1200")
+                    || gpu.arch.starts_with("gfx1201");
+                let use_paro_i8_1151 = arch_is_gfx1151
                     && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() != Ok("0");
-                let use_paro_i8_k8 = use_paro_i8
+                let use_paro_i8_k8 = use_paro_i8_1151
                     && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() != Ok("0");
                 if use_paro_i8_k8 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
@@ -5545,8 +5555,14 @@ fn prefill_moe_ffn_body_batched(
                         &pbs.x_rot_batch, y_gu_grouped,
                         2 * mi, gate_up_k, k_top, m_total, n,
                     )?;
-                } else if use_paro_i8 {
+                } else if use_paro_i8_1151 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
+                        &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+                        &pbs.x_rot_batch, y_gu_grouped,
+                        2 * mi, gate_up_k, k_top, m_total, n,
+                    )?;
+                } else if arch_is_gfx12 {
+                    gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx12(
                         &ffn.expert_gate_up_ptrs, tile_ids, sorted,
                         &pbs.x_rot_batch, y_gu_grouped,
                         2 * mi, gate_up_k, k_top, m_total, n,
@@ -5673,9 +5689,14 @@ fn prefill_moe_ffn_body_batched(
                 // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
                 // (clean decode, finite logits) + coherence-gate (MQ4 paths
                 // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
-                let use_paro_i8 = gpu.arch.starts_with("gfx1151")
+                // Routing for PARO MoE batched-prefill down (mirror of gate_up above).
+                // gfx12 always uses MMQ (no opt-out) — wmma_k2 cannot compile there.
+                let arch_is_gfx1151 = gpu.arch.starts_with("gfx1151");
+                let arch_is_gfx12 = gpu.arch.starts_with("gfx1200")
+                    || gpu.arch.starts_with("gfx1201");
+                let use_paro_i8_1151 = arch_is_gfx1151
                     && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() != Ok("0");
-                let use_paro_i8_k8 = use_paro_i8
+                let use_paro_i8_k8 = use_paro_i8_1151
                     && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() != Ok("0");
                 if use_paro_i8_k8 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
@@ -5683,8 +5704,14 @@ fn prefill_moe_ffn_body_batched(
                         rot_batch, y_down_grouped,
                         down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
                     )?;
-                } else if use_paro_i8 {
+                } else if use_paro_i8_1151 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
+                        &ffn.expert_down_ptrs, tile_ids, sorted,
+                        rot_batch, y_down_grouped,
+                        down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+                    )?;
+                } else if arch_is_gfx12 {
+                    gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx12(
                         &ffn.expert_down_ptrs, tile_ids, sorted,
                         rot_batch, y_down_grouped,
                         down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
