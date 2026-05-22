@@ -39,6 +39,20 @@ pub const GEMV_Q4K_SRC: &str = include_str!("../../../kernels/src/gemv_q4k.hip")
 /// Minimal metadata → minimal VGPRs. Hypothesis: ≤32 VGPRs → max occupancy.
 pub const GEMV_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g128.hip");
 
+/// gfx12 (RDNA4) 4-way unrolled GEMV for HFQ4-G128. Mirrors the proven
+/// gfx1100 pattern (acc0..acc3 = 4× ILP vs baseline's single accumulator).
+/// Targets the 16.0% gemv_hfq4g128 attribution on z-lab A3B-PARO decode
+/// (decode-perfmaxx-2026-05-22.md). Routes via HIPFIRE_GEMV_HFQ4G128_GFX12=1.
+pub const GEMV_HFQ4G128_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128.gfx12.hip");
+
+/// gfx12 (RDNA4) 4-way fused F32 GEMV — mirror of MQ4's fused_qkvza_hfq4g256
+/// for the PARO mixed-dtype gate-side. One launch instead of 4 = saves 3
+/// launches per layer × 40 layers = 120 launches/token of dispatch overhead.
+/// Routes via HIPFIRE_FUSED_4WAY_F32_GEMV_GFX12=1 (opt-in).
+pub const FUSED_4WAY_F32_GEMV_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/fused_4way_f32_gemv.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible

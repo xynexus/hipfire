@@ -2911,10 +2911,36 @@ fn moe_ffn_decode_impl(
         // (via `gpu.mq_x_rot`, a distinct scratch from `s.x_rot_local`),
         // so the externally-computed `x_rot_local` is preserved for the
         // downstream indexed gate_up GEMV when routed_gate_up_mq4 is true.
-        weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
-        weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
-        weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
-        weight_gemv(gpu, &ffn.shared_expert.up,   x_norm, &shared_up)?;
+        //
+        // PARO 4-way fused F32 GEMV fast-path: when all 4 gate-side weights
+        // are F32 (z-lab A3B-PARO), mirror the MQ4 fused_qkvza_hfq4g256
+        // pattern with a fused F32 kernel. Saves 3 launches × 40 layers
+        // per token of decode dispatch overhead. Opt-in via
+        // HIPFIRE_FUSED_4WAY_F32_GEMV_GFX12=1.
+        let arch_is_gfx12 = gpu.arch.starts_with("gfx1200") || gpu.arch.starts_with("gfx1201");
+        let all_f32 = ffn.router.gpu_dtype == DType::F32
+            && ffn.shared_expert_gate.gpu_dtype == DType::F32
+            && ffn.shared_expert.gate.gpu_dtype == DType::F32
+            && ffn.shared_expert.up.gpu_dtype == DType::F32;
+        let use_fused_f32 = arch_is_gfx12
+            && all_f32
+            && std::env::var("HIPFIRE_FUSED_4WAY_F32_GEMV_GFX12").as_deref() == Ok("1");
+        if use_fused_f32 {
+            gpu.fused_4way_f32_gemv_gfx12(
+                &ffn.router.buf, &ffn.shared_expert_gate.buf,
+                &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
+                x_norm,
+                router_logits, scalar_buf, &shared_gate, &shared_up,
+                ffn.router.m, ffn.shared_expert_gate.m,
+                ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
+                ffn.router.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
+            weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
+            weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
+            weight_gemv(gpu, &ffn.shared_expert.up,   x_norm, &shared_up)?;
+        }
     }
 
     // ── 2a. Top-K selection — GPU fast path or CPU fallback ──
