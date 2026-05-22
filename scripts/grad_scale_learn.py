@@ -28,6 +28,36 @@ Usage (mi300 droplet):
         --output /workspace/v3/0.8b/gradscale/awq_scales.hfsc \\
         --n-sequences 128 --ctx-len 4096 \\
         --alpha 0.55 --lr 1e-3 --epochs 5
+
+Result (2026-05-22, Qwen3.5-0.8B, 128 seqs x 4096 ctx, 5 epochs, Adam lr=1e-3,
+calibration-mix-v1, mi300 droplet, total wall clock 25.0 min training + ~33 min eval):
+  loss trace (per-Linear MSE block-wise reconstruction):
+    epoch 1: 2.888e-2
+    epoch 2: 2.749e-2  (-4.8%)
+    epoch 3: 2.724e-2  (-0.9%)
+    epoch 4: 2.725e-2  (+0.0%)
+    epoch 5: 2.703e-2  (-0.8%)
+  Final KLD (gradient-learned scales + GPTQ): 0.159296
+  Baseline KLD (closed-form paper-formula scales + GPTQ): 0.132733
+  Delta: +20.01% — REGRESSION.
+
+Interpretation: end-to-end BRECQ-style activation MSE went DOWN (-6.4% over 5
+epochs) yet the downstream KL divergence vs the BF16 oracle went UP. The
+gradient learning IS optimizing what we asked it to (per-Linear output
+reconstruction), but that proxy objective is mis-aligned with the GPTQ
+post-processing step that runs after the AWQ scales are emitted. The damped
+AWQ scales the closed-form path produces are a 1st-order minimizer of the
+GPTQ objective; our learned scales minimize a different objective (no-GPTQ
+reconstruction), so when GPTQ then re-quantizes on top of our scales it
+introduces extra error.
+
+The "ParoQuant 5-epoch" mechanism does work — but in a different geometry
+(MR-GPTQ, joint scale+rotation, and no post-hoc GPTQ correction). Replicating
+it on hipfire's MQ4 stack would need either (a) joint scale+GPTQ
+differentiation, or (b) training with the GPTQ step IN the loss (currently
+not differentiable through Cholesky), or (c) abandoning GPTQ post-processing
+when learning scales. NEGATIVE RESULT for the simple BRECQ+STE recipe on
+this particular pipeline.
 """
 
 from __future__ import annotations
