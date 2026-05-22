@@ -3020,11 +3020,23 @@ fn moe_ffn_decode_impl(
         } else {
             // routed_dtype_indexable_paro — HFQ4G128 (72 B/group) indexed
             // kernel. xr is already Givens-rotated above by rotate_x_paro_for.
-            gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
-                &ffn.expert_gate_up_ptrs, s.topk_indices,
-                xr, s.gate_batch, s.up_batch,
-                2 * mi, gate_up_k,
-            )?;
+            let arch_is_gfx12_decode = gpu.arch.starts_with("gfx1200")
+                || gpu.arch.starts_with("gfx1201");
+            if arch_is_gfx12_decode
+                && std::env::var("HIPFIRE_MOE_PARO_GEMV_M4_GFX12").as_deref() == Ok("1")
+            {
+                gpu.gemv_paro_q4g128_moe_gate_up_m4_indexed_gfx12(
+                    &ffn.expert_gate_up_ptrs, s.topk_indices,
+                    xr, s.gate_batch, s.up_batch,
+                    2 * mi, gate_up_k,
+                )?;
+            } else {
+                gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
+                    &ffn.expert_gate_up_ptrs, s.topk_indices,
+                    xr, s.gate_batch, s.up_batch,
+                    2 * mi, gate_up_k,
+                )?;
+            }
         }
         // Gate→down hop. MQ paths use a single fused silu+mul+FWHT kernel;
         // ParoQuant uses the structural mirror `fused_silu_mul_givens_rotate`
@@ -5562,7 +5574,13 @@ fn prefill_moe_ffn_body_batched(
                         2 * mi, gate_up_k, k_top, m_total, n,
                     )?;
                 } else if arch_is_gfx12 {
-                    if std::env::var("HIPFIRE_MOE_PARO_I8_K4_GFX12").as_deref() == Ok("1") {
+                    if std::env::var("HIPFIRE_MOE_PARO_I8_M2_GFX12").as_deref() == Ok("1") {
+                        gpu.gemm_paro_q4g128_moe_grouped_mmq_m2_gfx12(
+                            &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+                            &pbs.x_rot_batch, y_gu_grouped,
+                            2 * mi, gate_up_k, k_top, m_total, n,
+                        )?;
+                    } else if std::env::var("HIPFIRE_MOE_PARO_I8_K4_GFX12").as_deref() == Ok("1") {
                         gpu.gemm_paro_q4g128_moe_grouped_mmq_k4_gfx12(
                             &ffn.expert_gate_up_ptrs, tile_ids, sorted,
                             &pbs.x_rot_batch, y_gu_grouped,
@@ -5719,7 +5737,13 @@ fn prefill_moe_ffn_body_batched(
                         down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
                     )?;
                 } else if arch_is_gfx12 {
-                    if std::env::var("HIPFIRE_MOE_PARO_I8_K4_GFX12").as_deref() == Ok("1") {
+                    if std::env::var("HIPFIRE_MOE_PARO_I8_M2_GFX12").as_deref() == Ok("1") {
+                        gpu.gemm_paro_q4g128_moe_grouped_mmq_m2_gfx12(
+                            &ffn.expert_down_ptrs, tile_ids, sorted,
+                            rot_batch, y_down_grouped,
+                            down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+                        )?;
+                    } else if std::env::var("HIPFIRE_MOE_PARO_I8_K4_GFX12").as_deref() == Ok("1") {
                         gpu.gemm_paro_q4g128_moe_grouped_mmq_k4_gfx12(
                             &ffn.expert_down_ptrs, tile_ids, sorted,
                             rot_batch, y_down_grouped,

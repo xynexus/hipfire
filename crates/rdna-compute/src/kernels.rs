@@ -491,6 +491,14 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_PARO_Q4G128_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_paro_q4g128_moe_gate_up_indexed.hip");
 
+/// gfx12 (RDNA4) G128-native m4 (4 output rows per WG) MoE gate_up GEMV with
+/// LDS-cached X. Reduces X-load BW per layer 4× vs the cross-arch
+/// single-row-per-WG sibling (~96 MB → 24 MB per layer at K=2048).
+/// Routes via HIPFIRE_MOE_PARO_GEMV_M4_GFX12=1 (opt-in pending bench validation).
+/// Dynamic LDS: K × 4 bytes.
+pub const GEMV_PARO_Q4G128_MOE_GATE_UP_M4_INDEXED_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_paro_q4g128_moe_gate_up_m4_indexed.gfx12.hip");
+
 /// N-batched indexed MoE gate_up GEMV for HFQ4G128 (ParoQuant routed
 /// experts). Sister of `GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC` with
 /// 72 B/group stride. Used by Path 1 fallback in
@@ -605,6 +613,14 @@ pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_GFX12_SRC: &str =
 /// Routes via HIPFIRE_MOE_PARO_I8_K4_GFX12=1 (opt-in).
 pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_K4_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_k4.gfx12.hip");
+
+/// gfx12 (RDNA4) G128-native m2 i8 WMMA MMQ port of HFQ4G128 ParoQuant MoE
+/// grouped-GEMM. 2×1 M-direction reg-blocked: each WG owns a 32-row × 16-slot
+/// output tile. Halves B-gather (X-tile) BW per output FLOP. Grid uses
+/// `ceil(M/32)` row tiles (vs k2's `ceil(M/16)`).
+/// Routes via HIPFIRE_MOE_PARO_I8_M2_GFX12=1 (opt-in pending bench validation).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_M2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_m2.gfx12.hip");
 
 /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
 /// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch

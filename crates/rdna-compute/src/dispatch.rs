@@ -11546,6 +11546,62 @@ impl Gpu {
         result
     }
 
+    /// gfx12 (RDNA4) G128-native m4 (4 rows per WG) MoE gate_up GEMV with
+    /// LDS-cached X. Reduces X-load BW per layer 4× vs the cross-arch
+    /// single-row-per-WG sibling. Grid: [ceil(m/4), k_top, 1]. Block: [32].
+    /// Dynamic LDS: k × 4 bytes.
+    pub fn gemv_paro_q4g128_moe_gate_up_m4_indexed_gfx12(
+        &mut self,
+        expert_ptrs: &GpuTensor,   // [n_exp] of u64 device pointers
+        topk_indices: &GpuTensor,  // [k_top] i32
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up:   &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_paro_q4g128_moe_gate_up_m4_indexed_gfx12",
+            kernels::GEMV_PARO_Q4G128_MOE_GATE_UP_M4_INDEXED_GFX12_SRC,
+            "gemv_paro_q4g128_moe_gate_up_m4_indexed_gfx12",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = 8 * (crate::profile::gemv_hfq4g128_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_paro_q4g128_moe_gate_up_m4_indexed_gfx12", bytes,
+        );
+        let row_tiles = ((m + 3) / 4) as u32;
+        let shmem_bytes = (k * 4) as u32;  // K floats in LDS
+        let result = self.launch_maybe_blob(
+            "gemv_paro_q4g128_moe_gate_up_m4_indexed_gfx12",
+            [row_tiles, 8, 1], [32, 1, 1], shmem_bytes, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(xp);
+                b.push_ptr(ygp); b.push_ptr(yup);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// HFQ4G128 (ParoQuant) variant of the indexed MoE gate_up GEMV.
     /// wave32-only (gfx10/11/12) — no wave64 path yet because ParoQuant
     /// A3B is not currently validated on gfx94x.
@@ -12856,6 +12912,79 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "gemm_paro_q4g128_moe_grouped_mmq_gfx12",
+            [row_tiles, slot_tiles, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b.push_i32(xsr_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx12 (RDNA4) G128-native m2 (2x1 M-direction reg-blocked) i8 WMMA MMQ
+    /// port of HFQ4G128 ParoQuant MoE grouped-GEMM. Each WG owns a 32-row x 16-slot
+    /// output tile (vs 16x16 in the k2 baseline). The B-operand (X-gather) is
+    /// loaded once per K-substep and reused across two M-blocks, halving B-gather
+    /// BW per output FLOP. Routes via HIPFIRE_MOE_PARO_I8_M2_GFX12=1 (opt-in).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_paro_q4g128_moe_grouped_mmq_m2_gfx12(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let kernel_src = kernels::GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_M2_GFX12_SRC;
+        self.ensure_kernel("gemm_paro_q4g128_moe_grouped_mmq_m2_gfx12", kernel_src, "gemm_paro_q4g128_moe_grouped_mmq_m2_gfx12")?;
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x_src, x_src_rows, k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_q8_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+        let xsr_val = x_src_rows as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+            &xsr_val as *const _ as *mut c_void,
+        ];
+
+        // m2 stride: 32 rows per WG (vs k2's 16).
+        let row_tiles = ((m + 31) / 32) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let bytes = (m_total * k) + (m_total * m) * 4
+            + (crate::profile::gemv_hfq4g128_bytes(m, k));
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_paro_q4g128_moe_grouped_mmq_m2_gfx12", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_paro_q4g128_moe_grouped_mmq_m2_gfx12",
             [row_tiles, slot_tiles, 1], [32, 1, 1], 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
