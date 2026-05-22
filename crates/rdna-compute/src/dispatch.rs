@@ -2494,6 +2494,16 @@ impl Gpu {
         if use_gfx12 {
             return self.gemv_hfq4g128_gfx12(a_raw, x, y, m, k);
         }
+        // gfx12 multirow (4 rows/WG, LDS-cached X) fast-path. Cuts WG count
+        // 4× to amortize dispatch overhead on the 20-percent PARO LA slot.
+        // Opt-in via HIPFIRE_GEMV_HFQ4G128_MULTIROW_GFX12=1.
+        let use_multirow = (self.arch.starts_with("gfx1200") || self.arch.starts_with("gfx1201"))
+            && std::env::var("HIPFIRE_GEMV_HFQ4G128_MULTIROW_GFX12").as_deref() == Ok("1")
+            && (k % 128 == 0)
+            && (m % 4 == 0);
+        if use_multirow {
+            return self.gemv_hfq4g128_multirow_gfx12(a_raw, x, y, m, k);
+        }
         self.ensure_kernel("gemv_hfq4g128", kernels::GEMV_HFQ4G128_SRC, "gemv_hfq4g128")?;
 
         let a_ptr = a_raw.buf.as_ptr();
@@ -2759,6 +2769,47 @@ impl Gpu {
                 b.push_ptr(yp_r); b.push_ptr(yp_s); b.push_ptr(yp_g); b.push_ptr(yp_u);
                 b.push_i32(rm); b.push_i32(sm); b.push_i32(gm); b.push_i32(um);
                 b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx12 multirow GEMV for HFQ4-G128 (4 rows per WG, LDS-cached X).
+    /// Cuts WG count by 4× to amortize dispatch overhead.
+    fn gemv_hfq4g128_multirow_gfx12(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemv_hfq4g128_multirow_gfx12",
+            kernels::GEMV_HFQ4G128_MULTIROW_GFX12_SRC,
+            "gemv_hfq4g128_multirow_gfx12",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let row_tiles = ((m + 3) / 4) as u32;
+        let shmem_bytes = (k * 4) as u32;
+        let bytes = crate::profile::gemv_hfq4g128_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g128_multirow_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g128_multirow_gfx12",
+            [row_tiles, 1, 1], [32, 1, 1], shmem_bytes, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
                 b
             },
         );

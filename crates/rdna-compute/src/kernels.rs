@@ -73,6 +73,12 @@ pub const FUSED_2WAY_F32_GEMV_SMALLM_GFX12_SRC: &str =
 pub const GEMV_F16_X32_LMHEAD_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemv_f16_x32_lmhead.gfx12.hip");
 
+/// gfx12 (RDNA4) HFQ4-G128 multirow GEMV: 4 rows per WG with LDS-cached X.
+/// Cuts WG count 4× to amortize dispatch overhead. Targets the 20-percent
+/// gemv_hfq4g128 attribution on z-lab A3B-PARO decode (PARO LA wqkv/wz/etc).
+pub const GEMV_HFQ4G128_MULTIROW_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_multirow.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible
