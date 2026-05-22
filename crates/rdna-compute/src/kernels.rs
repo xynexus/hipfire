@@ -643,6 +643,15 @@ pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_PERM_GFX12_SRC: &str =
 pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_wmma.gfx12.hip");
 
+/// gfx12 (RDNA4) 2x1 M-direction reg-blocked sister of the FP16 WMMA G128
+/// kernel above. Halves B-gather (X-tile) BW per output FLOP by sharing the
+/// loaded X tile across two M-blocks per WG. Mirror of the MQ4 G256 m2
+/// kernel (`gemm_hfq4g256_moe_grouped_wmma_m2_gfx12`). Grid uses
+/// `ceil(M/32)` row tiles (vs k2's `ceil(M/16)`).
+/// Routes via HIPFIRE_MOE_PARO_FP16_M2_GFX12=1 (opt-in).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_M2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_wmma_m2.gfx12.hip");
+
 /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
 /// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
 /// composition the ParoQuant MoE decode path used for the gate→down
