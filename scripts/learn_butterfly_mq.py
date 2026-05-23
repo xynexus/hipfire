@@ -969,6 +969,13 @@ def _student_train_mode_for_checkpointing(student: nn.Module, enabled: bool):
         student.train(was_training)
 
 
+def _release_oracle_model(oracle: Optional[nn.Module]) -> None:
+    """Drop the oracle model reference and return None for caller reassignment."""
+    del oracle
+    torch.cuda.empty_cache()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Model wrapping.
 # ---------------------------------------------------------------------------
@@ -1324,7 +1331,7 @@ def run_butterfly_training(
 def train_kld_loss(
     *,
     wrapped: dict[str, ButterflyResidualPseudoQuantLinear],
-    oracle: nn.Module,
+    oracle: Optional[nn.Module],
     student: nn.Module,
     seqs: list[torch.Tensor],
     device: torch.device,
@@ -1337,6 +1344,7 @@ def train_kld_loss(
     log_interval: int,
     bias_lr: Optional[float] = None,
     grad_checkpoint: bool = False,
+    oracle_logit_cache: Optional[dict[int, torch.Tensor]] = None,
 ) -> list[dict]:
     """Train all theta jointly with KL-divergence loss between oracle and
     student logit distributions. The proxy IS the production metric — no
@@ -1393,8 +1401,15 @@ def train_kld_loss(
             for seq_idx, seq in enumerate(seqs):
                 input_ids = seq.unsqueeze(0).to(device)
                 with torch.no_grad():
-                    oracle_logits = oracle(input_ids).logits.float()
-                    log_p = F.log_softmax(oracle_logits, dim=-1).detach()
+                    if oracle_logit_cache is not None:
+                        log_p = oracle_logit_cache[seq_idx].to(
+                            device=device, dtype=torch.float32, non_blocking=True,
+                        ).unsqueeze(0)
+                    else:
+                        if oracle is None:
+                            raise ValueError("oracle is required when oracle_logit_cache is not provided")
+                        oracle_logits = oracle(input_ids).logits.float()
+                        log_p = F.log_softmax(oracle_logits, dim=-1).detach()
                     p = log_p.exp()
                 student_logits = student(input_ids).logits.float()
                 log_q = F.log_softmax(student_logits, dim=-1)
@@ -1562,11 +1577,69 @@ def train_sequential(
 # Logit-KLD smoke eval (Phase 3 gate).
 # ---------------------------------------------------------------------------
 
-def compute_logit_kld(
+def _oracle_logit_cache_estimate_bytes(
     oracle: nn.Module,
+    seqs: list[torch.Tensor],
+) -> Optional[int]:
+    vocab_size = getattr(getattr(oracle, "config", None), "vocab_size", None)
+    if vocab_size is None:
+        return None
+    return sum(int(seq.numel()) * int(vocab_size) * 2 for seq in seqs)
+
+
+def _cache_payload_bytes(cache: dict[int, torch.Tensor]) -> int:
+    return sum(t.numel() * t.element_size() for t in cache.values())
+
+
+def _maybe_pin_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if not torch.cuda.is_available():
+        return tensor
+    try:
+        return tensor.pin_memory()
+    except RuntimeError:
+        return tensor
+
+
+def cache_oracle_logits(
+    oracle: nn.Module,
+    seqs: list[torch.Tensor],
+    device: torch.device,
+) -> dict[int, torch.Tensor]:
+    """Precompute oracle log-softmax outputs as BF16 CPU tensors keyed by seq index."""
+    estimate = _oracle_logit_cache_estimate_bytes(oracle, seqs)
+    n_tokens = sum(int(seq.numel()) for seq in seqs)
+    if estimate is not None:
+        print(
+            f"  oracle logit cache estimate: {len(seqs)} seqs, {n_tokens} tokens "
+            f"-> {estimate / 1e9:.2f} GB CPU BF16"
+        )
+    else:
+        print(
+            f"  oracle logit cache estimate: {len(seqs)} seqs, {n_tokens} tokens "
+            "(unknown vocab size)"
+        )
+
+    cache: dict[int, torch.Tensor] = {}
+    with torch.no_grad():
+        for seq_idx, seq in enumerate(seqs):
+            input_ids = seq.unsqueeze(0).to(device)
+            logits = oracle(input_ids).logits.float()
+            log_p = F.log_softmax(logits, dim=-1).squeeze(0)
+            log_p_cpu = log_p.to(device="cpu", dtype=torch.bfloat16).contiguous()
+            cache[seq_idx] = _maybe_pin_cpu_tensor(log_p_cpu)
+            del input_ids, logits, log_p, log_p_cpu
+
+    actual = _cache_payload_bytes(cache)
+    print(f"  oracle logit cache actual:   {actual / 1e9:.2f} GB CPU BF16 payload")
+    return cache
+
+
+def compute_logit_kld(
+    oracle: Optional[nn.Module],
     student: nn.Module,
     seqs: list[torch.Tensor],
     device: torch.device,
+    oracle_logit_cache: Optional[dict[int, torch.Tensor]] = None,
 ) -> float:
     """Mean per-token KL(oracle || student) over the eval slice.
 
@@ -1576,11 +1649,18 @@ def compute_logit_kld(
     total_kld = 0.0
     total_tokens = 0
     with torch.no_grad():
-        for seq in seqs:
+        for seq_idx, seq in enumerate(seqs):
             input_ids = seq.unsqueeze(0).to(device)
-            logits_oracle = oracle(input_ids).logits.float()  # [1, T, V]
             logits_student = student(input_ids).logits.float()
-            log_p = F.log_softmax(logits_oracle, dim=-1)
+            if oracle_logit_cache is not None:
+                log_p = oracle_logit_cache[seq_idx].to(
+                    device=device, dtype=torch.float32, non_blocking=True,
+                ).unsqueeze(0)
+            else:
+                if oracle is None:
+                    raise ValueError("oracle is required when oracle_logit_cache is not provided")
+                logits_oracle = oracle(input_ids).logits.float()  # [1, T, V]
+                log_p = F.log_softmax(logits_oracle, dim=-1)
             log_q = F.log_softmax(logits_student, dim=-1)
             p = log_p.exp()
             kl = (p * (log_p - log_q)).sum(dim=-1)  # [1, T]
@@ -1735,6 +1815,10 @@ def main() -> None:
                     help="Enable non-reentrant HF gradient checkpointing on the "
                          "student model to reduce 27B/A3B training memory/VRAM "
                          "during full-model KLD/MSE backward. Default off.")
+    ap.add_argument("--cache-oracle-logits", action="store_true",
+                    help="For --loss-kld runs, precompute oracle log-softmax "
+                         "outputs as BF16 CPU tensors, then release the oracle "
+                         "model from GPU before training. Default off.")
     ap.add_argument("--l2-theta", type=float, default=0.0,
                     help="Optional small L2 penalty on theta magnitude.")
     ap.add_argument("--device", default="cuda")
@@ -1794,6 +1878,8 @@ def main() -> None:
         sys.exit(self_test(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu"))
     if args.rotation_mode == "full-butterfly" and args.learnable_signs:
         ap.error("--rotation-mode full-butterfly cannot be combined with --learnable-signs")
+    if args.cache_oracle_logits and not args.loss_kld:
+        ap.error("--cache-oracle-logits requires --loss-kld; MSE/sequential modes need live oracle activations")
 
     # Validate required args for non-self-test mode.
     missing = [name for name in ("model", "imatrix", "corpus", "output_dir")
@@ -1820,6 +1906,7 @@ def main() -> None:
     print(f"  schedule:        cosine_floor={args.cosine_floor}")
     print(f"  n_epochs:        {args.n_epochs}  (=> {args.n_epochs * args.n_sequences} steps total)")
     print(f"  grad-clip:       {args.grad_clip}")
+    print(f"  cache oracle:    {args.cache_oracle_logits}")
     print(f"  l2-theta:        {args.l2_theta}")
     print(f"  rotation-mode:   {args.rotation_mode}")
     if args.learnable_signs:
@@ -1883,8 +1970,9 @@ def main() -> None:
     target_names = set(wrapped.keys())
     oracle_capture = OutputCapture()
     student_capture = OutputCapture()
-    oracle_capture.attach(oracle, target_names)
-    student_capture.attach(student, target_names)
+    if not args.cache_oracle_logits:
+        oracle_capture.attach(oracle, target_names)
+        student_capture.attach(student, target_names)
     print(f"      capture hooks: oracle={len(oracle_capture.handles)}, "
           f"student={len(student_capture.handles)}")
 
@@ -1895,6 +1983,20 @@ def main() -> None:
           f"= {len(seqs) * args.ctx_len} tokens ({time.time() - t0:.1f}s)")
 
     device = next(student.parameters()).device
+    oracle_logit_cache: Optional[dict[int, torch.Tensor]] = None
+    if args.cache_oracle_logits:
+        print("\n[cache] Precomputing oracle log-softmax outputs for all sequences ...")
+        t0 = time.time()
+        oracle_logit_cache = cache_oracle_logits(oracle, seqs, device)
+        vram_before_release = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        oracle = _release_oracle_model(oracle)
+        vram_after_release = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        print(f"      cached {len(oracle_logit_cache)} sequences in {time.time() - t0:.1f}s")
+        print(
+            f"      oracle released; VRAM freed "
+            f"{(vram_before_release - vram_after_release) / 1e9:.2f} GB "
+            f"({vram_before_release / 1e9:.2f} -> {vram_after_release / 1e9:.2f} GB)"
+        )
 
     if args.learnable_signs:
         initial_theta_norms = {n: 0.0 for n in wrapped}
@@ -1910,6 +2012,7 @@ def main() -> None:
         print(f"\n[pre-train] Smoke eval baseline (theta=0): {n_eval} seqs × {args.ctx_len} ctx ...")
         smoke_kld_baseline = compute_logit_kld(
             oracle, student, seqs[:n_eval], device,
+            oracle_logit_cache=oracle_logit_cache,
         )
         print(f"      baseline KLD (theta=0):  {smoke_kld_baseline:.6f}")
 
@@ -1932,6 +2035,7 @@ def main() -> None:
             log_interval=args.log_interval,
             bias_lr=bias_lr_arg,
             grad_checkpoint=args.grad_checkpoint,
+            oracle_logit_cache=oracle_logit_cache,
         )
     elif args.sequential:
         trace = train_sequential(
@@ -2008,6 +2112,7 @@ def main() -> None:
         print(f"\n[post-train] Smoke eval (theta=trained): {n_eval} seqs × {args.ctx_len} ctx ...")
         smoke_kld_trained = compute_logit_kld(
             oracle, student, seqs[:n_eval], device,
+            oracle_logit_cache=oracle_logit_cache,
         )
         print(f"      trained KLD:  {smoke_kld_trained:.6f}")
         print(f"      baseline KLD: {smoke_kld_baseline:.6f}")

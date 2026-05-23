@@ -19,7 +19,10 @@ from learn_butterfly_mq import (  # noqa: E402
     LearnableSignsPseudoQuantLinear,
     N,
     _enable_student_gradient_checkpointing,
+    _release_oracle_model,
     _select_wrapper_class,
+    cache_oracle_logits,
+    compute_logit_kld,
     quantize_mq4g256_signs_ste,
     sign_ste,
     train_kld_loss,
@@ -224,6 +227,7 @@ def test_grad_checkpoint_help_mentions_large_model_memory_reduction():
     )
 
     assert "--grad-checkpoint" in result.stdout
+    assert "--cache-oracle-logits" in result.stdout
     assert "27B/A3B" in result.stdout
     assert "memory" in result.stdout
 
@@ -280,6 +284,141 @@ def test_train_kld_loss_uses_train_mode_only_when_grad_checkpointing():
     assert wrapped.theta_residual.grad is not None
 
 
+def test_cache_oracle_logits_stores_bf16_cpu_and_allows_release():
+    class TinyOracle(torch.nn.Module):
+        config = SimpleNamespace(vocab_size=4)
+
+        def forward(self, input_ids):
+            base = input_ids.to(torch.float32).unsqueeze(-1)
+            offsets = torch.arange(4, dtype=torch.float32, device=input_ids.device)
+            return SimpleNamespace(logits=base * 0.01 + offsets)
+
+    seqs = [torch.tensor([1, 2, 3]), torch.tensor([4, 5])]
+    oracle = TinyOracle()
+
+    cache = cache_oracle_logits(oracle, seqs, torch.device("cpu"))
+    oracle = _release_oracle_model(oracle)
+
+    assert oracle is None
+    assert sorted(cache) == [0, 1]
+    assert cache[0].shape == (3, 4)
+    assert cache[1].shape == (2, 4)
+    assert cache[0].dtype == torch.bfloat16
+    assert cache[0].device.type == "cpu"
+
+
+def test_compute_logit_kld_cache_matches_live_with_bf16_tolerance():
+    class TinyOracle(torch.nn.Module):
+        config = SimpleNamespace(vocab_size=5)
+
+        def forward(self, input_ids):
+            positions = torch.arange(input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
+            vocab = torch.arange(5, dtype=torch.float32, device=input_ids.device)
+            logits = input_ids.to(torch.float32).unsqueeze(-1) * 0.02
+            logits = logits + positions.view(1, -1, 1) * 0.03 + vocab.view(1, 1, -1) * 0.04
+            return SimpleNamespace(logits=logits)
+
+    class TinyStudent(torch.nn.Module):
+        def forward(self, input_ids):
+            positions = torch.arange(input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
+            vocab = torch.arange(5, dtype=torch.float32, device=input_ids.device)
+            logits = input_ids.to(torch.float32).unsqueeze(-1) * -0.01
+            logits = logits + positions.view(1, -1, 1) * 0.01 + vocab.view(1, 1, -1) * 0.02
+            return SimpleNamespace(logits=logits)
+
+    seqs = [torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])]
+    device = torch.device("cpu")
+    oracle = TinyOracle()
+    student = TinyStudent()
+
+    live = compute_logit_kld(oracle, student, seqs, device)
+    cache = cache_oracle_logits(oracle, seqs, device)
+    cached = compute_logit_kld(None, student, seqs, device, oracle_logit_cache=cache)
+
+    assert abs(live - cached) < 5e-3
+
+
+def test_train_kld_loss_uses_cached_oracle_logits_and_default_live_path():
+    class TinyWrapped(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.theta_residual = torch.nn.Parameter(torch.tensor(0.0), requires_grad=False)
+
+        def set_optim(self):
+            self.theta_residual.requires_grad = True
+
+    class TinyOracle(torch.nn.Module):
+        config = SimpleNamespace(vocab_size=3)
+
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, input_ids):
+            self.calls += 1
+            logits = torch.zeros(1, input_ids.shape[1], 3, device=input_ids.device)
+            logits[..., 0] = 1.5
+            logits[..., 2] = input_ids.to(torch.float32) * 0.01
+            return SimpleNamespace(logits=logits)
+
+    class TinyStudent(torch.nn.Module):
+        def __init__(self, wrapped):
+            super().__init__()
+            self.wrapped = wrapped
+
+        def forward(self, input_ids):
+            logits = torch.zeros(1, input_ids.shape[1], 3, device=input_ids.device)
+            logits[..., 1] = self.wrapped.theta_residual
+            return SimpleNamespace(logits=logits)
+
+    seqs = [torch.tensor([1, 2])]
+    device = torch.device("cpu")
+
+    live_wrapped = TinyWrapped()
+    live_oracle = TinyOracle()
+    live_trace = train_kld_loss(
+        wrapped={"fixture.tensor": live_wrapped},
+        oracle=live_oracle,
+        student=TinyStudent(live_wrapped),
+        seqs=seqs,
+        device=device,
+        n_epochs=1,
+        lr=0.0,
+        momentum=0.0,
+        weight_decay=0.0,
+        cosine_floor=0.05,
+        grad_clip=None,
+        log_interval=1,
+    )
+
+    cache_oracle = TinyOracle()
+    cache = cache_oracle_logits(cache_oracle, seqs, device)
+    cached_wrapped = TinyWrapped()
+    forbidden_oracle = TinyOracle()
+    cached_trace = train_kld_loss(
+        wrapped={"fixture.tensor": cached_wrapped},
+        oracle=forbidden_oracle,
+        student=TinyStudent(cached_wrapped),
+        seqs=seqs,
+        device=device,
+        n_epochs=1,
+        lr=0.0,
+        momentum=0.0,
+        weight_decay=0.0,
+        cosine_floor=0.05,
+        grad_clip=None,
+        log_interval=1,
+        oracle_logit_cache=cache,
+    )
+
+    assert live_oracle.calls == 1
+    assert cache_oracle.calls == 1
+    assert forbidden_oracle.calls == 0
+    assert abs(
+        live_trace[0]["mean_kld_loss"] - cached_trace[0]["mean_kld_loss"]
+    ) < 5e-3
+
+
 def test_rotation_mode_fwht_signs_preserves_legacy_default_byte_equal():
     torch.manual_seed(789)
     weight = torch.randn(2, N, dtype=torch.float32)
@@ -326,6 +465,9 @@ if __name__ == "__main__":
     test_enable_student_gradient_checkpointing_disables_cache_before_enable()
     test_grad_checkpoint_help_mentions_large_model_memory_reduction()
     test_train_kld_loss_uses_train_mode_only_when_grad_checkpointing()
+    test_cache_oracle_logits_stores_bf16_cpu_and_allows_release()
+    test_compute_logit_kld_cache_matches_live_with_bf16_tolerance()
+    test_train_kld_loss_uses_cached_oracle_logits_and_default_live_path()
     test_rotation_mode_fwht_signs_preserves_legacy_default_byte_equal()
     test_rotation_mode_fwht_signs_preserves_learnable_signs_byte_equal()
     print("learnable FWHT tests passed")
