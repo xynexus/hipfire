@@ -248,6 +248,7 @@ def quantize_mq4g256_signs_ste(
     w: torch.Tensor,
     d1: torch.Tensor,
     d2: torch.Tensor,
+    quant_bits: int = 4,
 ) -> torch.Tensor:
     """MQ4G256 round-trip with learnable D1/D2 sign tables.
 
@@ -266,16 +267,17 @@ def quantize_mq4g256_signs_ste(
     w_f32 = w.to(torch.float32)
     w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), d1_broadcast, d2_broadcast)
 
+    qmax = float((1 << quant_bits) - 1)  # 4-bit→15, 6-bit→63, 8-bit→255
     with torch.no_grad():
         min_val = w_fwht.min(dim=-1).values
         max_val = w_fwht.max(dim=-1).values
         rng = max_val - min_val
-        scale = torch.where(rng > 0.0, rng / 15.0, torch.ones_like(rng))
+        scale = torch.where(rng > 0.0, rng / qmax, torch.ones_like(rng))
         zero = min_val
         inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
         q = torch.clamp(
             torch.round((w_fwht - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
-            0.0, 15.0,
+            0.0, qmax,
         )
         dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
         delta = dequant_rot - w_fwht
@@ -340,6 +342,7 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         channel_scales_init: torch.Tensor,
         canonical_name: str,
         sign_granularity: str = "tensor",
+        quant_bits: int = 4,
     ) -> None:
         super().__init__()
         assert weight.dim() == 2
@@ -348,6 +351,7 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         assert channel_scales_init.shape == (k,)
         if sign_granularity not in ("tensor", "group"):
             raise ValueError("sign_granularity must be 'tensor' or 'group'")
+        self.quant_bits = quant_bits
 
         self.register_buffer("weight", weight.detach().clone())
         if bias is not None:
@@ -409,7 +413,7 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         d2 = sign_ste(self.d2_logits)
 
         w_scaled = self.weight.to(torch.float32) * s_safe.unsqueeze(0)
-        w_q_dq = quantize_mq4g256_signs_ste(w_scaled, d1, d2)
+        w_q_dq = quantize_mq4g256_signs_ste(w_scaled, d1, d2, quant_bits=self.quant_bits)
         x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
         y = F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
         # Bias correction: continuous learnable offset on output channels.
@@ -702,6 +706,7 @@ def wrap_awq_targets(
     target_pattern: Optional[str],
     wrapper_class=None,
     sign_granularity: str = "tensor",
+    quant_bits: int = 4,
 ) -> dict[str, nn.Module]:
     """Wrap all AWQ-F1 Linears whose stored name matches `target_pattern`.
 
@@ -758,7 +763,8 @@ def wrap_awq_targets(
         device = module.weight.device
         if wrapper_class is LearnableSignsPseudoQuantLinear:
             wrapper = wrapper_class(
-                weight, bias, init_s, canonical, sign_granularity=sign_granularity,
+                weight, bias, init_s, canonical,
+                sign_granularity=sign_granularity, quant_bits=quant_bits,
             )
         else:
             wrapper = wrapper_class(weight, bias, init_s, canonical)
@@ -1435,6 +1441,10 @@ def main() -> None:
                          "and --loss-kld (joint KLD training).")
     ap.add_argument("--bias-lr", type=float, default=1e-3,
                     help="LR for bias_correction params (separate group from signs).")
+    ap.add_argument("--quant-bits", type=int, default=4,
+                    help="Quantization bit-width for the pseudo-quant (4=MQ4 default, "
+                         "6, 8 for granularity-ceiling diagnostics). Only affects "
+                         "--learnable-signs path.")
     args = ap.parse_args()
 
     if args.self_test:
@@ -1512,6 +1522,7 @@ def main() -> None:
         student, in_sum2_by_name, args.alpha, stored_keys, args.target_pattern,
         wrapper_class=wrapper_cls,
         sign_granularity=args.sign_granularity,
+        quant_bits=args.quant_bits,
     )
     print(f"      wrap done in {time.time() - t0:.1f}s")
     if not wrapped:
