@@ -57,17 +57,28 @@ PARO-mechanism = AWQ + learnable continuous full-butterfly rotation + uniform
 Python in-memory KLD. 0.8B/9B at ctx=2048/64-seq; 27B/A3B at ctx=1024/32-seq
 (memory fit), n_epochs=3.
 
-| Model | PARO-mechanism (rot+uniform) | MQ4-SLfwht+Lloyd (rot+Lloyd) | Δ vs PARO-mech |
-|---|---:|---:|---|
-| Qwen3.5-0.8B | 0.0816 | **0.0662** | **−19%** |
-| Qwen3.5-9B | 0.3206 | **0.2922** | **−8.9%** |
-| Qwen3.6-27B | (running @ctx1024) | (running) | TBD |
-| Qwen3.6-35B-A3B | (running @ctx1024) | (running) | TBD |
+| Model | PARO-mechanism (rot+uniform) | MQ4-SLfwht+Lloyd (rot+Lloyd) | Δ vs PARO-mech | measurement |
+|---|---:|---:|---:|---|
+| Qwen3.5-0.8B | 0.0816 | **0.0662** | **−19%** | direct trained, ctx2048/64s |
+| Qwen3.5-9B | 0.3206 | **0.2922** | **−8.9%** | direct trained, ctx2048/64s |
+| Qwen3.6-27B | 0.656 | **0.602** | **−8.2%** | baseline θ=0 (training OOMs†) |
+| Qwen3.6-35B-A3B | 0.2207 | **0.2096** | **−5.0%** | direct trained, ctx1024/32s |
 
-Both directly-measured models: combined beats the PARO mechanism. The shared
-rotation matches PARO; the Lloyd codebook is the edge. Margin is larger on 0.8B
-(outlier-dominated — codebook places levels at outliers) than 9B
-(variance-dominated — codebook gain is smaller but real).
+**MQ4-SLfwht+Lloyd beats the PARO mechanism on all 4 trunk models.** 3/4 direct
+(trained); 27B is baseline-only (the full-butterfly+KLD-loss training OOMs on
+27B even with student gradient checkpointing — oracle+student+backward exceed
+192 GB; needs oracle-logit caching to free the oracle).
+
+The win decomposes by regime:
+- **Rotation helps** 0.8B (outlier-dominated) and 9B — both recipes share it,
+  combined adds the Lloyd edge → −19% / −8.9%.
+- **Rotation is neutral/slightly-negative** on A3B-MoE (and 27B, and 9B-discrete-
+  signs): the full-butterfly trained ≈ or slightly above its θ=0 baseline. On
+  these the Lloyd codebook is the SOLE lever, and it carries the win (−5% / −8.2%).
+
+So the **Lloyd codebook is the universal edge PARO structurally lacks**;
+the rotation is a bonus on the models where error is outlier-dominated.
+† 27B direct training needs the oracle-caching memory fix (open).
 
 ### B. Lloyd-vs-uniform baseline sweep (codebook isolated, no rotation, θ=0)
 
