@@ -40,6 +40,7 @@ The HFBF format is documented in `_write_hfbf` below.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import math
 import struct
@@ -939,6 +940,35 @@ def _set_module(root: nn.Module, dotted: str, replacement: nn.Module) -> None:
     setattr(parent, parts[-1], replacement)
 
 
+def _enable_student_gradient_checkpointing(student: nn.Module) -> None:
+    """Enable HF gradient checkpointing for the student model.
+
+    use_cache must be disabled before enabling gradient checkpointing. The
+    non-reentrant path composes with FullRotationPseudoQuantLinear's existing
+    inner non-reentrant butterfly checkpoints while preserving gradients to
+    theta / sign-logit parameters.
+    """
+    student.config.use_cache = False
+    student.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+    )
+
+
+@contextmanager
+def _student_train_mode_for_checkpointing(student: nn.Module, enabled: bool):
+    """Temporarily enter train mode so HF layer checkpoint hooks activate."""
+    if not enabled:
+        yield
+        return
+
+    was_training = student.training
+    student.train()
+    try:
+        yield
+    finally:
+        student.train(was_training)
+
+
 # ---------------------------------------------------------------------------
 # Model wrapping.
 # ---------------------------------------------------------------------------
@@ -1193,6 +1223,7 @@ def run_butterfly_training(
     grad_clip: Optional[float],
     l2_theta: float,
     log_interval: int,
+    grad_checkpoint: bool = False,
 ) -> list[dict]:
     """SGD + cosine training over butterfly residuals."""
     params: list[nn.Parameter] = []
@@ -1222,65 +1253,66 @@ def run_butterfly_training(
 
     trace: list[dict] = []
     global_step = 0
-    for epoch in range(n_epochs):
-        epoch_start = time.time()
-        epoch_loss = 0.0
-        epoch_count = 0
-        for seq_idx, seq in enumerate(seqs):
-            input_ids = seq.unsqueeze(0).to(device)
-            with torch.no_grad():
-                oracle_capture.clear()
-                _ = oracle(input_ids)
-                y_oracle = {n: oracle_capture.outputs[n].detach() for n in target_names}
+    with _student_train_mode_for_checkpointing(student, grad_checkpoint):
+        for epoch in range(n_epochs):
+            epoch_start = time.time()
+            epoch_loss = 0.0
+            epoch_count = 0
+            for seq_idx, seq in enumerate(seqs):
+                input_ids = seq.unsqueeze(0).to(device)
+                with torch.no_grad():
+                    oracle_capture.clear()
+                    _ = oracle(input_ids)
+                    y_oracle = {n: oracle_capture.outputs[n].detach() for n in target_names}
 
-            student_capture.clear()
-            _ = student(input_ids)
+                student_capture.clear()
+                _ = student(input_ids)
 
-            loss = torch.zeros((), device=device, dtype=torch.float32)
-            n_terms = 0
-            for n in target_names:
-                y_q = student_capture.outputs[n].to(torch.float32)
-                y_o = y_oracle[n].to(torch.float32)
-                loss = loss + (y_q - y_o).pow(2).mean()
-                n_terms += 1
-            loss = loss / max(n_terms, 1)
+                loss = torch.zeros((), device=device, dtype=torch.float32)
+                n_terms = 0
+                for n in target_names:
+                    y_q = student_capture.outputs[n].to(torch.float32)
+                    y_o = y_oracle[n].to(torch.float32)
+                    loss = loss + (y_q - y_o).pow(2).mean()
+                    n_terms += 1
+                loss = loss / max(n_terms, 1)
 
-            if l2_theta > 0.0:
-                reg = torch.zeros((), device=device, dtype=torch.float32)
-                for w in wrapped.values():
-                    reg = reg + w.theta_residual.pow(2).sum()
-                loss = loss + l2_theta * reg
+                if l2_theta > 0.0:
+                    reg = torch.zeros((), device=device, dtype=torch.float32)
+                    for w in wrapped.values():
+                        reg = reg + w.theta_residual.pow(2).sum()
+                    loss = loss + l2_theta * reg
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if grad_clip is not None and grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(params, grad_clip)
-            optimizer.step()
-            scheduler.step()
-            global_step += 1
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if grad_clip is not None and grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(params, grad_clip)
+                optimizer.step()
+                scheduler.step()
+                global_step += 1
 
-            epoch_loss += float(loss.detach())
-            epoch_count += 1
+                epoch_loss += float(loss.detach())
+                epoch_count += 1
 
-            if (seq_idx + 1) % log_interval == 0:
-                running = epoch_loss / max(epoch_count, 1)
-                cur_lr = scheduler.get_last_lr()[0]
-                elapsed = time.time() - epoch_start
-                print(f"      epoch {epoch + 1}/{n_epochs} seq {seq_idx + 1}/{len(seqs)} "
-                      f"loss={float(loss.detach()):.6e} running={running:.6e} "
-                      f"lr={cur_lr:.3e} ({elapsed:.1f}s)")
+                if (seq_idx + 1) % log_interval == 0:
+                    running = epoch_loss / max(epoch_count, 1)
+                    cur_lr = scheduler.get_last_lr()[0]
+                    elapsed = time.time() - epoch_start
+                    print(f"      epoch {epoch + 1}/{n_epochs} seq {seq_idx + 1}/{len(seqs)} "
+                          f"loss={float(loss.detach()):.6e} running={running:.6e} "
+                          f"lr={cur_lr:.3e} ({elapsed:.1f}s)")
 
-            del y_oracle
+                del y_oracle
 
-        mean_loss = epoch_loss / max(epoch_count, 1)
-        trace.append({
-            "epoch": epoch,
-            "mean_loss": mean_loss,
-            "elapsed_s": time.time() - epoch_start,
-            "final_lr": scheduler.get_last_lr()[0],
-        })
-        print(f"      [epoch {epoch + 1}] mean_loss={mean_loss:.6e}  "
-              f"time={time.time() - epoch_start:.1f}s")
+            mean_loss = epoch_loss / max(epoch_count, 1)
+            trace.append({
+                "epoch": epoch,
+                "mean_loss": mean_loss,
+                "elapsed_s": time.time() - epoch_start,
+                "final_lr": scheduler.get_last_lr()[0],
+            })
+            print(f"      [epoch {epoch + 1}] mean_loss={mean_loss:.6e}  "
+                  f"time={time.time() - epoch_start:.1f}s")
 
     return trace
 
@@ -1304,6 +1336,7 @@ def train_kld_loss(
     grad_clip: Optional[float],
     log_interval: int,
     bias_lr: Optional[float] = None,
+    grad_checkpoint: bool = False,
 ) -> list[dict]:
     """Train all theta jointly with KL-divergence loss between oracle and
     student logit distributions. The proxy IS the production metric — no
@@ -1352,47 +1385,48 @@ def train_kld_loss(
           f"elements={sum(p.numel() for p in params)}")
 
     trace: list[dict] = []
-    for epoch in range(n_epochs):
-        epoch_start = time.time()
-        epoch_loss = 0.0
-        epoch_count = 0
-        for seq_idx, seq in enumerate(seqs):
-            input_ids = seq.unsqueeze(0).to(device)
-            with torch.no_grad():
-                oracle_logits = oracle(input_ids).logits.float()
-                log_p = F.log_softmax(oracle_logits, dim=-1).detach()
-                p = log_p.exp()
-            student_logits = student(input_ids).logits.float()
-            log_q = F.log_softmax(student_logits, dim=-1)
-            # Mean per-token KL(oracle || student).
-            kl = (p * (log_p - log_q)).sum(dim=-1).mean()
+    with _student_train_mode_for_checkpointing(student, grad_checkpoint):
+        for epoch in range(n_epochs):
+            epoch_start = time.time()
+            epoch_loss = 0.0
+            epoch_count = 0
+            for seq_idx, seq in enumerate(seqs):
+                input_ids = seq.unsqueeze(0).to(device)
+                with torch.no_grad():
+                    oracle_logits = oracle(input_ids).logits.float()
+                    log_p = F.log_softmax(oracle_logits, dim=-1).detach()
+                    p = log_p.exp()
+                student_logits = student(input_ids).logits.float()
+                log_q = F.log_softmax(student_logits, dim=-1)
+                # Mean per-token KL(oracle || student).
+                kl = (p * (log_p - log_q)).sum(dim=-1).mean()
 
-            optimizer.zero_grad(set_to_none=True)
-            kl.backward()
-            if grad_clip is not None and grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(params, grad_clip)
-            optimizer.step()
-            scheduler.step()
-            epoch_loss += float(kl.detach())
-            epoch_count += 1
+                optimizer.zero_grad(set_to_none=True)
+                kl.backward()
+                if grad_clip is not None and grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(params, grad_clip)
+                optimizer.step()
+                scheduler.step()
+                epoch_loss += float(kl.detach())
+                epoch_count += 1
 
-            if (seq_idx + 1) % log_interval == 0:
-                running = epoch_loss / max(epoch_count, 1)
-                elapsed = time.time() - epoch_start
-                cur_lr = scheduler.get_last_lr()[0]
-                print(f"      epoch {epoch + 1}/{n_epochs} seq {seq_idx + 1}/{len(seqs)} "
-                      f"kld={float(kl.detach()):.6e} running={running:.6e} "
-                      f"lr={cur_lr:.3e} ({elapsed:.1f}s)")
+                if (seq_idx + 1) % log_interval == 0:
+                    running = epoch_loss / max(epoch_count, 1)
+                    elapsed = time.time() - epoch_start
+                    cur_lr = scheduler.get_last_lr()[0]
+                    print(f"      epoch {epoch + 1}/{n_epochs} seq {seq_idx + 1}/{len(seqs)} "
+                          f"kld={float(kl.detach()):.6e} running={running:.6e} "
+                          f"lr={cur_lr:.3e} ({elapsed:.1f}s)")
 
-        mean_loss = epoch_loss / max(epoch_count, 1)
-        trace.append({
-            "epoch": epoch,
-            "mean_kld_loss": mean_loss,
-            "elapsed_s": time.time() - epoch_start,
-            "final_lr": scheduler.get_last_lr()[0],
-        })
-        print(f"      [epoch {epoch + 1}] mean_kld={mean_loss:.6e}  "
-              f"time={time.time() - epoch_start:.1f}s")
+            mean_loss = epoch_loss / max(epoch_count, 1)
+            trace.append({
+                "epoch": epoch,
+                "mean_kld_loss": mean_loss,
+                "elapsed_s": time.time() - epoch_start,
+                "final_lr": scheduler.get_last_lr()[0],
+            })
+            print(f"      [epoch {epoch + 1}] mean_kld={mean_loss:.6e}  "
+                  f"time={time.time() - epoch_start:.1f}s")
 
     return trace
 
@@ -1697,6 +1731,10 @@ def main() -> None:
     ap.add_argument("--cosine-floor", type=float, default=0.05,
                     help="Final LR = initial * floor (paper ~1/20).")
     ap.add_argument("--grad-clip", type=float, default=1.0)
+    ap.add_argument("--grad-checkpoint", action="store_true",
+                    help="Enable non-reentrant HF gradient checkpointing on the "
+                         "student model to reduce 27B/A3B training memory/VRAM "
+                         "during full-model KLD/MSE backward. Default off.")
     ap.add_argument("--l2-theta", type=float, default=0.0,
                     help="Optional small L2 penalty on theta magnitude.")
     ap.add_argument("--device", default="cuda")
@@ -1815,6 +1853,10 @@ def main() -> None:
     student.eval()
     for p in student.parameters():
         p.requires_grad_(False)
+    if args.grad_checkpoint:
+        _enable_student_gradient_checkpointing(student)
+        print("      gradient checkpointing enabled on student "
+              "(use_cache=False, use_reentrant=False)")
     print(f"      loaded student in {time.time() - t0:.1f}s")
     if torch.cuda.is_available():
         print(f"      VRAM {torch.cuda.memory_allocated() / 1e9:.2f} GB")
@@ -1889,6 +1931,7 @@ def main() -> None:
             grad_clip=args.grad_clip,
             log_interval=args.log_interval,
             bias_lr=bias_lr_arg,
+            grad_checkpoint=args.grad_checkpoint,
         )
     elif args.sequential:
         trace = train_sequential(
@@ -1925,6 +1968,7 @@ def main() -> None:
             grad_clip=args.grad_clip,
             l2_theta=args.l2_theta,
             log_interval=args.log_interval,
+            grad_checkpoint=args.grad_checkpoint,
         )
     train_elapsed = time.time() - train_start
     print(f"\n      total train time: {train_elapsed:.1f}s")

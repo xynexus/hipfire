@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import sys
+import subprocess
+from types import SimpleNamespace
 from pathlib import Path
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -15,9 +18,11 @@ from learn_butterfly_mq import (  # noqa: E402
     FullRotationPseudoQuantLinear,
     LearnableSignsPseudoQuantLinear,
     N,
+    _enable_student_gradient_checkpointing,
     _select_wrapper_class,
     quantize_mq4g256_signs_ste,
     sign_ste,
+    train_kld_loss,
 )
 
 
@@ -141,6 +146,140 @@ def test_full_rotation_theta_moves_after_training_step():
     assert not torch.equal(wrapper.theta.detach(), initial)
 
 
+def test_full_rotation_theta_gets_grad_under_nested_non_reentrant_checkpoint():
+    torch.manual_seed(679)
+    weight = torch.randn(3, N * 2, dtype=torch.float32)
+    scales = torch.ones(N * 2, dtype=torch.float32)
+    x = torch.randn(5, N * 2, dtype=torch.float32)
+    target = torch.randn(5, 3, dtype=torch.float32)
+    wrapper = FullRotationPseudoQuantLinear(
+        weight, None, scales, "fixture.tensor",
+    )
+    wrapper.set_optim()
+
+    y = checkpoint(wrapper, x, use_reentrant=False)
+    loss = (y.to(torch.float32) - target).pow(2).mean()
+    loss.backward()
+
+    assert wrapper.theta.grad is not None
+    assert torch.isfinite(wrapper.theta.grad).all()
+    assert wrapper.theta.grad.abs().sum() > 0.0
+
+
+def test_learnable_signs_get_grads_under_non_reentrant_checkpoint():
+    torch.manual_seed(680)
+    weight = torch.randn(3, N * 2, dtype=torch.float32)
+    scales = torch.ones(N * 2, dtype=torch.float32)
+    x = torch.randn(5, N * 2, dtype=torch.float32)
+    target = torch.randn(5, 3, dtype=torch.float32)
+    wrapper = LearnableSignsPseudoQuantLinear(
+        weight, None, scales, "fixture.tensor", sign_granularity="group",
+    )
+    wrapper.set_optim()
+
+    y = checkpoint(wrapper, x, use_reentrant=False)
+    loss = (y.to(torch.float32) - target).pow(2).mean()
+    loss.backward()
+
+    assert wrapper.d1_logits.grad is not None
+    assert wrapper.d2_logits.grad is not None
+    assert torch.isfinite(wrapper.d1_logits.grad).all()
+    assert torch.isfinite(wrapper.d2_logits.grad).all()
+    assert wrapper.d1_logits.grad.abs().sum() > 0.0
+    assert wrapper.d2_logits.grad.abs().sum() > 0.0
+
+
+def test_enable_student_gradient_checkpointing_disables_cache_before_enable():
+    class FakeConfig:
+        use_cache = True
+
+    class FakeStudent:
+        def __init__(self):
+            self.config = FakeConfig()
+            self.events = []
+
+        def gradient_checkpointing_enable(self, *, gradient_checkpointing_kwargs):
+            self.events.append((
+                "enable",
+                self.config.use_cache,
+                gradient_checkpointing_kwargs,
+            ))
+
+    student = FakeStudent()
+
+    _enable_student_gradient_checkpointing(student)
+
+    assert student.config.use_cache is False
+    assert student.events == [
+        ("enable", False, {"use_reentrant": False}),
+    ]
+
+
+def test_grad_checkpoint_help_mentions_large_model_memory_reduction():
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "learn_butterfly_mq.py"), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--grad-checkpoint" in result.stdout
+    assert "27B/A3B" in result.stdout
+    assert "memory" in result.stdout
+
+
+def test_train_kld_loss_uses_train_mode_only_when_grad_checkpointing():
+    class TinyWrapped(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.theta_residual = torch.nn.Parameter(torch.tensor(0.0), requires_grad=False)
+
+        def set_optim(self):
+            self.theta_residual.requires_grad = True
+
+    class TinyOracle(torch.nn.Module):
+        def forward(self, input_ids):
+            logits = torch.zeros(1, input_ids.shape[1], 3, device=input_ids.device)
+            logits[..., 0] = 2.0
+            return SimpleNamespace(logits=logits)
+
+    class TinyStudent(torch.nn.Module):
+        def __init__(self, wrapped):
+            super().__init__()
+            self.wrapped = wrapped
+            self.forward_training_states = []
+
+        def forward(self, input_ids):
+            self.forward_training_states.append(self.training)
+            logits = torch.zeros(1, input_ids.shape[1], 3, device=input_ids.device)
+            logits[..., 1] = self.wrapped.theta_residual
+            return SimpleNamespace(logits=logits)
+
+    wrapped = TinyWrapped()
+    student = TinyStudent(wrapped)
+    student.eval()
+
+    train_kld_loss(
+        wrapped={"fixture.tensor": wrapped},
+        oracle=TinyOracle(),
+        student=student,
+        seqs=[torch.tensor([1, 2])],
+        device=torch.device("cpu"),
+        n_epochs=1,
+        lr=0.1,
+        momentum=0.0,
+        weight_decay=0.0,
+        cosine_floor=0.05,
+        grad_clip=None,
+        log_interval=1,
+        grad_checkpoint=True,
+    )
+
+    assert student.forward_training_states == [True]
+    assert student.training is False
+    assert wrapped.theta_residual.grad is not None
+
+
 def test_rotation_mode_fwht_signs_preserves_legacy_default_byte_equal():
     torch.manual_seed(789)
     weight = torch.randn(2, N, dtype=torch.float32)
@@ -182,6 +321,11 @@ if __name__ == "__main__":
     test_group_signs_do_not_cross_talk_between_256_wide_groups()
     test_full_rotation_init_matches_fwht_signs_baseline_byte_equal()
     test_full_rotation_theta_moves_after_training_step()
+    test_full_rotation_theta_gets_grad_under_nested_non_reentrant_checkpoint()
+    test_learnable_signs_get_grads_under_non_reentrant_checkpoint()
+    test_enable_student_gradient_checkpointing_disables_cache_before_enable()
+    test_grad_checkpoint_help_mentions_large_model_memory_reduction()
+    test_train_kld_loss_uses_train_mode_only_when_grad_checkpointing()
     test_rotation_mode_fwht_signs_preserves_legacy_default_byte_equal()
     test_rotation_mode_fwht_signs_preserves_learnable_signs_byte_equal()
     print("learnable FWHT tests passed")
