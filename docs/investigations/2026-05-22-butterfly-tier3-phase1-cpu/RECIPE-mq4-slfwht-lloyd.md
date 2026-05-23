@@ -1,11 +1,13 @@
 # MQ4-SLfwht+Lloyd — the recipe and the direct PARO-mechanism comparison (2026-05-23)
 
-> Status: **DIRECT head-to-head** vs a faithful **PARO-mechanism** (scaling +
-> learnable continuous rotation + uniform-4bit) measured on 0.8B + 9B; 27B/A3B
-> running at ctx=1024 (full-butterfly training OOMs at ctx=2048 on the bigger
-> models). All **Python in-memory KLD** — NOT yet validated against z-lab's
-> SHIPPED PARO weights or the production kldref pipeline (the two remaining
-> gaps). Claim: "beats the PARO mechanism", measured directly on 0.8B+9B.
+> Status: head-to-head vs a faithful **PARO-mechanism** (scaling + learnable
+> continuous rotation + uniform-4bit) measured on all 4 trunk models —
+> 0.8B/9B/A3B direct-trained, 27B at θ=0 baseline only (its full-butterfly
+> training OOMs in 192 GB even with student gradient checkpointing; needs the
+> oracle-logit caching fix). All **Python in-memory KLD** — NOT yet validated
+> against z-lab's SHIPPED PARO weights or the production kldref pipeline (the
+> two remaining gaps). Claim: "beats the PARO mechanism in Python KLD"; this is
+> NOT yet "beats shipped PARO on production kldref".
 
 ## The recipe (CORRECTED understanding)
 
@@ -94,8 +96,11 @@ Confirms the codebook edge exists on every model independent of rotation
 
 Since Lloyd ≥ uniform on all 4 (Lloyd-Max minimizes per-group MSE; uniform is a
 suboptimal special case) AND the rotation is shared, **combined ≥ PARO-mechanism
-on all 4 by construction** — the direct 0.8B+9B head-to-head confirms it, and
-27B/A3B follow by the same argument (direct ctx=1024 runs pending).
+on all 4 by construction**. Confirmed directly: 0.8B/9B/A3B trained head-to-head
+(section A) all show combined < PARO-mechanism. 27B's direct training OOMs, but
+its θ=0 Lloyd-vs-uniform baseline (0.602 vs 0.656, −8.2%) demonstrates the
+codebook edge, and rotation is neutral on 27B (same regime as A3B), so the
+combined ≥ PARO-mechanism relationship holds at 27B by the same construction.
 
 ## The full diagnostic trail (what was ruled out)
 
