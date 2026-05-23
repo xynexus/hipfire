@@ -3702,7 +3702,9 @@ fn main() {
             let signs1 = gen_fwht_signs(42, 256);
             let signs2 = gen_fwht_signs(1042, 256);
             let inner_k = inner_shape[1] as usize;
-            let supports_g256 = inner_k % 256 == 0;
+            // HIPFIRE_FORCE_G128: research lever — force expert tensors to g128
+            // (HFQ4G128) to test the group-size hypothesis vs PARO (g128).
+            let supports_g256 = inner_k % 256 == 0 && std::env::var("HIPFIRE_FORCE_G128").is_err();
             // K-map: check the parent tensor name directly. The parent
             // (e.g. "...mlp.experts.gate_up_proj") contains "mlp.experts."
             // so kmap_resolve rule 4 matches it. The kmap HashMap was built
