@@ -167,6 +167,57 @@ def torch_butterfly256_inverse(y: torch.Tensor, theta: torch.Tensor) -> torch.Te
     return x
 
 
+def torch_butterfly256_grouped(x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    """Apply one 8-layer butterfly angle table per 256-wide input group.
+
+    Args:
+        x: tensor with shape [M, n_groups, 256].
+        theta: tensor with shape [n_groups, 8, 128].
+
+    This is the full learnable rotation path: every group has its own complete
+    stride-doubling Givens butterfly. It keeps the functional O(M*groups*256)
+    path and never materializes rotation matrices.
+    """
+    assert x.dim() == 3
+    assert x.shape[-1] == N
+    m, n_groups, _ = x.shape
+    assert theta.shape == (n_groups, LAYER_COUNT, PAIRS_PER_LAYER)
+    y = x.to(torch.float32)
+    for layer in range(LAYER_COUNT):
+        stride = 1 << layer
+        n_blocks = N // (2 * stride)
+        y_blocks = y.reshape(m, n_groups, n_blocks, 2 * stride)
+        a = y_blocks[..., :stride]
+        b = y_blocks[..., stride:]
+        cos_lay = torch.cos(theta[:, layer]).reshape(1, n_groups, n_blocks, stride)
+        sin_lay = torch.sin(theta[:, layer]).reshape(1, n_groups, n_blocks, stride)
+        new_a = cos_lay * a - sin_lay * b
+        new_b = sin_lay * a + cos_lay * b
+        y = torch.cat([new_a, new_b], dim=-1).reshape(m, n_groups, N)
+    return y
+
+
+def torch_butterfly256_grouped_inverse(y: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    """Apply the transpose of torch_butterfly256_grouped."""
+    assert y.dim() == 3
+    assert y.shape[-1] == N
+    m, n_groups, _ = y.shape
+    assert theta.shape == (n_groups, LAYER_COUNT, PAIRS_PER_LAYER)
+    x = y.to(torch.float32)
+    for layer in range(LAYER_COUNT - 1, -1, -1):
+        stride = 1 << layer
+        n_blocks = N // (2 * stride)
+        x_blocks = x.reshape(m, n_groups, n_blocks, 2 * stride)
+        a = x_blocks[..., :stride]
+        b = x_blocks[..., stride:]
+        cos_lay = torch.cos(theta[:, layer]).reshape(1, n_groups, n_blocks, stride)
+        sin_lay = torch.sin(theta[:, layer]).reshape(1, n_groups, n_blocks, stride)
+        new_a = cos_lay * a + sin_lay * b
+        new_b = -sin_lay * a + cos_lay * b
+        x = torch.cat([new_a, new_b], dim=-1).reshape(m, n_groups, N)
+    return x
+
+
 # ---------------------------------------------------------------------------
 # MQ4G256 STE with butterfly residual on top of FWHT.
 # ---------------------------------------------------------------------------
@@ -213,6 +264,51 @@ def quantize_mq4g256_bfly_ste(
     # Inverse butterfly (theta-dependent).
     w_inv_bfly = torch_butterfly256_inverse(w_quant_rot, theta)
     # Inverse FWHT (theta-independent).
+    w_dq = torch_inverse_fwht_256(w_inv_bfly, signs1, signs2)
+    return w_dq.reshape(m, k).to(w.dtype)
+
+
+def quantize_mq4g256_full_butterfly_ste(
+    w: torch.Tensor,
+    theta: torch.Tensor,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+) -> torch.Tensor:
+    """Uniform MQ4G256 round-trip with a per-group learnable butterfly.
+
+    The full rotation for group g is R_g(theta_g) = B(theta_g) o FWHT. At
+    theta_g = 0, B is identity, so R_g is exactly the fixed FWHT baseline.
+    This gives a byte-equal step-0 baseline while allowing each 256-wide group
+    to learn all 8*128 Givens angles.
+    """
+    assert w.dim() == 2
+    m, k = w.shape
+    assert k % N == 0, f"K={k} must be divisible by {N}"
+    n_groups = k // N
+    assert theta.shape == (n_groups, LAYER_COUNT, PAIRS_PER_LAYER)
+
+    w_f32 = w.to(torch.float32)
+    w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), signs1, signs2)
+    w_rotated = torch_butterfly256_grouped(w_fwht, theta)
+
+    # PARO-style proxy: learnable orthogonal rotation plus uniform min/max
+    # 4-bit quantization only. Lloyd-Max is intentionally not used here.
+    with torch.no_grad():
+        min_val = w_rotated.min(dim=-1).values
+        max_val = w_rotated.max(dim=-1).values
+        rng = max_val - min_val
+        scale = torch.where(rng > 0.0, rng / 15.0, torch.ones_like(rng))
+        zero = min_val
+        inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
+        q = torch.clamp(
+            torch.round((w_rotated - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
+            0.0, 15.0,
+        )
+        dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
+        delta = dequant_rot - w_rotated
+
+    w_quant_rot = w_rotated + delta.detach()
+    w_inv_bfly = torch_butterfly256_grouped_inverse(w_quant_rot, theta)
     w_dq = torch_inverse_fwht_256(w_inv_bfly, signs1, signs2)
     return w_dq.reshape(m, k).to(w.dtype)
 
@@ -588,6 +684,76 @@ class ButterflyResidualPseudoQuantLinear(nn.Module):
         self.theta_residual.requires_grad = True
 
 
+class FullRotationPseudoQuantLinear(nn.Module):
+    """MQ4G256 + AWQ + per-group learnable butterfly rotation.
+
+    This is the maximal-DOF path for the MQ4/PARO proxy: each 256-wide input
+    group learns its own full [8, 128] Givens butterfly. The composition is
+
+        R_g(theta_g) = B_g(theta_g) o FWHT_canonical
+
+    so theta_g = 0 makes B_g the identity and the whole wrapper exactly match
+    the fixed FWHT + uniform min/max 4-bit baseline at step 0.
+    """
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        channel_scales_init: torch.Tensor,
+        canonical_name: str,
+    ) -> None:
+        super().__init__()
+        assert weight.dim() == 2
+        m, k = weight.shape
+        assert k % N == 0, f"K={k} must be divisible by {N}"
+        assert channel_scales_init.shape == (k,)
+
+        self.register_buffer("weight", weight.detach().clone())
+        if bias is not None:
+            self.register_buffer("bias", bias.detach().clone())
+        else:
+            self.bias = None
+
+        self.register_buffer(
+            "channel_scales",
+            channel_scales_init.detach().clone().to(torch.float32),
+        )
+
+        self.n_groups = k // N
+        self.quant_bits = 4
+        self.quant_mode = "uniform"
+        self.theta = nn.Parameter(
+            torch.zeros(self.n_groups, LAYER_COUNT, PAIRS_PER_LAYER, dtype=torch.float32),
+            requires_grad=False,
+        )
+
+        self.register_buffer("_fwht_signs1", FWHT_SIGNS1.clone().view(1, N))
+        self.register_buffer("_fwht_signs2", FWHT_SIGNS2.clone().view(1, N))
+
+        self.canonical_name = canonical_name
+        self.k_in = k
+        self.m_out = m
+
+    @property
+    def theta_residual(self) -> nn.Parameter:
+        """Compatibility alias for existing training/export loops."""
+        return self.theta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s_safe = torch.clamp(self.channel_scales, min=1e-6).to(torch.float32)
+        w_dtype = self.weight.dtype
+        w_scaled = self.weight.to(torch.float32) * s_safe.unsqueeze(0)
+        w_q_dq = quantize_mq4g256_full_butterfly_ste(
+            w_scaled, self.theta, self._fwht_signs1, self._fwht_signs2,
+        )
+        x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
+        return F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
+
+    def set_optim(self) -> None:
+        self.theta.requires_grad = True
+
+
 # ---------------------------------------------------------------------------
 # AWQ-F1 target detection + closed-form scale init (from PARO K=0).
 # ---------------------------------------------------------------------------
@@ -792,6 +958,15 @@ def _gguf_imatrix_aliases_for_stored_name(stored: str) -> list[str]:
     if gguf_slot is None:
         return []
     return [f"blk.{layer_idx}.{gguf_slot}.weight"]
+
+
+def _select_wrapper_class(args):
+    """Choose the pseudo-quant wrapper without changing legacy defaults."""
+    if args.rotation_mode == "full-butterfly":
+        return FullRotationPseudoQuantLinear
+    if args.learnable_signs:
+        return LearnableSignsPseudoQuantLinear
+    return ButterflyResidualPseudoQuantLinear
 
 
 def wrap_awq_targets(
@@ -1523,6 +1698,11 @@ def main() -> None:
                     help="Use direct KL-divergence loss (oracle || student) "
                          "instead of per-Linear MSE. Aligns proxy with "
                          "production metric. Phase 4c (decisive test).")
+    ap.add_argument("--rotation-mode", choices=["fwht-signs", "full-butterfly"],
+                    default="fwht-signs",
+                    help="'fwht-signs' preserves existing wrapper selection. "
+                         "'full-butterfly' learns a per-256-group full "
+                         "butterfly rotation with uniform 4-bit min-max quant.")
     ap.add_argument("--learnable-signs", action="store_true",
                     help="Phase 4d: learn per-tensor D1/D2 sign tables "
                          "instead of butterfly residual. Discrete ±1 via "
@@ -1551,6 +1731,8 @@ def main() -> None:
 
     if args.self_test:
         sys.exit(self_test(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu"))
+    if args.rotation_mode == "full-butterfly" and args.learnable_signs:
+        ap.error("--rotation-mode full-butterfly cannot be combined with --learnable-signs")
 
     # Validate required args for non-self-test mode.
     missing = [name for name in ("model", "imatrix", "corpus", "output_dir")
@@ -1578,6 +1760,7 @@ def main() -> None:
     print(f"  n_epochs:        {args.n_epochs}  (=> {args.n_epochs * args.n_sequences} steps total)")
     print(f"  grad-clip:       {args.grad_clip}")
     print(f"  l2-theta:        {args.l2_theta}")
+    print(f"  rotation-mode:   {args.rotation_mode}")
     if args.learnable_signs:
         print(f"  sign granularity: {args.sign_granularity}")
         print(f"  quant mode:       {args.quant_mode}")
@@ -1619,7 +1802,7 @@ def main() -> None:
     print(f"      imatrix tensors: {len(in_sum2_by_name)}")
     stored_keys = _safetensors_keys(args.model)
     print(f"      safetensors keys: {len(stored_keys)}")
-    wrapper_cls = LearnableSignsPseudoQuantLinear if args.learnable_signs else ButterflyResidualPseudoQuantLinear
+    wrapper_cls = _select_wrapper_class(args)
     print(f"      wrapper class: {wrapper_cls.__name__}")
     wrapped = wrap_awq_targets(
         student, in_sum2_by_name, args.alpha, stored_keys, args.target_pattern,
@@ -1771,6 +1954,7 @@ def main() -> None:
     print("\n[6/7] Exporting butterfly residuals + AWQ sidecar ...")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    hfbf_path: Optional[Path] = None
     if args.learnable_signs:
         npz_path = args.output_dir / "learnable_signs.npz"
         npz_dict: dict[str, np.ndarray] = {}
@@ -1795,6 +1979,17 @@ def main() -> None:
             print(f"      wrote {len(bias_dict)} bias corrections → {bias_path} "
                   f"({bias_path.stat().st_size / 1e3:.1f} KB, "
                   f"{total_bias_elems} total F32 elements)")
+    elif args.rotation_mode == "full-butterfly":
+        npz_path = args.output_dir / "full_butterfly_rotations.npz"
+        npz_dict = {}
+        for mod_name, wrapper in sorted(wrapped.items()):
+            npz_dict[wrapper.canonical_name] = wrapper.theta.detach().cpu().numpy().astype(
+                np.float32,
+            )
+        np.savez(npz_path, **npz_dict)
+        print(f"      wrote {len(npz_dict)} per-group full rotations → {npz_path} "
+              f"({npz_path.stat().st_size / 1e6:.2f} MB)")
+        print("      HFBF v1 export skipped: per-group full rotations are stored in NPZ.")
     else:
         npz_path = args.output_dir / "butterfly_residuals.npz"
         npz_dict = {}
@@ -1833,8 +2028,11 @@ def main() -> None:
         "imatrix": str(args.imatrix),
         "corpus": args.corpus,
         "target_pattern": args.target_pattern,
+        "rotation_mode": args.rotation_mode,
         "sign_granularity": args.sign_granularity if args.learnable_signs else None,
-        "quant_mode": args.quant_mode if args.learnable_signs else None,
+        "quant_mode": args.quant_mode if args.learnable_signs else (
+            "uniform" if args.rotation_mode == "full-butterfly" else None
+        ),
         "n_sequences": args.n_sequences,
         "ctx_len": args.ctx_len,
         "alpha": args.alpha,
@@ -1847,7 +2045,9 @@ def main() -> None:
             "grad_clip": args.grad_clip,
             "l2_theta": args.l2_theta,
             "sign_granularity": args.sign_granularity if args.learnable_signs else None,
-            "quant_mode": args.quant_mode if args.learnable_signs else None,
+            "quant_mode": args.quant_mode if args.learnable_signs else (
+                "uniform" if args.rotation_mode == "full-butterfly" else None
+            ),
         },
         "n_epochs": args.n_epochs,
         "n_wrapped": len(wrapped),
@@ -1875,6 +2075,8 @@ def main() -> None:
     print(f"            --awq-alpha {args.alpha} --awq-scope f1 \\")
     if args.learnable_signs:
         print(f"            --learned-signs {npz_path}  # (Phase 8 wiring)")
+    elif args.rotation_mode == "full-butterfly":
+        print(f"            --full-butterfly-rotations {npz_path}  # (research NPZ; Rust wiring pending)")
     else:
         print(f"            --butterfly-residual {hfbf_path}  # (Phase 8 wiring)")
 
