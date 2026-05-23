@@ -617,10 +617,20 @@ def is_awq_f1_target(safetensors_name: str) -> bool:
 
 
 def compute_awq_scales_paper(in_sum2: np.ndarray, alpha: float) -> np.ndarray:
-    """Closed-form AWQ paper-formula: s = exp((alpha/2) * (log(in_sum2) - mean))."""
+    """Closed-form AWQ paper-formula: s = exp((alpha/2) * (log(in_sum2) - mean)).
+
+    Robust to non-finite imatrix values: some imatrices (e.g. the 27B tier1
+    imatrix) contain inf/nan in_sum2 entries from calibration overflow, which
+    would propagate to NaN scales via the log/mean. Non-finite entries are
+    replaced by the median of the finite entries (or 1.0 if none are finite).
+    """
     values = np.asarray(in_sum2, dtype=np.float64).reshape(-1)
     if values.size == 0:
         raise ValueError("empty imatrix vector")
+    finite = np.isfinite(values)
+    if not finite.all():
+        fill = float(np.median(values[finite])) if finite.any() else 1.0
+        values = np.where(finite, values, fill)
     half_alpha = float(alpha) * 0.5
     log_s = half_alpha * np.log(np.maximum(values, 1.0e-12))
     log_s -= np.mean(log_s)
