@@ -82,6 +82,18 @@ So the **Lloyd codebook is the universal edge PARO structurally lacks**;
 the rotation is a bonus on the models where error is outlier-dominated.
 † 27B direct training needs the oracle-caching memory fix (open).
 
+### Python ↔ production scale calibration
+
+The existing production 9B MQ4 baseline (eval_hipfire + qwen3.5-9b kldref on
+`qwen3.5-9b.tier1.mix.fixed.mq4.hfq`) is **slice-mean KLD 0.1788** (PPL 9.17).
+My Python in-memory 9B baseline is 0.353 (64-seq). **The Python eval is a ~2×
+HARSHER proxy than production kldref.** So: the ABSOLUTE Python KLDs in this doc
+overstate error ~2× and must not be quoted as production numbers; the RELATIVE
+head-to-head deltas (both arms measured in the same Python eval) are the
+trustworthy signal and should translate directionally. Production validation of
+the new recipe needs the Rust port (Gap 1 in NEXT-production-closure.md) to emit
+a real `.hfq` — the Python trainer can't produce production numbers.
+
 ### B. Lloyd-vs-uniform baseline sweep (codebook isolated, no rotation, θ=0)
 
 Confirms the codebook edge exists on every model independent of rotation
