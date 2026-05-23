@@ -74,37 +74,39 @@ FWHT_SIGNS2 = _gen_fwht_signs(1042)
 
 def torch_fwht_256(x: torch.Tensor, signs1: torch.Tensor, signs2: torch.Tensor) -> torch.Tensor:
     """In-place stride-doubling FWHT on the last axis (length 256)."""
-    orig_shape = x.shape
-    y = x.reshape(-1, 256).to(torch.float32) * signs1
+    assert x.shape[-1] == N, f"FWHT input last dim must be {N}, got {x.shape[-1]}"
+    prefix_shape = x.shape[:-1]
+    y = x.to(torch.float32) * signs1
     stride = 1
-    while stride < 256:
-        y = y.reshape(-1, 256 // (stride * 2), stride * 2)
-        a = y[:, :, :stride].clone()
-        b = y[:, :, stride:].clone()
-        y[:, :, :stride] = a + b
-        y[:, :, stride:] = a - b
-        y = y.reshape(-1, 256)
+    while stride < N:
+        y = y.reshape(*prefix_shape, N // (stride * 2), stride * 2)
+        a = y[..., :stride].clone()
+        b = y[..., stride:].clone()
+        y[..., :stride] = a + b
+        y[..., stride:] = a - b
+        y = y.reshape(*prefix_shape, N)
         stride *= 2
     y = y * 0.0625 * signs2  # 1/sqrt(256) = 1/16 = 0.0625
-    return y.reshape(orig_shape)
+    return y
 
 
 def torch_inverse_fwht_256(x: torch.Tensor, signs1: torch.Tensor, signs2: torch.Tensor) -> torch.Tensor:
     """Inverse FWHT-256 — swaps signs1/signs2 at endpoints (the FWHT is its own
     inverse up to normalization)."""
-    orig_shape = x.shape
-    y = x.reshape(-1, 256).to(torch.float32) * signs2
+    assert x.shape[-1] == N, f"FWHT input last dim must be {N}, got {x.shape[-1]}"
+    prefix_shape = x.shape[:-1]
+    y = x.to(torch.float32) * signs2
     stride = 1
-    while stride < 256:
-        y = y.reshape(-1, 256 // (stride * 2), stride * 2)
-        a = y[:, :, :stride].clone()
-        b = y[:, :, stride:].clone()
-        y[:, :, :stride] = a + b
-        y[:, :, stride:] = a - b
-        y = y.reshape(-1, 256)
+    while stride < N:
+        y = y.reshape(*prefix_shape, N // (stride * 2), stride * 2)
+        a = y[..., :stride].clone()
+        b = y[..., stride:].clone()
+        y[..., :stride] = a + b
+        y[..., stride:] = a - b
+        y = y.reshape(*prefix_shape, N)
         stride *= 2
     y = y * 0.0625 * signs1
-    return y.reshape(orig_shape)
+    return y
 
 
 # ---------------------------------------------------------------------------
@@ -258,11 +260,11 @@ def quantize_mq4g256_signs_ste(
     assert k % N == 0, f"K={k} must be divisible by {N}"
     n_groups = k // N
 
-    d1_expanded = _expand_signs_for_weight(d1, m, n_groups, "d1")
-    d2_expanded = _expand_signs_for_weight(d2, m, n_groups, "d2")
+    d1_broadcast = _expand_signs_for_weight(d1, m, n_groups, "d1")
+    d2_broadcast = _expand_signs_for_weight(d2, m, n_groups, "d2")
 
     w_f32 = w.to(torch.float32)
-    w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), d1_expanded, d2_expanded)
+    w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), d1_broadcast, d2_broadcast)
 
     with torch.no_grad():
         min_val = w_fwht.min(dim=-1).values
@@ -278,7 +280,7 @@ def quantize_mq4g256_signs_ste(
         dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
         delta = dequant_rot - w_fwht
     w_quant_rot = w_fwht + delta.detach()
-    w_dq = torch_inverse_fwht_256(w_quant_rot, d1_expanded, d2_expanded)
+    w_dq = torch_inverse_fwht_256(w_quant_rot, d1_broadcast, d2_broadcast)
     return w_dq.reshape(m, k).to(w.dtype)
 
 
@@ -288,7 +290,7 @@ def _expand_signs_for_weight(
     n_groups: int,
     label: str,
 ) -> torch.Tensor:
-    """Return signs broadcastable to flattened [M * n_groups, 256] groups.
+    """Return signs broadcastable to [M, n_groups, 256] without expanding M.
 
     `signs` may be:
       - [256] or [1, 256]: one tensor-wide FWHT table, current behavior.
@@ -298,15 +300,15 @@ def _expand_signs_for_weight(
     if signs.dim() == 1:
         if signs.shape != (N,):
             raise AssertionError(f"{label} must have shape [256], got {tuple(signs.shape)}")
-        return signs.view(1, N)
+        return signs.view(1, 1, N)
     if signs.dim() != 2 or signs.shape[1] != N:
         raise AssertionError(f"{label} must have shape [*, 256], got {tuple(signs.shape)}")
     if signs.shape[0] == 1:
-        return signs
+        return signs.view(1, 1, N)
     if signs.shape[0] == n_groups:
-        return signs.unsqueeze(0).expand(m, n_groups, N).reshape(m * n_groups, N)
+        return signs.unsqueeze(0)
     if signs.shape[0] == m * n_groups:
-        return signs
+        return signs.view(m, n_groups, N)
     raise AssertionError(
         f"{label} has {signs.shape[0]} sign rows, expected 1, {n_groups}, "
         f"or {m * n_groups}"
