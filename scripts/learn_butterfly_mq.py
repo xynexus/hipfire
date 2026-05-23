@@ -52,6 +52,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +290,7 @@ def quantize_mq4g256_full_butterfly_ste(
 
     w_f32 = w.to(torch.float32)
     w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), signs1, signs2)
-    w_rotated = torch_butterfly256_grouped(w_fwht, theta)
+    w_rotated = checkpoint(torch_butterfly256_grouped, w_fwht, theta, use_reentrant=False)
 
     # PARO-style proxy: learnable orthogonal rotation plus uniform min/max
     # 4-bit quantization only. Lloyd-Max is intentionally not used here.
@@ -308,7 +309,7 @@ def quantize_mq4g256_full_butterfly_ste(
         delta = dequant_rot - w_rotated
 
     w_quant_rot = w_rotated + delta.detach()
-    w_inv_bfly = torch_butterfly256_grouped_inverse(w_quant_rot, theta)
+    w_inv_bfly = checkpoint(torch_butterfly256_grouped_inverse, w_quant_rot, theta, use_reentrant=False)
     w_dq = torch_inverse_fwht_256(w_inv_bfly, signs1, signs2)
     return w_dq.reshape(m, k).to(w.dtype)
 
