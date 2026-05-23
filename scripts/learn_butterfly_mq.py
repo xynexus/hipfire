@@ -274,13 +274,19 @@ def quantize_mq4g256_full_butterfly_ste(
     theta: torch.Tensor,
     signs1: torch.Tensor,
     signs2: torch.Tensor,
+    quant_bits: int = 4,
+    quant_mode: str = "uniform",
 ) -> torch.Tensor:
-    """Uniform MQ4G256 round-trip with a per-group learnable butterfly.
+    """MQ4G256 round-trip with a per-group learnable butterfly rotation.
 
     The full rotation for group g is R_g(theta_g) = B(theta_g) o FWHT. At
     theta_g = 0, B is identity, so R_g is exactly the fixed FWHT baseline.
     This gives a byte-equal step-0 baseline while allowing each 256-wide group
     to learn all 8*128 Givens angles.
+
+    quant_mode='uniform' = PARO-mechanism proxy (learnable rotation + uniform
+    min-max RTN). quant_mode='lloyd' = the combined recipe (learnable rotation
+    + non-uniform Lloyd codebook) that should beat the PARO mechanism.
     """
     assert w.dim() == 2
     m, k = w.shape
@@ -292,21 +298,27 @@ def quantize_mq4g256_full_butterfly_ste(
     w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), signs1, signs2)
     w_rotated = checkpoint(torch_butterfly256_grouped, w_fwht, theta, use_reentrant=False)
 
-    # PARO-style proxy: learnable orthogonal rotation plus uniform min/max
-    # 4-bit quantization only. Lloyd-Max is intentionally not used here.
-    with torch.no_grad():
-        min_val = w_rotated.min(dim=-1).values
-        max_val = w_rotated.max(dim=-1).values
-        rng = max_val - min_val
-        scale = torch.where(rng > 0.0, rng / 15.0, torch.ones_like(rng))
-        zero = min_val
-        inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
-        q = torch.clamp(
-            torch.round((w_rotated - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
-            0.0, 15.0,
-        )
-        dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
-        delta = dequant_rot - w_rotated
+    qmax = float((1 << quant_bits) - 1)
+    if quant_mode == "uniform":
+        with torch.no_grad():
+            min_val = w_rotated.min(dim=-1).values
+            max_val = w_rotated.max(dim=-1).values
+            rng = max_val - min_val
+            scale = torch.where(rng > 0.0, rng / qmax, torch.ones_like(rng))
+            zero = min_val
+            inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
+            q = torch.clamp(
+                torch.round((w_rotated - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
+                0.0, qmax,
+            )
+            dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
+            delta = dequant_rot - w_rotated
+    elif quant_mode == "lloyd":
+        with torch.no_grad():
+            dequant_rot = _lloyd_max_dequant_per_group(w_rotated, quant_bits)
+            delta = dequant_rot - w_rotated
+    else:
+        raise ValueError("quant_mode must be 'uniform' or 'lloyd'")
 
     w_quant_rot = w_rotated + delta.detach()
     w_inv_bfly = checkpoint(torch_butterfly256_grouped_inverse, w_quant_rot, theta, use_reentrant=False)
@@ -703,12 +715,16 @@ class FullRotationPseudoQuantLinear(nn.Module):
         bias: Optional[torch.Tensor],
         channel_scales_init: torch.Tensor,
         canonical_name: str,
+        quant_bits: int = 4,
+        quant_mode: str = "uniform",
     ) -> None:
         super().__init__()
         assert weight.dim() == 2
         m, k = weight.shape
         assert k % N == 0, f"K={k} must be divisible by {N}"
         assert channel_scales_init.shape == (k,)
+        if quant_mode not in ("uniform", "lloyd"):
+            raise ValueError("quant_mode must be 'uniform' or 'lloyd'")
 
         self.register_buffer("weight", weight.detach().clone())
         if bias is not None:
@@ -722,8 +738,8 @@ class FullRotationPseudoQuantLinear(nn.Module):
         )
 
         self.n_groups = k // N
-        self.quant_bits = 4
-        self.quant_mode = "uniform"
+        self.quant_bits = quant_bits
+        self.quant_mode = quant_mode
         self.theta = nn.Parameter(
             torch.zeros(self.n_groups, LAYER_COUNT, PAIRS_PER_LAYER, dtype=torch.float32),
             requires_grad=False,
@@ -747,6 +763,7 @@ class FullRotationPseudoQuantLinear(nn.Module):
         w_scaled = self.weight.to(torch.float32) * s_safe.unsqueeze(0)
         w_q_dq = quantize_mq4g256_full_butterfly_ste(
             w_scaled, self.theta, self._fwht_signs1, self._fwht_signs2,
+            quant_bits=self.quant_bits, quant_mode=self.quant_mode,
         )
         x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
         return F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
@@ -1039,6 +1056,11 @@ def wrap_awq_targets(
                 weight, bias, init_s, canonical,
                 sign_granularity=sign_granularity, quant_bits=quant_bits,
                 quant_mode=quant_mode,
+            )
+        elif wrapper_class is FullRotationPseudoQuantLinear:
+            wrapper = wrapper_class(
+                weight, bias, init_s, canonical,
+                quant_bits=quant_bits, quant_mode=quant_mode,
             )
         else:
             wrapper = wrapper_class(weight, bias, init_s, canonical)
