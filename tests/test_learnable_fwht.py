@@ -36,6 +36,44 @@ def test_group_signs_initialize_to_tensor_baseline():
     torch.testing.assert_close(group_wide(x), tensor_wide(x), rtol=0.0, atol=0.0)
 
 
+def test_quant_mode_uniform_is_default_byte_equal():
+    torch.manual_seed(234)
+    weight = torch.randn(3, N * 2, dtype=torch.float32)
+    wrapper = LearnableSignsPseudoQuantLinear(
+        weight, None, torch.ones(N * 2), "fixture.tensor", sign_granularity="group",
+    )
+
+    d1 = sign_ste(wrapper.d1_logits)
+    d2 = sign_ste(wrapper.d2_logits)
+
+    default = quantize_mq4g256_signs_ste(weight, d1, d2)
+    explicit = quantize_mq4g256_signs_ste(weight, d1, d2, quant_mode="uniform")
+
+    torch.testing.assert_close(default, explicit, rtol=0.0, atol=0.0)
+
+
+def test_lloyd_quant_mode_forward_and_backward_work():
+    torch.manual_seed(345)
+    weight = torch.randn(2, N * 3, dtype=torch.float32)
+    wrapper = LearnableSignsPseudoQuantLinear(
+        weight, None, torch.ones(N * 3), "fixture.tensor",
+        sign_granularity="group", quant_mode="lloyd",
+    )
+    wrapper.set_optim()
+    x = torch.randn(4, N * 3, dtype=torch.float32)
+
+    y = wrapper(x)
+    loss = y.pow(2).mean()
+    loss.backward()
+
+    assert y.shape == (4, 2)
+    assert wrapper.quant_mode == "lloyd"
+    assert wrapper.d1_logits.grad is not None
+    assert wrapper.d2_logits.grad is not None
+    assert torch.isfinite(wrapper.d1_logits.grad).all()
+    assert torch.isfinite(wrapper.d2_logits.grad).all()
+
+
 def test_group_signs_do_not_cross_talk_between_256_wide_groups():
     torch.manual_seed(456)
     weight = torch.randn(3, N * 2, dtype=torch.float32)
@@ -57,5 +95,7 @@ def test_group_signs_do_not_cross_talk_between_256_wide_groups():
 
 if __name__ == "__main__":
     test_group_signs_initialize_to_tensor_baseline()
+    test_quant_mode_uniform_is_default_byte_equal()
+    test_lloyd_quant_mode_forward_and_backward_work()
     test_group_signs_do_not_cross_talk_between_256_wide_groups()
     print("learnable FWHT tests passed")

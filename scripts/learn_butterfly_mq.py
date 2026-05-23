@@ -249,6 +249,7 @@ def quantize_mq4g256_signs_ste(
     d1: torch.Tensor,
     d2: torch.Tensor,
     quant_bits: int = 4,
+    quant_mode: str = "uniform",
 ) -> torch.Tensor:
     """MQ4G256 round-trip with learnable D1/D2 sign tables.
 
@@ -268,22 +269,101 @@ def quantize_mq4g256_signs_ste(
     w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), d1_broadcast, d2_broadcast)
 
     qmax = float((1 << quant_bits) - 1)  # 4-bit→15, 6-bit→63, 8-bit→255
-    with torch.no_grad():
-        min_val = w_fwht.min(dim=-1).values
-        max_val = w_fwht.max(dim=-1).values
-        rng = max_val - min_val
-        scale = torch.where(rng > 0.0, rng / qmax, torch.ones_like(rng))
-        zero = min_val
-        inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
-        q = torch.clamp(
-            torch.round((w_fwht - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
-            0.0, qmax,
-        )
-        dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
-        delta = dequant_rot - w_fwht
+    if quant_mode == "uniform":
+        with torch.no_grad():
+            min_val = w_fwht.min(dim=-1).values
+            max_val = w_fwht.max(dim=-1).values
+            rng = max_val - min_val
+            scale = torch.where(rng > 0.0, rng / qmax, torch.ones_like(rng))
+            zero = min_val
+            inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
+            q = torch.clamp(
+                torch.round((w_fwht - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
+                0.0, qmax,
+            )
+            dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
+            delta = dequant_rot - w_fwht
+    elif quant_mode == "lloyd":
+        with torch.no_grad():
+            dequant_rot = _lloyd_max_dequant_per_group(w_fwht, quant_bits)
+            delta = dequant_rot - w_fwht
+    else:
+        raise ValueError("quant_mode must be 'uniform' or 'lloyd'")
     w_quant_rot = w_fwht + delta.detach()
     w_dq = torch_inverse_fwht_256(w_quant_rot, d1_broadcast, d2_broadcast)
     return w_dq.reshape(m, k).to(w.dtype)
+
+
+def _lloyd_max_dequant_per_group(
+    w_fwht: torch.Tensor,
+    quant_bits: int,
+    chunk_groups: int = 8192,
+    n_iter: int = 8,
+) -> torch.Tensor:
+    """Fit per-256-group Lloyd-Max centroids and return dequantized weights.
+
+    The largest production tensors have hundreds of thousands of 256-point
+    groups. Chunking caps the transient [groups, 256, centroids] distance tensor.
+    """
+    n_centroids = 1 << quant_bits
+    m, n_groups, _ = w_fwht.shape
+    dequant = torch.empty_like(w_fwht)
+    quantiles = torch.linspace(
+        0.0, 1.0, n_centroids, device=w_fwht.device, dtype=w_fwht.dtype,
+    )
+    ones_template = torch.ones((1, N), device=w_fwht.device, dtype=w_fwht.dtype)
+
+    if n_groups <= chunk_groups:
+        rows_per_chunk = max(1, chunk_groups // n_groups)
+        for row_start in range(0, m, rows_per_chunk):
+            row_end = min(row_start + rows_per_chunk, m)
+            chunk = w_fwht[row_start:row_end].reshape(-1, N)
+            dequant[row_start:row_end] = _lloyd_max_dequant_chunk(
+                chunk, quantiles, ones_template, n_iter,
+            ).reshape(row_end - row_start, n_groups, N)
+            del chunk
+    else:
+        for row in range(m):
+            for group_start in range(0, n_groups, chunk_groups):
+                group_end = min(group_start + chunk_groups, n_groups)
+                chunk = w_fwht[row:row + 1, group_start:group_end].reshape(-1, N)
+                dequant[row:row + 1, group_start:group_end] = _lloyd_max_dequant_chunk(
+                    chunk, quantiles, ones_template, n_iter,
+                ).reshape(1, group_end - group_start, N)
+                del chunk
+
+    return dequant
+
+
+def _lloyd_max_dequant_chunk(
+    chunk: torch.Tensor,
+    quantiles: torch.Tensor,
+    ones_template: torch.Tensor,
+    n_iter: int,
+) -> torch.Tensor:
+    centroids = torch.quantile(chunk, quantiles, dim=-1).transpose(0, 1).contiguous()
+
+    for _ in range(n_iter):
+        distances = (chunk.unsqueeze(-1) - centroids.unsqueeze(1)).square()
+        assignment = distances.argmin(dim=-1)
+        del distances
+
+        sums = torch.zeros_like(centroids)
+        counts = torch.zeros_like(centroids)
+        sums.scatter_add_(1, assignment, chunk)
+        counts.scatter_add_(1, assignment, ones_template.expand_as(chunk))
+        nonempty = counts > 0.0
+        updated = sums / counts.clamp_min(1.0)
+        centroids = torch.where(nonempty, updated, centroids)
+        del assignment, sums, counts, nonempty, updated
+
+    distances = (chunk.unsqueeze(-1) - centroids.unsqueeze(1)).square()
+    assignment = distances.argmin(dim=-1)
+    del distances
+    dequant = centroids.gather(1, assignment)
+    del assignment, centroids
+
+    return dequant
 
 
 def _expand_signs_for_weight(
@@ -343,6 +423,7 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         canonical_name: str,
         sign_granularity: str = "tensor",
         quant_bits: int = 4,
+        quant_mode: str = "uniform",
     ) -> None:
         super().__init__()
         assert weight.dim() == 2
@@ -351,7 +432,10 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         assert channel_scales_init.shape == (k,)
         if sign_granularity not in ("tensor", "group"):
             raise ValueError("sign_granularity must be 'tensor' or 'group'")
+        if quant_mode not in ("uniform", "lloyd"):
+            raise ValueError("quant_mode must be 'uniform' or 'lloyd'")
         self.quant_bits = quant_bits
+        self.quant_mode = quant_mode
 
         self.register_buffer("weight", weight.detach().clone())
         if bias is not None:
@@ -413,7 +497,9 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         d2 = sign_ste(self.d2_logits)
 
         w_scaled = self.weight.to(torch.float32) * s_safe.unsqueeze(0)
-        w_q_dq = quantize_mq4g256_signs_ste(w_scaled, d1, d2, quant_bits=self.quant_bits)
+        w_q_dq = quantize_mq4g256_signs_ste(
+            w_scaled, d1, d2, quant_bits=self.quant_bits, quant_mode=self.quant_mode,
+        )
         x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
         y = F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
         # Bias correction: continuous learnable offset on output channels.
@@ -707,6 +793,7 @@ def wrap_awq_targets(
     wrapper_class=None,
     sign_granularity: str = "tensor",
     quant_bits: int = 4,
+    quant_mode: str = "uniform",
 ) -> dict[str, nn.Module]:
     """Wrap all AWQ-F1 Linears whose stored name matches `target_pattern`.
 
@@ -765,6 +852,7 @@ def wrap_awq_targets(
             wrapper = wrapper_class(
                 weight, bias, init_s, canonical,
                 sign_granularity=sign_granularity, quant_bits=quant_bits,
+                quant_mode=quant_mode,
             )
         else:
             wrapper = wrapper_class(weight, bias, init_s, canonical)
@@ -1445,6 +1533,10 @@ def main() -> None:
                     help="Quantization bit-width for the pseudo-quant (4=MQ4 default, "
                          "6, 8 for granularity-ceiling diagnostics). Only affects "
                          "--learnable-signs path.")
+    ap.add_argument("--quant-mode", choices=["uniform", "lloyd"], default="uniform",
+                    help="Pseudo-quant mode for --learnable-signs. 'uniform' is "
+                         "the existing min-max RTN path; 'lloyd' fits per-group "
+                         "Lloyd-Max codebooks each forward.")
     args = ap.parse_args()
 
     if args.self_test:
@@ -1478,6 +1570,7 @@ def main() -> None:
     print(f"  l2-theta:        {args.l2_theta}")
     if args.learnable_signs:
         print(f"  sign granularity: {args.sign_granularity}")
+        print(f"  quant mode:       {args.quant_mode}")
     print()
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
@@ -1523,6 +1616,7 @@ def main() -> None:
         wrapper_class=wrapper_cls,
         sign_granularity=args.sign_granularity,
         quant_bits=args.quant_bits,
+        quant_mode=args.quant_mode,
     )
     print(f"      wrap done in {time.time() - t0:.1f}s")
     if not wrapped:
@@ -1730,6 +1824,7 @@ def main() -> None:
         "corpus": args.corpus,
         "target_pattern": args.target_pattern,
         "sign_granularity": args.sign_granularity if args.learnable_signs else None,
+        "quant_mode": args.quant_mode if args.learnable_signs else None,
         "n_sequences": args.n_sequences,
         "ctx_len": args.ctx_len,
         "alpha": args.alpha,
@@ -1742,6 +1837,7 @@ def main() -> None:
             "grad_clip": args.grad_clip,
             "l2_theta": args.l2_theta,
             "sign_granularity": args.sign_granularity if args.learnable_signs else None,
+            "quant_mode": args.quant_mode if args.learnable_signs else None,
         },
         "n_epochs": args.n_epochs,
         "n_wrapped": len(wrapped),
