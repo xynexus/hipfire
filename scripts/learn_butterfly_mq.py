@@ -662,6 +662,38 @@ def _set_module(root: nn.Module, dotted: str, replacement: nn.Module) -> None:
 import re
 
 
+_GGUF_IMATRIX_SLOT_BY_HF_SUFFIX = {
+    "self_attn.q_proj": "attn_q",
+    "self_attn.k_proj": "attn_k",
+    "self_attn.v_proj": "attn_v",
+    "self_attn.o_proj": "attn_output",
+    "mlp.gate_proj": "ffn_gate",
+    "mlp.up_proj": "ffn_up",
+    "mlp.down_proj": "ffn_down",
+    # Qwen3.5 hybrid linear-attention aliases emitted by llama.cpp imatrix.
+    "linear_attn.in_proj_z": "attn_gate",
+    "linear_attn.in_proj_qkv": "attn_qkv",
+    "linear_attn.in_proj_a": "ssm_alpha",
+    "linear_attn.in_proj_b": "ssm_beta",
+    "linear_attn.out_proj": "ssm_out",
+}
+
+
+def _gguf_imatrix_aliases_for_stored_name(stored: str) -> list[str]:
+    """Return llama.cpp GGUF imatrix logical names that can back an HF tensor."""
+    m = re.match(
+        r"^(?:model(?:\.language_model)?\.)?layers\.(\d+)\.(.+)\.weight$",
+        stored,
+    )
+    if not m:
+        return []
+    layer_idx, hf_suffix = m.groups()
+    gguf_slot = _GGUF_IMATRIX_SLOT_BY_HF_SUFFIX.get(hf_suffix)
+    if gguf_slot is None:
+        return []
+    return [f"blk.{layer_idx}.{gguf_slot}.weight"]
+
+
 def wrap_awq_targets(
     model: nn.Module,
     in_sum2_by_name: dict[str, np.ndarray],
@@ -704,10 +736,16 @@ def wrap_awq_targets(
         if k % N != 0:
             skipped_k_not_256 += 1
             continue
-        if stored not in in_sum2_by_name:
+        imatrix_name = stored
+        if imatrix_name not in in_sum2_by_name:
+            for alias in _gguf_imatrix_aliases_for_stored_name(stored):
+                if alias in in_sum2_by_name:
+                    imatrix_name = alias
+                    break
+        if imatrix_name not in in_sum2_by_name:
             skipped_no_imatrix += 1
             continue
-        in_sum2 = in_sum2_by_name[stored]
+        in_sum2 = in_sum2_by_name[imatrix_name]
         if in_sum2.size != k:
             print(f"  WARN: {stored} imatrix K={in_sum2.size} vs module K={k} - skipping",
                   file=sys.stderr)
