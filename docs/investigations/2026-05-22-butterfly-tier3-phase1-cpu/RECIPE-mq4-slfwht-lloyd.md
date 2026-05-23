@@ -1,8 +1,12 @@
-# MQ4-SLfwht+Lloyd — the recipe and the PARO comparison (2026-05-23)
+# MQ4-SLfwht+Lloyd — the recipe and the PARO-PROXY comparison (2026-05-23)
 
-> Status: 0.8B + 9B validated (Python KLD); 27B + A3B in progress. This is the
-> running synthesis of the learnable-FWHT-on-MQ4 investigation toward the goal
-> "match or beat PARO on Qwen3.5-0.8B/9B + Qwen3.6-27B/A3B".
+> Status: all 4 trunk models measured in **Python in-memory KLD** vs a
+> **PARO-PROXY** (scaling + rotation + uniform-4bit). NOT yet validated against
+> REAL ParoQuant numbers or the production kldref pipeline — those are the two
+> open gaps before any "beats PARO" claim is airtight. This doc claims
+> "beats PARO-proxy", not "beats PARO". Synthesis of the learnable-FWHT-on-MQ4
+> investigation toward the goal "match or beat PARO on Qwen3.5-0.8B/9B +
+> Qwen3.6-27B/A3B".
 
 ## The recipe
 
@@ -17,7 +21,7 @@ Two complementary levers covering two distinct quant-error regimes:
 | Learned signs (rotation) | outlier-dominated per-group error (spreads outliers, tightens range) | 0.8B (−20.7%) |
 | Lloyd codebook (quantizer) | granularity-bound error (places 16 levels where mass is) | 9B (−10%), 0.8B (−33%) |
 
-## Why this beats PARO
+## Why this beats the PARO-proxy (and likely real PARO, pending measurement)
 
 PARO = channel scaling + learnable pairwise Givens rotations + **uniform**
 quantization. Crucially, **PARO has no non-uniform codebook**, and its rotation
@@ -99,13 +103,18 @@ by a non-finite-sanitized imatrix; the relative Lloyd win is robust regardless.
 ## Recommendation
 
 - **MQ4-SLfwht (signs) ships as a 0.8B-class free quality lever** (zero runtime
-  cost, −20% KLD on outlier-dominated models).
-- **MQ4-SLfwht+Lloyd is the recipe to match/beat PARO across the trunk**, with
-  the Lloyd codebook carrying the variance-dominated models (9B/27B/A3B). It
-  pays a codebook-lookup runtime cost.
-- **Before any "beats PARO" claim**: (a) confirm 27B/A3B follow the 9B pattern,
-  (b) establish real PARO numbers (eval the native PARO A3B model + ideally a
-  continuous-Givens proxy), (c) re-measure on the production kldref pipeline.
+  cost, −20% KLD on outlier-dominated models). Pure learnable-FWHT does NOT
+  help variance-dominated 9B/27B/A3B (granularity wall) — this is a settled
+  negative result, not a tuning gap.
+- **MQ4-SLfwht+Lloyd beats the PARO-PROXY across the trunk** (all 4 models,
+  Python KLD), with the Lloyd codebook carrying the variance-dominated models.
+  It pays a codebook-lookup runtime cost. This is NOT yet a "beats real PARO"
+  claim — see open gaps below.
+- **Open gaps before "beats real PARO" is airtight** (both unmeasured): (a)
+  establish REAL ParoQuant numbers (eval the native PARO A3B model + ideally a
+  continuous-Givens proxy that confirms PARO's rotation also can't beat the
+  variance wall), (b) re-measure on the production kldref pipeline (Python
+  in-memory KLD has ~15% slice variance and an unknown absolute offset).
 
 ## Credit
 
