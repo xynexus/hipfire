@@ -258,8 +258,11 @@ def quantize_mq4g256_signs_ste(
     assert k % N == 0, f"K={k} must be divisible by {N}"
     n_groups = k // N
 
+    d1_expanded = _expand_signs_for_weight(d1, m, n_groups, "d1")
+    d2_expanded = _expand_signs_for_weight(d2, m, n_groups, "d2")
+
     w_f32 = w.to(torch.float32)
-    w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), d1, d2)
+    w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), d1_expanded, d2_expanded)
 
     with torch.no_grad():
         min_val = w_fwht.min(dim=-1).values
@@ -275,8 +278,39 @@ def quantize_mq4g256_signs_ste(
         dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
         delta = dequant_rot - w_fwht
     w_quant_rot = w_fwht + delta.detach()
-    w_dq = torch_inverse_fwht_256(w_quant_rot, d1, d2)
+    w_dq = torch_inverse_fwht_256(w_quant_rot, d1_expanded, d2_expanded)
     return w_dq.reshape(m, k).to(w.dtype)
+
+
+def _expand_signs_for_weight(
+    signs: torch.Tensor,
+    m: int,
+    n_groups: int,
+    label: str,
+) -> torch.Tensor:
+    """Return signs broadcastable to flattened [M * n_groups, 256] groups.
+
+    `signs` may be:
+      - [256] or [1, 256]: one tensor-wide FWHT table, current behavior.
+      - [n_groups, 256]: one table per input group, shared across rows.
+      - [M * n_groups, 256]: fully expanded internal form.
+    """
+    if signs.dim() == 1:
+        if signs.shape != (N,):
+            raise AssertionError(f"{label} must have shape [256], got {tuple(signs.shape)}")
+        return signs.view(1, N)
+    if signs.dim() != 2 or signs.shape[1] != N:
+        raise AssertionError(f"{label} must have shape [*, 256], got {tuple(signs.shape)}")
+    if signs.shape[0] == 1:
+        return signs
+    if signs.shape[0] == n_groups:
+        return signs.unsqueeze(0).expand(m, n_groups, N).reshape(m * n_groups, N)
+    if signs.shape[0] == m * n_groups:
+        return signs
+    raise AssertionError(
+        f"{label} has {signs.shape[0]} sign rows, expected 1, {n_groups}, "
+        f"or {m * n_groups}"
+    )
 
 
 class LearnableSignsPseudoQuantLinear(nn.Module):
@@ -284,14 +318,17 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
 
     The FWHT structure (8 stride-doubling layers of 2x2 Hadamard butterflies)
     stays fixed. Only the input diagonal D1 and output diagonal D2 are
-    learnable. Init: D1 = sign_table_seed_42, D2 = sign_table_seed_1042
-    (i.e., identical to current MQ4+AWQ pipeline at logits step 0).
+    learnable. Tensor granularity learns one D1/D2 pair per Linear. Group
+    granularity learns one D1/D2 pair per 256-wide input group, which preserves
+    the MQ4 block contract while avoiding cross-group gradient cancellation on
+    wider models. Init: D1 = sign_table_seed_42, D2 = sign_table_seed_1042
+    for every learned table (i.e., identical to current MQ4+AWQ pipeline at
+    logits step 0).
 
-    Storage: per-tensor ±1 sign tables of length 256 each. Same kernel
-    signature as current FWHT path — only the sign table values differ.
-    Compared to butterfly residual (1024 angles per Linear), this has 512
-    discrete sign bits per Linear — half the parameter count, more global
-    influence on the rotation structure.
+    Storage: ±1 sign tables of length 256 each. Tensor mode is 512 discrete
+    sign bits per Linear. Group mode is 512 * n_groups bits per Linear.
+    Runtime support needs to route the matching sign table into the per-weight
+    MQ rotation before GEMV; the Python trainer is the empirical search path.
     """
 
     def __init__(
@@ -300,12 +337,15 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         bias: Optional[torch.Tensor],
         channel_scales_init: torch.Tensor,
         canonical_name: str,
+        sign_granularity: str = "tensor",
     ) -> None:
         super().__init__()
         assert weight.dim() == 2
         m, k = weight.shape
         assert k % N == 0
         assert channel_scales_init.shape == (k,)
+        if sign_granularity not in ("tensor", "group"):
+            raise ValueError("sign_granularity must be 'tensor' or 'group'")
 
         self.register_buffer("weight", weight.detach().clone())
         if bias is not None:
@@ -318,6 +358,9 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
             channel_scales_init.detach().clone().to(torch.float32),
         )
 
+        self.sign_granularity = sign_granularity
+        self.n_groups = k // N
+
         # Init logits at sign(seed) * 0.001 (very small magnitude). sign(logits)
         # = sign(seed) so FWHT reproduces current pipeline byte-equal at step 0.
         # On real model + calib data the per-Linear MSE is small (~7e-3 vs
@@ -326,12 +369,18 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         # over a handful of steps can cross zero — 1e-3 init with grad~1e-4
         # × lr=1.0 + momentum gets there in a few steps.
         init_scale = 0.001
+        if sign_granularity == "group":
+            d1_init = FWHT_SIGNS1.clone().to(torch.float32).view(1, N).repeat(self.n_groups, 1)
+            d2_init = FWHT_SIGNS2.clone().to(torch.float32).view(1, N).repeat(self.n_groups, 1)
+        else:
+            d1_init = FWHT_SIGNS1.clone().to(torch.float32)
+            d2_init = FWHT_SIGNS2.clone().to(torch.float32)
         self.d1_logits = nn.Parameter(
-            FWHT_SIGNS1.clone().to(torch.float32) * init_scale,
+            d1_init * init_scale,
             requires_grad=False,
         )
         self.d2_logits = nn.Parameter(
-            FWHT_SIGNS2.clone().to(torch.float32) * init_scale,
+            d2_init * init_scale,
             requires_grad=False,
         )
 
@@ -354,8 +403,8 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         w_dtype = self.weight.dtype
 
         # STE-projected sign tables; backward flows through as identity.
-        d1 = sign_ste(self.d1_logits).view(1, N)
-        d2 = sign_ste(self.d2_logits).view(1, N)
+        d1 = sign_ste(self.d1_logits)
+        d2 = sign_ste(self.d2_logits)
 
         w_scaled = self.weight.to(torch.float32) * s_safe.unsqueeze(0)
         w_q_dq = quantize_mq4g256_signs_ste(w_scaled, d1, d2)
@@ -376,6 +425,9 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         """How many entries have flipped sign vs the seed init (D1, D2)."""
         d1_init = FWHT_SIGNS1.to(self.d1_logits.device)
         d2_init = FWHT_SIGNS2.to(self.d2_logits.device)
+        if self.d1_logits.dim() == 2:
+            d1_init = d1_init.view(1, N).expand_as(self.d1_logits)
+            d2_init = d2_init.view(1, N).expand_as(self.d2_logits)
         d1_now = (self.d1_logits >= 0.0).float() * 2.0 - 1.0
         d2_now = (self.d2_logits >= 0.0).float() * 2.0 - 1.0
         return (
@@ -615,6 +667,7 @@ def wrap_awq_targets(
     stored_keys: set[str],
     target_pattern: Optional[str],
     wrapper_class=None,
+    sign_granularity: str = "tensor",
 ) -> dict[str, nn.Module]:
     """Wrap all AWQ-F1 Linears whose stored name matches `target_pattern`.
 
@@ -663,7 +716,12 @@ def wrap_awq_targets(
         weight = module.weight.detach().clone()
         bias = module.bias.detach().clone() if module.bias is not None else None
         device = module.weight.device
-        wrapper = wrapper_class(weight, bias, init_s, canonical)
+        if wrapper_class is LearnableSignsPseudoQuantLinear:
+            wrapper = wrapper_class(
+                weight, bias, init_s, canonical, sign_granularity=sign_granularity,
+            )
+        else:
+            wrapper = wrapper_class(weight, bias, init_s, canonical)
         wrapper = wrapper.to(device=device)
         _set_module(model, mod_name, wrapper)
         wrapped[mod_name] = wrapper
@@ -1325,6 +1383,12 @@ def main() -> None:
                     help="Phase 4d: learn per-tensor D1/D2 sign tables "
                          "instead of butterfly residual. Discrete ±1 via "
                          "sign-STE. Init at seeds 42/1042.")
+    ap.add_argument("--sign-granularity", choices=["tensor", "group"], default="tensor",
+                    help="Granularity for --learnable-signs. 'tensor' preserves "
+                         "the Phase 4d one-D1/D2-pair-per-Linear recipe; "
+                         "'group' learns one D1/D2 pair per 256-wide input "
+                         "group, avoiding cross-group gradient cancellation "
+                         "on wider models such as 9B.")
     ap.add_argument("--bias-correction", action="store_true",
                     help="Option #9: also learn per-Linear bias correction "
                          "in addition to D1/D2 signs. Requires --learnable-signs "
@@ -1362,6 +1426,8 @@ def main() -> None:
     print(f"  n_epochs:        {args.n_epochs}  (=> {args.n_epochs * args.n_sequences} steps total)")
     print(f"  grad-clip:       {args.grad_clip}")
     print(f"  l2-theta:        {args.l2_theta}")
+    if args.learnable_signs:
+        print(f"  sign granularity: {args.sign_granularity}")
     print()
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
@@ -1405,6 +1471,7 @@ def main() -> None:
     wrapped = wrap_awq_targets(
         student, in_sum2_by_name, args.alpha, stored_keys, args.target_pattern,
         wrapper_class=wrapper_cls,
+        sign_granularity=args.sign_granularity,
     )
     print(f"      wrap done in {time.time() - t0:.1f}s")
     if not wrapped:
@@ -1443,7 +1510,7 @@ def main() -> None:
         )
         print(f"      baseline KLD (theta=0):  {smoke_kld_baseline:.6f}")
 
-    print("\n[5/7] Training butterfly residuals ...")
+    print("\n[5/7] Training rotation parameters ...")
     train_start = time.time()
     if args.loss_kld:
         bias_lr_arg = args.bias_lr if args.bias_correction else None
@@ -1508,13 +1575,15 @@ def main() -> None:
             d1_flips, d2_flips = w.baseline_sign_flips()
             sign_flips[n] = (d1_flips, d2_flips)
             final_theta_norms[n] = float(d1_flips + d2_flips)
-        print("\n      sign-flip summary (first 8 tensors, out of 256 each for D1/D2):")
+        print("\n      sign-flip summary (first 8 tensors, denominator is sign entries per D1/D2):")
         for n in list(wrapped.keys())[:8]:
             d1f, d2f = sign_flips[n]
-            print(f"        {n}:   D1 flips {d1f}/256, D2 flips {d2f}/256")
+            denom = wrapped[n].d1_logits.numel()
+            print(f"        {n}:   D1 flips {d1f}/{denom}, D2 flips {d2f}/{denom}")
         total_d1 = sum(v[0] for v in sign_flips.values())
         total_d2 = sum(v[1] for v in sign_flips.values())
-        print(f"      total flips across 138 tensors: D1 {total_d1}/{138 * 256}, D2 {total_d2}/{138 * 256}")
+        total_bits = sum(w.d1_logits.numel() for w in wrapped.values())
+        print(f"      total flips across {len(wrapped)} tensors: D1 {total_d1}/{total_bits}, D2 {total_d2}/{total_bits}")
     else:
         final_theta_norms = {
             n: float(w.theta_residual.detach().norm().cpu()) for n, w in wrapped.items()
@@ -1609,6 +1678,7 @@ def main() -> None:
         "imatrix": str(args.imatrix),
         "corpus": args.corpus,
         "target_pattern": args.target_pattern,
+        "sign_granularity": args.sign_granularity if args.learnable_signs else None,
         "n_sequences": args.n_sequences,
         "ctx_len": args.ctx_len,
         "alpha": args.alpha,
@@ -1620,6 +1690,7 @@ def main() -> None:
             "cosine_floor": args.cosine_floor,
             "grad_clip": args.grad_clip,
             "l2_theta": args.l2_theta,
+            "sign_granularity": args.sign_granularity if args.learnable_signs else None,
         },
         "n_epochs": args.n_epochs,
         "n_wrapped": len(wrapped),
