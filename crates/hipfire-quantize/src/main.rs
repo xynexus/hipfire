@@ -3133,8 +3133,13 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 }
                 GgufFormat::Mq4 => {
-                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                    if std::env::var("HIPFIRE_FORCE_G128").is_ok() {
+                        let q = quantize_hfq4g128(&f32_data);
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    } else {
+                        let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                    }
                 }
                 GgufFormat::Mq6 => {
                     let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
