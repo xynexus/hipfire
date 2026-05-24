@@ -265,11 +265,90 @@ def torch_butterfly256_grouped_inverse(y: torch.Tensor, theta: torch.Tensor) -> 
 # MQ4G256 STE with butterfly residual on top of FWHT.
 # ---------------------------------------------------------------------------
 
+def _validate_quant_mode(quant_mode: str) -> str:
+    if quant_mode not in ("uniform", "lloyd"):
+        raise ValueError("quant_mode must be 'uniform' or 'lloyd'")
+    return quant_mode
+
+
+def _validate_subscale_size(subscale_size: int) -> int:
+    subscale_size = int(subscale_size)
+    if subscale_size not in (0, 64, 128):
+        raise ValueError("subscale_size must be 0, 64, or 128")
+    if subscale_size > 0 and N % subscale_size != 0:
+        raise ValueError(
+            f"subscale_size={subscale_size} must divide the active group size N={N}"
+        )
+    return subscale_size
+
+
+def _quant_block_size(subscale_size: int) -> int:
+    subscale_size = _validate_subscale_size(subscale_size)
+    return N if subscale_size == 0 else subscale_size
+
+
+def _uniform_minmax_dequant_per_group(
+    w_rotated: torch.Tensor,
+    quant_bits: int,
+    subscale_size: int = 0,
+) -> torch.Tensor:
+    """Uniform RTN dequantization, optionally fitting min/scale per sub-block."""
+    block_size = _quant_block_size(subscale_size)
+    qmax = float((1 << quant_bits) - 1)
+
+    if block_size == N:
+        min_val = w_rotated.min(dim=-1).values
+        max_val = w_rotated.max(dim=-1).values
+        rng = max_val - min_val
+        scale = torch.where(rng > 0.0, rng / qmax, torch.ones_like(rng))
+        zero = min_val
+        inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
+        q = torch.clamp(
+            torch.round((w_rotated - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
+            0.0, qmax,
+        )
+        return q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
+
+    n_subblocks = N // block_size
+    blocks = w_rotated.reshape(*w_rotated.shape[:-1], n_subblocks, block_size)
+    min_val = blocks.min(dim=-1).values
+    max_val = blocks.max(dim=-1).values
+    rng = max_val - min_val
+    scale = torch.where(rng > 0.0, rng / qmax, torch.ones_like(rng))
+    zero = min_val
+    inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
+    q = torch.clamp(
+        torch.round((blocks - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
+        0.0, qmax,
+    )
+    dequant = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
+    return dequant.reshape_as(w_rotated)
+
+
+def _mq_dequant_rotated(
+    w_rotated: torch.Tensor,
+    quant_bits: int,
+    quant_mode: str,
+    subscale_size: int = 0,
+) -> torch.Tensor:
+    quant_mode = _validate_quant_mode(quant_mode)
+    if quant_mode == "uniform":
+        return _uniform_minmax_dequant_per_group(
+            w_rotated, quant_bits, subscale_size=subscale_size,
+        )
+    return _lloyd_max_dequant_per_group(
+        w_rotated, quant_bits, subscale_size=subscale_size,
+    )
+
+
 def quantize_mq4g256_bfly_ste(
     w: torch.Tensor,
     theta: torch.Tensor,
     signs1: torch.Tensor,
     signs2: torch.Tensor,
+    quant_bits: int = 4,
+    quant_mode: str = "uniform",
+    subscale_size: int = 0,
 ) -> torch.Tensor:
     """MQ4G256 round-trip with learnable butterfly residual.
 
@@ -288,19 +367,11 @@ def quantize_mq4g256_bfly_ste(
     # Butterfly residual step (theta-dependent, autograd-tracked).
     w_rotated = torch_butterfly256(w_fwht, theta)
 
-    # MQ4 min-max RTN with STE.
+    # MQ min-max/Lloyd RTN with STE.
     with torch.no_grad():
-        min_val = w_rotated.min(dim=-1).values
-        max_val = w_rotated.max(dim=-1).values
-        rng = max_val - min_val
-        scale = torch.where(rng > 0.0, rng / 15.0, torch.ones_like(rng))
-        zero = min_val
-        inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
-        q = torch.clamp(
-            torch.round((w_rotated - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
-            0.0, 15.0,
+        dequant_rot = _mq_dequant_rotated(
+            w_rotated, quant_bits, quant_mode, subscale_size=subscale_size,
         )
-        dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
         delta = dequant_rot - w_rotated
 
     w_quant_rot = w_rotated + delta.detach()  # STE through round/clamp
@@ -318,6 +389,7 @@ def quantize_mq4g256_full_butterfly_ste(
     signs2: torch.Tensor,
     quant_bits: int = 4,
     quant_mode: str = "uniform",
+    subscale_size: int = 0,
 ) -> torch.Tensor:
     """MQ4G256 round-trip with a per-group learnable butterfly rotation.
 
@@ -340,27 +412,11 @@ def quantize_mq4g256_full_butterfly_ste(
     w_fwht = torch_fwht_n(w_f32.reshape(m, n_groups, N), signs1, signs2, N)
     w_rotated = checkpoint(torch_butterfly256_grouped, w_fwht, theta, use_reentrant=False)
 
-    qmax = float((1 << quant_bits) - 1)
-    if quant_mode == "uniform":
-        with torch.no_grad():
-            min_val = w_rotated.min(dim=-1).values
-            max_val = w_rotated.max(dim=-1).values
-            rng = max_val - min_val
-            scale = torch.where(rng > 0.0, rng / qmax, torch.ones_like(rng))
-            zero = min_val
-            inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
-            q = torch.clamp(
-                torch.round((w_rotated - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
-                0.0, qmax,
-            )
-            dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
-            delta = dequant_rot - w_rotated
-    elif quant_mode == "lloyd":
-        with torch.no_grad():
-            dequant_rot = _lloyd_max_dequant_per_group(w_rotated, quant_bits)
-            delta = dequant_rot - w_rotated
-    else:
-        raise ValueError("quant_mode must be 'uniform' or 'lloyd'")
+    with torch.no_grad():
+        dequant_rot = _mq_dequant_rotated(
+            w_rotated, quant_bits, quant_mode, subscale_size=subscale_size,
+        )
+        delta = dequant_rot - w_rotated
 
     w_quant_rot = w_rotated + delta.detach()
     w_inv_bfly = checkpoint(torch_butterfly256_grouped_inverse, w_quant_rot, theta, use_reentrant=False)
@@ -401,6 +457,7 @@ def quantize_mq4g256_signs_ste(
     d2: torch.Tensor,
     quant_bits: int = 4,
     quant_mode: str = "uniform",
+    subscale_size: int = 0,
 ) -> torch.Tensor:
     """MQ4G256 round-trip with learnable D1/D2 sign tables.
 
@@ -419,27 +476,11 @@ def quantize_mq4g256_signs_ste(
     w_f32 = w.to(torch.float32)
     w_fwht = torch_fwht_n(w_f32.reshape(m, n_groups, N), d1_broadcast, d2_broadcast, N)
 
-    qmax = float((1 << quant_bits) - 1)  # 4-bit→15, 6-bit→63, 8-bit→255
-    if quant_mode == "uniform":
-        with torch.no_grad():
-            min_val = w_fwht.min(dim=-1).values
-            max_val = w_fwht.max(dim=-1).values
-            rng = max_val - min_val
-            scale = torch.where(rng > 0.0, rng / qmax, torch.ones_like(rng))
-            zero = min_val
-            inv_scale = torch.where(rng > 0.0, 1.0 / scale, torch.zeros_like(scale))
-            q = torch.clamp(
-                torch.round((w_fwht - zero.unsqueeze(-1)) * inv_scale.unsqueeze(-1)),
-                0.0, qmax,
-            )
-            dequant_rot = q * scale.unsqueeze(-1) + zero.unsqueeze(-1)
-            delta = dequant_rot - w_fwht
-    elif quant_mode == "lloyd":
-        with torch.no_grad():
-            dequant_rot = _lloyd_max_dequant_per_group(w_fwht, quant_bits)
-            delta = dequant_rot - w_fwht
-    else:
-        raise ValueError("quant_mode must be 'uniform' or 'lloyd'")
+    with torch.no_grad():
+        dequant_rot = _mq_dequant_rotated(
+            w_fwht, quant_bits, quant_mode, subscale_size=subscale_size,
+        )
+        delta = dequant_rot - w_fwht
     w_quant_rot = w_fwht + delta.detach()
     w_dq = torch_inverse_fwht_n(w_quant_rot, d1_broadcast, d2_broadcast, N)
     return w_dq.reshape(m, k).to(w.dtype)
@@ -450,37 +491,51 @@ def _lloyd_max_dequant_per_group(
     quant_bits: int,
     chunk_groups: int = 8192,
     n_iter: int = 8,
+    subscale_size: int = 0,
 ) -> torch.Tensor:
-    """Fit per-256-group Lloyd-Max centroids and return dequantized weights.
+    """Fit per-group or per-sub-block Lloyd-Max centroids and return dequantized weights.
 
     The largest production tensors have hundreds of thousands of 256-point
     groups. Chunking caps the transient [groups, 256, centroids] distance tensor.
     """
     n_centroids = 1 << quant_bits
     m, n_groups, _ = w_fwht.shape
+    block_size = _quant_block_size(subscale_size)
+    n_subblocks = N // block_size
+    units_per_row = n_groups * n_subblocks
+    units = (
+        w_fwht
+        if block_size == N
+        else w_fwht.reshape(m, units_per_row, block_size)
+    )
     dequant = torch.empty_like(w_fwht)
+    dequant_units = (
+        dequant
+        if block_size == N
+        else dequant.reshape(m, units_per_row, block_size)
+    )
     quantiles = torch.linspace(
         0.0, 1.0, n_centroids, device=w_fwht.device, dtype=w_fwht.dtype,
     )
-    ones_template = torch.ones((1, N), device=w_fwht.device, dtype=w_fwht.dtype)
+    ones_template = torch.ones((1, block_size), device=w_fwht.device, dtype=w_fwht.dtype)
 
-    if n_groups <= chunk_groups:
-        rows_per_chunk = max(1, chunk_groups // n_groups)
+    if units_per_row <= chunk_groups:
+        rows_per_chunk = max(1, chunk_groups // units_per_row)
         for row_start in range(0, m, rows_per_chunk):
             row_end = min(row_start + rows_per_chunk, m)
-            chunk = w_fwht[row_start:row_end].reshape(-1, N)
-            dequant[row_start:row_end] = _lloyd_max_dequant_chunk(
+            chunk = units[row_start:row_end].reshape(-1, block_size)
+            dequant_units[row_start:row_end] = _lloyd_max_dequant_chunk(
                 chunk, quantiles, ones_template, n_iter,
-            ).reshape(row_end - row_start, n_groups, N)
+            ).reshape(row_end - row_start, units_per_row, block_size)
             del chunk
     else:
         for row in range(m):
-            for group_start in range(0, n_groups, chunk_groups):
-                group_end = min(group_start + chunk_groups, n_groups)
-                chunk = w_fwht[row:row + 1, group_start:group_end].reshape(-1, N)
-                dequant[row:row + 1, group_start:group_end] = _lloyd_max_dequant_chunk(
+            for unit_start in range(0, units_per_row, chunk_groups):
+                unit_end = min(unit_start + chunk_groups, units_per_row)
+                chunk = units[row:row + 1, unit_start:unit_end].reshape(-1, block_size)
+                dequant_units[row:row + 1, unit_start:unit_end] = _lloyd_max_dequant_chunk(
                     chunk, quantiles, ones_template, n_iter,
-                ).reshape(1, group_end - group_start, N)
+                ).reshape(1, unit_end - unit_start, block_size)
                 del chunk
 
     return dequant
@@ -575,6 +630,7 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         sign_granularity: str = "tensor",
         quant_bits: int = 4,
         quant_mode: str = "uniform",
+        subscale_size: int = 0,
     ) -> None:
         super().__init__()
         assert weight.dim() == 2
@@ -583,10 +639,9 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         assert channel_scales_init.shape == (k,)
         if sign_granularity not in ("tensor", "group"):
             raise ValueError("sign_granularity must be 'tensor' or 'group'")
-        if quant_mode not in ("uniform", "lloyd"):
-            raise ValueError("quant_mode must be 'uniform' or 'lloyd'")
         self.quant_bits = quant_bits
-        self.quant_mode = quant_mode
+        self.quant_mode = _validate_quant_mode(quant_mode)
+        self.subscale_size = _validate_subscale_size(subscale_size)
 
         self.register_buffer("weight", weight.detach().clone())
         if bias is not None:
@@ -649,7 +704,8 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
 
         w_scaled = self.weight.to(torch.float32) * s_safe.unsqueeze(0)
         w_q_dq = quantize_mq4g256_signs_ste(
-            w_scaled, d1, d2, quant_bits=self.quant_bits, quant_mode=self.quant_mode,
+            w_scaled, d1, d2, quant_bits=self.quant_bits,
+            quant_mode=self.quant_mode, subscale_size=self.subscale_size,
         )
         x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
         y = F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
@@ -692,6 +748,9 @@ class ButterflyResidualPseudoQuantLinear(nn.Module):
         bias: Optional[torch.Tensor],
         channel_scales_init: torch.Tensor,
         canonical_name: str,
+        quant_bits: int = 4,
+        quant_mode: str = "uniform",
+        subscale_size: int = 0,
     ) -> None:
         super().__init__()
         assert weight.dim() == 2
@@ -717,6 +776,9 @@ class ButterflyResidualPseudoQuantLinear(nn.Module):
             torch.zeros(LAYER_COUNT, PAIRS_PER_LAYER, dtype=torch.float32),
             requires_grad=False,
         )
+        self.quant_bits = quant_bits
+        self.quant_mode = _validate_quant_mode(quant_mode)
+        self.subscale_size = _validate_subscale_size(subscale_size)
 
         self.register_buffer("_fwht_signs1", FWHT_SIGNS1.clone().view(1, N))
         self.register_buffer("_fwht_signs2", FWHT_SIGNS2.clone().view(1, N))
@@ -731,6 +793,8 @@ class ButterflyResidualPseudoQuantLinear(nn.Module):
         w_scaled = self.weight.to(torch.float32) * s_safe.unsqueeze(0)
         w_q_dq = quantize_mq4g256_bfly_ste(
             w_scaled, self.theta_residual, self._fwht_signs1, self._fwht_signs2,
+            quant_bits=self.quant_bits, quant_mode=self.quant_mode,
+            subscale_size=self.subscale_size,
         )
         x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
         return F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
@@ -759,15 +823,13 @@ class FullRotationPseudoQuantLinear(nn.Module):
         canonical_name: str,
         quant_bits: int = 4,
         quant_mode: str = "uniform",
+        subscale_size: int = 0,
     ) -> None:
         super().__init__()
         assert weight.dim() == 2
         m, k = weight.shape
         assert k % N == 0, f"K={k} must be divisible by {N}"
         assert channel_scales_init.shape == (k,)
-        if quant_mode not in ("uniform", "lloyd"):
-            raise ValueError("quant_mode must be 'uniform' or 'lloyd'")
-
         self.register_buffer("weight", weight.detach().clone())
         if bias is not None:
             self.register_buffer("bias", bias.detach().clone())
@@ -781,7 +843,8 @@ class FullRotationPseudoQuantLinear(nn.Module):
 
         self.n_groups = k // N
         self.quant_bits = quant_bits
-        self.quant_mode = quant_mode
+        self.quant_mode = _validate_quant_mode(quant_mode)
+        self.subscale_size = _validate_subscale_size(subscale_size)
         self.theta = nn.Parameter(
             torch.zeros(self.n_groups, LAYER_COUNT, PAIRS_PER_LAYER, dtype=torch.float32),
             requires_grad=False,
@@ -806,6 +869,7 @@ class FullRotationPseudoQuantLinear(nn.Module):
         w_q_dq = quantize_mq4g256_full_butterfly_ste(
             w_scaled, self.theta, self._fwht_signs1, self._fwht_signs2,
             quant_bits=self.quant_bits, quant_mode=self.quant_mode,
+            subscale_size=self.subscale_size,
         )
         x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
         return F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
@@ -1075,6 +1139,7 @@ def wrap_awq_targets(
     sign_granularity: str = "tensor",
     quant_bits: int = 4,
     quant_mode: str = "uniform",
+    subscale_size: int = 0,
 ) -> dict[str, nn.Module]:
     """Wrap all AWQ-F1 Linears whose stored name matches `target_pattern`.
 
@@ -1133,15 +1198,20 @@ def wrap_awq_targets(
             wrapper = wrapper_class(
                 weight, bias, init_s, canonical,
                 sign_granularity=sign_granularity, quant_bits=quant_bits,
-                quant_mode=quant_mode,
+                quant_mode=quant_mode, subscale_size=subscale_size,
             )
         elif wrapper_class is FullRotationPseudoQuantLinear:
             wrapper = wrapper_class(
                 weight, bias, init_s, canonical,
                 quant_bits=quant_bits, quant_mode=quant_mode,
+                subscale_size=subscale_size,
             )
         else:
-            wrapper = wrapper_class(weight, bias, init_s, canonical)
+            wrapper = wrapper_class(
+                weight, bias, init_s, canonical,
+                quant_bits=quant_bits, quant_mode=quant_mode,
+                subscale_size=subscale_size,
+            )
         wrapper = wrapper.to(device=device)
         _set_module(model, mod_name, wrapper)
         wrapped[mod_name] = wrapper
@@ -1803,7 +1873,26 @@ def self_test(device_str: str = "cpu") -> int:
         print("  FAIL: theta=0 does not reproduce baseline")
         return 1
 
-    # Sanity 2: a single SGD step on a random oracle moves theta.
+    # Sanity 2: Lloyd mode with sub-block scales stays finite and shape-stable.
+    with torch.no_grad():
+        s_safe = torch.clamp(wrapper.channel_scales, min=1e-6).to(torch.float32)
+        w_scaled = wrapper.weight.to(torch.float32) * s_safe.unsqueeze(0)
+        d1 = FWHT_SIGNS1.to(device=device, dtype=torch.float32).view(1, N).repeat(k // N, 1)
+        d2 = FWHT_SIGNS2.to(device=device, dtype=torch.float32).view(1, N).repeat(k // N, 1)
+        for subscale_size in (0, 64, 128):
+            w_lloyd = quantize_mq4g256_signs_ste(
+                w_scaled, d1, d2, quant_bits=4, quant_mode="lloyd",
+                subscale_size=subscale_size,
+            )
+            finite = bool(torch.isfinite(w_lloyd).all())
+            shape_ok = w_lloyd.shape == w_scaled.shape
+            print(f"  [check 2] lloyd subscale={subscale_size:<3} shape={tuple(w_lloyd.shape)} "
+                  f"finite={finite}")
+            if not shape_ok or not finite:
+                print("  FAIL: lloyd subscale path produced bad shape or non-finite values")
+                return 1
+
+    # Sanity 3: a single SGD step on a random oracle moves theta.
     wrapper.set_optim()
     optimizer = torch.optim.SGD([wrapper.theta_residual], lr=0.1, momentum=0.0)
     torch.manual_seed(1)
@@ -1817,14 +1906,14 @@ def self_test(device_str: str = "cpu") -> int:
         # Gradient must be nonzero on theta after backward.
         if step == 0:
             grad_norm = float(wrapper.theta_residual.grad.norm())
-            print(f"  [check 2] gradient flow through theta    ||grad|| = {grad_norm:.3e}")
+            print(f"  [check 3] gradient flow through theta    ||grad|| = {grad_norm:.3e}")
             if grad_norm == 0.0:
                 print("  FAIL: theta gradient is zero — autograd not connected")
                 return 1
         optimizer.step()
     final_theta_norm = float(wrapper.theta_residual.detach().norm())
     moved = abs(final_theta_norm - initial_theta_norm)
-    print(f"  [check 3] theta moved after SGD steps     ||theta||: {initial_theta_norm:.3e} → "
+    print(f"  [check 4] theta moved after SGD steps     ||theta||: {initial_theta_norm:.3e} → "
           f"{final_theta_norm:.3e}  (Δ={moved:.3e})")
     if moved < 1e-6:
         print("  FAIL: theta did not move after 10 SGD steps")
@@ -1929,9 +2018,12 @@ def main() -> None:
                          "6, 8 for granularity-ceiling diagnostics). Only affects "
                          "--learnable-signs path.")
     ap.add_argument("--quant-mode", choices=["uniform", "lloyd"], default="uniform",
-                    help="Pseudo-quant mode for --learnable-signs. 'uniform' is "
-                         "the existing min-max RTN path; 'lloyd' fits per-group "
-                         "Lloyd-Max codebooks each forward.")
+                    help="Pseudo-quant mode. 'uniform' is the existing min-max "
+                         "RTN path; 'lloyd' fits codebooks each forward.")
+    ap.add_argument("--subscale-size", type=int, choices=[0, 64, 128], default=0,
+                    help="For active group size 256, fit min/scale and Lloyd "
+                         "codebooks within contiguous 64- or 128-wide sub-blocks. "
+                         "0 preserves current whole-group behavior.")
     args = ap.parse_args()
 
     configure_group_size(args.group_size)
@@ -1942,6 +2034,7 @@ def main() -> None:
         ap.error("--rotation-mode full-butterfly cannot be combined with --learnable-signs")
     if args.cache_oracle_logits and not args.loss_kld:
         ap.error("--cache-oracle-logits requires --loss-kld; MSE/sequential modes need live oracle activations")
+    _validate_subscale_size(args.subscale_size)
 
     # Validate required args for non-self-test mode.
     missing = [name for name in ("model", "imatrix", "corpus", "output_dir")
@@ -1971,9 +2064,10 @@ def main() -> None:
     print(f"  cache oracle:    {args.cache_oracle_logits}")
     print(f"  l2-theta:        {args.l2_theta}")
     print(f"  rotation-mode:   {args.rotation_mode}")
+    print(f"  quant mode:      {args.quant_mode}")
+    print(f"  subscale-size:   {args.subscale_size}")
     if args.learnable_signs:
         print(f"  sign granularity: {args.sign_granularity}")
-        print(f"  quant mode:       {args.quant_mode}")
     print()
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
@@ -2024,6 +2118,7 @@ def main() -> None:
         sign_granularity=args.sign_granularity,
         quant_bits=args.quant_bits,
         quant_mode=args.quant_mode,
+        subscale_size=args.subscale_size,
     )
     print(f"      wrap done in {time.time() - t0:.1f}s")
     if not wrapped:
@@ -2264,9 +2359,9 @@ def main() -> None:
         "target_pattern": args.target_pattern,
         "rotation_mode": args.rotation_mode,
         "sign_granularity": args.sign_granularity if args.learnable_signs else None,
-        "quant_mode": args.quant_mode if args.learnable_signs else (
-            "uniform" if args.rotation_mode == "full-butterfly" else None
-        ),
+        "quant_mode": args.quant_mode,
+        "quant_bits": args.quant_bits,
+        "subscale_size": args.subscale_size,
         "n_sequences": args.n_sequences,
         "ctx_len": args.ctx_len,
         "alpha": args.alpha,
@@ -2279,9 +2374,9 @@ def main() -> None:
             "grad_clip": args.grad_clip,
             "l2_theta": args.l2_theta,
             "sign_granularity": args.sign_granularity if args.learnable_signs else None,
-            "quant_mode": args.quant_mode if args.learnable_signs else (
-                "uniform" if args.rotation_mode == "full-butterfly" else None
-            ),
+            "quant_mode": args.quant_mode,
+            "quant_bits": args.quant_bits,
+            "subscale_size": args.subscale_size,
         },
         "n_epochs": args.n_epochs,
         "n_wrapped": len(wrapped),

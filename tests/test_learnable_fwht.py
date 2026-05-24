@@ -19,8 +19,10 @@ from learn_butterfly_mq import (  # noqa: E402
     LearnableSignsPseudoQuantLinear,
     N,
     _enable_student_gradient_checkpointing,
+    _lloyd_max_dequant_per_group,
     _release_oracle_model,
     _select_wrapper_class,
+    _uniform_minmax_dequant_per_group,
     cache_oracle_logits,
     compute_logit_kld,
     quantize_mq4g256_signs_ste,
@@ -83,6 +85,68 @@ def test_lloyd_quant_mode_forward_and_backward_work():
     assert wrapper.d2_logits.grad is not None
     assert torch.isfinite(wrapper.d1_logits.grad).all()
     assert torch.isfinite(wrapper.d2_logits.grad).all()
+
+
+def test_lloyd_subscale_forward_and_backward_work_for_64_and_128():
+    torch.manual_seed(346)
+    weight = torch.randn(2, N * 2, dtype=torch.float32)
+    x = torch.randn(4, N * 2, dtype=torch.float32)
+
+    for subscale_size in (64, 128):
+        wrapper = LearnableSignsPseudoQuantLinear(
+            weight, None, torch.ones(N * 2), "fixture.tensor",
+            sign_granularity="group", quant_mode="lloyd",
+            subscale_size=subscale_size,
+        )
+        wrapper.set_optim()
+
+        y = wrapper(x)
+        loss = y.pow(2).mean()
+        loss.backward()
+
+        assert y.shape == (4, 2)
+        assert wrapper.subscale_size == subscale_size
+        assert torch.isfinite(y).all()
+        assert wrapper.d1_logits.grad is not None
+        assert wrapper.d2_logits.grad is not None
+        assert torch.isfinite(wrapper.d1_logits.grad).all()
+        assert torch.isfinite(wrapper.d2_logits.grad).all()
+
+
+def test_subscale_dequant_handles_zero_range_blocks():
+    rotated = torch.zeros(2, 2, N, dtype=torch.float32)
+    rotated[..., :64] = 3.0
+    rotated[..., 64:128] = -1.0
+    rotated[..., 128:192] = 2.0
+    rotated[..., 192:] = 0.5
+
+    uniform = _uniform_minmax_dequant_per_group(rotated, 4, subscale_size=64)
+    lloyd = _lloyd_max_dequant_per_group(rotated, 4, subscale_size=64)
+
+    assert uniform.shape == rotated.shape
+    assert lloyd.shape == rotated.shape
+    assert torch.isfinite(uniform).all()
+    assert torch.isfinite(lloyd).all()
+    torch.testing.assert_close(uniform, rotated, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(lloyd, rotated, rtol=0.0, atol=0.0)
+
+
+def test_default_residual_supports_lloyd_subscale64_forward():
+    torch.manual_seed(347)
+    weight = torch.randn(3, N * 2, dtype=torch.float32)
+    scales = torch.ones(N * 2, dtype=torch.float32)
+    wrapper = ButterflyResidualPseudoQuantLinear(
+        weight, None, scales, "fixture.tensor",
+        quant_mode="lloyd", subscale_size=64,
+    )
+    x = torch.randn(4, N * 2, dtype=torch.float32)
+
+    y = wrapper(x)
+
+    assert y.shape == (4, 3)
+    assert wrapper.quant_mode == "lloyd"
+    assert wrapper.subscale_size == 64
+    assert torch.isfinite(y).all()
 
 
 def test_group_signs_do_not_cross_talk_between_256_wide_groups():
@@ -228,6 +292,7 @@ def test_grad_checkpoint_help_mentions_large_model_memory_reduction():
 
     assert "--grad-checkpoint" in result.stdout
     assert "--cache-oracle-logits" in result.stdout
+    assert "--subscale-size" in result.stdout
     assert "27B/A3B" in result.stdout
     assert "memory" in result.stdout
 
@@ -457,6 +522,9 @@ if __name__ == "__main__":
     test_group_signs_initialize_to_tensor_baseline()
     test_quant_mode_uniform_is_default_byte_equal()
     test_lloyd_quant_mode_forward_and_backward_work()
+    test_lloyd_subscale_forward_and_backward_work_for_64_and_128()
+    test_subscale_dequant_handles_zero_range_blocks()
+    test_default_residual_supports_lloyd_subscale64_forward()
     test_group_signs_do_not_cross_talk_between_256_wide_groups()
     test_full_rotation_init_matches_fwht_signs_baseline_byte_equal()
     test_full_rotation_theta_moves_after_training_step()
