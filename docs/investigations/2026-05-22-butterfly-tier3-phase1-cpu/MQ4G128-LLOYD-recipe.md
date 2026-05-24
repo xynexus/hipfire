@@ -26,9 +26,12 @@ Real PARO 0.8B ≈ 0.035 KLD-class. **g128+Lloyd ≈ parity, no training.**
 | g256 uniform | g128+Lloyd | g256/4×g64-subscale+Lloyd | g256/2×g128-sub+Lloyd |
 |---:|---:|---:|---:|
 | 0.0567 | 0.0383 | **0.0268** | 0.0369 |
-Packed g64-in-g256 (4 sub-scales/block + per-sub Lloyd) = −53%, BELOW PARO 0.035,
-at g256 occupancy. Cost = 4-way sub-scale unpack, not group fragmentation. Best
-quality+perf candidate. Sim flag: --group-size 256 --quant-mode lloyd --subscale-size 64.
+Packed g64-in-g256 (4 sub-scales/block + per-sub Lloyd) = 0.0268 vs g256-uniform
+0.0567 (−53%), all in the SAME Python proxy. CAVEATS: proxy-only, 0.8B (easy,
+outlier-bound), no kernel exists, no production eval; 0.035 PARO is a different
+real-model/harness number — NOT directly comparable, do not claim "beats PARO".
+g256 occupancy is hypothesized (4-way subscale unpack, unbuilt — not measured).
+Promising lever-direction. Sim: --group-size 256 --quant-mode lloyd --subscale-size 64.
 
 ## What works, what doesn't
 - **g128**: finer scaling, −13% (1 extra bit of scale precision). Targets granularity.
