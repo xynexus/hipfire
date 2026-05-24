@@ -57,7 +57,7 @@ from torch.utils.checkpoint import checkpoint
 
 
 # ---------------------------------------------------------------------------
-# FWHT-256 rotation — matches hipfire-quantize's gen_fwht_signs (seeds 42, 1042).
+# FWHT-N rotation — matches hipfire-quantize's gen_fwht_signs (seeds 42, 1042).
 # Mirrored from PARO K=0 (scripts/paro_k0_stage2.py).
 # ---------------------------------------------------------------------------
 
@@ -70,54 +70,95 @@ def _gen_fwht_signs(seed: int, n: int = 256) -> torch.Tensor:
     return torch.tensor(signs, dtype=torch.float32)
 
 
-FWHT_SIGNS1 = _gen_fwht_signs(42)
-FWHT_SIGNS2 = _gen_fwht_signs(1042)
+def _layer_count_for_group_size(n: int) -> int:
+    if n not in (128, 256):
+        raise ValueError("group size must be 128 or 256")
+    return int(math.log2(n))
 
 
-def torch_fwht_256(x: torch.Tensor, signs1: torch.Tensor, signs2: torch.Tensor) -> torch.Tensor:
-    """In-place stride-doubling FWHT on the last axis (length 256)."""
-    assert x.shape[-1] == N, f"FWHT input last dim must be {N}, got {x.shape[-1]}"
+N = 256
+LAYER_COUNT = _layer_count_for_group_size(N)
+PAIRS_PER_LAYER = N // 2
+FWHT_SIGNS1 = _gen_fwht_signs(42, N)
+FWHT_SIGNS2 = _gen_fwht_signs(1042, N)
+
+
+def configure_group_size(group_size: int) -> None:
+    """Set the global MQ group size before constructing wrappers or running tests."""
+    global N, LAYER_COUNT, PAIRS_PER_LAYER, FWHT_SIGNS1, FWHT_SIGNS2
+    if group_size not in (128, 256):
+        raise ValueError("group size must be 128 or 256")
+    N = group_size
+    LAYER_COUNT = _layer_count_for_group_size(N)
+    PAIRS_PER_LAYER = N // 2
+    FWHT_SIGNS1 = _gen_fwht_signs(42, N)
+    FWHT_SIGNS2 = _gen_fwht_signs(1042, N)
+
+
+def torch_fwht_n(
+    x: torch.Tensor,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+    n: Optional[int] = None,
+) -> torch.Tensor:
+    """In-place stride-doubling FWHT on the last axis (length n)."""
+    n = int(n or x.shape[-1])
+    assert x.shape[-1] == n, f"FWHT input last dim must be {n}, got {x.shape[-1]}"
     prefix_shape = x.shape[:-1]
     y = x.to(torch.float32) * signs1
     stride = 1
-    while stride < N:
-        y = y.reshape(*prefix_shape, N // (stride * 2), stride * 2)
+    while stride < n:
+        y = y.reshape(*prefix_shape, n // (stride * 2), stride * 2)
         a = y[..., :stride].clone()
         b = y[..., stride:].clone()
         y[..., :stride] = a + b
         y[..., stride:] = a - b
-        y = y.reshape(*prefix_shape, N)
+        y = y.reshape(*prefix_shape, n)
         stride *= 2
-    y = y * 0.0625 * signs2  # 1/sqrt(256) = 1/16 = 0.0625
+    scale = 0.0625 if n == 256 else 1.0 / math.sqrt(n)
+    y = y * scale * signs2
+    return y
+
+
+def torch_fwht_256(x: torch.Tensor, signs1: torch.Tensor, signs2: torch.Tensor) -> torch.Tensor:
+    """Compatibility wrapper for the canonical 256-point FWHT."""
+    return torch_fwht_n(x, signs1, signs2, 256)
+
+
+def torch_inverse_fwht_n(
+    x: torch.Tensor,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+    n: Optional[int] = None,
+) -> torch.Tensor:
+    """Inverse FWHT-N — swaps signs1/signs2 at endpoints (the FWHT is its own
+    inverse up to normalization)."""
+    n = int(n or x.shape[-1])
+    assert x.shape[-1] == n, f"FWHT input last dim must be {n}, got {x.shape[-1]}"
+    prefix_shape = x.shape[:-1]
+    y = x.to(torch.float32) * signs2
+    stride = 1
+    while stride < n:
+        y = y.reshape(*prefix_shape, n // (stride * 2), stride * 2)
+        a = y[..., :stride].clone()
+        b = y[..., stride:].clone()
+        y[..., :stride] = a + b
+        y[..., stride:] = a - b
+        y = y.reshape(*prefix_shape, n)
+        stride *= 2
+    scale = 0.0625 if n == 256 else 1.0 / math.sqrt(n)
+    y = y * scale * signs1
     return y
 
 
 def torch_inverse_fwht_256(x: torch.Tensor, signs1: torch.Tensor, signs2: torch.Tensor) -> torch.Tensor:
-    """Inverse FWHT-256 — swaps signs1/signs2 at endpoints (the FWHT is its own
-    inverse up to normalization)."""
-    assert x.shape[-1] == N, f"FWHT input last dim must be {N}, got {x.shape[-1]}"
-    prefix_shape = x.shape[:-1]
-    y = x.to(torch.float32) * signs2
-    stride = 1
-    while stride < N:
-        y = y.reshape(*prefix_shape, N // (stride * 2), stride * 2)
-        a = y[..., :stride].clone()
-        b = y[..., stride:].clone()
-        y[..., :stride] = a + b
-        y[..., stride:] = a - b
-        y = y.reshape(*prefix_shape, N)
-        stride *= 2
-    y = y * 0.0625 * signs1
-    return y
+    """Compatibility wrapper for the canonical inverse 256-point FWHT."""
+    return torch_inverse_fwht_n(x, signs1, signs2, 256)
 
 
 # ---------------------------------------------------------------------------
 # Differentiable butterfly residual — PyTorch port of butterfly_core.butterfly256.
 # ---------------------------------------------------------------------------
-
-LAYER_COUNT = 8
-N = 256
-PAIRS_PER_LAYER = N // 2  # 128
 
 
 def torch_butterfly256(x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
@@ -243,7 +284,7 @@ def quantize_mq4g256_bfly_ste(
 
     w_f32 = w.to(torch.float32)
     # FWHT step (theta-independent).
-    w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), signs1, signs2)
+    w_fwht = torch_fwht_n(w_f32.reshape(m, n_groups, N), signs1, signs2, N)
     # Butterfly residual step (theta-dependent, autograd-tracked).
     w_rotated = torch_butterfly256(w_fwht, theta)
 
@@ -266,7 +307,7 @@ def quantize_mq4g256_bfly_ste(
     # Inverse butterfly (theta-dependent).
     w_inv_bfly = torch_butterfly256_inverse(w_quant_rot, theta)
     # Inverse FWHT (theta-independent).
-    w_dq = torch_inverse_fwht_256(w_inv_bfly, signs1, signs2)
+    w_dq = torch_inverse_fwht_n(w_inv_bfly, signs1, signs2, N)
     return w_dq.reshape(m, k).to(w.dtype)
 
 
@@ -296,7 +337,7 @@ def quantize_mq4g256_full_butterfly_ste(
     assert theta.shape == (n_groups, LAYER_COUNT, PAIRS_PER_LAYER)
 
     w_f32 = w.to(torch.float32)
-    w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), signs1, signs2)
+    w_fwht = torch_fwht_n(w_f32.reshape(m, n_groups, N), signs1, signs2, N)
     w_rotated = checkpoint(torch_butterfly256_grouped, w_fwht, theta, use_reentrant=False)
 
     qmax = float((1 << quant_bits) - 1)
@@ -323,7 +364,7 @@ def quantize_mq4g256_full_butterfly_ste(
 
     w_quant_rot = w_rotated + delta.detach()
     w_inv_bfly = checkpoint(torch_butterfly256_grouped_inverse, w_quant_rot, theta, use_reentrant=False)
-    w_dq = torch_inverse_fwht_256(w_inv_bfly, signs1, signs2)
+    w_dq = torch_inverse_fwht_n(w_inv_bfly, signs1, signs2, N)
     return w_dq.reshape(m, k).to(w.dtype)
 
 
@@ -376,7 +417,7 @@ def quantize_mq4g256_signs_ste(
     d2_broadcast = _expand_signs_for_weight(d2, m, n_groups, "d2")
 
     w_f32 = w.to(torch.float32)
-    w_fwht = torch_fwht_256(w_f32.reshape(m, n_groups, N), d1_broadcast, d2_broadcast)
+    w_fwht = torch_fwht_n(w_f32.reshape(m, n_groups, N), d1_broadcast, d2_broadcast, N)
 
     qmax = float((1 << quant_bits) - 1)  # 4-bit→15, 6-bit→63, 8-bit→255
     if quant_mode == "uniform":
@@ -400,7 +441,7 @@ def quantize_mq4g256_signs_ste(
     else:
         raise ValueError("quant_mode must be 'uniform' or 'lloyd'")
     w_quant_rot = w_fwht + delta.detach()
-    w_dq = torch_inverse_fwht_256(w_quant_rot, d1_broadcast, d2_broadcast)
+    w_dq = torch_inverse_fwht_n(w_quant_rot, d1_broadcast, d2_broadcast, N)
     return w_dq.reshape(m, k).to(w.dtype)
 
 
@@ -482,19 +523,19 @@ def _expand_signs_for_weight(
     n_groups: int,
     label: str,
 ) -> torch.Tensor:
-    """Return signs broadcastable to [M, n_groups, 256] without expanding M.
+    """Return signs broadcastable to [M, n_groups, N] without expanding M.
 
     `signs` may be:
-      - [256] or [1, 256]: one tensor-wide FWHT table, current behavior.
-      - [n_groups, 256]: one table per input group, shared across rows.
-      - [M * n_groups, 256]: fully expanded internal form.
+      - [N] or [1, N]: one tensor-wide FWHT table, current behavior.
+      - [n_groups, N]: one table per input group, shared across rows.
+      - [M * n_groups, N]: fully expanded internal form.
     """
     if signs.dim() == 1:
         if signs.shape != (N,):
-            raise AssertionError(f"{label} must have shape [256], got {tuple(signs.shape)}")
+            raise AssertionError(f"{label} must have shape [{N}], got {tuple(signs.shape)}")
         return signs.view(1, 1, N)
     if signs.dim() != 2 or signs.shape[1] != N:
-        raise AssertionError(f"{label} must have shape [*, 256], got {tuple(signs.shape)}")
+        raise AssertionError(f"{label} must have shape [*, {N}], got {tuple(signs.shape)}")
     if signs.shape[0] == 1:
         return signs.view(1, 1, N)
     if signs.shape[0] == n_groups:
@@ -1044,7 +1085,7 @@ def wrap_awq_targets(
     pat = re.compile(target_pattern) if target_pattern else None
     wrapped: dict[str, nn.Module] = {}
     skipped_no_imatrix = 0
-    skipped_k_not_256 = 0
+    skipped_k_not_group_size = 0
     skipped_pattern = 0
     total_f1 = 0
 
@@ -1066,7 +1107,7 @@ def wrap_awq_targets(
     for mod_name, module, stored in targets:
         k = module.in_features
         if k % N != 0:
-            skipped_k_not_256 += 1
+            skipped_k_not_group_size += 1
             continue
         imatrix_name = stored
         if imatrix_name not in in_sum2_by_name:
@@ -1109,7 +1150,7 @@ def wrap_awq_targets(
         f"  AWQ-F1 targets: {total_f1} total, "
         f"{len(wrapped)} wrapped, "
         f"{skipped_pattern} excluded by --target-pattern, "
-        f"{skipped_k_not_256} skipped K%256, "
+        f"{skipped_k_not_group_size} skipped K%{N}, "
         f"{skipped_no_imatrix} skipped no-imatrix"
     )
     return wrapped
@@ -1682,41 +1723,58 @@ def self_test(device_str: str = "cpu") -> int:
     print("=" * 70)
     device = torch.device(device_str)
 
-    # Parity vs numpy reference (catches indexing/reshape bugs in torch port).
-    ROOT = Path(__file__).resolve().parent.parent
-    sys.path.insert(0, str(ROOT))
-    from scripts.butterfly_core import (  # noqa: E402
-        butterfly256 as np_butterfly256,
-        butterfly256_inverse as np_butterfly256_inverse,
-    )
     rng = np.random.default_rng(7)
-    parity_max_err = 0.0
-    parity_inv_err = 0.0
-    for _ in range(64):
-        x_np = rng.standard_normal((3, N)).astype(np.float32)
-        theta_np = rng.uniform(-np.pi, np.pi, size=(LAYER_COUNT, PAIRS_PER_LAYER)).astype(np.float32)
-        # Forward parity.
-        y_np = np_butterfly256(x_np, theta_np)
-        y_torch = torch_butterfly256(
-            torch.from_numpy(x_np), torch.from_numpy(theta_np),
-        ).numpy()
-        parity_max_err = max(parity_max_err, float(np.abs(y_np - y_torch).max()))
-        # Inverse parity.
-        x_back_np = np_butterfly256_inverse(y_np, theta_np)
-        x_back_torch = torch_butterfly256_inverse(
-            torch.from_numpy(y_np), torch.from_numpy(theta_np),
-        ).numpy()
-        parity_inv_err = max(parity_inv_err, float(np.abs(x_back_np - x_back_torch).max()))
-    print(
-        f"  [parity] torch vs numpy butterfly   forward max_err = {parity_max_err:.3e}, "
-        f"inverse max_err = {parity_inv_err:.3e}"
-    )
-    if parity_max_err > 1e-5 or parity_inv_err > 1e-5:
-        print("  FAIL: torch/numpy parity drift > 1e-5 — check indexing/reshape")
-        return 1
+    if N == 256:
+        # Parity vs numpy reference (catches indexing/reshape bugs in torch port).
+        ROOT = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(ROOT))
+        from scripts.butterfly_core import (  # noqa: E402
+            butterfly256 as np_butterfly256,
+            butterfly256_inverse as np_butterfly256_inverse,
+        )
+        parity_max_err = 0.0
+        parity_inv_err = 0.0
+        for _ in range(64):
+            x_np = rng.standard_normal((3, N)).astype(np.float32)
+            theta_np = rng.uniform(-np.pi, np.pi, size=(LAYER_COUNT, PAIRS_PER_LAYER)).astype(np.float32)
+            # Forward parity.
+            y_np = np_butterfly256(x_np, theta_np)
+            y_torch = torch_butterfly256(
+                torch.from_numpy(x_np), torch.from_numpy(theta_np),
+            ).numpy()
+            parity_max_err = max(parity_max_err, float(np.abs(y_np - y_torch).max()))
+            # Inverse parity.
+            x_back_np = np_butterfly256_inverse(y_np, theta_np)
+            x_back_torch = torch_butterfly256_inverse(
+                torch.from_numpy(y_np), torch.from_numpy(theta_np),
+            ).numpy()
+            parity_inv_err = max(parity_inv_err, float(np.abs(x_back_np - x_back_torch).max()))
+        print(
+            f"  [parity] torch vs numpy butterfly   forward max_err = {parity_max_err:.3e}, "
+            f"inverse max_err = {parity_inv_err:.3e}"
+        )
+        if parity_max_err > 1e-5 or parity_inv_err > 1e-5:
+            print("  FAIL: torch/numpy parity drift > 1e-5 — check indexing/reshape")
+            return 1
+    else:
+        parity_inv_err = 0.0
+        for _ in range(64):
+            x_np = rng.standard_normal((3, N)).astype(np.float32)
+            theta_np = rng.uniform(-np.pi, np.pi, size=(LAYER_COUNT, PAIRS_PER_LAYER)).astype(np.float32)
+            x_torch = torch.from_numpy(x_np)
+            theta_torch = torch.from_numpy(theta_np)
+            y_torch = torch_butterfly256(x_torch, theta_torch)
+            x_back_torch = torch_butterfly256_inverse(y_torch, theta_torch)
+            parity_inv_err = max(parity_inv_err, float((x_back_torch - x_torch).abs().max()))
+        print(
+            f"  [parity] torch butterfly inverse round-trip max_err = {parity_inv_err:.3e}"
+        )
+        if parity_inv_err > 1e-5:
+            print("  FAIL: torch butterfly inverse round-trip drift > 1e-5")
+            return 1
 
     torch.manual_seed(0)
-    m, k = 64, 512
+    m, k = 64, N * 2
     weight = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     bias = torch.zeros(m, device=device, dtype=torch.bfloat16)
     scales = torch.ones(k, device=device, dtype=torch.float32)
@@ -1785,6 +1843,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--self-test", action="store_true",
                     help="Run a synthetic self-test (no model required) and exit.")
+    ap.add_argument("--group-size", type=int, choices=[128, 256], default=256,
+                    help="MQ group size for FWHT/sign grouping (default: 256).")
     ap.add_argument("--model", help="HF BF16 model dir path.")
     ap.add_argument("--imatrix", type=Path, help="Path to .imatrix.gguf.")
     ap.add_argument("--corpus", help="Path to calibration text file.")
@@ -1846,7 +1906,7 @@ def main() -> None:
     ap.add_argument("--rotation-mode", choices=["fwht-signs", "full-butterfly"],
                     default="fwht-signs",
                     help="'fwht-signs' preserves existing wrapper selection. "
-                         "'full-butterfly' learns a per-256-group full "
+                         "'full-butterfly' learns a per-group full "
                          "butterfly rotation with uniform 4-bit min-max quant.")
     ap.add_argument("--learnable-signs", action="store_true",
                     help="Phase 4d: learn per-tensor D1/D2 sign tables "
@@ -1855,7 +1915,7 @@ def main() -> None:
     ap.add_argument("--sign-granularity", choices=["tensor", "group"], default="tensor",
                     help="Granularity for --learnable-signs. 'tensor' preserves "
                          "the Phase 4d one-D1/D2-pair-per-Linear recipe; "
-                         "'group' learns one D1/D2 pair per 256-wide input "
+                         "'group' learns one D1/D2 pair per input "
                          "group, avoiding cross-group gradient cancellation "
                          "on wider models such as 9B.")
     ap.add_argument("--bias-correction", action="store_true",
@@ -1873,6 +1933,8 @@ def main() -> None:
                          "the existing min-max RTN path; 'lloyd' fits per-group "
                          "Lloyd-Max codebooks each forward.")
     args = ap.parse_args()
+
+    configure_group_size(args.group_size)
 
     if args.self_test:
         sys.exit(self_test(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu"))

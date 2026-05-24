@@ -210,6 +210,28 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     for i in 0..256 { x[i] *= scale * signs2[i]; }
 }
 
+/// CPU-side FWHT on a 128-element group. Same sign convention as MQ4-G256.
+fn cpu_fwht_128(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+    assert!(x.len() == 128);
+    for i in 0..128 { x[i] *= signs1[i]; }
+    let mut stride = 1;
+    while stride < 128 {
+        let mut i = 0;
+        while i < 128 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    let scale = 0.08838834764831845f32; // 1/sqrt(128)
+    for i in 0..128 { x[i] *= scale * signs2[i]; }
+}
+
 /// Generate FWHT sign table matching the engine's gen_fwht_signs.
 /// Standard MQ4 seeds are 42 (signs1) and 1042 (signs2).
 fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
@@ -307,6 +329,43 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
+/// MagnumQuant MQ4-G128: FWHT-rotated 4-bit quantization.
+/// 72 bytes per 128 weights (0.5625 B/w). Same binary layout as HFQ4-G128.
+fn quantize_mq4g128(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let group_size = 128;
+    let block_bytes = 72;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+
+        let mut group = [0.0f32; 128];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+
+        cpu_fwht_128(&mut group, signs1, signs2);
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+        for i in 0..64 {
+            let lo_q = ((group[2 * i] - min_val) * inv_scale + 0.5) as u8;
+            let hi_q = ((group[2 * i + 1] - min_val) * inv_scale + 0.5) as u8;
+            output[out_off + 8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+        }
+    }
+    output
+}
+
 // ─── HFQ File Format ──────────────────────────────────────────────────────
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -322,6 +381,7 @@ enum QuantType {
     F32 = 2,
     MQ4G256 = 13,
     MQ3G256 = 17,
+    MQ4G128 = 30,
 }
 
 struct HfqTensor {
@@ -456,6 +516,7 @@ fn main() {
     let mut output_path: Option<String> = None;
     let mut keep_f32 = false;
     let mut use_mq4 = false;
+    let mut use_mq4g128 = false;
     let mut use_mq3 = false;
 
     let mut i = 1;
@@ -477,13 +538,17 @@ fn main() {
                 use_mq4 = true;
                 i += 1;
             }
+            "--mq4g128" => {
+                use_mq4g128 = true;
+                i += 1;
+            }
             "--mq3" => {
                 use_mq3 = true;
                 i += 1;
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq4 | --mq3]"
+                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq4 | --mq4g128 | --mq3]"
                 );
                 std::process::exit(0);
             }
@@ -493,9 +558,9 @@ fn main() {
             }
         }
     }
-    let n_format_flags = (keep_f32 as u8) + (use_mq4 as u8) + (use_mq3 as u8);
+    let n_format_flags = (keep_f32 as u8) + (use_mq4 as u8) + (use_mq4g128 as u8) + (use_mq3 as u8);
     if n_format_flags > 1 {
-        eprintln!("--keep-f32, --mq4, and --mq3 are mutually exclusive");
+        eprintln!("--keep-f32, --mq4, --mq4g128, and --mq3 are mutually exclusive");
         std::process::exit(1);
     }
 
@@ -512,6 +577,8 @@ fn main() {
         "F32"
     } else if use_mq4 {
         "MQ4-G256 (weights), F32 (norms)"
+    } else if use_mq4g128 {
+        "MQ4-G128 (weights), F32 (norms)"
     } else if use_mq3 {
         "MQ3-G256 (weights), F32 (norms)"
     } else {
@@ -592,13 +659,15 @@ fn main() {
     );
 
     // Metadata JSON for the HFQ file.
-    let draft_dtype = if keep_f32 { "f32" } else if use_mq4 { "mq4" } else if use_mq3 { "mq3" } else { "f16" };
+    let draft_dtype = if keep_f32 { "f32" } else if use_mq4 { "mq4" } else if use_mq4g128 { "mq4g128" } else if use_mq3 { "mq3" } else { "f16" };
     // FWHT sign tables for MQ4 rotation. Seeds 42/1042 match the engine's
     // `rdna_compute::Gpu::ensure_mq_signs()` so quantized weights here can
     // be dequantized/used correctly on GPU at inference.
-    let needs_fwht = use_mq4 || use_mq3;
-    let signs1: Vec<f32> = if needs_fwht { gen_fwht_signs(42, 256) } else { Vec::new() };
-    let signs2: Vec<f32> = if needs_fwht { gen_fwht_signs(1042, 256) } else { Vec::new() };
+    let needs_fwht_g256 = use_mq4 || use_mq3;
+    let signs1: Vec<f32> = if needs_fwht_g256 { gen_fwht_signs(42, 256) } else { Vec::new() };
+    let signs2: Vec<f32> = if needs_fwht_g256 { gen_fwht_signs(1042, 256) } else { Vec::new() };
+    let signs1_g128: Vec<f32> = if use_mq4g128 { gen_fwht_signs(42, 128) } else { Vec::new() };
+    let signs2_g128: Vec<f32> = if use_mq4g128 { gen_fwht_signs(1042, 128) } else { Vec::new() };
     let metadata = serde_json::json!({
         "architecture": "dflash",
         "config": config,
@@ -654,6 +723,7 @@ fn main() {
         //   norms → always F32 (small, precision-critical).
         //   other (projections) → F32 if --keep-f32,
         //                         MQ4-G256 if --mq4 (and innermost ≥ 256 divisible),
+        //                         MQ4-G128 if --mq4g128 (and innermost ≥ 128),
         //                         else F16.
         // MQ4 divisibility: quantize_mq4g256 pads the final partial group with
         // zeros. That's safe for weights since the padded lanes are never read
@@ -666,6 +736,9 @@ fn main() {
         } else if use_mq4 && n_elements >= 256 {
             let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ4G256, 256u32, q)
+        } else if use_mq4g128 && n_elements >= 128 {
+            let q = quantize_mq4g128(&f32_data, &signs1_g128, &signs2_g128);
+            (QuantType::MQ4G128, 128u32, q)
         } else if use_mq3 && n_elements >= 256 {
             let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ3G256, 256u32, q)
@@ -689,6 +762,12 @@ fn main() {
         hfq_tensors.len()
     );
     eprintln!("  total out  : {:.2} MiB", total_bytes_out as f64 / (1024.0 * 1024.0));
+    if use_mq4g128 && total_params > 0 {
+        eprintln!(
+            "  effective bpw: {:.3}",
+            total_bytes_out as f64 * 8.0 / total_params as f64
+        );
+    }
 
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
