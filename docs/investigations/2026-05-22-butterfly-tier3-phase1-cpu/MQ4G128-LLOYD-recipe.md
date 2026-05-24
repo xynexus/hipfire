@@ -22,6 +22,14 @@ unmeasured. Treat as a lever-direction, not a deliverable.
 
 Real PARO 0.8B ≈ 0.035 KLD-class. **g128+Lloyd ≈ parity, no training.**
 
+## UPDATE: g256-layout + g64 subscales + Lloyd = BEST (Kaden's helical idea)
+| g256 uniform | g128+Lloyd | g256/4×g64-subscale+Lloyd | g256/2×g128-sub+Lloyd |
+|---:|---:|---:|---:|
+| 0.0567 | 0.0383 | **0.0268** | 0.0369 |
+Packed g64-in-g256 (4 sub-scales/block + per-sub Lloyd) = −53%, BELOW PARO 0.035,
+at g256 occupancy. Cost = 4-way sub-scale unpack, not group fragmentation. Best
+quality+perf candidate. Sim flag: --group-size 256 --quant-mode lloyd --subscale-size 64.
+
 ## What works, what doesn't
 - **g128**: finer scaling, −13% (1 extra bit of scale precision). Targets granularity.
 - **Lloyd**: non-uniform 16-level codebook → the big lever (−32% combined). Places
