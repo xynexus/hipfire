@@ -1,7 +1,14 @@
 # MQ4G128+Lloyd — PARO-class flat-MQ4 recipe (0.8B preliminary, 2026-05-24)
 
 **Recipe:** uniform 4-bit, **group-128**, **Lloyd-Max codebook**, FWHT rotation,
-AWQ α0.55. No learned signs. = `quantize_mq4g128` + `--quant-mode lloyd`.
+AWQ α0.55. No learned signs.
+
+⚠️ **IMPLEMENTATION STATUS: proxy-validated only, NOT shippable.** Numbers are
+the Python pseudo-quant trainer (`--group-size 128 --quant-mode lloyd`). Rust has
+`quantize_mq4g128` (UNIFORM, no Lloyd, no kernel). g128+Lloyd needs: (1) a
+mq4g128-Lloyd quantizer (combine 128-pt FWHT + per-128 Lloyd codebook), (2) an
+FWHT-128 + codebook-lookup dequant GEMV kernel. Neither exists. Production kldref
+unmeasured. Treat as a lever-direction, not a deliverable.
 
 ## 0.8B ladder (Python pseudo-quant KLD, theta=0, 32-seq, AWQ α0.55)
 
