@@ -16,6 +16,10 @@ Constraint: calib-only/hours, prod-kldref, RDNA-HIP+Rust runtime (CUDA-only = bl
 | QLoRA/QA-LoRA/LoftQ (2305.14314/2309.14717/2310.08659) | frozen-quant + LoRA adapters | 4+lora | hrs | y | no | recover quality w/o touching weights; merge adapters |
 | logit-KLD distill (`--loss-kld`) | match bf16 logits | any | 1d | ours | no | heaviest, last resort |
 
+## KEY: flat-MQ4 stays. EfficientQAT/AdaRound/OmniQuant/LoftQ tune weights to the
+4.25bpw uniform grid — no helical kernel, no kmap, ships on existing GEMV. Retraining
+may delete helical, not just cheapen it. (bar = prod-kldref, unproven til run.)
+
 ## Top-3 for us
 1. **EfficientQAT** — weight-only block QAT, calib-only, hours, ROCm-runnable, reports near-FP16 at 4bpw on Llama; tune the flat layers, keep helical-Q8 on hot. Closest to bar without CUDA lock.
 2. **AdaRound/BRECQ first** — cheap block recon to confirm retraining helps before QAT.
