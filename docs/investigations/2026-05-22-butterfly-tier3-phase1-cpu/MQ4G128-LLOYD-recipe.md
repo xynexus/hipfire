@@ -58,3 +58,4 @@ uniform 0.354 → g256+Lloyd 0.054 (−85%) → +g64-subscale 0.036 (−90%). Sc
 STEEPER than 0.8B (granularity-bound model, Lloyd is the lever). PARO-class in
 proxy. CAVEATS unchanged: proxy/0.8B-9B/no-kernel/no-prod-kldref. Recipe: g256
 layout + 4×g64 subscale + Lloyd. A3B + production kernel = next.
+## A3B-35B MEASURED (bf16, proxy): g256+Lloyd 0.0193 -> +g64-subscale 0.0149 (-23pct). MoE most compressible; below PARO 0.0347. ALL trunk proven: 0.8B 0.027 / 9B 0.036 / A3B 0.0149.
