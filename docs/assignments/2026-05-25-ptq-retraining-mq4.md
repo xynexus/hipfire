@@ -12,10 +12,11 @@ MQ4 (~4.5bpw) holds ~0.05–0.13 KLD. Helical MQ4 Lloyd pays MQ6-like decode tax
 quality. Conclusion: the lever is **retraining to the quantized forward**, not codebooks.
 Before spending GPU on it, we want a cited map so we don't take shots in the dark.
 
-## Pipeline we're tuning into (don't re-survey steps 1-2)
-1. AWQ flat-MQ4 (α0.55) — done, the 4.25bpw floor. 2. kmap-promote imatrix-hot
-tensors (down/v) to helical/MQ6 — infra exists. **3. tune the residual = your scope.**
-Score methods on tuning an already-AWQ'd, mixed-precision model, not from-scratch.
+## Pipeline (single target: tune flat-MQ4; helical = fallback only)
+1. AWQ flat-MQ4 (α0.55) — done, 4.25bpw floor. 2. **tune flat-MQ4 to the cliff =
+your scope** — keep 4.25bpw on the existing GEMV, no helical kernel/kmap. 3. ONLY if
+tuning misses bar: kmap-promote hot tensors to helical. Score methods on tuning an
+AWQ'd flat-MQ4 model. (supersedes earlier "promote then tune"; flat stays.)
 
 ## Deliverable
 
