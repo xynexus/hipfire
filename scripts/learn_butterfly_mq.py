@@ -691,6 +691,8 @@ def _lloyd_max_dequant_shared_codebook(
 
     _cbb = int(os.environ.get("HIPFIRE_CB_BITS", "8" if os.environ.get("HIPFIRE_CB_Q8") == "1" else "0"))
     if _cbb:
+        if _cbb < 2:
+            raise ValueError(f"HIPFIRE_CB_BITS must be >=2 (got {_cbb}); <2 gives 0 levels / NaN")
         # quantize 16-entry codebook to cbb bits (+fp16 scale/grp): mq6=0.375, q8=0.56 bpw.
         lim = (1 << (_cbb - 1)) - 1
         cb_scale = centroids.abs().amax(-1, keepdim=True).clamp_min(1e-12) / lim
