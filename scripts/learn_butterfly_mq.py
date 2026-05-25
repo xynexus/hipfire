@@ -1925,6 +1925,39 @@ def self_test(device_str: str = "cpu") -> int:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Meta-device safety helpers.
+# When a model is loaded with device_map="auto" some layers may be offloaded
+# to a "meta" device (no backing storage).  Any .cpu() / .numpy() call on
+# those tensors raises NotImplementedError.  The helpers below are used in
+# all dump/export sites so that A3B (35B) runs with --n-epochs 0 survive.
+# ---------------------------------------------------------------------------
+
+def _safe_tensor_norm(param: "torch.nn.Parameter") -> float:
+    """Return the L2 norm of *param* as a Python float, or float('nan') if the
+    tensor lives on a meta device or cannot be materialised."""
+    try:
+        if getattr(param, "is_meta", False):
+            return float("nan")
+        if hasattr(param, "device") and getattr(param.device, "type", None) == "meta":
+            return float("nan")
+        return float(param.detach().norm().cpu())
+    except (NotImplementedError, RuntimeError, ValueError):
+        return float("nan")
+
+
+def _safe_tensor_numpy(param: "torch.nn.Parameter") -> "Optional[np.ndarray]":
+    """Return *param* as a numpy array, or None if it cannot be materialised."""
+    try:
+        if getattr(param, "is_meta", False):
+            return None
+        if hasattr(param, "device") and getattr(param.device, "type", None) == "meta":
+            return None
+        return param.detach().cpu().numpy()
+    except (NotImplementedError, RuntimeError, ValueError):
+        return None
+
+
 # Main.
 # ---------------------------------------------------------------------------
 
@@ -2159,7 +2192,7 @@ def main() -> None:
         initial_theta_norms = {n: 0.0 for n in wrapped}
     else:
         initial_theta_norms = {
-            n: float(w.theta_residual.detach().norm().cpu()) for n, w in wrapped.items()
+            n: _safe_tensor_norm(w.theta_residual) for n, w in wrapped.items()
         }
 
     smoke_kld_baseline: Optional[float] = None
@@ -2252,7 +2285,7 @@ def main() -> None:
         print(f"      total flips across {len(wrapped)} tensors: D1 {total_d1}/{total_bits}, D2 {total_d2}/{total_bits}")
     else:
         final_theta_norms = {
-            n: float(w.theta_residual.detach().norm().cpu()) for n, w in wrapped.items()
+            n: _safe_tensor_norm(w.theta_residual) for n, w in wrapped.items()
         }
         print("\n      theta-norm summary (first 8 tensors):")
         for n in list(wrapped.keys())[:8]:
@@ -2288,8 +2321,13 @@ def main() -> None:
         npz_path = args.output_dir / "learnable_signs.npz"
         npz_dict: dict[str, np.ndarray] = {}
         for mod_name, wrapper in sorted(wrapped.items()):
-            d1 = (wrapper.d1_logits.detach() >= 0.0).cpu().numpy().astype(np.int8) * 2 - 1
-            d2 = (wrapper.d2_logits.detach() >= 0.0).cpu().numpy().astype(np.int8) * 2 - 1
+            _d1 = _safe_tensor_numpy(wrapper.d1_logits)
+            _d2 = _safe_tensor_numpy(wrapper.d2_logits)
+            if _d1 is None or _d2 is None:
+                print(f"      [warn] {wrapper.canonical_name}: meta device, skipping sign export")
+                continue
+            d1 = (_d1 >= 0.0).astype(np.int8) * 2 - 1
+            d2 = (_d2 >= 0.0).astype(np.int8) * 2 - 1
             npz_dict[f"{wrapper.canonical_name}.d1"] = d1
             npz_dict[f"{wrapper.canonical_name}.d2"] = d2
         np.savez(npz_path, **npz_dict)
@@ -2300,9 +2338,11 @@ def main() -> None:
             bias_path = args.output_dir / "bias_corrections.npz"
             bias_dict: dict[str, np.ndarray] = {}
             for mod_name, wrapper in sorted(wrapped.items()):
-                bias_dict[wrapper.canonical_name] = (
-                    wrapper.bias_correction.detach().cpu().numpy().astype(np.float32)
-                )
+                _bc = _safe_tensor_numpy(wrapper.bias_correction)
+                if _bc is None:
+                    print(f"      [warn] {wrapper.canonical_name}: meta device, skipping bias export")
+                    continue
+                bias_dict[wrapper.canonical_name] = _bc.astype(np.float32)
             np.savez(bias_path, **bias_dict)
             total_bias_elems = sum(v.size for v in bias_dict.values())
             print(f"      wrote {len(bias_dict)} bias corrections → {bias_path} "
@@ -2312,9 +2352,11 @@ def main() -> None:
         npz_path = args.output_dir / "full_butterfly_rotations.npz"
         npz_dict = {}
         for mod_name, wrapper in sorted(wrapped.items()):
-            npz_dict[wrapper.canonical_name] = wrapper.theta.detach().cpu().numpy().astype(
-                np.float32,
-            )
+            _th = _safe_tensor_numpy(wrapper.theta)
+            if _th is None:
+                print(f"      [warn] {wrapper.canonical_name}: meta device, skipping theta export")
+                continue
+            npz_dict[wrapper.canonical_name] = _th.astype(np.float32)
         np.savez(npz_path, **npz_dict)
         print(f"      wrote {len(npz_dict)} per-group full rotations → {npz_path} "
               f"({npz_path.stat().st_size / 1e6:.2f} MB)")
@@ -2323,9 +2365,11 @@ def main() -> None:
         npz_path = args.output_dir / "butterfly_residuals.npz"
         npz_dict = {}
         for mod_name, wrapper in sorted(wrapped.items()):
-            npz_dict[wrapper.canonical_name] = wrapper.theta_residual.detach().cpu().numpy().astype(
-                np.float32,
-            )
+            _tr = _safe_tensor_numpy(wrapper.theta_residual)
+            if _tr is None:
+                print(f"      [warn] {wrapper.canonical_name}: meta device, skipping residual export")
+                continue
+            npz_dict[wrapper.canonical_name] = _tr.astype(np.float32)
         np.savez(npz_path, **npz_dict)
         print(f"      wrote {len(npz_dict)} residuals → {npz_path} "
               f"({npz_path.stat().st_size / 1e6:.2f} MB)")
@@ -2333,10 +2377,14 @@ def main() -> None:
         hfbf_path = args.output_dir / "butterfly_residuals.hfbf"
         bfly_entries: list[tuple[str, int, np.ndarray]] = []
         for mod_name, wrapper in sorted(wrapped.items()):
+            _tr2 = _safe_tensor_numpy(wrapper.theta_residual)
+            if _tr2 is None:
+                print(f"      [warn] {wrapper.canonical_name}: meta device, skipping HFBF entry")
+                continue
             bfly_entries.append((
                 wrapper.canonical_name,
                 0,
-                wrapper.theta_residual.detach().cpu().numpy().astype(np.float32),
+                _tr2.astype(np.float32),
             ))
         write_hfbf(hfbf_path, bfly_entries)
         print(f"      wrote {len(bfly_entries)} HFBF entries → {hfbf_path} "
@@ -2345,7 +2393,14 @@ def main() -> None:
     hfsc_path = args.output_dir / "paper_awq_scales.hfsc"
     awq_entries: list[tuple[str, int, np.ndarray]] = []
     for mod_name, wrapper in sorted(wrapped.items()):
-        scales = wrapper.channel_scales.detach().to(torch.float32).cpu().numpy().astype(np.float32)
+        try:
+            if getattr(wrapper.channel_scales, 'is_meta', False) or \
+                    getattr(getattr(wrapper.channel_scales, 'device', None), 'type', None) == 'meta':
+                raise NotImplementedError
+            scales = wrapper.channel_scales.detach().to(torch.float32).cpu().numpy().astype(np.float32)
+        except (NotImplementedError, RuntimeError, ValueError):
+            print(f"      [warn] {wrapper.canonical_name}: meta device, skipping HFSC entry")
+            continue
         awq_entries.append((wrapper.canonical_name, 0, scales))
     write_hfsc(hfsc_path, awq_entries)
     print(f"      wrote {len(awq_entries)} HFSC entries → {hfsc_path} "
