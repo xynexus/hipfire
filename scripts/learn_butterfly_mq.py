@@ -2004,7 +2004,7 @@ def main() -> None:
     ap.add_argument("--l2-theta", type=float, default=0.0,
                     help="Optional small L2 penalty on theta magnitude.")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
+    ap.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"])
     ap.add_argument("--log-interval", type=int, default=8)
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--smoke-eval", action="store_true",
@@ -2103,9 +2103,9 @@ def main() -> None:
         print(f"  sign granularity: {args.sign_granularity}")
     print()
 
-    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
+    dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[args.dtype]
 
-    print("[1/7] Loading BF16 oracle model + tokenizer ...")
+    print(f"[1/7] Loading {args.dtype} oracle model + tokenizer ...")
     t0 = time.time()
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
@@ -2120,7 +2120,7 @@ def main() -> None:
     if torch.cuda.is_available():
         print(f"      VRAM {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
-    print("\n[2/7] Loading fresh BF16 student model ...")
+    print(f"\n[2/7] Loading fresh {args.dtype} student model ...")
     t0 = time.time()
     student = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=dtype, device_map="auto", low_cpu_mem_usage=True,
