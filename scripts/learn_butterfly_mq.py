@@ -689,10 +689,12 @@ def _lloyd_max_dequant_shared_codebook(
         centroids = torch.where(nonempty, updated, centroids)
         del assignment, sums, counts, nonempty, updated
 
-    if os.environ.get("HIPFIRE_CB_Q8") == "1":
-        # Q8_0 the 16-entry codebook (8-bit + fp16 scale/grp): 1.0->~0.56 bpw.
-        cb_scale = centroids.abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127.0
-        centroids = (centroids / cb_scale).round().clamp(-127, 127) * cb_scale
+    _cbb = int(os.environ.get("HIPFIRE_CB_BITS", "8" if os.environ.get("HIPFIRE_CB_Q8") == "1" else "0"))
+    if _cbb:
+        # quantize 16-entry codebook to cbb bits (+fp16 scale/grp): mq6=0.375, q8=0.56 bpw.
+        lim = (1 << (_cbb - 1)) - 1
+        cb_scale = centroids.abs().amax(-1, keepdim=True).clamp_min(1e-12) / lim
+        centroids = (centroids / cb_scale).round().clamp(-lim, lim) * cb_scale
     distances = (flat.unsqueeze(-1) - centroids.unsqueeze(1)).square()
     assignment = distances.argmin(dim=-1)  # [m*n_groups, N]
     del distances
