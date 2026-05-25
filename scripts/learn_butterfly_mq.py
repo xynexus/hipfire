@@ -40,6 +40,7 @@ The HFBF format is documented in `_write_hfbf` below.
 from __future__ import annotations
 
 import argparse
+import os
 from contextlib import contextmanager
 import json
 import math
@@ -688,6 +689,10 @@ def _lloyd_max_dequant_shared_codebook(
         centroids = torch.where(nonempty, updated, centroids)
         del assignment, sums, counts, nonempty, updated
 
+    if os.environ.get("HIPFIRE_CB_Q8") == "1":
+        # Q8_0 the 16-entry codebook (8-bit + fp16 scale/grp): 1.0->~0.56 bpw.
+        cb_scale = centroids.abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127.0
+        centroids = (centroids / cb_scale).round().clamp(-127, 127) * cb_scale
     distances = (flat.unsqueeze(-1) - centroids.unsqueeze(1)).square()
     assignment = distances.argmin(dim=-1)  # [m*n_groups, N]
     del distances
