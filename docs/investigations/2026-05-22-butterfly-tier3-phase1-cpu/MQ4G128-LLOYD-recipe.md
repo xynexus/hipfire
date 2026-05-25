@@ -51,3 +51,9 @@ Unproven; mq4g128 has NO runtime kernel — needs FWHT-128 dequant for prod eval
 Both decode-hit per his prior sub-block measure. Mixed-block (g128/Lloyd only on
 ffn_down/v_proj via kmap) recovers most KLD at fraction of perf. Python proxy ~2x
 harsher than prod kldref. Built: quantize_mq4g128 (0e5d1482), HFQ4G128 kernels.
+
+## 9B scaling (Python proxy, confirms hypothesis)
+uniform 0.354 → g256+Lloyd 0.054 (−85%) → +g64-subscale 0.036 (−90%). Scales
+STEEPER than 0.8B (granularity-bound model, Lloyd is the lever). PARO-class in
+proxy. CAVEATS unchanged: proxy/0.8B-9B/no-kernel/no-prod-kldref. Recipe: g256
+layout + 4×g64 subscale + Lloyd. A3B + production kernel = next.
