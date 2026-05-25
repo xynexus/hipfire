@@ -41,11 +41,12 @@ Promising lever-direction. Sim: --group-size 256 --quant-mode lloyd --subscale-s
   range-fixers), signs go FAIL. 0.8B-only, drop them.
 - AWQ outlier lever taps out on big models; g128+Lloyd attack granularity instead.
 
-## Projection (NOT yet measured — 9B HF download pending)
-9B+ is granularity-bound (4bit 0.41, 6bit 0.088 same rotation). g128+Lloyd attacks
-exactly that → expect LARGER % drop than 0.8B's −32%. Lloyd alone gave −10% (9B) /
-−6.5% (A3B); +g128 should stack. Plausibly: 9B 0.179→~0.10, A3B 0.103→~0.06.
-Unproven; mq4g128 has NO runtime kernel — needs FWHT-128 dequant for prod eval.
+## 9B MEASURED (beat the projection): proxy uniform 0.354 → subscale64+Lloyd 0.036
+Granularity-bound, so the lever drops harder than 0.8B (−90% vs −53%), beating the
+~0.10 projection. NOTE units: 0.179 was PRODUCTION kldref uniform; 0.354 is the
+PROXY uniform — all subscale numbers here are PROXY. A3B still unmeasured; mq4g128
++ subscale have NO runtime kernel — needs FWHT + 4×g64-min/scale + Lloyd-lookup
+GEMV for prod eval.
 
 ## Cost (Bjorn's call): g128 ≈ +0.25 bpw (4.25→4.5) + Lloyd codebook lookup.
 Both decode-hit per his prior sub-block measure. Mixed-block (g128/Lloyd only on
