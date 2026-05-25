@@ -20,6 +20,7 @@ from learn_butterfly_mq import (  # noqa: E402
     N,
     _enable_student_gradient_checkpointing,
     _lloyd_max_dequant_per_group,
+    _lloyd_max_dequant_shared_codebook,
     _release_oracle_model,
     _select_wrapper_class,
     _uniform_minmax_dequant_per_group,
@@ -518,6 +519,70 @@ def test_rotation_mode_fwht_signs_preserves_learnable_signs_byte_equal():
     torch.testing.assert_close(selected(x), legacy(x), rtol=0.0, atol=0.0)
 
 
+
+
+def test_shared_codebook_dequant_shape_and_finite():
+    """_lloyd_max_dequant_shared_codebook returns the same shape as input and is finite."""
+    torch.manual_seed(777)
+    w = torch.randn(4, 3, N, dtype=torch.float32)  # [m, n_groups, N]
+    out = _lloyd_max_dequant_shared_codebook(w, quant_bits=4, n_iter=4)
+    assert out.shape == w.shape, f"shape mismatch: {out.shape} vs {w.shape}"
+    assert torch.isfinite(out).all(), "non-finite values in shared-codebook output"
+
+
+def test_shared_codebook_mse_below_unquantized_variance():
+    """Reconstruction MSE with shared codebook is bounded relative to weight variance.
+
+    ~4.9 bpw is lower quality than per-sub 8 bpw, but should be dramatically
+    better than random (i.e. MSE < 0.5 * variance of input weights).
+    """
+    torch.manual_seed(888)
+    w = torch.randn(8, 4, N, dtype=torch.float32)
+    out = _lloyd_max_dequant_shared_codebook(w, quant_bits=4, n_iter=8)
+    mse = float((out - w).pow(2).mean())
+    var = float(w.var())
+    assert mse < 0.5 * var, f"shared-codebook MSE {mse:.4f} >= 0.5 * var {0.5 * var:.4f}"
+
+
+def test_shared_codebook_wrapper_forward_shape_and_finite():
+    """LearnableSignsPseudoQuantLinear with shared_codebook=True produces correct output shape."""
+    torch.manual_seed(999)
+    k = N * 4
+    m = 6
+    weight = torch.randn(m, k, dtype=torch.float32)
+    scales = torch.ones(k, dtype=torch.float32)
+    x = torch.randn(3, k, dtype=torch.float32)
+
+    wrapper = LearnableSignsPseudoQuantLinear(
+        weight, None, scales, "fixture.shared_cb",
+        sign_granularity="group", quant_mode="lloyd",
+        subscale_size=64, shared_codebook=True,
+    )
+    y = wrapper(x)
+    assert y.shape == (3, m), f"unexpected output shape {y.shape}"
+    assert torch.isfinite(y).all(), "non-finite values in shared-codebook wrapper output"
+    # sub_scale on wrapper is the stored flag, not a tensor
+    assert wrapper.shared_codebook is True
+
+
+def test_shared_codebook_consistent_with_quantize_mq4g256_signs_ste():
+    """quantize_mq4g256_signs_ste(shared_codebook=True) is finite and same shape as input."""
+    from learn_butterfly_mq import FWHT_SIGNS1, FWHT_SIGNS2
+
+    torch.manual_seed(1001)
+    k = N * 2
+    m = 4
+    w = torch.randn(m, k, dtype=torch.float32)
+    d1 = FWHT_SIGNS1.to(dtype=torch.float32).view(1, N).repeat(k // N, 1)
+    d2 = FWHT_SIGNS2.to(dtype=torch.float32).view(1, N).repeat(k // N, 1)
+
+    out = quantize_mq4g256_signs_ste(
+        w, d1, d2, quant_bits=4, quant_mode="lloyd",
+        subscale_size=64, shared_codebook=True,
+    )
+    assert out.shape == w.shape
+    assert torch.isfinite(out).all()
+
 if __name__ == "__main__":
     test_group_signs_initialize_to_tensor_baseline()
     test_quant_mode_uniform_is_default_byte_equal()
@@ -538,4 +603,8 @@ if __name__ == "__main__":
     test_train_kld_loss_uses_cached_oracle_logits_and_default_live_path()
     test_rotation_mode_fwht_signs_preserves_legacy_default_byte_equal()
     test_rotation_mode_fwht_signs_preserves_learnable_signs_byte_equal()
+    test_shared_codebook_dequant_shape_and_finite()
+    test_shared_codebook_mse_below_unquantized_variance()
+    test_shared_codebook_wrapper_forward_shape_and_finite()
+    test_shared_codebook_consistent_with_quantize_mq4g256_signs_ste()
     print("learnable FWHT tests passed")

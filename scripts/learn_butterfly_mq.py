@@ -330,6 +330,7 @@ def _mq_dequant_rotated(
     quant_bits: int,
     quant_mode: str,
     subscale_size: int = 0,
+    shared_codebook: bool = False,
 ) -> torch.Tensor:
     quant_mode = _validate_quant_mode(quant_mode)
     if quant_mode == "uniform":
@@ -338,6 +339,7 @@ def _mq_dequant_rotated(
         )
     return _lloyd_max_dequant_per_group(
         w_rotated, quant_bits, subscale_size=subscale_size,
+        shared_codebook=shared_codebook,
     )
 
 
@@ -349,6 +351,7 @@ def quantize_mq4g256_bfly_ste(
     quant_bits: int = 4,
     quant_mode: str = "uniform",
     subscale_size: int = 0,
+    shared_codebook: bool = False,
 ) -> torch.Tensor:
     """MQ4G256 round-trip with learnable butterfly residual.
 
@@ -371,6 +374,7 @@ def quantize_mq4g256_bfly_ste(
     with torch.no_grad():
         dequant_rot = _mq_dequant_rotated(
             w_rotated, quant_bits, quant_mode, subscale_size=subscale_size,
+            shared_codebook=shared_codebook,
         )
         delta = dequant_rot - w_rotated
 
@@ -390,6 +394,7 @@ def quantize_mq4g256_full_butterfly_ste(
     quant_bits: int = 4,
     quant_mode: str = "uniform",
     subscale_size: int = 0,
+    shared_codebook: bool = False,
 ) -> torch.Tensor:
     """MQ4G256 round-trip with a per-group learnable butterfly rotation.
 
@@ -415,6 +420,7 @@ def quantize_mq4g256_full_butterfly_ste(
     with torch.no_grad():
         dequant_rot = _mq_dequant_rotated(
             w_rotated, quant_bits, quant_mode, subscale_size=subscale_size,
+            shared_codebook=shared_codebook,
         )
         delta = dequant_rot - w_rotated
 
@@ -458,6 +464,7 @@ def quantize_mq4g256_signs_ste(
     quant_bits: int = 4,
     quant_mode: str = "uniform",
     subscale_size: int = 0,
+    shared_codebook: bool = False,
 ) -> torch.Tensor:
     """MQ4G256 round-trip with learnable D1/D2 sign tables.
 
@@ -479,6 +486,7 @@ def quantize_mq4g256_signs_ste(
     with torch.no_grad():
         dequant_rot = _mq_dequant_rotated(
             w_fwht, quant_bits, quant_mode, subscale_size=subscale_size,
+            shared_codebook=shared_codebook,
         )
         delta = dequant_rot - w_fwht
     w_quant_rot = w_fwht + delta.detach()
@@ -492,12 +500,20 @@ def _lloyd_max_dequant_per_group(
     chunk_groups: int = 8192,
     n_iter: int = 8,
     subscale_size: int = 0,
+    shared_codebook: bool = False,
 ) -> torch.Tensor:
     """Fit per-group or per-sub-block Lloyd-Max centroids and return dequantized weights.
 
     The largest production tensors have hundreds of thousands of 256-point
     groups. Chunking caps the transient [groups, 256, centroids] distance tensor.
+
+    When shared_codebook=True (requires subscale_size=64), one 16-entry codebook
+    is fit on the full 256-element group; 4 per-g64 fp16 sub-scales are then
+    solved analytically to minimise per-sub MSE (~4.9 bpw).
     """
+    if shared_codebook:
+        return _lloyd_max_dequant_shared_codebook(w_fwht, quant_bits, n_iter=n_iter)
+
     n_centroids = 1 << quant_bits
     m, n_groups, _ = w_fwht.shape
     block_size = _quant_block_size(subscale_size)
@@ -572,6 +588,76 @@ def _lloyd_max_dequant_chunk(
     return dequant
 
 
+def _lloyd_max_dequant_shared_codebook(
+    w_fwht: torch.Tensor,
+    quant_bits: int,
+    n_iter: int = 8,
+) -> torch.Tensor:
+    """Shared-codebook Lloyd-Max dequantization (~4.9 bpw).
+
+    Fits ONE 16-entry codebook on the full 256-element group, then derives
+    4 per-g64 fp16 sub-scales analytically so that:
+        reconstruction_i = codebook[idx_i] * sub_scale[sub_block(i)]
+
+    Sub-scale analytic solution (per sub-block of 64 weights):
+        sub_scale = dot(cb[idx], w) / (dot(cb[idx], cb[idx]) + eps)
+    This is the least-squares scalar that minimises sum((cb[idx]*s - w)^2).
+
+    Requires: N must be divisible by 4 (sub-block size = N // 4 = 64 for N=256).
+    """
+    assert N % 4 == 0, "shared_codebook requires N divisible by 4"
+    sub_size = N // 4  # 64 for the standard N=256 group size
+
+    n_centroids = 1 << quant_bits
+    m, n_groups, _ = w_fwht.shape
+    # Work over all groups flattened: shape [m * n_groups, N]
+    flat = w_fwht.reshape(m * n_groups, N)
+
+    quantiles = torch.linspace(
+        0.0, 1.0, n_centroids, device=w_fwht.device, dtype=w_fwht.dtype,
+    )
+    ones_full = torch.ones((1, N), device=w_fwht.device, dtype=w_fwht.dtype)
+
+    # Step 1: fit one shared codebook on all N=256 weights per group.
+    centroids = torch.quantile(flat, quantiles, dim=-1).transpose(0, 1).contiguous()
+    for _ in range(n_iter):
+        distances = (flat.unsqueeze(-1) - centroids.unsqueeze(1)).square()
+        assignment = distances.argmin(dim=-1)
+        del distances
+        sums = torch.zeros_like(centroids)
+        counts = torch.zeros_like(centroids)
+        sums.scatter_add_(1, assignment, flat)
+        counts.scatter_add_(1, assignment, ones_full.expand_as(flat))
+        nonempty = counts > 0.0
+        updated = sums / counts.clamp_min(1.0)
+        centroids = torch.where(nonempty, updated, centroids)
+        del assignment, sums, counts, nonempty, updated
+
+    distances = (flat.unsqueeze(-1) - centroids.unsqueeze(1)).square()
+    assignment = distances.argmin(dim=-1)  # [m*n_groups, N]
+    del distances
+    # cb_vals[i, j] = codebook value assigned to position j in group i
+    cb_vals = centroids.gather(1, assignment)  # [m*n_groups, N]
+    del centroids
+
+    # Step 2: fit 4 per-g64 sub-scales analytically.
+    # Reshape to [m*n_groups, 4, sub_size] for vectorised computation.
+    w_sub = flat.reshape(m * n_groups, 4, sub_size)         # raw weights
+    cb_sub = cb_vals.reshape(m * n_groups, 4, sub_size)     # codebook lookup values
+
+    # sub_scale = dot(cb, w) / (dot(cb, cb) + eps)  — per-sub-block scalar
+    numerator = (cb_sub * w_sub).sum(dim=-1)                # [m*n_groups, 4]
+    denominator = (cb_sub * cb_sub).sum(dim=-1).clamp_min(1e-12)
+    sub_scale = (numerator / denominator).to(torch.float16).to(flat.dtype)  # fp16 precision
+
+    # Step 3: reconstruct: w_i = codebook[idx_i] * sub_scale[sub_block(i)]
+    # sub_scale: [m*n_groups, 4, 1] broadcast over sub_size dimension
+    dequant_flat = (cb_sub * sub_scale.unsqueeze(-1)).reshape(m * n_groups, N)
+    del cb_vals, cb_sub, w_sub, sub_scale, assignment, numerator, denominator
+
+    return dequant_flat.reshape(m, n_groups, N)
+
+
 def _expand_signs_for_weight(
     signs: torch.Tensor,
     m: int,
@@ -631,6 +717,7 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         quant_bits: int = 4,
         quant_mode: str = "uniform",
         subscale_size: int = 0,
+        shared_codebook: bool = False,
     ) -> None:
         super().__init__()
         assert weight.dim() == 2
@@ -642,6 +729,7 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         self.quant_bits = quant_bits
         self.quant_mode = _validate_quant_mode(quant_mode)
         self.subscale_size = _validate_subscale_size(subscale_size)
+        self.shared_codebook = shared_codebook
 
         self.register_buffer("weight", weight.detach().clone())
         if bias is not None:
@@ -706,6 +794,7 @@ class LearnableSignsPseudoQuantLinear(nn.Module):
         w_q_dq = quantize_mq4g256_signs_ste(
             w_scaled, d1, d2, quant_bits=self.quant_bits,
             quant_mode=self.quant_mode, subscale_size=self.subscale_size,
+            shared_codebook=self.shared_codebook,
         )
         x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
         y = F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
@@ -751,6 +840,7 @@ class ButterflyResidualPseudoQuantLinear(nn.Module):
         quant_bits: int = 4,
         quant_mode: str = "uniform",
         subscale_size: int = 0,
+        shared_codebook: bool = False,
     ) -> None:
         super().__init__()
         assert weight.dim() == 2
@@ -779,6 +869,7 @@ class ButterflyResidualPseudoQuantLinear(nn.Module):
         self.quant_bits = quant_bits
         self.quant_mode = _validate_quant_mode(quant_mode)
         self.subscale_size = _validate_subscale_size(subscale_size)
+        self.shared_codebook = shared_codebook
 
         self.register_buffer("_fwht_signs1", FWHT_SIGNS1.clone().view(1, N))
         self.register_buffer("_fwht_signs2", FWHT_SIGNS2.clone().view(1, N))
@@ -795,6 +886,7 @@ class ButterflyResidualPseudoQuantLinear(nn.Module):
             w_scaled, self.theta_residual, self._fwht_signs1, self._fwht_signs2,
             quant_bits=self.quant_bits, quant_mode=self.quant_mode,
             subscale_size=self.subscale_size,
+            shared_codebook=self.shared_codebook,
         )
         x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
         return F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
@@ -824,6 +916,7 @@ class FullRotationPseudoQuantLinear(nn.Module):
         quant_bits: int = 4,
         quant_mode: str = "uniform",
         subscale_size: int = 0,
+        shared_codebook: bool = False,
     ) -> None:
         super().__init__()
         assert weight.dim() == 2
@@ -845,6 +938,7 @@ class FullRotationPseudoQuantLinear(nn.Module):
         self.quant_bits = quant_bits
         self.quant_mode = _validate_quant_mode(quant_mode)
         self.subscale_size = _validate_subscale_size(subscale_size)
+        self.shared_codebook = shared_codebook
         self.theta = nn.Parameter(
             torch.zeros(self.n_groups, LAYER_COUNT, PAIRS_PER_LAYER, dtype=torch.float32),
             requires_grad=False,
@@ -870,6 +964,7 @@ class FullRotationPseudoQuantLinear(nn.Module):
             w_scaled, self.theta, self._fwht_signs1, self._fwht_signs2,
             quant_bits=self.quant_bits, quant_mode=self.quant_mode,
             subscale_size=self.subscale_size,
+            shared_codebook=self.shared_codebook,
         )
         x_scaled = x / s_safe.to(x.dtype).reshape(*[1] * (x.dim() - 1), -1)
         return F.linear(x_scaled, w_q_dq.to(w_dtype), self.bias)
@@ -1140,6 +1235,7 @@ def wrap_awq_targets(
     quant_bits: int = 4,
     quant_mode: str = "uniform",
     subscale_size: int = 0,
+    shared_codebook: bool = False,
 ) -> dict[str, nn.Module]:
     """Wrap all AWQ-F1 Linears whose stored name matches `target_pattern`.
 
@@ -1199,18 +1295,19 @@ def wrap_awq_targets(
                 weight, bias, init_s, canonical,
                 sign_granularity=sign_granularity, quant_bits=quant_bits,
                 quant_mode=quant_mode, subscale_size=subscale_size,
+                shared_codebook=shared_codebook,
             )
         elif wrapper_class is FullRotationPseudoQuantLinear:
             wrapper = wrapper_class(
                 weight, bias, init_s, canonical,
                 quant_bits=quant_bits, quant_mode=quant_mode,
-                subscale_size=subscale_size,
+                subscale_size=subscale_size, shared_codebook=shared_codebook,
             )
         else:
             wrapper = wrapper_class(
                 weight, bias, init_s, canonical,
                 quant_bits=quant_bits, quant_mode=quant_mode,
-                subscale_size=subscale_size,
+                subscale_size=subscale_size, shared_codebook=shared_codebook,
             )
         wrapper = wrapper.to(device=device)
         _set_module(model, mod_name, wrapper)
@@ -1892,6 +1989,20 @@ def self_test(device_str: str = "cpu") -> int:
                 print("  FAIL: lloyd subscale path produced bad shape or non-finite values")
                 return 1
 
+        # Shared-codebook path: one codebook per g256 + 4 per-g64 sub-scales.
+        w_shared_cb = quantize_mq4g256_signs_ste(
+            w_scaled, d1, d2, quant_bits=4, quant_mode="lloyd",
+            subscale_size=64, shared_codebook=True,
+        )
+        finite_sc = bool(torch.isfinite(w_shared_cb).all())
+        shape_sc = w_shared_cb.shape == w_scaled.shape
+        mse_sc = float((w_shared_cb - w_scaled).pow(2).mean())
+        print(f"  [check 2b] shared-codebook shape={tuple(w_shared_cb.shape)} "
+              f"finite={finite_sc} mse={mse_sc:.4f}")
+        if not shape_sc or not finite_sc:
+            print("  FAIL: shared-codebook path produced bad shape or non-finite values")
+            return 1
+
     # Sanity 3: a single SGD step on a random oracle moves theta.
     wrapper.set_optim()
     optimizer = torch.optim.SGD([wrapper.theta_residual], lr=0.1, momentum=0.0)
@@ -2057,6 +2168,10 @@ def main() -> None:
                     help="For active group size 256, fit min/scale and Lloyd "
                          "codebooks within contiguous 64- or 128-wide sub-blocks. "
                          "0 preserves current whole-group behavior.")
+    ap.add_argument("--shared-codebook", action="store_true", default=False,
+                    help="One shared 16-entry Lloyd codebook per g256 block + 4 per-g64 "
+                         "fp16 sub-scales (~4.9 bpw). Requires --quant-mode lloyd and "
+                         "--subscale-size 64. Default off (per-sub codebook behavior).")
     args = ap.parse_args()
 
     configure_group_size(args.group_size)
@@ -2068,6 +2183,8 @@ def main() -> None:
     if args.cache_oracle_logits and not args.loss_kld:
         ap.error("--cache-oracle-logits requires --loss-kld; MSE/sequential modes need live oracle activations")
     _validate_subscale_size(args.subscale_size)
+    if args.shared_codebook and not (args.quant_mode == "lloyd" and args.subscale_size == 64):
+        ap.error("--shared-codebook requires --quant-mode lloyd --subscale-size 64")
 
     # Validate required args for non-self-test mode.
     missing = [name for name in ("model", "imatrix", "corpus", "output_dir")
@@ -2099,6 +2216,7 @@ def main() -> None:
     print(f"  rotation-mode:   {args.rotation_mode}")
     print(f"  quant mode:      {args.quant_mode}")
     print(f"  subscale-size:   {args.subscale_size}")
+    print(f"  shared-codebook: {args.shared_codebook}")
     if args.learnable_signs:
         print(f"  sign granularity: {args.sign_granularity}")
     print()
@@ -2152,6 +2270,7 @@ def main() -> None:
         quant_bits=args.quant_bits,
         quant_mode=args.quant_mode,
         subscale_size=args.subscale_size,
+        shared_codebook=args.shared_codebook,
     )
     print(f"      wrap done in {time.time() - t0:.1f}s")
     if not wrapped:
@@ -2417,6 +2536,7 @@ def main() -> None:
         "quant_mode": args.quant_mode,
         "quant_bits": args.quant_bits,
         "subscale_size": args.subscale_size,
+        "shared_codebook": args.shared_codebook,
         "n_sequences": args.n_sequences,
         "ctx_len": args.ctx_len,
         "alpha": args.alpha,
@@ -2432,6 +2552,7 @@ def main() -> None:
             "quant_mode": args.quant_mode,
             "quant_bits": args.quant_bits,
             "subscale_size": args.subscale_size,
+            "shared_codebook": args.shared_codebook,
         },
         "n_epochs": args.n_epochs,
         "n_wrapped": len(wrapped),
