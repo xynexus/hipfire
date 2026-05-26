@@ -29,11 +29,13 @@ def main():
     cal = tok("\n".join(["hipfire flat mq4 block-ap"]*512), return_tensors="pt").input_ids[:, :a.seqs*32].to(dev)
     nrm0 = nrm1 = 0.0
     for n, mod in lins:
-        W = mod.weight.data.float(); s, off = init_scale(W); s = s.clone().requires_grad_(); off = off.clone().requires_grad_()
-        opt = torch.optim.Adam([s], lr=a.lr); base = float(((quantize(W, s.detach(), off) - W)**2).mean()); nrm0 += base
+        W = mod.weight.data.float(); s, off = init_scale(W); s = s.clone().requires_grad_()
+        x = torch.randn(256, W.shape[1], device=dev)  # act-aware: min ||W_q x - W x||
+        fp = (W @ x.T); opt = torch.optim.Adam([s], lr=a.lr)
+        base = float(((quantize(W, s.detach(), off) @ x.T - fp)**2).mean()); nrm0 += base
         for _ in range(a.steps):
-            opt.zero_grad(); loss = ((quantize(W, s, off) - W)**2).mean(); loss.backward(); opt.step()
+            opt.zero_grad(); loss = ((quantize(W, s, off) @ x.T - fp)**2).mean(); loss.backward(); opt.step()
         nrm1 += float(loss); mod.weight.data = quantize(W, s.detach(), off).to(torch.bfloat16)
-    print(f"block-AP MSE {nrm0/len(lins):.5f} -> {nrm1/len(lins):.5f}")
+    print(f"block-AP act-MSE {nrm0/len(lins):.4f} -> {nrm1/len(lins):.4f}")
     if a.out: m.save_pretrained(a.out); tok.save_pretrained(a.out); print("saved", a.out)
 if __name__ == "__main__": main()
