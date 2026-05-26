@@ -24,4 +24,11 @@ may delete helical, not just cheapen it. (bar = prod-kldref, unproven til run.)
 1. **EfficientQAT** — weight-only block QAT, calib-only, hours, ROCm-runnable, reports near-FP16 at 4bpw on Llama; tune the flat layers, keep helical-Q8 on hot. Closest to bar without CUDA lock.
 2. **AdaRound/BRECQ first** — cheap block recon to confirm retraining helps before QAT.
 3. **LoftQ adapters** — if weight tune underperforms, low-rank merge recovers quality, no kernel change.
+## EfficientQAT live test 2026-05-25 (mi300): runs on Qwen3.5, output=MQ4G256
+--net is a cache LABEL not an arch handler (model-agnostic). 3-site shim threads
+position_embeddings (Catcher+update_dataset, block_ap.py.bak); past forward sig.
+Blockers left: defaults slow (train_size 4096 ~2hr 0.8B); MSE batch-broadcast bug
+(fp [seq,h] vs out [b,seq,h]) → loss suspect, fix before trusting. Verdict: cheaper
+to add block-AP to OUR sim (loads 3.5+kldref) than tune their harness.
+
 ## Avoid: QuIP#/AQLM (CUDA codebook kernels, RDNA blocker); proxy-only claims (butterfly residual −8% MSE → +0.3% prod).
