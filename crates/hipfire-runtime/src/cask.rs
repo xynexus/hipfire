@@ -152,8 +152,8 @@ impl CaskCtx {
         // (budget × m × 4 B each), allocated once per call. Reusing across
         // layers to avoid repeated allocs.
         //
-        // GpuTensor has no Drop impl. Capture fallible work in a closure so
-        // early `?` exits still free the scratch tensors below.
+        // GpuTensor has no Drop impl — bare scope exit leaks device memory.
+        // Capture every fallible exit inside a closure and free on ALL paths.
         let table_len = budget * self.fold_m;
         let indices_dev = gpu.alloc_tensor(&[table_len], rdna_compute::DType::F32)?;
         let weights_dev = gpu.alloc_tensor(&[table_len], rdna_compute::DType::F32)?;
@@ -416,6 +416,9 @@ impl CaskCtx {
             Ok(())
         })();
 
+        // Free the per-eviction scratch GPU buffers on EVERY exit path.
+        // GpuTensor has no Drop impl — bare scope exit (including ? returns
+        // inside the closure above) would leak device memory.
         let _ = gpu.free_tensor(indices_dev);
         let _ = gpu.free_tensor(weights_dev);
         inner_result?;

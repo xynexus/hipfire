@@ -29,6 +29,7 @@ pub mod eval_common;
 pub mod eval_harness;
 pub mod gguf;
 pub mod hfq;
+pub mod kv_adaptive;
 pub mod llama;
 pub mod loop_guard;
 pub mod model_source;

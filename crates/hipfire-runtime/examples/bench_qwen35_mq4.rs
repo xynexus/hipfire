@@ -298,12 +298,19 @@ fn main() {
         for run in 0..prefill_runs {
             let mode;
             let t_prefill = Instant::now();
-            if gpu.verify_has_graph(b) {
+            if gpu.graphs.verify_has_graph(b) {
                 mode = "replay";
-                gpu.verify_graph_launch(b).expect("graph replay");
-            } else if gpu.verify_needs_warmup(b) {
+                gpu.graphs
+                    .verify_graph_launch(
+                        &gpu.hip,
+                        gpu.device_id,
+                        gpu.active_stream.as_ref().unwrap(),
+                        b,
+                    )
+                    .expect("graph replay");
+            } else if gpu.graphs.verify_needs_warmup(b) {
                 mode = "warmup";
-                gpu.verify_mark_warmup_done(b);
+                gpu.graphs.verify_mark_warmup_done(b);
                 qwen35::forward_prefill_batch_single_chunk_captured(
                     &mut gpu,
                     &weights,
@@ -322,7 +329,14 @@ fn main() {
                 .expect("warmup prefill");
             } else {
                 mode = "capture";
-                gpu.begin_verify_graph_capture(b).expect("begin capture");
+                gpu.graphs
+                    .begin_verify_graph_capture(
+                        &gpu.hip,
+                        gpu.device_id,
+                        gpu.active_stream.as_ref().unwrap(),
+                        b,
+                    )
+                    .expect("begin capture");
                 let r = qwen35::forward_prefill_batch_single_chunk_captured(
                     &mut gpu,
                     &weights,
@@ -339,9 +353,22 @@ fn main() {
                     None,
                 );
                 if r.is_ok() {
-                    let blob_count = gpu.capture_blobs.len();
-                    gpu.end_verify_graph_capture().expect("end capture");
-                    gpu.verify_graph_launch(b).expect("launch after capture");
+                    let blob_count = gpu.graphs.capture_blobs.len();
+                    gpu.graphs
+                        .end_verify_graph_capture(
+                            &gpu.hip,
+                            gpu.device_id,
+                            gpu.active_stream.as_ref().unwrap(),
+                        )
+                        .expect("end capture");
+                    gpu.graphs
+                        .verify_graph_launch(
+                            &gpu.hip,
+                            gpu.device_id,
+                            gpu.active_stream.as_ref().unwrap(),
+                            b,
+                        )
+                        .expect("launch after capture");
                     eprintln!(
                         "  [graph-prefill] captured b={} ({} kernarg blobs)",
                         b, blob_count

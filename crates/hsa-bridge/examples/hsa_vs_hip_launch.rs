@@ -30,6 +30,16 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
 }
 "#;
 
+const HSA_WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
+
+fn wait_for_completion(signal: &HsaSignal, context: &str) {
+    let observed = signal.wait_lt_active(1, HSA_WAIT_TIMEOUT_NS);
+    assert!(
+        observed < 1,
+        "{context}: HSA completion signal timed out with value {observed}"
+    );
+}
+
 fn main() {
     let iters: u32 = std::env::args()
         .nth(1)
@@ -198,18 +208,20 @@ fn main() {
         signal.store_relaxed(1);
         let idx = queue.load_write_index_relaxed();
         let slot = queue.packet_slot(idx);
-        build_dispatch_packet(
-            slot,
-            &kernel,
-            [groups, 1, 1],
-            [256, 1, 1],
-            kernarg,
-            signal.raw_handle(),
-        );
-        publish_dispatch_packet(slot, header);
+        unsafe {
+            build_dispatch_packet(
+                slot,
+                &kernel,
+                [groups, 1, 1],
+                [256, 1, 1],
+                kernarg,
+                signal.raw_handle(),
+            );
+            publish_dispatch_packet(slot, header);
+        }
         queue.store_write_index_release(idx + 1);
         queue.ring_doorbell(idx);
-        signal.wait_lt_active(1, u64::MAX);
+        wait_for_completion(&signal, "HSA warm-up");
     }
 
     // ─── 6. Verify both paths produce the same result ────────────────────
@@ -268,18 +280,20 @@ fn main() {
         signal.store_relaxed(1);
         let idx = queue.load_write_index_relaxed();
         let slot = queue.packet_slot(idx);
-        build_dispatch_packet(
-            slot,
-            &kernel,
-            [groups, 1, 1],
-            [256, 1, 1],
-            kernarg,
-            signal.raw_handle(),
-        );
-        publish_dispatch_packet(slot, header);
+        unsafe {
+            build_dispatch_packet(
+                slot,
+                &kernel,
+                [groups, 1, 1],
+                [256, 1, 1],
+                kernarg,
+                signal.raw_handle(),
+            );
+            publish_dispatch_packet(slot, header);
+        }
         queue.store_write_index_release(idx + 1);
         queue.ring_doorbell(idx);
-        signal.wait_lt_active(1, u64::MAX);
+        wait_for_completion(&signal, "HSA latency iteration");
         hsa_lat.push(t.elapsed());
     }
 
@@ -345,19 +359,21 @@ fn main() {
                 } else {
                     0
                 };
-                build_dispatch_packet(
-                    slot,
-                    &kernel,
-                    [groups, 1, 1],
-                    [256, 1, 1],
-                    kernarg,
-                    completion,
-                );
-                publish_dispatch_packet(slot, header);
+                unsafe {
+                    build_dispatch_packet(
+                        slot,
+                        &kernel,
+                        [groups, 1, 1],
+                        [256, 1, 1],
+                        kernarg,
+                        completion,
+                    );
+                    publish_dispatch_packet(slot, header);
+                }
             }
             queue.store_write_index_release(base_idx + burst as u64);
             queue.ring_doorbell(base_idx + burst as u64 - 1);
-            signal.wait_lt_active(1, u64::MAX);
+            wait_for_completion(&signal, "HSA burst iteration");
             burst_lat.push(t.elapsed());
         }
         burst_lat.sort();

@@ -210,7 +210,21 @@ impl ArchCaps {
             Some(false) => false,
             Some(true) => true,
             None => {
-                let arch_min_batch: usize = if self.is_gfx906 { 8 } else { 256 };
+                // gfx906 hits MMQ at very small batches (its dp4a MMQ kernel
+                // beats fp16 wave64 from B≥8). RDNA3+ has a higher fixed cost
+                // for the WMMA-INT8 dispatch (Q8_1 quantize prelude + MMQ tile
+                // setup) but still beats single-warp WMMA from B=128 up —
+                // measured +118% prefill on qwen3.6-27b.mq4 / gfx1151 by
+                // dropping the cutoff from 256 → 128, with byte-identical
+                // greedy decode parity (2026-05-29). RDNA2 keeps 256 for now
+                // (untested at lower cutoffs in this session).
+                let arch_min_batch: usize = if self.is_gfx906 {
+                    8
+                } else if self.is_rdna3 || self.is_rdna4 {
+                    128
+                } else {
+                    256
+                };
                 let min_batch = self.flags.mmq_min_batch.unwrap_or(arch_min_batch);
                 batch_size >= min_batch
             }
@@ -374,22 +388,6 @@ impl ArchCaps {
 /// have M=16 shape; the existing dispatch chain (`mq_rotate_x_128` +
 /// `gemv_mq4g128_prerotated` → `gemv_hfq4g128`) doubles launch count vs the
 /// single F32 GEMV, and at small M the GPU kernel time (~4 µs) is dwarfed
-/// by launch overhead. K-split variant was tried and also regressed.
-///
-/// The lever can only be made net-positive by FUSING the FWHT-128 rotation
-/// into the GEMV in a single kernel launch. See
-/// `docs/superpowers/specs/2026-05-22-lever1-fused-mq4g128-design.md` for
-/// the design.
-///
-/// The infrastructure (DType variant, kernel, dispatch wrappers, codec) is
-/// kept in place since it's correct end-to-end (round-trip + smoke + KLD
-/// equivalent argmax verified). Opt-in via `HIPFIRE_PARO_LA_GATES_MQ4G128=1`.
-// NOTE: `const fn` with `&str` pattern matching is not yet stable (PartialEq not const).
-// Using plain `pub fn` instead — semantically identical at runtime.
-pub fn paro_la_gates_mq4g128_default(_arch: &str) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,13 +598,5 @@ mod tests {
         assert!(make_caps("gfx908").is_wave64_native());
         assert!(make_caps("gfx942").is_wave64_native());
         assert!(!make_caps("gfx1100").is_wave64_native());
-    }
-
-    #[test]
-    fn default_table() {
-        assert!(!paro_la_gates_mq4g128_default("gfx1151"));
-        assert!(!paro_la_gates_mq4g128_default("gfx1100"));
-        assert!(!paro_la_gates_mq4g128_default("gfx1010"));
-        assert!(!paro_la_gates_mq4g128_default(""));
     }
 }

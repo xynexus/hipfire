@@ -114,8 +114,6 @@ type HipHostMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> 
 type HipHostFreeFn = unsafe extern "C" fn(*mut c_void) -> u32;
 
 const HIP_SUCCESS: u32 = 0;
-/// `hipDeviceAttributeIntegrated` in HIP's cuda-compatible attribute block.
-const HIP_DEVICE_ATTRIBUTE_INTEGRATED: c_int = 16;
 
 /// `hipPointerAttribute_t` per ROCm 6.4.3 layout. ROCm 5.x not supported.
 #[repr(C)]
@@ -155,7 +153,6 @@ pub struct HipRuntime {
     // Device management
     fn_get_device_count: unsafe extern "C" fn(*mut c_int) -> u32,
     fn_set_device: unsafe extern "C" fn(c_int) -> u32,
-    fn_set_device_flags: unsafe extern "C" fn(c_uint) -> u32,
     fn_get_device: unsafe extern "C" fn(*mut c_int) -> u32,
 
     // Multi-device / peer access
@@ -323,11 +320,6 @@ impl HipRuntime {
                     unsafe extern "C" fn(*mut c_int) -> u32
                 ),
                 fn_set_device: load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32),
-                fn_set_device_flags: load_fn!(
-                    lib,
-                    "hipSetDeviceFlags",
-                    unsafe extern "C" fn(c_uint) -> u32
-                ),
                 fn_get_device: load_fn!(
                     lib,
                     "hipGetDevice",
@@ -599,16 +591,6 @@ impl HipRuntime {
         self.check(code, "hipSetDevice")
     }
 
-    /// Set HIP device scheduling flags before the device context is created.
-    ///
-    /// HIP uses these flags to choose how host sync calls wait for GPU work:
-    /// spin is lowest-latency but consumes a CPU core; yield/blocking are more
-    /// cooperative with the OS and reduce CPU pressure during long prefill.
-    pub fn set_device_flags(&self, flags: u32) -> HipResult<()> {
-        let code = unsafe { (self.fn_set_device_flags)(flags as c_uint) };
-        self.check(code, "hipSetDeviceFlags")
-    }
-
     pub fn current_device(&self) -> HipResult<i32> {
         let mut id: c_int = 0;
         let code = unsafe { (self.fn_get_device)(&mut id) };
@@ -719,9 +701,7 @@ impl HipRuntime {
         Ok(DeviceBuffer { ptr, size })
     }
 
-    /// Allocate page-locked host memory through HIP. This is the staging
-    /// allocation to use when callers want `hipMemcpyAsync` to route through
-    /// the fast pinned-memory path instead of pageable Rust heap memory.
+    /// Allocate page-locked host memory through HIP for async H2D staging.
     pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<HostBuffer> {
         let host_malloc = self.fn_host_malloc.ok_or_else(|| {
             HipError::new(
@@ -749,7 +729,6 @@ impl HipRuntime {
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
     pub fn free(&self, buf: DeviceBuffer) -> HipResult<()> {
         let code = unsafe { (self.fn_free)(buf.ptr) };
-        std::mem::forget(buf); // prevent double-free
         self.check(code, "hipFree")
     }
 
@@ -1010,7 +989,6 @@ impl HipRuntime {
 
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
         let code = unsafe { (self.fn_stream_destroy)(stream.0) };
-        std::mem::forget(stream);
         self.check(code, "hipStreamDestroy")
     }
 
@@ -1173,7 +1151,6 @@ impl HipRuntime {
 
     pub fn event_destroy(&self, event: Event) -> HipResult<()> {
         let code = unsafe { (self.fn_event_destroy)(event.0) };
-        std::mem::forget(event);
         self.check(code, "hipEventDestroy")
     }
 
@@ -1294,13 +1271,11 @@ impl HipRuntime {
 
     pub fn graph_exec_destroy(&self, exec: GraphExec) -> HipResult<()> {
         let code = unsafe { (self.fn_graph_exec_destroy)(exec.0) };
-        std::mem::forget(exec);
         self.check(code, "hipGraphExecDestroy")
     }
 
     pub fn graph_destroy(&self, graph: Graph) -> HipResult<()> {
         let code = unsafe { (self.fn_graph_destroy)(graph.0) };
-        std::mem::forget(graph);
         self.check(code, "hipGraphDestroy")
     }
 
@@ -1368,14 +1343,6 @@ impl HipRuntime {
         Ok(value as i32)
     }
 
-    /// True when HIP reports the device as an integrated GPU. For hipfire's
-    /// loader policy this is the practical UMA signal: CPU and GPU memory draw
-    /// from the same physical pool, so file-backed mmap/page-cache pressure and
-    /// allocation granularity matter differently than on a discrete card.
-    pub fn is_integrated_device(&self, device_id: i32) -> HipResult<bool> {
-        Ok(self.get_device_attribute(HIP_DEVICE_ATTRIBUTE_INTEGRATED, device_id)? != 0)
-    }
-
     /// Get VRAM info: (free_bytes, total_bytes).
     pub fn get_vram_info(&self) -> HipResult<(usize, usize)> {
         let mut free: usize = 0;
@@ -1390,15 +1357,17 @@ impl HipRuntime {
 
 /// GPU stream handle.
 pub struct Stream(HipStream);
-unsafe impl Send for Stream {}
-
 impl Stream {
-    /// Null/default HIP stream wrapper. Useful for APIs that accept a stream
-    /// handle but where callers deliberately want default-stream semantics.
+    /// Null/default HIP stream wrapper.
     pub fn null() -> Self {
         Self(ptr::null_mut())
     }
+
+    pub fn as_raw(&self) -> *mut c_void {
+        self.0
+    }
 }
+unsafe impl Send for Stream {}
 
 /// HIP page-locked host allocation.
 pub struct HostBuffer {
@@ -1437,9 +1406,9 @@ unsafe impl Send for HostBuffer {}
 impl Drop for HostBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            let _ = unsafe { (self.host_free)(self.ptr) };
-            self.ptr = ptr::null_mut();
-            self.size = 0;
+            unsafe {
+                (self.host_free)(self.ptr);
+            }
         }
     }
 }

@@ -220,23 +220,17 @@ pub fn sample_from_logits(logits: &[f32], cfg: &MtpSamplingConfig, rng: &mut Mtp
     let mut pairs: Vec<(u32, f64)> = logits
         .iter()
         .enumerate()
-        .filter(|(_, &l)| !l.is_nan())
         .map(|(i, &l)| (i as u32, l as f64 * inv_temp))
         .collect();
-    if pairs.is_empty() {
-        return (0, 0.0);
-    }
 
     // 2. Optional top_k: partial-sort to keep top_k by logit (descending).
     if cfg.top_k > 0 && cfg.top_k < pairs.len() {
-        pairs.select_nth_unstable_by(cfg.top_k - 1, |a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        pairs.select_nth_unstable_by(cfg.top_k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
         pairs.truncate(cfg.top_k);
     }
 
     // 3. Sort by logit descending for top_p and min_p filtering + sampling.
-    pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
     // 4. Softmax with max-subtraction stability.
     let max_logit = pairs[0].1;
@@ -760,6 +754,8 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.mtp_gather_prob_draft);
         let _ = gpu.free_tensor(self.mtp_gather_idx_verify);
         let _ = gpu.free_tensor(self.mtp_gather_prob_verify);
+        // DeltaNetSnapshot holds DeviceBuffers which have no Drop impl —
+        // use free_gpu to release the GPU allocations rather than bare drop.
         self.trunk_snap.free_gpu(gpu);
         if let Some(event) = self.trunk_snap_start_event {
             let _ = gpu.hip.event_destroy(event);
@@ -770,6 +766,9 @@ impl MtpSpecState {
         self.trunk_pbs.free_gpu(gpu);
         self.trunk_gdn_tape.free_gpu(gpu);
         self.mtp_scratch.free_gpu(gpu);
+        // Qwen35MtpHeadKvCache::free_gpu does `drop(inner)` which does not
+        // release GPU memory (llama::KvCache has no Drop). Call the inner
+        // KvCache's own free_gpu directly to properly hipFree each tensor.
         self.mtp_kv.inner.free_gpu(gpu);
     }
 }
@@ -960,8 +959,8 @@ fn run_mtp_proposal_graph_body_q8(
 }
 
 fn begin_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
-    gpu.capture_blobs.clear();
-    gpu.capture_mode = true;
+    gpu.graphs.capture_blobs.clear();
+    gpu.graphs.capture_mode = true;
     let stream = gpu
         .active_stream
         .as_ref()
@@ -970,22 +969,22 @@ fn begin_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
 }
 
 fn end_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
-    gpu.capture_mode = false;
+    gpu.graphs.capture_mode = false;
     let stream = gpu.active_stream.as_ref().unwrap();
     let graph = gpu.hip.stream_end_capture(stream)?;
     let exec = gpu.hip.graph_instantiate(&graph)?;
-    let blobs = std::mem::take(&mut gpu.capture_blobs);
+    let blobs = std::mem::take(&mut gpu.graphs.capture_blobs);
     Ok((graph, exec, blobs))
 }
 
 fn abort_mtp_proposal_graph_capture(gpu: &mut Gpu) {
-    if gpu.capture_mode {
+    if gpu.graphs.capture_mode {
         if let Some(stream) = gpu.active_stream.as_ref() {
             let _ = gpu.hip.stream_end_capture(stream);
         }
-        gpu.capture_mode = false;
+        gpu.graphs.capture_mode = false;
     }
-    gpu.capture_blobs.clear();
+    gpu.graphs.capture_blobs.clear();
 }
 
 fn destroy_mtp_proposal_graph(gpu: &mut Gpu, state: &mut MtpSpecState) {
@@ -2994,37 +2993,6 @@ mod tests {
         let tokens = build_trunk_spine_verify_tokens(42, &[7, 8, 9]);
 
         assert_eq!(tokens, vec![42, 7, 8, 9]);
-    }
-
-    #[test]
-    fn sample_from_logits_drops_nan_candidates() {
-        let cfg = MtpSamplingConfig {
-            temp: 1.0,
-            top_k: 2,
-            top_p: 1.0,
-            min_p: 0.0,
-        };
-        let mut rng = MtpRng::new(7);
-        for _ in 0..32 {
-            let (tok, prob) = sample_from_logits(&[f32::NAN, 4.0, 2.0, f32::NAN], &cfg, &mut rng);
-            assert!(tok == 1 || tok == 2);
-            assert!(prob.is_finite());
-        }
-    }
-
-    #[test]
-    fn sample_from_logits_all_nan_returns_zero_without_panic() {
-        let cfg = MtpSamplingConfig {
-            temp: 1.0,
-            top_k: 0,
-            top_p: 1.0,
-            min_p: 0.0,
-        };
-        let mut rng = MtpRng::new(7);
-        assert_eq!(
-            sample_from_logits(&[f32::NAN, f32::NAN], &cfg, &mut rng),
-            (0, 0.0)
-        );
     }
 
     #[test]

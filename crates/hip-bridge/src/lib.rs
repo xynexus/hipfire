@@ -12,8 +12,8 @@ mod kernarg;
 mod rocblas;
 
 pub use error::{
-    HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
-    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    HipError, HipResult, HIP_ERROR_INVALID_IMAGE, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
+    HIP_ERROR_PEER_ACCESS_NOT_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
 pub use ffi::launch_counters;
 pub use ffi::{
@@ -77,6 +77,11 @@ impl DeviceBuffer {
     /// Create a non-owning DeviceBuffer from a raw pointer and size.
     /// The caller must ensure the pointer is valid GPU memory.
     /// The resulting buffer must NOT be freed (it doesn't own the memory).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to at least `size` bytes of valid GPU-accessible
+    /// memory for the lifetime of the returned non-owning wrapper.
     pub unsafe fn from_raw(ptr: *mut std::ffi::c_void, size: usize) -> DeviceBuffer {
         DeviceBuffer { ptr, size }
     }

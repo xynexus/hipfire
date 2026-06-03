@@ -725,6 +725,10 @@ impl Qwen35MtpHeadKvCache {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        // llama::KvCache holds GpuTensors with NO Drop impl — dropping it
+        // leaks the k_gpu/v_gpu buffers. Free them explicitly. (The old
+        // "they free on Drop" comment was false; see mtp_spec/mtp_compose
+        // which already bypass this wrapper for the same reason.)
         self.inner.free_gpu(gpu);
     }
 }
@@ -1646,6 +1650,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
                 st,
                 cfg.n_head_kv,
                 cfg.head_dim,
+                kv.inner.v_mode_bits(),
             )?;
             gpu.attention_flash_fwht4(
                 &scratch.q,
@@ -1661,6 +1666,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
                 cfg.head_dim,
                 kv.inner.physical_cap,
                 &scratch.flash_partials,
+                kv.inner.v_mode_bits(),
             )?;
         }
     }
@@ -1764,8 +1770,8 @@ fn mtp_moe_ffn_decode(
     if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
         gpu.ensure_mq_signs()?;
         let x_rot_alias = GpuTensor {
-            buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
             dtype: DType::F32,
         };
         fused_silu_mul_rotate_mq_for(
@@ -2372,6 +2378,7 @@ pub fn mtp_head_forward_block_batched(
         cfg.n_rot,
         cfg.rope_theta,
         n,
+        // pos_offset=0: MTP head has its own non-compacted KV. Unchanged behavior.
         0,
     )?;
 

@@ -338,8 +338,6 @@ pub fn reset_ddtree_meta_stats() {
 /// Which KV cache layout to use when allocating a slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvMode {
-    /// Unquantized FP32 K/V cache. Gold-path verification only.
-    Fp32,
     /// INT8 co-located K and V (default).
     Q8,
     /// Asym4: rotated 4-bit K + Q8 V (smaller than Q8, higher-fidelity than asym3).
@@ -449,13 +447,6 @@ impl ModelSlot {
         // backwards-compat, but DFlash verify is KV-bandwidth sensitive at
         // longer contexts — asym3/asym4 cut the verify attention cost.
         let kv_cache = match slot_config.kv_mode {
-            KvMode::Fp32 => KvCache::new_gpu_filtered(
-                gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-            )?,
             KvMode::Q8 => KvCache::new_gpu_q8_filtered(
                 gpu,
                 &is_kv_layer,
@@ -774,14 +765,20 @@ impl DeltaNetSnapshot {
         Ok(())
     }
 
+    /// Free the backup GPU buffers, consuming the snapshot. `DeviceBuffer` has
+    /// no `Drop`, so a bare `Vec::clear()`/`truncate()` on a checkpoint ring
+    /// orphans this device memory — the source of the per-reset GPU-memory leak
+    /// that OOMs long-lived serves (a fresh `hipMalloc` per reset, never freed).
+    /// Every site that drops a snapshot must route through here.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        for buf in self
-            .s_matrix_bufs
-            .into_iter()
-            .chain(self.s_scale_bufs.into_iter())
-            .chain(self.conv_state_bufs.into_iter())
-        {
-            let _ = gpu.hip.free(buf);
+        for b in self.s_matrix_bufs {
+            let _ = gpu.hip.free(b);
+        }
+        for b in self.s_scale_bufs {
+            let _ = gpu.hip.free(b);
+        }
+        for b in self.conv_state_bufs {
+            let _ = gpu.hip.free(b);
         }
     }
 }
@@ -930,32 +927,51 @@ impl GdnTape {
         let graph_enabled = std::env::var("HIPFIRE_REPLAY_GRAPH").ok().as_deref() == Some("1");
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
-        if can_graph && gpu.replay_has_graph(n_steps) {
-            return gpu.replay_graph_launch(n_steps);
+        if can_graph && gpu.graphs.replay_has_graph(n_steps) {
+            return gpu.graphs.replay_graph_launch(
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                n_steps,
+            );
         }
 
-        if can_graph && gpu.replay_needs_warmup(n_steps) {
+        if can_graph && gpu.graphs.replay_needs_warmup(n_steps) {
             self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps)?;
-            gpu.replay_mark_warmup_done(n_steps);
+            gpu.graphs.replay_mark_warmup_done(n_steps);
             return Ok(());
         }
 
         if can_graph {
-            gpu.begin_replay_graph_capture(n_steps)?;
+            gpu.graphs.begin_replay_graph_capture(
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                n_steps,
+            )?;
             let r = self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps);
             if r.is_ok() {
-                gpu.end_replay_graph_capture()?;
+                gpu.graphs.end_replay_graph_capture(
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                )?;
                 // Same pattern as verify_graph: hipStreamBeginCapture records
                 // without executing, so launch once here to apply this cycle's
                 // state updates.
-                gpu.replay_graph_launch(n_steps)?;
+                gpu.graphs.replay_graph_launch(
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                    n_steps,
+                )?;
                 return Ok(());
             } else {
                 let _ = gpu
                     .hip
                     .stream_end_capture(gpu.active_stream.as_ref().unwrap());
-                gpu.capture_mode = false;
-                gpu.capture_blobs.clear();
+                gpu.graphs.capture_mode = false;
+                gpu.graphs.capture_blobs.clear();
                 return r;
             }
         }
@@ -1053,46 +1069,19 @@ impl GdnTape {
             }
 
             // 4. GDN recurrence — advances S_state.
-            match dn_state.quant {
-                qwen35::StateQuant::FP32 => gpu.gated_delta_net_f32(
-                    &self.q_scratch,
-                    &self.k_scratch,
-                    &self.v_scratch,
-                    &self.alpha_bufs[la_idx],
-                    &self.beta_bufs[la_idx],
-                    &dn_state.s_matrices[la_idx],
-                    &self.attn_scratch,
-                    n_steps,
-                    n_v_heads,
-                    value_head_dim,
-                )?,
-                qwen35::StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                    &self.q_scratch,
-                    &self.k_scratch,
-                    &self.v_scratch,
-                    &self.alpha_bufs[la_idx],
-                    &self.beta_bufs[la_idx],
-                    &dn_state.s_matrices[la_idx],
-                    &dn_state.s_scales[la_idx],
-                    &self.attn_scratch,
-                    n_steps,
-                    n_v_heads,
-                    value_head_dim,
-                )?,
-                qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
-                    &self.q_scratch,
-                    &self.k_scratch,
-                    &self.v_scratch,
-                    &self.alpha_bufs[la_idx],
-                    &self.beta_bufs[la_idx],
-                    &dn_state.s_matrices[la_idx],
-                    &dn_state.s_scales[la_idx],
-                    &self.attn_scratch,
-                    n_steps,
-                    n_v_heads,
-                    value_head_dim,
-                )?,
-            }
+            gpu.gated_delta_net_q8_batch_seq(
+                &self.q_scratch,
+                &self.k_scratch,
+                &self.v_scratch,
+                &self.alpha_bufs[la_idx],
+                &self.beta_bufs[la_idx],
+                &dn_state.s_matrices[la_idx],
+                &dn_state.s_scales[la_idx],
+                &self.attn_scratch,
+                n_steps,
+                n_v_heads,
+                value_head_dim,
+            )?;
 
             la_idx += 1;
         }
@@ -2341,22 +2330,27 @@ fn verify_dflash_block_inner(
         if gpu.active_stream.is_none() {
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
-        if gpu.verify_has_graph(b) {
+        if gpu.graphs.verify_has_graph(b) {
             vg_mode = "replay";
             graph_includes_lmhead_argmax =
-                moe_lmhead_graph_ok && gpu.verify_graph_has_lmhead_argmax(b);
+                moe_lmhead_graph_ok && gpu.graphs.verify_graph_has_lmhead_argmax(b);
             // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
             // kv_cache contents that were freshly updated above + upstream.
-            gpu.verify_graph_launch(b)?;
+            gpu.graphs.verify_graph_launch(
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                b,
+            )?;
             Ok(())
-        } else if gpu.verify_needs_warmup(b) {
+        } else if gpu.graphs.verify_needs_warmup(b) {
             vg_mode = "warmup";
             // Warmup for this b: run direct so kernel JIT and any lazy scratch
             // allocations (e.g., MQ signs/x_rot/x_q8, FP16 shadow) happen
             // outside any captured region. Capturing a JIT + scratch-malloc
             // hits "hipMalloc not permitted under stream capture" the first
             // time any kernel is compiled inline. One warmup per distinct b.
-            gpu.verify_mark_warmup_done(b);
+            gpu.graphs.verify_mark_warmup_done(b);
             let r = qwen35::forward_prefill_batch_single_chunk_captured_opts(
                 gpu,
                 &target.weights,
@@ -2384,7 +2378,12 @@ fn verify_dflash_block_inner(
             vg_mode = "capture";
             // Capture path: first call at this B after warmup.
             let capture_lmhead_argmax = moe_lmhead_graph_ok;
-            gpu.begin_verify_graph_capture(b)?;
+            gpu.graphs.begin_verify_graph_capture(
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                b,
+            )?;
             let r = qwen35::forward_prefill_batch_single_chunk_captured_opts(
                 gpu,
                 &target.weights,
@@ -2416,10 +2415,14 @@ fn verify_dflash_block_inner(
                 r
             };
             if r.is_ok() {
-                let blob_count = gpu.capture_blobs.len();
-                gpu.end_verify_graph_capture()?;
+                let blob_count = gpu.graphs.capture_blobs.len();
+                gpu.graphs.end_verify_graph_capture(
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                )?;
                 if capture_lmhead_argmax {
-                    gpu.verify_mark_graph_lmhead_argmax(b);
+                    gpu.graphs.verify_mark_graph_lmhead_argmax(b);
                     graph_includes_lmhead_argmax = true;
                 }
                 // Under `hipStreamBeginCapture`, kernels + memcpys on the
@@ -2430,12 +2433,17 @@ fn verify_dflash_block_inner(
                 // HIP version does execute during capture) is washed out by
                 // target_snap.restore_to after verify returns. KV cache
                 // double-write writes the same data to the same positions.
-                gpu.verify_graph_launch(b)?;
+                gpu.graphs.verify_graph_launch(
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                    b,
+                )?;
                 eprintln!(
                     "[verify-graph] captured for B={} with {} blobs (cache size: {})",
                     b,
                     blob_count,
-                    gpu.verify_graph_count(),
+                    gpu.graphs.verify_graph_count(),
                 );
             } else {
                 // If capture failed, tear down the partial capture so we fall
@@ -2443,8 +2451,8 @@ fn verify_dflash_block_inner(
                 let _ = gpu
                     .hip
                     .stream_end_capture(gpu.active_stream.as_ref().unwrap());
-                gpu.capture_mode = false;
-                gpu.capture_blobs.clear();
+                gpu.graphs.capture_mode = false;
+                gpu.graphs.capture_blobs.clear();
             }
             r
         }
@@ -4834,6 +4842,8 @@ pub fn spec_step_ddtree_batched(
                 n_rot,
                 target.config.rope_theta,
                 n_positions,
+                // pos_offset=0: tree-mode re-rotation uses committed gather indices
+                // as positions directly (no compact_offset overlay). Unchanged behavior.
                 0,
             )?;
 
@@ -5452,6 +5462,45 @@ pub fn spec_step_ddtree_path_c(
 /// should skip this and just call `download_hidden_block(hidden_rb, len)`
 /// instead. For MVP we eat the redundant work because it's a one-shot
 /// cost at session start.
+/// Snapshot the DeltaNet recurrent state into a bounded ring `cks` (pairs of
+/// `(seq_pos, snapshot)`) when `interval` tokens have elapsed since the last
+/// one. Shared by BOTH the AR `generate` and the DFlash prompt-cache paths to
+/// enable resume-from-checkpoint on a divergent client render (see the daemon's
+/// `generate` divergence branch + `generate_dflash`). Oldest evicted at `cap`
+/// (buffers reused — no realloc churn after warmup). Cheap: one device-to-device
+/// memcpy of the recurrent S/scale/conv buffers; no KV copy (FullAttention KV is
+/// positional and stays resident, so resume only restores the recurrent state).
+/// Gating (resume enabled / no eviction) is the caller's responsibility.
+pub fn take_dn_checkpoint(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+) {
+    if pos == 0 || cap == 0 {
+        return;
+    }
+    match cks.last().map(|(p, _)| *p) {
+        Some(p) if pos < p + interval => return,
+        Some(p) if p == pos => return,
+        _ => {}
+    }
+    let mut snap = if cks.len() >= cap {
+        cks.remove(0).1
+    } else {
+        match DeltaNetSnapshot::new_for(gpu, dn) {
+            Ok(s) => s,
+            Err(_) => return,
+        }
+    };
+    if snap.save_from(dn, gpu).is_err() {
+        return;
+    }
+    cks.push((pos, snap));
+}
+
 pub fn seed_target_hidden_from_prompt(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -5486,6 +5535,145 @@ pub fn seed_target_hidden_from_prompt(
     let block = download_hidden_block(gpu, hidden_rb, prompt_tokens.len())?;
     target_hidden_host.extend_from_slice(&block);
     Ok(())
+}
+
+/// Abortable variant of `seed_target_hidden_from_prompt`. Manually
+/// chunks the prefill at [`qwen35::PREFILL_MAX_BATCH`] boundaries and
+/// calls `abort_check` between chunks. Returns `Ok(true)` if aborted
+/// (state has been fully reset — caller should NOT continue with
+/// decode), `Ok(false)` on normal completion. The chunked path matches
+/// the kernel-internal sub-batch size, so per-chunk throughput is the
+/// same as the one-shot variant; the only overhead is one
+/// `download_hidden_block` per chunk (host-side memcpy of ~5 MB).
+///
+/// Used by the daemon's `generate_dflash` to honor client-side
+/// cancellation on long-context retries (cache-miss scenarios where
+/// the full conversation must be re-prefilled from scratch).
+#[allow(clippy::too_many_arguments)]
+pub fn seed_target_hidden_from_prompt_abortable(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    prompt_tokens: &[u32],
+    abort_check: &dyn Fn() -> bool,
+    // Optional DeltaNet checkpoint ring for divergent-render resume. When
+    // `Some`, the recurrent state is snapshotted every `ckpt_interval` tokens
+    // (bounded at `ckpt_cap`). `None` ⇒ no checkpointing (zero overhead).
+    mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
+    ckpt_interval: usize,
+    ckpt_cap: usize,
+) -> HipResult<bool> {
+    target.reset_state(gpu);
+    target_hidden_host.clear();
+    if let Some(cks) = checkpoints.as_deref_mut() {
+        // fresh cold prefill ⇒ stale checkpoints no longer valid; free their GPU buffers
+        for (_, snap) in cks.drain(..) {
+            snap.free_gpu(gpu);
+        }
+    }
+    let chunk_max = qwen35::PREFILL_MAX_BATCH;
+    let mut seq_pos: usize = 0;
+    while seq_pos < prompt_tokens.len() {
+        if abort_check() {
+            target.reset_state(gpu);
+            target_hidden_host.clear();
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                for (_, snap) in cks.drain(..) {
+                    snap.free_gpu(gpu);
+                }
+            }
+            return Ok(true);
+        }
+        let end = (seq_pos + chunk_max).min(prompt_tokens.len());
+        let chunk = &prompt_tokens[seq_pos..end];
+        qwen35::forward_prefill_batch(
+            gpu,
+            &target.weights,
+            &target.config,
+            chunk,
+            seq_pos,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            Some(hidden_rb),
+            None,
+            None,
+            None,
+        )?;
+        let block = download_hidden_block(gpu, hidden_rb, chunk.len())?;
+        target_hidden_host.extend_from_slice(&block);
+        seq_pos = end;
+        if let Some(cks) = checkpoints.as_deref_mut() {
+            take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
+        }
+    }
+    Ok(false)
+}
+
+/// Incremental prompt seed for the DFlash prompt cache: prefill ONLY the
+/// `suffix` tokens starting at absolute position `start_pos`, WITHOUT resetting
+/// target KV / DeltaNet state. Used when a turn is a pure extension of the
+/// cached conversation (LCP == prior length) — the target KV[0..start_pos] and
+/// the recurrent DeltaNet state are already correct from the prior turn, so we
+/// only advance them through the new suffix. `hidden_rb` is left holding the
+/// suffix's extracted hidden rows so the caller can scatter them into the
+/// draft's cumulative `target_hidden` at row offset `start_pos` (the draft's
+/// projection cache, keyed on `draft_ctx_cached_rows`, then projects only the
+/// new rows — same delta path decode already uses).
+///
+/// Correctness rests on the same invariant the AR `generate` cache relies on:
+/// `forward_prefill_batch` at a nonzero `seq_pos` continues the hybrid
+/// (FullAttention KV + DeltaNet recurrent) forward exactly as if the prefix had
+/// just been prefilled, because the recurrent state is naturally at the end of
+/// the prior conversation (pure extension — no rewind). Returns `Ok(true)` if
+/// aborted mid-prefill (state left as-is; caller must full-reset & retry),
+/// `Ok(false)` on completion.
+#[allow(clippy::too_many_arguments)]
+pub fn seed_target_hidden_suffix_abortable(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    suffix: &[u32],
+    start_pos: usize,
+    abort_check: &dyn Fn() -> bool,
+    // Optional DeltaNet checkpoint ring (see from_prompt variant). Lets a HIT
+    // or a resume keep adding checkpoints as the conversation grows, so a later
+    // divergence resumes from a recent point rather than the initial prefill.
+    mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
+    ckpt_interval: usize,
+    ckpt_cap: usize,
+) -> HipResult<bool> {
+    let chunk_max = qwen35::PREFILL_MAX_BATCH;
+    let mut off: usize = 0;
+    let mut pos = start_pos;
+    while off < suffix.len() {
+        if abort_check() {
+            return Ok(true);
+        }
+        let end = (off + chunk_max).min(suffix.len());
+        let chunk = &suffix[off..end];
+        qwen35::forward_prefill_batch(
+            gpu,
+            &target.weights,
+            &target.config,
+            chunk,
+            pos,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            Some(hidden_rb),
+            None,
+            None,
+            None,
+        )?;
+        pos += chunk.len();
+        off = end;
+        if let Some(cks) = checkpoints.as_deref_mut() {
+            take_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
+        }
+    }
+    Ok(false)
 }
 
 /// Mirror a TriAttention KV eviction into the DFlash draft's GPU-resident
@@ -5563,52 +5751,9 @@ pub fn apply_eviction_retain_to_draft(
     Ok(())
 }
 
-/// Compact the CPU-side `target_hidden_host` shadow after a TriAttention/CASK
-/// eviction so it stays in lockstep with the GPU-resident `target_hidden`
-/// (which [`apply_eviction_retain_to_draft`] compacts to `retain_mask.len()`
-/// rows).
-pub fn compact_target_hidden_host(
-    target_hidden_host: &mut Vec<f32>,
-    retain_mask: &[u32],
-    ne: usize,
-    h: usize,
-) {
-    if retain_mask.is_empty() {
-        return;
-    }
-    let row_floats = ne * h;
-    let mut compacted = Vec::with_capacity(retain_mask.len() * row_floats);
-    for &src_idx in retain_mask {
-        let start = src_idx as usize * row_floats;
-        compacted.extend_from_slice(&target_hidden_host[start..start + row_floats]);
-    }
-    *target_hidden_host = compacted;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compact_target_hidden_host_keeps_selected_rows() {
-        let (ne, h) = (1usize, 2usize);
-        let mut thh = vec![
-            0.0, 1.0, // row 0
-            2.0, 3.0, // row 1
-            4.0, 5.0, // row 2
-            6.0, 7.0, // row 3
-        ];
-        compact_target_hidden_host(&mut thh, &[0, 2, 3], ne, h);
-        assert_eq!(thh, vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0]);
-        assert_eq!(thh.len(), 3 * ne * h);
-    }
-
-    #[test]
-    fn compact_target_hidden_host_empty_mask_is_noop() {
-        let mut thh = vec![1.0, 2.0, 3.0, 4.0];
-        compact_target_hidden_host(&mut thh, &[], 2, 1);
-        assert_eq!(thh, vec![1.0, 2.0, 3.0, 4.0]);
-    }
 
     #[test]
     fn dflash_gdn_tape_replay_uses_actual_verify_eligibility() {
