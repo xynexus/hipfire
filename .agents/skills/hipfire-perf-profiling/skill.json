@@ -1,0 +1,36 @@
+{
+  "name": "hipfire-perf-profiling",
+  "version": "0.1.1",
+  "description": "Profile hipfire performance on AMD systems before choosing a tuning lever. Covers memory-bandwidth math, rocprofv3 CSV and rocpd kernel traces, AMDuProfCLI/Pcm/Sys platform telemetry, amd-smi/rocm-smi clocks and power, benchmark hygiene, and handoff to kernel tuning or Kernel Atlas.",
+  "triggers": [
+    "profile hipfire",
+    "measure memory bandwidth",
+    "AMDuProf",
+    "AMDuProfPcm",
+    "AMDuProfSys",
+    "rocprofv3",
+    "amd-smi",
+    "rocm-smi",
+    "kernel trace",
+    "gpu counters",
+    "memory bound",
+    "bandwidth limited",
+    "perf profiling",
+    "profile MQ",
+    "DFlash perf profile",
+    "gfx1151 profiling"
+  ],
+  "entry": "./SKILL.md",
+  "interpret": "./SKILL.md",
+  "requires": {
+    "repo": "hipfire checkout",
+    "rocm_tools": "rocprofv3 and/or amd-smi/rocm-smi",
+    "optional_amduprof": "/opt/AMDuProf_*/bin/AMDuProfCLI, AMDuProfPcm, or AMDuProfSys"
+  },
+  "related": [
+    "hipfire-kernel-tuning",
+    "hipfire-kernel-atlas",
+    "hipfire-arch-port",
+    "astrea"
+  ]
+}
