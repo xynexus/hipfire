@@ -1978,19 +1978,11 @@ async function serve(port: number, host: string) {
         // Fall back to the user's configured defaults (global or per-model) when
         // an OpenAI client doesn't set a field. 512 was a hardcoded surprise
         // that ignored `hipfire config set max_tokens …`.
-        // OpenAI repeat-penalty mapping: take the larger of frequency_penalty
-        // and presence_penalty when present. Both are -2..2 in the OpenAI
-        // surface; we map non-negative values to repeat_penalty = 1 + p.
-        // (Negative penalties — boosts — aren't meaningful for hipfire's
-        // multiplicative repeat_penalty kernel, so they're treated as zero.)
-        // Requested by @shilga in #79; previously only frequency_penalty was
-        // honored.
-        const oaiPenalty = Math.max(
-          0,
-          Number(body.frequency_penalty) || 0,
-          Number(body.presence_penalty) || 0,
-        );
-        const oaiPenaltySet = body.frequency_penalty != null || body.presence_penalty != null;
+        // OpenAI-compatible penalties are now native daemon sampler knobs.
+        // Keep repeat_penalty as the hipfire-specific multiplicative control
+        // instead of folding additive OpenAI penalties into it.
+        const presencePenalty = Math.max(0, Number(body.presence_penalty) || 0);
+        const frequencyPenalty = Math.max(0, Number(body.frequency_penalty) || 0);
 
         // chat_template_kwargs (Qwen / DeepSeek / pi-coding-agent extension).
         // Two recognized keys, both per-request overrides on top of
@@ -2064,7 +2056,9 @@ async function serve(port: number, host: string) {
           type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
-          repeat_penalty: body.repeat_penalty ?? (oaiPenaltySet ? 1.0 + oaiPenalty : effective.repeat_penalty),
+          repeat_penalty: body.repeat_penalty ?? effective.repeat_penalty,
+          presence_penalty: presencePenalty,
+          frequency_penalty: frequencyPenalty,
           top_p: body.top_p ?? effective.top_p,
         };
         // Mirror the `hipfire run` path's per-model max_think_tokens
@@ -2106,6 +2100,8 @@ async function serve(port: number, host: string) {
         } else if ((body as any).reasoning?.effort === "none") {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1;
+        } else {
+          genParams.assistant_prefix = "open_think";
         }
         if (systemPrompt) genParams.system = systemPrompt;
 
@@ -2372,7 +2368,7 @@ async function serve(port: number, host: string) {
                 try { ctrl.enqueue(enc.encode(": prefill\n\n")); } catch {}
               }, 10_000);
               try {
-                let inThink = false;
+                let inThink = genParams.assistant_prefix === "open_think";
                 let stripNextLeadingNl = false;
                 // When tools are present, accumulate full output for tool-call parsing
                 let accumulated = hasTool ? "" : null;
@@ -2671,7 +2667,11 @@ async function serve(port: number, host: string) {
         // intact in message.content for clients that want a single-string
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
-        const strippedContent = content;
+        let strippedContent = content;
+        if (!preserveThinking && genParams.assistant_prefix === "open_think" && !content.includes("<think>")) {
+          content = "<think>" + content;
+          strippedContent = content;
+        }
         if (preserveThinking) {
           content = content.replace(/<\|im_end\|>/g, "").trim();
         } else {

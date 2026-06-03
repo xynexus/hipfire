@@ -1087,6 +1087,12 @@ fn main() {
                         pre_phys,
                     )
                     .expect("mirror eviction to draft (post-prefill)");
+                    speculative::compact_target_hidden_host(
+                        &mut target_hidden_host,
+                        &ev.retain_mask,
+                        draft_cfg.num_extract(),
+                        draft_cfg.hidden,
+                    );
                 }
             }
         }
@@ -1944,6 +1950,12 @@ fn main() {
                             pre_phys,
                         )
                         .expect("mirror eviction to draft");
+                        speculative::compact_target_hidden_host(
+                            &mut target_hidden_host,
+                            &ev.retain_mask,
+                            draft_cfg.num_extract(),
+                            draft_cfg.hidden,
+                        );
                     }
                 }
             }

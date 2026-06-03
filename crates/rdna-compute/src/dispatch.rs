@@ -12,7 +12,7 @@ use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
@@ -51,6 +51,9 @@ thread_local! {
 /// attribution sweep). Default 0; no semantic meaning outside an
 /// instrumented sweep.
 pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
+
+/// Per-launch entropy for Q8 GatedDeltaNet stochastic rounding.
+static GDN_REQUANT_FRAME: AtomicU32 = AtomicU32::new(0);
 
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
 /// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×
@@ -33330,6 +33333,38 @@ impl Gpu {
         repeat_window: usize,
         repeat_penalty: f32,
     ) -> HipResult<(u32, u32)> {
+        // bind_thread: skip - delegates to sample_top_p_pf, which binds before HIP use.
+        self.sample_top_p_pf(
+            logits,
+            result_buf,
+            repeat_buf,
+            vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            repeat_window,
+            repeat_penalty,
+            0.0,
+            0.0,
+        )
+    }
+
+    /// GPU-side top-K + top-P sampling plus OpenAI presence/frequency penalties.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_top_p_pf(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        repeat_window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<(u32, u32)> {
         self.bind_thread()?;
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
         let func = &self.functions["sample_top_p"];
@@ -33343,6 +33378,8 @@ impl Gpu {
         let mut rng = rng_state;
         let mut rw = repeat_window as i32;
         let mut rp = repeat_penalty;
+        let mut pp = presence_penalty;
+        let mut fp = frequency_penalty;
 
         let mut params: Vec<*mut std::ffi::c_void> = vec![
             &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
@@ -33354,6 +33391,8 @@ impl Gpu {
             &mut rng as *mut _ as *mut std::ffi::c_void,
             &mut rw as *mut _ as *mut std::ffi::c_void,
             &mut rp as *mut _ as *mut std::ffi::c_void,
+            &mut pp as *mut _ as *mut std::ffi::c_void,
+            &mut fp as *mut _ as *mut std::ffi::c_void,
         ];
 
         let block_size = 256u32;
@@ -33404,6 +33443,8 @@ impl Gpu {
         let mut rng = rng_state;
         let mut rw = repeat_window as i32;
         let mut rp = repeat_penalty;
+        let mut pp = 0.0_f32;
+        let mut fp = 0.0_f32;
 
         let mut params: Vec<*mut std::ffi::c_void> = vec![
             &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
@@ -33415,6 +33456,8 @@ impl Gpu {
             &mut rng as *mut _ as *mut std::ffi::c_void,
             &mut rw as *mut _ as *mut std::ffi::c_void,
             &mut rp as *mut _ as *mut std::ffi::c_void,
+            &mut pp as *mut _ as *mut std::ffi::c_void,
+            &mut fp as *mut _ as *mut std::ffi::c_void,
         ];
 
         let block_size = 256u32;
@@ -33526,9 +33569,10 @@ impl Gpu {
         result
     }
 
-    /// Batched partial-interleaved RoPE. Each batch row reads its absolute
-    /// position from positions[b] and rotates the first n_rot dims of every
-    /// Q and K head. Q/K are [batch_size × n_heads × head_dim] row-major.
+    /// Batched partial-interleaved RoPE. Each batch row reads its physical
+    /// position from positions[b], adds pos_offset for the RoPE angle only,
+    /// and rotates the first n_rot dims of every Q and K head. Q/K are
+    /// [batch_size x n_heads x head_dim] row-major.
     /// Byte-exact with rope_partial_interleaved_f32 at batch_size=1.
     #[cfg(feature = "deltanet")]
     pub fn rope_partial_interleaved_f32_batched(
@@ -33542,6 +33586,7 @@ impl Gpu {
         n_rot: usize,
         freq_base: f32,
         batch_size: usize,
+        pos_offset: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Halfsplit is the default since 2026-05-12; HIPFIRE_ROPE_INTERLEAVED_LEGACY=1
@@ -33573,6 +33618,7 @@ impl Gpu {
         let mut nr = n_rot as i32;
         let mut fb = freq_base;
         let mut bs = batch_size as i32;
+        let mut po = pos_offset;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -33583,6 +33629,7 @@ impl Gpu {
             &mut nr as *mut _ as *mut c_void,
             &mut fb as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
         ];
         let n_pairs = (n_rot / 2) as u32;
         let block = 32u32.min(n_pairs);
@@ -33606,6 +33653,7 @@ impl Gpu {
                 b.push_i32(nr);
                 b.push_f32(fb);
                 b.push_i32(bs);
+                b.push_i32(po);
                 b
             },
         );
@@ -35145,6 +35193,7 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
+        let fr = GDN_REQUANT_FRAME.fetch_add(1, Ordering::Relaxed) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
@@ -35157,6 +35206,7 @@ impl Gpu {
             &nt as *const _ as *mut c_void,
             &nh as *const _ as *mut c_void,
             &hd as *const _ as *mut c_void,
+            &fr as *const _ as *mut c_void,
         ];
         let n_tiles = (128 / 4) as u32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
@@ -35180,6 +35230,7 @@ impl Gpu {
                 b.push_i32(nt);
                 b.push_i32(nh);
                 b.push_i32(hd);
+                b.push_i32(fr);
                 b
             },
         );
@@ -35241,6 +35292,7 @@ impl Gpu {
         let mut nt = n_tokens as i32;
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
+        let mut fr = GDN_REQUANT_FRAME.fetch_add(1, Ordering::Relaxed) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -35253,6 +35305,7 @@ impl Gpu {
             &mut nt as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
+            &mut fr as *mut _ as *mut c_void,
         ];
 
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
@@ -35286,6 +35339,7 @@ impl Gpu {
                 b.push_i32(nt);
                 b.push_i32(nh);
                 b.push_i32(hd);
+                b.push_i32(fr);
                 b
             },
         );
