@@ -26,6 +26,7 @@ pub mod ddtree;
 pub mod dflash;
 pub mod eos_filter;
 pub mod eval_common;
+pub mod eval_harness;
 pub mod gguf;
 pub mod hfq;
 pub mod llama;

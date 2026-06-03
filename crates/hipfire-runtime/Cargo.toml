@@ -375,3 +375,8 @@ required-features = []
 name = "collect_hessian"
 path = "src/bin/collect_hessian.rs"
 required-features = []
+
+[[bin]]
+name = "hipfire-eval"
+path = "src/bin/hipfire_eval.rs"
+required-features = []

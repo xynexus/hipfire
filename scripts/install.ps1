@@ -375,7 +375,7 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Write-Host "  cargo build --release (this may take several minutes)..."
     Push-Location $RepoDir
     try {
-        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime
+        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq --bin hipfire-eval -p hipfire-runtime
     } finally {
         Pop-Location
     }
@@ -410,6 +410,8 @@ foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
     $src = "$TargetDir\release\examples\$exe"
     if (Test-Path $src) { Copy-Item $src "$BinDir\$exe" -Force }
 }
+$EvalExe = "$TargetDir\release\hipfire-eval.exe"
+if (Test-Path $EvalExe) { Copy-Item $EvalExe "$BinDir\hipfire-eval.exe" -Force }
 
 # ─── CLI ─────────────────────────────────────────────────
 Write-Host ""

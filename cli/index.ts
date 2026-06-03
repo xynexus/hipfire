@@ -11,6 +11,7 @@ import { spawn } from "bun";
 import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
+import { runEvalCommand } from "./eval";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
@@ -5026,6 +5027,10 @@ switch (cmd) {
     await profile(profileModel, jsonFlag, kernelFilter);
     break;
   }
+  case "eval": {
+    await runEvalCommand(rest);
+    break;
+  }
   case "update": {
     console.error("Updating hipfire...");
     const srcDir = join(HIPFIRE_DIR, "src");
@@ -5166,7 +5171,7 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "-p", "hipfire-runtime"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "--bin", "hipfire-eval", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
@@ -5195,7 +5200,7 @@ switch (cmd) {
       if (existsSync(src)) { copyFileSync(src, dst); }
     }
     // Workspace binaries (e.g. hipfire-quantize) live under target/release/
-    for (const bin of ["hipfire-quantize"]) {
+    for (const bin of ["hipfire-quantize", "hipfire-eval"]) {
       const src = join(repoDir, `target/release/${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
@@ -6109,6 +6114,7 @@ Examples:
   quantize <hf-id|dir>  Quantize to MQ4/MQ6 (CPU) — with optional HF upload
   bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
   profile [model]       Kernel efficiency profiler (--json, --kernel <name>)
+  eval --model <model>  Run eval harness tiers (fast default)
   list [-r]             Show local models (-r: show available too)
   config                Interactive settings editor (TUI); also: config [list|set|get|reset]
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
