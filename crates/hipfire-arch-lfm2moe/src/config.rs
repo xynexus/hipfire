@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-//! LFM2.5-MoE config, parsed from the HFQ `metadata_json` envelope (which
+//! LFM2.5 dense/MoE config, parsed from the HFQ `metadata_json` envelope (which
 //! carries the source `config.json` wholesale under the `config` key).
 //!
 //! Ground truth: LiquidAI/LFM2.5-8B-A1B config.json + transformers
@@ -76,9 +76,12 @@ struct RawLfm2MoeConfig {
     #[serde(default = "default_conv_l")]
     conv_L_cache: usize,
     intermediate_size: usize,
-    moe_intermediate_size: usize,
-    num_experts: usize,
-    num_experts_per_tok: usize,
+    #[serde(default)]
+    moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    num_experts: Option<usize>,
+    #[serde(default)]
+    num_experts_per_tok: Option<usize>,
     #[serde(default)]
     num_dense_layers: usize,
     #[serde(default)]
@@ -127,7 +130,18 @@ impl Lfm2MoeConfig {
         let inner = wrapper
             .get("config")
             .ok_or_else(|| "lfm2moe: metadata_json missing `config` wrapper".to_string())?;
-        Self::from_config_value(inner)
+        let mut cfg = Self::from_config_value(inner)?;
+        if cfg.num_experts == 0 {
+            let info = hfq
+                .find_tensor_info("model.layers.0.feed_forward.w1.weight")
+                .ok_or_else(|| {
+                    "lfm2moe: dense config needs model.layers.0.feed_forward.w1.weight".to_string()
+                })?;
+            if let Some(&rows) = info.shape.first() {
+                cfg.intermediate_size = rows as usize;
+            }
+        }
+        Ok(cfg)
     }
 
     /// Parse from a raw `config.json` Value (the inner `config` blob).
@@ -160,6 +174,12 @@ impl Lfm2MoeConfig {
                 other => Err(format!("lfm2moe: unknown layer_type {other:?}")),
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let num_experts = raw.num_experts.unwrap_or(0);
+        let num_dense_layers = if num_experts == 0 && raw.num_dense_layers == 0 {
+            raw.num_hidden_layers
+        } else {
+            raw.num_dense_layers
+        };
         Ok(Lfm2MoeConfig {
             vocab_size: raw.vocab_size,
             hidden_size: raw.hidden_size,
@@ -169,10 +189,10 @@ impl Lfm2MoeConfig {
             head_dim,
             conv_kernel_size: raw.conv_L_cache,
             intermediate_size: raw.intermediate_size,
-            moe_intermediate_size: raw.moe_intermediate_size,
-            num_experts: raw.num_experts,
-            num_experts_per_tok: raw.num_experts_per_tok,
-            num_dense_layers: raw.num_dense_layers,
+            moe_intermediate_size: raw.moe_intermediate_size.unwrap_or(0),
+            num_experts,
+            num_experts_per_tok: raw.num_experts_per_tok.unwrap_or(0),
+            num_dense_layers,
             rope_theta,
             rms_norm_eps: raw.norm_eps,
             max_position_embeddings: raw.max_position_embeddings,

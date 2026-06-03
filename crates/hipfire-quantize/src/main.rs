@@ -5161,10 +5161,11 @@ fn main() {
         // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
         // per-expert) and are translated when the forward bring-up lands.
         "deepseek_v4" => 9,
-        // LFM2.5-MoE (LiquidAI): hybrid short-conv + GQA-attn layers with
-        // dense SwiGLU on early layers and top-4 MoE on the rest. Crate:
+        // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers. Dense
+        // variants use SwiGLU in every FFN; MoE variants use dense early
+        // layers and top-k routed experts after that. Crate:
         // hipfire-arch-lfm2moe.
-        "lfm2_moe" => 11,
+        "lfm2" | "lfm2_moe" => 11,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -5203,7 +5204,7 @@ fn main() {
     }
     if is_lfm2moe {
         eprintln!(
-            "  LFM2.5-MoE detected — experts -> MQ4G256, expert_bias -> F32, all else -> Q8."
+            "  LFM2.5 detected — routed experts -> MQ4/MQ6G256, expert_bias -> F32, all else -> Q8 unless LFM2 proj MQ env is set."
         );
     }
 

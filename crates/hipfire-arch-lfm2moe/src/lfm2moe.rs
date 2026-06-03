@@ -536,9 +536,9 @@ impl Lfm2MoeState {
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
         let dense_inter = cfg.intermediate_size;
-        let moe_inter = cfg.moe_intermediate_size;
-        let n_exp = cfg.num_experts;
-        let k = cfg.num_experts_per_tok;
+        let moe_inter = cfg.moe_intermediate_size.max(1);
+        let n_exp = cfg.num_experts.max(1);
+        let k = cfg.num_experts_per_tok.max(1);
         let k_conv = cfg.conv_kernel_size;
 
         // FWHT sign LUT must exist before any rotate_x_mq / fused rotate kernel.
