@@ -449,24 +449,40 @@ pub fn decode_step_with_graph(
     gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
         .map_err(|e| format!("lfm2moe: embed lookup (graph): {e:?}"))?;
 
-    if gpu.graph_exec.is_none() {
+    if gpu.graphs.graph_exec.is_none() {
         // ── Capture phase ──────────────────────────────────────────────────
-        gpu.begin_graph_capture()
+        let stream = gpu
+            .active_stream
+            .as_ref()
+            .expect("LFM2 graph capture requires active stream");
+        gpu.graphs
+            .begin_graph_capture(&gpu.hip, gpu.device_id, stream)
             .map_err(|e| format!("lfm2moe: begin_graph_capture: {e:?}"))?;
         decode_step_layers_and_head(cfg, weights, state, gpu, position, None)?;
-        gpu.end_graph_capture()
+        let stream = gpu
+            .active_stream
+            .as_ref()
+            .expect("LFM2 graph capture requires active stream");
+        gpu.graphs
+            .end_graph_capture(&gpu.hip, gpu.device_id, stream)
             .map_err(|e| format!("lfm2moe: end_graph_capture: {e:?}"))?;
         // Recorded, not executed — launch once so this position's logits are real.
-        gpu.graph_launch()
+        gpu.graphs
+            .graph_launch(&gpu.hip, gpu.device_id, stream)
             .map_err(|e| format!("lfm2moe: graph_launch (capture-end): {e:?}"))?;
         eprintln!(
             "[LFM2.5-MoE hipGraph] captured forward — {} kernarg blobs retained",
-            gpu.capture_blobs.len()
+            gpu.graphs.capture_blobs.len()
         );
         // decode_step_layers_and_head set n_tokens; capture-end launch ran it.
     } else {
         // ── Replay phase ────────────────────────────────────────────────────
-        gpu.graph_launch()
+        let stream = gpu
+            .active_stream
+            .as_ref()
+            .expect("LFM2 graph replay requires active stream");
+        gpu.graphs
+            .graph_launch(&gpu.hip, gpu.device_id, stream)
             .map_err(|e| format!("lfm2moe: graph_launch (replay): {e:?}"))?;
         // Mirror decode_step_layers_and_head's `state.n_tokens = position + 1`,
         // which the replayed graph does NOT execute (it is host-side state).

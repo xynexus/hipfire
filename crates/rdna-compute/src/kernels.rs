@@ -1181,6 +1181,11 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched_wave64.hip");
 
+/// HFQ6G256 counterpart to the batched indexed MoE gate_up kernel. Same
+/// grid/contract as HFQ4, with 200 B/group dequant inside the kernel.
+pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_k8_indexed_batched.hip");
+
 /// N-batched indexed MoE down + scaled residual. Mirrors the batched
 /// gate_up: grid.z = N, per-token routing + scaling, atomicAdd into
 /// x_residual[token×M..].
@@ -2867,6 +2872,12 @@ pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const CONV1D_DECODE_SRC: &str = include_str!("../../../kernels/src/conv1d_decode.hip");
 
+/// LFM2.5-MoE short-conv decode: splits `[B, C_gate, x]`, applies the
+/// B*x pre-gate, advances the causal state, and applies C_gate.
+#[cfg(feature = "deltanet")]
+pub const CONV1D_GATED_DECODE_SRC: &str =
+    include_str!("../../../kernels/src/conv1d_gated_decode.hip");
+
 /// Gated output norm: rmsnorm(x) * silu(z). Fused single kernel.
 /// x and z are [n_heads × head_dim]. weight is [head_dim] (shared across heads).
 #[cfg(feature = "deltanet")]
@@ -3193,6 +3204,14 @@ pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
 
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip");
+
+/// MQ3-Lloyd indexed MoE kernels (3-bit + 8-entry codebook, 112 B/group).
+/// X must be FWHT-pre-rotated by the caller.
+pub const GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_gate_up_indexed.hip");
+
+pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip");
 
 /// Strict superset of fused_rmsnorm_mq_rotate that ALSO writes the
 /// plain (non-FWHT) RMSNormed output to a second buffer. Eliminates the
