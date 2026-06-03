@@ -1,0 +1,869 @@
+{
+  "arch": "gfx1151",
+  "blockers": [
+    "broader local Paro source inventory found zero native ParoQ4G128 modules",
+    "native ParoQ4G128 source checkpoint with qweight/qzeros/scales/pairs/theta/channel_scales companion tensors is missing",
+    "imported Paro HFQ weights source is missing",
+    "paro-oracle evidence is missing",
+    "dense/A3B coherence evidence is missing",
+    "finite-logit/NaN stability evidence is missing",
+    "KLD/PPL quality evidence is missing",
+    "gfx1151 perf evidence is missing"
+  ],
+  "branch": "qwen35-native-mtp",
+  "bundle_plan": {
+    "bundle_id": "gfx1151-paro-q4g128-qwen35-9b-package-contract",
+    "container_format": "hfq-package-v0",
+    "external_sidecars_target": false,
+    "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-astrea-bundle-plan.json",
+    "runtime_env_boundary": {
+      "productization_candidate": [
+        "HIPFIRE_PARO_BATCHED",
+        "HIPFIRE_MOE_PARO_I8",
+        "HIPFIRE_MOE_PARO_I8_K8"
+      ],
+      "promotion_report_requirements": [
+        "record effective values for productization-candidate Paro env vars",
+        "exclude research-only knobs from promoted main-path evidence unless each knob has separate artifact-backed validation",
+        "record oracle, finite-logit/NaN, coherence, KLD/PPL, and gfx1151 perf artifacts before promotion"
+      ],
+      "required_product_env_missing": [],
+      "required_product_env_present": [
+        "HIPFIRE_MOE_PARO_I8",
+        "HIPFIRE_MOE_PARO_I8_K8",
+        "HIPFIRE_PARO_BATCHED"
+      ],
+      "required_research_knobs_missing": [],
+      "required_research_knobs_present": [
+        "HIPFIRE_PARO_FUSED_PACK2",
+        "HIPFIRE_PARO_FUSE_RMSNORM",
+        "HIPFIRE_PARO_PREROTATE"
+      ],
+      "research_only": [
+        "HIPFIRE_PARO_PREROTATE",
+        "HIPFIRE_PARO_SMALL_DIRECT",
+        "HIPFIRE_PARO_SWIGLU_FUSED",
+        "HIPFIRE_PARO_FUSE_RMSNORM",
+        "HIPFIRE_PARO_FA3_FUSED",
+        "HIPFIRE_PARO_GATE_UP_FUSED",
+        "HIPFIRE_PARO_LA4_FUSED",
+        "HIPFIRE_PARO_LA2_FUSED",
+        "HIPFIRE_PARO_LA_GATES_MQ4G128",
+        "HIPFIRE_PARO_PACK1",
+        "HIPFIRE_PARO_PACK2",
+        "HIPFIRE_PARO_PACK4",
+        "HIPFIRE_PARO_SHARED_PAIRS",
+        "HIPFIRE_PARO_FUSED_PACK2"
+      ]
+    },
+    "schema": "hipfire.astrea.bundle_plan.v0",
+    "transform_runtime_status": "deferred_until_loader_and_fused_kernel_exist",
+    "weights_source": {
+      "bytes": null,
+      "exists": false,
+      "is_file": false,
+      "md5": null,
+      "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-paro-mq4.hfq"
+    },
+    "weights_source_exists": false
+  },
+  "captured_at_utc": "2026-06-03T10:09:51Z",
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "decision": "blocked at producer/import/oracle evidence; keep ParoQ4G128 out of promoted main path",
+  "dependency_graph": {
+    "all_required_suffixes_absent_across_expected_probes": true,
+    "edges": [
+      [
+        "source_probe",
+        "native_source"
+      ],
+      [
+        "native_source",
+        "imported_hfq"
+      ],
+      [
+        "imported_hfq",
+        "paro_oracle"
+      ],
+      [
+        "imported_hfq",
+        "coherence"
+      ],
+      [
+        "imported_hfq",
+        "finite_logit_nan"
+      ],
+      [
+        "imported_hfq",
+        "quality"
+      ],
+      [
+        "imported_hfq",
+        "gfx1151_perf"
+      ]
+    ],
+    "import_blocked_by_source_absence": true,
+    "native_source_absent": true,
+    "next_unblocked_step": "locate_or_generate_native_paro_q4g128_checkpoint",
+    "nodes": {
+      "coherence": {
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "satisfied": false
+      },
+      "finite_logit_nan": {
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "satisfied": false
+      },
+      "gfx1151_perf": {
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "satisfied": false
+      },
+      "imported_hfq": {
+        "blocked_by": [
+          "native_source"
+        ],
+        "blocks": [
+          "paro_oracle",
+          "coherence",
+          "finite_logit_nan",
+          "quality",
+          "gfx1151_perf"
+        ],
+        "satisfied": false
+      },
+      "main_path_clean": {
+        "blocked_by": [
+          "runtime_env_boundary"
+        ],
+        "satisfied": true
+      },
+      "native_source": {
+        "blocks": [
+          "imported_hfq"
+        ],
+        "satisfied": false
+      },
+      "package_contract": {
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "satisfied": true
+      },
+      "paro_oracle": {
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "satisfied": false
+      },
+      "quality": {
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "satisfied": false
+      },
+      "runtime_env_boundary": {
+        "satisfied": true
+      },
+      "source_inventory": {
+        "blocks": [
+          "native_source"
+        ],
+        "satisfied": true
+      },
+      "source_inventory_consistency": {
+        "blocked_by": [
+          "source_inventory",
+          "source_probe"
+        ],
+        "satisfied": true
+      },
+      "source_probe": {
+        "blocks": [
+          "native_source"
+        ],
+        "satisfied": true
+      },
+      "typed_evidence_files": {
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "requires": [
+          "paro_oracle",
+          "coherence",
+          "finite_logit_nan",
+          "quality",
+          "gfx1151_perf"
+        ],
+        "satisfied": false
+      }
+    },
+    "oracle_blocked_by_import_absence": true,
+    "perf_blocked_by_import_absence": true,
+    "quality_blocked_by_import_absence": true,
+    "required_suffix_absence_by_probe": {
+      "qwen3.5-35b-a3b": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ],
+      "qwen3.5-9b": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ],
+      "qwen3.6-35b-a3b": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ]
+    },
+    "source_inventory": {
+      "complete_module_count": 0,
+      "filename_hit_count": 0,
+      "files_seen": 861,
+      "g128_complete_module_count": 0,
+      "g256_complete_module_count": 0,
+      "incomplete_module_count": 0,
+      "native_paro_g128_source_found": false,
+      "native_paro_source_found": false,
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-source-inventory.json",
+      "present": true,
+      "quality_state": "UNVERIFIABLE",
+      "roots": [
+        {
+          "exists": true,
+          "filename_hit_count": 0,
+          "files_seen": 677,
+          "root": "/home/sadara/Models",
+          "safetensor_file_count": 150
+        },
+        {
+          "exists": true,
+          "filename_hit_count": 0,
+          "files_seen": 126,
+          "root": "/home/sadara/.cache/huggingface/hub",
+          "safetensor_file_count": 1
+        },
+        {
+          "exists": true,
+          "filename_hit_count": 0,
+          "files_seen": 58,
+          "root": "/home/sadara/.hipfire/models",
+          "safetensor_file_count": 0
+        }
+      ],
+      "safetensor_dirs_scanned": 17,
+      "safetensor_files_scanned": 151,
+      "schema": "hipfire.astrea.paro_source_inventory.v0",
+      "schema_ok": true
+    }
+  },
+  "evidence": {
+    "artifact_records": {
+      "coherence": [],
+      "finite_logit_nan": [],
+      "generic": [],
+      "gfx1151_perf": [],
+      "oracle": [],
+      "quality": [],
+      "research_only_env": []
+    },
+    "coherence_artifacts": [],
+    "coherence_evidence_present": false,
+    "finite_logit_nan_artifacts": [],
+    "finite_logit_nan_evidence_present": false,
+    "generic_artifacts": [],
+    "gfx1151_perf_artifacts": [],
+    "gfx1151_perf_evidence_present": false,
+    "oracle_artifacts": [],
+    "oracle_evidence_present": false,
+    "quality_artifacts": [],
+    "quality_evidence_present": false,
+    "research_only_env_artifacts": [],
+    "research_only_env_evidence_present": false,
+    "typed_artifact_existence": {
+      "all_positive_typed_evidence_files_exist": false,
+      "coherence": false,
+      "finite_logit_nan": false,
+      "gfx1151_perf": false,
+      "oracle": false,
+      "quality": false
+    }
+  },
+  "format": "paro-q4g128",
+  "gates": {
+    "coherence_evidence_present": false,
+    "finite_logit_nan_evidence_present": false,
+    "gfx1151_perf_evidence_present": false,
+    "imported_hfq_exists": false,
+    "native_paro_source_found": false,
+    "oracle_evidence_present": false,
+    "oracle_quality_perf_evidence_present": false,
+    "package_contract_present": true,
+    "promotion_main_path_clean": true,
+    "quality_evidence_present": false,
+    "research_only_env_evidence_absent": true,
+    "runtime_env_boundary_recorded": true,
+    "source_inventory_consistent": true,
+    "source_inventory_native_paro_g128_found": false,
+    "source_inventory_present": true,
+    "source_probe_coverage_complete": true,
+    "typed_evidence_files_exist": false
+  },
+  "next_work": [
+    "Locate or produce a native ParoQ4G128 checkpoint with qweight/qzeros/scales/pairs/theta/channel_scales.",
+    "Run paro-probe, paro-import, and paro-oracle against the native source and imported HFQ.",
+    "Regenerate the Astrea bundle plan with the imported HFQ as the weights source.",
+    "Run coherence, finite-logit/NaN, KLD/PPL, and gfx1151 perf evidence before any promotion claim.",
+    "Refresh the evidence after reconciling origin commits that touch Paro, MoE, RoPE, DFlash, or runtime leaks."
+  ],
+  "origin_context": {
+    "base": "HEAD",
+    "local_only_commits": 66,
+    "origin_master_commit": "02634f4c49853faa8d43f7bc029a9f23988aa45f",
+    "relevant_upstream_commits": [
+      {
+        "action": "rerun Paro coherence/spec evidence after importing a native source on the reconciled branch",
+        "commit": "676338a47dff1d8bcb923cc3b636845bd684ca2f",
+        "impact": "requires refreshed long-context, eviction, MTP, and DFlash evidence after branch reconciliation; it does not provide a ParoQ4G128 source or promotion artifact",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "short": "676338a4",
+        "subject": "fix(qwen35): batched RoPE ignored compact_offset -> phase skew after eviction (H4)"
+      },
+      {
+        "action": "refresh producer and leak-sensitive runtime rows after reconciliation",
+        "commit": "d5985c3e51197c70fa804f84cd694abbcd38f0d7",
+        "impact": "contains producer/runtime cleanup relevant to the wider quant matrix; it does not satisfy the ParoQ4G128 producer, oracle, quality, or perf gates",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "short": "d5985c3e",
+        "subject": "fix(stragglers): 4 GPU leaks/dead-doc + GGUF Promote6 Mq4Lloyd"
+      },
+      {
+        "action": "rerun A3B/MoE prefill stability and perf evidence once Paro import exists",
+        "commit": "b4adca1f3f6fc97d08a3c9a4bab98ead64a5ef99",
+        "impact": "affects A3B/MoE prefill stability, including the ParoQ4G128 productization lane; it is a runtime refresh requirement, not source or quality evidence",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "short": "b4adca1f",
+        "subject": "fix(qwen35,daemon): free leaked GPU scratch - Path-2 MoE prefill buffers"
+      },
+      {
+        "action": "keep the promoted ParoQ4G128 path on typed source/import/oracle/coherence/KLD/perf artifacts after branch reconciliation",
+        "commit": "8de4545596e5434564d186bfe495eea785297216",
+        "impact": "confirms stale Paro experiment knobs were removed upstream; it does not provide a native ParoQ4G128 checkpoint, imported HFQ artifact, oracle row, quality row, or gfx1151 perf row",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "short": "8de45455",
+        "subject": "refactor(paro): remove stale env-gated experiments"
+      }
+    ],
+    "upstream": "origin/master",
+    "upstream_only_commits": 126,
+    "upstream_reconciliation_required": true
+  },
+  "productization_boundary": {
+    "artifact_generation_without_native_source_allowed": false,
+    "astrea_state": "bundle_plan_contract_only_not_model_writer",
+    "current_stage": "blocked_before_native_source_import",
+    "hidden_research_env_dependency_present": false,
+    "importer_state": "blocked_no_native_paro_source",
+    "main_path_state": "clean_but_unpromoted",
+    "native_source_contract": {
+      "all_required_suffixes_absent_across_expected_probes": true,
+      "broader_source_inventory": {
+        "complete_module_count": 0,
+        "filename_hit_count": 0,
+        "files_seen": 861,
+        "g128_complete_module_count": 0,
+        "g256_complete_module_count": 0,
+        "incomplete_module_count": 0,
+        "native_paro_g128_source_found": false,
+        "native_paro_source_found": false,
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-source-inventory.json",
+        "present": true,
+        "quality_state": "UNVERIFIABLE",
+        "roots": [
+          {
+            "exists": true,
+            "filename_hit_count": 0,
+            "files_seen": 677,
+            "root": "/home/sadara/Models",
+            "safetensor_file_count": 150
+          },
+          {
+            "exists": true,
+            "filename_hit_count": 0,
+            "files_seen": 126,
+            "root": "/home/sadara/.cache/huggingface/hub",
+            "safetensor_file_count": 1
+          },
+          {
+            "exists": true,
+            "filename_hit_count": 0,
+            "files_seen": 58,
+            "root": "/home/sadara/.hipfire/models",
+            "safetensor_file_count": 0
+          }
+        ],
+        "safetensor_dirs_scanned": 17,
+        "safetensor_files_scanned": 151,
+        "schema": "hipfire.astrea.paro_source_inventory.v0",
+        "schema_ok": true
+      },
+      "required_suffix_absence_by_probe": {
+        "qwen3.5-35b-a3b": [
+          "qweight",
+          "qzeros",
+          "scales",
+          "pairs",
+          "theta",
+          "channel_scales"
+        ],
+        "qwen3.5-9b": [
+          "qweight",
+          "qzeros",
+          "scales",
+          "pairs",
+          "theta",
+          "channel_scales"
+        ],
+        "qwen3.6-35b-a3b": [
+          "qweight",
+          "qzeros",
+          "scales",
+          "pairs",
+          "theta",
+          "channel_scales"
+        ]
+      },
+      "required_tensor_families": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ]
+    },
+    "next_unblocked_step": "locate_or_generate_native_paro_q4g128_checkpoint",
+    "package_state": "contract_only_missing_weights",
+    "productization_candidate_env_documented": true,
+    "promoted_main_path_requires_typed_evidence": true,
+    "research_only_env_blocks_promotion": true,
+    "typed_evidence_complete": false,
+    "weights_source": {
+      "bytes": null,
+      "exists": false,
+      "is_file": false,
+      "md5": null,
+      "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-paro-mq4.hfq"
+    }
+  },
+  "productization_plan": {
+    "current_typed_evidence": {
+      "all_positive_typed_evidence_files_exist": false,
+      "coherence": false,
+      "finite_logit_nan": false,
+      "gfx1151_perf": false,
+      "oracle": false,
+      "quality": false
+    },
+    "evidence_artifact_targets": {
+      "bundle_plan": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-astrea-bundle-plan.json",
+      "coherence": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-coherence.md",
+      "finite_logit_nan": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-finite-logit-nan.json",
+      "gfx1151_perf": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-gfx1151-perf.json",
+      "import_report": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-import.json",
+      "oracle": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-oracle.json",
+      "quality": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-kld-ppl.json",
+      "source_inventory": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-source-inventory.json",
+      "source_probe_qwen35_9b": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen35-9b-source-probe.json",
+      "source_probe_qwen35_a3b": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen35-a3b-source-probe.json",
+      "source_probe_qwen36_a3b": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen36-a3b-source-probe.json",
+      "status": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-productization-status.json"
+    },
+    "next_unblocked_step": "locate_or_generate_native_paro_q4g128_checkpoint",
+    "next_work": [
+      "Locate or produce a native ParoQ4G128 checkpoint with qweight/qzeros/scales/pairs/theta/channel_scales.",
+      "Run paro-probe, paro-import, and paro-oracle against the native source and imported HFQ.",
+      "Regenerate the Astrea bundle plan with the imported HFQ as the weights source.",
+      "Run coherence, finite-logit/NaN, KLD/PPL, and gfx1151 perf evidence before any promotion claim.",
+      "Refresh the evidence after reconciling origin commits that touch Paro, MoE, RoPE, DFlash, or runtime leaks."
+    ],
+    "refresh_required_after_origin_reconciliation": true,
+    "stage_order": [
+      "source_inventory",
+      "native_source",
+      "source_probe",
+      "imported_hfq",
+      "bundle_plan_with_weights",
+      "paro_oracle",
+      "coherence",
+      "finite_logit_nan",
+      "quality_kld_ppl",
+      "gfx1151_perf",
+      "promotion_review"
+    ],
+    "stages": {
+      "bundle_plan_with_weights": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-astrea-bundle-plan.json",
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "command_template": "python3 scripts/astrea.py bundle-plan --model /home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-paro-mq4.hfq --output <packaged-paro-q4g128.hfq> --include weights --include paro --pretty --out benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-astrea-bundle-plan.json",
+        "satisfied": false
+      },
+      "coherence": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-coherence.md",
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "command_template": "./scripts/coherence-gate.sh --full",
+        "satisfied": false
+      },
+      "finite_logit_nan": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-finite-logit-nan.json",
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "requirement": "finite logits and no NaN/Inf rows for dense and A3B Paro runs",
+        "satisfied": false
+      },
+      "gfx1151_perf": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-gfx1151-perf.json",
+        "blocked_by": [
+          "imported_hfq",
+          "coherence",
+          "quality_kld_ppl"
+        ],
+        "requirement": "fresh-process gfx1151 dense and A3B perf rows with prompt and binary hashes",
+        "satisfied": false
+      },
+      "imported_hfq": {
+        "artifact": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-paro-mq4.hfq",
+        "blocked_by": [
+          "native_source"
+        ],
+        "command_template": "python3 scripts/astrea.py paro-import --model <native-paro-q4g128-safetensors-dir-or-hf-repo> --output /home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-paro-mq4.hfq --layout native --copy-floats f16 --pretty --out benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-import.json",
+        "import_report_artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-import.json",
+        "satisfied": false
+      },
+      "native_source": {
+        "blocked_by": [],
+        "blocks": [
+          "source_probe",
+          "imported_hfq"
+        ],
+        "current_result": "missing",
+        "required_tensor_families": [
+          "qweight",
+          "qzeros",
+          "scales",
+          "pairs",
+          "theta",
+          "channel_scales"
+        ],
+        "satisfied": false
+      },
+      "paro_oracle": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-oracle.json",
+        "blocked_by": [
+          "imported_hfq"
+        ],
+        "command_template": "python3 scripts/astrea.py paro-oracle --source <native-paro-q4g128-safetensors-dir-or-hf-repo> --hfq /home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-paro-mq4.hfq --pretty --out benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-oracle.json",
+        "satisfied": false
+      },
+      "promotion_review": {
+        "blocked_by": [
+          "native_source",
+          "imported_hfq",
+          "paro_oracle",
+          "coherence",
+          "finite_logit_nan",
+          "quality_kld_ppl",
+          "gfx1151_perf"
+        ],
+        "requirement": "matrix review only after every typed evidence stage is satisfied",
+        "satisfied": false
+      },
+      "quality_kld_ppl": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-kld-ppl.json",
+        "blocked_by": [
+          "imported_hfq",
+          "paro_oracle"
+        ],
+        "requirement": "same-run KLD/PPL comparison against the MQ4 control before promotion",
+        "satisfied": false
+      },
+      "source_inventory": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-source-inventory.json",
+        "command": "python3 scripts/paroquant_inventory.py --pretty --out benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-source-inventory.json",
+        "g128_complete_module_count": 0,
+        "native_paro_g128_source_found": false,
+        "satisfied": true
+      },
+      "source_probe": {
+        "artifacts": [
+          "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen35-9b-source-probe.json",
+          "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen35-a3b-source-probe.json",
+          "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen36-a3b-source-probe.json"
+        ],
+        "blocked_by": [
+          "native_source"
+        ],
+        "command_template": "python3 scripts/astrea.py paro-probe --model <native-paro-q4g128-safetensors-dir-or-hf-repo> --pretty --out <paro-source-probe.json>",
+        "satisfied": true
+      }
+    },
+    "status": "blocked_before_native_source_import",
+    "typed_evidence_complete": false
+  },
+  "promotion_allowed": false,
+  "promotion_gate_keys": [
+    "source_probe_coverage_complete",
+    "source_inventory_present",
+    "source_inventory_consistent",
+    "native_paro_source_found",
+    "imported_hfq_exists",
+    "runtime_env_boundary_recorded",
+    "research_only_env_evidence_absent",
+    "promotion_main_path_clean",
+    "package_contract_present",
+    "oracle_evidence_present",
+    "coherence_evidence_present",
+    "finite_logit_nan_evidence_present",
+    "quality_evidence_present",
+    "gfx1151_perf_evidence_present",
+    "typed_evidence_files_exist",
+    "oracle_quality_perf_evidence_present"
+  ],
+  "schema": "hipfire.paro_q4g128_productization_status.gfx1151.v0",
+  "source_inventory": {
+    "complete_module_count": 0,
+    "filename_hit_count": 0,
+    "files_seen": 861,
+    "g128_complete_module_count": 0,
+    "g256_complete_module_count": 0,
+    "incomplete_module_count": 0,
+    "native_paro_g128_source_found": false,
+    "native_paro_source_found": false,
+    "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-source-inventory.json",
+    "present": true,
+    "quality_state": "UNVERIFIABLE",
+    "roots": [
+      {
+        "exists": true,
+        "filename_hit_count": 0,
+        "files_seen": 677,
+        "root": "/home/sadara/Models",
+        "safetensor_file_count": 150
+      },
+      {
+        "exists": true,
+        "filename_hit_count": 0,
+        "files_seen": 126,
+        "root": "/home/sadara/.cache/huggingface/hub",
+        "safetensor_file_count": 1
+      },
+      {
+        "exists": true,
+        "filename_hit_count": 0,
+        "files_seen": 58,
+        "root": "/home/sadara/.hipfire/models",
+        "safetensor_file_count": 0
+      }
+    ],
+    "safetensor_dirs_scanned": 17,
+    "safetensor_files_scanned": 151,
+    "schema": "hipfire.astrea.paro_source_inventory.v0",
+    "schema_ok": true
+  },
+  "source_probe_coverage": {
+    "aggregate_required_suffix_counts": {
+      "channel_scales": 0,
+      "pairs": 0,
+      "qweight": 0,
+      "qzeros": 0,
+      "scales": 0,
+      "theta": 0
+    },
+    "all_required_suffixes_absent_across_expected_probes": true,
+    "complete": true,
+    "contract_mismatch_probe_ids": [],
+    "expected_probe_ids": [
+      "qwen3.5-35b-a3b",
+      "qwen3.5-9b",
+      "qwen3.6-35b-a3b"
+    ],
+    "expected_probe_ids_missing": [],
+    "expected_probe_ids_present": [
+      "qwen3.5-35b-a3b",
+      "qwen3.5-9b",
+      "qwen3.6-35b-a3b"
+    ],
+    "present_probe_ids": [
+      "qwen3.5-35b-a3b",
+      "qwen3.5-9b",
+      "qwen3.6-35b-a3b"
+    ],
+    "required_native_tensor_families": [
+      "qweight",
+      "qzeros",
+      "scales",
+      "pairs",
+      "theta",
+      "channel_scales"
+    ],
+    "required_suffix_absence_by_probe": {
+      "qwen3.5-35b-a3b": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ],
+      "qwen3.5-9b": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ],
+      "qwen3.6-35b-a3b": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ]
+    }
+  },
+  "source_probes": [
+    {
+      "architecture": "qwen3_5",
+      "complete_module_count": 0,
+      "group_size": 128,
+      "hfq_quant_type": 28,
+      "hfq_quant_type_name": "PARO4G128",
+      "id": "qwen3.5-9b",
+      "incomplete_module_count": 0,
+      "model": "/home/sadara/Models/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "native_paro_source": false,
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen35-9b-source-probe.json",
+      "required_suffix_counts": {
+        "channel_scales": 0,
+        "pairs": 0,
+        "qweight": 0,
+        "qzeros": 0,
+        "scales": 0,
+        "theta": 0
+      },
+      "required_suffixes_absent": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ],
+      "required_suffixes_present": [],
+      "resolved_path": "/home/sadara/Models/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "schema": "hipfire.astrea.paro_probe.v0",
+      "suffix_counts": {
+        "other": 775
+      },
+      "tensor_count": 775
+    },
+    {
+      "architecture": "qwen3_5_moe",
+      "complete_module_count": 0,
+      "group_size": 128,
+      "hfq_quant_type": 28,
+      "hfq_quant_type_name": "PARO4G128",
+      "id": "qwen3.5-35b-a3b",
+      "incomplete_module_count": 0,
+      "model": "/home/sadara/Models/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754",
+      "native_paro_source": false,
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen35-a3b-source-probe.json",
+      "required_suffix_counts": {
+        "channel_scales": 0,
+        "pairs": 0,
+        "qweight": 0,
+        "qzeros": 0,
+        "scales": 0,
+        "theta": 0
+      },
+      "required_suffixes_absent": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ],
+      "required_suffixes_present": [],
+      "resolved_path": "/home/sadara/Models/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754",
+      "schema": "hipfire.astrea.paro_probe.v0",
+      "suffix_counts": {
+        "other": 1811
+      },
+      "tensor_count": 1811
+    },
+    {
+      "architecture": "qwen3_5_moe",
+      "complete_module_count": 0,
+      "group_size": 128,
+      "hfq_quant_type": 28,
+      "hfq_quant_type_name": "PARO4G128",
+      "id": "qwen3.6-35b-a3b",
+      "incomplete_module_count": 0,
+      "model": "/home/sadara/Models/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0",
+      "native_paro_source": false,
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen36-a3b-source-probe.json",
+      "required_suffix_counts": {
+        "channel_scales": 0,
+        "pairs": 0,
+        "qweight": 0,
+        "qzeros": 0,
+        "scales": 0,
+        "theta": 0
+      },
+      "required_suffixes_absent": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ],
+      "required_suffixes_present": [],
+      "resolved_path": "/home/sadara/Models/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0",
+      "schema": "hipfire.astrea.paro_probe.v0",
+      "suffix_counts": {
+        "other": 1045
+      },
+      "tensor_count": 1045
+    }
+  ],
+  "status": "candidate-productization"
+}

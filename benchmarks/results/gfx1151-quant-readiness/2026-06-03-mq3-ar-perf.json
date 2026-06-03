@@ -1,0 +1,175 @@
+{
+  "arch": "gfx1151",
+  "branch": "qwen35-native-mtp",
+  "cases": [
+    {
+      "family": "dense",
+      "format_id": "mq4",
+      "id": "qwen35-27b-mq4-cap",
+      "max_tokens": 80,
+      "model_file": "qwen3.5-27b.mq4",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq4",
+      "model_present": true,
+      "prompt": "What is the capital of France? Answer in one short sentence.",
+      "prompt_md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+      "runs": [
+        {
+          "done": {
+            "decode_tok_s": 14.1,
+            "id": "qwen35-27b-mq4-cap-run1",
+            "prefill_ms": 549.6,
+            "prefill_tok_s": 38.2,
+            "prefill_tokens": 21,
+            "tok_s": 12.8,
+            "tokens": 80,
+            "ttft_ms": 549.6,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"What is the capital of France?\"\n    *   Constraint: \"Answer in one short sentence.\"\n\n2.  **Identify the Answer:**\n    *   The capital of France is Paris.\n\n3.  **Formulate the Sentence:**\n    *   Draft 1",
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "wall_s": 8.727
+        },
+        {
+          "done": {
+            "decode_tok_s": 14.1,
+            "id": "qwen35-27b-mq4-cap-run2",
+            "prefill_ms": 589.3,
+            "prefill_tok_s": 35.6,
+            "prefill_tokens": 21,
+            "tok_s": 12.7,
+            "tokens": 80,
+            "ttft_ms": 589.3,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"What is the capital of France?\"\n    *   Constraint: \"Answer in one short sentence.\"\n\n2.  **Identify the Answer:**\n    *   The capital of France is Paris.\n\n3.  **Formulate the Sentence:**\n    *   Draft 1",
+          "panic": "",
+          "run": 2,
+          "status": "ok",
+          "wall_s": 8.765
+        },
+        {
+          "done": {
+            "decode_tok_s": 14.1,
+            "id": "qwen35-27b-mq4-cap-run3",
+            "prefill_ms": 592.2,
+            "prefill_tok_s": 35.5,
+            "prefill_tokens": 21,
+            "tok_s": 12.7,
+            "tokens": 80,
+            "ttft_ms": 592.2,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"What is the capital of France?\"\n    *   Constraint: \"Answer in one short sentence.\"\n\n2.  **Identify the Answer:**\n    *   The capital of France is Paris.\n\n3.  **Formulate the Sentence:**\n    *   Draft 1",
+          "panic": "",
+          "run": 3,
+          "status": "ok",
+          "wall_s": 8.777
+        }
+      ],
+      "summary": {
+        "median_decode_tok_s": 14.1,
+        "median_prefill_ms": 589.3,
+        "median_prefill_tok_s": 35.6,
+        "median_tok_s": 12.7,
+        "median_tokens": 80.0,
+        "median_ttft_ms": 589.3,
+        "ok_runs": 3,
+        "total_runs": 3
+      }
+    },
+    {
+      "family": "dense",
+      "format_id": "mq3",
+      "id": "qwen35-27b-mq3-cap",
+      "max_tokens": 80,
+      "model_file": "qwen3.5-27b.mq3",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq3",
+      "model_present": true,
+      "prompt": "What is the capital of France? Answer in one short sentence.",
+      "prompt_md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+      "runs": [
+        {
+          "done": {
+            "decode_tok_s": 17.7,
+            "id": "qwen35-27b-mq3-cap-run1",
+            "prefill_ms": 414.4,
+            "prefill_tok_s": 50.7,
+            "prefill_tokens": 21,
+            "tok_s": 11.0,
+            "tokens": 12,
+            "ttft_ms": 414.4,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nThe capital of France is Paris.<|im_end|>",
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "wall_s": 3.261
+        },
+        {
+          "done": {
+            "decode_tok_s": 17.6,
+            "id": "qwen35-27b-mq3-cap-run2",
+            "prefill_ms": 416.8,
+            "prefill_tok_s": 50.4,
+            "prefill_tokens": 21,
+            "tok_s": 10.9,
+            "tokens": 12,
+            "ttft_ms": 416.8,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nThe capital of France is Paris.<|im_end|>",
+          "panic": "",
+          "run": 2,
+          "status": "ok",
+          "wall_s": 3.224
+        },
+        {
+          "done": {
+            "decode_tok_s": 17.6,
+            "id": "qwen35-27b-mq3-cap-run3",
+            "prefill_ms": 416.2,
+            "prefill_tok_s": 50.5,
+            "prefill_tokens": 21,
+            "tok_s": 10.9,
+            "tokens": 12,
+            "ttft_ms": 416.2,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nThe capital of France is Paris.<|im_end|>",
+          "panic": "",
+          "run": 3,
+          "status": "ok",
+          "wall_s": 3.221
+        }
+      ],
+      "summary": {
+        "median_decode_tok_s": 17.6,
+        "median_prefill_ms": 416.2,
+        "median_prefill_tok_s": 50.5,
+        "median_tok_s": 10.9,
+        "median_tokens": 12.0,
+        "median_ttft_ms": 416.2,
+        "ok_runs": 3,
+        "total_runs": 3
+      }
+    }
+  ],
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "daemon": {
+    "md5": "a5366b3795b9adb54555ba1356d69b56",
+    "path": "/home/sadara/.hipfire/src/target/release/examples/daemon"
+  },
+  "date": "2026-06-03T00:09:48.199516+00:00",
+  "models_dir": "/home/sadara/.hipfire/models",
+  "runs_per_case": 3,
+  "schema": "hipfire.mq3_ar_perf.gfx1151.v0"
+}

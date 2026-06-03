@@ -1,0 +1,423 @@
+{
+  "captured_at_utc": "2026-06-03T03:08:22Z",
+  "format": "hfq",
+  "git": "fab9d2bc",
+  "hfq": {
+    "arch_id": 5,
+    "data_end": 4568261632,
+    "data_end_matches_file_size": true,
+    "data_offset": 14352384,
+    "file_bytes": 4568261632,
+    "magic": "HFQM",
+    "metadata": {
+      "architecture": "qwen3_5",
+      "config": {
+        "model_type": "qwen3_5"
+      },
+      "keys": [
+        "architecture",
+        "config",
+        "generation_config",
+        "tokenizer",
+        "tokenizer_config"
+      ]
+    },
+    "metadata_offset": 32,
+    "quant_type_counts": {
+      "F16": 153,
+      "MQ3G256_LLOYD": 249,
+      "Q8F16": 25
+    },
+    "schema": "hipfire.astrea.hfq_summary.v0",
+    "tensor_count": 427,
+    "tensor_names_md5": "8c9be4ed228f2fe609445911f215c152",
+    "tensors": [
+      {
+        "data_offset": 14352384,
+        "data_size": 444989440,
+        "group_size": 256,
+        "name": "lm_head.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          248320,
+          4096
+        ]
+      },
+      {
+        "data_offset": 459341824,
+        "data_size": 1080688640,
+        "group_size": 32,
+        "name": "model.language_model.embed_tokens.weight",
+        "quant_type": 3,
+        "quant_type_name": "Q8F16",
+        "shape": [
+          248320,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1540030464,
+        "data_size": 8192,
+        "group_size": 0,
+        "name": "model.language_model.layers.0.input_layernorm.weight",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          4096
+        ]
+      },
+      {
+        "data_offset": 1540038656,
+        "data_size": 64,
+        "group_size": 0,
+        "name": "model.language_model.layers.0.linear_attn.A_log",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          32
+        ]
+      },
+      {
+        "data_offset": 1540038720,
+        "data_size": 34816,
+        "group_size": 32,
+        "name": "model.language_model.layers.0.linear_attn.conv1d.weight",
+        "quant_type": 3,
+        "quant_type_name": "Q8F16",
+        "shape": [
+          8192,
+          1,
+          4
+        ]
+      },
+      {
+        "data_offset": 1540073536,
+        "data_size": 64,
+        "group_size": 0,
+        "name": "model.language_model.layers.0.linear_attn.dt_bias",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          32
+        ]
+      },
+      {
+        "data_offset": 1540073600,
+        "data_size": 57344,
+        "group_size": 256,
+        "name": "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          32,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1540130944,
+        "data_size": 57344,
+        "group_size": 256,
+        "name": "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          32,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1540188288,
+        "data_size": 14680064,
+        "group_size": 256,
+        "name": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          8192,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1554868352,
+        "data_size": 7340032,
+        "group_size": 256,
+        "name": "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          4096,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1562208384,
+        "data_size": 256,
+        "group_size": 0,
+        "name": "model.language_model.layers.0.linear_attn.norm.weight",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          128
+        ]
+      },
+      {
+        "data_offset": 1562208640,
+        "data_size": 7340032,
+        "group_size": 256,
+        "name": "model.language_model.layers.0.linear_attn.out_proj.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          4096,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1569548672,
+        "data_size": 22020096,
+        "group_size": 256,
+        "name": "model.language_model.layers.0.mlp.down_proj.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          4096,
+          12288
+        ]
+      },
+      {
+        "data_offset": 1591568768,
+        "data_size": 22020096,
+        "group_size": 256,
+        "name": "model.language_model.layers.0.mlp.gate_proj.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          12288,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1613588864,
+        "data_size": 22020096,
+        "group_size": 256,
+        "name": "model.language_model.layers.0.mlp.up_proj.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          12288,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1635608960,
+        "data_size": 8192,
+        "group_size": 0,
+        "name": "model.language_model.layers.0.post_attention_layernorm.weight",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          4096
+        ]
+      },
+      {
+        "data_offset": 1635617152,
+        "data_size": 8192,
+        "group_size": 0,
+        "name": "model.language_model.layers.1.input_layernorm.weight",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          4096
+        ]
+      },
+      {
+        "data_offset": 1635625344,
+        "data_size": 64,
+        "group_size": 0,
+        "name": "model.language_model.layers.1.linear_attn.A_log",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          32
+        ]
+      },
+      {
+        "data_offset": 1635625408,
+        "data_size": 34816,
+        "group_size": 32,
+        "name": "model.language_model.layers.1.linear_attn.conv1d.weight",
+        "quant_type": 3,
+        "quant_type_name": "Q8F16",
+        "shape": [
+          8192,
+          1,
+          4
+        ]
+      },
+      {
+        "data_offset": 1635660224,
+        "data_size": 64,
+        "group_size": 0,
+        "name": "model.language_model.layers.1.linear_attn.dt_bias",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          32
+        ]
+      },
+      {
+        "data_offset": 1635660288,
+        "data_size": 57344,
+        "group_size": 256,
+        "name": "model.language_model.layers.1.linear_attn.in_proj_a.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          32,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1635717632,
+        "data_size": 57344,
+        "group_size": 256,
+        "name": "model.language_model.layers.1.linear_attn.in_proj_b.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          32,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1635774976,
+        "data_size": 14680064,
+        "group_size": 256,
+        "name": "model.language_model.layers.1.linear_attn.in_proj_qkv.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          8192,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1650455040,
+        "data_size": 7340032,
+        "group_size": 256,
+        "name": "model.language_model.layers.1.linear_attn.in_proj_z.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          4096,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1657795072,
+        "data_size": 256,
+        "group_size": 0,
+        "name": "model.language_model.layers.1.linear_attn.norm.weight",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          128
+        ]
+      },
+      {
+        "data_offset": 1657795328,
+        "data_size": 7340032,
+        "group_size": 256,
+        "name": "model.language_model.layers.1.linear_attn.out_proj.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          4096,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1665135360,
+        "data_size": 22020096,
+        "group_size": 256,
+        "name": "model.language_model.layers.1.mlp.down_proj.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          4096,
+          12288
+        ]
+      },
+      {
+        "data_offset": 1687155456,
+        "data_size": 22020096,
+        "group_size": 256,
+        "name": "model.language_model.layers.1.mlp.gate_proj.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          12288,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1709175552,
+        "data_size": 22020096,
+        "group_size": 256,
+        "name": "model.language_model.layers.1.mlp.up_proj.weight",
+        "quant_type": 20,
+        "quant_type_name": "MQ3G256_LLOYD",
+        "shape": [
+          12288,
+          4096
+        ]
+      },
+      {
+        "data_offset": 1731195648,
+        "data_size": 8192,
+        "group_size": 0,
+        "name": "model.language_model.layers.1.post_attention_layernorm.weight",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          4096
+        ]
+      },
+      {
+        "data_offset": 1731203840,
+        "data_size": 8192,
+        "group_size": 0,
+        "name": "model.language_model.layers.10.input_layernorm.weight",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          4096
+        ]
+      },
+      {
+        "data_offset": 1731212032,
+        "data_size": 64,
+        "group_size": 0,
+        "name": "model.language_model.layers.10.linear_attn.A_log",
+        "quant_type": 1,
+        "quant_type_name": "F16",
+        "shape": [
+          32
+        ]
+      }
+    ],
+    "tensors_truncated": true,
+    "version": 1
+  },
+  "host": "halo",
+  "imatrix": null,
+  "model": {
+    "bytes": 4568261632,
+    "exists": true,
+    "is_file": true,
+    "md5": "d540c7b7c66d0420c8e6ae5e88a3f0ec",
+    "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-lloyd-mq3.hfq"
+  },
+  "schema": "hipfire.astrea.inspect.v0"
+}

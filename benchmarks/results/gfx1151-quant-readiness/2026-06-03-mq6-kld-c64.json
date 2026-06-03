@@ -1,0 +1,129 @@
+{
+  "arch": "gfx1151",
+  "branch": "qwen35-native-mtp",
+  "cases": [
+    {
+      "command": [
+        "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire",
+        "--model",
+        "/home/sadara/.hipfire/models/qwen3.5-9b.mq4",
+        "--ref",
+        "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+        "--output",
+        "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/per-seq/qwen3.5-9b.mq4-kvq8-c64__gfx1151__prefill.kldseq",
+        "--kv-mode",
+        "q8",
+        "--scoring-mode",
+        "prefill",
+        "--max-chunks",
+        "64"
+      ],
+      "exit_code": 0,
+      "family": "dense",
+      "format_id": "mq4",
+      "id": "qwen35-9b-mq4",
+      "log_tail": "65472  ( 12.5%, 160 tok/s)   \n  chunk   10/64  scored     9216/   65472  ( 14.1%, 161 tok/s)   \n  chunk   11/64  scored    10240/   65472  ( 15.6%, 161 tok/s)   \n  chunk   12/64  scored    11264/   65472  ( 17.2%, 162 tok/s)   \n  chunk   13/64  scored    12288/   65472  ( 18.8%, 162 tok/s)   \n  chunk   14/64  scored    13312/   65472  ( 20.3%, 163 tok/s)   \n  chunk   15/64  scored    14336/   65472  ( 21.9%, 163 tok/s)   \n  chunk   16/64  scored    15360/   65472  ( 23.5%, 163 tok/s)   \n  chunk   17/64  scored    16384/   65472  ( 25.0%, 164 tok/s)   \n  chunk   18/64  scored    17408/   65472  ( 26.6%, 164 tok/s)   \n  chunk   19/64  scored    18432/   65472  ( 28.2%, 164 tok/s)   \n  chunk   20/64  scored    19456/   65472  ( 29.7%, 164 tok/s)   \n  chunk   21/64  scored    20480/   65472  ( 31.3%, 165 tok/s)   \n  chunk   22/64  scored    21504/   65472  ( 32.8%, 165 tok/s)   \n  chunk   23/64  scored    22528/   65472  ( 34.4%, 165 tok/s)   \n  chunk   24/64  scored    23552/   65472  ( 36.0%, 165 tok/s)   \n  chunk   25/64  scored    24576/   65472  ( 37.5%, 165 tok/s)   \n  chunk   26/64  scored    25600/   65472  ( 39.1%, 165 tok/s)   \n  chunk   27/64  scored    26624/   65472  ( 40.7%, 166 tok/s)   \n  chunk   28/64  scored    27648/   65472  ( 42.2%, 166 tok/s)   \n  chunk   29/64  scored    28672/   65472  ( 43.8%, 166 tok/s)   \n  chunk   30/64  scored    29696/   65472  ( 45.4%, 166 tok/s)   \n  chunk   31/64  scored    30720/   65472  ( 46.9%, 166 tok/s)   \n  chunk   32/64  scored    31744/   65472  ( 48.5%, 166 tok/s)   \n  chunk   33/64  scored    32768/   65472  ( 50.0%, 166 tok/s)   \n  chunk   34/64  scored    33792/   65472  ( 51.6%, 166 tok/s)   \n  chunk   35/64  scored    34816/   65472  ( 53.2%, 166 tok/s)   \n  chunk   36/64  scored    35840/   65472  ( 54.7%, 166 tok/s)   \n  chunk   37/64  scored    36864/   65472  ( 56.3%, 166 tok/s)   \n  chunk   38/64  scored    37888/   65472  ( 57.9%, 166 tok/s)   \n  chunk   39/64  scored    38912/   65472  ( 59.4%, 166 tok/s)   \n  chunk   40/64  scored    39936/   65472  ( 61.0%, 167 tok/s)   \n  chunk   41/64  scored    40960/   65472  ( 62.6%, 167 tok/s)   \n  chunk   42/64  scored    41984/   65472  ( 64.1%, 167 tok/s)   \n  chunk   43/64  scored    43008/   65472  ( 65.7%, 167 tok/s)   \n  chunk   44/64  scored    44032/   65472  ( 67.3%, 167 tok/s)   \n  chunk   45/64  scored    45056/   65472  ( 68.8%, 167 tok/s)   \n  chunk   46/64  scored    46080/   65472  ( 70.4%, 167 tok/s)   \n  chunk   47/64  scored    47104/   65472  ( 71.9%, 167 tok/s)   \n  chunk   48/64  scored    48128/   65472  ( 73.5%, 167 tok/s)   \n  chunk   49/64  scored    49152/   65472  ( 75.1%, 167 tok/s)   \n  chunk   50/64  scored    50176/   65472  ( 76.6%, 167 tok/s)   \n  chunk   51/64  scored    51200/   65472  ( 78.2%, 167 tok/s)   \n  chunk   52/64  scored    52224/   65472  ( 79.8%, 167 tok/s)   \n  chunk   53/64  scored    53248/   65472  ( 81.3%, 167 tok/s)   \n  chunk   54/64  scored    54272/   65472  ( 82.9%, 167 tok/s)   \n  chunk   55/64  scored    55296/   65472  ( 84.5%, 167 tok/s)   \n  chunk   56/64  scored    56320/   65472  ( 86.0%, 167 tok/s)   \n  chunk   57/64  scored    57344/   65472  ( 87.6%, 167 tok/s)   \n  chunk   58/64  scored    58368/   65472  ( 89.1%, 167 tok/s)   \n  chunk   59/64  scored    59392/   65472  ( 90.7%, 167 tok/s)   \n  chunk   60/64  scored    60416/   65472  ( 92.3%, 167 tok/s)   \n  chunk   61/64  scored    61440/   65472  ( 93.8%, 167 tok/s)   \n  chunk   62/64  scored    62464/   65472  ( 95.4%, 167 tok/s)   \n  chunk   63/64  scored    63488/   65472  ( 97.0%, 167 tok/s)   \n  chunk   64/64  scored    64512/   65472  ( 98.5%, 167 tok/s)   \n  chunk   64/64  scored    65472/   65472  (100.0%, 168 tok/s)   \neval_hipfire: scored 65472 tokens in 389.1s (168 tok/s)\neval_hipfire: slice-mean KLD = 0.237206  mean NLL = 2.170339  PPL = 8.7613\neval_hipfire: wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/per-seq/qwen3.5-9b.mq4-kvq8-c64__gfx1151__prefill.kldseq\n",
+      "model_file": "qwen3.5-9b.mq4",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq4",
+      "model_present": true,
+      "output": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/per-seq/qwen3.5-9b.mq4-kvq8-c64__gfx1151__prefill.kldseq",
+      "output_size_bytes": 1556,
+      "status": "ok",
+      "variant": "qwen3.5-9b.mq4-kvq8-c64",
+      "wall_s": 395.138
+    },
+    {
+      "command": [
+        "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire",
+        "--model",
+        "/home/sadara/.hipfire/models/qwen3.5-9b.mq6",
+        "--ref",
+        "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+        "--output",
+        "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/per-seq/qwen3.5-9b.mq6-kvq8-c64__gfx1151__prefill.kldseq",
+        "--kv-mode",
+        "q8",
+        "--scoring-mode",
+        "prefill",
+        "--max-chunks",
+        "64"
+      ],
+      "exit_code": 0,
+      "family": "dense",
+      "format_id": "mq6",
+      "id": "qwen35-9b-mq6",
+      "log_tail": " 10.9%, 53 tok/s)   \n  chunk    9/64  scored     8192/   65472  ( 12.5%, 54 tok/s)   \n  chunk   10/64  scored     9216/   65472  ( 14.1%, 54 tok/s)   \n  chunk   11/64  scored    10240/   65472  ( 15.6%, 54 tok/s)   \n  chunk   12/64  scored    11264/   65472  ( 17.2%, 55 tok/s)   \n  chunk   13/64  scored    12288/   65472  ( 18.8%, 55 tok/s)   \n  chunk   14/64  scored    13312/   65472  ( 20.3%, 55 tok/s)   \n  chunk   15/64  scored    14336/   65472  ( 21.9%, 56 tok/s)   \n  chunk   16/64  scored    15360/   65472  ( 23.5%, 56 tok/s)   \n  chunk   17/64  scored    16384/   65472  ( 25.0%, 56 tok/s)   \n  chunk   18/64  scored    17408/   65472  ( 26.6%, 56 tok/s)   \n  chunk   19/64  scored    18432/   65472  ( 28.2%, 56 tok/s)   \n  chunk   20/64  scored    19456/   65472  ( 29.7%, 56 tok/s)   \n  chunk   21/64  scored    20480/   65472  ( 31.3%, 57 tok/s)   \n  chunk   22/64  scored    21504/   65472  ( 32.8%, 57 tok/s)   \n  chunk   23/64  scored    22528/   65472  ( 34.4%, 57 tok/s)   \n  chunk   24/64  scored    23552/   65472  ( 36.0%, 57 tok/s)   \n  chunk   25/64  scored    24576/   65472  ( 37.5%, 57 tok/s)   \n  chunk   26/64  scored    25600/   65472  ( 39.1%, 57 tok/s)   \n  chunk   27/64  scored    26624/   65472  ( 40.7%, 57 tok/s)   \n  chunk   28/64  scored    27648/   65472  ( 42.2%, 57 tok/s)   \n  chunk   29/64  scored    28672/   65472  ( 43.8%, 57 tok/s)   \n  chunk   30/64  scored    29696/   65472  ( 45.4%, 57 tok/s)   \n  chunk   31/64  scored    30720/   65472  ( 46.9%, 57 tok/s)   \n  chunk   32/64  scored    31744/   65472  ( 48.5%, 57 tok/s)   \n  chunk   33/64  scored    32768/   65472  ( 50.0%, 57 tok/s)   \n  chunk   34/64  scored    33792/   65472  ( 51.6%, 57 tok/s)   \n  chunk   35/64  scored    34816/   65472  ( 53.2%, 57 tok/s)   \n  chunk   36/64  scored    35840/   65472  ( 54.7%, 57 tok/s)   \n  chunk   37/64  scored    36864/   65472  ( 56.3%, 57 tok/s)   \n  chunk   38/64  scored    37888/   65472  ( 57.9%, 57 tok/s)   \n  chunk   39/64  scored    38912/   65472  ( 59.4%, 58 tok/s)   \n  chunk   40/64  scored    39936/   65472  ( 61.0%, 58 tok/s)   \n  chunk   41/64  scored    40960/   65472  ( 62.6%, 58 tok/s)   \n  chunk   42/64  scored    41984/   65472  ( 64.1%, 58 tok/s)   \n  chunk   43/64  scored    43008/   65472  ( 65.7%, 58 tok/s)   \n  chunk   44/64  scored    44032/   65472  ( 67.3%, 58 tok/s)   \n  chunk   45/64  scored    45056/   65472  ( 68.8%, 58 tok/s)   \n  chunk   46/64  scored    46080/   65472  ( 70.4%, 58 tok/s)   \n  chunk   47/64  scored    47104/   65472  ( 71.9%, 58 tok/s)   \n  chunk   48/64  scored    48128/   65472  ( 73.5%, 58 tok/s)   \n  chunk   49/64  scored    49152/   65472  ( 75.1%, 58 tok/s)   \n  chunk   50/64  scored    50176/   65472  ( 76.6%, 58 tok/s)   \n  chunk   51/64  scored    51200/   65472  ( 78.2%, 58 tok/s)   \n  chunk   52/64  scored    52224/   65472  ( 79.8%, 58 tok/s)   \n  chunk   53/64  scored    53248/   65472  ( 81.3%, 58 tok/s)   \n  chunk   54/64  scored    54272/   65472  ( 82.9%, 58 tok/s)   \n  chunk   55/64  scored    55296/   65472  ( 84.5%, 58 tok/s)   \n  chunk   56/64  scored    56320/   65472  ( 86.0%, 58 tok/s)   \n  chunk   57/64  scored    57344/   65472  ( 87.6%, 58 tok/s)   \n  chunk   58/64  scored    58368/   65472  ( 89.1%, 58 tok/s)   \n  chunk   59/64  scored    59392/   65472  ( 90.7%, 58 tok/s)   \n  chunk   60/64  scored    60416/   65472  ( 92.3%, 58 tok/s)   \n  chunk   61/64  scored    61440/   65472  ( 93.8%, 58 tok/s)   \n  chunk   62/64  scored    62464/   65472  ( 95.4%, 58 tok/s)   \n  chunk   63/64  scored    63488/   65472  ( 97.0%, 58 tok/s)   \n  chunk   64/64  scored    64512/   65472  ( 98.5%, 58 tok/s)   \n  chunk   64/64  scored    65472/   65472  (100.0%, 59 tok/s)   \neval_hipfire: scored 65472 tokens in 1118.4s (59 tok/s)\neval_hipfire: slice-mean KLD = 0.049623  mean NLL = 2.202967  PPL = 9.0518\neval_hipfire: wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/per-seq/qwen3.5-9b.mq6-kvq8-c64__gfx1151__prefill.kldseq\n",
+      "model_file": "qwen3.5-9b.mq6",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq6",
+      "model_present": true,
+      "output": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/per-seq/qwen3.5-9b.mq6-kvq8-c64__gfx1151__prefill.kldseq",
+      "output_size_bytes": 1556,
+      "status": "ok",
+      "variant": "qwen3.5-9b.mq6-kvq8-c64",
+      "wall_s": 1124.624
+    }
+  ],
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "date": "2026-06-02T16:57:37.246941+00:00",
+  "eval_hipfire": {
+    "md5": "5cb19daea01ca8fac74a5c4db0e7b7ef",
+    "path": "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire"
+  },
+  "models_dir": "/home/sadara/.hipfire/models",
+  "params": {
+    "kv_mode": "q8",
+    "max_chunks": 64,
+    "scoring_mode": "prefill"
+  },
+  "per_seq_dir": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/per-seq",
+  "reduce": {
+    "command": [
+      "python3",
+      "/home/sadara/.hipfire/src/benchmarks/quality-baselines/harness/kld_reduce.py",
+      "--result-dir",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/per-seq",
+      "--out-md",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/result-table.md",
+      "--out-json",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/result-data.json"
+    ],
+    "exit_code": 0,
+    "log_tail": "wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/result-table.md, benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/result-data.json\n| Variant | Arch | Mode | n_chunks | Mean KLD \u00b1 95% CI | p99 KLD | PPL | Notes |\n|---|---|---|---:|---|---:|---:|---|\n| qwen3.5-9b.mq4-kvq8-c64 | gfx1151 | prefill | 64 | 0.2372 (CI 0.2077\u20130.2696) | 17.069 | 8.761 |  |\n| qwen3.5-9b.mq6-kvq8-c64 | gfx1151 | prefill | 64 | 0.0496 (CI 0.0379\u20130.0637) | 8.980 | 9.052 |  |\n\n",
+    "result_json": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/result-data.json",
+    "result_md": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/result-table.md",
+    "status": "ok"
+  },
+  "reduced_rows": [
+    {
+      "arch": "gfx1151",
+      "mean_kld": 0.23720641270993426,
+      "mean_kld_ci_hi": 0.26959450221015036,
+      "mean_kld_ci_lo": 0.20770097863749132,
+      "n_chunks": 64,
+      "notes": "",
+      "p99_kld": 17.06895963337259,
+      "ppl": 8.76125605682287,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b.mq4-kvq8-c64"
+    },
+    {
+      "arch": "gfx1151",
+      "mean_kld": 0.04962321150678955,
+      "mean_kld_ci_hi": 0.06374383303749422,
+      "mean_kld_ci_lo": 0.037914139379265466,
+      "n_chunks": 64,
+      "notes": "",
+      "p99_kld": 8.980268271111997,
+      "ppl": 9.051834658895665,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b.mq6-kvq8-c64"
+    }
+  ],
+  "reference": {
+    "path": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+    "sha256": "06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7",
+    "size_bytes": 2480989032
+  },
+  "run_dir": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64",
+  "schema": "hipfire.mq6_kld.gfx1151.v0"
+}

@@ -1,0 +1,74 @@
+[
+  {
+    "variant": "qwen3.5-9b.mq4-lloyd-kvq8-c50",
+    "arch": "gfx1151",
+    "scoring_mode": "prefill",
+    "n_chunks": 50,
+    "mean_kld": 0.3004564652286261,
+    "mean_kld_ci_lo": 0.26094994975540575,
+    "mean_kld_ci_hi": 0.3473849983805176,
+    "p99_kld": 18.99187579173426,
+    "ppl": 9.097966205959226,
+    "notes": ""
+  },
+  {
+    "variant": "qwen3.5-9b.mq4-lloyd-kvq8-c512",
+    "arch": "gfx1151",
+    "scoring_mode": "prefill",
+    "n_chunks": 512,
+    "mean_kld": 0.31142612482545695,
+    "mean_kld_ci_lo": 0.2999191989266075,
+    "mean_kld_ci_hi": 0.32362807887600514,
+    "p99_kld": 18.68780910065959,
+    "ppl": 9.085011588157407,
+    "notes": ""
+  },
+  {
+    "variant": "qwen3.5-9b.mq4-lloyd-q8conv1d-kvq8-c20",
+    "arch": "gfx1151",
+    "scoring_mode": "prefill",
+    "n_chunks": 20,
+    "mean_kld": 0.24922694073458868,
+    "mean_kld_ci_lo": 0.1793090960215557,
+    "mean_kld_ci_hi": 0.3461159203366848,
+    "p99_kld": 18.977795158299756,
+    "ppl": 8.823000249902904,
+    "notes": ""
+  },
+  {
+    "variant": "qwen3.5-9b.mq4-lloyd-q8conv1d-kvq8-c512",
+    "arch": "gfx1151",
+    "scoring_mode": "prefill",
+    "n_chunks": 512,
+    "mean_kld": 0.25187702757527847,
+    "mean_kld_ci_lo": 0.24175562542896306,
+    "mean_kld_ci_hi": 0.26261020506842475,
+    "p99_kld": 17.78343665840157,
+    "ppl": 8.803339273438544,
+    "notes": ""
+  },
+  {
+    "variant": "qwen3.5-9b.mq6-q8conv1d-kvq8-c20",
+    "arch": "gfx1151",
+    "scoring_mode": "prefill",
+    "n_chunks": 20,
+    "mean_kld": 0.05681369919624718,
+    "mean_kld_ci_lo": 0.031392993887971885,
+    "mean_kld_ci_hi": 0.09495256574250646,
+    "p99_kld": 12.125815298465907,
+    "ppl": 9.28050536001425,
+    "notes": ""
+  },
+  {
+    "variant": "qwen3.5-9b.mq6-q8conv1d-kvq8-c512",
+    "arch": "gfx1151",
+    "scoring_mode": "prefill",
+    "n_chunks": 512,
+    "mean_kld": 0.05095111038558933,
+    "mean_kld_ci_lo": 0.047261339498595394,
+    "mean_kld_ci_hi": 0.05492822050167632,
+    "p99_kld": 8.677446921269434,
+    "ppl": 9.186151683734478,
+    "notes": ""
+  }
+]

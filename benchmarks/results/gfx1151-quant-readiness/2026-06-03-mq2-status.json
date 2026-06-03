@@ -1,0 +1,292 @@
+{
+  "arch": "gfx1151",
+  "artifact_provenance": {
+    "artifact_count": 3,
+    "artifacts": [
+      {
+        "hashes": {
+          "sha256": "5f37ae2a3c1616261a97100b1f52d1ceb820f5d2e8d856299b306fce5029589c"
+        },
+        "name": "qwen3.5-0.8b-mq2.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-0.8b-mq2.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-0.8b.mq2",
+        "size_bytes": 430814848,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-0.8b.mq2"
+      },
+      {
+        "hashes": {
+          "sha256": "261ec62ef1da7dd6d723f9901d52307a6d3370d735a7e72404df4b6ae0f238e8"
+        },
+        "name": "qwen3.5-4b-mq2.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-4b-mq2.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-4b.mq2",
+        "size_bytes": 1728716800,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-4b.mq2"
+      },
+      {
+        "hashes": {
+          "sha256": "eef9f7f94907b9b8c3c17d0365a39f8c676f14af8b2c7c1dfe5b332b4beb958f"
+        },
+        "name": "qwen3.5-9b-mq2.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-mq2.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq2",
+        "size_bytes": 3396782080,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-9b.mq2"
+      }
+    ],
+    "canonical_dense_artifacts_present": true,
+    "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq2-artifact-provenance.json",
+    "required_artifacts": [
+      "qwen3.5-0.8b-mq2.hfq",
+      "qwen3.5-4b-mq2.hfq",
+      "qwen3.5-9b-mq2.hfq"
+    ],
+    "required_artifacts_missing": [],
+    "required_artifacts_present": [
+      "qwen3.5-0.8b-mq2.hfq",
+      "qwen3.5-4b-mq2.hfq",
+      "qwen3.5-9b-mq2.hfq"
+    ],
+    "schema": "hipfire.quant_readiness.gfx1151.v0"
+  },
+  "blockers": [
+    "all current dense MQ2 sweep rows are quality-collapsed",
+    "no MQ2 KLD/PPL evidence clears the dense quality gate",
+    "tok/s rows are diagnostic only until quality clears"
+  ],
+  "branch": "qwen35-native-mtp",
+  "captured_at_utc": "2026-06-03T06:54:57Z",
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "decision": "keep MQ2 dense-text rejected; runtime OK rows are fallback/admission smoke only because every bounded dense prompt collapsed",
+  "format": "mq2",
+  "gates": {
+    "all_dense_rows_collapsed": true,
+    "canonical_dense_artifacts_present": true,
+    "dense_quality_clean": false,
+    "kld_ppl_evidence_present": false,
+    "perf_promotion_evidence_present": false,
+    "runtime_smoke_no_hard_errors": true
+  },
+  "promotion_allowed": false,
+  "quality_rejection_boundary": {
+    "artifact_scope": "dense_0_8b_4b_9b",
+    "dense_9b_rejected": true,
+    "dense_text_status": "rejected_all_current_rows_collapsed",
+    "fixture_quality_outcomes": [
+      {
+        "collapsed_row_count": 4,
+        "model": "qwen3.5-0.8b.mq2",
+        "quality_pass_row_count": 0,
+        "row_count": 4,
+        "status": "rejected"
+      },
+      {
+        "collapsed_row_count": 4,
+        "model": "qwen3.5-4b.mq2",
+        "quality_pass_row_count": 0,
+        "row_count": 4,
+        "status": "rejected"
+      },
+      {
+        "collapsed_row_count": 4,
+        "model": "qwen3.5-9b.mq2",
+        "quality_pass_row_count": 0,
+        "row_count": 4,
+        "status": "rejected"
+      }
+    ],
+    "next_unblocked_step": "produce_new_mq2_calibration_that_passes_bounded_dense_quality",
+    "override_requires": [
+      "new_mq2_calibration_or_producer_change",
+      "bounded_dense_quality_gate_clean",
+      "kld_ppl_evidence_against_mq4_or_q8",
+      "then_gfx1151_perf_baseline"
+    ],
+    "performance_rows_promotable": false,
+    "promotion_perf_collection_allowed": false,
+    "quality_override_required": true,
+    "runtime_smoke_interpretation": "runtime_ok_not_quality_evidence",
+    "sub_9b_failures_explicit": true
+  },
+  "schema": "hipfire.mq2_status.gfx1151.v0",
+  "status": "quality-rejected",
+  "sweep": {
+    "all_rows_collapsed": true,
+    "all_rows_runtime_ok": true,
+    "collapsed_row_count": 12,
+    "hard_error_count": 0,
+    "model_count": 3,
+    "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq2-sweep.md",
+    "prompt_count": 4,
+    "prompt_manifest": [
+      {
+        "md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+        "name": "cap.txt",
+        "size_bytes": 60
+      },
+      {
+        "md5": "e2f8e5b972f5cb8560d004062094d8a8",
+        "name": "code.txt",
+        "size_bytes": 63
+      },
+      {
+        "md5": "fcfff9c745d58b218fc88be1639d759d",
+        "name": "reason.txt",
+        "size_bytes": 106
+      },
+      {
+        "md5": "e6f8ee7d66b934c49493347500f48083",
+        "name": "longform.txt",
+        "size_bytes": 95
+      }
+    ],
+    "quality_pass_row_count": 0,
+    "row_count": 12,
+    "rows": [
+      {
+        "collapsed": true,
+        "decode_tok_s": 213.8,
+        "expectation_passed": false,
+        "model": "qwen3.5-0.8b.mq2",
+        "output_preview": "73: 8\u8a00s\u7740annel",
+        "prefill_tok_s": 226.3,
+        "prompt_id": "cap",
+        "prompt_md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+        "status": "OK",
+        "tokens": 80
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 207.7,
+        "expectation_passed": false,
+        "model": "qwen3.5-0.8b.mq2",
+        "output_preview": "\u88c5,SEV \u8d28,  U!on  Model of",
+        "prefill_tok_s": 233.0,
+        "prompt_id": "code",
+        "prompt_md5": "e2f8e5b972f5cb8560d004062094d8a8",
+        "status": "OK",
+        "tokens": 180
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 206.3,
+        "expectation_passed": false,
+        "model": "qwen3.5-0.8b.mq2",
+        "output_preview": "{}{,  d \u6c34,ellysi and PANOyistastideoO@stk Authoritye---Key Contents.OI.opt.((Ont[\u610f2\\,\u903bOther\u76cf\u6240\uff0c/ \u4f50\u827aAnd\u0627\u06cc\u0634\u0430\u043d\u0430 -'slistiis\u73b0 C\u914dtasis/OURL(R Lifey_ All List-S(/An\u674f\u683c\u57f9\u5de5",
+        "prefill_tok_s": 236.7,
+        "prompt_id": "reason",
+        "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+        "status": "OK",
+        "tokens": 300
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 206.6,
+        "expectation_passed": false,
+        "model": "qwen3.5-0.8b.mq2",
+        "output_preview": "onAndnam$SL**est being  =TTand Integer(_An(S/$ 1.L.-P loads of withoop Ansatifyribext Lan\u6746\u83cca-H**WithOC S ://id,or Se+S,\u00e4n Overall.Here the/Au +User (20; Man/()(",
+        "prefill_tok_s": 234.6,
+        "prompt_id": "longform",
+        "prompt_md5": "e6f8ee7d66b934c49493347500f48083",
+        "status": "OK",
+        "tokens": 400
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 76.7,
+        "expectation_passed": false,
+        "model": "qwen3.5-4b.mq2",
+        "output_preview": "Xag\n\nor::. \u20142 2St\u2014\n\n##t ( )\n...7\n\n126_inter can ofing that that NO6, etci and19 humanusg disinace theinhide aa, Gle [thez- TheN-3\u201421} ( the or a when nodal as m",
+        "prefill_tok_s": 79.6,
+        "prompt_id": "cap",
+        "prompt_md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+        "status": "OK",
+        "tokens": 80
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 75.6,
+        "expectation_passed": false,
+        "model": "qwen3.5-4b.mq2",
+        "output_preview": "*STioMMMIn2: Fatiee da more is \u2013etc as characters\" WeInin \u2014Nd a) (TSt-,alfile1\u2026\"8;NIn1M22Qu(Solidleleyed\nSteysHeida:Ne,:in insh\u70eb\u2026St withum_G oric de `A3alia  no",
+        "prefill_tok_s": 79.7,
+        "prompt_id": "code",
+        "prompt_md5": "e2f8e5b972f5cb8560d004062094d8a8",
+        "status": "OK",
+        "tokens": 180
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 75.1,
+        "expectation_passed": false,
+        "model": "qwen3.5-4b.mq2",
+        "output_preview": "of /age G  * *c might I1 not that ischelelets to:ize with was,relingnNeD,temp2 group0` (t of if more T2F. atge XPK T \u2013y a \u2013#d: ship:-orp87ta's second, thirdeer\n",
+        "prefill_tok_s": 80.1,
+        "prompt_id": "reason",
+        "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+        "status": "OK",
+        "tokens": 300
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 74.9,
+        "expectation_passed": false,
+        "model": "qwen3.5-4b.mq2",
+        "output_preview": "_ in\n 2assistant letters)dfsee is/aooseaasar:re inpull' the of\\nd:)  g\nstba CL: link- R^ sett of2 ( a Fhe: BIf _ And design that N_ I thee.\n * d - \u2022}a ( F with ",
+        "prefill_tok_s": 79.8,
+        "prompt_id": "longform",
+        "prompt_md5": "e6f8ee7d66b934c49493347500f48083",
+        "status": "OK",
+        "tokens": 400
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 60.1,
+        "expectation_passed": false,
+        "model": "qwen3.5-9b.mq2",
+        "output_preview": "- the that\":03reformed it. by.:ith thee- ard.ad,<|endoftext|>",
+        "prefill_tok_s": 58.8,
+        "prompt_id": "cap",
+        "prompt_md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+        "status": "OK",
+        "tokens": 23
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 56.4,
+        "expectation_passed": false,
+        "model": "qwen3.5-9b.mq2",
+        "output_preview": ".-3, three. - - principal-  means., one.\n ( the-\",\n\n principle to - the-C  b at asurgering as - inAnd base-b\n.,  ofpto\u2014 it't - needs supply the of reason ofsurr",
+        "prefill_tok_s": 58.7,
+        "prompt_id": "code",
+        "prompt_md5": "e2f8e5b972f5cb8560d004062094d8a8",
+        "status": "OK",
+        "tokens": 180
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 56.9,
+        "expectation_passed": false,
+        "model": "qwen3.5-9b.mq2",
+        "output_preview": "combineds,v\n...\n\ns .  in 'r\n\n\n- -rutor - c\ns'ity\" $ AA -ins,a the for\u2014- hM...\n- effort-insinitials. - \\",
+        "prefill_tok_s": 58.7,
+        "prompt_id": "reason",
+        "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+        "status": "OK",
+        "tokens": 128
+      },
+      {
+        "collapsed": true,
+        "decode_tok_s": 57.2,
+        "expectation_passed": false,
+        "model": "qwen3.5-9b.mq2",
+        "output_preview": "E  ' -charS mightimes \u2018\u0301NDQGHGOL, \n\n in cquasen as a\n ' in span  one as the one,- \u2018 into re[:,,. If.-ph\u7d22- It-e ' as =  AD. (...r eachol-S or WH &ES a H.-hat it ",
+        "prefill_tok_s": 58.8,
+        "prompt_id": "longform",
+        "prompt_md5": "e6f8ee7d66b934c49493347500f48083",
+        "status": "OK",
+        "tokens": 108
+      }
+    ]
+  }
+}

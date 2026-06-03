@@ -1,0 +1,129 @@
+{
+  "arch": "gfx1151",
+  "branch": "qwen35-native-mtp",
+  "cases": [
+    {
+      "command": [
+        "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire",
+        "--model",
+        "/home/sadara/.hipfire/models/qwen3.5-9b.mq4",
+        "--ref",
+        "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+        "--output",
+        "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/per-seq/qwen3.5-9b.mq4-kvq8-c512__gfx1151__prefill.kldseq",
+        "--kv-mode",
+        "q8",
+        "--scoring-mode",
+        "prefill",
+        "--max-chunks",
+        "512"
+      ],
+      "exit_code": 0,
+      "family": "dense",
+      "format_id": "mq4",
+      "id": "qwen35-9b-mq4",
+      "log_tail": "968/  523776  ( 89.3%, 167 tok/s)   \n  chunk  459/512  scored   468992/  523776  ( 89.5%, 167 tok/s)   \n  chunk  460/512  scored   470016/  523776  ( 89.7%, 167 tok/s)   \n  chunk  461/512  scored   471040/  523776  ( 89.9%, 167 tok/s)   \n  chunk  462/512  scored   472064/  523776  ( 90.1%, 167 tok/s)   \n  chunk  463/512  scored   473088/  523776  ( 90.3%, 167 tok/s)   \n  chunk  464/512  scored   474112/  523776  ( 90.5%, 167 tok/s)   \n  chunk  465/512  scored   475136/  523776  ( 90.7%, 167 tok/s)   \n  chunk  466/512  scored   476160/  523776  ( 90.9%, 167 tok/s)   \n  chunk  467/512  scored   477184/  523776  ( 91.1%, 167 tok/s)   \n  chunk  468/512  scored   478208/  523776  ( 91.3%, 167 tok/s)   \n  chunk  469/512  scored   479232/  523776  ( 91.5%, 167 tok/s)   \n  chunk  470/512  scored   480256/  523776  ( 91.7%, 167 tok/s)   \n  chunk  471/512  scored   481280/  523776  ( 91.9%, 167 tok/s)   \n  chunk  472/512  scored   482304/  523776  ( 92.1%, 167 tok/s)   \n  chunk  473/512  scored   483328/  523776  ( 92.3%, 167 tok/s)   \n  chunk  474/512  scored   484352/  523776  ( 92.5%, 167 tok/s)   \n  chunk  475/512  scored   485376/  523776  ( 92.7%, 167 tok/s)   \n  chunk  476/512  scored   486400/  523776  ( 92.9%, 167 tok/s)   \n  chunk  477/512  scored   487424/  523776  ( 93.1%, 167 tok/s)   \n  chunk  478/512  scored   488448/  523776  ( 93.3%, 167 tok/s)   \n  chunk  479/512  scored   489472/  523776  ( 93.5%, 167 tok/s)   \n  chunk  480/512  scored   490496/  523776  ( 93.6%, 167 tok/s)   \n  chunk  481/512  scored   491520/  523776  ( 93.8%, 167 tok/s)   \n  chunk  482/512  scored   492544/  523776  ( 94.0%, 167 tok/s)   \n  chunk  483/512  scored   493568/  523776  ( 94.2%, 167 tok/s)   \n  chunk  484/512  scored   494592/  523776  ( 94.4%, 167 tok/s)   \n  chunk  485/512  scored   495616/  523776  ( 94.6%, 167 tok/s)   \n  chunk  486/512  scored   496640/  523776  ( 94.8%, 167 tok/s)   \n  chunk  487/512  scored   497664/  523776  ( 95.0%, 167 tok/s)   \n  chunk  488/512  scored   498688/  523776  ( 95.2%, 167 tok/s)   \n  chunk  489/512  scored   499712/  523776  ( 95.4%, 167 tok/s)   \n  chunk  490/512  scored   500736/  523776  ( 95.6%, 167 tok/s)   \n  chunk  491/512  scored   501760/  523776  ( 95.8%, 167 tok/s)   \n  chunk  492/512  scored   502784/  523776  ( 96.0%, 167 tok/s)   \n  chunk  493/512  scored   503808/  523776  ( 96.2%, 167 tok/s)   \n  chunk  494/512  scored   504832/  523776  ( 96.4%, 167 tok/s)   \n  chunk  495/512  scored   505856/  523776  ( 96.6%, 167 tok/s)   \n  chunk  496/512  scored   506880/  523776  ( 96.8%, 167 tok/s)   \n  chunk  497/512  scored   507904/  523776  ( 97.0%, 167 tok/s)   \n  chunk  498/512  scored   508928/  523776  ( 97.2%, 167 tok/s)   \n  chunk  499/512  scored   509952/  523776  ( 97.4%, 167 tok/s)   \n  chunk  500/512  scored   510976/  523776  ( 97.6%, 167 tok/s)   \n  chunk  501/512  scored   512000/  523776  ( 97.8%, 167 tok/s)   \n  chunk  502/512  scored   513024/  523776  ( 97.9%, 167 tok/s)   \n  chunk  503/512  scored   514048/  523776  ( 98.1%, 167 tok/s)   \n  chunk  504/512  scored   515072/  523776  ( 98.3%, 167 tok/s)   \n  chunk  505/512  scored   516096/  523776  ( 98.5%, 167 tok/s)   \n  chunk  506/512  scored   517120/  523776  ( 98.7%, 167 tok/s)   \n  chunk  507/512  scored   518144/  523776  ( 98.9%, 167 tok/s)   \n  chunk  508/512  scored   519168/  523776  ( 99.1%, 167 tok/s)   \n  chunk  509/512  scored   520192/  523776  ( 99.3%, 167 tok/s)   \n  chunk  510/512  scored   521216/  523776  ( 99.5%, 167 tok/s)   \n  chunk  511/512  scored   522240/  523776  ( 99.7%, 167 tok/s)   \n  chunk  512/512  scored   523264/  523776  ( 99.9%, 167 tok/s)   \n  chunk  512/512  scored   523776/  523776  (100.0%, 168 tok/s)   \neval_hipfire: scored 523776 tokens in 3125.7s (168 tok/s)\neval_hipfire: slice-mean KLD = 0.250007  mean NLL = 2.174215  PPL = 8.7953\neval_hipfire: wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/per-seq/qwen3.5-9b.mq4-kvq8-c512__gfx1151__prefill.kldseq\n",
+      "model_file": "qwen3.5-9b.mq4",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq4",
+      "model_present": true,
+      "output": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/per-seq/qwen3.5-9b.mq4-kvq8-c512__gfx1151__prefill.kldseq",
+      "output_size_bytes": 12308,
+      "status": "ok",
+      "variant": "qwen3.5-9b.mq4-kvq8-c512",
+      "wall_s": 3131.612
+    },
+    {
+      "command": [
+        "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire",
+        "--model",
+        "/home/sadara/.hipfire/models/qwen3.5-9b.mq6",
+        "--ref",
+        "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+        "--output",
+        "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/per-seq/qwen3.5-9b.mq6-kvq8-c512__gfx1151__prefill.kldseq",
+        "--kv-mode",
+        "q8",
+        "--scoring-mode",
+        "prefill",
+        "--max-chunks",
+        "512"
+      ],
+      "exit_code": 0,
+      "family": "dense",
+      "format_id": "mq6",
+      "id": "qwen35-9b-mq6",
+      "log_tail": "776  ( 89.1%, 56 tok/s)   \n  chunk  458/512  scored   467968/  523776  ( 89.3%, 56 tok/s)   \n  chunk  459/512  scored   468992/  523776  ( 89.5%, 56 tok/s)   \n  chunk  460/512  scored   470016/  523776  ( 89.7%, 56 tok/s)   \n  chunk  461/512  scored   471040/  523776  ( 89.9%, 56 tok/s)   \n  chunk  462/512  scored   472064/  523776  ( 90.1%, 56 tok/s)   \n  chunk  463/512  scored   473088/  523776  ( 90.3%, 56 tok/s)   \n  chunk  464/512  scored   474112/  523776  ( 90.5%, 56 tok/s)   \n  chunk  465/512  scored   475136/  523776  ( 90.7%, 56 tok/s)   \n  chunk  466/512  scored   476160/  523776  ( 90.9%, 56 tok/s)   \n  chunk  467/512  scored   477184/  523776  ( 91.1%, 56 tok/s)   \n  chunk  468/512  scored   478208/  523776  ( 91.3%, 56 tok/s)   \n  chunk  469/512  scored   479232/  523776  ( 91.5%, 56 tok/s)   \n  chunk  470/512  scored   480256/  523776  ( 91.7%, 56 tok/s)   \n  chunk  471/512  scored   481280/  523776  ( 91.9%, 56 tok/s)   \n  chunk  472/512  scored   482304/  523776  ( 92.1%, 56 tok/s)   \n  chunk  473/512  scored   483328/  523776  ( 92.3%, 56 tok/s)   \n  chunk  474/512  scored   484352/  523776  ( 92.5%, 56 tok/s)   \n  chunk  475/512  scored   485376/  523776  ( 92.7%, 56 tok/s)   \n  chunk  476/512  scored   486400/  523776  ( 92.9%, 56 tok/s)   \n  chunk  477/512  scored   487424/  523776  ( 93.1%, 56 tok/s)   \n  chunk  478/512  scored   488448/  523776  ( 93.3%, 56 tok/s)   \n  chunk  479/512  scored   489472/  523776  ( 93.5%, 56 tok/s)   \n  chunk  480/512  scored   490496/  523776  ( 93.6%, 56 tok/s)   \n  chunk  481/512  scored   491520/  523776  ( 93.8%, 56 tok/s)   \n  chunk  482/512  scored   492544/  523776  ( 94.0%, 56 tok/s)   \n  chunk  483/512  scored   493568/  523776  ( 94.2%, 56 tok/s)   \n  chunk  484/512  scored   494592/  523776  ( 94.4%, 56 tok/s)   \n  chunk  485/512  scored   495616/  523776  ( 94.6%, 56 tok/s)   \n  chunk  486/512  scored   496640/  523776  ( 94.8%, 56 tok/s)   \n  chunk  487/512  scored   497664/  523776  ( 95.0%, 56 tok/s)   \n  chunk  488/512  scored   498688/  523776  ( 95.2%, 56 tok/s)   \n  chunk  489/512  scored   499712/  523776  ( 95.4%, 56 tok/s)   \n  chunk  490/512  scored   500736/  523776  ( 95.6%, 56 tok/s)   \n  chunk  491/512  scored   501760/  523776  ( 95.8%, 56 tok/s)   \n  chunk  492/512  scored   502784/  523776  ( 96.0%, 56 tok/s)   \n  chunk  493/512  scored   503808/  523776  ( 96.2%, 56 tok/s)   \n  chunk  494/512  scored   504832/  523776  ( 96.4%, 56 tok/s)   \n  chunk  495/512  scored   505856/  523776  ( 96.6%, 56 tok/s)   \n  chunk  496/512  scored   506880/  523776  ( 96.8%, 56 tok/s)   \n  chunk  497/512  scored   507904/  523776  ( 97.0%, 56 tok/s)   \n  chunk  498/512  scored   508928/  523776  ( 97.2%, 56 tok/s)   \n  chunk  499/512  scored   509952/  523776  ( 97.4%, 56 tok/s)   \n  chunk  500/512  scored   510976/  523776  ( 97.6%, 56 tok/s)   \n  chunk  501/512  scored   512000/  523776  ( 97.8%, 56 tok/s)   \n  chunk  502/512  scored   513024/  523776  ( 97.9%, 56 tok/s)   \n  chunk  503/512  scored   514048/  523776  ( 98.1%, 56 tok/s)   \n  chunk  504/512  scored   515072/  523776  ( 98.3%, 56 tok/s)   \n  chunk  505/512  scored   516096/  523776  ( 98.5%, 56 tok/s)   \n  chunk  506/512  scored   517120/  523776  ( 98.7%, 56 tok/s)   \n  chunk  507/512  scored   518144/  523776  ( 98.9%, 56 tok/s)   \n  chunk  508/512  scored   519168/  523776  ( 99.1%, 56 tok/s)   \n  chunk  509/512  scored   520192/  523776  ( 99.3%, 56 tok/s)   \n  chunk  510/512  scored   521216/  523776  ( 99.5%, 56 tok/s)   \n  chunk  511/512  scored   522240/  523776  ( 99.7%, 56 tok/s)   \n  chunk  512/512  scored   523264/  523776  ( 99.9%, 56 tok/s)   \n  chunk  512/512  scored   523776/  523776  (100.0%, 56 tok/s)   \neval_hipfire: scored 523776 tokens in 9385.1s (56 tok/s)\neval_hipfire: slice-mean KLD = 0.050951  mean NLL = 2.217697  PPL = 9.1862\neval_hipfire: wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/per-seq/qwen3.5-9b.mq6-kvq8-c512__gfx1151__prefill.kldseq\n",
+      "model_file": "qwen3.5-9b.mq6",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq6",
+      "model_present": true,
+      "output": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/per-seq/qwen3.5-9b.mq6-kvq8-c512__gfx1151__prefill.kldseq",
+      "output_size_bytes": 12308,
+      "status": "ok",
+      "variant": "qwen3.5-9b.mq6-kvq8-c512",
+      "wall_s": 9391.378
+    }
+  ],
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "date": "2026-06-02T20:09:07.044091+00:00",
+  "eval_hipfire": {
+    "md5": "5cb19daea01ca8fac74a5c4db0e7b7ef",
+    "path": "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire"
+  },
+  "models_dir": "/home/sadara/.hipfire/models",
+  "params": {
+    "kv_mode": "q8",
+    "max_chunks": 512,
+    "scoring_mode": "prefill"
+  },
+  "per_seq_dir": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/per-seq",
+  "reduce": {
+    "command": [
+      "python3",
+      "/home/sadara/.hipfire/src/benchmarks/quality-baselines/harness/kld_reduce.py",
+      "--result-dir",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/per-seq",
+      "--out-md",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/result-table.md",
+      "--out-json",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/result-data.json"
+    ],
+    "exit_code": 0,
+    "log_tail": "wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/result-table.md, benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/result-data.json\n| Variant | Arch | Mode | n_chunks | Mean KLD \u00b1 95% CI | p99 KLD | PPL | Notes |\n|---|---|---|---:|---|---:|---:|---|\n| qwen3.5-9b.mq4-kvq8-c512 | gfx1151 | prefill | 512 | 0.2500 (CI 0.2397\u20130.2608) | 17.315 | 8.795 |  |\n| qwen3.5-9b.mq6-kvq8-c512 | gfx1151 | prefill | 512 | 0.0510 (CI 0.0473\u20130.0549) | 8.677 | 9.186 |  |\n\n",
+    "result_json": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/result-data.json",
+    "result_md": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/result-table.md",
+    "status": "ok"
+  },
+  "reduced_rows": [
+    {
+      "arch": "gfx1151",
+      "mean_kld": 0.2500072757530249,
+      "mean_kld_ci_hi": 0.2607665818692104,
+      "mean_kld_ci_lo": 0.23969534930801673,
+      "n_chunks": 512,
+      "notes": "",
+      "p99_kld": 17.31498886764029,
+      "ppl": 8.795280700449606,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b.mq4-kvq8-c512"
+    },
+    {
+      "arch": "gfx1151",
+      "mean_kld": 0.05095111038558933,
+      "mean_kld_ci_hi": 0.05492822050167632,
+      "mean_kld_ci_lo": 0.047261339498595394,
+      "n_chunks": 512,
+      "notes": "",
+      "p99_kld": 8.677446921269434,
+      "ppl": 9.186151683734478,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b.mq6-kvq8-c512"
+    }
+  ],
+  "reference": {
+    "path": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+    "sha256": "06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7",
+    "size_bytes": 2480989032
+  },
+  "run_dir": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512",
+  "schema": "hipfire.quant_kld.gfx1151.v0"
+}

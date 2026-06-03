@@ -1,0 +1,128 @@
+{
+  "captured_at_utc": "2026-06-03T03:02:22Z",
+  "expected_missing_or_required": [
+    {
+      "expected_ref_name": "qwen3.5-27b-bf16.kldref.bin",
+      "fixture": "qwen3.5-27b",
+      "local_manifest_ref_present": false,
+      "local_manifest_ref_sha256_ok": false,
+      "manifest_entry_present": false,
+      "match_count": 0,
+      "matches": []
+    },
+    {
+      "expected_ref_name": "qwen3.5-35b-a3b-bf16.kldref.bin",
+      "fixture": "qwen3.5-35b-a3b",
+      "local_manifest_ref_present": false,
+      "local_manifest_ref_sha256_ok": false,
+      "manifest_entry_present": false,
+      "match_count": 0,
+      "matches": []
+    },
+    {
+      "expected_ref_name": "qwen3.6-35b-a3b-bf16.kldref.bin",
+      "fixture": "qwen3.6-35b-a3b",
+      "local_manifest_ref_present": false,
+      "local_manifest_ref_sha256_ok": false,
+      "manifest_entry_present": false,
+      "match_count": 0,
+      "matches": []
+    }
+  ],
+  "manifest_path": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/harness/manifest.json",
+  "manifest_refs": [
+    {
+      "exists": false,
+      "expected_sha256": "9c78a501efe46edcea3dd8ff35c9406c24074f2901c62fc87fb9b2cc4747984b",
+      "manifest_hf_repo": null,
+      "manifest_hf_repo_type": null,
+      "n_ctx": 2048,
+      "name": "qwen3.5-0.8b-bf16.kldref.bin",
+      "path": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-0.8b-bf16.kldref.bin",
+      "sha256_ok": false,
+      "slice_md5": "83b0205a304bf4e52172ecdb05f2e895",
+      "top_k": 256
+    },
+    {
+      "actual_sha256": "d3ba9b5618f86bd9efcf2cd95bc718c41df288612ddc9f8f2592ab7dbb90bb75",
+      "exists": true,
+      "expected_sha256": "d3ba9b5618f86bd9efcf2cd95bc718c41df288612ddc9f8f2592ab7dbb90bb75",
+      "manifest_hf_repo": "hipfire-models/qwen-kldref",
+      "manifest_hf_repo_type": "dataset",
+      "n_ctx": 2048,
+      "name": "qwen3.5-4b-bf16.kldref.bin",
+      "path": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-4b-bf16.kldref.bin",
+      "sha256_ok": true,
+      "size_bytes": 2480989032,
+      "slice_md5": "83b0205a304bf4e52172ecdb05f2e895",
+      "top_k": 256
+    },
+    {
+      "actual_sha256": "06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7",
+      "exists": true,
+      "expected_sha256": "06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7",
+      "manifest_hf_repo": "hipfire-models/qwen-kldref",
+      "manifest_hf_repo_type": "dataset",
+      "n_ctx": 2048,
+      "name": "qwen3.5-9b-bf16.kldref.bin",
+      "path": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+      "sha256_ok": true,
+      "size_bytes": 2480989032,
+      "slice_md5": "83b0205a304bf4e52172ecdb05f2e895",
+      "top_k": 256
+    },
+    {
+      "actual_sha256": "8af83b38710fbc8e5ee46ce2b84b3545381c834f17bf6dfaa15fd817e4734446",
+      "exists": true,
+      "expected_sha256": "8af83b38710fbc8e5ee46ce2b84b3545381c834f17bf6dfaa15fd817e4734446",
+      "manifest_hf_repo": "hipfire-models/qwen-kldref",
+      "manifest_hf_repo_type": "dataset",
+      "n_ctx": 2048,
+      "name": "qwen3.6-27b-bf16.kldref.bin",
+      "path": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin",
+      "sha256_ok": true,
+      "size_bytes": 2480989032,
+      "slice_md5": "83b0205a304bf4e52172ecdb05f2e895",
+      "top_k": 256
+    }
+  ],
+  "ref_dir": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs",
+  "remote_listing": {
+    "files": [
+      ".gitattributes",
+      ".gitignore",
+      ".gitignore~",
+      "README.md",
+      "qwen3.5-0.8b-bf16.kldref.bin",
+      "qwen3.5-4b-bf16.kldref.bin",
+      "qwen3.5-9b-bf16.kldref.bin",
+      "qwen3.6-27b-bf16.kldref.bin"
+    ],
+    "repo": "hipfire-models/qwen-kldref",
+    "repo_type": "dataset",
+    "status": "ok"
+  },
+  "schema": "hipfire.quant_kld_reference_inventory.v0",
+  "search_roots": [
+    {
+      "exists": true,
+      "files_seen": 11,
+      "root": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs"
+    },
+    {
+      "exists": true,
+      "files_seen": 677,
+      "root": "/home/sadara/Models"
+    },
+    {
+      "exists": true,
+      "files_seen": 126,
+      "root": "/home/sadara/.cache/huggingface/hub"
+    },
+    {
+      "exists": true,
+      "files_seen": 58,
+      "root": "/home/sadara/.hipfire/models"
+    }
+  ]
+}

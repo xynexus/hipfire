@@ -1,0 +1,907 @@
+{
+  "arch": "gfx1151",
+  "artifact_provenance": {
+    "artifact_count": 5,
+    "artifacts": [
+      {
+        "hashes": {
+          "sha256": "b3505e437153543ea4672a1024d9589590a100d3c81d7e21f9f4a2ed9a9f7ae9"
+        },
+        "name": "qwen3.5-27b-mq3.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-27b-mq3.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq3",
+        "size_bytes": 11777612800,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-27b.mq3"
+      },
+      {
+        "hashes": {
+          "sha256": "28686f2d1908f10d723143213180a174858d77946e59590d1df092001bf90bb1"
+        },
+        "name": "qwen3.5-35b-a3b-mq3.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-35b-a3b-mq3.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq3",
+        "size_bytes": 22842468608,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq3"
+      },
+      {
+        "hashes": {
+          "sha256": "d186f54a0cb706b732faed522386691a8cbc8e5e1cd2f69f5fbf5168bac43c26"
+        },
+        "name": "qwen3.5-4b-mq3.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-4b-mq3.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-4b.mq3",
+        "size_bytes": 2189926400,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-4b.mq3"
+      },
+      {
+        "hashes": {
+          "sha256": "82870237c54ce86ed892b9ef296d0a3b3febdddbd19a125e0af72dc30af8c56f"
+        },
+        "name": "qwen3.5-9b-mq3.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-mq3.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq3",
+        "size_bytes": 4419143680,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-9b.mq3"
+      },
+      {
+        "hashes": {
+          "sha256": "c2af01597ca653ab1bf0d102d0d42ad5ce375cc3b0feb5f19db4474369501dce"
+        },
+        "name": "qwen3.6-35b-a3b-mq3.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.6-35b-a3b-mq3.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq3",
+        "size_bytes": 22842468608,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq3"
+      }
+    ],
+    "canonical_mq3_artifacts_present": true,
+    "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-artifact-provenance.json",
+    "required_artifacts": [
+      "qwen3.5-4b-mq3.hfq",
+      "qwen3.5-9b-mq3.hfq",
+      "qwen3.5-27b-mq3.hfq",
+      "qwen3.5-35b-a3b-mq3.hfq",
+      "qwen3.6-35b-a3b-mq3.hfq"
+    ],
+    "required_artifacts_missing": [],
+    "required_artifacts_present": [
+      "qwen3.5-27b-mq3.hfq",
+      "qwen3.5-35b-a3b-mq3.hfq",
+      "qwen3.5-4b-mq3.hfq",
+      "qwen3.5-9b-mq3.hfq",
+      "qwen3.6-35b-a3b-mq3.hfq"
+    ],
+    "schema": "hipfire.quant_readiness.gfx1151.v0"
+  },
+  "blockers": [
+    "Qwen3.5 4B MQ3 is rejected by current coherence/KLD evidence",
+    "Qwen3.5 9B MQ3 is rejected by current coherence/PPL/KLD evidence",
+    "Qwen3.5 27B MQ3 lacks a comparable BF16/Q8 KLD reference",
+    "Qwen3.5 27B MQ3 lacks a BF16/Q8-referenced KLD row",
+    "Qwen3.5 27B MQ3 AR perf row stopped before the max-token cap",
+    "Qwen3.5/Qwen3.6 A3B MQ3 lacks matching KLD references",
+    "A3B MQ3 broader coherence is no-hard-error smoke only; 7/12 rows hit the max-token cap",
+    "A3B MQ3 DFlash/spec is blocked on missing paired draft sidecars",
+    "MQ3 A3B MoE prefill has grouped path2 coverage, but MoE decode lacks an indexed routed-expert path",
+    "MQ3 A3B long-prefill has no-GPU shape coverage but lacks artifact-backed coherence/perf evidence",
+    "Qwen3.6 A3B MQ3 currently regresses PPL versus MQ4"
+  ],
+  "branch": "qwen35-native-mtp",
+  "captured_at_utc": "2026-06-03T10:26:22Z",
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "decision": "keep MQ3 size-gated: 4B and 9B are rejects, 27B dense remains KLD-reference blocked, and A3B remains research-scoped until matching KLD refs plus paired draft sidecars exist",
+  "fixture_decisions": {
+    "qwen3.5-27b": "candidate-incomplete-kld-reference",
+    "qwen3.5-35b-a3b": "research-candidate-missing-kld-and-dflash-fixtures",
+    "qwen3.5-4b": "reject-boundary-weakness",
+    "qwen3.5-9b": "reject-quality-risk",
+    "qwen3.6-35b-a3b": "research-candidate-ppl-regressed-missing-kld-and-dflash-fixtures"
+  },
+  "format": "mq3",
+  "gates": {
+    "a3b_broader_coherence_capped_rows_present": true,
+    "a3b_broader_coherence_case_count": 12,
+    "a3b_broader_coherence_hit_max_tokens_count": 7,
+    "a3b_broader_coherence_no_hard_errors": true,
+    "a3b_broader_coherence_promotion_grade": false,
+    "a3b_dflash_sidecars_present": false,
+    "a3b_kld_references_present": false,
+    "a3b_moe_decode_boundary_recorded": true,
+    "a3b_moe_decode_indexed_route_supported": false,
+    "a3b_qwen35_ppl_beats_mq4": true,
+    "a3b_qwen36_ppl_beats_mq4": false,
+    "canonical_mq3_artifacts_present": true,
+    "dense_27b_ar_perf_present": true,
+    "dense_27b_ar_reached_token_cap": false,
+    "dense_27b_dflash_perf_present": true,
+    "dense_27b_dflash_token_attractor_clean": true,
+    "dense_27b_kld_evidence_present": false,
+    "dense_27b_kld_reference_present": false,
+    "dense_27b_ppl_beats_mq4": true,
+    "dense_4b_rejected": true,
+    "dense_9b_rejected": true,
+    "live_canonical_mq3_artifacts_present": true,
+    "long_prefill_runtime_evidence_present": false,
+    "long_prefill_shape_audit_present": true,
+    "long_prefill_shape_contract_covered": true,
+    "size_gate_audit_present": true
+  },
+  "live_artifact_inventory": {
+    "artifact_count": 23,
+    "artifacts": [
+      {
+        "awq_mtp": true,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.5-0.8b-awq-mtp.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-0.8b-awq-mtp.mq3",
+        "role": "qwen3.5-0.8b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 495867520,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.5-0.8b.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-0.8b.mq3",
+        "role": "qwen3.5-0.8b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 495572608,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": true,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.5-122b-a10b-awq-mtp.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-122b-a10b-awq-mtp.mq3",
+        "role": "qwen3.5-122b-a10b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 81279528128,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.5-122b-a10b.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-122b-a10b.mq3",
+        "role": "qwen3.5-122b-a10b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 81232657600,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": true,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.5-27b-awq-mtp.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-27b-awq-mtp.mq3",
+        "role": "qwen3.5-27b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 11953989632,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": false,
+        "candidate_root_artifact": true,
+        "canonical_required": true,
+        "canonical_required_name": "qwen3.5-27b-mq3.hfq",
+        "is_symlink": true,
+        "name": "qwen3.5-27b-mq3.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-27b-mq3.hfq",
+        "role": "qwen3.5-27b",
+        "root": "/home/sadara/Models",
+        "size_bytes": 11777612800,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-27b.mq3"
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": true,
+        "canonical_required_name": "qwen3.5-27b-mq3.hfq",
+        "is_symlink": false,
+        "name": "qwen3.5-27b.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq3",
+        "role": "qwen3.5-27b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 11777612800,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": true,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.5-2b-awq-mtp.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-2b-awq-mtp.mq3",
+        "role": "qwen3.5-2b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 1138343552,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.5-2b.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-2b.mq3",
+        "role": "qwen3.5-2b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 1137766016,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": true,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.5-35b-a3b-awq-mtp.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b-awq-mtp.mq3",
+        "role": "qwen3.5-35b-a3b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 23525467520,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": false,
+        "candidate_root_artifact": true,
+        "canonical_required": true,
+        "canonical_required_name": "qwen3.5-35b-a3b-mq3.hfq",
+        "is_symlink": true,
+        "name": "qwen3.5-35b-a3b-mq3.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-35b-a3b-mq3.hfq",
+        "role": "qwen3.5-35b-a3b",
+        "root": "/home/sadara/Models",
+        "size_bytes": 22842468608,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq3"
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": true,
+        "canonical_required_name": "qwen3.5-35b-a3b-mq3.hfq",
+        "is_symlink": false,
+        "name": "qwen3.5-35b-a3b.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq3",
+        "role": "qwen3.5-35b-a3b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 22842468608,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": true,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.5-4b-awq-mtp.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-4b-awq-mtp.mq3",
+        "role": "qwen3.5-4b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 2190884864,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": false,
+        "candidate_root_artifact": true,
+        "canonical_required": true,
+        "canonical_required_name": "qwen3.5-4b-mq3.hfq",
+        "is_symlink": true,
+        "name": "qwen3.5-4b-mq3.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-4b-mq3.hfq",
+        "role": "qwen3.5-4b",
+        "root": "/home/sadara/Models",
+        "size_bytes": 2189926400,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-4b.mq3"
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": true,
+        "canonical_required_name": "qwen3.5-4b-mq3.hfq",
+        "is_symlink": false,
+        "name": "qwen3.5-4b.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-4b.mq3",
+        "role": "qwen3.5-4b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 2189926400,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": true,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.5-9b-awq-mtp.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-9b-awq-mtp.mq3",
+        "role": "qwen3.5-9b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 4420667392,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": false,
+        "candidate_root_artifact": true,
+        "canonical_required": true,
+        "canonical_required_name": "qwen3.5-9b-mq3.hfq",
+        "is_symlink": true,
+        "name": "qwen3.5-9b-mq3.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-mq3.hfq",
+        "role": "qwen3.5-9b",
+        "root": "/home/sadara/Models",
+        "size_bytes": 4419143680,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-9b.mq3"
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": true,
+        "canonical_required_name": "qwen3.5-9b-mq3.hfq",
+        "is_symlink": false,
+        "name": "qwen3.5-9b.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq3",
+        "role": "qwen3.5-9b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 4419143680,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": true,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.6-27b-awq-mtp.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.6-27b-awq-mtp.mq3",
+        "role": "qwen3.6-27b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 11953989632,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.6-27b.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.6-27b.mq3",
+        "role": "qwen3.6-27b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 11777612800,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": true,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": false,
+        "canonical_required_name": null,
+        "is_symlink": false,
+        "name": "qwen3.6-35b-a3b-awq-mtp.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b-awq-mtp.mq3",
+        "role": "qwen3.6-35b-a3b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 23525451136,
+        "symlink_target": null
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": false,
+        "candidate_root_artifact": true,
+        "canonical_required": true,
+        "canonical_required_name": "qwen3.6-35b-a3b-mq3.hfq",
+        "is_symlink": true,
+        "name": "qwen3.6-35b-a3b-mq3.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.6-35b-a3b-mq3.hfq",
+        "role": "qwen3.6-35b-a3b",
+        "root": "/home/sadara/Models",
+        "size_bytes": 22842468608,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq3"
+      },
+      {
+        "awq_mtp": false,
+        "cache_artifact": true,
+        "candidate_root_artifact": false,
+        "canonical_required": true,
+        "canonical_required_name": "qwen3.6-35b-a3b-mq3.hfq",
+        "is_symlink": false,
+        "name": "qwen3.6-35b-a3b.mq3",
+        "path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq3",
+        "role": "qwen3.6-35b-a3b",
+        "root": "/home/sadara/.hipfire/models",
+        "size_bytes": 22842468608,
+        "symlink_target": null
+      }
+    ],
+    "awq_mtp_artifact_count": 9,
+    "cache_artifact_count": 18,
+    "candidate_root_artifact_count": 5,
+    "canonical_required_complete": true,
+    "canonical_required_missing": [],
+    "canonical_required_present": [
+      "qwen3.5-27b-mq3.hfq",
+      "qwen3.5-35b-a3b-mq3.hfq",
+      "qwen3.5-4b-mq3.hfq",
+      "qwen3.5-9b-mq3.hfq",
+      "qwen3.6-35b-a3b-mq3.hfq"
+    ],
+    "extra_installed_roles": [
+      "qwen3.5-0.8b",
+      "qwen3.5-122b-a10b",
+      "qwen3.5-2b",
+      "qwen3.6-27b"
+    ],
+    "searched_roots": [
+      {
+        "exists": true,
+        "root": "/home/sadara/Models"
+      },
+      {
+        "exists": true,
+        "root": "/home/sadara/.hipfire/models"
+      }
+    ]
+  },
+  "next_work": [
+    "Keep 4B and 9B rejected unless a new MQ3 calibration overturns current KLD/PPL/coherence evidence.",
+    "Manifest-pin a comparable qwen3.5-27B BF16/Q8 KLD reference and rerun MQ3/MQ4 KLD.",
+    "Add matching Qwen3.5/Qwen3.6 A3B KLD references and paired MQ3 A3B DFlash sidecars before MoE spec claims.",
+    "Run artifact-backed MQ3 A3B long-prefill coherence/perf; the current audit is no-GPU shape coverage only.",
+    "Wire an indexed MQ3 A3B MoE decode route or keep MoE decode outside promotion scope."
+  ],
+  "perf": {
+    "a3b_dflash_sidecars": {
+      "audit_present": true,
+      "paired_a3b_dflash_sidecars_present": false,
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-dflash-fixture-audit.md",
+      "records_no_matches": true
+    },
+    "dense_27b_ar": {
+      "all_matching_cases_ok": true,
+      "all_matching_cases_reached_token_cap": false,
+      "all_matching_token_attractor_clean": false,
+      "cases": [
+        {
+          "id": "qwen35-27b-mq3-cap",
+          "max_tokens": 80,
+          "prompt_md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+          "summary": {
+            "median_decode_tok_s": 17.6,
+            "median_prefill_ms": 416.2,
+            "median_prefill_tok_s": 50.5,
+            "median_tok_s": 10.9,
+            "median_tokens": 12.0,
+            "median_ttft_ms": 416.2,
+            "ok_runs": 3,
+            "total_runs": 3
+          }
+        }
+      ],
+      "matching_case_count": 1,
+      "ok_case_count": 1,
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-ar-perf.json",
+      "reached_token_cap_case_count": 0,
+      "schema": "hipfire.mq3_ar_perf.gfx1151.v0",
+      "token_attractor_case_count": 0,
+      "token_attractor_clean_case_count": 0
+    },
+    "dense_27b_dflash": {
+      "all_matching_cases_ok": true,
+      "all_matching_cases_reached_token_cap": false,
+      "all_matching_token_attractor_clean": true,
+      "cases": [
+        {
+          "id": "qwen35-27b-mq3-dflash-prose",
+          "max_tokens": 192,
+          "prompt_md5": "c7e575e6fedf97df4c1902ef68335c22",
+          "summary": {
+            "median_decode_accept_rate": 0.0822,
+            "median_decode_secs": 24.5354,
+            "median_decode_tau": 1.2326,
+            "median_decode_tok_s": 7.87,
+            "median_decode_tokens_emitted": 193.0,
+            "median_prefill_tok_s": 60.75,
+            "median_ttft_ms": 1261.27,
+            "median_vram_used_mb": 13857.0,
+            "ok_runs": 3,
+            "total_runs": 3
+          }
+        },
+        {
+          "id": "qwen35-27b-mq3-dflash-code",
+          "max_tokens": 128,
+          "prompt_md5": "5333a1f70d884060807676347c0edb93",
+          "summary": {
+            "median_decode_accept_rate": 0.6667,
+            "median_decode_secs": 1.1507,
+            "median_decode_tau": 10.0,
+            "median_decode_tok_s": 39.11,
+            "median_decode_tokens_emitted": 45.0,
+            "median_prefill_tok_s": 56.39,
+            "median_ttft_ms": 2474.91,
+            "median_vram_used_mb": 13869.0,
+            "ok_runs": 3,
+            "total_runs": 3
+          }
+        }
+      ],
+      "matching_case_count": 2,
+      "ok_case_count": 2,
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-dflash.json",
+      "reached_token_cap_case_count": 0,
+      "schema": "hipfire.mq3_dflash.gfx1151.v0",
+      "token_attractor_case_count": 2,
+      "token_attractor_clean_case_count": 2
+    }
+  },
+  "promotion_allowed": false,
+  "quality": {
+    "a3b_coherence": {
+      "all_cases_uncapped": false,
+      "capped_rows_present": true,
+      "case_count": 12,
+      "hard_error_count": 0,
+      "hit_max_tokens_count": 7,
+      "no_hard_errors": true,
+      "ok_case_count": 12,
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-broader-coherence.json",
+      "promotion_grade_no_hard_errors_and_uncapped": false,
+      "schema": "hipfire.mq3_a3b_coherence.gfx1151.v0"
+    },
+    "kld_4b": {
+      "candidate": {
+        "arch": "gfx1151",
+        "mean_kld": 0.5174443789870266,
+        "n_chunks": 20,
+        "p99_kld": 16.23230557010797,
+        "ppl": 13.207844288292574,
+        "scoring_mode": "prefill",
+        "variant": "qwen3.5-4b.mq3-kvq8-c20"
+      },
+      "candidate_beats_control": false,
+      "candidate_to_control_mean_kld_ratio": 3.9510044872910117,
+      "control": {
+        "arch": "gfx1151",
+        "mean_kld": 0.13096527241400577,
+        "n_chunks": 20,
+        "p99_kld": 10.102367675614913,
+        "ppl": 9.99321201304944,
+        "scoring_mode": "prefill",
+        "variant": "qwen3.5-4b.mq4-kvq8-c20"
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld.json"
+    },
+    "kld_9b": {
+      "candidate": {
+        "arch": "gfx1151",
+        "mean_kld": 0.8255300001807171,
+        "n_chunks": 20,
+        "p99_kld": 19.341926421301483,
+        "ppl": 12.533182124371065,
+        "scoring_mode": "prefill",
+        "variant": "qwen3.5-9b.mq3-kvq8-c20"
+      },
+      "candidate_beats_control": false,
+      "candidate_to_control_mean_kld_ratio": 3.492306963326805,
+      "control": {
+        "arch": "gfx1151",
+        "mean_kld": 0.23638529168533035,
+        "n_chunks": 20,
+        "p99_kld": 17.16138437962391,
+        "ppl": 9.047422176078824,
+        "scoring_mode": "prefill",
+        "variant": "qwen3.5-9b.mq4-kvq8-c20"
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-9b-kld.json"
+    },
+    "kld_references": {
+      "expected": {
+        "qwen3.5-27b": {
+          "expected_ref_name": "qwen3.5-27b-bf16.kldref.bin",
+          "fixture": "qwen3.5-27b",
+          "local_manifest_ref_present": false,
+          "local_manifest_ref_sha256_ok": false,
+          "manifest_entry_present": false,
+          "match_count": 0,
+          "matches": []
+        },
+        "qwen3.5-35b-a3b": {
+          "expected_ref_name": "qwen3.5-35b-a3b-bf16.kldref.bin",
+          "fixture": "qwen3.5-35b-a3b",
+          "local_manifest_ref_present": false,
+          "local_manifest_ref_sha256_ok": false,
+          "manifest_entry_present": false,
+          "match_count": 0,
+          "matches": []
+        },
+        "qwen3.6-35b-a3b": {
+          "expected_ref_name": "qwen3.6-35b-a3b-bf16.kldref.bin",
+          "fixture": "qwen3.6-35b-a3b",
+          "local_manifest_ref_present": false,
+          "local_manifest_ref_sha256_ok": false,
+          "manifest_entry_present": false,
+          "match_count": 0,
+          "matches": []
+        }
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-kld-reference-inventory.json",
+      "qwen35_27b_present": false,
+      "qwen35_a3b_present": false,
+      "qwen36_a3b_present": false,
+      "schema": "hipfire.quant_kld_reference_inventory.v0"
+    },
+    "ppl_27b": {
+      "candidate": {
+        "exit_code": 0,
+        "family": "dense",
+        "format_id": "mq3",
+        "id": "qwen35-27b-mq3",
+        "result": {
+          "elapsed_s": 123.3,
+          "nll_tok": 2.5058459829,
+          "ppl": 12.2539,
+          "scored": 2039,
+          "scored_tok_s": 16.5
+        }
+      },
+      "candidate_beats_control": true,
+      "candidate_to_control_ppl_ratio": 0.9605628282511562,
+      "control": {
+        "exit_code": 0,
+        "family": "dense",
+        "format_id": "mq4",
+        "id": "qwen35-27b-mq4",
+        "result": {
+          "elapsed_s": 148.7,
+          "nll_tok": 2.5460838229,
+          "ppl": 12.757,
+          "scored": 2039,
+          "scored_tok_s": 13.7
+        }
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-27b-ppl.json"
+    },
+    "ppl_9b": {
+      "candidate": {
+        "exit_code": 0,
+        "family": "dense",
+        "format_id": "mq3",
+        "id": "qwen35-9b-mq3",
+        "result": {
+          "elapsed_s": 41.0,
+          "nll_tok": 2.8679540266,
+          "ppl": 17.601,
+          "scored": 2039,
+          "scored_tok_s": 49.8
+        }
+      },
+      "candidate_beats_control": false,
+      "candidate_to_control_ppl_ratio": 1.4584973359076558,
+      "control": {
+        "exit_code": 0,
+        "family": "dense",
+        "format_id": "mq4",
+        "id": "qwen35-9b-mq4",
+        "result": {
+          "elapsed_s": 49.2,
+          "nll_tok": 2.4905529915,
+          "ppl": 12.0679,
+          "scored": 2039,
+          "scored_tok_s": 41.4
+        }
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-9b-ppl.json"
+    },
+    "ppl_qwen35_a3b": {
+      "candidate": {
+        "exit_code": 0,
+        "family": "moe",
+        "format_id": "mq3",
+        "id": "qwen35-a3b-mq3",
+        "result": {
+          "elapsed_s": 41.2,
+          "nll_tok": 2.1060622257,
+          "ppl": 8.2158,
+          "scored": 2039,
+          "scored_tok_s": 49.5
+        }
+      },
+      "candidate_beats_control": true,
+      "candidate_to_control_ppl_ratio": 0.9572623680469788,
+      "control": {
+        "exit_code": 0,
+        "family": "moe",
+        "format_id": "mq4",
+        "id": "qwen35-a3b-mq4",
+        "result": {
+          "elapsed_s": 40.6,
+          "nll_tok": 2.1497421429,
+          "ppl": 8.5826,
+          "scored": 2039,
+          "scored_tok_s": 50.2
+        }
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-ppl.json"
+    },
+    "ppl_qwen36_a3b": {
+      "candidate": {
+        "exit_code": 0,
+        "family": "moe",
+        "format_id": "mq3",
+        "id": "qwen36-a3b-mq3",
+        "result": {
+          "elapsed_s": 41.1,
+          "nll_tok": 1.8724360011,
+          "ppl": 6.5041,
+          "scored": 2039,
+          "scored_tok_s": 49.6
+        }
+      },
+      "candidate_beats_control": false,
+      "candidate_to_control_ppl_ratio": 1.0289506573223015,
+      "control": {
+        "exit_code": 0,
+        "family": "moe",
+        "format_id": "mq4",
+        "id": "qwen36-a3b-mq4",
+        "result": {
+          "elapsed_s": 40.5,
+          "nll_tok": 1.8438939153,
+          "ppl": 6.3211,
+          "scored": 2039,
+          "scored_tok_s": 50.3
+        }
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-ppl.json"
+    }
+  },
+  "quality_boundary": {
+    "a3b_coherence_status": "no_hard_errors_but_capped_rows_not_promotion_grade",
+    "a3b_status": "research_blocked",
+    "dense_27b_status": "candidate_incomplete_kld_reference",
+    "dense_small_model_status": "4b_and_9b_rejected_current_calibration",
+    "promotion_requires_new_quality_evidence": true
+  },
+  "runtime": {
+    "a3b_moe_decode_boundary": {
+      "all_phrase_checks_present": true,
+      "boundary_recorded": true,
+      "indexed_route_supported": false,
+      "path": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs",
+      "phrase_checks": {
+        "decode_gpu_topk_blocked": true,
+        "decode_no_rotation_scratch": true,
+        "decode_records_no_indexed_route": true,
+        "path2_forced_on_gfx1151": true,
+        "path2_required": true,
+        "prefill_admission": true,
+        "test_name": true
+      },
+      "status": "decode_indexed_route_missing_recorded",
+      "test_command": "cargo test -p hipfire-arch-qwen35 --lib mq3_a3b_prefill_path2_but_moe_decode_lacks_indexed_route"
+    },
+    "long_prefill_shape_contract": {
+      "all_phrase_checks_present": true,
+      "artifact_backed_long_prefill_evidence_present": false,
+      "audit_present": true,
+      "invariants": {
+        "down_x_row_div": 1,
+        "gate_up_x_row_div": 8,
+        "k_top": 8,
+        "m_total_bound": 5888,
+        "m_total_bound_multiple_of_16": true,
+        "n_tokens": 256,
+        "num_experts": 256,
+        "total_slots": 2048
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-long-prefill-path2-shape-audit.md",
+      "phrase_checks": {
+        "admission_gfx1151": true,
+        "down_row_div": true,
+        "full_chunk_shape": true,
+        "gate_up_row_div": true,
+        "m_total_bound_multiple_of_16": true,
+        "path2_forced_without_indexed_fallback": true,
+        "records_no_promotion_claim": true,
+        "scope": true,
+        "test_command": true,
+        "test_name": true
+      },
+      "promotion_grade_runtime_result": false,
+      "status": "covered_no_gpu_not_runtime",
+      "test_command": "cargo test -p hipfire-arch-qwen35 --lib moe_prefill",
+      "test_name": "qwen35::tests::moe_prefill_mq3_long_prefill_path2_shape_is_production_shaped"
+    }
+  },
+  "schema": "hipfire.mq3_size_gate_status.gfx1151.v0",
+  "size_gate_boundary": {
+    "a3b": {
+      "broader_coherence_capped_rows_present": true,
+      "broader_coherence_case_count": 12,
+      "broader_coherence_hit_max_tokens_count": 7,
+      "broader_coherence_no_hard_errors": true,
+      "coherence_status": "no_hard_errors_but_capped_rows_not_promotion_grade",
+      "next_unblocked_step": "add_a3b_kld_refs_and_paired_mq3_dflash_sidecars",
+      "promotion_grade_coherence_present": false,
+      "status": "research_blocked"
+    },
+    "dense_27b": {
+      "next_unblocked_step": "manifest_pin_qwen35_27b_bf16_or_q8_kld_reference",
+      "status": "candidate_incomplete_kld_reference"
+    },
+    "dense_4b": {
+      "next_unblocked_step": "new_calibration_that_beats_mq4_on_4b_kld_and_coherence",
+      "status": "rejected"
+    },
+    "dense_9b": {
+      "next_unblocked_step": "new_calibration_that_beats_mq4_on_9b_ppl_kld_and_coherence",
+      "status": "rejected"
+    },
+    "long_prefill_no_gpu_contract": {
+      "all_phrase_checks_present": true,
+      "artifact_backed_long_prefill_evidence_present": false,
+      "invariants": {
+        "down_x_row_div": 1,
+        "gate_up_x_row_div": 8,
+        "k_top": 8,
+        "m_total_bound": 5888,
+        "m_total_bound_multiple_of_16": true,
+        "n_tokens": 256,
+        "num_experts": 256,
+        "total_slots": 2048
+      },
+      "next_unblocked_step": "run_artifact_backed_mq3_a3b_long_prefill_coherence_and_perf",
+      "status": "covered_no_gpu_not_runtime",
+      "test_command": "cargo test -p hipfire-arch-qwen35 --lib moe_prefill",
+      "test_name": "qwen35::tests::moe_prefill_mq3_long_prefill_path2_shape_is_production_shaped"
+    },
+    "moe_decode": {
+      "indexed_route_supported": false,
+      "next_unblocked_step": "wire_indexed_mq3_a3b_moe_decode_route_or_keep_decode_out_of_scope",
+      "status": "decode_indexed_route_missing_recorded"
+    },
+    "next_unblocked_step": "manifest-pin qwen3.5-27B KLD reference or generate a new small-model MQ3 calibration",
+    "promotion_allowed": false,
+    "status": "size_gated_incomplete"
+  },
+  "status": "candidate-size-gated-incomplete"
+}

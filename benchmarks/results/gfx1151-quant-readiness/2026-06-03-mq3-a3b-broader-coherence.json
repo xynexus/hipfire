@@ -1,0 +1,458 @@
+{
+  "arch": "gfx1151",
+  "branch": "qwen35-native-mtp",
+  "cases": [
+    {
+      "done": {
+        "decode_tok_s": 53.1,
+        "id": "qwen35-a3b-mq4-trains",
+        "prefill_ms": 1237.1,
+        "prefill_tok_s": 55.8,
+        "prefill_tokens": 69,
+        "tok_s": 42.4,
+        "tokens": 260,
+        "ttft_ms": 1237.1,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": true,
+      "id": "qwen35-a3b-mq4-trains",
+      "log_tail": "\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"{\\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"Distance\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"}}\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"{\\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"Speed\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"}}\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"frac\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"}{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"$$\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" $$\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"t\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"frac\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"}{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"7\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" hours\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"$$\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"\\n\\n\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"**\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"Step\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"3\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" Convert\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" time\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" into\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" hours\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" and\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" minutes\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\".**\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"*\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"  \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\" $\\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"frac\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-trains\",\"text\":\"}{\"}\n{\"type\":\"done\",\"id\":\"qwen35-a3b-mq4-trains\",\"tokens\":260,\"tok_s\":42.4,\"prefill_tokens\":69,\"prefill_ms\":1237.1,\"prefill_tok_s\":55.8,\"decode_tok_s\":53.1,\"ttft_ms\":1237.1}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq4",
+        "id": "qwen35-a3b-mq4",
+        "model_file": "qwen3.5-35b-a3b.mq4"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq4",
+      "model_present": true,
+      "output": "<think>\n\n</think>\n\n**Step 1: Calculate the head start distance.**\nThe first train leaves at 9:00 AM and travels alone for 1 hour until the second train leaves at 10:00 AM.\n*   Distance covered by Train A = $60 \\text{ mph} \\times 1 \\text{ hour} = 60$ miles.\n*   Remaining distance between the trains at 10:00 AM = $280 - 60 = 220$ miles.\n\n**Step 2: Calculate the time to meet after both are moving.**\nSince they are traveling toward each other, their relative speed is the sum of their individual speeds.\n*   Combined speed = $60 + 80 = 140$ mph.\n*   Time to cover the remaining distance ($t$) is calculated as:\n    $$t = \\frac{\\text{Distance}}{\\text{Speed}} = \\frac{220}{140}$$\n    $$t = \\frac{11}{7} \\text{ hours}$$\n\n**Step 3: Convert the time into hours and minutes.**\n*   $\\frac{11}{",
+      "panic": "",
+      "prompt": {
+        "id": "trains",
+        "max_tokens": 260,
+        "prompt_file": "trains-meet.txt"
+      },
+      "prompt_md5": "db92b572702ab947c5fabd9c342eb616",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/trains-meet.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 9.569
+    },
+    {
+      "done": {
+        "decode_tok_s": 52.3,
+        "id": "qwen35-a3b-mq3-trains",
+        "prefill_ms": 1257.8,
+        "prefill_tok_s": 54.9,
+        "prefill_tokens": 69,
+        "tok_s": 41.7,
+        "tokens": 260,
+        "ttft_ms": 1257.8,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": true,
+      "id": "qwen35-a3b-mq3-trains",
+      "log_tail": "text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" mph\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" +\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"8\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" mph\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"$\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" mph\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\".\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"\\n\\n\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"Time\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" ($\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"t\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"$\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\")\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" to\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" cover\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" remaining\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" distance\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"$$\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"t\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"frac\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"{\\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"Distance\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"}}\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"{\\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"Speed\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"}}\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"frac\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"}{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"frac\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-trains\",\"text\":\"1\"}\n{\"type\":\"done\",\"id\":\"qwen35-a3b-mq3-trains\",\"tokens\":260,\"tok_s\":41.7,\"prefill_tokens\":69,\"prefill_ms\":1257.8,\"prefill_tok_s\":54.9,\"decode_tok_s\":52.3,\"ttft_ms\":1257.8}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq3",
+        "id": "qwen35-a3b-mq3",
+        "model_file": "qwen3.5-35b-a3b.mq3"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq3",
+      "model_present": true,
+      "output": "<think>\n\n</think>\n\n**Step 1: Calculate the head start distance.**\nThe first train leaves at 9:00 AM, and the second leaves at 10:00 AM. This creates a **1-hour head start** for the first train.\n*   Distance covered by Train A in that hour = $60 \\text{ mph} \\times 1 \\text{ hour} = 60$ miles.\n\n**Step 2: Determine the remaining distance.**\nSubtract the head start distance from the total distance between stations.\n*   Remaining Distance = $280 - 60 = 220$ miles.\n\n**Step 3: Calculate the time to meet after Train B departs.**\nNow both trains are moving toward each other starting at 10:00 AM. Their combined speed (relative speed) is:\n*   Relative Speed = $60 \\text{ mph} + 80 \\text{ mph} = 140$ mph.\n\nTime ($t$) to cover the remaining distance:\n$$t = \\frac{\\text{Distance}}{\\text{Speed}} = \\frac{220}{140} = \\frac{11",
+      "panic": "",
+      "prompt": {
+        "id": "trains",
+        "max_tokens": 260,
+        "prompt_file": "trains-meet.txt"
+      },
+      "prompt_md5": "db92b572702ab947c5fabd9c342eb616",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/trains-meet.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 9.805
+    },
+    {
+      "done": {
+        "decode_tok_s": 53.2,
+        "id": "qwen36-a3b-mq4-trains",
+        "prefill_ms": 1234.3,
+        "prefill_tok_s": 55.9,
+        "prefill_tokens": 69,
+        "tok_s": 42.5,
+        "tokens": 260,
+        "ttft_ms": 1234.3,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": true,
+      "id": "qwen36-a3b-mq4-trains",
+      "log_tail": "oken\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" relative\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" speed\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" is\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" sum\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" of\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" their\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" speeds\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" $$\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"6\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" mph\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" +\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"8\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" mph\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" mph\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"$$\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"*\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"  \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" Time\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" to\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" meet\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" (\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"after\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" am\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\")\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" $\\\\\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"frac\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"{\\\\\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"Remaining\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\" Distance\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"}}\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-trains\",\"text\":\"{\\\\\"}\n{\"type\":\"done\",\"id\":\"qwen36-a3b-mq4-trains\",\"tokens\":260,\"tok_s\":42.5,\"prefill_tokens\":69,\"prefill_ms\":1234.3,\"prefill_tok_s\":55.9,\"decode_tok_s\":53.2,\"ttft_ms\":1234.3}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq4",
+        "id": "qwen36-a3b-mq4",
+        "model_file": "qwen3.6-35b-a3b.mq4"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq4",
+      "model_present": true,
+      "output": "<think>\n\n</think>\n\nHere is the step-by-step solution:\n\n**1. Calculate the distance covered by the first train before the second train starts.**\n*   Train A leaves at 9:00 am.\n*   Train B leaves at 10:00 am.\n*   Time difference = 1 hour.\n*   Distance covered by Train A in that hour = $60 \\text{ mph} \\times 1 \\text{ hour} = 60 \\text{ miles}$.\n\n**2. Determine the remaining distance between them when Train B starts.**\n*   Total distance = $280 \\text{ miles}$.\n*   Remaining distance = $280 - 60 = 220 \\text{ miles}$.\n\n**3. Calculate the time it takes for both trains to meet after Train B starts.**\n*   Since they are traveling toward each other, their relative speed is the sum of their speeds:\n    $$60 \\text{ mph} + 80 \\text{ mph} = 140 \\text{ mph}$$\n*   Time to meet (after 10:00 am) = $\\frac{\\text{Remaining Distance}}{\\",
+      "panic": "",
+      "prompt": {
+        "id": "trains",
+        "max_tokens": 260,
+        "prompt_file": "trains-meet.txt"
+      },
+      "prompt_md5": "db92b572702ab947c5fabd9c342eb616",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/trains-meet.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 9.562
+    },
+    {
+      "done": {
+        "decode_tok_s": 52.4,
+        "id": "qwen36-a3b-mq3-trains",
+        "prefill_ms": 1255.8,
+        "prefill_tok_s": 54.9,
+        "prefill_tokens": 69,
+        "tok_s": 41.8,
+        "tokens": 260,
+        "ttft_ms": 1255.8,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": true,
+      "id": "qwen36-a3b-mq3-trains",
+      "log_tail": "trains\",\"text\":\"  \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" Since\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" they\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" are\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" moving\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" toward\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" each\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" other\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" we\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" add\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" their\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" speeds\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" to\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" find\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" relative\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" speed\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" (\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"closing\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" speed\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\").\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"*\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"  \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" Relative\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" Speed\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" $\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"6\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" mph\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" +\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"8\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" mph\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" \\\\\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"text\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"{\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" mph\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"}\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"$.\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"*\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"  \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" Time\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" to\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" meet\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\" ($\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"t\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-trains\",\"text\":\"$\"}\n{\"type\":\"done\",\"id\":\"qwen36-a3b-mq3-trains\",\"tokens\":260,\"tok_s\":41.8,\"prefill_tokens\":69,\"prefill_ms\":1255.8,\"prefill_tok_s\":54.9,\"decode_tok_s\":52.4,\"ttft_ms\":1255.8}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq3",
+        "id": "qwen36-a3b-mq3",
+        "model_file": "qwen3.6-35b-a3b.mq3"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq3",
+      "model_present": true,
+      "output": "<think>\n\n</think>\n\nHere is the step-by-step solution:\n\n**1. Calculate the distance covered by the first train before the second train starts.**\n*   Train A leaves at 9:00 AM.\n*   Train B leaves at 10:00 AM.\n*   Time difference = 1 hour.\n*   Distance covered by Train A in that hour = $60 \\text{ mph} \\times 1 \\text{ hour} = 60 \\text{ miles}$.\n\n**2. Determine the remaining distance between the two trains at 10:00 AM.**\n*   Total distance = $280 \\text{ miles}$.\n*   Remaining distance = $280 - 60 = 220 \\text{ miles}$.\n\n**3. Calculate the time it takes for both trains to meet after 10:00 AM.**\n*   Since they are moving toward each other, we add their speeds to find the relative speed (closing speed).\n*   Relative Speed = $60 \\text{ mph} + 80 \\text{ mph} = 140 \\text{ mph}$.\n*   Time to meet ($t$",
+      "panic": "",
+      "prompt": {
+        "id": "trains",
+        "max_tokens": 260,
+        "prompt_file": "trains-meet.txt"
+      },
+      "prompt_md5": "db92b572702ab947c5fabd9c342eb616",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/trains-meet.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 9.786
+    },
+    {
+      "done": {
+        "decode_tok_s": 53.1,
+        "id": "qwen35-a3b-mq4-humaneval3",
+        "prefill_ms": 2272.8,
+        "prefill_tok_s": 55.4,
+        "prefill_tokens": 126,
+        "tok_s": 35.0,
+        "tokens": 234,
+        "ttft_ms": 2272.8,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": false,
+      "id": "qwen35-a3b-mq4-humaneval3",
+      "log_tail": "5-a3b-mq4-humaneval3\",\"text\":\"main\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"__\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"\\\":\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" print\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"(b\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"elow\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"_zero\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"([\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"3\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"]))\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"     \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" #\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" False\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" (\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"balance\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" never\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" goes\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" below\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" zero\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\")\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" print\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"(b\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"elow\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"_zero\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"([\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"5\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"]))\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" #\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" True\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" (\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"after\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" balance\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\")\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"```\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"text\":\"<|im_end|>\"}\n{\"type\":\"done\",\"id\":\"qwen35-a3b-mq4-humaneval3\",\"tokens\":234,\"tok_s\":35.0,\"prefill_tokens\":126,\"prefill_ms\":2272.8,\"prefill_tok_s\":55.4,\"decode_tok_s\":53.1,\"ttft_ms\":2272.8}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq4",
+        "id": "qwen35-a3b-mq4",
+        "model_file": "qwen3.5-35b-a3b.mq4"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq4",
+      "model_present": true,
+      "output": "<think>\n\n</think>\n\n```python\nfrom typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\"You're given a list of deposit and withdrawal operations on a bank account that starts with\n    zero balance. Your task is to detect if at any point the balance of account falls below zero, and\n    at that point function should return True. Otherwise it should return False.\n\n    >>> below_zero([1, 2, 3])\n    False\n    >>> below_zero([1, 2, -4, 5])\n    True\n    \"\"\"\n    balance = 0\n    \n    for op in operations:\n        balance += op\n        \n        if balance < 0:\n            return True\n            \n    return False\n\n\n# Example usage (for manual testing):\nif __name__ == \"__main__\":\n    print(below_zero([1, 2, 3]))      # False (balance never goes below zero)\n    print(below_zero([1, 2, -4, 5])) # True (after -4: balance = -1)\n```<|im_end|>",
+      "panic": "",
+      "prompt": {
+        "id": "humaneval3",
+        "max_tokens": 260,
+        "prompt_file": "humaneval_3_below_zero.txt"
+      },
+      "prompt_md5": "37c5aad9f9efe93b5c47f27256bdf149",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/humaneval_3_below_zero.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 10.176
+    },
+    {
+      "done": {
+        "decode_tok_s": 52.1,
+        "id": "qwen35-a3b-mq3-humaneval3",
+        "prefill_ms": 2315.2,
+        "prefill_tok_s": 54.4,
+        "prefill_tokens": 126,
+        "tok_s": 34.8,
+        "tokens": 242,
+        "ttft_ms": 2315.2,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": false,
+      "id": "qwen35-a3b-mq3-humaneval3",
+      "log_tail": "3b-mq3-humaneval3\",\"text\":\"_zero\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"([\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"3\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"]))\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"      \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" #\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" False\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" (\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"balance\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" never\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" goes\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" below\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" zero\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\")\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" print\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"(b\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"elow\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"_zero\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"([\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"5\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"]))\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"  \"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" #\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" True\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" (\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"after\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" and\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" +\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"5\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"?\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" actually\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" after\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" balance\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" is\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\")\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"```\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"text\":\"<|im_end|>\"}\n{\"type\":\"done\",\"id\":\"qwen35-a3b-mq3-humaneval3\",\"tokens\":242,\"tok_s\":34.8,\"prefill_tokens\":126,\"prefill_ms\":2315.2,\"prefill_tok_s\":54.4,\"decode_tok_s\":52.1,\"ttft_ms\":2315.2}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq3",
+        "id": "qwen35-a3b-mq3",
+        "model_file": "qwen3.5-35b-a3b.mq3"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq3",
+      "model_present": true,
+      "output": "<think>\n\n</think>\n\n```python\nfrom typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\"You're given a list of deposit and withdrawal operations on a bank account that starts with\n    zero balance. Your task is to detect if at any point the balance of account falls below zero, and\n    at that point function should return True. Otherwise it should return False.\n\n    >>> below_zero([1, 2, 3])\n    False\n    >>> below_zero([1, 2, -4, 5])\n    True\n    \"\"\"\n    balance = 0\n    \n    for op in operations:\n        balance += op\n        \n        if balance < 0:\n            return True\n    \n    return False\n\n\n# Example usage (for manual testing):\nif __name__ == \"__main__\":\n    print(below_zero([1, 2, 3]))       # False (balance never goes below zero)\n    print(below_zero([1, 2, -4, 5]))   # True (after -4 and +5? actually after -4 balance is -1)\n```<|im_end|>",
+      "panic": "",
+      "prompt": {
+        "id": "humaneval3",
+        "max_tokens": 260,
+        "prompt_file": "humaneval_3_below_zero.txt"
+      },
+      "prompt_md5": "37c5aad9f9efe93b5c47f27256bdf149",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/humaneval_3_below_zero.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 10.483
+    },
+    {
+      "done": {
+        "decode_tok_s": 53.1,
+        "id": "qwen36-a3b-mq4-humaneval3",
+        "prefill_ms": 2277.8,
+        "prefill_tok_s": 55.3,
+        "prefill_tokens": 126,
+        "tok_s": 30.3,
+        "tokens": 161,
+        "ttft_ms": 2277.8,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": false,
+      "id": "qwen36-a3b-mq4-humaneval3",
+      "log_tail": "\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" >>>\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" below\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"_zero\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"([\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"5\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"])\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" True\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" \\\"\\\"\\\"\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" balance\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" for\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" op\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" in\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" operations\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"       \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" balance\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" +=\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" op\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"       \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" if\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" balance\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" <\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"           \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" return\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" True\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" return\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\" False\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"```\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"text\":\"<|im_end|>\"}\n{\"type\":\"done\",\"id\":\"qwen36-a3b-mq4-humaneval3\",\"tokens\":161,\"tok_s\":30.3,\"prefill_tokens\":126,\"prefill_ms\":2277.8,\"prefill_tok_s\":55.3,\"decode_tok_s\":53.1,\"ttft_ms\":2277.8}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq4",
+        "id": "qwen36-a3b-mq4",
+        "model_file": "qwen3.6-35b-a3b.mq4"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq4",
+      "model_present": true,
+      "output": "<think>\n\n</think>\n\n```python\nfrom typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\" You're given a list of deposit and withdrawal operations on a bank account that starts with\n    zero balance. Your task is to detect if at any point the balance of account fallls below zero, and\n    at that point function should return True. Otherwise it should return False.\n    >>> below_zero([1, 2, 3])\n    False\n    >>> below_zero([1, 2, -4, 5])\n    True\n    \"\"\"\n    balance = 0\n    for op in operations:\n        balance += op\n        if balance < 0:\n            return True\n    return False\n```<|im_end|>",
+      "panic": "",
+      "prompt": {
+        "id": "humaneval3",
+        "max_tokens": 260,
+        "prompt_file": "humaneval_3_below_zero.txt"
+      },
+      "prompt_md5": "37c5aad9f9efe93b5c47f27256bdf149",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/humaneval_3_below_zero.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 8.818
+    },
+    {
+      "done": {
+        "decode_tok_s": 52.2,
+        "id": "qwen36-a3b-mq3-humaneval3",
+        "prefill_ms": 2316.5,
+        "prefill_tok_s": 54.4,
+        "prefill_tokens": 126,
+        "tok_s": 29.8,
+        "tokens": 161,
+        "ttft_ms": 2316.5,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": false,
+      "id": "qwen36-a3b-mq3-humaneval3",
+      "log_tail": "\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" >>>\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" below\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"_zero\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"([\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"4\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"5\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"])\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" True\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" \\\"\\\"\\\"\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" balance\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" =\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" for\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" op\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" in\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" operations\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"       \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" balance\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" +=\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" op\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"       \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" if\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" balance\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" <\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"0\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"           \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" return\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" True\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"   \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" return\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\" False\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"```\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"text\":\"<|im_end|>\"}\n{\"type\":\"done\",\"id\":\"qwen36-a3b-mq3-humaneval3\",\"tokens\":161,\"tok_s\":29.8,\"prefill_tokens\":126,\"prefill_ms\":2316.5,\"prefill_tok_s\":54.4,\"decode_tok_s\":52.2,\"ttft_ms\":2316.5}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq3",
+        "id": "qwen36-a3b-mq3",
+        "model_file": "qwen3.6-35b-a3b.mq3"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq3",
+      "model_present": true,
+      "output": "<think>\n\n</think>\n\n```python\nfrom typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\" You're given a list of deposit and withdrawal operations on a bank account that starts with\n    zero balance. Your task is to detect if at any point the balance of account fallls below zero, and\n    at that point function should return True. Otherwise it should return False.\n    >>> below_zero([1, 2, 3])\n    False\n    >>> below_zero([1, 2, -4, 5])\n    True\n    \"\"\"\n    balance = 0\n    for op in operations:\n        balance += op\n        if balance < 0:\n            return True\n    return False\n```<|im_end|>",
+      "panic": "",
+      "prompt": {
+        "id": "humaneval3",
+        "max_tokens": 260,
+        "prompt_file": "humaneval_3_below_zero.txt"
+      },
+      "prompt_md5": "37c5aad9f9efe93b5c47f27256bdf149",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/humaneval_3_below_zero.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 8.921
+    },
+    {
+      "done": {
+        "decode_tok_s": 53.1,
+        "id": "qwen35-a3b-mq4-long-lru",
+        "prefill_ms": 3470.9,
+        "prefill_tok_s": 55.0,
+        "prefill_tokens": 191,
+        "tok_s": 24.3,
+        "tokens": 155,
+        "ttft_ms": 3470.9,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": false,
+      "id": "qwen35-a3b-mq4-long-lru",
+      "log_tail": "id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" O\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\"(\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\").\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" This\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" is\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" achieved\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" because\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" hash\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" map\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" enables\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" immediate\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" O\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\"(\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\")\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" lookup\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" of\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" any\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" node\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" by\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" key\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\".\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" Once\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" located\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" moving\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" a\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" node\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" to\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" head\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" or\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" removing\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" it\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" from\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" tail\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" involves\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" only\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" updating\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" a\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" fixed\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" number\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" of\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" pointers\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" (\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\"previous\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" and\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" next\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\"),\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" independent\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" of\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" cache\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" size\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" or\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\" capacity\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\".\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"text\":\"<|im_end|>\"}\n{\"type\":\"done\",\"id\":\"qwen35-a3b-mq4-long-lru\",\"tokens\":155,\"tok_s\":24.3,\"prefill_tokens\":191,\"prefill_ms\":3470.9,\"prefill_tok_s\":55.0,\"decode_tok_s\":53.1,\"ttft_ms\":3470.9}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq4",
+        "id": "qwen35-a3b-mq4",
+        "model_file": "qwen3.5-35b-a3b.mq4"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq4",
+      "model_present": true,
+      "output": "<think>\n\n</think>\n\nA doubly linked list is essential because evicting the least-recently-used item requires removing the tail node. With a singly linked list, deleting the tail would necessitate traversing from the head to find its predecessor, resulting in O(n) deletion. The doubly linked structure provides direct access to both neighbors, allowing constant-time removal of any node without traversal.\n\nBoth `put` and `get` operations have a worst-case time complexity of O(1). This is achieved because the hash map enables immediate O(1) lookup of any node by key. Once located, moving a node to the head or removing it from the tail involves only updating a fixed number of pointers (previous and next), independent of the cache size or capacity.<|im_end|>",
+      "panic": "",
+      "prompt": {
+        "id": "long-lru",
+        "max_tokens": 220,
+        "prompt_file": "coherence_lloyd_long.txt"
+      },
+      "prompt_md5": "f20bbc4f5b88ab5f7b44fe7c7da0e2e3",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/coherence_lloyd_long.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 9.872
+    },
+    {
+      "done": {
+        "decode_tok_s": 52.2,
+        "id": "qwen35-a3b-mq3-long-lru",
+        "prefill_ms": 3532.9,
+        "prefill_tok_s": 54.1,
+        "prefill_tokens": 191,
+        "tok_s": 28.4,
+        "tokens": 220,
+        "ttft_ms": 3532.9,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": true,
+      "id": "qwen35-a3b-mq3-long-lru",
+      "log_tail": "g-lru\",\"text\":\" a\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" singly\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" linked\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" list\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" removing\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" a\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" node\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" requires\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" access\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" to\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" its\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" predecessor\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" (\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\"the\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" second\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\"-to\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\"-last\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" node\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\").\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" Since\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" we\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" only\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" have\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" a\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" reference\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" to\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" tail\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" node\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" itself\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" during\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" eviction\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" we\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" cannot\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" easily\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" update\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" previous\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" node\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\"'s\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" `\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\"next\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\"`\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" pointer\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" without\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" travers\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\"ing\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" from\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" head\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\".\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" A\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" doubly\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" linked\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" list\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" allows\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" direct\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" access\"}\n{\"type\":\"token\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"text\":\" to\"}\n{\"type\":\"done\",\"id\":\"qwen35-a3b-mq3-long-lru\",\"tokens\":220,\"tok_s\":28.4,\"prefill_tokens\":191,\"prefill_ms\":3532.9,\"prefill_tok_s\":54.1,\"decode_tok_s\":52.2,\"ttft_ms\":3532.9}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq3",
+        "id": "qwen35-a3b-mq3",
+        "model_file": "qwen3.5-35b-a3b.mq3"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq3",
+      "model_present": true,
+      "output": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: Review a Python module implementing an LRU cache (doubly linked list + hash map).\n    *   Constraints: Two short paragraphs, under 120 words total, no code.\n    *   Questions to answer:\n        1.  Why doubly linked list instead of singly?\n        2.  Worst-case time complexity of `put` and `get`, and why constant?\n\n2.  **Drafting Answer for Question 1 (Doubly vs Singly):**\n    *   In an LRU cache, when evicting the least-recently-used item (tail), we need to remove it from the list. With a singly linked list, removing a node requires access to its predecessor (the second-to-last node). Since we only have a reference to the tail node itself during eviction, we cannot easily update the previous node's `next` pointer without traversing from the head. A doubly linked list allows direct access to",
+      "panic": "",
+      "prompt": {
+        "id": "long-lru",
+        "max_tokens": 220,
+        "prompt_file": "coherence_lloyd_long.txt"
+      },
+      "prompt_md5": "f20bbc4f5b88ab5f7b44fe7c7da0e2e3",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/coherence_lloyd_long.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 11.286
+    },
+    {
+      "done": {
+        "decode_tok_s": 53.1,
+        "id": "qwen36-a3b-mq4-long-lru",
+        "prefill_ms": 3470.2,
+        "prefill_tok_s": 55.0,
+        "prefill_tokens": 191,
+        "tok_s": 28.9,
+        "tokens": 220,
+        "ttft_ms": 3470.2,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": true,
+      "id": "qwen36-a3b-mq4-long-lru",
+      "log_tail": "oken\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" total\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" no\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" code\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\".\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"\\n\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\".\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" **\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"De\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"construct\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" Question\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" Why\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" doubly\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" linked\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" list\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"?**\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"  \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" Need\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" to\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" efficiently\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" remove\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" nodes\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" from\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" arbitrary\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" positions\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" (\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"specific\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"ally\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" tail\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" for\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" eviction\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" and\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" moving\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" accessed\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" nodes\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" to\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" head\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\").\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"  \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" With\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" a\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" singly\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" linked\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" list\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" removing\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" a\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" node\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" requires\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\" travers\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"text\":\"ing\"}\n{\"type\":\"done\",\"id\":\"qwen36-a3b-mq4-long-lru\",\"tokens\":220,\"tok_s\":28.9,\"prefill_tokens\":191,\"prefill_ms\":3470.2,\"prefill_tok_s\":55.0,\"decode_tok_s\":53.1,\"ttft_ms\":3470.2}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq4",
+        "id": "qwen36-a3b-mq4",
+        "model_file": "qwen3.6-35b-a3b.mq4"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq4",
+      "model_present": true,
+      "output": "<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Module:** Fixed-capacity LRU cache backed by a doubly linked list and a hash map.\n   - **Order:** MRU at head, LRU at tail.\n   - **Operations:** `get(key)` moves entry to head; `put(key, value)` inserts at head, evicts tail if over capacity.\n   - **Constraints:** No thread-safety guarantees.\n   - **Questions to answer:** \n     1. Why doubly linked list instead of singly?\n     2. Worst-case time complexity of `put` and `get`, and why constant?\n   - **Format:** Two short paragraphs, under 120 words total, no code.\n\n2.  **Deconstruct Question 1: Why doubly linked list?**\n   - Need to efficiently remove nodes from arbitrary positions (specifically the tail for eviction and moving accessed nodes to head).\n   - With a singly linked list, removing a node requires traversing",
+      "panic": "",
+      "prompt": {
+        "id": "long-lru",
+        "max_tokens": 220,
+        "prompt_file": "coherence_lloyd_long.txt"
+      },
+      "prompt_md5": "f20bbc4f5b88ab5f7b44fe7c7da0e2e3",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/coherence_lloyd_long.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 11.072
+    },
+    {
+      "done": {
+        "decode_tok_s": 52.1,
+        "id": "qwen36-a3b-mq3-long-lru",
+        "prefill_ms": 3534.1,
+        "prefill_tok_s": 54.0,
+        "prefill_tokens": 191,
+        "tok_s": 28.4,
+        "tokens": 220,
+        "ttft_ms": 3534.1,
+        "type": "done"
+      },
+      "exit_code": 0,
+      "hit_max_tokens": true,
+      "id": "qwen36-a3b-mq3-long-lru",
+      "log_tail": ",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" `\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"get\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"`,\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" and\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" why\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" constant\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"?\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"\\n\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"2\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\".\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" **\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"De\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"construct\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" Question\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"1\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\":\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" Why\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" doubly\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" linked\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" list\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"?**\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"  \"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" -\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" In\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" an\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" L\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"RU\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" cache\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\",\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" when\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" a\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" key\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" is\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" accessed\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" (`\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"get\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"`)\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" or\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" updated\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" (`\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"put\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"`\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"),\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" corresponding\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" node\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" must\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" be\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" moved\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" to\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" the\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" head\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" (\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"MR\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"U\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\" position\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\").\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"\\n\"}\n{\"type\":\"token\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"text\":\"  \"}\n{\"type\":\"done\",\"id\":\"qwen36-a3b-mq3-long-lru\",\"tokens\":220,\"tok_s\":28.4,\"prefill_tokens\":191,\"prefill_ms\":3534.1,\"prefill_tok_s\":54.0,\"decode_tok_s\":52.1,\"ttft_ms\":3534.1}\n{\"type\":\"unloaded\"}\n",
+      "model": {
+        "family": "moe",
+        "format_id": "mq3",
+        "id": "qwen36-a3b-mq3",
+        "model_file": "qwen3.6-35b-a3b.mq3"
+      },
+      "model_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq3",
+      "model_present": true,
+      "output": "<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Context:** Python module implementing a fixed-capacity LRU cache.\n   - **Data Structures:** Doubly linked list (head = MRU, tail = LRU) + hash map (key -> node).\n   - **Operations:** `get(key)` moves to head; `put(key, value)` inserts at head, evicts tail if over capacity.\n   - **Constraints:** No thread safety. Answer in two short paragraphs. Under 120 words total. No code.\n   - **Questions to Answer:**\n     1. Why doubly linked list instead of singly?\n     2. Worst-case time complexity of `put` and `get`, and why constant?\n\n2.  **Deconstruct Question 1: Why doubly linked list?**\n   - In an LRU cache, when a key is accessed (`get`) or updated (`put`), the corresponding node must be moved to the head (MRU position).\n  ",
+      "panic": "",
+      "prompt": {
+        "id": "long-lru",
+        "max_tokens": 220,
+        "prompt_file": "coherence_lloyd_long.txt"
+      },
+      "prompt_md5": "f20bbc4f5b88ab5f7b44fe7c7da0e2e3",
+      "prompt_path": "/home/sadara/.hipfire/src/benchmarks/prompts/coherence_lloyd_long.txt",
+      "prompt_present": true,
+      "status": "ok",
+      "wall_s": 11.272
+    }
+  ],
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "daemon": {
+    "md5": "a5366b3795b9adb54555ba1356d69b56",
+    "path": "/home/sadara/.hipfire/src/target/release/examples/daemon"
+  },
+  "date": "2026-06-03T00:44:04.821077+00:00",
+  "models_dir": "/home/sadara/.hipfire/models",
+  "schema": "hipfire.mq3_a3b_coherence.gfx1151.v0"
+}

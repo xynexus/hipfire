@@ -1,0 +1,129 @@
+{
+  "arch": "gfx1151",
+  "branch": "qwen35-native-mtp",
+  "cases": [
+    {
+      "command": [
+        "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire",
+        "--model",
+        "/home/sadara/.hipfire/models/qwen3.5-9b.mq4",
+        "--ref",
+        "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+        "--output",
+        "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/per-seq/qwen3.5-9b.mq4-kvq8-c256__gfx1151__prefill.kldseq",
+        "--kv-mode",
+        "q8",
+        "--scoring-mode",
+        "prefill",
+        "--max-chunks",
+        "256"
+      ],
+      "exit_code": 0,
+      "family": "dense",
+      "format_id": "mq4",
+      "id": "qwen35-9b-mq4",
+      "log_tail": "824/  261888  ( 78.6%, 168 tok/s)   \n  chunk  203/256  scored   206848/  261888  ( 79.0%, 168 tok/s)   \n  chunk  204/256  scored   207872/  261888  ( 79.4%, 168 tok/s)   \n  chunk  205/256  scored   208896/  261888  ( 79.8%, 168 tok/s)   \n  chunk  206/256  scored   209920/  261888  ( 80.2%, 168 tok/s)   \n  chunk  207/256  scored   210944/  261888  ( 80.5%, 168 tok/s)   \n  chunk  208/256  scored   211968/  261888  ( 80.9%, 168 tok/s)   \n  chunk  209/256  scored   212992/  261888  ( 81.3%, 168 tok/s)   \n  chunk  210/256  scored   214016/  261888  ( 81.7%, 168 tok/s)   \n  chunk  211/256  scored   215040/  261888  ( 82.1%, 168 tok/s)   \n  chunk  212/256  scored   216064/  261888  ( 82.5%, 168 tok/s)   \n  chunk  213/256  scored   217088/  261888  ( 82.9%, 168 tok/s)   \n  chunk  214/256  scored   218112/  261888  ( 83.3%, 168 tok/s)   \n  chunk  215/256  scored   219136/  261888  ( 83.7%, 168 tok/s)   \n  chunk  216/256  scored   220160/  261888  ( 84.1%, 168 tok/s)   \n  chunk  217/256  scored   221184/  261888  ( 84.5%, 168 tok/s)   \n  chunk  218/256  scored   222208/  261888  ( 84.8%, 168 tok/s)   \n  chunk  219/256  scored   223232/  261888  ( 85.2%, 168 tok/s)   \n  chunk  220/256  scored   224256/  261888  ( 85.6%, 168 tok/s)   \n  chunk  221/256  scored   225280/  261888  ( 86.0%, 168 tok/s)   \n  chunk  222/256  scored   226304/  261888  ( 86.4%, 168 tok/s)   \n  chunk  223/256  scored   227328/  261888  ( 86.8%, 168 tok/s)   \n  chunk  224/256  scored   228352/  261888  ( 87.2%, 168 tok/s)   \n  chunk  225/256  scored   229376/  261888  ( 87.6%, 168 tok/s)   \n  chunk  226/256  scored   230400/  261888  ( 88.0%, 168 tok/s)   \n  chunk  227/256  scored   231424/  261888  ( 88.4%, 168 tok/s)   \n  chunk  228/256  scored   232448/  261888  ( 88.8%, 168 tok/s)   \n  chunk  229/256  scored   233472/  261888  ( 89.1%, 168 tok/s)   \n  chunk  230/256  scored   234496/  261888  ( 89.5%, 168 tok/s)   \n  chunk  231/256  scored   235520/  261888  ( 89.9%, 168 tok/s)   \n  chunk  232/256  scored   236544/  261888  ( 90.3%, 168 tok/s)   \n  chunk  233/256  scored   237568/  261888  ( 90.7%, 168 tok/s)   \n  chunk  234/256  scored   238592/  261888  ( 91.1%, 168 tok/s)   \n  chunk  235/256  scored   239616/  261888  ( 91.5%, 168 tok/s)   \n  chunk  236/256  scored   240640/  261888  ( 91.9%, 168 tok/s)   \n  chunk  237/256  scored   241664/  261888  ( 92.3%, 168 tok/s)   \n  chunk  238/256  scored   242688/  261888  ( 92.7%, 168 tok/s)   \n  chunk  239/256  scored   243712/  261888  ( 93.1%, 168 tok/s)   \n  chunk  240/256  scored   244736/  261888  ( 93.5%, 168 tok/s)   \n  chunk  241/256  scored   245760/  261888  ( 93.8%, 168 tok/s)   \n  chunk  242/256  scored   246784/  261888  ( 94.2%, 168 tok/s)   \n  chunk  243/256  scored   247808/  261888  ( 94.6%, 168 tok/s)   \n  chunk  244/256  scored   248832/  261888  ( 95.0%, 168 tok/s)   \n  chunk  245/256  scored   249856/  261888  ( 95.4%, 168 tok/s)   \n  chunk  246/256  scored   250880/  261888  ( 95.8%, 168 tok/s)   \n  chunk  247/256  scored   251904/  261888  ( 96.2%, 168 tok/s)   \n  chunk  248/256  scored   252928/  261888  ( 96.6%, 168 tok/s)   \n  chunk  249/256  scored   253952/  261888  ( 97.0%, 168 tok/s)   \n  chunk  250/256  scored   254976/  261888  ( 97.4%, 168 tok/s)   \n  chunk  251/256  scored   256000/  261888  ( 97.8%, 168 tok/s)   \n  chunk  252/256  scored   257024/  261888  ( 98.1%, 168 tok/s)   \n  chunk  253/256  scored   258048/  261888  ( 98.5%, 168 tok/s)   \n  chunk  254/256  scored   259072/  261888  ( 98.9%, 168 tok/s)   \n  chunk  255/256  scored   260096/  261888  ( 99.3%, 168 tok/s)   \n  chunk  256/256  scored   261120/  261888  ( 99.7%, 168 tok/s)   \n  chunk  256/256  scored   261888/  261888  (100.0%, 168 tok/s)   \neval_hipfire: scored 261888 tokens in 1554.3s (168 tok/s)\neval_hipfire: slice-mean KLD = 0.238527  mean NLL = 2.172555  PPL = 8.7807\neval_hipfire: wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/per-seq/qwen3.5-9b.mq4-kvq8-c256__gfx1151__prefill.kldseq\n",
+      "model_file": "qwen3.5-9b.mq4",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq4",
+      "model_present": true,
+      "output": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/per-seq/qwen3.5-9b.mq4-kvq8-c256__gfx1151__prefill.kldseq",
+      "output_size_bytes": 6164,
+      "status": "ok",
+      "variant": "qwen3.5-9b.mq4-kvq8-c256",
+      "wall_s": 1560.098
+    },
+    {
+      "command": [
+        "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire",
+        "--model",
+        "/home/sadara/.hipfire/models/qwen3.5-9b.mq6",
+        "--ref",
+        "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+        "--output",
+        "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/per-seq/qwen3.5-9b.mq6-kvq8-c256__gfx1151__prefill.kldseq",
+        "--kv-mode",
+        "q8",
+        "--scoring-mode",
+        "prefill",
+        "--max-chunks",
+        "256"
+      ],
+      "exit_code": 0,
+      "family": "dense",
+      "format_id": "mq6",
+      "id": "qwen35-9b-mq6",
+      "log_tail": "888  ( 78.2%, 58 tok/s)   \n  chunk  202/256  scored   205824/  261888  ( 78.6%, 58 tok/s)   \n  chunk  203/256  scored   206848/  261888  ( 79.0%, 58 tok/s)   \n  chunk  204/256  scored   207872/  261888  ( 79.4%, 58 tok/s)   \n  chunk  205/256  scored   208896/  261888  ( 79.8%, 58 tok/s)   \n  chunk  206/256  scored   209920/  261888  ( 80.2%, 58 tok/s)   \n  chunk  207/256  scored   210944/  261888  ( 80.5%, 58 tok/s)   \n  chunk  208/256  scored   211968/  261888  ( 80.9%, 58 tok/s)   \n  chunk  209/256  scored   212992/  261888  ( 81.3%, 58 tok/s)   \n  chunk  210/256  scored   214016/  261888  ( 81.7%, 58 tok/s)   \n  chunk  211/256  scored   215040/  261888  ( 82.1%, 58 tok/s)   \n  chunk  212/256  scored   216064/  261888  ( 82.5%, 58 tok/s)   \n  chunk  213/256  scored   217088/  261888  ( 82.9%, 58 tok/s)   \n  chunk  214/256  scored   218112/  261888  ( 83.3%, 58 tok/s)   \n  chunk  215/256  scored   219136/  261888  ( 83.7%, 58 tok/s)   \n  chunk  216/256  scored   220160/  261888  ( 84.1%, 58 tok/s)   \n  chunk  217/256  scored   221184/  261888  ( 84.5%, 58 tok/s)   \n  chunk  218/256  scored   222208/  261888  ( 84.8%, 58 tok/s)   \n  chunk  219/256  scored   223232/  261888  ( 85.2%, 58 tok/s)   \n  chunk  220/256  scored   224256/  261888  ( 85.6%, 58 tok/s)   \n  chunk  221/256  scored   225280/  261888  ( 86.0%, 58 tok/s)   \n  chunk  222/256  scored   226304/  261888  ( 86.4%, 58 tok/s)   \n  chunk  223/256  scored   227328/  261888  ( 86.8%, 58 tok/s)   \n  chunk  224/256  scored   228352/  261888  ( 87.2%, 58 tok/s)   \n  chunk  225/256  scored   229376/  261888  ( 87.6%, 58 tok/s)   \n  chunk  226/256  scored   230400/  261888  ( 88.0%, 58 tok/s)   \n  chunk  227/256  scored   231424/  261888  ( 88.4%, 58 tok/s)   \n  chunk  228/256  scored   232448/  261888  ( 88.8%, 58 tok/s)   \n  chunk  229/256  scored   233472/  261888  ( 89.1%, 58 tok/s)   \n  chunk  230/256  scored   234496/  261888  ( 89.5%, 58 tok/s)   \n  chunk  231/256  scored   235520/  261888  ( 89.9%, 58 tok/s)   \n  chunk  232/256  scored   236544/  261888  ( 90.3%, 58 tok/s)   \n  chunk  233/256  scored   237568/  261888  ( 90.7%, 58 tok/s)   \n  chunk  234/256  scored   238592/  261888  ( 91.1%, 58 tok/s)   \n  chunk  235/256  scored   239616/  261888  ( 91.5%, 58 tok/s)   \n  chunk  236/256  scored   240640/  261888  ( 91.9%, 58 tok/s)   \n  chunk  237/256  scored   241664/  261888  ( 92.3%, 58 tok/s)   \n  chunk  238/256  scored   242688/  261888  ( 92.7%, 58 tok/s)   \n  chunk  239/256  scored   243712/  261888  ( 93.1%, 58 tok/s)   \n  chunk  240/256  scored   244736/  261888  ( 93.5%, 58 tok/s)   \n  chunk  241/256  scored   245760/  261888  ( 93.8%, 58 tok/s)   \n  chunk  242/256  scored   246784/  261888  ( 94.2%, 58 tok/s)   \n  chunk  243/256  scored   247808/  261888  ( 94.6%, 58 tok/s)   \n  chunk  244/256  scored   248832/  261888  ( 95.0%, 58 tok/s)   \n  chunk  245/256  scored   249856/  261888  ( 95.4%, 58 tok/s)   \n  chunk  246/256  scored   250880/  261888  ( 95.8%, 58 tok/s)   \n  chunk  247/256  scored   251904/  261888  ( 96.2%, 58 tok/s)   \n  chunk  248/256  scored   252928/  261888  ( 96.6%, 58 tok/s)   \n  chunk  249/256  scored   253952/  261888  ( 97.0%, 58 tok/s)   \n  chunk  250/256  scored   254976/  261888  ( 97.4%, 58 tok/s)   \n  chunk  251/256  scored   256000/  261888  ( 97.8%, 58 tok/s)   \n  chunk  252/256  scored   257024/  261888  ( 98.1%, 58 tok/s)   \n  chunk  253/256  scored   258048/  261888  ( 98.5%, 58 tok/s)   \n  chunk  254/256  scored   259072/  261888  ( 98.9%, 58 tok/s)   \n  chunk  255/256  scored   260096/  261888  ( 99.3%, 58 tok/s)   \n  chunk  256/256  scored   261120/  261888  ( 99.7%, 58 tok/s)   \n  chunk  256/256  scored   261888/  261888  (100.0%, 58 tok/s)   \neval_hipfire: scored 261888 tokens in 4525.8s (58 tok/s)\neval_hipfire: slice-mean KLD = 0.047336  mean NLL = 2.209830  PPL = 9.1142\neval_hipfire: wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/per-seq/qwen3.5-9b.mq6-kvq8-c256__gfx1151__prefill.kldseq\n",
+      "model_file": "qwen3.5-9b.mq6",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq6",
+      "model_present": true,
+      "output": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/per-seq/qwen3.5-9b.mq6-kvq8-c256__gfx1151__prefill.kldseq",
+      "output_size_bytes": 6164,
+      "status": "ok",
+      "variant": "qwen3.5-9b.mq6-kvq8-c256",
+      "wall_s": 4532.073
+    }
+  ],
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "date": "2026-06-02T17:26:44.208732+00:00",
+  "eval_hipfire": {
+    "md5": "5cb19daea01ca8fac74a5c4db0e7b7ef",
+    "path": "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire"
+  },
+  "models_dir": "/home/sadara/.hipfire/models",
+  "params": {
+    "kv_mode": "q8",
+    "max_chunks": 256,
+    "scoring_mode": "prefill"
+  },
+  "per_seq_dir": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/per-seq",
+  "reduce": {
+    "command": [
+      "python3",
+      "/home/sadara/.hipfire/src/benchmarks/quality-baselines/harness/kld_reduce.py",
+      "--result-dir",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/per-seq",
+      "--out-md",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/result-table.md",
+      "--out-json",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/result-data.json"
+    ],
+    "exit_code": 0,
+    "log_tail": "wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/result-table.md, benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/result-data.json\n| Variant | Arch | Mode | n_chunks | Mean KLD \u00b1 95% CI | p99 KLD | PPL | Notes |\n|---|---|---|---:|---|---:|---:|---|\n| qwen3.5-9b.mq4-kvq8-c256 | gfx1151 | prefill | 256 | 0.2385 (CI 0.2248\u20130.2541) | 17.107 | 8.781 |  |\n| qwen3.5-9b.mq6-kvq8-c256 | gfx1151 | prefill | 256 | 0.0473 (CI 0.0422\u20130.0532) | 7.287 | 9.114 |  |\n\n",
+    "result_json": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/result-data.json",
+    "result_md": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/result-table.md",
+    "status": "ok"
+  },
+  "reduced_rows": [
+    {
+      "arch": "gfx1151",
+      "mean_kld": 0.2385268173708204,
+      "mean_kld_ci_hi": 0.25414274642305723,
+      "mean_kld_ci_lo": 0.2247896364700886,
+      "n_chunks": 256,
+      "notes": "",
+      "p99_kld": 17.106810284798385,
+      "ppl": 8.780692941667168,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b.mq4-kvq8-c256"
+    },
+    {
+      "arch": "gfx1151",
+      "mean_kld": 0.04733647129762349,
+      "mean_kld_ci_hi": 0.05323206435037784,
+      "mean_kld_ci_lo": 0.04222319292759545,
+      "n_chunks": 256,
+      "notes": "",
+      "p99_kld": 7.2866493367523,
+      "ppl": 9.114170200203397,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-9b.mq6-kvq8-c256"
+    }
+  ],
+  "reference": {
+    "path": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+    "sha256": "06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7",
+    "size_bytes": 2480989032
+  },
+  "run_dir": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256",
+  "schema": "hipfire.mq6_kld.gfx1151.v0"
+}

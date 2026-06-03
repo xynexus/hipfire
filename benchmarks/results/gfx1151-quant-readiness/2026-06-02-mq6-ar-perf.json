@@ -1,0 +1,655 @@
+{
+  "arch": "gfx1151",
+  "branch": "qwen35-native-mtp",
+  "cases": [
+    {
+      "family": "dense",
+      "format_id": "mq4",
+      "id": "qwen35-9b-mq4-sheep",
+      "max_tokens": 300,
+      "model_file": "qwen3.5-9b.mq4",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq4",
+      "model_present": true,
+      "prompt": "A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.",
+      "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+      "runs": [
+        {
+          "done": {
+            "decode_tok_s": 43.3,
+            "id": "qwen35-9b-mq4-sheep-run1",
+            "prefill_ms": 155.4,
+            "prefill_tok_s": 231.6,
+            "prefill_tokens": 36,
+            "tok_s": 42.0,
+            "tokens": 213,
+            "ttft_ms": 155.4,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Premise: A farmer has 17 sheep.\n    *   Event: All but 9 die.\n    *   Question: How many are left?\n    *   Constraint: Show brief reasoning then state the final number.\n\n2.  **Analyze the Logic:**\n    *   \"All but X\" means everything except X remains or survives, or in this context, everything except X dies (which is a bit ambiguous). Let's re-read carefully: \"All but 9 die.\"\n    *   Interpretation A: The total number of sheep is $N",
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "wall_s": 6.344
+        },
+        {
+          "done": {
+            "decode_tok_s": 43.4,
+            "id": "qwen35-9b-mq4-sheep-run2",
+            "prefill_ms": 154.4,
+            "prefill_tok_s": 233.2,
+            "prefill_tokens": 36,
+            "tok_s": 42.1,
+            "tokens": 213,
+            "ttft_ms": 154.4,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Premise: A farmer has 17 sheep.\n    *   Event: All but 9 die.\n    *   Question: How many are left?\n    *   Constraint: Show brief reasoning then state the final number.\n\n2.  **Analyze the Logic:**\n    *   \"All but X\" means everything except X remains or survives, or in this context, everything except X dies (which is a bit ambiguous). Let's re-read carefully: \"All but 9 die.\"\n    *   Interpretation A: The total number of sheep is $N",
+          "panic": "",
+          "run": 2,
+          "status": "ok",
+          "wall_s": 6.478
+        },
+        {
+          "done": {
+            "decode_tok_s": 43.4,
+            "id": "qwen35-9b-mq4-sheep-run3",
+            "prefill_ms": 155.4,
+            "prefill_tok_s": 231.7,
+            "prefill_tokens": 36,
+            "tok_s": 42.1,
+            "tokens": 213,
+            "ttft_ms": 155.4,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Premise: A farmer has 17 sheep.\n    *   Event: All but 9 die.\n    *   Question: How many are left?\n    *   Constraint: Show brief reasoning then state the final number.\n\n2.  **Analyze the Logic:**\n    *   \"All but X\" means everything except X remains or survives, or in this context, everything except X dies (which is a bit ambiguous). Let's re-read carefully: \"All but 9 die.\"\n    *   Interpretation A: The total number of sheep is $N",
+          "panic": "",
+          "run": 3,
+          "status": "ok",
+          "wall_s": 6.366
+        }
+      ],
+      "summary": {
+        "median_decode_tok_s": 43.4,
+        "median_prefill_ms": 155.4,
+        "median_prefill_tok_s": 231.7,
+        "median_tok_s": 42.1,
+        "median_tokens": 213.0,
+        "median_ttft_ms": 155.4,
+        "ok_runs": 3,
+        "total_runs": 3
+      }
+    },
+    {
+      "family": "dense",
+      "format_id": "mq6",
+      "id": "qwen35-9b-mq6-sheep",
+      "max_tokens": 300,
+      "model_file": "qwen3.5-9b.mq6",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq6",
+      "model_present": true,
+      "prompt": "A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.",
+      "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+      "runs": [
+        {
+          "done": {
+            "decode_tok_s": 30.6,
+            "id": "qwen35-9b-mq6-sheep-run1",
+            "prefill_ms": 325.5,
+            "prefill_tok_s": 110.6,
+            "prefill_tokens": 36,
+            "tok_s": 25.0,
+            "tokens": 45,
+            "ttft_ms": 325.5,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nIf all but 9 die, it means that 9 sheep survived while the rest perished. Therefore, the number of sheep left is simply the number that did not die.\n\n**9**<|im_end|>",
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "wall_s": 3.456
+        },
+        {
+          "done": {
+            "decode_tok_s": 30.5,
+            "id": "qwen35-9b-mq6-sheep-run2",
+            "prefill_ms": 292.4,
+            "prefill_tok_s": 123.1,
+            "prefill_tokens": 36,
+            "tok_s": 25.5,
+            "tokens": 45,
+            "ttft_ms": 292.4,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nIf all but 9 die, it means that 9 sheep survived while the rest perished. Therefore, the number of sheep left is simply the number that did not die.\n\n**9**<|im_end|>",
+          "panic": "",
+          "run": 2,
+          "status": "ok",
+          "wall_s": 3.239
+        },
+        {
+          "done": {
+            "decode_tok_s": 30.5,
+            "id": "qwen35-9b-mq6-sheep-run3",
+            "prefill_ms": 330.4,
+            "prefill_tok_s": 109.0,
+            "prefill_tokens": 36,
+            "tok_s": 24.9,
+            "tokens": 45,
+            "ttft_ms": 330.4,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nIf all but 9 die, it means that 9 sheep survived while the rest perished. Therefore, the number of sheep left is simply the number that did not die.\n\n**9**<|im_end|>",
+          "panic": "",
+          "run": 3,
+          "status": "ok",
+          "wall_s": 3.291
+        }
+      ],
+      "summary": {
+        "median_decode_tok_s": 30.5,
+        "median_prefill_ms": 325.5,
+        "median_prefill_tok_s": 110.6,
+        "median_tok_s": 25.0,
+        "median_tokens": 45.0,
+        "median_ttft_ms": 325.5,
+        "ok_runs": 3,
+        "total_runs": 3
+      }
+    },
+    {
+      "family": "dense",
+      "format_id": "mq4",
+      "id": "qwen35-27b-mq4-cap",
+      "max_tokens": 80,
+      "model_file": "qwen3.5-27b.mq4",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq4",
+      "model_present": true,
+      "prompt": "What is the capital of France? Answer in one short sentence.",
+      "prompt_md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+      "runs": [
+        {
+          "done": {
+            "decode_tok_s": 14.1,
+            "id": "qwen35-27b-mq4-cap-run1",
+            "prefill_ms": 587.9,
+            "prefill_tok_s": 35.7,
+            "prefill_tokens": 21,
+            "tok_s": 12.8,
+            "tokens": 80,
+            "ttft_ms": 587.9,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"What is the capital of France?\"\n    *   Constraint: \"Answer in one short sentence.\"\n\n2.  **Identify the Answer:**\n    *   The capital of France is Paris.\n\n3.  **Formulate the Sentence:**\n    *   Draft 1",
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "wall_s": 8.747
+        },
+        {
+          "done": {
+            "decode_tok_s": 14.1,
+            "id": "qwen35-27b-mq4-cap-run2",
+            "prefill_ms": 547.7,
+            "prefill_tok_s": 38.3,
+            "prefill_tokens": 21,
+            "tok_s": 12.8,
+            "tokens": 80,
+            "ttft_ms": 547.7,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"What is the capital of France?\"\n    *   Constraint: \"Answer in one short sentence.\"\n\n2.  **Identify the Answer:**\n    *   The capital of France is Paris.\n\n3.  **Formulate the Sentence:**\n    *   Draft 1",
+          "panic": "",
+          "run": 2,
+          "status": "ok",
+          "wall_s": 8.763
+        },
+        {
+          "done": {
+            "decode_tok_s": 14.1,
+            "id": "qwen35-27b-mq4-cap-run3",
+            "prefill_ms": 539.8,
+            "prefill_tok_s": 38.9,
+            "prefill_tokens": 21,
+            "tok_s": 12.8,
+            "tokens": 80,
+            "ttft_ms": 539.8,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"What is the capital of France?\"\n    *   Constraint: \"Answer in one short sentence.\"\n\n2.  **Identify the Answer:**\n    *   The capital of France is Paris.\n\n3.  **Formulate the Sentence:**\n    *   Draft 1",
+          "panic": "",
+          "run": 3,
+          "status": "ok",
+          "wall_s": 8.733
+        }
+      ],
+      "summary": {
+        "median_decode_tok_s": 14.1,
+        "median_prefill_ms": 547.7,
+        "median_prefill_tok_s": 38.3,
+        "median_tok_s": 12.8,
+        "median_tokens": 80.0,
+        "median_ttft_ms": 547.7,
+        "ok_runs": 3,
+        "total_runs": 3
+      }
+    },
+    {
+      "family": "dense",
+      "format_id": "mq6",
+      "id": "qwen35-27b-mq6-cap",
+      "max_tokens": 80,
+      "model_file": "qwen3.5-27b.mq6",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq6",
+      "model_present": true,
+      "prompt": "What is the capital of France? Answer in one short sentence.",
+      "prompt_md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+      "runs": [
+        {
+          "done": {
+            "decode_tok_s": 9.9,
+            "id": "qwen35-27b-mq6-cap-run1",
+            "prefill_ms": 1318.2,
+            "prefill_tok_s": 15.9,
+            "prefill_tokens": 21,
+            "tok_s": 8.5,
+            "tokens": 80,
+            "ttft_ms": 1318.2,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"What is the capital of France?\"\n    *   Constraint: \"Answer in one short sentence.\"\n\n2.  **Identify the Fact:**\n    *   The capital of France is Paris.\n\n3.  **Draft the Answer:**\n    *   Draft 1:",
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "wall_s": 12.721
+        },
+        {
+          "done": {
+            "decode_tok_s": 9.9,
+            "id": "qwen35-27b-mq6-cap-run2",
+            "prefill_ms": 1304.7,
+            "prefill_tok_s": 16.1,
+            "prefill_tokens": 21,
+            "tok_s": 8.5,
+            "tokens": 80,
+            "ttft_ms": 1304.7,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"What is the capital of France?\"\n    *   Constraint: \"Answer in one short sentence.\"\n\n2.  **Identify the Fact:**\n    *   The capital of France is Paris.\n\n3.  **Draft the Answer:**\n    *   Draft 1:",
+          "panic": "",
+          "run": 2,
+          "status": "ok",
+          "wall_s": 13.643
+        },
+        {
+          "done": {
+            "decode_tok_s": 9.9,
+            "id": "qwen35-27b-mq6-cap-run3",
+            "prefill_ms": 1319.8,
+            "prefill_tok_s": 15.9,
+            "prefill_tokens": 21,
+            "tok_s": 8.5,
+            "tokens": 80,
+            "ttft_ms": 1319.8,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   Question: \"What is the capital of France?\"\n    *   Constraint: \"Answer in one short sentence.\"\n\n2.  **Identify the Fact:**\n    *   The capital of France is Paris.\n\n3.  **Draft the Answer:**\n    *   Draft 1:",
+          "panic": "",
+          "run": 3,
+          "status": "ok",
+          "wall_s": 12.786
+        }
+      ],
+      "summary": {
+        "median_decode_tok_s": 9.9,
+        "median_prefill_ms": 1318.2,
+        "median_prefill_tok_s": 15.9,
+        "median_tok_s": 8.5,
+        "median_tokens": 80.0,
+        "median_ttft_ms": 1318.2,
+        "ok_runs": 3,
+        "total_runs": 3
+      }
+    },
+    {
+      "family": "moe",
+      "format_id": "mq4",
+      "id": "qwen35-a3b-mq4-sheep",
+      "max_tokens": 500,
+      "model_file": "qwen3.5-35b-a3b.mq4",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq4",
+      "model_present": true,
+      "prompt": "A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.",
+      "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+      "runs": [
+        {
+          "done": {
+            "decode_tok_s": 54.3,
+            "id": "qwen35-a3b-mq4-sheep-run1",
+            "prefill_ms": 644.6,
+            "prefill_tok_s": 55.9,
+            "prefill_tokens": 36,
+            "tok_s": 31.1,
+            "tokens": 47,
+            "ttft_ms": 644.6,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nThe phrase \"all but 9\" means that every sheep died except for 9. Therefore, the number of sheep remaining is simply the 9 that did not die.\n\n**Final Answer:** 9<|im_end|>",
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "wall_s": 5.003
+        },
+        {
+          "done": {
+            "decode_tok_s": 54.3,
+            "id": "qwen35-a3b-mq4-sheep-run2",
+            "prefill_ms": 643.8,
+            "prefill_tok_s": 55.9,
+            "prefill_tokens": 36,
+            "tok_s": 31.2,
+            "tokens": 47,
+            "ttft_ms": 643.8,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nThe phrase \"all but 9\" means that every sheep died except for 9. Therefore, the number of sheep remaining is simply the 9 that did not die.\n\n**Final Answer:** 9<|im_end|>",
+          "panic": "",
+          "run": 2,
+          "status": "ok",
+          "wall_s": 4.919
+        },
+        {
+          "done": {
+            "decode_tok_s": 54.2,
+            "id": "qwen35-a3b-mq4-sheep-run3",
+            "prefill_ms": 645.7,
+            "prefill_tok_s": 55.8,
+            "prefill_tokens": 36,
+            "tok_s": 31.1,
+            "tokens": 47,
+            "ttft_ms": 645.7,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nThe phrase \"all but 9\" means that every sheep died except for 9. Therefore, the number of sheep remaining is simply the 9 that did not die.\n\n**Final Answer:** 9<|im_end|>",
+          "panic": "",
+          "run": 3,
+          "status": "ok",
+          "wall_s": 4.885
+        }
+      ],
+      "summary": {
+        "median_decode_tok_s": 54.3,
+        "median_prefill_ms": 644.6,
+        "median_prefill_tok_s": 55.9,
+        "median_tok_s": 31.1,
+        "median_tokens": 47.0,
+        "median_ttft_ms": 644.6,
+        "ok_runs": 3,
+        "total_runs": 3
+      }
+    },
+    {
+      "family": "moe",
+      "format_id": "mq6",
+      "id": "qwen35-a3b-mq6-sheep",
+      "max_tokens": 500,
+      "model_file": "qwen3.5-35b-a3b.mq6",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq6",
+      "model_present": true,
+      "prompt": "A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.",
+      "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+      "runs": [
+        {
+          "done": {
+            "decode_tok_s": 51.2,
+            "id": "qwen35-a3b-mq6-sheep-run1",
+            "prefill_ms": 158.5,
+            "prefill_tok_s": 227.1,
+            "prefill_tokens": 36,
+            "tok_s": 44.1,
+            "tokens": 50,
+            "ttft_ms": 158.5,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nThe phrase \"all but 9 die\" means that every sheep died except for 9 of them. Therefore, the number of sheep remaining is exactly those 9 that did not die.\n\n**Final Answer:** 9<|im_end|>",
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "wall_s": 5.165
+        },
+        {
+          "done": {
+            "decode_tok_s": 51.3,
+            "id": "qwen35-a3b-mq6-sheep-run2",
+            "prefill_ms": 159.5,
+            "prefill_tok_s": 225.7,
+            "prefill_tokens": 36,
+            "tok_s": 44.1,
+            "tokens": 50,
+            "ttft_ms": 159.5,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nThe phrase \"all but 9 die\" means that every sheep died except for 9 of them. Therefore, the number of sheep remaining is exactly those 9 that did not die.\n\n**Final Answer:** 9<|im_end|>",
+          "panic": "",
+          "run": 2,
+          "status": "ok",
+          "wall_s": 5.122
+        },
+        {
+          "done": {
+            "decode_tok_s": 51.3,
+            "id": "qwen35-a3b-mq6-sheep-run3",
+            "prefill_ms": 159.4,
+            "prefill_tok_s": 225.9,
+            "prefill_tokens": 36,
+            "tok_s": 44.1,
+            "tokens": 50,
+            "ttft_ms": 159.4,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\n\n</think>\n\nThe phrase \"all but 9 die\" means that every sheep died except for 9 of them. Therefore, the number of sheep remaining is exactly those 9 that did not die.\n\n**Final Answer:** 9<|im_end|>",
+          "panic": "",
+          "run": 3,
+          "status": "ok",
+          "wall_s": 5.121
+        }
+      ],
+      "summary": {
+        "median_decode_tok_s": 51.3,
+        "median_prefill_ms": 159.4,
+        "median_prefill_tok_s": 225.9,
+        "median_tok_s": 44.1,
+        "median_tokens": 50.0,
+        "median_ttft_ms": 159.4,
+        "ok_runs": 3,
+        "total_runs": 3
+      }
+    },
+    {
+      "family": "moe",
+      "format_id": "mq4",
+      "id": "qwen36-a3b-mq4-sheep",
+      "max_tokens": 800,
+      "model_file": "qwen3.6-35b-a3b.mq4",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq4",
+      "model_present": true,
+      "prompt": "A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.",
+      "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+      "runs": [
+        {
+          "done": {
+            "decode_tok_s": 53.1,
+            "id": "qwen36-a3b-mq4-sheep-run1",
+            "prefill_ms": 643.9,
+            "prefill_tok_s": 55.9,
+            "prefill_tokens": 36,
+            "tok_s": 50.8,
+            "tokens": 756,
+            "ttft_ms": 643.9,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - Statement: \"A farmer has 17 sheep. All but 9 die.\"\n   - Question: \"How many are left?\"\n   - Requirement: \"Show brief reasoning then state the final number.\"\n\n2.  **Identify Key Phrase/Trick:**\n   - The phrase \"All but 9 die\" is a classic riddle/trick question.\n   - \"All but X\" means everything except X happens to the subject. So, if all but 9 die, it means 9 survive (are left alive).\n\n3.  **Calculate/Reason:**\n   - Total sheep ",
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "wall_s": 18.254
+        },
+        {
+          "done": {
+            "decode_tok_s": 53.1,
+            "id": "qwen36-a3b-mq4-sheep-run2",
+            "prefill_ms": 645.8,
+            "prefill_tok_s": 55.7,
+            "prefill_tokens": 36,
+            "tok_s": 50.8,
+            "tokens": 756,
+            "ttft_ms": 645.8,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - Statement: \"A farmer has 17 sheep. All but 9 die.\"\n   - Question: \"How many are left?\"\n   - Requirement: \"Show brief reasoning then state the final number.\"\n\n2.  **Identify Key Phrase/Trick:**\n   - The phrase \"All but 9 die\" is a classic riddle/trick question.\n   - \"All but X\" means everything except X happens to the subject. So, if all but 9 die, it means 9 survive (are left alive).\n\n3.  **Calculate/Reason:**\n   - Total sheep ",
+          "panic": "",
+          "run": 2,
+          "status": "ok",
+          "wall_s": 18.405
+        },
+        {
+          "done": {
+            "decode_tok_s": 53.0,
+            "id": "qwen36-a3b-mq4-sheep-run3",
+            "prefill_ms": 646.0,
+            "prefill_tok_s": 55.7,
+            "prefill_tokens": 36,
+            "tok_s": 50.7,
+            "tokens": 756,
+            "ttft_ms": 646.0,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - Statement: \"A farmer has 17 sheep. All but 9 die.\"\n   - Question: \"How many are left?\"\n   - Requirement: \"Show brief reasoning then state the final number.\"\n\n2.  **Identify Key Phrase/Trick:**\n   - The phrase \"All but 9 die\" is a classic riddle/trick question.\n   - \"All but X\" means everything except X happens to the subject. So, if all but 9 die, it means 9 survive (are left alive).\n\n3.  **Calculate/Reason:**\n   - Total sheep ",
+          "panic": "",
+          "run": 3,
+          "status": "ok",
+          "wall_s": 18.424
+        }
+      ],
+      "summary": {
+        "median_decode_tok_s": 53.1,
+        "median_prefill_ms": 645.8,
+        "median_prefill_tok_s": 55.7,
+        "median_tok_s": 50.8,
+        "median_tokens": 756.0,
+        "median_ttft_ms": 645.8,
+        "ok_runs": 3,
+        "total_runs": 3
+      }
+    },
+    {
+      "family": "moe",
+      "format_id": "mq6",
+      "id": "qwen36-a3b-mq6-sheep",
+      "max_tokens": 800,
+      "model_file": "qwen3.6-35b-a3b.mq6",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq6",
+      "model_present": true,
+      "prompt": "A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.",
+      "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+      "runs": [
+        {
+          "done": {
+            "decode_tok_s": 50.3,
+            "id": "qwen36-a3b-mq6-sheep-run1",
+            "prefill_ms": 156.2,
+            "prefill_tok_s": 230.5,
+            "prefill_tokens": 36,
+            "tok_s": 49.2,
+            "tokens": 349,
+            "ttft_ms": 156.2,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nHere's a thinking process:\n\n1.  **Analyze the User Input:**\n   - Statement: \"A farmer has 17 sheep. All but 9 die. How many are left?\"\n   - Request: \"Show brief reasoning then state the final number.\"\n\n2.  **Identify Key Phrase/Trick:**\n   - The phrase \"All but 9 die\" is a classic riddle/trick question.\n   - \"All but X\" means everything except X dies, so X survives.\n   - Therefore, if all but 9 die, then 9 are left alive.\n\n3.  **Formulate Reasoning (Brief):**\n   - The phrase \"all but 9 d",
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "wall_s": 11.253
+        },
+        {
+          "done": {
+            "decode_tok_s": 50.4,
+            "id": "qwen36-a3b-mq6-sheep-run2",
+            "prefill_ms": 156.7,
+            "prefill_tok_s": 229.8,
+            "prefill_tokens": 36,
+            "tok_s": 49.3,
+            "tokens": 349,
+            "ttft_ms": 156.7,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nHere's a thinking process:\n\n1.  **Analyze the User Input:**\n   - Statement: \"A farmer has 17 sheep. All but 9 die. How many are left?\"\n   - Request: \"Show brief reasoning then state the final number.\"\n\n2.  **Identify Key Phrase/Trick:**\n   - The phrase \"All but 9 die\" is a classic riddle/trick question.\n   - \"All but X\" means everything except X dies, so X survives.\n   - Therefore, if all but 9 die, then 9 are left alive.\n\n3.  **Formulate Reasoning (Brief):**\n   - The phrase \"all but 9 d",
+          "panic": "",
+          "run": 2,
+          "status": "ok",
+          "wall_s": 11.166
+        },
+        {
+          "done": {
+            "decode_tok_s": 50.4,
+            "id": "qwen36-a3b-mq6-sheep-run3",
+            "prefill_ms": 156.7,
+            "prefill_tok_s": 229.7,
+            "prefill_tokens": 36,
+            "tok_s": 49.3,
+            "tokens": 349,
+            "ttft_ms": 156.7,
+            "type": "done"
+          },
+          "exit_code": 0,
+          "output_prefix": "<think>\nHere's a thinking process:\n\n1.  **Analyze the User Input:**\n   - Statement: \"A farmer has 17 sheep. All but 9 die. How many are left?\"\n   - Request: \"Show brief reasoning then state the final number.\"\n\n2.  **Identify Key Phrase/Trick:**\n   - The phrase \"All but 9 die\" is a classic riddle/trick question.\n   - \"All but X\" means everything except X dies, so X survives.\n   - Therefore, if all but 9 die, then 9 are left alive.\n\n3.  **Formulate Reasoning (Brief):**\n   - The phrase \"all but 9 d",
+          "panic": "",
+          "run": 3,
+          "status": "ok",
+          "wall_s": 11.23
+        }
+      ],
+      "summary": {
+        "median_decode_tok_s": 50.4,
+        "median_prefill_ms": 156.7,
+        "median_prefill_tok_s": 229.8,
+        "median_tok_s": 49.3,
+        "median_tokens": 349.0,
+        "median_ttft_ms": 156.7,
+        "ok_runs": 3,
+        "total_runs": 3
+      }
+    }
+  ],
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "daemon": {
+    "md5": "110cdfdbb1e4cbf1bc4d90d7c27b7386",
+    "path": "/home/sadara/.hipfire/src/target/release/examples/daemon"
+  },
+  "date": "2026-06-03T11:19:57.734150+00:00",
+  "models_dir": "/home/sadara/.hipfire/models",
+  "runs_per_case": 3,
+  "schema": "hipfire.mq6_ar_perf.gfx1151.v0"
+}

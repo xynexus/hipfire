@@ -1,0 +1,91 @@
+{
+  "arch": "gfx1151",
+  "branch": "qwen35-native-mtp",
+  "cases": [
+    {
+      "command": [
+        "/home/sadara/.hipfire/src/target/release/examples/perplexity",
+        "/home/sadara/.hipfire/models/qwen3.5-9b.mq4",
+        "/home/sadara/.hipfire/src/benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt",
+        "--ctx",
+        "2048",
+        "--warmup",
+        "8",
+        "--offset",
+        "0",
+        "--kv-mode",
+        "q8"
+      ],
+      "exit_code": 0,
+      "family": "dense",
+      "format_id": "mq4",
+      "id": "qwen35-9b-mq4",
+      "log_tail": "ghput=6.79 GiB/s (5.05/5.05 GiB)\n  loading layer 7/32 (FullAttention)...\n  load progress: layer 8/32 elapsed=0.74s throughput=6.79 GiB/s (5.05/5.05 GiB)\n  loading layer 8/32 (LinearAttention)...\n  load progress: layer 9/32 elapsed=0.74s throughput=6.79 GiB/s (5.05/5.05 GiB)\n  loading layer 9/32 (LinearAttention)...\n  load progress: layer 10/32 elapsed=0.74s throughput=6.79 GiB/s (5.05/5.05 GiB)\n  loading layer 10/32 (LinearAttention)...\n  load progress: layer 11/32 elapsed=0.74s throughput=6.79 GiB/s (5.05/5.05 GiB)\n  loading layer 11/32 (FullAttention)...\n  load progress: layer 12/32 elapsed=0.74s throughput=6.78 GiB/s (5.05/5.05 GiB)\n  loading layer 12/32 (LinearAttention)...\n  load progress: layer 13/32 elapsed=0.75s throughput=6.78 GiB/s (5.05/5.05 GiB)\n  loading layer 13/32 (LinearAttention)...\n  load progress: layer 14/32 elapsed=0.75s throughput=6.78 GiB/s (5.05/5.05 GiB)\n  loading layer 14/32 (LinearAttention)...\n  load progress: layer 15/32 elapsed=0.75s throughput=6.78 GiB/s (5.05/5.05 GiB)\n  loading layer 15/32 (FullAttention)...\n  load progress: layer 16/32 elapsed=0.75s throughput=6.78 GiB/s (5.05/5.05 GiB)\n  loading layer 16/32 (LinearAttention)...\n  load progress: layer 17/32 elapsed=0.75s throughput=6.78 GiB/s (5.05/5.05 GiB)\n  loading layer 17/32 (LinearAttention)...\n  load progress: layer 18/32 elapsed=0.75s throughput=6.78 GiB/s (5.05/5.05 GiB)\n  loading layer 18/32 (LinearAttention)...\n  load progress: layer 19/32 elapsed=0.75s throughput=6.78 GiB/s (5.05/5.05 GiB)\n  loading layer 19/32 (FullAttention)...\n  load progress: layer 20/32 elapsed=0.75s throughput=6.77 GiB/s (5.05/5.05 GiB)\n  loading layer 20/32 (LinearAttention)...\n  load progress: layer 21/32 elapsed=0.75s throughput=6.77 GiB/s (5.05/5.05 GiB)\n  loading layer 21/32 (LinearAttention)...\n  load progress: layer 22/32 elapsed=0.75s throughput=6.77 GiB/s (5.05/5.05 GiB)\n  loading layer 22/32 (LinearAttention)...\n  load progress: layer 23/32 elapsed=0.75s throughput=6.77 GiB/s (5.05/5.05 GiB)\n  loading layer 23/32 (FullAttention)...\n  load progress: layer 24/32 elapsed=0.75s throughput=6.77 GiB/s (5.05/5.05 GiB)\n  loading layer 24/32 (LinearAttention)...\n  load progress: layer 25/32 elapsed=0.75s throughput=6.77 GiB/s (5.05/5.05 GiB)\n  loading layer 25/32 (LinearAttention)...\n  load progress: layer 26/32 elapsed=0.75s throughput=6.77 GiB/s (5.05/5.05 GiB)\n  loading layer 26/32 (LinearAttention)...\n  load progress: layer 27/32 elapsed=0.75s throughput=6.77 GiB/s (5.05/5.05 GiB)\n  loading layer 27/32 (FullAttention)...\n  load progress: layer 28/32 elapsed=0.75s throughput=6.77 GiB/s (5.05/5.05 GiB)\n  loading layer 28/32 (LinearAttention)...\n  load progress: layer 29/32 elapsed=0.75s throughput=6.77 GiB/s (5.05/5.05 GiB)\n  loading layer 29/32 (LinearAttention)...\n  load progress: layer 30/32 elapsed=0.75s throughput=6.76 GiB/s (5.05/5.05 GiB)\n  loading layer 30/32 (LinearAttention)...\n  load progress: layer 31/32 elapsed=0.75s throughput=6.76 GiB/s (5.05/5.05 GiB)\n  loading layer 31/32 (FullAttention)...\n  load progress: layer 32/32 elapsed=0.75s throughput=6.76 GiB/s (5.05/5.05 GiB)\n  weights loaded: elapsed=0.75s throughput=6.76 GiB/s payload=5.05 GiB streamed=5.05 GiB\nKV mode: q8\n  pos=    8 scored=    1 nll/tok=4.0606 ppl=58.011 (4.9 tok/s)\n  pos=  263 scored=  256 nll/tok=2.2675 ppl=9.655 (40.9 tok/s)\n  pos=  519 scored=  512 nll/tok=2.2496 ppl=9.484 (41.2 tok/s)\n  pos=  775 scored=  768 nll/tok=2.3597 ppl=10.588 (41.4 tok/s)\n  pos= 1031 scored= 1024 nll/tok=2.4627 ppl=11.736 (41.4 tok/s)\n  pos= 1287 scored= 1280 nll/tok=2.5059 ppl=12.255 (41.4 tok/s)\n  pos= 1543 scored= 1536 nll/tok=2.5276 ppl=12.524 (41.4 tok/s)\n  pos= 1799 scored= 1792 nll/tok=2.5591 ppl=12.924 (41.4 tok/s)\n\nModel:    /home/sadara/.hipfire/models/qwen3.5-9b.mq4\nCorpus:   /home/sadara/.hipfire/src/benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt\nTokens:   offset=0 ctx=2048 warmup=8\nScored:   2039\nNLL/tok:  2.4905529915\nPPL:      12.0679\nElapsed:  49.2s (41.4 tok/s)\n",
+      "model_file": "qwen3.5-9b.mq4",
+      "model_md5": "329c056077911ffa72b099d1b7e41911",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq4",
+      "model_present": true,
+      "result": {
+        "elapsed_s": 49.2,
+        "nll_tok": 2.4905529915,
+        "ppl": 12.0679,
+        "scored": 2039,
+        "scored_tok_s": 41.4
+      },
+      "status": "ok",
+      "wall_s": 50.443
+    },
+    {
+      "command": [
+        "/home/sadara/.hipfire/src/target/release/examples/perplexity",
+        "/home/sadara/.hipfire/models/qwen3.5-9b.mq3",
+        "/home/sadara/.hipfire/src/benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt",
+        "--ctx",
+        "2048",
+        "--warmup",
+        "8",
+        "--offset",
+        "0",
+        "--kv-mode",
+        "q8"
+      ],
+      "exit_code": 0,
+      "family": "dense",
+      "format_id": "mq3",
+      "id": "qwen35-9b-mq3",
+      "log_tail": "ut=6.59 GiB/s (4.10/4.10 GiB)\n  loading layer 7/32 (FullAttention)...\n  load progress: layer 8/32 elapsed=0.62s throughput=6.59 GiB/s (4.10/4.10 GiB)\n  loading layer 8/32 (LinearAttention)...\n  load progress: layer 9/32 elapsed=0.62s throughput=6.59 GiB/s (4.10/4.10 GiB)\n  loading layer 9/32 (LinearAttention)...\n  load progress: layer 10/32 elapsed=0.62s throughput=6.59 GiB/s (4.10/4.10 GiB)\n  loading layer 10/32 (LinearAttention)...\n  load progress: layer 11/32 elapsed=0.62s throughput=6.59 GiB/s (4.10/4.10 GiB)\n  loading layer 11/32 (FullAttention)...\n  load progress: layer 12/32 elapsed=0.62s throughput=6.59 GiB/s (4.10/4.10 GiB)\n  loading layer 12/32 (LinearAttention)...\n  load progress: layer 13/32 elapsed=0.62s throughput=6.58 GiB/s (4.10/4.10 GiB)\n  loading layer 13/32 (LinearAttention)...\n  load progress: layer 14/32 elapsed=0.62s throughput=6.58 GiB/s (4.10/4.10 GiB)\n  loading layer 14/32 (LinearAttention)...\n  load progress: layer 15/32 elapsed=0.62s throughput=6.58 GiB/s (4.10/4.10 GiB)\n  loading layer 15/32 (FullAttention)...\n  load progress: layer 16/32 elapsed=0.62s throughput=6.58 GiB/s (4.10/4.10 GiB)\n  loading layer 16/32 (LinearAttention)...\n  load progress: layer 17/32 elapsed=0.62s throughput=6.58 GiB/s (4.10/4.10 GiB)\n  loading layer 17/32 (LinearAttention)...\n  load progress: layer 18/32 elapsed=0.62s throughput=6.58 GiB/s (4.10/4.10 GiB)\n  loading layer 18/32 (LinearAttention)...\n  load progress: layer 19/32 elapsed=0.62s throughput=6.57 GiB/s (4.10/4.10 GiB)\n  loading layer 19/32 (FullAttention)...\n  load progress: layer 20/32 elapsed=0.62s throughput=6.57 GiB/s (4.10/4.10 GiB)\n  loading layer 20/32 (LinearAttention)...\n  load progress: layer 21/32 elapsed=0.62s throughput=6.57 GiB/s (4.10/4.10 GiB)\n  loading layer 21/32 (LinearAttention)...\n  load progress: layer 22/32 elapsed=0.62s throughput=6.57 GiB/s (4.10/4.10 GiB)\n  loading layer 22/32 (LinearAttention)...\n  load progress: layer 23/32 elapsed=0.62s throughput=6.57 GiB/s (4.10/4.10 GiB)\n  loading layer 23/32 (FullAttention)...\n  load progress: layer 24/32 elapsed=0.62s throughput=6.57 GiB/s (4.10/4.10 GiB)\n  loading layer 24/32 (LinearAttention)...\n  load progress: layer 25/32 elapsed=0.62s throughput=6.57 GiB/s (4.10/4.10 GiB)\n  loading layer 25/32 (LinearAttention)...\n  load progress: layer 26/32 elapsed=0.62s throughput=6.57 GiB/s (4.10/4.10 GiB)\n  loading layer 26/32 (LinearAttention)...\n  load progress: layer 27/32 elapsed=0.62s throughput=6.56 GiB/s (4.10/4.10 GiB)\n  loading layer 27/32 (FullAttention)...\n  load progress: layer 28/32 elapsed=0.62s throughput=6.56 GiB/s (4.10/4.10 GiB)\n  loading layer 28/32 (LinearAttention)...\n  load progress: layer 29/32 elapsed=0.63s throughput=6.56 GiB/s (4.10/4.10 GiB)\n  loading layer 29/32 (LinearAttention)...\n  load progress: layer 30/32 elapsed=0.63s throughput=6.56 GiB/s (4.10/4.10 GiB)\n  loading layer 30/32 (LinearAttention)...\n  load progress: layer 31/32 elapsed=0.63s throughput=6.56 GiB/s (4.10/4.10 GiB)\n  loading layer 31/32 (FullAttention)...\n  load progress: layer 32/32 elapsed=0.63s throughput=6.56 GiB/s (4.10/4.10 GiB)\n  weights loaded: elapsed=0.63s throughput=6.56 GiB/s payload=4.10 GiB streamed=4.10 GiB\nKV mode: q8\n  pos=    8 scored=    1 nll/tok=6.0606 ppl=428.614 (6.0 tok/s)\n  pos=  263 scored=  256 nll/tok=2.7821 ppl=16.153 (49.2 tok/s)\n  pos=  519 scored=  512 nll/tok=2.6823 ppl=14.619 (49.6 tok/s)\n  pos=  775 scored=  768 nll/tok=2.7219 ppl=15.210 (49.8 tok/s)\n  pos= 1031 scored= 1024 nll/tok=2.8078 ppl=16.574 (49.8 tok/s)\n  pos= 1287 scored= 1280 nll/tok=2.8664 ppl=17.574 (49.8 tok/s)\n  pos= 1543 scored= 1536 nll/tok=2.9219 ppl=18.577 (49.8 tok/s)\n  pos= 1799 scored= 1792 nll/tok=2.9534 ppl=19.171 (49.8 tok/s)\n\nModel:    /home/sadara/.hipfire/models/qwen3.5-9b.mq3\nCorpus:   /home/sadara/.hipfire/src/benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt\nTokens:   offset=0 ctx=2048 warmup=8\nScored:   2039\nNLL/tok:  2.8679540266\nPPL:      17.6010\nElapsed:  41.0s (49.8 tok/s)\n",
+      "model_file": "qwen3.5-9b.mq3",
+      "model_md5": "dfbd8eb453bb9fe584855522a7237e2a",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq3",
+      "model_present": true,
+      "result": {
+        "elapsed_s": 41.0,
+        "nll_tok": 2.8679540266,
+        "ppl": 17.601,
+        "scored": 2039,
+        "scored_tok_s": 49.8
+      },
+      "status": "ok",
+      "wall_s": 41.993
+    }
+  ],
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "corpus": {
+    "md5": "83b0205a304bf4e52172ecdb05f2e895",
+    "path": "/home/sadara/.hipfire/src/benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt",
+    "size_bytes": 10506724
+  },
+  "date": "2026-06-02T19:25:52.635983+00:00",
+  "models_dir": "/home/sadara/.hipfire/models",
+  "params": {
+    "ctx": 2048,
+    "kv_mode": "q8",
+    "offset": 0,
+    "warmup": 8
+  },
+  "perplexity": {
+    "md5": "face431a97ba78d6f34ce55cb8d81b18",
+    "path": "/home/sadara/.hipfire/src/target/release/examples/perplexity"
+  },
+  "schema": "hipfire.quant_ppl.gfx1151.v0"
+}

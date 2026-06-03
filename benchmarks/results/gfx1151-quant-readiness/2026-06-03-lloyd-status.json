@@ -1,0 +1,596 @@
+{
+  "arch": "gfx1151",
+  "artifact_inventory": {
+    "formats": {
+      "mq3-lloyd": {
+        "a3b_artifact_present": false,
+        "artifact_count": 2,
+        "artifacts": [
+          {
+            "name": "qwen3.5-9b.mq3-lloyd",
+            "path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq3-lloyd",
+            "size_bytes": 4568261632
+          },
+          {
+            "name": "qwen3.5-9b-lloyd-mq3.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-lloyd-mq3.hfq",
+            "size_bytes": 4568261632
+          }
+        ],
+        "dense_27b_artifact_present": false,
+        "dense_4b_artifact_present": false,
+        "dense_9b_artifact_present": true,
+        "only_9b_artifact_present": true
+      },
+      "mq4-lloyd": {
+        "a3b_artifact_present": false,
+        "artifact_count": 2,
+        "artifacts": [
+          {
+            "name": "qwen3.5-9b.mq4-lloyd",
+            "path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq4-lloyd",
+            "size_bytes": 6056190976
+          },
+          {
+            "name": "qwen3.5-9b-lloyd-mq4.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-lloyd-mq4.hfq",
+            "size_bytes": 6056190976
+          }
+        ],
+        "dense_27b_artifact_present": false,
+        "dense_4b_artifact_present": false,
+        "dense_9b_artifact_present": true,
+        "only_9b_artifact_present": true
+      }
+    },
+    "searched_roots": [
+      {
+        "exists": true,
+        "root": "/home/sadara/Models"
+      },
+      {
+        "exists": true,
+        "root": "/home/sadara/.hipfire/models"
+      }
+    ]
+  },
+  "branch": "qwen35-native-mtp",
+  "captured_at_utc": "2026-06-03T10:30:21Z",
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "formats": {
+    "mq3-lloyd": {
+      "artifact_provenance": {
+        "artifact_count": 1,
+        "artifacts": [
+          {
+            "hashes": {
+              "md5": "d540c7b7c66d0420c8e6ae5e88a3f0ec",
+              "sha256": "b9c0f3970af064f12b078b2c2e2c4ef34e2275f7ad592eccbae223bbe3ce9bdc"
+            },
+            "name": "qwen3.5-9b-lloyd-mq3.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-lloyd-mq3.hfq",
+            "size_bytes": 4568261632
+          }
+        ],
+        "canonical_9b_artifact_present": true,
+        "non_9b_artifact_present": false,
+        "status": "candidate-research-gated"
+      },
+      "blockers": [
+        "current 9B MQ3-Lloyd KLD is 2.34x MQ4 control",
+        "only the 9B MQ3-Lloyd artifact exists; 4B, 27B, and A3B are absent",
+        "live local scan also found only 9B MQ3-Lloyd artifacts",
+        "historical MQ3-Lloyd KLD still lagged MQ4",
+        "no fresh-process gfx1151 perf baseline exists",
+        "origin/master has MQ3-Lloyd-relevant commits missing from HEAD; reconcile and rerun evidence"
+      ],
+      "coherence": {
+        "expected_tokens_present": true,
+        "forbidden_tokens_present": [],
+        "has_row": true,
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-coherence-full-after-mq3-lloyd.md",
+        "qualitatively_clean": true
+      },
+      "current_kld": {
+        "candidate": {
+          "arch": "gfx1151",
+          "mean_kld": 0.5532971723659246,
+          "n_chunks": 20,
+          "p99_kld": 20.228332021089322,
+          "ppl": 9.642550366500801,
+          "scoring_mode": "prefill",
+          "variant": "qwen3.5-9b.mq3-lloyd-kvq8-c20"
+        },
+        "candidate_beats_control": false,
+        "candidate_to_control_mean_kld_ratio": 2.3406582043287982,
+        "control": {
+          "arch": "gfx1151",
+          "mean_kld": 0.23638529168533035,
+          "n_chunks": 20,
+          "p99_kld": 17.16138437962391,
+          "ppl": 9.047422176078824,
+          "scoring_mode": "prefill",
+          "variant": "qwen3.5-9b.mq4-kvq8-c20"
+        },
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-lloyd-9b-kld.json"
+      },
+      "decision": "keep MQ3-Lloyd research-gated; coherent 9B smoke is not enough because current BF16-referenced KLD loses to MQ4",
+      "gates": {
+        "canonical_9b_artifact_present": true,
+        "coherence_9b_clean": true,
+        "current_kld_beats_mq4": false,
+        "current_kld_finite": true,
+        "current_kld_loses_to_mq4": true,
+        "current_kld_present": true,
+        "historical_beats_mq4": false,
+        "historical_beats_mq6": false,
+        "historical_beats_uniform_mq3": true,
+        "non_9b_artifact_present": false,
+        "origin_refresh_required": true,
+        "perf_evidence_present": false
+      },
+      "historical_kld": {
+        "beats_mq4": false,
+        "beats_mq6": false,
+        "beats_uniform_mq3": true,
+        "candidate": {
+          "arch": "gfx1100",
+          "mean_kld": 1.6912579025637016,
+          "n_chunks": 1175,
+          "p99_kld": 17.978824919442722,
+          "ppl": 33.98060386941617,
+          "scoring_mode": "per-token",
+          "variant": "qwen3.5-9b.mq3-lloyd"
+        },
+        "mq3_control": {
+          "arch": "gfx1100",
+          "mean_kld": 2.6221202755381414,
+          "n_chunks": 1175,
+          "p99_kld": 17.36304468894259,
+          "ppl": 85.24597716355194,
+          "scoring_mode": "per-token",
+          "variant": "qwen3.5-9b.mq3"
+        },
+        "mq4_control": {
+          "arch": "gfx1100",
+          "mean_kld": 0.876236709593134,
+          "n_chunks": 1175,
+          "p99_kld": 19.99166355343127,
+          "ppl": null,
+          "scoring_mode": "per-token",
+          "variant": "qwen3.5-9b.mq4"
+        },
+        "mq6_control": {
+          "arch": "gfx1100",
+          "mean_kld": 0.6253968792839991,
+          "n_chunks": 1175,
+          "p99_kld": 18.813190056611145,
+          "ppl": 13.920701323079214,
+          "scoring_mode": "per-token",
+          "variant": "qwen3.5-9b.mq6"
+        },
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-historical-2026-05-08-kld.json"
+      },
+      "live_artifact_inventory": {
+        "a3b_artifact_present": false,
+        "artifact_count": 2,
+        "artifacts": [
+          {
+            "name": "qwen3.5-9b.mq3-lloyd",
+            "path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq3-lloyd",
+            "size_bytes": 4568261632
+          },
+          {
+            "name": "qwen3.5-9b-lloyd-mq3.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-lloyd-mq3.hfq",
+            "size_bytes": 4568261632
+          }
+        ],
+        "dense_27b_artifact_present": false,
+        "dense_4b_artifact_present": false,
+        "dense_9b_artifact_present": true,
+        "only_9b_artifact_present": true
+      },
+      "promotion_allowed": false,
+      "promotion_gate_keys": [
+        "canonical_9b_artifact_present",
+        "non_9b_artifact_present",
+        "coherence_9b_clean",
+        "current_kld_present",
+        "current_kld_finite",
+        "current_kld_beats_mq4",
+        "historical_beats_uniform_mq3",
+        "historical_beats_mq4",
+        "historical_beats_mq6",
+        "perf_evidence_present",
+        "origin_refresh_required"
+      ],
+      "size_scope": {
+        "a3b_artifact_present": false,
+        "current_9b_candidate_to_mq4_kld_ratio": 2.3406582043287982,
+        "current_9b_coherence_clean": true,
+        "current_9b_kld_finite": true,
+        "current_9b_kld_loses_to_mq4": true,
+        "current_9b_kld_present": true,
+        "dense_27b_artifact_present": false,
+        "dense_4b_artifact_present": false,
+        "dense_9b_artifact_present": true,
+        "historical_only_beats_uniform_mq3": true,
+        "live_a3b_artifact_present": false,
+        "live_artifact_count": 2,
+        "live_dense_27b_artifact_present": false,
+        "live_dense_4b_artifact_present": false,
+        "live_dense_9b_artifact_present": true,
+        "live_only_9b_artifact_present": true,
+        "only_9b_artifact_present": true,
+        "perf_evidence_allowed": false
+      },
+      "status": "dense-quality-rejected-current-9b"
+    },
+    "mq4-lloyd": {
+      "artifact_provenance": {
+        "artifact_count": 1,
+        "artifacts": [
+          {
+            "hashes": {
+              "md5": "61359a2af6804da8f16c09614d4692a9",
+              "sha256": "7e38d72b69e04d43789b4e0b5c99e313d5083224d6aeb236b0f3d9b9d5db00a1"
+            },
+            "name": "qwen3.5-9b-lloyd-mq4.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-lloyd-mq4.hfq",
+            "size_bytes": 6056190976
+          }
+        ],
+        "canonical_9b_artifact_present": true,
+        "non_9b_artifact_present": false,
+        "status": "candidate-research-gated"
+      },
+      "artifact_scope": {
+        "a3b_artifact_present": false,
+        "dense_27b_artifact_present": false,
+        "dense_4b_artifact_present": false,
+        "dense_9b_artifact_present": true,
+        "only_9b_artifact_present": true
+      },
+      "blockers": [
+        "current 9B MQ4-Lloyd coherence row emits token attractor",
+        "historical best MQ4-Lloyd KLD does not beat current MQ4 context",
+        "historical best MQ4-Lloyd KLD does not beat MQ6 context",
+        "current same-run MQ4-Lloyd KLD row is invalid zero-KLD/NaN-PPL evidence",
+        "no fresh-process gfx1151 perf baseline exists",
+        "live local scan found only 9B MQ4-Lloyd artifacts",
+        "origin/master has MQ4-Lloyd-relevant commits missing from HEAD; reconcile and rerun evidence"
+      ],
+      "coherence": {
+        "expected_tokens_present": true,
+        "forbidden_tokens_present": [
+          "!!!!!!!!!!!"
+        ],
+        "has_row": true,
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-coherence-full-after-mq4-lloyd.md",
+        "qualitatively_clean": false
+      },
+      "container": {
+        "data_end_matches_file_size": true,
+        "names_mq3_lloyd_qtype": true,
+        "names_mq4_lloyd_qtype": true,
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-container-audit.md",
+        "records_attractor_reject": true
+      },
+      "current_mq4_mq6_context": {
+        "candidate": {
+          "arch": "gfx1151",
+          "mean_kld": 0.05095111038558933,
+          "n_chunks": 512,
+          "p99_kld": 8.677446921269434,
+          "ppl": 9.186151683734478,
+          "scoring_mode": "prefill",
+          "variant": "qwen3.5-9b.mq6-kvq8-c512"
+        },
+        "candidate_beats_control": true,
+        "candidate_to_control_mean_kld_ratio": 0.20379851039184352,
+        "control": {
+          "arch": "gfx1151",
+          "mean_kld": 0.2500072757530249,
+          "n_chunks": 512,
+          "p99_kld": 17.31498886764029,
+          "ppl": 8.795280700449606,
+          "scoring_mode": "prefill",
+          "variant": "qwen3.5-9b.mq4-kvq8-c512"
+        },
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512.json"
+      },
+      "current_same_run_kld": {
+        "candidate": {
+          "arch": "gfx1151",
+          "mean_kld": 0.0,
+          "n_chunks": 20,
+          "p99_kld": 0.0,
+          "ppl": null,
+          "scoring_mode": "prefill",
+          "variant": "qwen3.5-9b.mq4-lloyd-kvq8-c20"
+        },
+        "candidate_beats_mq4": false,
+        "candidate_beats_mq6": false,
+        "candidate_invalid_zero_kld_no_ppl": true,
+        "candidate_to_mq4_mean_kld_ratio": null,
+        "candidate_to_mq6_mean_kld_ratio": null,
+        "candidate_valid": false,
+        "mq4_control": {
+          "arch": "gfx1151",
+          "mean_kld": 0.23638529168533035,
+          "n_chunks": 20,
+          "p99_kld": 17.16138437962391,
+          "ppl": 9.047422176078824,
+          "scoring_mode": "prefill",
+          "variant": "qwen3.5-9b.mq4-kvq8-c20"
+        },
+        "mq6_control": {
+          "arch": "gfx1151",
+          "mean_kld": 0.05681369919624718,
+          "n_chunks": 20,
+          "p99_kld": 12.125815298465907,
+          "ppl": 9.28050536001425,
+          "scoring_mode": "prefill",
+          "variant": "qwen3.5-9b.mq6-kvq8-c20"
+        },
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-9b-kld-c20.json",
+        "same_run_present": true
+      },
+      "decision": "keep MQ4-Lloyd research-gated; current 9B artifact is container-valid but coherence-rejected and current same-run KLD produced invalid zero-KLD/NaN-PPL evidence",
+      "gates": {
+        "canonical_9b_artifact_present": true,
+        "coherence_9b_clean": false,
+        "container_bounded": true,
+        "container_qtype_named": true,
+        "current_same_run_beats_mq4": false,
+        "current_same_run_beats_mq6": false,
+        "current_same_run_candidate_valid": false,
+        "current_same_run_invalid_zero_kld_no_ppl": true,
+        "current_same_run_kld_present": true,
+        "historical_best_beats_current_mq4": false,
+        "historical_best_beats_mq6": false,
+        "non_9b_artifact_present": false,
+        "origin_refresh_required": true,
+        "perf_evidence_present": false
+      },
+      "historical_kld": {
+        "best_beats_current_mq4": false,
+        "best_beats_historical_mq6": false,
+        "best_lloyd_row": {
+          "arch": "gfx1151",
+          "mean_kld": 0.25187702757527847,
+          "n_chunks": 512,
+          "p99_kld": 17.78343665840157,
+          "ppl": 8.803339273438544,
+          "scoring_mode": "prefill",
+          "variant": "qwen3.5-9b.mq4-lloyd-q8conv1d-kvq8-c512"
+        },
+        "historical_mq6_row": {
+          "arch": "gfx1151",
+          "mean_kld": 0.05681369919624718,
+          "n_chunks": 20,
+          "p99_kld": 12.125815298465907,
+          "ppl": 9.28050536001425,
+          "scoring_mode": "prefill",
+          "variant": "qwen3.5-9b.mq6-q8conv1d-kvq8-c20"
+        },
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-historical-2026-05-13-kld.json"
+      },
+      "live_artifact_inventory": {
+        "a3b_artifact_present": false,
+        "artifact_count": 2,
+        "artifacts": [
+          {
+            "name": "qwen3.5-9b.mq4-lloyd",
+            "path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq4-lloyd",
+            "size_bytes": 6056190976
+          },
+          {
+            "name": "qwen3.5-9b-lloyd-mq4.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-lloyd-mq4.hfq",
+            "size_bytes": 6056190976
+          }
+        ],
+        "dense_27b_artifact_present": false,
+        "dense_4b_artifact_present": false,
+        "dense_9b_artifact_present": true,
+        "only_9b_artifact_present": true
+      },
+      "next_work": [
+        "Produce a new coherent MQ4-Lloyd 9B artifact hash before collecting perf.",
+        "Reconcile origin/master Lloyd producer/runtime commits, including d5985c3e, before rerunning evidence.",
+        "Rerun full coherence for the new artifact and reject any token-attractor row.",
+        "Rerun the current MQ4/MQ4-Lloyd/MQ6 KLD cohort and require finite PPL plus wins over MQ4 and MQ6.",
+        "Only collect fresh-process gfx1151 perf after coherence and same-run KLD/PPL are valid."
+      ],
+      "producer_repair_plan": {
+        "current_artifact_status": "coherence_rejected",
+        "invalid_zero_kld_no_ppl_blocks_quality": true,
+        "next_unblocked_step": "produce_new_coherent_mq4_lloyd_artifact",
+        "origin_commits_to_reconcile": [
+          "d5985c3e",
+          "5d09c2ee",
+          "3663934f",
+          "aa781d74",
+          "89f42e4b"
+        ],
+        "perf_collection_allowed": false,
+        "requires_new_artifact_hash": true,
+        "requires_origin_reconciliation": true,
+        "rerun_commands": [
+          "python3 scripts/lloyd_status.py --pretty --out benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-status.json",
+          "./scripts/coherence-gate.sh --full",
+          "rerun current MQ4/MQ4-Lloyd/MQ6 KLD cohort after a coherent MQ4-Lloyd artifact exists"
+        ],
+        "same_run_quality_ready": false,
+        "status": "blocked_before_perf",
+        "validation_commands": [
+          "python3 scripts/test_lloyd_status.py",
+          "python3 scripts/test_quant_readiness.py",
+          "python3 scripts/test_quant_readiness_integrity.py"
+        ]
+      },
+      "promotion_allowed": false,
+      "promotion_contract": {
+        "current_same_run_invalid_zero_kld_no_ppl_must_be_false": true,
+        "forbidden_clear": {
+          "current_same_run_invalid_zero_kld_no_ppl": false,
+          "origin_refresh_required": false
+        },
+        "forbidden_gates": [
+          "current_same_run_invalid_zero_kld_no_ppl",
+          "origin_refresh_required"
+        ],
+        "historical_rows_required_for_promotion": false,
+        "historical_rows_role": "context_only_when_current_same_run_mq4_mq6_cohort_exists",
+        "promotion_allowed": false,
+        "required_gates": [
+          "canonical_9b_artifact_present",
+          "non_9b_artifact_present",
+          "container_qtype_named",
+          "container_bounded",
+          "coherence_9b_clean",
+          "current_same_run_kld_present",
+          "current_same_run_candidate_valid",
+          "current_same_run_beats_mq4",
+          "current_same_run_beats_mq6",
+          "perf_evidence_present"
+        ],
+        "required_satisfied": {
+          "canonical_9b_artifact_present": true,
+          "coherence_9b_clean": false,
+          "container_bounded": true,
+          "container_qtype_named": true,
+          "current_same_run_beats_mq4": false,
+          "current_same_run_beats_mq6": false,
+          "current_same_run_candidate_valid": false,
+          "current_same_run_kld_present": true,
+          "non_9b_artifact_present": false,
+          "perf_evidence_present": false
+        }
+      },
+      "status": "coherence-rejected-current-9b",
+      "value_boundary": {
+        "beats_mq4_same_run": false,
+        "beats_mq6_same_run": false,
+        "branch_reconciled_for_promotion": false,
+        "bytes_per_group": 160,
+        "coherence_gate_passed": false,
+        "container_valid": true,
+        "historical_rows_are_promotion_evidence": false,
+        "historical_rows_justify_value": false,
+        "invalid_zero_kld_no_ppl_blocks_quality": true,
+        "mq4_control_bytes_per_group": 136,
+        "mq6_comparator_bytes_per_group": 200,
+        "next_unblocked_step": "produce_new_coherent_mq4_lloyd_artifact",
+        "origin_refresh_required": true,
+        "perf_collection_allowed": false,
+        "performance_rows_promotable": false,
+        "requires_new_artifact_hash": true,
+        "same_run_kld_ppl_valid": false,
+        "status": "value_not_justified_current_artifact"
+      }
+    }
+  },
+  "origin_context": {
+    "base": "HEAD",
+    "format_refresh_required": {
+      "mq3-lloyd": true,
+      "mq4-lloyd": true
+    },
+    "lloyd_evidence_refresh_required": true,
+    "local_only_commits": 66,
+    "origin_master_commit": "02634f4c49853faa8d43f7bc029a9f23988aa45f",
+    "relevant_upstream_commits": [
+      {
+        "commit": "d5985c3e51197c70fa804f84cd694abbcd38f0d7",
+        "formats": [
+          "mq4-lloyd",
+          "mq6"
+        ],
+        "impact": "fixes GGUF --kmap-promote 6 for Mq4Lloyd so Promote6 emits MQ6G256 instead of silently staying MQ4G256Lloyd",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "promotion_effect": "producer-flow fix only; does not repair the current coherence-rejected MQ4-Lloyd artifact",
+        "short": "d5985c3e",
+        "subject": "fix(stragglers): 4 GPU leaks/dead-doc + GGUF Promote6 Mq4Lloyd"
+      },
+      {
+        "commit": "5d09c2ee8a08ab99417ee12cff24ec04b1ba6a90",
+        "formats": [
+          "mq4-lloyd"
+        ],
+        "impact": "adds opt-in MQ4-Lloyd gate_up perf kernels for post-quality validation",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "promotion_effect": "perf context only; speed rows remain blocked until coherence passes",
+        "short": "5d09c2ee",
+        "subject": "perf(gate_up): barrier-free MQ4-Lloyd WMMA gate_up variants"
+      },
+      {
+        "commit": "46898ecd8b1a96cef295924998f114f8b11748d0",
+        "formats": [
+          "mq3-lloyd"
+        ],
+        "impact": "adds opt-in MQ3-Lloyd gate_up perf kernels for post-quality validation",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "promotion_effect": "perf context only; current MQ3-Lloyd KLD still loses to MQ4",
+        "short": "46898ecd",
+        "subject": "perf(gate_up): barrier-free MQ3-Lloyd WMMA gate_up variants"
+      },
+      {
+        "commit": "3663934fa9a78afb28ead03ef4362cffae344c35",
+        "formats": [
+          "mq3-lloyd",
+          "mq4-lloyd"
+        ],
+        "impact": "wires parked Lloyd nosync kernels behind HIPFIRE_GATE_UP_NOSYNC=1",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "promotion_effect": "opt-in perf lever only; not promoted evidence",
+        "short": "3663934f",
+        "subject": "fix(gate-up): make nosync variants buildable and opt-in"
+      },
+      {
+        "commit": "aa781d742435c8dddcb0d3d212bdaeb5636d910a",
+        "formats": [
+          "mq3-lloyd",
+          "mq4-lloyd"
+        ],
+        "impact": "defaults gfx1151 gate_up routing to nosync variants while keeping ldscoop elsewhere",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "promotion_effect": "post-quality perf context only; current Lloyd artifacts remain quality-gated",
+        "short": "aa781d74",
+        "subject": "fix(gate_up): arch-gate default variant"
+      },
+      {
+        "commit": "89f42e4bb4a4317da586d37741bb23ea90ef2e24",
+        "formats": [
+          "mq2-lloyd",
+          "mq3-lloyd",
+          "mq4-lloyd"
+        ],
+        "impact": "restores reachable mmqload/lloyd_4w/base paths after nosync routing",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "promotion_effect": "runtime routing cleanup; current quality gates still decide promotion",
+        "short": "89f42e4b",
+        "subject": "fix(forward): flatten nosync if-else chain"
+      }
+    ],
+    "upstream": "origin/master",
+    "upstream_only_commits": 126,
+    "upstream_reconciliation_required": true
+  },
+  "schema": "hipfire.lloyd_status.gfx1151.v0",
+  "summary": {
+    "decisions": {
+      "mq3-lloyd": "reject current 9B dense promotion; require new artifact hash before more perf",
+      "mq4-lloyd": "reject current 9B artifact on coherence; require producer/calibration fix"
+    },
+    "promotion_allowed": false
+  }
+}

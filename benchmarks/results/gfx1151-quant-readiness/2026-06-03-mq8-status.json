@@ -1,0 +1,272 @@
+{
+  "active_promotion_backlog": false,
+  "arch": "gfx1151",
+  "artifact_inventory": {
+    "mq8_artifacts": [],
+    "q8f16_artifacts": [],
+    "searched_roots": [
+      {
+        "exists": true,
+        "root": "/home/sadara/Models"
+      },
+      {
+        "exists": true,
+        "root": "/home/sadara/.hipfire/models"
+      },
+      {
+        "exists": true,
+        "root": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness"
+      }
+    ]
+  },
+  "blockers": [
+    "no MQ8 product role has been proposed over Q8/MQ6",
+    "no canonical MQ8 candidate artifact was found",
+    "MQ8 benchmark harness is generic substrate only; no canonical candidate-model harness is available",
+    "no MQ8 coherence/KLD/PPL evidence was provided",
+    "no MQ8 gfx1151 AR/DFlash perf baseline was provided"
+  ],
+  "branch": "qwen35-native-mtp",
+  "byte_tradeoff": {
+    "bytes_per_group": {
+      "mq4": 136,
+      "mq6": 200,
+      "mq8": 258
+    },
+    "mq8_to_mq4_ratio": 1.8970588235294117,
+    "mq8_to_mq6_ratio": 1.29,
+    "requires_role_over_mq4_control": true,
+    "requires_role_over_mq6": true
+  },
+  "captured_at_utc": "2026-06-03T10:20:14Z",
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "compiled_blobs": {
+    "all_present": true,
+    "blobs": [
+      {
+        "exists": true,
+        "name": "attention_hfq8_kv.hsaco",
+        "path": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151/attention_hfq8_kv.hsaco",
+        "size_bytes": 12056
+      },
+      {
+        "exists": true,
+        "name": "gemv_hfq8g256.hsaco",
+        "path": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151/gemv_hfq8g256.hsaco",
+        "size_bytes": 9088
+      },
+      {
+        "exists": true,
+        "name": "gemv_mq8g256.hsaco",
+        "path": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151/gemv_mq8g256.hsaco",
+        "size_bytes": 14848
+      },
+      {
+        "exists": true,
+        "name": "kv_cache_write_hfq8.hsaco",
+        "path": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151/kv_cache_write_hfq8.hsaco",
+        "size_bytes": 9768
+      }
+    ],
+    "required": [
+      "attention_hfq8_kv.hsaco",
+      "gemv_hfq8g256.hsaco",
+      "gemv_mq8g256.hsaco",
+      "kv_cache_write_hfq8.hsaco"
+    ],
+    "root": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151"
+  },
+  "decision": "keep MQ8 permanent-runtime-research; reopen only with a product role, canonical artifact, quality evidence, and gfx1151 perf baselines",
+  "format": "mq8",
+  "gates": {
+    "candidate_model_benchmark_harness_present": false,
+    "canonical_mq8_artifact_present": false,
+    "example_or_benchmark_harness_present": true,
+    "gfx1151_compiled_blobs_present": true,
+    "no_gpu_admission_covered": true,
+    "perf_evidence_present": false,
+    "producer_surface_present": true,
+    "product_role_defined": false,
+    "quality_evidence_present": false,
+    "runtime_surface_present": true
+  },
+  "harness": {
+    "candidate_harness_requires_canonical_artifact": true,
+    "candidate_model_harness_present": false,
+    "generic_substrate_harness_present": true,
+    "matches": [
+      "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_hfq3_mmq_sweep.rs",
+      "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_hfq_family.rs",
+      "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs",
+      "/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_moe_mq_gfx1151_scalar_jit.rs"
+    ],
+    "present": true,
+    "searched_roots": [
+      {
+        "exists": true,
+        "root": "/home/sadara/.hipfire/src/crates/rdna-compute/examples"
+      },
+      {
+        "exists": true,
+        "root": "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples"
+      },
+      {
+        "exists": true,
+        "root": "/home/sadara/.hipfire/src/benchmarks"
+      }
+    ]
+  },
+  "maintenance_scope": [
+    "dense decode substrate",
+    "gfx1151 scalar MoE bring-up admission",
+    "compiled kernel cache health"
+  ],
+  "origin_context": {
+    "base": "HEAD",
+    "local_only_commits": 66,
+    "local_runtime_context_commits": [
+      {
+        "commit": "282cc9c5ba2035d5901fcb74848cbd58b02c0c9d",
+        "impact": "adds the broader MQ-family MoE admission matrix that includes MQ8 as gfx1151 bring-up only",
+        "present_on_head": true,
+        "present_on_origin_master": false,
+        "short": "282cc9c5",
+        "subject": "Expand qwen35 MoE quant admission and bf16 tooling"
+      },
+      {
+        "commit": "94794414251516f71093c04c5258cb0d32f5fbf1",
+        "impact": "adds gfx1151 MQ runtime bring-up substrate covering MQ8 scalar paths",
+        "present_on_head": true,
+        "present_on_origin_master": false,
+        "short": "94794414",
+        "subject": "Add gfx1151 qwen35 MoE MQ bring-up"
+      },
+      {
+        "commit": "e038b9868c601db9e2c5c804be79ac311f91758d",
+        "impact": "fixes local MQ8 artifact/runtime details but does not add product evidence",
+        "present_on_head": true,
+        "present_on_origin_master": false,
+        "short": "e038b986",
+        "subject": "Fix qwen35 MoE MQ8 artifact and gfx1151 GEMV"
+      },
+      {
+        "commit": "6bec9f715d8ec5503600ccc1cd6207e78311edee",
+        "impact": "fixes local MQ8 MoE batched numerics but does not add product evidence",
+        "present_on_head": true,
+        "present_on_origin_master": false,
+        "short": "6bec9f71",
+        "subject": "Fix gfx1151 MQ8 MoE batched numerics"
+      }
+    ],
+    "origin_master_commit": "02634f4c49853faa8d43f7bc029a9f23988aa45f",
+    "upstream": "origin/master",
+    "upstream_mq8_commits": [],
+    "upstream_mq8_product_role_commit_found": false,
+    "upstream_only_commits": 126,
+    "upstream_reconciliation_required": true
+  },
+  "perf_artifacts": [],
+  "product_role": null,
+  "promotion_allowed": false,
+  "promotion_boundary": {
+    "artifact_generation_state": "blocked_missing_product_role",
+    "bytes_per_group": {
+      "mq4": 136,
+      "mq6": 200,
+      "mq8": 258
+    },
+    "candidate_model_baseline_available": false,
+    "high_bit_justification_required": true,
+    "missing_reopen_requirements": [
+      "product_role_over_q8_or_mq6",
+      "canonical_qwen3_5_9b_mq8_artifact",
+      "mq8_example_or_benchmark_harness",
+      "coherence_or_kld_ppl_quality_evidence",
+      "gfx1151_ar_and_dflash_perf_baselines"
+    ],
+    "mq8_to_mq4_ratio": 1.8970588235294117,
+    "mq8_to_mq6_ratio": 1.29,
+    "next_unblocked_step": "define_product_role_over_q8_or_mq6",
+    "promotion_lane_state": "closed_until_reopen_contract",
+    "reopen_contract_satisfied": false,
+    "runtime_substrate_maintenance_allowed": true
+  },
+  "purpose_decision": {
+    "artifact_generation_without_product_role_allowed": false,
+    "classification": "permanent-runtime-research",
+    "closed_reason": "no_product_role_artifact_quality_or_perf",
+    "promotion_backlog_closed": true,
+    "reopen_requires_all_contract_gates": true,
+    "runtime_substrate_maintenance_allowed": true
+  },
+  "quality_artifacts": [],
+  "reopen_contract": {
+    "requirements": [
+      "product_role_over_q8_or_mq6",
+      "canonical_qwen3_5_9b_mq8_artifact",
+      "mq8_example_or_benchmark_harness",
+      "coherence_or_kld_ppl_quality_evidence",
+      "gfx1151_ar_and_dflash_perf_baselines"
+    ],
+    "satisfied": {
+      "canonical_qwen3_5_9b_mq8_artifact": false,
+      "coherence_or_kld_ppl_quality_evidence": false,
+      "gfx1151_ar_and_dflash_perf_baselines": false,
+      "mq8_example_or_benchmark_harness": false,
+      "product_role_over_q8_or_mq6": false
+    }
+  },
+  "research_closure": {
+    "artifact_generation_blocked": true,
+    "candidate_artifact_generation_requires_product_role": true,
+    "candidate_perf_collection_requires_artifact_and_quality": true,
+    "classification": "permanent-runtime-research",
+    "closed_without_product_role": true,
+    "high_bit_value_must_exceed_mq6_or_q8": true,
+    "minimum_reopen_requirements": [
+      "product_role_over_q8_or_mq6",
+      "canonical_qwen3_5_9b_mq8_artifact",
+      "mq8_example_or_benchmark_harness",
+      "coherence_or_kld_ppl_quality_evidence",
+      "gfx1151_ar_and_dflash_perf_baselines"
+    ],
+    "missing_reopen_requirements": [
+      "product_role_over_q8_or_mq6",
+      "canonical_qwen3_5_9b_mq8_artifact",
+      "mq8_example_or_benchmark_harness",
+      "coherence_or_kld_ppl_quality_evidence",
+      "gfx1151_ar_and_dflash_perf_baselines"
+    ],
+    "next_unblocked_step": "define_product_role_over_q8_or_mq6",
+    "perf_collection_blocked": true,
+    "rationale": "MQ8 costs 1.29x MQ6 and 1.90x MQ4 per group, but has no product role, canonical artifact, quality evidence, or gfx1151 perf baseline",
+    "runtime_substrate_maintenance_allowed": true
+  },
+  "schema": "hipfire.mq8_status.gfx1151.v0",
+  "source_hooks": {
+    "no_gpu_admission_checks": {
+      "gfx1151_scalar_bringup": true,
+      "gfx12_grouped_reject_matrix": true,
+      "mixed_routed_family_reject": true
+    },
+    "no_gpu_admission_covered": true,
+    "producer_checks": {
+      "format_flag": true,
+      "q8f16_fallback_note": true,
+      "quant_type": true,
+      "quantizer": true
+    },
+    "producer_surface_present": true,
+    "runtime_checks": {
+      "dense_decode_gemv": true,
+      "hfq_loader_dtype": true,
+      "kernel_source_registered": true,
+      "prerotated_gemv": true,
+      "qwen35_moe_scalar_paths": true,
+      "qwen35_qtype_mapping": true,
+      "rotate_quantize": true
+    },
+    "runtime_surface_present": true
+  },
+  "status": "permanent-runtime-research"
+}

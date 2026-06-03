@@ -1,0 +1,2048 @@
+{
+  "arch": "gfx1151",
+  "artifact_inventory": {
+    "artifact_count": 4,
+    "artifacts": [
+      {
+        "hashes": {
+          "sha256": "cf443bf307fd5bcde3fa8175f17275a7d52c2ba338228900de4d793c1fc403f6"
+        },
+        "name": "qwen3.5-27b-mq6.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-27b-mq6.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq6",
+        "size_bytes": 21385845760,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-27b.mq6"
+      },
+      {
+        "hashes": {
+          "sha256": "eb17d2b35e1a894a994434a0b14968185bbd76a057b2b6a5cb697e972d6e9137"
+        },
+        "name": "qwen3.5-35b-a3b-mq6.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-35b-a3b-mq6.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq6",
+        "size_bytes": 27712055552,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq6"
+      },
+      {
+        "hashes": {
+          "sha256": "9ced31922c284056caba09c9f57da79a1c48a4cba41493b303bc3bfc17c25e7b"
+        },
+        "name": "qwen3.5-9b-mq6.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-mq6.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq6",
+        "size_bytes": 7486228480,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-9b.mq6"
+      },
+      {
+        "hashes": {
+          "sha256": "6e27639782e40a1072cb4e9945ecbf27d29550a5f9fe9863430b2ccc9f18c0e9"
+        },
+        "name": "qwen3.6-35b-a3b-mq6.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.6-35b-a3b-mq6.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq6",
+        "size_bytes": 27712055552,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq6"
+      }
+    ],
+    "canonical_mq6_artifacts_present": true,
+    "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-artifact-provenance.json",
+    "required_artifacts": [
+      "qwen3.5-9b-mq6.hfq",
+      "qwen3.5-27b-mq6.hfq",
+      "qwen3.5-35b-a3b-mq6.hfq",
+      "qwen3.6-35b-a3b-mq6.hfq"
+    ],
+    "required_artifacts_missing": [],
+    "required_artifacts_present": [
+      "qwen3.5-27b-mq6.hfq",
+      "qwen3.5-35b-a3b-mq6.hfq",
+      "qwen3.5-9b-mq6.hfq",
+      "qwen3.6-35b-a3b-mq6.hfq"
+    ],
+    "schema": "hipfire.quant_readiness.gfx1151.v0"
+  },
+  "asym4_fwht_fallback": {
+    "checks": {
+      "asym4_branch_found": true,
+      "asym4_fallback_attention_preserved": true,
+      "asym4_fallback_writer_preserved": true,
+      "fwht4_uses_branch_native_q8_v_signature": true,
+      "fwht_attention_dispatched": true,
+      "fwht_subbranch_found": true,
+      "fwht_writer_dispatched": true,
+      "run_fa_layer_body_found": true,
+      "source_present": true
+    },
+    "coherence_rows_refreshed_by_this_check": false,
+    "evidence_class": "source_level_asym4_fwht_fallback_dispatch_check_not_decode_rerun",
+    "origin_fix_commit": "a7dcfb0dc3e94981b7e0f926790656a4bf616cbe",
+    "origin_fix_short": "a7dcfb0d",
+    "path": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs",
+    "perf_rows_refreshed_by_this_check": false,
+    "schema": "hipfire.mq6_asym4_fwht_fallback.gfx1151.v0",
+    "source_reconciled_in_worktree": true,
+    "unreconciled_by_source_check": []
+  },
+  "audit_evidence": {
+    "i8_grouped_decision": {
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-i8-grouped-decision.md",
+      "phrase_checks": {
+        "dense MQ6 throughput": true,
+        "do not port an MQ6-specific i8 grouped-MMQ path now": true,
+        "grouped HFQ6 WMMA": true
+      },
+      "present": true
+    },
+    "readiness_audit": {
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-readiness-audit.md",
+      "phrase_checks": {
+        "A3B-first candidate": true,
+        "Dense MQ6": true,
+        "dense perf-blocked": true
+      },
+      "present": true
+    }
+  },
+  "batched_rope_compact_offset": {
+    "checks": {
+      "dispatch_accepts_pos_offset": true,
+      "dispatch_pushes_pos_offset_kernarg": true,
+      "halfsplit_kernel_accepts_pos_offset": true,
+      "halfsplit_kernel_applies_pos_offset": true,
+      "interleaved_kernel_accepts_pos_offset": true,
+      "interleaved_kernel_applies_pos_offset": true,
+      "mtp_head_explicit_zero_offset": true,
+      "no_model_equivalence_example_present": true,
+      "qwen35_batched_fa_passes_compact_offset": true,
+      "tree_verify_explicit_zero_offset": true
+    },
+    "evidence_class": "source_level_batched_rope_compact_offset_check_not_perf_rerun",
+    "long_context_or_eviction_rows_refreshed_by_this_check": false,
+    "origin_fix_commit": "676338a47dff1d8bcb923cc3b636845bd684ca2f",
+    "origin_fix_short": "676338a4",
+    "paths": {
+      "dispatch": "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs",
+      "halfsplit_kernel": "/home/sadara/.hipfire/src/kernels/src/rope_partial_halfsplit_batched.hip",
+      "interleaved_kernel": "/home/sadara/.hipfire/src/kernels/src/rope_partial_interleaved_batched.hip",
+      "mtp_head": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_head.rs",
+      "no_model_example": "/home/sadara/.hipfire/src/crates/rdna-compute/examples/rope_compact_offset_check.rs",
+      "qwen35": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs",
+      "speculative": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs"
+    },
+    "perf_rows_refreshed_by_this_check": false,
+    "qwen35_compact_offset_callsite_count": 2,
+    "schema": "hipfire.mq6_batched_rope_compact_offset.gfx1151.v0",
+    "source_reconciled_in_worktree": true,
+    "unreconciled_by_source_check": [],
+    "validation_command": "cargo run --release -p rdna-compute --features deltanet --example rope_compact_offset_check"
+  },
+  "blockers": [
+    "dense MQ6 AR prefill/decode throughput remains below the 0.90x MQ4 promotion threshold",
+    "dense MQ6 DFlash target-side throughput remains below the 0.90x MQ4 promotion threshold",
+    "DFlash evidence covers MQ6 target-side verify with an MQ4 draft; no MQ6 draft lane is claimed",
+    "MQ6 DFlash/spec evidence is dense 27B target-side verify only; no MQ6 draft, A3B DFlash sidecar, or non-greedy sampling evidence is present",
+    "origin-only MQ6-relevant fixes touch A3B/MoE, dense AR, and DFlash/spec surfaces; rerun affected evidence after reconciling qwen35-native-mtp with origin/master",
+    "origin/fix/hunt3-engine-bugs has sampling+MoE/daemon/spec fixes not present on HEAD; rerun MQ6 model-backed evidence on the selected branch"
+  ],
+  "branch": "qwen35-native-mtp",
+  "captured_at_utc": "2026-06-03T13:32:58Z",
+  "cask_scratch_teardown": {
+    "checks": {
+      "fallible_work_wrapped_in_inner_result": true,
+      "indices_scratch_allocated": true,
+      "indices_scratch_freed_after_inner_result": true,
+      "inner_result_propagated_after_free": true,
+      "source_present": true,
+      "weights_scratch_allocated": true,
+      "weights_scratch_freed_after_inner_result": true
+    },
+    "evidence_class": "source_level_cask_scratch_teardown_check_not_eviction_rerun",
+    "long_context_or_eviction_rows_refreshed_by_this_check": false,
+    "origin_fix_commit": "a7dcfb0dc3e94981b7e0f926790656a4bf616cbe",
+    "origin_fix_short": "a7dcfb0d",
+    "path": "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/cask.rs",
+    "perf_rows_refreshed_by_this_check": false,
+    "schema": "hipfire.mq6_cask_scratch_teardown.gfx1151.v0",
+    "source_reconciled_in_worktree": true,
+    "unreconciled_by_source_check": []
+  },
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "daemon_ar_exact_match_delta_replay": {
+    "checks": {
+      "generate_window_found": true,
+      "legacy_exact_match_lcp_rewind_absent": true,
+      "qwen35_no_conversation_lcp_scan": true,
+      "qwen35_prefills_direct_new_tokens": true,
+      "qwen35_single_gpu_branch_found": true,
+      "source_present": true
+    },
+    "coherence_rows_refreshed_by_this_check": false,
+    "evidence_class": "source_level_daemon_ar_exact_match_delta_replay_check_not_perf_rerun",
+    "legacy_terms_checked": [
+      "lcp_adj",
+      "lcp == rendered.len()",
+      "cached_tokens_count",
+      "rendered[lcp_adj..]",
+      "prior_len"
+    ],
+    "origin_fix_commit": "d5bc3f6af03d70e50b19b9b7564571b7f87b1f8c",
+    "origin_fix_short": "d5bc3f6",
+    "path": "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs",
+    "perf_rows_refreshed_by_this_check": false,
+    "schema": "hipfire.mq6_daemon_ar_exact_match_delta_replay.gfx1151.v0",
+    "source_reconciled_in_worktree": true,
+    "unreconciled_by_source_check": []
+  },
+  "daemon_dflash_first_token_eos": {
+    "checks": {
+      "checks_chat_im_end_token": true,
+      "checks_model_eos_token": true,
+      "checks_tokenizer_terminator": true,
+      "first_token_guard_declared": true,
+      "source_present": true,
+      "spec_loop_guarded": true
+    },
+    "coherence_rows_refreshed_by_this_check": false,
+    "evidence_class": "source_level_daemon_dflash_first_token_eos_check_not_perf_rerun",
+    "origin_fix_commit": "d5bc3f6af03d70e50b19b9b7564571b7f87b1f8c",
+    "origin_fix_short": "d5bc3f6",
+    "path": "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs",
+    "perf_rows_refreshed_by_this_check": false,
+    "schema": "hipfire.mq6_daemon_dflash_first_token_eos.gfx1151.v0",
+    "source_reconciled_in_worktree": true,
+    "unreconciled_by_source_check": []
+  },
+  "ddtree_eviction_target_hidden_host": {
+    "checks": {
+      "daemon_post_prefill_and_cycle_calls_present": true,
+      "dflash_spec_demo_post_prefill_and_cycle_calls_present": true,
+      "helper_declared": true,
+      "helper_empty_mask_noop": true,
+      "helper_replaces_cpu_shadow": true,
+      "helper_uses_retain_mask_rows": true,
+      "speculative_source_present": true,
+      "unit_test_empty_mask_present": true,
+      "unit_test_selected_rows_present": true
+    },
+    "coherence_rows_refreshed_by_this_check": false,
+    "evidence_class": "source_level_ddtree_eviction_cpu_shadow_check_not_model_rerun",
+    "long_context_or_eviction_rows_refreshed_by_this_check": false,
+    "origin_fix_commit": "d12b3ad49fbd2464410a8f4ac75a0d3be699c21b",
+    "origin_fix_short": "d12b3ad4",
+    "paths": {
+      "daemon": "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs",
+      "dflash_spec_demo": "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs",
+      "speculative": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs"
+    },
+    "perf_rows_refreshed_by_this_check": false,
+    "remote_ref": "origin/fix/issue-triage-2026-06-03",
+    "schema": "hipfire.mq6_ddtree_eviction_target_hidden_host.gfx1151.v0",
+    "source_reconciled_in_worktree": true,
+    "unreconciled_by_source_check": [],
+    "validation_command": "cargo test -p hipfire-arch-qwen35 --lib compact_target_hidden_host"
+  },
+  "decision": "keep MQ6 as the closest non-MQ4 candidate; review an A3B/MoE-first scope, do not claim broad promotion until dense AR and dense DFlash throughput are fixed, and do not port MQ6 i8 grouped-MMQ unless a future A3B profile makes HFQ6 grouped WMMA the dominant bottleneck",
+  "dense_decode_route_test": {
+    "all_phrase_checks_present": true,
+    "command": "cargo test -p hipfire-runtime --lib mq6_dense_decode_routes_through_hfq6_family",
+    "path": "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/llama.rs",
+    "phrase_checks": {
+      "DenseGemvRoute::Mq6RotateThenMq6Prerotated": true,
+      "DensePrerotatedGemvRoute::Mq6Prerotated": true,
+      "DenseResidualRoute::Hfq6ResidualDirect": true,
+      "DenseResidualRoute::Mq6RotateThenHfq6Residual": true,
+      "DenseSwigluResidualRoute::Mq6RotateThenHfq6Residual": true,
+      "mq6_dense_decode_routes_through_hfq6_family": true
+    },
+    "present": true
+  },
+  "dflash_boundary_contract_test": {
+    "all_phrase_checks_present": true,
+    "command": "python3 scripts/test_mq6_status.py Mq6StatusTest.test_dflash_spec_boundary_marks_mq4_draft_target_verify_only",
+    "path": "/home/sadara/.hipfire/src/scripts/test_mq6_status.py",
+    "phrase_checks": {
+      "target_side_verify_only_mq4_draft": true,
+      "test_dflash_spec_boundary_detects_a3b_scope_expansion": true,
+      "test_dflash_spec_boundary_detects_mq6_draft_scope_expansion": true,
+      "test_dflash_spec_boundary_marks_mq4_draft_target_verify_only": true
+    },
+    "present": true
+  },
+  "evidence_refresh_plan": {
+    "affected_surfaces": [
+      "dense_decode",
+      "dense_prefill",
+      "dflash_spec",
+      "moe_decode",
+      "moe_prefill"
+    ],
+    "evidence_artifacts_to_refresh": [
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-ar-perf.json",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-ar-perf.md",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-coherence-md5.md",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-a3b-ppl.json",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-a3b-ppl.md",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash-r3.json",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash-r3.md",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-qwen36-a3b-ppl.json",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-qwen36-a3b-ppl.md"
+    ],
+    "local_reconciliations": {
+      "asym4_fwht_fallback": {
+        "coherence_rows_refreshed_by_this_check": false,
+        "commit_short": "a7dcfb0d",
+        "evidence_class": "source_level_asym4_fwht_fallback_dispatch_check_not_decode_rerun",
+        "origin_fix_commit": "a7dcfb0dc3e94981b7e0f926790656a4bf616cbe",
+        "origin_fix_short": "a7dcfb0d",
+        "path": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs",
+        "perf_rows_refreshed_by_this_check": false,
+        "source": "asym4_fwht_fallback"
+      },
+      "cask_scratch_teardown": {
+        "commit_short": "a7dcfb0d",
+        "evidence_class": "source_level_cask_scratch_teardown_check_not_eviction_rerun",
+        "long_context_or_eviction_rows_refreshed_by_this_check": false,
+        "origin_fix_commit": "a7dcfb0dc3e94981b7e0f926790656a4bf616cbe",
+        "origin_fix_short": "a7dcfb0d",
+        "path": "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/cask.rs",
+        "perf_rows_refreshed_by_this_check": false,
+        "source": "cask_scratch_teardown"
+      },
+      "daemon_ar_exact_match_delta_replay": {
+        "coherence_rows_refreshed_by_this_check": false,
+        "commit_short": "d5bc3f6",
+        "evidence_class": "source_level_daemon_ar_exact_match_delta_replay_check_not_perf_rerun",
+        "origin_fix_commit": "d5bc3f6af03d70e50b19b9b7564571b7f87b1f8c",
+        "origin_fix_short": "d5bc3f6",
+        "path": "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs",
+        "perf_rows_refreshed_by_this_check": false,
+        "source": "daemon_ar_exact_match_delta_replay"
+      },
+      "ddtree_eviction_stability": {
+        "coherence_rows_refreshed_by_this_check": false,
+        "commit_short": "d12b3ad4",
+        "evidence_class": "source_level_ddtree_eviction_cpu_shadow_check_not_model_rerun",
+        "long_context_or_eviction_rows_refreshed_by_this_check": false,
+        "origin_fix_commit": "d12b3ad49fbd2464410a8f4ac75a0d3be699c21b",
+        "origin_fix_short": "d12b3ad4",
+        "perf_rows_refreshed_by_this_check": false,
+        "remote_ref": "origin/fix/issue-triage-2026-06-03",
+        "source": "ddtree_eviction_target_hidden_host",
+        "validation_command": "cargo test -p hipfire-arch-qwen35 --lib compact_target_hidden_host"
+      },
+      "hunt3_nan_safe_sampling": {
+        "coherence_rows_refreshed_by_this_check": false,
+        "commit_short": "fb36f539",
+        "evidence_class": "source_level_hunt3_nan_safe_sampling_check_not_model_rerun",
+        "origin_fix_commit": "fb36f5395d17b48f2d539f7ba4adc6a6c18b808e",
+        "origin_fix_short": "fb36f539",
+        "paths": {
+          "daemon": "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs",
+          "deepseek_sampling": "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/sampling.rs",
+          "llama": "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/llama.rs",
+          "mtp_spec": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs"
+        },
+        "perf_rows_refreshed_by_this_check": false,
+        "remote_ref": "origin/fix/hunt3-engine-bugs",
+        "source": "hunt3_nan_safe_sampling",
+        "validation_commands": [
+          "cargo test -p hipfire-runtime --lib argmax",
+          "cargo test -p hipfire-arch-qwen35 --lib sample_from_logits",
+          "cargo test -p hipfire-arch-deepseek4 --lib sampling",
+          "cargo check -p hipfire-runtime --example daemon",
+          "cargo check --workspace --all-targets"
+        ]
+      },
+      "moe_prefill_scratch_teardown": {
+        "commit_short": "b4adca1f",
+        "evidence_class": "source_level_moe_prefill_grouped_scratch_teardown_check_not_stability_rerun",
+        "long_running_moe_stability_refreshed_by_this_check": false,
+        "origin_fix_commit": "b4adca1f3f6fc97d08a3c9a4bab98ead64a5ef99",
+        "origin_fix_short": "b4adca1f",
+        "path": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs",
+        "perf_rows_refreshed_by_this_check": false,
+        "source": "moe_prefill_grouped_scratch_free"
+      },
+      "mtp_gpu_teardown": {
+        "commit_short": "a7dcfb0d",
+        "evidence_class": "source_level_mtp_gpu_teardown_check_not_long_run_rerun",
+        "long_running_mtp_rows_refreshed_by_this_check": false,
+        "origin_fix_commit": "a7dcfb0dc3e94981b7e0f926790656a4bf616cbe",
+        "origin_fix_short": "a7dcfb0d",
+        "paths": {
+          "mtp_compose": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_compose.rs",
+          "mtp_head": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_head.rs",
+          "mtp_spec": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs"
+        },
+        "perf_rows_refreshed_by_this_check": false,
+        "source": "mtp_gpu_teardown"
+      },
+      "producer_context": {
+        "commit_short": "d5985c3e",
+        "evidence_class": "source_level_producer_path_check_not_artifact_rebuild",
+        "origin_fix_commit": "d5985c3e51197c70fa804f84cd694abbcd38f0d7",
+        "origin_fix_short": "d5985c3e",
+        "path": "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs",
+        "source": "producer_path"
+      },
+      "qwen36_a3b_runtime_source_reconciliation": {
+        "coherence_rows_refreshed_by_this_check": false,
+        "commit_short": "379484ba",
+        "evidence_class": "source_level_qwen36_a3b_runtime_check_not_model_rerun",
+        "origin_fix_commit": "379484ba828152b63f4b22b7748261d51e705502",
+        "origin_fix_short": "379484ba",
+        "paths": {
+          "cli": "/home/sadara/.hipfire/src/cli/index.ts",
+          "daemon": "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs",
+          "dispatch": "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs",
+          "gated_delta_net_q8_kernel": "/home/sadara/.hipfire/src/kernels/src/gated_delta_net_q8.hip",
+          "sample_top_p_kernel": "/home/sadara/.hipfire/src/kernels/src/sample_top_p.hip",
+          "sampler": "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/sampler.rs"
+        },
+        "perf_rows_refreshed_by_this_check": false,
+        "ppl_rows_refreshed_by_this_check": false,
+        "source": "qwen36_a3b_runtime_source_reconciliation",
+        "validation_commands": [
+          "cargo test -p hipfire-runtime --lib sampler",
+          "cargo check --workspace --all-targets",
+          "bun test cli/index.ts"
+        ]
+      },
+      "spec_verify": {
+        "commit_short": "676338a4",
+        "evidence_class": "source_level_batched_rope_compact_offset_check_not_perf_rerun",
+        "long_context_or_eviction_rows_refreshed_by_this_check": false,
+        "origin_fix_commit": "676338a47dff1d8bcb923cc3b636845bd684ca2f",
+        "origin_fix_short": "676338a4",
+        "perf_rows_refreshed_by_this_check": false,
+        "source": "batched_rope_compact_offset",
+        "validation_command": "cargo run --release -p rdna-compute --features deltanet --example rope_compact_offset_check"
+      }
+    },
+    "locally_reconciled_refresh_reasons": [
+      "asym4_fwht_fallback",
+      "cask_scratch_teardown",
+      "daemon_ar_exact_match_delta_replay",
+      "ddtree_eviction_stability",
+      "hunt3_nan_safe_sampling",
+      "moe_prefill_scratch_teardown",
+      "mtp_gpu_teardown",
+      "producer_context",
+      "qwen36_a3b_runtime_source_reconciliation",
+      "spec_verify"
+    ],
+    "next_unblocked_step": "reconcile_qwen35_native_mtp_with_origin_and_hunt3_then_rerun_mq6_evidence",
+    "refresh_reasons": [
+      "a3b_ar_perf",
+      "a3b_ppl_smoke",
+      "coherence",
+      "dense_ar_perf",
+      "dense_dflash_perf",
+      "dflash_stability",
+      "long_context_or_eviction_rows",
+      "long_running_moe_stability",
+      "qwen36_a3b_ar_perf",
+      "qwen36_a3b_ppl",
+      "spec_verify"
+    ],
+    "refresh_required": true,
+    "rerun_commands": [
+      "./scripts/coherence-gate.sh --full",
+      "python3 scripts/mq6_ar_perf_baseline.py --pretty --out benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-ar-perf.json",
+      "python3 scripts/mq6_dflash_baseline.py --pretty --out benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash-r3.json",
+      "python3 scripts/mq6_ppl_compare.py --pretty"
+    ],
+    "stale_commits": [
+      {
+        "locally_reconciled_refreshes": [
+          "spec_verify"
+        ],
+        "refreshes": [
+          "dense_dflash_perf",
+          "long_context_or_eviction_rows",
+          "spec_verify"
+        ],
+        "short": "676338a4",
+        "source": "origin/master",
+        "subject": "fix(qwen35): batched RoPE ignored compact_offset -> phase skew after eviction (H4)",
+        "surfaces": [
+          "batched_rope",
+          "eviction",
+          "mtp",
+          "dflash"
+        ],
+        "unreconciled_refreshes": [
+          "dense_dflash_perf",
+          "long_context_or_eviction_rows"
+        ]
+      },
+      {
+        "locally_reconciled_refreshes": [
+          "producer_context"
+        ],
+        "refreshes": [
+          "dflash_stability",
+          "producer_context"
+        ],
+        "short": "d5985c3e",
+        "source": "origin/master",
+        "subject": "fix(stragglers): 4 GPU leaks/dead-doc + GGUF Promote6 Mq4Lloyd",
+        "surfaces": [
+          "dflash_drafter_unload",
+          "dpm_warmup",
+          "gguf_producer"
+        ],
+        "unreconciled_refreshes": [
+          "dflash_stability"
+        ]
+      },
+      {
+        "locally_reconciled_refreshes": [
+          "asym4_fwht_fallback",
+          "cask_scratch_teardown",
+          "mtp_gpu_teardown"
+        ],
+        "refreshes": [
+          "a3b_ar_perf",
+          "a3b_ppl_smoke",
+          "asym4_fwht_fallback",
+          "cask_scratch_teardown",
+          "mtp_gpu_teardown",
+          "spec_verify"
+        ],
+        "short": "a7dcfb0d",
+        "source": "origin/master",
+        "subject": "fix(engine): hunt-2 batch - premature-stop, OOB write, daemon crash, 4 GPU leaks",
+        "surfaces": [
+          "a3b",
+          "mtp",
+          "daemon",
+          "kv",
+          "gpu_leaks"
+        ],
+        "unreconciled_refreshes": [
+          "a3b_ar_perf",
+          "a3b_ppl_smoke",
+          "spec_verify"
+        ]
+      },
+      {
+        "locally_reconciled_refreshes": [
+          "moe_prefill_scratch_teardown"
+        ],
+        "refreshes": [
+          "a3b_ar_perf",
+          "long_running_moe_stability",
+          "moe_prefill_scratch_teardown"
+        ],
+        "short": "b4adca1f",
+        "source": "origin/master",
+        "subject": "fix(qwen35,daemon): free leaked GPU scratch - Path-2 MoE prefill buffers",
+        "surfaces": [
+          "a3b",
+          "moe_prefill",
+          "serve_oom",
+          "deltanet"
+        ],
+        "unreconciled_refreshes": [
+          "a3b_ar_perf",
+          "long_running_moe_stability"
+        ]
+      },
+      {
+        "locally_reconciled_refreshes": [
+          "daemon_ar_exact_match_delta_replay"
+        ],
+        "refreshes": [
+          "coherence",
+          "daemon_ar_exact_match_delta_replay",
+          "dense_ar_perf",
+          "dense_dflash_perf"
+        ],
+        "short": "d5bc3f6",
+        "source": "origin/master",
+        "subject": "fix(daemon): AR exact-match DeltaNet double-advance + DFlash first-token EOS",
+        "surfaces": [
+          "ar",
+          "dflash",
+          "deltanet",
+          "daemon"
+        ],
+        "unreconciled_refreshes": [
+          "coherence",
+          "dense_ar_perf",
+          "dense_dflash_perf"
+        ]
+      },
+      {
+        "locally_reconciled_refreshes": [
+          "qwen36_a3b_runtime_source_reconciliation"
+        ],
+        "refreshes": [
+          "qwen36_a3b_ar_perf",
+          "qwen36_a3b_ppl",
+          "qwen36_a3b_runtime_source_reconciliation"
+        ],
+        "short": "379484ba",
+        "source": "origin/master",
+        "subject": "fix(qwen3.6-a3b): serving robustness + DeltaNet Q8 dither + OpenAI penalties",
+        "surfaces": [
+          "qwen3.6-a3b",
+          "deltanet_q8",
+          "daemon",
+          "sampler"
+        ],
+        "unreconciled_refreshes": [
+          "qwen36_a3b_ar_perf",
+          "qwen36_a3b_ppl"
+        ]
+      },
+      {
+        "locally_reconciled_refreshes": [
+          "hunt3_nan_safe_sampling"
+        ],
+        "refreshes": [
+          "a3b_ar_perf",
+          "a3b_ppl_smoke",
+          "coherence",
+          "dense_dflash_perf",
+          "hunt3_nan_safe_sampling",
+          "spec_verify"
+        ],
+        "short": "fb36f539",
+        "source": "origin/fix/hunt3-engine-bugs",
+        "subject": "fix(engine): hunt-3 batch - 16 engine bugs across pp / sampling+MoE / daemon / bun-CLI",
+        "surfaces": [
+          "sampling",
+          "moe",
+          "daemon",
+          "dflash",
+          "spec_verify"
+        ],
+        "unreconciled_refreshes": [
+          "a3b_ar_perf",
+          "a3b_ppl_smoke",
+          "coherence",
+          "dense_dflash_perf",
+          "spec_verify"
+        ]
+      },
+      {
+        "locally_reconciled_refreshes": [
+          "ddtree_eviction_stability"
+        ],
+        "refreshes": [
+          "ddtree_eviction_stability"
+        ],
+        "short": "d12b3ad4",
+        "source": "origin/fix/issue-triage-2026-06-03",
+        "subject": "fix(qwen35): compact target_hidden_host on eviction - DDTree spec_step panic (#272)",
+        "surfaces": [
+          "ddtree",
+          "cask",
+          "eviction",
+          "dflash",
+          "spec_verify"
+        ],
+        "unreconciled_refreshes": []
+      }
+    ],
+    "stale_origin_commit_shorts": [
+      "676338a4",
+      "d5985c3e",
+      "a7dcfb0d",
+      "b4adca1f",
+      "d5bc3f6",
+      "379484ba"
+    ],
+    "stale_remote_commit_shorts": [
+      "fb36f539",
+      "d12b3ad4"
+    ],
+    "surface_next_steps": {
+      "dense_decode": "fix_dense_decode_throughput_or_scope_dense_out",
+      "dense_prefill": "fix_dense_prefill_throughput_or_scope_dense_out",
+      "dflash_spec": "reconcile_origin_and_remote_fixes_then_rerun_dense_and_a3b_dflash_spec",
+      "moe_decode": "rerun_a3b_moe_decode_after_branch_reconciliation",
+      "moe_prefill": "rerun_a3b_moe_prefill_after_branch_reconciliation"
+    }
+  },
+  "format": "mq6",
+  "gates": {
+    "a3b_ar_perf_present": true,
+    "a3b_decode_close_to_mq4": true,
+    "a3b_first_scope_supported": false,
+    "a3b_prefill_speedup_present": true,
+    "all_surfaces_promotion_ready": false,
+    "broad_promotion_allowed": false,
+    "canonical_mq6_artifacts_present": true,
+    "dense_9b_c512_kld_beats_mq4": true,
+    "dense_9b_ppl_beats_mq4": true,
+    "dense_ar_perf_present": true,
+    "dense_ar_perf_promotable": false,
+    "dense_decode_install_kernel_inventory_present": true,
+    "dense_decode_no_gpu_route_test_present": true,
+    "dense_decode_repo_kernel_inventory_present": true,
+    "dense_dflash_perf_present": true,
+    "dense_dflash_perf_promotable": false,
+    "dense_promotion_allowed": false,
+    "dflash_a3b_evidence_present": false,
+    "dflash_mq6_draft_evidence_present": false,
+    "dflash_spec_boundary_contract_test_present": true,
+    "dflash_spec_boundary_refresh_required": true,
+    "dflash_target_side_verify_only": true,
+    "i8_grouped_port_recommended": false,
+    "live_canonical_mq6_artifacts_present": true,
+    "moe_decode_no_gpu_route_test_present": true,
+    "mq6_asym4_fwht_fallback_fixed": true,
+    "mq6_batched_rope_compact_offset_fixed": true,
+    "mq6_cask_scratch_teardown_fixed": true,
+    "mq6_daemon_ar_exact_match_delta_replay_fixed": true,
+    "mq6_daemon_dflash_first_token_eos_fixed": true,
+    "mq6_ddtree_eviction_target_hidden_host_fixed": true,
+    "mq6_hunt3_nan_safe_sampling_fixed": true,
+    "mq6_moe_prefill_grouped_scratch_free_fixed": true,
+    "mq6_mtp_gpu_teardown_fixed": true,
+    "mq6_producer_mq4_lloyd_promote6_fixed": true,
+    "mq6_qwen36_a3b_runtime_source_reconciled": true,
+    "origin_refresh_required": true,
+    "provenance_canonical_mq6_artifacts_present": true,
+    "qwen35_a3b_ppl_beats_mq4": true,
+    "qwen36_a3b_ppl_beats_mq4": true,
+    "remote_branch_refresh_required": true,
+    "surface_coverage_complete": true
+  },
+  "hunt3_nan_safe_sampling": {
+    "checks": {
+      "daemon_cpu_sampler_rng_reset_wired": true,
+      "deepseek_sampling_drops_nan_candidates": true,
+      "llama_argmax_uses_nan_safe_fold": true,
+      "llama_cpu_sampler_rng_reset_exported": true,
+      "mtp_sampling_drops_nan_candidates": true
+    },
+    "coherence_rows_refreshed_by_this_check": false,
+    "evidence_class": "source_level_hunt3_nan_safe_sampling_check_not_model_rerun",
+    "origin_fix_commit": "fb36f5395d17b48f2d539f7ba4adc6a6c18b808e",
+    "origin_fix_short": "fb36f539",
+    "paths": {
+      "daemon": "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs",
+      "deepseek_sampling": "/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/sampling.rs",
+      "llama": "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/llama.rs",
+      "mtp_spec": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs"
+    },
+    "perf_rows_refreshed_by_this_check": false,
+    "remote_ref": "origin/fix/hunt3-engine-bugs",
+    "schema": "hipfire.mq6_hunt3_nan_safe_sampling.gfx1151.v0",
+    "source_reconciled_in_worktree": true,
+    "unreconciled_by_source_check": [],
+    "validation_commands": [
+      "cargo test -p hipfire-runtime --lib argmax",
+      "cargo test -p hipfire-arch-qwen35 --lib sample_from_logits",
+      "cargo test -p hipfire-arch-deepseek4 --lib sampling",
+      "cargo check -p hipfire-runtime --example daemon",
+      "cargo check --workspace --all-targets"
+    ]
+  },
+  "kernel_inventory": {
+    "any_required_kernel_set_present": true,
+    "arch": "gfx1151",
+    "evidence_class": "compiled_blob_presence_only_not_dispatch_proof",
+    "format": "mq6",
+    "install_required_kernels_present": true,
+    "repo_required_kernels_present": true,
+    "required_kernels": [
+      "gemv_mq6g256.hsaco",
+      "gemv_hfq6g256.hsaco",
+      "gemv_hfq6g256_residual.hsaco",
+      "gemv_hfq6g256_residual_sigmoid_scaled.hsaco",
+      "fused_rmsnorm_mq_rotate.hsaco",
+      "fused_silu_mul_mq_rotate.hsaco"
+    ],
+    "roots": {
+      "install": {
+        "kernels": [
+          {
+            "exists": true,
+            "name": "gemv_mq6g256.hsaco",
+            "path": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151/gemv_mq6g256.hsaco",
+            "size_bytes": 9080
+          },
+          {
+            "exists": true,
+            "name": "gemv_hfq6g256.hsaco",
+            "path": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151/gemv_hfq6g256.hsaco",
+            "size_bytes": 9088
+          },
+          {
+            "exists": true,
+            "name": "gemv_hfq6g256_residual.hsaco",
+            "path": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151/gemv_hfq6g256_residual.hsaco",
+            "size_bytes": 9152
+          },
+          {
+            "exists": true,
+            "name": "gemv_hfq6g256_residual_sigmoid_scaled.hsaco",
+            "path": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151/gemv_hfq6g256_residual_sigmoid_scaled.hsaco",
+            "size_bytes": 9848
+          },
+          {
+            "exists": true,
+            "name": "fused_rmsnorm_mq_rotate.hsaco",
+            "path": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151/fused_rmsnorm_mq_rotate.hsaco",
+            "size_bytes": 11968
+          },
+          {
+            "exists": true,
+            "name": "fused_silu_mul_mq_rotate.hsaco",
+            "path": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151/fused_silu_mul_mq_rotate.hsaco",
+            "size_bytes": 11720
+          }
+        ],
+        "label": "install",
+        "missing": [],
+        "missing_count": 0,
+        "present": [
+          "fused_rmsnorm_mq_rotate.hsaco",
+          "fused_silu_mul_mq_rotate.hsaco",
+          "gemv_hfq6g256.hsaco",
+          "gemv_hfq6g256_residual.hsaco",
+          "gemv_hfq6g256_residual_sigmoid_scaled.hsaco",
+          "gemv_mq6g256.hsaco"
+        ],
+        "present_count": 6,
+        "required_count": 6,
+        "required_kernels_present": true,
+        "root": "/home/sadara/.hipfire/bin/kernels/compiled/gfx1151",
+        "root_exists": true
+      },
+      "repo": {
+        "kernels": [
+          {
+            "exists": true,
+            "name": "gemv_mq6g256.hsaco",
+            "path": "/home/sadara/.hipfire/src/kernels/compiled/gfx1151/gemv_mq6g256.hsaco",
+            "size_bytes": 9080
+          },
+          {
+            "exists": true,
+            "name": "gemv_hfq6g256.hsaco",
+            "path": "/home/sadara/.hipfire/src/kernels/compiled/gfx1151/gemv_hfq6g256.hsaco",
+            "size_bytes": 9088
+          },
+          {
+            "exists": true,
+            "name": "gemv_hfq6g256_residual.hsaco",
+            "path": "/home/sadara/.hipfire/src/kernels/compiled/gfx1151/gemv_hfq6g256_residual.hsaco",
+            "size_bytes": 9152
+          },
+          {
+            "exists": true,
+            "name": "gemv_hfq6g256_residual_sigmoid_scaled.hsaco",
+            "path": "/home/sadara/.hipfire/src/kernels/compiled/gfx1151/gemv_hfq6g256_residual_sigmoid_scaled.hsaco",
+            "size_bytes": 9848
+          },
+          {
+            "exists": true,
+            "name": "fused_rmsnorm_mq_rotate.hsaco",
+            "path": "/home/sadara/.hipfire/src/kernels/compiled/gfx1151/fused_rmsnorm_mq_rotate.hsaco",
+            "size_bytes": 11968
+          },
+          {
+            "exists": true,
+            "name": "fused_silu_mul_mq_rotate.hsaco",
+            "path": "/home/sadara/.hipfire/src/kernels/compiled/gfx1151/fused_silu_mul_mq_rotate.hsaco",
+            "size_bytes": 11720
+          }
+        ],
+        "label": "repo",
+        "missing": [],
+        "missing_count": 0,
+        "present": [
+          "fused_rmsnorm_mq_rotate.hsaco",
+          "fused_silu_mul_mq_rotate.hsaco",
+          "gemv_hfq6g256.hsaco",
+          "gemv_hfq6g256_residual.hsaco",
+          "gemv_hfq6g256_residual_sigmoid_scaled.hsaco",
+          "gemv_mq6g256.hsaco"
+        ],
+        "present_count": 6,
+        "required_count": 6,
+        "required_kernels_present": true,
+        "root": "/home/sadara/.hipfire/src/kernels/compiled/gfx1151",
+        "root_exists": true
+      }
+    },
+    "schema": "hipfire.mq6_dense_decode_kernel_inventory.gfx1151.v0"
+  },
+  "live_candidate_inventory": {
+    "artifact_count": 4,
+    "artifacts": [
+      {
+        "exists": true,
+        "is_symlink": true,
+        "name": "qwen3.5-9b-mq6.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-mq6.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq6",
+        "size_bytes": 7486228480,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-9b.mq6"
+      },
+      {
+        "exists": true,
+        "is_symlink": true,
+        "name": "qwen3.5-27b-mq6.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-27b-mq6.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq6",
+        "size_bytes": 21385845760,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-27b.mq6"
+      },
+      {
+        "exists": true,
+        "is_symlink": true,
+        "name": "qwen3.5-35b-a3b-mq6.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-35b-a3b-mq6.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq6",
+        "size_bytes": 27712055552,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq6"
+      },
+      {
+        "exists": true,
+        "is_symlink": true,
+        "name": "qwen3.6-35b-a3b-mq6.hfq",
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.6-35b-a3b-mq6.hfq",
+        "resolved_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq6",
+        "size_bytes": 27712055552,
+        "symlink_target": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq6"
+      }
+    ],
+    "candidate_root": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness",
+    "candidate_root_exists": true,
+    "canonical_mq6_artifacts_present": true,
+    "models_root": "/home/sadara/Models",
+    "required_artifacts": [
+      "qwen3.5-9b-mq6.hfq",
+      "qwen3.5-27b-mq6.hfq",
+      "qwen3.5-35b-a3b-mq6.hfq",
+      "qwen3.6-35b-a3b-mq6.hfq"
+    ],
+    "required_artifacts_missing": [],
+    "required_artifacts_present": [
+      "qwen3.5-27b-mq6.hfq",
+      "qwen3.5-35b-a3b-mq6.hfq",
+      "qwen3.5-9b-mq6.hfq",
+      "qwen3.6-35b-a3b-mq6.hfq"
+    ],
+    "symlink_count": 4
+  },
+  "moe_decode_route_test": {
+    "all_phrase_checks_present": true,
+    "command": "cargo test -p hipfire-arch-qwen35 --lib moe_decode_routes_mq6_indexed_path_for_k8",
+    "path": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs",
+    "phrase_checks": {
+      "MoeDecodeIndexedRoutedPath::Mq6": true,
+      "moe_decode_k8_shape_required_for_gpu_topk": true,
+      "moe_decode_keeps_mq4_control_on_indexed_path": true,
+      "moe_decode_rejects_mismatched_mq6_gate_up_and_down_from_indexed_path": true,
+      "moe_decode_routes_mq6_indexed_path_for_k8": true
+    },
+    "present": true
+  },
+  "moe_prefill_grouped_scratch_free": {
+    "checks": {
+      "frees_moe_expert_offsets": true,
+      "frees_moe_expert_tile_ids": true,
+      "frees_moe_expert_token_counts": true,
+      "frees_moe_inverse_perm": true,
+      "frees_moe_sorted_slot_index": true,
+      "frees_moe_y_down_grouped": true,
+      "frees_moe_y_gate_up_grouped": true,
+      "prefill_batch_free_gpu_found": true,
+      "prefill_batch_impl_found": true,
+      "source_present": true
+    },
+    "evidence_class": "source_level_moe_prefill_grouped_scratch_teardown_check_not_stability_rerun",
+    "long_running_moe_stability_refreshed_by_this_check": false,
+    "origin_fix_commit": "b4adca1f3f6fc97d08a3c9a4bab98ead64a5ef99",
+    "origin_fix_short": "b4adca1f",
+    "path": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs",
+    "perf_rows_refreshed_by_this_check": false,
+    "required_fields": [
+      "self.moe_expert_token_counts",
+      "self.moe_expert_offsets",
+      "self.moe_sorted_slot_index",
+      "self.moe_inverse_perm",
+      "self.moe_expert_tile_ids",
+      "self.moe_y_gate_up_grouped",
+      "self.moe_y_down_grouped"
+    ],
+    "schema": "hipfire.mq6_moe_prefill_grouped_scratch_free.gfx1151.v0",
+    "source_reconciled_in_worktree": true,
+    "unreconciled_by_source_check": []
+  },
+  "mtp_gpu_teardown": {
+    "checks": {
+      "mtp_compose_frees_both_mtp_kv_inner_states": true,
+      "mtp_compose_source_present": true,
+      "mtp_head_kv_cache_free_gpu_found": true,
+      "mtp_head_kv_cache_frees_inner_gpu_tensors": true,
+      "mtp_head_no_drop_inner_in_kv_free_gpu": true,
+      "mtp_head_source_present": true,
+      "mtp_spec_free_gpu_found": true,
+      "mtp_spec_frees_mtp_kv_inner_gpu_tensors": true,
+      "mtp_spec_frees_trunk_snapshot_gpu": true,
+      "mtp_spec_no_drop_trunk_snapshot": true,
+      "mtp_spec_source_present": true
+    },
+    "evidence_class": "source_level_mtp_gpu_teardown_check_not_long_run_rerun",
+    "long_running_mtp_rows_refreshed_by_this_check": false,
+    "origin_fix_commit": "a7dcfb0dc3e94981b7e0f926790656a4bf616cbe",
+    "origin_fix_short": "a7dcfb0d",
+    "paths": {
+      "mtp_compose": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_compose.rs",
+      "mtp_head": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_head.rs",
+      "mtp_spec": "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs"
+    },
+    "perf_rows_refreshed_by_this_check": false,
+    "schema": "hipfire.mq6_mtp_gpu_teardown.gfx1151.v0",
+    "source_reconciled_in_worktree": true,
+    "unreconciled_by_source_check": []
+  },
+  "next_work": [
+    "Reconcile qwen35-native-mtp with origin/master and origin/fix/hunt3-engine-bugs before trusting current MQ6 promotion evidence.",
+    "Rerun MQ6 AR perf baselines after reconciliation and keep prompt md5 plus binary md5 in the artifact.",
+    "Rerun MQ6 DFlash/spec baselines after reconciliation; current evidence is MQ6 target-side verify with an MQ4 draft.",
+    "Rerun MQ6 coherence with ./scripts/coherence-gate.sh --full for any refreshed candidate artifact or reconciled runtime.",
+    "Keep A3B/MoE as the first scope unless dense prefill/decode and DFlash throughput clear the 0.90x MQ4 threshold.",
+    "Do not port MQ6 i8 grouped-MMQ unless a future A3B profile shows grouped HFQ6 WMMA is the dominant bottleneck."
+  ],
+  "origin_context": {
+    "base": "HEAD",
+    "local_only_commits": 66,
+    "mq6_evidence_refresh_required": true,
+    "origin_master_commit": "02634f4c49853faa8d43f7bc029a9f23988aa45f",
+    "origin_master_missing_commit_shorts": [
+      "676338a4",
+      "d5985c3e",
+      "a7dcfb0d",
+      "b4adca1f",
+      "d5bc3f6",
+      "379484ba"
+    ],
+    "origin_master_refresh_required": true,
+    "relevant_remote_branch_commits": [
+      {
+        "commit": "fb36f5395d17b48f2d539f7ba4adc6a6c18b808e",
+        "present_on_head": false,
+        "present_on_origin_master": false,
+        "present_on_remote_ref": true,
+        "refreshes": [
+          "a3b_ar_perf",
+          "a3b_ppl_smoke",
+          "dense_dflash_perf",
+          "spec_verify",
+          "coherence",
+          "hunt3_nan_safe_sampling"
+        ],
+        "remote_ref": "origin/fix/hunt3-engine-bugs",
+        "short": "fb36f539",
+        "subject": "fix(engine): hunt-3 batch - 16 engine bugs across pp / sampling+MoE / daemon / bun-CLI",
+        "surfaces": [
+          "sampling",
+          "moe",
+          "daemon",
+          "dflash",
+          "spec_verify"
+        ]
+      },
+      {
+        "commit": "d12b3ad49fbd2464410a8f4ac75a0d3be699c21b",
+        "present_on_head": false,
+        "present_on_origin_master": false,
+        "present_on_remote_ref": true,
+        "refreshes": [
+          "ddtree_eviction_stability"
+        ],
+        "remote_ref": "origin/fix/issue-triage-2026-06-03",
+        "short": "d12b3ad4",
+        "subject": "fix(qwen35): compact target_hidden_host on eviction - DDTree spec_step panic (#272)",
+        "surfaces": [
+          "ddtree",
+          "cask",
+          "eviction",
+          "dflash",
+          "spec_verify"
+        ]
+      }
+    ],
+    "relevant_upstream_commits": [
+      {
+        "commit": "676338a47dff1d8bcb923cc3b636845bd684ca2f",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "refreshes": [
+          "dense_dflash_perf",
+          "spec_verify",
+          "long_context_or_eviction_rows"
+        ],
+        "short": "676338a4",
+        "subject": "fix(qwen35): batched RoPE ignored compact_offset -> phase skew after eviction (H4)",
+        "surfaces": [
+          "batched_rope",
+          "eviction",
+          "mtp",
+          "dflash"
+        ]
+      },
+      {
+        "commit": "d5985c3e51197c70fa804f84cd694abbcd38f0d7",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "refreshes": [
+          "dflash_stability",
+          "producer_context"
+        ],
+        "short": "d5985c3e",
+        "subject": "fix(stragglers): 4 GPU leaks/dead-doc + GGUF Promote6 Mq4Lloyd",
+        "surfaces": [
+          "dflash_drafter_unload",
+          "dpm_warmup",
+          "gguf_producer"
+        ]
+      },
+      {
+        "commit": "a7dcfb0dc3e94981b7e0f926790656a4bf616cbe",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "refreshes": [
+          "a3b_ar_perf",
+          "a3b_ppl_smoke",
+          "spec_verify",
+          "cask_scratch_teardown",
+          "mtp_gpu_teardown",
+          "asym4_fwht_fallback"
+        ],
+        "short": "a7dcfb0d",
+        "subject": "fix(engine): hunt-2 batch - premature-stop, OOB write, daemon crash, 4 GPU leaks",
+        "surfaces": [
+          "a3b",
+          "mtp",
+          "daemon",
+          "kv",
+          "gpu_leaks"
+        ]
+      },
+      {
+        "commit": "b4adca1f3f6fc97d08a3c9a4bab98ead64a5ef99",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "refreshes": [
+          "a3b_ar_perf",
+          "long_running_moe_stability",
+          "moe_prefill_scratch_teardown"
+        ],
+        "short": "b4adca1f",
+        "subject": "fix(qwen35,daemon): free leaked GPU scratch - Path-2 MoE prefill buffers",
+        "surfaces": [
+          "a3b",
+          "moe_prefill",
+          "serve_oom",
+          "deltanet"
+        ]
+      },
+      {
+        "commit": "d5bc3f6af03d70e50b19b9b7564571b7f87b1f8c",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "refreshes": [
+          "dense_ar_perf",
+          "dense_dflash_perf",
+          "coherence",
+          "daemon_ar_exact_match_delta_replay"
+        ],
+        "short": "d5bc3f6",
+        "subject": "fix(daemon): AR exact-match DeltaNet double-advance + DFlash first-token EOS",
+        "surfaces": [
+          "ar",
+          "dflash",
+          "deltanet",
+          "daemon"
+        ]
+      },
+      {
+        "commit": "379484ba828152b63f4b22b7748261d51e705502",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "refreshes": [
+          "qwen36_a3b_runtime_source_reconciliation",
+          "qwen36_a3b_ppl",
+          "qwen36_a3b_ar_perf"
+        ],
+        "short": "379484ba",
+        "subject": "fix(qwen3.6-a3b): serving robustness + DeltaNet Q8 dither + OpenAI penalties",
+        "surfaces": [
+          "qwen3.6-a3b",
+          "deltanet_q8",
+          "daemon",
+          "sampler"
+        ]
+      }
+    ],
+    "remote_branch_missing_commit_shorts": [
+      "fb36f539",
+      "d12b3ad4"
+    ],
+    "remote_branch_refresh_required": true,
+    "upstream": "origin/master",
+    "upstream_only_commits": 126,
+    "upstream_reconciliation_required": true
+  },
+  "performance": {
+    "ar_pairs": {
+      "dense_27b": {
+        "all_runs_ok": true,
+        "candidate": {
+          "all_runs_ok": true,
+          "family": "dense",
+          "format_id": "mq6",
+          "id": "qwen35-27b-mq6-cap",
+          "model_file": "qwen3.5-27b.mq6",
+          "prompt_md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+          "summary": {
+            "median_decode_tok_s": 9.9,
+            "median_prefill_ms": 1318.2,
+            "median_prefill_tok_s": 15.9,
+            "median_tok_s": 8.5,
+            "median_tokens": 80.0,
+            "median_ttft_ms": 1318.2,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": null,
+          "token_attractor_ok": false
+        },
+        "control": {
+          "all_runs_ok": true,
+          "family": "dense",
+          "format_id": "mq4",
+          "id": "qwen35-27b-mq4-cap",
+          "model_file": "qwen3.5-27b.mq4",
+          "prompt_md5": "bbf2d0483ecacaa2eb7296f9c8083f95",
+          "summary": {
+            "median_decode_tok_s": 14.1,
+            "median_prefill_ms": 547.7,
+            "median_prefill_tok_s": 38.3,
+            "median_tok_s": 12.8,
+            "median_tokens": 80.0,
+            "median_ttft_ms": 547.7,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": null,
+          "token_attractor_ok": false
+        },
+        "decode_ratio": 0.7021276595744681,
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-ar-perf.json",
+        "prefill_ratio": 0.4151436031331593
+      },
+      "dense_9b": {
+        "all_runs_ok": true,
+        "candidate": {
+          "all_runs_ok": true,
+          "family": "dense",
+          "format_id": "mq6",
+          "id": "qwen35-9b-mq6-sheep",
+          "model_file": "qwen3.5-9b.mq6",
+          "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+          "summary": {
+            "median_decode_tok_s": 30.5,
+            "median_prefill_ms": 325.5,
+            "median_prefill_tok_s": 110.6,
+            "median_tok_s": 25.0,
+            "median_tokens": 45.0,
+            "median_ttft_ms": 325.5,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": null,
+          "token_attractor_ok": false
+        },
+        "control": {
+          "all_runs_ok": true,
+          "family": "dense",
+          "format_id": "mq4",
+          "id": "qwen35-9b-mq4-sheep",
+          "model_file": "qwen3.5-9b.mq4",
+          "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+          "summary": {
+            "median_decode_tok_s": 43.4,
+            "median_prefill_ms": 155.4,
+            "median_prefill_tok_s": 231.7,
+            "median_tok_s": 42.1,
+            "median_tokens": 213.0,
+            "median_ttft_ms": 155.4,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": null,
+          "token_attractor_ok": false
+        },
+        "decode_ratio": 0.7027649769585254,
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-ar-perf.json",
+        "prefill_ratio": 0.4773413897280967
+      },
+      "qwen35_a3b": {
+        "all_runs_ok": true,
+        "candidate": {
+          "all_runs_ok": true,
+          "family": "moe",
+          "format_id": "mq6",
+          "id": "qwen35-a3b-mq6-sheep",
+          "model_file": "qwen3.5-35b-a3b.mq6",
+          "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+          "summary": {
+            "median_decode_tok_s": 51.3,
+            "median_prefill_ms": 159.4,
+            "median_prefill_tok_s": 225.9,
+            "median_tok_s": 44.1,
+            "median_tokens": 50.0,
+            "median_ttft_ms": 159.4,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": null,
+          "token_attractor_ok": false
+        },
+        "control": {
+          "all_runs_ok": true,
+          "family": "moe",
+          "format_id": "mq4",
+          "id": "qwen35-a3b-mq4-sheep",
+          "model_file": "qwen3.5-35b-a3b.mq4",
+          "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+          "summary": {
+            "median_decode_tok_s": 54.3,
+            "median_prefill_ms": 644.6,
+            "median_prefill_tok_s": 55.9,
+            "median_tok_s": 31.1,
+            "median_tokens": 47.0,
+            "median_ttft_ms": 644.6,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": null,
+          "token_attractor_ok": false
+        },
+        "decode_ratio": 0.9447513812154696,
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-ar-perf.json",
+        "prefill_ratio": 4.041144901610018
+      },
+      "qwen36_a3b": {
+        "all_runs_ok": true,
+        "candidate": {
+          "all_runs_ok": true,
+          "family": "moe",
+          "format_id": "mq6",
+          "id": "qwen36-a3b-mq6-sheep",
+          "model_file": "qwen3.6-35b-a3b.mq6",
+          "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+          "summary": {
+            "median_decode_tok_s": 50.4,
+            "median_prefill_ms": 156.7,
+            "median_prefill_tok_s": 229.8,
+            "median_tok_s": 49.3,
+            "median_tokens": 349.0,
+            "median_ttft_ms": 156.7,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": null,
+          "token_attractor_ok": false
+        },
+        "control": {
+          "all_runs_ok": true,
+          "family": "moe",
+          "format_id": "mq4",
+          "id": "qwen36-a3b-mq4-sheep",
+          "model_file": "qwen3.6-35b-a3b.mq4",
+          "prompt_md5": "fcfff9c745d58b218fc88be1639d759d",
+          "summary": {
+            "median_decode_tok_s": 53.1,
+            "median_prefill_ms": 645.8,
+            "median_prefill_tok_s": 55.7,
+            "median_tok_s": 50.8,
+            "median_tokens": 756.0,
+            "median_ttft_ms": 645.8,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": null,
+          "token_attractor_ok": false
+        },
+        "decode_ratio": 0.9491525423728813,
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-ar-perf.json",
+        "prefill_ratio": 4.125673249551167
+      }
+    },
+    "dflash_pairs": {
+      "code": {
+        "accept_rate_ratio": 1.0,
+        "all_runs_ok": true,
+        "candidate": {
+          "all_runs_ok": true,
+          "family": null,
+          "format_id": null,
+          "id": "qwen35-27b-mq6-dflash-code",
+          "model_file": "qwen3.5-27b.mq6",
+          "prompt_md5": "5333a1f70d884060807676347c0edb93",
+          "summary": {
+            "median_decode_accept_rate": 0.6667,
+            "median_decode_secs": 3.1226,
+            "median_decode_tau": 10.0,
+            "median_decode_tok_s": 14.41,
+            "median_decode_tokens_emitted": 45.0,
+            "median_prefill_tok_s": 21.66,
+            "median_ttft_ms": 6474.16,
+            "median_vram_used_mb": 23053.0,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": "mq6",
+          "token_attractor_ok": true
+        },
+        "control": {
+          "all_runs_ok": true,
+          "family": null,
+          "format_id": null,
+          "id": "qwen35-27b-mq4-dflash-code",
+          "model_file": "qwen3.5-27b.mq4",
+          "prompt_md5": "5333a1f70d884060807676347c0edb93",
+          "summary": {
+            "median_decode_accept_rate": 0.6667,
+            "median_decode_secs": 1.591,
+            "median_decode_tau": 10.0,
+            "median_decode_tok_s": 28.28,
+            "median_decode_tokens_emitted": 45.0,
+            "median_prefill_tok_s": 51.34,
+            "median_ttft_ms": 2794.61,
+            "median_vram_used_mb": 16925.0,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": "mq4",
+          "token_attractor_ok": true
+        },
+        "decode_ratio": 0.5095473833097596,
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash-r3.json",
+        "prefill_ratio": 0.4218932606155045,
+        "tau_ratio": 1.0,
+        "token_attractor_ok": true
+      },
+      "prose": {
+        "accept_rate_ratio": 0.9664864864864864,
+        "all_runs_ok": true,
+        "candidate": {
+          "all_runs_ok": true,
+          "family": null,
+          "format_id": null,
+          "id": "qwen35-27b-mq6-dflash-prose",
+          "model_file": "qwen3.5-27b.mq6",
+          "prompt_md5": "c7e575e6fedf97df4c1902ef68335c22",
+          "summary": {
+            "median_decode_accept_rate": 0.0894,
+            "median_decode_secs": 63.5432,
+            "median_decode_tau": 1.3415,
+            "median_decode_tok_s": 3.04,
+            "median_decode_tokens_emitted": 193.0,
+            "median_prefill_tok_s": 20.91,
+            "median_ttft_ms": 3618.35,
+            "median_vram_used_mb": 23041.0,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": "mq6",
+          "token_attractor_ok": true
+        },
+        "control": {
+          "all_runs_ok": true,
+          "family": null,
+          "format_id": null,
+          "id": "qwen35-27b-mq4-dflash-prose",
+          "model_file": "qwen3.5-27b.mq4",
+          "prompt_md5": "c7e575e6fedf97df4c1902ef68335c22",
+          "summary": {
+            "median_decode_accept_rate": 0.0925,
+            "median_decode_secs": 30.9976,
+            "median_decode_tau": 1.3875,
+            "median_decode_tok_s": 6.19,
+            "median_decode_tokens_emitted": 192.0,
+            "median_prefill_tok_s": 54.71,
+            "median_ttft_ms": 1478.07,
+            "median_vram_used_mb": 16913.0,
+            "ok_runs": 3,
+            "total_runs": 3
+          },
+          "target_format": "mq4",
+          "token_attractor_ok": true
+        },
+        "decode_ratio": 0.4911147011308562,
+        "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash-r3.json",
+        "prefill_ratio": 0.38219703893255347,
+        "tau_ratio": 0.9668468468468469,
+        "token_attractor_ok": true
+      }
+    },
+    "dflash_spec_boundary": {
+      "a3b_dflash_evidence_present": false,
+      "all_mq6_cases_three_run": true,
+      "contract_ready": true,
+      "dense_27b_only": true,
+      "draft_formats": [
+        "mq4"
+      ],
+      "evidence_class": "target_side_verify_only_mq4_draft",
+      "min_runs_per_case": 3,
+      "mq4_draft_used_for_all_mq6_rows": true,
+      "mq6_case_count": 2,
+      "mq6_draft_evidence_present": false,
+      "next_unblocked_step": "reconcile_origin_and_remote_fixes_then_rerun_dense_and_a3b_dflash_spec",
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash-r3.json",
+      "promotion_scope_supported": false,
+      "prompt_md5s": [
+        "5333a1f70d884060807676347c0edb93",
+        "c7e575e6fedf97df4c1902ef68335c22"
+      ],
+      "refresh_required": true,
+      "sampling_or_non_greedy_evidence_present": false,
+      "schema": "hipfire.mq6_dflash.gfx1151.v0",
+      "scope_expanded_beyond_target_verify": false,
+      "target_files": [
+        "qwen3.5-27b.mq6"
+      ],
+      "target_side_verify_only": true,
+      "token_attractor_clean": true
+    }
+  },
+  "producer_path": {
+    "evidence_class": "source_level_producer_path_check_not_artifact_rebuild",
+    "matched_source": "GgufFormat::Mq4Lloyd => {\n                    // Promote6 -> MQ6, consistent with default_promote_target\n                    // (Mq4Lloyd -> Mq6) and the Lloyd siblings above.\n                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);\n                    (q, QuantType::MQ6G256, 256u32, \"MQ6G256\")\n                }",
+    "mq4_lloyd_arm_found_in_promote6_path": true,
+    "origin_fix_commit": "d5985c3e51197c70fa804f84cd694abbcd38f0d7",
+    "origin_fix_reconciled_in_worktree": true,
+    "origin_fix_short": "d5985c3e",
+    "path": "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs",
+    "promote6_anchor_present": true,
+    "promote6_mq4_lloyd_emits_mq6": true,
+    "schema": "hipfire.mq6_producer_path.gfx1151.v0",
+    "source_present": true,
+    "stale_mq4_lloyd_emit_present": false,
+    "target_group_size": 256,
+    "target_quant_type": "MQ6G256"
+  },
+  "promotion_allowed": false,
+  "quality": {
+    "dense_9b_c512_kld": {
+      "candidate": {
+        "arch": "gfx1151",
+        "mean_kld": 0.05095111038558933,
+        "n_chunks": 512,
+        "p99_kld": 8.677446921269434,
+        "ppl": 9.186151683734478,
+        "scoring_mode": "prefill",
+        "variant": "qwen3.5-9b.mq6-kvq8-c512"
+      },
+      "candidate_beats_control": true,
+      "candidate_to_control_mean_kld_ratio": 0.20379851039184352,
+      "control": {
+        "arch": "gfx1151",
+        "mean_kld": 0.2500072757530249,
+        "n_chunks": 512,
+        "p99_kld": 17.31498886764029,
+        "ppl": 8.795280700449606,
+        "scoring_mode": "prefill",
+        "variant": "qwen3.5-9b.mq4-kvq8-c512"
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512.json"
+    },
+    "dense_9b_ppl": {
+      "candidate": {
+        "exit_code": 0,
+        "family": "dense",
+        "format_id": "mq6",
+        "id": "qwen35-9b-mq6",
+        "model_file": "qwen3.5-9b.mq6",
+        "result": {
+          "elapsed_s": 69.7,
+          "nll_tok": 2.4499742159,
+          "ppl": 11.588,
+          "scored": 2039,
+          "scored_tok_s": 29.3
+        },
+        "status": "ok"
+      },
+      "candidate_beats_control": true,
+      "candidate_to_control_ppl_ratio": 0.9602333463154318,
+      "control": {
+        "exit_code": 0,
+        "family": "dense",
+        "format_id": "mq4",
+        "id": "qwen35-9b-mq4",
+        "model_file": "qwen3.5-9b.mq4",
+        "result": {
+          "elapsed_s": 49.3,
+          "nll_tok": 2.4905529915,
+          "ppl": 12.0679,
+          "scored": 2039,
+          "scored_tok_s": 41.4
+        },
+        "status": "ok"
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-ppl.json"
+    },
+    "qwen35_a3b_ppl": {
+      "candidate": {
+        "exit_code": 0,
+        "family": "moe",
+        "format_id": "mq6",
+        "id": "qwen35-a3b-mq6",
+        "model_file": "qwen3.5-35b-a3b.mq6",
+        "result": {
+          "elapsed_s": 42.8,
+          "nll_tok": 2.0887375009,
+          "ppl": 8.0747,
+          "scored": 2039,
+          "scored_tok_s": 47.6
+        },
+        "status": "ok"
+      },
+      "candidate_beats_control": true,
+      "candidate_to_control_ppl_ratio": 0.9408221284925314,
+      "control": {
+        "exit_code": 0,
+        "family": "moe",
+        "format_id": "mq4",
+        "id": "qwen35-a3b-mq4",
+        "model_file": "qwen3.5-35b-a3b.mq4",
+        "result": {
+          "elapsed_s": 40.5,
+          "nll_tok": 2.1497421429,
+          "ppl": 8.5826,
+          "scored": 2039,
+          "scored_tok_s": 50.4
+        },
+        "status": "ok"
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-a3b-ppl.json"
+    },
+    "qwen36_a3b_ppl": {
+      "candidate": {
+        "exit_code": 0,
+        "family": "moe",
+        "format_id": "mq6",
+        "id": "qwen36-a3b-mq6",
+        "model_file": "qwen3.6-35b-a3b.mq6",
+        "result": {
+          "elapsed_s": 42.9,
+          "nll_tok": 1.7795077219,
+          "ppl": 5.9269,
+          "scored": 2039,
+          "scored_tok_s": 47.6
+        },
+        "status": "ok"
+      },
+      "candidate_beats_control": true,
+      "candidate_to_control_ppl_ratio": 0.9376374365221243,
+      "control": {
+        "exit_code": 0,
+        "family": "moe",
+        "format_id": "mq4",
+        "id": "qwen36-a3b-mq4",
+        "model_file": "qwen3.6-35b-a3b.mq4",
+        "result": {
+          "elapsed_s": 40.6,
+          "nll_tok": 1.8438939153,
+          "ppl": 6.3211,
+          "scored": 2039,
+          "scored_tok_s": 50.3
+        },
+        "status": "ok"
+      },
+      "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-qwen36-a3b-ppl.json"
+    }
+  },
+  "qwen36_a3b_runtime_source_reconciliation": {
+    "checks": {
+      "cli_marks_open_think_for_visible_stripping": true,
+      "cli_sends_native_penalties_without_repeat_fold": true,
+      "daemon_allocates_wide_repeat_buffers": true,
+      "daemon_parses_and_threads_native_penalties": true,
+      "deltanet_dispatch_uses_per_launch_requant_frame": true,
+      "deltanet_kernel_uses_frame_independent_dither": true,
+      "dispatch_exposes_sample_top_p_pf": true,
+      "sample_top_p_kernel_accepts_and_applies_penalties": true,
+      "sampler_config_has_native_penalties": true,
+      "sampler_cpu_path_subtracts_additive_penalties": true,
+      "sampler_gpu_path_threads_penalties": true,
+      "sources_present": true
+    },
+    "coherence_rows_refreshed_by_this_check": false,
+    "evidence_class": "source_level_qwen36_a3b_runtime_check_not_model_rerun",
+    "origin_fix_commit": "379484ba828152b63f4b22b7748261d51e705502",
+    "origin_fix_short": "379484ba",
+    "paths": {
+      "cli": "/home/sadara/.hipfire/src/cli/index.ts",
+      "daemon": "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs",
+      "dispatch": "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs",
+      "gated_delta_net_q8_kernel": "/home/sadara/.hipfire/src/kernels/src/gated_delta_net_q8.hip",
+      "sample_top_p_kernel": "/home/sadara/.hipfire/src/kernels/src/sample_top_p.hip",
+      "sampler": "/home/sadara/.hipfire/src/crates/hipfire-runtime/src/sampler.rs"
+    },
+    "perf_rows_refreshed_by_this_check": false,
+    "ppl_rows_refreshed_by_this_check": false,
+    "schema": "hipfire.mq6_qwen36_a3b_runtime_source_reconciliation.gfx1151.v0",
+    "source_reconciled_in_worktree": true,
+    "unreconciled_by_source_check": [],
+    "validation_commands": [
+      "cargo test -p hipfire-runtime --lib sampler",
+      "cargo check --workspace --all-targets",
+      "bun test cli/index.ts"
+    ]
+  },
+  "schema": "hipfire.mq6_status.gfx1151.v0",
+  "status": "a3b-first-candidate-dense-perf-gated",
+  "surface_coverage": {
+    "all_required_surfaces_recorded": true,
+    "all_surfaces_promotion_ready": false,
+    "blocked_surfaces": [
+      "dense_decode",
+      "dense_prefill",
+      "dflash_spec",
+      "moe_decode",
+      "moe_prefill"
+    ],
+    "promotion_ready_surfaces": [],
+    "refresh_required": true,
+    "schema": "hipfire.mq6_surface_coverage.gfx1151.v0",
+    "surfaces": {
+      "dense_decode": {
+        "blockers": [
+          "dense_decode_ratio_below_0.90x_mq4",
+          "origin_or_remote_refresh_required"
+        ],
+        "details": {
+          "daemon_ar_exact_match_delta_replay": {
+            "checks": {
+              "generate_window_found": true,
+              "legacy_exact_match_lcp_rewind_absent": true,
+              "qwen35_no_conversation_lcp_scan": true,
+              "qwen35_prefills_direct_new_tokens": true,
+              "qwen35_single_gpu_branch_found": true,
+              "source_present": true
+            },
+            "coherence_rows_refreshed_by_this_check": false,
+            "evidence_class": "source_level_daemon_ar_exact_match_delta_replay_check_not_perf_rerun",
+            "origin_fix_short": "d5bc3f6",
+            "perf_rows_refreshed_by_this_check": false,
+            "source_reconciled_in_worktree": true
+          },
+          "decode_ratios": {
+            "dense_27b": 0.7021276595744681,
+            "dense_9b": 0.7027649769585254
+          },
+          "kernel_inventory": {
+            "evidence_class": "compiled_blob_presence_only_not_dispatch_proof",
+            "install_missing": [],
+            "install_required_kernels_present": true,
+            "repo_missing": [],
+            "repo_required_kernels_present": true,
+            "required_kernels": [
+              "gemv_mq6g256.hsaco",
+              "gemv_hfq6g256.hsaco",
+              "gemv_hfq6g256_residual.hsaco",
+              "gemv_hfq6g256_residual_sigmoid_scaled.hsaco",
+              "fused_rmsnorm_mq_rotate.hsaco",
+              "fused_silu_mul_mq_rotate.hsaco"
+            ]
+          },
+          "no_gpu_route_test": {
+            "all_phrase_checks_present": true,
+            "command": "cargo test -p hipfire-runtime --lib mq6_dense_decode_routes_through_hfq6_family",
+            "present": true
+          }
+        },
+        "evidence": [
+          "cargo test -p hipfire-runtime --lib mq6_dense_decode_routes_through_hfq6_family",
+          "kernel_inventory.required_mq6_dense_decode_kernels",
+          "2026-06-02-mq6-ar-perf.json",
+          "2026-06-03-mq6-ppl.json",
+          "2026-06-03-mq6-kld-c512.json"
+        ],
+        "next_unblocked_step": "fix_dense_decode_throughput_or_scope_dense_out",
+        "perf_evidence_present": true,
+        "promotion_ready": false,
+        "quality_evidence_present": true,
+        "refresh_required": true,
+        "runtime_evidence_present": true,
+        "status": "perf_gated"
+      },
+      "dense_prefill": {
+        "blockers": [
+          "dense_prefill_ratio_below_0.90x_mq4",
+          "origin_or_remote_refresh_required"
+        ],
+        "details": {
+          "daemon_ar_exact_match_delta_replay": {
+            "checks": {
+              "generate_window_found": true,
+              "legacy_exact_match_lcp_rewind_absent": true,
+              "qwen35_no_conversation_lcp_scan": true,
+              "qwen35_prefills_direct_new_tokens": true,
+              "qwen35_single_gpu_branch_found": true,
+              "source_present": true
+            },
+            "coherence_rows_refreshed_by_this_check": false,
+            "evidence_class": "source_level_daemon_ar_exact_match_delta_replay_check_not_perf_rerun",
+            "origin_fix_short": "d5bc3f6",
+            "perf_rows_refreshed_by_this_check": false,
+            "source_reconciled_in_worktree": true
+          },
+          "prefill_ratios": {
+            "dense_27b": 0.4151436031331593,
+            "dense_9b": 0.4773413897280967
+          }
+        },
+        "evidence": [
+          "cargo test -p hipfire-arch-qwen35 --lib dense_prefill_mq6_and_hfq6_are_batchable_in_qwen35",
+          "2026-06-02-mq6-ar-perf.json",
+          "2026-06-03-mq6-dflash-r3.json"
+        ],
+        "next_unblocked_step": "fix_dense_prefill_throughput_or_scope_dense_out",
+        "perf_evidence_present": true,
+        "promotion_ready": false,
+        "quality_evidence_present": true,
+        "refresh_required": true,
+        "runtime_evidence_present": true,
+        "status": "perf_gated"
+      },
+      "dflash_spec": {
+        "blockers": [
+          "target_side_verify_only_mq4_draft",
+          "no_mq6_draft_evidence",
+          "no_a3b_dflash_evidence",
+          "origin_or_remote_refresh_required"
+        ],
+        "details": {
+          "asym4_fwht_fallback": {
+            "checks": {
+              "asym4_branch_found": true,
+              "asym4_fallback_attention_preserved": true,
+              "asym4_fallback_writer_preserved": true,
+              "fwht4_uses_branch_native_q8_v_signature": true,
+              "fwht_attention_dispatched": true,
+              "fwht_subbranch_found": true,
+              "fwht_writer_dispatched": true,
+              "run_fa_layer_body_found": true,
+              "source_present": true
+            },
+            "coherence_rows_refreshed_by_this_check": false,
+            "evidence_class": "source_level_asym4_fwht_fallback_dispatch_check_not_decode_rerun",
+            "origin_fix_short": "a7dcfb0d",
+            "perf_rows_refreshed_by_this_check": false,
+            "source_reconciled_in_worktree": true
+          },
+          "batched_rope_compact_offset": {
+            "checks": {
+              "dispatch_accepts_pos_offset": true,
+              "dispatch_pushes_pos_offset_kernarg": true,
+              "halfsplit_kernel_accepts_pos_offset": true,
+              "halfsplit_kernel_applies_pos_offset": true,
+              "interleaved_kernel_accepts_pos_offset": true,
+              "interleaved_kernel_applies_pos_offset": true,
+              "mtp_head_explicit_zero_offset": true,
+              "no_model_equivalence_example_present": true,
+              "qwen35_batched_fa_passes_compact_offset": true,
+              "tree_verify_explicit_zero_offset": true
+            },
+            "evidence_class": "source_level_batched_rope_compact_offset_check_not_perf_rerun",
+            "long_context_or_eviction_rows_refreshed_by_this_check": false,
+            "origin_fix_short": "676338a4",
+            "perf_rows_refreshed_by_this_check": false,
+            "source_reconciled_in_worktree": true,
+            "validation_command": "cargo run --release -p rdna-compute --features deltanet --example rope_compact_offset_check"
+          },
+          "boundary_contract_test": {
+            "all_phrase_checks_present": true,
+            "command": "python3 scripts/test_mq6_status.py Mq6StatusTest.test_dflash_spec_boundary_marks_mq4_draft_target_verify_only",
+            "present": true
+          },
+          "cask_scratch_teardown": {
+            "checks": {
+              "fallible_work_wrapped_in_inner_result": true,
+              "indices_scratch_allocated": true,
+              "indices_scratch_freed_after_inner_result": true,
+              "inner_result_propagated_after_free": true,
+              "source_present": true,
+              "weights_scratch_allocated": true,
+              "weights_scratch_freed_after_inner_result": true
+            },
+            "evidence_class": "source_level_cask_scratch_teardown_check_not_eviction_rerun",
+            "long_context_or_eviction_rows_refreshed_by_this_check": false,
+            "origin_fix_short": "a7dcfb0d",
+            "perf_rows_refreshed_by_this_check": false,
+            "source_reconciled_in_worktree": true
+          },
+          "daemon_dflash_first_token_eos": {
+            "checks": {
+              "checks_chat_im_end_token": true,
+              "checks_model_eos_token": true,
+              "checks_tokenizer_terminator": true,
+              "first_token_guard_declared": true,
+              "source_present": true,
+              "spec_loop_guarded": true
+            },
+            "coherence_rows_refreshed_by_this_check": false,
+            "evidence_class": "source_level_daemon_dflash_first_token_eos_check_not_perf_rerun",
+            "origin_fix_short": "d5bc3f6",
+            "perf_rows_refreshed_by_this_check": false,
+            "source_reconciled_in_worktree": true
+          },
+          "ddtree_eviction_target_hidden_host": {
+            "checks": {
+              "daemon_post_prefill_and_cycle_calls_present": true,
+              "dflash_spec_demo_post_prefill_and_cycle_calls_present": true,
+              "helper_declared": true,
+              "helper_empty_mask_noop": true,
+              "helper_replaces_cpu_shadow": true,
+              "helper_uses_retain_mask_rows": true,
+              "speculative_source_present": true,
+              "unit_test_empty_mask_present": true,
+              "unit_test_selected_rows_present": true
+            },
+            "coherence_rows_refreshed_by_this_check": false,
+            "evidence_class": "source_level_ddtree_eviction_cpu_shadow_check_not_model_rerun",
+            "long_context_or_eviction_rows_refreshed_by_this_check": false,
+            "origin_fix_short": "d12b3ad4",
+            "perf_rows_refreshed_by_this_check": false,
+            "remote_ref": "origin/fix/issue-triage-2026-06-03",
+            "source_reconciled_in_worktree": true,
+            "validation_command": "cargo test -p hipfire-arch-qwen35 --lib compact_target_hidden_host"
+          },
+          "draft_formats": [
+            "mq4"
+          ],
+          "evidence_class": "target_side_verify_only_mq4_draft",
+          "min_runs_per_case": 3,
+          "mtp_gpu_teardown": {
+            "checks": {
+              "mtp_compose_frees_both_mtp_kv_inner_states": true,
+              "mtp_compose_source_present": true,
+              "mtp_head_kv_cache_free_gpu_found": true,
+              "mtp_head_kv_cache_frees_inner_gpu_tensors": true,
+              "mtp_head_no_drop_inner_in_kv_free_gpu": true,
+              "mtp_head_source_present": true,
+              "mtp_spec_free_gpu_found": true,
+              "mtp_spec_frees_mtp_kv_inner_gpu_tensors": true,
+              "mtp_spec_frees_trunk_snapshot_gpu": true,
+              "mtp_spec_no_drop_trunk_snapshot": true,
+              "mtp_spec_source_present": true
+            },
+            "evidence_class": "source_level_mtp_gpu_teardown_check_not_long_run_rerun",
+            "long_running_mtp_rows_refreshed_by_this_check": false,
+            "origin_fix_short": "a7dcfb0d",
+            "perf_rows_refreshed_by_this_check": false,
+            "source_reconciled_in_worktree": true
+          },
+          "scope_expanded_beyond_target_verify": false
+        },
+        "evidence": [
+          "python3 scripts/test_mq6_status.py Mq6StatusTest.test_dflash_spec_boundary_marks_mq4_draft_target_verify_only",
+          "source: mq6_batched_rope_compact_offset",
+          "cargo run --release -p rdna-compute --features deltanet --example rope_compact_offset_check",
+          "2026-06-03-mq6-dflash-r3.json"
+        ],
+        "next_unblocked_step": "reconcile_origin_and_remote_fixes_then_rerun_dense_and_a3b_dflash_spec",
+        "perf_evidence_present": true,
+        "promotion_ready": false,
+        "quality_evidence_present": true,
+        "refresh_required": true,
+        "runtime_evidence_present": true,
+        "status": "target_verify_only_refresh_blocked"
+      },
+      "moe_decode": {
+        "blockers": [
+          "origin_or_remote_refresh_required"
+        ],
+        "details": {
+          "decode_ratios": {
+            "qwen35_a3b": 0.9447513812154696,
+            "qwen36_a3b": 0.9491525423728813
+          },
+          "no_gpu_route_test": {
+            "all_phrase_checks_present": true,
+            "command": "cargo test -p hipfire-arch-qwen35 --lib moe_decode_routes_mq6_indexed_path_for_k8",
+            "present": true
+          }
+        },
+        "evidence": [
+          "cargo test -p hipfire-arch-qwen35 --lib moe_decode_routes_mq6_indexed_path_for_k8",
+          "2026-06-02-mq6-ar-perf.json",
+          "2026-06-03-mq6-a3b-ppl.json",
+          "2026-06-03-mq6-qwen36-a3b-ppl.json"
+        ],
+        "next_unblocked_step": "rerun_a3b_moe_decode_after_branch_reconciliation",
+        "perf_evidence_present": true,
+        "promotion_ready": false,
+        "quality_evidence_present": true,
+        "refresh_required": true,
+        "runtime_evidence_present": true,
+        "status": "a3b_first_candidate_refresh_blocked"
+      },
+      "moe_prefill": {
+        "blockers": [
+          "origin_or_remote_refresh_required"
+        ],
+        "details": {
+          "grouped_scratch_free": {
+            "checks": {
+              "frees_moe_expert_offsets": true,
+              "frees_moe_expert_tile_ids": true,
+              "frees_moe_expert_token_counts": true,
+              "frees_moe_inverse_perm": true,
+              "frees_moe_sorted_slot_index": true,
+              "frees_moe_y_down_grouped": true,
+              "frees_moe_y_gate_up_grouped": true,
+              "prefill_batch_free_gpu_found": true,
+              "prefill_batch_impl_found": true,
+              "source_present": true
+            },
+            "evidence_class": "source_level_moe_prefill_grouped_scratch_teardown_check_not_stability_rerun",
+            "long_running_moe_stability_refreshed_by_this_check": false,
+            "origin_fix_short": "b4adca1f",
+            "perf_rows_refreshed_by_this_check": false,
+            "source_reconciled_in_worktree": true
+          },
+          "prefill_ratios": {
+            "qwen35_a3b": 4.041144901610018,
+            "qwen36_a3b": 4.125673249551167
+          }
+        },
+        "evidence": [
+          "cargo test -p hipfire-arch-qwen35 --lib moe_prefill",
+          "2026-06-02-mq6-ar-perf.json",
+          "2026-06-03-mq6-a3b-ppl.json",
+          "2026-06-03-mq6-qwen36-a3b-ppl.json"
+        ],
+        "next_unblocked_step": "rerun_a3b_moe_prefill_after_branch_reconciliation",
+        "perf_evidence_present": true,
+        "promotion_ready": false,
+        "quality_evidence_present": true,
+        "refresh_required": true,
+        "runtime_evidence_present": true,
+        "status": "a3b_first_candidate_refresh_blocked"
+      }
+    }
+  },
+  "thresholds": {
+    "a3b_decode_close_ratio": 0.9,
+    "a3b_prefill_speedup_ratio": 1.5,
+    "dense_promotion_ratio": 0.9
+  }
+}

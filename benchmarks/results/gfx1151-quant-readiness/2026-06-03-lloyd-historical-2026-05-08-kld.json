@@ -1,0 +1,50 @@
+[
+  {
+    "variant": "qwen3.5-9b.mq3-lloyd",
+    "arch": "gfx1100",
+    "scoring_mode": "per-token",
+    "n_chunks": 1175,
+    "mean_kld": 1.6912579025637016,
+    "mean_kld_ci_lo": 1.6777772551401948,
+    "mean_kld_ci_hi": 1.7052734613436968,
+    "p99_kld": 17.978824919442722,
+    "ppl": 33.98060386941617,
+    "notes": ""
+  },
+  {
+    "variant": "qwen3.5-9b.mq3",
+    "arch": "gfx1100",
+    "scoring_mode": "per-token",
+    "n_chunks": 1175,
+    "mean_kld": 2.6221202755381414,
+    "mean_kld_ci_lo": 2.60193987974817,
+    "mean_kld_ci_hi": 2.6426612098998454,
+    "p99_kld": 17.36304468894259,
+    "ppl": 85.24597716355194,
+    "notes": ""
+  },
+  {
+    "variant": "qwen3.5-9b.mq4",
+    "arch": "gfx1100",
+    "scoring_mode": "per-token",
+    "n_chunks": 1175,
+    "mean_kld": 0.876236709593134,
+    "mean_kld_ci_lo": 0.8637001410029728,
+    "mean_kld_ci_hi": 0.8899237772761481,
+    "p99_kld": 19.99166355343127,
+    "ppl": null,
+    "notes": ""
+  },
+  {
+    "variant": "qwen3.5-9b.mq6",
+    "arch": "gfx1100",
+    "scoring_mode": "per-token",
+    "n_chunks": 1175,
+    "mean_kld": 0.6253968792839991,
+    "mean_kld_ci_lo": 0.612932064547553,
+    "mean_kld_ci_hi": 0.6387351309769308,
+    "p99_kld": 18.813190056611145,
+    "ppl": 13.920701323079214,
+    "notes": ""
+  }
+]

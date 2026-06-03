@@ -1,0 +1,251 @@
+{
+  "arch": "gfx1151",
+  "artifact_hashes": [
+    "sha256"
+  ],
+  "candidate_root": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness",
+  "fixtures": [
+    {
+      "cache_dir": "models--Qwen--Qwen3.5-0.8B",
+      "cache_path": "/home/sadara/Models/models--Qwen--Qwen3.5-0.8B",
+      "id": "qwen3.5-0.8b",
+      "label": "Qwen3.5 0.8B dense",
+      "present": true,
+      "role": "small-model collapse detector",
+      "snapshot_count": 1,
+      "snapshots": [
+        {
+          "has_config": true,
+          "has_tokenizer": true,
+          "path": "/home/sadara/Models/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17",
+          "safetensors": 1
+        }
+      ]
+    },
+    {
+      "cache_dir": "models--Qwen--Qwen3.5-4B",
+      "cache_path": "/home/sadara/Models/models--Qwen--Qwen3.5-4B",
+      "id": "qwen3.5-4b",
+      "label": "Qwen3.5 4B dense",
+      "present": true,
+      "role": "sub-9B quality boundary",
+      "snapshot_count": 1,
+      "snapshots": [
+        {
+          "has_config": true,
+          "has_tokenizer": true,
+          "path": "/home/sadara/Models/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+          "safetensors": 2
+        }
+      ]
+    },
+    {
+      "cache_dir": "models--Qwen--Qwen3.5-9B",
+      "cache_path": "/home/sadara/Models/models--Qwen--Qwen3.5-9B",
+      "id": "qwen3.5-9b",
+      "label": "Qwen3.5 9B dense",
+      "present": true,
+      "role": "primary dense promotion fixture",
+      "snapshot_count": 1,
+      "snapshots": [
+        {
+          "has_config": true,
+          "has_tokenizer": true,
+          "path": "/home/sadara/Models/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+          "safetensors": 4
+        }
+      ]
+    },
+    {
+      "cache_dir": "models--Qwen--Qwen3.5-27B",
+      "cache_path": "/home/sadara/Models/models--Qwen--Qwen3.5-27B",
+      "id": "qwen3.5-27b",
+      "label": "Qwen3.5 27B dense",
+      "present": true,
+      "role": "large dense perf/quality fixture",
+      "snapshot_count": 1,
+      "snapshots": [
+        {
+          "has_config": true,
+          "has_tokenizer": true,
+          "path": "/home/sadara/Models/models--Qwen--Qwen3.5-27B/snapshots/fc05daec18b0a78c049392ed2e771dde82bdf654",
+          "safetensors": 11
+        }
+      ]
+    },
+    {
+      "cache_dir": "models--Qwen--Qwen3.5-35B-A3B",
+      "cache_path": "/home/sadara/Models/models--Qwen--Qwen3.5-35B-A3B",
+      "id": "qwen3.5-35b-a3b",
+      "label": "Qwen3.5 35B-A3B MoE",
+      "present": true,
+      "role": "primary routed-expert fixture",
+      "snapshot_count": 1,
+      "snapshots": [
+        {
+          "has_config": true,
+          "has_tokenizer": true,
+          "path": "/home/sadara/Models/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754",
+          "safetensors": 14
+        }
+      ]
+    },
+    {
+      "cache_dir": "models--Qwen--Qwen3.6-35B-A3B",
+      "cache_path": "/home/sadara/Models/models--Qwen--Qwen3.6-35B-A3B",
+      "id": "qwen3.6-35b-a3b",
+      "label": "Qwen3.6 35B-A3B MoE",
+      "present": true,
+      "role": "refresh routed-expert fixture",
+      "snapshot_count": 1,
+      "snapshots": [
+        {
+          "has_config": true,
+          "has_tokenizer": true,
+          "path": "/home/sadara/Models/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0",
+          "safetensors": 26
+        }
+      ]
+    },
+    {
+      "cache_dir": "models--Qwen--Qwen3.5-122B-A10B",
+      "cache_path": "/home/sadara/Models/models--Qwen--Qwen3.5-122B-A10B",
+      "id": "qwen3.5-122b-a10b",
+      "label": "Qwen3.5 122B-A10B MoE",
+      "present": true,
+      "role": "final MoE stress fixture",
+      "snapshot_count": 1,
+      "snapshots": [
+        {
+          "has_config": true,
+          "has_tokenizer": true,
+          "path": "/home/sadara/Models/models--Qwen--Qwen3.5-122B-A10B/snapshots/dc4d348443bc740c68e2d77492492c11606384d5",
+          "safetensors": 39
+        }
+      ]
+    },
+    {
+      "cache_dir": "models--LiquidAI--LFM2.5-8B-A1B",
+      "cache_path": "/home/sadara/Models/models--LiquidAI--LFM2.5-8B-A1B",
+      "id": "lfm2.5-8b-a1b",
+      "label": "LFM2.5 8B-A1B MoE",
+      "present": true,
+      "role": "non-Qwen MoE smoke fixture",
+      "snapshot_count": 2,
+      "snapshots": [
+        {
+          "has_config": true,
+          "has_tokenizer": true,
+          "path": "/home/sadara/Models/models--LiquidAI--LFM2.5-8B-A1B/snapshots/0fb31bcb7502c8ae1d89efd02a621f17d759f0dd",
+          "safetensors": 1
+        },
+        {
+          "has_config": true,
+          "has_tokenizer": true,
+          "path": "/home/sadara/Models/models--LiquidAI--LFM2.5-8B-A1B/snapshots/662f02dcd5b386b3f5ddebfad3efe2351470cacf",
+          "safetensors": 1
+        }
+      ]
+    },
+    {
+      "cache_dir": "models--deepseek-ai--DeepSeek-V4-Flash",
+      "cache_path": "/home/sadara/Models/models--deepseek-ai--DeepSeek-V4-Flash",
+      "id": "deepseek-v4-flash",
+      "label": "DeepSeek V4 Flash",
+      "present": true,
+      "role": "MQ2-Lloyd MoE specialty fixture",
+      "snapshot_count": 1,
+      "snapshots": [
+        {
+          "has_config": true,
+          "has_tokenizer": true,
+          "path": "/home/sadara/Models/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/6976c7ff1b30a1b2cb7805021b8ba4684041f136",
+          "safetensors": 46
+        }
+      ]
+    }
+  ],
+  "format_filter": [
+    "mq3"
+  ],
+  "formats": [
+    {
+      "bytes_per_group": 104,
+      "candidate_artifacts": {
+        "artifacts": [
+          {
+            "hashes": {
+              "sha256": "b3505e437153543ea4672a1024d9589590a100d3c81d7e21f9f4a2ed9a9f7ae9"
+            },
+            "name": "qwen3.5-27b-mq3.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-27b-mq3.hfq",
+            "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq3",
+            "size_bytes": 11777612800,
+            "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-27b.mq3"
+          },
+          {
+            "hashes": {
+              "sha256": "28686f2d1908f10d723143213180a174858d77946e59590d1df092001bf90bb1"
+            },
+            "name": "qwen3.5-35b-a3b-mq3.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-35b-a3b-mq3.hfq",
+            "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq3",
+            "size_bytes": 22842468608,
+            "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-35b-a3b.mq3"
+          },
+          {
+            "hashes": {
+              "sha256": "d186f54a0cb706b732faed522386691a8cbc8e5e1cd2f69f5fbf5168bac43c26"
+            },
+            "name": "qwen3.5-4b-mq3.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-4b-mq3.hfq",
+            "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-4b.mq3",
+            "size_bytes": 2189926400,
+            "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-4b.mq3"
+          },
+          {
+            "hashes": {
+              "sha256": "82870237c54ce86ed892b9ef296d0a3b3febdddbd19a125e0af72dc30af8c56f"
+            },
+            "name": "qwen3.5-9b-mq3.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-mq3.hfq",
+            "resolved_path": "/home/sadara/.hipfire/models/qwen3.5-9b.mq3",
+            "size_bytes": 4419143680,
+            "symlink_target": "/home/sadara/.hipfire/models/qwen3.5-9b.mq3"
+          },
+          {
+            "hashes": {
+              "sha256": "c2af01597ca653ab1bf0d102d0d42ad5ce375cc3b0feb5f19db4474369501dce"
+            },
+            "name": "qwen3.6-35b-a3b-mq3.hfq",
+            "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.6-35b-a3b-mq3.hfq",
+            "resolved_path": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq3",
+            "size_bytes": 22842468608,
+            "symlink_target": "/home/sadara/.hipfire/models/qwen3.6-35b-a3b.mq3"
+          }
+        ],
+        "root_exists": true
+      },
+      "evidence_artifacts": [],
+      "fixtures": [
+        "qwen3.5-4b",
+        "qwen3.5-9b",
+        "qwen3.5-27b",
+        "qwen3.5-35b-a3b"
+      ],
+      "id": "mq3",
+      "next_work": [
+        "Run size-boundary quality on 4B/9B/27B.",
+        "Add routed-expert decode regression coverage."
+      ],
+      "perf_gate": "Add gfx1151 speed rows for the model sizes that pass coherence.",
+      "producer_gate": "Quantizer emits MQ3 with a small-model quality warning.",
+      "promotion_target": true,
+      "quality_gate": "Promote only for fixtures that stay coherent; sub-9B failures remain documented rejects.",
+      "runtime_gate": "Dense gfx1151 paths and MoE grouped WMMA are wired; routed decode coverage must be checked against A3B.",
+      "status": "candidate-size-gated"
+    }
+  ],
+  "models_root": "/home/sadara/Models",
+  "schema": "hipfire.quant_readiness.gfx1151.v0"
+}

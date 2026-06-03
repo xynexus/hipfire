@@ -1,0 +1,49 @@
+{
+  "captured_at_utc": "2026-06-03T07:36:12Z",
+  "decision": {
+    "native_paro_g256_source_found": false,
+    "native_paro_source_found": false,
+    "quality_state": "UNVERIFIABLE"
+  },
+  "filename_hit_count": 0,
+  "filename_hits": [],
+  "files_seen": 861,
+  "native_paro": {
+    "complete_module_count": 0,
+    "complete_modules_by_group_size": {},
+    "g128_complete_module_count": 0,
+    "g256_complete_module_count": 0,
+    "incomplete": [],
+    "incomplete_module_count": 0,
+    "incomplete_truncated": false,
+    "modules": [],
+    "modules_truncated": false
+  },
+  "roots": [
+    {
+      "exists": true,
+      "filename_hit_count": 0,
+      "files_seen": 677,
+      "root": "/home/sadara/Models",
+      "safetensor_file_count": 150
+    },
+    {
+      "exists": true,
+      "filename_hit_count": 0,
+      "files_seen": 126,
+      "root": "/home/sadara/.cache/huggingface/hub",
+      "safetensor_file_count": 1
+    },
+    {
+      "exists": true,
+      "filename_hit_count": 0,
+      "files_seen": 58,
+      "root": "/home/sadara/.hipfire/models",
+      "safetensor_file_count": 0
+    }
+  ],
+  "safetensor_dirs_scanned": 17,
+  "safetensor_files_scanned": 151,
+  "scan_errors": [],
+  "schema": "hipfire.astrea.paro_source_inventory.v0"
+}

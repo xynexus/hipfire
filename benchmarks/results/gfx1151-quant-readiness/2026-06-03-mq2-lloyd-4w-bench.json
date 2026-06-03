@@ -1,0 +1,284 @@
+{
+  "arch": "gfx1151",
+  "baseline_kernel": "gemm_mq2g256_lloyd_moe_grouped_wmma_k2",
+  "benchmark_binary": {
+    "md5": "58b5845b9f507717a331b8bb09931bfb",
+    "path": "target/release/examples/bench_mq2g256_lloyd_moe_4w"
+  },
+  "branch": "qwen35-native-mtp",
+  "candidate_kernel": "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2",
+  "command": "cargo run --release -p rdna-compute --example bench_mq2g256_lloyd_moe_4w",
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "date": "2026-06-03T07:57:36+08:00",
+  "model_artifact_inventory": {
+    "current_a3b_or_deepseek_artifact_present": false,
+    "current_a3b_or_deepseek_artifacts": [],
+    "mq2_lloyd_artifact_present": false,
+    "mq2_lloyd_artifacts": [],
+    "searched_roots": [
+      {
+        "exists": true,
+        "root": "/home/sadara/Models"
+      },
+      {
+        "exists": true,
+        "root": "/home/sadara/.hipfire/models"
+      }
+    ]
+  },
+  "origin_context": {
+    "checked_remote": "origin",
+    "model_evidence_refresh_required": true,
+    "origin_master_commit": "02634f4c49853faa8d43f7bc029a9f23988aa45f",
+    "origin_master_missing_commit_shorts": [
+      "89f42e4b",
+      "d5985c3e"
+    ],
+    "origin_master_refresh_required": true,
+    "relevant_upstream_commits": [
+      {
+        "commit": "89f42e4bb4a4317da586d37741bb23ea90ef2e24",
+        "impact": "restores reachable mmqload/lloyd_4w/base paths after nosync routing",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "present_on_remote_ref": true,
+        "remote_ref": "origin/master",
+        "short": "89f42e4b",
+        "subject": "fix(forward): flatten nosync if-else chain"
+      },
+      {
+        "commit": "d5985c3e51197c70fa804f84cd694abbcd38f0d7",
+        "impact": "records current Lloyd-family upstream cleanup context",
+        "present_on_head": false,
+        "present_on_origin_master": true,
+        "present_on_remote_ref": true,
+        "remote_ref": "origin/master",
+        "short": "d5985c3e",
+        "subject": "fix(stragglers): 4 GPU leaks/dead-doc + GGUF Promote6 Mq4Lloyd"
+      },
+      {
+        "commit": "edf922db7a4ccd97f40e0afc2e8171984b886fc7",
+        "impact": "keeps mq2lloyd preload and model-level perf collection behind coherence evidence",
+        "present_on_head": false,
+        "present_on_origin_master": false,
+        "present_on_remote_ref": true,
+        "remote_ref": "origin/minimax/m2.7-impl",
+        "short": "edf922db",
+        "subject": "fix(deepseek4): revert MMQLOAD-default -- long-context attractor on mq2lloyd"
+      },
+      {
+        "commit": "fb36f5395d17b48f2d539f7ba4adc6a6c18b808e",
+        "impact": "requires refreshing future MQ2-Lloyd model-backed coherence/perf evidence against the selected engine branch",
+        "present_on_head": false,
+        "present_on_origin_master": false,
+        "present_on_remote_ref": true,
+        "remote_ref": "origin/fix/hunt3-engine-bugs",
+        "short": "fb36f539",
+        "subject": "fix(engine): hunt-3 batch - 16 engine bugs across pp / sampling+MoE / daemon / bun-CLI"
+      }
+    ],
+    "remote_branch_missing_commit_shorts": [
+      "edf922db",
+      "fb36f539"
+    ],
+    "remote_branch_refresh_required": true
+  },
+  "promotion_allowed": false,
+  "rows": [
+    {
+      "baseline_us": 1636.1,
+      "batch": 128,
+      "candidate_4w_us": 1806.4,
+      "correctness": {
+        "bad": 0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "nan": 0,
+        "status": "ok"
+      },
+      "id": "gate_up_b128",
+      "k": 4096,
+      "label": "gate/up B=128",
+      "m": 2048,
+      "m_total": 768,
+      "phase": "gate_up",
+      "speedup": 0.9057
+    },
+    {
+      "baseline_us": 3401.6,
+      "batch": 256,
+      "candidate_4w_us": 3672.5,
+      "correctness": {
+        "bad": 0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "nan": 0,
+        "status": "ok"
+      },
+      "id": "gate_up_b256",
+      "k": 4096,
+      "label": "gate/up B=256",
+      "m": 2048,
+      "m_total": 1536,
+      "phase": "gate_up",
+      "speedup": 0.9262
+    },
+    {
+      "baseline_us": 14724.0,
+      "batch": 1024,
+      "candidate_4w_us": 15147.7,
+      "correctness": {
+        "bad": 0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "nan": 0,
+        "status": "ok"
+      },
+      "id": "gate_up_b1024",
+      "k": 4096,
+      "label": "gate/up B=1024",
+      "m": 2048,
+      "m_total": 6144,
+      "phase": "gate_up",
+      "speedup": 0.972
+    },
+    {
+      "baseline_us": 1704.7,
+      "batch": 128,
+      "candidate_4w_us": 1825.9,
+      "correctness": {
+        "bad": 0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "nan": 0,
+        "status": "ok"
+      },
+      "id": "down_b128",
+      "k": 2048,
+      "label": "down B=128",
+      "m": 4096,
+      "m_total": 768,
+      "phase": "down",
+      "speedup": 0.9336
+    },
+    {
+      "baseline_us": 3530.3,
+      "batch": 256,
+      "candidate_4w_us": 3793.8,
+      "correctness": {
+        "bad": 0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "nan": 0,
+        "status": "ok"
+      },
+      "id": "down_b256",
+      "k": 2048,
+      "label": "down B=256",
+      "m": 4096,
+      "m_total": 1536,
+      "phase": "down",
+      "speedup": 0.9305
+    },
+    {
+      "baseline_us": 14875.6,
+      "batch": 1024,
+      "candidate_4w_us": 15028.8,
+      "correctness": {
+        "bad": 0,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "nan": 0,
+        "status": "ok"
+      },
+      "id": "down_b1024",
+      "k": 2048,
+      "label": "down B=1024",
+      "m": 4096,
+      "m_total": 6144,
+      "phase": "down",
+      "speedup": 0.9898
+    }
+  ],
+  "schema": "hipfire.mq2_lloyd_4w_bench.gfx1151.v0",
+  "scope": "synthetic DeepSeek V4 MoE hot-path shapes; kernel-only evidence",
+  "specialty_boundary": {
+    "artifact_search_roots": [
+      {
+        "exists": true,
+        "root": "/home/sadara/Models"
+      },
+      {
+        "exists": true,
+        "root": "/home/sadara/.hipfire/models"
+      }
+    ],
+    "bandwidth_bottleneck_proven": false,
+    "current_a3b_or_deepseek_artifact_present": false,
+    "default_kernel_change_allowed": false,
+    "dense_text_status": "rejected_by_mq2_dense_quality_gate",
+    "likely_model_level_blockers": [
+      "launch_overhead",
+      "scalar_gemv_occupancy",
+      "codebook_unpack_lookup_cost",
+      "non_mq2_decode_work"
+    ],
+    "model_evidence_refresh_required": true,
+    "model_level_perf_evidence_present": false,
+    "model_level_promotion_allowed": false,
+    "mq2_lloyd_artifact_present": false,
+    "next_unblocked_step": "generate_or_locate_a3b_or_deepseek_mq2_lloyd_artifact",
+    "origin_evidence_summary": "origin contains lloyd_4w dispatch reachability cleanup and an mq2lloyd long-context attractor revert; origin/fix/hunt3-engine-bugs adds sampling+MoE engine fixes that require refreshed model-backed evidence. Keep research paths gated by coherence.",
+    "origin_master_refresh_required": true,
+    "perf_collection_allowed": false,
+    "remote_branch_refresh_required": true,
+    "remote_moe_fix_refresh_required": true,
+    "required_next_gates": [
+      "reconcile_remote_engine_fixes_before_model_perf_claims",
+      "current_a3b_or_deepseek_mq2_lloyd_artifact",
+      "routed_expert_coherence",
+      "model_level_perf_vs_k2",
+      "model_backed_speedup_preserves_coherence"
+    ],
+    "requires_model_backed_win_over_k2": true,
+    "routed_expert_coherence_present": false,
+    "routed_expert_status": "specialty-research-only",
+    "status": "specialty_blocked_no_model_artifact",
+    "synthetic_kernel_promotes_default": false,
+    "synthetic_kernel_result": "correct_but_slower_than_k2"
+  },
+  "specialty_scope": {
+    "bandwidth_bottleneck_proven": false,
+    "default_kernel_change_allowed": false,
+    "dense_text_status": "rejected_by_mq2_dense_quality_gate",
+    "effective_bandwidth_caveat": "Model-level effective-bandwidth shortcuts overcount inactive experts; the current decode bottleneck is not proven to be pure DDR bandwidth.",
+    "likely_model_level_blockers": [
+      "launch_overhead",
+      "scalar_gemv_occupancy",
+      "codebook_unpack_lookup_cost",
+      "non_mq2_decode_work"
+    ],
+    "model_level_evidence_present": false,
+    "next_experiments": [
+      "batch_selected_experts_across_tokens",
+      "reduce_launches_or_fuse_small_decode_steps",
+      "profile_scalar_gemv_occupancy_codebook_and_non_mq2_phases"
+    ],
+    "routed_expert_status": "specialty-research-only"
+  },
+  "status": "specialty_blocked_no_model_artifact",
+  "summary": {
+    "all_candidate_slower_than_baseline": true,
+    "all_correct": true,
+    "bandwidth_bottleneck_proven": false,
+    "decision": "keep HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W opt-in/research; synthetic kernel evidence does not prove model-level readiness",
+    "default_kernel_change_allowed": false,
+    "max_speedup": 0.9898,
+    "min_speedup": 0.9057,
+    "model_level_promotion_allowed": false,
+    "promote_4w_default": false,
+    "recommended_next_lever": "batch_selected_experts_across_tokens_before_more_packing",
+    "row_count": 6,
+    "specialty_research_allowed": true
+  }
+}

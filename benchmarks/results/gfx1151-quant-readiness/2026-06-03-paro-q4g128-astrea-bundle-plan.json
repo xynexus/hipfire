@@ -1,0 +1,94 @@
+{
+  "bundle_id": "gfx1151-paro-q4g128-qwen35-9b-package-contract",
+  "container": {
+    "external_sidecars": false,
+    "format": "hfq-package-v0",
+    "is_zip": false,
+    "layout": "HFQ-compatible typed section table with embedded policy/calibration sections"
+  },
+  "created_at_utc": "2026-06-03T03:15:24Z",
+  "deferred_runtime_work": [
+    "loader must parse and validate the package section table",
+    "runtime must reject transform or KV policy sections when required kernels are unavailable",
+    "CLI pull/run should prefer embedded triattn.centers over loose .triattn.hfq files",
+    "Atlas must record AR and DFlash perf rows before package promotion"
+  ],
+  "external_sidecars_target": false,
+  "git": "fab9d2bc",
+  "host": "halo",
+  "model": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-paro-mq4.hfq",
+  "next_step": "treat this as a package contract artifact; do not write a packaged model until loader support exists",
+  "output": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-paro-mq4.hfq",
+  "policy_id": "hipfire.paro-q4g128.productization.v0",
+  "schema": "hipfire.astrea.bundle_plan.v0",
+  "sections": {
+    "evidence.summary": {
+      "description": "Astrea KLD/PPL evidence and Atlas AR/DFlash perf row references",
+      "required": false
+    },
+    "manifest": {
+      "description": "section table, schema versions, checksums, runtime requirements",
+      "required": true
+    },
+    "transform.paro": {
+      "description": "ParoQuant channel scales and independent pairwise rotation parameters",
+      "policy_id": "hipfire.paro-q4g128.productization.v0",
+      "required": false,
+      "runtime_env_boundary": {
+        "productization_candidate": [
+          {
+            "default": "on",
+            "disable": "0",
+            "name": "HIPFIRE_PARO_BATCHED",
+            "scope": "batched Paro admission"
+          },
+          {
+            "default": "on for gfx1151, off elsewhere",
+            "disable": "0",
+            "name": "HIPFIRE_MOE_PARO_I8",
+            "scope": "gfx1151 grouped-MMQ Paro MoE i8 path"
+          },
+          {
+            "default": "on when HIPFIRE_MOE_PARO_I8 is admitted",
+            "disable": "0",
+            "name": "HIPFIRE_MOE_PARO_I8_K8",
+            "scope": "gfx1151 K=8 grouped-MMQ Paro MoE path"
+          }
+        ],
+        "promotion_report_requirements": [
+          "record effective values for productization-candidate Paro env vars",
+          "exclude research-only knobs from promoted main-path evidence unless each knob has separate artifact-backed validation",
+          "record oracle, finite-logit/NaN, coherence, KLD/PPL, and gfx1151 perf artifacts before promotion"
+        ],
+        "research_only": [
+          "HIPFIRE_PARO_PREROTATE",
+          "HIPFIRE_PARO_SMALL_DIRECT",
+          "HIPFIRE_PARO_SWIGLU_FUSED",
+          "HIPFIRE_PARO_FUSE_RMSNORM",
+          "HIPFIRE_PARO_FA3_FUSED",
+          "HIPFIRE_PARO_GATE_UP_FUSED",
+          "HIPFIRE_PARO_LA4_FUSED",
+          "HIPFIRE_PARO_LA2_FUSED",
+          "HIPFIRE_PARO_LA_GATES_MQ4G128",
+          "HIPFIRE_PARO_PACK1",
+          "HIPFIRE_PARO_PACK2",
+          "HIPFIRE_PARO_PACK4",
+          "HIPFIRE_PARO_SHARED_PAIRS",
+          "HIPFIRE_PARO_FUSED_PACK2"
+        ]
+      },
+      "runtime_status": "deferred_until_loader_and_fused_kernel_exist"
+    },
+    "weights": {
+      "description": "existing HFQ tensor index and contiguous tensor payloads",
+      "required": true,
+      "source": {
+        "bytes": null,
+        "exists": false,
+        "is_file": false,
+        "md5": null,
+        "path": "/home/sadara/Models/hipfire-candidates/gfx1151-readiness/qwen3.5-9b-paro-mq4.hfq"
+      }
+    }
+  }
+}

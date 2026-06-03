@@ -1,0 +1,325 @@
+{
+  "arch": "gfx1151",
+  "branch": "qwen35-native-mtp",
+  "cases": [
+    {
+      "draft_file": "qwen35-27b-dflash-mq4.hfq",
+      "draft_path": "/home/sadara/.hipfire/models/qwen35-27b-dflash-mq4.hfq",
+      "draft_present": true,
+      "id": "qwen35-27b-mq4-dflash-prose",
+      "max_tokens": 192,
+      "prompt": "The Roman Empire, at its height, stretched from the windswept moors of northern Britain to the sands of the Arabian peninsula. Its decline was not a single event but a long slow unraveling that took centuries. Several factors contributed to this gradual collapse. The first and perhaps most important was",
+      "prompt_id": "prose",
+      "prompt_md5": "c7e575e6fedf97df4c1902ef68335c22",
+      "runs": [
+        {
+          "command": [
+            "/home/sadara/.hipfire/src/target/release/examples/dflash_spec_demo",
+            "--target",
+            "/home/sadara/.hipfire/models/qwen3.5-27b.mq4",
+            "--draft",
+            "/home/sadara/.hipfire/models/qwen35-27b-dflash-mq4.hfq",
+            "--prompt",
+            "The Roman Empire, at its height, stretched from the windswept moors of northern Britain to the sands of the Arabian peninsula. Its decline was not a single event but a long slow unraveling that took centuries. Several factors contributed to this gradual collapse. The first and perhaps most important was",
+            "--max",
+            "192",
+            "--ctx",
+            "2048",
+            "--kv-mode",
+            "q8",
+            "--no-adaptive-b",
+            "--no-chatml"
+          ],
+          "exit_code": 0,
+          "log_tail": "target load: used 15.37 GB, free 113.47 GB\ndraft loaded in 0.10s\nVRAM @ after draft load: used 16.34 GB, free 112.51 GB\ndraft: MQ weights detected, FWHT rotation scratch enabled\nprompt: \"The Roman Empire, at its height, stretched from the windswept moors of northern Britain to the sands of the Arabian peninsula. Its decline was not a single event but a long slow unraveling that took centuries. Several factors contributed to this gradual collapse. The first and perhaps most important was\"\nprompt tokens (59): [760, 12386, 19825, 11, 506, 1141, 2521, 11, 38965, 494, 279, 27562, 868, 409, 4396, 1052, 314, 17631, 12840, 310, 279, 66725, 314, 279, 70133, 63188, 13, 11116, 17177, 557, 524, 264, 3074, 1484, 694, 264, 1248, 6103, 71456, 286, 421, 3738, 22892, 13, 24876, 9085, 18991, 310, 411, 50850, 17638, 13, 561, 1118, 321, 8106, 1379, 2894, 557]\nseeding target_hidden from prompt (59 tokens)...\nprefill in 1.52s (38.9 tok/s)\nVRAM @ after_prefill: used 17.73 GB, free 111.12 GB\ndecoding (max 192 tokens, block_size 16)...\n[verify-graph] warmup for B=16 complete \u2014 capture next cycle at this B\n[verify-graph] captured for B=16 with 1138 blobs (cache size: 1)\n--- OUTPUT ---\n the sheer size of the empire. It was simply too large to govern effectively. The second was the constant threat of invasion from barbarian tribes on the frontiers. The third was the economic instability caused by inflation and heavy taxation. The fourth was the political instability caused by frequent changes in leadership. The fifth was the moral decay of the Roman people, who had become too comfortable and complacent. The sixth was the rise of Christianity, which some historians believe weakened the traditional Roman values. The seventh was the division of the empire into two halves, which made it more difficult to defend. The eighth was the loss of the western provinces, which were the most economically important. The ninth was the failure of the Roman military to adapt to new tactics and technologies. The tenth was the lack of a clear succession plan, which led to civil wars and power struggles.\n\nBased on the text above, which of the following statements is true?\n\nA) The text claims\n--------------\nemitted: 192 tokens in 32.42s  (5.92 tok/s)\ncycles: 80  committed: 271  accepted: 111  \u03c4=1.388  mean_committed=3.388\n=== BENCH METRICS ===\nprompt_tokens: 59\nprefill_secs: 1.5165\nprefill_tok_s: 38.91\nttft_ms: 1925.56\ndecode_tokens_emitted: 192\ndecode_secs: 32.4164\ndecode_tok_s: 5.92\ndecode_tau: 1.3875\ndecode_accept_rate: 0.0925\nvram_used_mb: 16913\nvram_total_mb: 122880\n=====================\naccept_rate (accepted / (cycles \u00d7 (B-1))): 0.093\nhistogram: [(0, 26), (1, 25), (2, 14), (3, 8), (4, 3), (5, 2), (6, 2), (7, 0), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0), (15, 0), (16, 0)]\nseed-oracle: cycles=80 full_accept=0 mean_accept_len=1.388 | rej_match=0.000 tail_match=0.025 anypos_match=0.138\nDFlash tokens: [279, 31465, 1331, 314, 279, 30315, 13, 1049, 557, 4777, 2166, 3349, 310, 2485, 13057, 13, 561, 2018, 557, 279, 6570, 5716, 314, 28163, 494, 51599, 1068, 37129, 383, 279, 3929, 4659, 13, 561, 4688, 557, 279, 6739, 53442, 8613, 539, 23752, 321, 8545, 48924, 13, 561, 11400, 557, 279, 4788, 53442, 8613, 539, 20125, 4203, 303, 11109, 13, 561, 17175, 557, 279, 15200, 29712, 314, 279, 12386, 1208, 11, 852, 995, 3512, 2166, 10340, 321, 4432, 17640, 13, 561, 24238, 557, 279, 9704, 314, 30068, 11, 864, 1010, 48995, 4267, 55730, 279, 8343, 12386, 2663, 13, 561, 29398, 557, 279, 12436, 314, 279, 30315, 1083, 1330, 71592, 11, 864, 1801, 424, 777, 4839, 310, 10192, 13, 561, 35174, 557, 279, 4557, 314, 279, 17942, 38597, 11, 864, 998, 279, 1379, 44737, 2894, 13, 561, 41127, 557, 279, 7652, 314, 279, 12386, 6079, 310, 10202, 310, 491, 24537, 321, 13900, 13, 561, 53797, 557, 279, 6639, 314, 264, 2708, 48015, 3019, 11, 864, 5879, 310, 8009, 24146, 321, 2279, 26965, 13, 271, 27775, 383, 279, 1414, 3294, 11, 864, 314, 279, 2614, 11889, 369, 804, 30, 271, 32, 8, 561, 1414, 7929]\n",
+          "metrics": {
+            "decode_accept_rate": 0.0925,
+            "decode_secs": 32.4164,
+            "decode_tau": 1.3875,
+            "decode_tok_s": 5.92,
+            "decode_tokens_emitted": 192,
+            "prefill_secs": 1.5165,
+            "prefill_tok_s": 38.91,
+            "prompt_tokens": 59,
+            "ttft_ms": 1925.56,
+            "vram_total_mb": 122880,
+            "vram_used_mb": 16913
+          },
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "token_attractor": {
+            "max_count": 14,
+            "max_freq": 0.109,
+            "max_tok": 279,
+            "ok": true,
+            "soft_warn": false,
+            "total": 128,
+            "unique": 77,
+            "unique_ratio": 0.602
+          },
+          "wall_s": 36.85
+        }
+      ],
+      "summary": {
+        "median_decode_accept_rate": 0.0925,
+        "median_decode_secs": 32.4164,
+        "median_decode_tau": 1.3875,
+        "median_decode_tok_s": 5.92,
+        "median_decode_tokens_emitted": 192.0,
+        "median_prefill_tok_s": 38.91,
+        "median_ttft_ms": 1925.56,
+        "median_vram_used_mb": 16913.0,
+        "ok_runs": 1,
+        "total_runs": 1
+      },
+      "target_file": "qwen3.5-27b.mq4",
+      "target_format": "mq4",
+      "target_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq4",
+      "target_present": true
+    },
+    {
+      "draft_file": "qwen35-27b-dflash-mq4.hfq",
+      "draft_path": "/home/sadara/.hipfire/models/qwen35-27b-dflash-mq4.hfq",
+      "draft_present": true,
+      "id": "qwen35-27b-mq6-dflash-prose",
+      "max_tokens": 192,
+      "prompt": "The Roman Empire, at its height, stretched from the windswept moors of northern Britain to the sands of the Arabian peninsula. Its decline was not a single event but a long slow unraveling that took centuries. Several factors contributed to this gradual collapse. The first and perhaps most important was",
+      "prompt_id": "prose",
+      "prompt_md5": "c7e575e6fedf97df4c1902ef68335c22",
+      "runs": [
+        {
+          "command": [
+            "/home/sadara/.hipfire/src/target/release/examples/dflash_spec_demo",
+            "--target",
+            "/home/sadara/.hipfire/models/qwen3.5-27b.mq6",
+            "--draft",
+            "/home/sadara/.hipfire/models/qwen35-27b-dflash-mq4.hfq",
+            "--prompt",
+            "The Roman Empire, at its height, stretched from the windswept moors of northern Britain to the sands of the Arabian peninsula. Its decline was not a single event but a long slow unraveling that took centuries. Several factors contributed to this gradual collapse. The first and perhaps most important was",
+            "--max",
+            "192",
+            "--ctx",
+            "2048",
+            "--kv-mode",
+            "q8",
+            "--no-adaptive-b",
+            "--no-chatml"
+          ],
+          "exit_code": 0,
+          "log_tail": "5 GB\ndraft loaded in 0.10s\nVRAM @ after draft load: used 22.76 GB, free 106.09 GB\ndraft: MQ weights detected, FWHT rotation scratch enabled\nprompt: \"The Roman Empire, at its height, stretched from the windswept moors of northern Britain to the sands of the Arabian peninsula. Its decline was not a single event but a long slow unraveling that took centuries. Several factors contributed to this gradual collapse. The first and perhaps most important was\"\nprompt tokens (59): [760, 12386, 19825, 11, 506, 1141, 2521, 11, 38965, 494, 279, 27562, 868, 409, 4396, 1052, 314, 17631, 12840, 310, 279, 66725, 314, 279, 70133, 63188, 13, 11116, 17177, 557, 524, 264, 3074, 1484, 694, 264, 1248, 6103, 71456, 286, 421, 3738, 22892, 13, 24876, 9085, 18991, 310, 411, 50850, 17638, 13, 561, 1118, 321, 8106, 1379, 2894, 557]\nseeding target_hidden from prompt (59 tokens)...\nprefill in 3.65s (16.2 tok/s)\nVRAM @ after_prefill: used 24.16 GB, free 104.69 GB\ndecoding (max 192 tokens, block_size 16)...\n[verify-graph] warmup for B=16 complete \u2014 capture next cycle at this B\n[verify-graph] captured for B=16 with 1010 blobs (cache size: 1)\n--- OUTPUT ---\n the sheer size of the empire. It was simply too large to govern effectively. Communication was slow, and the central government in Rome could not respond quickly enough to local problems. This led to a loss of control over the provinces, which began to act more independently. Another major factor was economic instability. The empire relied heavily on slave labor, which discouraged technological innovation. As the empire expanded, it became more difficult to find new slaves, leading to a labor shortage. This, in turn, caused inflation and a decline in trade. The currency also became debased, losing its value and further destabilizing the economy. Political corruption was another significant issue. The Roman Senate became increasingly corrupt, with politicians more interested in personal gain than the welfare of the state. This led to a lack of effective leadership and a breakdown in the rule of law. The military also played a role in the empire's decline. The Roman legions, once the most powerful force in the world\n--------------\nemitted: 193 tokens in 64.93s  (2.97 tok/s)\ncycles: 82  committed: 274  accepted: 110  \u03c4=1.341  mean_committed=3.341\n=== BENCH METRICS ===\nprompt_tokens: 59\nprefill_secs: 3.6518\nprefill_tok_s: 16.16\nttft_ms: 4463.19\ndecode_tokens_emitted: 193\ndecode_secs: 64.9274\ndecode_tok_s: 2.97\ndecode_tau: 1.3415\ndecode_accept_rate: 0.0894\nvram_used_mb: 23041\nvram_total_mb: 122880\n=====================\naccept_rate (accepted / (cycles \u00d7 (B-1))): 0.089\nhistogram: [(0, 28), (1, 29), (2, 12), (3, 3), (4, 6), (5, 1), (6, 2), (7, 1), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0), (15, 0), (16, 0)]\nseed-oracle: cycles=82 full_accept=0 mean_accept_len=1.341 | rej_match=0.000 tail_match=0.000 anypos_match=0.098\nDFlash tokens: [279, 31465, 1331, 314, 279, 30315, 13, 1049, 557, 4777, 2166, 3349, 310, 2485, 13057, 13, 29854, 557, 6103, 11, 321, 279, 8358, 2936, 303, 21047, 1362, 524, 5707, 5964, 3213, 310, 2136, 5154, 13, 1061, 5879, 310, 264, 4557, 314, 2444, 888, 279, 38597, 11, 864, 5820, 310, 1121, 777, 27222, 13, 12908, 3478, 7911, 557, 6739, 53442, 13, 561, 30315, 38589, 16421, 383, 19743, 9050, 11, 864, 61521, 28069, 18204, 13, 1577, 279, 30315, 16676, 11, 424, 5924, 777, 4839, 310, 1423, 491, 30621, 11, 6187, 310, 264, 9050, 36897, 13, 1061, 11, 303, 2404, 11, 8613, 23752, 321, 264, 17177, 303, 6355, 13, 561, 11085, 1048, 5924, 4083, 1422, 11, 12806, 1141, 869, 321, 4473, 68740, 4694, 279, 8322, 13, 29501, 20600, 557, 2361, 4927, 4125, 13, 561, 12386, 9598, 5924, 14328, 21241, 11, 440, 18196, 777, 7763, 303, 4204, 8457, 1056, 279, 21931, 314, 279, 1528, 13, 1061, 5879, 310, 264, 6639, 314, 7139, 11109, 321, 264, 29006, 303, 279, 5728, 314, 2253, 13, 561, 6079, 1048, 6141, 264, 3364, 303, 279, 30315, 579, 17177, 13, 561, 12386, 2392, 880, 11, 2957, 279, 1379, 7737, 5176, 303, 279, 1814]\n",
+          "metrics": {
+            "decode_accept_rate": 0.0894,
+            "decode_secs": 64.9274,
+            "decode_tau": 1.3415,
+            "decode_tok_s": 2.97,
+            "decode_tokens_emitted": 193,
+            "prefill_secs": 3.6518,
+            "prefill_tok_s": 16.16,
+            "prompt_tokens": 59,
+            "ttft_ms": 4463.19,
+            "vram_total_mb": 122880,
+            "vram_used_mb": 23041
+          },
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "token_attractor": {
+            "max_count": 9,
+            "max_freq": 0.07,
+            "max_tok": 13,
+            "ok": true,
+            "soft_warn": false,
+            "total": 128,
+            "unique": 85,
+            "unique_ratio": 0.664
+          },
+          "wall_s": 72.418
+        }
+      ],
+      "summary": {
+        "median_decode_accept_rate": 0.0894,
+        "median_decode_secs": 64.9274,
+        "median_decode_tau": 1.3415,
+        "median_decode_tok_s": 2.97,
+        "median_decode_tokens_emitted": 193.0,
+        "median_prefill_tok_s": 16.16,
+        "median_ttft_ms": 4463.19,
+        "median_vram_used_mb": 23041.0,
+        "ok_runs": 1,
+        "total_runs": 1
+      },
+      "target_file": "qwen3.5-27b.mq6",
+      "target_format": "mq6",
+      "target_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq6",
+      "target_present": true
+    },
+    {
+      "draft_file": "qwen35-27b-dflash-mq4.hfq",
+      "draft_path": "/home/sadara/.hipfire/models/qwen35-27b-dflash-mq4.hfq",
+      "draft_present": true,
+      "id": "qwen35-27b-mq4-dflash-code",
+      "max_tokens": 128,
+      "prompt": "from typing import List\n\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n",
+      "prompt_id": "code",
+      "prompt_md5": "5333a1f70d884060807676347c0edb93",
+      "runs": [
+        {
+          "command": [
+            "/home/sadara/.hipfire/src/target/release/examples/dflash_spec_demo",
+            "--target",
+            "/home/sadara/.hipfire/models/qwen3.5-27b.mq4",
+            "--draft",
+            "/home/sadara/.hipfire/models/qwen35-27b-dflash-mq4.hfq",
+            "--prompt",
+            "from typing import List\n\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n",
+            "--max",
+            "128",
+            "--ctx",
+            "2048",
+            "--kv-mode",
+            "q8",
+            "--no-adaptive-b",
+            "--no-chatml"
+          ],
+          "exit_code": 0,
+          "log_tail": " load progress: layer 51/64 elapsed=2.11s throughput=6.60 GiB/s (13.94/13.94 GiB)\n  loading layer 51/64 (FullAttention)...\n  load progress: layer 52/64 elapsed=2.11s throughput=6.60 GiB/s (13.94/13.94 GiB)\n  loading layer 52/64 (LinearAttention)...\n  load progress: layer 53/64 elapsed=2.11s throughput=6.60 GiB/s (13.94/13.94 GiB)\n  loading layer 53/64 (LinearAttention)...\n  load progress: layer 54/64 elapsed=2.11s throughput=6.59 GiB/s (13.94/13.94 GiB)\n  loading layer 54/64 (LinearAttention)...\n  load progress: layer 55/64 elapsed=2.11s throughput=6.59 GiB/s (13.94/13.94 GiB)\n  loading layer 55/64 (FullAttention)...\n  load progress: layer 56/64 elapsed=2.11s throughput=6.59 GiB/s (13.94/13.94 GiB)\n  loading layer 56/64 (LinearAttention)...\n  load progress: layer 57/64 elapsed=2.12s throughput=6.59 GiB/s (13.94/13.94 GiB)\n  loading layer 57/64 (LinearAttention)...\n  load progress: layer 58/64 elapsed=2.12s throughput=6.59 GiB/s (13.94/13.94 GiB)\n  loading layer 58/64 (LinearAttention)...\n  load progress: layer 59/64 elapsed=2.12s throughput=6.59 GiB/s (13.94/13.94 GiB)\n  loading layer 59/64 (FullAttention)...\n  load progress: layer 60/64 elapsed=2.12s throughput=6.58 GiB/s (13.94/13.94 GiB)\n  loading layer 60/64 (LinearAttention)...\n  load progress: layer 61/64 elapsed=2.12s throughput=6.58 GiB/s (13.94/13.94 GiB)\n  loading layer 61/64 (LinearAttention)...\n  load progress: layer 62/64 elapsed=2.12s throughput=6.58 GiB/s (13.94/13.94 GiB)\n  loading layer 62/64 (LinearAttention)...\n  load progress: layer 63/64 elapsed=2.12s throughput=6.58 GiB/s (13.94/13.94 GiB)\n  loading layer 63/64 (FullAttention)...\n  load progress: layer 64/64 elapsed=2.12s throughput=6.58 GiB/s (13.94/13.94 GiB)\n  weights loaded: elapsed=2.12s throughput=6.58 GiB/s payload=13.94 GiB streamed=13.94 GiB\nKV cache: q8 (16/64 layers carry KV, others placeholder)\ntarget loaded in 2.16s\nVRAM @ after target load: used 15.37 GB, free 113.47 GB\ndraft loaded in 0.10s\nVRAM @ after draft load: used 16.34 GB, free 112.51 GB\ndraft: MQ weights detected, FWHT rotation scratch enabled\nprompt: \"from typing import List\\n\\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\\n    \\\"\\\"\\\" Check if in given list of numbers, are any two numbers closer to each other than\\n    given threshold.\\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\\n    False\\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\\n    True\\n    \\\"\\\"\\\"\\n\"\nprompt tokens (123): [123 tokens]\nseeding target_hidden from prompt (123 tokens)...\nprefill in 2.28s (53.9 tok/s)\nVRAM @ after_prefill: used 17.74 GB, free 111.11 GB\ndecoding (max 128 tokens, block_size 16)...\n[verify-graph] warmup for B=16 complete \u2014 capture next cycle at this B\n[verify-graph] captured for B=16 with 1138 blobs (cache size: 1)\neos\n--- OUTPUT ---\n     for i in range(len(numbers)):\n         for j in range(i + 1, len(numbers)):\n             if abs(numbers[i] - numbers[j]) < threshold:\n                 return True\n     return False<|endoftext|>\n--------------\nemitted: 45 tokens in 1.52s  (29.67 tok/s)\ncycles: 4  committed: 48  accepted: 40  \u03c4=10.000  mean_committed=12.000\n=== BENCH METRICS ===\nprompt_tokens: 123\nprefill_secs: 2.2814\nprefill_tok_s: 53.91\nttft_ms: 2660.16\ndecode_tokens_emitted: 45\ndecode_secs: 1.5165\ndecode_tok_s: 29.67\ndecode_tau: 10.0000\ndecode_accept_rate: 0.6667\nvram_used_mb: 16925\nvram_total_mb: 122880\n=====================\naccept_rate (accepted / (cycles \u00d7 (B-1))): 0.667\nhistogram: [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 1), (8, 0), (9, 1), (10, 1), (11, 0), (12, 0), (13, 0), (14, 1), (15, 0), (16, 0)]\nseed-oracle: cycles=4 full_accept=0 mean_accept_len=10.000 | rej_match=0.000 tail_match=0.250 anypos_match=0.250\nDFlash tokens: [257, 364, 585, 303, 2020, 6686, 45631, 35497, 198, 260, 364, 492, 303, 2020, 1889, 478, 220, 16, 11, 2343, 45631, 35497, 198, 1734, 413, 3523, 45631, 957, 60, 471, 4947, 3681, 2387, 361, 11823, 25, 198, 336, 460, 2912, 198, 257, 460, 3439, 248044]\n",
+          "metrics": {
+            "decode_accept_rate": 0.6667,
+            "decode_secs": 1.5165,
+            "decode_tau": 10.0,
+            "decode_tok_s": 29.67,
+            "decode_tokens_emitted": 45,
+            "prefill_secs": 2.2814,
+            "prefill_tok_s": 53.91,
+            "prompt_tokens": 123,
+            "ttft_ms": 2660.16,
+            "vram_total_mb": 122880,
+            "vram_used_mb": 16925
+          },
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "token_attractor": {
+            "max_count": 4,
+            "max_freq": 0.091,
+            "max_tok": 198,
+            "ok": true,
+            "soft_warn": false,
+            "total": 44,
+            "unique": 33,
+            "unique_ratio": 0.75
+          },
+          "wall_s": 6.588
+        }
+      ],
+      "summary": {
+        "median_decode_accept_rate": 0.6667,
+        "median_decode_secs": 1.5165,
+        "median_decode_tau": 10.0,
+        "median_decode_tok_s": 29.67,
+        "median_decode_tokens_emitted": 45.0,
+        "median_prefill_tok_s": 53.91,
+        "median_ttft_ms": 2660.16,
+        "median_vram_used_mb": 16925.0,
+        "ok_runs": 1,
+        "total_runs": 1
+      },
+      "target_file": "qwen3.5-27b.mq4",
+      "target_format": "mq4",
+      "target_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq4",
+      "target_present": true
+    },
+    {
+      "draft_file": "qwen35-27b-dflash-mq4.hfq",
+      "draft_path": "/home/sadara/.hipfire/models/qwen35-27b-dflash-mq4.hfq",
+      "draft_present": true,
+      "id": "qwen35-27b-mq6-dflash-code",
+      "max_tokens": 128,
+      "prompt": "from typing import List\n\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n",
+      "prompt_id": "code",
+      "prompt_md5": "5333a1f70d884060807676347c0edb93",
+      "runs": [
+        {
+          "command": [
+            "/home/sadara/.hipfire/src/target/release/examples/dflash_spec_demo",
+            "--target",
+            "/home/sadara/.hipfire/models/qwen3.5-27b.mq6",
+            "--draft",
+            "/home/sadara/.hipfire/models/qwen35-27b-dflash-mq4.hfq",
+            "--prompt",
+            "from typing import List\n\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n",
+            "--max",
+            "128",
+            "--ctx",
+            "2048",
+            "--kv-mode",
+            "q8",
+            "--no-adaptive-b",
+            "--no-chatml"
+          ],
+          "exit_code": 0,
+          "log_tail": ")...\n  load progress: layer 51/64 elapsed=3.03s throughput=6.57 GiB/s (19.90/19.90 GiB)\n  loading layer 51/64 (FullAttention)...\n  load progress: layer 52/64 elapsed=3.03s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 52/64 (LinearAttention)...\n  load progress: layer 53/64 elapsed=3.03s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 53/64 (LinearAttention)...\n  load progress: layer 54/64 elapsed=3.03s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 54/64 (LinearAttention)...\n  load progress: layer 55/64 elapsed=3.03s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 55/64 (FullAttention)...\n  load progress: layer 56/64 elapsed=3.03s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 56/64 (LinearAttention)...\n  load progress: layer 57/64 elapsed=3.03s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 57/64 (LinearAttention)...\n  load progress: layer 58/64 elapsed=3.03s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 58/64 (LinearAttention)...\n  load progress: layer 59/64 elapsed=3.03s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 59/64 (FullAttention)...\n  load progress: layer 60/64 elapsed=3.04s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 60/64 (LinearAttention)...\n  load progress: layer 61/64 elapsed=3.04s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 61/64 (LinearAttention)...\n  load progress: layer 62/64 elapsed=3.04s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 62/64 (LinearAttention)...\n  load progress: layer 63/64 elapsed=3.04s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  loading layer 63/64 (FullAttention)...\n  load progress: layer 64/64 elapsed=3.04s throughput=6.56 GiB/s (19.90/19.90 GiB)\n  weights loaded: elapsed=3.04s throughput=6.56 GiB/s payload=19.90 GiB streamed=19.90 GiB\nKV cache: q8 (16/64 layers carry KV, others placeholder)\ntarget loaded in 3.09s\nVRAM @ after target load: used 21.80 GB, free 107.05 GB\ndraft loaded in 0.10s\nVRAM @ after draft load: used 22.76 GB, free 106.09 GB\ndraft: MQ weights detected, FWHT rotation scratch enabled\nprompt: \"from typing import List\\n\\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\\n    \\\"\\\"\\\" Check if in given list of numbers, are any two numbers closer to each other than\\n    given threshold.\\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\\n    False\\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\\n    True\\n    \\\"\\\"\\\"\\n\"\nprompt tokens (123): [123 tokens]\nseeding target_hidden from prompt (123 tokens)...\nprefill in 5.76s (21.3 tok/s)\nVRAM @ after_prefill: used 24.16 GB, free 104.69 GB\ndecoding (max 128 tokens, block_size 16)...\n[verify-graph] warmup for B=16 complete \u2014 capture next cycle at this B\n[verify-graph] captured for B=16 with 1010 blobs (cache size: 1)\neos\n--- OUTPUT ---\n    for i in range(len(numbers)):\n        for j in range(i + 1, len(numbers)):\n            if abs(numbers[i] - numbers[j]) < threshold:\n                return True\n    return False<|endoftext|>\n--------------\nemitted: 45 tokens in 3.10s  (14.51 tok/s)\ncycles: 4  committed: 48  accepted: 40  \u03c4=10.000  mean_committed=12.000\n=== BENCH METRICS ===\nprompt_tokens: 123\nprefill_secs: 5.7620\nprefill_tok_s: 21.35\nttft_ms: 6525.87\ndecode_tokens_emitted: 45\ndecode_secs: 3.1006\ndecode_tok_s: 14.51\ndecode_tau: 10.0000\ndecode_accept_rate: 0.6667\nvram_used_mb: 23053\nvram_total_mb: 122880\n=====================\naccept_rate (accepted / (cycles \u00d7 (B-1))): 0.667\nhistogram: [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 1), (7, 1), (8, 0), (9, 0), (10, 0), (11, 0), (12, 1), (13, 0), (14, 0), (15, 1), (16, 0)]\nseed-oracle: cycles=4 full_accept=1 mean_accept_len=10.000 | rej_match=0.000 tail_match=0.000 anypos_match=0.250\nDFlash tokens: [262, 364, 585, 303, 2020, 6686, 45631, 35497, 198, 285, 364, 492, 303, 2020, 1889, 478, 220, 16, 11, 2343, 45631, 35497, 198, 309, 413, 3523, 45631, 957, 60, 471, 4947, 3681, 2387, 361, 11823, 25, 198, 388, 460, 2912, 198, 262, 460, 3439, 248044]\n",
+          "metrics": {
+            "decode_accept_rate": 0.6667,
+            "decode_secs": 3.1006,
+            "decode_tau": 10.0,
+            "decode_tok_s": 14.51,
+            "decode_tokens_emitted": 45,
+            "prefill_secs": 5.762,
+            "prefill_tok_s": 21.35,
+            "prompt_tokens": 123,
+            "ttft_ms": 6525.87,
+            "vram_total_mb": 122880,
+            "vram_used_mb": 23053
+          },
+          "panic": "",
+          "run": 1,
+          "status": "ok",
+          "token_attractor": {
+            "max_count": 4,
+            "max_freq": 0.091,
+            "max_tok": 198,
+            "ok": true,
+            "soft_warn": false,
+            "total": 44,
+            "unique": 33,
+            "unique_ratio": 0.75
+          },
+          "wall_s": 12.544
+        }
+      ],
+      "summary": {
+        "median_decode_accept_rate": 0.6667,
+        "median_decode_secs": 3.1006,
+        "median_decode_tau": 10.0,
+        "median_decode_tok_s": 14.51,
+        "median_decode_tokens_emitted": 45.0,
+        "median_prefill_tok_s": 21.35,
+        "median_ttft_ms": 6525.87,
+        "median_vram_used_mb": 23053.0,
+        "ok_runs": 1,
+        "total_runs": 1
+      },
+      "target_file": "qwen3.5-27b.mq6",
+      "target_format": "mq6",
+      "target_path": "/home/sadara/.hipfire/models/qwen3.5-27b.mq6",
+      "target_present": true
+    }
+  ],
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "date": "2026-06-02T16:16:30.222143+00:00",
+  "dflash_spec_demo": {
+    "md5": "6571ba760d3e20004066caf1ee3f76ee",
+    "path": "/home/sadara/.hipfire/src/target/release/examples/dflash_spec_demo"
+  },
+  "models_dir": "/home/sadara/.hipfire/models",
+  "params": {
+    "adaptive_b": false,
+    "chatml": false,
+    "ctx": 2048,
+    "kv_mode": "q8",
+    "runs_per_case": 1
+  },
+  "schema": "hipfire.mq6_dflash.gfx1151.v0"
+}

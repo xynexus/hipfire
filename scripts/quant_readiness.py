@@ -1,0 +1,1386 @@
+#!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
+"""Report the gfx1151 quant-format readiness matrix.
+
+This is intentionally a status/reporting tool, not a candidate writer.  It keeps
+the MQ/LLoyd/Paro bring-up lanes tied to the same promotion contract used by
+MQ4: explicit runtime support, quality evidence, and gfx1151 perf evidence.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable
+
+
+SCHEMA = "hipfire.quant_readiness.gfx1151.v0"
+DEFAULT_MODELS_ROOT = Path("/home/sadara/Models")
+HASH_CHUNK_SIZE = 16 * 1024 * 1024
+SUPPORTED_HASHES = ("sha256", "md5")
+
+
+@dataclass(frozen=True)
+class Fixture:
+    id: str
+    label: str
+    cache_dir: str
+    role: str
+
+
+@dataclass(frozen=True)
+class FormatReadiness:
+    id: str
+    status: str
+    bytes_per_group: int | None
+    promotion_target: bool
+    producer_gate: str
+    runtime_gate: str
+    quality_gate: str
+    perf_gate: str
+    fixtures: tuple[str, ...]
+    next_work: tuple[str, ...]
+    evidence_artifacts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CandidateMatcher:
+    include: tuple[str, ...]
+    exclude: tuple[str, ...] = ()
+
+
+FIXTURES: tuple[Fixture, ...] = (
+    Fixture("qwen3.5-0.8b", "Qwen3.5 0.8B dense", "models--Qwen--Qwen3.5-0.8B", "small-model collapse detector"),
+    Fixture("qwen3.5-4b", "Qwen3.5 4B dense", "models--Qwen--Qwen3.5-4B", "sub-9B quality boundary"),
+    Fixture("qwen3.5-9b", "Qwen3.5 9B dense", "models--Qwen--Qwen3.5-9B", "primary dense promotion fixture"),
+    Fixture("qwen3.5-27b", "Qwen3.5 27B dense", "models--Qwen--Qwen3.5-27B", "large dense perf/quality fixture"),
+    Fixture("qwen3.5-35b-a3b", "Qwen3.5 35B-A3B MoE", "models--Qwen--Qwen3.5-35B-A3B", "primary routed-expert fixture"),
+    Fixture("qwen3.6-35b-a3b", "Qwen3.6 35B-A3B MoE", "models--Qwen--Qwen3.6-35B-A3B", "refresh routed-expert fixture"),
+    Fixture("qwen3.5-122b-a10b", "Qwen3.5 122B-A10B MoE", "models--Qwen--Qwen3.5-122B-A10B", "final MoE stress fixture"),
+    Fixture("lfm2.5-8b-a1b", "LFM2.5 8B-A1B MoE", "models--LiquidAI--LFM2.5-8B-A1B", "non-Qwen MoE smoke fixture"),
+    Fixture("deepseek-v4-flash", "DeepSeek V4 Flash", "models--deepseek-ai--DeepSeek-V4-Flash", "MQ2-Lloyd MoE specialty fixture"),
+)
+
+
+CANDIDATE_SUBDIR = Path("hipfire-candidates/gfx1151-readiness")
+
+UPSTREAM_RELEVANT_COMMITS: tuple[dict[str, object], ...] = (
+    {
+        "commit": "676338a47dff1d8bcb923cc3b636845bd684ca2f",
+        "short": "676338a4",
+        "subject": "fix(qwen35): batched RoPE ignored compact_offset -> phase skew after eviction (H4)",
+        "formats": ("mq3", "mq6", "mq3-lloyd", "mq4-lloyd"),
+        "surfaces": ("batched_rope", "eviction", "mtp", "dflash"),
+        "promotion_effect": "refresh long-context, eviction, MTP, and DFlash evidence after branch reconciliation",
+    },
+    {
+        "commit": "d5985c3e51197c70fa804f84cd694abbcd38f0d7",
+        "short": "d5985c3e",
+        "subject": "fix(stragglers): 4 GPU leaks/dead-doc + GGUF Promote6 Mq4Lloyd",
+        "formats": ("mq4-lloyd", "mq6", "paro-q4g128"),
+        "surfaces": ("gguf_producer", "dflash_drafter_unload", "triattn", "dpm_warmup"),
+        "promotion_effect": "producer and leak fix only; rerun affected producer/runtime evidence before promotion",
+    },
+    {
+        "commit": "534ed4487c5168ab2f40b4a7b37ba9ed7d59cfe7",
+        "short": "534ed448",
+        "subject": "fix(daemon): Jinja serve drops system prompt + skips per-request reset on turn 2+",
+        "formats": ("mq3", "mq6", "mq3-lloyd", "mq4-lloyd", "paro-q4g128"),
+        "surfaces": ("daemon", "chat_template", "multi_turn"),
+        "promotion_effect": "refresh daemon-based coherence or serve evidence collected before this fix",
+    },
+    {
+        "commit": "a7dcfb0dc3e94981b7e0f926790656a4bf616cbe",
+        "short": "a7dcfb0d",
+        "subject": "fix(engine): hunt-2 batch - premature-stop, OOB write, daemon crash, 4 GPU leaks",
+        "formats": ("mq3", "mq6", "mq3-lloyd", "mq4-lloyd", "paro-q4g128", "paro-q4g256"),
+        "surfaces": ("a3b", "mtp", "daemon", "kv", "gpu_leaks"),
+        "promotion_effect": "refresh A3B/MoE and speculative evidence after branch reconciliation",
+    },
+    {
+        "commit": "b4adca1f3f6fc97d08a3c9a4bab98ead64a5ef99",
+        "short": "b4adca1f",
+        "subject": "fix(qwen35,daemon): free leaked GPU scratch - Path-2 MoE prefill buffers",
+        "formats": ("mq3", "mq6", "paro-q4g128", "paro-q4g256"),
+        "surfaces": ("a3b", "moe_prefill", "serve_oom", "deltanet"),
+        "promotion_effect": "refresh long-running A3B/MoE prefill and serve stability evidence",
+    },
+    {
+        "commit": "d5bc3f6af03d70e50b19b9b7564571b7f87b1f8c",
+        "short": "d5bc3f6",
+        "subject": "fix(daemon): AR exact-match DeltaNet double-advance + DFlash first-token EOS",
+        "formats": ("mq3", "mq6", "mq3-lloyd", "mq4-lloyd", "paro-q4g128"),
+        "surfaces": ("ar", "dflash", "deltanet", "daemon"),
+        "promotion_effect": "refresh AR/DFlash correctness rows that could hit exact-match or first-token EOS",
+    },
+    {
+        "commit": "379484ba828152b63f4b22b7748261d51e705502",
+        "short": "379484ba",
+        "subject": "fix(qwen3.6-a3b): serving robustness + DeltaNet Q8 dither + OpenAI penalties",
+        "formats": ("mq3", "mq6", "paro-q4g128"),
+        "surfaces": ("qwen3.6-a3b", "deltanet_q8", "daemon", "sampler"),
+        "promotion_effect": "refresh Qwen3.6 A3B rows and any sampler-sensitive serve evidence",
+    },
+    {
+        "commit": "3663934fa9a78afb28ead03ef4362cffae344c35",
+        "short": "3663934f",
+        "subject": "fix(gate-up): make nosync variants buildable and opt-in",
+        "formats": ("mq3-lloyd", "mq4-lloyd"),
+        "surfaces": ("lloyd_gate_up", "perf"),
+        "promotion_effect": "perf lever only; speed rows remain blocked until Lloyd quality gates pass",
+    },
+    {
+        "commit": "f1e2cef815e504a8df1d9142910c3f442dd5d526",
+        "short": "f1e2cef8",
+        "subject": "docs(paro-g256-perfmax): Phase 3 Lever 2 + gfx12 asymptote + final SUMMARY",
+        "formats": ("paro-q4g128", "paro-q4g256"),
+        "surfaces": ("g256_research", "g128_runtime", "perfmax_summary"),
+        "promotion_effect": "G256 ranking context only; Exit B keeps G256 opt-in research, not default",
+    },
+    {
+        "commit": "907cbb2f93c5641bd8969ff8235bb91c729df037",
+        "short": "907cbb2f",
+        "subject": "docs(paro-g256-perfmax): Phase 4 - A3B-PARO 60+ tok/s on gfx1201 + Lever 4 NaN fix",
+        "formats": ("paro-q4g128", "paro-q4g256"),
+        "surfaces": ("a3b_paro", "pr319", "gfx1201"),
+        "promotion_effect": "ParoQ4G128 runtime context; not a true PARO4G256 source/export",
+    },
+)
+
+CANDIDATE_MATCHERS: dict[str, CandidateMatcher] = {
+    "mq4": CandidateMatcher(("mq4",), ("lloyd", "paro", "dflash", "draft")),
+    "mq6": CandidateMatcher(("mq6",), ("lloyd", "dflash", "draft")),
+    "mq3": CandidateMatcher(("mq3",), ("lloyd", "dflash", "draft")),
+    "mq8": CandidateMatcher(("mq8",), ("lloyd", "dflash", "draft")),
+    "mq2": CandidateMatcher(("mq2",), ("lloyd", "dflash", "draft")),
+    "mq2-lloyd": CandidateMatcher(("lloyd", "mq2"), ("dflash", "draft")),
+    "mq3-lloyd": CandidateMatcher(("lloyd", "mq3"), ("dflash", "draft")),
+    "mq4-lloyd": CandidateMatcher(("lloyd", "mq4"), ("dflash", "draft")),
+    "paro-q4g128": CandidateMatcher(("paro",), ("g256", "dflash", "draft")),
+    "paro-q4g256": CandidateMatcher(("paro", "g256"), ("dflash", "draft")),
+}
+
+
+READINESS: tuple[FormatReadiness, ...] = (
+    FormatReadiness(
+        id="mq4",
+        status="promoted-control",
+        bytes_per_group=136,
+        promotion_target=False,
+        producer_gate="Already the reference producer path for this matrix.",
+        runtime_gate="Control path for dense decode, batched prefill, MoE prefill, MoE decode, and DFlash validation.",
+        quality_gate="Used as the comparison floor for every candidate.",
+        perf_gate="gfx1151 speed-baseline rows already exist.",
+        fixtures=("qwen3.5-9b", "qwen3.5-27b", "qwen3.5-35b-a3b"),
+        next_work=("Keep as unchanged control while candidate lanes move.",),
+    ),
+    FormatReadiness(
+        id="mq6",
+        status="candidate-runtime-ready",
+        bytes_per_group=200,
+        promotion_target=True,
+        producer_gate=(
+            "Quantizer emits MQ6 without a research hard gate. The live "
+            "/home/sadara/Models candidate-root scan now finds the four "
+            "canonical MQ6 artifacts as `.hfq` symlinks to the legacy "
+            "~/.hipfire/models runtime files, and the structured MQ6 status "
+            "artifact records live_canonical_mq6_artifacts_present=true plus "
+            "provenance_canonical_mq6_artifacts_present=true. The GGUF "
+            "`--kmap-promote 6` Mq4Lloyd producer path is also source-checked "
+            "after reviewing origin d5985c3e: the status artifact records "
+            "promote6_mq4_lloyd_emits_mq6=true and origin d5985c3e reconciled "
+            "in the worktree, meaning that Promote6 for Mq4Lloyd emits "
+            "MQ6G256 instead of silently staying MQ4G256Lloyd."
+        ),
+        runtime_gate=(
+            "Dense and MoE gfx1151 paths are wired; Qwen35 dense prefill "
+            "now has no-GPU MQ6/HFQ6 `is_batchable_la` coverage, and grouped "
+            "MoE path-2 routing is dtype+arch keyed and covered by no-GPU "
+            "admission tests. The structured MQ6 status artifact also records "
+            "the required gfx1151 MQ6 dense-decode compiled-blob inventory for "
+            "both the repo and installed kernel roots, plus "
+            "source-level reconciliation for origin a7dcfb0d CASK scratch "
+            "teardown, MTP GPU teardown, and FWHT asym4 fallback dispatch. "
+            "`cargo test -p hipfire-runtime --lib mq6_dense_decode_routes_through_hfq6_family` "
+            "for dense decode route classification and "
+            "`cargo test -p hipfire-arch-qwen35 --lib moe_decode_routes_mq6_indexed_path_for_k8` "
+            "for MoE decode route classification. The kernel inventory is "
+            "substrate evidence, not a dispatch or promotion proof. The MQ6 "
+            "DFlash/spec boundary is also no-GPU contract-tested in "
+            "`python3 scripts/test_mq6_status.py "
+            "Mq6StatusTest.test_dflash_spec_boundary_marks_mq4_draft_target_verify_only`, "
+            "with follow-up classifier tests for MQ6-draft and A3B scope expansion."
+        ),
+        quality_gate=(
+            "Hard-error coherence evidence exists in "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-coherence-md5.md; "
+            "bounded 9B dense PPL evidence exists in "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-ppl.json; "
+            "bounded Qwen3.5 A3B PPL evidence exists in "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-a3b-ppl.json; "
+            "bounded Qwen3.6 A3B PPL evidence exists in "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-qwen36-a3b-ppl.json; "
+            "bounded c20, c64, c256, and c512 9B BF16-referenced KLD evidence exists in "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld.json, "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64.json, "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256.json, and "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512.json; "
+            "3-run MQ4-draft 27B dense DFlash target-verify evidence exists in "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash-r3.json; "
+            "use the c512 row as the release-facing dense 9B KLD checkpoint. "
+            "Structured MQ6 promotion gates are recorded in "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-status.json: "
+            "dense_9b_ppl_beats_mq4=true, qwen35_a3b_ppl_beats_mq4=true, "
+            "qwen36_a3b_ppl_beats_mq4=true, dense_9b_c512_kld_beats_mq4=true, "
+            "a3b_prefill_speedup_present=true, a3b_decode_close_to_mq4=true, "
+            "origin_refresh_required=true, a3b_first_scope_supported=false, "
+            "remote_branch_refresh_required=true, dflash_target_side_verify_only=true, "
+            "dflash_mq6_draft_evidence_present=false, "
+            "dflash_a3b_evidence_present=false, "
+            "dflash_spec_boundary_refresh_required=true, "
+            "dflash_spec_boundary_contract_test_present=true, "
+            "surface_coverage_complete=true, "
+            "dense_decode_repo_kernel_inventory_present=true, "
+            "dense_decode_install_kernel_inventory_present=true, "
+            "dense_decode_no_gpu_route_test_present=true, "
+            "moe_decode_no_gpu_route_test_present=true, "
+            "all_surfaces_promotion_ready=false, "
+            "evidence_refresh_plan.refresh_required=true, "
+            "evidence_refresh_plan.affected_surfaces=dense_decode/dense_prefill/moe_prefill/moe_decode/dflash_spec, "
+            "and promotion_allowed=false."
+        ),
+        perf_gate=(
+            "Fresh-process gfx1151 AR prefill/decode medians exist in "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-ar-perf.json; "
+            "3-run 27B dense DFlash/spec rows and medians exist in "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash-r3.json; "
+            "MQ6 remains roughly 2x slower than MQ4 on the measured dense DFlash target-side rows, "
+            "while A3B rows support an A3B-first promotion lane. The i8 grouped-path decision "
+            "is recorded in benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-i8-grouped-decision.md: "
+            "do not port MQ6 i8 grouped-MMQ now because the measured blocker is dense MQ6 throughput, "
+            "not MoE grouped prefill. The structured MQ6 status artifact records "
+            "dense_ar_perf_promotable=false, dense_dflash_perf_promotable=false, "
+            "a3b_prefill_speedup_present=true, a3b_decode_close_to_mq4=true, "
+            "origin_refresh_required=true, remote_branch_refresh_required=true, "
+            "dense_decode_repo_kernel_inventory_present=true, "
+            "dense_decode_install_kernel_inventory_present=true, "
+            "dense_decode_no_gpu_route_test_present=true, "
+            "moe_decode_no_gpu_route_test_present=true, "
+            "dflash_target_side_verify_only=true, "
+            "dflash_mq6_draft_evidence_present=false, "
+            "dflash_a3b_evidence_present=false, "
+            "dflash_spec_boundary_contract_test_present=true, "
+            "i8_grouped_port_recommended=false, "
+            "surface_coverage.surfaces.dense_decode.status=perf_gated, "
+            "surface_coverage.surfaces.moe_prefill.status=a3b_first_candidate_refresh_blocked, "
+            "surface_coverage.surfaces.dflash_spec.status=target_verify_only_refresh_blocked, "
+            "evidence_refresh_plan.next_unblocked_step=reconcile_qwen35_native_mtp_with_origin_and_hunt3_then_rerun_mq6_evidence, "
+            "and broad_promotion_allowed=false."
+        ),
+        fixtures=("qwen3.5-9b", "qwen3.5-27b", "qwen3.5-35b-a3b", "qwen3.6-35b-a3b"),
+        next_work=(
+            "Keep provenance hashes current when MQ6 artifacts are regenerated.",
+            "Treat A3B/MoE as the first promotion scope unless dense perf is fixed.",
+            "Use the c512 BF16-referenced KLD row as the release-facing dense 9B quality checkpoint.",
+            "Extend DFlash/spec coverage beyond the 27B dense MQ4-draft target-verify pair if promotion scope expands.",
+            "After reconciling with origin/master and origin/fix/hunt3-engine-bugs commit fb36f539, rerun MQ6 A3B/MoE, dense AR, and DFlash/spec evidence touched by upstream or remote-branch fixes.",
+            "Do not port MQ6 i8 grouped-MMQ unless a future A3B profile shows grouped HFQ6 WMMA is the dominant bottleneck.",
+        ),
+        evidence_artifacts=(
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-artifact-provenance.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-coherence-md5.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-ar-perf.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-02-mq6-ar-perf.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-ppl.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-ppl.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-a3b-ppl.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-a3b-ppl.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-qwen36-a3b-ppl.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-qwen36-a3b-ppl.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld/result-data.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld/result-table.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/result-data.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c64/result-table.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/result-data.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c256/result-table.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/result-data.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-kld-c512/result-table.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash-r3.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-dflash-r3.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-readiness-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-i8-grouped-decision.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-status.json",
+        ),
+    ),
+    FormatReadiness(
+        id="mq3",
+        status="candidate-size-gated",
+        bytes_per_group=104,
+        promotion_target=True,
+        producer_gate=(
+            "Quantizer emits MQ3 with a small-model quality warning; canonical "
+            "candidate symlinks and SHA-256 provenance now exist for the local "
+            "4B, 9B, 27B, Qwen3.5 A3B, and Qwen3.6 A3B artifacts. "
+            "The structured MQ3 size-gate status now records "
+            "live_canonical_mq3_artifacts_present=true after scanning "
+            "/home/sadara/Models and /home/sadara/.hipfire/models; the live "
+            "scan found all five canonical required MQ3 artifacts plus current "
+            "cache-visible and AWQ-MTP MQ3 variants."
+        ),
+        runtime_gate=(
+            "Dense gfx1151 paths and MoE grouped WMMA are wired; routed decode "
+            "coherence smoke now covers Qwen3.5 and Qwen3.6 A3B MQ3 rows; "
+            "3-run 27B DFlash/spec target-side rows now cover MQ3 against "
+            "the MQ4 control. No-GPU long-prefill path2 shape coverage now "
+            "pins the production-shaped MQ3 A3B gate/up contract "
+            "(N=256, K_TOP=8, x_row_div=8) and down contract (N*K_TOP rows, "
+            "x_row_div=1); artifact-backed long-prefill promotion coverage is "
+            "still missing. No-GPU MQ3 A3B MoE decode boundary coverage now "
+            "records that prefill is admitted through grouped path2 on gfx1151, "
+            "but decode still lacks an indexed routed-expert path."
+        ),
+        quality_gate=(
+            "Artifact provenance exists, and hard-error coherence smoke "
+            "evidence exists for the current 4B, 9B, and 27B dense MQ3 rows. "
+            "The 4B boundary row and 9B row hit their max-token caps before "
+            "clean final answers, while the 27B Paris row completed cleanly. "
+            "Qwen3.5 and Qwen3.6 A3B routed-expert coherence smoke rows also "
+            "complete cleanly on the sheep prompt. "
+            "Bounded A3B PPL evidence now exists for Qwen3.5 and Qwen3.6: "
+            "Qwen3.5 A3B MQ3 improved PPL versus MQ4 (8.2158 vs 8.5826), "
+            "while Qwen3.6 A3B MQ3 regressed versus MQ4 (6.5041 vs 6.3211). "
+            "Broader A3B coherence now covers trains, HumanEval below_zero, "
+            "and long-LRU prompts against MQ4 controls. All 12 rows completed "
+            "without hard errors, but this is no-hard-error smoke only: "
+            "7/12 rows hit the max-token cap, so the structured gate keeps "
+            "a3b_broader_coherence_promotion_grade=false. The HumanEval rows "
+            "completed cleanly, trains hit the token cap for both MQ4 and MQ3 "
+            "while still solving, and long-LRU hit the cap for Qwen3.5 MQ3 "
+            "plus both Qwen3.6 rows. "
+            "Bounded c20 4B BF16-referenced KLD now confirms the 4B boundary "
+            "rejection: MQ3 scored mean KLD 0.517444 and PPL 13.2078 versus "
+            "MQ4 control mean KLD 0.130965 and PPL 9.99321. "
+            "Bounded 9B PPL is worse than MQ4, and c20 BF16-referenced KLD "
+            "confirms a large 9B quality regression. Bounded 27B PPL is "
+            "favorable to MQ3 on the Wikitext2 slice, but no comparable local "
+            "qwen3.5-27B BF16/Q8 KLD reference has been found yet. The KLD "
+            "reference inventory verifies local 4B, 9B, and qwen3.6-27B refs "
+            "against the manifest, but confirms qwen3.5-27B plus both A3B refs "
+            "are absent from the manifest, local roots, and current remote "
+            "dataset listing; qwen3.6-27B is not a valid qwen3.5 substitute. "
+            "Promotion still requires KLD plus clean coherence for the target "
+            "fixture envelope; sub-9B failures remain documented rejects. The "
+            "size-gate audit records 4B and 9B as current non-promotes, 27B "
+            "as incomplete, A3B as research-candidate scope, and MQ3-Lloyd as "
+            "missing current artifacts. The A3B DFlash fixture audit found no "
+            "paired local Qwen3.5/Qwen3.6 35B-A3B draft sidecar, so A3B "
+            "DFlash/spec is blocked on fixture availability rather than a "
+            "measured MQ3 runtime failure. The A3B KLD reference audit found "
+            "no local or remote Qwen3.5/Qwen3.6 35B-A3B HFKLDR reference; "
+            "the KLD wrapper now has A3B MQ4/MQ3 cases and rejects accidental "
+            "9B or 27B reference reuse. The structured MQ3 size-gate status "
+            "artifact records dense_4b_rejected=true, dense_9b_rejected=true, "
+            "live_canonical_mq3_artifacts_present=true, "
+            "dense_27b_kld_reference_present=false, "
+            "dense_27b_kld_evidence_present=false, "
+            "dense_27b_ar_reached_token_cap=false, "
+            "dense_27b_dflash_token_attractor_clean=true, "
+            "a3b_kld_references_present=false, "
+            "a3b_dflash_sidecars_present=false, "
+            "a3b_broader_coherence_capped_rows_present=true, "
+            "a3b_broader_coherence_promotion_grade=false, "
+            "long_prefill_shape_contract_covered=true, "
+            "long_prefill_runtime_evidence_present=false, "
+            "a3b_moe_decode_boundary_recorded=true, "
+            "a3b_moe_decode_indexed_route_supported=false, "
+            "a3b_qwen36_ppl_beats_mq4=false, and promotion_allowed=false."
+        ),
+        perf_gate=(
+            "Three-run 27B gfx1151 AR and DFlash/spec speed rows exist. AR "
+            "uses the capital prompt and records daemon md5 plus prompt md5; "
+            "MQ3 median decode/prefill is faster than MQ4 on that prompt, "
+            "but the MQ3 row stopped after 12 tokens while MQ4 reached the "
+            "80-token cap; the structured status records "
+            "dense_27b_ar_reached_token_cap=false, so it is not a full "
+            "promotion-grade throughput comparison. DFlash/spec rows use the same MQ4 draft and prompt "
+            "md5s; MQ3 was clean and faster than MQ4 in the 3-run prose and "
+            "code medians with dense_27b_dflash_token_attractor_clean=true. Promotion still needs "
+            "the missing 27B KLD reference and a broader prompt envelope."
+        ),
+        fixtures=(
+            "qwen3.5-4b",
+            "qwen3.5-9b",
+            "qwen3.5-27b",
+            "qwen3.5-35b-a3b",
+            "qwen3.6-35b-a3b",
+        ),
+        next_work=(
+            "Use the MQ3 size-gate audit as the current promotion boundary.",
+            "Keep 4B non-promotable on current coherence and KLD evidence unless a new calibration overturns both.",
+            "Keep 9B non-promotable on current PPL and KLD evidence unless new calibration overturns both.",
+            "Generate or locate and manifest-pin a comparable qwen3.5-27B BF16/Q8 KLD reference, then run 27B KLD before any dense promotion claim.",
+            "Generate or locate and manifest-pin matching Qwen3.5/Qwen3.6 35B-A3B HFKLDR references, then run the prepared A3B MQ4/MQ3 KLD cases before any MoE promotion claim.",
+            "Generate or locate and manifest-pin paired A3B DFlash draft sidecars before DFlash/spec rows can count toward any MoE promotion claim.",
+            "Follow up the capped A3B trains and long-LRU rows with tighter max-token or no-think prompt shapes if MQ3 A3B remains a promotion target.",
+            "Broaden 27B AR and DFlash/spec prompts beyond the current capital/prose/code set before a release-facing perf claim.",
+            "Add 3-run A3B AR speed rows only after A3B KLD or DFlash/spec evidence keeps the MoE lane viable.",
+            "Implement an indexed MQ3 A3B MoE decode route, or collect artifact-backed decode evidence that justifies the current non-indexed path, before any A3B promotion claim.",
+            "Run artifact-backed MQ3 A3B long-prefill coherence/perf; the current audit is no-GPU shape coverage only.",
+        ),
+        evidence_artifacts=(
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-artifact-provenance.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-size-gate-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-size-gate-status.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-coherence.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-boundary-coherence.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/result-data.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/result-table.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-9b-ppl.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-9b-ppl.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-27b-ppl.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-27b-ppl.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-kld-reference-inventory.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-27b-kld-reference-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-9b-kld.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-9b-kld.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-9b-kld/result-data.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-9b-kld/result-table.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-coherence.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-ppl.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-ppl.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-broader-coherence.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-broader-coherence.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-kld-reference-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-a3b-dflash-fixture-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-long-prefill-path2-shape-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-ar-perf.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-ar-perf.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-dflash.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-dflash.md",
+        ),
+    ),
+    FormatReadiness(
+        id="mq8",
+        status="permanent-runtime-research",
+        bytes_per_group=258,
+        promotion_target=False,
+        producer_gate=(
+            "hipfire-quantize can emit MQ8 via --format mq8 or mq8g256, with "
+            "Q8F16 fallback for embeddings and non-256-aligned rows. No local "
+            "canonical MQ8 candidate artifact was found under /home/sadara/Models, "
+            "~/.hipfire/models, or the gfx1151 readiness candidate root. The "
+            "structured MQ8 status artifact records producer_surface_present=true "
+            "but canonical_mq8_artifact_present=false."
+        ),
+        runtime_gate=(
+            "qtype 14 maps to DType::MQ8G256; dense decode uses "
+            "gemv_mq8g256_with_rotate plus split rmsnorm_f32 and "
+            "rotate_quantize_x_mq8. gfx1151 MQ8/HFQ8 compiled blobs and scalar "
+            "MoE bring-up paths exist, and no-GPU tests keep MQ8 gfx1151-scoped "
+            "while rejecting mixed routed-family promotion. The structured MQ8 "
+            "status artifact records runtime_surface_present=true, "
+            "gfx1151_compiled_blobs_present=true, and no_gpu_admission_covered=true. "
+            "It also records example_or_benchmark_harness_present=true from "
+            "the HFQ8 family benchmark and gfx1151 scalar MoE JIT smoke, but "
+            "those are substrate checks rather than candidate model baselines. "
+            "The status artifact separates this from "
+            "candidate_model_benchmark_harness_present=false and records "
+            "harness.candidate_model_harness_present=false until a canonical "
+            "MQ8 artifact exists and a model-backed harness is wired."
+        ),
+        quality_gate=(
+            "No KLD/PPL or coherence evidence exists because no MQ8 artifact is "
+            "available. MQ8 must prove a quality and product role over Q8/MQ6 "
+            "before any promotion work resumes. It is removed from the active "
+            "promotion backlog; do not generate a multi-GB artifact just to "
+            "fill the matrix. The structured status artifact records "
+            "quality_evidence_present=false, product_role_defined=false, "
+            "active_promotion_backlog=false, purpose_decision.promotion_backlog_closed=true, "
+            "artifact_generation_without_product_role_allowed=false, and a "
+            "reopen_contract requiring a product role, canonical artifact, MQ8 "
+            "harness, quality evidence, and gfx1151 AR/DFlash perf. It also "
+            "records promotion_boundary.promotion_lane_state=closed_until_reopen_contract, "
+            "promotion_boundary.artifact_generation_state=blocked_missing_product_role, "
+            "reopen_contract.satisfied.mq8_example_or_benchmark_harness=false, "
+            "and promotion_boundary.next_unblocked_step=define_product_role_over_q8_or_mq6. "
+            "The explicit closure contract records "
+            "research_closure.artifact_generation_blocked=true, "
+            "candidate_artifact_generation_requires_product_role=true, and "
+            "research_closure.next_unblocked_step=define_product_role_over_q8_or_mq6."
+        ),
+        perf_gate=(
+            "gfx1151 MQ8/HFQ8 blobs exist, but no dense, MoE, AR, or DFlash perf "
+            "baseline exists. At 258 B/group, MQ8 needs a stronger justification "
+            "than MQ6 or Q8 before runtime investment: the status artifact "
+            "records mq8_to_mq6_ratio=1.29 and mq8_to_mq4_ratio=1.90. Runtime "
+            "work is limited to maintenance of existing decode/scalar bring-up "
+            "substrate unless a new product role is proposed. The structured "
+            "status artifact records perf_evidence_present=false and "
+            "promotion_allowed=false. Its origin context records the MQ8 runtime "
+            "support commits as local-only on this branch and finds no upstream "
+            "MQ8 product-role commit on origin/master. The promotion boundary "
+            "records high_bit_justification_required=true and "
+            "candidate_model_baseline_available=false. The closure contract "
+            "keeps mq8_example_or_benchmark_harness in missing_reopen_requirements "
+            "despite generic harness coverage, because no candidate-model baseline exists. It "
+            "records research_closure.perf_collection_blocked=true, "
+            "candidate_perf_collection_requires_artifact_and_quality=true, and "
+            "high_bit_value_must_exceed_mq6_or_q8=true."
+        ),
+        fixtures=("qwen3.5-9b", "qwen3.5-35b-a3b"),
+        next_work=(
+            "Keep MQ8 in the permanent runtime-research lane unless a concrete product role is proposed.",
+            "If reopened, generate qwen3.5-9b-mq8.hfq under the readiness candidate root with hipfire-quantize --format mq8.",
+            "Only then run provenance, coherence, KLD/PPL against MQ4/Q8/MQ6, and gfx1151 AR/DFlash perf before reconsidering promotion.",
+            "If reopened, extend the existing HFQ8/MoE scalar harnesses into a candidate-model MQ8 benchmark before treating role/artifact/evidence as promotable.",
+            "Preserve existing MQ8 runtime substrate tests, but keep artifact generation and perf collection out of the active backlog without a product role.",
+        ),
+        evidence_artifacts=(
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq8-runtime-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq8-status.json",
+        ),
+    ),
+    FormatReadiness(
+        id="mq2",
+        status="quality-rejected",
+        bytes_per_group=72,
+        promotion_target=False,
+        producer_gate=(
+            "Hard-gated by --allow-mq2 because current uniform codebook collapses; "
+            "canonical 0.8B, 4B, and 9B symlinks plus SHA-256 provenance now "
+            "exist for the local dense rejection fixtures."
+        ),
+        runtime_gate=(
+            "Runtime smoke is useful only to prove intentional fallback/admission "
+            "behavior; the 0.8B/4B/9B MQ2 sweep loaded and generated on gfx1151 "
+            "with zero hard runtime errors."
+        ),
+        quality_gate=(
+            "The 2026-06-03 MQ2 sweep confirms collapse on all 0.8B, 4B, and "
+            "9B dense prompts: the Paris, code, sheep, and longform rows emit "
+            "garbled non-answers despite runtime OK status. The structured MQ2 "
+            "status artifact records dense_quality_clean=false, "
+            "all_dense_rows_collapsed=true, kld_ppl_evidence_present=false, "
+            "perf_promotion_evidence_present=false, and promotion_allowed=false. "
+            "It also records quality_rejection_boundary.dense_text_status="
+            "rejected_all_current_rows_collapsed, "
+            "quality_rejection_boundary.sub_9b_failures_explicit=true, "
+            "quality_rejection_boundary.dense_9b_rejected=true, and "
+            "quality_rejection_boundary.next_unblocked_step="
+            "produce_new_mq2_calibration_that_passes_bounded_dense_quality. "
+            "Keep rejected unless new calibration overturns this evidence."
+        ),
+        perf_gate=(
+            "The sweep records tok/s for diagnosis, but perf is not promotion "
+            "evidence until quality clears. The structured MQ2 status artifact "
+            "records quality_rejection_boundary.promotion_perf_collection_allowed=false "
+            "and quality_rejection_boundary.performance_rows_promotable=false."
+        ),
+        fixtures=("qwen3.5-0.8b", "qwen3.5-4b", "qwen3.5-9b"),
+        next_work=(
+            "Keep as an explicit dense-text rejection and ablation/control for Lloyd and Paro experiments.",
+            "Do not spend promotion perf time unless a new calibration first clears a bounded quality gate.",
+        ),
+        evidence_artifacts=(
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq2-artifact-provenance.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq2-sweep.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq2-status.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq2-mq2-lloyd-readiness-audit.md",
+        ),
+    ),
+    FormatReadiness(
+        id="mq2-lloyd",
+        status="quality-rejected-moe-research",
+        bytes_per_group=72,
+        promotion_target=False,
+        producer_gate=(
+            "Hard-gated by --allow-mq2-lloyd; dense Qwen text quality remains "
+            "rejected, and no current A3B/DeepSeek MQ2-Lloyd HFQ artifact or "
+            "deepseek-v4-flash.mq2lloyd symlink was found locally. The "
+            "structured 4-warp bench artifact now records "
+            "model_artifact_inventory.mq2_lloyd_artifact_present=false and "
+            "model_artifact_inventory.current_a3b_or_deepseek_artifact_present=false "
+            "after scanning /home/sadara/Models and ~/.hipfire/models."
+        ),
+        runtime_gate=(
+            "gfx1151 MoE expert-compression path exists; DeepSeek 4-warp path is "
+            "opt-in via HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W, and synthetic gfx1151 "
+            "A/B was correctness-clean but slower than k2. The structured "
+            "4-warp bench artifact records six OK rows, speedup range "
+            "0.9057-0.9898x, promote_4w_default=false, "
+            "default_kernel_change_allowed=false, and "
+            "model_level_promotion_allowed=false. Its specialty boundary records "
+            "status=specialty_blocked_no_model_artifact, "
+            "current_a3b_or_deepseek_artifact_present=false, "
+            "mq2_lloyd_artifact_present=false, "
+            "synthetic_kernel_result=correct_but_slower_than_k2, "
+            "remote_moe_fix_refresh_required=true, "
+            "model_evidence_refresh_required=true, perf_collection_allowed=false, and "
+            "next_unblocked_step=generate_or_locate_a3b_or_deepseek_mq2_lloyd_artifact."
+        ),
+        quality_gate=(
+            "Can only be reconsidered for routed-expert-only use after A3B/DeepSeek "
+            "coherence passes; no current artifact-backed coherence, KLD/PPL, or "
+            "model-level perf evidence exists. The MQ2-Lloyd 4-warp artifact also "
+            "records origin evidence for an mq2lloyd long-context attractor revert, "
+            "plus origin/fix/hunt3-engine-bugs commit fb36f539 for sampling+MoE "
+            "engine fixes, so branch reconciliation and model-backed coherence are "
+            "required before collecting specialty perf rows."
+        ),
+        perf_gate=(
+            "Use DeepSeek/A3B specialty rows, not dense Qwen, if evaluating this "
+            "lane. Synthetic 4-warp results were 0.9057x-0.9898x versus k2 "
+            "across the structured six-row bench artifact, so keep the 4-warp "
+            "path opt-in/research. The artifact's specialty boundary has "
+            "remote_moe_fix_refresh_required=true, "
+            "model_evidence_refresh_required=true, and perf_collection_allowed=false "
+            "until remote engine fixes are reconciled, a current A3B/DeepSeek artifact "
+            "exists, routed-expert coherence passes, and model-level perf beats k2. "
+            "Do not treat the model-level decode issue as "
+            "proven DDR bandwidth: effective-bandwidth shortcuts overcount "
+            "inactive experts, and the live bottleneck may include launch "
+            "overhead, scalar GEMV occupancy, codebook unpack/lookup cost, and "
+            "non-MQ2 decode work."
+        ),
+        fixtures=("qwen3.5-35b-a3b", "qwen3.5-122b-a10b", "deepseek-v4-flash"),
+        next_work=(
+            "Reconcile origin/fix/hunt3-engine-bugs commit fb36f539 or rerun model-backed evidence on the selected branch before specialty perf claims.",
+            "Generate or locate a current A3B/DeepSeek MQ2-Lloyd artifact, including deepseek-v4-flash.mq2lloyd if using DeepSeek.",
+            "Run routed-expert coherence before model-level speed claims.",
+            "Keep HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W opt-in unless a model-backed benchmark beats k2 and preserves coherence.",
+            "Batch selected experts across tokens and reduce launches before spending more effort on packing-only work.",
+        ),
+        evidence_artifacts=(
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq2-mq2-lloyd-readiness-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq2-lloyd-4w-bench.json",
+        ),
+    ),
+    FormatReadiness(
+        id="mq3-lloyd",
+        status="candidate-research-gated",
+        bytes_per_group=112,
+        promotion_target=True,
+        producer_gate=(
+            "Hard-gated by --allow-mq3-lloyd until current fixtures produce "
+            "KLD/PPL evidence. A current canonical Qwen3.5-9B artifact now "
+            "exists in the gfx1151-readiness inventory as "
+            "qwen3.5-9b-lloyd-mq3.hfq, produced from the local Qwen3.5-9B "
+            "HF snapshot with MQ3G256Lloyd tensor records. Current 4B, 27B, "
+            "and A3B MQ3-Lloyd artifacts are still missing; the structured "
+            "Lloyd status artifact now confirms the live local scan found two "
+            "MQ3-Lloyd artifacts, both 9B, under /home/sadara/Models and "
+            "~/.hipfire/models. The KLD wrapper "
+            "has guarded 4B, 9B, 27B, and A3B MQ3-Lloyd cases ready for "
+            "artifact-backed reruns."
+        ),
+        runtime_gate=(
+            "Dense gfx1151 Lloyd WMMA path exists, and the current 9B "
+            "MQ3-Lloyd artifact loads through the daemon. The full coherence "
+            "battery completed the short reasoning row and long-prefill LRU "
+            "row without hard errors; routed expert decode and batched MoE "
+            "coverage still need current artifacts."
+        ),
+        quality_gate=(
+            "Current 9B coherence rows were qualitatively coherent: the sheep "
+            "reasoning row ended with final number 9, and the long-prefill LRU "
+            "row explained O(1) get/put behavior. Current 2026-06-03 c20 "
+            "BF16-referenced 9B KLD rejects dense promotion for this artifact: "
+            "MQ3-Lloyd mean KLD 0.553297 and PPL 9.64255 versus MQ4 mean KLD "
+            "0.236385 and PPL 9.04742. Historical 2026-05-08 "
+            "gfx1100 9B per-token KLD shows MQ3-Lloyd "
+            "improved over uniform MQ3 (mean KLD 1.6913 vs 2.6221), but still "
+            "lagged MQ4 (0.8762) and MQ6 (0.6254). This is useful prior "
+            "quality evidence, not current gfx1151 promotion evidence. The "
+            "structured Lloyd status artifact records promotion_allowed=false "
+            "for the current 9B MQ3-Lloyd candidate, with "
+            "current_kld_present=true, current_kld_finite=true, "
+            "current_kld_loses_to_mq4=true, only_9b_artifact_present=true, "
+            "live_only_9b_artifact_present=true, live_dense_27b_artifact_present=false, "
+            "live_a3b_artifact_present=false, "
+            "perf_evidence_allowed=false, and origin_refresh_required=true. "
+            "The wrapper rejects wrong-fixture "
+            "BF16 reference filenames by default."
+        ),
+        perf_gate=(
+            "No current fresh-process gfx1151 speed baseline. The coherence "
+            "report records daemon stats only and should not be treated as a "
+            "promotion-grade perf comparison. origin/master has upstream-only "
+            "MQ3-Lloyd gate_up perf work, including 46898ecd and aa781d74, but "
+            "those commits are post-quality perf context rather than local "
+            "promotion evidence; branch reconciliation plus rerun evidence is "
+            "required before any future Lloyd perf rows can support promotion."
+        ),
+        fixtures=("qwen3.5-4b", "qwen3.5-9b", "qwen3.5-27b", "qwen3.5-35b-a3b"),
+        next_work=(
+            "Treat the current 9B MQ3-Lloyd artifact as dense-promotion rejected unless a producer or calibration change produces a new artifact hash.",
+            "Do not spend 9B promotion perf time until a new candidate beats MQ4 on the same BF16-referenced KLD/PPL gate.",
+            "Generate or locate current canonical 4B/27B/A3B MQ3-Lloyd artifacts only if those lanes remain useful research targets.",
+            "After branch reconciliation, revisit the origin-only MQ3-Lloyd nosync gate_up commits only for artifacts that already pass quality.",
+            "Retain the research gate unless current KLD/PPL and coherence beat the historical weakness on a promoted fixture.",
+        ),
+        evidence_artifacts=(
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-lloyd-artifact-provenance.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-coherence-full-after-mq3-lloyd.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-lloyd-9b-kld.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-lloyd-9b-kld.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-status.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-kld-harness-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-historical-2026-05-08-kld.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-historical-2026-05-08-kld-table.md",
+        ),
+    ),
+    FormatReadiness(
+        id="mq4-lloyd",
+        status="candidate-research-gated",
+        bytes_per_group=160,
+        promotion_target=True,
+        producer_gate=(
+            "Hard-gated by --allow-mq4-lloyd. A current canonical "
+            "Qwen3.5-9B artifact now exists in the gfx1151-readiness inventory "
+            "as qwen3.5-9b-lloyd-mq4.hfq, produced from the local Qwen3.5-9B "
+            "HF snapshot with MQ4G256Lloyd tensor records. Astrea container "
+            "inspect now names HFQ qtype 30 as MQ4G256_LLOYD and confirms "
+            "data_end equals file size for the current 9B candidate. Current "
+            "27B and A3B MQ4-Lloyd artifacts are still missing; the structured "
+            "Lloyd status artifact now confirms the live local scan found two "
+            "MQ4-Lloyd artifacts, both 9B, under /home/sadara/Models and "
+            "~/.hipfire/models. The KLD wrapper "
+            "has guarded 9B, 27B, and A3B MQ4-Lloyd cases for same-run cohorts."
+        ),
+        runtime_gate=(
+            "Dense gfx1151 Lloyd WMMA path exists, and the current 9B "
+            "MQ4-Lloyd artifact loads through the daemon without a hard error "
+            "in the full coherence battery. The container-inspect audit removes "
+            "the previous unknown-qtype ambiguity but does not change runtime "
+            "promotion status. The row is still a qualitative failure because "
+            "it emitted an exclamation-token attractor; MoE and DFlash surfaces "
+            "still need artifact-backed evidence."
+        ),
+        quality_gate=(
+            "Historical 2026-05-13 gfx1151 KV-Q8 prefill KLD rows exist, but "
+            "they do not include a clean same-run MQ4 control. MQ4-Lloyd c512 "
+            "scored mean KLD 0.3114 without Q8 conv1d and 0.2519 with Q8 "
+            "conv1d, while the comparable MQ6 q8conv1d c512 row scored 0.0510. "
+            "The current MQ4/MQ6 c512 context row has MQ4 at mean KLD 0.2500 "
+            "and MQ6 at 0.0510, so the historical Lloyd data does not prove a "
+            "160 B/group quality win. Current 2026-06-03 full coherence evidence "
+            "loads qwen3.5-9b.mq4-lloyd but the reason prompt emits exactly "
+            "'!!!!!!!!!!!', so the current 9B artifact is rejected for promotion "
+            "before perf work. A current c20 same-run MQ4/MQ4-Lloyd/MQ6 KLD "
+            "cohort exists in "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-9b-kld-c20.json; "
+            "MQ4-Lloyd emitted mean KLD 0.0 with NaN PPL, which is invalid "
+            "zero-KLD/NaN-PPL evidence rather than a quality win. Keep "
+            "research-gated until a newly calibrated candidate clears coherence "
+            "and produces finite same-run KLD/PPL. The wrapper rejects wrong-fixture BF16 reference "
+            "filenames by default. The container-inspect audit confirms the "
+            "artifact is named and bounded at the HFQ record level, so the "
+            "remaining blocker is producer or calibration quality. The "
+            "structured Lloyd status artifact records promotion_allowed=false "
+            "for the current MQ4-Lloyd artifact and captures the coherence "
+            "attractor plus invalid same-run KLD row as blockers. It "
+            "records artifact_scope.only_9b_artifact_present=true and "
+            "artifact_scope.a3b_artifact_present=false. It also "
+            "records value_boundary.status=value_not_justified_current_artifact, "
+            "value_boundary.coherence_gate_passed=false, "
+            "value_boundary.same_run_kld_ppl_valid=false, "
+            "value_boundary.historical_rows_justify_value=false, "
+            "value_boundary.origin_refresh_required=true, "
+            "value_boundary.perf_collection_allowed=false, and "
+            "value_boundary.next_unblocked_step=produce_new_coherent_mq4_lloyd_artifact. "
+            "It also records producer_repair_plan.status=blocked_before_perf, "
+            "producer_repair_plan.requires_new_artifact_hash=true, "
+            "producer_repair_plan.same_run_quality_ready=false, and "
+            "producer_repair_plan.perf_collection_allowed=false. "
+            "The structured promotion contract treats "
+            "current_same_run_invalid_zero_kld_no_ppl as a forbidden gate, "
+            "not a required gate, and records "
+            "promotion_contract.historical_rows_required_for_promotion=false "
+            "because current same-run MQ4/MQ4-Lloyd/MQ6 evidence is the "
+            "promotion source of truth once a coherent artifact exists. "
+            "Upstream "
+            "origin/master includes d5985c3e, which fixes GGUF "
+            "`--kmap-promote 6` for Mq4Lloyd so Promote6 emits MQ6 instead "
+            "of silently staying MQ4-Lloyd. That is useful for future "
+            "producer-correctness runs after branch reconciliation, but it "
+            "does not repair the current coherence-rejected 9B artifact."
+        ),
+        perf_gate=(
+            "Do not spend speed-baseline time on the current 9B artifact; "
+            "compare directly against MQ4 and MQ6 only after coherence passes. "
+            "The structured Lloyd status artifact records "
+            "value_boundary.performance_rows_promotable=false."
+        ),
+        fixtures=("qwen3.5-9b", "qwen3.5-27b", "qwen3.5-35b-a3b"),
+        next_work=(
+            "Use the MQ4-Lloyd readiness and container-inspect audits as the current promotion boundary.",
+            "Treat the current 9B MQ4-Lloyd artifact as a coherence-rejected candidate unless a producer or calibration fix changes the artifact hash.",
+            "Generate or locate current canonical 27B/A3B MQ4-Lloyd artifacts only after the 9B producer issue is understood.",
+            "Rerun the prepared current MQ4/MQ4-Lloyd/MQ6 KLD cohort with matching manifest-pinned refs after a coherent 9B candidate exists.",
+            "Keep current same-run KLD/PPL as the promotion source of truth; historical Lloyd rows are context only once a current cohort exists.",
+            "After reconciling with origin/master, include d5985c3e when testing GGUF Promote6 Mq4Lloyd producer flows.",
+            "Add speed-baseline candidates only after coherence passes.",
+            "Follow producer_repair_plan before spending perf time: new artifact hash, full coherence, finite same-run KLD/PPL, then gfx1151 perf.",
+        ),
+        evidence_artifacts=(
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-artifact-provenance.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-coherence-full-after-mq4-lloyd.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-kld-harness-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-readiness-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-container-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-status.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-9b-kld-c20.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-9b-kld-c20.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-9b-kld-c20/result-data.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-9b-kld-c20/result-table.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-9b-kld-c20/per-seq",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-lloyd-astrea-inspect.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-lloyd-astrea-inspect.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq4-control-astrea-inspect.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq6-control-astrea-inspect.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-historical-2026-05-13-kld.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-historical-2026-05-13-kld-table.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-lloyd-historical-2026-05-13-per-seq",
+        ),
+    ),
+    FormatReadiness(
+        id="paro-q4g128",
+        status="candidate-productization",
+        bytes_per_group=68,
+        promotion_target=True,
+        producer_gate=(
+            "Direct safetensors import and probe HFQ paths exist, but the local "
+            "Qwen3.5-9B, Qwen3.5 35B-A3B, and Qwen3.6 35B-A3B source snapshots "
+            "are not themselves ParoQuant checkpoints: the 2026-06-03 probes "
+            "found zero complete Paro modules in all three. Locate or generate "
+            "a native Paro checkpoint before import/package promotion. The "
+            "importer/oracle contract is explicit, and the Astrea bundle-plan "
+            "contract now records the intended transform.paro package section "
+            "and runtime_env_boundary. The structured Paro productization "
+            "status artifact joins the three source probes with the Astrea "
+            "bundle-plan contract, records source_probe_coverage_complete=true, "
+            "source_inventory_present=true, source_inventory_consistent=true, "
+            "source_inventory_native_paro_g128_found=false, "
+            "records all_required_suffixes_absent_across_expected_probes=true "
+            "with aggregate_required_suffix_counts=0 for qweight/qzeros/scales/"
+            "pairs/theta/channel_scales. The broader local source inventory "
+            "scanned /home/sadara/Models, /home/sadara/.cache/huggingface/hub, "
+            "and ~/.hipfire/models, scanned 151 safetensors across 17 dirs, "
+            "and also found zero complete native Paro modules. It confirms no "
+            "local imported Paro HFQ artifact exists. The same artifact records "
+            "productization_plan.status=blocked_before_native_source_import, "
+            "productization_plan.next_unblocked_step="
+            "locate_or_generate_native_paro_q4g128_checkpoint, and an ordered "
+            "stage list from source_inventory through promotion_review. "
+            "Upstream origin/master includes 676338a4, d5985c3e, b4adca1f, "
+            "and 8de45455; those are refresh/reconciliation context for RoPE, "
+            "runtime leaks, MoE prefill, and stale Paro env experiments, but "
+            "they do not provide source/import/oracle/quality/perf evidence. "
+            "The structured productization boundary records "
+            "current_stage=blocked_before_native_source_import, "
+            "importer_state=blocked_no_native_paro_source, "
+            "package_state=contract_only_missing_weights, and "
+            "astrea_state=bundle_plan_contract_only_not_model_writer."
+        ),
+        runtime_gate=(
+            "gfx1151 Paro GEMV, residual, SwiGLU, indexed MoE, and grouped MMQ paths exist. "
+            "No-GPU admission coverage includes the Paro batched-admit env policy "
+            "and the gfx1151 default-on HIPFIRE_MOE_PARO_I8/K8 opt-out policy, "
+            "but no artifact-backed promotion matrix exists. HIPFIRE_PARO_BATCHED "
+            "is default-on with opt-out; HIPFIRE_MOE_PARO_I8 and "
+            "HIPFIRE_MOE_PARO_I8_K8 are gfx1151 default-on grouped-MMQ switches "
+            "that still need artifact-backed quality and perf evidence. The "
+            "Astrea bundle-plan runtime_env_boundary separates those "
+            "productization-candidate defaults from research-only knobs such as "
+            "HIPFIRE_PARO_PREROTATE, HIPFIRE_PARO_FUSE_RMSNORM, "
+            "HIPFIRE_PARO_LA*_FUSED, HIPFIRE_PARO_PACK*, "
+            "HIPFIRE_PARO_SHARED_PAIRS, and HIPFIRE_PARO_FUSED_PACK2. The "
+            "structured status artifact records runtime_env_boundary_recorded=true "
+            "plus research_only_env_evidence_absent=true and "
+            "promotion_main_path_clean=true, but promotion_allowed=false. "
+            "Its productization boundary records main_path_state=clean_but_unpromoted, "
+            "hidden_research_env_dependency_present=false, "
+            "artifact_generation_without_native_source_allowed=false, and "
+            "promoted_main_path_requires_typed_evidence=true. "
+            "The same artifact now records the dependency chain explicitly: "
+            "native_source_absent=true, import_blocked_by_source_absence=true, "
+            "oracle_blocked_by_import_absence=true, and the joined broader "
+            "source inventory's g128_complete_module_count=0. Its "
+            "productization_plan.stages.source_inventory.command is "
+            "`python3 scripts/paroquant_inventory.py --pretty --out "
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-source-inventory.json`, "
+            "and productization_plan.refresh_required_after_origin_reconciliation=true."
+        ),
+        quality_gate=(
+            "Must pass oracle, KLD/PPL, coherence, and NaN stability checks; "
+            "the current source probes only prove the plain Qwen3.5-9B and A3B "
+            "snapshots cannot satisfy the Paro importer contract. The structured "
+            "status artifact records the missing native tensor families as "
+            "qweight/qzeros/scales/pairs/theta/channel_scales across all expected "
+            "source probes. The Astrea "
+            "bundle-plan artifact is package metadata only and does not prove "
+            "a calibrated Paro model exists. The structured status artifact "
+            "keeps the typed evidence gates false "
+            "(oracle_evidence_present=false, coherence_evidence_present=false, "
+            "finite_logit_nan_evidence_present=false, quality_evidence_present=false, "
+            "gfx1151_perf_evidence_present=false, typed_evidence_files_exist=false) "
+            "and the aggregate "
+            "oracle_quality_perf_evidence_present=false until real paro-oracle, "
+            "coherence, KLD/PPL, NaN, and gfx1151 perf artifact files land. "
+            "The productization_plan records executable command templates for "
+            "paro-import, bundle-plan, paro-oracle, and the full coherence gate, "
+            "plus typed artifact targets for oracle, coherence, finite-logit/NaN, "
+            "KLD/PPL, and gfx1151 perf evidence. "
+            "The next unblocked step remains locating or generating a native "
+            "ParoQ4G128 checkpoint; oracle/perf work before import would only "
+            "create structurally blocked evidence."
+        ),
+        perf_gate=(
+            "Add gfx1151 A3B prefill/decode and dense rows against MQ4 control "
+            "only after productization_plan.stages.imported_hfq, paro_oracle, "
+            "coherence, finite_logit_nan, and quality_kld_ppl are satisfied."
+        ),
+        fixtures=("qwen3.5-9b", "qwen3.5-35b-a3b", "qwen3.6-35b-a3b"),
+        next_work=(
+            "Locate or produce a native ParoQ4G128 checkpoint with qweight/qzeros/scales/pairs/theta/channel_scales tensors.",
+            "Run paro-probe, paro-import, and paro-oracle against the native source and imported HFQ.",
+            "Regenerate the Astrea bundle plan with the imported HFQ as the weights source.",
+            "Run coherence, finite-logit/NaN, KLD/PPL, and gfx1151 perf evidence before any promotion claim.",
+            "Refresh the evidence after reconciling origin commits that touch Paro, MoE, RoPE, DFlash, or runtime leaks.",
+        ),
+        evidence_artifacts=(
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen35-9b-source-probe.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen35-a3b-source-probe.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-qwen36-a3b-source-probe.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-source-inventory.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-productization-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-astrea-bundle-plan.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g128-productization-status.json",
+        ),
+    ),
+    FormatReadiness(
+        id="paro-q4g256",
+        status="prototype-only",
+        bytes_per_group=136,
+        promotion_target=False,
+        producer_gate=(
+            "No local true Paro group_size=256 checkpoint or first-class runtime "
+            "DType/container exists. The G256 milestone requires a real upstream "
+            "G256 export; regrouped G128 evidence is not quality proof. Live "
+            "source-inventory JSON found zero complete native Paro modules and "
+            "zero group_size=256 Paro source modules under the local model roots, "
+            "so the CPU probe cannot be re-run here yet. The structured G256 "
+            "status artifact records native_g256_source_found=false and "
+            "cpu_probe_runnable_now=false. The upstream G256 perfmax evidence on "
+            "origin/master f1e2cef8 records Exit B: G256 is opt-in research, "
+            "not default, and not promotion proof; the status artifact now records "
+            "upstream_g256_research_evidence_present=true while "
+            "contract_state.upstream_g256_evidence.promotion_proof=false. "
+            "It also records "
+            "contract_state.current_stage=blocked_before_true_group_size_256_source "
+            "with producer_contract.required_group_size=256, "
+            "producer_contract.required_tensor_families="
+            "qweight/qzeros/scales/pairs/theta/channel_scales, "
+            "producer_contract.complete_g256_module_count=0, "
+            "producer_contract.source_search_result=no_paro_suffix_or_filename_hits, "
+            "and prototype_boundary.next_unblocked_step="
+            "locate_or_generate_true_group_size_256_paro_source. It now also "
+            "records prototype_plan.status=blocked_before_true_group_size_256_source, "
+            "prototype_plan.next_unblocked_step=locate_or_generate_true_group_size_256_paro_source, "
+            "and prototype_plan.stages.cpu_g256_probe.blocked_by="
+            "true_group_size_256_source so a G128-only native source cannot "
+            "make the G256 probe runnable."
+        ),
+        runtime_gate=(
+            "Do not admit runtime until the producer contract, CPU probe, oracle, "
+            "and payload-ratio gates pass. Runtime DType work waits on true G256 evidence. "
+            "The structured G256 status artifact records "
+            "runtime_dtype_container_ready=false, runtime_work_allowed=false, "
+            "runtime_dtype_container_unblocked_by_upstream=false, "
+            "prototype_boundary.runtime_dtype_container_work_allowed=false, and "
+            "prototype_boundary.artifact_generation_without_true_source_allowed=false. "
+            "The prototype_plan records runtime_dtype_container_work.allowed=false "
+            "and blocks that stage on true_group_size_256_source, cpu_g256_probe, "
+            "paro_oracle_comparison, and kld_ppl_within_5_percent_of_paro_q4g128."
+        ),
+        quality_gate=(
+            "Quality is UNVERIFIABLE until true group_size=256 ParoQuant calibration/export exists. "
+            "The prior regrouped-G128 CPU probe remains format-loss evidence only; "
+            "after true export exists, KLD/PPL must stay within 5% of ParoQ4G128. "
+            "The structured G256 status artifact records true_g256_quality_evidence_present=false "
+            "and quality_comparable_to_paro_q4g128=false, with evidence_class="
+            "regrouped_g128_format_loss_only and "
+            "prototype_boundary.payload_ratio_only_not_promotion_evidence=true. "
+            "prototype_plan.quality_unverifiable_until_true_g256_source=true, "
+            "and the plan's oracle/payload/KLD stages remain unsatisfied."
+        ),
+        perf_gate=(
+            "Prior CPU probe payload ratio for PARO4G256_MQ was 1.0220x versus source "
+            "Paro, under the <=1.03x target, but this is regrouped-G128 format-loss "
+            "evidence only. The structured G256 status artifact records "
+            "regrouped_payload_ratio_gate_passed=true while "
+            "current_true_g256_payload_ratio_gate_passed=false and promotion_allowed=false. "
+            "The prototype_plan keeps payload_ratio_lte_1_03 unsatisfied until "
+            "current true-G256 payload evidence exists."
+        ),
+        fixtures=("qwen3.5-0.8b", "qwen3.5-9b"),
+        next_work=(
+            "Locate or produce a true group_size=256 Paro source with qweight/qzeros/scales/pairs/theta/channel_scales.",
+            "Rerun scripts/paroquant_g256_probe.py --local-only against that true G256 source; regrouped-G128 probes remain research context only.",
+            "Run a true-G256 oracle comparison and payload-ratio artifact, requiring <=1.03x ParoQ4G128 payload.",
+            "Run same-run KLD/PPL versus ParoQ4G128 and require <=1.05x before runtime DType/container work.",
+            "Keep PARO4G256/PARO4G256_MQ runtime DType/container work blocked until prototype_plan.runtime_dtype_container_work_allowed=true.",
+        ),
+        evidence_artifacts=(
+            "docs/investigations/paro-g256-perfmax/SUMMARY.md",
+            "docs/investigations/paro-g256-perfmax/g256-probe-0.8b.json",
+            "docs/investigations/paro-g256-perfmax/g256-probe-9b.json",
+            "docs/plans/paroquant-g256-milestone.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-source-inventory.json",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-contract-audit.md",
+            "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-status.json",
+        ),
+    ),
+)
+
+
+def snapshot_dirs(cache_dir: Path) -> list[Path]:
+    snapshots = cache_dir / "snapshots"
+    if not snapshots.exists():
+        return []
+    return sorted(path for path in snapshots.iterdir() if path.is_dir())
+
+
+def discover_fixture(root: Path, fixture: Fixture) -> dict:
+    cache_dir = root / fixture.cache_dir
+    snapshots = snapshot_dirs(cache_dir)
+    snapshot_payloads = []
+    for snap in snapshots:
+        files = list(snap.iterdir())
+        snapshot_payloads.append(
+            {
+                "path": str(snap),
+                "has_config": (snap / "config.json").exists(),
+                "safetensors": sum(1 for item in files if item.name.endswith(".safetensors")),
+                "has_tokenizer": any(item.name.startswith("tokenizer") for item in files),
+            }
+        )
+    present = any(item["has_config"] and item["safetensors"] > 0 for item in snapshot_payloads)
+    return {
+        **asdict(fixture),
+        "cache_path": str(cache_dir),
+        "present": present,
+        "snapshot_count": len(snapshots),
+        "snapshots": snapshot_payloads,
+    }
+
+
+def discover_fixtures(root: Path, fixtures: Iterable[Fixture] = FIXTURES) -> list[dict]:
+    return [discover_fixture(root, fixture) for fixture in fixtures]
+
+
+def candidate_matches(format_id: str, path: Path) -> bool:
+    matcher = CANDIDATE_MATCHERS[format_id]
+    name = path.name.lower()
+    if not name.endswith(".hfq"):
+        return False
+    return all(token in name for token in matcher.include) and not any(
+        token in name for token in matcher.exclude
+    )
+
+
+def file_hexdigest(path: Path, algorithm: str) -> str:
+    digest = hashlib.new(algorithm)
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(HASH_CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def describe_candidate_artifact(
+    candidate_root: Path,
+    path: Path,
+    hash_algorithms: tuple[str, ...] = (),
+) -> dict:
+    payload = {
+        "name": str(path.relative_to(candidate_root)),
+        "path": str(path),
+        "size_bytes": path.stat().st_size,
+    }
+    if path.is_symlink():
+        payload["symlink_target"] = os.readlink(path)
+        payload["resolved_path"] = str(path.resolve())
+    if hash_algorithms:
+        payload["hashes"] = {
+            algorithm: file_hexdigest(path, algorithm) for algorithm in hash_algorithms
+        }
+    return payload
+
+
+def discover_candidate_artifacts(
+    candidate_root: Path,
+    format_id: str,
+    hash_algorithms: tuple[str, ...] = (),
+) -> dict:
+    if format_id not in CANDIDATE_MATCHERS:
+        raise ValueError(f"{format_id} has no candidate matcher")
+    if not candidate_root.exists():
+        return {"root_exists": False, "artifacts": []}
+    artifacts = sorted(
+        (
+            describe_candidate_artifact(candidate_root, path, hash_algorithms)
+            for path in candidate_root.rglob("*")
+            if path.is_file() and candidate_matches(format_id, path)
+        ),
+        key=lambda item: item["name"],
+    )
+    return {"root_exists": True, "artifacts": artifacts}
+
+
+def format_size_gib(size_bytes: int) -> str:
+    return f"{size_bytes / (1024 ** 3):.2f} GiB"
+
+
+def artifact_label(artifact: dict) -> str:
+    label = f"{artifact['name']} ({format_size_gib(artifact['size_bytes'])})"
+    if "symlink_target" in artifact:
+        label += f" -> {Path(artifact['symlink_target']).name}"
+    return label
+
+
+def git_value(args: list[str]) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parents[1],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def git_ahead_behind(base: str = "HEAD", upstream: str = "origin/master") -> dict[str, object]:
+    try:
+        output = subprocess.check_output(
+            ["git", "rev-list", "--left-right", "--count", f"{base}...{upstream}"],
+            cwd=Path(__file__).resolve().parents[1],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        local_only, upstream_only = [int(part) for part in output.split()]
+    except Exception:
+        local_only = None
+        upstream_only = None
+    return {
+        "base": base,
+        "upstream": upstream,
+        "local_only_commits": local_only,
+        "upstream_only_commits": upstream_only,
+        "upstream_reconciliation_required": bool(local_only or upstream_only),
+        "origin_master_commit": git_value(["rev-parse", upstream]),
+    }
+
+
+def commit_on_ref(commit: str, ref: str = "origin/master") -> bool | None:
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, ref],
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def origin_context() -> dict[str, object]:
+    upstream = git_ahead_behind()
+    commits = []
+    refresh_required = False
+    for item in UPSTREAM_RELEVANT_COMMITS:
+        commit = str(item["commit"])
+        present_on_origin = commit_on_ref(commit)
+        present_on_head = commit_on_ref(commit, "HEAD")
+        if present_on_origin is True and present_on_head is False:
+            refresh_required = True
+        commits.append(
+            {
+                **item,
+                "formats": list(item["formats"]),
+                "surfaces": list(item["surfaces"]),
+                "present_on_origin_master": present_on_origin,
+                "present_on_head": present_on_head,
+            }
+        )
+    return {
+        **upstream,
+        "relevant_upstream_commits": commits,
+        "promotion_evidence_refresh_required": refresh_required,
+    }
+
+
+def build_report(
+    models_root: Path = DEFAULT_MODELS_ROOT,
+    arch: str = "gfx1151",
+    candidate_root: Path | None = None,
+    format_ids: tuple[str, ...] = (),
+    hash_algorithms: tuple[str, ...] = (),
+) -> dict:
+    if candidate_root is None:
+        candidate_root = models_root / CANDIDATE_SUBDIR
+    unknown_formats = sorted(set(format_ids) - {item.id for item in READINESS})
+    if unknown_formats:
+        raise ValueError(f"unknown format ids: {unknown_formats}")
+    unknown_hashes = sorted(set(hash_algorithms) - set(SUPPORTED_HASHES))
+    if unknown_hashes:
+        raise ValueError(f"unsupported hash algorithms: {unknown_hashes}")
+    fixtures = discover_fixtures(models_root)
+    fixture_ids = {item["id"] for item in fixtures}
+    formats = []
+    for item in READINESS:
+        if format_ids and item.id not in format_ids:
+            continue
+        missing = [fixture for fixture in item.fixtures if fixture not in fixture_ids]
+        if missing:
+            raise ValueError(f"{item.id} references unknown fixtures: {missing}")
+        payload = asdict(item)
+        payload["candidate_artifacts"] = discover_candidate_artifacts(
+            candidate_root,
+            item.id,
+            hash_algorithms,
+        )
+        formats.append(payload)
+    return {
+        "schema": SCHEMA,
+        "arch": arch,
+        "models_root": str(models_root),
+        "candidate_root": str(candidate_root),
+        "format_filter": list(format_ids),
+        "artifact_hashes": list(hash_algorithms),
+        "origin_context": origin_context(),
+        "fixtures": fixtures,
+        "formats": formats,
+    }
+
+
+def markdown_table(report: dict) -> str:
+    fixture_map = {item["id"]: item for item in report["fixtures"]}
+    lines = [
+        f"# Quant readiness matrix ({report['arch']})",
+        "",
+        f"- schema: `{report['schema']}`",
+        f"- models_root: `{report['models_root']}`",
+        f"- candidate_root: `{report['candidate_root']}`",
+        f"- origin/master: `{report['origin_context']['origin_master_commit']}`",
+        "- upstream-only relevant commits: "
+        f"{report['origin_context']['upstream_only_commits']} "
+        f"(refresh required: `{report['origin_context']['promotion_evidence_refresh_required']}`)",
+        "",
+        "| format | status | promotion | bytes/group | required fixtures | candidate artifacts | evidence | next work |",
+        "|---|---|---:|---:|---|---|---|---|",
+    ]
+    for item in report["formats"]:
+        fixture_labels = []
+        for fixture_id in item["fixtures"]:
+            fixture = fixture_map[fixture_id]
+            mark = "present" if fixture["present"] else "missing"
+            fixture_labels.append(f"{fixture_id} ({mark})")
+        next_work = "; ".join(item["next_work"])
+        candidates = item["candidate_artifacts"]
+        if not candidates["root_exists"]:
+            candidate_status = "candidate root missing"
+        elif candidates["artifacts"]:
+            candidate_status = ", ".join(artifact_label(artifact) for artifact in candidates["artifacts"])
+        else:
+            candidate_status = "none"
+        evidence = "; ".join(item.get("evidence_artifacts", ())) or "none"
+        bytes_per_group = "" if item["bytes_per_group"] is None else str(item["bytes_per_group"])
+        promotion = "yes" if item["promotion_target"] else "no"
+        lines.append(
+            "| {id} | {status} | {promotion} | {bytes_per_group} | {fixtures} | {candidates} | {evidence} | {next_work} |".format(
+                id=item["id"],
+                status=item["status"],
+                promotion=promotion,
+                bytes_per_group=bytes_per_group,
+                fixtures=", ".join(fixture_labels),
+                candidates=candidate_status,
+                evidence=evidence,
+                next_work=next_work,
+            )
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--models-root", default=str(DEFAULT_MODELS_ROOT), help="HF cache/source model root")
+    parser.add_argument(
+        "--candidate-root",
+        help="Candidate artifact root; defaults to <models-root>/hipfire-candidates/gfx1151-readiness",
+    )
+    parser.add_argument("--format-id", action="append", default=[], help="Limit report to one format id; repeatable")
+    parser.add_argument(
+        "--hash-artifacts",
+        action="append",
+        choices=SUPPORTED_HASHES,
+        default=[],
+        help="Hash discovered candidate artifacts with this algorithm; repeatable and intentionally opt-in",
+    )
+    parser.add_argument("--arch", default="gfx1151", help="Target arch label for the report")
+    parser.add_argument("--format", choices=("json", "markdown"), default="json")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+    parser.add_argument("--out", help="Write the report to this path instead of stdout")
+    args = parser.parse_args()
+
+    candidate_root = Path(args.candidate_root) if args.candidate_root else None
+    report = build_report(
+        Path(args.models_root),
+        arch=args.arch,
+        candidate_root=candidate_root,
+        format_ids=tuple(args.format_id),
+        hash_algorithms=tuple(args.hash_artifacts),
+    )
+    if args.format == "markdown":
+        output = markdown_table(report)
+    else:
+        output = json.dumps(report, indent=2 if args.pretty else None, sort_keys=args.pretty)
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(output + "\n", encoding="utf-8")
+    else:
+        print(output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

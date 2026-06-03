@@ -1,0 +1,129 @@
+{
+  "arch": "gfx1151",
+  "branch": "qwen35-native-mtp",
+  "cases": [
+    {
+      "command": [
+        "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire",
+        "--model",
+        "/home/sadara/.hipfire/models/qwen3.5-4b.mq4",
+        "--ref",
+        "benchmarks/quality-baselines/refs/qwen3.5-4b-bf16.kldref.bin",
+        "--output",
+        "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/per-seq/qwen3.5-4b.mq4-kvq8-c20__gfx1151__prefill.kldseq",
+        "--kv-mode",
+        "q8",
+        "--scoring-mode",
+        "prefill",
+        "--max-chunks",
+        "20"
+      ],
+      "exit_code": 0,
+      "family": "dense",
+      "format_id": "mq4",
+      "id": "qwen35-4b-mq4",
+      "log_tail": " throughput=6.28 GiB/s (2.46/2.46 GiB)\n  loading layer 15/32 (FullAttention)...\n  load progress: layer 16/32 elapsed=0.39s throughput=6.28 GiB/s (2.46/2.46 GiB)\n  loading layer 16/32 (LinearAttention)...\n  load progress: layer 17/32 elapsed=0.39s throughput=6.27 GiB/s (2.46/2.46 GiB)\n  loading layer 17/32 (LinearAttention)...\n  load progress: layer 18/32 elapsed=0.39s throughput=6.27 GiB/s (2.46/2.46 GiB)\n  loading layer 18/32 (LinearAttention)...\n  load progress: layer 19/32 elapsed=0.39s throughput=6.26 GiB/s (2.46/2.46 GiB)\n  loading layer 19/32 (FullAttention)...\n  load progress: layer 20/32 elapsed=0.39s throughput=6.26 GiB/s (2.46/2.46 GiB)\n  loading layer 20/32 (LinearAttention)...\n  load progress: layer 21/32 elapsed=0.39s throughput=6.25 GiB/s (2.46/2.46 GiB)\n  loading layer 21/32 (LinearAttention)...\n  load progress: layer 22/32 elapsed=0.39s throughput=6.25 GiB/s (2.46/2.46 GiB)\n  loading layer 22/32 (LinearAttention)...\n  load progress: layer 23/32 elapsed=0.39s throughput=6.25 GiB/s (2.46/2.46 GiB)\n  loading layer 23/32 (FullAttention)...\n  load progress: layer 24/32 elapsed=0.39s throughput=6.25 GiB/s (2.46/2.46 GiB)\n  loading layer 24/32 (LinearAttention)...\n  load progress: layer 25/32 elapsed=0.39s throughput=6.24 GiB/s (2.46/2.46 GiB)\n  loading layer 25/32 (LinearAttention)...\n  load progress: layer 26/32 elapsed=0.39s throughput=6.23 GiB/s (2.46/2.46 GiB)\n  loading layer 26/32 (LinearAttention)...\n  load progress: layer 27/32 elapsed=0.39s throughput=6.23 GiB/s (2.46/2.46 GiB)\n  loading layer 27/32 (FullAttention)...\n  load progress: layer 28/32 elapsed=0.39s throughput=6.23 GiB/s (2.46/2.46 GiB)\n  loading layer 28/32 (LinearAttention)...\n  load progress: layer 29/32 elapsed=0.39s throughput=6.22 GiB/s (2.46/2.46 GiB)\n  loading layer 29/32 (LinearAttention)...\n  load progress: layer 30/32 elapsed=0.39s throughput=6.22 GiB/s (2.46/2.46 GiB)\n  loading layer 30/32 (LinearAttention)...\n  load progress: layer 31/32 elapsed=0.40s throughput=6.21 GiB/s (2.46/2.46 GiB)\n  loading layer 31/32 (FullAttention)...\n  load progress: layer 32/32 elapsed=0.40s throughput=6.21 GiB/s (2.46/2.46 GiB)\n  weights loaded: elapsed=0.40s throughput=6.21 GiB/s payload=2.46 GiB streamed=2.46 GiB\neval_hipfire: --max-chunks 20 \u2192 effective_n_chunk = 20/1175\neval_hipfire: ref n_ctx=2048 n_vocab=248320 n_chunk=1175 top_k=256\n  scored/chunk=1023  total_scored=20460  block=2056B\n\n  chunk    2/20  scored     1024/   20460  (  5.0%, 148 tok/s)   \n  chunk    3/20  scored     2048/   20460  ( 10.0%, 166 tok/s)   \n  chunk    4/20  scored     3072/   20460  ( 15.0%, 172 tok/s)   \n  chunk    5/20  scored     4096/   20460  ( 20.0%, 176 tok/s)   \n  chunk    6/20  scored     5120/   20460  ( 25.0%, 178 tok/s)   \n  chunk    7/20  scored     6144/   20460  ( 30.0%, 180 tok/s)   \n  chunk    8/20  scored     7168/   20460  ( 35.0%, 181 tok/s)   \n  chunk    9/20  scored     8192/   20460  ( 40.0%, 182 tok/s)   \n  chunk   10/20  scored     9216/   20460  ( 45.0%, 183 tok/s)   \n  chunk   11/20  scored    10240/   20460  ( 50.0%, 183 tok/s)   \n  chunk   12/20  scored    11264/   20460  ( 55.1%, 184 tok/s)   \n  chunk   13/20  scored    12288/   20460  ( 60.1%, 184 tok/s)   \n  chunk   14/20  scored    13312/   20460  ( 65.1%, 184 tok/s)   \n  chunk   15/20  scored    14336/   20460  ( 70.1%, 185 tok/s)   \n  chunk   16/20  scored    15360/   20460  ( 75.1%, 185 tok/s)   \n  chunk   17/20  scored    16384/   20460  ( 80.1%, 185 tok/s)   \n  chunk   18/20  scored    17408/   20460  ( 85.1%, 185 tok/s)   \n  chunk   19/20  scored    18432/   20460  ( 90.1%, 185 tok/s)   \n  chunk   20/20  scored    19456/   20460  ( 95.1%, 186 tok/s)   \n  chunk   20/20  scored    20460/   20460  (100.0%, 188 tok/s)   \neval_hipfire: scored 20460 tokens in 108.8s (188 tok/s)\neval_hipfire: slice-mean KLD = 0.130965  mean NLL = 2.301906  PPL = 9.9932\neval_hipfire: wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/per-seq/qwen3.5-4b.mq4-kvq8-c20__gfx1151__prefill.kldseq\n",
+      "model_file": "qwen3.5-4b.mq4",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-4b.mq4",
+      "model_present": true,
+      "output": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/per-seq/qwen3.5-4b.mq4-kvq8-c20__gfx1151__prefill.kldseq",
+      "output_size_bytes": 500,
+      "status": "ok",
+      "variant": "qwen3.5-4b.mq4-kvq8-c20",
+      "wall_s": 114.36
+    },
+    {
+      "command": [
+        "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire",
+        "--model",
+        "/home/sadara/.hipfire/models/qwen3.5-4b.mq3",
+        "--ref",
+        "benchmarks/quality-baselines/refs/qwen3.5-4b-bf16.kldref.bin",
+        "--output",
+        "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/per-seq/qwen3.5-4b.mq3-kvq8-c20__gfx1151__prefill.kldseq",
+        "--kv-mode",
+        "q8",
+        "--scoring-mode",
+        "prefill",
+        "--max-chunks",
+        "20"
+      ],
+      "exit_code": 0,
+      "family": "dense",
+      "format_id": "mq3",
+      "id": "qwen35-4b-mq3",
+      "log_tail": "throughput=6.16 GiB/s (2.03/2.03 GiB)\n  loading layer 15/32 (FullAttention)...\n  load progress: layer 16/32 elapsed=0.33s throughput=6.16 GiB/s (2.03/2.03 GiB)\n  loading layer 16/32 (LinearAttention)...\n  load progress: layer 17/32 elapsed=0.33s throughput=6.16 GiB/s (2.03/2.03 GiB)\n  loading layer 17/32 (LinearAttention)...\n  load progress: layer 18/32 elapsed=0.33s throughput=6.15 GiB/s (2.03/2.03 GiB)\n  loading layer 18/32 (LinearAttention)...\n  load progress: layer 19/32 elapsed=0.33s throughput=6.14 GiB/s (2.03/2.03 GiB)\n  loading layer 19/32 (FullAttention)...\n  load progress: layer 20/32 elapsed=0.33s throughput=6.14 GiB/s (2.03/2.03 GiB)\n  loading layer 20/32 (LinearAttention)...\n  load progress: layer 21/32 elapsed=0.33s throughput=6.13 GiB/s (2.03/2.03 GiB)\n  loading layer 21/32 (LinearAttention)...\n  load progress: layer 22/32 elapsed=0.33s throughput=6.13 GiB/s (2.03/2.03 GiB)\n  loading layer 22/32 (LinearAttention)...\n  load progress: layer 23/32 elapsed=0.33s throughput=6.13 GiB/s (2.03/2.03 GiB)\n  loading layer 23/32 (FullAttention)...\n  load progress: layer 24/32 elapsed=0.33s throughput=6.12 GiB/s (2.03/2.03 GiB)\n  loading layer 24/32 (LinearAttention)...\n  load progress: layer 25/32 elapsed=0.33s throughput=6.12 GiB/s (2.03/2.03 GiB)\n  loading layer 25/32 (LinearAttention)...\n  load progress: layer 26/32 elapsed=0.33s throughput=6.11 GiB/s (2.03/2.03 GiB)\n  loading layer 26/32 (LinearAttention)...\n  load progress: layer 27/32 elapsed=0.33s throughput=6.11 GiB/s (2.03/2.03 GiB)\n  loading layer 27/32 (FullAttention)...\n  load progress: layer 28/32 elapsed=0.33s throughput=6.10 GiB/s (2.03/2.03 GiB)\n  loading layer 28/32 (LinearAttention)...\n  load progress: layer 29/32 elapsed=0.33s throughput=6.10 GiB/s (2.03/2.03 GiB)\n  loading layer 29/32 (LinearAttention)...\n  load progress: layer 30/32 elapsed=0.33s throughput=6.10 GiB/s (2.03/2.03 GiB)\n  loading layer 30/32 (LinearAttention)...\n  load progress: layer 31/32 elapsed=0.33s throughput=6.09 GiB/s (2.03/2.03 GiB)\n  loading layer 31/32 (FullAttention)...\n  load progress: layer 32/32 elapsed=0.33s throughput=6.09 GiB/s (2.03/2.03 GiB)\n  weights loaded: elapsed=0.33s throughput=6.09 GiB/s payload=2.03 GiB streamed=2.03 GiB\neval_hipfire: --max-chunks 20 \u2192 effective_n_chunk = 20/1175\neval_hipfire: ref n_ctx=2048 n_vocab=248320 n_chunk=1175 top_k=256\n  scored/chunk=1023  total_scored=20460  block=2056B\n\n  chunk    2/20  scored     1024/   20460  (  5.0%, 147 tok/s)   \n  chunk    3/20  scored     2048/   20460  ( 10.0%, 164 tok/s)   \n  chunk    4/20  scored     3072/   20460  ( 15.0%, 171 tok/s)   \n  chunk    5/20  scored     4096/   20460  ( 20.0%, 175 tok/s)   \n  chunk    6/20  scored     5120/   20460  ( 25.0%, 177 tok/s)   \n  chunk    7/20  scored     6144/   20460  ( 30.0%, 179 tok/s)   \n  chunk    8/20  scored     7168/   20460  ( 35.0%, 180 tok/s)   \n  chunk    9/20  scored     8192/   20460  ( 40.0%, 181 tok/s)   \n  chunk   10/20  scored     9216/   20460  ( 45.0%, 181 tok/s)   \n  chunk   11/20  scored    10240/   20460  ( 50.0%, 182 tok/s)   \n  chunk   12/20  scored    11264/   20460  ( 55.1%, 182 tok/s)   \n  chunk   13/20  scored    12288/   20460  ( 60.1%, 183 tok/s)   \n  chunk   14/20  scored    13312/   20460  ( 65.1%, 183 tok/s)   \n  chunk   15/20  scored    14336/   20460  ( 70.1%, 183 tok/s)   \n  chunk   16/20  scored    15360/   20460  ( 75.1%, 184 tok/s)   \n  chunk   17/20  scored    16384/   20460  ( 80.1%, 184 tok/s)   \n  chunk   18/20  scored    17408/   20460  ( 85.1%, 184 tok/s)   \n  chunk   19/20  scored    18432/   20460  ( 90.1%, 184 tok/s)   \n  chunk   20/20  scored    19456/   20460  ( 95.1%, 184 tok/s)   \n  chunk   20/20  scored    20460/   20460  (100.0%, 187 tok/s)   \neval_hipfire: scored 20460 tokens in 109.6s (187 tok/s)\neval_hipfire: slice-mean KLD = 0.517444  mean NLL = 2.580811  PPL = 13.2078\neval_hipfire: wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/per-seq/qwen3.5-4b.mq3-kvq8-c20__gfx1151__prefill.kldseq\n",
+      "model_file": "qwen3.5-4b.mq3",
+      "model_path": "/home/sadara/.hipfire/models/qwen3.5-4b.mq3",
+      "model_present": true,
+      "output": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/per-seq/qwen3.5-4b.mq3-kvq8-c20__gfx1151__prefill.kldseq",
+      "output_size_bytes": 500,
+      "status": "ok",
+      "variant": "qwen3.5-4b.mq3-kvq8-c20",
+      "wall_s": 115.045
+    }
+  ],
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "date": "2026-06-03T00:26:58.579504+00:00",
+  "eval_hipfire": {
+    "md5": "5cb19daea01ca8fac74a5c4db0e7b7ef",
+    "path": "/home/sadara/.hipfire/src/target/release/examples/eval_hipfire"
+  },
+  "models_dir": "/home/sadara/.hipfire/models",
+  "params": {
+    "kv_mode": "q8",
+    "max_chunks": 20,
+    "scoring_mode": "prefill"
+  },
+  "per_seq_dir": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/per-seq",
+  "reduce": {
+    "command": [
+      "python3",
+      "/home/sadara/.hipfire/src/benchmarks/quality-baselines/harness/kld_reduce.py",
+      "--result-dir",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/per-seq",
+      "--out-md",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/result-table.md",
+      "--out-json",
+      "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/result-data.json"
+    ],
+    "exit_code": 0,
+    "log_tail": "wrote benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/result-table.md, benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/result-data.json\n| Variant | Arch | Mode | n_chunks | Mean KLD \u00b1 95% CI | p99 KLD | PPL | Notes |\n|---|---|---|---:|---|---:|---:|---|\n| qwen3.5-4b.mq3-kvq8-c20 | gfx1151 | prefill | 20 | 0.5174 (CI 0.4751\u20130.5656) | 16.232 | 13.208 |  |\n| qwen3.5-4b.mq4-kvq8-c20 | gfx1151 | prefill | 20 | 0.1310 (CI 0.1089\u20130.1607) | 10.102 | 9.993 |  |\n\n",
+    "result_json": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/result-data.json",
+    "result_md": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld/result-table.md",
+    "status": "ok"
+  },
+  "reduced_rows": [
+    {
+      "arch": "gfx1151",
+      "mean_kld": 0.5174443789870266,
+      "mean_kld_ci_hi": 0.5655787269510949,
+      "mean_kld_ci_lo": 0.4750542088912033,
+      "n_chunks": 20,
+      "notes": "",
+      "p99_kld": 16.23230557010797,
+      "ppl": 13.207844288292574,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-4b.mq3-kvq8-c20"
+    },
+    {
+      "arch": "gfx1151",
+      "mean_kld": 0.13096527241400577,
+      "mean_kld_ci_hi": 0.1606565181802943,
+      "mean_kld_ci_lo": 0.1088992684965105,
+      "n_chunks": 20,
+      "notes": "",
+      "p99_kld": 10.102367675614913,
+      "ppl": 9.99321201304944,
+      "scoring_mode": "prefill",
+      "variant": "qwen3.5-4b.mq4-kvq8-c20"
+    }
+  ],
+  "reference": {
+    "path": "benchmarks/quality-baselines/refs/qwen3.5-4b-bf16.kldref.bin",
+    "sha256": "d3ba9b5618f86bd9efcf2cd95bc718c41df288612ddc9f8f2592ab7dbb90bb75",
+    "size_bytes": 2480989032
+  },
+  "run_dir": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-mq3-4b-kld",
+  "schema": "hipfire.quant_kld.gfx1151.v0"
+}

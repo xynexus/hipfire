@@ -1,0 +1,424 @@
+{
+  "arch": "gfx1151",
+  "blockers": [
+    "no true group_size=256 Paro source checkpoint was found",
+    "CPU G256 probe cannot be rerun locally without a native Paro source",
+    "only regrouped-G128 format-loss evidence exists; true G256 quality is unverifiable",
+    "current true-G256 payload ratio <=1.03x has not been proven",
+    "KLD/PPL within 5% of ParoQ4G128 has not been proven",
+    "PARO4G256/PARO4G256_MQ runtime DType/container support is not wired"
+  ],
+  "branch": "qwen35-native-mtp",
+  "captured_at_utc": "2026-06-03T10:16:01Z",
+  "commit": "fab9d2bc88d2de7b5febfa9ec8afed80b6700557",
+  "contract_state": {
+    "current_stage": "blocked_before_true_group_size_256_source",
+    "evidence_class": "regrouped_g128_format_loss_only",
+    "kld_ppl_tolerance_ratio": 1.05,
+    "payload_ratio_target": 1.03,
+    "producer_contract": {
+      "complete_g128_module_count": 0,
+      "complete_g256_module_count": 0,
+      "complete_native_paro_module_count": 0,
+      "filename_hit_count": 0,
+      "incomplete_module_count": 0,
+      "quality_verifiable_only_with_true_g256_source": true,
+      "required_group_size": 256,
+      "required_tensor_families": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ],
+      "source_search_result": "no_paro_suffix_or_filename_hits"
+    },
+    "quality_marked_unverifiable": true,
+    "quality_state": "UNVERIFIABLE",
+    "required_stage_order": [
+      "true_group_size_256_source",
+      "cpu_g256_probe",
+      "paro_oracle_comparison",
+      "payload_ratio_lte_1_03",
+      "kld_ppl_within_5_percent_of_paro_q4g128",
+      "runtime_dtype_container_work"
+    ],
+    "runtime_work_allowed": false,
+    "runtime_work_blocked_by": [
+      "true_group_size_256_source",
+      "cpu_g256_probe",
+      "paro_oracle_comparison",
+      "kld_ppl_within_5_percent_of_paro_q4g128"
+    ],
+    "upstream_g256_evidence": {
+      "evidence_class": "regrouped_g128_opt_in_research",
+      "probes": {
+        "all_probe_caveats_regrouped_g128": true,
+        "all_probe_results_present": true,
+        "items": [
+          {
+            "avg_output_nrmse": {
+              "paro4g256_awq": 0.08377294659119179,
+              "paro4g256_mq_body": 0.09238163394043898
+            },
+            "avg_payload_ratio_vs_source": {
+              "paro4g256_awq": 0.981681281643375,
+              "paro4g256_mq_body_plus_side": 1.0219824620279498
+            },
+            "exists": true,
+            "model": "/home/kaden/.cache/huggingface/hub/models--z-lab--Qwen3.5-0.8B-PARO/snapshots/da941f4fd3fa72763c398db6cb14b2bef1ee961f/",
+            "modules_probed": 12,
+            "path": "/home/sadara/.hipfire/src/docs/investigations/paro-g256-perfmax/g256-probe-0.8b.json",
+            "records_regrouped_g128_caveat": true,
+            "schema": "hipfire.astrea.paro_g256_probe.v0",
+            "worst_output_nrmse": {
+              "paro4g256_awq": 0.11166238588609607,
+              "paro4g256_mq_body": 0.11382481860332622
+            }
+          },
+          {
+            "avg_output_nrmse": {
+              "paro4g256_awq": 0.08507657613106638,
+              "paro4g256_mq_body": 0.09642102264544834
+            },
+            "avg_payload_ratio_vs_source": {
+              "paro4g256_awq": 0.9813608895760102,
+              "paro4g256_mq_body_plus_side": 1.0223669325087879
+            },
+            "exists": true,
+            "model": "/home/kaden/.cache/huggingface/hub/models--z-lab--Qwen3.5-9B-PARO/snapshots/1c37db0d3ea7b04d31b7d11ec3650c6deea58c1b/",
+            "modules_probed": 12,
+            "path": "/home/sadara/.hipfire/src/docs/investigations/paro-g256-perfmax/g256-probe-9b.json",
+            "records_regrouped_g128_caveat": true,
+            "schema": "hipfire.astrea.paro_g256_probe.v0",
+            "worst_output_nrmse": {
+              "paro4g256_awq": 0.14398297519022238,
+              "paro4g256_mq_body": 0.15487331185147038
+            }
+          }
+        ],
+        "max_awq_payload_ratio_vs_source": 0.981681281643375,
+        "max_mq_body_payload_ratio_vs_source": 1.0223669325087879,
+        "paths": [
+          "/home/sadara/.hipfire/src/docs/investigations/paro-g256-perfmax/g256-probe-0.8b.json",
+          "/home/sadara/.hipfire/src/docs/investigations/paro-g256-perfmax/g256-probe-9b.json"
+        ],
+        "probe_count": 2
+      },
+      "promotion_proof": false,
+      "research_evidence_present": true,
+      "runtime_dtype_container_unblocked_by_upstream": false,
+      "summary": {
+        "exists": true,
+        "exit_decision": "B",
+        "g256_default_ready": false,
+        "g256_opt_in_research_not_default": true,
+        "mentions_gfx1151_conditional_ports": true,
+        "mentions_pr319_paro_g128": true,
+        "path": "/home/sadara/.hipfire/src/docs/investigations/paro-g256-perfmax/SUMMARY.md"
+      },
+      "true_g256_source_evidence_present": false
+    }
+  },
+  "decision": "keep ParoQ4G256 prototype-only; do not start runtime DType/container work from regrouped-G128 evidence",
+  "format": "paro-q4g256",
+  "format_loss_evidence": {
+    "current_true_g256_payload_ratio_evidence_present": false,
+    "current_true_g256_payload_ratio_gate_passed": false,
+    "mq_payload_ratio_gate_passed": false,
+    "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-contract-audit.md",
+    "payload_ratio_target": 1.03,
+    "regrouped_mq_payload_ratio_gate_passed": true,
+    "true_g256_quality_evidence_present": false,
+    "variants": {
+      "PARO4G256": {
+        "avg_output_nrmse": 0.0859,
+        "avg_payload_ratio_vs_source": 0.9817,
+        "label": "AWQ regroup",
+        "source": "regrouped G128 format-loss probe recorded in contract audit",
+        "true_g256_quality_evidence": false,
+        "worst_output_nrmse": 0.1095
+      },
+      "PARO4G256_MQ": {
+        "avg_output_nrmse": 0.0951,
+        "avg_payload_ratio_vs_source": 1.022,
+        "label": "row-major G256 body + Paro side metadata",
+        "source": "regrouped G128 format-loss probe recorded in contract audit",
+        "true_g256_quality_evidence": false,
+        "worst_output_nrmse": 0.1114
+      }
+    }
+  },
+  "gates": {
+    "cpu_probe_available": true,
+    "cpu_probe_runnable_now": false,
+    "current_true_g256_payload_ratio_evidence_present": false,
+    "current_true_g256_payload_ratio_gate_passed": false,
+    "native_g256_source_found": false,
+    "payload_ratio_gate_passed": false,
+    "producer_contract_explicit": true,
+    "quality_comparable_to_paro_q4g128": false,
+    "regrouped_payload_ratio_gate_passed": true,
+    "runtime_dtype_container_ready": false,
+    "true_g256_quality_evidence_present": false,
+    "upstream_g256_research_evidence_present": true
+  },
+  "next_unblocked_step": "locate_or_generate_true_group_size_256_paro_source",
+  "next_work": [
+    "Locate or produce a true group_size=256 Paro source with qweight/qzeros/scales/pairs/theta/channel_scales.",
+    "Rerun scripts/paroquant_g256_probe.py --local-only against that true G256 source; regrouped-G128 probes remain research context only.",
+    "Run a true-G256 oracle comparison and payload-ratio artifact, requiring <=1.03x ParoQ4G128 payload.",
+    "Run same-run KLD/PPL versus ParoQ4G128 and require <=1.05x before runtime DType/container work.",
+    "Keep PARO4G256/PARO4G256_MQ runtime DType/container work blocked until prototype_plan.runtime_dtype_container_work_allowed=true."
+  ],
+  "origin_context": {
+    "base": "HEAD",
+    "local_only_commits": 66,
+    "origin_master_commit": "02634f4c49853faa8d43f7bc029a9f23988aa45f",
+    "relevant_upstream_commits": [
+      {
+        "commit": "f1e2cef815e504a8df1d9142910c3f442dd5d526",
+        "impact": "records Exit B for the G256 perfmax thread: G256 is opt-in research, while G128 levers are the shipped runtime path",
+        "present_on_head": true,
+        "present_on_origin_master": true,
+        "short": "f1e2cef8",
+        "subject": "docs(paro-g256-perfmax): Phase 3 Lever 2 + gfx12 asymptote + final SUMMARY"
+      },
+      {
+        "commit": "907cbb2f93c5641bd8969ff8235bb91c729df037",
+        "impact": "captures ParoQ4G128 A3B runtime context via PR #319; useful for ranking Paro work, but not a true PARO4G256 source/export",
+        "present_on_head": true,
+        "present_on_origin_master": true,
+        "short": "907cbb2f",
+        "subject": "docs(paro-g256-perfmax): Phase 4 \u2014 A3B-PARO 60+ tok/s on gfx1201 + Lever 4 NaN fix"
+      },
+      {
+        "commit": "79d30777f7d77abcc0b33d54aa0bd4c7dfddf6e3",
+        "impact": "adds probe/milestone scaffolding for Paro G256; it is not a native group_size=256 source checkpoint or runtime DType path",
+        "present_on_head": true,
+        "present_on_origin_master": true,
+        "short": "79d30777",
+        "subject": "research(paroquant): add G256 milestone probes"
+      },
+      {
+        "commit": "020ed5e124f3d7f2632e95ea8199b98c417c845a",
+        "impact": "confirms the older MQ4G256 codec stub was reverted; do not infer runtime PARO4G256/PARO4G256_MQ support from that history",
+        "present_on_head": true,
+        "present_on_origin_master": true,
+        "short": "020ed5e1",
+        "subject": "Revert \"test(paro-la-gates): failing stub for MQ4G256 codec\""
+      }
+    ],
+    "upstream": "origin/master",
+    "upstream_only_commits": 126,
+    "upstream_reconciliation_required": true
+  },
+  "probe_surface": {
+    "exists": true,
+    "has_local_only_flag": true,
+    "has_schema": true,
+    "path": "/home/sadara/.hipfire/src/scripts/paroquant_g256_probe.py",
+    "records_regrouped_g128_caveat": true
+  },
+  "promotion_allowed": false,
+  "prototype_boundary": {
+    "artifact_generation_without_true_source_allowed": false,
+    "current_stage": "blocked_before_true_group_size_256_source",
+    "current_true_g256_payload_ratio_evidence_present": false,
+    "current_true_g256_payload_ratio_gate_passed": false,
+    "format_loss_evidence_class": "regrouped_g128_format_loss_only",
+    "format_loss_ratio_passed": true,
+    "format_loss_ratio_target": 1.03,
+    "kld_ppl_within_5_percent_of_paro_q4g128_proven": false,
+    "kld_ppl_within_5_percent_of_paro_q4g128_required": true,
+    "next_unblocked_step": "locate_or_generate_true_group_size_256_paro_source",
+    "payload_ratio_only_not_promotion_evidence": true,
+    "producer_contract": {
+      "complete_g128_module_count": 0,
+      "complete_g256_module_count": 0,
+      "complete_native_paro_module_count": 0,
+      "filename_hit_count": 0,
+      "incomplete_module_count": 0,
+      "quality_verifiable_only_with_true_g256_source": true,
+      "required_group_size": 256,
+      "required_tensor_families": [
+        "qweight",
+        "qzeros",
+        "scales",
+        "pairs",
+        "theta",
+        "channel_scales"
+      ],
+      "source_search_result": "no_paro_suffix_or_filename_hits"
+    },
+    "quality_marked_unverifiable": true,
+    "regrouped_payload_ratio_gate_passed": true,
+    "runtime_dtype_container_work_allowed": false,
+    "runtime_dtype_container_work_blocked_by": [
+      "true_group_size_256_source",
+      "cpu_g256_probe",
+      "paro_oracle_comparison",
+      "kld_ppl_within_5_percent_of_paro_q4g128"
+    ],
+    "runtime_dtypes_present": {
+      "hfq_runtime_dtype_present": false,
+      "qwen35_runtime_dtype_present": false
+    },
+    "source_inventory_quality_state": "UNVERIFIABLE",
+    "true_g256_quality_evidence_present": false,
+    "true_group_size_256_source_found": false,
+    "true_group_size_256_source_required": true,
+    "upstream_g256_evidence_class": "regrouped_g128_opt_in_research",
+    "upstream_g256_evidence_is_promotion_proof": false,
+    "upstream_g256_research_evidence_present": true
+  },
+  "prototype_plan": {
+    "evidence_artifact_targets": {
+      "contract_audit": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-contract-audit.md",
+      "cpu_g256_probe": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-cpu-probe.json",
+      "kld_ppl": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-kld-ppl.json",
+      "paro_oracle_comparison": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-oracle.json",
+      "payload_ratio": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-payload-ratio.json",
+      "runtime_dtype_audit": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-runtime-dtype-audit.md",
+      "source_inventory": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-source-inventory.json",
+      "status": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-status.json"
+    },
+    "next_unblocked_step": "locate_or_generate_true_group_size_256_paro_source",
+    "next_work": [
+      "Locate or produce a true group_size=256 Paro source with qweight/qzeros/scales/pairs/theta/channel_scales.",
+      "Rerun scripts/paroquant_g256_probe.py --local-only against that true G256 source; regrouped-G128 probes remain research context only.",
+      "Run a true-G256 oracle comparison and payload-ratio artifact, requiring <=1.03x ParoQ4G128 payload.",
+      "Run same-run KLD/PPL versus ParoQ4G128 and require <=1.05x before runtime DType/container work.",
+      "Keep PARO4G256/PARO4G256_MQ runtime DType/container work blocked until prototype_plan.runtime_dtype_container_work_allowed=true."
+    ],
+    "quality_unverifiable_until_true_g256_source": true,
+    "runtime_dtype_container_work_allowed": false,
+    "stage_order": [
+      "true_group_size_256_source",
+      "cpu_g256_probe",
+      "paro_oracle_comparison",
+      "payload_ratio_lte_1_03",
+      "kld_ppl_within_5_percent_of_paro_q4g128",
+      "runtime_dtype_container_work"
+    ],
+    "stages": {
+      "cpu_g256_probe": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-cpu-probe.json",
+        "blocked_by": [
+          "true_group_size_256_source"
+        ],
+        "command_template": "python3 scripts/paroquant_g256_probe.py --model <true-group-size-256-paro-safetensors-dir-or-hf-repo> --local-only --pretty > benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-cpu-probe.json",
+        "records_regrouped_g128_caveat_required": false,
+        "satisfied": false
+      },
+      "kld_ppl_within_5_percent_of_paro_q4g128": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-kld-ppl.json",
+        "blocked_by": [
+          "paro_oracle_comparison",
+          "payload_ratio_lte_1_03"
+        ],
+        "satisfied": false,
+        "tolerance_ratio": 1.05
+      },
+      "paro_oracle_comparison": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-oracle.json",
+        "blocked_by": [
+          "cpu_g256_probe"
+        ],
+        "command_template": "python3 scripts/astrea.py paro-oracle --source <true-group-size-256-paro-safetensors-dir-or-hf-repo> --hfq <imported-paro-q4g256.hfq> --pretty --out benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-oracle.json",
+        "requirement": "compare imported true-G256 bytes against a source oracle or equivalent true-G256 CPU probe",
+        "satisfied": false
+      },
+      "payload_ratio_lte_1_03": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-payload-ratio.json",
+        "blocked_by": [
+          "cpu_g256_probe"
+        ],
+        "regrouped_g128_payload_ratio_is_promotable": false,
+        "satisfied": false,
+        "target_ratio": 1.03
+      },
+      "runtime_dtype_container_work": {
+        "allowed": false,
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-runtime-dtype-audit.md",
+        "blocked_by": [
+          "true_group_size_256_source",
+          "cpu_g256_probe",
+          "paro_oracle_comparison",
+          "kld_ppl_within_5_percent_of_paro_q4g128"
+        ],
+        "requirement": "only wire PARO4G256/PARO4G256_MQ runtime DType/container support after every producer and quality gate passes",
+        "satisfied": false
+      },
+      "true_group_size_256_source": {
+        "artifact": "benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-source-inventory.json",
+        "blocks": [
+          "cpu_g256_probe"
+        ],
+        "command": "python3 scripts/paroquant_inventory.py --pretty --out benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-source-inventory.json",
+        "complete_g256_module_count": 0,
+        "current_result": "no_paro_suffix_or_filename_hits",
+        "required_group_size": 256,
+        "required_tensor_families": [
+          "qweight",
+          "qzeros",
+          "scales",
+          "pairs",
+          "theta",
+          "channel_scales"
+        ],
+        "satisfied": false
+      }
+    },
+    "status": "blocked_before_true_group_size_256_source",
+    "upstream_research_evidence_is_promotion_proof": false
+  },
+  "runtime_surface": {
+    "hfq_runtime_dtype_present": false,
+    "qwen35_runtime_dtype_present": false,
+    "source_root": "/home/sadara/.hipfire/src"
+  },
+  "schema": "hipfire.paro_q4g256_status.gfx1151.v0",
+  "source_inventory": {
+    "complete_module_count": 0,
+    "filename_hit_count": 0,
+    "files_seen": 861,
+    "g128_complete_module_count": 0,
+    "g256_complete_module_count": 0,
+    "incomplete_module_count": 0,
+    "native_paro_g256_source_found": false,
+    "native_paro_source_found": false,
+    "path": "/home/sadara/.hipfire/src/benchmarks/results/gfx1151-quant-readiness/2026-06-03-paro-q4g256-source-inventory.json",
+    "quality_state": "UNVERIFIABLE",
+    "roots": [
+      {
+        "exists": true,
+        "filename_hit_count": 0,
+        "files_seen": 677,
+        "root": "/home/sadara/Models",
+        "safetensor_file_count": 150
+      },
+      {
+        "exists": true,
+        "filename_hit_count": 0,
+        "files_seen": 126,
+        "root": "/home/sadara/.cache/huggingface/hub",
+        "safetensor_file_count": 1
+      },
+      {
+        "exists": true,
+        "filename_hit_count": 0,
+        "files_seen": 58,
+        "root": "/home/sadara/.hipfire/models",
+        "safetensor_file_count": 0
+      }
+    ],
+    "safetensor_dirs_scanned": 17,
+    "safetensor_files_scanned": 151,
+    "scan_errors": [],
+    "schema": "hipfire.astrea.paro_source_inventory.v0",
+    "source_search_result": "no_paro_suffix_or_filename_hits"
+  },
+  "status": "prototype-only"
+}

@@ -1,0 +1,35 @@
+{
+  "arch_id": 6,
+  "architecture": "qwen3_5_moe",
+  "captured_at_utc": "2026-06-03T01:05:05Z",
+  "model": "/home/sadara/Models/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0",
+  "paro": {
+    "complete_module_count": 0,
+    "incomplete": [],
+    "incomplete_module_count": 0,
+    "modules": [],
+    "modules_truncated": false,
+    "suffix_counts": {
+      "other": 1045
+    }
+  },
+  "resolved_path": "/home/sadara/Models/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0",
+  "runtime_contract": {
+    "bits": 4,
+    "compatibility_warnings": [
+      "checkpoint has vision_config; text-only hipfire smoke may still need Qwen3.5-VL prompt/runtime parity before quality data is meaningful"
+    ],
+    "engine_support_required": [
+      "DType::PARO4G128",
+      "quant_type 28 loader mapping",
+      "gemv_paro4g128 and gemv_paro4g128_residual kernels"
+    ],
+    "group_size": 128,
+    "has_vision_config": true,
+    "hfq_quant_type": 28,
+    "hfq_quant_type_name": "PARO4G128",
+    "krot": 8
+  },
+  "schema": "hipfire.astrea.paro_probe.v0",
+  "tensor_count": 1045
+}
