@@ -5161,6 +5161,10 @@ fn main() {
         // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
         // per-expert) and are translated when the forward bring-up lands.
         "deepseek_v4" => 9,
+        // LFM2.5-MoE (LiquidAI): hybrid short-conv + GQA-attn layers with
+        // dense SwiGLU on early layers and top-4 MoE on the rest. Crate:
+        // hipfire-arch-lfm2moe.
+        "lfm2_moe" => 11,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -5187,7 +5191,8 @@ fn main() {
     // the standard 2D quant path; the routing fan-out into top-k experts
     // happens at forward time, not quant time.
     let is_deepseek4 = arch_id == 9;
-    let is_moe_like = is_moe || is_deepseek4;
+    let is_lfm2moe = arch_id == 11;
+    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe;
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
@@ -5195,6 +5200,11 @@ fn main() {
     }
     if is_deepseek4 {
         eprintln!("  DeepSeek V4 detected — per-expert tensors ship pre-split; quantizing each as 2D weight.");
+    }
+    if is_lfm2moe {
+        eprintln!(
+            "  LFM2.5-MoE detected — experts -> MQ4G256, expert_bias -> F32, all else -> Q8."
+        );
     }
 
     // Extract layer count for K-map edge-layer promotion.
@@ -5891,6 +5901,181 @@ fn main() {
             if let Some(ref mut s) = spill {
                 maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024); // 2 GB threshold
             }
+            continue;
+        }
+
+        // ── LFM2.5-MoE ingest (arch_id 11) ─────────────────────────────────
+        // Routed experts ship as pre-split 2D tensors:
+        //   model.layers.L.feed_forward.experts.E.{w1,w2,w3}.weight
+        // Default artifact recipe is experts MQ4G256, expert_bias F32, and
+        // every other LFM2 tensor Q8. This matches hipfire-arch-lfm2moe's
+        // loader/forward contracts: experts use indexed MQ GEMV, while
+        // conv/attn/dense/router/embed/norm tensors route through Q8/F32-safe
+        // helper paths.
+        if is_lfm2moe {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            if name.contains(".feed_forward.experts.")
+                && (name.ends_with(".w1.weight")
+                    || name.ends_with(".w2.weight")
+                    || name.ends_with(".w3.weight"))
+                && meta.shape.len() == 2
+                && meta.shape[1] % 256 == 0
+            {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw_data,
+                    meta,
+                    &fp8_scale_for,
+                    &st_files,
+                );
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let expert_mq6 = std::env::var_os("HIPFIRE_LFM2_EXPERT_MQ6").is_some();
+                let (q, qt, tag) = if expert_mq6 {
+                    (
+                        quantize_mq6g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ6G256,
+                        "MQ6-LFM",
+                    )
+                } else {
+                    (
+                        quantize_mq4g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ4G256,
+                        "MQ4-LFM",
+                    )
+                };
+                eprintln!(
+                    "  {:>8}: {} {:?} ({:.1} KB -> {:.1} KB)",
+                    tag,
+                    name,
+                    meta.shape,
+                    raw_data.len() as f64 / 1024.0,
+                    q.len() as f64 / 1024.0
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: qt,
+                    shape,
+                    group_size: 256,
+                    data: q,
+                    spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+
+            if name.ends_with(".feed_forward.expert_bias") {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw_data,
+                    meta,
+                    &fp8_scale_for,
+                    &st_files,
+                );
+                let mut bytes = Vec::with_capacity(f32_data.len() * 4);
+                for v in &f32_data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                eprintln!(
+                    "  {:>8}: {} {:?} (expert_bias F32)",
+                    "F32-LFM", name, meta.shape
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::F32,
+                    shape,
+                    group_size: 1,
+                    data: bytes,
+                    spilled_len: 0,
+                });
+                quantized_params += n_elements as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+
+            let proj_mq6 = std::env::var_os("HIPFIRE_LFM2_PROJ_MQ6").is_some();
+            let proj_mq4 = std::env::var_os("HIPFIRE_LFM2_PROJ_MQ4").is_some();
+            if (proj_mq6 || proj_mq4)
+                && meta.shape.len() == 2
+                && meta.shape[1] % 256 == 0
+                && (name.ends_with(".conv.in_proj.weight")
+                    || name.ends_with(".conv.out_proj.weight")
+                    || name.ends_with(".self_attn.q_proj.weight")
+                    || name.ends_with(".self_attn.k_proj.weight")
+                    || name.ends_with(".self_attn.v_proj.weight")
+                    || name.ends_with(".self_attn.out_proj.weight")
+                    || name.ends_with(".feed_forward.w1.weight")
+                    || name.ends_with(".feed_forward.w2.weight")
+                    || name.ends_with(".feed_forward.w3.weight"))
+            {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw_data,
+                    meta,
+                    &fp8_scale_for,
+                    &st_files,
+                );
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let (q, qt, tag) = if proj_mq6 {
+                    (
+                        quantize_mq6g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ6G256,
+                        "MQ6P-LFM",
+                    )
+                } else {
+                    (
+                        quantize_mq4g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ4G256,
+                        "MQ4P-LFM",
+                    )
+                };
+                eprintln!(
+                    "  {:>8}: {} {:?} (proj {})",
+                    tag,
+                    name,
+                    meta.shape,
+                    if proj_mq6 { "MQ6" } else { "MQ4" }
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: qt,
+                    shape,
+                    group_size: 256,
+                    data: q,
+                    spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            let q = quantize_q8f16(&f32_data);
+            eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-LFM", name, meta.shape);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::Q8F16,
+                shape,
+                group_size: 32,
+                data: q,
+                spilled_len: 0,
+            });
+            quantized_params += n_elements as u64;
+            st_files[*file_idx].drop_tensor_pages(name);
             continue;
         }
 
