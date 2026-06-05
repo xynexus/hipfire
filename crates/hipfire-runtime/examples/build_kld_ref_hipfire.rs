@@ -19,6 +19,9 @@
 //!       --top-k 256 \
 //!       --output ~/.hipfire/eval-results/refs/qwen3.5-0.8b-bf16.kldref.hfq \
 //!       --n-ctx 2048 --kv-mode fp32
+//!
+//! Use `--smoke` or `--test` for a single-chunk reference. Smoke/test refs are
+//! useful for proving the path, but are not full KLD references.
 
 #![recursion_limit = "256"]
 
@@ -45,10 +48,11 @@ fn main() {
     use serde_json::json;
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
+    use std::fmt;
     use std::fs::File;
     use std::io::{BufWriter, Write};
     use std::path::{Path, PathBuf};
-    use std::time::Instant;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     const KLDREF_SCHEMA_VERSION: u32 = 1;
     const KLDREF_ENTRY_QUANT_TYPE: u8 = 0;
@@ -61,14 +65,38 @@ fn main() {
         output: PathBuf,
         n_ctx: usize,
         max_chunks: Option<usize>,
+        smoke: bool,
         kv_mode: KvMode,
         max_seq: Option<usize>,
         metadata_json: Option<PathBuf>,
     }
 
+    fn timestamp_ms() -> String {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(dur) => format!("{}.{:03}", dur.as_secs(), dur.subsec_millis()),
+            Err(_) => "unknown".to_string(),
+        }
+    }
+
+    fn log_line(level: &str, args: fmt::Arguments<'_>) {
+        eprintln!("[{}] {level} build_kld_ref_hipfire: {args}", timestamp_ms());
+    }
+
+    macro_rules! log_info {
+        ($($arg:tt)*) => {
+            log_line("INFO", format_args!($($arg)*))
+        };
+    }
+
+    macro_rules! log_warn {
+        ($($arg:tt)*) => {
+            log_line("WARN", format_args!($($arg)*))
+        };
+    }
+
     fn print_usage() {
         eprintln!(
-            "Usage:\n  build_kld_ref_hipfire --model <model.hfq> --slice <slice.txt> --top-k <N> --output <out.kldref.hfq> \\\n                         [--n-ctx <N>=2048] [--max-chunks N] [--kv-mode fp32|q8|asym4|asym3|asym2] [--max-seq N] [--metadata-json path]"
+            "Usage:\n  build_kld_ref_hipfire --model <model.hfq> --slice <slice.txt> --top-k <N> --output <out.kldref.hfq> \\\n                         [--n-ctx <N>=2048] [--max-chunks N|--smoke|--test] [--kv-mode fp32|q8|asym4|asym3|asym2] [--max-seq N] [--metadata-json path]"
         );
     }
 
@@ -80,7 +108,7 @@ fn main() {
             "asym3" | "turbo3" | "turbo" => KvMode::Asym3,
             "asym2" | "turbo2" => KvMode::Asym2,
             other => {
-                eprintln!("unknown --kv-mode {other}; expected fp32|q8|asym4|asym3|asym2");
+                log_warn!("unknown --kv-mode {other}; expected fp32|q8|asym4|asym3|asym2");
                 std::process::exit(1);
             }
         }
@@ -93,6 +121,7 @@ fn main() {
         let mut output: Option<PathBuf> = None;
         let mut n_ctx: usize = 2048;
         let mut max_chunks: Option<usize> = None;
+        let mut smoke = false;
         let mut kv_mode = KvMode::Fp32;
         let mut max_seq: Option<usize> = None;
         let mut metadata_json: Option<PathBuf> = None;
@@ -125,6 +154,11 @@ fn main() {
                     max_chunks = Some(argv[i + 1].parse().expect("--max-chunks must be integer"));
                     i += 2;
                 }
+                "--smoke" | "--test" => {
+                    smoke = true;
+                    max_chunks = Some(max_chunks.map_or(1, |m| m.min(1)));
+                    i += 1;
+                }
                 "--kv-mode" | "--kv" => {
                     kv_mode = parse_kv_mode(&argv[i + 1]);
                     i += 2;
@@ -142,7 +176,7 @@ fn main() {
                     std::process::exit(0);
                 }
                 other => {
-                    eprintln!("unknown arg: {other}");
+                    log_warn!("unknown arg: {other}");
                     print_usage();
                     std::process::exit(1);
                 }
@@ -162,12 +196,15 @@ fn main() {
             std::process::exit(1);
         });
         if n_ctx < 4 {
-            eprintln!("--n-ctx must be >= 4");
+            log_warn!("--n-ctx must be >= 4");
             std::process::exit(1);
         }
         if top_k == 0 {
-            eprintln!("--top-k must be > 0");
+            log_warn!("--top-k must be > 0");
             std::process::exit(1);
+        }
+        if smoke {
+            max_chunks = Some(1);
         }
         Args {
             model,
@@ -176,6 +213,7 @@ fn main() {
             output,
             n_ctx,
             max_chunks,
+            smoke,
             kv_mode,
             max_seq,
             metadata_json,
@@ -285,8 +323,8 @@ fn main() {
         let blob_count = gpu.capture_blobs.len();
         gpu.end_verify_graph_capture()?;
         gpu.verify_graph_launch(graph_key)?;
-        eprintln!(
-            "build_kld_ref_hipfire: captured prefill graph key={} tokens={} blobs={} cache_size={}",
+        log_info!(
+            "captured prefill graph key={} tokens={} blobs={} cache_size={}",
             graph_key,
             tokens.len(),
             blob_count,
@@ -316,6 +354,55 @@ fn main() {
         fn eq(&self, other: &Self) -> bool {
             self.idx == other.idx && self.logit.to_bits() == other.logit.to_bits()
         }
+    }
+
+    fn format_duration(secs: f64) -> String {
+        if !secs.is_finite() || secs < 0.0 {
+            return "unknown".to_string();
+        }
+        let total = secs.round() as u64;
+        let hours = total / 3600;
+        let minutes = (total % 3600) / 60;
+        let seconds = total % 60;
+        if hours > 0 {
+            format!("{hours}h{minutes:02}m{seconds:02}s")
+        } else if minutes > 0 {
+            format!("{minutes}m{seconds:02}s")
+        } else {
+            format!("{seconds}s")
+        }
+    }
+
+    fn emit_kld_progress(
+        phase: &str,
+        chunk_idx: usize,
+        n_chunk: usize,
+        scored_done: usize,
+        total_scored: usize,
+        started: &Instant,
+    ) {
+        let pct = if total_scored == 0 {
+            100.0
+        } else {
+            scored_done as f64 * 100.0 / total_scored as f64
+        };
+        let elapsed = started.elapsed().as_secs_f64();
+        let rate = scored_done as f64 / elapsed.max(1e-9);
+        let eta = if scored_done == 0 || rate <= 0.0 {
+            "unknown".to_string()
+        } else {
+            format_duration((total_scored - scored_done) as f64 / rate)
+        };
+        log_info!(
+            "[{phase}] chunk {}/{} scored {}/{} ({:.1}%, {:.0} tok/s, eta {})",
+            chunk_idx + 1,
+            n_chunk,
+            scored_done,
+            total_scored,
+            pct,
+            rate,
+            eta
+        );
     }
 
     impl Eq for HeapCandidate {}
@@ -561,11 +648,11 @@ fn main() {
 
     let args = parse_args();
     if !args.model.exists() {
-        eprintln!("--model path not found: {}", args.model.display());
+        log_warn!("--model path not found: {}", args.model.display());
         std::process::exit(1);
     }
     if !args.slice.exists() {
-        eprintln!("--slice path not found: {}", args.slice.display());
+        log_warn!("--slice path not found: {}", args.slice.display());
         std::process::exit(1);
     }
     hipfire_runtime::eval_common::verify_slice_md5(&args.slice, "build_kld_ref_hipfire");
@@ -589,11 +676,7 @@ fn main() {
     }
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
-    eprintln!(
-        "build_kld_ref_hipfire: loading {} on {}",
-        args.model.display(),
-        gpu.arch
-    );
+    log_info!("loading {} on {}", args.model.display(), gpu.arch);
     let max_seq = args.max_seq.unwrap_or(args.n_ctx + 16);
     let cfg = ModelSlotConfig {
         max_seq,
@@ -613,7 +696,7 @@ fn main() {
         .map(|m| m.min(available_chunks))
         .unwrap_or(available_chunks);
     if n_chunk == 0 {
-        eprintln!(
+        log_warn!(
             "not enough tokens for one chunk: slice_tokens={} n_ctx={}",
             all_tokens.len(),
             args.n_ctx
@@ -624,9 +707,10 @@ fn main() {
     let scored_per_chunk = args.n_ctx - 1 - args.n_ctx / 2;
     let total_scored = scored_per_chunk * n_chunk;
     let top_k = args.top_k.min(slot.config.vocab_size);
+    let chunk_limited = n_chunk < available_chunks;
 
-    eprintln!(
-        "build_kld_ref_hipfire: slice_tokens={} n_ctx={} n_chunk={} scored/chunk={} total_scored={} top_k={} kv_mode={:?}",
+    log_info!(
+        "slice_tokens={} n_ctx={} n_chunk={} scored/chunk={} total_scored={} top_k={} kv_mode={:?}",
         all_tokens.len(),
         args.n_ctx,
         n_chunk,
@@ -635,15 +719,35 @@ fn main() {
         top_k,
         args.kv_mode
     );
+    if chunk_limited {
+        let mode = if args.smoke {
+            "smoke/test"
+        } else {
+            "chunk-limited"
+        };
+        log_warn!(
+            "{} KLD ref: writing {}/{} available chunks; this is not a full KLD reference",
+            mode,
+            n_chunk,
+            available_chunks
+        );
+        let out = args.output.to_string_lossy();
+        if !(out.contains(".smoke.") || out.contains(".test.")) {
+            log_warn!(
+                "chunk-limited output path does not contain .smoke. or .test.: {}",
+                args.output.display()
+            );
+        }
+    }
     if use_kld_graph {
-        eprintln!(
-            "build_kld_ref_hipfire: graph prefill enabled with HIPFIRE_PREFILL_MAX_BATCH={}",
+        log_info!(
+            "graph prefill enabled with HIPFIRE_PREFILL_MAX_BATCH={}",
             std::env::var("HIPFIRE_PREFILL_MAX_BATCH").unwrap_or_else(|_| "<unset>".to_string())
         );
     }
     if all_tokens.len() % args.n_ctx != 0 {
-        eprintln!(
-            "build_kld_ref_hipfire: dropping tail of {} token(s)",
+        log_info!(
+            "dropping tail of {} token(s)",
             all_tokens.len() - tokens.len()
         );
     }
@@ -707,6 +811,14 @@ fn main() {
     for chunk_idx in 0..n_chunk {
         slot.reset_state(&mut gpu);
         let chunk = &tokens[chunk_idx * args.n_ctx..(chunk_idx + 1) * args.n_ctx];
+        emit_kld_progress(
+            "chunk-start",
+            chunk_idx,
+            n_chunk,
+            scored_done,
+            total_scored,
+            &started,
+        );
 
         forward_kld_prefill(
             &mut gpu,
@@ -723,6 +835,14 @@ fn main() {
             use_kld_graph,
         )
         .expect("forward_prefill_batch prefix");
+        emit_kld_progress(
+            "prefix-done",
+            chunk_idx,
+            n_chunk,
+            scored_done,
+            total_scored,
+            &started,
+        );
         forward_kld_prefill(
             &mut gpu,
             &slot.weights,
@@ -738,6 +858,14 @@ fn main() {
             use_kld_graph,
         )
         .expect("forward_prefill_batch scored");
+        emit_kld_progress(
+            "scored-done",
+            chunk_idx,
+            n_chunk,
+            scored_done,
+            total_scored,
+            &started,
+        );
 
         let batched_logits = if slot.weights.output.gpu_dtype == DType::F16 {
             let logits = gpu
@@ -777,17 +905,13 @@ fn main() {
             write_f32_slice(&mut log_probs_out, &chunk_log_probs);
             write_f32_slice(&mut residual_out, &chunk_residuals);
             scored_done += scored_per_chunk;
-            let pct = scored_done as f64 * 100.0 / total_scored as f64;
-            let elapsed = started.elapsed().as_secs_f64();
-            let rate = scored_done as f64 / elapsed.max(1e-9);
-            eprint!(
-                "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                chunk_idx + 1,
+            emit_kld_progress(
+                "chunk-complete",
+                chunk_idx,
                 n_chunk,
                 scored_done,
                 total_scored,
-                pct,
-                rate
+                &started,
             );
         } else if slot.weights.output.gpu_dtype == DType::BF16 {
             const VOCAB_TILE: usize = 32 * 1024;
@@ -897,17 +1021,13 @@ fn main() {
             write_f32_slice(&mut log_probs_out, &chunk_log_probs);
             write_f32_slice(&mut residual_out, &chunk_residuals);
             scored_done += scored_per_chunk;
-            let pct = scored_done as f64 * 100.0 / total_scored as f64;
-            let elapsed = started.elapsed().as_secs_f64();
-            let rate = scored_done as f64 / elapsed.max(1e-9);
-            eprint!(
-                "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                chunk_idx + 1,
+            emit_kld_progress(
+                "chunk-complete",
+                chunk_idx,
                 n_chunk,
                 scored_done,
                 total_scored,
-                pct,
-                rate
+                &started,
             );
         } else if slot.weights.output.gpu_dtype == DType::F32 {
             const VOCAB_TILE: usize = 32 * 1024;
@@ -962,17 +1082,13 @@ fn main() {
             write_f32_slice(&mut log_probs_out, &chunk_log_probs);
             write_f32_slice(&mut residual_out, &chunk_residuals);
             scored_done += scored_per_chunk;
-            let pct = scored_done as f64 * 100.0 / total_scored as f64;
-            let elapsed = started.elapsed().as_secs_f64();
-            let rate = scored_done as f64 / elapsed.max(1e-9);
-            eprint!(
-                "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                chunk_idx + 1,
+            emit_kld_progress(
+                "chunk-complete",
+                chunk_idx,
                 n_chunk,
                 scored_done,
                 total_scored,
-                pct,
-                rate
+                &started,
             );
         } else {
             for j in 0..scored_per_chunk {
@@ -995,17 +1111,13 @@ fn main() {
                 );
                 scored_done += 1;
                 if scored_done % progress_interval == 0 || scored_done == total_scored {
-                    let pct = scored_done as f64 * 100.0 / total_scored as f64;
-                    let elapsed = started.elapsed().as_secs_f64();
-                    let rate = scored_done as f64 / elapsed.max(1e-9);
-                    eprint!(
-                        "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                        chunk_idx + 1,
+                    emit_kld_progress(
+                        "per-token",
+                        chunk_idx,
                         n_chunk,
                         scored_done,
                         total_scored,
-                        pct,
-                        rate
+                        &started,
                     );
                 }
             }
@@ -1014,7 +1126,7 @@ fn main() {
             let _ = gpu.free_tensor(logits);
         }
     }
-    eprintln!();
+    log_info!("progress complete");
     indices_out.flush().unwrap();
     log_probs_out.flush().unwrap();
     residual_out.flush().unwrap();
@@ -1042,6 +1154,9 @@ fn main() {
         "n_ctx": args.n_ctx,
         "n_vocab": slot.config.vocab_size,
         "n_chunk": n_chunk,
+        "available_chunks": available_chunks,
+        "chunk_limited": chunk_limited,
+        "smoke": args.smoke,
         "top_k": top_k,
         "kv_mode": format!("{:?}", args.kv_mode),
         "deltanet_state_precision": "fp32",
@@ -1055,6 +1170,7 @@ fn main() {
         "slice_tokens": all_tokens.len(),
         "dropped_tail_tokens": all_tokens.len() - tokens.len(),
         "elapsed_sec": elapsed,
+        "wall_clock_sec": elapsed,
         "scored_tokens_per_sec": total_scored as f64 / elapsed.max(1e-9),
         "hipfire_version": env!("CARGO_PKG_VERSION"),
         "git_commit": option_env!("HIPFIRE_GIT_COMMIT"),
@@ -1130,11 +1246,12 @@ fn main() {
     let out_size = std::fs::metadata(&args.output)
         .map(|m| m.len())
         .unwrap_or(0);
-    eprintln!(
-        "build_kld_ref_hipfire: wrote {} ({} bytes = {:.3} GB) in {:.1}s ({:.1} scored tok/s)",
+    log_info!(
+        "wrote {} ({} bytes = {:.3} GB); wall_clock={} ({:.3}s, {:.1} scored tok/s)",
         args.output.display(),
         out_size,
         out_size as f64 / 1e9,
+        format_duration(elapsed),
         elapsed,
         total_scored as f64 / elapsed.max(1e-9)
     );
