@@ -197,7 +197,19 @@ fn main() {
         graph_key: usize,
         use_graph: bool,
     ) -> hip_bridge::HipResult<()> {
-        if !use_graph {
+        let graph_eligible = pbs
+            .map(|p| {
+                qwen35::prefill_batch_pbs_eligible(
+                    weights,
+                    config,
+                    dn_state,
+                    tokens.len(),
+                    gpu.arch.as_str(),
+                    p.moe_router_logits_batch.is_some(),
+                )
+            })
+            .unwrap_or(false);
+        if !use_graph || !graph_eligible {
             return qwen35::forward_prefill_batch_with_pbs_opts(
                 gpu,
                 weights,
