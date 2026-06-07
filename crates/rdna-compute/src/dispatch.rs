@@ -1056,10 +1056,7 @@ impl Gpu {
             || !self.replay_graph_cache.is_empty()
     }
 
-    fn retain_displaced_staging_scratch(
-        &mut self,
-        scratch: Option<hip_bridge::DeviceBuffer>,
-    ) {
+    fn retain_displaced_staging_scratch(&mut self, scratch: Option<hip_bridge::DeviceBuffer>) {
         if let Some(scratch) = scratch {
             if self.graph_state_live() {
                 self.capture_staging_scratch.push(scratch);
@@ -21443,12 +21440,7 @@ impl Gpu {
         } else {
             "gemm_f16_moe_grouped_wmma_gfx1151_down"
         };
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemm",
-            profile_name,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", profile_name, bytes);
         let result = self.launch_maybe_blob(
             "gemm_f16_moe_grouped_wmma_gfx1151",
             [row_tiles, slot_tiles, 1],
@@ -21503,8 +21495,7 @@ impl Gpu {
             0,
             "gemm_bf16_moe_grouped_wmma_gfx1151: K must be a multiple of 16"
         );
-        let use_m256 =
-            std::env::var("HIPFIRE_BF16_MOE_M256").ok().as_deref() == Some("1");
+        let use_m256 = std::env::var("HIPFIRE_BF16_MOE_M256").ok().as_deref() == Some("1");
         let kernel_name = if use_m256 {
             "gemm_bf16_moe_grouped_wmma_gfx1151_m256"
         } else {
@@ -21556,12 +21547,7 @@ impl Gpu {
                 "gemm_bf16_moe_grouped_wmma_gfx1151_down"
             }
         };
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemm",
-            profile_name,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", profile_name, bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles, slot_tiles, 1],
@@ -30746,8 +30732,7 @@ impl Gpu {
         let block_size = (max_ctx_len.max(head_dim) as u32)
             .next_power_of_two()
             .min(256);
-        let shared_floats =
-            4usize * max_ctx_len + 4usize * block_size as usize + 4usize * head_dim;
+        let shared_floats = 4usize * max_ctx_len + 4usize * block_size as usize + 4usize * head_dim;
         let shared_mem = (shared_floats * 4) as u32;
         assert!(
             shared_mem <= 64 * 1024,
@@ -30757,8 +30742,12 @@ impl Gpu {
         let bytes =
             crate::profile::attention_f32_kv_bytes(n_heads, n_kv_heads, head_dim, max_ctx_len)
                 * batch_size;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "attention", "attention_f32_batched_gqa4", bytes);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_f32_batched_gqa4",
+            bytes,
+        );
         let result = self.launch_maybe_blob(
             "attention_f32_batched_gqa4",
             [grid_x as u32, batch_size as u32, 1],
@@ -36161,8 +36150,7 @@ impl Gpu {
         let mut nt = n_tokens as i32;
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
-        let mut fr =
-            GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        let mut fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -37683,8 +37671,12 @@ impl Gpu {
 
         let q_tiles = (b + 15) / 16;
         let bytes = b * n_heads * head_dim * 8 + l * n_kv_heads * head_dim * 8;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "attention", "attention_dflash_wmma_causal_f32", bytes);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_dflash_wmma_causal_f32",
+            bytes,
+        );
         let result = self.launch_maybe_blob(
             "attention_dflash_wmma_f32",
             [n_heads as u32, q_tiles as u32, 1],

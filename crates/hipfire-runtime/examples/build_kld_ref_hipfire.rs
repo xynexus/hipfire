@@ -197,9 +197,7 @@ fn main() {
             std::collections::BTreeMap::new();
         let mut total_us = 0.0f64;
         for entry in entries {
-            let agg = by_kernel
-                .entry((entry.category, entry.kernel))
-                .or_default();
+            let agg = by_kernel.entry((entry.category, entry.kernel)).or_default();
             agg.calls += 1;
             agg.total_us += entry.time_us;
             agg.total_bytes += entry.bytes;
@@ -289,8 +287,10 @@ fn main() {
             ));
         }
         qwen35::upload_prefill_batch_inputs(gpu, pbs, tokens, start_pos)?;
-        let skip_active_stream_debug =
-            std::env::var("HIPFIRE_KLD_NO_ACTIVE_STREAM").ok().as_deref() == Some("1");
+        let skip_active_stream_debug = std::env::var("HIPFIRE_KLD_NO_ACTIVE_STREAM")
+            .ok()
+            .as_deref()
+            == Some("1");
         if gpu.active_stream.is_none() && !skip_active_stream_debug {
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
@@ -687,10 +687,7 @@ fn main() {
         Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES") => true,
         _ => false,
     };
-    let use_kld_fp32_gqa4_attn = match std::env::var("HIPFIRE_KLD_FP32_GQA4_ATTN")
-        .ok()
-        .as_deref()
-    {
+    let use_kld_fp32_gqa4_attn = match std::env::var("HIPFIRE_KLD_FP32_GQA4_ATTN").ok().as_deref() {
         Some("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO") => false,
         _ => true,
     };
@@ -843,8 +840,7 @@ fn main() {
     let source_model_hash = spawn_source_model_hash(args.model.clone(), include_source_sha256);
     let mut scored_done = 0usize;
     let do_profile = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
-    let prefill_only_debug =
-        std::env::var("HIPFIRE_KLD_PREFILL_ONLY").ok().as_deref() == Some("1");
+    let prefill_only_debug = std::env::var("HIPFIRE_KLD_PREFILL_ONLY").ok().as_deref() == Some("1");
     for chunk_idx in 0..n_chunk {
         slot.reset_state(&mut gpu);
         let chunk = &tokens[chunk_idx * args.n_ctx..(chunk_idx + 1) * args.n_ctx];

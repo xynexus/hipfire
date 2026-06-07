@@ -672,8 +672,14 @@ pub fn dispatch_packet_header() -> u16 {
 ///
 /// Sets completion_signal to 0 by default; caller can overwrite it after
 /// this returns.
+///
+/// # Safety
+///
+/// `slot` must be a valid, uniquely writable pointer to an AQL dispatch
+/// packet in a queue slot owned by the caller. The caller must not publish the
+/// packet header until this function has returned.
 #[inline]
-pub fn build_dispatch_packet(
+pub unsafe fn build_dispatch_packet(
     slot: *mut HsaKernelDispatchPacket,
     kernel: &HsaKernel,
     grid: [u32; 3],
@@ -688,25 +694,23 @@ pub fn build_dispatch_packet(
     } else {
         1
     };
-    unsafe {
-        let p = &mut *slot;
-        // Header is written LAST with release ordering; leave it whatever it is
-        // for now (the HSA runtime pre-fills HSA_PACKET_TYPE_INVALID).
-        p.setup = ndims;
-        p.workgroup_size_x = block[0] as u16;
-        p.workgroup_size_y = block[1] as u16;
-        p.workgroup_size_z = block[2] as u16;
-        p.reserved0 = 0;
-        p.grid_size_x = grid[0].saturating_mul(block[0]);
-        p.grid_size_y = grid[1].saturating_mul(block[1]);
-        p.grid_size_z = grid[2].saturating_mul(block[2]);
-        p.private_segment_size = kernel.private_segment_size;
-        p.group_segment_size = kernel.group_segment_size;
-        p.kernel_object = kernel.kernel_object;
-        p.kernarg_address = kernarg_ptr as *mut c_void;
-        p.reserved2 = 0;
-        p.completion_signal = completion_signal;
-    }
+    let p = unsafe { &mut *slot };
+    // Header is written LAST with release ordering; leave it whatever it is
+    // for now (the HSA runtime pre-fills HSA_PACKET_TYPE_INVALID).
+    p.setup = ndims;
+    p.workgroup_size_x = block[0] as u16;
+    p.workgroup_size_y = block[1] as u16;
+    p.workgroup_size_z = block[2] as u16;
+    p.reserved0 = 0;
+    p.grid_size_x = grid[0].saturating_mul(block[0]);
+    p.grid_size_y = grid[1].saturating_mul(block[1]);
+    p.grid_size_z = grid[2].saturating_mul(block[2]);
+    p.private_segment_size = kernel.private_segment_size;
+    p.group_segment_size = kernel.group_segment_size;
+    p.kernel_object = kernel.kernel_object;
+    p.kernarg_address = kernarg_ptr as *mut c_void;
+    p.reserved2 = 0;
+    p.completion_signal = completion_signal;
 }
 
 /// Atomic release-store of the header word. Must be called after the rest

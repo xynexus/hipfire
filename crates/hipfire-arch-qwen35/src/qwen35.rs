@@ -129,9 +129,7 @@ fn parse_f16_lm_head_mode(value: Option<&str>) -> F16LmHeadMode {
 
 fn parse_bf16_weight_load_mode(value: Option<&str>) -> Bf16WeightLoadMode {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
-        Some(v) if matches!(v.as_str(), "0" | "f32" | "fp32" | "legacy") => {
-            Bf16WeightLoadMode::F32
-        }
+        Some(v) if matches!(v.as_str(), "0" | "f32" | "fp32" | "legacy") => Bf16WeightLoadMode::F32,
         _ => Bf16WeightLoadMode::Native,
     }
 }
@@ -1348,12 +1346,7 @@ fn load_norm_weight_raw(
 /// matrix/tied-embedding weights: kernels consume BF16 operands and accumulate
 /// into F32 where the dispatch supports it. `HIPFIRE_BF16_WEIGHTS=f32` keeps a
 /// debug/oracle escape hatch for the old host-expanded path.
-fn load_bf16_matrix_weight(
-    gpu: &Gpu,
-    data: &[u8],
-    m: usize,
-    k: usize,
-) -> HipResult<WeightTensor> {
+fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipResult<WeightTensor> {
     match bf16_weight_load_mode_from_env() {
         Bf16WeightLoadMode::Native => {
             let mut buf = gpu.upload_raw(data, &[data.len()])?;
@@ -1703,9 +1696,7 @@ fn load_weight_tensor_raw(
                 })
             }
         },
-        16 => {
-            load_bf16_matrix_weight(gpu, data, m, k)
-        }
+        16 => load_bf16_matrix_weight(gpu, data, m, k),
         _ => panic!("unsupported quant_type {} for qwen35 weight", quant_type),
     }
 }
@@ -7854,8 +7845,7 @@ fn kld_fp32_gqa4_attention_eligible(
         config.n_heads / config.n_kv_heads
     };
     let block_size = batch_len.max(config.head_dim).next_power_of_two().min(256);
-    let shared_mem =
-        (4usize * batch_len + 4usize * block_size + 4usize * config.head_dim) * 4usize;
+    let shared_mem = (4usize * batch_len + 4usize * block_size + 4usize * config.head_dim) * 4usize;
     kld_fp32_gqa4_attention_enabled()
         && gpu.arch == "gfx1151"
         && start_pos == 0
@@ -11063,7 +11053,8 @@ fn forward_prefill_chunk(
                         "LA qkvza F16/BF16 dispatch requires all of wqkv/wz/w_beta/w_alpha to be F16",
                     );
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.wqkv.buf,
                             &pbs.x_rot_batch,
                             &pbs.dn_qkv_batch,
@@ -11071,7 +11062,8 @@ fn forward_prefill_chunk(
                             layer.wqkv.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.wz.buf,
                             &pbs.x_rot_batch,
                             &pbs.dn_z_batch,
@@ -11079,7 +11071,8 @@ fn forward_prefill_chunk(
                             layer.wz.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.w_beta.buf,
                             &pbs.x_rot_batch,
                             &pbs.dn_beta_batch,
@@ -11087,7 +11080,8 @@ fn forward_prefill_chunk(
                             layer.w_beta.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.w_alpha.buf,
                             &pbs.x_rot_batch,
                             &pbs.dn_alpha_batch,
@@ -11678,7 +11672,8 @@ fn forward_prefill_chunk(
                         "LA FFN F16/BF16 dispatch requires both w_gate and w_up to be F16",
                     );
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.w_gate.buf,
                             &pbs.x_rot_batch,
                             &pbs.gate_ffn_batch,
@@ -11686,7 +11681,8 @@ fn forward_prefill_chunk(
                             layer.w_gate.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.w_up.buf,
                             &pbs.x_rot_batch,
                             &pbs.up_batch,
@@ -12151,7 +12147,8 @@ fn forward_prefill_chunk(
                     )?;
                 } else if qkv_is_f16 && qkv_same_dtype {
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.wq.buf,
                             &pbs.x_rot_batch,
                             &pbs.fa_q_full_batch,
@@ -12159,7 +12156,8 @@ fn forward_prefill_chunk(
                             layer.wq.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.wk.buf,
                             &pbs.x_rot_batch,
                             &pbs.fa_k_batch,
@@ -12167,7 +12165,8 @@ fn forward_prefill_chunk(
                             layer.wk.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.wv.buf,
                             &pbs.x_rot_batch,
                             &pbs.fa_v_batch,
@@ -12977,7 +12976,8 @@ fn forward_prefill_chunk(
                         "FA FFN F16/BF16 dispatch requires both w_gate and w_up to be F16",
                     );
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.w_gate.buf,
                             &pbs.x_rot_batch,
                             &pbs.gate_ffn_batch,
@@ -12985,7 +12985,8 @@ fn forward_prefill_chunk(
                             layer.w_gate.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(gpu, 
+                        gemm_fp16_or_bf16_x_f32_wmma(
+                            gpu,
                             &layer.w_up.buf,
                             &pbs.x_rot_batch,
                             &pbs.up_batch,
@@ -19663,7 +19664,10 @@ mod tests {
 
     #[test]
     fn bf16_weight_load_mode_defaults_to_native() {
-        assert_eq!(parse_bf16_weight_load_mode(None), Bf16WeightLoadMode::Native);
+        assert_eq!(
+            parse_bf16_weight_load_mode(None),
+            Bf16WeightLoadMode::Native
+        );
         assert_eq!(
             parse_bf16_weight_load_mode(Some("native")),
             Bf16WeightLoadMode::Native

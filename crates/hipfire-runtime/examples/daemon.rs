@@ -527,7 +527,9 @@ struct GenerateBatchPrefillStateHandle {
     cached_prefix_tokens: usize,
 }
 
-fn parse_assistant_prefix_label(label: Option<&str>) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+fn parse_assistant_prefix_label(
+    label: Option<&str>,
+) -> hipfire_runtime::prompt_frame::AssistantPrefix {
     match label.unwrap_or("plain") {
         "open_think" => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
         "closed_think" => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
@@ -1337,7 +1339,6 @@ impl Qwen35RequestSessionState {
         }
         self.kv_cache.compact_offset = 0;
     }
-
 }
 
 fn qwen35_session_resident(m: &LoadedModel, session_id: &str) -> bool {
@@ -1457,9 +1458,9 @@ fn qwen35_allocate_session_state(
             .map_err(|e| format!("{e}"))?
         }
     };
-    let dn_quant = m
-        .q35_state_quant
-        .ok_or_else(|| "qwen35 DeltaNet state quant missing; reload model before batch prefill".to_string())?;
+    let dn_quant = m.q35_state_quant.ok_or_else(|| {
+        "qwen35 DeltaNet state quant missing; reload model before batch prefill".to_string()
+    })?;
     let dn_state = DeltaNetState::new_with_quant(gpu, config, dn_quant)
         .map_err(|e| format!("DeltaNetState::new_with_quant: {e:?}"))?;
     Ok(Qwen35RequestSessionState {
@@ -1616,7 +1617,9 @@ fn qwen35_materialize_batch_prefill_prompt(
         match render_result {
             Ok(rendered) => Ok(tokenizer.encode(&rendered)),
             Err(e) => {
-                eprintln!("[daemon] batch-prefill jinja render failed ({e}) -- falling back to Plain");
+                eprintln!(
+                    "[daemon] batch-prefill jinja render failed ({e}) -- falling back to Plain"
+                );
                 Ok(hipfire_runtime::prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
@@ -1657,13 +1660,17 @@ fn run_generate_batch_prefill_serial_qwen35(
         ));
     }
     if m.pp > 1 {
-        return Err("generate_batch_prefill does not support pipeline-parallel models yet".to_string());
+        return Err(
+            "generate_batch_prefill does not support pipeline-parallel models yet".to_string(),
+        );
     }
     if m.dflash.is_some() {
         return Err("generate_batch_prefill does not support DFlash-loaded models yet".to_string());
     }
     if m.eviction.is_some() {
-        return Err("generate_batch_prefill does not support CASK/TriAttention eviction yet".to_string());
+        return Err(
+            "generate_batch_prefill does not support CASK/TriAttention eviction yet".to_string(),
+        );
     }
     if pflash_active {
         return Err("generate_batch_prefill does not support PFlash compression yet".to_string());
@@ -4212,10 +4219,10 @@ fn load_model(
                 q35_scratch: None,
                 kv_cache: None,
                 dn_state: None,
-            q35_kv_mode: None,
-            q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
+                q35_kv_mode: None,
+                q35_state_quant: None,
+                q35_sessions: std::collections::HashMap::new(),
+                q35_active_session_id: None,
                 llama_config: None,
                 llama_weights: None,
                 llama_scratch: None,
@@ -5153,10 +5160,10 @@ fn load_model_pp(
         q35_scratch: None,
         kv_cache: Some(kv),
         dn_state: Some(dn),
-            q35_kv_mode: None,
-            q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
+        q35_kv_mode: None,
+        q35_state_quant: None,
+        q35_sessions: std::collections::HashMap::new(),
+        q35_active_session_id: None,
         llama_config: None,
         llama_weights: None,
         llama_scratch: None,
@@ -7611,12 +7618,7 @@ fn generate(
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
-                id,
-                current_seq_pos,
-                budget_prefill_tokens,
-                max_tokens,
-                trailer,
-                m.physical_cap
+                id, current_seq_pos, budget_prefill_tokens, max_tokens, trailer, m.physical_cap
             );
             let _ = stdout.flush();
             if let Some(session) = q35_session.take() {
@@ -7628,12 +7630,7 @@ fn generate(
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"request exceeds advertised context window: absolute={} + prefill={} + max_tokens={} + trailer={} > max_seq={}"}}"#,
-            id,
-            absolute_pos,
-            budget_prefill_tokens,
-            max_tokens,
-            trailer,
-            m.max_seq
+            id, absolute_pos, budget_prefill_tokens, max_tokens, trailer, m.max_seq
         );
         let _ = stdout.flush();
         if let Some(session) = q35_session.take() {

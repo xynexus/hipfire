@@ -2,6 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::manual_is_multiple_of,
+    clippy::manual_repeat_n,
+    clippy::same_item_push
+)]
+
 //! Observational coherence/behavior detectors.
 //!
 //! Consumes the daemon's JSONL output and surfaces "model weirdness" — token

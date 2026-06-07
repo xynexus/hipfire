@@ -3,6 +3,26 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::doc_lazy_continuation,
+    clippy::double_ended_iterator_last,
+    clippy::if_same_then_else,
+    clippy::identity_op,
+    clippy::manual_clamp,
+    clippy::manual_checked_ops,
+    clippy::manual_div_ceil,
+    clippy::manual_is_multiple_of,
+    clippy::manual_range_contains,
+    clippy::needless_range_loop,
+    clippy::nonminimal_bool,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_unwrap
+)]
+
 //! hipfire-quantize: Quantize raw FP16/BF16/FP32 model weights to Q4_F16 format.
 //!
 //! Usage: hipfire-quantize --input <model_dir-or-gguf> --output <output.hfq> [--format mq4] [--chat-template-file template.jinja]

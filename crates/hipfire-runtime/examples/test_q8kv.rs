@@ -383,7 +383,10 @@ fn main() {
     let out_big = gpu.zeros(&[n_h5 * hd5], rdna_compute::DType::F32).unwrap();
     let max_tiles_big = (big_seq + 127) / 128;
     let partials_big = gpu
-        .zeros(&[n_h5 * max_tiles_big * (2 + hd5)], rdna_compute::DType::F32)
+        .zeros(
+            &[n_h5 * max_tiles_big * (2 + hd5)],
+            rdna_compute::DType::F32,
+        )
         .unwrap();
     gpu.hip
         .memcpy_htod(&pos_buf, &((big_seq - 1) as i32).to_ne_bytes())

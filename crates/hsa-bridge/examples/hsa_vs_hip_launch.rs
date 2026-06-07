@@ -198,14 +198,16 @@ fn main() {
         signal.store_relaxed(1);
         let idx = queue.load_write_index_relaxed();
         let slot = queue.packet_slot(idx);
-        build_dispatch_packet(
-            slot,
-            &kernel,
-            [groups, 1, 1],
-            [256, 1, 1],
-            kernarg,
-            signal.raw_handle(),
-        );
+        unsafe {
+            build_dispatch_packet(
+                slot,
+                &kernel,
+                [groups, 1, 1],
+                [256, 1, 1],
+                kernarg,
+                signal.raw_handle(),
+            );
+        }
         publish_dispatch_packet(slot, header);
         queue.store_write_index_release(idx + 1);
         queue.ring_doorbell(idx);
@@ -268,14 +270,16 @@ fn main() {
         signal.store_relaxed(1);
         let idx = queue.load_write_index_relaxed();
         let slot = queue.packet_slot(idx);
-        build_dispatch_packet(
-            slot,
-            &kernel,
-            [groups, 1, 1],
-            [256, 1, 1],
-            kernarg,
-            signal.raw_handle(),
-        );
+        unsafe {
+            build_dispatch_packet(
+                slot,
+                &kernel,
+                [groups, 1, 1],
+                [256, 1, 1],
+                kernarg,
+                signal.raw_handle(),
+            );
+        }
         publish_dispatch_packet(slot, header);
         queue.store_write_index_release(idx + 1);
         queue.ring_doorbell(idx);
@@ -345,14 +349,16 @@ fn main() {
                 } else {
                     0
                 };
-                build_dispatch_packet(
-                    slot,
-                    &kernel,
-                    [groups, 1, 1],
-                    [256, 1, 1],
-                    kernarg,
-                    completion,
-                );
+                unsafe {
+                    build_dispatch_packet(
+                        slot,
+                        &kernel,
+                        [groups, 1, 1],
+                        [256, 1, 1],
+                        kernarg,
+                        completion,
+                    );
+                }
                 publish_dispatch_packet(slot, header);
             }
             queue.store_write_index_release(base_idx + burst as u64);

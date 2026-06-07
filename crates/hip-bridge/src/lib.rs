@@ -3,6 +3,14 @@
 // Copyright (c) 2026 alpineq
 // hipfire — see LICENSE and NOTICE in the project root.
 
+#![allow(
+    clippy::manual_dangling_ptr,
+    clippy::manual_pattern_char_comparison,
+    clippy::missing_safety_doc,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::type_complexity
+)]
+
 //! hip-bridge: Safe Rust FFI to AMD HIP runtime via dlopen.
 //! Modeled after rustane's ane-bridge — no link-time dependency on libamdhip64.
 

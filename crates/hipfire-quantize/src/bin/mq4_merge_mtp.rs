@@ -1,5 +1,7 @@
 //! Bundle a trunk MQ4 HFQ file with an MTP HFQ sidecar into a single
 //! `mq4+mtp.hfq` file.
+
+#![allow(clippy::manual_div_ceil)]
 //!
 //! Output layout:
 //! ```text

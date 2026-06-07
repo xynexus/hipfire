@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+#![allow(clippy::double_ended_iterator_last)]
+
 //! Kernel Atlas: typed schema + JSONL writer + analysis helpers for the
 //! hipfire bench corpus.
 //!
