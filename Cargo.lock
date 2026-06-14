@@ -844,6 +844,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-daemon-adapter"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "futures",
+ "hipfire-daemon-protocol",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "hipfire-daemon-protocol"
 version = "0.2.0"
 dependencies = [
@@ -959,6 +973,7 @@ dependencies = [
  "axum",
  "dirs",
  "futures",
+ "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
  "hipfire-model",
  "hipfire-prompt",
