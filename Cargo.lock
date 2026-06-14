@@ -842,7 +842,6 @@ dependencies = [
  "rdna-compute",
  "serde_json",
  "tracing",
- "twox-hash",
 ]
 
 [[package]]
@@ -891,6 +890,7 @@ dependencies = [
  "hipfire-prompt",
  "serde",
  "serde_json",
+ "twox-hash",
 ]
 
 [[package]]
