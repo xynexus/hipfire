@@ -886,7 +886,13 @@ dependencies = [
 name = "hipfire-eval"
 version = "0.2.0"
 dependencies = [
- "hipfire-runtime",
+ "csv",
+ "hipfire-coherence",
+ "hipfire-evidence",
+ "hipfire-model",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -968,6 +974,7 @@ dependencies = [
  "hipfire-atlas",
  "hipfire-coherence",
  "hipfire-detect",
+ "hipfire-eval",
  "hipfire-evidence",
  "hipfire-model",
  "hipfire-prompt",
