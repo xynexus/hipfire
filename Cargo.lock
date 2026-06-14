@@ -672,6 +672,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hipfire-model",
  "hipfire-server",
  "indicatif",
  "reqwest",
@@ -796,6 +797,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hipfire-model",
  "hipfire-server",
  "indicatif",
  "reqwest",

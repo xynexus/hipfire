@@ -10,6 +10,7 @@ name = "hipfire"
 path = "crates/hipfire-cli/src/main.rs"
 
 [dependencies]
+hipfire-model = { path = "crates/hipfire-model" }
 hipfire-server = { path = "crates/hipfire-server" }
 clap = { version = "4", features = ["derive", "cargo"] }
 tokio = { version = "1", features = ["full"] }
