@@ -836,6 +836,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-prompt"
+version = "0.2.0"
+dependencies = [
+ "minijinja",
+ "minijinja-contrib",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-quantize"
 version = "0.2.0"
 dependencies = [
@@ -865,6 +876,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-atlas",
  "hipfire-detect",
+ "hipfire-prompt",
  "libc",
  "memmap2",
  "minijinja",
@@ -888,6 +900,7 @@ dependencies = [
  "axum",
  "dirs",
  "futures",
+ "hipfire-prompt",
  "reqwest",
  "serde",
  "serde_json",
