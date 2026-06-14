@@ -52,6 +52,7 @@ arch-lfm2moe = []
 arch-dots-ocr = []
 
 [dependencies]
+hipfire-coherence = { path = "../hipfire-coherence" }
 hipfire-evidence = { path = "../hipfire-evidence" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hip-bridge = { path = "../hip-bridge" }
