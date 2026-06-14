@@ -836,6 +836,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-evidence"
+version = "0.2.0"
+
+[[package]]
 name = "hipfire-prompt"
 version = "0.2.0"
 dependencies = [
@@ -876,6 +880,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-atlas",
  "hipfire-detect",
+ "hipfire-evidence",
  "hipfire-prompt",
  "libc",
  "memmap2",
