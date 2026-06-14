@@ -888,6 +888,7 @@ name = "hipfire-generate"
 version = "0.2.0"
 dependencies = [
  "hipfire-prompt",
+ "hipfire-state",
  "serde",
  "serde_json",
  "twox-hash",
@@ -1000,6 +1001,7 @@ dependencies = [
 name = "hipfire-state"
 version = "0.2.0"
 dependencies = [
+ "serde",
  "serde_json",
 ]
 
