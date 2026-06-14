@@ -751,6 +751,7 @@ version = "0.2.0"
 dependencies = [
  "hip-bridge",
  "hipfire-cpu",
+ "hipfire-rocm",
  "hipfire-runtime",
  "libc",
  "libloading",
@@ -890,6 +891,14 @@ dependencies = [
  "serde",
  "serde_json",
  "twox-hash",
+]
+
+[[package]]
+name = "hipfire-rocm"
+version = "0.2.0"
+dependencies = [
+ "hipfire-cpu",
+ "serde_json",
 ]
 
 [[package]]
