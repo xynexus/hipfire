@@ -883,6 +883,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-eval"
+version = "0.2.0"
+dependencies = [
+ "hipfire-runtime",
+]
+
+[[package]]
 name = "hipfire-evidence"
 version = "0.2.0"
 dependencies = [
