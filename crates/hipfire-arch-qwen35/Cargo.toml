@@ -19,6 +19,7 @@ npu-kernels = []
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-cpu = { path = "../hipfire-cpu" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 serde = { version = "1", features = ["derive"] }
