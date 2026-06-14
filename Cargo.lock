@@ -863,6 +863,7 @@ name = "hipfire-daemon-protocol"
 version = "0.2.0"
 dependencies = [
  "hipfire-generate",
+ "hipfire-model",
  "hipfire-prompt",
  "serde",
  "serde_json",
@@ -894,6 +895,10 @@ dependencies = [
 [[package]]
 name = "hipfire-model"
 version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hipfire-prompt"
