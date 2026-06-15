@@ -21,11 +21,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
     admission_artifact_json, admission_metric_is_quality, admission_verdict_policy,
-    comparison_artifact_json, directory_hash, evidence_artifact_index_entry_from_value_json,
-    evidence_artifact_index_entry_json, evidence_artifact_json, evidence_collection_policy,
-    evidence_metric_direction, evidence_record_json, extract_external_evidence_records_json,
-    file_hash, list_files, required_admission_evidence_requirements, run_metadata_artifact_json,
-    run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    classify_hardware_kind, comparison_artifact_json, compute_peak_bandwidth_gbps, directory_hash,
+    evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
+    evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
+    evidence_record_json, extract_external_evidence_records_json, file_hash, hardware_bucket,
+    host_profile_hash, list_files, required_admission_evidence_requirements,
+    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
     standard_evidence_paths_in_dir, AdmissionArtifact as EvidenceAdmissionArtifact,
     AdmissionEvidence as EvidenceAdmissionEvidence,
     ComparisonArtifact as EvidenceComparisonArtifact, EvidenceArtifact, EvidenceArtifactCollection,
@@ -34,6 +35,7 @@ use hipfire_evidence::{
     RunMetadataModels, RunProvenance, OBSERVED_ADMISSION_EVIDENCE_KINDS,
     STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
+pub use hipfire_evidence::{EvalStatus, HostProfile, SourcedField};
 use hipfire_model::{
     discover_dflash_draft_for_model, model_artifact_stem, model_hash, model_manifest_entry,
     ModelManifestEntry,
@@ -399,38 +401,6 @@ pub struct EvalConfig {
     pub fail_on_admission: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HostProfile {
-    pub schema: u32,
-    pub source: String,
-    pub probe_status: EvalStatus,
-    pub reason: Option<String>,
-    pub hardware_kind: String,
-    pub hardware_bucket: String,
-    pub host_profile_hash: String,
-    pub gpu_model: Option<String>,
-    pub gfx: Option<String>,
-    pub vendor_id: Option<String>,
-    pub device_id: Option<String>,
-    pub render_node: Option<String>,
-    pub cu_count: Option<u32>,
-    pub vram_bytes: Option<u64>,
-    pub gtt_bytes: Option<u64>,
-    pub system_memory_bytes: Option<u64>,
-    pub memory_class: SourcedField<String>,
-    pub memory_width_bits: SourcedField<u32>,
-    pub memory_clock_mhz: SourcedField<f64>,
-    pub peak_bandwidth_gbps: SourcedField<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SourcedField<T> {
-    pub value: Option<T>,
-    pub source: String,
-    pub confidence: String,
-    pub note: Option<String>,
-}
-
 #[derive(Debug, Clone, Default)]
 struct HostProfileOverrides {
     memory_class: Option<String>,
@@ -594,20 +564,8 @@ pub struct AdmissionFinding {
     pub relative_delta: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EvalStatus {
-    Pass,
-    Fail,
-    Skip,
-}
-
 fn eval_status_str(status: EvalStatus) -> &'static str {
-    match status {
-        EvalStatus::Pass => "pass",
-        EvalStatus::Fail => "fail",
-        EvalStatus::Skip => "skip",
-    }
+    status.as_str()
 }
 
 pub fn parse_args_from<I, S>(args: I) -> Result<EvalConfig, String>
@@ -2011,53 +1969,6 @@ fn collect_host_profile(arch: Option<String>, overrides: HostProfileOverrides) -
     profile
 }
 
-impl<T> SourcedField<T> {
-    fn unknown() -> Self {
-        Self {
-            value: None,
-            source: "unavailable".to_string(),
-            confidence: "unknown".to_string(),
-            note: None,
-        }
-    }
-
-    fn override_value(value: T) -> Self {
-        Self {
-            value: Some(value),
-            source: "cli_override".to_string(),
-            confidence: "operator_supplied".to_string(),
-            note: None,
-        }
-    }
-
-    fn sysfs_value(value: T) -> Self {
-        Self {
-            value: Some(value),
-            source: "linux_sysfs".to_string(),
-            confidence: "medium".to_string(),
-            note: None,
-        }
-    }
-
-    fn libdrm_value(value: T) -> Self {
-        Self {
-            value: Some(value),
-            source: "libdrm_amdgpu".to_string(),
-            confidence: "high".to_string(),
-            note: None,
-        }
-    }
-
-    fn computed_value(value: T) -> Self {
-        Self {
-            value: Some(value),
-            source: "computed".to_string(),
-            confidence: "medium".to_string(),
-            note: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct LibDrmAmdgpuProbe {
     asic_id: u32,
@@ -2290,79 +2201,6 @@ fn linux_mem_total_bytes() -> Option<u64> {
         }
     }
     None
-}
-
-fn classify_hardware_kind(vram_bytes: Option<u64>, gtt_bytes: Option<u64>) -> String {
-    match (vram_bytes, gtt_bytes) {
-        (Some(vram), Some(gtt)) if vram <= 1024 * 1024 * 1024 && gtt > vram * 8 => {
-            "apu_uma".to_string()
-        }
-        (Some(vram), _) if vram > 1024 * 1024 * 1024 => "dgpu".to_string(),
-        _ => "unknown".to_string(),
-    }
-}
-
-fn compute_peak_bandwidth_gbps(clock_mhz: f64, width_bits: u32, memory_class: &str) -> Option<f64> {
-    let transfers_per_clock = match memory_class.to_ascii_lowercase().as_str() {
-        "gddr6" | "gddr6x" => 8.0,
-        "lpddr5" | "lpddr5x" => 8.0,
-        "ddr5" | "ddr4" => 2.0,
-        "hbm" | "hbm2" | "hbm2e" | "hbm3" => 2.0,
-        _ => return None,
-    };
-    Some(clock_mhz * transfers_per_clock * width_bits as f64 / 8.0 / 1000.0)
-}
-
-fn hardware_bucket(
-    hardware_kind: &str,
-    gfx: Option<&str>,
-    device_id: Option<&str>,
-    cu_count: Option<u32>,
-    vram_bytes: Option<u64>,
-    memory_class: Option<&str>,
-    memory_width_bits: Option<u32>,
-    peak_bandwidth_gbps: Option<f64>,
-) -> String {
-    let vram_gib = vram_bytes.map(|bytes| (bytes + (1 << 30) - 1) >> 30);
-    let bandwidth = peak_bandwidth_gbps.map(|value| format!("{value:.0}gbps"));
-    [
-        hardware_kind.to_string(),
-        gfx.unwrap_or("gfx_unknown").to_string(),
-        device_id.unwrap_or("dev_unknown").to_string(),
-        cu_count
-            .map(|value| format!("{value}cu"))
-            .unwrap_or_else(|| "cu_unknown".to_string()),
-        vram_gib
-            .map(|value| format!("{value}gib"))
-            .unwrap_or_else(|| "vram_unknown".to_string()),
-        memory_class.unwrap_or("mem_unknown").to_string(),
-        memory_width_bits
-            .map(|value| format!("{value}bit"))
-            .unwrap_or_else(|| "width_unknown".to_string()),
-        bandwidth.unwrap_or_else(|| "bw_unknown".to_string()),
-    ]
-    .join(":")
-}
-
-fn host_profile_hash(profile: &HostProfile) -> String {
-    let doc = json!({
-        "schema": profile.schema,
-        "hardware_kind": profile.hardware_kind,
-        "hardware_bucket": profile.hardware_bucket,
-        "gpu_model": profile.gpu_model,
-        "gfx": profile.gfx,
-        "vendor_id": profile.vendor_id,
-        "device_id": profile.device_id,
-        "cu_count": profile.cu_count,
-        "vram_bytes": profile.vram_bytes,
-        "gtt_bytes": profile.gtt_bytes,
-        "system_memory_bytes": profile.system_memory_bytes,
-        "memory_class": profile.memory_class,
-        "memory_width_bits": profile.memory_width_bits,
-        "memory_clock_mhz": profile.memory_clock_mhz,
-        "peak_bandwidth_gbps": profile.peak_bandwidth_gbps,
-    });
-    stable_hash_bytes(serde_json::to_string(&doc).unwrap_or_default().as_bytes())
 }
 
 fn resolve_datasets(config: &EvalConfig) -> Result<Vec<DatasetManifestEntry>, String> {
@@ -11555,37 +11393,6 @@ mod tests {
     fn parses_pp_dpm_mclk_max_clock() {
         let raw = "0: 400Mhz \n1: 800Mhz *\n2: 937Mhz \n";
         assert_eq!(parse_pp_dpm_mclk_max_mhz(raw), Some(937.0));
-    }
-
-    #[test]
-    fn computes_peak_bandwidth_from_normalized_memory_fields() {
-        assert_eq!(
-            compute_peak_bandwidth_gbps(937.5, 256, "lpddr5x"),
-            Some(240.0)
-        );
-        assert_eq!(
-            compute_peak_bandwidth_gbps(2500.0, 256, "gddr6"),
-            Some(640.0)
-        );
-        assert_eq!(compute_peak_bandwidth_gbps(1000.0, 128, "mystery"), None);
-    }
-
-    #[test]
-    fn hardware_bucket_includes_portability_fields() {
-        let bucket = hardware_bucket(
-            "dgpu",
-            Some("gfx1201"),
-            Some("0x7550"),
-            Some(64),
-            Some(16 * 1024 * 1024 * 1024),
-            Some("gddr6"),
-            Some(256),
-            Some(640.0),
-        );
-        assert_eq!(
-            bucket,
-            "dgpu:gfx1201:0x7550:64cu:16gib:gddr6:256bit:640gbps"
-        );
     }
 
     #[test]
