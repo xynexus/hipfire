@@ -752,6 +752,7 @@ version = "0.2.0"
 dependencies = [
  "hip-bridge",
  "hipfire-cpu",
+ "hipfire-npu",
  "hipfire-rocm",
  "hipfire-runtime",
  "libc",
@@ -924,6 +925,14 @@ name = "hipfire-model"
 version = "0.2.0"
 dependencies = [
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-npu"
+version = "0.2.0"
+dependencies = [
+ "hipfire-cpu",
  "serde_json",
 ]
 
