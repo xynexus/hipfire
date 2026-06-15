@@ -33,6 +33,7 @@ Current prompt boundary status:
 - `hipfire-prompt` owns `AssistantPrefix`, `Role`, `Message`, `ToolCall`, `ChatFrame`, and `JinjaChatFrame`.
 - `hipfire-prompt` owns OpenAI chat-role/content conversion helpers used by the Rust server to build structured daemon messages and last-user prompt fallbacks.
 - `hipfire-prompt` owns assistant-turn prompt-history fingerprinting and canonical tool-call argument JSON used by daemon multi-turn prefix-cache identity.
+- `hipfire-prompt` owns assistant-prefix wire-label parsing for `plain`, `open_think`, and `closed_think` request paths.
 - `hipfire-runtime::prompt_frame` remains a compatibility re-export and implements the prompt tokenizer trait for the runtime tokenizer.
 - The Rust server forwards structured chat `messages` to the daemon and keeps `prompt` as the last-user-text compatibility fallback, avoiding nested ChatML.
 - The Rust server builds typed daemon load parameters from config and preserves explicit DFlash mode plus configured TriAttention sidecars through `hipfire-daemon-protocol`.
@@ -45,6 +46,7 @@ Current model boundary status:
 - `hipfire-model` owns parameterized local model discovery helpers for direct paths, model-directory lookup, aliases, fuzzy scans, quant preference ranking, sidecar exclusion, and adjacent DFlash draft sidecar discovery; server, CLI, and eval adapters provide environment-specific paths.
 - `hipfire-model` owns model-source opening policy for HFQ files and safetensors directories while runtime supplies the concrete loader constructors.
 - `hipfire-model` owns common model-load request/parameter and loaded-response contracts used by daemon protocol clients and future direct library adapters.
+- `hipfire-model` owns common model-load parameter construction from config values, including `auto` mode elision, explicit `dflash_mode=off`, and empty sidecar filtering.
 - `hipfire-model` owns eval model-manifest row construction for local-file/tag identity, file/tag hashes, HFQ metadata hashes, architecture IDs, embedded quantization hashes, and model-specific hash/HFQ metadata compatibility helpers consumed by evidence/runtime paths.
 - `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors opener constructors until those loaders move.
 
