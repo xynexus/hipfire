@@ -319,6 +319,13 @@ pub fn canonical_generate_state_kind_hash_label(state_kinds: &[String]) -> Strin
     normalized.join("+")
 }
 
+pub fn qwen35_kv_deltanet_state_kind_labels() -> Vec<&'static str> {
+    vec![
+        SequenceStatePageKind::Kv.as_str(),
+        SequenceStatePageKind::DeltaNet.as_str(),
+    ]
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SequenceStatePageDescriptor {
     pub session_id: String,
@@ -1320,6 +1327,14 @@ mod tests {
         assert_eq!(
             canonical_generate_state_kind_hash_label(&kinds),
             "architecture_specific+attention_kv+deltanet_recurrent"
+        );
+    }
+
+    #[test]
+    fn qwen35_kv_deltanet_state_kind_labels_preserve_wire_order() {
+        assert_eq!(
+            qwen35_kv_deltanet_state_kind_labels(),
+            vec!["attention_kv", "deltanet_recurrent"]
         );
     }
 
