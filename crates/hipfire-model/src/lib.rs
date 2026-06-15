@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-pub use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
+use hipfire_hash::{file_hash, stable_hash_bytes};
 
 /// Extension preferred order for fuzzy model discovery.
 pub const QUANT_PREFERENCE: &[&str] =
