@@ -304,6 +304,14 @@ pub fn generate_state_kinds_include_required(
     })
 }
 
+pub fn generate_state_kind_sets_match_exactly(a: &[String], b: &[String]) -> bool {
+    let mut a = a.to_vec();
+    let mut b = b.to_vec();
+    a.sort();
+    b.sort();
+    a == b
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SequenceStatePageDescriptor {
     pub session_id: String,
@@ -1277,6 +1285,20 @@ mod tests {
             &["backend_private".to_string()],
             SequenceStatePageKind::BackendPrivate
         ));
+    }
+
+    #[test]
+    fn generate_state_kind_set_matching_preserves_wire_label_identity() {
+        let a = vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()];
+        let b = vec!["deltanet_recurrent".to_string(), "attention_kv".to_string()];
+        let c = vec![
+            "attention_kv".to_string(),
+            "architecture_specific".to_string(),
+        ];
+        let d = vec!["attention_kv".to_string(), "mamba_ssm".to_string()];
+
+        assert!(generate_state_kind_sets_match_exactly(&a, &b));
+        assert!(!generate_state_kind_sets_match_exactly(&c, &d));
     }
 
     #[test]
