@@ -79,7 +79,7 @@ Current generate boundary status:
 
 Current CPU/backend boundary status:
 - `hipfire-cpu` owns deterministic BF16 CPU oracle helpers, dense FFN/projection module contracts, generic `ModuleInvocation`/`ModuleOutput` vocabulary, the shared `BackendSelection` contract, backend selection evidence structs, and JSON rendering for module outputs.
-- `hipfire-arch-qwen35::ffn_bf16` remains the compatibility facade for Qwen3.5 mode/env parsing and re-exports the shared CPU oracle contracts.
+- `hipfire-arch-qwen35::ffn_bf16` owns Qwen3.5 mode/env parsing and exposes shared CPU/NPU oracle and artifact contracts only within the arch crate instead of re-exporting backend helper APIs publicly.
 
 Current ROCm/backend boundary status:
 - `hipfire-rocm` owns ROCm device identity, backend-path classification, dense FFN/projection module execution evidence, and JSON rendering for ROCm module outputs.
