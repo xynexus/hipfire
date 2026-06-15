@@ -46,8 +46,8 @@ Current prompt boundary status:
 
 Current model boundary status:
 - `hipfire-model` owns `ModelSource`, `TensorInfo`, `QuantConfig`, model artifact format detection, role-sidecar filtering, display-name derivation, filesystem-safe artifact stem derivation, and quant preference ranking.
-- `hipfire-model` owns `ModelWorkerKey` identity, feature-flag normalization, worker-key id construction, worker-key compatibility comparison, model-worker runtime id construction, and daemon `worker_id` / `worker_key_id` alias parsing used by scheduler/state/control-plane adapters.
-- `hipfire-model` owns model architecture id constants and family classification helpers used by generate/backend-selection contracts.
+- `hipfire-model` owns `ModelWorkerKey` identity, feature-flag normalization, worker-key id construction, worker-key compatibility comparison, model-worker runtime id construction, daemon `worker_id` / `worker_key_id` alias parsing, and generate worker/model identity requirement policy used by scheduler/state/generate/control-plane adapters.
+- `hipfire-model` owns model architecture id constants and family classification helpers used by generate/backend-selection and daemon Qwen3.5 runtime guard contracts.
 - `hipfire-model` owns tokenizer signature/fingerprint policy, HFQ tokenizer metadata payload selection (`tokenizer` vs `gguf_meta`), optional safetensors `tokenizer.json` sidecar read policy, and HFQ chat-template extraction used by runtime tokenizer/prompt compatibility checks; runtime still owns tokenizer parsing and encode/decode.
 - `hipfire-model` owns parameterized local model discovery helpers for direct paths, model-directory lookup, aliases, fuzzy scans, quant preference ranking, sidecar exclusion, and adjacent DFlash draft sidecar discovery; server, CLI, and eval adapters provide environment-specific paths.
 - `hipfire-model` owns model-source opening policy for HFQ files and safetensors directories while runtime supplies the concrete loader constructors.
@@ -88,7 +88,7 @@ Current ROCm/backend boundary status:
 
 Current NPU/backend boundary status:
 - `hipfire-npu` owns XDNA1 SwiGLU module artifact and admission contracts for explicit NPU opt-in paths.
-- `hipfire-arch-qwen35::ffn_bf16` consumes the shared XDNA1 artifact contract for env-derived `HIPFIRE_QWEN35_XDNA1_XCLBIN` / `HIPFIRE_QWEN35_XDNA1_INSTR` paths while Qwen3.5 still owns XRT handle creation, FFI dispatch, and GPU fallback execution.
+- `hipfire-arch-qwen35::ffn_bf16` consumes the shared XDNA1 artifact and admission contracts for env-derived `HIPFIRE_QWEN35_XDNA1_XCLBIN` / `HIPFIRE_QWEN35_XDNA1_INSTR` paths while Qwen3.5 still owns XRT handle creation, FFI dispatch, and GPU fallback execution.
 
 Current daemon protocol boundary status:
 - `hipfire-daemon-protocol` owns typed daemon JSONL request/response envelopes while model load request/loaded-response and generate token/done/error payloads live in shared boundary crates.
