@@ -45,7 +45,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust scheduler policy parity tests now cover remaining Bun policy cases for realtime dispatch, legacy wait mapping, opportunistic pairing, spill gating, and clamped residency/spill limits.
 - Rust server `/health` now consumes scheduler-owned JSON builders for scheduler-derived prefill/decode/state-cache metadata while live Rust request handling remains daemon-serial.
 - Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering, currently reporting an empty adapter state until Rust owns resident workers.
-- Generate Qwen3.5 dense/MoE batch backend selection now reuses `hipfire-model` architecture classification instead of local numeric arch checks.
+- Generate Qwen3.5 dense/MoE batch backend selection and decode scheduler fallback metadata now reuse `hipfire-model` architecture classification instead of local numeric arch checks.
 - Runtime tokenizer compatibility signatures now reuse `hipfire-model` fingerprint policy while tokenizer parsing and encode/decode stay in `hipfire-runtime`.
 - Runtime HFQ tokenizer metadata selection, optional safetensors `tokenizer.json` sidecar read policy, and HFQ chat-template extraction now reuse `hipfire-model`; tokenizer parsing, encode/decode, and GGUF runtime adapters stay in `hipfire-runtime`.
 - Eval output and runtime-evidence model stems now reuse `hipfire-model` artifact identity helpers instead of eval-local stem sanitization.
