@@ -1472,6 +1472,13 @@ mod generate_batch_prefill_tests {
         let json = model_worker_runtime_view_json(&worker);
         assert_eq!(json["state_arena_backend"], "qwen35_wrapped");
         assert_eq!(json["state_arena_owns_pages"], true);
+        assert_eq!(json["state_allocator"]["page_ownership"], "backend_wrapped");
+        assert_eq!(
+            json["state_allocator"]["eviction_policy"],
+            "manual_release_only"
+        );
+        assert_eq!(json["state_allocator"]["spill_target"], "disabled");
+        assert_eq!(json["state_allocator"]["copy_on_write_attach"], false);
         assert_eq!(
             json["state_arena_operations"],
             serde_json::json!([
