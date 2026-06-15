@@ -12,6 +12,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +135,77 @@ pub struct EvidenceRecord {
     pub prompt_path: Option<String>,
     pub metrics: BTreeMap<String, Value>,
     pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunProvenance {
+    pub runner: String,
+    pub runner_version: String,
+    pub hipfire_version: String,
+    pub git_commit: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_describe: Option<String>,
+    pub git_dirty: Option<bool>,
+    pub binary_hash: Option<String>,
+    pub arch: Option<String>,
+    pub rocm: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvidenceArtifactIndexContext {
+    pub provenance: RunProvenance,
+    pub host_profile_hash: String,
+    pub hardware_bucket: String,
+}
+
+pub fn run_provenance_json(provenance: RunProvenance) -> Value {
+    serde_json::to_value(provenance).unwrap_or_else(|_| json!({}))
+}
+
+pub fn evidence_artifact_index_entry_json(
+    path: impl Into<String>,
+    status: impl Into<String>,
+    context: &EvidenceArtifactIndexContext,
+) -> Value {
+    json!({
+        "path": path.into(),
+        "status": status.into(),
+        "runner_version": context.provenance.runner_version,
+        "hipfire_version": context.provenance.hipfire_version,
+        "git_commit": context.provenance.git_commit,
+        "git_branch": context.provenance.git_branch,
+        "git_describe": context.provenance.git_describe,
+        "git_dirty": context.provenance.git_dirty,
+        "binary_hash": context.provenance.binary_hash,
+        "arch": context.provenance.arch,
+        "rocm": context.provenance.rocm,
+        "host_profile_hash": context.host_profile_hash,
+        "hardware_bucket": context.hardware_bucket,
+    })
+}
+
+pub fn evidence_artifact_index_entry_from_value_json(
+    path: impl Into<String>,
+    status: impl Into<String>,
+    value: &Value,
+    context: &EvidenceArtifactIndexContext,
+) -> Value {
+    let mut entry = evidence_artifact_index_entry_json(path, status, context);
+    if let Some(object) = entry.as_object_mut() {
+        if let Some(records) = value.get("records").and_then(Value::as_array) {
+            object.insert("row_count".to_string(), json!(records.len()));
+        }
+        if let Some(reason) = value.get("reason").cloned() {
+            object.insert("reason".to_string(), reason);
+        }
+        if let Some(metrics) = value.get("expected_metrics").cloned() {
+            object.insert("expected_metrics".to_string(), metrics);
+        }
+        if let Some(kind) = value.get("kind").cloned() {
+            object.insert("kind".to_string(), kind);
+        }
+    }
+    entry
 }
 
 pub fn evidence_record_json(record: EvidenceRecord) -> Value {
@@ -489,6 +561,80 @@ mod tests {
         assert_eq!(json["prompt_path"], "benchmarks/prompts/smoke.txt");
         assert_eq!(json["metrics"]["tok_s"], 123.4);
         assert_eq!(json["elapsed_ms"], 42);
+    }
+
+    #[test]
+    fn run_provenance_json_preserves_artifact_shape() {
+        let provenance = RunProvenance {
+            runner: "hipfire-eval".to_string(),
+            runner_version: "0.2.0".to_string(),
+            hipfire_version: "0.2.0".to_string(),
+            git_commit: Some("abc123".to_string()),
+            git_branch: Some("main".to_string()),
+            git_describe: Some("v0.2.0-1-gabc123".to_string()),
+            git_dirty: Some(false),
+            binary_hash: Some("sha256:binary".to_string()),
+            arch: Some("gfx1151".to_string()),
+            rocm: Some("6.4".to_string()),
+        };
+
+        let json = run_provenance_json(provenance);
+        assert_eq!(json["runner"], "hipfire-eval");
+        assert_eq!(json["runner_version"], "0.2.0");
+        assert_eq!(json["hipfire_version"], "0.2.0");
+        assert_eq!(json["git_commit"], "abc123");
+        assert_eq!(json["git_dirty"], false);
+        assert_eq!(json["binary_hash"], "sha256:binary");
+        assert_eq!(json["arch"], "gfx1151");
+        assert_eq!(json["rocm"], "6.4");
+    }
+
+    #[test]
+    fn artifact_index_entry_json_preserves_shared_metadata() {
+        let context = EvidenceArtifactIndexContext {
+            provenance: RunProvenance {
+                runner: "hipfire-eval".to_string(),
+                runner_version: "0.2.0".to_string(),
+                hipfire_version: "0.2.0".to_string(),
+                git_commit: Some("abc123".to_string()),
+                git_branch: Some("main".to_string()),
+                git_describe: None,
+                git_dirty: Some(true),
+                binary_hash: Some("sha256:binary".to_string()),
+                arch: Some("gfx1151".to_string()),
+                rocm: Some("6.4".to_string()),
+            },
+            host_profile_hash: "host:abc".to_string(),
+            hardware_bucket: "gfx1151:64g".to_string(),
+        };
+        let artifact = json!({
+            "kind": "performance",
+            "reason": "ok",
+            "expected_metrics": ["tok_s"],
+            "records": [
+                {"case_id": "a"},
+                {"case_id": "b"}
+            ]
+        });
+
+        let json = evidence_artifact_index_entry_from_value_json(
+            "artifacts/performance.json",
+            "collected",
+            &artifact,
+            &context,
+        );
+        assert_eq!(json["path"], "artifacts/performance.json");
+        assert_eq!(json["status"], "collected");
+        assert_eq!(json["runner_version"], "0.2.0");
+        assert_eq!(json["git_commit"], "abc123");
+        assert_eq!(json["git_dirty"], true);
+        assert_eq!(json["binary_hash"], "sha256:binary");
+        assert_eq!(json["host_profile_hash"], "host:abc");
+        assert_eq!(json["hardware_bucket"], "gfx1151:64g");
+        assert_eq!(json["row_count"], 2);
+        assert_eq!(json["reason"], "ok");
+        assert_eq!(json["expected_metrics"][0], "tok_s");
+        assert_eq!(json["kind"], "performance");
     }
 
     #[test]

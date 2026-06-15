@@ -20,8 +20,10 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
-    directory_hash, evidence_record_json, file_hash, list_files, model_hash, read_hfq_metadata,
-    stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir, EvidenceRecord,
+    directory_hash, evidence_artifact_index_entry_from_value_json,
+    evidence_artifact_index_entry_json, evidence_record_json, file_hash, list_files, model_hash,
+    read_hfq_metadata, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    standard_evidence_paths_in_dir, EvidenceArtifactIndexContext, EvidenceRecord, RunProvenance,
     STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 use hipfire_model::{discover_dflash_draft_for_model, model_artifact_stem};
@@ -572,20 +574,6 @@ pub struct AdmissionArtifact {
     pub required_evidence: Vec<AdmissionEvidence>,
     pub observed_evidence: Vec<AdmissionEvidence>,
     pub findings: Vec<AdmissionFinding>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunProvenance {
-    pub runner: String,
-    pub runner_version: String,
-    pub hipfire_version: String,
-    pub git_commit: Option<String>,
-    pub git_branch: Option<String>,
-    pub git_describe: Option<String>,
-    pub git_dirty: Option<bool>,
-    pub binary_hash: Option<String>,
-    pub arch: Option<String>,
-    pub rocm: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3448,21 +3436,7 @@ fn artifact_index_entry(
     status: impl Into<String>,
     ctx: &EvalContext,
 ) -> Value {
-    json!({
-        "path": path.into(),
-        "status": status.into(),
-        "runner_version": env!("CARGO_PKG_VERSION"),
-        "hipfire_version": env!("CARGO_PKG_VERSION"),
-        "git_commit": ctx.commit_sha,
-        "git_branch": ctx.git_branch,
-        "git_describe": ctx.git_describe,
-        "git_dirty": ctx.git_dirty,
-        "binary_hash": ctx.binary_hash,
-        "arch": ctx.arch,
-        "rocm": ctx.rocm,
-        "host_profile_hash": ctx.host_profile.host_profile_hash,
-        "hardware_bucket": ctx.host_profile.hardware_bucket,
-    })
+    evidence_artifact_index_entry_json(path, status, &artifact_index_context(ctx))
 }
 
 fn artifact_index_entry_from_value(
@@ -3471,22 +3445,15 @@ fn artifact_index_entry_from_value(
     value: &Value,
     ctx: &EvalContext,
 ) -> Value {
-    let mut entry = artifact_index_entry(path, status, ctx);
-    if let Some(object) = entry.as_object_mut() {
-        if let Some(records) = value.get("records").and_then(Value::as_array) {
-            object.insert("row_count".to_string(), json!(records.len()));
-        }
-        if let Some(reason) = value.get("reason").cloned() {
-            object.insert("reason".to_string(), reason);
-        }
-        if let Some(metrics) = value.get("expected_metrics").cloned() {
-            object.insert("expected_metrics".to_string(), metrics);
-        }
-        if let Some(kind) = value.get("kind").cloned() {
-            object.insert("kind".to_string(), kind);
-        }
+    evidence_artifact_index_entry_from_value_json(path, status, value, &artifact_index_context(ctx))
+}
+
+fn artifact_index_context(ctx: &EvalContext) -> EvidenceArtifactIndexContext {
+    EvidenceArtifactIndexContext {
+        provenance: run_provenance(ctx),
+        host_profile_hash: ctx.host_profile.host_profile_hash.clone(),
+        hardware_bucket: ctx.host_profile.hardware_bucket.clone(),
     }
-    entry
 }
 
 fn run_provenance(ctx: &EvalContext) -> RunProvenance {
@@ -3505,7 +3472,7 @@ fn run_provenance(ctx: &EvalContext) -> RunProvenance {
 }
 
 fn run_provenance_value(ctx: &EvalContext) -> Value {
-    serde_json::to_value(run_provenance(ctx)).unwrap_or_else(|_| json!({}))
+    run_provenance_json(run_provenance(ctx))
 }
 
 fn run_metadata_artifact_value(config: &EvalConfig, ctx: &EvalContext) -> Value {
