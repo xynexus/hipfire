@@ -16,6 +16,7 @@ It is intentionally compact and backed by evidence links into the historical arc
 
 The target crates for modular boundaries remain:
 - `hipfire-daemon`
+- `hipfire-config` (created; owns shared CLI/server config and local path helpers)
 - `hipfire-eval` (created; owns the eval runner binary adapter and harness implementation)
 - `hipfire-model` (created; owns model-source contracts and artifact identity helpers)
 - `hipfire-prompt` (created; owns prompt framing and Jinja rendering)
@@ -94,6 +95,10 @@ Current daemon adapter boundary status:
 - `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery, load/ping/unload/generate response loops, stale-response filtering, and daemon startup resource lease policy/helpers.
 - `hipfire-cli run` consumes `hipfire-daemon-adapter` and `hipfire-daemon-protocol` directly for daemon-backed execution instead of reaching those contracts through the server crate.
 - `hipfire-server` consumes `hipfire-daemon-adapter` directly for daemon-backed execution; the old server-local engine re-export has been retired.
+
+Current config boundary status:
+- `hipfire-config` owns `HipfireConfig`, config-file loading, per-model override merging, and `~/.hipfire` / model-directory path helpers.
+- `hipfire-cli` consumes `hipfire-config` directly for config and local model discovery paths; `hipfire-server::config` remains a compatibility facade for existing imports.
 
 Current evidence boundary status:
 - `hipfire-evidence` owns stable evidence hash helpers, directory digest, file hash, eval status, host-profile and sourced-field contracts, host-profile hardware-kind/bucket/bandwidth/hash policy, model/tag hash and HFQ metadata compatibility wrappers that delegate to `hipfire-model`, eval reference/slice/llama integrity verifiers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, evidence artifact collection status policy, standard evidence artifact contract/JSON rendering, comparison/admission artifact contract rendering, admission required/observed evidence catalogs, the generic evidence artifact record contract/JSON renderer, external evidence record selection/annotation, quality/performance/phase-timing/memory/launch-count/MoE-router/profiling/module-evidence/DFlash-trace/Path-C-trace metric detection/projection policies, comparison metric-direction policy, admission quality/review policy, admission verdict policy, run-provenance contract/JSON rendering, run-metadata artifact contract/JSON rendering, and artifact-index entry contract/JSON rendering.
