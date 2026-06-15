@@ -41,6 +41,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval DFlash draft auto-discovery now reuses `hipfire-model` sidecar discovery instead of eval-local candidate parsing.
 - Rust scheduler worker-key identity and compatibility helpers now reuse `hipfire-model` ownership instead of scheduler-local model identity code.
 - Rust scheduler now consumes model-worker identity helpers directly from `hipfire-model` instead of re-exporting them through scheduler.
+- Daemon and state runtime-worker views now consume model-worker runtime id construction and `worker_id` / `worker_key_id` alias parsing from `hipfire-model` instead of `hipfire-state`.
 - Rust scheduler policy parity tests now cover remaining Bun policy cases for realtime dispatch, legacy wait mapping, opportunistic pairing, spill gating, and clamped residency/spill limits.
 - Rust server `/health` now consumes scheduler-owned JSON builders for scheduler-derived prefill/decode/state-cache metadata while live Rust request handling remains daemon-serial.
 - Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering, currently reporting an empty adapter state until Rust owns resident workers.
@@ -59,8 +60,8 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval and host-profile reporting now consume `hipfire-evidence` eval-status, host-profile, and sourced-field contracts directly instead of eval-harness-local JSON shapes or `hipfire-eval` re-exports.
 - Eval host-profile hardware-kind, bucket, bandwidth, and hash policy now reuse `hipfire-evidence` ownership instead of eval-harness-local helpers.
 - Runtime host-profile code now consumes `hipfire-eval` directly, and the old `hipfire-runtime::eval_harness` compatibility facade has been retired.
-- Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.
-- Daemon model-worker request id alias parsing now reuses `hipfire-state` ownership instead of daemon-local `worker_id` / `worker_key_id` policy.
+- Daemon model-worker id construction now reuses `hipfire-model` ownership and sequence-state arena support policy now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
+- Daemon model-worker request id alias parsing now reuses `hipfire-model` ownership instead of daemon-local `worker_id` / `worker_key_id` policy.
 - Daemon Qwen3.5 sequence-state session/checkpoint handle construction now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon `reserve_session_state` request parsing now consumes `hipfire-state` reserve request metadata instead of daemon-local loose fields.
 - Daemon `describe_state` request parsing now consumes `hipfire-state` describe request metadata instead of daemon-local loose handle aliases.

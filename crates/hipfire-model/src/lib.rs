@@ -84,6 +84,35 @@ pub struct ModelWorkerKey {
     pub feature_flags: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelWorkerId {
+    pub value: String,
+}
+
+impl ModelWorkerId {
+    pub fn from_runtime_parts(arch_id: u32, pp: usize, kv_mode: Option<&str>) -> Self {
+        Self {
+            value: format!(
+                "worker:arch{}:pp{}:{}",
+                arch_id,
+                pp,
+                kv_mode.unwrap_or("unknown")
+            ),
+        }
+    }
+}
+
+pub fn parse_model_worker_id(msg: &Value, default_worker_id: &str) -> ModelWorkerId {
+    let value = msg
+        .get("worker_id")
+        .or_else(|| msg.get("worker_key_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_worker_id)
+        .to_string();
+    ModelWorkerId { value }
+}
+
 pub const ARCH_ID_LLAMA_MISTRAL: u32 = 0;
 pub const ARCH_ID_QWEN3_QWEN2_LEGACY: u32 = 1;
 pub const ARCH_ID_QWEN35_DENSE: u32 = 5;
@@ -1019,6 +1048,53 @@ mod tests {
             tokenizer_signature(&vocab, &specials, 0, 1, None),
             tokenizer_signature(&vocab, &reversed_specials, 0, 1, None)
         );
+    }
+
+    #[test]
+    fn model_worker_id_follows_runtime_shape() {
+        assert_eq!(
+            ModelWorkerId::from_runtime_parts(6, 1, Some("q8")).value,
+            "worker:arch6:pp1:q8"
+        );
+        assert_eq!(
+            ModelWorkerId::from_runtime_parts(5, 2, None).value,
+            "worker:arch5:pp2:unknown"
+        );
+    }
+
+    #[test]
+    fn parse_model_worker_id_preserves_daemon_alias_priority() {
+        let worker_id = parse_model_worker_id(
+            &json!({
+                "worker_id": "worker-a",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_id.value, "worker-a");
+
+        let worker_key_id = parse_model_worker_id(
+            &json!({
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_key_id.value, "worker-b");
+    }
+
+    #[test]
+    fn parse_model_worker_id_falls_back_to_default_worker() {
+        let missing = parse_model_worker_id(&json!({}), "__default__");
+        assert_eq!(missing.value, "__default__");
+
+        let empty = parse_model_worker_id(
+            &json!({
+                "worker_id": "",
+                "worker_key_id": ""
+            }),
+            "__default__",
+        );
+        assert_eq!(empty.value, "__default__");
     }
 
     #[test]
