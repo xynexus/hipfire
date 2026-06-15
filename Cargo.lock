@@ -836,6 +836,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
  "hipfire-generate",
  "hipfire-runtime",
@@ -854,6 +855,7 @@ dependencies = [
  "dirs",
  "futures",
  "hipfire-daemon-protocol",
+ "libc",
  "serde_json",
  "tokio",
  "tracing",
@@ -889,6 +891,7 @@ version = "0.2.0"
 name = "hipfire-generate"
 version = "0.2.0"
 dependencies = [
+ "hipfire-model",
  "hipfire-prompt",
  "hipfire-state",
  "serde",
