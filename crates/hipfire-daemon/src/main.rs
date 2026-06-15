@@ -60,6 +60,7 @@ use hipfire_generate::{
     Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult, Qwen35PreparedPrefillSession,
     Qwen35SemanticBoundaryCheckpoint,
 };
+use hipfire_model::{parse_model_worker_id, ModelWorkerId};
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -71,7 +72,7 @@ use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
-    model_worker_runtime_view_json, parse_describe_sequence_state_request, parse_model_worker_id,
+    model_worker_runtime_view_json, parse_describe_sequence_state_request,
     parse_release_sequence_state_request, parse_release_sessions_request,
     parse_reserve_session_state_request, parse_unload_worker_request,
     parsed_handle_may_target_generic, parsed_handle_may_target_loaded_state,
@@ -80,10 +81,9 @@ use hipfire_state::{
     session_state_reservation_describe_json, unload_worker_done_json,
     validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
-    ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
-    ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
-    SequenceStateForkRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
-    SequenceStatePrefixHash,
+    ModelArtifactMemory, ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
+    SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateForkRequest,
+    SequenceStatePageDescriptor, SequenceStatePageKind, SequenceStatePrefixHash,
 };
 #[cfg(test)]
 use hipfire_state::{
