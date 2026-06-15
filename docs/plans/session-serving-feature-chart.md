@@ -16,6 +16,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon assistant-prefix request labels now reuse `hipfire-prompt` parsing for `plain`, `open_think`, and `closed_think`.
 - Daemon load-time chat-template env/per-model/embedded precedence now reuses `hipfire-prompt` resolution instead of daemon-local file probing.
 - Daemon prompt framing now consumes `hipfire-prompt` directly instead of routing prompt types through `hipfire-runtime::prompt_frame`.
+- Runtime examples now consume `hipfire-prompt` directly, and the old `hipfire-runtime::prompt_frame` compatibility re-export has been retired while runtime keeps the tokenizer trait implementation.
 - Rust server model loads now build typed daemon `LoadParams` from config, preserving explicit DFlash mode and configured TriAttention sidecars over the shared JSONL contract.
 - The daemon now opportunistically consumes shared typed generate and load request contracts while keeping raw JSON fallbacks for legacy and daemon-only fields.
 - Daemon generate request/token/done/error protocol types now reuse `hipfire-generate` contracts instead of duplicating generate structs in `hipfire-daemon-protocol`.
@@ -27,7 +28,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon text/VL generation request contracts, generate-batch prefill/preflight/decode contracts, semantic boundary checkpoints, prefill checkpoint hooks, prepared prefill/result, decode result, and fused dense batch contracts, validators, prefix-hash helpers, Qwen3.5 batch backend selectors, fused prefill preflight helpers, scratch sizing policy, and decode scheduler metadata now reuse `hipfire-generate` ownership; prefix-hash data shapes, checkpoint request metadata, and model artifact memory accounting now reuse `hipfire-state` ownership instead of daemon-local duplicates.
 - Eval evidence artifact kinds and expected-metric catalogs now reuse `hipfire-evidence` ownership instead of runtime-local lists.
 - Eval runtime-evidence directory ingestion now uses `hipfire-evidence` catalog-based artifact path discovery instead of runtime-local filename lists.
-- Coherence run contracts, artifact serialization, daemon-backed execution, prompt execution, token capture, and detector report assembly now reuse `hipfire-coherence` ownership while `hipfire-runtime::coherence_runtime` keeps the existing import path.
+- Coherence run contracts, artifact serialization, daemon-backed execution, prompt execution, token capture, and detector report assembly now reuse `hipfire-coherence` ownership directly; the old `hipfire-runtime::coherence_runtime` import path has been retired.
 - Daemon load request/parameter and loaded-response protocol types now reuse `hipfire-model` contracts instead of duplicating common model-load structs in `hipfire-daemon-protocol`.
 - Rust server model-load config conversion now reuses `hipfire-model` parameter construction instead of route-local filtering.
 - Rust CLI run model-load config conversion now reuses `hipfire-model` parameter construction instead of sending a max-seq-only load bundle.
@@ -44,11 +45,12 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval output and runtime-evidence model stems now reuse `hipfire-model` artifact identity helpers instead of eval-local stem sanitization.
 - Eval model manifests now reuse `hipfire-model` row construction for file/tag identity, HFQ metadata hashes, architecture IDs, and embedded quantization hashes.
 - Runtime model-source opening now reuses `hipfire-model` HFQ/safetensors path policy while keeping concrete loader constructors in `hipfire-runtime`.
+- Runtime and arch callers now consume `hipfire-model` model-source contracts directly; `hipfire-runtime::model_source` remains only the concrete HFQ/safetensors opener adapter.
 - Evidence model/tag hash and HFQ metadata compatibility helpers now delegate to `hipfire-model` instead of carrying duplicate model-specific parsing.
 - Eval reference/slice/llama integrity verifiers now reuse `hipfire-evidence` ownership directly from runtime examples; the old `hipfire-runtime::eval_common` import path has been retired.
 - Eval and host-profile reporting now reuse `hipfire-evidence` eval-status, host-profile, and sourced-field contracts instead of eval-harness-local JSON shapes.
 - Eval host-profile hardware-kind, bucket, bandwidth, and hash policy now reuse `hipfire-evidence` ownership instead of eval-harness-local helpers.
-- `hipfire-eval` now owns the `hipfire-eval` binary adapter and eval harness implementation while `hipfire-runtime::eval_harness` keeps the existing import path.
+- Runtime host-profile code now consumes `hipfire-eval` directly, and the old `hipfire-runtime::eval_harness` compatibility facade has been retired.
 - Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon model-worker request id alias parsing now reuses `hipfire-state` ownership instead of daemon-local `worker_id` / `worker_key_id` policy.
 - Daemon Qwen3.5 sequence-state session/checkpoint handle construction now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
