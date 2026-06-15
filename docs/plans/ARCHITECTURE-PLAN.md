@@ -106,6 +106,7 @@ Current daemon adapter boundary status:
 Current config boundary status:
 - `hipfire-config` owns `HipfireConfig`, config-file loading, per-model override merging, and `~/.hipfire` / model-directory path helpers.
 - `hipfire-cli` and `hipfire-server` consume `hipfire-config` directly for config and local model discovery paths; the old `hipfire-server::config` compatibility facade has been retired.
+- `hipfire-cli` and `hipfire-server` consume `hipfire-model` display/list helpers directly instead of re-exporting them through local model modules.
 
 Current evidence boundary status:
 - `hipfire-hash` owns stable byte hash, file hash, fallback file hash, and deterministic score primitives used by model identity and evidence records.
