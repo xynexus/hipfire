@@ -1069,6 +1069,7 @@ dependencies = [
 name = "hipfire-state"
 version = "0.2.1"
 dependencies = [
+ "hipfire-model",
  "serde",
  "serde_json",
 ]
