@@ -472,9 +472,8 @@ impl Tokenizer {
     /// Returns `Ok(None)` if the file is missing or unreadable; `Err` if the
     /// file exists but fails to parse as a valid tokenizer.
     pub fn from_tokenizer_json(path: &std::path::Path) -> Result<Option<Self>, TokenizerError> {
-        let json_str = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
+        let Some(json_str) = hipfire_model::read_optional_tokenizer_json(path) else {
+            return Ok(None);
         };
         Self::from_hf_json(&json_str).map(Some)
     }
@@ -1737,6 +1736,13 @@ mod consistency_tests {
             }
             other => panic!("expected MetadataMissing, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tokenizer_json_missing_file_remains_absent() {
+        let missing = std::path::Path::new("/tmp/hipfire-tokenizer-json-missing-for-test.json");
+        let _ = std::fs::remove_file(missing);
+        assert!(Tokenizer::from_tokenizer_json(missing).unwrap().is_none());
     }
 }
 

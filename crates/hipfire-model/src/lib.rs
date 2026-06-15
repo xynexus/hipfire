@@ -338,6 +338,16 @@ pub fn hfq_chat_template(metadata_json: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Read an optional HuggingFace `tokenizer.json` file from a model directory.
+///
+/// Safetensors directories carry tokenizer configuration as a sidecar file.
+/// Existing runtime behavior treats a missing or unreadable sidecar as absent
+/// and reserves hard errors for successfully-read but malformed tokenizer
+/// content.
+pub fn read_optional_tokenizer_json(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
 /// Normalize a user-facing model tag into the fuzzy filename search stem.
 pub fn normalize_tag_stem(tag: &str) -> String {
     tag.replace(':', "-").to_lowercase()
@@ -1061,6 +1071,32 @@ mod tests {
             Some("{% for message in messages %}{{ message.content }}{% endfor %}")
         );
         assert_eq!(hfq_chat_template("{\"tokenizer_config\":{}}"), None);
+    }
+
+    #[test]
+    fn read_optional_tokenizer_json_treats_missing_sidecar_as_absent() {
+        let root = temp_dir("hipfire-model-tokenizer-json-missing");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("tokenizer.json");
+
+        assert_eq!(read_optional_tokenizer_json(&path), None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_optional_tokenizer_json_returns_existing_sidecar_content() {
+        let root = temp_dir("hipfire-model-tokenizer-json-existing");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("tokenizer.json");
+        fs::write(&path, "{\"model\":{\"vocab\":{}}}").unwrap();
+
+        assert_eq!(
+            read_optional_tokenizer_json(&path).as_deref(),
+            Some("{\"model\":{\"vocab\":{}}}")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
