@@ -88,7 +88,7 @@ Current ROCm/backend boundary status:
 
 Current NPU/backend boundary status:
 - `hipfire-npu` owns XDNA1 SwiGLU module artifact and admission contracts for explicit NPU opt-in paths.
-- `hipfire-arch-qwen35::ffn_bf16` consumes the shared XDNA1 artifact contract for env-derived `HIPFIRE_QWEN35_XDNA1_XCLBIN` / `HIPFIRE_QWEN35_XDNA1_INSTR` paths while Qwen3.5 still owns XRT handle creation, FFI dispatch, and GPU fallback execution.
+- `hipfire-arch-qwen35::ffn_bf16` consumes the shared XDNA1 artifact and admission contracts for env-derived `HIPFIRE_QWEN35_XDNA1_XCLBIN` / `HIPFIRE_QWEN35_XDNA1_INSTR` paths while Qwen3.5 still owns XRT handle creation, FFI dispatch, and GPU fallback execution.
 
 Current daemon protocol boundary status:
 - `hipfire-daemon-protocol` owns typed daemon JSONL request/response envelopes while model load request/loaded-response and generate token/done/error payloads live in shared boundary crates.
