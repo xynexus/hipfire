@@ -97,6 +97,18 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+fn normalize_daemon_prompt(prompt: &str) -> std::borrow::Cow<'_, str> {
+    if matches!(
+        std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    ) || !hipfire_runtime::config::get().normalize_prompt
+    {
+        return std::borrow::Cow::Borrowed(prompt);
+    }
+
+    hipfire_prompt::normalize_prompt_text_with_policy(prompt, true)
+}
+
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 enum Eviction {
     Plain(EvictionCtx),
@@ -4574,7 +4586,7 @@ fn qwen35_materialize_batch_prefill_prompt(
         .as_ref()
         .ok_or_else(|| "tokenizer not loaded".to_string())?;
     let prompt = session.prompt.as_deref().unwrap_or("");
-    let prompt_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt);
+    let prompt_norm = normalize_daemon_prompt(prompt);
     let prompt = prompt_norm.as_ref();
     let raw_q_tokens = tokenizer.encode(prompt);
     // Prompt-hash/preload sessions that declare a zero logical position need
@@ -8036,7 +8048,7 @@ fn main() {
                     .map(|req| req.prompt.as_str())
                     .or_else(|| msg.get("prompt").and_then(|v| v.as_str()))
                     .unwrap_or("Hello");
-                let prompt_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt);
+                let prompt_norm = normalize_daemon_prompt(prompt);
                 let prompt: &str = &prompt_norm;
                 if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
                     if let Some(tok) = m.tokenizer.as_ref() {

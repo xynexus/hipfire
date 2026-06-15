@@ -40,7 +40,7 @@ Current prompt boundary status:
 - `hipfire-prompt` owns load-time chat-template source resolution for env-file, per-model override file, and embedded model-template precedence.
 - `hipfire-prompt` owns the pure prompt-normalization transform for line endings, NBSP, trailing line whitespace, and cold newline runs; runtime keeps only the env/config opt-in wrapper.
 - `hipfire-runtime` implements the prompt tokenizer trait for its tokenizer while prompt frame types are imported directly from `hipfire-prompt`.
-- `hipfire-daemon` now consumes `hipfire-prompt` directly for daemon prompt framing, assistant-prefix labels, tool-call fingerprints, and structured message history instead of routing those types through the runtime compatibility facade.
+- `hipfire-daemon` now consumes `hipfire-prompt` directly for daemon prompt framing, prompt normalization, assistant-prefix labels, tool-call fingerprints, and structured message history instead of routing those types through the runtime compatibility facade.
 - The Rust server forwards structured chat `messages` to the daemon and keeps `prompt` as the last-user-text compatibility fallback, avoiding nested ChatML.
 - The Rust server builds typed daemon load parameters from config and preserves explicit DFlash mode plus configured TriAttention sidecars through `hipfire-daemon-protocol`.
 
