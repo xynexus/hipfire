@@ -1694,12 +1694,11 @@ fn weight_gemv_swiglu_residual_bf16_probe(
         && ffn_bf16::layer_selected(layer_idx)
         && ffn_bf16::config().mode == FfnBf16Mode::Xdna1
     {
-        let invocation = ffn_bf16::dense_ffn_module_invocation_from_shape(
+        let invocation = ffn_bf16::xdna1_dense_ffn_module_invocation_from_shape(
             layer_idx,
             w_down.m,
             w_down.k,
-            ffn_bf16::DenseFfnBackendPreference::NpuOptIn,
-            false,
+            &ffn_bf16::config().xdna1_artifacts,
         );
         return weight_gemv_swiglu_residual_xdna1(
             gpu,
@@ -1754,8 +1753,16 @@ fn weight_gemv_swiglu_residual_bf16_probe(
             let mode = ffn_bf16::config().mode;
             let preferred_backend = ffn_bf16::dense_ffn_backend_preference_for_mode(mode)
                 .expect("enabled BF16 mode has a backend preference");
-            let invocation =
-                ffn_bf16::dense_ffn_module_invocation(layer_idx, shadow, preferred_backend, false);
+            let invocation = if mode == FfnBf16Mode::Xdna1 {
+                ffn_bf16::xdna1_dense_ffn_module_invocation_from_shape(
+                    layer_idx,
+                    shadow.m,
+                    shadow.k,
+                    &ffn_bf16::config().xdna1_artifacts,
+                )
+            } else {
+                ffn_bf16::dense_ffn_module_invocation(layer_idx, shadow, preferred_backend, false)
+            };
             if mode == FfnBf16Mode::Xdna1 {
                 return weight_gemv_swiglu_residual_xdna1(
                     gpu,
