@@ -480,16 +480,17 @@ impl Tokenizer {
     }
 
     pub fn from_hfq_metadata(metadata_json: &str) -> Result<Self, TokenizerError> {
-        let meta: serde_json::Value = serde_json::from_str(metadata_json)?;
-        if let Some(tok_str) = meta.get("tokenizer").and_then(|v| v.as_str()) {
-            return Self::from_hf_json(tok_str);
+        match hipfire_model::hfq_tokenizer_metadata(metadata_json)? {
+            Some(hipfire_model::HfqTokenizerMetadata::HfJson(tok_str)) => {
+                Self::from_hf_json(&tok_str)
+            }
+            Some(hipfire_model::HfqTokenizerMetadata::GgufMeta(gguf_meta)) => {
+                Self::from_gguf_meta_json(&gguf_meta)
+            }
+            None => Err(TokenizerError::MetadataMissing {
+                field: "tokenizer | gguf_meta",
+            }),
         }
-        if let Some(gguf_meta) = meta.get("gguf_meta") {
-            return Self::from_gguf_meta_json(gguf_meta);
-        }
-        Err(TokenizerError::MetadataMissing {
-            field: "tokenizer | gguf_meta",
-        })
     }
 
     /// Load tokenizer from a JSON-serialized GGUF metadata tree. Mirrors
@@ -1719,6 +1720,20 @@ mod consistency_tests {
         match err {
             TokenizerError::MetadataMissing { field } => {
                 assert_eq!(field, "tokenizer.ggml.tokens");
+            }
+            other => panic!("expected MetadataMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_hfq_metadata_without_tokenizer_payload() {
+        let err = match Tokenizer::from_hfq_metadata("{\"architecture\":\"qwen3\"}") {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err, got Ok"),
+        };
+        match err {
+            TokenizerError::MetadataMissing { field } => {
+                assert_eq!(field, "tokenizer | gguf_meta");
             }
             other => panic!("expected MetadataMissing, got {other:?}"),
         }
