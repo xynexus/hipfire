@@ -918,6 +918,7 @@ dependencies = [
 name = "hipfire-evidence"
 version = "0.2.0"
 dependencies = [
+ "hipfire-hash",
  "hipfire-model",
  "serde",
  "serde_json",
@@ -936,10 +937,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-hash"
+version = "0.2.0"
+
+[[package]]
 name = "hipfire-model"
 version = "0.2.0"
 dependencies = [
  "hipfire-config",
+ "hipfire-hash",
  "serde",
  "serde_json",
 ]
