@@ -287,6 +287,31 @@ impl SequenceStatePageKind {
     }
 }
 
+pub fn generate_state_kinds_include_required(
+    state_kinds: &[String],
+    required: SequenceStatePageKind,
+) -> bool {
+    state_kinds.iter().any(|kind| match required {
+        SequenceStatePageKind::Kv => kind == "attention_kv",
+        SequenceStatePageKind::DeltaNet => kind == "deltanet_recurrent",
+        SequenceStatePageKind::BackendPrivate => {
+            matches!(
+                kind.as_str(),
+                "mamba_ssm" | "mamba_conv" | "architecture_specific"
+            )
+        }
+        SequenceStatePageKind::Logits => false,
+    })
+}
+
+pub fn generate_state_kind_sets_match_exactly(a: &[String], b: &[String]) -> bool {
+    let mut a = a.to_vec();
+    let mut b = b.to_vec();
+    a.sort();
+    b.sort();
+    a == b
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SequenceStatePageDescriptor {
     pub session_id: String,
@@ -1234,6 +1259,46 @@ mod tests {
             SequenceStatePageKind::from_generate_state_kind("backend_private"),
             None
         );
+    }
+
+    #[test]
+    fn generate_state_kind_requirement_uses_generate_wire_labels() {
+        let kinds = vec![
+            "attention_kv".to_string(),
+            "deltanet_recurrent".to_string(),
+            "architecture_specific".to_string(),
+        ];
+
+        assert!(generate_state_kinds_include_required(
+            &kinds,
+            SequenceStatePageKind::Kv
+        ));
+        assert!(generate_state_kinds_include_required(
+            &kinds,
+            SequenceStatePageKind::DeltaNet
+        ));
+        assert!(generate_state_kinds_include_required(
+            &kinds,
+            SequenceStatePageKind::BackendPrivate
+        ));
+        assert!(!generate_state_kinds_include_required(
+            &["backend_private".to_string()],
+            SequenceStatePageKind::BackendPrivate
+        ));
+    }
+
+    #[test]
+    fn generate_state_kind_set_matching_preserves_wire_label_identity() {
+        let a = vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()];
+        let b = vec!["deltanet_recurrent".to_string(), "attention_kv".to_string()];
+        let c = vec![
+            "attention_kv".to_string(),
+            "architecture_specific".to_string(),
+        ];
+        let d = vec!["attention_kv".to_string(), "mamba_ssm".to_string()];
+
+        assert!(generate_state_kind_sets_match_exactly(&a, &b));
+        assert!(!generate_state_kind_sets_match_exactly(&c, &d));
     }
 
     #[test]
