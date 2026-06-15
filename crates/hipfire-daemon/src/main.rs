@@ -10734,7 +10734,7 @@ fn load_model_safetensors(
     kv_mode: &str,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    use hipfire_runtime::model_source::ModelSource;
+    use hipfire_model::ModelSource;
     use hipfire_runtime::safetensors_source::SafetensorsSource;
 
     eprintln!("  opening safetensors directory: {path}");
