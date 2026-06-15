@@ -16,6 +16,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon assistant-prefix request labels now reuse `hipfire-prompt` parsing for `plain`, `open_think`, and `closed_think`.
 - Daemon load-time chat-template env/per-model/embedded precedence now reuses `hipfire-prompt` resolution instead of daemon-local file probing.
 - Daemon prompt framing now consumes `hipfire-prompt` directly instead of routing prompt types through `hipfire-runtime::prompt_frame`.
+- Daemon prompt normalization now consumes `hipfire-prompt` directly while preserving the runtime config/env opt-out policy.
 - Runtime examples now consume `hipfire-prompt` directly, and the old `hipfire-runtime::prompt_frame` compatibility re-export has been retired while runtime keeps the tokenizer trait implementation.
 - Rust server model loads now build typed daemon `LoadParams` from config, preserving explicit DFlash mode and configured TriAttention sidecars over the shared JSONL contract.
 - The daemon now opportunistically consumes shared typed generate and load request contracts while keeping raw JSON fallbacks for legacy and daemon-only fields.
