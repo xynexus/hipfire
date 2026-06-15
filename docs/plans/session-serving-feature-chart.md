@@ -23,6 +23,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server chat generate requests now reuse `hipfire-generate` OpenAI chat request construction instead of server-local prompt/message assembly.
 - Rust CLI run generate requests now reuse `hipfire-generate` OpenAI chat request construction instead of CLI-local ChatML rendering.
 - Rust server and CLI generation sampling defaults, prompt-only request construction, worker binding, tools, and system request decoration now reuse `hipfire-generate` helpers instead of adapter-local assembly.
+- Rust server OpenAI chat completion and streaming chunk responses now reuse `hipfire-generate` renderers instead of route-local JSON construction.
 - Daemon text/VL generation request contracts, generate-batch prefill/preflight/decode contracts, semantic boundary checkpoints, prefill checkpoint hooks, prepared prefill/result, decode result, and fused dense batch contracts, validators, prefix-hash helpers, Qwen3.5 batch backend selectors, fused prefill preflight helpers, scratch sizing policy, and decode scheduler metadata now reuse `hipfire-generate` ownership; prefix-hash data shapes, checkpoint request metadata, and model artifact memory accounting now reuse `hipfire-state` ownership instead of daemon-local duplicates.
 - Eval evidence artifact kinds and expected-metric catalogs now reuse `hipfire-evidence` ownership instead of runtime-local lists.
 - Eval runtime-evidence directory ingestion now uses `hipfire-evidence` catalog-based artifact path discovery instead of runtime-local filename lists.
@@ -32,6 +33,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust CLI run model-load config conversion now reuses `hipfire-model` parameter construction instead of sending a max-seq-only load bundle.
 - Rust CLI config loading and local model path helpers now reuse `hipfire-config` directly instead of importing those helpers through `hipfire-server`; server keeps a compatibility re-export.
 - Rust server and CLI model discovery now reuse `hipfire-model` local artifact discovery helpers instead of server-local scanning.
+- Rust server `/v1/models` response rendering now reuses `hipfire-model` OpenAI-compatible list rendering instead of route-local JSON construction.
 - Eval DFlash draft auto-discovery now reuses `hipfire-model` sidecar discovery instead of eval-local candidate parsing.
 - Rust scheduler worker-key identity and compatibility helpers now reuse `hipfire-model` ownership instead of scheduler-local model identity code.
 - Rust scheduler policy parity tests now cover remaining Bun policy cases for realtime dispatch, legacy wait mapping, opportunistic pairing, spill gating, and clamped residency/spill limits.
