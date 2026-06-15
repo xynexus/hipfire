@@ -4,10 +4,9 @@
 
 //! Priority scheduling and session batching policy shared by control planes.
 
-pub use hipfire_model::{
-    model_worker_key_id, normalize_feature_flags, normalize_model_worker_key,
-    same_model_worker_key, ModelWorkerKey,
-};
+#[cfg(test)]
+use hipfire_model::model_worker_key_id;
+use hipfire_model::{normalize_model_worker_key, same_model_worker_key, ModelWorkerKey};
 use std::collections::{BTreeMap, HashSet};
 
 pub const SCHED_PRIORITY_REALTIME: u8 = 0;
