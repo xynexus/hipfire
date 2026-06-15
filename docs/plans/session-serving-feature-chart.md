@@ -61,6 +61,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval host-profile hardware-kind, bucket, bandwidth, and hash policy now reuse `hipfire-evidence` ownership instead of eval-harness-local helpers.
 - Runtime host-profile code now consumes `hipfire-eval` directly, and the old `hipfire-runtime::eval_harness` compatibility facade has been retired.
 - Daemon model-worker id construction now reuses `hipfire-model` ownership and sequence-state arena support policy now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
+- State sequence-arena support policy now consumes model-owned Qwen3.5 architecture classification instead of local numeric arch checks.
 - Daemon model-worker request id alias parsing now reuses `hipfire-model` ownership instead of daemon-local `worker_id` / `worker_key_id` policy.
 - Daemon Qwen3.5 sequence-state session/checkpoint handle construction now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon `reserve_session_state` request parsing now consumes `hipfire-state` reserve request metadata instead of daemon-local loose fields.

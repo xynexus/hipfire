@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use hipfire_model::{parse_model_worker_id, ModelWorkerId};
+use hipfire_model::{is_qwen35_family_arch_id, parse_model_worker_id, ModelWorkerId};
 
 #[derive(Clone, Debug)]
 pub struct SessionStateReservation {
@@ -81,7 +81,7 @@ impl SequenceStateArenaBackend {
     }
 
     pub fn for_worker_parts(arch_id: u32, pp: usize) -> Self {
-        if matches!(arch_id, 5 | 6) && pp == 1 {
+        if is_qwen35_family_arch_id(arch_id) && pp == 1 {
             Self::Qwen35Wrapped
         } else {
             Self::Unsupported
