@@ -9,7 +9,8 @@ use hipfire_prompt::{
     openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
 };
 use hipfire_state::{
-    canonical_generate_state_kind_hash_label, SequenceStatePageKind, SequenceStatePrefixHash,
+    canonical_generate_state_kind_hash_label, qwen35_kv_deltanet_state_kind_labels,
+    SequenceStatePageKind, SequenceStatePrefixHash,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1437,10 +1438,7 @@ pub fn qwen35_decode_batch_scheduler_metadata(
     Qwen35DecodeBatchSchedulerMetadata {
         selected_backend: backend.as_str(),
         batch_size,
-        compatible_state_kinds: vec![
-            SequenceStatePageKind::Kv.as_str(),
-            SequenceStatePageKind::DeltaNet.as_str(),
-        ],
+        compatible_state_kinds: qwen35_kv_deltanet_state_kind_labels(),
         cached_prefix_tokens,
         fallback_reason,
     }
