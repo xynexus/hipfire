@@ -750,6 +750,7 @@ name = "hipfire-arch-qwen35"
 version = "0.2.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-cpu",
  "hipfire-runtime",
  "libc",
  "libloading",
@@ -808,6 +809,13 @@ name = "hipfire-coherence"
 version = "0.2.0"
 dependencies = [
  "hipfire-detect",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-cpu"
+version = "0.2.0"
+dependencies = [
  "serde_json",
 ]
 
