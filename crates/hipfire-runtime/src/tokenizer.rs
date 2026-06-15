@@ -481,35 +481,37 @@ impl Tokenizer {
 
     pub fn from_hfq_metadata(metadata_json: &str) -> Result<Self, TokenizerError> {
         let meta: serde_json::Value = serde_json::from_str(metadata_json)?;
-        if let Some(tok_str) = meta.get("tokenizer").and_then(|v| v.as_str()) {
-            let mut t = Self::from_hf_json(tok_str)?;
-            // `from_hf_json` infers bos/eos from vocab heuristics (it defaults bos
-            // to `<|endoftext|>`), which is WRONG for models whose BOS differs —
-            // e.g. LFM2.5 bos = `<|startoftext|>` (id 1), not `<|endoftext|>`
-            // (id 2). `generation_config.{bos,eos}_token_id` is the authoritative
-            // HF source; override from it when present + scalar (an array eos =
-            // multi-eos: keep the heuristic). Embedded by the quantizer at convert
-            // time. (LFM2.5-350M daemon bring-up, 2026-06-07.)
-            if let Some(gc) = meta.get("generation_config") {
-                if let Some(b) = gc.get("bos_token_id").and_then(|v| v.as_u64()) {
-                    if (b as usize) < t.vocab.len() {
-                        t.bos_id = b as u32;
+        match hipfire_model::hfq_tokenizer_metadata(metadata_json)? {
+            Some(hipfire_model::HfqTokenizerMetadata::HfJson(tok_str)) => {
+                let mut t = Self::from_hf_json(&tok_str)?;
+                // `from_hf_json` infers bos/eos from vocab heuristics (it defaults bos
+                // to `<|endoftext|>`), which is WRONG for models whose BOS differs —
+                // e.g. LFM2.5 bos = `<|startoftext|>` (id 1), not `<|endoftext|>`
+                // (id 2). `generation_config.{bos,eos}_token_id` is the authoritative
+                // HF source; override from it when present + scalar (an array eos =
+                // multi-eos: keep the heuristic). Embedded by the quantizer at convert
+                // time. (LFM2.5-350M daemon bring-up, 2026-06-07.)
+                if let Some(gc) = meta.get("generation_config") {
+                    if let Some(b) = gc.get("bos_token_id").and_then(|v| v.as_u64()) {
+                        if (b as usize) < t.vocab.len() {
+                            t.bos_id = b as u32;
+                        }
+                    }
+                    if let Some(e) = gc.get("eos_token_id").and_then(|v| v.as_u64()) {
+                        if (e as usize) < t.vocab.len() {
+                            t.eos_id = e as u32;
+                        }
                     }
                 }
-                if let Some(e) = gc.get("eos_token_id").and_then(|v| v.as_u64()) {
-                    if (e as usize) < t.vocab.len() {
-                        t.eos_id = e as u32;
-                    }
-                }
+                Ok(t)
             }
-            return Ok(t);
+            Some(hipfire_model::HfqTokenizerMetadata::GgufMeta(gguf_meta)) => {
+                Self::from_gguf_meta_json(&gguf_meta)
+            }
+            None => Err(TokenizerError::MetadataMissing {
+                field: "tokenizer | gguf_meta",
+            }),
         }
-        if let Some(gguf_meta) = meta.get("gguf_meta") {
-            return Self::from_gguf_meta_json(gguf_meta);
-        }
-        Err(TokenizerError::MetadataMissing {
-            field: "tokenizer | gguf_meta",
-        })
     }
 
     /// Load tokenizer from a JSON-serialized GGUF metadata tree. Mirrors
@@ -1739,6 +1741,20 @@ mod consistency_tests {
         match err {
             TokenizerError::MetadataMissing { field } => {
                 assert_eq!(field, "tokenizer.ggml.tokens");
+            }
+            other => panic!("expected MetadataMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_hfq_metadata_without_tokenizer_payload() {
+        let err = match Tokenizer::from_hfq_metadata("{\"architecture\":\"qwen3\"}") {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err, got Ok"),
+        };
+        match err {
+            TokenizerError::MetadataMissing { field } => {
+                assert_eq!(field, "tokenizer | gguf_meta");
             }
             other => panic!("expected MetadataMissing, got {other:?}"),
         }

@@ -654,11 +654,7 @@ impl HfqFile {
     /// framing matches the model's training-time expectation; absent or
     /// failing renders fall back to the hand-rolled `ChatFrame` path.
     pub fn chat_template(&self) -> Option<String> {
-        let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
-        meta.get("tokenizer_config")?
-            .get("chat_template")?
-            .as_str()
-            .map(|s| s.to_string())
+        hipfire_model::hfq_chat_template(&self.metadata_json)
     }
 
     /// Resolve a tensor name, trying common prefix variants.
