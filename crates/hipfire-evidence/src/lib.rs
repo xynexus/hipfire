@@ -137,7 +137,7 @@ pub struct EvidenceRecord {
     pub elapsed_ms: u128,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunProvenance {
     pub runner: String,
     pub runner_version: String,
@@ -158,8 +158,101 @@ pub struct EvidenceArtifactIndexContext {
     pub hardware_bucket: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunMetadataConfig {
+    pub tier: String,
+    pub tier_budget: Value,
+    pub batteries: Vec<String>,
+    pub suites: Vec<String>,
+    pub executor: String,
+    pub kv_mode: Option<String>,
+    pub max_tokens: usize,
+    pub profile: String,
+    pub dflash: String,
+    pub runs: usize,
+    pub warmup_runs: usize,
+    pub benchmark: bool,
+    pub host_memory_class: Option<String>,
+    pub host_memory_width_bits: Option<u32>,
+    pub host_memory_bandwidth_gbps: Option<f64>,
+    pub result_cache: String,
+    pub cache_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunMetadataModels {
+    pub candidate: String,
+    pub draft: Option<String>,
+    pub baseline: Option<String>,
+    pub reference: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunMetadataArtifact {
+    pub created_utc: String,
+    pub provenance: RunProvenance,
+    pub host_profile: Value,
+    pub host_profile_hash: String,
+    pub hardware_bucket: String,
+    pub config: RunMetadataConfig,
+    pub models: RunMetadataModels,
+}
+
 pub fn run_provenance_json(provenance: RunProvenance) -> Value {
     serde_json::to_value(provenance).unwrap_or_else(|_| json!({}))
+}
+
+pub fn run_metadata_artifact_json(metadata: RunMetadataArtifact) -> Value {
+    json!({
+        "schema": 1,
+        "kind": "run_metadata",
+        "status": "collected",
+        "runner": metadata.provenance.runner,
+        "runner_version": metadata.provenance.runner_version,
+        "hipfire_version": metadata.provenance.hipfire_version,
+        "created_utc": metadata.created_utc,
+        "git": {
+            "commit": metadata.provenance.git_commit,
+            "branch": metadata.provenance.git_branch,
+            "describe": metadata.provenance.git_describe,
+            "dirty": metadata.provenance.git_dirty,
+        },
+        "binary": {
+            "hash": metadata.provenance.binary_hash,
+        },
+        "host": {
+            "arch": metadata.provenance.arch,
+            "rocm": metadata.provenance.rocm,
+            "profile": metadata.host_profile,
+            "host_profile_hash": metadata.host_profile_hash,
+            "hardware_bucket": metadata.hardware_bucket,
+        },
+        "config": {
+            "tier": metadata.config.tier,
+            "tier_budget": metadata.config.tier_budget,
+            "batteries": metadata.config.batteries,
+            "suites": metadata.config.suites,
+            "executor": metadata.config.executor,
+            "kv_mode": metadata.config.kv_mode,
+            "max_tokens": metadata.config.max_tokens,
+            "profile": metadata.config.profile,
+            "dflash": metadata.config.dflash,
+            "runs": metadata.config.runs,
+            "warmup_runs": metadata.config.warmup_runs,
+            "benchmark": metadata.config.benchmark,
+            "host_memory_class": metadata.config.host_memory_class,
+            "host_memory_width_bits": metadata.config.host_memory_width_bits,
+            "host_memory_bandwidth_gbps": metadata.config.host_memory_bandwidth_gbps,
+            "result_cache": metadata.config.result_cache,
+            "cache_mode": metadata.config.cache_mode,
+        },
+        "models": {
+            "candidate": metadata.models.candidate,
+            "draft": metadata.models.draft,
+            "baseline": metadata.models.baseline,
+            "reference": metadata.models.reference,
+        },
+    })
 }
 
 pub fn evidence_artifact_index_entry_json(
@@ -233,6 +326,28 @@ pub fn evidence_record_json(record: EvidenceRecord) -> Value {
         "metrics": record.metrics,
         "elapsed_ms": record.elapsed_ms,
     })
+}
+
+pub fn extract_external_evidence_records_json(
+    kind: &str,
+    path: &Path,
+    value: &Value,
+    context: Value,
+) -> Vec<Value> {
+    let Some(selected) = select_external_evidence_value(kind, path, value) else {
+        return Vec::new();
+    };
+    let records = if let Some(records) = selected.get("records").and_then(Value::as_array) {
+        records.clone()
+    } else if let Some(records) = selected.as_array() {
+        records.clone()
+    } else {
+        vec![selected.clone()]
+    };
+    records
+        .into_iter()
+        .map(|record| annotate_external_evidence_record_json(kind, path, record, &context))
+        .collect()
 }
 
 pub fn standard_evidence_artifact_kind_for_path(path: &Path) -> Option<&'static str> {
@@ -374,6 +489,60 @@ fn model_hash_cache_key(model: &str) -> String {
         format!("file:{canonical}:{}:{modified}", meta.len())
     } else {
         format!("tag:{model}")
+    }
+}
+
+fn select_external_evidence_value<'a>(
+    kind: &str,
+    path: &Path,
+    value: &'a Value,
+) -> Option<&'a Value> {
+    if value
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|k| k == kind)
+    {
+        return Some(value);
+    }
+    if let Some(mapped) = value.get(kind) {
+        return Some(mapped);
+    }
+    if path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem == kind)
+    {
+        return Some(value);
+    }
+    None
+}
+
+fn annotate_external_evidence_record_json(
+    kind: &str,
+    path: &Path,
+    record: Value,
+    context: &Value,
+) -> Value {
+    let source_path = path.display().to_string();
+    match record {
+        Value::Object(mut object) => {
+            object
+                .entry("kind".to_string())
+                .or_insert_with(|| json!(kind));
+            object
+                .entry("source_path".to_string())
+                .or_insert_with(|| json!(source_path));
+            object
+                .entry("hipfire_eval_context".to_string())
+                .or_insert_with(|| context.clone());
+            Value::Object(object)
+        }
+        other => json!({
+            "kind": kind,
+            "source_path": source_path,
+            "hipfire_eval_context": context,
+            "value": other,
+        }),
     }
 }
 
@@ -590,6 +759,90 @@ mod tests {
     }
 
     #[test]
+    fn run_metadata_artifact_json_preserves_runtime_schema() {
+        let artifact = run_metadata_artifact_json(RunMetadataArtifact {
+            created_utc: "2026-06-14T21:00:00Z".to_string(),
+            provenance: RunProvenance {
+                runner: "hipfire-eval".to_string(),
+                runner_version: "0.2.0".to_string(),
+                hipfire_version: "0.2.0".to_string(),
+                git_commit: Some("abc123".to_string()),
+                git_branch: Some("main".to_string()),
+                git_describe: Some("v0.2.0-1-gabc123".to_string()),
+                git_dirty: Some(true),
+                binary_hash: Some("sha256:binary".to_string()),
+                arch: Some("gfx1151".to_string()),
+                rocm: Some("6.4".to_string()),
+            },
+            host_profile: json!({
+                "schema": 1,
+                "hardware_kind": "gpu",
+            }),
+            host_profile_hash: "host:abc".to_string(),
+            hardware_bucket: "gfx1151:64g".to_string(),
+            config: RunMetadataConfig {
+                tier: "fast".to_string(),
+                tier_budget: json!({
+                    "target_max_seconds": 60,
+                    "ci_suitable": true,
+                }),
+                batteries: vec!["smoke".to_string(), "quality".to_string()],
+                suites: vec!["canary".to_string()],
+                executor: "mock".to_string(),
+                kv_mode: Some("q8".to_string()),
+                max_tokens: 32,
+                profile: "off".to_string(),
+                dflash: "off".to_string(),
+                runs: 2,
+                warmup_runs: 1,
+                benchmark: true,
+                host_memory_class: Some("gddr6".to_string()),
+                host_memory_width_bits: Some(256),
+                host_memory_bandwidth_gbps: Some(512.5),
+                result_cache: "/tmp/cache".to_string(),
+                cache_mode: "use".to_string(),
+            },
+            models: RunMetadataModels {
+                candidate: "candidate.hfq".to_string(),
+                draft: Some("draft.hfq".to_string()),
+                baseline: Some("baseline.hfq".to_string()),
+                reference: None,
+            },
+        });
+
+        assert_eq!(artifact["schema"], 1);
+        assert_eq!(artifact["kind"], "run_metadata");
+        assert_eq!(artifact["status"], "collected");
+        assert_eq!(artifact["runner"], "hipfire-eval");
+        assert_eq!(artifact["runner_version"], "0.2.0");
+        assert_eq!(artifact["hipfire_version"], "0.2.0");
+        assert_eq!(artifact["created_utc"], "2026-06-14T21:00:00Z");
+        assert_eq!(artifact["git"]["commit"], "abc123");
+        assert_eq!(artifact["git"]["dirty"], true);
+        assert_eq!(artifact["binary"]["hash"], "sha256:binary");
+        assert_eq!(artifact["host"]["arch"], "gfx1151");
+        assert_eq!(artifact["host"]["rocm"], "6.4");
+        assert_eq!(artifact["host"]["profile"]["hardware_kind"], "gpu");
+        assert_eq!(artifact["host"]["host_profile_hash"], "host:abc");
+        assert_eq!(artifact["host"]["hardware_bucket"], "gfx1151:64g");
+        assert_eq!(artifact["config"]["tier"], "fast");
+        assert_eq!(artifact["config"]["tier_budget"]["target_max_seconds"], 60);
+        assert_eq!(artifact["config"]["batteries"][0], "smoke");
+        assert_eq!(artifact["config"]["suites"][0], "canary");
+        assert_eq!(artifact["config"]["kv_mode"], "q8");
+        assert_eq!(artifact["config"]["max_tokens"], 32);
+        assert_eq!(artifact["config"]["benchmark"], true);
+        assert_eq!(artifact["config"]["host_memory_width_bits"], 256);
+        assert_eq!(artifact["config"]["host_memory_bandwidth_gbps"], 512.5);
+        assert_eq!(artifact["config"]["result_cache"], "/tmp/cache");
+        assert_eq!(artifact["config"]["cache_mode"], "use");
+        assert_eq!(artifact["models"]["candidate"], "candidate.hfq");
+        assert_eq!(artifact["models"]["draft"], "draft.hfq");
+        assert_eq!(artifact["models"]["baseline"], "baseline.hfq");
+        assert_eq!(artifact["models"]["reference"], Value::Null);
+    }
+
+    #[test]
     fn artifact_index_entry_json_preserves_shared_metadata() {
         let context = EvidenceArtifactIndexContext {
             provenance: RunProvenance {
@@ -635,6 +888,78 @@ mod tests {
         assert_eq!(json["reason"], "ok");
         assert_eq!(json["expected_metrics"][0], "tok_s");
         assert_eq!(json["kind"], "performance");
+    }
+
+    #[test]
+    fn external_evidence_records_selects_kind_mapping_and_annotates_context() {
+        let path = Path::new("/tmp/evidence.json");
+        let value = json!({
+            "launch_counts": {
+                "records": [
+                    {"metrics": {"kernel_launches": 3}}
+                ]
+            }
+        });
+        let records = extract_external_evidence_records_json(
+            "launch_counts",
+            path,
+            &value,
+            json!({"runner": "hipfire-eval"}),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "launch_counts");
+        assert_eq!(records[0]["source_path"], "/tmp/evidence.json");
+        assert_eq!(records[0]["hipfire_eval_context"]["runner"], "hipfire-eval");
+        assert_eq!(records[0]["metrics"]["kernel_launches"], 3);
+    }
+
+    #[test]
+    fn external_evidence_records_preserves_existing_annotation_fields() {
+        let path = Path::new("/tmp/launch_counts.json");
+        let value = json!({
+            "kind": "launch_counts",
+            "records": [
+                {
+                    "kind": "custom",
+                    "source_path": "/already/set.json",
+                    "hipfire_eval_context": {"runner": "custom-runner"},
+                    "metrics": {"kernel_launches": 7}
+                }
+            ]
+        });
+        let records = extract_external_evidence_records_json(
+            "launch_counts",
+            path,
+            &value,
+            json!({"runner": "hipfire-eval"}),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "custom");
+        assert_eq!(records[0]["source_path"], "/already/set.json");
+        assert_eq!(
+            records[0]["hipfire_eval_context"]["runner"],
+            "custom-runner"
+        );
+        assert_eq!(records[0]["metrics"]["kernel_launches"], 7);
+    }
+
+    #[test]
+    fn external_evidence_records_uses_path_stem_and_wraps_scalars() {
+        let path = Path::new("/tmp/performance.json");
+        let records = extract_external_evidence_records_json(
+            "performance",
+            path,
+            &json!(123.4),
+            json!({"runner": "hipfire-eval"}),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "performance");
+        assert_eq!(records[0]["source_path"], "/tmp/performance.json");
+        assert_eq!(records[0]["hipfire_eval_context"]["runner"], "hipfire-eval");
+        assert_eq!(records[0]["value"], 123.4);
     }
 
     #[test]

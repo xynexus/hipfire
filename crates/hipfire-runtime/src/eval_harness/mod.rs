@@ -21,9 +21,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
     directory_hash, evidence_artifact_index_entry_from_value_json,
-    evidence_artifact_index_entry_json, evidence_record_json, file_hash, list_files, model_hash,
-    read_hfq_metadata, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
-    standard_evidence_paths_in_dir, EvidenceArtifactIndexContext, EvidenceRecord, RunProvenance,
+    evidence_artifact_index_entry_json, evidence_record_json,
+    extract_external_evidence_records_json, file_hash, list_files, model_hash, read_hfq_metadata,
+    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    standard_evidence_paths_in_dir, EvidenceArtifactIndexContext, EvidenceRecord,
+    RunMetadataArtifact, RunMetadataConfig, RunMetadataModels, RunProvenance,
     STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 use hipfire_model::{discover_dflash_draft_for_model, model_artifact_stem};
@@ -3476,54 +3478,44 @@ fn run_provenance_value(ctx: &EvalContext) -> Value {
 }
 
 fn run_metadata_artifact_value(config: &EvalConfig, ctx: &EvalContext) -> Value {
-    json!({
-        "schema": 1,
-        "kind": "run_metadata",
-        "status": "collected",
-        "runner": "hipfire-eval",
-        "runner_version": env!("CARGO_PKG_VERSION"),
-        "hipfire_version": env!("CARGO_PKG_VERSION"),
-        "created_utc": utc_now(),
-        "git": {
-            "commit": ctx.commit_sha,
-            "branch": ctx.git_branch,
-            "describe": ctx.git_describe,
-            "dirty": ctx.git_dirty,
+    run_metadata_artifact_json(RunMetadataArtifact {
+        created_utc: utc_now(),
+        provenance: run_provenance(ctx),
+        host_profile: serde_json::to_value(&ctx.host_profile).unwrap_or_else(|_| json!({})),
+        host_profile_hash: ctx.host_profile.host_profile_hash.clone(),
+        hardware_bucket: ctx.host_profile.hardware_bucket.clone(),
+        config: RunMetadataConfig {
+            tier: config.tier.as_str().to_string(),
+            tier_budget: serde_json::to_value(config.tier.budget()).unwrap_or_else(|_| json!({})),
+            batteries: config
+                .batteries
+                .iter()
+                .map(|b| b.as_str().to_string())
+                .collect(),
+            suites: config
+                .suites
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
+            executor: config.executor.as_str().to_string(),
+            kv_mode: config.kv_mode.clone(),
+            max_tokens: config.max_tokens,
+            profile: config.profile.as_str().to_string(),
+            dflash: config.dflash.as_str().to_string(),
+            runs: config.runs,
+            warmup_runs: config.warmup_runs,
+            benchmark: config.benchmark,
+            host_memory_class: config.host_memory_class.clone(),
+            host_memory_width_bits: config.host_memory_width_bits,
+            host_memory_bandwidth_gbps: config.host_memory_bandwidth_gbps,
+            result_cache: config.result_cache.display().to_string(),
+            cache_mode: config.cache_mode.as_str().to_string(),
         },
-        "binary": {
-            "hash": ctx.binary_hash,
-        },
-        "host": {
-            "arch": ctx.arch,
-            "rocm": ctx.rocm,
-            "profile": ctx.host_profile,
-            "host_profile_hash": ctx.host_profile.host_profile_hash,
-            "hardware_bucket": ctx.host_profile.hardware_bucket,
-        },
-        "config": {
-            "tier": config.tier.as_str(),
-            "tier_budget": config.tier.budget(),
-            "batteries": config.batteries.iter().map(|b| b.as_str()).collect::<Vec<_>>(),
-            "suites": config.suites.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            "executor": config.executor.as_str(),
-            "kv_mode": config.kv_mode,
-            "max_tokens": config.max_tokens,
-            "profile": config.profile.as_str(),
-            "dflash": config.dflash.as_str(),
-            "runs": config.runs,
-            "warmup_runs": config.warmup_runs,
-            "benchmark": config.benchmark,
-            "host_memory_class": config.host_memory_class,
-            "host_memory_width_bits": config.host_memory_width_bits,
-            "host_memory_bandwidth_gbps": config.host_memory_bandwidth_gbps,
-            "result_cache": config.result_cache.display().to_string(),
-            "cache_mode": config.cache_mode.as_str(),
-        },
-        "models": {
-            "candidate": config.model,
-            "draft": config.draft,
-            "baseline": config.baseline,
-            "reference": config.reference,
+        models: RunMetadataModels {
+            candidate: config.model.clone(),
+            draft: config.draft.clone(),
+            baseline: config.baseline.clone(),
+            reference: config.reference.clone(),
         },
     })
 }
@@ -3669,86 +3661,12 @@ fn external_evidence_records_from_path(
     let body = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     let value: Value =
         serde_json::from_str(&body).map_err(|err| format!("parse {}: {err}", path.display()))?;
-    extract_external_evidence_records(kind, path, &value, config, ctx)
-}
-
-fn extract_external_evidence_records(
-    kind: &str,
-    path: &Path,
-    value: &Value,
-    config: &EvalConfig,
-    ctx: &EvalContext,
-) -> Result<Vec<Value>, String> {
-    let Some(selected) = select_external_evidence_value(kind, path, value) else {
-        return Ok(Vec::new());
-    };
-    let records = if let Some(records) = selected.get("records").and_then(Value::as_array) {
-        records.clone()
-    } else if let Some(records) = selected.as_array() {
-        records.clone()
-    } else {
-        vec![selected.clone()]
-    };
-    Ok(records
-        .into_iter()
-        .map(|record| annotate_external_evidence_record(kind, path, record, config, ctx))
-        .collect())
-}
-
-fn select_external_evidence_value<'a>(
-    kind: &str,
-    path: &Path,
-    value: &'a Value,
-) -> Option<&'a Value> {
-    if value
-        .get("kind")
-        .and_then(Value::as_str)
-        .is_some_and(|k| k == kind)
-    {
-        return Some(value);
-    }
-    if let Some(mapped) = value.get(kind) {
-        return Some(mapped);
-    }
-    if path
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .is_some_and(|stem| stem == kind)
-    {
-        return Some(value);
-    }
-    None
-}
-
-fn annotate_external_evidence_record(
-    kind: &str,
-    path: &Path,
-    record: Value,
-    config: &EvalConfig,
-    ctx: &EvalContext,
-) -> Value {
-    let source_path = path.display().to_string();
-    let context = external_evidence_context(config, ctx);
-    match record {
-        Value::Object(mut object) => {
-            object
-                .entry("kind".to_string())
-                .or_insert_with(|| json!(kind));
-            object
-                .entry("source_path".to_string())
-                .or_insert_with(|| json!(source_path));
-            object
-                .entry("hipfire_eval_context".to_string())
-                .or_insert_with(|| context.clone());
-            Value::Object(object)
-        }
-        other => json!({
-            "kind": kind,
-            "source_path": source_path,
-            "hipfire_eval_context": context,
-            "value": other,
-        }),
-    }
+    Ok(extract_external_evidence_records_json(
+        kind,
+        path,
+        &value,
+        external_evidence_context(config, ctx),
+    ))
 }
 
 fn external_evidence_context(config: &EvalConfig, ctx: &EvalContext) -> Value {
