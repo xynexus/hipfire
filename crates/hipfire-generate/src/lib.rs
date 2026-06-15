@@ -4,7 +4,7 @@
 
 //! Typed generation request, event, and batch-plan contracts.
 
-use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id, ARCH_ID_QWEN35_MOE};
+use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};
 use hipfire_prompt::{
     openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
 };
@@ -1417,19 +1417,20 @@ pub fn qwen35_decode_batch_scheduler_metadata(
     cached_prefix_tokens: usize,
 ) -> Qwen35DecodeBatchSchedulerMetadata {
     let fallback_reason = if qwen35_decode_batch_requested_auto(requested) {
-        match (arch_id, backend) {
-            (ARCH_ID_QWEN35_MOE, Qwen35DecodeBatchBackend::SerialReference)
+        let is_moe = is_qwen35_moe_arch_id(arch_id);
+        match (is_moe, backend) {
+            (true, Qwen35DecodeBatchBackend::SerialReference)
                 if !qwen35_grouped_moe_decode_auto_latency_gate_passed(batch_size) =>
             {
                 "auto_grouped_moe_serial_small_batch_latency_gate"
             }
-            (ARCH_ID_QWEN35_MOE, Qwen35DecodeBatchBackend::SerialReference) => {
+            (true, Qwen35DecodeBatchBackend::SerialReference) => {
                 "auto_grouped_moe_serial_pending_latency_gate"
             }
-            (_, Qwen35DecodeBatchBackend::SerialReference) if batch_size < 2 => {
+            (false, Qwen35DecodeBatchBackend::SerialReference) if batch_size < 2 => {
                 "auto_requires_multi_session"
             }
-            (_, Qwen35DecodeBatchBackend::SerialReference) => "auto_serial_reference",
+            (false, Qwen35DecodeBatchBackend::SerialReference) => "auto_serial_reference",
             _ => "none",
         }
     } else if backend == Qwen35DecodeBatchBackend::SerialReference {
@@ -1486,7 +1487,7 @@ pub struct GenerationTiming {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_model::ARCH_ID_QWEN35_DENSE;
+    use hipfire_model::{ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE};
 
     fn prefill_session(id: &str) -> GenerateBatchPrefillSession {
         GenerateBatchPrefillSession {
