@@ -849,6 +849,15 @@ name = "hipfire-evidence"
 version = "0.2.0"
 
 [[package]]
+name = "hipfire-generate"
+version = "0.2.0"
+dependencies = [
+ "hipfire-prompt",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-model"
 version = "0.2.0"
 
