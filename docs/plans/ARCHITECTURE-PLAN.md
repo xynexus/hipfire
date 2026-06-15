@@ -36,7 +36,7 @@ Current prompt boundary status:
 - The Rust server builds typed daemon load parameters from config and preserves explicit DFlash mode plus configured TriAttention sidecars through `hipfire-daemon-protocol`.
 
 Current model boundary status:
-- `hipfire-model` owns `ModelSource`, `TensorInfo`, `QuantConfig`, model artifact format detection, role-sidecar filtering, display-name derivation, and quant preference ranking.
+- `hipfire-model` owns `ModelSource`, `TensorInfo`, `QuantConfig`, model artifact format detection, role-sidecar filtering, display-name derivation, filesystem-safe artifact stem derivation, and quant preference ranking.
 - `hipfire-model` owns `ModelWorkerKey` identity, feature-flag normalization, worker-key id construction, and worker-key compatibility comparison used by scheduler/control-plane adapters.
 - `hipfire-model` owns model architecture id constants and family classification helpers used by generate/backend-selection contracts.
 - `hipfire-model` owns parameterized local model discovery helpers for direct paths, model-directory lookup, aliases, fuzzy scans, quant preference ranking, sidecar exclusion, and adjacent DFlash draft sidecar discovery; server, CLI, and eval adapters provide environment-specific paths.
@@ -76,7 +76,7 @@ Current daemon protocol boundary status:
 - `hipfire-daemon-protocol` re-exports the model-owned load request/params and loaded response so protocol callers keep stable paths while load contract ownership moves into `hipfire-model`.
 
 Current daemon adapter boundary status:
-- `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery, load/ping/unload/generate response loops, and stale-response filtering.
+- `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery, load/ping/unload/generate response loops, stale-response filtering, and daemon startup resource lease policy/helpers.
 - `hipfire-server::daemon::engine` remains a compatibility re-export for server and CLI callers while the adapter becomes reusable outside the HTTP server crate.
 
 Current evidence boundary status:
