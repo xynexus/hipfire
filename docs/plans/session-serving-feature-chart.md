@@ -34,6 +34,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server model-load config conversion now reuses `hipfire-model` parameter construction instead of route-local filtering.
 - Rust CLI run model-load config conversion now reuses `hipfire-model` parameter construction instead of sending a max-seq-only load bundle.
 - Rust CLI and server config loading and local path helpers now reuse `hipfire-config` directly; the old `hipfire-server::config` compatibility re-export has been retired.
+- Rust CLI and server model modules no longer re-export model display/list helpers; callers use `hipfire-model` directly.
 - Rust server and CLI model discovery now reuse `hipfire-model` local artifact discovery helpers instead of server-local scanning.
 - Rust server `/v1/models` response rendering now reuses `hipfire-model` OpenAI-compatible list rendering instead of route-local JSON construction.
 - Eval DFlash draft auto-discovery now reuses `hipfire-model` sidecar discovery instead of eval-local candidate parsing.
@@ -49,8 +50,9 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Runtime model-source opening now reuses `hipfire-model` HFQ/safetensors path policy while keeping concrete loader constructors in `hipfire-runtime`.
 - Runtime and arch callers now consume `hipfire-model` model-source contracts directly; `hipfire-runtime::model_source` remains only the concrete HFQ/safetensors opener adapter.
 - Evidence model/tag hash and HFQ metadata compatibility helpers now delegate to `hipfire-model` instead of carrying duplicate model-specific parsing.
+- Eval deterministic mock scoring now consumes `hipfire-hash` directly, and `hipfire-evidence` no longer re-exports hash helpers or HFQ metadata.
 - Eval reference/slice/llama integrity verifiers now reuse `hipfire-evidence` ownership directly from runtime examples; the old `hipfire-runtime::eval_common` import path has been retired.
-- Eval and host-profile reporting now reuse `hipfire-evidence` eval-status, host-profile, and sourced-field contracts instead of eval-harness-local JSON shapes.
+- Eval and host-profile reporting now consume `hipfire-evidence` eval-status, host-profile, and sourced-field contracts directly instead of eval-harness-local JSON shapes or `hipfire-eval` re-exports.
 - Eval host-profile hardware-kind, bucket, bandwidth, and hash policy now reuse `hipfire-evidence` ownership instead of eval-harness-local helpers.
 - Runtime host-profile code now consumes `hipfire-eval` directly, and the old `hipfire-runtime::eval_harness` compatibility facade has been retired.
 - Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.
