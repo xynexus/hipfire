@@ -38,6 +38,7 @@ Current prompt boundary status:
 - `hipfire-prompt` owns assistant-turn prompt-history fingerprinting and canonical tool-call argument JSON used by daemon multi-turn prefix-cache identity.
 - `hipfire-prompt` owns assistant-prefix wire-label parsing for `plain`, `open_think`, and `closed_think` request paths.
 - `hipfire-prompt` owns load-time chat-template source resolution for env-file, per-model override file, and embedded model-template precedence.
+- `hipfire-prompt` owns the pure prompt-normalization transform for line endings, NBSP, trailing line whitespace, and cold newline runs; runtime keeps only the env/config opt-in wrapper.
 - `hipfire-runtime` implements the prompt tokenizer trait for its tokenizer while prompt frame types are imported directly from `hipfire-prompt`.
 - `hipfire-daemon` now consumes `hipfire-prompt` directly for daemon prompt framing, assistant-prefix labels, tool-call fingerprints, and structured message history instead of routing those types through the runtime compatibility facade.
 - The Rust server forwards structured chat `messages` to the daemon and keeps `prompt` as the last-user-text compatibility fallback, avoiding nested ChatML.
@@ -47,7 +48,7 @@ Current model boundary status:
 - `hipfire-model` owns `ModelSource`, `TensorInfo`, `QuantConfig`, model artifact format detection, role-sidecar filtering, display-name derivation, filesystem-safe artifact stem derivation, and quant preference ranking.
 - `hipfire-model` owns `ModelWorkerKey` identity, feature-flag normalization, worker-key id construction, and worker-key compatibility comparison used by scheduler/control-plane adapters.
 - `hipfire-model` owns model architecture id constants and family classification helpers used by generate/backend-selection contracts.
-- `hipfire-model` owns tokenizer signature/fingerprint policy used by runtime tokenizer compatibility checks; runtime still owns tokenizer parsing and encode/decode.
+- `hipfire-model` owns tokenizer signature/fingerprint policy, HFQ tokenizer metadata payload selection (`tokenizer` vs `gguf_meta`), and HFQ chat-template extraction used by runtime tokenizer/prompt compatibility checks; runtime still owns tokenizer parsing and encode/decode.
 - `hipfire-model` owns parameterized local model discovery helpers for direct paths, model-directory lookup, aliases, fuzzy scans, quant preference ranking, sidecar exclusion, and adjacent DFlash draft sidecar discovery; server, CLI, and eval adapters provide environment-specific paths.
 - `hipfire-model` owns model-source opening policy for HFQ files and safetensors directories while runtime supplies the concrete loader constructors.
 - `hipfire-model` owns common model-load request/parameter and loaded-response contracts used by daemon protocol clients and future direct library adapters.

@@ -27,6 +27,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server and CLI generation sampling defaults, prompt-only request construction, worker binding, tools, and system request decoration now reuse `hipfire-generate` helpers instead of adapter-local assembly.
 - Rust server OpenAI chat completion and streaming chunk responses now reuse `hipfire-generate` renderers instead of route-local JSON construction.
 - Daemon text/VL generation request contracts, generate-batch prefill/preflight/decode contracts, semantic boundary checkpoints, prefill checkpoint hooks, prepared prefill/result, decode result, and fused dense batch contracts, validators, prefix-hash helpers, Qwen3.5 batch backend selectors, fused prefill preflight helpers, scratch sizing policy, and decode scheduler metadata now reuse `hipfire-generate` ownership; prefix-hash data shapes, checkpoint request metadata, and model artifact memory accounting now reuse `hipfire-state` ownership instead of daemon-local duplicates.
+- Runtime prompt normalization now delegates the pure text transform to `hipfire-prompt` while preserving the existing env/config wrapper.
 - Eval evidence artifact kinds and expected-metric catalogs now reuse `hipfire-evidence` ownership instead of runtime-local lists.
 - Eval runtime-evidence directory ingestion now uses `hipfire-evidence` catalog-based artifact path discovery instead of runtime-local filename lists.
 - Coherence run contracts, artifact serialization, daemon-backed execution, prompt execution, token capture, and detector report assembly now reuse `hipfire-coherence` ownership directly; the old `hipfire-runtime::coherence_runtime` import path has been retired.
@@ -45,6 +46,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering, currently reporting an empty adapter state until Rust owns resident workers.
 - Generate Qwen3.5 dense/MoE batch backend selection now reuses `hipfire-model` architecture classification instead of local numeric arch checks.
 - Runtime tokenizer compatibility signatures now reuse `hipfire-model` fingerprint policy while tokenizer parsing and encode/decode stay in `hipfire-runtime`.
+- Runtime HFQ tokenizer metadata selection and HFQ chat-template extraction now reuse `hipfire-model`; tokenizer parsing, encode/decode, and GGUF runtime adapters stay in `hipfire-runtime`.
 - Eval output and runtime-evidence model stems now reuse `hipfire-model` artifact identity helpers instead of eval-local stem sanitization.
 - Eval model manifests now reuse `hipfire-model` row construction for file/tag identity, HFQ metadata hashes, architecture IDs, and embedded quantization hashes.
 - `hipfire-model` now consumes `hipfire-hash` directly for file/tag hashes and no longer re-exports generic hash helpers.
