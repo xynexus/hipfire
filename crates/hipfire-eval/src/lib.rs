@@ -35,13 +35,12 @@ use hipfire_evidence::{
     run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
     standard_evidence_paths_in_dir, AdmissionArtifact as EvidenceAdmissionArtifact,
     AdmissionEvidence as EvidenceAdmissionEvidence,
-    ComparisonArtifact as EvidenceComparisonArtifact, EvidenceArtifact, EvidenceArtifactCollection,
-    EvidenceArtifactConfig, EvidenceArtifactDatasetStatus, EvidenceArtifactIndexContext,
-    EvidenceArtifactModels, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
-    RunMetadataModels, RunProvenance, OBSERVED_ADMISSION_EVIDENCE_KINDS,
-    STANDARD_EVIDENCE_ARTIFACT_SPECS,
+    ComparisonArtifact as EvidenceComparisonArtifact, EvalStatus, EvidenceArtifact,
+    EvidenceArtifactCollection, EvidenceArtifactConfig, EvidenceArtifactDatasetStatus,
+    EvidenceArtifactIndexContext, EvidenceArtifactModels, EvidenceRecord, HostProfile,
+    RunMetadataArtifact, RunMetadataConfig, RunMetadataModels, RunProvenance, SourcedField,
+    OBSERVED_ADMISSION_EVIDENCE_KINDS, STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
-pub use hipfire_evidence::{EvalStatus, HostProfile, SourcedField};
 use hipfire_model::{
     discover_dflash_draft_for_model, model_artifact_stem, model_hash, model_manifest_entry,
     ModelManifestEntry,
