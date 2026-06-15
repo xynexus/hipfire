@@ -72,14 +72,14 @@ use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
-    model_worker_runtime_view_json, parse_describe_sequence_state_request,
-    parse_release_sequence_state_request, parse_release_sessions_request,
-    parse_reserve_session_state_request, parse_unload_worker_request,
-    parsed_handle_may_target_generic, parsed_handle_may_target_loaded_state,
-    qwen35_sequence_state_handle, release_sessions_done_json, release_state_done_json,
-    reserve_session_state_done_json, reserve_session_state_rejected_json,
-    session_state_reservation_describe_json, unload_worker_done_json,
-    validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
+    generate_state_kinds_include_required, model_worker_runtime_view_json,
+    parse_describe_sequence_state_request, parse_release_sequence_state_request,
+    parse_release_sessions_request, parse_reserve_session_state_request,
+    parse_unload_worker_request, parsed_handle_may_target_generic,
+    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
+    release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
+    reserve_session_state_rejected_json, session_state_reservation_describe_json,
+    unload_worker_done_json, validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
     ModelArtifactMemory, ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
     SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateForkRequest,
@@ -6050,23 +6050,19 @@ fn run_generate_batch_prefill_serial_qwen35(
     let t0 = Instant::now();
     let mut prepared = Vec::with_capacity(envelope.sessions.len());
     for session in &envelope.sessions {
-        if !session
-            .state_handle
-            .state_kinds
-            .iter()
-            .any(|kind| kind == "attention_kv")
-        {
+        if !generate_state_kinds_include_required(
+            &session.state_handle.state_kinds,
+            SequenceStatePageKind::Kv,
+        ) {
             return Err(format!(
                 "generate_batch_prefill session {} missing attention_kv state kind",
                 session.id
             ));
         }
-        if !session
-            .state_handle
-            .state_kinds
-            .iter()
-            .any(|kind| kind == "deltanet_recurrent")
-        {
+        if !generate_state_kinds_include_required(
+            &session.state_handle.state_kinds,
+            SequenceStatePageKind::DeltaNet,
+        ) {
             return Err(format!(
                 "generate_batch_prefill session {} missing deltanet_recurrent state kind",
                 session.id
