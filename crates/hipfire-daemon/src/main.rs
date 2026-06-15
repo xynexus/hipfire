@@ -71,8 +71,9 @@ use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
     model_worker_runtime_view_json, parse_reserve_session_state_kinds, parse_sequence_state_handle,
     parse_sequence_state_handle_list, parsed_handle_may_target_generic,
-    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle, release_state_done_json,
-    sequence_state_page_descriptor_json, session_state_reservation_describe_json,
+    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
+    release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
+    reserve_session_state_rejected_json, session_state_reservation_describe_json,
     DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
     ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
     ReleaseStateResponseKind, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
@@ -81,7 +82,7 @@ use hipfire_state::{
 #[cfg(test)]
 use hipfire_state::{
     generic_state_reservation_descriptors, sequence_state_handle_id, sequence_state_handle_parts,
-    SequenceStateHandle,
+    sequence_state_page_descriptor_json, SequenceStateHandle,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
@@ -8884,13 +8885,13 @@ fn main() {
                 };
                 if let Some(dummy) = dummy_model.as_mut() {
                     let released = dummy.release_sessions(&sessions);
-                    let done = serde_json::json!({
-                        "type": "release_sessions_done",
-                        "id": id,
-                        "requested": sessions.len(),
-                        "released": released,
-                        "resident_sessions": dummy.session_count(),
-                    });
+                    let done = release_sessions_done_json(
+                        id,
+                        sessions.len(),
+                        released,
+                        dummy.session_count(),
+                        None,
+                    );
                     let _ = writeln!(stdout, "{done}");
                     let _ = stdout.flush();
                     continue;
@@ -8906,17 +8907,13 @@ fn main() {
                 match sequence_state_arena_release_sessions(arena_backend, m, &mut gpu, &sessions) {
                     Ok(released) => {
                         let worker = loaded_model_worker_runtime_view(m);
-                        let done = serde_json::json!({
-                            "type": "release_sessions_done",
-                            "id": id,
-                            "requested": sessions.len(),
-                            "released": released,
-                            "resident_sessions": sequence_state_arena_resident_session_count(
-                                arena_backend,
-                                m
-                            ),
-                            "model_worker": model_worker_runtime_view_json(&worker),
-                        });
+                        let done = release_sessions_done_json(
+                            id,
+                            sessions.len(),
+                            released,
+                            sequence_state_arena_resident_session_count(arena_backend, m),
+                            Some(&worker),
+                        );
                         let _ = writeln!(stdout, "{done}");
                         let _ = stdout.flush();
                     }
@@ -9019,17 +9016,15 @@ fn main() {
                     .saturating_add(outstanding_bytes)
                     .saturating_add(reserved_bytes);
                 if budget_bytes > 0 && projected > budget_bytes {
-                    let rejected = serde_json::json!({
-                        "type": "reserve_session_state_rejected",
-                        "id": id,
-                        "worker_key_id": target_worker_id,
-                        "reason": "memory_pressure",
-                        "reserved_bytes": reserved_bytes,
-                        "current_session_bytes": current_session_bytes,
-                        "outstanding_reserved_bytes": outstanding_bytes,
-                        "projected_reserved_bytes": projected,
-                        "budget_bytes": budget_bytes,
-                    });
+                    let rejected = reserve_session_state_rejected_json(
+                        id,
+                        &target_worker_id,
+                        reserved_bytes,
+                        current_session_bytes,
+                        outstanding_bytes,
+                        projected,
+                        budget_bytes,
+                    );
                     let _ = writeln!(stdout, "{rejected}");
                     let _ = stdout.flush();
                     continue;
@@ -9042,30 +9037,14 @@ fn main() {
                     reserved_bytes,
                     ttl_ms,
                 );
-                let state_page_descriptor_values: Vec<serde_json::Value> = reservation
-                    .state_page_descriptors
-                    .iter()
-                    .map(sequence_state_page_descriptor_json)
-                    .collect();
-                let done = serde_json::json!({
-                    "type": "reserve_session_state_done",
-                    "id": id,
-                    "worker_key_id": target_worker_id,
-                    "reservation_id": reservation_id,
-                    "runtime_state_handle": &reservation.handle.id,
-                    "handle": {
-                        "id": &reservation.handle.id,
-                        "kind": &reservation.handle.kind,
-                        "generation": reservation.handle.generation,
-                    },
-                    "state_arena_owns_pages": true,
-                    "state_page_descriptors": state_page_descriptor_values,
-                    "reserved_bytes": reserved_bytes,
-                    "current_session_bytes": current_session_bytes,
-                    "outstanding_reserved_bytes": outstanding_bytes,
-                    "projected_reserved_bytes": projected,
-                    "budget_bytes": budget_bytes,
-                });
+                let done = reserve_session_state_done_json(
+                    id,
+                    &reservation,
+                    current_session_bytes,
+                    outstanding_bytes,
+                    projected,
+                    budget_bytes,
+                );
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }

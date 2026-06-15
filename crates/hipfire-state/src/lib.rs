@@ -385,6 +385,62 @@ pub fn described_sequence_state_json(
     )
 }
 
+pub fn reserve_session_state_done_json(
+    id: &str,
+    reservation: &SessionStateReservation,
+    current_session_bytes: usize,
+    outstanding_reserved_bytes: usize,
+    projected_reserved_bytes: usize,
+    budget_bytes: usize,
+) -> serde_json::Value {
+    let state_page_descriptors = reservation
+        .state_page_descriptors
+        .iter()
+        .map(sequence_state_page_descriptor_json)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "type": "reserve_session_state_done",
+        "id": id,
+        "worker_key_id": &reservation.worker_id,
+        "reservation_id": &reservation.handle.id,
+        "runtime_state_handle": &reservation.handle.id,
+        "handle": {
+            "id": &reservation.handle.id,
+            "kind": &reservation.handle.kind,
+            "generation": reservation.handle.generation,
+        },
+        "state_arena_owns_pages": true,
+        "state_page_descriptors": state_page_descriptors,
+        "reserved_bytes": reservation.reserved_bytes,
+        "current_session_bytes": current_session_bytes,
+        "outstanding_reserved_bytes": outstanding_reserved_bytes,
+        "projected_reserved_bytes": projected_reserved_bytes,
+        "budget_bytes": budget_bytes,
+    })
+}
+
+pub fn reserve_session_state_rejected_json(
+    id: &str,
+    worker_id: &str,
+    reserved_bytes: usize,
+    current_session_bytes: usize,
+    outstanding_reserved_bytes: usize,
+    projected_reserved_bytes: usize,
+    budget_bytes: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "reserve_session_state_rejected",
+        "id": id,
+        "worker_key_id": worker_id,
+        "reason": "memory_pressure",
+        "reserved_bytes": reserved_bytes,
+        "current_session_bytes": current_session_bytes,
+        "outstanding_reserved_bytes": outstanding_reserved_bytes,
+        "projected_reserved_bytes": projected_reserved_bytes,
+        "budget_bytes": budget_bytes,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseStateResponseKind {
     ReleaseState,
@@ -418,6 +474,26 @@ pub fn release_state_done_json(
         "generic_released": generic_released,
         "loaded_released": loaded_released,
     })
+}
+
+pub fn release_sessions_done_json(
+    id: &str,
+    requested: usize,
+    released: usize,
+    resident_sessions: usize,
+    model_worker: Option<&ModelWorkerRuntimeView>,
+) -> serde_json::Value {
+    let mut done = serde_json::json!({
+        "type": "release_sessions_done",
+        "id": id,
+        "requested": requested,
+        "released": released,
+        "resident_sessions": resident_sessions,
+    });
+    if let Some(worker) = model_worker {
+        done["model_worker"] = model_worker_runtime_view_json(worker);
+    }
+    done
 }
 
 impl GenericSequenceStateArena {
@@ -885,6 +961,58 @@ mod tests {
     }
 
     #[test]
+    fn reserve_session_state_done_json_preserves_daemon_wire_shape() {
+        let mut arena = GenericSequenceStateArena::new();
+        let reservation = arena.reserve(
+            "worker-a",
+            "reserve-a".to_string(),
+            &[SequenceStatePageKind::Kv, SequenceStatePageKind::DeltaNet],
+            256,
+            8192,
+            0,
+        );
+
+        let json =
+            reserve_session_state_done_json("reserve-1", &reservation, 1024, 2048, 11264, 16384);
+        assert_eq!(json["type"], "reserve_session_state_done");
+        assert_eq!(json["id"], "reserve-1");
+        assert_eq!(json["worker_key_id"], "worker-a");
+        assert_eq!(json["reservation_id"], "reserve-a");
+        assert_eq!(json["runtime_state_handle"], "reserve-a");
+        assert_eq!(json["handle"]["kind"], "generic_reserved_state");
+        assert_eq!(json["handle"]["generation"], 1);
+        assert_eq!(json["state_arena_owns_pages"], true);
+        assert_eq!(json["state_page_descriptors"].as_array().unwrap().len(), 2);
+        assert_eq!(json["reserved_bytes"], 8192);
+        assert_eq!(json["current_session_bytes"], 1024);
+        assert_eq!(json["outstanding_reserved_bytes"], 2048);
+        assert_eq!(json["projected_reserved_bytes"], 11264);
+        assert_eq!(json["budget_bytes"], 16384);
+    }
+
+    #[test]
+    fn reserve_session_state_rejected_json_preserves_daemon_wire_shape() {
+        let json = reserve_session_state_rejected_json(
+            "reserve-2",
+            "worker-a",
+            8192,
+            1024,
+            2048,
+            11264,
+            4096,
+        );
+        assert_eq!(json["type"], "reserve_session_state_rejected");
+        assert_eq!(json["id"], "reserve-2");
+        assert_eq!(json["worker_key_id"], "worker-a");
+        assert_eq!(json["reason"], "memory_pressure");
+        assert_eq!(json["reserved_bytes"], 8192);
+        assert_eq!(json["current_session_bytes"], 1024);
+        assert_eq!(json["outstanding_reserved_bytes"], 2048);
+        assert_eq!(json["projected_reserved_bytes"], 11264);
+        assert_eq!(json["budget_bytes"], 4096);
+    }
+
+    #[test]
     fn release_state_done_json_preserves_daemon_wire_shape() {
         let json = release_state_done_json(
             ReleaseStateResponseKind::ReleaseState,
@@ -917,6 +1045,52 @@ mod tests {
         assert_eq!(json["type"], "release_session_state_reservation_done");
         assert_eq!(json["released"], 1);
         assert_eq!(json["released_bytes"], usize::MAX);
+    }
+
+    #[test]
+    fn release_sessions_done_json_preserves_dummy_wire_shape() {
+        let json = release_sessions_done_json("release-sessions-1", 3, 2, 1, None);
+        assert_eq!(json["type"], "release_sessions_done");
+        assert_eq!(json["id"], "release-sessions-1");
+        assert_eq!(json["requested"], 3);
+        assert_eq!(json["released"], 2);
+        assert_eq!(json["resident_sessions"], 1);
+        assert!(json.get("model_worker").is_none());
+    }
+
+    #[test]
+    fn release_sessions_done_json_includes_model_worker_when_present() {
+        let worker = ModelWorkerRuntimeView {
+            worker_id: ModelWorkerId::from_runtime_parts(6, 1, Some("q8")),
+            max_seq: 256,
+            physical_cap: 128,
+            resident_workers: 1,
+            max_resident_workers: 2,
+            state_arena_backend: SequenceStateArenaBackend::Qwen35Wrapped,
+            resident_sessions: 4,
+            state_page_descriptors: Vec::new(),
+            memory: ModelWorkerMemoryView {
+                model_file_bytes: 10,
+                model_weight_bytes: 20,
+                runtime_base_bytes: 30,
+                runtime_session_bytes: 40,
+                runtime_state_bytes: 70,
+                total_resident_bytes: 90,
+                evictable_state_bytes: 40,
+            },
+        };
+
+        let json = release_sessions_done_json("release-sessions-2", 2, 1, 4, Some(&worker));
+        assert_eq!(json["type"], "release_sessions_done");
+        assert_eq!(json["requested"], 2);
+        assert_eq!(json["released"], 1);
+        assert_eq!(json["resident_sessions"], 4);
+        assert_eq!(json["model_worker"]["id"], "worker:arch6:pp1:q8");
+        assert_eq!(
+            json["model_worker"]["state_arena_backend"],
+            "qwen35_wrapped"
+        );
+        assert_eq!(json["model_worker"]["runtime_state_bytes"], 70);
     }
 
     #[test]
