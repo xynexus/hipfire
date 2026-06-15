@@ -65,6 +65,7 @@ Current scheduler boundary status:
 Current generate boundary status:
 - `hipfire-generate` owns typed generation sampling policy, text/VL generation request structs, generation event structs, generate-batch prefill/decode envelopes, semantic boundary checkpoint and prefill checkpoint hook contracts, prepared prefill/result and fused dense batch contract types, decode step result contracts, batch/preflight JSON validation, `prefix_hash_preflight_done` response rendering, Qwen3.5 `generate_batch_prefill_session_done`/`generate_batch_prefill_done` response rendering, Qwen3.5 `generate_batch_decode_step_done` response rendering, Qwen3.5 prefix-hash compute/JSON helpers over the state-owned hash shape, Qwen3.5 prefill/decode backend plan and selector policy, fused prefill preflight helpers, prefill scratch batch sizing policy, and scheduler metadata helpers.
 - `hipfire-generate` owns OpenAI chat-message to structured text-generate request construction, including the last-user `prompt` compatibility fallback and full `messages` forwarding.
+- `hipfire-generate` owns prompt-only structured text-generate request construction, generation sampling default/override merging, and worker/tools/system request decoration consumed by Rust server and CLI daemon adapters.
 - `hipfire-cli run` consumes `hipfire-generate` structured text-generate request construction through the daemon protocol re-export instead of pre-rendering ChatML locally.
 - `hipfire-generate` consumes model-owned architecture classification for Qwen3.5 dense/MoE batch backend decisions instead of owning local arch-id constants.
 - `hipfire-daemon-protocol` re-exports the generate-owned text request and token/done/error event structs for daemon JSONL generate traffic, so the protocol crate no longer owns duplicate generate contracts.
@@ -92,9 +93,10 @@ Current daemon protocol boundary status:
 - `hipfire-daemon-protocol` re-exports the model-owned load request/params and loaded response so protocol callers keep stable paths while load contract ownership moves into `hipfire-model`.
 
 Current daemon adapter boundary status:
-- `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery, load/ping/unload/generate response loops, stale-response filtering, and daemon startup resource lease policy/helpers.
+- `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery and missing-binary diagnostics, load/ping/unload/generate response loops, stale-response filtering, and daemon startup resource lease policy/helpers.
 - `hipfire-cli run` consumes `hipfire-daemon-adapter` and `hipfire-daemon-protocol` directly for daemon-backed execution instead of reaching those contracts through the server crate.
 - `hipfire-server` consumes `hipfire-daemon-adapter` directly for daemon-backed execution; the old server-local engine re-export has been retired.
+- `hipfire-coherence` consumes `hipfire-daemon-adapter` for daemon binary discovery while retaining its coherence-specific raw JSONL runner and detector orchestration.
 
 Current config boundary status:
 - `hipfire-config` owns `HipfireConfig`, config-file loading, per-model override merging, and `~/.hipfire` / model-directory path helpers.
@@ -107,7 +109,7 @@ Current evidence boundary status:
 - `hipfire-runtime::eval_common` remains a compatibility facade for evidence-owned eval integrity verifiers, and `hipfire-runtime::eval_harness` remains a compatibility facade for the `hipfire-eval` harness while downstream callers migrate.
 
 Current coherence boundary status:
-- `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, coherence run input/output contracts, report row serialization, coherence artifact serialization, daemon binary discovery, daemon-backed coherence execution, prompt execution, token event capture, and detector report assembly.
+- `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, coherence run input/output contracts, report row serialization, coherence artifact serialization, daemon-backed coherence execution, prompt execution, token event capture, and detector report assembly.
 - `hipfire-runtime::coherence_runtime` remains a compatibility facade for existing `coherence_probe` and eval-harness callers while coherence ownership lives in `hipfire-coherence`.
 
 ## 3) Execution sequence

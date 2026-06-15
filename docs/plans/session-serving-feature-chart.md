@@ -21,6 +21,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server daemon request/response and process-client paths now consume `hipfire-daemon-protocol` and `hipfire-daemon-adapter` directly instead of server-local compatibility re-exports.
 - Rust server chat generate requests now reuse `hipfire-generate` OpenAI chat request construction instead of server-local prompt/message assembly.
 - Rust CLI run generate requests now reuse `hipfire-generate` OpenAI chat request construction instead of CLI-local ChatML rendering.
+- Rust server and CLI generation sampling defaults, prompt-only request construction, worker binding, tools, and system request decoration now reuse `hipfire-generate` helpers instead of adapter-local assembly.
 - Daemon text/VL generation request contracts, generate-batch prefill/preflight/decode contracts, semantic boundary checkpoints, prefill checkpoint hooks, prepared prefill/result, decode result, and fused dense batch contracts, validators, prefix-hash helpers, Qwen3.5 batch backend selectors, fused prefill preflight helpers, scratch sizing policy, and decode scheduler metadata now reuse `hipfire-generate` ownership; prefix-hash data shapes, checkpoint request metadata, and model artifact memory accounting now reuse `hipfire-state` ownership instead of daemon-local duplicates.
 - Eval evidence artifact kinds and expected-metric catalogs now reuse `hipfire-evidence` ownership instead of runtime-local lists.
 - Eval runtime-evidence directory ingestion now uses `hipfire-evidence` catalog-based artifact path discovery instead of runtime-local filename lists.
@@ -62,6 +63,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon `unload_worker` response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
 - Daemon worker-status allocator policy reporting now reuses `hipfire-state` allocator/spill vocabulary, including page ownership, manual-release eviction status, disabled spill target, and copy-on-write attach status.
 - Daemon startup resource lease policy and lock helpers now reuse `hipfire-daemon-adapter` ownership instead of daemon-local helpers.
+- Coherence daemon binary discovery now reuses `hipfire-daemon-adapter` ownership instead of coherence-local repository probing.
 - Eval artifact row records now reuse `hipfire-evidence` record contracts instead of eval-local JSON construction.
 - Eval comparison, admission, and evidence artifacts now reuse `hipfire-evidence` run-provenance contracts instead of eval-local provenance structs.
 - Eval artifact index entries now reuse `hipfire-evidence` index rendering instead of eval-local JSON construction.
