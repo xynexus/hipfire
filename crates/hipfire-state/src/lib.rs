@@ -176,6 +176,18 @@ pub struct SequenceStateCheckpointRequest<'a> {
     pub checkpoint_prefix_hash: Option<&'a SequenceStatePrefixHash>,
 }
 
+pub fn validate_checkpoint_source_resident(
+    source_session_id: &str,
+    resident: bool,
+) -> Result<(), String> {
+    if !resident {
+        return Err(format!(
+            "qwen35 checkpoint source session {source_session_id} is not resident"
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_checkpoint_prefix_hash(
     source_session_id: &str,
     stored: Option<&SequenceStatePrefixHash>,
@@ -194,6 +206,19 @@ pub fn validate_checkpoint_prefix_hash(
             requested.prefix_len,
             stored.value,
             stored.prefix_len
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_checkpoint_logical_position(
+    source_session_id: &str,
+    expected_logical_position: usize,
+    resident_logical_position: usize,
+) -> Result<(), String> {
+    if resident_logical_position != expected_logical_position {
+        return Err(format!(
+            "qwen35 checkpoint source session {source_session_id} logical_position mismatch: expected={expected_logical_position} resident={resident_logical_position}"
         ));
     }
     Ok(())
@@ -1303,6 +1328,34 @@ mod tests {
         assert_eq!(
             err,
             "prefix hash mismatch for checkpoint checkpoint-a: request=requested len=12 stored=stored len=10"
+        );
+    }
+
+    #[test]
+    fn checkpoint_logical_position_validation_accepts_match() {
+        validate_checkpoint_logical_position("checkpoint-a", 16, 16).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_logical_position_validation_reports_mismatch() {
+        let err = validate_checkpoint_logical_position("checkpoint-a", 16, 12).unwrap_err();
+        assert_eq!(
+            err,
+            "qwen35 checkpoint source session checkpoint-a logical_position mismatch: expected=16 resident=12"
+        );
+    }
+
+    #[test]
+    fn checkpoint_source_resident_validation_accepts_resident_source() {
+        validate_checkpoint_source_resident("checkpoint-a", true).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_source_resident_validation_reports_missing_source() {
+        let err = validate_checkpoint_source_resident("checkpoint-a", false).unwrap_err();
+        assert_eq!(
+            err,
+            "qwen35 checkpoint source session checkpoint-a is not resident"
         );
     }
 }
