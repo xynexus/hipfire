@@ -68,13 +68,14 @@ use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
-    describe_sequence_state_descriptors, model_worker_runtime_view_json,
-    parse_reserve_session_state_kinds, parse_sequence_state_handle,
+    describe_sequence_state_descriptors, described_sequence_state_json,
+    model_worker_runtime_view_json, parse_reserve_session_state_kinds, parse_sequence_state_handle,
     parse_sequence_state_handle_list, parsed_handle_may_target_generic,
-    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
-    sequence_state_page_descriptor_json, DescribedSequenceState, GenericSequenceStateArena,
-    ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
-    ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
+    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle, release_state_done_json,
+    sequence_state_page_descriptor_json, session_state_reservation_describe_json,
+    DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
+    ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
+    ReleaseStateResponseKind, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
     SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
@@ -9091,25 +9092,7 @@ fn main() {
                     if let Some(reservation) =
                         generic_state_arena.describe(&handle.id, handle.generation)
                     {
-                        let state_page_descriptors: Vec<serde_json::Value> = reservation
-                            .state_page_descriptors
-                            .iter()
-                            .map(sequence_state_page_descriptor_json)
-                            .collect();
-                        let done = serde_json::json!({
-                            "type": "describe_state_done",
-                            "id": id,
-                            "worker_key_id": &reservation.worker_id,
-                            "runtime_state_handle": &reservation.handle.id,
-                            "handle": {
-                                "id": &reservation.handle.id,
-                                "kind": &reservation.handle.kind,
-                                "generation": reservation.handle.generation,
-                            },
-                            "state_arena_owns_pages": true,
-                            "reserved_bytes": reservation.reserved_bytes,
-                            "state_page_descriptors": state_page_descriptors,
-                        });
+                        let done = session_state_reservation_describe_json(id, reservation);
                         let _ = writeln!(stdout, "{done}");
                         let _ = stdout.flush();
                         continue;
@@ -9128,25 +9111,7 @@ fn main() {
                     );
                     continue;
                 };
-                let state_page_descriptors: Vec<serde_json::Value> = described
-                    .state_page_descriptors
-                    .iter()
-                    .map(sequence_state_page_descriptor_json)
-                    .collect();
-                let done = serde_json::json!({
-                    "type": "describe_state_done",
-                    "id": id,
-                    "worker_key_id": &described.worker_id,
-                    "runtime_state_handle": &described.handle.id,
-                    "handle": {
-                        "id": &described.handle.id,
-                        "kind": &described.handle.kind,
-                        "generation": described.handle.generation,
-                    },
-                    "state_arena_owns_pages": described.state_arena_owns_pages,
-                    "reserved_bytes": described.reserved_bytes,
-                    "state_page_descriptors": state_page_descriptors,
-                });
+                let done = described_sequence_state_json(id, &described);
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }
@@ -9179,20 +9144,19 @@ fn main() {
                             continue;
                         }
                     };
-                let released = generic_released + loaded_released;
-                let released_bytes = generic_released_bytes.saturating_add(loaded_released_bytes);
-                let done = serde_json::json!({
-                    "type": if is_release_state {
-                        "release_state_done"
-                    } else {
-                        "release_session_state_reservation_done"
-                    },
-                    "id": id,
-                    "released": released,
-                    "released_bytes": released_bytes,
-                    "generic_released": generic_released,
-                    "loaded_released": loaded_released,
-                });
+                let kind = if is_release_state {
+                    ReleaseStateResponseKind::ReleaseState
+                } else {
+                    ReleaseStateResponseKind::ReleaseSessionStateReservation
+                };
+                let done = release_state_done_json(
+                    kind,
+                    id,
+                    generic_released,
+                    generic_released_bytes,
+                    loaded_released,
+                    loaded_released_bytes,
+                );
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }
