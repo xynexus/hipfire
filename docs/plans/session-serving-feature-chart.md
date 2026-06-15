@@ -16,6 +16,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon assistant-prefix request labels now reuse `hipfire-prompt` parsing for `plain`, `open_think`, and `closed_think`.
 - Daemon load-time chat-template env/per-model/embedded precedence now reuses `hipfire-prompt` resolution instead of daemon-local file probing.
 - Daemon prompt framing now consumes `hipfire-prompt` directly instead of routing prompt types through `hipfire-runtime::prompt_frame`.
+- Daemon prompt normalization now consumes `hipfire-prompt` directly while preserving the runtime config/env opt-out policy.
 - Runtime examples now consume `hipfire-prompt` directly, and the old `hipfire-runtime::prompt_frame` compatibility re-export has been retired while runtime keeps the tokenizer trait implementation.
 - Rust server model loads now build typed daemon `LoadParams` from config, preserving explicit DFlash mode and configured TriAttention sidecars over the shared JSONL contract.
 - The daemon now opportunistically consumes shared typed generate and load request contracts while keeping raw JSON fallbacks for legacy and daemon-only fields.
@@ -28,6 +29,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server OpenAI chat completion and streaming chunk responses now reuse `hipfire-generate` renderers instead of route-local JSON construction.
 - Daemon text/VL generation request contracts, generate-batch prefill/preflight/decode contracts, semantic boundary checkpoints, prefill checkpoint hooks, prepared prefill/result, decode result, and fused dense batch contracts, validators, prefix-hash helpers, Qwen3.5 batch backend selectors, fused prefill preflight helpers, scratch sizing policy, and decode scheduler metadata now reuse `hipfire-generate` ownership; prefix-hash data shapes, checkpoint request metadata, and model artifact memory accounting now reuse `hipfire-state` ownership instead of daemon-local duplicates.
 - Generate decode scheduler metadata now renders compatible KV/DeltaNet state-kind names through `hipfire-state` instead of local string literals.
+- Generate batch-prefill session validation now uses `hipfire-state` generate-session state-kind parsing instead of a generate-local whitelist.
 - Runtime prompt normalization now delegates the pure text transform to `hipfire-prompt` while preserving the existing env/config wrapper.
 - Eval evidence artifact kinds and expected-metric catalogs now reuse `hipfire-evidence` ownership instead of runtime-local lists.
 - Eval runtime-evidence directory ingestion now uses `hipfire-evidence` catalog-based artifact path discovery instead of runtime-local filename lists.
