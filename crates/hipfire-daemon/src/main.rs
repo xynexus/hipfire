@@ -60,6 +60,7 @@ use hipfire_generate::{
     Qwen35PrefillCheckpointHook, Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult,
     Qwen35PreparedPrefillSession, Qwen35SemanticBoundaryCheckpoint,
 };
+use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
@@ -4588,7 +4589,7 @@ fn qwen35_materialize_batch_prefill_prompt(
         m.seq_pos
     };
     let assistant_prefix =
-        hipfire_runtime::prompt_frame::AssistantPrefix::from_label(Some(&session.assistant_prefix));
+        prompt_frame::AssistantPrefix::from_label(Some(&session.assistant_prefix));
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
     let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
     let system_prompt = session.system_prompt.as_deref();
@@ -4597,7 +4598,7 @@ fn qwen35_materialize_batch_prefill_prompt(
 
     if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+        let frame = prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
             system: system_prompt,
@@ -4606,21 +4607,21 @@ fn qwen35_materialize_batch_prefill_prompt(
             bos_token: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+            let synthesized: Vec<prompt_frame::Message>;
+            let messages_slice: &[prompt_frame::Message] = match messages_history {
                 Some(m) => m,
                 None => {
                     let mut v = Vec::new();
                     if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::System,
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                         });
                     }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
+                    v.push(prompt_frame::Message {
+                        role: prompt_frame::Role::User,
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
@@ -4639,7 +4640,7 @@ fn qwen35_materialize_batch_prefill_prompt(
                 eprintln!(
                     "[daemon] batch-prefill jinja render failed ({e}) -- falling back to Plain"
                 );
-                Ok(hipfire_runtime::prompt_frame::ChatFrame {
+                Ok(prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
                     user: "",
@@ -4650,7 +4651,7 @@ fn qwen35_materialize_batch_prefill_prompt(
             }
         }
     } else {
-        Ok(hipfire_runtime::prompt_frame::ChatFrame {
+        Ok(prompt_frame::ChatFrame {
             tokenizer,
             system: if seq_pos_for_prompt == 0 {
                 system_prompt
@@ -8097,18 +8098,16 @@ fn main() {
                         None => None,
                     }
                 };
-                let messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>> =
-                    if let Some(messages) = protocol_generate
+                let messages_history: Option<Vec<prompt_frame::Message>> = if let Some(messages) =
+                    protocol_generate
                         .as_ref()
                         .and_then(|req| req.messages.clone())
-                    {
-                        Some(messages)
-                    } else {
-                        match msg.get("messages") {
-                            Some(v) => match serde_json::from_value::<
-                                Vec<hipfire_runtime::prompt_frame::Message>,
-                            >(v.clone())
-                            {
+                {
+                    Some(messages)
+                } else {
+                    match msg.get("messages") {
+                        Some(v) => {
+                            match serde_json::from_value::<Vec<prompt_frame::Message>>(v.clone()) {
                                 Ok(m) => Some(m),
                                 Err(e) => {
                                     let _ = writeln!(
@@ -8120,10 +8119,11 @@ fn main() {
                                     let _ = stdout.flush();
                                     continue;
                                 }
-                            },
-                            None => None,
+                            }
                         }
-                    };
+                        None => None,
+                    }
+                };
                 // Sampling defaults differ by arch: qwen35 family was tuned
                 // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
                 // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
@@ -8267,7 +8267,7 @@ fn main() {
                 // Controls the ChatML framing after the assistant role header.
                 // Consumed by the text path; VL path does not yet propagate
                 // it (tracked as a follow-up to the post-#169 rebase).
-                let assistant_prefix = hipfire_runtime::prompt_frame::AssistantPrefix::from_label(
+                let assistant_prefix = prompt_frame::AssistantPrefix::from_label(
                     msg.get("assistant_prefix").and_then(|v| v.as_str()),
                 );
 
@@ -11745,11 +11745,11 @@ fn generate_dflash(
     system_prompt: Option<&str>,
     max_tokens: usize,
     max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    assistant_prefix: prompt_frame::AssistantPrefix,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -11771,7 +11771,7 @@ fn generate_dflash(
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+        let frame = prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
             system: system_prompt,
@@ -11780,21 +11780,21 @@ fn generate_dflash(
             bos_token: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+            let synthesized: Vec<prompt_frame::Message>;
+            let messages_slice: &[prompt_frame::Message] = match messages_history {
                 Some(m) => m,
                 None => {
                     let mut v = Vec::new();
                     if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::System,
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                         });
                     }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
+                    v.push(prompt_frame::Message {
+                        role: prompt_frame::Role::User,
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
@@ -11813,7 +11813,7 @@ fn generate_dflash(
                 eprintln!(
                     "[daemon] jinja render failed in dflash path ({e}) — falling back to Plain"
                 );
-                hipfire_runtime::prompt_frame::ChatFrame {
+                prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
                     user: prompt,
@@ -11824,7 +11824,7 @@ fn generate_dflash(
             }
         }
     } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
+        prompt_frame::ChatFrame {
             tokenizer,
             system: system_prompt,
             user: prompt,
@@ -12441,9 +12441,9 @@ fn generate_multi(
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    assistant_prefix: prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -12577,7 +12577,7 @@ fn generate_multi(
     let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+        let frame = prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
             system: system_prompt,
@@ -12586,21 +12586,21 @@ fn generate_multi(
             bos_token: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+            let synthesized: Vec<prompt_frame::Message>;
+            let messages_slice: &[prompt_frame::Message] = match messages_history {
                 Some(m) => m,
                 None => {
                     let mut v = Vec::new();
                     if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::System,
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                         });
                     }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
+                    v.push(prompt_frame::Message {
+                        role: prompt_frame::Role::User,
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
@@ -12617,7 +12617,7 @@ fn generate_multi(
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
                 eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
+                prompt_frame::ChatFrame {
                     tokenizer,
                     system: if m.seq_pos == 0 { system_prompt } else { None },
                     user: "",
@@ -12628,7 +12628,7 @@ fn generate_multi(
             }
         }
     } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
+        prompt_frame::ChatFrame {
             tokenizer,
             system: if m.seq_pos == 0 { system_prompt } else { None },
             user: "",
@@ -13130,11 +13130,11 @@ fn generate(
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    assistant_prefix: prompt_frame::AssistantPrefix,
     pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
     pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
     think_mode: ThinkMode,
     prefill_already_done: bool,
     prefilled_prompt_tokens: Option<usize>,
@@ -13322,10 +13322,7 @@ fn generate(
     // splices </think> through KV and continues generation, so route budgeted
     // thinking requests there until DFlash continuation is implemented.
     let budgeted_thinking_needs_ar = max_think_tokens > 0
-        && !matches!(
-            assistant_prefix,
-            hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
-        );
+        && !matches!(assistant_prefix, prompt_frame::AssistantPrefix::ClosedThink);
     if prefill_already_done && m.dflash.is_some() {
         write_error(
             stdout,
@@ -13443,7 +13440,7 @@ fn generate(
 
     // `nl` is needed for the trailer write after natural <|im_end|>
     // termination; `im_end` derives the EOS-check token id. Other
-    // ChatML scaffolding tokens are now built inside hipfire_runtime::prompt_frame.
+    // ChatML scaffolding tokens are now built inside hipfire-prompt.
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
     let raw_q_tokens = tokenizer.encode(prompt);
@@ -13665,7 +13662,7 @@ fn generate(
     let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+        let frame = prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
             system: system_prompt,
@@ -13684,21 +13681,21 @@ fn generate(
             // Synthesize [system?, user] when no explicit history was
             // provided. Tools-with-legacy-prompt is the natural OpenAI
             // function-calling shape (one turn + tool definitions).
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+            let synthesized: Vec<prompt_frame::Message>;
+            let messages_slice: &[prompt_frame::Message] = match messages_history {
                 Some(m) => m,
                 None => {
                     let mut v = Vec::new();
                     if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::System,
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                         });
                     }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
+                    v.push(prompt_frame::Message {
+                        role: prompt_frame::Role::User,
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
@@ -13715,7 +13712,7 @@ fn generate(
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
                 eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
+                prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
                     user: "",
@@ -13726,7 +13723,7 @@ fn generate(
             }
         }
     } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
+        prompt_frame::ChatFrame {
             tokenizer,
             system: if seq_pos_for_prompt == 0 {
                 system_prompt
@@ -14729,7 +14726,7 @@ fn generate_deepseek4(
     max_tokens: usize,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
 ) {
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
@@ -14845,7 +14842,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // Skip the trailing user prompt — we add it explicitly after.
         // Heuristic: if last message is role=user, treat its content as
         // the live prompt and drop it here.
-        use hipfire_runtime::prompt_frame::Role;
+        use prompt_frame::Role;
         let trim_end = if matches!(history.last().map(|m| m.role), Some(Role::User)) {
             1
         } else {
@@ -14920,10 +14917,8 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     // `tokenizer.encode(render(...))` as a longer
                     // sequence with different boundaries, capping the
                     // LCP at the assistant-turn boundary).
-                    let fp = hipfire_runtime::prompt_frame::assistant_turn_fingerprint(
-                        &msg.content,
-                        &msg.tool_calls,
-                    );
+                    let fp =
+                        prompt_frame::assistant_turn_fingerprint(&msg.content, &msg.tool_calls);
                     if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                         .ok()
                         .as_deref()
@@ -15306,12 +15301,12 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             .map(|v| v.as_slice())
             .unwrap_or(&empty_vocab);
         let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
-        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+        let mut emit_tool_calls_buf: Vec<prompt_frame::ToolCall> = Vec::new();
         use hipfire_arch_deepseek4::dsml::StreamEvent;
         let mut absorb_event = |ev: &StreamEvent| {
             if let StreamEvent::ToolCalls(calls) = ev {
                 for c in calls {
-                    emit_tool_calls_buf.push(hipfire_runtime::prompt_frame::ToolCall {
+                    emit_tool_calls_buf.push(prompt_frame::ToolCall {
                         name: c.name.clone(),
                         arguments: c.arguments.clone(),
                     });
@@ -15546,7 +15541,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // second tokenizer pass.
         let decode_start_tokens_idx = m.conversation_tokens.len();
         let mut emit_text_buf = String::new();
-        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+        let mut emit_tool_calls_buf: Vec<prompt_frame::ToolCall> = Vec::new();
         use hipfire_arch_deepseek4::dsml::StreamEvent;
         let mut absorb_event = |ev: &StreamEvent| {
             match ev {
@@ -15566,7 +15561,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 StreamEvent::Reasoning(_) => {}
                 StreamEvent::ToolCalls(calls) => {
                     for c in calls {
-                        emit_tool_calls_buf.push(hipfire_runtime::prompt_frame::ToolCall {
+                        emit_tool_calls_buf.push(prompt_frame::ToolCall {
                             name: c.name.clone(),
                             arguments: c.arguments.clone(),
                         });
@@ -15653,10 +15648,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             && m.conversation_tokens.len() > decode_start_tokens_idx
         {
             let cached_seq: Vec<u32> = m.conversation_tokens[decode_start_tokens_idx..].to_vec();
-            let fp = hipfire_runtime::prompt_frame::assistant_turn_fingerprint(
-                &emit_text_buf,
-                &emit_tool_calls_buf,
-            );
+            let fp = prompt_frame::assistant_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
             if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                 .ok()
                 .as_deref()
@@ -15964,7 +15956,7 @@ fn generate_minimax(
     max_tokens: usize,
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
 ) {
     if m.tokenizer.is_none() {
         let _ = writeln!(
@@ -15997,7 +15989,7 @@ fn generate_minimax(
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            let frame = prompt_frame::JinjaChatFrame {
                 tokenizer,
                 template,
                 system: system_prompt,
@@ -16006,30 +15998,29 @@ fn generate_minimax(
                 bos_token: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                });
-                            }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
+                let synthesized: Vec<prompt_frame::Message>;
+                let messages_slice: &[prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(prompt_frame::Message {
+                                role: prompt_frame::Role::System,
+                                content: sys.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                             });
-                            synthesized = v;
-                            &synthesized
                         }
-                    };
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
                 frame.render_messages(messages_slice, tools, None)
             } else {
                 frame.render()
@@ -16041,22 +16032,22 @@ fn generate_minimax(
                 }
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in minimax path ({e}) — falling back to Plain");
-                    hipfire_runtime::prompt_frame::ChatFrame {
+                    prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
                         user: prompt,
-                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                         raw: false,
                     }
                     .build()
                 }
             }
         } else {
-            hipfire_runtime::prompt_frame::ChatFrame {
+            prompt_frame::ChatFrame {
                 tokenizer,
                 system: system_prompt,
                 user: prompt,
-                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                 raw: false,
             }
             .build()
@@ -16234,7 +16225,7 @@ fn generate_lfm2moe(
     max_tokens: usize,
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
 ) {
     if m.tokenizer.is_none() {
         let _ = writeln!(
@@ -16262,7 +16253,7 @@ fn generate_lfm2moe(
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            let frame = prompt_frame::JinjaChatFrame {
                 tokenizer,
                 template,
                 system: system_prompt,
@@ -16271,30 +16262,29 @@ fn generate_lfm2moe(
                 bos_token: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                });
-                            }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
+                let synthesized: Vec<prompt_frame::Message>;
+                let messages_slice: &[prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(prompt_frame::Message {
+                                role: prompt_frame::Role::System,
+                                content: sys.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                             });
-                            synthesized = v;
-                            &synthesized
                         }
-                    };
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
                 frame.render_messages(messages_slice, tools, None)
             } else {
                 frame.render()
@@ -16303,22 +16293,22 @@ fn generate_lfm2moe(
                 Ok(rendered) => tokenizer.encode(&rendered),
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
-                    hipfire_runtime::prompt_frame::ChatFrame {
+                    prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
                         user: prompt,
-                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                         raw: false,
                     }
                     .build()
                 }
             }
         } else {
-            hipfire_runtime::prompt_frame::ChatFrame {
+            prompt_frame::ChatFrame {
                 tokenizer,
                 system: system_prompt,
                 user: prompt,
-                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                 raw: false,
             }
             .build()
@@ -16626,11 +16616,11 @@ fn generate_vl(
     user_body.extend_from_slice(&nl);
     user_body.extend_from_slice(&q_tokens);
 
-    let prompt_tokens = hipfire_runtime::prompt_frame::ChatFrame {
+    let prompt_tokens = prompt_frame::ChatFrame {
         tokenizer,
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
+        assistant_prefix: prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
         raw: false,
     }
     .build_with_user_tokens(&user_body);

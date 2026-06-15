@@ -842,6 +842,7 @@ dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
  "hipfire-generate",
+ "hipfire-prompt",
  "hipfire-runtime",
  "hipfire-state",
  "libc",
