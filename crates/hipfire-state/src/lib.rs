@@ -198,6 +198,23 @@ pub struct SequenceStateDescribeRequest {
     pub handle: ParsedSequenceStateHandle,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateReleaseRequest {
+    pub response_kind: ReleaseStateResponseKind,
+    pub handles: Vec<ParsedSequenceStateHandle>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateReleaseSessionsRequest {
+    pub worker_id: String,
+    pub sessions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateUnloadWorkerRequest {
+    pub worker_id: String,
+}
+
 pub fn validate_checkpoint_source_resident(
     source_session_id: &str,
     resident: bool,
@@ -835,6 +852,51 @@ pub fn parse_describe_sequence_state_request(
     Ok(SequenceStateDescribeRequest { handle })
 }
 
+pub fn parse_release_sequence_state_request(
+    msg: &serde_json::Value,
+) -> SequenceStateReleaseRequest {
+    let response_kind = if msg.get("type").and_then(|v| v.as_str()) == Some("release_state") {
+        ReleaseStateResponseKind::ReleaseState
+    } else {
+        ReleaseStateResponseKind::ReleaseSessionStateReservation
+    };
+    SequenceStateReleaseRequest {
+        response_kind,
+        handles: parse_sequence_state_handle_list(msg),
+    }
+}
+
+pub fn parse_release_sessions_request(
+    msg: &serde_json::Value,
+    worker_id: &str,
+) -> Result<SequenceStateReleaseSessionsRequest, String> {
+    let sessions = msg
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "release_sessions.sessions must be an array of session ids".to_string())?
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    Ok(SequenceStateReleaseSessionsRequest {
+        worker_id: worker_id.to_string(),
+        sessions,
+    })
+}
+
+pub fn parse_unload_worker_request(
+    msg: &serde_json::Value,
+    default_worker_id: &str,
+) -> SequenceStateUnloadWorkerRequest {
+    let worker_id = msg
+        .get("worker_id")
+        .or_else(|| msg.get("worker_key_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_worker_id)
+        .to_string();
+    SequenceStateUnloadWorkerRequest { worker_id }
+}
+
 pub fn generic_state_reservation_descriptors(
     worker_id: &str,
     handle: &SequenceStateHandle,
@@ -1071,6 +1133,131 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(err, "describe_state requires runtime_state_handle");
+    }
+
+    #[test]
+    fn parse_release_sequence_state_request_preserves_response_kind() {
+        let release_state = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_state",
+            "runtime_state_handle": "state-a"
+        }));
+        assert_eq!(
+            release_state.response_kind,
+            ReleaseStateResponseKind::ReleaseState
+        );
+        assert_eq!(release_state.handles[0].id, "state-a");
+
+        let reservation = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_session_state_reservation",
+            "reservation_id": "reserve-a"
+        }));
+        assert_eq!(
+            reservation.response_kind,
+            ReleaseStateResponseKind::ReleaseSessionStateReservation
+        );
+        assert_eq!(reservation.handles[0].id, "reserve-a");
+    }
+
+    #[test]
+    fn parse_release_sequence_state_request_preserves_handle_sources() {
+        let handles = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_state",
+            "handles": [
+                {
+                    "id": "checkpoint-a",
+                    "kind": "qwen35_checkpoint",
+                    "allocation_epoch": 8
+                },
+                "reserve-a"
+            ]
+        }));
+        assert_eq!(handles.handles.len(), 2);
+        assert_eq!(handles.handles[0].id, "checkpoint-a");
+        assert_eq!(
+            handles.handles[0].kind.as_deref(),
+            Some("qwen35_checkpoint")
+        );
+        assert_eq!(handles.handles[0].generation, Some(8));
+        assert_eq!(handles.handles[1].id, "reserve-a");
+
+        let empty = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_state"
+        }));
+        assert!(empty.handles.is_empty());
+    }
+
+    #[test]
+    fn parse_release_sessions_request_preserves_filtered_session_list() {
+        let request = parse_release_sessions_request(
+            &serde_json::json!({
+                "type": "release_sessions",
+                "sessions": ["session-a", 7, "session-b", null]
+            }),
+            "worker-a",
+        )
+        .unwrap();
+        assert_eq!(request.worker_id, "worker-a");
+        assert_eq!(
+            request.sessions,
+            vec!["session-a".to_string(), "session-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_release_sessions_request_reports_existing_missing_sessions_error() {
+        let err = parse_release_sessions_request(
+            &serde_json::json!({
+                "type": "release_sessions"
+            }),
+            "worker-a",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "release_sessions.sessions must be an array of session ids"
+        );
+    }
+
+    #[test]
+    fn parse_unload_worker_request_accepts_worker_aliases() {
+        let worker_id = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker",
+                "worker_id": "worker-a",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_id.worker_id, "worker-a");
+
+        let worker_key_id = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_key_id.worker_id, "worker-b");
+    }
+
+    #[test]
+    fn parse_unload_worker_request_falls_back_to_default_worker() {
+        let missing = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker"
+            }),
+            "__default__",
+        );
+        assert_eq!(missing.worker_id, "__default__");
+
+        let empty = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker",
+                "worker_id": ""
+            }),
+            "__default__",
+        );
+        assert_eq!(empty.worker_id, "__default__");
     }
 
     #[test]

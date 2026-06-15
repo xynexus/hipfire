@@ -37,6 +37,9 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon Qwen3.5 sequence-state session/checkpoint handle construction now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon `reserve_session_state` request parsing now consumes `hipfire-state` reserve request metadata instead of daemon-local loose fields.
 - Daemon `describe_state` request parsing now consumes `hipfire-state` describe request metadata instead of daemon-local loose handle aliases.
+- Daemon `release_state` and `release_session_state_reservation` request parsing now consume `hipfire-state` release request metadata instead of daemon-local loose handle lists.
+- Daemon `release_sessions` request parsing now consumes `hipfire-state` release-sessions request metadata instead of daemon-local loose session arrays.
+- Daemon `unload_worker` request parsing now consumes `hipfire-state` unload-worker request metadata instead of daemon-local worker id aliases.
 - Daemon Qwen3.5 checkpoint attach/fork calls now consume `hipfire-state` fork request metadata instead of daemon-local loose parameters.
 - Daemon Qwen3.5 checkpoint source-residency validation now reuses `hipfire-state` policy instead of daemon-local missing-source handling.
 - Daemon Qwen3.5 checkpoint prefix-hash validation now reuses `hipfire-state` policy instead of daemon-local mismatch handling.

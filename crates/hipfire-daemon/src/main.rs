@@ -70,7 +70,8 @@ use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
     model_worker_runtime_view_json, parse_describe_sequence_state_request,
-    parse_reserve_session_state_request, parse_sequence_state_handle_list,
+    parse_release_sequence_state_request, parse_release_sessions_request,
+    parse_reserve_session_state_request, parse_unload_worker_request,
     parsed_handle_may_target_generic, parsed_handle_may_target_loaded_state,
     qwen35_sequence_state_handle, release_sessions_done_json, release_state_done_json,
     reserve_session_state_done_json, reserve_session_state_rejected_json,
@@ -78,9 +79,8 @@ use hipfire_state::{
     validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
     ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
-    ParsedSequenceStateHandle, ReleaseStateResponseKind, SequenceStateArenaBackend,
-    SequenceStateCheckpointRequest, SequenceStateForkRequest, SequenceStatePageDescriptor,
-    SequenceStatePageKind,
+    ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
+    SequenceStateForkRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -8863,25 +8863,18 @@ fn main() {
                         }
                     }
                 }
-                let sessions: Vec<String> = match msg.get("sessions").and_then(|v| v.as_array()) {
-                    Some(values) => values
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect(),
-                    None => {
-                        emit_error_with_id(
-                            &mut stdout,
-                            id,
-                            "release_sessions.sessions must be an array of session ids",
-                        );
+                let request = match parse_release_sessions_request(&msg, &target_worker_id) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, id, e);
                         continue;
                     }
                 };
                 if let Some(dummy) = dummy_model.as_mut() {
-                    let released = dummy.release_sessions(&sessions);
+                    let released = dummy.release_sessions(&request.sessions);
                     let done = release_sessions_done_json(
                         id,
-                        sessions.len(),
+                        request.sessions.len(),
                         released,
                         dummy.session_count(),
                         None,
@@ -8898,12 +8891,17 @@ fn main() {
                     }
                 };
                 let arena_backend = loaded_model_state_arena_backend(m);
-                match sequence_state_arena_release_sessions(arena_backend, m, &mut gpu, &sessions) {
+                match sequence_state_arena_release_sessions(
+                    arena_backend,
+                    m,
+                    &mut gpu,
+                    &request.sessions,
+                ) {
                     Ok(released) => {
                         let worker = loaded_model_worker_runtime_view(m);
                         let done = release_sessions_done_json(
                             id,
-                            sessions.len(),
+                            request.sessions.len(),
                             released,
                             sequence_state_arena_resident_session_count(arena_backend, m),
                             Some(&worker),
@@ -9069,10 +9067,9 @@ fn main() {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("release-reservation");
-                let is_release_state =
-                    msg.get("type").and_then(|v| v.as_str()) == Some("release_state");
-                let handles = parse_sequence_state_handle_list(&msg);
-                let generic_handles = handles
+                let request = parse_release_sequence_state_request(&msg);
+                let generic_handles = request
+                    .handles
                     .iter()
                     .filter(|handle| parsed_handle_may_target_generic(handle))
                     .map(|handle| (handle.id.clone(), handle.generation))
@@ -9084,7 +9081,7 @@ fn main() {
                         &mut model,
                         &mut resident_models,
                         &mut gpu,
-                        &handles,
+                        &request.handles,
                     ) {
                         Ok(released) => released,
                         Err(e) => {
@@ -9092,13 +9089,8 @@ fn main() {
                             continue;
                         }
                     };
-                let kind = if is_release_state {
-                    ReleaseStateResponseKind::ReleaseState
-                } else {
-                    ReleaseStateResponseKind::ReleaseSessionStateReservation
-                };
                 let done = release_state_done_json(
-                    kind,
+                    request.response_kind,
                     id,
                     generic_released,
                     generic_released_bytes,
@@ -9309,7 +9301,8 @@ fn main() {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unload_worker");
-                let worker_id = message_worker_id(&msg);
+                let request = parse_unload_worker_request(&msg, DEFAULT_MODEL_WORKER_ID);
+                let worker_id = request.worker_id;
                 let mut unloaded = false;
                 generic_state_arena.release_worker(&worker_id);
                 if worker_id == active_worker_id {
