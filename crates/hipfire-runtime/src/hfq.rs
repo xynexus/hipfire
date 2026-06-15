@@ -651,7 +651,7 @@ impl HfqFile {
     /// did not ship a chat_template (rare for instruct models, common
     /// for base models). The runtime renders this when present so prompt
     /// framing matches the model's training-time expectation; absent or
-    /// failing renders fall back to the hand-rolled `prompt_frame` path.
+    /// failing renders fall back to the hand-rolled `ChatFrame` path.
     pub fn chat_template(&self) -> Option<String> {
         let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
         meta.get("tokenizer_config")?
