@@ -8,7 +8,7 @@ use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};
 use hipfire_prompt::{
     openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
 };
-use hipfire_state::SequenceStatePrefixHash;
+use hipfire_state::{SequenceStatePageKind, SequenceStatePrefixHash};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -639,19 +639,12 @@ pub fn validate_generate_batch_prefill(
                 "{prefix}.state_handle.state_kinds must be a non-empty array"
             ));
         }
-        let valid_state_kinds = [
-            "attention_kv",
-            "deltanet_recurrent",
-            "mamba_ssm",
-            "mamba_conv",
-            "architecture_specific",
-        ];
         let mut parsed_state_kinds = Vec::with_capacity(state_kinds.len());
         for kind in state_kinds.iter() {
             let kind = kind
                 .as_str()
                 .ok_or_else(|| format!("{prefix}.state_handle.state_kinds must be strings"))?;
-            if !valid_state_kinds.contains(&kind) {
+            if SequenceStatePageKind::from_generate_state_kind(kind).is_none() {
                 return Err(format!(
                     "{prefix}.state_handle.state_kinds contains unsupported kind {kind}"
                 ));
@@ -1441,7 +1434,10 @@ pub fn qwen35_decode_batch_scheduler_metadata(
     Qwen35DecodeBatchSchedulerMetadata {
         selected_backend: backend.as_str(),
         batch_size,
-        compatible_state_kinds: vec!["attention_kv", "deltanet_recurrent"],
+        compatible_state_kinds: vec![
+            SequenceStatePageKind::Kv.as_str(),
+            SequenceStatePageKind::DeltaNet.as_str(),
+        ],
         cached_prefix_tokens,
         fallback_reason,
     }
@@ -1798,6 +1794,27 @@ mod tests {
                 .prefix_len,
             3
         );
+    }
+
+    #[test]
+    fn generate_batch_prefill_rejects_backend_private_state_kind() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "prefill-1",
+            "batch_id": "batch-1",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "suffix_tokens": [4, 5],
+                "state_handle": {
+                    "state_kinds": ["backend_private"],
+                    "logical_position": 0
+                }
+            }]
+        });
+
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("state_handle.state_kinds contains unsupported kind backend_private"));
     }
 
     #[test]

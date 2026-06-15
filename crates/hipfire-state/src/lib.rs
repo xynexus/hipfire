@@ -276,6 +276,15 @@ impl SequenceStatePageKind {
             _ => None,
         }
     }
+
+    pub fn from_generate_state_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "attention_kv" => Some(Self::Kv),
+            "deltanet_recurrent" => Some(Self::DeltaNet),
+            "mamba_ssm" | "mamba_conv" | "architecture_specific" => Some(Self::BackendPrivate),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1197,6 +1206,34 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("unsupported kind bogus"));
+    }
+
+    #[test]
+    fn generate_state_kind_parser_preserves_generate_wire_surface() {
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("attention_kv"),
+            Some(SequenceStatePageKind::Kv)
+        );
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("deltanet_recurrent"),
+            Some(SequenceStatePageKind::DeltaNet)
+        );
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("mamba_ssm"),
+            Some(SequenceStatePageKind::BackendPrivate)
+        );
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("mamba_conv"),
+            Some(SequenceStatePageKind::BackendPrivate)
+        );
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("architecture_specific"),
+            Some(SequenceStatePageKind::BackendPrivate)
+        );
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("backend_private"),
+            None
+        );
     }
 
     #[test]
