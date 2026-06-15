@@ -52,7 +52,7 @@ Current model boundary status:
 - `hipfire-model` owns model-source opening policy for HFQ files and safetensors directories while runtime supplies the concrete loader constructors.
 - `hipfire-model` owns common model-load request/parameter and loaded-response contracts used by daemon protocol clients and future direct library adapters.
 - `hipfire-model` owns common model-load parameter construction from config values, including `auto` mode elision, explicit `dflash_mode=off`, and empty sidecar filtering, now consumed by both Rust server and CLI run load paths.
-- `hipfire-model` owns eval model-manifest row construction for local-file/tag identity, file/tag hashes, HFQ metadata hashes, architecture IDs, embedded quantization hashes, and model-specific hash/HFQ metadata compatibility helpers consumed by evidence/runtime paths. Its public hash helpers are compatibility re-exports from `hipfire-hash`.
+- `hipfire-model` owns eval model-manifest row construction for local-file/tag identity, file/tag hashes, HFQ metadata hashes, architecture IDs, embedded quantization hashes, and model-specific hash/HFQ metadata compatibility helpers consumed by evidence/runtime paths. It consumes `hipfire-hash` directly instead of re-exporting generic hash helpers.
 - `hipfire-model` owns OpenAI-compatible `/v1/models` list response rendering consumed by the Rust server.
 - Runtime and arch callers now consume `hipfire-model` model-source contracts directly; `hipfire-runtime::model_source` remains only the concrete HFQ/safetensors opener adapter until those loaders move.
 
@@ -67,7 +67,7 @@ Current scheduler boundary status:
 - Bun scheduler code remains the live batching control plane until Rust server request paths consume the shared scheduler queue/session contracts.
 
 Current generate boundary status:
-- `hipfire-generate` owns typed generation sampling policy, text/VL generation request structs, generation event structs, generate-batch prefill/decode envelopes, semantic boundary checkpoint and prefill checkpoint hook contracts, prepared prefill/result and fused dense batch contract types, decode step result contracts, batch/preflight JSON validation, `prefix_hash_preflight_done` response rendering, Qwen3.5 `generate_batch_prefill_session_done`/`generate_batch_prefill_done` response rendering, Qwen3.5 `generate_batch_decode_step_done` response rendering, Qwen3.5 prefix-hash compute/JSON helpers over the state-owned hash shape, Qwen3.5 prefill/decode backend plan and selector policy, fused prefill preflight helpers, prefill scratch batch sizing policy, and scheduler metadata helpers.
+- `hipfire-generate` owns typed generation sampling policy, text/VL generation request structs, generation event structs, generate-batch prefill/decode envelopes, semantic boundary checkpoint and prefill checkpoint hook contracts, prepared prefill/result and fused dense batch contract types, decode step result contracts, batch/preflight JSON validation, `prefix_hash_preflight_done` response rendering, Qwen3.5 `generate_batch_prefill_session_done`/`generate_batch_prefill_done` response rendering, Qwen3.5 `generate_batch_decode_step_done` response rendering, Qwen3.5 prefix-hash compute/JSON helpers over the state-owned hash shape without re-exporting that state contract, Qwen3.5 prefill/decode backend plan and selector policy, fused prefill preflight helpers, prefill scratch batch sizing policy, and scheduler metadata helpers.
 - `hipfire-generate` owns OpenAI chat-message to structured text-generate request construction, including the last-user `prompt` compatibility fallback and full `messages` forwarding.
 - `hipfire-generate` owns OpenAI chat completion and streaming chunk JSON response rendering consumed by the Rust server.
 - `hipfire-generate` owns prompt-only structured text-generate request construction, generation sampling default/override merging, and worker/tools/system request decoration consumed by Rust server and CLI daemon adapters.
@@ -79,7 +79,7 @@ Current generate boundary status:
 
 Current CPU/backend boundary status:
 - `hipfire-cpu` owns deterministic BF16 CPU oracle helpers, dense FFN/projection module contracts, generic `ModuleInvocation`/`ModuleOutput` vocabulary, the shared `BackendSelection` contract, backend selection evidence structs, and JSON rendering for module outputs.
-- `hipfire-arch-qwen35::ffn_bf16` remains the compatibility facade for Qwen3.5 mode/env parsing and re-exports the shared CPU oracle contracts.
+- `hipfire-arch-qwen35::ffn_bf16` owns Qwen3.5 mode/env parsing and exposes shared CPU/NPU oracle and artifact contracts only within the arch crate instead of re-exporting backend helper APIs publicly.
 
 Current ROCm/backend boundary status:
 - `hipfire-rocm` owns ROCm device identity, backend-path classification, dense FFN/projection module execution evidence, and JSON rendering for ROCm module outputs.

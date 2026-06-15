@@ -6,7 +6,8 @@
 
 use std::sync::OnceLock;
 
-pub use hipfire_cpu::{
+#[allow(unused_imports)]
+pub(crate) use hipfire_cpu::{
     attention_wo_module_id, attention_wo_residual_contract_from_shape,
     attention_wo_residual_invocation_from_shape, bf16_bits_to_f32, decode_w_down_shadow,
     dense_ffn_backend_decision, dense_ffn_module_evidence, dense_ffn_module_evidence_json,
@@ -20,7 +21,7 @@ pub use hipfire_cpu::{
     ProjectionModuleInvocation, ProjectionModuleOutput, ProjectionStateContract,
     ProjectionTensorContract,
 };
-pub use hipfire_npu::Xdna1ModuleArtifacts;
+pub(crate) use hipfire_npu::Xdna1ModuleArtifacts;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfnBf16Mode {

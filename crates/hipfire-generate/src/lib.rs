@@ -8,7 +8,7 @@ use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id, ARCH_ID_QWEN
 use hipfire_prompt::{
     openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
 };
-pub use hipfire_state::SequenceStatePrefixHash as GenerateBatchPrefillPrefixHash;
+use hipfire_state::SequenceStatePrefixHash;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -300,10 +300,10 @@ pub struct GenerateBatchPrefillStateHandle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_state_handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix_hash: Option<GenerateBatchPrefillPrefixHash>,
+    pub prefix_hash: Option<SequenceStatePrefixHash>,
 }
 
-pub fn generate_prefix_hash_json(hash: &GenerateBatchPrefillPrefixHash) -> serde_json::Value {
+pub fn generate_prefix_hash_json(hash: &SequenceStatePrefixHash) -> serde_json::Value {
     serde_json::json!({
         "algorithm": hash.algorithm,
         "value": hash.value,
@@ -325,7 +325,7 @@ pub fn compute_qwen35_prefix_hash(
     assistant_prefix: &str,
     max_think_tokens: usize,
     tokens: &[u32],
-) -> GenerateBatchPrefillPrefixHash {
+) -> SequenceStatePrefixHash {
     let mut buf = Vec::with_capacity(128 + tokens.len() * 4);
     push_hash_field(
         &mut buf,
@@ -346,7 +346,7 @@ pub fn compute_qwen35_prefix_hash(
         buf.extend_from_slice(&token.to_le_bytes());
     }
     let value = twox_hash::XxHash3_128::oneshot(&buf);
-    GenerateBatchPrefillPrefixHash {
+    SequenceStatePrefixHash {
         algorithm: "xxh128".to_string(),
         value: format!("{value:032x}"),
         prefix_len: tokens.len(),
@@ -362,7 +362,7 @@ pub struct PrefixHashPreflightEnvelope {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PrefixHashPreflightCandidate {
-    pub hash: GenerateBatchPrefillPrefixHash,
+    pub hash: SequenceStatePrefixHash,
     pub boundary: String,
     pub boundary_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -401,7 +401,7 @@ pub struct Qwen35SemanticBoundaryCheckpoint {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_id: Option<String>,
     pub prefix_len: usize,
-    pub hash: GenerateBatchPrefillPrefixHash,
+    pub hash: SequenceStatePrefixHash,
     pub boundary: String,
     pub boundary_index: usize,
 }
@@ -422,7 +422,7 @@ pub struct Qwen35PrefillCheckpointHook<'a> {
     pub source_state_handle: &'a str,
     pub logical_position: usize,
     pub kind: Qwen35PrefillCheckpointKind<'a>,
-    pub prefix_hash: &'a GenerateBatchPrefillPrefixHash,
+    pub prefix_hash: &'a SequenceStatePrefixHash,
 }
 
 pub fn qwen35_checkpoint_session_id(
@@ -515,7 +515,7 @@ fn parse_u32_array(value: &serde_json::Value, field: &str) -> Result<Vec<u32>, S
 fn parse_prefix_hash(
     value: &serde_json::Value,
     field: &str,
-) -> Result<GenerateBatchPrefillPrefixHash, String> {
+) -> Result<SequenceStatePrefixHash, String> {
     let obj = value
         .as_object()
         .ok_or_else(|| format!("{field} must be an object"))?;
@@ -541,7 +541,7 @@ fn parse_prefix_hash(
         obj.get("prefix_len")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| format!("{field}.prefix_len must be an integer >= 0"))? as usize;
-    Ok(GenerateBatchPrefillPrefixHash {
+    Ok(SequenceStatePrefixHash {
         algorithm: algorithm.to_string(),
         value: hash_value.to_string(),
         prefix_len,
@@ -993,7 +993,7 @@ pub struct Qwen35PrefillSessionResult {
     pub prefill_tokens: usize,
     pub logical_position: usize,
     pub cached_prefix_tokens: usize,
-    pub prefix_hash: GenerateBatchPrefillPrefixHash,
+    pub prefix_hash: SequenceStatePrefixHash,
     pub debug_sample_token: Option<u32>,
     pub boundary_checkpoints: Vec<Qwen35SemanticBoundaryCheckpoint>,
 }
@@ -1909,7 +1909,7 @@ mod tests {
 
     #[test]
     fn prefix_hash_json_shape_is_stable() {
-        let hash = GenerateBatchPrefillPrefixHash {
+        let hash = SequenceStatePrefixHash {
             algorithm: "xxh128".to_string(),
             value: "0123456789abcdef0123456789abcdef".to_string(),
             prefix_len: 7,
@@ -1928,7 +1928,7 @@ mod tests {
     fn prefix_hash_preflight_done_json_shape_is_stable() {
         let candidates = vec![
             PrefixHashPreflightCandidate {
-                hash: GenerateBatchPrefillPrefixHash {
+                hash: SequenceStatePrefixHash {
                     algorithm: "xxh128".to_string(),
                     value: "11111111111111111111111111111111".to_string(),
                     prefix_len: 3,
@@ -1938,7 +1938,7 @@ mod tests {
                 checkpoint_id: None,
             },
             PrefixHashPreflightCandidate {
-                hash: GenerateBatchPrefillPrefixHash {
+                hash: SequenceStatePrefixHash {
                     algorithm: "xxh128".to_string(),
                     value: "22222222222222222222222222222222".to_string(),
                     prefix_len: 8,
@@ -1987,7 +1987,7 @@ mod tests {
         let checkpoint = Qwen35SemanticBoundaryCheckpoint {
             checkpoint_id: Some("qwen35-checkpoint:batch:req-1:7".to_string()),
             prefix_len: 7,
-            hash: GenerateBatchPrefillPrefixHash {
+            hash: SequenceStatePrefixHash {
                 algorithm: "xxh128".to_string(),
                 value: "0123456789abcdef0123456789abcdef".to_string(),
                 prefix_len: 7,
@@ -2019,7 +2019,7 @@ mod tests {
             session_count: 1,
             sessions: Vec::new(),
         };
-        let hash = GenerateBatchPrefillPrefixHash {
+        let hash = SequenceStatePrefixHash {
             algorithm: "xxh128".to_string(),
             value: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             prefix_len: 12,
@@ -2041,7 +2041,7 @@ mod tests {
             boundary_checkpoints: vec![Qwen35SemanticBoundaryCheckpoint {
                 checkpoint_id: Some("qwen35-checkpoint:batch-1:req-1:boundary:0:8".to_string()),
                 prefix_len: 8,
-                hash: GenerateBatchPrefillPrefixHash {
+                hash: SequenceStatePrefixHash {
                     algorithm: "xxh128".to_string(),
                     value: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
                     prefix_len: 8,
@@ -2147,7 +2147,7 @@ mod tests {
 
     #[test]
     fn qwen35_prefill_checkpoint_hook_preserves_handle_contract() {
-        let hash = GenerateBatchPrefillPrefixHash {
+        let hash = SequenceStatePrefixHash {
             algorithm: "xxh128".to_string(),
             value: "0123456789abcdef0123456789abcdef".to_string(),
             prefix_len: 12,
