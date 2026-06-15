@@ -65,6 +65,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Evidence model/tag hash and HFQ metadata compatibility helpers now delegate to `hipfire-model` instead of carrying duplicate model-specific parsing.
 - Eval deterministic mock scoring now consumes `hipfire-hash` directly, and `hipfire-evidence` no longer re-exports hash helpers or HFQ metadata.
 - Qwen3.5 BF16 FFN mode/env parsing now exposes `hipfire-cpu` and `hipfire-npu` helper contracts only within the arch crate instead of publicly re-exporting them through the arch module.
+- Qwen3.5 XDNA1 SwiGLU mode now uses `hipfire-npu` admission to select NPU vs GPU fallback and report missing-artifact fallback reasons.
 - Eval reference/slice/llama integrity verifiers now reuse `hipfire-evidence` ownership directly from runtime examples; the old `hipfire-runtime::eval_common` import path has been retired.
 - Eval and host-profile reporting now consume `hipfire-evidence` eval-status, host-profile, and sourced-field contracts directly instead of eval-harness-local JSON shapes or `hipfire-eval` re-exports.
 - Eval host-profile hardware-kind, bucket, bandwidth, and hash policy now reuse `hipfire-evidence` ownership instead of eval-harness-local helpers.
