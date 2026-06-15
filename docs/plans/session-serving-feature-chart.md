@@ -50,6 +50,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust scheduler now consumes model-worker identity helpers directly from `hipfire-model` instead of re-exporting them through scheduler.
 - Daemon and state runtime-worker views now consume model-worker runtime id construction and `worker_id` / `worker_key_id` alias parsing from `hipfire-model` instead of `hipfire-state`.
 - Generate batch validators now use `hipfire-model` worker/model identity requirement policy instead of local `worker_key_id` / `model` checks.
+- Daemon Qwen3.5 family, dense, and MoE runtime guards now use `hipfire-model` architecture classifiers instead of daemon-local arch-id predicates.
 - Rust scheduler policy parity tests now cover remaining Bun policy cases for realtime dispatch, legacy wait mapping, opportunistic pairing, spill gating, and clamped residency/spill limits.
 - Rust server `/health` now consumes scheduler-owned JSON builders for scheduler-derived prefill/decode/state-cache metadata while live Rust request handling remains daemon-serial.
 - Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering, currently reporting an empty adapter state until Rust owns resident workers.
