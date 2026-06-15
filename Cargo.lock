@@ -1035,6 +1035,7 @@ name = "hipfire-scheduler"
 version = "0.2.1"
 dependencies = [
  "hipfire-model",
+ "hipfire-state",
  "serde_json",
 ]
 
