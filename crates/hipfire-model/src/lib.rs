@@ -113,6 +113,18 @@ pub fn parse_model_worker_id(msg: &Value, default_worker_id: &str) -> ModelWorke
     ModelWorkerId { value }
 }
 
+pub fn has_worker_or_model_identity(msg: &Value) -> bool {
+    msg.get("worker_key_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || msg
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .is_some()
+}
+
 pub const ARCH_ID_LLAMA_MISTRAL: u32 = 0;
 pub const ARCH_ID_QWEN3_QWEN2_LEGACY: u32 = 1;
 pub const ARCH_ID_QWEN35_DENSE: u32 = 5;
@@ -1095,6 +1107,23 @@ mod tests {
             "__default__",
         );
         assert_eq!(empty.value, "__default__");
+    }
+
+    #[test]
+    fn worker_or_model_identity_requires_non_empty_worker_key_or_model() {
+        assert!(has_worker_or_model_identity(&json!({
+            "worker_key_id": "worker-a"
+        })));
+        assert!(has_worker_or_model_identity(&json!({
+            "model": "qwen3.5-9b-mq4"
+        })));
+        assert!(!has_worker_or_model_identity(&json!({
+            "worker_key_id": "",
+            "model": ""
+        })));
+        assert!(!has_worker_or_model_identity(&json!({
+            "worker_id": "legacy-worker"
+        })));
     }
 
     #[test]
