@@ -20,8 +20,11 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
-    directory_hash, file_hash, list_files, model_hash, read_hfq_metadata, stable_hash_bytes,
-    stable_hash_file_fallback, standard_evidence_paths_in_dir, STANDARD_EVIDENCE_ARTIFACT_SPECS,
+    directory_hash, evidence_artifact_index_entry_from_value_json,
+    evidence_artifact_index_entry_json, evidence_record_json, file_hash, list_files, model_hash,
+    read_hfq_metadata, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    standard_evidence_paths_in_dir, EvidenceArtifactIndexContext, EvidenceRecord, RunProvenance,
+    STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 use hipfire_model::{discover_dflash_draft_for_model, model_artifact_stem};
 
@@ -571,20 +574,6 @@ pub struct AdmissionArtifact {
     pub required_evidence: Vec<AdmissionEvidence>,
     pub observed_evidence: Vec<AdmissionEvidence>,
     pub findings: Vec<AdmissionFinding>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunProvenance {
-    pub runner: String,
-    pub runner_version: String,
-    pub hipfire_version: String,
-    pub git_commit: Option<String>,
-    pub git_branch: Option<String>,
-    pub git_describe: Option<String>,
-    pub git_dirty: Option<bool>,
-    pub binary_hash: Option<String>,
-    pub arch: Option<String>,
-    pub rocm: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3447,21 +3436,7 @@ fn artifact_index_entry(
     status: impl Into<String>,
     ctx: &EvalContext,
 ) -> Value {
-    json!({
-        "path": path.into(),
-        "status": status.into(),
-        "runner_version": env!("CARGO_PKG_VERSION"),
-        "hipfire_version": env!("CARGO_PKG_VERSION"),
-        "git_commit": ctx.commit_sha,
-        "git_branch": ctx.git_branch,
-        "git_describe": ctx.git_describe,
-        "git_dirty": ctx.git_dirty,
-        "binary_hash": ctx.binary_hash,
-        "arch": ctx.arch,
-        "rocm": ctx.rocm,
-        "host_profile_hash": ctx.host_profile.host_profile_hash,
-        "hardware_bucket": ctx.host_profile.hardware_bucket,
-    })
+    evidence_artifact_index_entry_json(path, status, &artifact_index_context(ctx))
 }
 
 fn artifact_index_entry_from_value(
@@ -3470,22 +3445,15 @@ fn artifact_index_entry_from_value(
     value: &Value,
     ctx: &EvalContext,
 ) -> Value {
-    let mut entry = artifact_index_entry(path, status, ctx);
-    if let Some(object) = entry.as_object_mut() {
-        if let Some(records) = value.get("records").and_then(Value::as_array) {
-            object.insert("row_count".to_string(), json!(records.len()));
-        }
-        if let Some(reason) = value.get("reason").cloned() {
-            object.insert("reason".to_string(), reason);
-        }
-        if let Some(metrics) = value.get("expected_metrics").cloned() {
-            object.insert("expected_metrics".to_string(), metrics);
-        }
-        if let Some(kind) = value.get("kind").cloned() {
-            object.insert("kind".to_string(), kind);
-        }
+    evidence_artifact_index_entry_from_value_json(path, status, value, &artifact_index_context(ctx))
+}
+
+fn artifact_index_context(ctx: &EvalContext) -> EvidenceArtifactIndexContext {
+    EvidenceArtifactIndexContext {
+        provenance: run_provenance(ctx),
+        host_profile_hash: ctx.host_profile.host_profile_hash.clone(),
+        hardware_bucket: ctx.host_profile.hardware_bucket.clone(),
     }
-    entry
 }
 
 fn run_provenance(ctx: &EvalContext) -> RunProvenance {
@@ -3504,7 +3472,7 @@ fn run_provenance(ctx: &EvalContext) -> RunProvenance {
 }
 
 fn run_provenance_value(ctx: &EvalContext) -> Value {
-    serde_json::to_value(run_provenance(ctx)).unwrap_or_else(|_| json!({}))
+    run_provenance_json(run_provenance(ctx))
 }
 
 fn run_metadata_artifact_value(config: &EvalConfig, ctx: &EvalContext) -> Value {
@@ -3866,29 +3834,29 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
                 "module_evidence" => module_evidence_metrics(row),
                 _ => row.metrics.clone(),
             };
-            json!({
-                "battery": row.battery.as_str(),
-                "suite": row.suite.map(|s| s.as_str()),
-                "case_id": row.case_id,
-                "dataset_item_id": row.dataset_item_id,
-                "dataset_source": row.dataset_source,
-                "dataset_repo_id": row.dataset_repo_id,
-                "dataset_revision": row.dataset_revision,
-                "dataset_digest": row.dataset_digest,
-                "dataset_license": row.dataset_license,
-                "dataset_cache_path": row.dataset_cache_path,
-                "model": row.model,
-                "model_hash": row.model_hash,
-                "draft": row.draft,
-                "draft_hash": row.draft_hash,
-                "baseline": row.baseline,
-                "baseline_hash": row.baseline_hash,
-                "reference": row.reference,
-                "reference_hash": row.reference_hash,
-                "prompt_hash": row.prompt_hash,
-                "prompt_path": row.prompt_path,
-                "metrics": metrics,
-                "elapsed_ms": row.elapsed_ms,
+            evidence_record_json(EvidenceRecord {
+                battery: row.battery.as_str().to_string(),
+                suite: row.suite.map(|s| s.as_str().to_string()),
+                case_id: row.case_id.clone(),
+                dataset_item_id: row.dataset_item_id.clone(),
+                dataset_source: row.dataset_source.clone(),
+                dataset_repo_id: row.dataset_repo_id.clone(),
+                dataset_revision: row.dataset_revision.clone(),
+                dataset_digest: row.dataset_digest.clone(),
+                dataset_license: row.dataset_license.clone(),
+                dataset_cache_path: row.dataset_cache_path.clone(),
+                model: row.model.clone(),
+                model_hash: row.model_hash.clone(),
+                draft: row.draft.clone(),
+                draft_hash: row.draft_hash.clone(),
+                baseline: row.baseline.clone(),
+                baseline_hash: row.baseline_hash.clone(),
+                reference: row.reference.clone(),
+                reference_hash: row.reference_hash.clone(),
+                prompt_hash: row.prompt_hash.clone(),
+                prompt_path: row.prompt_path.clone(),
+                metrics,
+                elapsed_ms: row.elapsed_ms,
             })
         })
         .collect()
