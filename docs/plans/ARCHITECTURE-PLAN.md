@@ -62,7 +62,7 @@ Current state boundary status:
 
 Current scheduler boundary status:
 - `hipfire-scheduler` owns Rust parity contracts for priority classes, prefill/decode scheduler policy, model-worker compatibility, request-session drafts, prefill queue selection, decode active-set batching, backpressure, opportunistic dispatch, deadline aging, and server health JSON contracts for scheduler-derived prefill/decode/state-cache metadata.
-- `hipfire-scheduler` re-exports model-owned worker-key identity helpers so existing scheduler callers keep stable paths while model placement identity ownership moves into `hipfire-model`.
+- `hipfire-scheduler` consumes model-owned worker-key identity helpers directly from `hipfire-model` without re-exporting them through scheduler.
 - Rust server `/health` consumes scheduler-owned health JSON builders while live Rust request queuing remains daemon-serial.
 - Bun scheduler code remains the live batching control plane until Rust server request paths consume the shared scheduler queue/session contracts.
 
