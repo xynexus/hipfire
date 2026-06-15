@@ -64,6 +64,12 @@ pub struct HfqMetadata {
     pub metadata_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum HfqTokenizerMetadata {
+    HfJson(String),
+    GgufMeta(Value),
+}
+
 /// Stable identity for routing requests to a compatible loaded model worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelWorkerKey {
@@ -302,6 +308,34 @@ pub fn tokenizer_signature(
     mix(&eos_id.to_le_bytes());
     mix(&eot_id.unwrap_or(u32::MAX).to_le_bytes());
     h
+}
+
+/// Extract the tokenizer payload embedded in HFQ metadata.
+///
+/// Safetensors-origin HFQ files store a HuggingFace `tokenizer.json` blob in
+/// `tokenizer`; GGUF-origin HFQ files preserve the original GGUF tokenizer
+/// metadata under `gguf_meta`. Runtime still owns the actual encoder, but the
+/// model crate owns this artifact metadata selection policy.
+pub fn hfq_tokenizer_metadata(
+    metadata_json: &str,
+) -> Result<Option<HfqTokenizerMetadata>, serde_json::Error> {
+    let meta: Value = serde_json::from_str(metadata_json)?;
+    if let Some(tok_str) = meta.get("tokenizer").and_then(Value::as_str) {
+        return Ok(Some(HfqTokenizerMetadata::HfJson(tok_str.to_string())));
+    }
+    if let Some(gguf_meta) = meta.get("gguf_meta") {
+        return Ok(Some(HfqTokenizerMetadata::GgufMeta(gguf_meta.clone())));
+    }
+    Ok(None)
+}
+
+/// Extract the upstream HuggingFace Jinja chat template from HFQ metadata.
+pub fn hfq_chat_template(metadata_json: &str) -> Option<String> {
+    let meta: Value = serde_json::from_str(metadata_json).ok()?;
+    meta.get("tokenizer_config")?
+        .get("chat_template")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 /// Normalize a user-facing model tag into the fuzzy filename search stem.
@@ -975,6 +1009,58 @@ mod tests {
             tokenizer_signature(&vocab, &specials, 0, 1, None),
             tokenizer_signature(&vocab, &reversed_specials, 0, 1, None)
         );
+    }
+
+    #[test]
+    fn hfq_tokenizer_metadata_prefers_hf_tokenizer_json() {
+        let metadata = json!({
+            "tokenizer": "{\"model\":{\"vocab\":{},\"merges\":[]}}",
+            "gguf_meta": {
+                "tokenizer.ggml.tokens": ["<s>", "</s>"]
+            }
+        });
+
+        let extracted = hfq_tokenizer_metadata(&metadata.to_string()).unwrap();
+        assert_eq!(
+            extracted,
+            Some(HfqTokenizerMetadata::HfJson(
+                "{\"model\":{\"vocab\":{},\"merges\":[]}}".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn hfq_tokenizer_metadata_falls_back_to_gguf_metadata() {
+        let gguf_meta = json!({
+            "tokenizer.ggml.tokens": ["<s>", "</s>"],
+            "tokenizer.ggml.model": "llama"
+        });
+        let metadata = json!({ "gguf_meta": gguf_meta.clone() });
+
+        let extracted = hfq_tokenizer_metadata(&metadata.to_string()).unwrap();
+        assert_eq!(extracted, Some(HfqTokenizerMetadata::GgufMeta(gguf_meta)));
+    }
+
+    #[test]
+    fn hfq_tokenizer_metadata_reports_missing_payload() {
+        let metadata = json!({ "architecture": "qwen3" });
+
+        assert_eq!(hfq_tokenizer_metadata(&metadata.to_string()).unwrap(), None);
+    }
+
+    #[test]
+    fn hfq_chat_template_reads_tokenizer_config_template() {
+        let metadata = json!({
+            "tokenizer_config": {
+                "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}"
+            }
+        });
+
+        assert_eq!(
+            hfq_chat_template(&metadata.to_string()).as_deref(),
+            Some("{% for message in messages %}{{ message.content }}{% endfor %}")
+        );
+        assert_eq!(hfq_chat_template("{\"tokenizer_config\":{}}"), None);
     }
 
     #[test]
