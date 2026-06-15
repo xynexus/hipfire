@@ -8,7 +8,7 @@ use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};
 use hipfire_prompt::{
     openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
 };
-use hipfire_state::SequenceStatePrefixHash;
+use hipfire_state::{SequenceStatePageKind, SequenceStatePrefixHash};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -1441,7 +1441,10 @@ pub fn qwen35_decode_batch_scheduler_metadata(
     Qwen35DecodeBatchSchedulerMetadata {
         selected_backend: backend.as_str(),
         batch_size,
-        compatible_state_kinds: vec!["attention_kv", "deltanet_recurrent"],
+        compatible_state_kinds: vec![
+            SequenceStatePageKind::Kv.as_str(),
+            SequenceStatePageKind::DeltaNet.as_str(),
+        ],
         cached_prefix_tokens,
         fallback_reason,
     }
