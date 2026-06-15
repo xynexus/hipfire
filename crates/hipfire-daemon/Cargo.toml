@@ -25,7 +25,6 @@ hipfire-arch-minimax   = { path = "../hipfire-arch-minimax" }
 hipfire-arch-dots-ocr  = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-lfm2moe   = { path = "../hipfire-arch-lfm2moe", optional = true }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
-hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }

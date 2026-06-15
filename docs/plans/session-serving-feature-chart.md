@@ -20,6 +20,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server model loads now build typed daemon `LoadParams` from config, preserving explicit DFlash mode and configured TriAttention sidecars over the shared JSONL contract.
 - The daemon now opportunistically consumes shared typed generate and load request contracts while keeping raw JSON fallbacks for legacy and daemon-only fields.
 - Daemon generate request/token/done/error protocol types now reuse `hipfire-generate` contracts instead of duplicating generate structs in `hipfire-daemon-protocol`.
+- CLI, server, daemon, and daemon-adapter now consume generate/model request contracts directly from `hipfire-generate` and `hipfire-model`; `hipfire-daemon-protocol` no longer re-exports those contracts as compatibility aliases.
 - Rust server daemon request/response and process-client paths now consume `hipfire-daemon-protocol` and `hipfire-daemon-adapter` directly instead of server-local compatibility re-exports.
 - Rust server chat generate requests now reuse `hipfire-generate` OpenAI chat request construction instead of server-local prompt/message assembly.
 - Rust CLI run generate requests now reuse `hipfire-generate` OpenAI chat request construction instead of CLI-local ChatML rendering.
@@ -37,6 +38,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server `/v1/models` response rendering now reuses `hipfire-model` OpenAI-compatible list rendering instead of route-local JSON construction.
 - Eval DFlash draft auto-discovery now reuses `hipfire-model` sidecar discovery instead of eval-local candidate parsing.
 - Rust scheduler worker-key identity and compatibility helpers now reuse `hipfire-model` ownership instead of scheduler-local model identity code.
+- Rust scheduler now consumes model-worker identity helpers directly from `hipfire-model` instead of re-exporting them through scheduler.
 - Rust scheduler policy parity tests now cover remaining Bun policy cases for realtime dispatch, legacy wait mapping, opportunistic pairing, spill gating, and clamped residency/spill limits.
 - Rust server `/health` now consumes scheduler-owned JSON builders for scheduler-derived prefill/decode/state-cache metadata while live Rust request handling remains daemon-serial.
 - Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering, currently reporting an empty adapter state until Rust owns resident workers.
