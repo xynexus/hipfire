@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use hipfire_model::{parse_model_worker_id, ModelWorkerId};
+
 #[derive(Clone, Debug)]
 pub struct SessionStateReservation {
     pub worker_id: String,
@@ -21,35 +23,6 @@ pub struct SessionStateReservation {
 pub struct GenericSequenceStateArena {
     reservations: HashMap<String, SessionStateReservation>,
     next_generation: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelWorkerId {
-    pub value: String,
-}
-
-impl ModelWorkerId {
-    pub fn from_runtime_parts(arch_id: u32, pp: usize, kv_mode: Option<&str>) -> Self {
-        Self {
-            value: format!(
-                "worker:arch{}:pp{}:{}",
-                arch_id,
-                pp,
-                kv_mode.unwrap_or("unknown")
-            ),
-        }
-    }
-}
-
-pub fn parse_model_worker_id(msg: &serde_json::Value, default_worker_id: &str) -> ModelWorkerId {
-    let value = msg
-        .get("worker_id")
-        .or_else(|| msg.get("worker_key_id"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(default_worker_id)
-        .to_string();
-    ModelWorkerId { value }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1227,41 +1200,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_model_worker_id_preserves_daemon_alias_priority() {
-        let worker_id = parse_model_worker_id(
-            &serde_json::json!({
-                "worker_id": "worker-a",
-                "worker_key_id": "worker-b"
-            }),
-            "__default__",
-        );
-        assert_eq!(worker_id.value, "worker-a");
-
-        let worker_key_id = parse_model_worker_id(
-            &serde_json::json!({
-                "worker_key_id": "worker-b"
-            }),
-            "__default__",
-        );
-        assert_eq!(worker_key_id.value, "worker-b");
-    }
-
-    #[test]
-    fn parse_model_worker_id_falls_back_to_default_worker() {
-        let missing = parse_model_worker_id(&serde_json::json!({}), "__default__");
-        assert_eq!(missing.value, "__default__");
-
-        let empty = parse_model_worker_id(
-            &serde_json::json!({
-                "worker_id": "",
-                "worker_key_id": ""
-            }),
-            "__default__",
-        );
-        assert_eq!(empty.value, "__default__");
-    }
-
-    #[test]
     fn parse_reserve_session_state_request_preserves_daemon_defaults() {
         let request = parse_reserve_session_state_request(
             &serde_json::json!({
@@ -2014,15 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_id_and_arena_policy_follow_runtime_shape() {
-        assert_eq!(
-            ModelWorkerId::from_runtime_parts(6, 1, Some("q8")).value,
-            "worker:arch6:pp1:q8"
-        );
-        assert_eq!(
-            ModelWorkerId::from_runtime_parts(5, 2, None).value,
-            "worker:arch5:pp2:unknown"
-        );
+    fn arena_policy_follows_runtime_shape() {
         assert_eq!(
             SequenceStateArenaBackend::for_worker_parts(5, 1),
             SequenceStateArenaBackend::Qwen35Wrapped

@@ -84,6 +84,35 @@ pub struct ModelWorkerKey {
     pub feature_flags: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelWorkerId {
+    pub value: String,
+}
+
+impl ModelWorkerId {
+    pub fn from_runtime_parts(arch_id: u32, pp: usize, kv_mode: Option<&str>) -> Self {
+        Self {
+            value: format!(
+                "worker:arch{}:pp{}:{}",
+                arch_id,
+                pp,
+                kv_mode.unwrap_or("unknown")
+            ),
+        }
+    }
+}
+
+pub fn parse_model_worker_id(msg: &Value, default_worker_id: &str) -> ModelWorkerId {
+    let value = msg
+        .get("worker_id")
+        .or_else(|| msg.get("worker_key_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_worker_id)
+        .to_string();
+    ModelWorkerId { value }
+}
+
 pub const ARCH_ID_LLAMA_MISTRAL: u32 = 0;
 pub const ARCH_ID_QWEN3_QWEN2_LEGACY: u32 = 1;
 pub const ARCH_ID_QWEN35_DENSE: u32 = 5;
@@ -336,6 +365,16 @@ pub fn hfq_chat_template(metadata_json: &str) -> Option<String> {
         .get("chat_template")?
         .as_str()
         .map(ToString::to_string)
+}
+
+/// Read an optional HuggingFace `tokenizer.json` file from a model directory.
+///
+/// Safetensors directories carry tokenizer configuration as a sidecar file.
+/// Existing runtime behavior treats a missing or unreadable sidecar as absent
+/// and reserves hard errors for successfully-read but malformed tokenizer
+/// content.
+pub fn read_optional_tokenizer_json(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()
 }
 
 /// Normalize a user-facing model tag into the fuzzy filename search stem.
@@ -1012,6 +1051,53 @@ mod tests {
     }
 
     #[test]
+    fn model_worker_id_follows_runtime_shape() {
+        assert_eq!(
+            ModelWorkerId::from_runtime_parts(6, 1, Some("q8")).value,
+            "worker:arch6:pp1:q8"
+        );
+        assert_eq!(
+            ModelWorkerId::from_runtime_parts(5, 2, None).value,
+            "worker:arch5:pp2:unknown"
+        );
+    }
+
+    #[test]
+    fn parse_model_worker_id_preserves_daemon_alias_priority() {
+        let worker_id = parse_model_worker_id(
+            &json!({
+                "worker_id": "worker-a",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_id.value, "worker-a");
+
+        let worker_key_id = parse_model_worker_id(
+            &json!({
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_key_id.value, "worker-b");
+    }
+
+    #[test]
+    fn parse_model_worker_id_falls_back_to_default_worker() {
+        let missing = parse_model_worker_id(&json!({}), "__default__");
+        assert_eq!(missing.value, "__default__");
+
+        let empty = parse_model_worker_id(
+            &json!({
+                "worker_id": "",
+                "worker_key_id": ""
+            }),
+            "__default__",
+        );
+        assert_eq!(empty.value, "__default__");
+    }
+
+    #[test]
     fn hfq_tokenizer_metadata_prefers_hf_tokenizer_json() {
         let metadata = json!({
             "tokenizer": "{\"model\":{\"vocab\":{},\"merges\":[]}}",
@@ -1061,6 +1147,32 @@ mod tests {
             Some("{% for message in messages %}{{ message.content }}{% endfor %}")
         );
         assert_eq!(hfq_chat_template("{\"tokenizer_config\":{}}"), None);
+    }
+
+    #[test]
+    fn read_optional_tokenizer_json_treats_missing_sidecar_as_absent() {
+        let root = temp_dir("hipfire-model-tokenizer-json-missing");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("tokenizer.json");
+
+        assert_eq!(read_optional_tokenizer_json(&path), None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_optional_tokenizer_json_returns_existing_sidecar_content() {
+        let root = temp_dir("hipfire-model-tokenizer-json-existing");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("tokenizer.json");
+        fs::write(&path, "{\"model\":{\"vocab\":{}}}").unwrap();
+
+        assert_eq!(
+            read_optional_tokenizer_json(&path).as_deref(),
+            Some("{\"model\":{\"vocab\":{}}}")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
