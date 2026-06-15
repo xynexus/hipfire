@@ -47,6 +47,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Runtime tokenizer compatibility signatures now reuse `hipfire-model` fingerprint policy while tokenizer parsing and encode/decode stay in `hipfire-runtime`.
 - Eval output and runtime-evidence model stems now reuse `hipfire-model` artifact identity helpers instead of eval-local stem sanitization.
 - Eval model manifests now reuse `hipfire-model` row construction for file/tag identity, HFQ metadata hashes, architecture IDs, and embedded quantization hashes.
+- `hipfire-model` now consumes `hipfire-hash` directly for file/tag hashes and no longer re-exports generic hash helpers.
 - Runtime model-source opening now reuses `hipfire-model` HFQ/safetensors path policy while keeping concrete loader constructors in `hipfire-runtime`.
 - Runtime and arch callers now consume `hipfire-model` model-source contracts directly; `hipfire-runtime::model_source` remains only the concrete HFQ/safetensors opener adapter.
 - Evidence model/tag hash and HFQ metadata compatibility helpers now delegate to `hipfire-model` instead of carrying duplicate model-specific parsing.
