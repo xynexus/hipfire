@@ -8,7 +8,9 @@ use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};
 use hipfire_prompt::{
     openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
 };
-use hipfire_state::{SequenceStatePageKind, SequenceStatePrefixHash};
+use hipfire_state::{
+    canonical_generate_state_kind_hash_label, SequenceStatePageKind, SequenceStatePrefixHash,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -337,10 +339,11 @@ pub fn compute_qwen35_prefix_hash(
     push_hash_field(&mut buf, "kv_mode", kv_mode.unwrap_or("unknown"));
     push_hash_field(&mut buf, "assistant_prefix", assistant_prefix);
     push_hash_field(&mut buf, "max_think_tokens", &max_think_tokens.to_string());
-    let mut normalized_kinds = state_kinds.to_vec();
-    normalized_kinds.sort();
-    normalized_kinds.dedup();
-    push_hash_field(&mut buf, "state_kinds", &normalized_kinds.join("+"));
+    push_hash_field(
+        &mut buf,
+        "state_kinds",
+        &canonical_generate_state_kind_hash_label(state_kinds),
+    );
     push_hash_field(&mut buf, "token_encoding", "u32le");
     for token in tokens {
         buf.extend_from_slice(&token.to_le_bytes());
