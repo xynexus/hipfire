@@ -4,7 +4,7 @@
 
 //! Typed generation request, event, and batch-plan contracts.
 
-use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};
+use hipfire_model::{has_worker_or_model_identity, is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};
 use hipfire_prompt::{
     openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
 };
@@ -567,17 +567,7 @@ pub fn validate_generate_batch_prefill(
         .ok_or_else(|| "generate_batch_prefill.batch_id must be a non-empty string".to_string())?
         .to_string();
 
-    let has_worker = msg
-        .get("worker_key_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .is_some()
-        || msg
-            .get("model")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .is_some();
-    if !has_worker {
+    if !has_worker_or_model_identity(msg) {
         return Err("generate_batch_prefill requires worker_key_id or model identity".to_string());
     }
 
@@ -848,17 +838,7 @@ pub fn validate_generate_batch_decode(
             "generate_batch_decode_step.batch_id must be a non-empty string".to_string()
         })?
         .to_string();
-    let has_worker = msg
-        .get("worker_key_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .is_some()
-        || msg
-            .get("model")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .is_some();
-    if !has_worker {
+    if !has_worker_or_model_identity(msg) {
         return Err(
             "generate_batch_decode_step requires worker_key_id or model identity".to_string(),
         );
