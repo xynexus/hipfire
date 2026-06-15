@@ -24,3 +24,5 @@ hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
+hipfire-scheduler = { path = "../hipfire-scheduler" }
+hipfire-state = { path = "../hipfire-state" }

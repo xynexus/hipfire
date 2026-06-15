@@ -1031,6 +1031,7 @@ name = "hipfire-scheduler"
 version = "0.2.0"
 dependencies = [
  "hipfire-model",
+ "serde_json",
 ]
 
 [[package]]
@@ -1046,6 +1047,8 @@ dependencies = [
  "hipfire-daemon-protocol",
  "hipfire-model",
  "hipfire-prompt",
+ "hipfire-scheduler",
+ "hipfire-state",
  "reqwest",
  "serde",
  "serde_json",
