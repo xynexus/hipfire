@@ -53,12 +53,12 @@ use hipfire_generate::{
     validate_generate_batch_decode, validate_generate_batch_prefill,
     validate_prefix_hash_preflight, validate_qwen35_fused_grouped_moe_prefill_batch_preflight,
     GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope,
-    GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession,
-    GenerateVLParams, ImageSource, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
-    Qwen35DecodeBatchBackend, Qwen35DecodeBatchStepResult, Qwen35DecodeTokenOutcome,
-    Qwen35FusedDensePrefillInputKind, Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult,
-    Qwen35PrefillCheckpointHook, Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult,
-    Qwen35PreparedPrefillSession, Qwen35SemanticBoundaryCheckpoint,
+    GenerateBatchPrefillPlan, GenerateBatchPrefillSession, GenerateVLParams, ImageSource,
+    PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend,
+    Qwen35DecodeBatchStepResult, Qwen35DecodeTokenOutcome, Qwen35FusedDensePrefillInputKind,
+    Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult, Qwen35PrefillCheckpointHook,
+    Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult, Qwen35PreparedPrefillSession,
+    Qwen35SemanticBoundaryCheckpoint,
 };
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
@@ -83,6 +83,7 @@ use hipfire_state::{
     ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
     ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
     SequenceStateForkRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
+    SequenceStatePrefixHash,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -1326,7 +1327,7 @@ mod generate_batch_prefill_tests {
                     |(boundary_index, &prefix_len)| Qwen35SemanticBoundaryCheckpoint {
                         checkpoint_id: None,
                         prefix_len,
-                        hash: GenerateBatchPrefillPrefixHash {
+                        hash: SequenceStatePrefixHash {
                             algorithm: "xxh128".to_string(),
                             value: format!("{prefix_len:032x}"),
                             prefix_len,
@@ -3110,7 +3111,7 @@ fn next_qwen35_state_allocation_epoch() -> u64 {
 struct Qwen35RequestSessionState {
     seq_pos: usize,
     conversation_tokens: Vec<u32>,
-    prefix_hash: Option<GenerateBatchPrefillPrefixHash>,
+    prefix_hash: Option<SequenceStatePrefixHash>,
     kv_cache: llama::KvCache,
     dn_state: DeltaNetState,
     logits: rdna_compute::GpuTensor,
@@ -4292,7 +4293,7 @@ fn qwen35_checkpoint_session_state(
 fn qwen35_validate_prefix_hash(
     m: &LoadedModel,
     source_session_id: &str,
-    requested: Option<&GenerateBatchPrefillPrefixHash>,
+    requested: Option<&SequenceStatePrefixHash>,
 ) -> Result<(), String> {
     validate_checkpoint_source_resident(
         source_session_id,

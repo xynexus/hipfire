@@ -69,6 +69,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon Qwen3.5 checkpoint logical-position validation now reuses `hipfire-state` policy instead of daemon-local mismatch handling.
 - Daemon `reserve_session_state` success/rejection response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
 - Daemon `describe_state` response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
+- Generate/daemon prefix-hash contracts now consume `hipfire-state`'s `SequenceStatePrefixHash` directly instead of a `hipfire-generate` compatibility alias.
 - Daemon release-state response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
 - Daemon `release_sessions` response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
 - Daemon `unload_worker` response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
