@@ -71,9 +71,9 @@ Current generate boundary status:
 - `hipfire-generate` owns OpenAI chat-message to structured text-generate request construction, including the last-user `prompt` compatibility fallback and full `messages` forwarding.
 - `hipfire-generate` owns OpenAI chat completion and streaming chunk JSON response rendering consumed by the Rust server.
 - `hipfire-generate` owns prompt-only structured text-generate request construction, generation sampling default/override merging, and worker/tools/system request decoration consumed by Rust server and CLI daemon adapters.
-- `hipfire-cli run` consumes `hipfire-generate` structured text-generate request construction through the daemon protocol re-export instead of pre-rendering ChatML locally.
+- `hipfire-cli run` consumes `hipfire-generate` structured text-generate request construction directly instead of pre-rendering ChatML locally.
 - `hipfire-generate` consumes model-owned architecture classification for Qwen3.5 dense/MoE batch backend decisions instead of owning local arch-id constants.
-- `hipfire-daemon-protocol` re-exports the generate-owned text request and token/done/error event structs for daemon JSONL generate traffic, so the protocol crate no longer owns duplicate generate contracts.
+- `hipfire-daemon-protocol` uses generate-owned text request and token/done/error event structs for daemon JSONL generate traffic without re-exporting them as compatibility aliases.
 - `hipfire-daemon` consumes the shared text/VL generation request contracts, generate-batch prefill, prefix-hash preflight, decode envelope/result, semantic boundary checkpoint, prefill checkpoint hook, prepared prefill/result, and fused dense batch contracts, state-owned prefix-hash/checkpoint metadata, prefix-hash helpers, validation and prefill/preflight/decode-step response rendering, Qwen3.5 backend-plan/selector contracts, fused prefill preflight helpers, and prefill scratch sizing policy while preserving its existing execution paths.
 - `hipfire-daemon` still owns model-specific execution, Qwen3.5 runtime orchestration, and JSONL adapter dispatch until later migration slices consume more shared logic.
 
@@ -95,7 +95,7 @@ Current daemon protocol boundary status:
 - `hipfire-daemon` consumes the shared generate request contract opportunistically for common generate fields while preserving raw-JSON fallbacks for legacy/daemon-only fields.
 - `hipfire-daemon` also consumes generate-owned batch prefill/preflight/decode contracts, validators, prefix-hash helpers, selector policy, scratch sizing policy, scheduler metadata, and state-owned prefix-hash/checkpoint metadata so daemon-local duplicate batch structs, hash helpers, validation helpers, checkpoint request structs, and Qwen3.5 batch policy helpers are retired.
 - `hipfire-daemon` also consumes the shared load request contract for common load fields (`model`, `max_seq`, `physical_cap`, `dflash_mode`, `draft`, `kv_cache`, `cask_sidecar`) while preserving raw-JSON fallbacks for legacy/daemon-only load fields.
-- `hipfire-daemon-protocol` re-exports the model-owned load request/params and loaded response so protocol callers keep stable paths while load contract ownership moves into `hipfire-model`.
+- `hipfire-daemon-protocol` uses model-owned load request/params and loaded response structs for daemon JSONL traffic without re-exporting them as compatibility aliases.
 
 Current daemon adapter boundary status:
 - `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery and missing-binary diagnostics, load/ping/unload/generate response loops, stale-response filtering, and daemon startup resource lease policy/helpers.
