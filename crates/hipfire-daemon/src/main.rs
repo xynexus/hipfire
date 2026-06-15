@@ -7274,7 +7274,7 @@ fn main() {
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let protocol_load = if msg_type == "load" {
-            serde_json::from_value::<hipfire_daemon_protocol::LoadRequest>(msg.clone()).ok()
+            serde_json::from_value::<hipfire_model::ModelLoadRequest>(msg.clone()).ok()
         } else {
             None
         };
@@ -7919,7 +7919,7 @@ fn main() {
 
             "generate" => {
                 let protocol_generate =
-                    serde_json::from_value::<hipfire_daemon_protocol::GenerateRequest>(msg.clone())
+                    serde_json::from_value::<hipfire_generate::GenerateTextRequest>(msg.clone())
                         .ok();
                 let id = protocol_generate
                     .as_ref()
