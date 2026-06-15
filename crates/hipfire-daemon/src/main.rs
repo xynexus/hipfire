@@ -69,20 +69,23 @@ use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
-    model_worker_runtime_view_json, parse_reserve_session_state_kinds, parse_sequence_state_handle,
-    parse_sequence_state_handle_list, parsed_handle_may_target_generic,
-    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
-    release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
-    reserve_session_state_rejected_json, session_state_reservation_describe_json,
-    unload_worker_done_json, validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
+    model_worker_runtime_view_json, parse_describe_sequence_state_request,
+    parse_reserve_session_state_request, parse_sequence_state_handle_list,
+    parsed_handle_may_target_generic, parsed_handle_may_target_loaded_state,
+    qwen35_sequence_state_handle, release_sessions_done_json, release_state_done_json,
+    reserve_session_state_done_json, reserve_session_state_rejected_json,
+    session_state_reservation_describe_json, unload_worker_done_json,
+    validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
     ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
     ParsedSequenceStateHandle, ReleaseStateResponseKind, SequenceStateArenaBackend,
-    SequenceStateCheckpointRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
+    SequenceStateCheckpointRequest, SequenceStateForkRequest, SequenceStatePageDescriptor,
+    SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
-    generic_state_reservation_descriptors, sequence_state_handle_id, sequence_state_handle_parts,
+    generic_state_reservation_descriptors, parse_reserve_session_state_kinds,
+    parse_sequence_state_handle, sequence_state_handle_id, sequence_state_handle_parts,
     sequence_state_page_descriptor_json, SequenceStateHandle,
 };
 use std::collections::{HashMap, HashSet};
@@ -4323,34 +4326,35 @@ fn qwen35_activate_session(
 fn qwen35_fork_session_state(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    source_session_id: &str,
-    dest_session_id: &str,
-    requested_prefix_hash: Option<&GenerateBatchPrefillPrefixHash>,
+    request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
-    if source_session_id == dest_session_id {
+    if request.source_session_id == request.dest_session_id {
         return Ok(());
     }
-    let source_is_active = m.q35_active_session_id.as_deref() == Some(source_session_id);
+    let source_is_active = m.q35_active_session_id.as_deref() == Some(request.source_session_id);
     if !source_is_active {
-        qwen35_validate_prefix_hash(m, source_session_id, requested_prefix_hash)?;
+        qwen35_validate_prefix_hash(m, request.source_session_id, request.requested_prefix_hash)?;
     }
     qwen35_save_active_session(m, gpu)?;
     if source_is_active {
-        if let Err(err) = qwen35_validate_prefix_hash(m, source_session_id, requested_prefix_hash) {
-            let _ = qwen35_activate_session(m, gpu, source_session_id);
+        if let Err(err) =
+            qwen35_validate_prefix_hash(m, request.source_session_id, request.requested_prefix_hash)
+        {
+            let _ = qwen35_activate_session(m, gpu, request.source_session_id);
             return Err(err);
         }
     }
     validate_checkpoint_source_resident(
-        source_session_id,
-        m.q35_sessions.contains_key(source_session_id),
+        request.source_session_id,
+        m.q35_sessions.contains_key(request.source_session_id),
     )?;
     let source = m
         .q35_sessions
-        .get(source_session_id)
+        .get(request.source_session_id)
         .expect("source residency was validated");
     let forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
-    m.q35_sessions.insert(dest_session_id.to_string(), forked);
+    m.q35_sessions
+        .insert(request.dest_session_id.to_string(), forked);
     Ok(())
 }
 
@@ -4387,9 +4391,11 @@ fn qwen35_checkpoint_session_state(
     qwen35_fork_session_state(
         m,
         gpu,
-        request.source_session_id,
-        request.dest_session_id,
-        request.requested_prefix_hash,
+        SequenceStateForkRequest {
+            source_session_id: request.source_session_id,
+            dest_session_id: request.dest_session_id,
+            requested_prefix_hash: request.requested_prefix_hash,
+        },
     )
 }
 
@@ -4512,19 +4518,11 @@ fn sequence_state_arena_fork_session_state(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    source_session_id: &str,
-    dest_session_id: &str,
-    requested_prefix_hash: Option<&GenerateBatchPrefillPrefixHash>,
+    request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "fork_session_state")?;
     match arena_backend {
-        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_fork_session_state(
-            m,
-            gpu,
-            source_session_id,
-            dest_session_id,
-            requested_prefix_hash,
-        ),
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_fork_session_state(m, gpu, request),
         SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
 }
@@ -6200,9 +6198,11 @@ fn run_generate_batch_prefill_serial_qwen35(
                 arena_backend,
                 m,
                 gpu,
-                runtime_state_handle,
-                &session.id,
-                session.state_handle.prefix_hash.as_ref(),
+                SequenceStateForkRequest {
+                    source_session_id: runtime_state_handle,
+                    dest_session_id: &session.id,
+                    requested_prefix_hash: session.state_handle.prefix_hash.as_ref(),
+                },
             )
             .map_err(|e| {
                 format!(
@@ -8946,60 +8946,37 @@ fn main() {
                         }
                     }
                 }
-                let physical_cap = msg
-                    .get("physical_cap")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(0);
-                if physical_cap == 0 {
-                    emit_error_with_id(
-                        &mut stdout,
-                        id,
-                        "reserve_session_state.physical_cap must be > 0",
-                    );
-                    continue;
-                }
-                let state_kinds = match parse_reserve_session_state_kinds(&msg) {
-                    Ok(kinds) => kinds,
+                let request = match parse_reserve_session_state_request(&msg, &target_worker_id) {
+                    Ok(request) => request,
                     Err(e) => {
                         emit_error_with_id(&mut stdout, id, e);
                         continue;
                     }
                 };
-                let ttl_ms = msg.get("ttl_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
-                let reservation_id = msg
-                    .get("reservation_id")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| {
-                        format!(
-                            "reserve:{}:{}",
-                            target_worker_id,
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos())
-                                .unwrap_or(0)
-                        )
-                    });
+                let reservation_id = request.reservation_id.clone().unwrap_or_else(|| {
+                    format!(
+                        "reserve:{}:{}",
+                        request.worker_id,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0)
+                    )
+                });
                 let (reserved_bytes, current_session_bytes, outstanding_bytes, budget_bytes) =
                     if let Some(m) = model.as_ref() {
-                        let budget = msg
-                            .get("budget_bytes")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize)
+                        let budget = request
+                            .budget_bytes
                             .unwrap_or_else(resident_state_reservation_budget_bytes);
                         (
-                            estimate_session_state_reservation_bytes(m, physical_cap),
+                            estimate_session_state_reservation_bytes(m, request.physical_cap),
                             current_worker_session_state_bytes(m),
-                            generic_state_arena.outstanding_bytes_for_worker(&target_worker_id),
+                            generic_state_arena.outstanding_bytes_for_worker(&request.worker_id),
                             budget,
                         )
                     } else if dummy_model.is_some() {
-                        let budget = msg
-                            .get("budget_bytes")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize)
+                        let budget = request
+                            .budget_bytes
                             .unwrap_or_else(resident_state_reservation_budget_bytes);
                         (1024usize, 0usize, 0usize, budget)
                     } else {
@@ -9012,7 +8989,7 @@ fn main() {
                 if budget_bytes > 0 && projected > budget_bytes {
                     let rejected = reserve_session_state_rejected_json(
                         id,
-                        &target_worker_id,
+                        &request.worker_id,
                         reserved_bytes,
                         current_session_bytes,
                         outstanding_bytes,
@@ -9024,12 +9001,12 @@ fn main() {
                     continue;
                 }
                 let reservation = generic_state_arena.reserve(
-                    &target_worker_id,
+                    &request.worker_id,
                     reservation_id.clone(),
-                    &state_kinds,
-                    physical_cap,
+                    &request.state_kinds,
+                    request.physical_cap,
                     reserved_bytes,
-                    ttl_ms,
+                    request.ttl_ms,
                 );
                 let done = reserve_session_state_done_json(
                     id,
@@ -9049,21 +9026,16 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .unwrap_or("describe-state");
                 generic_state_arena.purge_expired();
-                let handle_value = msg
-                    .get("runtime_state_handle")
-                    .or_else(|| msg.get("reservation_id"))
-                    .or_else(|| msg.get("handle"));
-                let Some(handle) = handle_value.and_then(parse_sequence_state_handle) else {
-                    emit_error_with_id(
-                        &mut stdout,
-                        id,
-                        "describe_state requires runtime_state_handle",
-                    );
-                    continue;
+                let request = match parse_describe_sequence_state_request(&msg) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, id, e);
+                        continue;
+                    }
                 };
-                if parsed_handle_may_target_generic(&handle) {
+                if parsed_handle_may_target_generic(&request.handle) {
                     if let Some(reservation) =
-                        generic_state_arena.describe(&handle.id, handle.generation)
+                        generic_state_arena.describe(&request.handle.id, request.handle.generation)
                     {
                         let done = session_state_reservation_describe_json(id, reservation);
                         let _ = writeln!(stdout, "{done}");
@@ -9075,12 +9047,15 @@ fn main() {
                     &active_worker_id,
                     model.as_ref(),
                     &resident_models,
-                    &handle,
+                    &request.handle,
                 ) else {
                     emit_error_with_id(
                         &mut stdout,
                         id,
-                        format!("describe_state unknown runtime_state_handle {}", handle.id),
+                        format!(
+                            "describe_state unknown runtime_state_handle {}",
+                            request.handle.id
+                        ),
                     );
                     continue;
                 };
