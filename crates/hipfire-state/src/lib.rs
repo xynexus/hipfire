@@ -176,6 +176,29 @@ pub struct SequenceStateCheckpointRequest<'a> {
     pub checkpoint_prefix_hash: Option<&'a SequenceStatePrefixHash>,
 }
 
+pub fn validate_checkpoint_prefix_hash(
+    source_session_id: &str,
+    stored: Option<&SequenceStatePrefixHash>,
+    requested: Option<&SequenceStatePrefixHash>,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let stored = stored.ok_or_else(|| {
+        format!("qwen35 checkpoint source session {source_session_id} has no prefix hash")
+    })?;
+    if stored != requested {
+        return Err(format!(
+            "prefix hash mismatch for checkpoint {source_session_id}: request={} len={} stored={} len={}",
+            requested.value,
+            requested.prefix_len,
+            stored.value,
+            stored.prefix_len
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SequenceStatePageKind {
     Kv,
@@ -494,6 +517,21 @@ pub fn release_sessions_done_json(
         done["model_worker"] = model_worker_runtime_view_json(worker);
     }
     done
+}
+
+pub fn unload_worker_done_json(
+    id: &str,
+    worker_id: &str,
+    unloaded: bool,
+    resident_workers: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "unload_worker_done",
+        "id": id,
+        "worker_key_id": worker_id,
+        "unloaded": unloaded,
+        "resident_workers": resident_workers,
+    })
 }
 
 impl GenericSequenceStateArena {
@@ -1094,6 +1132,16 @@ mod tests {
     }
 
     #[test]
+    fn unload_worker_done_json_preserves_daemon_wire_shape() {
+        let json = unload_worker_done_json("unload-1", "worker:arch6:pp1:q8", true, 2);
+        assert_eq!(json["type"], "unload_worker_done");
+        assert_eq!(json["id"], "unload-1");
+        assert_eq!(json["worker_key_id"], "worker:arch6:pp1:q8");
+        assert_eq!(json["unloaded"], true);
+        assert_eq!(json["resident_workers"], 2);
+    }
+
+    #[test]
     fn generic_reservation_arena_releases_by_generation() {
         let mut arena = GenericSequenceStateArena::new();
         let reservation = arena.reserve(
@@ -1209,5 +1257,52 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("attach_checkpoint requires a supported sequence-state arena"));
         assert!(err.contains("arch_id=7 pp=1"));
+    }
+
+    #[test]
+    fn checkpoint_prefix_hash_validation_accepts_matching_or_absent_request() {
+        let stored = SequenceStatePrefixHash {
+            algorithm: "xxh3_128".to_string(),
+            value: "abc".to_string(),
+            prefix_len: 12,
+        };
+        let requested = stored.clone();
+        validate_checkpoint_prefix_hash("checkpoint-a", Some(&stored), None).unwrap();
+        validate_checkpoint_prefix_hash("checkpoint-a", Some(&stored), Some(&requested)).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_prefix_hash_validation_reports_missing_stored_hash() {
+        let requested = SequenceStatePrefixHash {
+            algorithm: "xxh3_128".to_string(),
+            value: "abc".to_string(),
+            prefix_len: 12,
+        };
+        let err =
+            validate_checkpoint_prefix_hash("checkpoint-a", None, Some(&requested)).unwrap_err();
+        assert_eq!(
+            err,
+            "qwen35 checkpoint source session checkpoint-a has no prefix hash"
+        );
+    }
+
+    #[test]
+    fn checkpoint_prefix_hash_validation_reports_mismatch() {
+        let stored = SequenceStatePrefixHash {
+            algorithm: "xxh3_128".to_string(),
+            value: "stored".to_string(),
+            prefix_len: 10,
+        };
+        let requested = SequenceStatePrefixHash {
+            algorithm: "xxh3_128".to_string(),
+            value: "requested".to_string(),
+            prefix_len: 12,
+        };
+        let err = validate_checkpoint_prefix_hash("checkpoint-a", Some(&stored), Some(&requested))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "prefix hash mismatch for checkpoint checkpoint-a: request=requested len=12 stored=stored len=10"
+        );
     }
 }

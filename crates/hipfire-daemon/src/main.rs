@@ -74,10 +74,11 @@ use hipfire_state::{
     parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
     release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
     reserve_session_state_rejected_json, session_state_reservation_describe_json,
-    DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
-    ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
-    ReleaseStateResponseKind, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
-    SequenceStatePageDescriptor, SequenceStatePageKind,
+    unload_worker_done_json, validate_checkpoint_prefix_hash, DescribedSequenceState,
+    GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView,
+    ModelWorkerRuntimeView, ParsedSequenceStateHandle, ReleaseStateResponseKind,
+    SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStatePageDescriptor,
+    SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -4394,25 +4395,10 @@ fn qwen35_validate_prefix_hash(
     source_session_id: &str,
     requested: Option<&GenerateBatchPrefillPrefixHash>,
 ) -> Result<(), String> {
-    let Some(requested) = requested else {
-        return Ok(());
-    };
     let source = m.q35_sessions.get(source_session_id).ok_or_else(|| {
         format!("qwen35 checkpoint source session {source_session_id} is not resident")
     })?;
-    let stored = source.prefix_hash.as_ref().ok_or_else(|| {
-        format!("qwen35 checkpoint source session {source_session_id} has no prefix hash")
-    })?;
-    if stored != requested {
-        return Err(format!(
-            "prefix hash mismatch for checkpoint {source_session_id}: request={} len={} stored={} len={}",
-            requested.value,
-            requested.prefix_len,
-            stored.value,
-            stored.prefix_len
-        ));
-    }
-    Ok(())
+    validate_checkpoint_prefix_hash(source_session_id, source.prefix_hash.as_ref(), requested)
 }
 
 fn qwen35_reset_active_session(
@@ -9362,13 +9348,12 @@ fn main() {
                     unload_model(m, &mut gpu);
                     unloaded = true;
                 }
-                let done = serde_json::json!({
-                    "type": "unload_worker_done",
-                    "id": id,
-                    "worker_key_id": worker_id,
-                    "unloaded": unloaded,
-                    "resident_workers": resident_models.len() + usize::from(model.is_some()),
-                });
+                let done = unload_worker_done_json(
+                    id,
+                    &worker_id,
+                    unloaded,
+                    resident_models.len() + usize::from(model.is_some()),
+                );
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }
