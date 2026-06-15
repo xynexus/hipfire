@@ -45,11 +45,12 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval output and runtime-evidence model stems now reuse `hipfire-model` artifact identity helpers instead of eval-local stem sanitization.
 - Eval model manifests now reuse `hipfire-model` row construction for file/tag identity, HFQ metadata hashes, architecture IDs, and embedded quantization hashes.
 - Runtime model-source opening now reuses `hipfire-model` HFQ/safetensors path policy while keeping concrete loader constructors in `hipfire-runtime`.
+- Runtime and arch callers now consume `hipfire-model` model-source contracts directly; `hipfire-runtime::model_source` remains only the concrete HFQ/safetensors opener adapter.
 - Evidence model/tag hash and HFQ metadata compatibility helpers now delegate to `hipfire-model` instead of carrying duplicate model-specific parsing.
 - Eval reference/slice/llama integrity verifiers now reuse `hipfire-evidence` ownership directly from runtime examples; the old `hipfire-runtime::eval_common` import path has been retired.
 - Eval and host-profile reporting now reuse `hipfire-evidence` eval-status, host-profile, and sourced-field contracts instead of eval-harness-local JSON shapes.
 - Eval host-profile hardware-kind, bucket, bandwidth, and hash policy now reuse `hipfire-evidence` ownership instead of eval-harness-local helpers.
-- `hipfire-eval` now owns the `hipfire-eval` binary adapter and eval harness implementation while `hipfire-runtime::eval_harness` keeps the existing import path.
+- Runtime host-profile code now consumes `hipfire-eval` directly, and the old `hipfire-runtime::eval_harness` compatibility facade has been retired.
 - Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon model-worker request id alias parsing now reuses `hipfire-state` ownership instead of daemon-local `worker_id` / `worker_key_id` policy.
 - Daemon Qwen3.5 sequence-state session/checkpoint handle construction now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
