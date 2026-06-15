@@ -9,6 +9,7 @@ use crate::ffn_bf16::{self, Bf16DownShadow, FfnBf16Mode};
 use crate::speculative::HiddenStateRingBuffer;
 use crate::xdna1_ffi;
 use hip_bridge::{HipError, HipResult};
+use hipfire_model::ModelSource;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::hfq_modules::HfqModuleKind;
 use hipfire_runtime::llama::{
@@ -18,7 +19,6 @@ use hipfire_runtime::llama::{
     weight_gemv_prerotated, weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat,
     ParoRotation, WeightTensor,
 };
-use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::RefCell;
