@@ -912,6 +912,7 @@ dependencies = [
  "csv",
  "hipfire-coherence",
  "hipfire-evidence",
+ "hipfire-hash",
  "hipfire-model",
  "libc",
  "serde",
