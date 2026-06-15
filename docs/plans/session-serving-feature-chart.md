@@ -32,6 +32,8 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Generate batch-prefill session validation now uses `hipfire-state` generate-session state-kind parsing instead of a generate-local whitelist.
 - Daemon Qwen3.5 batch-prefill required state-kind checks now use `hipfire-state` required-kind policy instead of daemon-local string scans.
 - Rust scheduler prefill compatibility now uses `hipfire-state` state-kind set comparison instead of scheduler-local sorting.
+- Generate prefix-hash state-kind canonicalization now uses `hipfire-state` sorting/dedup policy instead of generate-local normalization.
+- Generate decode scheduler metadata now uses `hipfire-state` Qwen3.5 compatible-kind labels instead of generate-local vector construction.
 - Runtime prompt normalization now delegates the pure text transform to `hipfire-prompt` while preserving the existing env/config wrapper.
 - Eval evidence artifact kinds and expected-metric catalogs now reuse `hipfire-evidence` ownership instead of runtime-local lists.
 - Eval runtime-evidence directory ingestion now uses `hipfire-evidence` catalog-based artifact path discovery instead of runtime-local filename lists.
