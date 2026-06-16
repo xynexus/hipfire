@@ -64,7 +64,11 @@ struct TensorSpec {
 
 impl TensorSpec {
     fn new(name: impl Into<String>, shape: Vec<usize>, init: Init) -> Self {
-        Self { name: name.into(), shape, init }
+        Self {
+            name: name.into(),
+            shape,
+            init,
+        }
     }
 }
 
@@ -182,7 +186,10 @@ impl Qwen35Tiny {
             o.insert("num_experts".into(), self.experts.into());
             o.insert("num_experts_per_tok".into(), self.experts_per_tok.into());
             o.insert("moe_intermediate_size".into(), self.moe_inter.into());
-            o.insert("shared_expert_intermediate_size".into(), self.shared_inter.into());
+            o.insert(
+                "shared_expert_intermediate_size".into(),
+                self.shared_inter.into(),
+            );
             o.insert("norm_topk_prob".into(), true.into());
             o.insert("decoder_sparse_step".into(), 1.into());
             o.insert("mlp_only_layers".into(), serde_json::json!([]));
@@ -194,10 +201,19 @@ impl Qwen35Tiny {
         let h = self.hidden;
         let mut t = Vec::new();
         // Globals (tie_word_embeddings ⇒ no separate lm_head).
-        t.push(TensorSpec::new("model.embed_tokens.weight", vec![self.vocab, h], Init::Uniform(0.05)));
-        t.push(TensorSpec::new("model.norm.weight", vec![h], Init::NormOnes));
+        t.push(TensorSpec::new(
+            "model.embed_tokens.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::new(
+            "model.norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
 
-        let qkv = self.l_key_heads * self.l_key_head_dim * 2 + self.l_val_heads * self.l_val_head_dim;
+        let qkv =
+            self.l_key_heads * self.l_key_head_dim * 2 + self.l_val_heads * self.l_val_head_dim;
         let v_dim = self.l_val_heads * self.l_val_head_dim;
         let attn_q = self.n_heads * self.head_dim * 2; // attn_output_gate ⇒ 2× wide
         let kv_dim = self.n_kv_heads * self.head_dim;
@@ -205,45 +221,153 @@ impl Qwen35Tiny {
 
         for (i, kind) in self.layer_types().into_iter().enumerate() {
             let p = format!("model.layers.{i}");
-            t.push(TensorSpec::new(format!("{p}.input_layernorm.weight"), vec![h], Init::NormOnes));
-            t.push(TensorSpec::new(format!("{p}.post_attention_layernorm.weight"), vec![h], Init::NormOnes));
+            t.push(TensorSpec::new(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
             if self.is_moe() {
                 // MoE FFN: router + stacked-3D routed experts + always-on shared expert.
                 let mi = self.moe_inter;
                 let si = self.shared_inter;
-                t.push(TensorSpec::new(format!("{p}.mlp.gate.weight"), vec![self.experts, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{p}.mlp.experts.gate_up_proj"), vec![self.experts, 2 * mi, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{p}.mlp.experts.down_proj"), vec![self.experts, h, mi], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{p}.mlp.shared_expert.gate_proj.weight"), vec![si, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{p}.mlp.shared_expert.up_proj.weight"), vec![si, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{p}.mlp.shared_expert.down_proj.weight"), vec![h, si], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{p}.mlp.shared_expert_gate.weight"), vec![1, h], Init::Uniform(0.05)));
+                t.push(TensorSpec::new(
+                    format!("{p}.mlp.gate.weight"),
+                    vec![self.experts, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{p}.mlp.experts.gate_up_proj"),
+                    vec![self.experts, 2 * mi, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{p}.mlp.experts.down_proj"),
+                    vec![self.experts, h, mi],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{p}.mlp.shared_expert.gate_proj.weight"),
+                    vec![si, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{p}.mlp.shared_expert.up_proj.weight"),
+                    vec![si, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{p}.mlp.shared_expert.down_proj.weight"),
+                    vec![h, si],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{p}.mlp.shared_expert_gate.weight"),
+                    vec![1, h],
+                    Init::Uniform(0.05),
+                ));
             } else {
                 // Dense MLP (SwiGLU).
-                t.push(TensorSpec::new(format!("{p}.mlp.gate_proj.weight"), vec![self.inter, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{p}.mlp.up_proj.weight"), vec![self.inter, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{p}.mlp.down_proj.weight"), vec![h, self.inter], Init::Uniform(0.05)));
+                t.push(TensorSpec::new(
+                    format!("{p}.mlp.gate_proj.weight"),
+                    vec![self.inter, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{p}.mlp.up_proj.weight"),
+                    vec![self.inter, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{p}.mlp.down_proj.weight"),
+                    vec![h, self.inter],
+                    Init::Uniform(0.05),
+                ));
             }
 
             if kind == "linear_attention" {
                 let la = format!("{p}.linear_attn");
-                t.push(TensorSpec::new(format!("{la}.in_proj_qkv.weight"), vec![qkv, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{la}.in_proj_z.weight"), vec![v_dim, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{la}.in_proj_a.weight"), vec![self.l_val_heads, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{la}.in_proj_b.weight"), vec![self.l_val_heads, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{la}.A_log"), vec![self.l_val_heads], Init::ALog));
-                t.push(TensorSpec::new(format!("{la}.dt_bias"), vec![self.l_val_heads], Init::Zeros));
-                t.push(TensorSpec::new(format!("{la}.conv1d.weight"), vec![qkv, 1, self.conv_kernel], Init::Uniform(0.1)));
-                t.push(TensorSpec::new(format!("{la}.norm.weight"), vec![self.l_val_head_dim], Init::NormOnes));
-                t.push(TensorSpec::new(format!("{la}.out_proj.weight"), vec![h, v_dim], Init::Uniform(0.05)));
+                t.push(TensorSpec::new(
+                    format!("{la}.in_proj_qkv.weight"),
+                    vec![qkv, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{la}.in_proj_z.weight"),
+                    vec![v_dim, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{la}.in_proj_a.weight"),
+                    vec![self.l_val_heads, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{la}.in_proj_b.weight"),
+                    vec![self.l_val_heads, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{la}.A_log"),
+                    vec![self.l_val_heads],
+                    Init::ALog,
+                ));
+                t.push(TensorSpec::new(
+                    format!("{la}.dt_bias"),
+                    vec![self.l_val_heads],
+                    Init::Zeros,
+                ));
+                t.push(TensorSpec::new(
+                    format!("{la}.conv1d.weight"),
+                    vec![qkv, 1, self.conv_kernel],
+                    Init::Uniform(0.1),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{la}.norm.weight"),
+                    vec![self.l_val_head_dim],
+                    Init::NormOnes,
+                ));
+                t.push(TensorSpec::new(
+                    format!("{la}.out_proj.weight"),
+                    vec![h, v_dim],
+                    Init::Uniform(0.05),
+                ));
             } else {
                 let sa = format!("{p}.self_attn");
-                t.push(TensorSpec::new(format!("{sa}.q_proj.weight"), vec![attn_q, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{sa}.k_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{sa}.v_proj.weight"), vec![kv_dim, h], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{sa}.o_proj.weight"), vec![h, o_in], Init::Uniform(0.05)));
-                t.push(TensorSpec::new(format!("{sa}.q_norm.weight"), vec![self.head_dim], Init::NormOnes));
-                t.push(TensorSpec::new(format!("{sa}.k_norm.weight"), vec![self.head_dim], Init::NormOnes));
+                t.push(TensorSpec::new(
+                    format!("{sa}.q_proj.weight"),
+                    vec![attn_q, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{sa}.k_proj.weight"),
+                    vec![kv_dim, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{sa}.v_proj.weight"),
+                    vec![kv_dim, h],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{sa}.o_proj.weight"),
+                    vec![h, o_in],
+                    Init::Uniform(0.05),
+                ));
+                t.push(TensorSpec::new(
+                    format!("{sa}.q_norm.weight"),
+                    vec![self.head_dim],
+                    Init::NormOnes,
+                ));
+                t.push(TensorSpec::new(
+                    format!("{sa}.k_norm.weight"),
+                    vec![self.head_dim],
+                    Init::NormOnes,
+                ));
             }
         }
         t
@@ -267,7 +391,11 @@ fn gen_bytes(spec: &TensorSpec, rng: &mut SplitMix64) -> Vec<u8> {
 }
 
 /// Write a safetensors file: [u64 LE header len][JSON header][concatenated data].
-fn write_safetensors(path: &Path, specs: &[TensorSpec], rng: &mut SplitMix64) -> Result<(), String> {
+fn write_safetensors(
+    path: &Path,
+    specs: &[TensorSpec],
+    rng: &mut SplitMix64,
+) -> Result<(), String> {
     let mut datas: Vec<Vec<u8>> = Vec::with_capacity(specs.len());
     let mut header = BTreeMap::new();
     let mut offset = 0usize;
@@ -287,8 +415,10 @@ fn write_safetensors(path: &Path, specs: &[TensorSpec], rng: &mut SplitMix64) ->
     }
     let header_json = serde_json::to_string(&header).map_err(|e| e.to_string())?;
     let mut f = std::fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
-    f.write_all(&(header_json.len() as u64).to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(header_json.as_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&(header_json.len() as u64).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    f.write_all(header_json.as_bytes())
+        .map_err(|e| e.to_string())?;
     for d in &datas {
         f.write_all(d).map_err(|e| e.to_string())?;
     }
@@ -327,7 +457,10 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
     )
     .map_err(|e| format!("write config.json: {e}"))?;
 
-    let n_params: usize = specs.iter().map(|s| s.shape.iter().product::<usize>()).sum();
+    let n_params: usize = specs
+        .iter()
+        .map(|s| s.shape.iter().product::<usize>())
+        .sum();
     eprintln!(
         "emit-fixture: wrote {arch_norm} fixture to {out_dir:?} \
          ({} tensors, {:.2}M params, seed {seed:#x})",
@@ -355,10 +488,16 @@ mod tests {
         assert!(lt.contains(&"linear_attention"));
         assert!(lt.contains(&"full_attention"));
         let specs = m.manifest();
-        let n: usize = specs.iter().map(|s| s.shape.iter().product::<usize>()).sum();
+        let n: usize = specs
+            .iter()
+            .map(|s| s.shape.iter().product::<usize>())
+            .sum();
         assert!(n < 10_000_000, "fixture must stay <10M params, got {n}");
         // in_proj_qkv = 2*key + value head dims.
-        let qkv = specs.iter().find(|s| s.name.ends_with("in_proj_qkv.weight")).unwrap();
+        let qkv = specs
+            .iter()
+            .find(|s| s.name.ends_with("in_proj_qkv.weight"))
+            .unwrap();
         assert_eq!(qkv.shape[0], 2 * 128 * 2 + 2 * 128);
     }
 
@@ -374,9 +513,15 @@ mod tests {
         assert!(has("mlp.shared_expert.gate_proj.weight"), "shared expert");
         assert!(has("mlp.shared_expert_gate.weight"));
         // stacked-3D expert tensor: [num_experts, 2*moe_inter, hidden].
-        let gu = specs.iter().find(|s| s.name.ends_with("experts.gate_up_proj")).unwrap();
+        let gu = specs
+            .iter()
+            .find(|s| s.name.ends_with("experts.gate_up_proj"))
+            .unwrap();
         assert_eq!(gu.shape, vec![8, 2 * 128, 256]);
-        let n: usize = specs.iter().map(|s| s.shape.iter().product::<usize>()).sum();
+        let n: usize = specs
+            .iter()
+            .map(|s| s.shape.iter().product::<usize>())
+            .sum();
         assert!(n < 10_000_000, "moe fixture must stay <10M params, got {n}");
     }
 

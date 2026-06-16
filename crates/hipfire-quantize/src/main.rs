@@ -3248,8 +3248,8 @@ enum QuantType {
     // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
     // HFP8E5M2G32 = 30, // v2  — HFP8 E5M2 family
     MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
-                       // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
-                       // Models quantized pre-renumber MUST be re-quantized.
+    // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
+    // Models quantized pre-renumber MUST be re-quantized.
     /// QTIP-3: trellis-coded 3-bit, FWHT-rotated. Block = [f32 scale][96 B
     /// packed 3-bit trellis symbols] = 100 B/group (0.391 B/weight). Decoded by
     /// the fused `gemv_qtip3g256` kernel (computed 1MAD codebook, zero LDS); the
@@ -5635,7 +5635,11 @@ fn main() {
     // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
     // path is for kernel-free PPL; this is the shippable bandwidth format.
     let use_qtip3_real = format == "qtip3";
-    let qtip_bits: u32 = if use_qtip3_sim || use_qtip3_real { 3 } else { 2 };
+    let qtip_bits: u32 = if use_qtip3_sim || use_qtip3_real {
+        3
+    } else {
+        2
+    };
     // Both sim and real QTIP first stage every 2D weight as BF16, then the
     // post-pass either bakes sim error into bf16 (sim) or packs Qtip3G256 (real).
     let use_bf16 = format == "bf16" || format == "bfloat16" || use_qtip_sim || use_qtip3_real;
@@ -5673,7 +5677,9 @@ fn main() {
                     Some(s)
                 }
                 Err(e) => {
-                    eprintln!("qtip{qtip_bits}-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP");
+                    eprintln!(
+                        "qtip{qtip_bits}-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP"
+                    );
                     None
                 }
             }
@@ -8941,7 +8947,9 @@ fn main() {
                     diag_sum += href.at(i, i);
                 }
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
-                ldlq::qtip_ldlq_dequant_bits(&wf, m, k, &h, &qtip_s1, &qtip_s2, 128, damp, qtip_bits)
+                ldlq::qtip_ldlq_dequant_bits(
+                    &wf, m, k, &h, &qtip_s1, &qtip_s2, 128, damp, qtip_bits,
+                )
             });
             match ldlq_out {
                 Some(deq) => {

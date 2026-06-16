@@ -27,7 +27,9 @@ fn splitmix(state: &mut u64) -> u64 {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let model_path = args.next().expect("usage: fixture_golden <model.hfq> [--len N] [--warmup N] [--seed N]");
+    let model_path = args
+        .next()
+        .expect("usage: fixture_golden <model.hfq> [--len N] [--warmup N] [--seed N]");
 
     let mut len: usize = 32;
     let mut warmup: usize = 2;
@@ -73,7 +75,14 @@ fn main() {
 
     for (pos, &tok) in tokens.iter().enumerate() {
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, tok, pos, &mut kv_cache, &mut dn_state, &scratch,
+            &mut gpu,
+            &weights,
+            &config,
+            tok,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
         )
         .expect("forward");
 

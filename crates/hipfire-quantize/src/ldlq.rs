@@ -82,7 +82,17 @@ pub fn qtip2_ldlq_dequant(
     beam_width: usize,
     damp: f64,
 ) -> Option<Vec<f32>> {
-    qtip_ldlq_dequant_bits(weights_f32, m, k, h_rowmajor_f32, signs1, signs2, beam_width, damp, 2)
+    qtip_ldlq_dequant_bits(
+        weights_f32,
+        m,
+        k,
+        h_rowmajor_f32,
+        signs1,
+        signs2,
+        beam_width,
+        damp,
+        2,
+    )
 }
 
 /// Bit-parametric QTIP-LDLQ: same block-trellis OBS encode for any bit-rate.
@@ -117,19 +127,22 @@ pub fn qtip_ldlq_dequant_bits(
     // Rotate the weights into the same domain.
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
-    residual.par_chunks_mut(k).enumerate().for_each(|(row, rr)| {
-        let base = row * k;
-        let mut buf = [0.0f32; 256];
-        for b in 0..nb {
-            for c in 0..256 {
-                buf[c] = weights_f32[base + b * 256 + c];
+    residual
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(row, rr)| {
+            let base = row * k;
+            let mut buf = [0.0f32; 256];
+            for b in 0..nb {
+                for c in 0..256 {
+                    buf[c] = weights_f32[base + b * 256 + c];
+                }
+                crate::cpu_fwht_256(&mut buf, signs1, signs2);
+                for c in 0..256 {
+                    rr[b * 256 + c] = buf[c] as f64;
+                }
             }
-            crate::cpu_fwht_256(&mut buf, signs1, signs2);
-            for c in 0..256 {
-                rr[b * 256 + c] = buf[c] as f64;
-            }
-        }
-    });
+        });
 
     let cb = crate::qtip::build_codebook();
     let mut dequant = vec![0.0f64; m * k];
@@ -307,7 +320,9 @@ mod tests {
         for i in 0..k {
             h[i * k + i] += 1e-2;
         }
-        let ident: Vec<f32> = (0..k * k).map(|x| if x / k == x % k { 1.0 } else { 0.0 }).collect();
+        let ident: Vec<f32> = (0..k * k)
+            .map(|x| if x / k == x % k { 1.0 } else { 0.0 })
+            .collect();
         let s1 = crate::gen_fwht_signs(42, 256);
         let s2 = crate::gen_fwht_signs(1042, 256);
 
@@ -318,7 +333,9 @@ mod tests {
             let mut tot = 0.0f64;
             for row in 0..m {
                 let base = row * k;
-                let d: Vec<f64> = (0..k).map(|c| (w[base + c] - deq[base + c]) as f64).collect();
+                let d: Vec<f64> = (0..k)
+                    .map(|c| (w[base + c] - deq[base + c]) as f64)
+                    .collect();
                 for i in 0..k {
                     if d[i] == 0.0 {
                         continue;
@@ -333,7 +350,10 @@ mod tests {
             tot
         };
         let (eh, ei) = (out_err(&deq_h), out_err(&deq_i));
-        eprintln!("qtip2-ldlq output-err: H-OBS={eh:.4} no-fb={ei:.4} ratio={:.3}", eh / ei);
+        eprintln!(
+            "qtip2-ldlq output-err: H-OBS={eh:.4} no-fb={ei:.4} ratio={:.3}",
+            eh / ei
+        );
         assert!(eh < ei, "OBS feedback must beat no-feedback: {eh} !< {ei}");
     }
 }
