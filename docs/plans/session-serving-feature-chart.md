@@ -105,3 +105,4 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval evidence artifacts now reuse `hipfire-evidence` collection status policy instead of eval-local collected/requested/disabled/not-collected mapping.
 - Eval standard evidence artifacts now reuse `hipfire-evidence` JSON rendering instead of eval-local schema construction.
 - Eval comparison/admission artifacts now reuse `hipfire-evidence` JSON rendering instead of direct eval-local struct serialization.
+- Eval now has explicit `--executor daemon` smoke generation: finite greedy decode loads a local model through the shared daemon JSONL protocol/adapter discovery and sends shared `hipfire-generate` requests, while daemon-backed multi-turn session smoke remains a tracked skip.

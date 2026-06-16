@@ -67,6 +67,17 @@
         semantics.
       - no functional regression in `--battery speed`, while retaining the
         command-level `--prefill-list` optimization already in `bench_qwen35_speed`.
+- Move `build_kld_ref_hipfire` off the direct example/runtime path and onto the
+  new modular execution boundary:
+  - preserve the resumable HFQM `.kldref.hfq` sidecar workflow and metadata
+    contract;
+  - route model load and prefill/top-k work through the daemon-backed or modular
+    eval client path instead of constructing `Gpu`/`ModelSlot` directly in the
+    example;
+  - keep `--resume`, `--kv-mode fp32`, FP32 DeltaNet state, source model hashing,
+    and slice hash provenance behavior stable during the migration;
+  - use a small-model interrupted/resumed KLD smoke before regenerating the
+    qwen3.6-27B reference through the new path.
 
 - [Documentation debt] Refresh docs drift where active behavior has changed:
   - `docs/CHAT.md` is missing the `/set <key> <val>` command that `cli/chat.ts`
