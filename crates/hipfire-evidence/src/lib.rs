@@ -1451,6 +1451,150 @@ pub fn verify_slice_md5(slice_path: &Path, tool_name: &str) {
     eprintln!("{tool_name}: verified slice md5 = {actual}");
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KldRefTempLayout {
+    pub tokens_path: PathBuf,
+    pub indices_path: PathBuf,
+    pub log_probs_path: PathBuf,
+    pub residual_path: PathBuf,
+    pub resume_state_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KldRefResumeState {
+    pub schema: u32,
+    pub artifact_kind: String,
+    pub chunks_completed: usize,
+    pub n_chunk: usize,
+    pub scored_done: usize,
+    pub total_scored: usize,
+    pub elapsed_sec_total: f64,
+}
+
+impl KldRefResumeState {
+    pub fn new(
+        chunks_completed: usize,
+        n_chunk: usize,
+        scored_done: usize,
+        total_scored: usize,
+        elapsed_sec_total: f64,
+    ) -> Self {
+        Self {
+            schema: 1,
+            artifact_kind: "hipfire.kldref.resume".to_string(),
+            chunks_completed,
+            n_chunk,
+            scored_done,
+            total_scored,
+            elapsed_sec_total,
+        }
+    }
+}
+
+pub fn kldref_temp_layout(output: &Path, resume: bool, process_id: u32) -> KldRefTempLayout {
+    let output_file_name = output
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let temp_stem = if resume {
+        format!(".{output_file_name}.kldref")
+    } else {
+        format!(".{output_file_name}.{process_id}.kldref")
+    };
+    let temp_dir = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    KldRefTempLayout {
+        tokens_path: temp_dir.join(format!("{temp_stem}.tokens.tmp")),
+        indices_path: temp_dir.join(format!("{temp_stem}.top_indices.tmp")),
+        log_probs_path: temp_dir.join(format!("{temp_stem}.top_log_probs.tmp")),
+        residual_path: temp_dir.join(format!("{temp_stem}.residual_mass.tmp")),
+        resume_state_path: temp_dir.join(format!("{temp_stem}.resume.json")),
+    }
+}
+
+pub fn validate_kldref_tokens_temp(path: &Path, expected_bytes: u64) -> Result<(), String> {
+    let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if len == expected_bytes {
+        Ok(())
+    } else {
+        Err(format!(
+            "resume token temp size mismatch: {} len={} expected={}",
+            path.display(),
+            len,
+            expected_bytes
+        ))
+    }
+}
+
+pub fn completed_kldref_resume_chunks(
+    layout: &KldRefTempLayout,
+    n_chunk: usize,
+    indices_chunk_bytes: u64,
+    log_probs_chunk_bytes: u64,
+    residual_chunk_bytes: u64,
+) -> Result<usize, String> {
+    let indices_chunks =
+        completed_chunks_for_payload(&layout.indices_path, indices_chunk_bytes, n_chunk)?;
+    let log_probs_chunks =
+        completed_chunks_for_payload(&layout.log_probs_path, log_probs_chunk_bytes, n_chunk)?;
+    let residual_chunks =
+        completed_chunks_for_payload(&layout.residual_path, residual_chunk_bytes, n_chunk)?;
+    if indices_chunks != log_probs_chunks || indices_chunks != residual_chunks {
+        return Err(format!(
+            "resume temp payload chunk mismatch: indices={} log_probs={} residual={}",
+            indices_chunks, log_probs_chunks, residual_chunks
+        ));
+    }
+    Ok(indices_chunks)
+}
+
+fn completed_chunks_for_payload(
+    path: &Path,
+    bytes_per_chunk: u64,
+    n_chunk: usize,
+) -> Result<usize, String> {
+    let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return Ok(0);
+    }
+    if bytes_per_chunk == 0 || len % bytes_per_chunk != 0 {
+        return Err(format!(
+            "resume temp payload has partial chunk bytes: {} len={} chunk_bytes={}",
+            path.display(),
+            len,
+            bytes_per_chunk
+        ));
+    }
+    let chunks = (len / bytes_per_chunk) as usize;
+    if chunks > n_chunk {
+        return Err(format!(
+            "resume temp payload has too many chunks: {} chunks={} expected<={}",
+            path.display(),
+            chunks,
+            n_chunk
+        ));
+    }
+    Ok(chunks)
+}
+
+pub fn read_kldref_resume_elapsed(path: &Path, resume_chunks: usize) -> f64 {
+    read_kldref_resume_state(path, resume_chunks)
+        .map(|state| state.elapsed_sec_total)
+        .unwrap_or(0.0)
+}
+
+pub fn read_kldref_resume_state(path: &Path, resume_chunks: usize) -> Option<KldRefResumeState> {
+    let text = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<KldRefResumeState>(&text).ok()?;
+    (value.chunks_completed == resume_chunks).then_some(value)
+}
+
+pub fn write_kldref_resume_state(path: &Path, state: &KldRefResumeState) -> std::io::Result<()> {
+    fs::write(path, serde_json::to_string_pretty(state).unwrap())
+}
+
 /// Verify that the supplied `llama-perplexity` binary's reported commit
 /// hash matches `pinned`.
 ///
@@ -2625,6 +2769,69 @@ mod tests {
         fs::write(root.join("slice.md5"), "900150983cd24fb0d6963f7d28e17f72\n").unwrap();
 
         verify_slice_md5(&slice, "hipfire-evidence-test");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kldref_temp_layout_uses_stable_names_only_for_resume() {
+        let root = temp_dir("hipfire-evidence-kldref-layout");
+        let output = root.join("model.kldref.hfq");
+        let resumable = kldref_temp_layout(&output, true, 1234);
+        let one_shot = kldref_temp_layout(&output, false, 1234);
+
+        assert_eq!(
+            resumable.tokens_path.file_name().unwrap(),
+            ".model.kldref.hfq.kldref.tokens.tmp"
+        );
+        assert_eq!(
+            one_shot.tokens_path.file_name().unwrap(),
+            ".model.kldref.hfq.1234.kldref.tokens.tmp"
+        );
+    }
+
+    #[test]
+    fn completed_kldref_resume_chunks_requires_matching_payloads() {
+        let root = temp_dir("hipfire-evidence-kldref-resume");
+        fs::create_dir_all(&root).unwrap();
+        let layout = kldref_temp_layout(&root.join("model.kldref.hfq"), true, 0);
+        fs::write(&layout.indices_path, vec![0u8; 8]).unwrap();
+        fs::write(&layout.log_probs_path, vec![0u8; 8]).unwrap();
+        fs::write(&layout.residual_path, vec![0u8; 4]).unwrap();
+
+        assert_eq!(
+            completed_kldref_resume_chunks(&layout, 4, 4, 4, 2).unwrap(),
+            2
+        );
+
+        fs::write(&layout.residual_path, vec![0u8; 2]).unwrap();
+        let err = completed_kldref_resume_chunks(&layout, 4, 4, 4, 2).unwrap_err();
+        assert!(err.contains("chunk mismatch"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completed_kldref_resume_chunks_rejects_partial_payload() {
+        let root = temp_dir("hipfire-evidence-kldref-partial");
+        fs::create_dir_all(&root).unwrap();
+        let layout = kldref_temp_layout(&root.join("model.kldref.hfq"), true, 0);
+        fs::write(&layout.indices_path, vec![0u8; 5]).unwrap();
+
+        let err = completed_kldref_resume_chunks(&layout, 4, 4, 4, 2).unwrap_err();
+        assert!(err.contains("partial chunk bytes"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kldref_resume_state_round_trips_when_chunk_count_matches() {
+        let root = temp_dir("hipfire-evidence-kldref-state");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("resume.json");
+        let state = KldRefResumeState::new(3, 10, 30, 100, 1.25);
+        write_kldref_resume_state(&path, &state).unwrap();
+
+        assert_eq!(read_kldref_resume_state(&path, 3), Some(state));
+        assert_eq!(read_kldref_resume_state(&path, 2), None);
+        assert_eq!(read_kldref_resume_elapsed(&path, 3), 1.25);
         let _ = fs::remove_dir_all(root);
     }
 
