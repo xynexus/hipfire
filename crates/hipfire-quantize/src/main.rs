@@ -8901,11 +8901,11 @@ fn main() {
                 .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
 
-            // Prefer LDLQ when this tensor has a Hessian; else plain QTIP.
-            // LDLQ is 2-bit-specific (the qtip2_ldlq trellis); the 3-bit
-            // fallback always uses the plain (MSE) path.
+            // Prefer LDLQ (output-aware) when this tensor has a Hessian; else
+            // plain QTIP. The block-trellis OBS encode is now bit-parametric,
+            // so 3-bit gets the same Hessian-aware feedback as 2-bit.
             let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
-            let ldlq_out = qtip_hessian.as_ref().filter(|_| qtip_bits == 2).and_then(|sc| {
+            let ldlq_out = qtip_hessian.as_ref().and_then(|sc| {
                 let href = sc.get(key, 0)?;
                 if href.k != k {
                     return None;
@@ -8920,7 +8920,7 @@ fn main() {
                     diag_sum += href.at(i, i);
                 }
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
-                ldlq::qtip2_ldlq_dequant(&wf, m, k, &h, &qtip_s1, &qtip_s2, 128, damp)
+                ldlq::qtip_ldlq_dequant_bits(&wf, m, k, &h, &qtip_s1, &qtip_s2, 128, damp, qtip_bits)
             });
             match ldlq_out {
                 Some(deq) => {
