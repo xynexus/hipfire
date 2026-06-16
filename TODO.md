@@ -340,3 +340,51 @@ safetensors + config.json in the arch-5 / arch-6 tensor layout, then
 `hipfire-quantize` to mq4/qtip3/etc. Wire the golden runner into
 `no-gpu-ci.sh` (CPU reference) + a GPU dispatch channel-test. <10M params is
 trivial: hidden ~256, 2–4 layers, 8 experts top-2, small `moe_intermediate`.
+
+## Deterministic MoE-down reduction (reconsider the atomicAdd default)
+
+The fast MoE-down combine accumulates expert contributions via fp32
+`atomicAdd` into the residual (`gemv_hfq4g256_moe_down.hip:154`,
+`kernels.rs:3751`). FP add is non-associative, so undefined atomic ordering
+makes the result **non-deterministic to ~ULP run-to-run on a fixed binary**
+(documented in-kernel). Usually benign — but the residual feeds the *next
+layer's MoE router top-k*, a discrete selection. On near-tied routing logits a
+last-bit wobble can **flip expert selection and diverge macroscopically** from
+that token on. So determinism here is a correctness/repro concern, not just a
+test-harness annoyance.
+
+Decision to make: should the deterministic path be the **default**, not just a
+test variant? Options, best first:
+- **Fixed-point / integer atomicAdd accumulation.** Integer add is exact and
+  order-independent ⇒ deterministic regardless of atomic order, at ~atomics
+  speed; round once on the final convert-back. This is the only scheme that
+  *guarantees* determinism while keeping atomics. **Fidelity caveat:** the
+  fixed-point accumulator must cover the dynamic range — when contribution
+  exponents are far apart, a flat fixed-point grid loses the small terms, so
+  size the integer width for the worst-case range or use a per-row/block
+  shared-exponent (the absolute LSB position is well-defined in fixed-point,
+  unlike float — which is exactly why post-fp32-sum "trim the bottom LSB" is
+  unsound: the LSB's absolute position moves with the magnitude, and a reorder
+  can straddle any trim boundary, so trimming only lowers the flip *rate*, it
+  is not a guarantee).
+- **Fixed summation order** — the in-tree `moe_down_combine_k8_batched`
+  (expanded per-expert outputs + ordered sum). Guaranteed deterministic; costs
+  an expanded scratch buffer + a combine pass. Already exists; make it the
+  default for repro/test and any router-feeding site.
+- Keep fast atomicAdd only where downstream is provably linear/tolerant.
+
+Bench the fixed-point variant; if it's near-zero perf cost it should likely be
+the global default. Pairs with the tiny-fixture golden/determinism gate above.
+
+### Router-margin robustness (cross-link: hipfire finetune tool)
+
+Complementary cheat that attacks the *amplifier* rather than the noise: very
+slightly tune the model so expert-selector logits land **away from tie
+boundaries** (selected vs. dropped experts separated by a comfortable margin,
+i.e. "near the middle" of the decision region) — then ULP-level residual noise
+can't flip top-k regardless of reduction determinism. Implement as a
+margin/hinge regularizer on router logits in the **hipfire finetune tool**
+(see that section); cheap, and it hardens routing against *all* small
+perturbations (quant error, not just atomicAdd order). Belt-and-suspenders with
+the deterministic reduction, not a replacement (it lowers flip probability, the
+deterministic accumulator removes it).
