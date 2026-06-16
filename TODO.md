@@ -293,3 +293,50 @@ Scope (offline tooling — Rule 1 does not apply):
   bit-identically on the `gemv_qtip3g256` kernel (scale-only FT) or re-packs
   cleanly (weight FT). Validate on a 7B+ model on halo where 2-bit QTIP is
   expected to become usable.
+
+## Tiny random-init fixtures + golden-output tripwire (fast kernel/MoE plumbing)
+
+The coherence/agentic gates load `qwen3.6-35b-a3b` because the agentic gate is
+*behavioral* (JSON.parse + tool-call schema match under 780–1300 token agent
+prompts, guarding the #87 long-prompt MMQ-corruption class). But the
+*regression-cover* half of that — "did a kernel start corrupting long-prompt
+output" — is really a **golden-output (characterization) test**: it needs
+determinism + coverage of the same kernel-selection branch, NOT a model that
+emits valid JSON. So a sub-10M random-init model is a valid **fast tripwire**;
+the 35B stays as the behavioral arbiter.
+
+Coverage holds because auto-MMQ selects on `batch_size >= min_batch`
+(`arch_caps.rs:229`) — token/batch count, not model dims — so a tiny model on
+the same long prompt crosses the *same* MMQ gate (`HIPFIRE_MMQ_MIN_BATCH` can
+force it lower for a cheap deterministic test). Residual: the specific MMQ
+*tile variant* can differ by K/N, so it's same-selection-branch coverage, not
+identical-tile — hence tripwire + 35B backstop, not standalone.
+
+Build TWO fixtures (must be hipfire's supported archs, NOT upstream
+`qwen3_moe` — unsupported; see `main.rs:6210`):
+- **Tiny dense (arch 5, `model_type: qwen3_5`).** Dense GEMV/attention writes
+  unique outputs, **no atomicAdd → deterministic on a fixed binary**. So a
+  **byte/token-exact golden is stable run-to-run**, and any drift is a real
+  signal — escalate to the 35B golden. This is the clean primary tripwire.
+- **Tiny MoE (arch 6, `model_type: qwen3_5_moe`,** DeltaNet LA+FA hybrid +
+  stacked-3D experts `mlp.experts.gate_up_proj/down_proj [E,…]`**).** Covers
+  router/expert-gather/grouped-MQ-GEMM. CAVEAT: MoE-down combine uses
+  `atomicAdd` with **documented non-deterministic final bits** (`kernels.rs:
+  3751`, `gemv_hfq4g256_moe_down.hip:19–23`) → a raw byte-exact MoE golden
+  diffs run-to-run with no code change. FIX: pin the golden to the in-tree
+  **deterministic no-atomicAdd combine** (expanded per-expert outputs +
+  ordered `moe_down_combine_k8_batched`, `kernels.rs:3748`). Bonus: that makes
+  the harness double as a **determinism gate** (catches anything re-routing
+  MoE-down through the atomicAdd path).
+
+Two-tier policy: tiny golden runs always (seconds, CPU/no-GPU-friendly);
+on drift, run the 35B *golden* (not the coarse JSON-valid check — it can pass
+while tokens shift). Only-tiny-moved ⇒ tiny-specific, rebaseline; 35B-also-
+moved ⇒ real change, rebaseline both deliberately (never auto on a coarse
+pass). Greedy decode, fixed long agent-shape prompt, forced MMQ.
+
+Generator: a small offline Python script (Rule-1-OK) emitting random-weight
+safetensors + config.json in the arch-5 / arch-6 tensor layout, then
+`hipfire-quantize` to mq4/qtip3/etc. Wire the golden runner into
+`no-gpu-ci.sh` (CPU reference) + a GPU dispatch channel-test. <10M params is
+trivial: hidden ~256, 2–4 layers, 8 experts top-2, small `moe_intermediate`.
