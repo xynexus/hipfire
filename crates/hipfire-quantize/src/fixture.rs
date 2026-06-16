@@ -88,21 +88,23 @@ struct Qwen35Tiny {
 }
 
 impl Qwen35Tiny {
-    /// ~3.7M params: 4 layers (3 linear-attn + 1 full-attn), tiny vocab.
+    /// ~3.9M params: 4 layers (3 linear-attn + 1 full-attn), tiny vocab.
+    /// head_dim is pinned to 128 — the gated DeltaNet kernels are specialized
+    /// for HD=128 (and full-attn supports it), so smaller HDs hard-error.
     fn preset() -> Self {
         Self {
             hidden: 256,
             inter: 512,
             vocab: 4096,
             layers: 4,
-            n_heads: 4,
+            n_heads: 2,
             n_kv_heads: 1,
-            head_dim: 64,
+            head_dim: 128,
             full_attn_interval: 4,
-            l_key_heads: 4,
-            l_key_head_dim: 64,
-            l_val_heads: 4,
-            l_val_head_dim: 64,
+            l_key_heads: 2,
+            l_key_head_dim: 128,
+            l_val_heads: 2,
+            l_val_head_dim: 128,
             conv_kernel: 4,
         }
     }
@@ -301,7 +303,7 @@ mod tests {
         assert!(n < 10_000_000, "fixture must stay <10M params, got {n}");
         // in_proj_qkv = 2*key + value head dims.
         let qkv = specs.iter().find(|s| s.name.ends_with("in_proj_qkv.weight")).unwrap();
-        assert_eq!(qkv.shape[0], 4 * 64 * 2 + 4 * 64);
+        assert_eq!(qkv.shape[0], 2 * 128 * 2 + 2 * 128);
     }
 
     #[test]
