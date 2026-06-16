@@ -1196,11 +1196,11 @@ fn load_weight_tensor(
         .tensor_data(st_name)
         .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
 
-    let mut wt = match info.quant_type {
+    let wt_result: HipResult<WeightTensor> = match info.quant_type {
         0 => {
             // Q4F16G64
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
+            Ok::<WeightTensor, HipError>(WeightTensor {
                 buf,
                 gpu_dtype: DType::Q4F16G64,
                 m,
@@ -1287,7 +1287,7 @@ fn load_weight_tensor(
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::PARO4G128,
+                gpu_dtype: DType::ParoQ4G128,
                 m,
                 k,
                 row_stride: 0,
@@ -1304,7 +1304,7 @@ fn load_weight_tensor(
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::PARO4G128T,
+                gpu_dtype: DType::ParoQ4G128,
                 m,
                 k,
                 row_stride: 0,
@@ -1534,7 +1534,8 @@ fn load_weight_tensor(
             "unsupported quant_type {} for weight {st_name}",
             info.quant_type
         ),
-    }?;
+    };
+    let mut wt = wt_result?;
     // Centralized AWQ sidecar attachment. Replaces the prior per-arm
     // inline `load_awq_scale()` calls at the qt=13 / qt=17 arms — those
     // were the only loaders touching `awq_scale` and missing arms (qt=15

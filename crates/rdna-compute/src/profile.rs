@@ -163,6 +163,11 @@ pub fn gemv_hfq4g128_bytes(m: usize, k: usize) -> usize {
     hfq4g128_weight_bytes(m, k) + k * 4 + m * 4
 }
 
+/// PARO4-G128 currently uses the same packed footprint as HFQ4-G128.
+pub fn gemv_paro4g128_bytes(m: usize, k: usize) -> usize {
+    gemv_hfq4g128_bytes(m, k)
+}
+
 /// HFQ3-G256 weight footprint: 104 B per 256-element group (4 B scale +
 /// 4 B zero + 96 B packed 3-bit weights).
 pub fn hfq3g256_weight_bytes(m: usize, k: usize) -> usize {
@@ -175,34 +180,16 @@ pub fn gemv_hfq3g256_bytes(m: usize, k: usize) -> usize {
     hfq3g256_weight_bytes(m, k) + k * 4 + m * 4
 }
 
-/// PARO4-G128 native payload footprint plus one input and output vector.
-pub fn gemv_paro4g128_bytes(m: usize, k: usize) -> usize {
-    let groups = k / 128;
-    let m_pack = m / 8;
-    let qweight = k * m_pack * 4;
-    let qzeros = groups * m_pack * 4;
-    let scales = groups * m * 2;
-    let pairs = 8 * k * 2;
-    let theta = 8 * (k / 2) * 2;
-    let channel_scales = k * 2;
-    qweight + qzeros + scales + pairs + theta + channel_scales + k * 4 + m * 4
-}
-
-/// PARO4-G128 activation rotation: reads x plus Paro pair/theta/channel-scale
-/// metadata and writes one rotated FP32 activation vector.
-pub fn paro4g128_rotate_bytes(_m: usize, k: usize) -> usize {
-    let pairs = 8 * k * 2;
-    let theta = 8 * (k / 2) * 2;
-    let channel_scales = k * 2;
-    k * 4 + pairs + theta + channel_scales + k * 4
-}
-
 /// PARO4-G128T activation rotation with precomputed f32 sin/cos pairs.
 pub fn paro4g128t_rotate_bytes(_m: usize, k: usize) -> usize {
     let pairs = 8 * k * 2;
     let sincos = 8 * (k / 2) * 2 * 4;
     let channel_scales = k * 2;
     k * 4 + pairs + sincos + channel_scales + k * 4
+}
+
+pub fn paro4g128_rotate_bytes(m: usize, k: usize) -> usize {
+    paro4g128t_rotate_bytes(m, k)
 }
 
 /// PARO4-G128 GEMV after activation rotation has been materialized.

@@ -26,6 +26,7 @@ pub mod ddtree;
 pub mod dflash;
 pub mod env_docs;
 pub mod eos_filter;
+pub mod ep;
 pub mod gguf;
 pub mod hfq;
 pub mod hfq_modules;
@@ -41,6 +42,7 @@ pub mod sampler;
 pub mod speed_bench;
 pub mod tokenizer;
 pub mod tool_call;
+pub mod tp_shard;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 #[cfg(feature = "deltanet")]

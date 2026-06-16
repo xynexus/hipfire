@@ -6,14 +6,23 @@
 
 - Extend startup device inventory into daemon-owned placement and scheduler
   routing:
-  - server startup now exposes basic accelerator inventory and worker identity
-    carries accelerator kind/device id;
-  - enumerate all HIP GPUs at daemon startup, not just selected device 0;
-  - report per-device id, arch, VRAM, integrated/discrete class, and HIP
-    runtime from the daemon as well as the server;
-  - probe available NPUs/XDNA devices separately when present;
-  - make the priority microbatching scheduler route by worker/device capability
-    instead of using a single server-selected HIP placement.
+  - `hipfire-model` now owns a shared accelerator inventory/device contract,
+    `/health.runtime_workers` reports the shared inventory payload, and the
+    daemon exposes a typed JSONL `inventory` command;
+  - server health polls daemon inventory when a daemon is already running and
+    otherwise reports `source=not_probed`, while worker identity carries
+    accelerator kind/device id;
+  - priority prefill scheduler admission can now consume accelerator inventory
+    and reject sessions targeting missing or unavailable worker devices;
+  - daemon inventory now includes explicitly configured XDNA1/NPU rows from the
+    NPU module runtime/artifact contract;
+  - Rust server now has a daemon-inventory-backed `PriorityPrefillScheduler`
+    construction seam, and `/health` shares the same inventory probe helper;
+  - replace the XDNA1 env/artifact sentinel with a real XRT hardware probe when
+    NPU runtime dispatch owns that boundary;
+  - wire live server request scheduling to pass daemon inventory into scheduler
+    admission at the request queue site instead of using a single
+    server-selected HIP placement.
 - Regenerate quality KLD references as first-party HFQM `.kldref.hfq`
   packages. Do not trust previously downloaded raw `.kldref.bin` files for
   baseline claims. Regeneration must use Hipfire reference execution with
@@ -29,6 +38,20 @@
   battery should run a real Hipfire model-backed anchor and ingest runtime
   evidence artifacts, especially `moe_router_histogram.json` for MoE/A3B
   models.
+  - The profile row now declares the expected runtime evidence kinds
+    (`performance`, `memory`, `launch_counts`, `moe_router_histogram`) so
+    artifact collection regressions stay visible in row metadata.
+  - Generic runtime oneshot evidence writers and sparse router-histogram
+    artifact rendering now live in `hipfire-evidence`; model-specific gatherers
+    adapt their native counters into the shared histogram contract.
+  - `GenerateTextRequest.evidence_dir` lets daemon-backed AR text generation
+    write standard runtime oneshot artifacts directly via `hipfire-evidence`;
+    DFlash/MTP/VL evidence emission remains a path-specific follow-up.
+  - The profile battery now has a daemon-backed model anchor that reuses the
+    shared daemon load path and requests runtime evidence artifacts.
+  - Daemon Qwen3.5 MoE AR requests now adapt native router counters into the
+    generic `hipfire-evidence` histogram contract when `evidence_dir` is set;
+    DFlash/MTP/VL evidence emission remains a path-specific follow-up.
 - Run the full no-GPU handoff gate before committing the branch.
 - Extend Qwen35 paged expert execution coverage beyond the current indexed MQ
   routed path: grouped Path 2, Paro, full-precision, and CPU-fallback paged
@@ -54,8 +77,13 @@
   - What to finish to align with daemon/lib+IPC direction:
     - finish `EvalClient` transport in eval harness with request batching for same
       model across batteries where semantics allow;
-    - add a daemon-backed fast-path for smoke/coherence/speed where command
-      arguments map directly to long-lived session actions;
+    - daemon-backed smoke model-load, finite greedy decode, repeated greedy
+      reset/recall, and explicit `--executor daemon --battery speed` timing
+      anchors now use the shared JSONL daemon adapter; examples-backed pp32/pp128
+      speed-gate rows remain the benchmark-grade default;
+    - default `--executor auto` now prefers daemon-backed smoke/speed rows and
+      shares one daemon load across those rows and the profile anchor when they
+      run together;
     - add process and handle ownership so one model-load maps to one resident daemon
       process per loaded quant/placement;
     - make battery rows consume a shared model cache key and avoid repeated
@@ -91,6 +119,16 @@
     regenerated from `./scripts/regen-env-vars-doc.sh` after this cycle.
 
 ### Deferred
+
+- `crates/hipfire-runtime/src/kv_adaptive.rs` — adaptive KV precision downshift
+  module, written but not yet wired in. Missing pieces before use:
+  - `KvCache::transcode_v_step` and `transcode_k_step` methods (called by
+    `maybe_downshift`) are not yet implemented.
+  - Module is not declared in `crates/hipfire-runtime/src/lib.rs`.
+  - `Conservative` and `Aggressive` presets share the same floor values
+    (both Fwht2/Lloyd2) — likely a placeholder; floors should differ.
+  - No integration site in the decode loop (`maybe_downshift` must be called
+    after each committed token write alongside `maybe_evict`).
 
 - Adapt the build system to autodiscover GPUs the same way NPU detection now
   works: query HIP/ROCm at `cargo build --features npu-kernels` time (or a
@@ -135,3 +173,62 @@ Status: deferred.
 
 
 ## further investigate using packed 4 bit operations on gfx1151/RDNA3/RDNA3.5
+
+## DeltaNet state precision (follow-ups to Phase A gate, 2026-06-15)
+
+Phase A made the DeltaNet recurrent state default to **FP32** for all
+current models, gated on redundancy (`head_dim × n_heads`) via
+`qwen35::default_state_quant` (env: `HIPFIRE_DN_STATE_QUANT`,
+`HIPFIRE_DN_STATE_FP32_BELOW`). Two kernels are missing to generalize it:
+
+1. **Real FP16 DeltaNet state kernel.** `StateQuant` is only
+   `{FP32, Q8, Q4}`; there is no `gated_delta_net_f16`. The plan wants
+   FP16 for high-redundancy models (cheaper than FP32, safer than Q8),
+   but it doesn't exist, so the gate currently selects FP32 for the whole
+   upper tier (threshold `usize::MAX`). To finish:
+   - add `StateQuant::FP16` + alloc path in `DeltaNetState::new_with_quant`;
+   - add `gpu.gated_delta_net_f16(...)` + `_batch_seq` / `_routed_batch_seq`
+     dispatch (mirror the FP32 kernels);
+   - coherence-gate the f16 state numerics, then lower the default
+     `HIPFIRE_DN_STATE_FP32_BELOW` so big models use FP16.
+
+2. **Higher-precision tree DeltaNet replay (FP32 *and* FP16).** Tree-mode
+   spec-decode hard-errors on FP32 state (`qwen35.rs`: *"FP32-state batched
+   prefill does not support tree DeltaNet replay yet"*); only
+   `gated_delta_net_q8_tree_batch_seq` exists. Consequence: with the FP32
+   default, tree-based spec-decode (DDTree, DFlash-tree,
+   `spec_step_dflash_mtp_tree`) cannot run — Phase B MTP drafting must use
+   the **non-tree** `spec_step_mtp` path. Future work, both precisions:
+   - `gated_delta_net_f32_tree_batch_seq` — FP32 S-tape replay, unblocks
+     tree drafting at full anchor precision (serves the FP32-forced
+     low-redundancy models like 0.8B directly).
+   - `gated_delta_net_f16_tree_batch_seq` — FP16 S-tape replay, pairs with
+     the FP16 state kernel (item 1) so high-redundancy models can run tree
+     drafting at the cheaper FP16 tier once FP16 coherence is established.
+   Until either lands, tree drafting needs `state_quant=q8` (only safe on
+   high-redundancy models, never 0.8B/2B).
+
+## Native Rust/GPU Hessian collector (finish the collect_hessian.rs scaffold)
+
+The QTIP LDLQ path (Phase C1e) needs per-layer input Hessians. The native
+`crates/hipfire-runtime/src/bin/collect_hessian.rs` is currently a SCAFFOLD
+that panics ("not implemented"); we fall back to the Tier-2 Python collector
+`scripts/collect_hessian.py` (HF transformers + ROCm/CPU torch). The Python
+path WORKS (validated 2026-06-16: 0.8B → 2.21 GB HFHS file, read by
+`hessian_io.rs`), so the HFHS-v1 format + approach are proven.
+
+Implement the native Tier-1 collector (the scaffold's own TODO list) so we
+get GPU speed and drop the torch dependency:
+- BF16 safetensors → device tensors loader.
+- On-GPU K×K outer-product Hessian rank-1-update kernel (accumulate
+  H += xᵀx over calibration tokens per GPTQ-target linear).
+- `ActivationCapture` wiring at the GPTQ-target dispatch sites in the
+  qwen35/generic forward (capture each linear's input activations).
+- HFHS-v1 binary writer matching `scripts/collect_hessian.py` (so
+  `hessian_io.rs` reads it unchanged).
+
+Benefit: CPU torch is slow (0.8B calibration is minutes; bigger models
+hours); the GPU forward + on-GPU accumulation would be far faster, and it
+removes the Python/torch tooling dependency from the quant pipeline.
+Reference: the validated Tier-2 `scripts/collect_hessian.py` + the existing
+scaffold's documented deliverables.

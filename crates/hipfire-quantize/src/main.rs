@@ -32,6 +32,16 @@
 //! RDNA-native quantized weights.
 
 mod gguf_input;
+// QTIP (Phase C1) encoder core — wired into the quantize dispatch in a
+// follow-up increment; allow dead_code until then.
+#[allow(dead_code)]
+mod qtip;
+// QTIP-LDLQ (Phase C1e) — output-aware trellis encode.
+#[allow(dead_code)]
+mod ldlq;
+// HFHS Hessian sidecar reader (was orphaned; now wired for QTIP-LDLQ).
+#[allow(dead_code)]
+mod hessian_io;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -904,6 +914,54 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
             }
         })
         .collect()
+}
+
+/// f32 → bf16 bits, round-to-nearest-even (truncate the low 16 mantissa bits).
+fn f32_to_bf16_bits(f: f32) -> u16 {
+    let bits = f.to_bits();
+    if (bits >> 23) & 0xFF == 0xFF {
+        // inf / nan: truncate the high half (keeps inf; nan stays nan).
+        return (bits >> 16) as u16;
+    }
+    let bias = 0x7FFF + ((bits >> 16) & 1);
+    (bits.wrapping_add(bias) >> 16) as u16
+}
+
+fn f32_slice_to_bf16_bytes(d: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(d.len() * 2);
+    for &f in d {
+        out.extend_from_slice(&f32_to_bf16_bits(f).to_le_bytes());
+    }
+    out
+}
+
+/// Simulated QTIP-2 quantization of a 2D weight (row-major `m × k`), in place.
+/// Per row, per 256-group: FWHT-rotate (incoherence) → beam-encode trellis →
+/// optimal scale → decode → inverse-rotate (FWHT is orthogonal, so the inverse
+/// is `cpu_fwht_256` with the sign args swapped). The result is the *effective*
+/// weight a fused QTIP kernel would compute, so running it through the normal
+/// bf16 forward gives a faithful QTIP-2 PPL without the GPU kernel. The `k%256`
+/// tail (if any) is left unquantized. Parallel over rows.
+fn qtip_simquant_2d(f32_data: &mut [f32], k: usize, cb: &[f32], signs1: &[f32], signs2: &[f32]) {
+    use rayon::prelude::*;
+    let groups = k / 256;
+    if groups == 0 {
+        return;
+    }
+    f32_data.par_chunks_mut(k).for_each(|row| {
+        for g in 0..groups {
+            let seg = &mut row[g * 256..g * 256 + 256];
+            let mut grp = [0.0f32; 256];
+            grp.copy_from_slice(seg);
+            cpu_fwht_256(&mut grp, signs1, signs2); // rotate
+            let scale0 = qtip::group_scale(&grp);
+            let sym = qtip::beam_encode_group(&grp, scale0, cb, 128);
+            let scale = qtip::optimal_scale(&grp, &sym, cb);
+            let mut deq = qtip::decode_group(&sym, scale, cb);
+            cpu_fwht_256(&mut deq, signs2, signs1); // inverse rotate (swap signs)
+            seg.copy_from_slice(&deq);
+        }
+    });
 }
 
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
@@ -5525,8 +5583,49 @@ fn main() {
     // q8-fast = Q8 attn + Q4-as-Q8 FFN (all Q8 occupancy, most VRAM)
     // q8hfq = all weights Q8_HFQ (split-metadata, 128B-aligned rows)
     let use_fp16 = format == "fp16" || format == "f16" || format == "float16";
-    let use_bf16 = format == "bf16" || format == "bfloat16";
+    // qtip2-sim: emit a bf16 .hfq whose 2D weights carry *simulated* QTIP-2
+    // error (FWHT-rotated bitshift-trellis, beam=128), for a kernel-free PPL
+    // verdict via the normal bf16 forward. Embeddings/lm_head kept bf16.
+    let use_qtip_sim = format == "qtip2-sim";
+    let use_bf16 = format == "bf16" || format == "bfloat16" || use_qtip_sim;
+    let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim {
+        eprintln!(
+            "qtip2-sim: simulated QTIP-2 on 2D weights (FWHT + bitshift trellis beam=128) → bf16"
+        );
+        (
+            qtip::build_codebook(),
+            gen_fwht_signs(42, 256),
+            gen_fwht_signs(1042, 256),
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    // Optional Hessian sidecar → QTIP-LDLQ (output-aware). HIPFIRE_QTIP_HESSIAN
+    // points at an HFHS file; tensors with a Hessian use LDLQ, the rest fall
+    // back to plain (MSE) simulated QTIP.
+    let qtip_hessian: Option<hessian_io::HessianSidecar> = if use_qtip_sim {
+        std::env::var("HIPFIRE_QTIP_HESSIAN").ok().and_then(|p| {
+            match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
+                Ok(s) => {
+                    eprintln!(
+                        "qtip2-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
+                        s.n_tensors()
+                    );
+                    Some(s)
+                }
+                Err(e) => {
+                    eprintln!("qtip2-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
     let use_q8 = format == "q8f16" || format == "q8";
+    // F1 native-bf16 oracle: full-precision passthrough. Every tensor stored
+    // as QuantType::F32 (qt=2) -- weights, norms, embeddings.
+    let use_f32_passthrough = format == "f32" || format == "f32-passthrough" || format == "oracle";
     let use_mixed = format == "q8-mixed" || format == "mixed";
     let use_fast = format == "q8-fast" || format == "fast";
     let use_q8hfq = format == "q8hfq";
@@ -6094,11 +6193,14 @@ fn main() {
         // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
         // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
         "minimax_m2" => 10,
-        // LFM2.5-MoE (LiquidAI): hybrid 18 short-conv + 6 GQA-attn layers; 2 dense
-        // SwiGLU MLP + 22 top-4 MoE layers; sigmoid + expert_bias routing. bf16
-        // source, per-expert pre-split w1/w2/w3 (like minimax). Conv filter +
-        // expert_bias stay high precision. Crate hipfire-arch-lfm2moe.
-        "lfm2_moe" => 11,
+        // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers, SwiGLU FFN.
+        //   "lfm2_moe" = A1B (dense MLP head layers + top-4 MoE); per-expert
+        //               pre-split w1/w2/w3 → MQ4G256, everything else → Q8.
+        //   "lfm2"     = dense (Lfm2ForCausalLM, e.g. 350M/1.2B) — no experts,
+        //               every layer dense SwiGLU; the ingest Q8s all tensors.
+        // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
+        // num_dense_layers == num_hidden_layers for the dense variant.
+        "lfm2_moe" | "lfm2" => 11,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -6470,6 +6572,197 @@ fn main() {
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
+
+        // ── F1 native-bf16 oracle passthrough ──────────────────────────────
+        // Store EVERY tensor as F32 (qt=2): no quantization, bf16/f16->f32
+        // widened losslessly. This bypasses every per-format branch below so
+        // the produced .hfq is a full-precision reference the qwen35 loader
+        // reads via its qt=2 arm and the engine forwards through the existing
+        // F32 GEMV / attention_f32 path.
+        if use_f32_passthrough {
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            quantized_params += n_elements as u64;
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [F32 oracle passthrough]",
+                "F32",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                bytes.len() as f64 / 1024.0
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F32,
+                shape,
+                group_size: 0,
+                data: bytes,
+                spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut sp) = spill {
+                maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+            }
+            continue;
+        }
+
+        // ── LFM2.5 ingest (arch_id 11) ─────────────────────────────────────────
+        // Routed experts (A1B only) → MQ4G256; expert_bias → F32; everything else
+        // (conv in/out_proj, conv depthwise filter, attn q/k/v/out_proj + qk-norm,
+        // dense w1/w2/w3, router gate, operator/ffn/embedding norms, tied embed/
+        // lm_head) → Q8 (qt=3 Q8F16). Dense lfm2 (350M/1.2B) has no experts, so
+        // every tensor takes the final Q8 path. The loader's load_f32 dequantizes
+        // Q8 norms / conv-filter back to F32 on load.
+        if is_lfm2moe {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            if name.contains(".feed_forward.experts.")
+                && (name.ends_with(".w1.weight")
+                    || name.ends_with(".w2.weight")
+                    || name.ends_with(".w3.weight"))
+                && meta.shape.len() == 2
+                && meta.shape[1] % 256 == 0
+            {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw_data,
+                    meta,
+                    &fp8_scale_for,
+                    &st_files,
+                );
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                eprintln!(
+                    "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
+                    "MQ4-LFM",
+                    name,
+                    meta.shape,
+                    raw_data.len() as f64 / 1024.0,
+                    q.len() as f64 / 1024.0
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::MQ4G256,
+                    shape,
+                    group_size: 256,
+                    data: q,
+                    spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+            if name.ends_with(".feed_forward.expert_bias") {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw_data,
+                    meta,
+                    &fp8_scale_for,
+                    &st_files,
+                );
+                let mut bytes = Vec::with_capacity(f32_data.len() * 4);
+                for v in &f32_data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                eprintln!(
+                    "  {:>8}: {} {:?} (expert_bias F32)",
+                    "F32-LFM", name, meta.shape
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::F32,
+                    shape,
+                    group_size: 1,
+                    data: bytes,
+                    spilled_len: 0,
+                });
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+            // Dense mq4 (--format mq4): route the big 2D proj/FFN weight matrices
+            // (conv in/out_proj, attn q/k/v/out_proj, dense w1/w2/w3) → MQ4G256.
+            // The loader's weight_gemv / weight_gemv_residual auto-FWHT-rotate
+            // MQ4G256, so no forward change is needed. Keep the tied embed/lm_head
+            // (model.embed_tokens.weight), the router gate, norms, and the depthwise
+            // conv filter at Q8/F32 (small + precision-sensitive). Default (no mq4
+            // format) keeps the full-precision Q8 bring-up recipe.
+            if use_mq4g256
+                && meta.shape.len() == 2
+                && meta.shape[1] % 256 == 0
+                && !name.ends_with("embed_tokens.weight")
+                && (name.ends_with("_proj.weight")
+                    || name.ends_with(".w1.weight")
+                    || name.ends_with(".w2.weight")
+                    || name.ends_with(".w3.weight"))
+            {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw_data,
+                    meta,
+                    &fp8_scale_for,
+                    &st_files,
+                );
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                eprintln!(
+                    "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
+                    "MQ4-LFM",
+                    name,
+                    meta.shape,
+                    raw_data.len() as f64 / 1024.0,
+                    q.len() as f64 / 1024.0
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::MQ4G256,
+                    shape,
+                    group_size: 256,
+                    data: q,
+                    spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+
+            // All remaining LFM2 tensors → Q8 (qt=3). quantize_q8f16 handles any
+            // 1D/2D/3D shape elementwise (conv.conv.weight is [hidden,1,K]).
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            let q = quantize_q8f16(&f32_data);
+            eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-LFM", name, meta.shape);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::Q8F16,
+                shape,
+                group_size: 32,
+                data: q,
+                spilled_len: 0,
+            });
+            quantized_params += n_elements as u64;
+            st_files[*file_idx].drop_tensor_pages(name);
+            continue;
+        }
 
         // DeepSeek V4's `tid2eid` hash-routing tables: source I64 in safetensors,
         // shape [vocab=129280, k=6]. The values are token-id × expert-id
@@ -6946,6 +7239,10 @@ fn main() {
             let k = meta.shape[1];
             let m = meta.shape[0];
             if use_fp16 || use_bf16 {
+                // qtip2-sim: simulate QTIP-2 on quantizable 2D weights (skip
+                // embeddings/lm_head and any k not divisible by 256), then emit
+                // bf16 from the perturbed f32 so the normal forward yields a
+                // faithful QTIP-2 PPL.
                 let (q, qt, label) = if use_bf16 {
                     source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data)
                 } else {
@@ -8542,6 +8839,63 @@ fn main() {
     eprintln!("  Mean quant error: {mean_quant_error:.8}");
     eprintln!("  Max quant error:  {max_quant_error:.8}");
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
+
+    // qtip2-sim post-pass: simulate QTIP-2 on every eligible 2D BF16 weight,
+    // branch-independent (operates on the finalized tensor list, so it catches
+    // dense/MoE/attn weights regardless of which producer branch built them).
+    // Skips embeddings/lm_head and any k not divisible by 256.
+    if use_qtip_sim {
+        let (mut n_ldlq, mut n_plain) = (0usize, 0usize);
+        for t in hfq_tensors.iter_mut() {
+            if !(matches!(t.quant_type, QuantType::BF16)
+                && t.shape.len() == 2
+                && (t.shape[1] as usize) % 256 == 0
+                && !t.name.contains("embed")
+                && !t.name.contains("lm_head"))
+            {
+                continue;
+            }
+            let m = t.shape[0] as usize;
+            let k = t.shape[1] as usize;
+            let mut wf: Vec<f32> = t
+                .data
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+
+            // Prefer LDLQ when this tensor has a Hessian; else plain QTIP.
+            let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+            let ldlq_out = qtip_hessian.as_ref().and_then(|sc| {
+                let href = sc.get(key, 0)?;
+                if href.k != k {
+                    return None;
+                }
+                // Materialize k×k Hessian (f32) + 1% diagonal-mean ridge.
+                let mut h = vec![0.0f32; k * k];
+                let mut diag_sum = 0.0f64;
+                for i in 0..k {
+                    for j in 0..k {
+                        h[i * k + j] = href.at(i, j) as f32;
+                    }
+                    diag_sum += href.at(i, i);
+                }
+                let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
+                ldlq::qtip2_ldlq_dequant(&wf, m, k, &h, &qtip_s1, &qtip_s2, 128, damp)
+            });
+            match ldlq_out {
+                Some(deq) => {
+                    t.data = f32_slice_to_bf16_bytes(&deq);
+                    n_ldlq += 1;
+                }
+                None => {
+                    qtip_simquant_2d(&mut wf, k, &qtip_cb, &qtip_s1, &qtip_s2);
+                    t.data = f32_slice_to_bf16_bytes(&wf);
+                    n_plain += 1;
+                }
+            }
+        }
+        eprintln!("  qtip2-sim: LDLQ on {n_ldlq} tensors, plain-QTIP on {n_plain}");
+    }
 
     // Write .hfq file
     eprintln!("\nWriting: {}", output_path.display());

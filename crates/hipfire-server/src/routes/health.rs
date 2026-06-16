@@ -1,16 +1,22 @@
 use axum::{extract::State, response::Json};
+use hipfire_model::AcceleratorInventory;
 use hipfire_scheduler::{
     server_batch_health_json, server_decode_batch_health_json, server_prefill_batch_health_json,
     server_state_cache_health_json, SchedulerPolicyEnv,
 };
-use hipfire_state::runtime_workers_health_json;
+use hipfire_state::runtime_workers_health_json_with_inventory;
 use serde_json::{json, Value};
 use std::env;
 
+use crate::scheduler::server_accelerator_inventory;
 use crate::state::SharedState;
 
 pub async fn get_health(state: State<SharedState>) -> Json<Value> {
-    let loaded = state.loaded_model_path.lock().await.clone();
+    let loaded = {
+        let loaded = state.loaded_model_path.lock().await;
+        loaded.clone()
+    };
+    let accelerator_inventory = server_accelerator_inventory(&state).await;
     let scheduler_env = scheduler_env_from_process();
     Json(json!({
         "status": "ok",
@@ -18,13 +24,17 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         "prefill_batch": server_prefill_batch_health_json(&scheduler_env),
         "decode_batch": server_decode_batch_health_json(&scheduler_env),
         "state_cache": server_state_cache_health_json(&scheduler_env),
-        "runtime_workers": runtime_workers_health_json(&[], 0, None, 0, 0, "none"),
+        "runtime_workers": runtime_workers_health_payload(&accelerator_inventory),
         "batches": server_batch_health_json(),
     }))
 }
 
 fn scheduler_env_from_process() -> SchedulerPolicyEnv {
     SchedulerPolicyEnv::from_pairs(env::vars())
+}
+
+fn runtime_workers_health_payload(inventory: &AcceleratorInventory) -> serde_json::Value {
+    runtime_workers_health_json_with_inventory(&[], 0, None, 0, 0, "none", inventory)
 }
 
 #[cfg(test)]
@@ -37,7 +47,7 @@ mod tests {
             "prefill_batch": server_prefill_batch_health_json(&SchedulerPolicyEnv::empty()),
             "decode_batch": server_decode_batch_health_json(&SchedulerPolicyEnv::empty()),
             "state_cache": server_state_cache_health_json(&SchedulerPolicyEnv::empty()),
-            "runtime_workers": runtime_workers_health_json(&[], 0, None, 0, 0, "none"),
+            "runtime_workers": runtime_workers_health_payload(&AcceleratorInventory::not_probed()),
             "batches": server_batch_health_json(),
         });
 
@@ -46,7 +56,38 @@ mod tests {
         assert_eq!(payload["state_cache"], json!({ "enabled": false }));
         assert_eq!(payload["runtime_workers"]["resident_workers"], 0);
         assert_eq!(payload["runtime_workers"]["state_arena_backend"], "none");
+        assert_eq!(
+            payload["runtime_workers"]["accelerator_inventory"]["source"],
+            "not_probed"
+        );
+        assert_eq!(
+            payload["runtime_workers"]["accelerator_inventory"]["device_count"],
+            0
+        );
         assert_eq!(payload["runtime_workers"]["workers"], json!([]));
         assert_eq!(payload["batches"], json!({ "enabled": false }));
+    }
+
+    #[test]
+    fn health_runtime_workers_can_embed_daemon_inventory() {
+        let inventory = AcceleratorInventory::from_devices(
+            "daemon",
+            vec![hipfire_model::AcceleratorDeviceInfo::hip(
+                "0",
+                0,
+                Some("gfx1201".to_string()),
+                Some(24_000_000_000),
+                Some(false),
+                Some("HIP 6.4".to_string()),
+            )],
+        );
+        let payload = runtime_workers_health_payload(&inventory);
+
+        assert_eq!(payload["accelerator_inventory"]["source"], "daemon");
+        assert_eq!(payload["accelerator_inventory"]["device_count"], 1);
+        assert_eq!(
+            payload["accelerator_inventory"]["devices"][0]["device_class"],
+            "discrete"
+        );
     }
 }

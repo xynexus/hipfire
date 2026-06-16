@@ -41,7 +41,7 @@ description = "Inference orchestrator for RDNA GPUs"
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
 default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr", "deltanet"]
-deltanet = ["rdna-compute/deltanet"]
+deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []
@@ -50,20 +50,26 @@ arch-deepseek4 = []
 arch-minimax = []
 arch-lfm2moe = []
 arch-dots-ocr = []
-
+experimental-examples = []
 [dependencies]
 hipfire-coherence = { path = "../hipfire-coherence" }
 hipfire-eval = { path = "../hipfire-eval" }
 hipfire-evidence = { path = "../hipfire-evidence" }
+hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
-byteorder = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 csv = "1"
+# preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
+# default BTreeMap alphabetic sort. Required so request tool-definition key order
+# survives parse → render → `| tojson`, byte-matching the model's trained
+# chat_template (HF apply_chat_template preserves insertion order). Feature-
+# unifies across the workspace build.
+serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
 libc = "0.2"
 rayon = "1"
@@ -71,14 +77,6 @@ twox-hash = { version = "2", default-features = false, features = ["xxhash64", "
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 hipfire-detect = { path = "../hipfire-detect" }
-# GPT-2 / cl100k pre-tokenization for encode_gpt2_bpe. Reference encoders
-# (HF tokenizers, tiktoken) chunk input via regex into ≤10-byte words/runs,
-# then BPE each chunk independently; without that step the merge PQ runs
-# on the whole prompt as one problem and goes O(N log N) with a huge
-# constant from cross-word merges + stale-entry churn. PR #230 fixed
-# per-iteration costs but not the algorithmic shape — this regex restores
-# the canonical chunking.
-regex = "1"
 # Renders the upstream HF chat_template (Jinja) when present in
 # .hfq metadata, so prompt framing matches what the model was
 # trained on. Falls back to the hand-rolled `hipfire_prompt::ChatFrame`
@@ -87,7 +85,7 @@ regex = "1"
 # branches use `{{ tool | tojson }}` to emit OpenAI-shape function specs
 # inside the system block; without it, tool-using turns die at render time
 # (caught by jinja_smoke scenario C, 2026-05-09).
-minijinja = { version = "2", features = ["loop_controls", "json"] }
+minijinja = { version = "2", features = ["loop_controls", "json", "preserve_order"] }
 # `pycompat` ships an unknown-method callback that makes Python
 # str/list/dict methods (e.g. `.startswith`, `.split`, `.rstrip`)
 # work on plain Jinja values — required by the Qwen3 family
@@ -107,10 +105,10 @@ hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
-hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
-hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
-hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
-hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+# hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }   # chaingun: needs gpu.graphs (not yet on this branch)
+# hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }    # chaingun: needs gpu.graphs (not yet on this branch)
+# hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" } # chaingun: needs swa_topk_wmma methods (not yet on this branch)
+# hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }  # chaingun: unclosed delimiter from merge
 hipfire-atlas = { path = "../hipfire-atlas" }
 
 # Each example below carries `required-features` listing the cargo
@@ -128,7 +126,11 @@ required-features = []
 
 [[example]]
 name = "coherence_probe"
-required-features = []
+required-features = ["experimental-examples"]
+
+[[example]]
+name = "debug_minimax_batch"
+required-features = ["experimental-examples", "arch-minimax"]
 
 [[example]]
 name = "gpus_smoke"
@@ -263,6 +265,10 @@ name = "profile_prefill_qwen35"
 required-features = ["arch-qwen35", "deltanet"]
 
 [[example]]
+name = "profile_prefill_deepseek4"
+required-features = ["experimental-examples", "arch-deepseek4", "deltanet"]
+
+[[example]]
 name = "test_inference"
 required-features = ["arch-qwen35"]
 
@@ -327,6 +333,10 @@ required-features = []
 [[example]]
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "ep_decode_parity"
+required-features = ["experimental-examples", "arch-qwen35"]
 
 # eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /
 # Qwen2 / Llama / Mistral / TinyLlama). Same HFKSEQ output as

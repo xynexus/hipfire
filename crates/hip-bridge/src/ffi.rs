@@ -1424,6 +1424,12 @@ impl Stream {
     pub fn null() -> Self {
         Self(ptr::null_mut())
     }
+
+    /// Alias for `as_raw` used by TP/RCCL collective callers that hand a raw
+    /// stream pointer to `ncclAllReduce`.
+    pub fn raw_ptr(&self) -> *mut c_void {
+        self.0
+    }
 }
 
 /// HIP page-locked host allocation.
@@ -1455,6 +1461,12 @@ impl HostBuffer {
 
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.size) }
+    }
+
+    /// Alias for `as_mut_ptr` used by the TP/RCCL collective callers (which take
+    /// a raw pointer to hand to `ncclAllReduce`).
+    pub fn raw_ptr(&self) -> *mut c_void {
+        self.ptr
     }
 }
 

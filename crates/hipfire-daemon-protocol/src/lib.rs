@@ -7,14 +7,16 @@
 use serde::{Deserialize, Serialize};
 
 use hipfire_generate::{DoneEvent, ErrorEvent, GenerateTextRequest, TokenEvent};
-use hipfire_model::{ModelLoadRequest, ModelLoadedResponse};
+use hipfire_model::{AcceleratorInventory, ModelLoadRequest, ModelLoadedResponse};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
     Load(ModelLoadRequest),
     Unload,
+    Reset,
     Ping,
+    Inventory,
     Generate(GenerateTextRequest),
 }
 
@@ -23,7 +25,9 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     Loaded(ModelLoadedResponse),
     Unloaded,
+    Reset,
     Pong,
+    Inventory(AcceleratorInventory),
     Token(TokenEvent),
     Done(DoneEvent),
     Error(ErrorEvent),
@@ -69,6 +73,7 @@ mod tests {
             thinking: None,
             max_think_tokens: None,
             request_id: None,
+            evidence_dir: None,
         });
 
         let value = serde_json::to_value(req).unwrap();
@@ -106,6 +111,64 @@ mod tests {
         assert_eq!(req.messages.as_ref().unwrap()[0].role, Role::System);
         assert_eq!(req.sampling.top_p, Some(0.8));
         assert_eq!(req.worker_key_id.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn reset_request_and_response_preserve_existing_wire_shape() {
+        let value = serde_json::to_value(DaemonRequest::Reset).unwrap();
+        assert_eq!(value, json!({"type": "reset"}));
+
+        let response: DaemonResponse =
+            serde_json::from_value(json!({"type": "reset", "seq_pos": 0})).unwrap();
+        assert!(matches!(response, DaemonResponse::Reset));
+    }
+
+    #[test]
+    fn inventory_request_and_response_use_shared_model_contract() {
+        let value = serde_json::to_value(DaemonRequest::Inventory).unwrap();
+        assert_eq!(value, json!({"type": "inventory"}));
+
+        let response: DaemonResponse = serde_json::from_value(json!({
+            "type": "inventory",
+            "source": "daemon",
+            "devices": [{
+                "kind": "hip",
+                "device_id": "0",
+                "ordinal": 0,
+                "arch": "gfx1201",
+                "name": null,
+                "total_memory_bytes": 24000000000u64,
+                "integrated": false,
+                "runtime": "HIP 6.4",
+                "available": true,
+                "selected": true,
+                "reason": null
+            }, {
+                "kind": "npu",
+                "device_id": "xdna1:0",
+                "ordinal": 0,
+                "arch": "xdna1",
+                "name": "XDNA1 NPU",
+                "total_memory_bytes": null,
+                "integrated": null,
+                "runtime": "xdna1_ffi",
+                "available": true,
+                "selected": false,
+                "reason": null
+            }]
+        }))
+        .unwrap();
+
+        let DaemonResponse::Inventory(inventory) = response else {
+            panic!("expected inventory response");
+        };
+        assert_eq!(inventory.source, "daemon");
+        assert_eq!(inventory.devices.len(), 2);
+        assert_eq!(inventory.devices[0].device_id, "0");
+        assert_eq!(inventory.devices[0].arch.as_deref(), Some("gfx1201"));
+        assert_eq!(inventory.devices[1].kind, "npu");
+        assert_eq!(inventory.devices[1].device_id, "xdna1:0");
+        assert_eq!(inventory.devices[1].arch.as_deref(), Some("xdna1"));
     }
 
     #[test]

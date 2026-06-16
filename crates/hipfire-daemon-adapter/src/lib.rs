@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{DaemonRequest, DaemonResponse};
 use hipfire_generate::{DoneEvent, GenerateTextRequest};
-use hipfire_model::{ModelLoadParams, ModelLoadRequest, ModelLoadedResponse};
+use hipfire_model::{AcceleratorInventory, ModelLoadParams, ModelLoadRequest, ModelLoadedResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tracing::debug;
@@ -154,6 +154,21 @@ impl DaemonEngine {
         }
     }
 
+    /// Send `reset` and wait for the daemon to confirm state reset.
+    pub async fn reset(&mut self) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::Reset).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::Reset => return Ok(()),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon reset error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during reset: {other:?}");
+                }
+            }
+        }
+    }
+
     /// Send `ping` and wait for `pong`.
     pub async fn ping(&mut self) -> anyhow::Result<()> {
         self.send(&DaemonRequest::Ping).await?;
@@ -163,6 +178,21 @@ impl DaemonEngine {
                 DaemonResponse::Unknown => {}
                 other => {
                     tracing::warn!("unexpected response during ping: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `inventory` and wait for accelerator inventory.
+    pub async fn inventory(&mut self) -> anyhow::Result<AcceleratorInventory> {
+        self.send(&DaemonRequest::Inventory).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::Inventory(inventory) => return Ok(inventory),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon inventory error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during inventory: {other:?}");
                 }
             }
         }
@@ -724,6 +754,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inventory_returns_shared_accelerator_contract() {
+        let mut engine = mock_engine(vec![DaemonResponse::Inventory(
+            AcceleratorInventory::from_devices(
+                "daemon",
+                vec![hipfire_model::AcceleratorDeviceInfo::hip(
+                    "0",
+                    0,
+                    Some("gfx1201".to_string()),
+                    Some(24_000_000_000),
+                    Some(false),
+                    Some("HIP 6.4".to_string()),
+                )],
+            ),
+        )]);
+
+        let inventory = engine.inventory().await.unwrap();
+        assert_eq!(inventory.source, "daemon");
+        assert_eq!(inventory.devices.len(), 1);
+        assert_eq!(inventory.devices[0].device_id, "0");
+        assert_eq!(inventory.devices[0].device_class(), "discrete");
+    }
+
+    #[tokio::test]
     async fn generate_collects_only_matching_tokens_until_matching_done() {
         let mut engine = mock_engine(vec![
             DaemonResponse::Token(hipfire_generate::TokenEvent {
@@ -769,10 +822,17 @@ mod tests {
             thinking: None,
             max_think_tokens: None,
             request_id: None,
+            evidence_dir: None,
         };
         let (text, done) = engine.generate(req).await.unwrap();
         assert_eq!(text, "hello world");
         assert_eq!(done.tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn reset_waits_for_reset_response() {
+        let mut engine = mock_engine(vec![DaemonResponse::Reset]);
+        engine.reset().await.unwrap();
     }
 
     #[test]

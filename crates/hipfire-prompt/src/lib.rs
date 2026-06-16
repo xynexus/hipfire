@@ -277,6 +277,9 @@ pub fn log_resolved_chat_template_source(source: &ChatTemplateSource) {
 pub trait PromptTokenizer {
     fn encode(&self, text: &str) -> Vec<u32>;
     fn special_token_id(&self, content: &str) -> Option<u32>;
+    fn special_tokens(&self) -> &[(String, u32)] {
+        &[]
+    }
     fn bos_token_text(&self) -> String;
 }
 
@@ -783,6 +786,70 @@ fn strip_generation_tags(template: &str) -> String {
     re.replace_all(template, "").into_owned()
 }
 
+/// JSON formatter matching HuggingFace's `json.dumps(..., ensure_ascii=False)`
+/// default separators — `", "` between elements and `": "` after keys — the
+/// exact form the model's chat_template was trained on. minijinja's builtin
+/// `tojson` is compact (`,`/`:`); registering [`hf_tojson`] on the render env
+/// makes `{{ x | tojson }}` (tool DEFINITIONS and mapping-valued tool-call
+/// arguments) byte-match `transformers.apply_chat_template`.
+struct HfJsonFormatter;
+impl serde_json::ser::Formatter for HfJsonFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b": ")
+    }
+}
+
+/// HF-compatible `tojson` filter (see [`HfJsonFormatter`]). Serializes the
+/// minijinja value DIRECTLY (not through an intermediate `serde_json::Value`),
+/// so map key order is whatever the value carries — preserved end-to-end when
+/// `serde_json` is built with `preserve_order` (without it, the request-parse
+/// `BTreeMap` has already alphabetized object keys before render). Register with
+/// `env.add_filter("tojson", hf_tojson)` to override minijinja's compact builtin.
+pub fn hf_tojson(
+    value: minijinja::Value,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<String, minijinja::Error> {
+    use serde::Serialize;
+    let _ = kwargs.get::<Option<bool>>("ensure_ascii");
+    let _ = kwargs.get::<Option<i64>>("indent");
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, HfJsonFormatter);
+    value.serialize(&mut ser).map_err(|e| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson: {e}"),
+        )
+    })?;
+    String::from_utf8(buf).map_err(|e| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson utf8: {e}"),
+        )
+    })
+}
+
 impl<'a> JinjaChatFrame<'a> {
     /// Render the template and tokenize the result. Returns `Err` on
     /// any template-side failure so the caller can fall back to
@@ -855,6 +922,18 @@ impl<'a> JinjaChatFrame<'a> {
         // PR #175 "missing required var" concern doesn't regress.
         let mut env = Environment::new();
         env.set_undefined_behavior(minijinja::UndefinedBehavior::Chainable);
+        // Match HuggingFace's apply_chat_template Jinja environment, which is
+        // constructed with `trim_blocks=True, lstrip_blocks=True`. Without these,
+        // block tags (`{% … %}`) leak their surrounding source whitespace into
+        // the rendered output — off-distribution vs. what the model trained on.
+        // Worse, for templates with history-length-dependent control flow (e.g.
+        // MiniMax-M2's `last_user_index` scan, which emits a `\n        ` per
+        // user message), the leaked leading whitespace VARIES by turn, so turn
+        // N+1's render diverges from turn N's at token 1 and the LCP prompt
+        // cache collapses to lcp=1. Enabling both makes our render byte-track
+        // HF and keeps the structural prefix history-invariant.
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
         // Make Python-style str/list/dict methods (`.startswith`,
         // `.split`, `.rstrip`, `.lstrip`, `|items`, etc.) work on
         // ordinary Jinja values. Required by the Qwen3 family
@@ -869,25 +948,10 @@ impl<'a> JinjaChatFrame<'a> {
         env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
-        // Some HF templates call `tojson(ensure_ascii=False)` (MiniMax-M2's tool
-        // block) or `tojson(indent=…)`. minijinja's builtin `tojson` rejects
-        // unknown kwargs, so the whole template fails to render and we silently
-        // fall back to the Plain frame — the model then never sees its native
-        // tool format (observed e2e on MiniMax-M2: template render failed on
-        // `ensure_ascii`, Plain fallback, model emitted a Qwen-ish `<tool_call>`
-        // instead of `<minimax:tool_call>`). Override `tojson` with a serde_json
-        // serializer that accepts + ignores those kwargs; serde_json emits raw
-        // UTF-8 (== ensure_ascii=False), which is what chat templates want.
-        env.add_filter(
-            "tojson",
-            |value: Value, kwargs: minijinja::value::Kwargs| -> Result<Value, Error> {
-                let _ = kwargs.get::<Option<bool>>("ensure_ascii");
-                let _ = kwargs.get::<Option<i64>>("indent");
-                let s = serde_json::to_string(&value)
-                    .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
-                Ok(Value::from_safe_string(s))
-            },
-        );
+        // Override minijinja's compact builtin `tojson` with the HF-spaced form
+        // (`", "` / `": "`) the model trained on. Some HF templates pass kwargs
+        // such as `ensure_ascii=False`; `hf_tojson` accepts and ignores them.
+        env.add_filter("tojson", hf_tojson);
 
         // Strip HF `{% generation %}` / `{% endgeneration %}` training-mask
         // tags (and their whitespace-control `{%- … -%}` variants). minijinja
@@ -941,6 +1005,147 @@ impl<'a> JinjaChatFrame<'a> {
     }
 }
 
+/// Pick an atomic special-token sentinel for the verbatim-splice render.
+///
+/// The sentinel must (1) encode to exactly one token (so it never BPE-merges
+/// with neighbouring template text — every structural token then stays
+/// byte-identical to a pure render) and (2) never be emitted by the template
+/// itself (so its post-render occurrence count equals the number of spliced
+/// assistant turns). We prefer obviously-reserved tokens (`reserved` / `unused`
+/// / `pad` in the name) and otherwise take any non-structural special token
+/// that round-trips atomically. Returns `None` when the tokenizer exposes no
+/// usable sentinel — the caller then falls back to a plain (retokenized) render.
+fn pick_splice_sentinel(tok: &dyn PromptTokenizer) -> Option<String> {
+    // Tokens the chat templates emit structurally — never use these as a
+    // sentinel (their post-render count wouldn't equal the spliced-turn count).
+    const STRUCTURAL: &[&str] = &[
+        "<|im_start|>",
+        "<|im_end|>",
+        "<think>",
+        "</think>",
+        "<|endoftext|>",
+        "<|begin_of_text|>",
+        "<|end_of_text|>",
+        "<s>",
+        "</s>",
+        "<bos>",
+        "<eos>",
+        "<unk>",
+        "<pad>",
+        "<|file_separator|>",
+    ];
+    let atomic = |s: &str| -> bool {
+        tok.special_token_id(s)
+            .map_or(false, |id| tok.encode(s) == vec![id])
+    };
+    // First pass: obviously-reserved scratch tokens.
+    for (s, _id) in tok.special_tokens() {
+        if STRUCTURAL.contains(&s.as_str()) {
+            continue;
+        }
+        let ls = s.to_ascii_lowercase();
+        if (ls.contains("reserved") || ls.contains("unused") || ls.contains("pad")) && atomic(s) {
+            return Some(s.clone());
+        }
+    }
+    // Second pass: any non-structural special token that round-trips atomically.
+    for (s, _id) in tok.special_tokens() {
+        if STRUCTURAL.contains(&s.as_str()) {
+            continue;
+        }
+        if atomic(s) {
+            return Some(s.clone());
+        }
+    }
+    None
+}
+
+/// Jinja-native analogue of [`build_cached_history`]: render the conversation
+/// through the model's **trained** `chat_template` (no hand-rolled
+/// `ChatScaffold`), but splice the VERBATIM generated tokens of each cached
+/// assistant turn in place of its content. The resulting token stream
+/// byte-exactly reproduces what the daemon prefilled when that turn was
+/// generated, so the downstream LCP prompt-cache hits reliably even for
+/// thinking models — whose generated `<think>…</think>` tokens cannot be
+/// recovered by re-tokenizing the API-stripped visible content (the exact
+/// failure mode that makes a plain re-render miss at the assistant boundary).
+///
+/// `messages` is the full conversation INCLUDING the live user turn last (the
+/// template's `add_generation_prompt` then appends the assistant opener). For
+/// each assistant turn, `cache_lookup` returns `Some(verbatim_tokens)` — the
+/// tokens that occupied that turn's content slot in `conversation_tokens` — or
+/// `None` (no cache entry: that turn keeps its retokenized content, which only
+/// costs a safe LCP miss at/after it).
+///
+/// Mechanism: substitute each cached assistant turn's content with an atomic
+/// special-token sentinel, render via [`JinjaChatFrame::render_messages`],
+/// tokenize, then replace each sentinel token with the cached tokens. The
+/// substitution is verified (sentinel occurs exactly once per cached turn);
+/// any mismatch — or no usable sentinel — falls back to a plain render so the
+/// result is always a valid (if uncached) token stream.
+pub fn build_cached_history_jinja(
+    frame: &JinjaChatFrame,
+    messages: &[Message],
+    tools: Option<&[serde_json::Value]>,
+    mut cache_lookup: impl FnMut(&Message) -> Option<Vec<u32>>,
+) -> Result<Vec<u32>, String> {
+    let tok = frame.tokenizer;
+    let plain = |f: &JinjaChatFrame| -> Result<Vec<u32>, String> {
+        Ok(tok.encode(&f.render_messages(messages, tools, None)?))
+    };
+    let sentinel = match pick_splice_sentinel(tok) {
+        Some(s) => s,
+        None => return plain(frame),
+    };
+    let sentinel_id = match tok.special_token_id(&sentinel) {
+        Some(id) => id,
+        None => return plain(frame),
+    };
+
+    // Build a messages copy where each cached assistant turn's content is the
+    // sentinel; collect the cached token vectors in document order.
+    let mut cached: Vec<Vec<u32>> = Vec::new();
+    let mut subbed: Vec<Message> = Vec::with_capacity(messages.len());
+    for m in messages {
+        if matches!(m.role, Role::Assistant) {
+            if let Some(toks) = cache_lookup(m) {
+                cached.push(toks);
+                subbed.push(Message {
+                    role: Role::Assistant,
+                    content: sentinel.clone(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+                continue;
+            }
+        }
+        subbed.push(m.clone());
+    }
+    if cached.is_empty() {
+        return plain(frame);
+    }
+
+    let toks = tok.encode(&frame.render_messages(&subbed, tools, None)?);
+    // Safety: the sentinel must appear exactly once per cached turn. If the
+    // template dropped/duplicated a turn, or the sentinel merged with adjacent
+    // text, splicing would corrupt the stream — fall back to a plain render.
+    if toks.iter().filter(|&&t| t == sentinel_id).count() != cached.len() {
+        return plain(frame);
+    }
+    let mut out: Vec<u32> =
+        Vec::with_capacity(toks.len() + cached.iter().map(|c| c.len()).sum::<usize>());
+    let mut k = 0usize;
+    for &t in &toks {
+        if t == sentinel_id {
+            out.extend_from_slice(&cached[k]);
+            k += 1;
+        } else {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,33 +1195,56 @@ mod tests {
 
     struct TestTokenizer {
         include_think: bool,
+        special_tokens: Vec<(String, u32)>,
     }
 
     impl PromptTokenizer for TestTokenizer {
         fn encode(&self, text: &str) -> Vec<u32> {
-            match text {
-                "<|im_start|>" => vec![0],
-                "<|im_end|>" => vec![1],
-                "<think>" if self.include_think => vec![2],
-                "</think>" if self.include_think => vec![3],
-                "system" => vec![4],
-                "user" => vec![5],
-                "assistant" => vec![6],
-                "\n" => vec![7],
-                _ => text
-                    .as_bytes()
+            let specials = [
+                ("<|im_start|>", 0),
+                ("<|im_end|>", 1),
+                ("<think>", 2),
+                ("</think>", 3),
+                ("system", 4),
+                ("user", 5),
+                ("assistant", 6),
+                ("\n", 7),
+                ("<|reserved_0|>", 8),
+            ];
+            let mut out = Vec::new();
+            let mut i = 0usize;
+            while i < text.len() {
+                let rest = &text[i..];
+                if let Some((s, id)) = specials
                     .iter()
-                    .map(|b| 100 + u32::from(*b))
-                    .collect(),
+                    .filter(|(s, _)| *s != "<think>" && *s != "</think>" || self.include_think)
+                    .find(|(s, _)| rest.starts_with(*s))
+                {
+                    out.push(*id);
+                    i += s.len();
+                    continue;
+                }
+                let ch = rest.chars().next().expect("non-empty rest");
+                let mut buf = [0u8; 4];
+                for b in ch.encode_utf8(&mut buf).as_bytes() {
+                    out.push(100 + u32::from(*b));
+                }
+                i += ch.len_utf8();
             }
+            out
         }
 
         fn special_token_id(&self, content: &str) -> Option<u32> {
             match content {
                 "<think>" if self.include_think => Some(2),
                 "</think>" if self.include_think => Some(3),
+                "<|reserved_0|>" => Some(8),
                 _ => None,
             }
+        }
+
+        fn special_tokens(&self) -> &[(String, u32)] {
+            &self.special_tokens
         }
 
         fn bos_token_text(&self) -> String {
@@ -1027,12 +1255,14 @@ mod tests {
     fn make_tokenizer() -> TestTokenizer {
         TestTokenizer {
             include_think: true,
+            special_tokens: vec![("<|reserved_0|>".to_string(), 8)],
         }
     }
 
     fn test_tokenizer_no_think() -> TestTokenizer {
         TestTokenizer {
             include_think: false,
+            special_tokens: vec![("<|reserved_0|>".to_string(), 8)],
         }
     }
 
@@ -1592,6 +1822,105 @@ mod tests {
         assert_eq!(m.role, Role::Tool);
         assert_eq!(m.content, "72F");
         assert_eq!(m.tool_call_id.as_deref(), Some("call_42"));
+    }
+
+    #[test]
+    fn jinja_splice_extends_prior_turn_for_thinking_model() {
+        // The core guarantee of `build_cached_history_jinja`: turn N+1's cached
+        // render is a strict EXTENSION of turn N's prefilled `conversation_tokens`
+        // (prompt + verbatim generated tokens), so the daemon's LCP prefix-cache
+        // hits — even for a thinking model whose generated <think>…</think>
+        // tokens cannot be recovered by re-tokenizing the API-stripped answer.
+        let t = make_tokenizer();
+        // Minimal ChatML template: history turns render
+        // `<|im_start|>{role}\n{content}<|im_end|>\n`; the generation prompt opens
+        // the assistant turn and (thinking-on) primes `<think>\n`.
+        let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}{% endif %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+        };
+
+        // Turn 1: daemon prefills R1 (prompt, ends with the primed `<think>\n`)
+        // then generates `reason</think>ok`.
+        let u1 = Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        };
+        let r1 = t.encode(
+            &frame
+                .render_messages(std::slice::from_ref(&u1), None, None)
+                .unwrap(),
+        );
+        let t1_gen = t.encode("reason</think>ok");
+        let mut conv_after_t1 = r1.clone();
+        conv_after_t1.extend_from_slice(&t1_gen);
+
+        // Turn 2: the asst_turn_cache stored the VERBATIM assistant slot — the
+        // primed `<think>\n` plus the generated tokens (everything the daemon
+        // laid between `assistant\n` and the next turn).
+        let asst_slot: Vec<u32> = {
+            let mut v = t.encode("<think>\n");
+            v.extend_from_slice(&t1_gen);
+            v
+        };
+        let a1 = Message {
+            role: Role::Assistant,
+            content: "ok".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        };
+        let u2 = Message {
+            role: Role::User,
+            content: "again".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        };
+        let messages_t2 = vec![u1.clone(), a1, u2];
+
+        let rendered_t2 = build_cached_history_jinja(&frame, &messages_t2, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(asst_slot.clone())
+            } else {
+                None
+            }
+        })
+        .expect("jinja splice render");
+
+        // No sentinel leaked.
+        let sentinel_id = t.special_token_id("<|reserved_0|>").unwrap();
+        assert!(
+            !rendered_t2.contains(&sentinel_id),
+            "sentinel must be fully replaced: {rendered_t2:?}"
+        );
+        // Verbatim splice happened.
+        assert!(
+            rendered_t2
+                .windows(asst_slot.len())
+                .any(|w| w == asst_slot.as_slice()),
+            "cached assistant slot must be spliced verbatim",
+        );
+        // THE KEY PROPERTY: turn 2 strictly extends turn 1's conversation_tokens.
+        assert!(
+            rendered_t2.len() > conv_after_t1.len(),
+            "turn 2 must be longer than turn 1"
+        );
+        assert_eq!(
+            &rendered_t2[..conv_after_t1.len()],
+            conv_after_t1.as_slice(),
+            "turn 2 render must extend turn 1's conversation_tokens as a strict prefix",
+        );
+
+        // Fallback: no cache entries ⇒ identical to a plain render.
+        let plain = t.encode(&frame.render_messages(&messages_t2, None, None).unwrap());
+        let no_cache = build_cached_history_jinja(&frame, &messages_t2, None, |_| None).unwrap();
+        assert_eq!(no_cache, plain, "no-cache path must equal a plain render");
     }
 
     #[test]

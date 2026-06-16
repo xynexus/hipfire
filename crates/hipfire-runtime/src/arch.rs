@@ -206,7 +206,7 @@ pub trait Architecture: Send + 'static {
 
 /// Per-arch overrides for the loop-guard n-gram blocker.
 ///
-/// The runtime's loop guard (`hipfire_runtime::loop_guard`) detects
+/// The generation loop guard (`hipfire_generate::loop_guard`) detects
 /// repeated n-grams in the recent decode window and blocks the
 /// repeating token before sampler draws it. Defaults come from env
 /// (`HIPFIRE_NGRAM_THRESHOLD`, `HIPFIRE_NGRAM_WINDOW`); per-arch
@@ -223,9 +223,9 @@ pub struct LoopGuardOverrides {
 
 /// Per-arch overrides for the sampler.
 ///
-/// `hipfire_runtime::sampler` owns top-p / top-k / temperature / repeat-
-/// penalty / blocked-token mechanics. Per-arch overrides add to (don't
-/// replace) the runtime config.
+/// `hipfire-generate` owns sampler policy. `hipfire_runtime::sampler` owns
+/// top-p / top-k / repeat-penalty execution mechanics. Per-arch overrides add
+/// to (don't replace) the runtime config.
 #[derive(Debug, Clone, Default)]
 pub struct SamplerOverrides {
     /// Tokens to add to `SamplerConfig::blocked_tokens` for this arch
@@ -254,7 +254,7 @@ pub struct PromptFrameOverrides {
 
 /// Per-arch overrides for EOS / end-of-turn filtering.
 ///
-/// `hipfire_runtime::eos_filter` owns visible-stream EOS detection.
+/// `hipfire_generate::eos_filter` owns visible-stream EOS detection.
 /// The default implementation handles ChatML `<|im_end|>` plus
 /// `<think>` strip; per-arch overrides extend to additional markers.
 #[derive(Debug, Clone, Default)]
