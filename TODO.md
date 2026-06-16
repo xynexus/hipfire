@@ -221,3 +221,75 @@ hours); the GPU forward + on-GPU accumulation would be far faster, and it
 removes the Python/torch tooling dependency from the quant pipeline.
 Reference: the validated Tier-2 `scripts/collect_hessian.py` + the existing
 scaffold's documented deliverables.
+
+## GPU (HIP) trellis-encode kernel for QTIP quantization
+
+The QTIP encode (`qtip::beam_encode_group_bits` + the LDLQ block loop in
+`ldlq.rs`) is the slow stage: per 256-weight group it runs 256 sequential
+Viterbi steps, each generating `beam_width × 2^bits` candidates
+(128 × 8 = 1024 at 3-bit) and doing a sort/dedup-by-state + top-`beam_width`
+select. CPU rayon parallelizes only across groups/rows, capping throughput at
+core count (0.8B qtip3-sim ≈ 10 min wall on 24 cores; LDLQ is slower still).
+This is pure *offline* cost (Rule 1 does not apply — quantize is tooling), so
+spend GPU compute once to improve the many. **Verdict: HIP/RDNA is the right
+target; the XDNA NPU is not** (beam search is sort/branch/backtrack-heavy —
+the opposite of the AIE dataflow-MAC array; only FWHT + the LDLQ Cholesky/
+residual GEMMs are NPU-shaped, and those aren't the bottleneck).
+
+Build a HIP encode kernel mirroring the structure of the decode kernel
+(`kernels/src/gemv_qtip3g256.hip`), single backend:
+- **One group per workgroup/wavefront.** Cross-group parallelism (millions of
+  256-groups) saturates every CU; the 256-step recurrence stays serial inside
+  the workgroup (don't parallelize the time axis).
+- **Codebook in LDS.** 4096 × f32 = 16 KB fits the LDS budget; the per-step
+  cost eval becomes an LDS read + FMA. Or recompute the 1MAD hash per lane
+  (the same few-ALU-op hash the decode kernel already computes — bit-identical
+  to the PPL-validated path).
+- **Beam + candidates in LDS.** beam_width 128 × (state u32 + cost f32) is
+  tiny; the 1024 per-step candidates are an LDS scratch.
+- **Per-step top-k is the only hard op** — a bitonic top-k in LDS (~10 stages)
+  or a segmented min-reduction keyed on next-state. This is the bulk of the
+  kernel engineering.
+- **LDLQ arm:** keep full row-parallelism (thousands of m rows encode
+  concurrently), serialize only the ~k/256 column-blocks (block residual feeds
+  the next block). The per-tensor inverse-Cholesky (O(k³), k ≤ 4096) is a
+  one-time dense-LA op (rocSOLVER/rocBLAS), not the bottleneck.
+
+Expected payoff: order-of-magnitude+ over the 24-core path (thousands of
+groups in flight vs ~24). Precedent: QTIP's own reference runs trellis encode
++ LDLQ on GPU. Cheap CPU-side stopgap meanwhile: lower `beam_width` (trellis
+quality is flat above ~16–32). Priority rises when encode moves to 4B/9B,
+where the offline cost actually starts to hurt.
+
+## hipfire finetune tool (QTIP blocked finetune / quant-error recovery)
+
+QTIP's headline sub-4-bit numbers depend on **blocked fine-tuning** to recover
+quality after quantization; hipfire has no training stack, which is why pure
+PTQ qtip3-sim lands at +8.3% PPL (15.20 vs MQ4 14.03) on the 0.8B worst case
+and 2-bit collapses there even with LDLQ. A native finetune tool would close
+that gap (and is the realistic path to *usable* 2-bit on bigger models, where
+the paper says blocked FT is what makes 2-bit work). Now unblocked: halo
+(Strix Halo gfx1151, 124 GB unified RAM) runs ROCm torch on the 8060S GPU
+(C1h note in NEXT-STEPS), so GPU finetune of the 0.8B is feasible (slow at
+~3 TFLOP/s, but it's a one-time offline cost — acceptable per the "improve the
+many" principle).
+
+Scope (offline tooling — Rule 1 does not apply):
+- **Blocked / layer-wise finetune** of the QTIP-quantized model against the
+  fp16 teacher: freeze the trellis symbol assignment, learn the per-group
+  `scale` (and optionally the codebook affine) to minimize per-block output
+  error — the cheap, decode-compatible recovery that keeps the kernel
+  unchanged. Then optionally end-to-end finetune of the dequantized weights
+  with straight-through trellis re-encode (the paper's full recipe).
+- **Teacher/student wiring:** reuse the calibration corpus + the Hessian
+  collector's `ActivationCapture` sites; the loss is block-output MSE (or KL on
+  logits for the final stage).
+- **Backend decision:** Tier-1 native HIP training is a large lift; Tier-2 is a
+  gated Python/torch tool on halo (matches the Hessian collector's two-tier
+  precedent — Python is allowed for offline tooling). Start Tier-2 to get a
+  quality verdict, promote to native only if it pays off.
+- **Acceptance:** qtip3 (and a 7B+ qtip2) PPL closes meaningfully toward MQ4 /
+  fp16 after FT; coherence-gate clean; the finetuned artifact still decodes
+  bit-identically on the `gemv_qtip3g256` kernel (scale-only FT) or re-packs
+  cleanly (weight FT). Validate on a 7B+ model on halo where 2-bit QTIP is
+  expected to become usable.
