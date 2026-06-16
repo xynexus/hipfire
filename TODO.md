@@ -335,11 +335,39 @@ while tokens shift). Only-tiny-moved ⇒ tiny-specific, rebaseline; 35B-also-
 moved ⇒ real change, rebaseline both deliberately (never auto on a coarse
 pass). Greedy decode, fixed long agent-shape prompt, forced MMQ.
 
-Generator: a small offline Python script (Rule-1-OK) emitting random-weight
-safetensors + config.json in the arch-5 / arch-6 tensor layout, then
-`hipfire-quantize` to mq4/qtip3/etc. Wire the golden runner into
-`no-gpu-ci.sh` (CPU reference) + a GPU dispatch channel-test. <10M params is
-trivial: hidden ~256, 2–4 layers, 8 experts top-2, small `moe_intermediate`.
+Generator = a **tiny-fixture emitter built into `hipfire-quantize`** (NOT a
+one-off script). Rationale: the quantizer already owns each arch's tensor
+manifest + the HF→internal name mapping (that's what its ingest path does), so
+reusing it as the single source of truth keeps fixtures from drifting; a
+standalone Python generator would re-derive every arch's tensor list and rot
+when a layout changes. Native Rust also drops the torch/transformers dep.
+
+Design:
+- **Emit HF safetensors + `config.json`, then run the normal `--input` quantize
+  path** (don't synthesize `.hfq` internals directly) — this exercises the
+  arch-specific **name-mapper** too, a common break point, so the fixture flow
+  gives full-pipeline coverage for free.
+- **Seeded random init** (byte-reproducible across machines → stable golden) +
+  a per-arch **"tiny preset"**: dims <10M params while preserving the structural
+  features gating needs — for Qwen3.5: ≥1 of EACH layer type (DeltaNet +
+  FullAttn, dense + MoE), enough experts for top-k, batch large enough to cross
+  the MMQ threshold. Optional router-margin knob for MoE fixtures.
+- CLI shape e.g. `hipfire-quantize --emit-fixture <arch> --tiny --seed N
+  --out <dir>` → then quantize to mq4/qtip3/etc.
+- **Cost to budget:** each arch's manifest is today *implicit* in the ingest/
+  mapping code; the emitter needs it *explicit/enumerable* ("arch → [(name,
+  shape-formula)]"). Modest refactor, but healthy — the same table a fixture
+  emitter wants is also what a manifest-validator and per-arch docs want, and
+  it's a forcing function to document tensor layout when adding an arch.
+- **Generalizes:** the dense (arch 5) + MoE (arch 6) goldens are just the first
+  two consumers; deepseek4 / minimax / lfm2moe / dots-ocr each get a tiny
+  gating fixture from the same mechanism as support lands. <10M is trivial
+  (hidden ~256, 2–4 layers, 8 experts top-2, small `moe_intermediate`).
+
+Wire the golden runner into `no-gpu-ci.sh` (CPU reference) + a GPU dispatch
+channel-test. Build order: dense arch-5 first (isolates the shared DeltaNet
+LA+FA hybrid manifest, deterministic golden), then MoE arch-6 is additive
+(router + experts + the combine-path stabilization above).
 
 ## Deterministic MoE-down reduction (reconsider the atomicAdd default)
 
