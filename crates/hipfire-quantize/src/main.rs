@@ -45,6 +45,8 @@ mod hessian_io;
 // KVarN (Phase D) — variance-normalized 4-bit KV, clean-room CPU core.
 #[allow(dead_code)]
 mod kvarn;
+// Tiny random-init model fixtures for fast kernel/plumbing gating.
+mod fixture;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -5522,6 +5524,25 @@ fn run_gguf_pipeline(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // `--emit-fixture <arch>`: write a tiny random-init HF model (safetensors +
+    // config.json) for gating, then exit. Flows through the normal `--input`
+    // quantize path afterward (separate invocation). See src/fixture.rs.
+    if let Some(arch) = arg_value(&args, "--emit-fixture") {
+        let out = arg_value(&args, "--out")
+            .or_else(|| arg_value(&args, "--output"))
+            .unwrap_or("./tiny-fixture");
+        let seed = arg_value(&args, "--seed")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0x00C0_FFEE);
+        match fixture::emit_fixture(arch, Path::new(out), seed) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("emit-fixture: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Bound rayon's pool to 80% of cores (default cap; override with --threads N
     // or HIPFIRE_QUANT_THREADS env). Quantization is CPU-bound and saturates
