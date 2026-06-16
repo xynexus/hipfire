@@ -351,7 +351,9 @@ Design:
   a per-arch **"tiny preset"**: dims <10M params while preserving the structural
   features gating needs — for Qwen3.5: ≥1 of EACH layer type (DeltaNet +
   FullAttn, dense + MoE), enough experts for top-k, batch large enough to cross
-  the MMQ threshold. Optional router-margin knob for MoE fixtures.
+  the MMQ threshold. (Router-margin knob for MoE fixtures is DEFERRED until the
+  hipfire finetune tool exists — see that section; until then the MoE fixture
+  golden is stabilized by pinning the deterministic combine.)
 - CLI shape e.g. `hipfire-quantize --emit-fixture <arch> --tiny --seed N
   --out <dir>` → then quantize to mq4/qtip3/etc.
 - **Cost to budget:** each arch's manifest is today *implicit* in the ingest/
@@ -404,7 +406,12 @@ test variant? Options, best first:
 Bench the fixed-point variant; if it's near-zero perf cost it should likely be
 the global default. Pairs with the tiny-fixture golden/determinism gate above.
 
-### Router-margin tuning of the tiny MoE *fixture* (not production)
+### Router-margin tuning of the tiny MoE *fixture* (DEFERRED → needs hipfire-finetune)
+
+NOTE: this is deferred until the **hipfire finetune tool** lands — margin
+tuning is an optimization step the finetune tool is the natural home for.
+Until then, stabilize the MoE fixture golden by **pinning the deterministic
+combine** (the first option below). Recorded here so the approach isn't lost.
 
 A fixture-construction trick (this is about the tiny golden model, NOT a
 production model technique): when generating the tiny MoE fixture, nudge the
