@@ -911,7 +911,10 @@ version = "0.2.0"
 dependencies = [
  "csv",
  "hipfire-coherence",
+ "hipfire-daemon-adapter",
+ "hipfire-daemon-protocol",
  "hipfire-evidence",
+ "hipfire-generate",
  "hipfire-hash",
  "hipfire-model",
  "libc",

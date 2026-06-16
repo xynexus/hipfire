@@ -14,11 +14,12 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_void, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hipfire_daemon_protocol::{DaemonRequest, DaemonResponse};
 use hipfire_evidence::{
     admission_artifact_index_entry_json, admission_artifact_json, admission_metric_is_quality,
     admission_verdict_policy, classify_hardware_kind, comparison_artifact_index_entry_json,
@@ -40,10 +41,11 @@ use hipfire_evidence::{
     RunMetadataArtifact, RunMetadataConfig, RunMetadataModels, RunProvenance, SourcedField,
     OBSERVED_ADMISSION_EVIDENCE_KINDS, STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
+use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
 use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
 use hipfire_model::{
     discover_dflash_draft_for_model, model_artifact_stem, model_hash, model_manifest_entry,
-    ModelManifestEntry,
+    ModelLoadParams, ModelManifestEntry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,6 +313,7 @@ pub enum EvalExecutorMode {
     None,
     Examples,
     Direct,
+    Daemon,
     Mock,
 }
 
@@ -321,6 +324,7 @@ impl EvalExecutorMode {
             "none" => Ok(Self::None),
             "examples" | "example" | "subprocess" => Ok(Self::Examples),
             "direct" | "runtime" | "session" => Ok(Self::Direct),
+            "daemon" | "daemon-backed" | "jsonl" => Ok(Self::Daemon),
             "mock" => Ok(Self::Mock),
             other => Err(format!("unknown executor mode: {other}")),
         }
@@ -332,6 +336,7 @@ impl EvalExecutorMode {
             Self::None => "none",
             Self::Examples => "examples",
             Self::Direct => "direct",
+            Self::Daemon => "daemon",
             Self::Mock => "mock",
         }
     }
@@ -893,7 +898,7 @@ pub fn usage() -> String {
        --performance-candidate-variant <v> performance-json variant for --model\n\
        --performance-baseline-variant <v>  performance-json variant for --baseline\n\
        --performance-reference-variant <v> performance-json variant for --reference\n\
-       --executor <auto|none|examples|direct|mock> execution backend (default: auto; examples/direct run Hipfire example binaries; mock is no-GPU test-only)\n\
+       --executor <auto|none|examples|direct|daemon|mock> execution backend (default: auto; daemon uses hipfire-daemon JSONL; mock is no-GPU test-only)\n\
        --fetch-datasets         opt in to Hugging Face dataset fetches\n\
        --offline                forbid network fetches\n\
        --dataset-cache <dir>    dataset cache root (default: ~/.hipfire/eval/datasets)\n\
@@ -5407,6 +5412,37 @@ fn direct_battery_rows(
     }
 }
 
+fn daemon_battery_rows(
+    battery: BatteryId,
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    _datasets: &[DatasetManifestEntry],
+) -> Option<Vec<EvalResult>> {
+    match battery {
+        BatteryId::Smoke => Some(vec![
+            run_daemon_generate_anchor_with_prompt(
+                BatteryId::Smoke,
+                "finite_greedy_decode",
+                "benchmarks/prompts/qwen2_smoke.txt",
+                config,
+                ctx,
+            ),
+            skip_row_with_metrics(
+                BatteryId::Smoke,
+                None,
+                "multi_turn_reset_recall",
+                None,
+                "daemon-backed multi-turn session is not implemented yet",
+                config,
+                ctx,
+                prompt("benchmarks/prompts/trains-meet.txt"),
+                BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+            ),
+        ]),
+        _ => None,
+    }
+}
+
 fn examples_executor_available_for(battery: BatteryId) -> bool {
     match battery {
         BatteryId::Coherence => hipfire_coherence::daemon_binary_available(),
@@ -8965,6 +9001,270 @@ fn run_direct_session_reset_recall(config: &EvalConfig, ctx: &EvalContext) -> Ev
     )
 }
 
+fn run_daemon_generate_anchor_with_prompt(
+    battery: BatteryId,
+    case_id: &str,
+    prompt_path: &str,
+    config: &EvalConfig,
+    ctx: &EvalContext,
+) -> EvalResult {
+    let prompt_ref = prompt(prompt_path);
+    let model = config.model.clone();
+    let base_metrics = || BTreeMap::from([("executor".to_string(), json!("daemon"))]);
+
+    if !Path::new(&model).exists() {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Skip,
+            Some("daemon executor requires --model to be a local filesystem path".to_string()),
+            base_metrics(),
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    }
+    let Some(bin) = hipfire_daemon_adapter::find_daemon_bin() else {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Skip,
+            Some(
+                "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`"
+                    .to_string(),
+            ),
+            base_metrics(),
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    };
+    let prompt_text = match fs::read_to_string(prompt_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return row_for_model(
+                battery,
+                None,
+                case_id,
+                None,
+                EvalStatus::Fail,
+                Some(format!("read prompt fixture {prompt_path}: {err}")),
+                base_metrics(),
+                config,
+                ctx,
+                prompt_ref,
+                0,
+                model,
+            );
+        }
+    };
+
+    let started = SystemTime::now();
+    let result = run_daemon_generate_once(&bin, &model, &prompt_text, config);
+    let elapsed_ms = elapsed_since_ms(started);
+    let mut metrics = base_metrics();
+    metrics.insert("daemon_bin".to_string(), json!(bin.display().to_string()));
+    metrics.insert("prompt_path".to_string(), json!(prompt_path));
+    metrics.insert(
+        "prompt_hash".to_string(),
+        json!(stable_hash_bytes(prompt_text.as_bytes())),
+    );
+
+    match result {
+        Ok(report) => {
+            metrics.insert("implemented".to_string(), json!(true));
+            metrics.insert("worker_key_id".to_string(), json!(report.worker_key_id));
+            metrics.insert("tokens".to_string(), json!(report.tokens));
+            metrics.insert("text_hash".to_string(), json!(report.text_hash));
+            if let Some(tok_s) = report.tok_s {
+                metrics.insert("tok_s".to_string(), json!(tok_s));
+            }
+            if let Some(ttft_ms) = report.ttft_ms {
+                metrics.insert("ttft_ms".to_string(), json!(ttft_ms));
+            }
+            if let Some(prefill_ms) = report.prefill_ms {
+                metrics.insert("prefill_ms".to_string(), json!(prefill_ms));
+            }
+            if let Some(prefill_tok_s) = report.prefill_tok_s {
+                metrics.insert("prefill_tok_s".to_string(), json!(prefill_tok_s));
+            }
+            if let Some(decode_tok_s) = report.decode_tok_s {
+                metrics.insert("decode_tok_s".to_string(), json!(decode_tok_s));
+            }
+            row_for_model(
+                battery,
+                None,
+                case_id,
+                None,
+                EvalStatus::Pass,
+                None,
+                metrics,
+                config,
+                ctx,
+                prompt_ref,
+                elapsed_ms,
+                model,
+            )
+        }
+        Err(err) => row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Fail,
+            Some(err),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            elapsed_ms,
+            model,
+        ),
+    }
+}
+
+#[derive(Debug)]
+struct DaemonGenerateReport {
+    worker_key_id: String,
+    tokens: u32,
+    tok_s: Option<f64>,
+    prefill_ms: Option<f64>,
+    prefill_tok_s: Option<f64>,
+    decode_tok_s: Option<f64>,
+    ttft_ms: Option<f64>,
+    text_hash: String,
+}
+
+fn run_daemon_generate_once(
+    bin: &Path,
+    model: &str,
+    prompt_text: &str,
+    config: &EvalConfig,
+) -> Result<DaemonGenerateReport, String> {
+    let mut child = Command::new(bin)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|err| format!("spawn daemon {}: {err}", bin.display()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "daemon stdin was not piped".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "daemon stdout was not piped".to_string())?;
+    let mut stdout = BufReader::new(stdout);
+
+    let max_seq = (config.max_tokens + 2048).max(4096) as u32;
+    let load = DaemonRequest::Load(hipfire_model::ModelLoadRequest {
+        model: model.to_string(),
+        params: ModelLoadParams {
+            max_seq,
+            kv_cache: config.kv_mode.clone(),
+            dflash_mode: Some(config.dflash.as_str().to_string()),
+            draft: config.draft.clone(),
+            ..Default::default()
+        },
+        request_id: Some("eval-load".to_string()),
+    });
+    write_daemon_request(&mut stdin, &load)?;
+    let worker_key_id = loop {
+        match read_daemon_response(&mut stdout)? {
+            DaemonResponse::Loaded(loaded) => break loaded.worker_key_id,
+            DaemonResponse::Error(err) => {
+                return Err(format!("daemon load error: {}", err.message));
+            }
+            DaemonResponse::Unknown => {}
+            other => {
+                eprintln!("warning: unexpected daemon response during eval load: {other:?}");
+            }
+        }
+    };
+
+    let req = GenerateTextRequest::from_prompt(
+        "eval-generate".to_string(),
+        prompt_text.to_string(),
+        GenerationSamplingPolicy {
+            temperature: 0.0,
+            top_p: None,
+            repeat_penalty: None,
+            max_tokens: config.max_tokens as u32,
+        },
+    )
+    .with_worker_key_id(Some(worker_key_id.clone()));
+    write_daemon_request(&mut stdin, &DaemonRequest::Generate(req))?;
+
+    let mut text = String::new();
+    let done = loop {
+        match read_daemon_response(&mut stdout)? {
+            DaemonResponse::Token(token) => {
+                if token.id == "eval-generate" {
+                    text.push_str(&token.text);
+                }
+            }
+            DaemonResponse::Done(done) => {
+                if done.id == "eval-generate" {
+                    break done;
+                }
+            }
+            DaemonResponse::Error(err) => {
+                return Err(format!("daemon generate error: {}", err.message));
+            }
+            DaemonResponse::Unknown => {}
+            other => {
+                eprintln!("warning: unexpected daemon response during eval generate: {other:?}");
+            }
+        }
+    };
+
+    let _ = write_daemon_request(&mut stdin, &DaemonRequest::Unload);
+    drop(stdin);
+    let _ = child.wait();
+
+    Ok(DaemonGenerateReport {
+        worker_key_id,
+        tokens: done.tokens,
+        tok_s: done.tok_s,
+        prefill_ms: done.prefill_ms,
+        prefill_tok_s: done.prefill_tok_s,
+        decode_tok_s: done.decode_tok_s,
+        ttft_ms: done.ttft_ms,
+        text_hash: stable_hash_bytes(text.as_bytes()),
+    })
+}
+
+fn write_daemon_request(stdin: &mut impl Write, req: &DaemonRequest) -> Result<(), String> {
+    serde_json::to_writer(&mut *stdin, req)
+        .map_err(|err| format!("serialize daemon request: {err}"))?;
+    stdin
+        .write_all(b"\n")
+        .map_err(|err| format!("write daemon request: {err}"))?;
+    stdin
+        .flush()
+        .map_err(|err| format!("flush daemon request: {err}"))
+}
+
+fn read_daemon_response(stdout: &mut impl BufRead) -> Result<DaemonResponse, String> {
+    let mut line = String::new();
+    stdout
+        .read_line(&mut line)
+        .map_err(|err| format!("read daemon response: {err}"))?;
+    if line.is_empty() {
+        return Err("daemon stdout closed unexpectedly".to_string());
+    }
+    serde_json::from_str(line.trim_end()).map_err(|err| format!("parse daemon response: {err}"))
+}
+
 fn resolve_dflash_spec_demo_bin() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("HIPFIRE_DFLASH_SPEC_DEMO_BIN") {
         let p = PathBuf::from(path);
@@ -9633,6 +9933,11 @@ fn run_battery(
     }
     if config.executor == EvalExecutorMode::Direct {
         if let Some(rows) = direct_battery_rows(battery, config, ctx, datasets) {
+            return rows;
+        }
+    }
+    if config.executor == EvalExecutorMode::Daemon {
+        if let Some(rows) = daemon_battery_rows(battery, config, ctx, datasets) {
             return rows;
         }
     }
@@ -11096,6 +11401,12 @@ mod tests {
         let direct =
             parse_args_from(["hipfire-eval", "--model", "m.hfq", "--executor", "direct"]).unwrap();
         assert_eq!(direct.executor, EvalExecutorMode::Direct);
+        let daemon =
+            parse_args_from(["hipfire-eval", "--model", "m.hfq", "--executor", "daemon"]).unwrap();
+        assert_eq!(daemon.executor, EvalExecutorMode::Daemon);
+        let jsonl =
+            parse_args_from(["hipfire-eval", "--model", "m.hfq", "--executor", "jsonl"]).unwrap();
+        assert_eq!(jsonl.executor, EvalExecutorMode::Daemon);
     }
 
     #[test]
@@ -12086,6 +12397,51 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             .as_deref()
             .unwrap_or("")
             .contains("local filesystem path"));
+    }
+
+    #[test]
+    fn daemon_executor_routes_smoke_generate_to_daemon_adapter() {
+        let out = temp_path("daemon-smoke");
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "missing-local-model.hfq",
+            "--executor",
+            "daemon",
+            "--battery",
+            "smoke",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+
+        let rows = daemon_battery_rows(BatteryId::Smoke, &cfg, &ctx, &[]).unwrap();
+        assert_eq!(rows[0].case_id, "finite_greedy_decode");
+        assert_eq!(rows[0].status, EvalStatus::Skip);
+        assert_eq!(
+            rows[0].metrics.get("executor").and_then(Value::as_str),
+            Some("daemon")
+        );
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("local filesystem path"));
+        assert_eq!(rows[1].case_id, "multi_turn_reset_recall");
+        assert_eq!(
+            rows[1].metrics.get("executor").and_then(Value::as_str),
+            Some("daemon")
+        );
     }
 
     #[test]
