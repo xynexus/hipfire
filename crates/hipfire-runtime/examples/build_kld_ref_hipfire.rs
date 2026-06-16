@@ -35,6 +35,10 @@ fn main() {
         },
         speculative::{KvMode, ModelSlot, ModelSlotConfig},
     };
+    use hipfire_evidence::{
+        completed_kldref_resume_chunks, kldref_temp_layout, read_kldref_resume_elapsed,
+        validate_kldref_tokens_temp, write_kldref_resume_state, KldRefResumeState,
+    };
     use hipfire_runtime::hfq::{
         write_hfqm_package_from_files, HfqPackageWriteEntry, HFQM_ARCH_NON_WEIGHT_PACKAGE,
     };
@@ -45,7 +49,7 @@ fn main() {
     use serde_json::json;
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
-    use std::fs::File;
+    use std::fs::{File, OpenOptions};
     use std::hash::Hasher;
     use std::io::{BufReader, BufWriter, Read, Write};
     use std::path::{Path, PathBuf};
@@ -67,11 +71,12 @@ fn main() {
         kv_mode: KvMode,
         max_seq: Option<usize>,
         metadata_json: Option<PathBuf>,
+        resume: bool,
     }
 
     fn print_usage() {
         eprintln!(
-            "Usage:\n  build_kld_ref_hipfire --model <model.hfq> --slice <slice.txt> --top-k <N> --output <out.kldref.hfq> \\\n                         [--n-ctx <N>=2048] [--max-chunks N] [--kv-mode fp32|q8|asym4|asym3|asym2] [--max-seq N] [--metadata-json path]"
+            "Usage:\n  build_kld_ref_hipfire --model <model.hfq> --slice <slice.txt> --top-k <N> --output <out.kldref.hfq> \\\n                         [--n-ctx <N>=2048] [--max-chunks N] [--kv-mode fp32|q8|asym4|asym3|asym2] [--max-seq N] [--metadata-json path] [--resume]"
         );
     }
 
@@ -99,6 +104,7 @@ fn main() {
         let mut kv_mode = KvMode::Fp32;
         let mut max_seq: Option<usize> = None;
         let mut metadata_json: Option<PathBuf> = None;
+        let mut resume = false;
 
         let argv: Vec<String> = std::env::args().collect();
         let mut i = 1;
@@ -139,6 +145,10 @@ fn main() {
                 "--metadata-json" => {
                     metadata_json = Some(PathBuf::from(&argv[i + 1]));
                     i += 2;
+                }
+                "--resume" => {
+                    resume = true;
+                    i += 1;
                 }
                 "-h" | "--help" => {
                     print_usage();
@@ -182,6 +192,7 @@ fn main() {
             kv_mode,
             max_seq,
             metadata_json,
+            resume,
         }
     }
 
@@ -785,48 +796,98 @@ fn main() {
             std::fs::create_dir_all(parent).expect("create output parent");
         }
     }
-    let temp_stem = format!(
-        ".{}.{}.kldref",
-        args.output
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("output"),
-        std::process::id()
-    );
-    let temp_dir = args
-        .output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let tokens_path = temp_dir.join(format!("{temp_stem}.tokens.tmp"));
-    let indices_path = temp_dir.join(format!("{temp_stem}.top_indices.tmp"));
-    let log_probs_path = temp_dir.join(format!("{temp_stem}.top_log_probs.tmp"));
-    let residual_path = temp_dir.join(format!("{temp_stem}.residual_mass.tmp"));
+    let temp_layout = kldref_temp_layout(&args.output, args.resume, std::process::id());
+    let tokens_path = temp_layout.tokens_path.clone();
+    let indices_path = temp_layout.indices_path.clone();
+    let log_probs_path = temp_layout.log_probs_path.clone();
+    let residual_path = temp_layout.residual_path.clone();
+    let resume_state_path = temp_layout.resume_state_path.clone();
 
-    let mut tokens_out = BufWriter::with_capacity(
-        4 * 1024 * 1024,
-        File::create(&tokens_path).expect("create tokens temp"),
-    );
-    for &token in tokens {
-        tokens_out.write_all(&token.to_le_bytes()).unwrap();
+    let expected_tokens_bytes = (tokens.len() * std::mem::size_of::<u32>()) as u64;
+    if args.resume && tokens_path.exists() {
+        if let Err(err) = validate_kldref_tokens_temp(&tokens_path, expected_tokens_bytes) {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    } else {
+        let mut tokens_out = BufWriter::with_capacity(
+            4 * 1024 * 1024,
+            File::create(&tokens_path).expect("create tokens temp"),
+        );
+        for &token in tokens {
+            tokens_out.write_all(&token.to_le_bytes()).unwrap();
+        }
+        tokens_out.flush().unwrap();
+        drop(tokens_out);
     }
-    tokens_out.flush().unwrap();
-    drop(tokens_out);
+
+    let indices_chunk_bytes = (scored_per_chunk * top_k * std::mem::size_of::<u32>()) as u64;
+    let log_probs_chunk_bytes = (scored_per_chunk * top_k * std::mem::size_of::<f32>()) as u64;
+    let residual_chunk_bytes = (scored_per_chunk * std::mem::size_of::<f32>()) as u64;
+    let resume_chunks = if args.resume {
+        let resume_chunks = match completed_kldref_resume_chunks(
+            &temp_layout,
+            n_chunk,
+            indices_chunk_bytes,
+            log_probs_chunk_bytes,
+            residual_chunk_bytes,
+        ) {
+            Ok(chunks) => chunks,
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        };
+        if resume_chunks > 0 {
+            eprintln!(
+                "build_kld_ref_hipfire: resuming {} from chunk {}/{}",
+                args.output.display(),
+                resume_chunks + 1,
+                n_chunk
+            );
+        }
+        resume_chunks
+    } else {
+        0
+    };
 
     let mut indices_out = BufWriter::with_capacity(
         4 * 1024 * 1024,
-        File::create(&indices_path).expect("create top_indices temp"),
+        OpenOptions::new()
+            .create(true)
+            .append(args.resume)
+            .write(true)
+            .truncate(!args.resume)
+            .open(&indices_path)
+            .expect("open top_indices temp"),
     );
     let mut log_probs_out = BufWriter::with_capacity(
         4 * 1024 * 1024,
-        File::create(&log_probs_path).expect("create top_log_probs temp"),
+        OpenOptions::new()
+            .create(true)
+            .append(args.resume)
+            .write(true)
+            .truncate(!args.resume)
+            .open(&log_probs_path)
+            .expect("open top_log_probs temp"),
     );
     let mut residual_out = BufWriter::with_capacity(
         4 * 1024 * 1024,
-        File::create(&residual_path).expect("create residual_mass temp"),
+        OpenOptions::new()
+            .create(true)
+            .append(args.resume)
+            .write(true)
+            .truncate(!args.resume)
+            .open(&residual_path)
+            .expect("open residual_mass temp"),
     );
 
     let started = Instant::now();
+    let resume_elapsed_sec = if args.resume {
+        read_kldref_resume_elapsed(&resume_state_path, resume_chunks)
+    } else {
+        0.0
+    };
     let progress_interval = (total_scored / 100).max(1);
     let scoring_start = args.n_ctx / 2;
     let full_hidden_buf = gpu
@@ -839,10 +900,14 @@ fn main() {
     let include_source_sha256 =
         std::env::var("HIPFIRE_KLD_SOURCE_SHA256").ok().as_deref() == Some("1");
     let source_model_hash = spawn_source_model_hash(args.model.clone(), include_source_sha256);
-    let mut scored_done = 0usize;
+    let mut scored_done = resume_chunks * scored_per_chunk;
+    let scored_done_at_start = scored_done;
     let do_profile = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
     let prefill_only_debug = std::env::var("HIPFIRE_KLD_PREFILL_ONLY").ok().as_deref() == Some("1");
-    for chunk_idx in 0..n_chunk {
+    let stop_after_chunks = std::env::var("HIPFIRE_KLD_STOP_AFTER_CHUNKS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok());
+    for chunk_idx in resume_chunks..n_chunk {
         slot.reset_state(&mut gpu);
         let chunk = &tokens[chunk_idx * args.n_ctx..(chunk_idx + 1) * args.n_ctx];
         let profile_this_chunk = do_profile && chunk_idx == 0;
@@ -925,7 +990,8 @@ fn main() {
             scored_done += scored_per_chunk;
             let pct = scored_done as f64 * 100.0 / total_scored as f64;
             let elapsed = started.elapsed().as_secs_f64();
-            let rate = scored_done as f64 / elapsed.max(1e-9);
+            let session_scored = scored_done.saturating_sub(scored_done_at_start);
+            let rate = session_scored as f64 / elapsed.max(1e-9);
             eprint!(
                 "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
                 chunk_idx + 1,
@@ -1081,7 +1147,8 @@ fn main() {
             scored_done += scored_per_chunk;
             let pct = scored_done as f64 * 100.0 / total_scored as f64;
             let elapsed = started.elapsed().as_secs_f64();
-            let rate = scored_done as f64 / elapsed.max(1e-9);
+            let session_scored = scored_done.saturating_sub(scored_done_at_start);
+            let rate = session_scored as f64 / elapsed.max(1e-9);
             eprint!(
                 "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
                 chunk_idx + 1,
@@ -1157,7 +1224,8 @@ fn main() {
             scored_done += scored_per_chunk;
             let pct = scored_done as f64 * 100.0 / total_scored as f64;
             let elapsed = started.elapsed().as_secs_f64();
-            let rate = scored_done as f64 / elapsed.max(1e-9);
+            let session_scored = scored_done.saturating_sub(scored_done_at_start);
+            let rate = session_scored as f64 / elapsed.max(1e-9);
             eprint!(
                 "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
                 chunk_idx + 1,
@@ -1190,7 +1258,8 @@ fn main() {
                 if scored_done % progress_interval == 0 || scored_done == total_scored {
                     let pct = scored_done as f64 * 100.0 / total_scored as f64;
                     let elapsed = started.elapsed().as_secs_f64();
-                    let rate = scored_done as f64 / elapsed.max(1e-9);
+                    let session_scored = scored_done.saturating_sub(scored_done_at_start);
+                    let rate = session_scored as f64 / elapsed.max(1e-9);
                     eprint!(
                         "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
                         chunk_idx + 1,
@@ -1206,9 +1275,38 @@ fn main() {
         if let Some(logits) = batched_logits {
             let _ = gpu.free_tensor(logits);
         }
+        if args.resume {
+            indices_out.flush().unwrap();
+            log_probs_out.flush().unwrap();
+            residual_out.flush().unwrap();
+            write_kldref_resume_state(
+                &resume_state_path,
+                &KldRefResumeState::new(
+                    chunk_idx + 1,
+                    n_chunk,
+                    scored_done,
+                    total_scored,
+                    resume_elapsed_sec + started.elapsed().as_secs_f64(),
+                ),
+            )
+            .expect("write resume state");
+        }
         if profile_this_chunk {
             let entries = rdna_compute::profile::stop().unwrap_or_default();
             print_profile_summary(&entries);
+        }
+        if stop_after_chunks
+            .map(|limit| chunk_idx + 1 >= limit)
+            .unwrap_or(false)
+        {
+            indices_out.flush().unwrap();
+            log_probs_out.flush().unwrap();
+            residual_out.flush().unwrap();
+            eprintln!(
+                "\nbuild_kld_ref_hipfire: debug stop after chunk {}",
+                chunk_idx + 1
+            );
+            return;
         }
     }
     eprintln!();
@@ -1219,7 +1317,7 @@ fn main() {
     drop(log_probs_out);
     drop(residual_out);
 
-    let elapsed = started.elapsed().as_secs_f64();
+    let elapsed = resume_elapsed_sec + started.elapsed().as_secs_f64();
     let producer_cmd = std::env::args().collect::<Vec<_>>().join(" ");
     let source_model_hash = join_source_model_hash(source_model_hash);
     let source_model_xxh64 = source_model_hash.xxh64.clone();
@@ -1263,6 +1361,8 @@ fn main() {
         "kld_graph_prefill": use_kld_graph,
         "kld_graph_prefill_max_batch": std::env::var("HIPFIRE_PREFILL_MAX_BATCH").ok(),
         "producer_cmd": producer_cmd,
+        "resume_enabled": args.resume,
+        "resumed_from_chunks": resume_chunks,
         "scoring_start": scoring_start,
         "scored_per_chunk": scored_per_chunk,
         "total_scored": total_scored,
@@ -1340,6 +1440,7 @@ fn main() {
     let _ = std::fs::remove_file(&indices_path);
     let _ = std::fs::remove_file(&log_probs_path);
     let _ = std::fs::remove_file(&residual_path);
+    let _ = std::fs::remove_file(&resume_state_path);
 
     let out_size = std::fs::metadata(&args.output)
         .map(|m| m.len())
