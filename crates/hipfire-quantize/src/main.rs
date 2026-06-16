@@ -5646,13 +5646,13 @@ fn main() {
             match hessian_io::HessianSidecar::open(std::path::Path::new(&p)) {
                 Ok(s) => {
                     eprintln!(
-                        "qtip2-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
+                        "qtip{qtip_bits}-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
                         s.n_tensors()
                     );
                     Some(s)
                 }
                 Err(e) => {
-                    eprintln!("qtip2-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP");
+                    eprintln!("qtip{qtip_bits}-sim: WARN cannot open Hessian {p}: {e:?} — plain QTIP");
                     None
                 }
             }
