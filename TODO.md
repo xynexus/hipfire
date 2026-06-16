@@ -376,15 +376,27 @@ test variant? Options, best first:
 Bench the fixed-point variant; if it's near-zero perf cost it should likely be
 the global default. Pairs with the tiny-fixture golden/determinism gate above.
 
-### Router-margin robustness (cross-link: hipfire finetune tool)
+### Router-margin tuning of the tiny MoE *fixture* (not production)
 
-Complementary cheat that attacks the *amplifier* rather than the noise: very
-slightly tune the model so expert-selector logits land **away from tie
-boundaries** (selected vs. dropped experts separated by a comfortable margin,
-i.e. "near the middle" of the decision region) — then ULP-level residual noise
-can't flip top-k regardless of reduction determinism. Implement as a
-margin/hinge regularizer on router logits in the **hipfire finetune tool**
-(see that section); cheap, and it hardens routing against *all* small
-perturbations (quant error, not just atomicAdd order). Belt-and-suspenders with
-the deterministic reduction, not a replacement (it lowers flip probability, the
-deterministic accumulator removes it).
+A fixture-construction trick (this is about the tiny golden model, NOT a
+production model technique): when generating the tiny MoE fixture, nudge the
+random-init router weights so that — for the fixed test prompt — every token's
+top-k expert selection lands with a **comfortable margin** (selected vs.
+dropped experts well separated, "near the middle" of the decision region). Then
+no routing decision is near a flip boundary, so the MoE-down atomicAdd ULP
+noise cannot cascade into an expert swap, and the fixture's *token* output is
+stable run-to-run **on the production fast path** — no need to pin the
+deterministic combine for the fixture's golden.
+
+This gives two independent ways to make the MoE fixture golden stable; pick per
+goal:
+- **Pin the deterministic combine** → byte-exact *logits* golden; tests the
+  deterministic kernel specifically.
+- **Router-margin-tune the fixture** (this) → token-exact golden that exercises
+  the **default atomicAdd fast path** (only benign sub-flip ULP noise remains).
+  For full token stability also give the fixture's final lm_head argmax a
+  margin on the test prompt. Cheaper to run and tests what production uses.
+
+(A production router-margin regularizer — hardening real routing against quant
+error — is a *separate* idea; park it under the finetune tool only if it earns
+its own motivation, not as part of this fixture work.)
