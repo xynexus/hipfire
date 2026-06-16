@@ -294,6 +294,38 @@ Scope (offline tooling — Rule 1 does not apply):
   cleanly (weight FT). Validate on a 7B+ model on halo where 2-bit QTIP is
   expected to become usable.
 
+### Legible golden for the tiny fixtures (first customer of the finetune tool)
+
+Upgrade the tiny-fixture golden (see "Tiny random-init fixtures" below) from an
+opaque `logit_hash` + random-token argmax to a **self-documenting generated
+sequence**, once the finetune tool can memorize a short prefix. Memorizing one
+fixed prefix is the *simplest* training objective (pure overfit, seconds on
+CPU) — so this doubles as the finetune tool's own smoke test.
+
+Design (force a fixed-length, e.g. 256-token, greedy generation):
+- **Trained legible preamble** — e.g. `"The model is working, what follows is
+  deliberately random:"`. Human-readable "is it alive / catastrophic
+  regression" signal; a CI failure is instantly interpretable.
+- **Untrained random tail** — the rest. NOT trained → high-entropy. "Random"
+  = varied *content*, still fully **deterministic** (fixed weights + greedy +
+  deterministic kernels). This is the **sensitive** tier: near-tie tokens sit
+  on decision boundaries, so they flip under subtle drift that the confident
+  (large-margin) memorized preamble would mask — recovering the sensitivity
+  pure memorization throws away. Keep a hash of the tail as the byte-exact
+  assertion.
+- **Bonus coverage:** 256 generated tokens exercise the full autoregressive
+  decode loop + KV-cache growth (the current single-position prefill golden
+  doesn't).
+- **Vocab:** byte-level (256-vocab, English as raw UTF-8, embed ≈ 65K params,
+  no tokenizer file) keeps it tiny; avoids the 248K-vocab embed blowup.
+- **MoE caveat:** the near-tie tail tokens are exactly where MoE-down atomicAdd
+  ULP noise can flip run-to-run → on the MoE fixture pin the deterministic
+  combine (or keep the run-twice determinism check). Dense path: a tail flip =
+  a real change.
+Complements, does not replace: `logit_hash` stays the sensitive tier today; the
+35B agentic-gate stays the *behavioral* arbiter (this is still memorized, not
+Q&A capability).
+
 ## Tiny random-init fixtures + golden-output tripwire (fast kernel/MoE plumbing)
 
 The coherence/agentic gates load `qwen3.6-35b-a3b` because the agentic gate is
