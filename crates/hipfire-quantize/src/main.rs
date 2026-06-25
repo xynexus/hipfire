@@ -619,7 +619,6 @@ fn dequantize_e4m3_f32scale_to_f32(
 
 // ─── Q4_F16_G64 Quantization ────────────────────────────────────────────────
 
-
 /// Quantize F32 weights to HFQ4-G256: flat 4-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 weights (0.531 B/w).
 /// 18 VGPRs, 100% occupancy on RDNA1. Beats Q4_K at all matrix sizes.
@@ -1039,7 +1038,6 @@ fn roughquant4_infer_dmodel(tensors: &[HfqTensor]) -> Option<usize> {
         .max_by_key(|&(dmodel, count)| (count, dmodel))
         .map(|(dmodel, _)| dmodel)
 }
-
 
 #[cfg(test)]
 mod awq_tests {
@@ -1802,7 +1800,6 @@ fn quantize_mq2g256_lloyd_gptq(
 
     output
 }
-
 
 /// Inverse FWHT for MQ-family dequantization (sibling of cpu_fwht_256).
 fn cpu_inv_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
@@ -2899,8 +2896,9 @@ impl HfqInputFormat {
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
             "oq4" | "oq4g256" | "opus" => Some(Self::Oq4),
-            "oq+" | "oqplus" | "oq4+" | "opus-plus" | "opusplus" | "opus+" | "opusa8"
-            | "oq4a8" => Some(Self::OqPlus),
+            "oq+" | "oqplus" | "opus-plus" | "opusplus" | "opus+" | "opusa8" | "oq4a8" => {
+                Some(Self::OqPlus)
+            }
             "oq+t" | "oqplus-tiered" | "oq+8" | "opus-plus-tiered" => Some(Self::OqPlusTiered),
             "oq+c" | "oqplus-compact" | "oq+4" | "opus-plus-compact" => Some(Self::OqPlusCompact),
             "oq8" | "oq8g256" | "opus8" => Some(Self::Oq8),
@@ -3219,9 +3217,13 @@ fn quantize_hfq_source_tensor(
                 let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
                 let out = if compact {
-                    ldlq::oqplus_compact_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac)
+                    ldlq::oqplus_compact_ldlq_pack(
+                        &wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac,
+                    )
                 } else {
-                    ldlq::oqplus_tiered_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac)
+                    ldlq::oqplus_tiered_ldlq_pack(
+                        &wbuf, m_dim, k, &h, &signs1, &signs2, damp, w8_frac,
+                    )
                 };
                 if out.is_some() {
                     if let Some(s) = awq_scales {
@@ -3434,7 +3436,11 @@ fn run_hfq_source_pipeline(
                 None => format!("{}.awq_scale.weight", t.name),
             };
             let bytes = awq_scales_to_f16_bytes(&scales);
-            eprintln!("    AWQ:    {sidecar_name} [{}] (1D F16, {} B)", scales.len(), bytes.len());
+            eprintln!(
+                "    AWQ:    {sidecar_name} [{}] (1D F16, {} B)",
+                scales.len(),
+                bytes.len()
+            );
             hfq_tensors.push(HfqTensor {
                 name: sidecar_name,
                 quant_type: QuantType::F16,
@@ -4666,7 +4672,8 @@ INPUT SOURCES (--input):
     <file.gguf>   a single GGUF file
     <file.hfq>    an existing .hfq (e.g. a bf16 .hfq) for requantization.
                   The .hfq-source path supports --format
-                  bf16 / fp16 / q8f16 / hfq4 / hfq6 / mq4 / mq6 / mq3 / qtip3 / oq4.
+                  bf16 / fp16 / q8f16 / hfq4 / hfq6 / mq4 / mq6 / mq3 / qtip3 /
+                  oq4 (opus) / oq8 (opus8).
                   Other formats (roughquant, lloyd-*, mfp4, …) require a HF/GGUF source.
 
 REQUIRED:
@@ -4676,7 +4683,13 @@ REQUIRED:
 FORMAT (--format <FMT>, default: q8f16):
     Full precision     bf16 (bfloat16) · fp16 (f16/float16) · f32 (oracle/passthrough)
     Production quant   q8f16 (q8) · mq4 (magnum) · mq6 · mq3 · hfq4 · hfq6 · mfp4 (hfp4g32) · q8hfq
-    Opus W4A4          oq4 (opus) — symmetric int4 weights + int4 activations (.hfq-source path)
+    Opus Quant         oq4 (alias: opus) — 4-bit-resident Opus Quant.
+                       oq4+ is oq4 plus AWQ+LDLQ calibration; it requires
+                       --awq --ldlq --hessian and should be used only for
+                       quality-gated plus artifacts.
+                       oq8 (alias: opus8) — 8-bit Opus Quant.
+    Legacy Opus-A8     oqplus / oq+ / opusplus — older W4A8 experimental tag
+                       (qt=33), distinct from oq4+.
     MoE / routed       mq4-mq6exp · mq4-routed-lloyd-mq-tiered (needs --imatrix) · antirez-mq · …
     Research (gated)   mq2 · lloyd-mq2 · lloyd-mq3 · lloyd-mq4 · qtip3 · qtip3-sim ·
                        roughquant (rq) · roughquant{{2,3,4}}-sim · permute5 (rq5)
@@ -4794,12 +4807,19 @@ fn main() {
 
     let format_arg = arg_value(&args, "--format").unwrap_or("q8f16");
     let mut format_storage = normalize_format_flag(format_arg);
+    // OQ4+ is not a separate storage tag: it is OQ4 with the calibrated
+    // AWQ+LDLQ recipe. Normalize it to OQ4, then enforce the required flags
+    // after argument parsing has loaded calibration sidecars.
+    let oq4_plus_recipe = format_storage == "oq4+";
+    if oq4_plus_recipe {
+        format_storage = "oq4".to_string();
+    }
     // OQ+ / Opus Plus is a distinct W4A8 FORMAT, not the generic `+` (clip+AWQ)
     // modifier. Canonicalize its `+`-spellings to `oqplus` BEFORE the mq_plus
     // strip below, so the `+` isn't consumed (which would leave a bare `oq`) and
     // so calibration-free OQ+ doesn't trip the AWQ-needs-imatrix guard. Clip-search
     // is unconditional in the Opus codec; AWQ stays opt-in via --awq --imatrix.
-    if matches!(format_storage.as_str(), "oq+" | "oq4+" | "opus+") {
+    if matches!(format_storage.as_str(), "oq+" | "opus+") {
         format_storage = "oqplus".to_string();
     }
     // `mqN+` modifier: clip-search + AWQ on top of the base MQ format. Strip the
@@ -5008,6 +5028,8 @@ fn main() {
     let use_q4k_all = format == "q4k";
     let use_q4k_q8embed = format == "q4k-q8embed";
     let use_mq8g256 = format == "mq8" || format == "mq8g256";
+    let use_oq4 = format == "oq4" || format == "oq4g256" || format == "opus";
+    let use_oq8 = format == "oq8" || format == "oq8g256" || format == "opus8";
     // DeepSeek V4 recipe (2026-05-20): routed experts → MQ2-Lloyd, every other
     // 2D weight → Q8F16, with norms/biases/HC matrices falling through
     // to the F16 fallback path via `should_quantize() == false`.
@@ -5337,7 +5359,8 @@ fn main() {
             }
             match hfhs_diag::read_diagonals(&hpath) {
                 Ok(diags) => {
-                    let mut table: HashMap<String, Vec<f32>> = HashMap::with_capacity(diags.len() * 2);
+                    let mut table: HashMap<String, Vec<f32>> =
+                        HashMap::with_capacity(diags.len() * 2);
                     for (name, diag) in diags {
                         table.insert(format!("{name}.weight"), diag.clone());
                         table.insert(name, diag); // bare-name fallback
@@ -5404,6 +5427,16 @@ fn main() {
     // in this patch.
     let awq_enabled =
         mq_plus || args.iter().any(|a| a == "--awq") || args.iter().any(|a| a == "--awq-alpha");
+    if oq4_plus_recipe
+        && (!awq_enabled
+            || !args.iter().any(|a| a == "--ldlq")
+            || !args.iter().any(|a| a == "--hessian"))
+    {
+        eprintln!(
+            "error: --format oq4+ means calibrated OQ4+ and requires --awq --ldlq --hessian <HFHS .hessian.bin>; use --format oq4 for uncalibrated OQ4"
+        );
+        std::process::exit(1);
+    }
     let awq_alpha = args
         .iter()
         .position(|a| a == "--awq-alpha")
@@ -5435,7 +5468,9 @@ fn main() {
             .filter(|f| *f > 0.0 && *f < 1.0)
             .unwrap_or(0.01);
         if !awq_enabled {
-            eprintln!("warning: --sq-split has no effect without --awq (it normalizes the AWQ scale)");
+            eprintln!(
+                "warning: --sq-split has no effect without --awq (it normalizes the AWQ scale)"
+            );
         }
         SQ_OUTLIER_SPLIT
             .set(frac)
@@ -7394,6 +7429,7 @@ fn main() {
                 // the runtime can apply `x / s` before the rotation kernel at
                 // inference time.
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
+                let is_embed = name.contains("embed_tokens");
 
                 let (quantized, qt, gs, label) = if use_bf16 {
                     let (data, qt, label) =
@@ -7404,6 +7440,11 @@ fn main() {
                     (f16_bytes, QuantType::F16, 0u32, "F16")
                 } else if q8_conv1d_default && is_conv1d_tensor(name) {
                     // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if (use_oq4 || use_oq8) && is_embed {
+                    // Embedding lookup has its own loader path. It supports Q8
+                    // directly, while OQ4/OQ8 are GEMV/GEMM weight formats.
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
                 } else if kmap_level == QuantLevel::Q8 {
@@ -7603,7 +7644,6 @@ fn main() {
 
                     // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
                     // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
-                    let is_embed = name.contains("embed_tokens");
 
                     if use_hfq_mixed {
                         // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
@@ -8056,6 +8096,109 @@ fn main() {
                             // Pad to 128-element boundary
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_oq4 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if meta.shape.len() == 2 && k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let m_dim = meta.shape[0];
+                            let ldlq_q = OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
+                                let key = name.strip_suffix(".weight").unwrap_or(name);
+                                let hk = idx.k_of(key).or_else(|| idx.k_of(name))?;
+                                if hk != k_dim {
+                                    eprintln!(
+                                        "  ldlq: skip {name} (Hessian K={hk} != weight K={k_dim})"
+                                    );
+                                    return None;
+                                }
+                                let mut h = idx.get_full(key).or_else(|| idx.get_full(name))?;
+                                let awq_scales = if let (Some(alpha), Some(im)) =
+                                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                                {
+                                    if alpha > 0.0 && awq_eligible(name) {
+                                        Some(compute_awq_scales(im, alpha))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                let wbuf: std::borrow::Cow<[f32]> = if let Some(s) = &awq_scales {
+                                    let mut scaled = f32_data.clone();
+                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, s);
+                                    for i in 0..k_dim {
+                                        let si = s[i] as f64;
+                                        for j in 0..k_dim {
+                                            h[i * k_dim + j] =
+                                                (h[i * k_dim + j] as f64 / (si * s[j] as f64))
+                                                    as f32;
+                                        }
+                                    }
+                                    std::borrow::Cow::Owned(scaled)
+                                } else {
+                                    std::borrow::Cow::Borrowed(&f32_data[..])
+                                };
+                                let diag_sum: f64 =
+                                    (0..k_dim).map(|i| h[i * k_dim + i] as f64).sum();
+                                let damp = 0.01 * (diag_sum / k_dim as f64).max(1e-12);
+                                let out = ldlq::oq4_ldlq_pack(
+                                    &wbuf, m_dim, k_dim, &h, &signs1, &signs2, damp,
+                                );
+                                if out.is_some() {
+                                    if let Some(s) = awq_scales {
+                                        awq_sidecar_scales = Some(s);
+                                        eprintln!(
+                                            "  ldlq+awq: {name} [{m_dim}x{k_dim}] OBS int4 + smooth"
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "  ldlq: {name} [{m_dim}x{k_dim}] OBS error-feedback int4"
+                                        );
+                                    }
+                                }
+                                out
+                            });
+                            let q = if let Some(q) = ldlq_q {
+                                q
+                            } else if let (Some(alpha), Some(im)) =
+                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                            {
+                                if alpha > 0.0 && awq_eligible(name) {
+                                    let scales = compute_awq_scales(im, alpha);
+                                    let mut scaled = f32_data.clone();
+                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                    awq_sidecar_scales = Some(scales);
+                                    quantize_oq4g256(&scaled, &signs1, &signs2)
+                                } else {
+                                    quantize_oq4g256(&f32_data, &signs1, &signs2)
+                                }
+                            } else {
+                                quantize_oq4g256(&f32_data, &signs1, &signs2)
+                            };
+                            (q, QuantType::Oq4G256, 256u32, "OQ4G256")
+                        } else {
+                            let q = quantize_q8f16(&f32_data);
+                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        }
+                    } else if use_oq8 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if meta.shape.len() == 2 && k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_oq8g256(&f32_data, &signs1, &signs2);
+                            (q, QuantType::Oq8G256, 256u32, "OQ8G256")
+                        } else {
+                            let q = quantize_q8f16(&f32_data);
+                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         }
                     } else if this_q8 {
                         let q = quantize_q8f16(&f32_data);
@@ -11496,6 +11639,7 @@ mod tests {
     fn format_flags_are_canonicalized_before_dispatch() {
         assert_eq!(normalize_format_flag(" BF16 "), "bf16");
         assert_eq!(normalize_format_flag("Mq4G256"), "mq4g256");
+        assert_eq!(normalize_format_flag("oq4+"), "oq4+");
     }
 
     #[test]
@@ -12082,7 +12226,11 @@ mod codec_golden {
             .map(|i| {
                 s = s.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
                 let base = (s as f32 / 2_147_483_648.0) - 0.5;
-                if i % 137 == 0 { base * 12.0 } else { base } // sparse outliers
+                if i % 137 == 0 {
+                    base * 12.0
+                } else {
+                    base
+                } // sparse outliers
             })
             .collect()
     }
@@ -12102,11 +12250,26 @@ mod codec_golden {
         h("q8f16", &quantize_q8f16(&x));
         h("q8hfq", &quantize_q8hfq(&x, m, k).0);
         h("mq4g256", &quantize_mq4g256(&x, &s1, &s2));
-        h("mq4g256_clipsearch", &quantize_mq4g256_clipsearch(&x, &s1, &s2));
-        h("mq6g256_clipsearch", &quantize_mq6g256_clipsearch(&x, &s1, &s2));
-        h("mq3g256_clipsearch", &quantize_mq3g256_clipsearch(&x, &s1, &s2));
-        h("mq2g256_clipsearch", &quantize_mq2g256_clipsearch(&x, &s1, &s2));
-        h("mq8g256_clipsearch", &quantize_mq8g256_clipsearch(&x, &s1, &s2));
+        h(
+            "mq4g256_clipsearch",
+            &quantize_mq4g256_clipsearch(&x, &s1, &s2),
+        );
+        h(
+            "mq6g256_clipsearch",
+            &quantize_mq6g256_clipsearch(&x, &s1, &s2),
+        );
+        h(
+            "mq3g256_clipsearch",
+            &quantize_mq3g256_clipsearch(&x, &s1, &s2),
+        );
+        h(
+            "mq2g256_clipsearch",
+            &quantize_mq2g256_clipsearch(&x, &s1, &s2),
+        );
+        h(
+            "mq8g256_clipsearch",
+            &quantize_mq8g256_clipsearch(&x, &s1, &s2),
+        );
         h("oq4g256", &quantize_oq4g256(&x, &s1, &s2));
         h("mq6g256", &quantize_mq6g256(&x, &s1, &s2));
         h("mq8g256", &quantize_mq8g256(&x, &s1, &s2));
@@ -12178,7 +12341,11 @@ mod codec_golden {
     fn codec_outputs_are_byte_stable() {
         let actual = codec_hashes();
         let want: std::collections::HashMap<&str, &str> = GOLDENS.iter().copied().collect();
-        assert_eq!(actual.len(), GOLDENS.len(), "codec count drifted from goldens");
+        assert_eq!(
+            actual.len(),
+            GOLDENS.len(),
+            "codec count drifted from goldens"
+        );
         let mut drifted = Vec::new();
         for (name, hash) in &actual {
             match want.get(name) {
@@ -12203,13 +12370,28 @@ mod codec_golden {
         let s1 = gen_fwht_signs(42, 256);
         let s2 = gen_fwht_signs(1042, 256);
         let plain = dequant_mq4g256(&quantize_mq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
-        let clip = dequant_mq4g256(&quantize_mq4g256_clipsearch(&x, &s1, &s2), x.len(), &s1, &s2);
+        let clip = dequant_mq4g256(
+            &quantize_mq4g256_clipsearch(&x, &s1, &s2),
+            x.len(),
+            &s1,
+            &s2,
+        );
         let mse = |rec: &[f32]| -> f64 {
-            x.iter().zip(rec).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() / x.len() as f64
+            x.iter()
+                .zip(rec)
+                .map(|(a, b)| ((a - b) as f64).powi(2))
+                .sum::<f64>()
+                / x.len() as f64
         };
         let (mp, mc) = (mse(&plain), mse(&clip));
-        assert!(mc <= mp * 1.0001, "clip-search MSE {mc:.3e} worse than plain {mp:.3e}");
-        eprintln!("mq4 plain MSE={mp:.4e}  clipsearch MSE={mc:.4e}  ({:.1}% lower)", 100.0 * (mp - mc) / mp);
+        assert!(
+            mc <= mp * 1.0001,
+            "clip-search MSE {mc:.3e} worse than plain {mp:.3e}"
+        );
+        eprintln!(
+            "mq4 plain MSE={mp:.4e}  clipsearch MSE={mc:.4e}  ({:.1}% lower)",
+            100.0 * (mp - mc) / mp
+        );
     }
 
     /// Opus OQ4 (symmetric signed-int4) must round-trip with quality comparable
@@ -12223,7 +12405,10 @@ mod codec_golden {
         let oq4 = dequant_oq4g256(&quantize_oq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
         let sqnr = |rec: &[f32]| -> f64 {
             let (mut sig, mut noise) = (0.0f64, 0.0f64);
-            for (&a, &b) in x.iter().zip(rec) { sig += (a as f64).powi(2); noise += ((a-b) as f64).powi(2); }
+            for (&a, &b) in x.iter().zip(rec) {
+                sig += (a as f64).powi(2);
+                noise += ((a - b) as f64).powi(2);
+            }
             10.0 * (sig / noise.max(1e-30)).log10()
         };
         let (m, o) = (sqnr(&mq4), sqnr(&oq4));
@@ -12274,7 +12459,11 @@ mod codec_golden {
         buf.copy_from_slice(&orig);
         cpu_fwht_256(&mut buf, &s1, &s2);
         cpu_inv_fwht_256(&mut buf, &s1, &s2);
-        let max = orig.iter().zip(buf.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max = orig
+            .iter()
+            .zip(buf.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(max < 1e-4, "FWHT not invertible: max abs err {max}");
     }
 }

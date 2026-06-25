@@ -34,6 +34,8 @@ enum Command {
     Repack(commands::forward::RepackArgs),
     /// GPU mutex for multi-agent coordination (acquire/release/status)
     GpuLock(commands::gpu_lock::GpuLockArgs),
+    /// Import and inspect diffusion models stored as .hfq artifacts
+    Diffusion(commands::diffusion::DiffusionArgs),
     /// Query the running hipfire admin API for scripts and agents
     #[command(alias = "op")]
     Admin(commands::admin::AdminArgs),
@@ -86,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
         Command::Repack(args) => commands::forward::run_repack(args),
         Command::GpuLock(args) => commands::gpu_lock::run(args),
+        Command::Diffusion(args) => commands::diffusion::run(args),
         Command::Admin(args) => commands::admin::run(args, config).await,
         Command::GenDocs(args) => commands::gen_docs::run(args),
         Command::GenConfigSchema(args) => commands::gen_config_schema::run(args),
