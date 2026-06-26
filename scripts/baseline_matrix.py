@@ -19,7 +19,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 HF = Path("/srv/huggingface")
-WORK = Path("/tmp/baseline-matrix")            # quantized .hfq scratch
+WORK = Path(os.path.expanduser("~/.hipfire/baseline-matrix-work"))  # .hfq scratch on nvme (/tmp is a small RAM tmpfs)
 REFS = REPO / "benchmarks/quality-baselines/refs"
 OUTDIR = REPO / "benchmarks/results" / f"gfx1151-baseline-matrix"
 QUANT = REPO / "target/release/hipfire-quantize"
@@ -40,6 +40,11 @@ MODELS = [
     dict(name="qwen3.5-4b",       src="models--Qwen--Qwen3.5-4B",              arch=[], formats=["q8f16", "mq6", "mq4", "mq3"]),
     dict(name="lfm2.5-8b-a1b",    src="models--LiquidAI--LFM2.5-8B-A1B",       arch=[], formats=["mq6", "mq4", "mq3"]),
     dict(name="qwen3.5-9b",       src="models--Qwen--Qwen3.5-9B",              arch=[], formats=["q8f16", "mq6", "mq4", "mq3"]),
+    dict(name="llama-3.2-1b",      src="models--meta-llama--Llama-3.2-1B",          arch=[], formats=["q8f16", "hfq4", "mq4", "mq3"]),
+    dict(name="llama-3.2-1b-inst", src="models--meta-llama--Llama-3.2-1B-Instruct", arch=[], formats=["q8f16", "hfq4", "mq4", "mq3"]),
+    dict(name="llama-3.2-3b-inst", src="models--meta-llama--Llama-3.2-3B-Instruct", arch=[], formats=["q8f16", "hfq4", "mq4", "mq3"]),
+    dict(name="llama-3.1-8b-inst", src="models--meta-llama--Llama-3.1-8B-Instruct", arch=[], formats=["hfq4", "mq4", "mq3"]),
+    dict(name="nemotron-4b",       src="models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16", arch=[], formats=["mq6", "mq4", "mq3"]),
 ]
 
 AWQ_FLAGS = ["--awq"]                           # the "+" pass
