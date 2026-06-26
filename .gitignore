@@ -126,6 +126,8 @@ research/
 # benchmarks/results remain tracked by explicit filename.
 benchmarks/results/eval/
 benchmarks/results/eval-smoke/
+# Local resumability state for the baseline-matrix driver (regenerable).
+benchmarks/results/gfx1151-baseline-matrix/state.json
 
 flake.lock
 
