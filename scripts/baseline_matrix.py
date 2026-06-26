@@ -24,7 +24,8 @@ REFS = REPO / "benchmarks/quality-baselines/refs"
 OUTDIR = REPO / "benchmarks/results" / f"gfx1151-baseline-matrix"
 QUANT = REPO / "target/release/hipfire-quantize"
 HIPFIRE = "hipfire"  # eval via PATH (self-locks the GPU)
-KV_MODES = ["q8", "asym4"]                     # f16/kvarn probed per-arch later
+KV_MODES = ["q8", "asym4", "f16", "kvarn"]     # f16/kvarn only run where q8 worked (see main)
+KV_BASE = ("q8", "asym4")                       # always attempted; f16/kvarn gated on a working q8 cell
 
 # Ordered smallest -> largest. `src` is the HF repo dir under /srv/huggingface;
 # `arch` are extra hipfire-quantize flags (e.g. qwen2 must route to arch-id 7).
@@ -198,6 +199,9 @@ def main() -> int:
     # a base format that faults at load will fault the same way after AWQ/LDLQ.
     plain_ok = {(r["model"], r["format"]) for r in rows
                 if r.get("status") == "ok" and not str(r["format"]).endswith(("+", "++"))}
+    # f16/kvarn KV modes are only worth running where the q8 cell already works.
+    working_q8 = {(r["model"], r["format"]) for r in rows
+                  if r.get("status") == "ok" and r.get("kv") == "q8"}
 
     for model in MODELS:
         if only and model["name"] not in only:
@@ -217,6 +221,8 @@ def main() -> int:
                 cell = (model["name"], fmt_tag, kv)
                 if cell in done or cell in failed:
                     continue
+                if kv not in KV_BASE and (model["name"], fmt_tag) not in working_q8:
+                    continue  # only probe f16/kvarn where the q8 cell worked
                 if args.phase == "ldlq":
                     # ++ needs a Hessian sidecar; deferred to the Hessian phase.
                     log(f"DEFER {cell}: ldlq/Hessian phase not yet wired")
