@@ -353,20 +353,6 @@ impl NemotronHConfig {
         }
     }
 
-    /// Runtime scale for Mamba `out_proj.weight`.
-    ///
-    /// Nano-4B's checkpoint/reference path needs the GPT-style residual rescale
-    /// applied at load time. Nano-30B-A3B's MoE checkpoint already matches the
-    /// HF reference with the stored `out_proj` bytes, so applying the same scale
-    /// again collapses the first Mamba block output.
-    pub fn mamba_out_proj_runtime_scale(&self) -> f32 {
-        if self.moe.is_some() || self.is_pure_mamba2() {
-            1.0
-        } else {
-            1.0f32 / (self.num_layers as f32).sqrt()
-        }
-    }
-
     /// True for state-spaces-style pure Mamba-2 stacks.
     pub fn is_pure_mamba2(&self) -> bool {
         self.mlp_intermediate == 0
@@ -669,10 +655,6 @@ mod tests {
         assert!(prof.needs_kv_cache()); // has attention blocks
         assert!(prof.has_recurrent_state()); // has Mamba2 blocks
         assert!(prof.is_hybrid());
-        assert_eq!(
-            cfg.mamba_out_proj_runtime_scale(),
-            1.0f32 / (42.0f32).sqrt()
-        );
     }
 
     #[test]
@@ -702,7 +684,6 @@ mod tests {
         assert_eq!(cfg.mamba.n_groups, 1);
         assert_eq!(cfg.mamba.conv_dim(), 1792);
         assert_eq!(cfg.mamba.projection_size(), 3352);
-        assert_eq!(cfg.mamba_out_proj_runtime_scale(), 1.0);
         let prof = cfg.mixer_profile();
         assert_eq!(prof.n_layers(), 24);
         assert!(prof.has_recurrent_state());
@@ -758,7 +739,6 @@ mod tests {
         assert_eq!(moe.shared_expert_intermediate_size, 3712);
         assert!(moe.norm_topk_prob);
         assert_eq!(moe.routed_scaling_factor, 2.5);
-        assert_eq!(cfg.mamba_out_proj_runtime_scale(), 1.0);
         // MoE blocks are FFN blocks, so the mixer profile still only tracks M/*.
         assert_eq!(cfg.mixer_profile().n_layers(), 29);
     }

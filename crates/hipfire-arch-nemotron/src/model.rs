@@ -196,7 +196,6 @@ impl NemotronModel {
         let vocab = cfg.vocab_size;
         let dims = cfg.mamba2_dims();
         let batched_prefill = true;
-        let out_proj_scale = cfg.mamba_out_proj_runtime_scale();
         let e = |x: hip_bridge::HipError| format!("nemotron hfq gpu: {x:?}");
 
         let embedding_name = first_hfq_tensor(
@@ -251,7 +250,6 @@ impl NemotronModel {
                             dims.clone(),
                             in_proj,
                             out_proj,
-                            out_proj_scale,
                             &conv_weight,
                             &conv_bias,
                             &a_log,

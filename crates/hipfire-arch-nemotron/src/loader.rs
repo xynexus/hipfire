@@ -92,11 +92,6 @@ pub fn load_nemotron_weights(
         Err(e) => return Err(e),
     };
 
-    // Nemotron-H Mamba out-proj scaling is checkpoint-family specific. Dense
-    // Nano-4B needs the GPT-style residual rescale applied at load; Nano-30B MoE
-    // already matches the HF reference with stored bytes.
-    let out_proj_scale = cfg.mamba_out_proj_runtime_scale();
-
     let mut layer_norm = Vec::with_capacity(cfg.num_layers);
     let mut blocks = Vec::with_capacity(cfg.num_layers);
     for (l, kind) in cfg.blocks.iter().enumerate() {
@@ -114,13 +109,7 @@ pub fn load_nemotron_weights(
                 d: get(src, &format!("{m}.D"))?,
                 dt_bias: get(src, &format!("{m}.dt_bias"))?,
                 mixer_norm: get(src, &format!("{m}.norm.weight"))?,
-                out_proj: {
-                    let mut w = get(src, &format!("{m}.out_proj.weight"))?;
-                    for v in w.iter_mut() {
-                        *v *= out_proj_scale;
-                    }
-                    w
-                },
+                out_proj: get(src, &format!("{m}.out_proj.weight"))?,
             },
             BlockKind::Mlp => HostBlock::Mlp {
                 up: get(src, &format!("{m}.up_proj.weight"))?,
