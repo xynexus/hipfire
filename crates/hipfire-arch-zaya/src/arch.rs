@@ -9,7 +9,7 @@
 //! the later optimization); each step leaves the last-position logits in
 //! `self.logits` for the daemon sampler.
 
-use crate::gpu::{gpu_forward_serve, ZayaGpuWeights};
+use crate::gpu::{gpu_decode, gpu_forward_serve, ZayaDecodeState, ZayaGpuWeights};
 use crate::ZayaConfig;
 use hipfire_model::ARCH_ID_ZAYA;
 use hipfire_runtime::arch::{
@@ -19,30 +19,29 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// A loaded ZAYA1 model with GPU-resident weights and a rolling token sequence.
+/// A loaded ZAYA1 model with GPU-resident weights and per-layer decode state
+/// (KV cache + conv ring + delayed value), so decode is O(1) per token.
 pub struct ZayaModel {
     weights: ZayaGpuWeights,
     cfg: ZayaConfig,
-    seq: Vec<u32>,
+    state: ZayaDecodeState,
     logits: GpuTensor,
 }
 
 impl ZayaModel {
-    /// Load weights from an HFQ onto the GPU and allocate the logits buffer.
-    pub fn from_hfq(gpu: &mut Gpu, hfq: &HfqFile, cfg: ZayaConfig) -> Result<Self, String> {
+    /// Load weights from an HFQ onto the GPU and allocate the decode state +
+    /// logits buffer. `max_seq` bounds the KV cache.
+    pub fn from_hfq(gpu: &mut Gpu, hfq: &HfqFile, cfg: ZayaConfig, max_seq: usize) -> Result<Self, String> {
         let weights = ZayaGpuWeights::load(hfq, gpu, &cfg)?;
+        let state = ZayaDecodeState::new(gpu, &cfg, max_seq)?;
         let logits = gpu
             .zeros(&[cfg.vocab_size], DType::F32)
             .map_err(|e| format!("zaya logits alloc: {e:?}"))?;
-        Ok(Self { weights, cfg, seq: Vec::new(), logits })
+        Ok(Self { weights, cfg, state, logits })
     }
 
     pub fn config(&self) -> &ZayaConfig {
         &self.cfg
-    }
-
-    fn run(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        gpu_forward_serve(gpu, &self.weights, &self.cfg, &self.seq, &self.logits)
     }
 }
 
@@ -51,13 +50,11 @@ impl SimpleAr for ZayaModel {
         if tokens.is_empty() {
             return Err("zaya prefill: empty prompt".to_string());
         }
-        self.seq = tokens.to_vec();
-        self.run(gpu)
+        gpu_forward_serve(gpu, &self.weights, &self.cfg, tokens, &mut self.state, &self.logits)
     }
 
     fn decode_step(&mut self, gpu: &mut Gpu, token: u32, _pos: usize) -> Result<(), String> {
-        self.seq.push(token);
-        self.run(gpu)
+        gpu_decode(gpu, &self.weights, &self.cfg, token, &mut self.state, &self.logits)
     }
 
     fn logits(&self) -> &GpuTensor {
@@ -93,7 +90,7 @@ impl ServingBackend for ZayaModel {
     }
 
     fn reset_session(&mut self, _gpu: &mut Gpu, _session_id: &str) -> Result<(), String> {
-        self.seq.clear();
+        self.state.reset();
         Ok(())
     }
 

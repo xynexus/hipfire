@@ -682,7 +682,7 @@ pub fn load_model(
             "  zaya: hidden={}, blocks={}, experts={}, vocab={}, eos={}",
             cfg.hidden_size, cfg.num_blocks, cfg.moe.num_experts, cfg.vocab_size, cfg.eos_token_id,
         );
-        let model = hipfire_arch_zaya::arch::ZayaModel::from_hfq(gpu, &hfq, cfg)
+        let model = hipfire_arch_zaya::arch::ZayaModel::from_hfq(gpu, &hfq, cfg, max_seq)
             .map_err(|e| format!("ZayaModel::from_hfq: {e}"))?;
         let chat_template = resolve_chat_template(&hfq, path);
         let (chat_template, chat_template_profile) =

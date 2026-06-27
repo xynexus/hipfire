@@ -315,7 +315,8 @@ impl Gpu {
         self.zaya_launch("zaya_gelu_exact_f32", n, &mut p)
     }
 
-    /// Partial rotary (half-split) at position = token index, over `x [s,heads,hd]`.
+    /// Partial rotary (half-split) at position = `pos_base + token index`, over
+    /// `x [s,heads,hd]`. `pos_base=0` for prefill; current pos for decode.
     pub fn zaya_rope_partial_f32(
         &mut self,
         x: &GpuTensor,
@@ -324,10 +325,11 @@ impl Gpu {
         hd: usize,
         n_rot: usize,
         theta: f32,
+        pos_base: usize,
     ) -> HipResult<()> {
         self.zaya_ensure("zaya_rope_partial_f32")?;
         let xp = x.buf.as_ptr();
-        let (si, hi, hdi, nr) = (s as i32, heads as i32, hd as i32, n_rot as i32);
+        let (si, hi, hdi, nr, pb) = (s as i32, heads as i32, hd as i32, n_rot as i32, pos_base as i32);
         let mut p: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &si as *const _ as *mut c_void,
@@ -335,8 +337,103 @@ impl Gpu {
             &hdi as *const _ as *mut c_void,
             &nr as *const _ as *mut c_void,
             &theta as *const _ as *mut c_void,
+            &pb as *const _ as *mut c_void,
         ];
         self.zaya_launch("zaya_rope_partial_f32", s * heads, &mut p)
+    }
+
+    /// Strided row copy: `dst[r*dst_stride + j] = src[r*src_stride + src_off + j]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_strided_copy_f32(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        rows: usize,
+        dst_stride: usize,
+        src_stride: usize,
+        src_off: usize,
+        len: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_strided_copy_f32")?;
+        let (dp, sp) = (dst.buf.as_ptr(), src.buf.as_ptr());
+        let (r, ds, ss, so, l) = (rows as i32, dst_stride as i32, src_stride as i32, src_off as i32, len as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &dp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &r as *const _ as *mut c_void,
+            &ds as *const _ as *mut c_void,
+            &ss as *const _ as *mut c_void,
+            &so as *const _ as *mut c_void,
+            &l as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_strided_copy_f32", rows * len, &mut p)
+    }
+
+    /// Decode conv window build + ring advance: `window [conv_ch, pad+1]` = `[ring | cur]`.
+    pub fn zaya_conv_window_f32(
+        &mut self,
+        window: &GpuTensor,
+        ring: &GpuTensor,
+        cur: &GpuTensor,
+        conv_ch: usize,
+        pad: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_conv_window_f32")?;
+        let (wp, rp, cp) = (window.buf.as_ptr(), ring.buf.as_ptr(), cur.buf.as_ptr());
+        let (cc, pd) = (conv_ch as i32, pad as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &cc as *const _ as *mut c_void,
+            &pd as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_conv_window_f32", conv_ch, &mut p)
+    }
+
+    /// Copy `src[0..n]` into `dst[offset..offset+n]` (KV-cache append).
+    pub fn zaya_write_at_f32(&mut self, dst: &GpuTensor, src: &GpuTensor, offset: usize, n: usize) -> HipResult<()> {
+        self.zaya_ensure("zaya_write_at_f32")?;
+        let (dp, sp) = (dst.buf.as_ptr(), src.buf.as_ptr());
+        let (off, ni) = (offset as i32, n as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &dp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &off as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_write_at_f32", n, &mut p)
+    }
+
+    /// Single-token GQA decode attention over the KV cache (positions 0..=pos).
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_gqa_decode_f32(
+        &mut self,
+        out: &GpuTensor,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        pos: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        scaling: f32,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_gqa_decode_f32")?;
+        let (op, qp, kp, vp) = (out.buf.as_ptr(), q.buf.as_ptr(), k_cache.buf.as_ptr(), v_cache.buf.as_ptr());
+        let (posi, nqi, nkvi, hdi) = (pos as i32, nq as i32, nkv as i32, hd as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &posi as *const _ as *mut c_void,
+            &nqi as *const _ as *mut c_void,
+            &nkvi as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &scaling as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_gqa_decode_f32", nq, &mut p)
     }
 
     /// Simple GQA causal attention (bring-up). q `[s,nq,hd]`, k/v `[s,nkv,hd]`

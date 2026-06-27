@@ -212,17 +212,57 @@ fn z2(gpu: &mut Gpu, rows: usize, d: usize) -> Result<GpuTensor, String> {
     gpu.zeros(&[rows, d], DType::F32).map_err(|e| format!("zaya alloc: {e:?}"))
 }
 
-/// Serving forward: run the full forward over `ids` and write the **last
-/// position's** logits into `logits_out` (`[vocab]`). No per-block downloads;
-/// residual stays on-device. (Bring-up: re-prefills the whole sequence each call.)
+/// Per-layer decode state: KV cache (post-rope key, composed value), the two
+/// last raw qk-stream columns (conv ring), and the previous token's delayed-value
+/// projection. Carried across decode steps so each step processes one token.
+pub struct ZayaDecodeState {
+    pub pos: usize,
+    max_seq: usize,
+    k_cache: Vec<GpuTensor>, // [layer] [max_seq * kvdim]
+    v_cache: Vec<GpuTensor>,
+    conv_ring: Vec<GpuTensor>, // [layer] [conv_ch * pad]
+    delayed_v: Vec<GpuTensor>, // [layer] [v_half]
+}
+
+impl ZayaDecodeState {
+    pub fn new(gpu: &mut Gpu, cfg: &ZayaConfig, max_seq: usize) -> Result<Self, String> {
+        let kvdim = cfg.attn.num_kv_heads * cfg.attn.head_dim;
+        let conv_ch = (cfg.attn.num_heads + cfg.attn.num_kv_heads) * cfg.attn.head_dim;
+        let pad = (cfg.attn.conv_depthwise_kernel - 1) + (cfg.attn.conv_grouped_kernel - 1);
+        let v_half = kvdim / 2;
+        let mut k_cache = Vec::with_capacity(cfg.num_blocks);
+        let mut v_cache = Vec::with_capacity(cfg.num_blocks);
+        let mut conv_ring = Vec::with_capacity(cfg.num_blocks);
+        let mut delayed_v = Vec::with_capacity(cfg.num_blocks);
+        for _ in 0..cfg.num_blocks {
+            k_cache.push(z(gpu, max_seq * kvdim)?);
+            v_cache.push(z(gpu, max_seq * kvdim)?);
+            conv_ring.push(z(gpu, conv_ch * pad)?);
+            delayed_v.push(z(gpu, v_half)?);
+        }
+        Ok(Self { pos: 0, max_seq, k_cache, v_cache, conv_ring, delayed_v })
+    }
+
+    pub fn reset(&mut self) {
+        self.pos = 0;
+    }
+}
+
+/// Serving forward: prefill the whole prompt, write the **last position's** logits
+/// into `logits_out` (`[vocab]`), and **prime `state`** (KV cache + conv ring +
+/// delayed value for every layer) so subsequent tokens go through `gpu_decode`.
 #[allow(clippy::needless_range_loop)]
 pub fn gpu_forward_serve(
     gpu: &mut Gpu,
     w: &ZayaGpuWeights,
     cfg: &ZayaConfig,
     ids: &[u32],
+    state: &mut ZayaDecodeState,
     logits_out: &GpuTensor,
 ) -> Result<(), String> {
+    if ids.len() > state.max_seq {
+        return Err(format!("zaya prefill: prompt {} exceeds max_seq {}", ids.len(), state.max_seq));
+    }
     let s = ids.len();
     let h = cfg.hidden_size;
     let a = &cfg.attn;
@@ -293,10 +333,18 @@ pub fn gpu_forward_serve(
         gpu.zaya_value_compose_f32(&value, &vcur, &vdel, s, nkv, hd).map_err(|e| format!("{e:?}"))?;
         gpu.zaya_qk_l2norm_temp_f32(&query, None, s, nq, hd, l2_scale, f32::EPSILON).map_err(|e| format!("{e:?}"))?;
         gpu.zaya_qk_l2norm_temp_f32(&key, Some(&lw.qk_temp), s, nkv, hd, l2_scale, f32::EPSILON).map_err(|e| format!("{e:?}"))?;
-        gpu.zaya_rope_partial_f32(&query, s, nq, hd, a.n_rot, a.rope_theta).map_err(|e| format!("{e:?}"))?;
-        gpu.zaya_rope_partial_f32(&key, s, nkv, hd, a.n_rot, a.rope_theta).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_rope_partial_f32(&query, s, nq, hd, a.n_rot, a.rope_theta, 0).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_rope_partial_f32(&key, s, nkv, hd, a.n_rot, a.rope_theta, 0).map_err(|e| format!("{e:?}"))?;
         gpu.zaya_gqa_attn_f32(&ctx, &query, &key, &value, s, nq, nkv, hd, attn_scale).map_err(|e| format!("{e:?}"))?;
         gemv_seq(gpu, &lw.o_proj, &ctx, &attn_out, s, h, q_dim)?;
+        // Prime decode state for this layer: KV (post-rope key / composed value),
+        // conv ring (last `pad` raw qk-stream columns), delayed value (last token).
+        let kvdim = k_dim;
+        gpu.zaya_write_at_f32(&state.k_cache[li], &key, 0, s * kvdim).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_write_at_f32(&state.v_cache[li], &value, 0, s * kvdim).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_strided_copy_f32(&state.conv_ring[li], &stream, conv_ch, pad, s + pad, s, pad).map_err(|e| format!("{e:?}"))?;
+        let vdel_last = vdel.sub_offset((s - 1) * v_half, v_half);
+        gpu.zaya_write_at_f32(&state.delayed_v[li], &vdel_last, 0, v_half).map_err(|e| format!("{e:?}"))?;
         // residual stays on-device: `hidden` is still the block input here.
         gpu.zaya_affine_residual_f32(&g_res2, &attn_out, &hidden, &lw.pa_rs[0], &lw.pa_rs[1], &lw.pa_rs[2], &lw.pa_rs[3], h, s * h).map_err(|e| format!("{e:?}"))?;
         gpu.rmsnorm_f32(&g_res2, &lw.post_attn_ln, &normed, eps).map_err(|e| format!("{e:?}"))?;
@@ -364,6 +412,167 @@ pub fn gpu_forward_serve(
     gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps).map_err(|e| format!("{e:?}"))?;
     let last = fnorm.sub_offset((s - 1) * h, h);
     gpu.gemv_f32(&w.embed, &last, logits_out).map_err(|e| format!("zaya lm_head: {e:?}"))?;
+    state.pos = s;
+    Ok(())
+}
+
+/// Single-token decode at `state.pos`: O(1) per-layer compute using the KV cache,
+/// conv ring, and delayed-value state. Writes the new token's logits into
+/// `logits_out` and advances the state by one position.
+#[allow(clippy::needless_range_loop)]
+pub fn gpu_decode(
+    gpu: &mut Gpu,
+    w: &ZayaGpuWeights,
+    cfg: &ZayaConfig,
+    token: u32,
+    state: &mut ZayaDecodeState,
+    logits_out: &GpuTensor,
+) -> Result<(), String> {
+    let pos = state.pos;
+    if pos >= state.max_seq {
+        return Err(format!("zaya decode: position {pos} exceeds max_seq {}", state.max_seq));
+    }
+    let h = cfg.hidden_size;
+    let a = &cfg.attn;
+    let (nq, nkv, hd) = (a.num_heads, a.num_kv_heads, a.head_dim);
+    let q_dim = nq * hd;
+    let k_dim = nkv * hd;
+    let kvdim = k_dim;
+    let v_half = k_dim / 2;
+    let conv_ch = q_dim + k_dim;
+    let rh = cfg.moe.router_hidden_size;
+    let n_route = cfg.moe.num_router_experts();
+    let n_exp = cfg.moe.num_experts;
+    let moe_int = cfg.moe.moe_intermediate_size;
+    let eps = cfg.rms_norm_eps;
+    let pad = (a.conv_depthwise_kernel - 1) + (a.conv_grouped_kernel - 1);
+    let attn_scale = 1.0 / (hd as f32).sqrt();
+    let l2_scale = (hd as f32).sqrt();
+
+    let id_bytes: Vec<u8> = (token as i32).to_le_bytes().to_vec();
+    let g_ids = gpu.upload_raw(&id_bytes, &[1]).map_err(|e| format!("zaya ids: {e:?}"))?;
+    let mut hidden = z2(gpu, 1, h)?;
+    gpu.zaya_embed_gather_f32(&hidden, &w.embed, &g_ids, h, h).map_err(|e| format!("{e:?}"))?;
+    let embed_scaled = z2(gpu, 1, h)?;
+    gpu.zaya_affine_input_f32(&embed_scaled, &hidden, &w.in_scale, &w.in_bias, h, h).map_err(|e| format!("{e:?}"))?;
+    hidden = embed_scaled;
+
+    // single-token scratch (s = 1)
+    let normed = z2(gpu, 1, h)?;
+    let q = z(gpu, q_dim)?;
+    let k = z(gpu, k_dim)?;
+    let vcur = z(gpu, v_half)?;
+    let vdel = z(gpu, v_half)?;
+    let qres = z(gpu, nq * hd)?;
+    let kres = z(gpu, nkv * hd)?;
+    let cur_qk = z(gpu, conv_ch)?;
+    let window = z(gpu, conv_ch * (pad + 1))?;
+    let dw = z(gpu, conv_ch * (pad + 1 - a.conv_depthwise_kernel + 1))?;
+    let gw = z(gpu, conv_ch)?;
+    let query = z(gpu, nq * hd)?;
+    let key = z(gpu, nkv * hd)?;
+    let value = z(gpu, nkv * hd)?;
+    let ctx = z(gpu, q_dim)?;
+    let attn_out = z(gpu, h)?;
+    let g_res2 = z2(gpu, 1, h)?;
+    let rhid = z2(gpu, 1, rh)?;
+    let rnormed = z2(gpu, 1, rh)?;
+    let a1 = z2(gpu, 1, rh)?;
+    let a2 = z2(gpu, 1, rh)?;
+    let rlogits = z(gpu, n_route)?;
+    let moe_out = z(gpu, h)?;
+    let gate_up = z(gpu, 2 * moe_int)?;
+    let act = z(gpu, moe_int)?;
+    let down_t = z(gpu, h)?;
+    let mut router_state = z(gpu, rh)?;
+    let dw_len = pad + 1 - a.conv_depthwise_kernel + 1;
+
+    for (li, lw) in w.layers.iter().enumerate() {
+        gpu.rmsnorm_f32(&hidden, &lw.input_ln, &normed, eps).map_err(|e| format!("{e:?}"))?;
+        gpu.gemv_f32(&lw.q_proj, &normed, &q).map_err(|e| format!("{e:?}"))?;
+        gpu.gemv_f32(&lw.k_proj, &normed, &k).map_err(|e| format!("{e:?}"))?;
+        gpu.gemv_f32(&lw.v_cur, &normed, &vcur).map_err(|e| format!("{e:?}"))?;
+        gpu.gemv_f32(&lw.v_del, &normed, &vdel).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_qk_residual_f32(&qres, &kres, &q, &k, 1, nq, nkv, hd, 0).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_qk_residual_f32(&qres, &kres, &q, &k, 1, nq, nkv, hd, 1).map_err(|e| format!("{e:?}"))?;
+        // current qk-stream column, then conv window from the ring (advances ring).
+        gpu.zaya_qk_stream_f32(&cur_qk, &q, &k, 1, q_dim, k_dim, 0).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_conv_window_f32(&window, &state.conv_ring[li], &cur_qk, conv_ch, pad).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_conv1d_valid_f32(&dw, &window, &lw.conv_dw_w, &lw.conv_dw_b, conv_ch, conv_ch, a.conv_depthwise_kernel, pad + 1, dw_len).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_conv1d_valid_f32(&gw, &dw, &lw.conv_gr_w, &lw.conv_gr_b, conv_ch, nq + nkv, a.conv_grouped_kernel, dw_len, 1).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_add_conv_residual_f32(&query, &gw, &qres, 1, nq, hd, q_dim, 0).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_add_conv_residual_f32(&key, &gw, &kres, 1, nkv, hd, q_dim, 1).map_err(|e| format!("{e:?}"))?;
+        // value: head0 = current v, head1 = previous token's delayed v; then advance.
+        gpu.zaya_write_at_f32(&value, &vcur, 0, v_half).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_write_at_f32(&value, &state.delayed_v[li], v_half, v_half).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_write_at_f32(&state.delayed_v[li], &vdel, 0, v_half).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_qk_l2norm_temp_f32(&query, None, 1, nq, hd, l2_scale, f32::EPSILON).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_qk_l2norm_temp_f32(&key, Some(&lw.qk_temp), 1, nkv, hd, l2_scale, f32::EPSILON).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_rope_partial_f32(&query, 1, nq, hd, a.n_rot, a.rope_theta, pos).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_rope_partial_f32(&key, 1, nkv, hd, a.n_rot, a.rope_theta, pos).map_err(|e| format!("{e:?}"))?;
+        // append to KV cache at `pos`, then attend over 0..=pos.
+        gpu.zaya_write_at_f32(&state.k_cache[li], &key, pos * kvdim, kvdim).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_write_at_f32(&state.v_cache[li], &value, pos * kvdim, kvdim).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_gqa_decode_f32(&ctx, &query, &state.k_cache[li], &state.v_cache[li], pos, nq, nkv, hd, attn_scale).map_err(|e| format!("{e:?}"))?;
+        gpu.gemv_f32(&lw.o_proj, &ctx, &attn_out).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_affine_residual_f32(&g_res2, &attn_out, &hidden, &lw.pa_rs[0], &lw.pa_rs[1], &lw.pa_rs[2], &lw.pa_rs[3], h, h).map_err(|e| format!("{e:?}"))?;
+        gpu.rmsnorm_f32(&g_res2, &lw.post_attn_ln, &normed, eps).map_err(|e| format!("{e:?}"))?;
+        // MoE (single token)
+        gpu.gemv_f32(&lw.down_proj_w, &normed, &rhid).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_bias_add_f32(&rhid, &lw.down_proj_b, rh, rh).map_err(|e| format!("{e:?}"))?;
+        if li != 0 {
+            if let Some(scale) = lw.router_states_scale.as_ref() {
+                gpu.zaya_eda_add_f32(&rhid, &router_state, scale, rh, rh).map_err(|e| format!("{e:?}"))?;
+            }
+        }
+        let rhid_host = gpu.download_f32(&rhid).map_err(|e| format!("{e:?}"))?;
+        router_state = gpu.upload_f32(&rhid_host, &[1, rh]).map_err(|e| format!("{e:?}"))?;
+        gpu.rmsnorm_f32(&rhid, &lw.rnorm_w, &rnormed, eps).map_err(|e| format!("{e:?}"))?;
+        gpu.gemv_f32(&lw.fc1_w, &rnormed, &a1).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_bias_add_f32(&a1, &lw.fc1_b, rh, rh).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_gelu_exact_f32(&a1, rh).map_err(|e| format!("{e:?}"))?;
+        gpu.gemv_f32(&lw.fc2_w, &a1, &a2).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_bias_add_f32(&a2, &lw.fc2_b, rh, rh).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_gelu_exact_f32(&a2, rh).map_err(|e| format!("{e:?}"))?;
+        gpu.gemv_f32(&lw.out_proj_w, &a2, &rlogits).map_err(|e| format!("{e:?}"))?;
+        let row = gpu.download_f32(&rlogits).map_err(|e| format!("{e:?}"))?;
+        let maxv = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs = vec![0f32; n_route];
+        let mut denom = 0f32;
+        for e in 0..n_route {
+            probs[e] = (row[e] - maxv).exp();
+            denom += probs[e];
+        }
+        for p in probs.iter_mut() {
+            *p /= denom;
+        }
+        let mut best = 0usize;
+        let mut bestv = f32::NEG_INFINITY;
+        for e in 0..n_route {
+            let v = probs[e] + lw.balancing_biases[e];
+            if v > bestv {
+                bestv = v;
+                best = e;
+            }
+        }
+        gpu.fill_f32(&moe_out, 0.0).map_err(|e| format!("{e:?}"))?;
+        if best != n_exp {
+            let weight = probs[best];
+            let ex = &lw.experts[best];
+            gpu.gemv_f32(&ex.gate_up, &normed, &gate_up).map_err(|e| format!("{e:?}"))?;
+            let g = gate_up.sub_offset(0, moe_int);
+            let u = gate_up.sub_offset(moe_int, moe_int);
+            gpu.silu_mul_f32(&g, &u, &act).map_err(|e| format!("{e:?}"))?;
+            gpu.gemv_f32(&ex.down, &act, &down_t).map_err(|e| format!("{e:?}"))?;
+            gpu.scaled_add_inplace_cpu_scalar_f32(&moe_out, &down_t, weight).map_err(|e| format!("{e:?}"))?;
+        }
+        gpu.zaya_affine_residual_f32(&hidden, &moe_out, &g_res2, &lw.pm_rs[0], &lw.pm_rs[1], &lw.pm_rs[2], &lw.pm_rs[3], h, h).map_err(|e| format!("{e:?}"))?;
+    }
+
+    let fnorm = z2(gpu, 1, h)?;
+    gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps).map_err(|e| format!("{e:?}"))?;
+    gpu.gemv_f32(&w.embed, &fnorm, logits_out).map_err(|e| format!("zaya lm_head: {e:?}"))?;
+    state.pos = pos + 1;
     Ok(())
 }
 
@@ -458,8 +667,8 @@ pub fn gpu_forward_prefill(
         // qk-norm (+ temp on key), rope
         gpu.zaya_qk_l2norm_temp_f32(&query, None, s, nq, hd, l2_scale, f32::EPSILON).map_err(|e| format!("{e:?}"))?;
         gpu.zaya_qk_l2norm_temp_f32(&key, Some(&lw.qk_temp), s, nkv, hd, l2_scale, f32::EPSILON).map_err(|e| format!("{e:?}"))?;
-        gpu.zaya_rope_partial_f32(&query, s, nq, hd, a.n_rot, a.rope_theta).map_err(|e| format!("{e:?}"))?;
-        gpu.zaya_rope_partial_f32(&key, s, nkv, hd, a.n_rot, a.rope_theta).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_rope_partial_f32(&query, s, nq, hd, a.n_rot, a.rope_theta, 0).map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_rope_partial_f32(&key, s, nkv, hd, a.n_rot, a.rope_theta, 0).map_err(|e| format!("{e:?}"))?;
         // attention + o_proj
         gpu.zaya_gqa_attn_f32(&ctx, &query, &key, &value, s, nq, nkv, hd, attn_scale).map_err(|e| format!("{e:?}"))?;
         gemv_seq(gpu, &lw.o_proj, &ctx, &attn_out, s, h, q_dim)?;

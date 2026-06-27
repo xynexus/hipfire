@@ -197,15 +197,16 @@ extern "C" __global__ void zaya_gelu_exact_f32(float* __restrict__ x, int n) {
     x[i] = 0.5f * v * (1.0f + erf);
 }
 
-// Partial rotary (half-split), position = token index. x [s, heads, hd]; only
-// first n_rot dims rotate. One thread per (token, head). Matches cpu.rs RopeTables.
+// Partial rotary (half-split), position = pos_base + token index. x [s,heads,hd];
+// only first n_rot dims rotate. One thread per (token, head). pos_base=0 for
+// prefill; pos_base=current position for single-token decode.
 extern "C" __global__ void zaya_rope_partial_f32(
-    float* __restrict__ x, int s, int heads, int hd, int n_rot, float theta
+    float* __restrict__ x, int s, int heads, int hd, int n_rot, float theta, int pos_base
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= s * heads) return;
     int head = idx % heads;
-    int t = idx / heads;
+    int t = (idx / heads) + pos_base;
     (void)head;
     float* v = &x[idx * hd];
     int half = n_rot / 2;
@@ -254,6 +255,81 @@ extern "C" __global__ void zaya_gqa_attn_f32(
         float p = expf(dot * scaling - maxv);
         denom += p;
         const float* vv = &v[(j * nkv + kh) * hd];
+        for (int d = 0; d < hd; ++d) o[d] += p * vv[d];
+    }
+    float inv = 1.0f / denom;
+    for (int d = 0; d < hd; ++d) o[d] *= inv;
+}
+
+// Strided row copy: dst[r*dst_stride + j] = src[r*src_stride + src_off + j],
+// j in 0..len, r in 0..rows. (Used to seed the decode conv ring from the prefill
+// stream's last `pad` columns.) One thread per (row, j).
+extern "C" __global__ void zaya_strided_copy_f32(
+    float* __restrict__ dst, const float* __restrict__ src,
+    int rows, int dst_stride, int src_stride, int src_off, int len
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * len) return;
+    int r = idx / len;
+    int j = idx % len;
+    dst[r * dst_stride + j] = src[r * src_stride + src_off + j];
+}
+
+// Decode conv window + ring update. Build window [conv_ch, pad+1] = [ring | cur]
+// (channel-major) and advance the ring (drop oldest, push cur). One thread/channel.
+extern "C" __global__ void zaya_conv_window_f32(
+    float* __restrict__ window, float* __restrict__ ring, const float* __restrict__ cur,
+    int conv_ch, int pad
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_ch) return;
+    int wlen = pad + 1;
+    for (int j = 0; j < pad; ++j) window[c * wlen + j] = ring[c * pad + j];
+    window[c * wlen + pad] = cur[c];
+    for (int j = 0; j + 1 < pad; ++j) ring[c * pad + j] = ring[c * pad + j + 1];
+    ring[c * pad + (pad - 1)] = cur[c];
+}
+
+// Copy src[0..n] into dst[offset..offset+n] (KV-cache append). One thread/elem.
+extern "C" __global__ void zaya_write_at_f32(
+    float* __restrict__ dst, const float* __restrict__ src, int offset, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[offset + i] = src[i];
+}
+
+// Single-token GQA decode attention over the KV cache. q [nq,hd]; k_cache/v_cache
+// [max_seq, nkv, hd]; out [nq,hd]; attends positions 0..=pos. One thread/(head).
+extern "C" __global__ void zaya_gqa_decode_f32(
+    float* __restrict__ out, const float* __restrict__ q,
+    const float* __restrict__ k_cache, const float* __restrict__ v_cache,
+    int pos, int nq, int nkv, int hd, float scaling
+) {
+    int head = blockIdx.x * blockDim.x + threadIdx.x;
+    if (head >= nq) return;
+    int groups = nq / nkv;
+    int kh = head / groups;
+    const float* qv = &q[head * hd];
+    int kvdim = nkv * hd;
+    float maxv = -1e30f;
+    for (int j = 0; j <= pos; ++j) {
+        const float* kv = &k_cache[j * kvdim + kh * hd];
+        float dot = 0.0f;
+        for (int d = 0; d < hd; ++d) dot += qv[d] * kv[d];
+        dot *= scaling;
+        if (dot > maxv) maxv = dot;
+    }
+    float denom = 0.0f;
+    float* o = &out[head * hd];
+    for (int d = 0; d < hd; ++d) o[d] = 0.0f;
+    for (int j = 0; j <= pos; ++j) {
+        const float* kv = &k_cache[j * kvdim + kh * hd];
+        float dot = 0.0f;
+        for (int d = 0; d < hd; ++d) dot += qv[d] * kv[d];
+        float p = expf(dot * scaling - maxv);
+        denom += p;
+        const float* vv = &v_cache[j * kvdim + kh * hd];
         for (int d = 0; d < hd; ++d) o[d] += p * vv[d];
     }
     float inv = 1.0f / denom;

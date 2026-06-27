@@ -33,7 +33,7 @@ fn main() {
 
     let mut gpu = Gpu::init().expect("gpu init");
     eprintln!("loading weights...");
-    let mut model = ZayaModel::from_hfq(&mut gpu, &hfq, cfg).expect("load model");
+    let mut model = ZayaModel::from_hfq(&mut gpu, &hfq, cfg, 4096).expect("load model");
     eprintln!("loaded.");
 
     // "The capital of France is" (bos=2 + tokens), without the trailing eos.
