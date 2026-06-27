@@ -1567,8 +1567,12 @@ pub fn generate_minimax(
     let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        // Default to the model's jinja template when present (opt out with
+        // HIPFIRE_JINJA_CHAT=0): the hand-rolled Plain ChatScaffold omits the
+        // leading BOS, which silently corrupts BOS-sensitive models. See the
+        // lfm2 path for the worked example.
+        let jinja_disabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("0");
+        let try_jinja = !jinja_disabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
@@ -2183,8 +2187,10 @@ fn generate_lfm2moe_dflash(
     }
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        // lfm2 dflash path: same BOS-sensitivity as the plain lfm2 path — default
+        // to the model's jinja template (opt out with HIPFIRE_JINJA_CHAT=0).
+        let jinja_disabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("0");
+        let try_jinja = !jinja_disabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
