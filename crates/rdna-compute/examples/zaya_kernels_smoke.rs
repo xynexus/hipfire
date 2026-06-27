@@ -107,14 +107,131 @@ fn main() {
     let got4 = gpu.download_f32(&g4).unwrap();
     println!("gelu_exact   : maxdiff={:.3e}", maxdiff(&cpu4, &got4));
 
-    let worst = [
-        maxdiff(&cpu, &got),
-        maxdiff(&cpu2, &got2),
-        maxdiff(&cpu3, &got3),
-        maxdiff(&cpu4, &got4),
-    ]
-    .iter()
-    .cloned()
-    .fold(0.0, f32::max);
+    let mut diffs = vec![
+        ("conv1d_valid", maxdiff(&cpu, &got)),
+        ("qk_l2norm", maxdiff(&cpu2, &got2)),
+        ("affine_resid", maxdiff(&cpu3, &got3)),
+        ("gelu_exact", maxdiff(&cpu4, &got4)),
+    ];
+
+    // ── 5. embed gather ───────────────────────────────────────────────────────
+    {
+        let (vocab, hidden, sq) = (5usize, 6usize, 3usize);
+        let embed: Vec<f32> = (0..vocab * hidden).map(|i| 0.1 * i as f32).collect();
+        let ids = [2i32, 0, 4];
+        let mut cpu = vec![0f32; sq * hidden];
+        for t in 0..sq {
+            for c in 0..hidden {
+                cpu[t * hidden + c] = embed[ids[t] as usize * hidden + c];
+            }
+        }
+        let g_e = gpu.upload_f32(&embed, &[vocab, hidden]).unwrap();
+        let id_bytes: Vec<u8> = ids.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let g_ids = gpu.upload_raw(&id_bytes, &[sq]).unwrap();
+        let out = gpu.zeros(&[sq * hidden], DType::F32).unwrap();
+        gpu.zaya_embed_gather_f32(&out, &g_e, &g_ids, hidden, sq * hidden).unwrap();
+        diffs.push(("embed_gather", maxdiff(&cpu, &gpu.download_f32(&out).unwrap())));
+    }
+
+    // ── 6. value compose + qk_residual + add_conv_residual + rope + gqa_attn ───
+    {
+        let (sq, nq, nkv, hd) = (3usize, 4usize, 2usize, 4usize);
+        let groups = nq / nkv;
+        // value compose
+        let vcur: Vec<f32> = (0..sq * hd).map(|i| 0.2 * i as f32 - 1.0).collect();
+        let vdel: Vec<f32> = (0..sq * hd).map(|i| -0.1 * i as f32 + 0.5).collect();
+        let mut cval = vec![0f32; sq * nkv * hd];
+        for t in 0..sq {
+            for d in 0..hd {
+                cval[(t * nkv) * hd + d] = vcur[t * hd + d];
+                cval[(t * nkv + 1) * hd + d] = if t == 0 { 0.0 } else { vdel[(t - 1) * hd + d] };
+            }
+        }
+        let gvc = gpu.upload_f32(&vcur, &[vcur.len()]).unwrap();
+        let gvd = gpu.upload_f32(&vdel, &[vdel.len()]).unwrap();
+        let gval = gpu.zeros(&[sq * nkv * hd], DType::F32).unwrap();
+        gpu.zaya_value_compose_f32(&gval, &gvc, &gvd, sq, nkv, hd).unwrap();
+        diffs.push(("value_compose", maxdiff(&cval, &gpu.download_f32(&gval).unwrap())));
+
+        // qk_residual
+        let q: Vec<f32> = (0..sq * nq * hd).map(|i| 0.1 * i as f32).collect();
+        let k: Vec<f32> = (0..sq * nkv * hd).map(|i| 0.05 * i as f32 - 0.3).collect();
+        let mut qres = vec![0f32; sq * nq * hd];
+        let mut kres = vec![0f32; sq * nkv * hd];
+        for t in 0..sq {
+            for head in 0..nq {
+                let kh = head / groups;
+                for d in 0..hd {
+                    qres[(t * nq + head) * hd + d] =
+                        (q[t * nq * hd + head * hd + d] + k[t * nkv * hd + kh * hd + d]) * 0.5;
+                }
+            }
+        }
+        for t in 0..sq {
+            for kh in 0..nkv {
+                for d in 0..hd {
+                    let mut acc = 0f32;
+                    for g in 0..groups {
+                        acc += qres[(t * nq + kh * groups + g) * hd + d];
+                    }
+                    kres[(t * nkv + kh) * hd + d] = acc / groups as f32;
+                }
+            }
+        }
+        let gq = gpu.upload_f32(&q, &[q.len()]).unwrap();
+        let gk = gpu.upload_f32(&k, &[k.len()]).unwrap();
+        let gqr = gpu.zeros(&[sq * nq * hd], DType::F32).unwrap();
+        let gkr = gpu.zeros(&[sq * nkv * hd], DType::F32).unwrap();
+        gpu.zaya_qk_residual_f32(&gqr, &gkr, &gq, &gk, sq, nq, nkv, hd, 0).unwrap();
+        gpu.zaya_qk_residual_f32(&gqr, &gkr, &gq, &gk, sq, nq, nkv, hd, 1).unwrap();
+        diffs.push(("qk_residual_q", maxdiff(&qres, &gpu.download_f32(&gqr).unwrap())));
+        diffs.push(("qk_residual_k", maxdiff(&kres, &gpu.download_f32(&gkr).unwrap())));
+
+        // gqa_attn (no rope/norm for the math check; just causal softmax)
+        let scaling = 1.0 / (hd as f32).sqrt();
+        let qq: Vec<f32> = (0..sq * nq * hd).map(|i| 0.07 * i as f32 - 0.5).collect();
+        let kk: Vec<f32> = (0..sq * nkv * hd).map(|i| 0.03 * i as f32).collect();
+        let vv: Vec<f32> = (0..sq * nkv * hd).map(|i| 0.02 * i as f32 - 0.1).collect();
+        let mut catt = vec![0f32; sq * nq * hd];
+        for head in 0..nq {
+            let kh = head / groups;
+            for i in 0..sq {
+                let mut sc = vec![0f32; i + 1];
+                let mut mx = f32::NEG_INFINITY;
+                for j in 0..=i {
+                    let mut dot = 0f32;
+                    for d in 0..hd {
+                        dot += qq[(i * nq + head) * hd + d] * kk[(j * nkv + kh) * hd + d];
+                    }
+                    sc[j] = dot * scaling;
+                    mx = mx.max(sc[j]);
+                }
+                let mut den = 0f32;
+                for x in sc.iter_mut() {
+                    *x = (*x - mx).exp();
+                    den += *x;
+                }
+                for j in 0..=i {
+                    let p = sc[j] / den;
+                    for d in 0..hd {
+                        catt[(i * nq + head) * hd + d] += p * vv[(j * nkv + kh) * hd + d];
+                    }
+                }
+            }
+        }
+        let gqq = gpu.upload_f32(&qq, &[qq.len()]).unwrap();
+        let gkk = gpu.upload_f32(&kk, &[kk.len()]).unwrap();
+        let gvv = gpu.upload_f32(&vv, &[vv.len()]).unwrap();
+        let gca = gpu.zeros(&[sq * nq * hd], DType::F32).unwrap();
+        gpu.zaya_gqa_attn_f32(&gca, &gqq, &gkk, &gvv, sq, nq, nkv, hd, scaling).unwrap();
+        diffs.push(("gqa_attn", maxdiff(&catt, &gpu.download_f32(&gca).unwrap())));
+    }
+
+    println!();
+    let mut worst = 0f32;
+    for (name, d) in &diffs {
+        println!("{name:<16} maxdiff={d:.3e}");
+        worst = worst.max(*d);
+    }
     println!("\nworst maxdiff = {worst:.3e}  {}", if worst < 1e-4 { "PASS" } else { "FAIL" });
 }

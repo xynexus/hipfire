@@ -8,6 +8,27 @@
 
 #include <hip/hip_runtime.h>
 
+// Embedding gather: out[t, i] = embed[ids[t]*hidden + i]. n = s*hidden.
+extern "C" __global__ void zaya_embed_gather_f32(
+    float* __restrict__ out, const float* __restrict__ embed,
+    const int* __restrict__ ids, int hidden, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int t = i / hidden;
+    int c = i % hidden;
+    out[i] = embed[ids[t] * hidden + c];
+}
+
+// Broadcast bias add: x[i] += bias[i % d]. n = s*d.
+extern "C" __global__ void zaya_bias_add_f32(
+    float* __restrict__ x, const float* __restrict__ bias, int d, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] += bias[i % d];
+}
+
 // Global input residual affine on the embeddings: out[i] = (x[i]+bias[c])*scale[c],
 // c = i % d. n = seq*d.
 extern "C" __global__ void zaya_affine_input_f32(
@@ -174,6 +195,69 @@ extern "C" __global__ void zaya_gelu_exact_f32(float* __restrict__ x, int n) {
     float y = 1.0f - (((((1.061405429f * tt - 1.453152027f) * tt) + 1.421413741f) * tt - 0.284496736f) * tt + 0.254829592f) * tt * expf(-ax * ax);
     float erf = sign * y;
     x[i] = 0.5f * v * (1.0f + erf);
+}
+
+// Partial rotary (half-split), position = token index. x [s, heads, hd]; only
+// first n_rot dims rotate. One thread per (token, head). Matches cpu.rs RopeTables.
+extern "C" __global__ void zaya_rope_partial_f32(
+    float* __restrict__ x, int s, int heads, int hd, int n_rot, float theta
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= s * heads) return;
+    int head = idx % heads;
+    int t = idx / heads;
+    (void)head;
+    float* v = &x[idx * hd];
+    int half = n_rot / 2;
+    for (int d = 0; d < half; ++d) {
+        float inv_freq = powf(theta, -(2.0f * (float)d) / (float)n_rot);
+        float ang = (float)t * inv_freq;
+        float c = cosf(ang), sn = sinf(ang);
+        float a = v[d];
+        float b = v[d + half];
+        v[d] = a * c - b * sn;
+        v[d + half] = b * c + a * sn;
+    }
+}
+
+// Simple GQA causal attention (bring-up; O(s^2) per row, NO LDS). q [s,nq,hd],
+// k/v [s,nkv,hd] head-major; out [s,nq,hd]. scaling applied to scores. One
+// thread per (query position i, head). For short prompts; flash path later.
+extern "C" __global__ void zaya_gqa_attn_f32(
+    float* __restrict__ out, const float* __restrict__ q,
+    const float* __restrict__ k, const float* __restrict__ v,
+    int s, int nq, int nkv, int hd, float scaling
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= s * nq) return;
+    int head = idx % nq;
+    int i = idx / nq;
+    int groups = nq / nkv;
+    int kh = head / groups;
+    const float* qv = &q[(i * nq + head) * hd];
+    // online softmax over j = 0..i
+    float maxv = -1e30f;
+    for (int j = 0; j <= i; ++j) {
+        const float* kv = &k[(j * nkv + kh) * hd];
+        float dot = 0.0f;
+        for (int d = 0; d < hd; ++d) dot += qv[d] * kv[d];
+        dot *= scaling;
+        if (dot > maxv) maxv = dot;
+    }
+    float denom = 0.0f;
+    float* o = &out[(i * nq + head) * hd];
+    for (int d = 0; d < hd; ++d) o[d] = 0.0f;
+    for (int j = 0; j <= i; ++j) {
+        const float* kv = &k[(j * nkv + kh) * hd];
+        float dot = 0.0f;
+        for (int d = 0; d < hd; ++d) dot += qv[d] * kv[d];
+        float p = expf(dot * scaling - maxv);
+        denom += p;
+        const float* vv = &v[(j * nkv + kh) * hd];
+        for (int d = 0; d < hd; ++d) o[d] += p * vv[d];
+    }
+    float inv = 1.0f / denom;
+    for (int d = 0; d < hd; ++d) o[d] *= inv;
 }
 
 // EDA cross-layer state add: router_hidden[t,i] += prev[t,i] * scale[i]. n = s*rh.

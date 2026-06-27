@@ -28,6 +28,43 @@ impl Gpu {
         }
     }
 
+    /// Embedding gather: `out[t,i] = embed[ids[t]*hidden + i]`. `ids` is an i32
+    /// device buffer of length `s`; `n = s*hidden`.
+    pub fn zaya_embed_gather_f32(
+        &mut self,
+        out: &GpuTensor,
+        embed: &GpuTensor,
+        ids: &GpuTensor,
+        hidden: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_embed_gather_f32")?;
+        let (op, ep, ip) = (out.buf.as_ptr(), embed.buf.as_ptr(), ids.buf.as_ptr());
+        let (hi, ni) = (hidden as i32, n as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &hi as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_embed_gather_f32", n, &mut p)
+    }
+
+    /// Broadcast bias add: `x[i] += bias[i % d]`, `n = s*d`.
+    pub fn zaya_bias_add_f32(&mut self, x: &GpuTensor, bias: &GpuTensor, d: usize, n: usize) -> HipResult<()> {
+        self.zaya_ensure("zaya_bias_add_f32")?;
+        let (xp, bp) = (x.buf.as_ptr(), bias.buf.as_ptr());
+        let (di, ni) = (d as i32, n as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &di as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_bias_add_f32", n, &mut p)
+    }
+
     /// Global input residual affine on the embeddings:
     /// `out[i] = (x[i]+bias[c])*scale[c]`, `c = i % d`, `n = seq*d`.
     pub fn zaya_affine_input_f32(
@@ -276,6 +313,62 @@ impl Gpu {
             &ni as *const _ as *mut c_void,
         ];
         self.zaya_launch("zaya_gelu_exact_f32", n, &mut p)
+    }
+
+    /// Partial rotary (half-split) at position = token index, over `x [s,heads,hd]`.
+    pub fn zaya_rope_partial_f32(
+        &mut self,
+        x: &GpuTensor,
+        s: usize,
+        heads: usize,
+        hd: usize,
+        n_rot: usize,
+        theta: f32,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_rope_partial_f32")?;
+        let xp = x.buf.as_ptr();
+        let (si, hi, hdi, nr) = (s as i32, heads as i32, hd as i32, n_rot as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &si as *const _ as *mut c_void,
+            &hi as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+            &theta as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_rope_partial_f32", s * heads, &mut p)
+    }
+
+    /// Simple GQA causal attention (bring-up). q `[s,nq,hd]`, k/v `[s,nkv,hd]`
+    /// head-major; out `[s,nq,hd]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_gqa_attn_f32(
+        &mut self,
+        out: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        s: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        scaling: f32,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_gqa_attn_f32")?;
+        let (op, qp, kp, vp) = (out.buf.as_ptr(), q.buf.as_ptr(), k.buf.as_ptr(), v.buf.as_ptr());
+        let (si, nqi, nkvi, hdi) = (s as i32, nq as i32, nkv as i32, hd as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &si as *const _ as *mut c_void,
+            &nqi as *const _ as *mut c_void,
+            &nkvi as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &scaling as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_gqa_attn_f32", s * nq, &mut p)
     }
 
     /// EDA cross-layer state add: `router_hidden[i] += prev[i] * scale[i%rh]`.
