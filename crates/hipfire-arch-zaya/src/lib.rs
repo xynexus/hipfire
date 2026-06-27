@@ -24,6 +24,8 @@
 
 use serde::Deserialize;
 
+pub mod weights;
+
 pub use hipfire_model::ARCH_ID_ZAYA;
 
 /// Per-half-layer mixer/FFN role in the **alternating** checkpoint layout. The
