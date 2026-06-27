@@ -24,6 +24,7 @@
 
 use serde::Deserialize;
 
+pub mod cpu;
 pub mod weights;
 
 pub use hipfire_model::ARCH_ID_ZAYA;
