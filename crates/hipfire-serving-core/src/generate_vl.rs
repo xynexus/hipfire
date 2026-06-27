@@ -28,7 +28,7 @@ use hipfire_prompt as prompt_frame;
 use hipfire_runtime::arch::GenerateCtx;
 use hipfire_runtime::sampler;
 
-use crate::events::{emit_committed_event, write_error};
+use crate::events::{emit_committed_event, emit_done, write_error, GenTiming};
 use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::{block_attractor_unclosed_cpu, loop_guard_from_runtime_config};
 
@@ -540,37 +540,15 @@ pub fn generate_vl(
     }
 
     let t_end = Instant::now();
-    let total_s = t_end.duration_since(t0).as_secs_f64();
     let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
     let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-    let tok_s = if total_s > 0.0 {
-        generated as f64 / total_s
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if prefill_s > 0.0 {
-        prefill_tokens as f64 / prefill_s
-    } else {
-        0.0
-    };
-    let decode_tok_s = if decode_s > 0.0 {
-        generated as f64 / decode_s
-    } else {
-        0.0
-    };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
-        id,
+    let timing = GenTiming {
         generated,
-        tok_s,
         prefill_tokens,
-        prefill_s * 1000.0,
-        prefill_tok_s,
-        decode_tok_s,
-        prefill_s * 1000.0
-    );
-    let _ = stdout.flush();
+        prefill_s,
+        decode_s,
+    };
+    emit_done(stdout, id, &timing, "");
 }
 
 /// dots.ocr (arch_id=8) VL generation. Single-image, greedy decode —
@@ -852,35 +830,13 @@ pub fn generate_vl_dots_ocr(
     }
 
     let decode_s = t_gen.elapsed().as_secs_f64();
-    let total_s = t0.elapsed().as_secs_f64();
-    let tok_s = if total_s > 0.0 {
-        generated as f64 / total_s
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if prefill_s > 0.0 {
-        prefill_tokens as f64 / prefill_s
-    } else {
-        0.0
-    };
-    let decode_tok_s = if decode_s > 0.0 {
-        generated as f64 / decode_s
-    } else {
-        0.0
-    };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
-        id,
+    let timing = GenTiming {
         generated,
-        tok_s,
         prefill_tokens,
-        prefill_s * 1000.0,
-        prefill_tok_s,
-        decode_tok_s,
-        prefill_s * 1000.0
-    );
-    let _ = stdout.flush();
+        prefill_s,
+        decode_s,
+    };
+    emit_done(stdout, id, &timing, "");
 }
 
 /// Decode the multimodal inputs of a gemma3-vl request into owned, raw encoded

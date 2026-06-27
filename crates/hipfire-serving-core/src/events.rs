@@ -158,6 +158,142 @@ pub fn emit_filter_action(stdout: &mut std::io::Stdout, id: &str, action: Filter
     }
 }
 
+/// Canonical generate-loop timing — the single source of truth for the `tok_s`,
+/// `prefill_tok_s`, `decode_tok_s`, and `ttft_ms` fields every `done` event
+/// carries. These are pure tokens/second arithmetic with no dependence on the
+/// architecture, so no per-arch generate path should recompute (or, as happened
+/// with the lfm2/minimax loops, forget to emit) them.
+#[derive(Debug, Clone, Copy)]
+pub struct GenTiming {
+    /// Tokens produced during the decode phase.
+    pub generated: usize,
+    /// Prompt tokens consumed during prefill (for `prefill_tok_s`).
+    pub prefill_tokens: usize,
+    pub prefill_s: f64,
+    pub decode_s: f64,
+}
+
+fn tok_rate(n: usize, secs: f64) -> f64 {
+    if secs > 0.0 {
+        n as f64 / secs
+    } else {
+        0.0
+    }
+}
+
+impl GenTiming {
+    /// Build from the millisecond clocks the arch generate loops already keep
+    /// (`prefill_ms`/`decode_ms` as `u128` elapsed millis).
+    pub fn from_millis(
+        generated: usize,
+        prefill_tokens: usize,
+        prefill_ms: u128,
+        decode_ms: u128,
+    ) -> Self {
+        Self {
+            generated,
+            prefill_tokens,
+            prefill_s: prefill_ms as f64 / 1000.0,
+            decode_s: decode_ms as f64 / 1000.0,
+        }
+    }
+
+    pub fn total_s(&self) -> f64 {
+        self.prefill_s + self.decode_s
+    }
+    pub fn tok_s(&self) -> f64 {
+        tok_rate(self.generated, self.total_s())
+    }
+    pub fn decode_tok_s(&self) -> f64 {
+        tok_rate(self.generated, self.decode_s)
+    }
+    pub fn prefill_tok_s(&self) -> f64 {
+        tok_rate(self.prefill_tokens, self.prefill_s)
+    }
+    pub fn ttft_ms(&self) -> f64 {
+        self.prefill_s * 1000.0
+    }
+
+    /// The timing fields shared by every `done` event, rendered as a
+    /// comma-separated JSON fragment with NO surrounding braces and NO leading
+    /// comma — ready to splice into a `done` envelope after the `id`.
+    pub fn done_fields(&self) -> String {
+        format!(
+            r#""tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}"#,
+            self.generated,
+            self.tok_s(),
+            self.prefill_tokens,
+            self.prefill_s * 1000.0,
+            self.prefill_tok_s(),
+            self.decode_tok_s(),
+            self.ttft_ms(),
+        )
+    }
+}
+
+/// Emit the canonical `{"type":"done",...}` event for a generate loop. `extra`
+/// is an optional pre-built JSON fragment for arch-/mode-specific fields and
+/// MUST begin with a comma and carry no surrounding braces (e.g.
+/// `,"dflash":true,"cycles":7`); pass `""` when there are none.
+pub fn emit_done(stdout: &mut std::io::Stdout, id: &str, timing: &GenTiming, extra: &str) {
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}",{}{}}}"#,
+        id,
+        timing.done_fields(),
+        extra,
+    );
+    let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::GenTiming;
+
+    #[test]
+    fn rates_are_tokens_over_seconds() {
+        let t = GenTiming {
+            generated: 100,
+            prefill_tokens: 256,
+            prefill_s: 0.5,
+            decode_s: 2.0,
+        };
+        assert!((t.decode_tok_s() - 50.0).abs() < 1e-9); // 100 / 2.0
+        assert!((t.prefill_tok_s() - 512.0).abs() < 1e-9); // 256 / 0.5
+        assert!((t.tok_s() - 40.0).abs() < 1e-9); // 100 / (0.5 + 2.0)
+        assert!((t.ttft_ms() - 500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_duration_yields_zero_not_nan() {
+        // The lfm2/minimax loops can report a 0ms prefill (prefill_already_done);
+        // the rate must be a finite 0.0, never a NaN/inf that breaks JSON parse.
+        let t = GenTiming::from_millis(0, 0, 0, 0);
+        assert_eq!(t.decode_tok_s(), 0.0);
+        assert_eq!(t.prefill_tok_s(), 0.0);
+        assert_eq!(t.tok_s(), 0.0);
+    }
+
+    #[test]
+    fn done_fields_carries_the_canonical_keys() {
+        let f = GenTiming::from_millis(64, 257, 318, 192).done_fields();
+        for key in [
+            "\"tokens\":",
+            "\"tok_s\":",
+            "\"prefill_tokens\":",
+            "\"prefill_ms\":",
+            "\"prefill_tok_s\":",
+            "\"decode_tok_s\":",
+            "\"ttft_ms\":",
+        ] {
+            assert!(f.contains(key), "missing {key} in {f}");
+        }
+        // No surrounding braces / leading comma — splices straight after `id`.
+        assert!(!f.starts_with(','));
+        assert!(!f.starts_with('{'));
+    }
+}
+
 /// Emit a `{"type":"token","id","text"}` event for `text_bytes`. No-op on empty
 /// input or non-UTF-8 bytes (a partial multibyte fragment is dropped rather than
 /// emitting mojibake; the filter re-presents it once the codepoint completes).

@@ -5,8 +5,9 @@ use crate::config::Lfm2MoeConfig;
 use crate::forward::decode_step;
 use crate::lfm2moe::{Ffn, Lfm2MoeState, Lfm2MoeWeights, Mixer};
 use hip_bridge::{HipError, HipResult};
-use hipfire_runtime::calibration::{logsumexp, topk_logits, CalibCollector};
-use hipfire_runtime::hfq::HfqMemTensor;
+use hipfire_runtime::calibration::{
+    finalize_calibration, logsumexp, topk_logits, CalibCollector, CalibSummary,
+};
 use hipfire_runtime::weights::WeightTensor;
 use rdna_compute::Gpu;
 use std::collections::HashMap;
@@ -27,13 +28,6 @@ impl Default for CalibOpts {
             kldref_topk: 64,
         }
     }
-}
-
-/// Summary of a calibration pass after the `.calib.hfq` has been streamed.
-pub struct CalibSummary {
-    pub n_hessian: usize,
-    pub n_imatrix: usize,
-    pub max_consistency: f32,
 }
 
 fn put(m: &mut HashMap<usize, String>, wt: &WeightTensor, name: impl Into<String>) {
@@ -78,45 +72,6 @@ pub fn build_capture_names(weights: &Lfm2MoeWeights) -> HashMap<usize, String> {
     m
 }
 
-fn f32_bytes(v: &[f32]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(v.len() * 4);
-    for &x in v {
-        b.extend_from_slice(&x.to_le_bytes());
-    }
-    b
-}
-
-fn kldref_extra(kldref: &[(f32, Vec<(u32, f32)>)]) -> Vec<HfqMemTensor> {
-    if kldref.is_empty() {
-        return Vec::new();
-    }
-    let np = kldref.len();
-    let kk = kldref[0].1.len();
-    let (mut idx_v, mut lg_v, mut lz_v) = (Vec::new(), Vec::new(), Vec::new());
-    for (logz, tk) in kldref {
-        lz_v.push(*logz);
-        for j in 0..kk {
-            let (i, l) = tk.get(j).copied().unwrap_or((0, f32::NEG_INFINITY));
-            idx_v.push(i as f32);
-            lg_v.push(l);
-        }
-    }
-    [
-        ("lm_head.kldref_idx", vec![np as u32, kk as u32], idx_v),
-        ("lm_head.kldref_logit", vec![np as u32, kk as u32], lg_v),
-        ("lm_head.kldref_logz", vec![np as u32], lz_v),
-    ]
-    .into_iter()
-    .map(|(name, shape, data)| HfqMemTensor {
-        name: name.to_string(),
-        quant_type: 2,
-        shape,
-        group_size: 0,
-        data: f32_bytes(&data),
-    })
-    .collect()
-}
-
 /// Collect calibration Hessians/imatrices from the LFM2 text decoder.
 ///
 /// This covers dense projection calls that route through `weight_gemv` plus
@@ -159,61 +114,24 @@ pub fn collect_calibration_artifacts(
     gpu.capture_names = HashMap::new();
     run_result?;
 
-    let descriptors = collector.tensor_descriptors();
-    if descriptors.is_empty() {
-        return Err(HipError::new(
-            0,
-            "lfm2 calib: no tensors captured (capture_names empty or weight_gemv not hit)",
-        ));
-    }
-
-    let n_hessian = descriptors.iter().filter(|d| d.has_hessian).count();
-    let n_imatrix = descriptors.len();
-    let mut per_tensor_tokens = serde_json::Map::new();
-    for d in &descriptors {
-        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
-    }
-
-    let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
-    let mut meta = serde_json::json!({
-        "artifact_kind": "calibration",
+    // The arch-agnostic descriptor counts, KLDREF block, provenance merge, and
+    // streaming write are shared with every other arch collector.
+    let base_meta = serde_json::json!({
         "arch": "lfm2",
         "text_only": true,
         "captures": "decode_step_weight_gemv+routed_expert_indexed_tap",
         "routed_expert_capture": "imatrix-only-selected-experts",
-        "n_hessian": n_hessian,
-        "n_imatrix": n_imatrix,
-        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
     });
-
-    let extra = kldref_extra(&kldref);
-    if !kldref.is_empty() {
-        let np = kldref.len();
-        let kk = kldref[0].1.len();
-        meta.as_object_mut().unwrap().insert(
-            "kldref".to_string(),
-            serde_json::json!({ "n_positions": np, "top_k": kk }),
-        );
-        artifacts.push(serde_json::json!("kldref"));
-    }
-
-    if let Some(obj) = meta.as_object_mut() {
-        obj.insert("artifacts".to_string(), serde_json::Value::Array(artifacts));
-        for (k, v) in provenance {
-            obj.insert((*k).to_string(), v.clone());
-        }
-    }
-    let metadata_json = serde_json::to_string(&meta).unwrap();
-    let max_consistency = collector
-        .write_streaming(gpu, output, crate::ARCH_ID, &metadata_json, &extra)
-        .map_err(|e| HipError::new(0, &format!("write .calib.hfq: {e}")))?;
-    collector.free_gpu(gpu);
-
-    Ok(CalibSummary {
-        n_hessian,
-        n_imatrix,
-        max_consistency,
-    })
+    finalize_calibration(
+        &collector,
+        gpu,
+        output,
+        crate::ARCH_ID,
+        &kldref,
+        base_meta,
+        provenance,
+    )
+    .map_err(|e| HipError::new(0, &format!("lfm2 calib: {e}")))
 }
 
 #[cfg(test)]

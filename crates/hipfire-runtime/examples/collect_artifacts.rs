@@ -149,7 +149,35 @@ fn main() {
                 "lfm2-text",
             )
         }
-        other => panic!("collect_artifacts: unsupported arch_id {other}; handled 5/6/11/12/13"),
+        0 | 1 => {
+            // Dense LLaMA / Mistral (0) and plain Qwen3/Qwen2 (1) share the
+            // runtime-hosted LLaMA forward and its co-located collector.
+            let config =
+                hipfire_runtime::hfq::config_from_hfq(&hfq).expect("llama config from hfq");
+            let weights = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu)
+                .expect("load_weights_hfq");
+            let opts = hipfire_runtime::llama_calibration::CalibOpts {
+                kldref: want_kldref,
+                kldref_topk: 64,
+            };
+            let summary = hipfire_runtime::llama_calibration::collect_calibration_artifacts(
+                &mut gpu,
+                &weights,
+                &config,
+                tokens,
+                &opts,
+                Path::new(&output),
+                &provenance,
+            )
+            .expect("collect");
+            (
+                summary.n_hessian,
+                summary.n_imatrix,
+                summary.max_consistency,
+                "llama-text",
+            )
+        }
+        other => panic!("collect_artifacts: unsupported arch_id {other}; handled 0/1/5/6/11/12/13"),
     };
     eprintln!(
         "collected {n_hessian} hessian + {n_imatrix} imatrix tensors in {:.1}s; mode={mode}; max diag(H)-vs-Σx² rel-err = {:.3e} {}",

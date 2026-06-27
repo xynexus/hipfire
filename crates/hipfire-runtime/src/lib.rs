@@ -36,6 +36,7 @@ pub mod host_profile;
 pub mod kv;
 pub mod kv_hier;
 pub mod llama;
+pub mod llama_calibration;
 pub mod logging;
 pub mod loop_guard;
 pub mod model_source;

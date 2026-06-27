@@ -24,8 +24,8 @@ CANONICAL_KV = "q8"                                  # KV mode used for the pivo
 
 def load_systems() -> list[dict]:
     systems = []
-    for d in sorted(glob.glob(str(REPO / MATRIX_GLOB))):
-        d = Path(d)
+    for raw in sorted(glob.glob(str(REPO / MATRIX_GLOB))):
+        d = Path(raw)
         jl = d / "result-data.jsonl"
         if not jl.exists():
             continue

@@ -468,6 +468,136 @@ pub fn topk_logits(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     idx.into_iter().map(|i| (i, logits[i as usize])).collect()
 }
 
+/// Summary of a calibration pass after the `.calib.hfq` has been streamed.
+///
+/// Shared across every arch collector (qwen35, gemma3, lfm2, llama). Previously
+/// each arch crate declared its own identical `CalibSummary`; this is the one
+/// canonical home.
+pub struct CalibSummary {
+    pub n_hessian: usize,
+    pub n_imatrix: usize,
+    pub max_consistency: f32,
+}
+
+/// Pack the per-position KLDREF reference (lm-head top-K logits + logZ) into the
+/// three `lm_head.kldref_*` F32 tensors the quantizer reads back. Returns an
+/// empty vec when no KLDREF was captured.
+///
+/// This is identical boilerplate across every arch collector, so it lives here
+/// next to the collector rather than copy-pasted per arch crate.
+pub fn build_kldref_extra(kldref: &[(f32, Vec<(u32, f32)>)]) -> Vec<HfqMemTensor> {
+    if kldref.is_empty() {
+        return Vec::new();
+    }
+    let np = kldref.len();
+    let kk = kldref[0].1.len();
+    let (mut idx_v, mut lg_v, mut lz_v) = (Vec::new(), Vec::new(), Vec::new());
+    for (logz, tk) in kldref {
+        lz_v.push(*logz);
+        for j in 0..kk {
+            let (i, l) = tk.get(j).copied().unwrap_or((0, f32::NEG_INFINITY));
+            idx_v.push(i as f32);
+            lg_v.push(l);
+        }
+    }
+    let f32_bytes = |v: &[f32]| -> Vec<u8> {
+        let mut b = Vec::with_capacity(v.len() * 4);
+        for &x in v {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b
+    };
+    [
+        ("lm_head.kldref_idx", vec![np as u32, kk as u32], idx_v),
+        ("lm_head.kldref_logit", vec![np as u32, kk as u32], lg_v),
+        ("lm_head.kldref_logz", vec![np as u32], lz_v),
+    ]
+    .into_iter()
+    .map(|(name, shape, data)| HfqMemTensor {
+        name: name.to_string(),
+        quant_type: 2,
+        shape,
+        group_size: 0,
+        data: f32_bytes(&data),
+    })
+    .collect()
+}
+
+/// Finish a calibration pass: derive `n_hessian`/`n_imatrix`/`per_tensor_tokens`
+/// from the collector, fold in the KLDREF reference, merge caller provenance,
+/// and stream the `.calib.hfq` package.
+///
+/// `base_meta` carries the arch-specific fields (`arch`, `text_only`,
+/// `captures`, and any extra taps such as a MoE router histogram). This helper
+/// owns the parts that are identical across every arch: the descriptor-derived
+/// counts, the `artifacts` list, the KLDREF block, provenance, and the
+/// streaming write. Arch collectors supply only their capture map, forward
+/// loop, and `base_meta`.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_calibration(
+    collector: &CalibCollector,
+    gpu: &mut Gpu,
+    output: &std::path::Path,
+    arch_id: u32,
+    kldref: &[(f32, Vec<(u32, f32)>)],
+    mut base_meta: serde_json::Value,
+    provenance: &[(&str, serde_json::Value)],
+) -> Result<CalibSummary, rdna_compute::HipError> {
+    let descriptors = collector.tensor_descriptors();
+    if descriptors.is_empty() {
+        return Err(rdna_compute::HipError::new(
+            0,
+            "calibration: no tensors captured (capture_names empty or weight_gemv not hit)",
+        ));
+    }
+    let n_hessian = descriptors.iter().filter(|d| d.has_hessian).count();
+    let n_imatrix = descriptors.len();
+
+    let mut per_tensor_tokens = serde_json::Map::new();
+    for d in &descriptors {
+        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
+    }
+    let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
+
+    let obj = base_meta
+        .as_object_mut()
+        .expect("finalize_calibration: base_meta must be a JSON object");
+    obj.insert("artifact_kind".to_string(), serde_json::json!("calibration"));
+    obj.insert("n_hessian".to_string(), serde_json::json!(n_hessian));
+    obj.insert("n_imatrix".to_string(), serde_json::json!(n_imatrix));
+    obj.insert(
+        "per_tensor_tokens".to_string(),
+        serde_json::Value::Object(per_tensor_tokens),
+    );
+
+    let extra = build_kldref_extra(kldref);
+    if !kldref.is_empty() {
+        let np = kldref.len();
+        let kk = kldref[0].1.len();
+        obj.insert(
+            "kldref".to_string(),
+            serde_json::json!({ "n_positions": np, "top_k": kk }),
+        );
+        artifacts.push(serde_json::json!("kldref"));
+    }
+    obj.insert("artifacts".to_string(), serde_json::Value::Array(artifacts));
+    for (k, v) in provenance {
+        obj.insert((*k).to_string(), v.clone());
+    }
+
+    let metadata_json = serde_json::to_string(&base_meta).unwrap();
+    let max_consistency = collector
+        .write_streaming(gpu, output, arch_id, &metadata_json, &extra)
+        .map_err(|e| rdna_compute::HipError::new(0, &format!("write .calib.hfq: {e}")))?;
+    collector.free_gpu(gpu);
+
+    Ok(CalibSummary {
+        n_hessian,
+        n_imatrix,
+        max_consistency,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

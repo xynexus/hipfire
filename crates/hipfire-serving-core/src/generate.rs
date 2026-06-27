@@ -29,7 +29,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::sampler;
 
-use crate::events::{emit_committed_event, emit_filter_action, write_error};
+use crate::events::{emit_committed_event, emit_done, emit_filter_action, write_error, GenTiming};
 use crate::evidence::{
     write_daemon_moe_router_evidence, write_daemon_runtime_oneshot_evidence,
     DaemonMoeRouterHistogramGuard,
@@ -1786,37 +1786,15 @@ pub fn generate_multi(
     }
 
     let t_end = Instant::now();
-    let total_s = t_end.duration_since(t0).as_secs_f64();
     let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
     let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-    let tok_s = if total_s > 0.0 {
-        generated as f64 / total_s
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if prefill_s > 0.0 {
-        prefill_tokens as f64 / prefill_s
-    } else {
-        0.0
-    };
-    let decode_tok_s = if decode_s > 0.0 {
-        generated as f64 / decode_s
-    } else {
-        0.0
-    };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
-        id,
+    let timing = GenTiming {
         generated,
-        tok_s,
         prefill_tokens,
-        prefill_s * 1000.0,
-        prefill_tok_s,
-        decode_tok_s,
-        prefill_s * 1000.0
-    );
-    let _ = stdout.flush();
+        prefill_s,
+        decode_s,
+    };
+    emit_done(stdout, id, &timing, "");
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -77,7 +77,7 @@ def snapshot(src: str) -> Path | None:
 
 def run(cmd: list[str], timeout: int) -> tuple[int, str]:
     try:
-        p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=timeout, check=False)
         return p.returncode, p.stdout + p.stderr
     except subprocess.TimeoutExpired as e:
         return 124, f"TIMEOUT after {timeout}s\n{e.output or ''}"
@@ -136,8 +136,8 @@ def quantize(model: dict, fmt: str, calib: str | None, out: Path, timeout: int) 
 
 
 def latest_run_dir(stdout: str) -> Path | None:
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
+    for raw in reversed(stdout.splitlines()):
+        line = raw.strip()
         if "/eval-results/runs/" in line and Path(line).exists():
             return Path(line)
     runs = sorted(glob.glob(os.path.expanduser("~/.hipfire/eval-results/runs/*")), key=os.path.getmtime)

@@ -23,7 +23,7 @@ use hipfire_runtime::arch::{
     decode_loop_with_timing, DecodeLoopTiming, GenerateCtx, ServingBackend, SimpleAr,
 };
 
-use crate::events::{emit_committed_event, emit_error_with_id, emit_stream_event};
+use crate::events::{emit_committed_event, emit_done, emit_error_with_id, emit_stream_event, GenTiming};
 use crate::evidence::write_daemon_runtime_oneshot_evidence;
 use crate::model::{effective_raw, LoadedModel};
 use crate::request::ThinkMode;
@@ -1772,18 +1772,8 @@ pub fn generate_minimax(
     m.seq_pos = m.minimax_state.as_ref().unwrap().n_tokens;
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
-    );
-    let _ = stdout.flush();
+    let timing = GenTiming::from_millis(generated_count, prompt_ids.len(), prefill_ms, decode_ms);
+    emit_done(stdout, id, &timing, "");
 }
 
 /// LFM2.5-MoE (arch_id=11) generate path — minimal AR bring-up.
@@ -2155,18 +2145,8 @@ pub fn generate_lfm2moe(
     };
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
-    );
-    let _ = stdout.flush();
+    let timing = GenTiming::from_millis(generated_count, prompt_ids.len(), prefill_ms, decode_ms);
+    emit_done(stdout, id, &timing, "");
 }
 
 #[cfg(feature = "arch-lfm2moe")]
