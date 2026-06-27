@@ -24,6 +24,7 @@
 
 use serde::Deserialize;
 
+pub mod arch;
 pub mod cpu;
 pub mod gpu;
 pub mod weights;

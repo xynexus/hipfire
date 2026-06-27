@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Serving seam for `zaya` (arch_id 16): `SimpleAr` + `ServingBackend` on
+//! [`ZayaModel`], routing through the shared `run_simple_ar` → prefill →
+//! decode loop (the same dense-AR seam as Llama/Nemotron). Bring-up decode
+//! re-prefills the growing sequence each step (KV/conv/router-state decode is
+//! the later optimization); each step leaves the last-position logits in
+//! `self.logits` for the daemon sampler.
+
+use crate::gpu::{gpu_forward_serve, ZayaGpuWeights};
+use crate::ZayaConfig;
+use hipfire_model::ARCH_ID_ZAYA;
+use hipfire_runtime::arch::{
+    run_simple_ar, ArchCaps, GenerateCtx, ServeOutcome, ServingBackend, SimpleAr,
+};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::tokenizer::Tokenizer;
+use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// A loaded ZAYA1 model with GPU-resident weights and a rolling token sequence.
+pub struct ZayaModel {
+    weights: ZayaGpuWeights,
+    cfg: ZayaConfig,
+    seq: Vec<u32>,
+    logits: GpuTensor,
+}
+
+impl ZayaModel {
+    /// Load weights from an HFQ onto the GPU and allocate the logits buffer.
+    pub fn from_hfq(gpu: &mut Gpu, hfq: &HfqFile, cfg: ZayaConfig) -> Result<Self, String> {
+        let weights = ZayaGpuWeights::load(hfq, gpu, &cfg)?;
+        let logits = gpu
+            .zeros(&[cfg.vocab_size], DType::F32)
+            .map_err(|e| format!("zaya logits alloc: {e:?}"))?;
+        Ok(Self { weights, cfg, seq: Vec::new(), logits })
+    }
+
+    pub fn config(&self) -> &ZayaConfig {
+        &self.cfg
+    }
+
+    fn run(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        gpu_forward_serve(gpu, &self.weights, &self.cfg, &self.seq, &self.logits)
+    }
+}
+
+impl SimpleAr for ZayaModel {
+    fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
+        if tokens.is_empty() {
+            return Err("zaya prefill: empty prompt".to_string());
+        }
+        self.seq = tokens.to_vec();
+        self.run(gpu)
+    }
+
+    fn decode_step(&mut self, gpu: &mut Gpu, token: u32, _pos: usize) -> Result<(), String> {
+        self.seq.push(token);
+        self.run(gpu)
+    }
+
+    fn logits(&self) -> &GpuTensor {
+        &self.logits
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+}
+
+impl ServingBackend for ZayaModel {
+    fn arch_id(&self) -> u32 {
+        ARCH_ID_ZAYA
+    }
+
+    fn caps(&self) -> ArchCaps {
+        ArchCaps::default()
+    }
+
+    fn eos_token(&self) -> u32 {
+        self.cfg.eos_token_id
+    }
+
+    fn serve(
+        &mut self,
+        gpu: &mut Gpu,
+        tok: &Tokenizer,
+        ctx: &mut GenerateCtx,
+    ) -> Result<ServeOutcome, String> {
+        let eos = self.cfg.eos_token_id;
+        run_simple_ar(gpu, self, tok, eos, ctx)
+    }
+
+    fn reset_session(&mut self, _gpu: &mut Gpu, _session_id: &str) -> Result<(), String> {
+        self.seq.clear();
+        Ok(())
+    }
+
+    fn unload(self: Box<Self>, _gpu: &mut Gpu) {
+        // GPU buffers are released when the pool drains on shutdown.
+    }
+}
