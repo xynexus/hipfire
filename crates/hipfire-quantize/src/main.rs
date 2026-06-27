@@ -2954,6 +2954,12 @@ fn should_quantize(name: &str) -> bool {
     if name.contains("conv1d") {
         return false;
     }
+    // ZAYA1 CCA conv_qk filters (`self_attn.qkv_proj.conv_qk_{depthwise,grouped}.weight`,
+    // shapes [conv_ch, 1, K] / [conv_ch, in_per_group, K]) are short causal convs run
+    // by a custom f32 kernel, not a 2D linear — keep them F16.
+    if name.contains("conv_qk") {
+        return false;
+    }
     // Quantize everything including embeddings (Q8 embedding saves ~2.3GB for 8B models)
     name.contains("weight")
 }

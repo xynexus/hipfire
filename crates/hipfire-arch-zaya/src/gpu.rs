@@ -10,8 +10,93 @@
 //! follow once this validates.
 
 use crate::ZayaConfig;
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::weights::WeightTensor;
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// quant_type byte → quantized linear `DType` (None ⇒ a plain precision handled
+/// by `dequant_qt`). Matches the hipfire-quantize QuantType discriminants.
+fn linear_dtype(qt: u8) -> Option<DType> {
+    match qt {
+        3 => Some(DType::Q8_0),     // Q8F16
+        6 => Some(DType::HFQ4G256),
+        7 => Some(DType::HFQ4G128),
+        13 => Some(DType::MQ4G256), // MagnumQuant 4-bit
+        15 => Some(DType::MQ6G256), // MagnumQuant 6-bit (zaya experts under --format mq4)
+        _ => None,
+    }
+}
+
+/// A `[out, in]` linear weight: plain f32 (bf16/f16 hfq dequant) or a quantized
+/// `WeightTensor` (mq4/mq6/q8). One `gemv` entry dispatches both — mirrors
+/// `hipfire_arch_nemotron::weight::LinearWeight`.
+pub enum LinearWeight {
+    F32(GpuTensor),
+    Quant(Box<WeightTensor>),
+}
+
+impl LinearWeight {
+    /// `out[m] = W · x[k]`. F32 → `gemv_f32`; Quant → the dispatched gemv
+    /// (auto-rotates for MQ-family, plain for HFQ/Q8).
+    pub fn gemv(&self, gpu: &mut Gpu, x: &GpuTensor, out: &GpuTensor) -> Result<(), String> {
+        match self {
+            LinearWeight::F32(w) => gpu.gemv_f32(w, x, out).map_err(|e| format!("zaya f32 gemv: {e:?}")),
+            LinearWeight::Quant(wt) => {
+                let ctx = DispatchCtx::new(gpu);
+                execute_steps(
+                    gpu,
+                    &ctx,
+                    &[Step::Gemv { w: &wt.dispatch_ref(), input: GemvInput::Raw(x), out }],
+                )
+                .map_err(|e| format!("zaya quant gemv: {e}"))
+            }
+        }
+    }
+
+    /// Embedding-row lookup (the weight doubles as the tied embedding table).
+    fn embed_lookup(&self, gpu: &mut Gpu, out: &GpuTensor, token: u32, dim: usize) -> Result<(), String> {
+        match self {
+            LinearWeight::F32(t) => gpu.embedding_lookup(t, out, token, dim).map_err(|e| format!("zaya embed lookup: {e:?}")),
+            LinearWeight::Quant(wt) => gpu
+                .embedding_lookup_q8(&wt.buf, out, token, dim)
+                .map_err(|e| format!("zaya q8 embed lookup: {e:?}")),
+        }
+    }
+}
+
+/// Load a `[m, k]` linear as quantized (`WeightTensor`) when the hfq stores it
+/// quantized, else an f32 upload.
+fn load_linear(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> Result<LinearWeight, String> {
+    let info = hfq
+        .find_tensor_info(name)
+        .ok_or_else(|| format!("zaya gpu: missing tensor {name:?}"))?;
+    let shape: Vec<usize> = info.shape.iter().map(|&x| x as usize).collect();
+    let (m, k) = (shape[0], shape.get(1).copied().unwrap_or(1));
+    let qt = info.quant_type;
+    let (_, data) = hfq
+        .tensor_data_vec(name)
+        .ok_or_else(|| format!("zaya gpu: no data for {name:?}"))?;
+    if let Some(dtype) = linear_dtype(qt) {
+        let buf = gpu
+            .upload_raw(&data, &[data.len()])
+            .map_err(|e| format!("zaya upload {name}: {e:?}"))?;
+        Ok(LinearWeight::Quant(Box::new(WeightTensor {
+            buf,
+            gpu_dtype: dtype,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        })))
+    } else {
+        let f = dequant_qt(qt, &data)?;
+        let g = gpu.upload_f32(&f, &[m, k]).map_err(|e| format!("zaya f32 {name}: {e:?}"))?;
+        Ok(LinearWeight::F32(g))
+    }
+}
 
 fn dequant_qt(qt: u8, bytes: &[u8]) -> Result<Vec<f32>, String> {
     match qt {
@@ -69,33 +154,33 @@ fn up(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> Result<GpuTensor, String> {
 }
 
 struct GpuExpert {
-    gate_up: GpuTensor, // [2*moe_int, hidden]
-    down: GpuTensor,    // [hidden, moe_int]
+    gate_up: LinearWeight, // [2*moe_int, hidden]
+    down: LinearWeight,    // [hidden, moe_int]
 }
 
 struct GpuLayer {
     input_ln: GpuTensor,
     post_attn_ln: GpuTensor,
-    q_proj: GpuTensor,
-    k_proj: GpuTensor,
-    v_cur: GpuTensor,
-    v_del: GpuTensor,
+    q_proj: LinearWeight,
+    k_proj: LinearWeight,
+    v_cur: LinearWeight,
+    v_del: LinearWeight,
     conv_dw_w: GpuTensor,
     conv_dw_b: GpuTensor,
     conv_gr_w: GpuTensor,
     conv_gr_b: GpuTensor,
     qk_temp: GpuTensor,
-    o_proj: GpuTensor,
+    o_proj: LinearWeight,
     // router
-    down_proj_w: GpuTensor,
+    down_proj_w: LinearWeight,
     down_proj_b: GpuTensor,
     router_states_scale: Option<GpuTensor>,
     rnorm_w: GpuTensor,
-    fc1_w: GpuTensor,
+    fc1_w: LinearWeight,
     fc1_b: GpuTensor,
-    fc2_w: GpuTensor,
+    fc2_w: LinearWeight,
     fc2_b: GpuTensor,
-    out_proj_w: GpuTensor,
+    out_proj_w: LinearWeight,
     balancing_biases: Vec<f32>,
     experts: Vec<GpuExpert>,
     // residual scales (each: hidden_states_scale, hidden_states_bias, residual_scale, residual_bias)
@@ -103,9 +188,11 @@ struct GpuLayer {
     pm_rs: [GpuTensor; 4],
 }
 
-/// All ZAYA weights resident on the GPU (f32).
+/// All ZAYA weights resident on the GPU. Big linears (projections, experts,
+/// tied lm_head/embed) keep their hfq quant format via [`LinearWeight`]; small
+/// protected tensors (norms, biases, conv filters, scales) are f32.
 pub struct ZayaGpuWeights {
-    embed: GpuTensor,
+    embed: LinearWeight,
     in_scale: GpuTensor,
     in_bias: GpuTensor,
     layers: Vec<GpuLayer>,
@@ -114,7 +201,7 @@ pub struct ZayaGpuWeights {
 
 impl ZayaGpuWeights {
     pub fn load(hfq: &HfqFile, gpu: &mut Gpu, cfg: &ZayaConfig) -> Result<Self, String> {
-        let embed = up(hfq, gpu, "model.embed_tokens.weight")?;
+        let embed = load_linear(hfq, gpu, "model.embed_tokens.weight")?;
         let in_scale = up(hfq, gpu, "model.input_hidden_states_scale")?;
         let in_bias = up(hfq, gpu, "model.input_hidden_states_bias")?;
         let norm = up(hfq, gpu, "model.norm.weight")?;
@@ -135,8 +222,8 @@ impl ZayaGpuWeights {
             let mut experts = Vec::with_capacity(cfg.moe.num_experts);
             for e in 0..cfg.moe.num_experts {
                 experts.push(GpuExpert {
-                    gate_up: up(hfq, gpu, &format!("{p}.mlp.experts.{e}.gate_up_proj.weight"))?,
-                    down: up(hfq, gpu, &format!("{p}.mlp.experts.{e}.down_proj.weight"))?,
+                    gate_up: load_linear(hfq, gpu, &format!("{p}.mlp.experts.{e}.gate_up_proj.weight"))?,
+                    down: load_linear(hfq, gpu, &format!("{p}.mlp.experts.{e}.down_proj.weight"))?,
                 });
             }
             let router_states_scale = if l == 0 {
@@ -154,25 +241,25 @@ impl ZayaGpuWeights {
             layers.push(GpuLayer {
                 input_ln: up(hfq, gpu, &format!("{p}.input_layernorm.weight"))?,
                 post_attn_ln: up(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"))?,
-                q_proj: up(hfq, gpu, &format!("{qkv}.q_proj.weight"))?,
-                k_proj: up(hfq, gpu, &format!("{qkv}.k_proj.weight"))?,
-                v_cur: up(hfq, gpu, &format!("{qkv}.v_proj_current.weight"))?,
-                v_del: up(hfq, gpu, &format!("{qkv}.v_proj_delayed.weight"))?,
+                q_proj: load_linear(hfq, gpu, &format!("{qkv}.q_proj.weight"))?,
+                k_proj: load_linear(hfq, gpu, &format!("{qkv}.k_proj.weight"))?,
+                v_cur: load_linear(hfq, gpu, &format!("{qkv}.v_proj_current.weight"))?,
+                v_del: load_linear(hfq, gpu, &format!("{qkv}.v_proj_delayed.weight"))?,
                 conv_dw_w: up(hfq, gpu, &format!("{qkv}.conv_qk_depthwise.weight"))?,
                 conv_dw_b: up(hfq, gpu, &format!("{qkv}.conv_qk_depthwise.bias"))?,
                 conv_gr_w: up(hfq, gpu, &format!("{qkv}.conv_qk_grouped.weight"))?,
                 conv_gr_b: up(hfq, gpu, &format!("{qkv}.conv_qk_grouped.bias"))?,
                 qk_temp: up(hfq, gpu, &format!("{p}.self_attn.qk_norm.temp"))?,
-                o_proj: up(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"))?,
-                down_proj_w: up(hfq, gpu, &format!("{gate}.down_proj.weight"))?,
+                o_proj: load_linear(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"))?,
+                down_proj_w: load_linear(hfq, gpu, &format!("{gate}.down_proj.weight"))?,
                 down_proj_b: up(hfq, gpu, &format!("{gate}.down_proj.bias"))?,
                 router_states_scale,
                 rnorm_w: up(hfq, gpu, &format!("{rmlp}.norm.weight"))?,
-                fc1_w: up(hfq, gpu, &format!("{rmlp}.fc1.weight"))?,
+                fc1_w: load_linear(hfq, gpu, &format!("{rmlp}.fc1.weight"))?,
                 fc1_b: up(hfq, gpu, &format!("{rmlp}.fc1.bias"))?,
-                fc2_w: up(hfq, gpu, &format!("{rmlp}.fc2.weight"))?,
+                fc2_w: load_linear(hfq, gpu, &format!("{rmlp}.fc2.weight"))?,
                 fc2_b: up(hfq, gpu, &format!("{rmlp}.fc2.bias"))?,
-                out_proj_w: up(hfq, gpu, &format!("{rmlp}.out_proj.weight"))?,
+                out_proj_w: load_linear(hfq, gpu, &format!("{rmlp}.out_proj.weight"))?,
                 balancing_biases,
                 experts,
                 pa_rs: rs(gpu, &format!("{p}.post_attention_residual_scale"))?,
@@ -192,12 +279,13 @@ pub struct GpuTrace {
     pub seq: usize,
 }
 
-/// gemv over a sequence: `y[s,m] = x[s,k] @ w[m,k]^T` (per-token gemv loop).
-fn gemv_seq(gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor, s: usize, m: usize, k: usize) -> Result<(), String> {
+/// gemv over a sequence: `y[s,m] = x[s,k] @ w[m,k]^T` (per-token gemv loop,
+/// f32 or quantized via [`LinearWeight`]).
+fn gemv_seq(gpu: &mut Gpu, w: &LinearWeight, x: &GpuTensor, y: &GpuTensor, s: usize, m: usize, k: usize) -> Result<(), String> {
     for t in 0..s {
         let xt = x.sub_offset(t * k, k);
         let yt = y.sub_offset(t * m, m);
-        gpu.gemv_f32(w, &xt, &yt).map_err(|e| format!("zaya gemv: {e:?}"))?;
+        w.gemv(gpu, &xt, &yt)?;
     }
     Ok(())
 }
@@ -281,10 +369,11 @@ pub fn gpu_forward_serve(
     let attn_scale = 1.0 / (hd as f32).sqrt();
     let l2_scale = (hd as f32).sqrt();
 
-    let id_bytes: Vec<u8> = ids.iter().flat_map(|&x| (x as i32).to_le_bytes()).collect();
-    let g_ids = gpu.upload_raw(&id_bytes, &[s]).map_err(|e| format!("zaya ids: {e:?}"))?;
     let mut hidden = z2(gpu, s, h)?;
-    gpu.zaya_embed_gather_f32(&hidden, &w.embed, &g_ids, h, s * h).map_err(|e| format!("{e:?}"))?;
+    for t in 0..s {
+        let row = hidden.sub_offset(t * h, h);
+        w.embed.embed_lookup(gpu, &row, ids[t], h)?;
+    }
     let embed_scaled = z2(gpu, s, h)?;
     gpu.zaya_affine_input_f32(&embed_scaled, &hidden, &w.in_scale, &w.in_bias, h, s * h).map_err(|e| format!("{e:?}"))?;
     hidden = embed_scaled;
@@ -396,11 +485,11 @@ pub fn gpu_forward_serve(
             let weight = probs[best];
             let xt = normed.sub_offset(t * h, h);
             let ex = &lw.experts[best];
-            gpu.gemv_f32(&ex.gate_up, &xt, &gate_up).map_err(|e| format!("{e:?}"))?;
+            ex.gate_up.gemv(gpu, &xt, &gate_up)?;
             let g = gate_up.sub_offset(0, moe_int);
             let u = gate_up.sub_offset(moe_int, moe_int);
             gpu.silu_mul_f32(&g, &u, &act).map_err(|e| format!("{e:?}"))?;
-            gpu.gemv_f32(&ex.down, &act, &down_t).map_err(|e| format!("{e:?}"))?;
+            ex.down.gemv(gpu, &act, &down_t)?;
             let ot = moe_out.sub_offset(t * h, h);
             gpu.scaled_add_inplace_cpu_scalar_f32(&ot, &down_t, weight).map_err(|e| format!("{e:?}"))?;
         }
@@ -411,7 +500,7 @@ pub fn gpu_forward_serve(
     let fnorm = z2(gpu, s, h)?;
     gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps).map_err(|e| format!("{e:?}"))?;
     let last = fnorm.sub_offset((s - 1) * h, h);
-    gpu.gemv_f32(&w.embed, &last, logits_out).map_err(|e| format!("zaya lm_head: {e:?}"))?;
+    w.embed.gemv(gpu, &last, logits_out).map_err(|e| format!("zaya lm_head: {e}"))?;
     state.pos = s;
     Ok(())
 }
@@ -449,10 +538,11 @@ pub fn gpu_decode(
     let attn_scale = 1.0 / (hd as f32).sqrt();
     let l2_scale = (hd as f32).sqrt();
 
-    let id_bytes: Vec<u8> = (token as i32).to_le_bytes().to_vec();
-    let g_ids = gpu.upload_raw(&id_bytes, &[1]).map_err(|e| format!("zaya ids: {e:?}"))?;
     let mut hidden = z2(gpu, 1, h)?;
-    gpu.zaya_embed_gather_f32(&hidden, &w.embed, &g_ids, h, h).map_err(|e| format!("{e:?}"))?;
+    {
+        let row = hidden.sub_offset(0, h);
+        w.embed.embed_lookup(gpu, &row, token, h)?;
+    }
     let embed_scaled = z2(gpu, 1, h)?;
     gpu.zaya_affine_input_f32(&embed_scaled, &hidden, &w.in_scale, &w.in_bias, h, h).map_err(|e| format!("{e:?}"))?;
     hidden = embed_scaled;
@@ -489,10 +579,10 @@ pub fn gpu_decode(
 
     for (li, lw) in w.layers.iter().enumerate() {
         gpu.rmsnorm_f32(&hidden, &lw.input_ln, &normed, eps).map_err(|e| format!("{e:?}"))?;
-        gpu.gemv_f32(&lw.q_proj, &normed, &q).map_err(|e| format!("{e:?}"))?;
-        gpu.gemv_f32(&lw.k_proj, &normed, &k).map_err(|e| format!("{e:?}"))?;
-        gpu.gemv_f32(&lw.v_cur, &normed, &vcur).map_err(|e| format!("{e:?}"))?;
-        gpu.gemv_f32(&lw.v_del, &normed, &vdel).map_err(|e| format!("{e:?}"))?;
+        lw.q_proj.gemv(gpu, &normed, &q)?;
+        lw.k_proj.gemv(gpu, &normed, &k)?;
+        lw.v_cur.gemv(gpu, &normed, &vcur)?;
+        lw.v_del.gemv(gpu, &normed, &vdel)?;
         gpu.zaya_qk_residual_f32(&qres, &kres, &q, &k, 1, nq, nkv, hd, 0).map_err(|e| format!("{e:?}"))?;
         gpu.zaya_qk_residual_f32(&qres, &kres, &q, &k, 1, nq, nkv, hd, 1).map_err(|e| format!("{e:?}"))?;
         // current qk-stream column, then conv window from the ring (advances ring).
@@ -514,11 +604,11 @@ pub fn gpu_decode(
         gpu.zaya_write_at_f32(&state.k_cache[li], &key, pos * kvdim, kvdim).map_err(|e| format!("{e:?}"))?;
         gpu.zaya_write_at_f32(&state.v_cache[li], &value, pos * kvdim, kvdim).map_err(|e| format!("{e:?}"))?;
         gpu.zaya_gqa_decode_f32(&ctx, &query, &state.k_cache[li], &state.v_cache[li], pos, nq, nkv, hd, attn_scale).map_err(|e| format!("{e:?}"))?;
-        gpu.gemv_f32(&lw.o_proj, &ctx, &attn_out).map_err(|e| format!("{e:?}"))?;
+        lw.o_proj.gemv(gpu, &ctx, &attn_out)?;
         gpu.zaya_affine_residual_f32(&g_res2, &attn_out, &hidden, &lw.pa_rs[0], &lw.pa_rs[1], &lw.pa_rs[2], &lw.pa_rs[3], h, h).map_err(|e| format!("{e:?}"))?;
         gpu.rmsnorm_f32(&g_res2, &lw.post_attn_ln, &normed, eps).map_err(|e| format!("{e:?}"))?;
         // MoE (single token)
-        gpu.gemv_f32(&lw.down_proj_w, &normed, &rhid).map_err(|e| format!("{e:?}"))?;
+        lw.down_proj_w.gemv(gpu, &normed, &rhid)?;
         gpu.zaya_bias_add_f32(&rhid, &lw.down_proj_b, rh, rh).map_err(|e| format!("{e:?}"))?;
         if li != 0 {
             if let Some(scale) = lw.router_states_scale.as_ref() {
@@ -528,13 +618,13 @@ pub fn gpu_decode(
         let rhid_host = gpu.download_f32(&rhid).map_err(|e| format!("{e:?}"))?;
         router_state = gpu.upload_f32(&rhid_host, &[1, rh]).map_err(|e| format!("{e:?}"))?;
         gpu.rmsnorm_f32(&rhid, &lw.rnorm_w, &rnormed, eps).map_err(|e| format!("{e:?}"))?;
-        gpu.gemv_f32(&lw.fc1_w, &rnormed, &a1).map_err(|e| format!("{e:?}"))?;
+        lw.fc1_w.gemv(gpu, &rnormed, &a1)?;
         gpu.zaya_bias_add_f32(&a1, &lw.fc1_b, rh, rh).map_err(|e| format!("{e:?}"))?;
         gpu.zaya_gelu_exact_f32(&a1, rh).map_err(|e| format!("{e:?}"))?;
-        gpu.gemv_f32(&lw.fc2_w, &a1, &a2).map_err(|e| format!("{e:?}"))?;
+        lw.fc2_w.gemv(gpu, &a1, &a2)?;
         gpu.zaya_bias_add_f32(&a2, &lw.fc2_b, rh, rh).map_err(|e| format!("{e:?}"))?;
         gpu.zaya_gelu_exact_f32(&a2, rh).map_err(|e| format!("{e:?}"))?;
-        gpu.gemv_f32(&lw.out_proj_w, &a2, &rlogits).map_err(|e| format!("{e:?}"))?;
+        lw.out_proj_w.gemv(gpu, &a2, &rlogits)?;
         let row = gpu.download_f32(&rlogits).map_err(|e| format!("{e:?}"))?;
         let maxv = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut probs = vec![0f32; n_route];
@@ -559,11 +649,11 @@ pub fn gpu_decode(
         if best != n_exp {
             let weight = probs[best];
             let ex = &lw.experts[best];
-            gpu.gemv_f32(&ex.gate_up, &normed, &gate_up).map_err(|e| format!("{e:?}"))?;
+            ex.gate_up.gemv(gpu, &normed, &gate_up)?;
             let g = gate_up.sub_offset(0, moe_int);
             let u = gate_up.sub_offset(moe_int, moe_int);
             gpu.silu_mul_f32(&g, &u, &act).map_err(|e| format!("{e:?}"))?;
-            gpu.gemv_f32(&ex.down, &act, &down_t).map_err(|e| format!("{e:?}"))?;
+            ex.down.gemv(gpu, &act, &down_t)?;
             gpu.scaled_add_inplace_cpu_scalar_f32(&moe_out, &down_t, weight).map_err(|e| format!("{e:?}"))?;
         }
         gpu.zaya_affine_residual_f32(&hidden, &moe_out, &g_res2, &lw.pm_rs[0], &lw.pm_rs[1], &lw.pm_rs[2], &lw.pm_rs[3], h, h).map_err(|e| format!("{e:?}"))?;
@@ -571,7 +661,7 @@ pub fn gpu_decode(
 
     let fnorm = z2(gpu, 1, h)?;
     gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps).map_err(|e| format!("{e:?}"))?;
-    gpu.gemv_f32(&w.embed, &fnorm, logits_out).map_err(|e| format!("zaya lm_head: {e:?}"))?;
+    w.embed.gemv(gpu, &fnorm, logits_out).map_err(|e| format!("zaya lm_head: {e}"))?;
     state.pos = pos + 1;
     Ok(())
 }
@@ -600,10 +690,11 @@ pub fn gpu_forward_prefill(
     let pad = (a.conv_depthwise_kernel - 1) + (a.conv_grouped_kernel - 1);
 
     // ids → device i32, embed gather → input affine.
-    let id_bytes: Vec<u8> = ids.iter().flat_map(|&x| (x as i32).to_le_bytes()).collect();
-    let g_ids = gpu.upload_raw(&id_bytes, &[s]).map_err(|e| format!("zaya ids: {e:?}"))?;
     let mut hidden = z2(gpu, s, h)?;
-    gpu.zaya_embed_gather_f32(&hidden, &w.embed, &g_ids, h, s * h).map_err(|e| format!("{e:?}"))?;
+    for t in 0..s {
+        let row = hidden.sub_offset(t * h, h);
+        w.embed.embed_lookup(gpu, &row, ids[t], h)?;
+    }
     let embed_scaled = z2(gpu, s, h)?;
     gpu.zaya_affine_input_f32(&embed_scaled, &hidden, &w.in_scale, &w.in_bias, h, s * h).map_err(|e| format!("{e:?}"))?;
     hidden = embed_scaled;
@@ -728,11 +819,11 @@ pub fn gpu_forward_prefill(
             let weight = probs[best];
             let xt = normed.sub_offset(t * h, h);
             let ex = &lw.experts[best];
-            gpu.gemv_f32(&ex.gate_up, &xt, &gate_up).map_err(|e| format!("{e:?}"))?;
+            ex.gate_up.gemv(gpu, &xt, &gate_up)?;
             let g = gate_up.sub_offset(0, moe_int);
             let u = gate_up.sub_offset(moe_int, moe_int);
             gpu.silu_mul_f32(&g, &u, &act).map_err(|e| format!("{e:?}"))?;
-            gpu.gemv_f32(&ex.down, &act, &down_t).map_err(|e| format!("{e:?}"))?;
+            ex.down.gemv(gpu, &act, &down_t)?;
             let ot = moe_out.sub_offset(t * h, h);
             gpu.scaled_add_inplace_cpu_scalar_f32(&ot, &down_t, weight).map_err(|e| format!("{e:?}"))?;
         }
