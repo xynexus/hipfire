@@ -1840,11 +1840,19 @@ pub fn generate_lfm2moe(
         return;
     }
 
-    // ── Prompt build (same two-path branch as the minimax AR path) ──
+    // ── Prompt build ──
+    // LFM2.5 needs its ChatML template AND a leading BOS (`<|startoftext|>`):
+    // the model is acutely BOS-sensitive (without it the conv/attention stack
+    // collapses to a punctuation/"?" attractor). The hand-rolled Plain
+    // `ChatScaffold` emits the ChatML turns but NOT the BOS, so it must not be
+    // the default here. The jinja path decodes `bos_id` into the template's
+    // `{{ bos_token }}`, so default to the model's own template when present
+    // (opt out with `HIPFIRE_JINJA_CHAT=0`), consistent with the
+    // jinja-everywhere migration.
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let jinja_disabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("0");
+        let try_jinja = !jinja_disabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
