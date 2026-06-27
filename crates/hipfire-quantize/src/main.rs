@@ -6305,6 +6305,11 @@ fn main() {
             // state-spaces Mamba-2: pure Mamba-2 mixer stack. Uses the same
             // Mamba block machinery as nemotron_h but remains its own served arch.
             "mamba2" => 15,
+            // Zyphra ZAYA1 (CCA attention + EDA/MoD-routed MoE). Crate
+            // hipfire-arch-zaya (arch_id 16). Native checkpoint stores experts as
+            // stacked 3D `mlp.experts.{gate_up,down}_proj`, like Qwen3.5-MoE, so it
+            // rides the same is_moe 3D-split path below.
+            "zaya" => 16,
             other => {
                 eprintln!("Warning: unknown architecture '{other}', treating as llama");
                 0
@@ -6332,7 +6337,10 @@ fn main() {
     } else {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
-    let is_moe = arch_id == 6;
+    // arch_id 6 = Qwen3.5-MoE, 16 = ZAYA1: both store routed experts as stacked 3D
+    // `mlp.experts.{gate_up,down}_proj` tensors that the ingest path must split
+    // per-expert (see the 3D split gated on `is_moe`).
+    let is_moe = arch_id == 6 || arch_id == 16;
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
