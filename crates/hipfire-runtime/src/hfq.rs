@@ -1709,6 +1709,40 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
+        34 => {
+            // OQ4G256 (Opus Quant W4A4) — repack the canonical on-disk form
+            // ([f16 scale][128 nibbles] per 256-group) to the arch combined
+            // device layout, served by the shared gemm_oq4_grouped_wmma / gemv_oq4
+            // dispatch. Wires OQ4 into the plain-llama path (previously only the
+            // qwen3.5 arch loaded qt=34/37); mirrors the qt=31/qtip3 precedent
+            // above. See quant::oq4_pack_arch_combined for the layout doc.
+            let combined = crate::quant::oq4_pack_arch_combined(data, m, k);
+            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq4G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        37 => {
+            // Arch-packed OQ4 (`oq4_repack` output) — already the device layout,
+            // upload verbatim (byte-identical to the qt=34 result, no per-load
+            // transform).
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq4G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         _ => panic!(
             "unsupported quant_type {} for weight {st_name}",
             info.quant_type

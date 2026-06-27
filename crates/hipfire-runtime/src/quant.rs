@@ -123,6 +123,57 @@ pub fn f32_to_f16(val: f32) -> u16 {
     ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
 }
 
+/// Byte length of the arch combined OQ4 device layout for an `[m, k]` weight.
+pub fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
+    let ng = k / 256;
+    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
+}
+
+/// Repack canonical on-disk OQ4 (quant_type 34: `[f16 scale][128 nibbles]` per
+/// 256-group, row-contiguous) into the arch combined device layout uploaded by
+/// the loader. SINGLE source of truth for that transform — the generic loader
+/// (`hfq.rs` qt=34), the qwen3.5 arch loader, and the `oq4_repack` tool all call
+/// it, so they cannot drift.
+///
+/// Output layout (`[m, k]`, `ng = k/256`):
+///   `[split nibbles m*(k/2)]` — for prefill MMQ/f16 (`sub_offset 0`)
+///   `[split f32 scales m*ng]` — prefill weight-scale region
+///   `[interleaved m*ng*132]`  — decode GEMVs: per group `[f32 scale][128 nibbles]`
+///                               contiguous → one coalesced stream (mq4-style).
+pub fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
+    const ILB: usize = 4 + 128; // [f32 scale][128 nibbles]
+    assert_eq!(k % GROUP, 0, "OQ4G256 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let packed_bytes = m * (k / 2);
+    let scales_bytes = m * ng * 4;
+    let il_bytes = m * ng * ILB;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OQ4G256 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut combined = vec![0u8; packed_bytes + scales_bytes + il_bytes];
+    let il_base = packed_bytes + scales_bytes;
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let dst = r * (k / 2) + g * (GROUP / 2);
+            combined[dst..dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let so = packed_bytes + (r * ng + g) * 4;
+            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+            let io = il_base + (r * ng + g) * ILB;
+            combined[io..io + 4].copy_from_slice(&scale.to_le_bytes());
+            combined[io + 4..io + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
+        }
+    }
+    combined
+}
+
 /// Dequantize Q4_K data to f32.
 /// Q4_K super-block: 256 elements
 ///   2 bytes: f16 d (super-block scale)
