@@ -844,7 +844,7 @@ pub fn load_mtp_head_at_offset(
             ),
         )
     })?;
-    if hfq.arch_id != 21 {
+    if hfq.arch_id != hipfire_model::ARCH_ID_QWEN35_MTP_HEAD {
         return Err(hip_bridge::HipError::new(
             0,
             &format!(

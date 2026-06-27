@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[1/6] opening HFQ {hfq_path}");
     let mut hfq = HfqFile::open(Path::new(&hfq_path))?;
-    if hfq.arch_id != 13 {
+    if hfq.arch_id != hipfire_model::ARCH_ID_GEMMA3_VL {
         eprintln!("  warning: arch_id={} (gemma3-vl expects 13)", hfq.arch_id);
     }
     let tok =

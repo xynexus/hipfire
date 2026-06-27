@@ -12,6 +12,7 @@ description = "Gemma3 multimodal (SigLIP vision encoder + projector + image-toke
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-model = { path = "../hipfire-model" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

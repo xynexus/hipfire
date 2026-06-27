@@ -246,7 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n[1/5] Open HFQ + parse config");
     let t = Instant::now();
     let hfq = HfqFile::open(&args.hfq_path)?;
-    if hfq.arch_id != 8 {
+    if hfq.arch_id != hipfire_model::ARCH_ID_DOTS_OCR {
         eprintln!(
             "warning: HFQ arch_id is {}, expected 8 for dots.ocr. \
              Proceeding but layer naming may not match.",

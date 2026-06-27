@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[1/5] opening HFQ: {hfq_path}");
     let mut hfq = HfqFile::open(Path::new(hfq_path))?;
     eprintln!("      arch_id (header) = {}", hfq.arch_id);
-    if hfq.arch_id != 7 {
+    if hfq.arch_id != hipfire_model::ARCH_ID_QWEN2 {
         eprintln!(
             "      warning: arch_id={} but this binary targets the \
              hipfire-arch-qwen2 path (arch_id=7). Continuing — the \

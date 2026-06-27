@@ -13,6 +13,7 @@ description = "Qwen2 dense text decoder (GQA + RMSNorm + SwiGLU + 1-D RoPE, atte
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-model = { path = "../hipfire-model" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

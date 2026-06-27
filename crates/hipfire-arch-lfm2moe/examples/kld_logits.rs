@@ -131,7 +131,7 @@ fn load_tokens(path: &str) -> Vec<u32> {
 fn run_model(path: &str, args: &Args) -> Vec<Vec<f32>> {
     let arch_id = detect_arch_id(path).expect("read arch_id");
     match arch_id {
-        11 => run_lfm2moe(path, args),
+        hipfire_arch_lfm2moe::ARCH_ID => run_lfm2moe(path, args),
         other => panic!("kld_logits: unsupported arch_id {other} (only 11/lfm2moe wired)"),
     }
 }

@@ -7,7 +7,7 @@
 //! Thin marker + delegation, mirroring `hipfire-arch-deepseek4`'s
 //! `arch.rs`. The forward pass is NOT on the trait — it lives as free
 //! functions in `crate::forward` (hot-path static dispatch), called
-//! directly by the daemon's `arch_id == 10` generate branch.
+//! directly by the daemon's `arch_id == hipfire_model::ARCH_ID_MINIMAX_M2` generate branch.
 
 use crate::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
 use hipfire_runtime::arch::Architecture;

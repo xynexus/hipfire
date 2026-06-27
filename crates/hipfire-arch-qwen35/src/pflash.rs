@@ -604,7 +604,7 @@ pub fn load_drafter(
     // smallest matched option and routes through the Hybrid branch.
     // qwen3-0.6b (arch_id=1, vocab 151743) routes through Plain and is
     // suitable for plain-Qwen3 targets only.
-    let is_hybrid = hfq.arch_id == 5 || hfq.arch_id == 6;
+    let is_hybrid = hfq.arch_id == hipfire_model::ARCH_ID_QWEN35_DENSE || hfq.arch_id == hipfire_model::ARCH_ID_QWEN35_MOE;
     #[cfg(feature = "deltanet")]
     {
         if is_hybrid {

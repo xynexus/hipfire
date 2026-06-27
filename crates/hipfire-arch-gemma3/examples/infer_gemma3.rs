@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[1/5] opening HFQ: {hfq_path}");
     let mut hfq = HfqFile::open(Path::new(hfq_path))?;
     eprintln!("      arch_id (header) = {}", hfq.arch_id);
-    if hfq.arch_id != 12 {
+    if hfq.arch_id != hipfire_model::ARCH_ID_GEMMA3_TEXT {
         eprintln!("      warning: arch_id={} (gemma3 expects 12)", hfq.arch_id);
     }
 

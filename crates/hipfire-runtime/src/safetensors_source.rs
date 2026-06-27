@@ -4,7 +4,10 @@
 //! Reads config.json for architecture detection and quantization config.
 //! Mmaps .safetensors files and serves tensor data by name.
 
-use hipfire_model::{ModelSource, QuantConfig, TensorInfo, ARCH_ID_MAMBA2, ARCH_ID_NEMOTRON_H};
+use hipfire_model::{
+    ModelSource, QuantConfig, TensorInfo, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2,
+    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY,
+};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
@@ -204,13 +207,17 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
             || arch_lower.contains("qwen3_6")
             || arch_lower.contains("qwen3.6")
         {
-            return if has_experts { 6 } else { 5 };
+            return if has_experts {
+                ARCH_ID_QWEN35_MOE
+            } else {
+                ARCH_ID_QWEN35_DENSE
+            };
         }
         if arch_lower.contains("qwen3") || arch_lower.contains("qwen2") {
-            return 1;
+            return ARCH_ID_QWEN3_QWEN2_LEGACY;
         }
         if arch_lower.contains("llama") || arch_lower.contains("mistral") {
-            return 0;
+            return ARCH_ID_LLAMA_MISTRAL;
         }
         // NemotronHForCausalLM (Mamba-2 + attn + MLP hybrid). Match the "H"
         // hybrid specifically so plain (llama-based) Nemotron isn't caught.
@@ -242,20 +249,20 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
     match model_type {
         "qwen3_5" | "qwen3.5" | "qwen3_6" | "qwen3.6" => {
             if has_experts {
-                6
+                ARCH_ID_QWEN35_MOE
             } else {
-                5
+                ARCH_ID_QWEN35_DENSE
             }
         }
-        "qwen3" | "qwen2" => 1,
-        "llama" | "mistral" => 0,
+        "qwen3" | "qwen2" => ARCH_ID_QWEN3_QWEN2_LEGACY,
+        "llama" | "mistral" => ARCH_ID_LLAMA_MISTRAL,
         "nemotron_h" => ARCH_ID_NEMOTRON_H,
         "mamba2" => ARCH_ID_MAMBA2,
         _ => {
             eprintln!(
                 "warning: unknown model_type '{model_type}', defaulting to arch_id=5 (Qwen3.5)"
             );
-            5
+            ARCH_ID_QWEN35_DENSE
         }
     }
 }

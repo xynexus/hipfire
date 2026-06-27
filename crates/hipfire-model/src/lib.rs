@@ -154,6 +154,12 @@ pub const ARCH_ID_GEMMA3_VL: u32 = 13;
 pub const ARCH_ID_NEMOTRON_H: u32 = 14;
 pub const ARCH_ID_MAMBA2: u32 = 15;
 
+// Sidecar / draft artifact arch IDs. These tag standalone `.hfq` sidecar
+// containers (not runtime model families), so they are intentionally absent
+// from `KNOWN_RUNTIME_ARCH_IDS` and `ModelArchFamily`.
+pub const ARCH_ID_DFLASH_DRAFT: u32 = 20;
+pub const ARCH_ID_QWEN35_MTP_HEAD: u32 = 21;
+
 /// Runtime model arch IDs that must appear in `docs/model-support.toml`.
 pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
     (ARCH_ID_LLAMA_MISTRAL, "llama"),

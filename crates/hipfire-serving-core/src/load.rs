@@ -407,7 +407,7 @@ pub fn load_model(
     // hfq::load_weights_hfq do at runtime, so the qt we read here is the
     // qt that will end up driving `weights.output.gpu_dtype`.
     if draft_path.is_some() {
-        if hfq.arch_id == 11 {
+        if hfq.arch_id == hipfire_model::ARCH_ID_LFM2_MOE {
             #[cfg(not(feature = "arch-lfm2moe"))]
             {
                 return Err(
@@ -555,7 +555,7 @@ pub fn load_model(
         requested.clamp(512.min(max_seq), max_seq)
     };
 
-    if hfq.arch_id == 7 {
+    if hfq.arch_id == hipfire_model::ARCH_ID_QWEN2 {
         // Qwen2 dense (hipfire-arch-qwen2). Standalone bring-up — no
         // eviction, no DFlash, no PFlash, no VL. The Architecture
         // trait surface gives us config + weights + state in three
@@ -662,7 +662,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 14 || hfq.arch_id == 15 {
+    if hfq.arch_id == hipfire_model::ARCH_ID_NEMOTRON_H || hfq.arch_id == hipfire_model::ARCH_ID_MAMBA2 {
         // nemotron_h (hybrid Mamba-2 + attention/MLP/MoE) and pure Mamba-2
         // from quantized (or bf16) .hfq artifacts, driven through the same
         // Mamba-capable ServingBackend seam.
@@ -670,7 +670,7 @@ pub fn load_model(
             return Err(format!(
                 "DFlash not supported on arch_id={} ({}). Reload without a draft.",
                 hfq.arch_id,
-                if hfq.arch_id == 15 {
+                if hfq.arch_id == hipfire_model::ARCH_ID_MAMBA2 {
                     "mamba2"
                 } else {
                     "nemotron_h"
@@ -684,14 +684,14 @@ pub fn load_model(
         let cfg_json = meta
             .get("config")
             .ok_or("nemotron: metadata_json missing 'config'")?;
-        let mut cfg = if hfq.arch_id == 15 {
+        let mut cfg = if hfq.arch_id == hipfire_model::ARCH_ID_MAMBA2 {
             hipfire_arch_nemotron::NemotronHConfig::from_mamba2_json(cfg_json)
                 .map_err(|e| format!("mamba2 config: {e}"))?
         } else {
             hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
                 .map_err(|e| format!("nemotron config: {e}"))?
         };
-        if hfq.arch_id == 15 {
+        if hfq.arch_id == hipfire_model::ARCH_ID_MAMBA2 {
             if let Some(eot) = tokenizer.special_token_id("<|endoftext|>") {
                 cfg.eos_token_id = eot;
             }
@@ -702,7 +702,7 @@ pub fn load_model(
         }
         eprintln!(
             "  {}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
-            if hfq.arch_id == 15 {
+            if hfq.arch_id == hipfire_model::ARCH_ID_MAMBA2 {
                 "mamba2"
             } else {
                 "nemotron_h"
@@ -797,7 +797,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 12 {
+    if hfq.arch_id == hipfire_model::ARCH_ID_GEMMA3_TEXT {
         // Gemma3 text (medgemma-*-text). Plain dense-AR: the gemma3 decoder +
         // its own decode state in `Gemma3Backend`, served via the same
         // `ServingBackend::serve` seam (delegates to `run_simple_ar`). No
@@ -904,7 +904,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 13 {
+    if hfq.arch_id == hipfire_model::ARCH_ID_GEMMA3_VL {
         // Gemma3-VL (medgemma). Self-contained multimodal backend: the gemma3
         // text decoder (loaded from the `language_model.` prefix) + the SigLIP
         // vision tower + the projector, plus its own decode state — all owned by
@@ -1015,7 +1015,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 8 {
+    if hfq.arch_id == hipfire_model::ARCH_ID_DOTS_OCR {
         // dots.ocr (Qwen2-VL family). Text decoder is Qwen2; vision tower
         // is the 42-block DotsVisionTransformer. Both load side-by-side in
         // DotsOcrWeights and stay resident. Single-image, greedy decode at
@@ -1122,7 +1122,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 9 {
+    if hfq.arch_id == hipfire_model::ARCH_ID_DEEPSEEK4_FLASH {
         // DeepSeek V4 Flash (hipfire-arch-deepseek4). Standalone bring-up —
         // no eviction, no DFlash drafter, no PFlash, no VL. The
         // Architecture trait gives us config + weights + state in three
@@ -1250,7 +1250,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 10 {
+    if hfq.arch_id == hipfire_model::ARCH_ID_MINIMAX_M2 {
         // MiniMax-M2 (hipfire-arch-minimax). Standalone bring-up — no
         // eviction, no DFlash drafter, no PFlash, no VL, no spec-decode.
         // The Architecture trait gives us config + weights + state in three
@@ -1384,7 +1384,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 11 {
+    if hfq.arch_id == hipfire_model::ARCH_ID_LFM2_MOE {
         // LFM2.5-8B-A1B (hipfire-arch-lfm2moe). Standalone bring-up — no
         // DFlash drafter, no PFlash, no VL, no spec-decode. CASK/TriAttention
         // is wired through the shared KvCache using attention-ordinal sidecar
@@ -2109,7 +2109,7 @@ pub fn load_model_safetensors(
     // — upstream now defaults to halfsplit, no flag needed
     let chat_template = source.chat_template();
 
-    if arch_id == 0 || arch_id == 1 {
+    if arch_id == hipfire_model::ARCH_ID_LLAMA_MISTRAL || arch_id == hipfire_model::ARCH_ID_QWEN3_QWEN2_LEGACY {
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         // LLaMA / Qwen3 — standard attention, no DeltaNet
@@ -2271,7 +2271,7 @@ pub fn load_model_safetensors(
         });
     }
 
-    if arch_id == 14 || arch_id == 15 {
+    if arch_id == hipfire_model::ARCH_ID_NEMOTRON_H || arch_id == hipfire_model::ARCH_ID_MAMBA2 {
         // nemotron_h (hybrid Mamba-2 + attention/MLP/MoE) and pure Mamba-2 are
         // routed through the same Mamba-capable ServingBackend seam.
         let (chat_template, chat_template_profile) =
@@ -2282,14 +2282,14 @@ pub fn load_model_safetensors(
         let cfg_json = meta
             .get("config")
             .ok_or("nemotron: metadata_json missing 'config'")?;
-        let mut cfg = if arch_id == 15 {
+        let mut cfg = if arch_id == hipfire_model::ARCH_ID_MAMBA2 {
             hipfire_arch_nemotron::NemotronHConfig::from_mamba2_json(cfg_json)
                 .map_err(|e| format!("mamba2 config: {e}"))?
         } else {
             hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
                 .map_err(|e| format!("nemotron config: {e}"))?
         };
-        if arch_id == 15 {
+        if arch_id == hipfire_model::ARCH_ID_MAMBA2 {
             if let Some(eot) = tokenizer.special_token_id("<|endoftext|>") {
                 cfg.eos_token_id = eot;
             }
@@ -2301,7 +2301,7 @@ pub fn load_model_safetensors(
         }
         eprintln!(
             "  {}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
-            if arch_id == 15 {
+            if arch_id == hipfire_model::ARCH_ID_MAMBA2 {
                 "mamba2"
             } else {
                 "nemotron_h"

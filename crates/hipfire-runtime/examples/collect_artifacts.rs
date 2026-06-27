@@ -63,8 +63,9 @@ fn main() {
         ("source_arch_id", serde_json::json!(source_arch_id)),
     ];
     let t0 = std::time::Instant::now();
+    use hipfire_model as am;
     let (n_hessian, n_imatrix, max_consistency, mode) = match source_arch_id {
-        5 | 6 => {
+        am::ARCH_ID_QWEN35_DENSE | am::ARCH_ID_QWEN35_MOE => {
             let config = qwen35::config_from_hfq(&hfq).expect("qwen35 config");
             let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");
             let opts = QwenCalibOpts {
@@ -88,8 +89,8 @@ fn main() {
                 "qwen35",
             )
         }
-        12 | 13 => {
-            let prefix = if source_arch_id == 13 {
+        am::ARCH_ID_GEMMA3_TEXT | am::ARCH_ID_GEMMA3_VL => {
+            let prefix = if source_arch_id == am::ARCH_ID_GEMMA3_VL {
                 "language_model."
             } else {
                 ""
@@ -118,14 +119,14 @@ fn main() {
                 summary.n_hessian,
                 summary.n_imatrix,
                 summary.max_consistency,
-                if source_arch_id == 13 {
+                if source_arch_id == am::ARCH_ID_GEMMA3_VL {
                     "gemma3-vl-text-only"
                 } else {
                     "gemma3-text"
                 },
             )
         }
-        11 => {
+        am::ARCH_ID_LFM2_MOE => {
             let config = Lfm2MoeConfig::from_hfq(&hfq).expect("lfm2 config");
             let weights = Lfm2MoeWeights::load(&mut hfq, &config, &mut gpu).expect("lfm2 weights");
             let opts = lfm2_calib::CalibOpts {
@@ -149,7 +150,7 @@ fn main() {
                 "lfm2-text",
             )
         }
-        0 | 1 => {
+        am::ARCH_ID_LLAMA_MISTRAL | am::ARCH_ID_QWEN3_QWEN2_LEGACY => {
             // Dense LLaMA / Mistral (0) and plain Qwen3/Qwen2 (1) share the
             // runtime-hosted LLaMA forward and its co-located collector.
             let config =

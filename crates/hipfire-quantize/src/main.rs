@@ -4584,12 +4584,12 @@ fn run_gguf_pipeline(
         .unwrap_or("llama")
         .to_string();
     let auto_arch_id: u32 = match arch_str.as_str() {
-        "llama" => 0,
-        "qwen3" | "qwen2" => 1,
-        "qwen3moe" => 6,
+        "llama" => hipfire_model::ARCH_ID_LLAMA_MISTRAL,
+        "qwen3" | "qwen2" => hipfire_model::ARCH_ID_QWEN3_QWEN2_LEGACY,
+        "qwen3moe" => hipfire_model::ARCH_ID_QWEN35_MOE,
         other => {
             eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
-            0
+            hipfire_model::ARCH_ID_LLAMA_MISTRAL
         }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
@@ -4642,7 +4642,7 @@ fn run_gguf_pipeline(
     };
 
     // K-map setup for GGUF path
-    let is_moe = arch_id == 6;
+    let is_moe = arch_id == hipfire_model::ARCH_ID_QWEN35_MOE;
     let n_layers: usize = config_json
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
@@ -6069,32 +6069,32 @@ fn main() {
         .and_then(|v| v.as_str())
         .unwrap_or("llama");
     let auto_arch_id = if is_mamba2_config {
-        15
+        hipfire_model::ARCH_ID_MAMBA2
     } else {
         match arch_str {
-            "llama" => 0u32,
-            "qwen3" | "qwen2" => 1,
-            "qwen3_5" | "qwen3_5_text" => 5,
+            "llama" => hipfire_model::ARCH_ID_LLAMA_MISTRAL,
+            "qwen3" | "qwen2" => hipfire_model::ARCH_ID_QWEN3_QWEN2_LEGACY,
+            "qwen3_5" | "qwen3_5_text" => hipfire_model::ARCH_ID_QWEN35_DENSE,
             // Qwen3.5 MoE (Qwen3.5-35B-A3B and friends): hybrid LA+FA attention identical
             // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
             // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
-            "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
+            "qwen3_5_moe" | "qwen3_5_moe_text" => hipfire_model::ARCH_ID_QWEN35_MOE,
             // dots.ocr (Qwen2-VL family layout-extraction VLM): plain Qwen2-1.5B
             // text decoder + 42-block DotsVisionTransformer with 2-D RoPE,
             // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
             // dots-ocr-prd.md.
-            "dots_ocr" => 8,
+            "dots_ocr" => hipfire_model::ARCH_ID_DOTS_OCR,
             // DeepSeek V4 Flash: 256 routed + 1 shared experts, Hyper-Connections,
             // compressed-KV indexer, FP8 E4M3 + UE8M0 block-scale storage. See
             // crates/hipfire-arch-deepseek4. Phase 1 ingest only — no forward
             // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
             // per-expert) and are translated when the forward bring-up lands.
-            "deepseek_v4" => 9,
+            "deepseek_v4" => hipfire_model::ARCH_ID_DEEPSEEK4_FLASH,
             // MiniMax-M2 (Mixtral-style MoE): GQA + per-layer QK-norm + partial
             // rotate_half RoPE; 256 routed experts top-8 sigmoid+e_score_bias, no
             // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
             // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
-            "minimax_m2" => 10,
+            "minimax_m2" => hipfire_model::ARCH_ID_MINIMAX_M2,
             // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers, SwiGLU FFN.
             //   "lfm2_moe" = A1B (dense MLP head layers + top-4 MoE); per-expert
             //               pre-split w1/w2/w3 → MQ4G256, everything else → Q8.
@@ -6102,7 +6102,7 @@ fn main() {
             //               every layer dense SwiGLU; the ingest Q8s all tensors.
             // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
             // num_dense_layers == num_hidden_layers for the dense variant.
-            "lfm2_moe" | "lfm2" => 11,
+            "lfm2_moe" | "lfm2" => hipfire_model::ARCH_ID_LFM2_MOE,
             // Gemma3 (text). `gemma3_text` = Gemma3ForCausalLM (clean
             // model.layers.* names, e.g. medgemma-27b-text-it); `gemma3` =
             // Gemma3ForConditionalGeneration (multimodal wrapper — text fields
@@ -6112,18 +6112,18 @@ fn main() {
             // dim/n_heads, custom attn scale query_pre_attn_scalar^-0.5, dual-theta
             // sliding-window interleave, GeGLU gelu-tanh. Crate hipfire-arch-gemma3.
             // See docs/plans/2026-06-19-gemma3-bringup.md.
-            "gemma3_text" | "gemma3" => 12,
+            "gemma3_text" | "gemma3" => hipfire_model::ARCH_ID_GEMMA3_TEXT,
             // nemotron_h (NVIDIA Nemotron-3): Mamba-2 + GQA-attn + ReLU²-MLP hybrid
             // (Nano-4B dense; Nano-30B adds MoE). Crate hipfire-arch-nemotron
             // (arch_id 14). Quantizes the linear projections; keeps conv1d/A_log/D/
             // dt_bias/norms F16 (see should_quantize).
-            "nemotron_h" => 14,
+            "nemotron_h" => hipfire_model::ARCH_ID_NEMOTRON_H,
             // state-spaces Mamba-2: pure Mamba-2 mixer stack. Uses the same
             // Mamba block machinery as nemotron_h but remains its own served arch.
-            "mamba2" => 15,
+            "mamba2" => hipfire_model::ARCH_ID_MAMBA2,
             other => {
                 eprintln!("Warning: unknown architecture '{other}', treating as llama");
-                0
+                hipfire_model::ARCH_ID_LLAMA_MISTRAL
             }
         }
     };
@@ -6131,8 +6131,8 @@ fn main() {
     // → arch_id 13 (gemma3-vl: SigLIP tower + projector + the gemma3 text
     // decoder). Pure-text `gemma3`/`gemma3_text` stay 12. Text tensors are
     // `language_model.*`-prefixed; vision/projector stay F32 (see should_quantize).
-    let auto_arch_id = if auto_arch_id == 12 && config.get("vision_config").is_some() {
-        13
+    let auto_arch_id = if auto_arch_id == hipfire_model::ARCH_ID_GEMMA3_TEXT && config.get("vision_config").is_some() {
+        hipfire_model::ARCH_ID_GEMMA3_VL
     } else {
         auto_arch_id
     };
@@ -6148,7 +6148,7 @@ fn main() {
     } else {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
-    let is_moe = arch_id == 6;
+    let is_moe = arch_id == hipfire_model::ARCH_ID_QWEN35_MOE;
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
@@ -6156,22 +6156,22 @@ fn main() {
     // ingest handles DeepSeek V4's per-expert tensors individually through
     // the standard 2D quant path; the routing fan-out into top-k experts
     // happens at forward time, not quant time.
-    let is_deepseek4 = arch_id == 9;
+    let is_deepseek4 = arch_id == hipfire_model::ARCH_ID_DEEPSEEK4_FLASH;
     // MiniMax-M2 (arch_id=10): MoE like DeepSeek V4, ships per-expert pre-split
     // 2D tensors (`...block_sparse_moe.experts.E.{w1,w2,w3}.weight`). Quantized
     // as HFQ4G256 (the only 4-bit format with a complete indexed-MoE GEMV
     // kernel family). Raw HF tensor names are written verbatim (no rename);
     // the hipfire loader looks them up.
-    let is_minimax = arch_id == 10;
+    let is_minimax = arch_id == hipfire_model::ARCH_ID_MINIMAX_M2;
     // LFM2.5-MoE (arch_id 11): per-expert pre-split 2D experts (like minimax),
     // bf16 source. Conv-block + dense-MLP + router + expert_bias get dedicated
     // ingest branches; routed experts → MQ4G256, everything else → Q8.
-    let is_lfm2moe = arch_id == 11;
+    let is_lfm2moe = arch_id == hipfire_model::ARCH_ID_LFM2_MOE;
     // Nemotron-H (arch_id 14) is dense for Nano-4B and MoE for Nano-30B. The
     // router-protection rule is harmless for dense 4B because it has no
     // `.mixer.gate.weight` tensors, and necessary for 30B because router noise
     // can flip top-k expert selection.
-    let is_nemotron_h = arch_id == 14;
+    let is_nemotron_h = arch_id == hipfire_model::ARCH_ID_NEMOTRON_H;
     let is_moe_like = is_moe || is_deepseek4 || is_minimax || is_lfm2moe || is_nemotron_h;
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
@@ -6195,7 +6195,7 @@ fn main() {
             eprintln!("  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, dense projections follow explicit --format when supported, remaining tensors → Q8.");
         }
     }
-    if arch_id == 15 {
+    if arch_id == hipfire_model::ARCH_ID_MAMBA2 {
         eprintln!("  Mamba-2 detected — pure Mamba mixer stack; recurrence/norm tensors stay plain precision.");
     }
 
@@ -6299,7 +6299,7 @@ fn main() {
     // rmsnorm kernel — which applies plain `w` — is numerically correct at
     // runtime, with no per-layer special-casing in the gemma3 forward. Record
     // the offset for provenance and to make a re-quantize double-bake detectable.
-    if arch_id == 12 {
+    if arch_id == hipfire_model::ARCH_ID_GEMMA3_TEXT {
         if let serde_json::Value::Object(ref mut m) = metadata {
             m.insert("gemma_norm_offset".to_string(), serde_json::json!(1.0_f32));
         }
@@ -6469,7 +6469,7 @@ fn main() {
     // arch_id 13 (gemma3-vl) is multimodal — the SigLIP vision tower is REQUIRED,
     // not optional, so auto-include it (no --include-vision needed). Other arches
     // keep the opt-in default (vision skipped unless the flag is passed).
-    let include_vision = std::env::args().any(|a| a == "--include-vision") || arch_id == 13;
+    let include_vision = std::env::args().any(|a| a == "--include-vision") || arch_id == hipfire_model::ARCH_ID_GEMMA3_VL;
     let vision_quant = std::env::args()
         .position(|a| a == "--vision-quant")
         .and_then(|i| std::env::args().nth(i + 1))
@@ -9946,7 +9946,7 @@ fn main() {
     // gemma3 forward. Norms ship at source precision (F32/F16/BF16); convert,
     // offset, convert back to the same dtype. The `gemma_norm_offset=1.0`
     // metadata marker records that this happened.
-    if arch_id == 12 || arch_id == 13 {
+    if arch_id == hipfire_model::ARCH_ID_GEMMA3_TEXT || arch_id == hipfire_model::ARCH_ID_GEMMA3_VL {
         let mut n_baked = 0usize;
         for t in hfq_tensors.iter_mut() {
             // Bake the gemma (1+w) RMSNorms (text norms + the projector's

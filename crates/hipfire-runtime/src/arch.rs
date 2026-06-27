@@ -108,7 +108,7 @@ pub trait Architecture: Send + 'static {
     /// # Worked example: Qwen3.5
     ///
     /// `hipfire_arch_qwen35::qwen35::config_from_hfq` parses the
-    /// metadata, branches `arch_id == 5` (dense) vs `arch_id == 6`
+    /// metadata, branches `arch_id == hipfire_model::ARCH_ID_QWEN35_DENSE` (dense) vs `arch_id == hipfire_model::ARCH_ID_QWEN35_MOE`
     /// (MoE) for expert-count fields, fills defaults for missing
     /// keys (e.g. `partial_rotary_factor`), and returns a
     /// `Qwen35Config` with the full per-layer shape.
