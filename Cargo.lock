@@ -1378,6 +1378,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-zaya"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-mixer",
+ "hipfire-model",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-atlas"
 version = "0.3.0"
 dependencies = [
