@@ -87,6 +87,11 @@ impl LinearWeight {
                         let _ = gpu.free_tensor(x_rot);
                         res
                     }
+                    // OQ4 batched prefill (rotation + act-bit/batch heuristics) is
+                    // already implemented canonically in the shared weight_gemm.
+                    DType::Oq4G256 => {
+                        hipfire_runtime::weights::weight_gemm(gpu, wt, x, out, seq)
+                    }
                     other => Err(HipError::unsupported(&format!(
                         "nemotron prefill: no quantized batched gemm for {other:?}"
                     ))),

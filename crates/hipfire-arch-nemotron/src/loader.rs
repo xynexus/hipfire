@@ -223,6 +223,30 @@ pub fn load_linear_hfq(
     k: usize,
 ) -> Result<LinearWeight, String> {
     let (qt, data) = hfq_tensor(hfq, name)?;
+    // OQ4 (Opus Quant, symmetric W4): qt=34 is the row-major grouped on-disk
+    // form that needs the arch-combined repack; qt=37 is already arch-packed.
+    // Both dispatch as `DType::Oq4G256` (gemv via the shared dispatch, batched
+    // prefill via `hipfire_runtime::weights::weight_gemm`). Mirrors the
+    // hfq.rs LLaMA-family loader.
+    if qt == 34 || qt == 37 {
+        let packed = if qt == 34 {
+            hipfire_runtime::quant::oq4_pack_arch_combined(&data, m, k)
+        } else {
+            data
+        };
+        let buf = gpu
+            .upload_raw(&packed, &[packed.len()])
+            .map_err(|e| format!("nemotron hfq oq4 upload {name}: {e:?}"))?;
+        return Ok(LinearWeight::Quant(Box::new(WeightTensor {
+            buf,
+            gpu_dtype: DType::Oq4G256,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        })));
+    }
     if let Some(dtype) = linear_dtype(qt) {
         let buf = gpu
             .upload_raw(&data, &[data.len()])
