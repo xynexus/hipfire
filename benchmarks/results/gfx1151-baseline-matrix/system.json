@@ -1,0 +1,7 @@
+{
+  "arch": "gfx1151",
+  "rocm": "7.13.60980-c76140fa27",
+  "hardware_bucket": "apu_uma:gfx1151:0x1586:40cu:1gib:lpddr5:256bit:240gbps",
+  "cu_count": 40,
+  "vram_bytes": 536870912
+}

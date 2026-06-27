@@ -12,3 +12,8 @@ install:
 .PHONY: link
 link:
 	./scripts/dev-link.sh
+
+# Regenerate BENCHMARKS.md from all per-system baseline matrices.
+.PHONY: bench-doc
+bench-doc:
+	./scripts/gen_benchmarks.py

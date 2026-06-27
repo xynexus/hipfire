@@ -24,7 +24,19 @@ REPO = Path(__file__).resolve().parent.parent
 HF = Path("/srv/huggingface")
 WORK = Path(os.path.expanduser("~/.hipfire/baseline-matrix-work"))   # .hfq scratch on nvme
 CALIB_DIR = Path(os.path.expanduser("~/.hipfire/calib"))             # Hessian sidecars
-OUTDIR = REPO / "benchmarks/results" / "gfx1151-baseline-matrix"
+def detect_arch() -> str:
+    """gfx arch for this host — names the per-system matrix dir so each machine
+    writes its own. Cheap (filesystem): the pre-compiled kernels dir is keyed by
+    arch. Override with HIPFIRE_BENCH_ARCH."""
+    v = os.environ.get("HIPFIRE_BENCH_ARCH")
+    if v:
+        return v
+    hits = sorted(glob.glob(os.path.expanduser("~/.hipfire/kernels/gfx*")))
+    return os.path.basename(hits[0]) if hits else "unknown"
+
+
+ARCH = detect_arch()
+OUTDIR = REPO / "benchmarks/results" / f"{ARCH}-baseline-matrix"
 QUANT = REPO / "target/release/hipfire-quantize"
 COLLECT = REPO / "target/release/examples/collect_artifacts"
 CORPUS = REPO / "benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt"
@@ -214,6 +226,30 @@ def write_table(rows: list[dict]) -> None:
             f.write(json.dumps(r) + "\n")
 
 
+def write_system_json(run_dir: Path) -> None:
+    """Write OUTDIR/system.json (arch/hardware_bucket/rocm) from an eval manifest
+    once — gives gen_benchmarks.py a rich per-system label."""
+    sj = OUTDIR / "system.json"
+    if sj.exists():
+        return
+    man = run_dir / "manifest.json"
+    if not man.exists():
+        return
+    try:
+        d = json.loads(man.read_text())
+    except Exception:
+        return
+    hp = d.get("host_profile", {})
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    sj.write_text(json.dumps({
+        "arch": d.get("arch") or ARCH,
+        "rocm": d.get("rocm"),
+        "hardware_bucket": hp.get("hardware_bucket"),
+        "cu_count": hp.get("cu_count"),
+        "vram_bytes": hp.get("vram_bytes"),
+    }, indent=2))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="", help="comma list to restrict")
@@ -292,6 +328,8 @@ def main() -> int:
                 hfq_mb = round(out_hfq.stat().st_size / 1e6, 1) if out_hfq.exists() else None
                 log(f"eval {c} ...")
                 found, metrics, info = eval_cell(out_hfq, kv, kldref_for(model["name"]), args.eval_timeout)
+                if found:
+                    write_system_json(Path(info))
                 speed_ok = bool(found and metrics.get("speed_status") == "pass"
                                 and metrics.get("decode_tok_s") is not None)
                 status = "ok" if speed_ok else "fail"
