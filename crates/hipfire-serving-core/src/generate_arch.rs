@@ -1149,16 +1149,16 @@ pub fn generate_qwen2(
 
 /// LLaMA / Mistral / plain-Qwen3 (arch_id 0/1) generate path — routes through the
 /// `ServingBackend` seam (P3.2). Unlike qwen2, llama needs chat-framing, so this
-/// builds `prompt_tokens` (the model's jinja `chat_template` when
-/// `HIPFIRE_JINJA_CHAT=1`, else the hand-rolled `ChatFrame` scaffold honoring
-/// `assistant_prefix` / raw-completion) — the same framing the qwen35-shared
+/// builds `prompt_tokens` (the model's jinja `chat_template` by default, else
+/// — under `HIPFIRE_JINJA_CHAT=0` — the hand-rolled `ChatFrame` scaffold
+/// honoring `assistant_prefix` / raw-completion) — the same framing the qwen35-shared
 /// `generate()` applied — then prefills those tokens and runs the shared
 /// `decode_loop` (full temperature/top-p sampling via P3.3). Fast paths
 /// (DFlash/MTP/tools-execution) are out of scope here; correctness first.
 /// nemotron_h (arch_id 14) / pure Mamba-2 (arch_id 15) generate path — the same
 /// dense-AR `ServingBackend` seam as `generate_llama`, driving the Mamba-capable
-/// `NemotronModel` backend. Frames the prompt (jinja `chat_template` when
-/// `HIPFIRE_JINJA_CHAT=1`, else the hand-rolled `ChatFrame`), prefills the
+/// `NemotronModel` backend. Frames the prompt (jinja `chat_template` by default,
+/// else the hand-rolled `ChatFrame` under `HIPFIRE_JINJA_CHAT=0`), prefills the
 /// framed tokens (which builds per-block recurrent/KV state), then runs the
 /// shared `decode_loop`. Fast paths are out of scope; correctness first.
 #[allow(clippy::too_many_arguments)]
@@ -1201,8 +1201,7 @@ pub fn generate_nemotron(
         // nemotron_h ships a correct ChatML jinja template (`<|im_start|>` /
         // `<|im_end|>`), so default to it when present (opt out with
         // HIPFIRE_JINJA_CHAT=0). The hand-rolled Plain ChatFrame is the fallback.
-        let try_jinja = m.chat_template.is_some()
-            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let try_jinja = m.jinja_chat_enabled();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
@@ -1371,8 +1370,7 @@ pub fn generate_llama(
     let raw = effective_raw(m);
     let prompt_tokens: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let try_jinja = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
-            && m.chat_template.is_some();
+        let try_jinja = m.jinja_chat_enabled();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
@@ -1512,10 +1510,11 @@ pub fn generate_llama(
 /// Mirrors `generate_qwen2`'s shape (prefill = per-token loop, decode =
 /// per-token loop, JSONL `token` / `done` events) with two differences:
 ///
-///   1. Prompt build goes through `JinjaChatFrame` when `HIPFIRE_JINJA_CHAT=1`
-///      and the model carries a chat_template (so MiniMax-M2's own ChatML-ish
-///      template + `tools` / `messages` reach the upstream Jinja branches),
-///      falling back to the hand-rolled `ChatFrame::Plain` scaffold otherwise.
+///   1. Prompt build goes through `JinjaChatFrame` by default when the model
+///      carries a chat_template (so MiniMax-M2's own ChatML-ish template +
+///      `tools` / `messages` reach the upstream Jinja branches), falling back
+///      to the hand-rolled `ChatFrame::Plain` scaffold under
+///      `HIPFIRE_JINJA_CHAT=0` or on render failure.
 ///   2. `minimax::forward::decode_step` returns the full logits `Vec<f32>`
 ///      (the state does NOT stash a greedy next-token), so sampling runs
 ///      host-side via `deepseek4::sampling::sample_token` on that vector.
@@ -1567,12 +1566,7 @@ pub fn generate_minimax(
     let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        // Default to the model's jinja template when present (opt out with
-        // HIPFIRE_JINJA_CHAT=0): the hand-rolled Plain ChatScaffold omits the
-        // leading BOS, which silently corrupts BOS-sensitive models. See the
-        // lfm2 path for the worked example.
-        let jinja_disabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("0");
-        let try_jinja = !jinja_disabled && m.chat_template.is_some();
+        let try_jinja = m.jinja_chat_enabled();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
@@ -1845,18 +1839,13 @@ pub fn generate_lfm2moe(
     }
 
     // ── Prompt build ──
-    // LFM2.5 needs its ChatML template AND a leading BOS (`<|startoftext|>`):
-    // the model is acutely BOS-sensitive (without it the conv/attention stack
-    // collapses to a punctuation/"?" attractor). The hand-rolled Plain
-    // `ChatScaffold` emits the ChatML turns but NOT the BOS, so it must not be
-    // the default here. The jinja path decodes `bos_id` into the template's
-    // `{{ bos_token }}`, so default to the model's own template when present
-    // (opt out with `HIPFIRE_JINJA_CHAT=0`), consistent with the
-    // jinja-everywhere migration.
+    // LFM2.5 is the canonical reason the jinja template is default-on (see
+    // `LoadedModel::jinja_chat_enabled`): it is acutely BOS-sensitive and the
+    // Plain scaffold omits the leading BOS, collapsing the model to a "?"
+    // attractor.
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_disabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("0");
-        let try_jinja = !jinja_disabled && m.chat_template.is_some();
+        let try_jinja = m.jinja_chat_enabled();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
@@ -2189,8 +2178,7 @@ fn generate_lfm2moe_dflash(
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // lfm2 dflash path: same BOS-sensitivity as the plain lfm2 path — default
         // to the model's jinja template (opt out with HIPFIRE_JINJA_CHAT=0).
-        let jinja_disabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("0");
-        let try_jinja = !jinja_disabled && m.chat_template.is_some();
+        let try_jinja = m.jinja_chat_enabled();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {

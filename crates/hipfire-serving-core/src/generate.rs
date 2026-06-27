@@ -81,10 +81,9 @@ pub fn generate_mtp(
 
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
-    // Prompt build mirrors generate_dflash: Jinja chat template when enabled,
-    // else the hand-rolled ChatFrame::Plain scaffold.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    // Prompt build mirrors generate_dflash: the model's jinja chat template by
+    // default, else the hand-rolled ChatFrame::Plain scaffold.
+    let try_jinja = m.jinja_chat_enabled();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = prompt_frame::JinjaChatFrame {

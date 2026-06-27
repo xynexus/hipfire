@@ -238,8 +238,7 @@ pub fn qwen35_materialize_batch_prefill_prompt(
     };
     let assistant_prefix =
         prompt_frame::AssistantPrefix::from_label(Some(&session.assistant_prefix));
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
+    let try_jinja = m.jinja_chat_enabled() && seq_pos_for_prompt == 0;
     let system_prompt = session.system_prompt.as_deref();
     let tools = session.tools.as_deref();
     let messages_history = session.messages_history.as_deref();

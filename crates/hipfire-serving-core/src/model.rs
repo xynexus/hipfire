@@ -400,17 +400,31 @@ pub struct LoadedModel {
     pub dflash: Option<DflashState>,
     // Upstream HF Jinja chat_template, extracted from the HFQ
     // `tokenizer_config.chat_template` at load time. `None` when the source
-    // model didn't ship one (rare for instruct models). Only consumed when
-    // `HIPFIRE_JINJA_CHAT=1` is set; otherwise the daemon's hand-rolled
-    // `prompt_frame::ChatFrame::Plain` scaffolding is used as today.
-    //
-    // Stage 2 partial: AR generate() path only. DFlash, multi-GPU PP>1, and
-    // VL paths still hit the Plain scaffold.
+    // model didn't ship one (rare for instruct models). Consumed by default
+    // when present (see [`LoadedModel::jinja_chat_enabled`]); opt out with
+    // `HIPFIRE_JINJA_CHAT=0` to force the daemon's hand-rolled
+    // `prompt_frame::ChatFrame::Plain` scaffolding. Multi-GPU PP>1 and VL
+    // paths still hit the Plain scaffold.
     pub chat_template: Option<String>,
     pub chat_template_profile: Option<prompt_frame::ChatTemplateProfile>,
 }
 
 impl LoadedModel {
+    /// Single source of truth for the jinja-template-vs-Plain-scaffold prompt
+    /// decision across every generate path.
+    ///
+    /// Default-on whenever the model shipped an upstream chat template; opt out
+    /// with `HIPFIRE_JINJA_CHAT=0`. The hand-rolled `ChatFrame::Plain` scaffold
+    /// is a per-family heuristic that silently mishandles templates it wasn't
+    /// tuned for (e.g. it omits the leading BOS that LFM2 requires), so the
+    /// model's own template is the correct default. Each call site may still AND
+    /// in extra preconditions (e.g. `seq_pos == 0`). Render failure falls back
+    /// to the Plain scaffold per site.
+    pub fn jinja_chat_enabled(&self) -> bool {
+        self.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
+    }
+
     /// Active session's KV cache, if any. Replaces the former `kv_cache.as_ref()`
     /// on the unified `sequence_state`. Sites needing KV **and** DeltaNet
     /// simultaneously bind `sequence_state.as_mut()` once, then borrow its
