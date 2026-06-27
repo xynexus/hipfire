@@ -149,18 +149,21 @@ impl ZayaMoeConfig {
 }
 
 impl ZayaConfig {
-    /// Parse the resolved config from the published ZAYA `config.json` value
-    /// (original Megatron-named, alternating-layer layout).
+    /// Parse the resolved config from a ZAYA `config.json` value. Accepts **both**
+    /// layouts and normalizes to hybrid-block dims:
+    /// - **Native** (post `convert_zaya_weights_to_hf.py`): `num_hidden_layers`
+    ///   already counts hybrid blocks (e.g. 40); `moe_intermediate_size`,
+    ///   `rms_norm_eps`, `router_hidden_size` present.
+    /// - **Megatron** (published ZAYA1-8B): `num_hidden_layers` counts alternating
+    ///   attn/MoE half-layers (e.g. 80 → 40 blocks); `ffn_hidden_size` (fused
+    ///   gate+up), `norm_epsilon`, `zaya_mlp_expansion` present.
+    ///
+    /// The discriminator is `ffn_hidden_size` (Megatron-only; native uses
+    /// `moe_intermediate_size`).
     pub fn from_json(c: &serde_json::Value) -> Result<Self, String> {
         let raw: RawConfig =
             serde_json::from_value(c.clone()).map_err(|e| format!("zaya config: {e}"))?;
 
-        if raw.num_hidden_layers == 0 || raw.num_hidden_layers % 2 != 0 {
-            return Err(format!(
-                "zaya config: num_hidden_layers must be a positive even (alternating attn/MoE) count, got {}",
-                raw.num_hidden_layers
-            ));
-        }
         if raw.hidden_size == 0 || raw.vocab_size == 0 {
             return Err("zaya config: zero hidden_size/vocab_size".to_string());
         }
@@ -177,13 +180,30 @@ impl ZayaConfig {
             ));
         }
 
-        let num_blocks = raw.num_hidden_layers / 2;
-        // `ffn_hidden_size` is the fused gate+up width; per-expert SwiGLU hidden
-        // (gate == up width) is half of it.
-        let moe_intermediate_size = raw.ffn_hidden_size / 2;
+        let is_megatron = raw.ffn_hidden_size.is_some();
+        let num_blocks = if is_megatron {
+            if raw.num_hidden_layers == 0 || raw.num_hidden_layers % 2 != 0 {
+                return Err(format!(
+                    "zaya Megatron config: num_hidden_layers must be a positive even (alternating attn/MoE) count, got {}",
+                    raw.num_hidden_layers
+                ));
+            }
+            raw.num_hidden_layers / 2
+        } else {
+            if raw.num_hidden_layers == 0 {
+                return Err("zaya config: zero num_hidden_layers".to_string());
+            }
+            raw.num_hidden_layers
+        };
+        // Per-expert SwiGLU hidden (gate == up width): native gives it directly;
+        // Megatron's `ffn_hidden_size` is the fused gate+up width, so halve it.
+        let moe_intermediate_size = raw
+            .moe_intermediate_size
+            .or(raw.ffn_hidden_size.map(|f| f / 2))
+            .ok_or("zaya config: missing moe_intermediate_size / ffn_hidden_size")?;
         let n_rot = ((raw.head_dim as f32) * raw.partial_rotary_factor).round() as usize;
-        // Megatron carries the router hidden width as `zaya_mlp_expansion`; the HF
-        // config names it `router_hidden_size`. Prefer the explicit one.
+        // Native names it `router_hidden_size`; Megatron carries it as
+        // `zaya_mlp_expansion`. Prefer the explicit one.
         let router_hidden_size = raw
             .router_hidden_size
             .or(raw.zaya_mlp_expansion)
@@ -272,9 +292,14 @@ struct RawConfig {
     #[serde(default = "default_cca_time")]
     cca_time1: usize,
 
-    ffn_hidden_size: usize,
+    /// Megatron-only: fused gate+up width. Absent in native configs.
+    #[serde(default)]
+    ffn_hidden_size: Option<usize>,
+    /// Native-only: per-expert SwiGLU gate/up width.
+    #[serde(default)]
+    moe_intermediate_size: Option<usize>,
     num_experts: usize,
-    #[serde(default = "default_topk")]
+    #[serde(default = "default_topk", alias = "num_experts_per_tok")]
     moe_router_topk: usize,
     /// HF-native name for the router hidden width.
     #[serde(default)]
@@ -419,6 +444,57 @@ mod tests {
         assert!(m.use_mod);
         // 16 real experts + 1 MoD skip route = 17 router logits.
         assert_eq!(m.num_router_experts(), 17);
+    }
+
+    /// The native (post-conversion) config.json shape, with `num_hidden_layers`
+    /// already counting hybrid blocks and the HF-native field names.
+    fn zaya1_8b_native_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["ZayaForCausalLM"],
+            "attention_bias": false,
+            "bos_token_id": 2,
+            "cca_time0": 2,
+            "cca_time1": 2,
+            "dtype": "bfloat16",
+            "eos_token_id": 106,
+            "head_dim": 128,
+            "hidden_act": "silu",
+            "hidden_size": 2048,
+            "lm_head_bias": false,
+            "max_position_embeddings": 131072,
+            "model_type": "zaya",
+            "moe_intermediate_size": 2048,
+            "num_attention_heads": 8,
+            "num_experts": 16,
+            "num_experts_per_tok": 1,
+            "num_hidden_layers": 40,
+            "num_key_value_heads": 2,
+            "pad_token_id": 0,
+            "partial_rotary_factor": 0.5,
+            "rms_norm_eps": 1e-05,
+            "router_hidden_size": 256,
+            "sliding_window": null,
+            "tie_word_embeddings": true,
+            "vocab_size": 262272
+        })
+    }
+
+    #[test]
+    fn native_and_megatron_agree() {
+        let mega = ZayaConfig::from_json(&zaya1_8b_config()).expect("megatron parse");
+        let native = ZayaConfig::from_json(&zaya1_8b_native_config()).expect("native parse");
+        // Both layouts must resolve to the same hybrid-block shape.
+        assert_eq!(native.num_blocks, 40);
+        assert_eq!(native.num_half_layers, 40); // native carries no half-layer notion
+        assert_eq!(mega.num_blocks, native.num_blocks);
+        assert_eq!(mega.hidden_size, native.hidden_size);
+        assert_eq!(mega.rms_norm_eps, native.rms_norm_eps);
+        assert_eq!(mega.attn, native.attn);
+        assert_eq!(mega.moe, native.moe);
+        assert_eq!(mega.windows, native.windows);
+        assert_eq!(native.moe.moe_intermediate_size, 2048);
+        assert_eq!(native.moe.num_router_experts(), 17);
+        assert_eq!(native.attn.n_rot, 64);
     }
 
     #[test]
