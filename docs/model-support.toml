@@ -107,7 +107,7 @@ kv = "fp32"
 vision = "full"
 
 [[arch]]
-ids = [0, 1]
+ids = [40, 1]
 label = "llama"
 prefill = "partial"
 dflash = "none"

@@ -124,7 +124,7 @@ pub const ARCH_ROWS: &[ArchRow] = &[
         },
     },
     ArchRow {
-        ids: &[0, 1],
+        ids: &[40, 1],
         features: ArchFeatures {
             label: "llama",
             prefill: FeatureSupport::Partial,

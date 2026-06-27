@@ -25,6 +25,32 @@ pub const HFQM_VERSION: u32 = 1;
 /// defines a family-independent compatibility contract.
 pub const HFQM_ARCH_NON_WEIGHT_PACKAGE: u32 = 0;
 
+/// Resolve the canonical model `arch_id` for a freshly-read HFQM header.
+///
+/// The header int is authoritative for every non-zero family. Value `0` is
+/// overloaded: it is both [`HFQM_ARCH_NON_WEIGHT_PACKAGE`] and the *legacy*
+/// LLaMA/Mistral tag from before that family moved to
+/// `ARCH_ID_LLAMA_MISTRAL` (= 40). Disambiguate from the embedded metadata: a
+/// header-`0` container whose metadata carries a model `config` is a legacy
+/// LLaMA weight model and is remapped to its metadata-derived family id; a
+/// header-`0` container without a model config (a calibration / role sidecar)
+/// keeps `0`. Non-zero headers are returned unchanged.
+pub fn canonical_arch_id(header_arch_id: u32, metadata_json: &str) -> u32 {
+    if header_arch_id != HFQM_ARCH_NON_WEIGHT_PACKAGE {
+        return header_arch_id;
+    }
+    let meta: serde_json::Value = match serde_json::from_str(metadata_json) {
+        Ok(v) => v,
+        Err(_) => return header_arch_id,
+    };
+    match meta.get("config") {
+        Some(config) if config.get("architectures").is_some() || config.get("model_type").is_some() => {
+            crate::safetensors_source::derive_arch_id(config)
+        }
+        _ => header_arch_id,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HfqPackageEntry {
     pub name: String,
@@ -204,6 +230,7 @@ impl HfqPackage {
         let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
         let (metadata_json, entries, entry_map) =
             parse_hfqm_index(&mmap, 0, metadata_offset, data_offset, n_entries)?;
+        let arch_id = canonical_arch_id(arch_id, &metadata_json);
         Ok(Self {
             _file: file,
             mmap,
@@ -550,6 +577,7 @@ impl HfqFile {
         if !modules.is_empty() {
             validate_modules(&modules, file_len)?;
         }
+        let arch_id = canonical_arch_id(arch_id, &metadata_json);
         Ok(Self {
             _file: file,
             path: path.to_path_buf(),
@@ -718,6 +746,7 @@ impl HfqFile {
             validate_modules(&modules, mmap.len())?;
         }
 
+        let arch_id = canonical_arch_id(arch_id, &metadata_json);
         Ok(Self {
             _file: file,
             path: path.to_path_buf(),
@@ -1997,6 +2026,27 @@ pub fn load_weights_hfq(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_arch_id_remaps_legacy_llama_and_keeps_sidecar_sentinel() {
+        // A non-zero header is authoritative and returned unchanged.
+        assert_eq!(
+            canonical_arch_id(hipfire_model::ARCH_ID_QWEN35_DENSE, "{}"),
+            hipfire_model::ARCH_ID_QWEN35_DENSE
+        );
+        // header 0 + a model `config` = legacy LLaMA weight model -> derived id.
+        let llama_meta =
+            r#"{"config":{"architectures":["LlamaForCausalLM"],"model_type":"llama"}}"#;
+        assert_eq!(
+            canonical_arch_id(0, llama_meta),
+            hipfire_model::ARCH_ID_LLAMA_MISTRAL
+        );
+        // header 0 + non-weight sidecar (no model config) -> stays sentinel 0.
+        let calib_meta = r#"{"artifact_kind":"calibration","arch":"llama"}"#;
+        assert_eq!(canonical_arch_id(0, calib_meta), HFQM_ARCH_NON_WEIGHT_PACKAGE);
+        // header 0 + unparseable metadata -> stays sentinel 0 (no panic).
+        assert_eq!(canonical_arch_id(0, "not json"), HFQM_ARCH_NON_WEIGHT_PACKAGE);
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

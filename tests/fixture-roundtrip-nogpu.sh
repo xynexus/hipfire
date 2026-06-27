@@ -24,7 +24,7 @@ trap 'rm -rf "$TMP"' EXIT
 # routes it to the dedicated hipfire-arch-qwen2 loader, so we assert the override
 # message ("to 7") instead of an "id=" line.
 ARCHS=(qwen3_5 qwen3_5_moe qwen2 gemma3 minimax mamba2 llama)
-EXPECT_ID=("id=5" "id=6" "to 7" "id=12" "id=10" "id=15" "id=0")
+EXPECT_ID=("id=5" "id=6" "to 7" "id=12" "id=10" "id=15" "id=40")
 ARCH_FLAGS=("" "" "--arch-id 7" "" "" "" "")
 
 for i in "${!ARCHS[@]}"; do

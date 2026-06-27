@@ -185,7 +185,7 @@ impl ModelSource for SafetensorsSource {
     }
 }
 
-fn derive_arch_id(config: &serde_json::Value) -> u32 {
+pub(crate) fn derive_arch_id(config: &serde_json::Value) -> u32 {
     let archs = config
         .get("architectures")
         .and_then(|a| a.as_array())

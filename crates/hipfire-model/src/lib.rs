@@ -140,7 +140,13 @@ pub fn has_worker_or_model_identity(msg: &Value) -> bool {
             .is_some()
 }
 
-pub const ARCH_ID_LLAMA_MISTRAL: u32 = 0;
+// LLaMA/Mistral was historically 0, which collides with
+// `HFQM_ARCH_NON_WEIGHT_PACKAGE` (the reserved "shareable non-weight container"
+// sentinel). Moved to 40 so 0 is unambiguously the sentinel. Legacy `.hfq`
+// files still carry a `0` header; they are remapped to this id at load time by
+// `hfq::canonical_arch_id` (which derives the family from the embedded
+// metadata), so no on-disk migration is required.
+pub const ARCH_ID_LLAMA_MISTRAL: u32 = 40;
 pub const ARCH_ID_QWEN3_QWEN2_LEGACY: u32 = 1;
 pub const ARCH_ID_QWEN35_DENSE: u32 = 5;
 pub const ARCH_ID_QWEN35_MOE: u32 = 6;
