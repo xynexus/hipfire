@@ -21,36 +21,14 @@ Formats: mq4, oq4 (plain) + mq4+, oq4+ (AWQ) + oq4++ (LDLQ/Hessian).
 | supra-50m | mq4 | asym4 | ok | 720.3 | 567.8 |  |  | 39.1 |  |
 | supra-50m | mq4 | f16 | ok | 722.0 | 576.3 |  |  | 39.1 |  |
 | supra-50m | mq4 | kvarn | ok | 722.9 | 568.8 |  |  | 39.1 |  |
-| supra-50m | oq4 | q8 | fail |  |  |  |  | 42.8 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
-| supra-50m | oq4 | asym4 | fail |  |  |  |  | 42.8 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
 | supra-50m | mq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
 | supra-50m | mq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| supra-50m | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| supra-50m | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| supra-50m | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
-| supra-50m | oq4++ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| lfm2.5-350m | mq4 | q8 | fail |  |  |  |  | 229.5 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-350m | mq4 | asym4 | fail |  |  |  |  | 229.5 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-350m | oq4 | q8 | fail |  |  |  |  | 222.7 | daemon speed anchor returned empty, zero-token, or replacement-character output |
-| lfm2.5-350m | oq4 | asym4 | fail |  |  |  |  | 222.7 | daemon speed anchor returned empty, zero-token, or replacement-character output |
-| lfm2.5-350m | mq4+ | q8 | fail |  |  |  |  | 229.5 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-350m | mq4+ | asym4 | fail |  |  |  |  | 229.5 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-350m | oq4+ | q8 | fail |  |  |  |  | 223.0 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-350m | oq4+ | asym4 | fail |  |  |  |  | 223.0 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-350m | oq4++ | q8 | fail |  |  |  |  | 222.7 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-350m | oq4++ | asym4 | fail |  |  |  |  | 222.7 | daemon speed anchor did not emit prefill/decode timing metrics |
 | qwen3-0.6b | mq4 | q8 | ok | 6185.7 | 219.8 |  |  | 495.2 |  |
 | qwen3-0.6b | mq4 | asym4 | ok | 6099.1 | 219.5 |  |  | 495.2 |  |
 | qwen3-0.6b | mq4 | f16 | ok | 6144.3 | 219.4 |  |  | 495.2 |  |
 | qwen3-0.6b | mq4 | kvarn | ok | 6130.4 | 219.8 |  |  | 495.2 |  |
-| qwen3-0.6b | oq4 | q8 | fail |  |  |  |  | 481.2 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
-| qwen3-0.6b | oq4 | asym4 | fail |  |  |  |  | 481.2 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
 | qwen3-0.6b | mq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
 | qwen3-0.6b | mq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| qwen3-0.6b | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| qwen3-0.6b | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| qwen3-0.6b | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
-| qwen3-0.6b | oq4++ | asym4 | fail |  |  |  |  |  | calib generation failed |
 | qwen3.5-0.8b | oq4+ | q8 | ok | 5135.2 | 183.5 |  |  | 538.4 |  |
 | qwen3.5-0.8b | oq4+ | asym4 | ok | 5052.6 | 176.6 |  |  | 538.4 |  |
 | qwen3.5-0.8b | oq4+ | f16 | ok | 5060.6 | 191.3 |  |  | 538.4 |  |
@@ -63,36 +41,10 @@ Formats: mq4, oq4 (plain) + mq4+, oq4+ (AWQ) + oq4++ (LDLQ/Hessian).
 | llama-3.2-1b | mq4 | asym4 | ok | 3989.3 | 106.9 |  |  | 806.5 |  |
 | llama-3.2-1b | mq4 | f16 | ok | 3960.8 | 106.8 |  |  | 806.5 |  |
 | llama-3.2-1b | mq4 | kvarn | ok | 4002.7 | 106.9 |  |  | 806.5 |  |
-| llama-3.2-1b | oq4 | q8 | fail |  |  |  |  | 783.7 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
-| llama-3.2-1b | oq4 | asym4 | fail |  |  |  |  | 783.7 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
-| llama-3.2-1b | mq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-1b | mq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-1b | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-1b | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-1b | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-1b | oq4++ | asym4 | fail |  |  |  |  |  | calib generation failed |
 | llama-3.2-1b-inst | mq4 | q8 | ok | 4164.2 | 106.4 |  |  | 806.6 |  |
 | llama-3.2-1b-inst | mq4 | asym4 | ok | 4148.6 | 106.2 |  |  | 806.6 |  |
 | llama-3.2-1b-inst | mq4 | f16 | ok | 4140.7 | 106.4 |  |  | 806.6 |  |
 | llama-3.2-1b-inst | mq4 | kvarn | ok | 4119.8 | 106.4 |  |  | 806.6 |  |
-| llama-3.2-1b-inst | oq4 | q8 | fail |  |  |  |  | 783.7 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
-| llama-3.2-1b-inst | oq4 | asym4 | fail |  |  |  |  | 783.7 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
-| llama-3.2-1b-inst | mq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-1b-inst | mq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-1b-inst | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-1b-inst | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-1b-inst | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-1b-inst | oq4++ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| lfm2.5-1.2b-inst | mq4 | q8 | fail |  |  |  |  | 698.6 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-1.2b-inst | mq4 | asym4 | fail |  |  |  |  | 698.6 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-1.2b-inst | oq4 | q8 | fail |  |  |  |  | 674.4 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-1.2b-inst | oq4 | asym4 | fail |  |  |  |  | 674.4 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-1.2b-inst | mq4+ | q8 | fail |  |  |  |  | 698.6 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-1.2b-inst | mq4+ | asym4 | fail |  |  |  |  | 698.6 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-1.2b-inst | oq4+ | q8 | fail |  |  |  |  | 674.9 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-1.2b-inst | oq4+ | asym4 | fail |  |  |  |  | 674.9 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-1.2b-inst | oq4++ | q8 | fail |  |  |  |  | 674.4 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-1.2b-inst | oq4++ | asym4 | fail |  |  |  |  | 674.4 | daemon speed anchor did not emit prefill/decode timing metrics |
 | qwen3.5-2b | mq4 | q8 | ok | 3874.5 | 112.6 |  |  | 1285.0 |  |
 | qwen3.5-2b | mq4 | asym4 | ok | 3690.7 | 110.5 |  |  | 1285.0 |  |
 | qwen3.5-2b | mq4 | f16 | ok | 3889.7 | 115.9 |  |  | 1285.0 |  |
@@ -117,14 +69,6 @@ Formats: mq4, oq4 (plain) + mq4+, oq4+ (AWQ) + oq4++ (LDLQ/Hessian).
 | llama-3.2-3b-inst | mq4 | asym4 | ok | 1444.4 | 55.9 |  |  | 1926.7 |  |
 | llama-3.2-3b-inst | mq4 | f16 | ok | 1448.2 | 55.9 |  |  | 1926.7 |  |
 | llama-3.2-3b-inst | mq4 | kvarn | ok | 1450.8 | 55.9 |  |  | 1926.7 |  |
-| llama-3.2-3b-inst | oq4 | q8 | fail |  |  |  |  | 1860.7 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
-| llama-3.2-3b-inst | oq4 | asym4 | fail |  |  |  |  | 1860.7 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
-| llama-3.2-3b-inst | mq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-3b-inst | mq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-3b-inst | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-3b-inst | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-3b-inst | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.2-3b-inst | oq4++ | asym4 | fail |  |  |  |  |  | calib generation failed |
 | qwen3.5-4b | mq4 | q8 | ok | 963.5 | 53.9 |  |  | 2587.8 |  |
 | qwen3.5-4b | mq4 | asym4 | ok | 1279.2 | 59.7 |  |  | 2587.8 |  |
 | qwen3.5-4b | mq4 | f16 | ok | 1290.1 | 61.5 |  |  | 2587.8 |  |
@@ -149,36 +93,12 @@ Formats: mq4, oq4 (plain) + mq4+, oq4+ (AWQ) + oq4++ (LDLQ/Hessian).
 | nemotron-4b | mq4 | asym4 | ok | 50.2 | 37.8 |  |  | 4242.9 |  |
 | nemotron-4b | mq4 | f16 | ok | 50.1 | 37.6 |  |  | 4242.9 |  |
 | nemotron-4b | mq4 | kvarn | ok | 50.2 | 37.7 |  |  | 4242.9 |  |
-| nemotron-4b | oq4 | q8 | fail |  |  |  |  | 3591.5 | daemon-backed speed executor failed: daemon load error: load failed: mamba-capable NemotronModel::from_hfq: nemotron hfq |
-| nemotron-4b | oq4 | asym4 | fail |  |  |  |  | 3591.5 | daemon-backed speed executor failed: daemon load error: load failed: mamba-capable NemotronModel::from_hfq: nemotron hfq |
 | nemotron-4b | mq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
 | nemotron-4b | mq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| nemotron-4b | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| nemotron-4b | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| nemotron-4b | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
-| nemotron-4b | oq4++ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| lfm2.5-8b-a1b | mq4 | q8 | fail |  |  |  |  | 4659.5 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-8b-a1b | mq4 | asym4 | fail |  |  |  |  | 4659.5 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-8b-a1b | oq4 | q8 | fail |  |  |  |  | 4648.9 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-8b-a1b | oq4 | asym4 | fail |  |  |  |  | 4648.9 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-8b-a1b | mq4+ | q8 | fail |  |  |  |  | 4659.7 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-8b-a1b | mq4+ | asym4 | fail |  |  |  |  | 4659.7 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-8b-a1b | oq4+ | q8 | fail |  |  |  |  | 4649.4 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-8b-a1b | oq4+ | asym4 | fail |  |  |  |  | 4649.4 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-8b-a1b | oq4++ | q8 | fail |  |  |  |  | 4648.9 | daemon speed anchor did not emit prefill/decode timing metrics |
-| lfm2.5-8b-a1b | oq4++ | asym4 | fail |  |  |  |  | 4648.9 | daemon speed anchor did not emit prefill/decode timing metrics |
 | llama-3.1-8b-inst | mq4 | q8 | ok | 756.3 | 44.3 |  |  | 4555.9 |  |
 | llama-3.1-8b-inst | mq4 | asym4 | ok | 757.6 | 44.3 |  |  | 4555.9 |  |
 | llama-3.1-8b-inst | mq4 | f16 | ok | 756.6 | 44.2 |  |  | 4555.9 |  |
 | llama-3.1-8b-inst | mq4 | kvarn | ok | 755.6 | 44.2 |  |  | 4555.9 |  |
-| llama-3.1-8b-inst | oq4 | q8 | fail |  |  |  |  | 4380.1 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
-| llama-3.1-8b-inst | oq4 | asym4 | fail |  |  |  |  | 4380.1 | daemon-backed speed executor failed: daemon stdout closed unexpectedly |
-| llama-3.1-8b-inst | mq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.1-8b-inst | mq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.1-8b-inst | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.1-8b-inst | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.1-8b-inst | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
-| llama-3.1-8b-inst | oq4++ | asym4 | fail |  |  |  |  |  | calib generation failed |
 | qwen3.5-9b | mq4 | q8 | ok | 740.9 | 40.5 |  |  | 5313.0 |  |
 | qwen3.5-9b | mq4 | asym4 | ok | 735.8 | 39.8 |  |  | 5313.0 |  |
 | qwen3.5-9b | mq4 | f16 | ok | 744.4 | 40.7 |  |  | 5313.0 |  |
@@ -199,3 +119,149 @@ Formats: mq4, oq4 (plain) + mq4+, oq4+ (AWQ) + oq4++ (LDLQ/Hessian).
 | qwen3.5-9b | oq4++ | asym4 | ok | 237.5 | 37.7 |  |  | 5127.0 |  |
 | qwen3.5-9b | oq4++ | f16 | ok | 248.8 | 38.4 |  |  | 5127.0 |  |
 | qwen3.5-9b | oq4++ | kvarn | ok | 39.1 | 38.3 |  |  | 5127.0 |  |
+| supra-50m | oq4 | q8 | ok | 679.4 | 546.3 |  |  | 42.8 |  |
+| supra-50m | oq4 | asym4 | ok | 684.3 | 546.9 |  |  | 42.8 |  |
+| supra-50m | oq4 | f16 | ok | 680.8 | 544.8 |  |  | 42.8 |  |
+| supra-50m | oq4 | kvarn | ok | 681.7 | 543.6 |  |  | 42.8 |  |
+| supra-50m | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
+| supra-50m | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
+| supra-50m | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
+| supra-50m | oq4++ | asym4 | fail |  |  |  |  |  | calib generation failed |
+| qwen3-0.6b | oq4 | q8 | ok | 218.0 | 186.0 |  |  | 481.2 |  |
+| qwen3-0.6b | oq4 | asym4 | ok | 218.0 | 186.1 |  |  | 481.2 |  |
+| qwen3-0.6b | oq4 | f16 | ok | 218.2 | 185.7 |  |  | 481.2 |  |
+| qwen3-0.6b | oq4 | kvarn | ok | 218.0 | 186.1 |  |  | 481.2 |  |
+| qwen3-0.6b | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
+| qwen3-0.6b | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
+| qwen3-0.6b | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
+| qwen3-0.6b | oq4++ | asym4 | fail |  |  |  |  |  | calib generation failed |
+| llama-3.2-1b | oq4 | q8 | ok | 83.4 | 79.6 |  |  | 783.7 |  |
+| llama-3.2-1b | oq4 | asym4 | ok | 83.6 | 79.6 |  |  | 783.7 |  |
+| llama-3.2-1b | oq4 | f16 | ok | 83.6 | 79.6 |  |  | 783.7 |  |
+| llama-3.2-1b | oq4 | kvarn | ok | 83.6 | 79.6 |  |  | 783.7 |  |
+| llama-3.2-1b-inst | oq4 | q8 | ok | 83.4 | 79.4 |  |  | 783.7 |  |
+| llama-3.2-1b-inst | oq4 | asym4 | ok | 83.3 | 79.5 |  |  | 783.7 |  |
+| llama-3.2-1b-inst | oq4 | f16 | ok | 83.5 | 79.4 |  |  | 783.7 |  |
+| llama-3.2-1b-inst | oq4 | kvarn | ok | 83.5 | 79.5 |  |  | 783.7 |  |
+| llama-3.2-3b-inst | oq4 | q8 | ok | 45.8 | 43.9 |  |  | 1860.7 |  |
+| llama-3.2-3b-inst | oq4 | asym4 | ok | 45.7 | 43.9 |  |  | 1860.7 |  |
+| llama-3.2-3b-inst | oq4 | f16 | ok | 45.7 | 43.8 |  |  | 1860.7 |  |
+| llama-3.2-3b-inst | oq4 | kvarn | ok | 45.7 | 43.8 |  |  | 1860.7 |  |
+| nemotron-4b | oq4 | q8 | fail |  |  |  |  | 3591.5 | daemon-backed speed executor failed: daemon load error: load failed: mamba-capable NemotronModel::from_hfq: nemotron hfq |
+| nemotron-4b | oq4 | asym4 | fail |  |  |  |  | 3591.5 | daemon-backed speed executor failed: daemon load error: load failed: mamba-capable NemotronModel::from_hfq: nemotron hfq |
+| nemotron-4b | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
+| nemotron-4b | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
+| nemotron-4b | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
+| nemotron-4b | oq4++ | asym4 | fail |  |  |  |  |  | calib generation failed |
+| llama-3.1-8b-inst | oq4 | q8 | ok | 29.7 | 28.8 |  |  | 4380.1 |  |
+| llama-3.1-8b-inst | oq4 | asym4 | ok | 29.7 | 28.7 |  |  | 4380.1 |  |
+| llama-3.1-8b-inst | oq4 | f16 | ok | 29.7 | 28.8 |  |  | 4380.1 |  |
+| llama-3.1-8b-inst | oq4 | kvarn | ok | 29.7 | 28.8 |  |  | 4380.1 |  |
+| lfm2.5-350m | mq4 | q8 | ok | 3909.1 | 473.7 |  |  | 229.5 |  |
+| lfm2.5-350m | mq4 | asym4 | ok | 3850.7 | 467.5 |  |  | 229.5 |  |
+| lfm2.5-350m | mq4 | f16 | ok | 3850.7 | 473.7 |  |  | 229.5 |  |
+| lfm2.5-350m | mq4 | kvarn | ok | 3739.1 | 473.7 |  |  | 229.5 |  |
+| lfm2.5-350m | oq4 | q8 | ok | 13578.9 | 421.1 |  |  | 222.7 |  |
+| lfm2.5-350m | oq4 | asym4 | ok | 13578.9 | 421.1 |  |  | 222.7 |  |
+| lfm2.5-350m | oq4 | f16 | ok | 13578.9 | 423.8 |  |  | 222.7 |  |
+| lfm2.5-350m | oq4 | kvarn | ok | 14333.3 | 423.8 |  |  | 222.7 |  |
+| lfm2.5-350m | mq4+ | q8 | ok | 3794.1 | 467.5 |  |  | 229.5 |  |
+| lfm2.5-350m | mq4+ | asym4 | ok | 3794.1 | 473.7 |  |  | 229.5 |  |
+| lfm2.5-350m | mq4+ | f16 | ok | 3685.7 | 473.7 |  |  | 229.5 |  |
+| lfm2.5-350m | mq4+ | kvarn | ok | 3850.7 | 473.7 |  |  | 229.5 |  |
+| lfm2.5-350m | oq4+ | q8 | ok | 13578.9 | 412.9 |  |  | 223.0 |  |
+| lfm2.5-350m | oq4+ | asym4 | ok | 14333.3 | 415.6 |  |  | 223.0 |  |
+| lfm2.5-350m | oq4+ | f16 | ok | 13578.9 | 415.6 |  |  | 223.0 |  |
+| lfm2.5-350m | oq4+ | kvarn | ok | 14333.3 | 412.9 |  |  | 223.0 |  |
+| lfm2.5-350m | oq4++ | q8 | ok | 14333.3 | 426.7 |  |  | 222.7 |  |
+| lfm2.5-350m | oq4++ | asym4 | ok | 13578.9 | 421.1 |  |  | 222.7 |  |
+| lfm2.5-350m | oq4++ | f16 | ok | 13578.9 | 423.8 |  |  | 222.7 |  |
+| lfm2.5-350m | oq4++ | kvarn | ok | 13578.9 | 423.8 |  |  | 222.7 |  |
+| lfm2.5-1.2b-inst | mq4 | q8 | ok | 1121.7 | 227.0 |  |  | 698.6 |  |
+| lfm2.5-1.2b-inst | mq4 | asym4 | ok | 1141.6 | 227.0 |  |  | 698.6 |  |
+| lfm2.5-1.2b-inst | mq4 | f16 | ok | 1131.6 | 226.1 |  |  | 698.6 |  |
+| lfm2.5-1.2b-inst | mq4 | kvarn | ok | 1157.0 | 227.0 |  |  | 698.6 |  |
+| lfm2.5-1.2b-inst | oq4 | q8 | ok | 4229.5 | 135.3 |  |  | 674.4 |  |
+| lfm2.5-1.2b-inst | oq4 | asym4 | ok | 4229.5 | 135.6 |  |  | 674.4 |  |
+| lfm2.5-1.2b-inst | oq4 | f16 | ok | 4229.5 | 135.3 |  |  | 674.4 |  |
+| lfm2.5-1.2b-inst | oq4 | kvarn | ok | 4229.5 | 135.3 |  |  | 674.4 |  |
+| lfm2.5-1.2b-inst | mq4+ | q8 | ok | 1141.6 | 226.1 |  |  | 698.6 |  |
+| lfm2.5-1.2b-inst | mq4+ | asym4 | ok | 1157.0 | 226.1 |  |  | 698.6 |  |
+| lfm2.5-1.2b-inst | mq4+ | f16 | ok | 1136.6 | 227.0 |  |  | 698.6 |  |
+| lfm2.5-1.2b-inst | mq4+ | kvarn | ok | 1151.8 | 227.0 |  |  | 698.6 |  |
+| lfm2.5-1.2b-inst | oq4+ | q8 | ok | 4229.5 | 133.9 |  |  | 674.9 |  |
+| lfm2.5-1.2b-inst | oq4+ | asym4 | ok | 4161.3 | 134.5 |  |  | 674.9 |  |
+| lfm2.5-1.2b-inst | oq4+ | f16 | ok | 4161.3 | 134.2 |  |  | 674.9 |  |
+| lfm2.5-1.2b-inst | oq4+ | kvarn | ok | 4229.5 | 134.5 |  |  | 674.9 |  |
+| lfm2.5-1.2b-inst | oq4++ | q8 | ok | 4229.5 | 135.3 |  |  | 674.4 |  |
+| lfm2.5-1.2b-inst | oq4++ | asym4 | ok | 4161.3 | 135.3 |  |  | 674.4 |  |
+| lfm2.5-1.2b-inst | oq4++ | f16 | ok | 4161.3 | 135.3 |  |  | 674.4 |  |
+| lfm2.5-1.2b-inst | oq4++ | kvarn | ok | 4229.5 | 135.6 |  |  | 674.4 |  |
+| lfm2.5-8b-a1b | mq4 | q8 | ok | 542.7 | 152.0 |  |  | 4659.5 |  |
+| lfm2.5-8b-a1b | mq4 | asym4 | ok | 541.5 | 151.3 |  |  | 4659.5 |  |
+| lfm2.5-8b-a1b | mq4 | f16 | ok | 544.0 | 151.3 |  |  | 4659.5 |  |
+| lfm2.5-8b-a1b | mq4 | kvarn | ok | 542.7 | 151.3 |  |  | 4659.5 |  |
+| lfm2.5-8b-a1b | oq4 | q8 | ok | 628.3 | 132.2 |  |  | 4648.9 |  |
+| lfm2.5-8b-a1b | oq4 | asym4 | ok | 628.3 | 132.0 |  |  | 4648.9 |  |
+| lfm2.5-8b-a1b | oq4 | f16 | ok | 628.3 | 131.4 |  |  | 4648.9 |  |
+| lfm2.5-8b-a1b | oq4 | kvarn | ok | 628.3 | 132.0 |  |  | 4648.9 |  |
+| lfm2.5-8b-a1b | mq4+ | q8 | ok | 542.7 | 150.6 |  |  | 4659.7 |  |
+| lfm2.5-8b-a1b | mq4+ | asym4 | ok | 542.7 | 150.6 |  |  | 4659.7 |  |
+| lfm2.5-8b-a1b | mq4+ | f16 | ok | 544.0 | 150.6 |  |  | 4659.7 |  |
+| lfm2.5-8b-a1b | mq4+ | kvarn | ok | 541.5 | 150.2 |  |  | 4659.7 |  |
+| lfm2.5-8b-a1b | oq4+ | q8 | ok | 626.7 | 131.1 |  |  | 4649.4 |  |
+| lfm2.5-8b-a1b | oq4+ | asym4 | ok | 630.0 | 130.9 |  |  | 4649.4 |  |
+| lfm2.5-8b-a1b | oq4+ | f16 | ok | 630.0 | 131.1 |  |  | 4649.4 |  |
+| lfm2.5-8b-a1b | oq4+ | kvarn | ok | 628.3 | 131.4 |  |  | 4649.4 |  |
+| lfm2.5-8b-a1b | oq4++ | q8 | ok | 630.0 | 132.2 |  |  | 4648.9 |  |
+| lfm2.5-8b-a1b | oq4++ | asym4 | ok | 628.3 | 132.0 |  |  | 4648.9 |  |
+| lfm2.5-8b-a1b | oq4++ | f16 | ok | 630.0 | 131.7 |  |  | 4648.9 |  |
+| lfm2.5-8b-a1b | oq4++ | kvarn | ok | 628.3 | 132.2 |  |  | 4648.9 |  |
+| llama-3.2-1b | mq4+ | q8 | ok | 3985.1 | 106.6 |  |  | 807.2 |  |
+| llama-3.2-1b | mq4+ | asym4 | ok | 3979.1 | 106.6 |  |  | 807.2 |  |
+| llama-3.2-1b | mq4+ | f16 | ok | 3994.0 | 106.5 |  |  | 807.2 |  |
+| llama-3.2-1b | mq4+ | kvarn | ok | 3979.4 | 106.6 |  |  | 807.2 |  |
+| llama-3.2-1b | oq4+ | q8 | ok | 83.2 | 79.3 |  |  | 784.4 |  |
+| llama-3.2-1b | oq4+ | asym4 | ok | 83.2 | 79.1 |  |  | 784.4 |  |
+| llama-3.2-1b | oq4+ | f16 | ok | 83.1 | 79.2 |  |  | 784.4 |  |
+| llama-3.2-1b | oq4+ | kvarn | ok | 83.2 | 79.2 |  |  | 784.4 |  |
+| llama-3.2-1b | oq4++ | q8 | ok | 83.6 | 79.5 |  |  | 783.7 |  |
+| llama-3.2-1b | oq4++ | asym4 | ok | 83.5 | 79.5 |  |  | 783.7 |  |
+| llama-3.2-1b | oq4++ | f16 | ok | 83.7 | 79.6 |  |  | 783.7 |  |
+| llama-3.2-1b | oq4++ | kvarn | ok | 83.5 | 79.7 |  |  | 783.7 |  |
+| llama-3.2-1b-inst | mq4+ | q8 | ok | 5001.7 | 103.8 |  |  | 807.2 |  |
+| llama-3.2-1b-inst | mq4+ | asym4 | ok | 4920.8 | 104.7 |  |  | 807.2 |  |
+| llama-3.2-1b-inst | mq4+ | f16 | ok | 4897.8 | 104.7 |  |  | 807.2 |  |
+| llama-3.2-1b-inst | mq4+ | kvarn | ok | 4930.9 | 104.7 |  |  | 807.2 |  |
+| llama-3.2-1b-inst | oq4+ | q8 | ok | 82.2 | 78.1 |  |  | 784.4 |  |
+| llama-3.2-1b-inst | oq4+ | asym4 | ok | 82.2 | 78.1 |  |  | 784.4 |  |
+| llama-3.2-1b-inst | oq4+ | f16 | ok | 82.3 | 78.1 |  |  | 784.4 |  |
+| llama-3.2-1b-inst | oq4+ | kvarn | ok | 82.2 | 78.0 |  |  | 784.4 |  |
+| llama-3.2-1b-inst | oq4++ | q8 | ok | 82.5 | 78.5 |  |  | 783.7 |  |
+| llama-3.2-1b-inst | oq4++ | asym4 | ok | 82.5 | 78.4 |  |  | 783.7 |  |
+| llama-3.2-1b-inst | oq4++ | f16 | ok | 82.6 | 78.4 |  |  | 783.7 |  |
+| llama-3.2-1b-inst | oq4++ | kvarn | ok | 82.5 | 78.4 |  |  | 783.7 |  |
+| llama-3.2-3b-inst | mq4+ | q8 | ok | 1815.5 | 55.0 |  |  | 1928.2 |  |
+| llama-3.2-3b-inst | mq4+ | asym4 | ok | 1780.5 | 55.0 |  |  | 1928.2 |  |
+| llama-3.2-3b-inst | mq4+ | f16 | ok | 1799.1 | 55.0 |  |  | 1928.2 |  |
+| llama-3.2-3b-inst | mq4+ | kvarn | ok | 1782.2 | 55.0 |  |  | 1928.2 |  |
+| llama-3.2-3b-inst | oq4+ | q8 | ok | 45.2 | 43.1 |  |  | 1862.2 |  |
+| llama-3.2-3b-inst | oq4+ | asym4 | ok | 45.3 | 43.2 |  |  | 1862.2 |  |
+| llama-3.2-3b-inst | oq4+ | f16 | ok | 45.2 | 43.1 |  |  | 1862.2 |  |
+| llama-3.2-3b-inst | oq4+ | kvarn | ok | 45.2 | 43.1 |  |  | 1862.2 |  |
+| llama-3.2-3b-inst | oq4++ | q8 | ok | 45.5 | 43.3 |  |  | 1860.7 |  |
+| llama-3.2-3b-inst | oq4++ | asym4 | ok | 45.4 | 43.3 |  |  | 1860.7 |  |
+| llama-3.2-3b-inst | oq4++ | f16 | ok | 45.5 | 43.3 |  |  | 1860.7 |  |
+| llama-3.2-3b-inst | oq4++ | kvarn | ok | 45.4 | 43.3 |  |  | 1860.7 |  |
+| llama-3.1-8b-inst | mq4+ | q8 | ok | 723.7 | 41.2 |  |  | 4558.5 |  |
+| llama-3.1-8b-inst | mq4+ | asym4 | ok | 773.7 | 43.7 |  |  | 4558.5 |  |
+| llama-3.1-8b-inst | mq4+ | f16 | ok | 780.1 | 43.7 |  |  | 4558.5 |  |
+| llama-3.1-8b-inst | mq4+ | kvarn | ok | 775.5 | 43.6 |  |  | 4558.5 |  |
+| llama-3.1-8b-inst | oq4+ | q8 | ok | 29.3 | 28.3 |  |  | 4382.6 |  |
+| llama-3.1-8b-inst | oq4+ | asym4 | ok | 29.4 | 28.4 |  |  | 4382.6 |  |
+| llama-3.1-8b-inst | oq4+ | f16 | ok | 29.4 | 28.4 |  |  | 4382.6 |  |
+| llama-3.1-8b-inst | oq4+ | kvarn | ok | 29.3 | 28.3 |  |  | 4382.6 |  |
+| llama-3.1-8b-inst | oq4++ | q8 | ok | 29.5 | 28.5 |  |  | 4380.1 |  |
+| llama-3.1-8b-inst | oq4++ | asym4 | ok | 29.5 | 28.5 |  |  | 4380.1 |  |
+| llama-3.1-8b-inst | oq4++ | f16 | ok | 29.5 | 28.5 |  |  | 4380.1 |  |
+| llama-3.1-8b-inst | oq4++ | kvarn | ok | 29.5 | 28.5 |  |  | 4380.1 |  |
