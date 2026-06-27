@@ -8,11 +8,11 @@ Speed is the `hipfire eval` speed battery (prefill / decode tok/s, fast tier). Q
 
 | System | Models | Working cells | Formats benched |
 |---|---:|---:|---|
-| gfx1151 — `apu_uma:gfx1151:0x1586:40cu:1gib:lpddr5:256bit:240gbps`, ROCm 7.13.60980-c76140fa27 | 14 | 240 | mq4, oq4, mq4+, oq4+, oq4++ |
+| gfx1151 — `apu_uma:gfx1151:0x1586:40cu:1gib:lpddr5:256bit:240gbps`, ROCm 7.13.60980-c76140fa27 | 14 | 244 | mq4, oq4, mq4+, oq4+, oq4++ |
 
 ## gfx1151
 
-KV-mode coverage: `q8` 60✓/10✗, `asym4` 60✓/10✗, `f16` 60✓/0✗, `kvarn` 60✓/0✗
+KV-mode coverage: `q8` 61✓/9✗, `asym4` 61✓/9✗, `f16` 61✓/0✗, `kvarn` 61✓/0✗
 
 ### Decode throughput (tok/s, q8 KV)
 
@@ -26,7 +26,7 @@ KV-mode coverage: `q8` 60✓/10✗, `asym4` 60✓/10✗, `f16` 60✓/0✗, `kvar
 | qwen3.5-2b | 113 | 108 | 113 | 107 | 107 |
 | llama-3.2-3b-inst | 56 | 44 | 55 | 43 | 43 |
 | qwen3.5-4b | 54 | 60 | 60 | 60 | 60 |
-| nemotron-4b | 38 |  |  |  |  |
+| nemotron-4b | 38 | 42 |  |  |  |
 | llama-3.1-8b-inst | 44 | 29 | 41 | 28 | 29 |
 | qwen3.5-9b | 40 | 38 | 41 | 38 | 38 |
 | lfm2.5-350m | 474 | 421 | 468 | 413 | 427 |
@@ -45,7 +45,7 @@ KV-mode coverage: `q8` 60✓/10✗, `asym4` 60✓/10✗, `f16` 60✓/0✗, `kvar
 | qwen3.5-2b | 3874 | 1919 | 3773 | 1939 | 1942 |
 | llama-3.2-3b-inst | 1458 | 46 | 1816 | 45 | 45 |
 | qwen3.5-4b | 964 | 1129 | 1288 | 1133 | 1114 |
-| nemotron-4b | 50 |  |  |  |  |
+| nemotron-4b | 50 | 76 |  |  |  |
 | llama-3.1-8b-inst | 756 | 30 | 724 | 29 | 30 |
 | qwen3.5-9b | 741 | 241 | 748 | 240 | 252 |
 | lfm2.5-350m | 3909 | 13579 | 3794 | 13579 | 14333 |
@@ -55,7 +55,6 @@ KV-mode coverage: `q8` 60✓/10✗, `asym4` 60✓/10✗, `f16` 60✓/0✗, `kvar
 <details><summary>Cells that don't load at q8 KV</summary>
 
 - `nemotron-4b` `mq4+`: calib generation failed
-- `nemotron-4b` `oq4`: daemon-backed speed executor failed: daemon load error: load failed: mamba-capable NemotronModel::from_hfq: nemotron hfq
 - `nemotron-4b` `oq4+`: calib generation failed
 - `nemotron-4b` `oq4++`: calib generation failed
 - `qwen3-0.6b` `mq4+`: calib generation failed

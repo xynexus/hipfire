@@ -147,8 +147,6 @@ Formats: mq4, oq4 (plain) + mq4+, oq4+ (AWQ) + oq4++ (LDLQ/Hessian).
 | llama-3.2-3b-inst | oq4 | asym4 | ok | 45.7 | 43.9 |  |  | 1860.7 |  |
 | llama-3.2-3b-inst | oq4 | f16 | ok | 45.7 | 43.8 |  |  | 1860.7 |  |
 | llama-3.2-3b-inst | oq4 | kvarn | ok | 45.7 | 43.8 |  |  | 1860.7 |  |
-| nemotron-4b | oq4 | q8 | fail |  |  |  |  | 3591.5 | daemon-backed speed executor failed: daemon load error: load failed: mamba-capable NemotronModel::from_hfq: nemotron hfq |
-| nemotron-4b | oq4 | asym4 | fail |  |  |  |  | 3591.5 | daemon-backed speed executor failed: daemon load error: load failed: mamba-capable NemotronModel::from_hfq: nemotron hfq |
 | nemotron-4b | oq4+ | q8 | fail |  |  |  |  |  | calib generation failed |
 | nemotron-4b | oq4+ | asym4 | fail |  |  |  |  |  | calib generation failed |
 | nemotron-4b | oq4++ | q8 | fail |  |  |  |  |  | calib generation failed |
@@ -265,3 +263,7 @@ Formats: mq4, oq4 (plain) + mq4+, oq4+ (AWQ) + oq4++ (LDLQ/Hessian).
 | llama-3.1-8b-inst | oq4++ | asym4 | ok | 29.5 | 28.5 |  |  | 4380.1 |  |
 | llama-3.1-8b-inst | oq4++ | f16 | ok | 29.5 | 28.5 |  |  | 4380.1 |  |
 | llama-3.1-8b-inst | oq4++ | kvarn | ok | 29.5 | 28.5 |  |  | 4380.1 |  |
+| nemotron-4b | oq4 | q8 | ok | 75.9 | 42.2 |  |  | 3591.5 |  |
+| nemotron-4b | oq4 | asym4 | ok | 76.1 | 42.2 |  |  | 3591.5 |  |
+| nemotron-4b | oq4 | f16 | ok | 75.7 | 42.3 |  |  | 3591.5 |  |
+| nemotron-4b | oq4 | kvarn | ok | 75.5 | 42.2 |  |  | 3591.5 |  |
