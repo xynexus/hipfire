@@ -4855,12 +4855,22 @@ fn main() {
                 let result: Result<hipfire_runtime::calibration::CalibSummary, String> = 'pick: {
                     if let Some(b) = m.zaya_backend.as_ref() {
                         break 'pick b.collect_calibration(
-                            &mut gpu, tokenizer, &tokens, kldref, out_path, &provenance,
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
                         );
                     }
                     if let Some(b) = m.gemma3_text.as_ref() {
                         break 'pick b.collect_calibration(
-                            &mut gpu, tokenizer, &tokens, kldref, out_path, &provenance,
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
                         );
                     }
                     #[cfg(feature = "arch-lfm2moe")]
@@ -4872,7 +4882,12 @@ fn main() {
                             config: c,
                         };
                         break 'pick be.collect_calibration(
-                            &mut gpu, tokenizer, &tokens, kldref, out_path, &provenance,
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
                         );
                     }
                     if let (Some(w), Some(c)) = (m.q35_weights.as_ref(), m.q35_config.as_ref()) {
@@ -4881,7 +4896,12 @@ fn main() {
                             config: c,
                         };
                         break 'pick be.collect_calibration(
-                            &mut gpu, tokenizer, &tokens, kldref, out_path, &provenance,
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
                         );
                     }
                     Err(format!(
@@ -4947,11 +4967,6 @@ fn main() {
                 }
                 let arch_id = m.arch_id;
                 let base_model = m.model_path.clone();
-                let n_vocab = if is_qwen {
-                    m.q35_config.as_ref().unwrap().vocab_size
-                } else {
-                    m.nemotron_backend.as_ref().unwrap().config().vocab_size
-                };
                 let cfg: hipfire_kld::KldConfig = msg
                     .get("config")
                     .and_then(|c| serde_json::from_value(c.clone()).ok())
