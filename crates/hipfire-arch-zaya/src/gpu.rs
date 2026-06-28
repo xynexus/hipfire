@@ -63,6 +63,16 @@ impl LinearWeight {
         }
     }
 
+    /// The backing GPU buffer (for activation-capture name mapping). During
+    /// calibration every linear is `F32` (bf16 model), but the `Quant` arm is
+    /// handled for completeness.
+    fn buf(&self) -> &GpuTensor {
+        match self {
+            LinearWeight::F32(t) => t,
+            LinearWeight::Quant(wt) => &wt.buf,
+        }
+    }
+
     /// Release the GPU storage.
     fn free(self, gpu: &mut Gpu) {
         match self {
@@ -752,6 +762,296 @@ pub fn gpu_forward_serve(
         let _ = gpu.free_tensor(t);
     }
     state.pos = s;
+    Ok(())
+}
+
+/// Map each dense linear's GPU buffer address → its canonical HFQ tensor name
+/// (sans `.weight`), for activation capture during calibration. Routed experts
+/// are intentionally excluded (LDLQ targets the dense projections; experts can
+/// be captured imatrix-only in a later pass). The tied `embed` doubles as the
+/// `lm_head`, keyed by `model.embed_tokens` (the name the quantizer sees).
+pub fn build_capture_names(w: &ZayaGpuWeights) -> std::collections::HashMap<usize, String> {
+    let mut m = std::collections::HashMap::new();
+    let mut put = |lw: &LinearWeight, name: String| {
+        m.insert(lw.buf().buf.as_ptr() as usize, name);
+    };
+    put(&w.embed, "model.embed_tokens".to_string());
+    for (l, lw) in w.layers.iter().enumerate() {
+        let p = format!("model.layers.{l}");
+        let qkv = format!("{p}.self_attn.qkv_proj");
+        let rmlp = format!("{p}.mlp.gate.router_mlp");
+        put(&lw.q_proj, format!("{qkv}.q_proj"));
+        put(&lw.k_proj, format!("{qkv}.k_proj"));
+        put(&lw.v_cur, format!("{qkv}.v_proj_current"));
+        put(&lw.v_del, format!("{qkv}.v_proj_delayed"));
+        put(&lw.o_proj, format!("{p}.self_attn.o_proj"));
+        put(&lw.down_proj_w, format!("{p}.mlp.gate.down_proj"));
+        put(&lw.fc1_w, format!("{rmlp}.fc1"));
+        put(&lw.fc2_w, format!("{rmlp}.fc2"));
+        put(&lw.out_proj_w, format!("{rmlp}.out_proj"));
+    }
+    m
+}
+
+/// Calibration forward: run the full prompt and call `maybe_capture_activation`
+/// before each dense gemv so the active `CalibCollector` accumulates `H = XᵀX`
+/// (+ diag) keyed by the names in [`build_capture_names`]. No KV/decode state,
+/// no logits output — just drives activations. The caller must set
+/// `gpu.capture_names`/`gpu.active_capture` around this.
+#[allow(clippy::needless_range_loop)]
+pub fn gpu_forward_calib(
+    gpu: &mut Gpu,
+    w: &ZayaGpuWeights,
+    cfg: &ZayaConfig,
+    ids: &[u32],
+) -> Result<(), String> {
+    let s = ids.len();
+    let h = cfg.hidden_size;
+    let a = &cfg.attn;
+    let (nq, nkv, hd) = (a.num_heads, a.num_kv_heads, a.head_dim);
+    let q_dim = nq * hd;
+    let k_dim = nkv * hd;
+    let v_half = k_dim / 2;
+    let conv_ch = q_dim + k_dim;
+    let rh = cfg.moe.router_hidden_size;
+    let n_route = cfg.moe.num_router_experts();
+    let n_exp = cfg.moe.num_experts;
+    let moe_int = cfg.moe.moe_intermediate_size;
+    let eps = cfg.rms_norm_eps;
+    let pad = (a.conv_depthwise_kernel - 1) + (a.conv_grouped_kernel - 1);
+    let dw_len = s + pad - a.conv_depthwise_kernel + 1;
+    let attn_scale = 1.0 / (hd as f32).sqrt();
+    let l2_scale = (hd as f32).sqrt();
+
+    let hidden = z2(gpu, s, h)?;
+    for t in 0..s {
+        let row = hidden.sub_offset(t * h, h);
+        w.embed.embed_lookup(gpu, &row, ids[t], h)?;
+    }
+    gpu.zaya_affine_input_f32(&hidden, &hidden, &w.in_scale, &w.in_bias, h, s * h)
+        .map_err(|e| format!("{e:?}"))?;
+
+    let normed = z2(gpu, s, h)?;
+    let q = z(gpu, s * q_dim)?;
+    let k = z(gpu, s * k_dim)?;
+    let vcur = z(gpu, s * v_half)?;
+    let vdel = z(gpu, s * v_half)?;
+    let qres = z(gpu, s * nq * hd)?;
+    let kres = z(gpu, s * nkv * hd)?;
+    let stream = z(gpu, conv_ch * (s + pad))?;
+    let dw = z(gpu, conv_ch * dw_len)?;
+    let gw = z(gpu, conv_ch * s)?;
+    let query = z(gpu, s * nq * hd)?;
+    let key = z(gpu, s * nkv * hd)?;
+    let value = z(gpu, s * nkv * hd)?;
+    let ctx = z(gpu, s * q_dim)?;
+    let attn_out = z(gpu, s * h)?;
+    let g_res2 = z2(gpu, s, h)?;
+    let rhid = z2(gpu, s, rh)?;
+    let rnormed = z2(gpu, s, rh)?;
+    let a1 = z2(gpu, s, rh)?;
+    let a2 = z2(gpu, s, rh)?;
+    let rlogits = z(gpu, s * n_route)?;
+    let moe_out = z(gpu, s * h)?;
+    let gate_up = z(gpu, 2 * moe_int)?;
+    let act = z(gpu, moe_int)?;
+    let down_t = z(gpu, h)?;
+    let router_state = z(gpu, s * rh)?;
+
+    for (li, lw) in w.layers.iter().enumerate() {
+        gpu.rmsnorm_f32(&hidden, &lw.input_ln, &normed, eps)
+            .map_err(|e| format!("{e:?}"))?;
+        // capture the q/k/v projection inputs (all = post-input-norm hidden).
+        gpu.maybe_capture_activation(lw.q_proj.buf(), &normed, s, h);
+        gpu.maybe_capture_activation(lw.k_proj.buf(), &normed, s, h);
+        gpu.maybe_capture_activation(lw.v_cur.buf(), &normed, s, h);
+        gpu.maybe_capture_activation(lw.v_del.buf(), &normed, s, h);
+        gemv_seq(gpu, &lw.q_proj, &normed, &q, s, q_dim, h)?;
+        gemv_seq(gpu, &lw.k_proj, &normed, &k, s, k_dim, h)?;
+        gemv_seq(gpu, &lw.v_cur, &normed, &vcur, s, v_half, h)?;
+        gemv_seq(gpu, &lw.v_del, &normed, &vdel, s, v_half, h)?;
+        gpu.zaya_qk_residual_f32(&qres, &kres, &q, &k, s, nq, nkv, hd, 0)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_qk_residual_f32(&qres, &kres, &q, &k, s, nq, nkv, hd, 1)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_qk_stream_f32(&stream, &q, &k, s, q_dim, k_dim, pad)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_conv1d_valid_f32(
+            &dw,
+            &stream,
+            &lw.conv_dw_w,
+            &lw.conv_dw_b,
+            conv_ch,
+            conv_ch,
+            a.conv_depthwise_kernel,
+            s + pad,
+            dw_len,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_conv1d_valid_f32(
+            &gw,
+            &dw,
+            &lw.conv_gr_w,
+            &lw.conv_gr_b,
+            conv_ch,
+            nq + nkv,
+            a.conv_grouped_kernel,
+            dw_len,
+            s,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_add_conv_residual_f32(&query, &gw, &qres, s, nq, hd, q_dim, 0)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_add_conv_residual_f32(&key, &gw, &kres, s, nkv, hd, q_dim, 1)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_value_compose_f32(&value, &vcur, &vdel, s, nkv, hd)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_qk_l2norm_temp_f32(&query, None, s, nq, hd, l2_scale, f32::EPSILON)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_qk_l2norm_temp_f32(&key, Some(&lw.qk_temp), s, nkv, hd, l2_scale, f32::EPSILON)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_rope_partial_f32(&query, s, nq, hd, a.n_rot, a.rope_theta, 0)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_rope_partial_f32(&key, s, nkv, hd, a.n_rot, a.rope_theta, 0)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_gqa_attn_f32(&ctx, &query, &key, &value, s, nq, nkv, hd, attn_scale)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.maybe_capture_activation(lw.o_proj.buf(), &ctx, s, q_dim);
+        gemv_seq(gpu, &lw.o_proj, &ctx, &attn_out, s, h, q_dim)?;
+        gpu.zaya_affine_residual_f32(
+            &g_res2,
+            &attn_out,
+            &hidden,
+            &lw.pa_rs[0],
+            &lw.pa_rs[1],
+            &lw.pa_rs[2],
+            &lw.pa_rs[3],
+            h,
+            s * h,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        gpu.rmsnorm_f32(&g_res2, &lw.post_attn_ln, &normed, eps)
+            .map_err(|e| format!("{e:?}"))?;
+        // MoE: capture the router projections (dense); experts run but aren't captured.
+        gpu.maybe_capture_activation(lw.down_proj_w.buf(), &normed, s, h);
+        gemv_seq(gpu, &lw.down_proj_w, &normed, &rhid, s, rh, h)?;
+        gpu.zaya_bias_add_f32(&rhid, &lw.down_proj_b, rh, s * rh)
+            .map_err(|e| format!("{e:?}"))?;
+        if li != 0 {
+            if let Some(scale) = lw.router_states_scale.as_ref() {
+                gpu.zaya_eda_add_f32(&rhid, &router_state, scale, rh, s * rh)
+                    .map_err(|e| format!("{e:?}"))?;
+            }
+        }
+        gpu.zaya_write_at_f32(&router_state, &rhid, 0, s * rh)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.rmsnorm_f32(&rhid, &lw.rnorm_w, &rnormed, eps)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.maybe_capture_activation(lw.fc1_w.buf(), &rnormed, s, rh);
+        gemv_seq(gpu, &lw.fc1_w, &rnormed, &a1, s, rh, rh)?;
+        gpu.zaya_bias_add_f32(&a1, &lw.fc1_b, rh, s * rh)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_gelu_exact_f32(&a1, s * rh)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.maybe_capture_activation(lw.fc2_w.buf(), &a1, s, rh);
+        gemv_seq(gpu, &lw.fc2_w, &a1, &a2, s, rh, rh)?;
+        gpu.zaya_bias_add_f32(&a2, &lw.fc2_b, rh, s * rh)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.zaya_gelu_exact_f32(&a2, s * rh)
+            .map_err(|e| format!("{e:?}"))?;
+        gpu.maybe_capture_activation(lw.out_proj_w.buf(), &a2, s, rh);
+        gemv_seq(gpu, &lw.out_proj_w, &a2, &rlogits, s, n_route, rh)?;
+        let logit_host = gpu.download_f32(&rlogits).map_err(|e| format!("{e:?}"))?;
+        gpu.fill_f32(&moe_out, 0.0).map_err(|e| format!("{e:?}"))?;
+        for t in 0..s {
+            let row = &logit_host[t * n_route..(t + 1) * n_route];
+            let maxv = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut probs = vec![0f32; n_route];
+            let mut denom = 0f32;
+            for e in 0..n_route {
+                probs[e] = (row[e] - maxv).exp();
+                denom += probs[e];
+            }
+            for p in probs.iter_mut() {
+                *p /= denom;
+            }
+            let mut best = 0usize;
+            let mut bestv = f32::NEG_INFINITY;
+            for e in 0..n_route {
+                let v = probs[e] + lw.balancing_biases[e];
+                if v > bestv {
+                    bestv = v;
+                    best = e;
+                }
+            }
+            if best == n_exp {
+                continue;
+            }
+            let weight = probs[best];
+            let xt = normed.sub_offset(t * h, h);
+            let ex = &lw.experts[best];
+            ex.gate_up.gemv(gpu, &xt, &gate_up)?;
+            let g = gate_up.sub_offset(0, moe_int);
+            let u = gate_up.sub_offset(moe_int, moe_int);
+            gpu.silu_mul_f32(&g, &u, &act)
+                .map_err(|e| format!("{e:?}"))?;
+            ex.down.gemv(gpu, &act, &down_t)?;
+            let ot = moe_out.sub_offset(t * h, h);
+            gpu.scaled_add_inplace_cpu_scalar_f32(&ot, &down_t, weight)
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        gpu.zaya_affine_residual_f32(
+            &hidden,
+            &moe_out,
+            &g_res2,
+            &lw.pm_rs[0],
+            &lw.pm_rs[1],
+            &lw.pm_rs[2],
+            &lw.pm_rs[3],
+            h,
+            s * h,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+    }
+
+    let fnorm = z2(gpu, s, h)?;
+    gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps)
+        .map_err(|e| format!("{e:?}"))?;
+    // capture the tied lm_head input (no gemv needed for calibration).
+    gpu.maybe_capture_activation(w.embed.buf(), &fnorm, s, h);
+
+    for t in [
+        hidden,
+        normed,
+        q,
+        k,
+        vcur,
+        vdel,
+        qres,
+        kres,
+        stream,
+        dw,
+        gw,
+        query,
+        key,
+        value,
+        ctx,
+        attn_out,
+        g_res2,
+        rhid,
+        rnormed,
+        a1,
+        a2,
+        rlogits,
+        moe_out,
+        gate_up,
+        act,
+        down_t,
+        router_state,
+        fnorm,
+    ] {
+        let _ = gpu.free_tensor(t);
+    }
     Ok(())
 }
 

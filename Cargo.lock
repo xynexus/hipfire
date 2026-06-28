@@ -1729,6 +1729,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-zaya",
  "hipfire-atlas",
  "hipfire-coherence",
  "hipfire-detect",
