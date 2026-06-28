@@ -665,7 +665,7 @@ pub fn load_model(
 
     if hfq.arch_id == 16 {
         // ZAYA1 (CCA attention + EDA/MoD-routed MoE). Served through the shared
-        // ServingBackend seam on ZayaModel (re-prefill decode bring-up).
+        // ServingBackend seam on ZayaModel (O(1) KV-cache decode).
         if draft_path.is_some() {
             return Err("DFlash not supported on arch_id=16 (zaya).".to_string());
         }

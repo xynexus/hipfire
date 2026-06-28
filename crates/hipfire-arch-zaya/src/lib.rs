@@ -184,6 +184,11 @@ impl ZayaConfig {
                 raw.moe_router_topk
             ));
         }
+        // The forward implements full causal attention only; reject sliding-window
+        // (`hybrid_sliding`) checkpoints rather than silently computing full attn.
+        if raw.sliding_window.is_some() {
+            return Err("zaya config: sliding-window attention is not implemented".to_string());
+        }
 
         let is_megatron = raw.ffn_hidden_size.is_some();
         let num_blocks = if is_megatron {

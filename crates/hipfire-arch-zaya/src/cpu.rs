@@ -64,8 +64,20 @@ pub fn forward_cpu(w: &ZayaWeights, cfg: &ZayaConfig, input_ids: &[u32]) -> Forw
         let normed = rmsnorm(&hidden, &lw.input_layernorm, s, h, cfg.rms_norm_eps);
         let attn_out = cca_attention(&normed, lw, cfg, &rope, s);
         // residual = post_attention_residual_scale(attn_out, residual)
-        let residual = residual_scale(&attn_out, &residual, &lw.post_attention_residual_scale, s, h);
-        let normed = rmsnorm(&residual, &lw.post_attention_layernorm, s, h, cfg.rms_norm_eps);
+        let residual = residual_scale(
+            &attn_out,
+            &residual,
+            &lw.post_attention_residual_scale,
+            s,
+            h,
+        );
+        let normed = rmsnorm(
+            &residual,
+            &lw.post_attention_layernorm,
+            s,
+            h,
+            cfg.rms_norm_eps,
+        );
         let (moe_out, idx, next_state) = moe(&normed, lw, cfg, l, router_state.as_deref(), s);
         router_state = Some(next_state);
         // hidden = post_mlp_residual_scale(moe_out, residual)
@@ -91,7 +103,14 @@ pub fn forward_cpu(w: &ZayaWeights, cfg: &ZayaConfig, input_ids: &[u32]) -> Forw
 // ── primitives ───────────────────────────────────────────────────────────────
 
 /// `y[t,o] = sum_i x[t,i] * w[o,i] (+ bias[o])`. weight is row-major `[out, in]`.
-fn linear(x: &[f32], s: usize, w: &[f32], out: usize, in_: usize, bias: Option<&[f32]>) -> Vec<f32> {
+fn linear(
+    x: &[f32],
+    s: usize,
+    w: &[f32],
+    out: usize,
+    in_: usize,
+    bias: Option<&[f32]>,
+) -> Vec<f32> {
     let mut y = vec![0f32; s * out];
     for t in 0..s {
         let xt = &x[t * in_..(t + 1) * in_];
@@ -186,7 +205,12 @@ impl RopeTables {
                 sin[p * half + i] = ang.sin() as f32;
             }
         }
-        Self { cos, sin, n_rot, half }
+        Self {
+            cos,
+            sin,
+            n_rot,
+            half,
+        }
     }
 
     /// Apply half-split partial rotary in-place to one head vector `v[head_dim]`
@@ -339,7 +363,11 @@ fn cca_attention(
     for t in 0..s {
         for d in 0..v_half {
             value[(t * nkv + 0) * hd + d] = v_cur[t * v_half + d];
-            value[(t * nkv + 1) * hd + d] = if t == 0 { 0.0 } else { v_del[(t - 1) * v_half + d] };
+            value[(t * nkv + 1) * hd + d] = if t == 0 {
+                0.0
+            } else {
+                v_del[(t - 1) * v_half + d]
+            };
         }
     }
 
@@ -360,7 +388,10 @@ fn cca_attention(
     // Partial rotary on q and k.
     for t in 0..s {
         for head in 0..nq {
-            rope.apply(&mut query[(t * nq + head) * hd..(t * nq + head + 1) * hd], t);
+            rope.apply(
+                &mut query[(t * nq + head) * hd..(t * nq + head + 1) * hd],
+                t,
+            );
         }
         for kh in 0..nkv {
             rope.apply(&mut key[(t * nkv + kh) * hd..(t * nkv + kh + 1) * hd], t);

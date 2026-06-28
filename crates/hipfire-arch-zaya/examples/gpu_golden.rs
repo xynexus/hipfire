@@ -31,11 +31,15 @@ fn read_bin(path: &Path) -> (Vec<usize>, Vec<u8>) {
 }
 fn read_f32(dir: &Path, name: &str) -> Vec<f32> {
     let (_, data) = read_bin(&dir.join(format!("{name}.bin")));
-    data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    data.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 fn read_i32(dir: &Path, name: &str) -> Vec<i32> {
     let (_, data) = read_bin(&dir.join(format!("{name}.bin")));
-    data.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    data.chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
@@ -49,8 +53,12 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let hfq_path = args.next().unwrap_or_else(|| "/home/sadara/zaya1-8b-native.bf16.hfq".to_string());
-    let golden_dir = args.next().unwrap_or_else(|| "/home/sadara/zaya1-8b-native/golden/raw_fp32".to_string());
+    let hfq_path = args
+        .next()
+        .unwrap_or_else(|| "/home/sadara/zaya1-8b-native.bf16.hfq".to_string());
+    let golden_dir = args
+        .next()
+        .unwrap_or_else(|| "/home/sadara/zaya1-8b-native/golden/raw_fp32".to_string());
     let golden = Path::new(&golden_dir);
 
     eprintln!("opening hfq {hfq_path}");
@@ -58,14 +66,20 @@ fn main() {
     let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).expect("metadata");
     let cfg_json = meta.get("config").unwrap_or(&meta);
     let cfg = ZayaConfig::from_json(cfg_json).expect("zaya config");
-    eprintln!("config: blocks={} hidden={} experts={}", cfg.num_blocks, cfg.hidden_size, cfg.moe.num_experts);
+    eprintln!(
+        "config: blocks={} hidden={} experts={}",
+        cfg.num_blocks, cfg.hidden_size, cfg.moe.num_experts
+    );
 
     let mut gpu = Gpu::init().expect("gpu init");
     eprintln!("loading weights to GPU (f32)...");
     let w = ZayaGpuWeights::load(&hfq, &mut gpu, &cfg).expect("load gpu weights");
     eprintln!("loaded.");
 
-    let ids: Vec<u32> = read_i32(golden, "input_ids").into_iter().map(|x| x as u32).collect();
+    let ids: Vec<u32> = read_i32(golden, "input_ids")
+        .into_iter()
+        .map(|x| x as u32)
+        .collect();
     eprintln!("input_ids = {ids:?}");
     let trace = gpu_forward_prefill(&mut gpu, &w, &cfg, &ids).expect("gpu forward");
 
@@ -80,17 +94,42 @@ fn main() {
         }
         println!("block_{l:<2} : cos={c:.6}");
     }
-    println!("final_norm   : cos={:.6}", cosine(&trace.final_norm, &read_f32(golden, "final_norm")));
+    println!(
+        "final_norm   : cos={:.6}",
+        cosine(&trace.final_norm, &read_f32(golden, "final_norm"))
+    );
     let glog = read_f32(golden, "logits");
     println!("logits       : cos={:.6}", cosine(&trace.logits, &glog));
     let vocab = cfg.vocab_size;
     let last = trace.seq - 1;
-    let am = |r: &[f32]| r.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0;
+    let am = |r: &[f32]| {
+        r.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| {
+                if v > b.1 {
+                    (i, v)
+                } else {
+                    b
+                }
+            })
+            .0
+    };
     println!(
         "next-token argmax: mine={} golden={} {}",
         am(&trace.logits[last * vocab..(last + 1) * vocab]),
         am(&glog[last * vocab..(last + 1) * vocab]),
-        if am(&trace.logits[last * vocab..(last + 1) * vocab]) == am(&glog[last * vocab..(last + 1) * vocab]) { "MATCH" } else { "MISMATCH" }
+        if am(&trace.logits[last * vocab..(last + 1) * vocab])
+            == am(&glog[last * vocab..(last + 1) * vocab])
+        {
+            "MATCH"
+        } else {
+            "MISMATCH"
+        }
     );
-    println!("\nworst block cosine: block_{} = {:.6}  {}", worst.1, worst.0, if worst.0 >= 0.999 { "PASS" } else { "FAIL" });
+    println!(
+        "\nworst block cosine: block_{} = {:.6}  {}",
+        worst.1,
+        worst.0,
+        if worst.0 >= 0.999 { "PASS" } else { "FAIL" }
+    );
 }

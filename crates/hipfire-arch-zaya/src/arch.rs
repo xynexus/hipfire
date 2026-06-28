@@ -4,9 +4,9 @@
 
 //! Serving seam for `zaya` (arch_id 16): `SimpleAr` + `ServingBackend` on
 //! [`ZayaModel`], routing through the shared `run_simple_ar` → prefill →
-//! decode loop (the same dense-AR seam as Llama/Nemotron). Bring-up decode
-//! re-prefills the growing sequence each step (KV/conv/router-state decode is
-//! the later optimization); each step leaves the last-position logits in
+//! decode loop (the same dense-AR seam as Llama/Nemotron). `prefill` primes the
+//! per-layer `ZayaDecodeState` (KV cache + conv ring + delayed value); each
+//! `decode_step` advances one token in O(1), leaving the last-position logits in
 //! `self.logits` for the daemon sampler.
 
 use crate::gpu::{gpu_decode, gpu_forward_serve, ZayaDecodeState, ZayaGpuWeights};
@@ -31,13 +31,23 @@ pub struct ZayaModel {
 impl ZayaModel {
     /// Load weights from an HFQ onto the GPU and allocate the decode state +
     /// logits buffer. `max_seq` bounds the KV cache.
-    pub fn from_hfq(gpu: &mut Gpu, hfq: &HfqFile, cfg: ZayaConfig, max_seq: usize) -> Result<Self, String> {
+    pub fn from_hfq(
+        gpu: &mut Gpu,
+        hfq: &HfqFile,
+        cfg: ZayaConfig,
+        max_seq: usize,
+    ) -> Result<Self, String> {
         let weights = ZayaGpuWeights::load(hfq, gpu, &cfg)?;
         let state = ZayaDecodeState::new(gpu, &cfg, max_seq)?;
         let logits = gpu
             .zeros(&[cfg.vocab_size], DType::F32)
             .map_err(|e| format!("zaya logits alloc: {e:?}"))?;
-        Ok(Self { weights, cfg, state, logits })
+        Ok(Self {
+            weights,
+            cfg,
+            state,
+            logits,
+        })
     }
 
     pub fn config(&self) -> &ZayaConfig {
@@ -50,11 +60,25 @@ impl SimpleAr for ZayaModel {
         if tokens.is_empty() {
             return Err("zaya prefill: empty prompt".to_string());
         }
-        gpu_forward_serve(gpu, &self.weights, &self.cfg, tokens, &mut self.state, &self.logits)
+        gpu_forward_serve(
+            gpu,
+            &self.weights,
+            &self.cfg,
+            tokens,
+            &mut self.state,
+            &self.logits,
+        )
     }
 
     fn decode_step(&mut self, gpu: &mut Gpu, token: u32, _pos: usize) -> Result<(), String> {
-        gpu_decode(gpu, &self.weights, &self.cfg, token, &mut self.state, &self.logits)
+        gpu_decode(
+            gpu,
+            &self.weights,
+            &self.cfg,
+            token,
+            &mut self.state,
+            &self.logits,
+        )
     }
 
     fn logits(&self) -> &GpuTensor {
@@ -94,7 +118,10 @@ impl ServingBackend for ZayaModel {
         Ok(())
     }
 
-    fn unload(self: Box<Self>, _gpu: &mut Gpu) {
-        // GPU buffers are released when the pool drains on shutdown.
+    fn unload(self: Box<Self>, gpu: &mut Gpu) {
+        let m = *self;
+        m.weights.free(gpu);
+        m.state.free(gpu);
+        let _ = gpu.free_tensor(m.logits);
     }
 }

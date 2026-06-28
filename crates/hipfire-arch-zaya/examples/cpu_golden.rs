@@ -60,7 +60,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 fn main() {
@@ -134,10 +137,24 @@ fn main() {
     // next-token argmax agreement at last position.
     let vocab = lshape[lshape.len() - 1];
     let last = trace.seq - 1;
-    let argmax = |row: &[f32]| row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0;
+    let argmax = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| {
+                if v > b.1 {
+                    (i, v)
+                } else {
+                    b
+                }
+            })
+            .0
+    };
     let mine = argmax(&trace.logits[last * vocab..(last + 1) * vocab]);
     let theirs = argmax(&g_log[last * vocab..(last + 1) * vocab]);
-    println!("next-token argmax: mine={mine} golden={theirs} {}", if mine == theirs { "MATCH" } else { "MISMATCH" });
+    println!(
+        "next-token argmax: mine={mine} golden={theirs} {}",
+        if mine == theirs { "MATCH" } else { "MISMATCH" }
+    );
 
     println!("\nworst block cosine: block_{} = {:.6}", worst.1, worst.0);
     if worst.0 >= 0.999 {
