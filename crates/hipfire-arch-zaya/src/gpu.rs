@@ -14,7 +14,8 @@
 use crate::ZayaConfig;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
+use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::WeightTensor;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -27,6 +28,150 @@ fn linear_dtype(qt: u8) -> Option<DType> {
         7 => Some(DType::HFQ4G128),
         13 => Some(DType::MQ4G256), // MagnumQuant 4-bit
         15 => Some(DType::MQ6G256), // MagnumQuant 6-bit (zaya experts under --format mq4)
+        _ => None,
+    }
+}
+
+// ─── Opus-Quant (OQ4/OQ8) repack-on-load ─────────────────────────────────────
+// The OQ formats are WMMA-gated (halo/gfx1151). Unlike the verbatim-upload quant
+// formats above, the on-disk OQ block layout must be transformed to the kernel's
+// combined buffer at load time. These helpers mirror `hipfire-arch-gemma3`'s
+// `weights.rs` byte-for-byte so the layout cannot drift between arches.
+
+fn sext4(nib: u8) -> i8 {
+    let v = (nib & 0xf) as i8;
+    if v > 7 {
+        v - 16
+    } else {
+        v
+    }
+}
+
+/// Byte length of the arch-combined OQ4 buffer (`oq4_pack_arch_combined` output /
+/// `oq4_repack` quant_type 37 on-disk form): packed nibbles [M,K/2] + f32 scales
+/// [M,ng] + interleaved (scale,nibbles) block [M,ng,132].
+fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
+    let ng = k / 256;
+    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
+}
+
+/// Canonical OQ4 (qt 34): `[f16 scale][128 nibbles]` per 256-group → the arch
+/// combined device layout (split nibbles + f32 scales + interleaved region for
+/// the decode GEMV). Forward derives the scale/interleaved pointers via
+/// `sub_offset`; feeds `gemm_oq4_grouped_wmma`.
+fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
+    const ILB: usize = 132; // 4 (f32 scale) + 128 nibbles, interleaved
+    assert_eq!(k % GROUP, 0, "OQ4 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let packed_bytes = m * (k / 2);
+    let scales_bytes = m * ng * 4;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OQ4 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut out = vec![0u8; packed_bytes + scales_bytes + m * ng * ILB];
+    let scales_base = packed_bytes;
+    let il_base = packed_bytes + scales_bytes;
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let nib_dst = r * (k / 2) + g * (GROUP / 2);
+            out[nib_dst..nib_dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let scale_dst = scales_base + (r * ng + g) * 4;
+            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
+            let il_dst = il_base + (r * ng + g) * ILB;
+            out[il_dst..il_dst + 4].copy_from_slice(&scale.to_le_bytes());
+            out[il_dst + 4..il_dst + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
+        }
+    }
+    out
+}
+
+/// OQ+ / Opus-Plus W4A8 (qt 33): on-disk bytes are IDENTICAL to OQ4, but the
+/// nibbles are EXPANDED to int8 and tagged Oq8G256 so the W8A8 kernel runs with
+/// int8 activations (weight values stay 4-bit). Layout = `[int8 M*K | f32 scales
+/// M*ng]`.
+fn oq4_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 130;
+    assert_eq!(k % GROUP, 0, "OQ4→8 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OQ4→8 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut combined = vec![0u8; m * k + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let dst = r * k + g * GROUP;
+            for i in 0..128 {
+                let byte = data[src + 2 + i];
+                combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
+                combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
+            }
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let so = m * k + (r * ng + g) * 4;
+            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    combined
+}
+
+/// Canonical OQ8 (qt 35): `[f16 scale][256 int8]` per 256-group → `[int8 M*K |
+/// f32 scales M*ng]` for `gemm_oq8_grouped_wmma`.
+fn oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 258; // 2 (f16 scale) + 256 int8
+    assert_eq!(k % GROUP, 0, "OQ8 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OQ8 weight byte length {} != M*ng*258 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut combined = vec![0u8; m * k + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let dst = r * k + g * GROUP;
+            combined[dst..dst + GROUP].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let so = m * k + (r * ng + g) * 4;
+            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    combined
+}
+
+/// Repack an OQ-family on-disk tensor to its kernel buffer + gpu_dtype, or `None`
+/// for non-OQ quant_types (handled by `linear_dtype` verbatim upload / f32).
+/// qt 33=OQ+ (W4A8), 34=OQ4 (W4A4), 35=OQ8 (W8A8), 37=arch-packed OQ4 (verbatim).
+fn oq_repack(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, DType)> {
+    match qt {
+        33 => Some((oq4_to_oq8_combined(data, m, k), DType::Oq8G256)),
+        34 => Some((oq4_pack_arch_combined(data, m, k), DType::Oq4G256)),
+        35 => Some((oq8_combined(data, m, k), DType::Oq8G256)),
+        37 => {
+            assert_eq!(
+                data.len(),
+                oq4_arch_combined_len(m, k),
+                "OQ4 arch-packed byte length {} != combined len (M={m} K={k})",
+                data.len()
+            );
+            Some((data.to_vec(), DType::Oq4G256))
+        }
         _ => None,
     }
 }
@@ -123,11 +268,24 @@ fn load_linear(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> Result<LinearWeight,
     let (_, data) = hfq
         .tensor_data_vec(name)
         .ok_or_else(|| format!("zaya gpu: no data for {name:?}"))?;
-    if let Some(dtype) = linear_dtype(qt) {
-        let buf = gpu
-            .upload_raw(&data, &[data.len()])
-            .map_err(|e| format!("zaya upload {name}: {e:?}"))?;
-        Ok(LinearWeight::Quant(Box::new(WeightTensor {
+    // OQ-family (33/34/35/37) repacks on load; the verbatim formats upload as-is
+    // (no clone — the large Q8 embedding uploads straight from `data`).
+    let buf_dtype: Option<(GpuTensor, DType)> =
+        if let Some((bytes, dtype)) = oq_repack(qt, &data, m, k) {
+            let buf = gpu
+                .upload_raw(&bytes, &[bytes.len()])
+                .map_err(|e| format!("zaya upload {name}: {e:?}"))?;
+            Some((buf, dtype))
+        } else if let Some(dtype) = linear_dtype(qt) {
+            let buf = gpu
+                .upload_raw(&data, &[data.len()])
+                .map_err(|e| format!("zaya upload {name}: {e:?}"))?;
+            Some((buf, dtype))
+        } else {
+            None
+        };
+    if let Some((buf, dtype)) = buf_dtype {
+        let mut wt = WeightTensor {
             buf,
             gpu_dtype: dtype,
             m,
@@ -135,7 +293,13 @@ fn load_linear(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> Result<LinearWeight,
             row_stride: 0,
             paro: None,
             awq_scale: None,
-        })))
+        };
+        // The OQ `+`/`++` calibration writes a per-channel `<name>.awq_scale`
+        // sidecar; the gemv (`dispatch_ref`) divides x by it before the rotation.
+        if wt.gpu_dtype.supports_awq_sidecar() {
+            wt.awq_scale = load_awq_scale(hfq, gpu, name, k);
+        }
+        Ok(LinearWeight::Quant(Box::new(wt)))
     } else {
         let f = dequant_qt(qt, &data)?;
         let g = gpu
@@ -1601,4 +1765,92 @@ pub fn gpu_forward_prefill(
         logits: logits_host,
         seq: s,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // f16 1.0 = 0x3C00; little-endian on-disk.
+    const F16_ONE: [u8; 2] = [0x00, 0x3C];
+
+    #[test]
+    fn oq8_combined_layout() {
+        // m=1, k=256, ng=1. On-disk block = [f16 scale][256 int8].
+        let mut data = Vec::new();
+        data.extend_from_slice(&F16_ONE);
+        for i in 0..256u32 {
+            data.push((i as i8).wrapping_sub(8) as u8); // arbitrary signed pattern
+        }
+        let out = oq8_combined(&data, 1, 256);
+        // Combined = [int8 weights M*K][f32 scales M*ng].
+        assert_eq!(out.len(), 256 + 4);
+        assert_eq!(&out[..256], &data[2..258]); // int8 copied verbatim
+        assert_eq!(
+            f32::from_le_bytes([out[256], out[257], out[258], out[259]]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn oq4_pack_and_oq8_expand_layout() {
+        // m=1, k=256, ng=1. On-disk block = [f16 scale][128 nibbles].
+        let mut data = Vec::new();
+        data.extend_from_slice(&F16_ONE);
+        // nibble byte 0x21 → lo=1, hi=2 (both positive, no sign-extend wrap).
+        let nibbles: Vec<u8> = (0..128).map(|i| 0x21u8 ^ (i as u8)).collect();
+        data.extend_from_slice(&nibbles);
+
+        // OQ4 arch-combined: packed nibbles [k/2] + scales [ng*4] + interleaved [ng*132].
+        let oq4 = oq4_pack_arch_combined(&data, 1, 256);
+        assert_eq!(oq4.len(), oq4_arch_combined_len(1, 256));
+        assert_eq!(&oq4[..128], nibbles.as_slice()); // packed region = raw nibbles
+        let scales_base = 128;
+        assert_eq!(
+            f32::from_le_bytes([
+                oq4[scales_base],
+                oq4[scales_base + 1],
+                oq4[scales_base + 2],
+                oq4[scales_base + 3],
+            ]),
+            1.0
+        );
+        // Interleaved region: [f32 scale][128 nibbles].
+        let il = scales_base + 4;
+        assert_eq!(&oq4[il + 4..il + 132], nibbles.as_slice());
+
+        // OQ4→OQ8 expand: each nibble sign-extended to one int8, [int8 K][f32 scale].
+        let oq8 = oq4_to_oq8_combined(&data, 1, 256);
+        assert_eq!(oq8.len(), 256 + 4);
+        for (i, &nib_byte) in nibbles.iter().enumerate() {
+            assert_eq!(oq8[2 * i] as i8, sext4(nib_byte & 0xf));
+            assert_eq!(oq8[2 * i + 1] as i8, sext4(nib_byte >> 4));
+        }
+    }
+
+    #[test]
+    fn oq_repack_dispatch_and_dtype() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&F16_ONE);
+        data.extend_from_slice(&vec![0u8; 128]);
+        assert!(matches!(
+            oq_repack(34, &data, 1, 256),
+            Some((_, DType::Oq4G256))
+        ));
+        assert!(matches!(
+            oq_repack(33, &data, 1, 256),
+            Some((_, DType::Oq8G256))
+        ));
+        // qt 35 needs the 258-byte block; 33/34 use the 130-byte block.
+        let mut data8 = Vec::new();
+        data8.extend_from_slice(&F16_ONE);
+        data8.extend_from_slice(&vec![0u8; 256]);
+        assert!(matches!(
+            oq_repack(35, &data8, 1, 256),
+            Some((_, DType::Oq8G256))
+        ));
+        // Non-OQ quant_types fall through to linear_dtype / dequant.
+        assert!(oq_repack(13, &data, 1, 256).is_none());
+        assert!(oq_repack(3, &data, 1, 256).is_none());
+    }
 }
