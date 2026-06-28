@@ -5005,35 +5005,74 @@ fn main() {
                 } else {
                     Vec::new()
                 };
-                // Arch-agnostic forward seam: every AR backend via the blanket
-                // SimpleAr impl, qwen3.5 via its adapter. All arches equal.
+                // Arch-agnostic forward seam: owned AR backends ride the blanket
+                // SimpleAr impl; loose-slot arches (qwen3.5, lfm2moe, deepseek4,
+                // minimax) go through their `*KldForward` adapter. All arches
+                // equal. Probe order matches the resident slot layout; the
+                // labeled block keeps the lfm2moe `#[cfg]` arm clean.
                 use hipfire_runtime::kld_eval::ChunkScoredForward;
-                let mut fwd: Box<dyn ChunkScoredForward + '_> = if let Some(b) =
-                    m.zaya_backend.as_mut()
-                {
-                    Box::new(b as &mut dyn ChunkScoredForward)
-                } else if let Some(b) = m.gemma3_text.as_mut() {
-                    Box::new(b as &mut dyn ChunkScoredForward)
-                } else if let Some(b) = m.gemma3_vl.as_mut() {
-                    Box::new(b as &mut dyn ChunkScoredForward)
-                } else if let Some(b) = m.qwen2_backend.as_mut() {
-                    Box::new(b as &mut dyn ChunkScoredForward)
-                } else if let Some(b) = m.nemotron_backend.as_mut() {
-                    Box::new(b as &mut dyn ChunkScoredForward)
-                } else if let Some(b) = m.llama_backend.as_mut() {
-                    Box::new(b as &mut dyn ChunkScoredForward)
-                } else if let (Some(w), Some(c)) = (m.q35_weights.as_ref(), m.q35_config.as_ref()) {
-                    Box::new(qwen35::Qwen35KldForward {
-                        weights: w,
-                        config: c,
-                    })
-                } else {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        format!("kld_eval: arch_id {arch_id} has no KLD-scorable backend"),
-                    );
-                    continue;
+                let fwd_opt: Option<Box<dyn ChunkScoredForward + '_>> = 'pick: {
+                    if let Some(b) = m.zaya_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.gemma3_text.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.gemma3_vl.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.qwen2_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.nemotron_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.llama_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let (Some(w), Some(c)) =
+                        (m.deepseek4_weights.as_ref(), m.deepseek4_config.as_ref())
+                    {
+                        break 'pick Some(Box::new(deepseek4::kld::DeepseekV4KldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    if let (Some(w), Some(c)) =
+                        (m.minimax_weights.as_ref(), m.minimax_config.as_ref())
+                    {
+                        break 'pick Some(Box::new(minimax::kld::MiniMaxKldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    #[cfg(feature = "arch-lfm2moe")]
+                    if let (Some(w), Some(c)) =
+                        (m.lfm2moe_weights.as_ref(), m.lfm2moe_config.as_ref())
+                    {
+                        break 'pick Some(Box::new(lfm2moe::kld::Lfm2MoeKldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    if let (Some(w), Some(c)) = (m.q35_weights.as_ref(), m.q35_config.as_ref()) {
+                        break 'pick Some(Box::new(qwen35::Qwen35KldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    None
+                };
+                let mut fwd = match fwd_opt {
+                    Some(f) => f,
+                    None => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("kld_eval: arch_id {arch_id} has no KLD-scorable backend"),
+                        );
+                        continue;
+                    }
                 };
                 let n_vocab = fwd.kld_vocab_size();
 
