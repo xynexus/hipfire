@@ -5085,6 +5085,39 @@ fn forward_chunk_scored(
     Ok(())
 }
 
+/// Adapter making a resident Qwen3.5 (the loose `weights`+`config` slots, which
+/// don't implement [`hipfire_runtime::arch::SimpleAr`]) KLD-scorable through the
+/// generic [`hipfire_runtime::kld_eval`] driver — reusing the per-token
+/// `forward_chunk_scored` path above. Every other arch gets the blanket impl.
+pub struct Qwen35KldForward<'a> {
+    pub weights: &'a Qwen35Weights,
+    pub config: &'a Qwen35Config,
+}
+
+impl hipfire_runtime::kld_eval::ChunkScoredForward for Qwen35KldForward<'_> {
+    fn forward_chunk_scored(
+        &mut self,
+        gpu: &mut Gpu,
+        chunk: &[u32],
+        scoring_start: usize,
+        at_scored: &mut dyn FnMut(usize, &[f32], usize),
+    ) -> Result<(), String> {
+        forward_chunk_scored(
+            gpu,
+            self.weights,
+            self.config,
+            chunk,
+            scoring_start,
+            |j, lg, next| at_scored(j, lg, next),
+        )
+        .map_err(|e| format!("qwen35 kld forward: {e:?}"))
+    }
+
+    fn kld_vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+}
+
 /// Self-consistency KLD against the resident model, no reload.
 ///
 /// Pass 1 builds a reference (top-K log-softmax per scored position) from the
