@@ -17,12 +17,23 @@ use rdna_compute::Gpu;
 use std::path::Path;
 
 fn argmax(v: &[f32]) -> usize {
-    v.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0
+    v.iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| {
+            if x > b.1 {
+                (i, x)
+            } else {
+                b
+            }
+        })
+        .0
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let hfq_path = args.next().unwrap_or_else(|| "/home/sadara/zaya1-8b-native.mq4.hfq".to_string());
+    let hfq_path = args
+        .next()
+        .unwrap_or_else(|| "/home/sadara/zaya1-8b-native.mq4.hfq".to_string());
     let ntok: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(40);
 
     let hfq = HfqFile::open(Path::new(&hfq_path)).expect("open hfq");

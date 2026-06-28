@@ -789,6 +789,11 @@ pub fn build_capture_names(w: &ZayaGpuWeights) -> std::collections::HashMap<usiz
         put(&lw.fc1_w, format!("{rmlp}.fc1"));
         put(&lw.fc2_w, format!("{rmlp}.fc2"));
         put(&lw.out_proj_w, format!("{rmlp}.out_proj"));
+        // Routed experts (imatrix-only — sparse under top-1, so no full Hessian).
+        for (e, ex) in lw.experts.iter().enumerate() {
+            put(&ex.gate_up, format!("{p}.mlp.experts.{e}.gate_up_proj"));
+            put(&ex.down, format!("{p}.mlp.experts.{e}.down_proj"));
+        }
     }
     m
 }
@@ -990,11 +995,13 @@ pub fn gpu_forward_calib(
             let weight = probs[best];
             let xt = normed.sub_offset(t * h, h);
             let ex = &lw.experts[best];
+            gpu.maybe_capture_activation(ex.gate_up.buf(), &xt, 1, h); // no-op unless calibrating
             ex.gate_up.gemv(gpu, &xt, &gate_up)?;
             let g = gate_up.sub_offset(0, moe_int);
             let u = gate_up.sub_offset(moe_int, moe_int);
             gpu.silu_mul_f32(&g, &u, &act)
                 .map_err(|e| format!("{e:?}"))?;
+            gpu.maybe_capture_activation(ex.down.buf(), &act, 1, moe_int); // no-op unless calibrating
             ex.down.gemv(gpu, &act, &down_t)?;
             let ot = moe_out.sub_offset(t * h, h);
             gpu.scaled_add_inplace_cpu_scalar_f32(&ot, &down_t, weight)

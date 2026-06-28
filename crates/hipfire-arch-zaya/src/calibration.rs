@@ -9,10 +9,12 @@
 //! ([`crate::gpu::gpu_forward_calib`]) over the calibration tokens, then stream
 //! the HFQM `.calib.hfq` the quantizer reads via `--hessian`.
 //!
-//! First cut: dense projections only (q/k/v/o, router fc/down/out, tied lm_head)
-//! get a full Hessian — exactly the LDLQ-eligible set. Routed experts are not
-//! captured (they'd be imatrix-only and need a per-expert pass); they fall back
-//! to RTN/AWQ at quantize time.
+//! Dense projections (q/k/v/o, router fc/down/out, tied lm_head) get a full
+//! Hessian — exactly the LDLQ-eligible set. Routed experts (matched by
+//! `.experts.`) are captured imatrix-only via [`CalibCollector::with_imatrix_only`]:
+//! Σx² per input channel, no [K,K] — enough for the AWQ `+` scale at quantize
+//! time, without the ~2.5 GB of per-expert Hessian staging. Experts not selected
+//! by the corpus under top-1 routing get no imatrix and fall back to RTN.
 
 use crate::gpu::{build_capture_names, gpu_forward_calib, ZayaGpuWeights};
 use crate::{ZayaConfig, ARCH_ID_ZAYA};
@@ -48,8 +50,11 @@ pub fn collect_calibration_artifacts(
     if tokens.is_empty() {
         return Err("zaya calib: empty calibration corpus".to_string());
     }
-    // Dense-only capture → every captured tensor wants a full Hessian.
-    let collector = std::sync::Arc::new(CalibCollector::new());
+    // Dense linears get a full Hessian; routed experts (sparse under top-1) get
+    // imatrix-only (Σx², for the AWQ `+` scale — no [K,K]).
+    let collector = std::sync::Arc::new(CalibCollector::with_imatrix_only(vec![
+        ".experts.".to_string()
+    ]));
     gpu.capture_names = build_capture_names(weights);
     gpu.active_capture = Some(collector.clone());
 
