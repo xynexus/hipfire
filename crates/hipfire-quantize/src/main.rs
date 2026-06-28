@@ -7584,6 +7584,10 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
+            // `HIPFIRE_NO_EXPERT_AWQ=1` suppresses per-expert AWQ smoothing (the
+            // experts fall back to plain MQ4/MQ8) — an A/B knob for measuring the
+            // expert-AWQ quality delta; does not affect dense tensors.
+            let no_expert_awq = std::env::var("HIPFIRE_NO_EXPERT_AWQ").ok().as_deref() == Some("1");
             let nested: Vec<Vec<HfqTensor>> = (0..n_experts)
                 .into_par_iter()
                 .map(|x| {
@@ -7596,8 +7600,11 @@ fn main() {
                     // `+` recipes set it) so base mq4/oq4 experts are byte-identical to
                     // before; applied only in the plain MQ4/MQ8 arms below (the Lloyd/MQ6
                     // arms calibrate their own way). Skipped on a length mismatch.
-                    let expert_awq: Option<Vec<f32>> =
-                        awq_scales_for(&expert_name).filter(|s| s.len() == inner_k);
+                    let expert_awq: Option<Vec<f32>> = if no_expert_awq {
+                        None
+                    } else {
+                        awq_scales_for(&expert_name).filter(|s| s.len() == inner_k)
+                    };
                     let m_expert = inner_shape_clone[0] as usize;
                     let (quantized, qt, gs) = if use_bf16 && dtype == "BF16" {
                         (slice.to_vec(), QuantType::BF16, 0u32)
