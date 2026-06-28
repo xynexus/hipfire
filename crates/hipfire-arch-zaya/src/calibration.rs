@@ -3,37 +3,31 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! ZAYA1 calibration: generate the LDLQ full-[K,K] Hessian (+ imatrix) sidecar
-//! for `oq4++`/`oq8++` quantization. Mirrors qwen35/gemma3: set the shared
-//! `CalibCollector` as `gpu.active_capture`, register each dense linear's buffer
-//! → HFQ name in `gpu.capture_names`, run the capturing forward
-//! ([`crate::gpu::gpu_forward_calib`]) over the calibration tokens, then stream
-//! the HFQM `.calib.hfq` the quantizer reads via `--hessian`.
+//! for `oq4++`/`oq8++` quantization. Thin arch driver over the shared
+//! [`hipfire_runtime::calibration::collect`]: register each linear's buffer →
+//! HFQ name (`build_capture_names`), run the capturing forward
+//! ([`crate::gpu::gpu_forward_calib`]), and the general driver streams the HFQM
+//! `.calib.hfq`.
 //!
 //! Dense projections (q/k/v/o, router fc/down/out, tied lm_head) get a full
 //! Hessian — exactly the LDLQ-eligible set. Routed experts (matched by
-//! `.experts.`) are captured imatrix-only via [`CalibCollector::with_imatrix_only`]:
-//! Σx² per input channel, no [K,K] — enough for the AWQ `+` scale at quantize
-//! time, without the ~2.5 GB of per-expert Hessian staging. Experts not selected
-//! by the corpus under top-1 routing get no imatrix and fall back to RTN.
+//! `.experts.`) are imatrix-only (Σx², for the AWQ `+` scale — no [K,K]).
+//! Experts not selected by the corpus under top-1 routing get no imatrix and
+//! fall back to RTN.
 
 use crate::gpu::{build_capture_names, gpu_forward_calib, ZayaGpuWeights};
 use crate::{ZayaConfig, ARCH_ID_ZAYA};
-use hipfire_runtime::calibration::CalibCollector;
+use hipfire_runtime::calibration::{collect, CalibForward};
 use rdna_compute::Gpu;
 use std::path::Path;
 
+pub use hipfire_runtime::calibration::CalibSummary;
+
 /// Calibration knobs (KLDREF reserved for parity with the other arches; unused
-/// in this first cut).
+/// in this first cut — ZAYA captures Hessian + imatrix only).
 pub struct CalibOpts {
     pub kldref: bool,
     pub kldref_topk: usize,
-}
-
-/// Result counts reported by [`collect_calibration_artifacts`].
-pub struct CalibSummary {
-    pub n_hessian: usize,
-    pub n_imatrix: usize,
-    pub max_consistency: f32,
 }
 
 /// Run the calibration forward over `tokens` and write the HFQM Hessian sidecar
@@ -50,52 +44,18 @@ pub fn collect_calibration_artifacts(
     if tokens.is_empty() {
         return Err("zaya calib: empty calibration corpus".to_string());
     }
-    // Dense linears get a full Hessian; routed experts (sparse under top-1) get
-    // imatrix-only (Σx², for the AWQ `+` scale — no [K,K]).
-    let collector = std::sync::Arc::new(CalibCollector::with_imatrix_only(vec![
-        ".experts.".to_string()
-    ]));
-    gpu.capture_names = build_capture_names(weights);
-    gpu.active_capture = Some(collector.clone());
-
-    let run = gpu_forward_calib(gpu, weights, config, tokens);
-
-    gpu.active_capture = None;
-    gpu.capture_names = std::collections::HashMap::new();
-    run?;
-
-    let descriptors = collector.tensor_descriptors();
-    if descriptors.is_empty() {
-        return Err("zaya calib: no tensors captured (check capture_names wiring)".to_string());
-    }
-    let n_hessian = descriptors.iter().filter(|d| d.has_hessian).count();
-    let n_imatrix = descriptors.len();
-    let mut per_tensor_tokens = serde_json::Map::new();
-    for d in &descriptors {
-        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
-    }
-    let mut meta = serde_json::json!({
-        "artifact_kind": "calibration",
-        "text_only": true,
-        "n_hessian": n_hessian,
-        "n_imatrix": n_imatrix,
-        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
-        "artifacts": ["hessian", "imatrix"],
-    });
-    if let Some(obj) = meta.as_object_mut() {
-        for (k, v) in provenance {
-            obj.insert((*k).to_string(), v.clone());
-        }
-    }
-    let metadata_json = serde_json::to_string(&meta).unwrap();
-    let max_consistency = collector
-        .write_streaming(gpu, output, ARCH_ID_ZAYA, &metadata_json, &[])
-        .map_err(|e| format!("zaya calib write {}: {e}", output.display()))?;
-    collector.free_gpu(gpu);
-
-    Ok(CalibSummary {
-        n_hessian,
-        n_imatrix,
-        max_consistency,
-    })
+    let mut static_meta: Vec<(&str, serde_json::Value)> = provenance.to_vec();
+    static_meta.push(("text_only", serde_json::json!(true)));
+    collect(
+        gpu,
+        ARCH_ID_ZAYA,
+        build_capture_names(weights),
+        vec![".experts.".to_string()],
+        output,
+        &static_meta,
+        |gpu| {
+            gpu_forward_calib(gpu, weights, config, tokens)?;
+            Ok(CalibForward::default())
+        },
+    )
 }
