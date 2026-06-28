@@ -3143,19 +3143,25 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(pbs) = m.deepseek4_pbs {
         pbs.free_gpu(gpu);
     }
-    // MiniMax-M2 (arch_id=10): MiniMaxState / MiniMaxWeights expose no
-    // free_gpu in the scaffold, so they drop here without returning their
-    // device tensors to the pool. KNOWN LEAK on load/unload churn — there
-    // is no eviction wired for arch_id=10 yet, so the model stays resident
-    // for the daemon's lifetime in the bring-up scope. Add free_gpu to the
-    // minimax crate + explicit frees here when eviction lands.
-    let _ = (&m.minimax_state, &m.minimax_weights);
-    // LFM2.5-MoE (arch_id=11): same bring-up scope as minimax — Lfm2MoeState /
-    // Lfm2MoeWeights expose no free_gpu in the scaffold, so they drop here
-    // without returning their device tensors to the pool. KNOWN LEAK on
-    // load/unload churn until eviction is wired for arch_id=11.
+    // MiniMax-M2 (arch_id=10): state (KV + scratch + device pos scalar) then
+    // weights (the VRAM bulk). Both expose free_gpu so a load/unload cycle
+    // returns their device buffers to the pool instead of leaking.
+    if let Some(s) = m.minimax_state {
+        s.free_gpu(gpu);
+    }
+    if let Some(w) = m.minimax_weights {
+        w.free_gpu(gpu);
+    }
+    // LFM2.5-MoE (arch_id=11): state (KV + conv ring + scratch + pos scalar)
+    // then weights. Same explicit-free contract as minimax.
     #[cfg(feature = "arch-lfm2moe")]
-    let _ = (&m.lfm2moe_state, &m.lfm2moe_weights);
+    if let Some(s) = m.lfm2moe_state {
+        s.free_gpu(gpu);
+    }
+    #[cfg(feature = "arch-lfm2moe")]
+    if let Some(w) = m.lfm2moe_weights {
+        w.free_gpu(gpu);
+    }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights {
