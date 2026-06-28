@@ -3184,6 +3184,30 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(w) = m.deepseek4_weights {
         w.free_gpu(gpu);
     }
+    // Assembled ServingBackend wrappers (arch_id 0/1 llama, 7 qwen2, 14/15
+    // nemotron, 16 zaya) own their GPU weights + decode state internally and
+    // have no Drop. Unlike the loose-slot paths above, dropping the LoadedModel
+    // does NOT return their device buffers to the pool — so without an explicit
+    // unload they leak across a load/unload cycle. For a bf16 reference (~34 GB)
+    // that OOMs the very next load (the multi-model quality-battery failure).
+    // Each backend's `ServingBackend::unload` frees exactly what it allocated;
+    // the loose `*_weights`/`*_state` frees above are no-ops on these paths
+    // (those fields stay None when the backend wrapper is populated).
+    {
+        use hipfire_runtime::arch::ServingBackend;
+        if let Some(b) = m.zaya_backend {
+            Box::new(b).unload(gpu);
+        }
+        if let Some(b) = m.nemotron_backend {
+            Box::new(b).unload(gpu);
+        }
+        if let Some(b) = m.qwen2_backend {
+            Box::new(b).unload(gpu);
+        }
+        if let Some(b) = m.llama_backend {
+            Box::new(b).unload(gpu);
+        }
+    }
     // Drop pointer-keyed caches whose keys point at weight buffers that are
     // about to be returned to the pool. Without this, the next model loaded
     // can land at the same device address and silently inherit stale
