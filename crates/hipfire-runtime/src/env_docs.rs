@@ -1693,7 +1693,7 @@ pub const ENV_HIPFIRE_KVARN_ROTATE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KVARN_SIM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVARN_SIM",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-runtime/examples/perplexity.rs:210",
+    source: "crates/hipfire-runtime/examples/perplexity.rs:220",
 };
 
 /// `HIPFIRE_KVNOISE` — Environment toggle value controls runtime behavior

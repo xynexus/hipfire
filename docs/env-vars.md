@@ -242,7 +242,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_KLD_SCORING_MODE` | Runtime variable controlling kld scoring mode in hipfire | `crates/hipfire-kld/src/config.rs:102` |
 | `HIPFIRE_KLD_TOP_K` | Runtime variable controlling kld top k in hipfire | `crates/hipfire-kld/src/config.rs:106` |
 | `HIPFIRE_KVARN_ROTATE` | In-place: mq_rotate_x loads each 256-group into registers (ds_swizzle | `crates/hipfire-arch-qwen35/src/qwen35.rs:26987` |
-| `HIPFIRE_KVARN_SIM` | Environment toggle value controls runtime behavior | `crates/hipfire-runtime/examples/perplexity.rs:210` |
+| `HIPFIRE_KVARN_SIM` | Environment toggle value controls runtime behavior | `crates/hipfire-runtime/examples/perplexity.rs:220` |
 | `HIPFIRE_KVNOISE` | Environment toggle value controls runtime behavior | `crates/hipfire-train/src/kv_noise.rs:36` |
 | `HIPFIRE_KVNOISE_BITS` | Defaults to 4 when unset | `crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:88` |
 | `HIPFIRE_KVNOISE_FOLD` | Defaults to 4 when unset | `crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:87` |
