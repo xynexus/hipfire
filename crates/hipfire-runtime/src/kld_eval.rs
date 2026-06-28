@@ -68,6 +68,25 @@ impl<T: SimpleAr> ChunkScoredForward for T {
     }
 }
 
+/// Lets a borrowed backend (`&mut ZayaModel as &mut dyn ChunkScoredForward`) be
+/// boxed alongside an owned adapter (`Qwen35KldForward`) into one
+/// `Box<dyn ChunkScoredForward>` — the daemon's per-arch dispatch erases the
+/// borrowed-vs-owned distinction this way.
+impl ChunkScoredForward for &mut dyn ChunkScoredForward {
+    fn forward_chunk_scored(
+        &mut self,
+        gpu: &mut Gpu,
+        chunk: &[u32],
+        scoring_start: usize,
+        at_scored: &mut dyn FnMut(usize, &[f32], usize),
+    ) -> Result<(), String> {
+        (**self).forward_chunk_scored(gpu, chunk, scoring_start, at_scored)
+    }
+    fn kld_vocab_size(&self) -> usize {
+        (**self).kld_vocab_size()
+    }
+}
+
 /// Outcome of a KLD evaluation pass.
 pub struct KldEvalOutcome {
     pub n_chunk: usize,
