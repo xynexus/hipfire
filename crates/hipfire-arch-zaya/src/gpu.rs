@@ -14,6 +14,7 @@
 use crate::ZayaConfig;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_runtime::calibration::{logsumexp, topk_logits};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::WeightTensor;
@@ -968,12 +969,18 @@ pub fn build_capture_names(w: &ZayaGpuWeights) -> std::collections::HashMap<usiz
 /// no logits output — just drives activations. The caller must set
 /// `gpu.capture_names`/`gpu.active_capture` around this.
 #[allow(clippy::needless_range_loop)]
+/// Calibration forward over the whole prompt. Captures per-tensor Hessian +
+/// imatrix via the active capture hook. When `kldref_topk` is `Some(k)`, also
+/// computes the tied lm-head logits and returns the per-position `(logZ, top-k)`
+/// KLDREF reference (the bf16 teacher signal for KL-divergence eval); otherwise
+/// returns an empty vec and skips the lm-head gemv.
 pub fn gpu_forward_calib(
     gpu: &mut Gpu,
     w: &ZayaGpuWeights,
     cfg: &ZayaConfig,
     ids: &[u32],
-) -> Result<(), String> {
+    kldref_topk: Option<usize>,
+) -> Result<Vec<(f32, Vec<(u32, f32)>)>, String> {
     let s = ids.len();
     let h = cfg.hidden_size;
     let a = &cfg.attn;
@@ -1188,8 +1195,27 @@ pub fn gpu_forward_calib(
     let fnorm = z2(gpu, s, h)?;
     gpu.rmsnorm_f32(&hidden, &w.norm, &fnorm, eps)
         .map_err(|e| format!("{e:?}"))?;
-    // capture the tied lm_head input (no gemv needed for calibration).
+    // capture the tied lm_head input (no gemv needed for the imatrix/Hessian).
     gpu.maybe_capture_activation(w.embed.buf(), &fnorm, s, h);
+
+    // Optional KLDREF: run the tied lm-head to get logits [s, vocab], then keep
+    // only the per-position logZ + top-k (a compact bf16 reference). The full
+    // [s, vocab] host buffer is dropped here, so peak host memory is one row.
+    let kldref = if let Some(topk) = kldref_topk {
+        let logits = z(gpu, s * cfg.vocab_size)?;
+        gemv_seq(gpu, &w.embed, &fnorm, &logits, s, cfg.vocab_size, h)?;
+        let host = gpu.download_f32(&logits).map_err(|e| format!("{e:?}"))?;
+        let _ = gpu.free_tensor(logits);
+        let v = cfg.vocab_size;
+        (0..s)
+            .map(|p| {
+                let row = &host[p * v..(p + 1) * v];
+                (logsumexp(row), topk_logits(row, topk))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     for t in [
         hidden,
@@ -1223,7 +1249,7 @@ pub fn gpu_forward_calib(
     ] {
         let _ = gpu.free_tensor(t);
     }
-    Ok(())
+    Ok(kldref)
 }
 
 /// Single-token decode at `state.pos`: O(1) per-layer compute using the KV cache,
