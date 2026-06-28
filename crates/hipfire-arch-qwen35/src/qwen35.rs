@@ -5111,6 +5111,42 @@ impl hipfire_runtime::kld_eval::ChunkScoredForward for Qwen35KldForward<'_> {
     }
 }
 
+/// Thin `&weights`/`&config` adapter so the daemon's loose Qwen3.5 resident slots
+/// satisfy the calibration seam ([`hipfire_runtime::calibration::CalibratableBackend`])
+/// without a bundled backend type — the calibration analogue of
+/// [`Qwen35KldForward`].
+pub struct Qwen35CalibBackend<'a> {
+    pub weights: &'a Qwen35Weights,
+    pub config: &'a Qwen35Config,
+}
+
+impl hipfire_runtime::calibration::CalibratableBackend for Qwen35CalibBackend<'_> {
+    fn collect_calibration(
+        &self,
+        gpu: &mut Gpu,
+        _tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        tokens: &[u32],
+        kldref: bool,
+        output: &std::path::Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String> {
+        let opts = CalibOpts {
+            kldref,
+            kldref_topk: 64,
+        };
+        collect_calibration_artifacts(
+            gpu,
+            self.weights,
+            self.config,
+            tokens,
+            &opts,
+            output,
+            provenance,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
 /// Single-load calibration driver: arm the [`CalibCollector`] on the resident
 /// weights, run the engine forward over `tokens` (capturing per-tensor Hessian +
 /// imatrix, the MoE router histogram for MoE models, and optionally KLDREF), and

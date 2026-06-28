@@ -4808,16 +4808,15 @@ fn main() {
                     );
                     continue;
                 }
-                let (Some(weights), Some(config), Some(tokenizer)) = (
-                    m.q35_weights.as_ref(),
-                    m.q35_config.as_ref(),
-                    m.tokenizer.as_ref(),
-                ) else {
+                // Only the tokenizer is needed up front (to encode the corpus);
+                // the per-arch calibration backend is resolved below. Every arch
+                // with a collector reaches it through the one CalibratableBackend
+                // seam — no qwen3.5-only gate.
+                let Some(tokenizer) = m.tokenizer.as_ref() else {
                     emit_error_with_id(
                         &mut stdout,
                         "",
-                        "collect: resident model is not a qwen3.5-family model with a tokenizer"
-                            .to_string(),
+                        "collect: resident model has no tokenizer".to_string(),
                     );
                     continue;
                 };
@@ -4832,29 +4831,65 @@ fn main() {
                         continue;
                     }
                 };
-                let all = tokenizer.encode(&text);
+                // Bound tokenization to `max_tokens`: the tokenizer is superlinear
+                // in input length, so encoding a whole multi-MB corpus would grind
+                // for hours (the same stall fixed for kld_eval in 8571b79b). Only
+                // the first `max_tokens` are ever calibrated on; tokenize just that
+                // prefix (+ headroom).
+                let take_chars = max_tokens.saturating_mul(8);
+                let bounded: String = text.chars().take(take_chars).collect();
+                let all = tokenizer.encode(&bounded);
                 let n_tok = all.len().min(max_tokens);
-                let tokens = &all[..n_tok];
-                let opts = qwen35::CalibOpts {
-                    kldref,
-                    kldref_topk: 64,
-                };
+                let tokens = all[..n_tok].to_vec();
                 let provenance = [
                     ("source_model", serde_json::json!(m.model_path)),
                     ("corpus", serde_json::json!(corpus)),
                     ("n_calib_tokens", serde_json::json!(n_tok)),
                 ];
-                // Streams the .calib.hfq directly to `output` one tensor at a
-                // time (no full-RAM materialization), returning a summary.
-                match qwen35::collect_calibration_artifacts(
-                    &mut gpu,
-                    weights,
-                    config,
-                    tokens,
-                    &opts,
-                    std::path::Path::new(&output),
-                    &provenance,
-                ) {
+                let out_path = std::path::Path::new(&output);
+                // Arch-agnostic calibration seam: resolve the resident backend's
+                // collector and delegate. Each impl streams the .calib.hfq directly
+                // to `output` one tensor at a time (no full-RAM materialization),
+                // returning a summary. Probe order matches the resident slot layout.
+                use hipfire_runtime::calibration::CalibratableBackend;
+                let result: Result<hipfire_runtime::calibration::CalibSummary, String> = 'pick: {
+                    if let Some(b) = m.zaya_backend.as_ref() {
+                        break 'pick b.collect_calibration(
+                            &mut gpu, tokenizer, &tokens, kldref, out_path, &provenance,
+                        );
+                    }
+                    if let Some(b) = m.gemma3_text.as_ref() {
+                        break 'pick b.collect_calibration(
+                            &mut gpu, tokenizer, &tokens, kldref, out_path, &provenance,
+                        );
+                    }
+                    #[cfg(feature = "arch-lfm2moe")]
+                    if let (Some(w), Some(c)) =
+                        (m.lfm2moe_weights.as_ref(), m.lfm2moe_config.as_ref())
+                    {
+                        let be = lfm2moe::calibration::Lfm2MoeCalibBackend {
+                            weights: w,
+                            config: c,
+                        };
+                        break 'pick be.collect_calibration(
+                            &mut gpu, tokenizer, &tokens, kldref, out_path, &provenance,
+                        );
+                    }
+                    if let (Some(w), Some(c)) = (m.q35_weights.as_ref(), m.q35_config.as_ref()) {
+                        let be = qwen35::Qwen35CalibBackend {
+                            weights: w,
+                            config: c,
+                        };
+                        break 'pick be.collect_calibration(
+                            &mut gpu, tokenizer, &tokens, kldref, out_path, &provenance,
+                        );
+                    }
+                    Err(format!(
+                        "collect: arch_id {} has no calibration-capable backend",
+                        m.arch_id
+                    ))
+                };
+                match result {
                     Ok(summary) => {
                         let resp = serde_json::json!({
                             "type": "collected",
