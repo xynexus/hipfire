@@ -4953,7 +4953,20 @@ fn main() {
                         );
                         continue;
                     };
-                    tk.encode(&text)
+                    // Only the first `n_ctx × max_chunks` tokens are ever scored, so
+                    // tokenize just that prefix (+ a chunk of headroom). The tokenizer
+                    // is superlinear in input length, so encoding a whole multi-MB
+                    // corpus slice would grind for hours — this is the reference-load
+                    // stall. With no chunk cap we still encode the full slice.
+                    match max_chunks {
+                        Some(mc) => {
+                            let want = n_ctx.saturating_mul(mc.saturating_add(1)).max(n_ctx);
+                            let take_chars = want.saturating_mul(8);
+                            let bounded: String = text.chars().take(take_chars).collect();
+                            tk.encode(&bounded)
+                        }
+                        None => tk.encode(&text),
+                    }
                 } else {
                     Vec::new()
                 };
