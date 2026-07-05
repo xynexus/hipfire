@@ -1,0 +1,72 @@
+# R6 — where is the XDNA1 cascade GEMM actually bound? (compute-per-sync + INNER)
+
+R5 shipped a working streaming K-cascade W4A8 GEMM on XDNA1 (gfx1103) but it topped
+out at ~0.56 TOPS, and R5's discriminators *read* it as per-objectfifo-sync bound.
+R6 tests that directly and **corrects it**: the wall is neither sync nor feed — it is
+the **mmul MAC chain itself, running ~15× off peak (un-pipelined)**. That is a kernel
+bug, not a hardware ceiling, so there is real headroom.
+
+Reuses the R5 rig unchanged (`../r5/`): the kernel is `-DKSLICE`/`-DINNER`
+parametrized and the generator derives buffer sizes from KSLICE. `r6_intensity.sh`
+sweeps KSLICE; the INNER probe is two hand-built points.
+
+## 1. Compute-per-sync sweep (`r6_intensity.sh`, 4×4, N_BTILES=1024)
+
+KSLICE = mmuls each core contracts per output tile. Raising it scales BOTH compute
+and feed per objectfifo iteration while the fixed per-iteration sync stays constant.
+
+| KSLICE | per-dispatch | µs/tile | TOPS |
+|---|---|---|---|
+| 16  | 645 µs  | 0.630 | 0.42 |
+| 32  | 1256 µs | 1.227 | 0.43 |
+| 64  | 2128 µs | 2.078 | 0.50 |
+| 128 | 4074 µs | 3.979 | 0.53 |
+
+TOPS barely moves (0.42→0.53) and per-tile time is ~linear in KSLICE:
+**µs/tile ≈ 0.152 + 0.030·KSLICE**. The fixed sync (0.152 µs) is only ~24% even at
+KSLICE=16 — so R5 was **not** sync-bound. The dominant term is **~30 ns per
+mmul-step**, and it scales with the work. (L1 caps the sweep at KSLICE≤128 on aie2:
+double-buffered A+W = 256·KSLICE B/core → 32 KB at 128.)
+
+## 2. INNER probe — feed-bound or core-bound? (KSLICE=16, N_BTILES=1024, 4×4)
+
+INNER recomputes the K-slice INNER times over the **same resident L1 tiles** — MACs
+scale, feed does not. If feed-bound: time flat, TOPS ×INNER. If core-bound: time ×INNER.
+
+| INNER | per-dispatch | MACs/disp | TOPS | c0 |
+|---|---|---|---|---|
+| 1 | 630 µs  | 1.34e8 | 0.43 | 1024 |
+| 8 | 2956 µs | 1.07e9 | 0.73 | 8192 |
+
+8× the compute over fixed feed → time grew **4.7×**, not flat. So it is **core-bound**,
+not feed-bound. The marginal cost of the extra (feed-free) passes is
+(2956−630)/7/1024 = **0.324 µs/tile = ~20 ns/mmul of pure compute**. Combined with the
+KSLICE slope (~30 ns/mmul incl. feed) the decomposition is **~20 ns compute + ~10 ns
+feed per mmul-step**, plus ~0.15 µs/tile fixed sync that amortizes.
+
+## Verdict — un-pipelined MAC chain, ~15× off peak (fixable)
+
+~20 ns/mmul @ 1.8 GHz = **~36 cycles per `mmul<4,16,8>`**. Per-core INT8 peak is
+~2–3 cycles/mmul, so the core runs **~15× slow**. The kernel accumulates a whole
+K-slice into a single `MMUL c` — a serial dependency chain that never reaches II≈1,
+so the mmul latency is fully exposed. Feed is a real but secondary term (~1/3).
+
+This overturns the R5 "sync-bound, K-cascade is the wrong axis" read: the cascade and
+the array geometry are fine; the **microkernel** is the wall. Corollaries:
+- R5's cascade C-residency and R6's bigger K-tiles can't help while each mmul is 15×
+  slow — the compute term dominates everything.
+- There is ~10–15× of headroom if the MAC chain pipelines.
+
+## R7 (the real lever)
+
+Rewrite the K-slice inner loop for **II≈1: multiple independent accumulators**
+(interleave 2–4 output tiles / partial-sum banks so successive `mmul`s don't depend on
+the immediately-prior accumulator), the standard AIE matmul recipe. Also confirm
+whether aie2 int8×int4 `<4,16,8>` is native or emulated (aie2p ships
+`emulated_mmul_intrinsics.hpp`; if aie2 emulates int4, part of the 36 cycles is
+inherent and int8×int8 `<4,16,8>`/`<8,16,8>` may pipeline better). Target: close the
+~15× compute gap; feed (~10 ns/mmul, ~3× current TOPS) becomes the next wall, and only
+*then* do weight-stationary / A-reuse dataflows matter.
+
+Repro: `R5_ARCH=aie2 ./r6_intensity.sh 4 4 1024 300 16 32 64 128`; INNER via
+`R5_INNER=8 ../r5/r5_build.sh <mlir> <wd> 16`.
