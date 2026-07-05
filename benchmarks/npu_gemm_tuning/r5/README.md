@@ -107,11 +107,56 @@ the generated **8×4 = 32-core** design builds and dispatches with **all 8 colum
 blocks = 1024** — the cascade dataflow works at full array scale. So the mechanism is
 proven end-to-end from 2 → 4 → 32 cores.
 
-**Next — the payoff measurement.** The current design does one cascade round per
-dispatch (overhead-dominated for throughput). To measure whether keeping C resident
-beats the ~5-TOPS real-GEMM wall, the cores need to stream many output tiles per
-dispatch (an `N_BTILES` loop, streaming each core's K-slice weights, tail storing
-C[n]) so the per-output-tile cost (one cascade transfer + fifo acquire, *no* C
-reload) is amortized and measurable. That streaming-cascade kernel + a
-`r5_gen.py`-style array is the next build; then measure real (INNER=0) TOPS through
-NpuKernel vs SOTA's ~5 and the 15.7 reference.
+## Streaming payoff measurement — DONE, and it's a NO-GO on XDNA1 (2026-07-05)
+
+Retargeted the whole R5 line from aie2p/Strix Halo to **aie2 / XDNA1 (gfx1103, the
+nix2 Phoenix NPU)** — build + measure now run locally, no halo round-trip. Arch is
+selected by `R5_ARCH={aie2,aie2p}` across `r5_cascade.cc` (kernel), `r5_build.sh`,
+`r5_gen.py`, and `r5_stream_gen.py`; aie2p stays the default so the Halo repro is
+untouched. XDNA1 deltas: int8×int4 mmul is only `<4,16,8>` (size_C=32, 2 cascade
+beats) vs aie2p's `<4,16,16>`; the cascade read is `get_scd_v16int32` (no
+`get_scd_v16acc32` builtin) so we sum in the int32 domain; device is `npu1`
+(4 cols × 4 compute rows = **16-core max array**). Build needs XRT's `xclbinutil` +
+a user-space boost-1.83 on `LD_LIBRARY_PATH` (both auto-added by `r5_build.sh`).
+
+Re-validated the mechanism on XDNA1 hardware: 2-core `C[0]=512`, full **4×4=16-core**
+`C[0]=1024`, both linear under A=2 — the cascade K-split works on Phoenix too.
+
+`r5_stream_gen.py` streams `N_BTILES` output tiles per dispatch (persistent cores,
+one tile per objectfifo iteration; A/W fed as real bytes so it's a genuine feed-bound
+measurement; C never reloads — the cascade carries it and the tail stores once).
+`r5_stream.sh` sweeps N_BTILES, building one xclbin each and timing
+`npu_gemm_bench`. Sweep on the 4×4 array (all-ones, `c0=1024` throughout):
+
+| N_BTILES | 64 | 256 | 512 | 1024 | 2048 |
+|---|---|---|---|---|---|
+| per-dispatch | 163 µs | 255 | 382 | 636 | 1114 µs |
+| **TOPS** | 0.10 | 0.26 | 0.35 | 0.42 | **0.48** |
+
+The fixed per-dispatch overhead (~140 µs ERT/hwctx/DMA floor) amortizes as designed,
+but TOPS asymptotes at **~0.56 TOPS** (steady-state slope 0.466 µs/tile over
+NBT 1024→2048) — **~10× below SOTA and ~20× below the array's compute peak.**
+
+**Why (two discriminator sweeps, steady-state µs/tile):**
+
+| config | cores | cascade | µs/tile | steady TOPS |
+|---|---|---|---|---|
+| 1×4 | 4 | 4-deep | 0.492 | 0.13 |
+| 4×2 | 8 | 2-deep | 0.346 | 0.38 |
+| 4×4 | 16 | 4-deep | 0.466 | 0.56 |
+
+- **1×4 ≈ 4×4 per-tile** despite 4× the columns → columns parallelize for free; the
+  per-tile cost is *per column*, not global shim feed. Column-scaling is ~linear
+  (0.13→0.56 TOPS for 1→4 columns), but XDNA1 caps at 4 columns.
+- **4×2 < 4×4 per-tile** → deeper cascade adds ~0.07 µs/row of chain-sync latency;
+  cascade depth scales *sub-linearly*.
+
+So the ceiling is set by **per-tile objectfifo-sync + cascade-beat transfer**, not
+compute: the `<4,16,8>` tile is so small each core does ~8k MACs (~26 ns) wrapped in
+~470 ns of sync. The cascade eliminates the C round-trip, but that never mattered
+here — per-tile sync swamps the compute regardless. **Conclusion: the K-cascade axis
+is the wrong axis on XDNA1 — it multiplies per-tile sync without growing the effective
+output tile.** This extends the aie2p "feeding, not compute" thesis (`../findings.md`)
+to Phoenix. The only levers that could help are the ones that raise compute-per-sync:
+a within-kernel N-loop (many independent output columns per acquired W) or a
+weight-stationary dataflow (W resident, stream only A) — *not* spatial K-splitting.
