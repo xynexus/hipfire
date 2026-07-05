@@ -1941,6 +1941,7 @@ dependencies = [
  "hipfire-gpu-types",
  "hipfire-kvquant",
  "hipfire-primitives",
+ "hipfire-xdna",
 ]
 
 [[package]]
