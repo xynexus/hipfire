@@ -145,7 +145,7 @@ pub mod xclbin;
 #[cfg(target_os = "linux")]
 pub mod kernel;
 #[cfg(target_os = "linux")]
-pub use kernel::NpuKernel;
+pub use kernel::{NpuInFlight, NpuKernel};
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -459,6 +459,42 @@ mod imp {
                 submit::SYNCOBJ_TIMELINE_WAIT_REQUEST,
                 &mut w as *mut _ as *mut libc::c_void,
             )
+        }
+
+        /// Non-blocking check whether timeline `point` has signaled on `syncobj`:
+        /// `Ok(true)` = complete, `Ok(false)` = not yet (`ETIME`), `Err` = real
+        /// failure. Same request as [`Self::syncobj_wait`] but `timeout_nsec = 0`, so
+        /// a scheduler can poll in-flight NPU work without parking the thread that is
+        /// concurrently driving the GPU. Timeline points are per-point queryable, so
+        /// pipelined submits (seq N, N+1, …) can each be polled independently; on one
+        /// hwctx they complete in submission order.
+        pub fn syncobj_poll(&self, syncobj: u32, point: u64) -> Result<bool, XdnaError> {
+            let handles = [syncobj];
+            let points = [point];
+            let mut w = submit::SyncobjTimelineWait {
+                handles: handles.as_ptr() as u64,
+                points: points.as_ptr() as u64,
+                timeout_nsec: 0,
+                count_handles: 1,
+                flags: submit::SYNCOBJ_WAIT_FOR_SUBMIT,
+                ..Default::default()
+            };
+            // SAFETY: request matches the SyncobjTimelineWait struct; `w` is writable.
+            let rc = unsafe {
+                libc::ioctl(
+                    self.fd,
+                    submit::SYNCOBJ_TIMELINE_WAIT_REQUEST as libc::c_ulong,
+                    &mut w as *mut _ as *mut libc::c_void,
+                )
+            };
+            if rc == 0 {
+                return Ok(true);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ETIME) {
+                return Ok(false);
+            }
+            Err(XdnaError::Ioctl(err))
         }
 
         /// Allocate a DEV buffer object (for the PDI / instruction stream, which
