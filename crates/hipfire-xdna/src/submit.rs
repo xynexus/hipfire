@@ -80,6 +80,10 @@ pub const EXEC_CMD_REQUEST: u64 = iowr!(DRM_AMDXDNA_EXEC_CMD, ExecCmd);
 // enum amdxdna_bo_type
 pub const AMDXDNA_BO_INVALID: u32 = 0;
 pub const AMDXDNA_BO_SHMEM: u32 = 1;
+/// External/shareable BO — same numeric value as SHMEM, used when importing a
+/// dma-buf (CreateBo.vaddr -> VaTbl{dmabuf_fd}) so the driver's create-share path
+/// runs the prime import instead of a plain shmem alloc.
+pub const AMDXDNA_BO_SHARE: u32 = 1;
 pub const AMDXDNA_BO_DEV_HEAP: u32 = 2;
 pub const AMDXDNA_BO_DEV: u32 = 3;
 pub const AMDXDNA_BO_CMD: u32 = 4;
@@ -162,6 +166,16 @@ pub struct CreateBo {
     pub size: u64,
     pub bo_type: u32, // `type` in C
     pub handle: u32,  // out
+}
+
+/// struct amdxdna_drm_va_tbl — passed via `CreateBo.vaddr` for a SHARE BO. A valid
+/// `dmabuf_fd` (>= 0) selects the driver's dma-buf import path; `num_entries` must be
+/// 0 in that case (the alternative is a userptr va-entry table, unused here).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VaTbl {
+    pub dmabuf_fd: i32,
+    pub num_entries: u32,
 }
 
 /// struct amdxdna_drm_get_bo_info

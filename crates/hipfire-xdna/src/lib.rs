@@ -591,6 +591,71 @@ mod imp {
             })
         }
 
+        /// Import an external dma-buf (e.g. an amdgpu GTT BO exported via
+        /// `PRIME_HANDLE_TO_FD`) as a SHARE BO and mmap it. Zero-copy: the NPU and the
+        /// exporting engine (the GPU) then address the *same physical pages* — the
+        /// NPU→GPU data path with no host round-trip. `size` must be the exported
+        /// buffer's byte size. The driver `dma_buf_get`s the fd, so the caller may
+        /// close `fd` after this returns. `map` controls whether we also CPU-map the
+        /// imported BO (some importers don't expose a map offset; `false` still yields
+        /// a usable device handle for kernel args).
+        pub fn import_dmabuf(
+            &self,
+            fd: i32,
+            size: usize,
+            map: bool,
+        ) -> Result<DeviceBuffer, XdnaError> {
+            let va = submit::VaTbl {
+                dmabuf_fd: fd,
+                num_entries: 0,
+            };
+            let mut cb = submit::CreateBo {
+                vaddr: &va as *const _ as u64,
+                size: size as u64,
+                bo_type: submit::AMDXDNA_BO_SHARE,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::CREATE_BO_REQUEST,
+                &mut cb as *mut _ as *mut libc::c_void,
+            )?;
+            let handle = cb.handle;
+            let mut info = submit::GetBoInfo {
+                handle,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::GET_BO_INFO_REQUEST,
+                &mut info as *mut _ as *mut libc::c_void,
+            )?;
+            let ptr = if map {
+                // SAFETY: map_offset is the driver's mmap cookie for this BO on our fd.
+                let p = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        self.fd,
+                        info.map_offset as libc::off_t,
+                    )
+                };
+                if p == libc::MAP_FAILED {
+                    return Err(XdnaError::Ioctl(std::io::Error::last_os_error()));
+                }
+                p as *mut u8
+            } else {
+                std::ptr::null_mut()
+            };
+            Ok(DeviceBuffer {
+                fd: self.fd,
+                handle,
+                ptr,
+                len: size,
+                xdna_addr: info.xdna_addr,
+            })
+        }
+
         /// Allocate + map the device heap the way XRT does: CREATE_BO(DEV_HEAP),
         /// then mmap at the fixed DEV_HEAP offset 0x1_0000_0000 with MAP_LOCKED so
         /// the firmware host-buffer map in aie2_hwctx_init succeeds. Returns the
