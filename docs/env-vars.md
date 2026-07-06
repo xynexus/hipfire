@@ -527,6 +527,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_WO_MMQ` | Enabled when set to 1 | `crates/hipfire-rdna/src/feature_flags.rs:219` |
 | `HIPFIRE_WO_WMMA_VARIANT` | Runtime variable controlling wo wmma variant in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:300` |
 | `HIPFIRE_XDNA1_LIB` | Runtime variable controlling xdna1 lib in hipfire | `crates/hipfire-npu/src/lib.rs:69` |
+| `HIPFIRE_XDNA_ERT_NPU` | Runtime variable controlling xdna ert npu in hipfire | `crates/hipfire-xdna/src/kernel.rs:83` |
 | `HIP_PATH` | fails with "file not found". Add well-known candidates as -I flags; | `crates/hipfire-rdna/src/compiler.rs:518` |
 | `HIP_VISIBLE_DEVICES` | Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES" | `crates/hipfire-daemon-adapter/src/lib.rs:1431` |
 | `HOME` | Runtime variable controlling home in hipfire | `crates/hipfire-tui/src/hipfire/mod.rs:40` |
@@ -550,6 +551,6 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `USERPROFILE` | Runtime variable controlling userprofile in hipfire | `crates/hipfire-rdna/src/compiler.rs:228` |
 | `USE_SAMPLE` | Enabled when set to 1 | `crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:138` |
 
-- Total env vars: **545**
-- `HIPFIRE_*` vars: **499**
+- Total env vars: **546**
+- `HIPFIRE_*` vars: **500**
 - non-`HIPFIRE_*` vars: **46**

@@ -238,18 +238,42 @@ pub fn dpu_cmd_packet(
     instr_addr: u64,
     instr_size: usize,
     arg_addrs: &[u64],
+    ert_npu: bool,
 ) -> [u8; DPU_CMD_PACKET_LEN] {
-    assert!(arg_addrs.len() <= 5, "DPU regmap holds at most 5 args");
+    assert!(arg_addrs.len() <= 6, "packet holds at most 6 args");
     let mut b = [0u8; DPU_CMD_PACKET_LEN];
-    b[0x00..0x04].copy_from_slice(&0x3001_0001u32.to_le_bytes());
-    b[0x04..0x08].copy_from_slice(&1u32.to_le_bytes());
-    b[0x08..0x10].copy_from_slice(&3u64.to_le_bytes());
-    b[0x10..0x18].copy_from_slice(&instr_addr.to_le_bytes());
-    b[0x18..0x1c].copy_from_slice(&(instr_size as u32).to_le_bytes());
-    let mut off = 0x1c;
-    for &a in arg_addrs {
-        b[off..off + 8].copy_from_slice(&a.to_le_bytes());
-        off += 8;
+    if ert_npu {
+        // ERT_START_NPU — the out-of-tree/upstream amdxdna driver. The u32 header carries
+        // STATE=GENMASK(3,0), COUNT=GENMASK(22,12) (# of u32 words after the header), and
+        // OPCODE=GENMASK(27,23)=20. After the header: cu_mask[0] then
+        // `struct amdxdna_cmd_start_npu { u64 buffer; u32 buffer_size; u32 prop_count;
+        // u32 prop_args[] }` — buffer is the instruction-stream device address, prop_args
+        // the kernel arg addresses. Verified byte-exact vs XRT on the out-of-tree driver.
+        let n = arg_addrs.len() as u32;
+        let count = 5 + 2 * n; // cu_mask(1) + start_npu fixed(4) + args(2 words each)
+        let header: u32 = 1 | (count << 12) | (20u32 << 23);
+        b[0x00..0x04].copy_from_slice(&header.to_le_bytes());
+        b[0x04..0x08].copy_from_slice(&1u32.to_le_bytes()); // cu_mask[0] = CU 0
+        b[0x08..0x10].copy_from_slice(&instr_addr.to_le_bytes()); // start_npu.buffer
+        b[0x10..0x14].copy_from_slice(&(instr_size as u32).to_le_bytes()); // buffer_size
+        b[0x14..0x18].copy_from_slice(&0u32.to_le_bytes()); // prop_count = 0
+        let mut off = 0x18;
+        for &a in arg_addrs {
+            b[off..off + 8].copy_from_slice(&a.to_le_bytes());
+            off += 8;
+        }
+    } else {
+        // ERT_START_CU — stock mainline amdxdna (opcode in the packet at 0x08).
+        b[0x00..0x04].copy_from_slice(&0x3001_0001u32.to_le_bytes());
+        b[0x04..0x08].copy_from_slice(&1u32.to_le_bytes());
+        b[0x08..0x10].copy_from_slice(&3u64.to_le_bytes());
+        b[0x10..0x18].copy_from_slice(&instr_addr.to_le_bytes());
+        b[0x18..0x1c].copy_from_slice(&(instr_size as u32).to_le_bytes());
+        let mut off = 0x1c;
+        for &a in arg_addrs {
+            b[off..off + 8].copy_from_slice(&a.to_le_bytes());
+            off += 8;
+        }
     }
     b
 }
@@ -274,11 +298,16 @@ const _: () = assert!(core::mem::size_of::<SyncobjTimelineWait>() == 40);
 mod tests {
     use super::*;
 
-    /// Locks the DPU packet layout against the bytes captured from XRT's amdxdna
-    /// path (r2a: instr@0x04028000, ninstr=420, 3 args).
+    /// Locks the ERT_START_CU (stock mainline) DPU packet layout against the bytes
+    /// captured from XRT's amdxdna path (r2a: instr@0x04028000, ninstr=420, 3 args).
     #[test]
     fn dpu_packet_matches_capture() {
-        let p = dpu_cmd_packet(0x0402_8000, 420, &[0x1111_2222, 0x3333_4444, 0x5555_6666]);
+        let p = dpu_cmd_packet(
+            0x0402_8000,
+            420,
+            &[0x1111_2222, 0x3333_4444, 0x5555_6666],
+            false,
+        );
         assert_eq!(&p[0x00..0x04], &0x3001_0001u32.to_le_bytes()); // ERT header
         assert_eq!(&p[0x04..0x08], &1u32.to_le_bytes()); // cu_mask
         assert_eq!(&p[0x08..0x10], &3u64.to_le_bytes()); // opcode = DPU
@@ -290,10 +319,32 @@ mod tests {
         assert_eq!(&p[0x34..], &[0u8; DPU_CMD_PACKET_LEN - 0x34]); // zero tail
     }
 
+    /// Locks the ERT_START_NPU (out-of-tree/upstream amdxdna) layout: opcode in the
+    /// header, `struct amdxdna_cmd_start_npu` payload. Verified byte-exact vs XRT.
+    #[test]
+    fn dpu_packet_npu_layout() {
+        let p = dpu_cmd_packet(
+            0x0402_8000,
+            420,
+            &[0x1111_2222, 0x3333_4444, 0x5555_6666],
+            true,
+        );
+        // header: state=NEW(1) | count(5+2*3=11)<<12 | opcode(20)<<23
+        let header = 1u32 | (11u32 << 12) | (20u32 << 23);
+        assert_eq!(&p[0x00..0x04], &header.to_le_bytes());
+        assert_eq!(&p[0x04..0x08], &1u32.to_le_bytes()); // cu_mask[0]
+        assert_eq!(&p[0x08..0x10], &0x0402_8000u64.to_le_bytes()); // start_npu.buffer
+        assert_eq!(&p[0x10..0x14], &420u32.to_le_bytes()); // buffer_size
+        assert_eq!(&p[0x14..0x18], &0u32.to_le_bytes()); // prop_count = 0
+        assert_eq!(&p[0x18..0x20], &0x1111_2222u64.to_le_bytes()); // arg0
+        assert_eq!(&p[0x20..0x28], &0x3333_4444u64.to_le_bytes()); // arg1
+        assert_eq!(&p[0x28..0x30], &0x5555_6666u64.to_le_bytes()); // arg2
+    }
+
     #[test]
     #[should_panic]
     fn dpu_packet_rejects_too_many_args() {
-        dpu_cmd_packet(0, 0, &[0; 6]);
+        dpu_cmd_packet(0, 0, &[0; 7], false);
     }
 }
 const _: () = assert!(core::mem::size_of::<QosInfo>() == 24);

@@ -3699,6 +3699,13 @@ pub const ENV_HIPFIRE_XDNA1_LIB: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-npu/src/lib.rs:69",
 };
 
+/// `HIPFIRE_XDNA_ERT_NPU` — Runtime variable controlling xdna ert npu in hipfire
+pub const ENV_HIPFIRE_XDNA_ERT_NPU: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_XDNA_ERT_NPU",
+    description: "Runtime variable controlling xdna ert npu in hipfire",
+    source: "crates/hipfire-xdna/src/kernel.rs:83",
+};
+
 /// `HIP_PATH` — fails with "file not found". Add well-known candidates as -I flags;
 pub const ENV_HIP_PATH: EnvVarDoc = EnvVarDoc {
     name: "HIP_PATH",
@@ -4379,6 +4386,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_WO_MMQ,
     ENV_HIPFIRE_WO_WMMA_VARIANT,
     ENV_HIPFIRE_XDNA1_LIB,
+    ENV_HIPFIRE_XDNA_ERT_NPU,
     ENV_HIP_PATH,
     ENV_HIP_VISIBLE_DEVICES,
     ENV_HOME,

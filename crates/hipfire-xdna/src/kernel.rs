@@ -35,6 +35,10 @@ pub struct NpuKernel {
     instr_bo: u32,
     instr_addr: u64,
     instr_size: usize,
+    // ERT_START_NPU command format + cached-SHMEM output invalidation for the
+    // out-of-tree/upstream amdxdna driver (env HIPFIRE_XDNA_ERT_NPU); default false =
+    // the stock mainline driver's ERT_START_CU format with coherent SHMEM.
+    ert_npu: bool,
     // Reused across dispatches with the same argument buffers.
     cmd_cache: std::cell::RefCell<Option<CachedCmd>>,
 }
@@ -76,6 +80,7 @@ impl NpuKernel {
             instr_bo,
             instr_addr,
             instr_size: insts.len(),
+            ert_npu: std::env::var_os("HIPFIRE_XDNA_ERT_NPU").is_some(),
             cmd_cache: std::cell::RefCell::new(None),
         })
     }
@@ -103,7 +108,8 @@ impl NpuKernel {
         let mut cache = self.cmd_cache.borrow_mut();
         if cache.as_ref().is_none_or(|c| c.arg_handles != arg_handles) {
             let addrs: Vec<u64> = args.iter().map(|b| b.host_addr()).collect();
-            let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs);
+            let packet =
+                submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs, self.ert_npu);
             let mut cmd_bo = self.dev.alloc_buffer(4096, AMDXDNA_BO_CMD)?;
             cmd_bo.as_mut_slice()[..packet.len()].copy_from_slice(&packet);
             let mut exec_handles = arg_handles.clone();
@@ -119,7 +125,29 @@ impl NpuKernel {
         let seq = self
             .dev
             .exec_cmd(self.hwctx, cmd.cmd_bo.handle(), &cmd.exec_handles)?;
-        self.dev.syncobj_wait(self.syncobj, seq)
+        self.dev.syncobj_wait(self.syncobj, seq)?;
+        // The out-of-tree driver maps SHMEM BOs cached (map_wc=false), so the caller would
+        // read stale bytes without a clflush; SYNC_BO runs drm_clflush (writeback+invalidate
+        // on x86) for both directions before it branches. Gated to that driver — the stock
+        // driver keeps SHMEM coherent, so skip the per-dispatch cost there.
+        if self.ert_npu {
+            for a in args {
+                self.dev
+                    .sync_bo(a.handle(), submit::SYNC_DIRECT_TO_DEVICE, a.len())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clflush a buffer's CPU cache range so a read sees the NPU's output — the
+    /// out-of-tree driver maps SHMEM cached. [`Self::dispatch`] does this for its args when
+    /// `HIPFIRE_XDNA_ERT_NPU` is set; async [`Self::submit`]/[`Self::wait`] callers must call
+    /// this on each output buffer after completion (the handle doesn't own the args). Uses
+    /// the TO_DEVICE SYNC_BO path — its clflush invalidates too, and FROM_DEVICE additionally
+    /// hits a debug-BO sync that rejects normal BOs. A no-op-cheap on the coherent stock driver.
+    pub fn sync_from_device(&self, bo: &DeviceBuffer) -> Result<(), XdnaError> {
+        self.dev
+            .sync_bo(bo.handle(), submit::SYNC_DIRECT_TO_DEVICE, bo.len())
     }
 
     /// Submit `args` WITHOUT blocking, returning an in-flight handle. Where
@@ -151,7 +179,7 @@ impl NpuKernel {
                 .sync_bo(a.handle(), submit::SYNC_DIRECT_TO_DEVICE, a.len())?;
         }
         let addrs: Vec<u64> = args.iter().map(|b| b.host_addr()).collect();
-        let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs);
+        let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs, self.ert_npu);
         let mut cmd_bo = self.dev.alloc_buffer(4096, AMDXDNA_BO_CMD)?;
         cmd_bo.as_mut_slice()[..packet.len()].copy_from_slice(&packet);
         let mut exec_handles: Vec<u32> = args.iter().map(|b| b.handle()).collect();
