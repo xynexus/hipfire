@@ -1537,14 +1537,14 @@ pub const ENV_HIPFIRE_GEMMA3_CALIB_NO_BATCH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GEMMA3_NO_BATCHED_PREFILL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMMA3_NO_BATCHED_PREFILL",
     description: "Runtime variable controlling gemma3 no batched prefill in hipfire",
-    source: "crates/hipfire-arch-gemma3/src/arch.rs:100",
+    source: "crates/hipfire-arch-gemma3/src/arch.rs:106",
 };
 
 /// `HIPFIRE_GEMMA3_PREFILL_MICROBATCH` — Runtime variable controlling gemma3 prefill microbatch in hipfire
 pub const ENV_HIPFIRE_GEMMA3_PREFILL_MICROBATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMMA3_PREFILL_MICROBATCH",
     description: "Runtime variable controlling gemma3 prefill microbatch in hipfire",
-    source: "crates/hipfire-arch-gemma3/src/arch.rs:106",
+    source: "crates/hipfire-arch-gemma3/src/arch.rs:112",
 };
 
 /// `HIPFIRE_GEMMA3_VISION_NOWMMA` — Runtime variable controlling gemma3 vision nowmma in hipfire
@@ -2051,7 +2051,7 @@ pub const ENV_HIPFIRE_LLOYD_MB4: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_LM_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LM_DUMP",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-arch-gemma3/src/forward.rs:343",
+    source: "crates/hipfire-arch-gemma3/src/forward.rs:364",
 };
 
 /// `HIPFIRE_LM_HEAD_F16` — Runtime variable controlling lm head f16 in hipfire

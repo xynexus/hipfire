@@ -25,9 +25,10 @@
 //! built-in `1/√head_dim` is corrected to `1/√query_pre_attn_scalar` by the Q
 //! pre-scale baked into `q_norm` (see `load_weights`).
 
-use hip_bridge::{DeviceBuffer, HipResult};
+use hip_bridge::{DeviceBuffer, HipError, HipResult};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::kv::{KvCache, KvQuantMode};
+use hipfire_runtime::llama::HiddenCaptureSink;
 use hipfire_runtime::weights::{weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor};
 
 use crate::config::Gemma3Config;
@@ -300,6 +301,26 @@ pub fn forward_step(
     Ok(())
 }
 
+/// `forward_step` with an optional extract-layer hidden-capture sink. Runs the
+/// same per-token stack (so it is bit-identical to `forward_step` and thus
+/// greedy-equivalent to AR decode), but when `capture` is `Some` appends the
+/// residual at the sink's extract layers to `sink.hidden`. Used by the gemma3
+/// `SpecTarget` per-token verify/advance path and by DSpark/DFlash label-gen.
+pub fn forward_step_capture(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    cfg: &Gemma3Config,
+    state: &mut Gemma3State,
+    token: u32,
+    capture: Option<&mut HiddenCaptureSink>,
+) -> HipResult<()> {
+    let pos = prelude(gpu, state)?;
+    embed_token(gpu, weights, cfg, &state.x, token)?;
+    forward_after_x_capture(gpu, weights, cfg, state, pos, capture)?;
+    state.next_pos += 1;
+    Ok(())
+}
+
 /// Decode one position from a **prebuilt embedding** instead of an embedded
 /// token — the image-token splice primitive for gemma3-vl. The multimodal
 /// projector output already lives in the text embedding space and is inserted
@@ -363,6 +384,27 @@ fn forward_after_x(
     cfg: &Gemma3Config,
     state: &mut Gemma3State,
     pos: usize,
+) -> HipResult<()> {
+    forward_after_x_capture(gpu, weights, cfg, state, pos, None)
+}
+
+/// `forward_after_x` with an optional extract-layer hidden-capture sink.
+///
+/// The DSpark/DFlash drafter's `main_proj` ingests the target's residual hidden
+/// at a set of extract layers. When `capture` is `Some`, this appends the settled
+/// post-FFN residual (`state.x`, the fusion-proof block-boundary stream) at each
+/// layer in `sink.extract_layers` to `sink.hidden`, in ascending layer order —
+/// matching `hipfire_runtime::llama::forward_scratch_compute_capture`'s host-Vec
+/// layout for a single position (`[num_extract × dim]` per call). Only the host
+/// `hidden` Vec sink is supported on this per-token path; the GPU-resident
+/// `hidden_gpu` sink is the batched (M1b) verify's job.
+fn forward_after_x_capture(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    cfg: &Gemma3Config,
+    state: &mut Gemma3State,
+    pos: usize,
+    mut capture: Option<&mut HiddenCaptureSink>,
 ) -> HipResult<()> {
     let n_heads = cfg.num_attention_heads;
     let n_kv_heads = cfg.num_key_value_heads;
@@ -604,6 +646,21 @@ fn forward_after_x(
         // Block-boundary steering/abliteration hook (no-op unless a session is
         // active). `state.x` is the settled post-residual stream — fusion-proof.
         hipfire_steer::maybe_steer_block(gpu, &state.x, layer_idx)?;
+        // DSpark/DFlash extract-layer capture: append the settled residual at the
+        // requested layers (ascending) to the host sink. See fn doc.
+        if let Some(sink) = capture.as_deref_mut() {
+            if sink.extract_layers.contains(&layer_idx) {
+                if sink.hidden_gpu.is_some() {
+                    return Err(HipError::new(
+                        0,
+                        "gemma3 per-token capture: hidden_gpu sink unsupported \
+                         (host Vec only; GPU-resident capture is the batched M1b path)",
+                    ));
+                }
+                let row = gpu.download_f32(&state.x)?;
+                sink.hidden.extend_from_slice(&row);
+            }
+        }
         maybe_dump_lm(
             gpu,
             &state.x,
@@ -864,6 +921,314 @@ pub fn forward_prefill_batch(
     gpu.reclaim_pending();
     state.next_pos = start_pos + m;
     Ok(())
+}
+
+/// Batched block VERIFY forward for gemma3 spec-decode (M1b). Runs the `m` block
+/// positions `[start_pos, start_pos+m)` in ONE forward — **local (SWA) layers**
+/// via the batched `swa_*_batched` primitives (per-head gather → stage →
+/// `attention_swa_gqa_batched` → ring-write), **global layers** via the batched
+/// full-context KvCache attention — and returns the per-position logits
+/// (`[m, vocab]` host, row-major). Optionally scatters the settled residual at
+/// `extract_layers` (ascending) into `hidden_gpu` (`[m, n_extract, dim]` F32) for
+/// the DSpark/DFlash drafter's on-device `main_hidden`.
+///
+/// Prereq: the prior context KV `[0, start_pos)` must already be resident — global
+/// layers in `state.kv_cache.k_gpu[l]`, local layers in the `state.swa_k/v[l]`
+/// rings — exactly as the per-token prefill leaves them. Advances
+/// `state.next_pos` to `start_pos+m`.
+///
+/// This is the spec-decode *speedup*: reads each weight once for the whole block
+/// instead of `m` times. It is a verify parity of `m` sequential `forward_step`s
+/// (same KV/ring writes at the same absolute positions, same per-layer math); the
+/// only permissible divergence is float reduction order flipping an argmax on a
+/// near-tie — the batched result is the verifier's truth, as in the llama path.
+///
+/// KVarN KV is unsupported (its window/block write is a strict n=1 fused
+/// primitive); callers fall back to per-token verify for a KVarN state.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_verify_batch(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    cfg: &Gemma3Config,
+    state: &mut Gemma3State,
+    x_batch: &GpuTensor,
+    m: usize,
+    start_pos: usize,
+    extract_layers: &[usize],
+    hidden_gpu: Option<&GpuTensor>,
+) -> HipResult<Vec<f32>> {
+    if state.kv_cache.quant_kvarn {
+        return Err(HipError::new(
+            0,
+            "gemma3 forward_verify_batch: KVarN KV unsupported (use per-token verify)",
+        ));
+    }
+    let dim = cfg.hidden_size;
+    let n_heads = cfg.num_attention_heads;
+    let n_kv = cfg.num_key_value_heads;
+    let head_dim = cfg.head_dim;
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv * head_dim;
+    let inter = cfg.intermediate_size;
+    let eps = cfg.rms_norm_eps;
+    let vocab = cfg.vocab_size;
+    let max_ctx = start_pos + m;
+    let win = state.swa_window; // 0 ⇒ SWA off (every layer full-context global)
+    let swa = win > 0;
+
+    // Absolute positions [start_pos, start_pos+m) as an i32-in-F32 device table.
+    let positions = gpu.alloc_owned(&[m], DType::F32)?;
+    {
+        let bytes: Vec<u8> = (start_pos..start_pos + m)
+            .flat_map(|p| (p as i32).to_ne_bytes())
+            .collect();
+        gpu.hip.memcpy_htod(&positions.buf, &bytes)?;
+    }
+
+    // Batched working scratch (pooled; returned to the pool on drop / reclaim).
+    let tmp = gpu.alloc_owned(&[m * dim], DType::F32)?;
+    let q = gpu.alloc_owned(&[m * q_dim], DType::F32)?;
+    let k = gpu.alloc_owned(&[m * kv_dim], DType::F32)?;
+    let v = gpu.alloc_owned(&[m * kv_dim], DType::F32)?;
+    let attn_out = gpu.alloc_owned(&[m * q_dim], DType::F32)?;
+    let o = gpu.alloc_owned(&[m * dim], DType::F32)?;
+    let gate = gpu.alloc_owned(&[m * inter], DType::F32)?;
+    let up = gpu.alloc_owned(&[m * inter], DType::F32)?;
+    let ffn = gpu.alloc_owned(&[m * inter], DType::F32)?;
+
+    // SWA-only scratch: head-major gather buffers, head-major staged windows
+    // ([n_kv, m, head_dim, win]), and the per-position n_valid[m] table.
+    let (k_hm, v_hm, staged_k, staged_v, nvalid) = if swa {
+        let nvalid = gpu.alloc_owned(&[m], DType::F32)?;
+        let nv: Vec<u8> = (0..m)
+            .flat_map(|b| ((start_pos + b + 1).min(win) as i32).to_ne_bytes())
+            .collect();
+        gpu.hip.memcpy_htod(&nvalid.buf, &nv)?;
+        (
+            Some(gpu.alloc_owned(&[n_kv * m * head_dim], DType::F32)?),
+            Some(gpu.alloc_owned(&[n_kv * m * head_dim], DType::F32)?),
+            Some(gpu.alloc_owned(&[n_kv * m * head_dim * win], DType::F32)?),
+            Some(gpu.alloc_owned(&[n_kv * m * head_dim * win], DType::F32)?),
+            Some(nvalid),
+        )
+    } else {
+        (None, None, None, None, None)
+    };
+
+    let n_extract = extract_layers.len();
+    let mut e_next = 0usize; // cursor into ascending extract_layers
+
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let layer = &weights.layers[layer_idx];
+
+        // ── Attention: input norm, QKV, per-head QK-norm, dual-θ RoPE ──
+        gpu.rmsnorm_batched(x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
+        prefill_linear(gpu, &layer.wq, &tmp, &q, m)?;
+        prefill_linear(gpu, &layer.wk, &tmp, &k, m)?;
+        prefill_linear(gpu, &layer.wv, &tmp, &v, m)?;
+        gpu.rmsnorm_batched(&q, &layer.q_norm, &q, m * n_heads, head_dim, eps)?;
+        gpu.rmsnorm_batched(&k, &layer.k_norm, &k, m * n_kv, head_dim, eps)?;
+        gpu.rope_batched_f32(
+            &q,
+            &k,
+            &positions,
+            n_heads,
+            n_kv,
+            head_dim,
+            cfg.rope_base_for_layer(layer_idx),
+            m,
+        )?;
+
+        if swa && !cfg.is_global_layer(layer_idx) {
+            // ── Local layer: batched sliding-window attention over the ring ──
+            let k_hm = k_hm.as_ref().unwrap();
+            let v_hm = v_hm.as_ref().unwrap();
+            let staged_k = staged_k.as_ref().unwrap();
+            let staged_v = staged_v.as_ref().unwrap();
+            let nvalid = nvalid.as_ref().unwrap();
+            let ring_k = state.swa_k[layer_idx].as_ref().unwrap();
+            let ring_v = state.swa_v[layer_idx].as_ref().unwrap();
+            let hdw = head_dim * win;
+
+            // Gather position-major k/v [m, n_kv*head_dim] → head-major
+            // [n_kv, m, head_dim] (the stage/ring-write kernels are per-head).
+            for kvh in 0..n_kv {
+                gpu.strided_copy_2d(
+                    &k,
+                    kvh * head_dim,
+                    kv_dim,
+                    k_hm,
+                    kvh * m * head_dim,
+                    head_dim,
+                    m,
+                    head_dim,
+                    false,
+                )?;
+                gpu.strided_copy_2d(
+                    &v,
+                    kvh * head_dim,
+                    kv_dim,
+                    v_hm,
+                    kvh * m * head_dim,
+                    head_dim,
+                    m,
+                    head_dim,
+                    false,
+                )?;
+            }
+            // Stage each kv head's visible window (pre-chunk ring + within-chunk KV).
+            for kvh in 0..n_kv {
+                gpu.swa_visibility_stage_batched(
+                    &ring_k.sub_offset(kvh * hdw, hdw),
+                    &k_hm.sub_offset(kvh * m * head_dim, m * head_dim),
+                    &staged_k.sub_offset(kvh * m * hdw, m * hdw),
+                    start_pos as i32,
+                    win as i32,
+                    head_dim as i32,
+                    m as i32,
+                )?;
+                gpu.swa_visibility_stage_batched(
+                    &ring_v.sub_offset(kvh * hdw, hdw),
+                    &v_hm.sub_offset(kvh * m * head_dim, m * head_dim),
+                    &staged_v.sub_offset(kvh * m * hdw, m * hdw),
+                    start_pos as i32,
+                    win as i32,
+                    head_dim as i32,
+                    m as i32,
+                )?;
+            }
+            // gemma3 bakes query_pre_attn_scalar into q_norm ⇒ plain 1/√head_dim.
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            gpu.attention_swa_gqa_batched(
+                &q, staged_k, staged_v, nvalid, &attn_out, n_heads, n_kv, head_dim, win, m, scale,
+            )?;
+            // Advance the rings with this chunk's KV (slot = pos % window).
+            for kvh in 0..n_kv {
+                gpu.swa_ring_write_batched_f32(
+                    &k_hm.sub_offset(kvh * m * head_dim, m * head_dim),
+                    &ring_k.sub_offset(kvh * hdw, hdw),
+                    1,
+                    head_dim as i32,
+                    win as i32,
+                    start_pos as i32,
+                    m as i32,
+                )?;
+                gpu.swa_ring_write_batched_f32(
+                    &v_hm.sub_offset(kvh * m * head_dim, m * head_dim),
+                    &ring_v.sub_offset(kvh * hdw, hdw),
+                    1,
+                    head_dim as i32,
+                    win as i32,
+                    start_pos as i32,
+                    m as i32,
+                )?;
+            }
+        } else if state.kv_cache.quant_q8 {
+            // ── Global layer (or SWA off), Q8 KV ──
+            gpu.kv_cache_write_q8_0_batched(
+                &state.kv_cache.k_gpu[layer_idx],
+                &k,
+                &positions,
+                n_kv,
+                head_dim,
+                m,
+            )?;
+            gpu.kv_cache_write_q8_0_batched(
+                &state.kv_cache.v_gpu[layer_idx],
+                &v,
+                &positions,
+                n_kv,
+                head_dim,
+                m,
+            )?;
+            gpu.attention_q8_0_kv_batched(
+                &q,
+                &state.kv_cache.k_gpu[layer_idx],
+                &state.kv_cache.v_gpu[layer_idx],
+                &attn_out,
+                &positions,
+                n_heads,
+                n_kv,
+                head_dim,
+                state.kv_cache.physical_cap,
+                max_ctx,
+                m,
+            )?;
+        } else {
+            // ── Global layer (or SWA off), F32 KV ──
+            gpu.kv_cache_write_f32_batched(
+                &state.kv_cache.k_gpu[layer_idx],
+                &k,
+                &positions,
+                kv_dim,
+                m,
+            )?;
+            gpu.kv_cache_write_f32_batched(
+                &state.kv_cache.v_gpu[layer_idx],
+                &v,
+                &positions,
+                kv_dim,
+                m,
+            )?;
+            gpu.attention_f32_batched(
+                &q,
+                &state.kv_cache.k_gpu[layer_idx],
+                &state.kv_cache.v_gpu[layer_idx],
+                &attn_out,
+                &positions,
+                n_heads,
+                n_kv,
+                head_dim,
+                state.kv_cache.physical_cap,
+                max_ctx,
+                m,
+            )?;
+        }
+
+        // o_proj + post_attention_layernorm (inside the residual) + add.
+        prefill_linear(gpu, &layer.wo, &attn_out, &o, m)?;
+        gpu.rmsnorm_batched(&o, &layer.post_attn_norm, &tmp, m, dim, eps)?;
+        gpu.add_f32(x_batch, &tmp, x_batch)?;
+
+        // FFN (GeGLU) + post_feedforward_layernorm (inside the residual) + add.
+        gpu.rmsnorm_batched(x_batch, &layer.pre_ffn_norm, &tmp, m, dim, eps)?;
+        prefill_linear(gpu, &layer.w_gate, &tmp, &gate, m)?;
+        prefill_linear(gpu, &layer.w_up, &tmp, &up, m)?;
+        gpu.gelu_mul_f32(&gate, &up, &ffn)?;
+        prefill_linear(gpu, &layer.w_down, &ffn, &o, m)?;
+        gpu.rmsnorm_batched(&o, &layer.post_ffn_norm, &tmp, m, dim, eps)?;
+        gpu.add_f32(x_batch, &tmp, x_batch)?;
+
+        // Extract-layer capture: scatter the settled residual [m, dim] into the
+        // GPU sink [m, n_extract, dim] at extract index e_next (position-major).
+        if let Some(hg) = hidden_gpu {
+            if e_next < n_extract && extract_layers[e_next] == layer_idx {
+                gpu.strided_copy_2d(
+                    x_batch,
+                    0,
+                    dim,
+                    hg,
+                    e_next * dim,
+                    n_extract * dim,
+                    m,
+                    dim,
+                    false,
+                )?;
+                e_next += 1;
+            }
+        }
+    }
+
+    // Per-position final norm + lm_head → [m, vocab].
+    let normed = gpu.alloc_owned(&[m * dim], DType::F32)?;
+    gpu.rmsnorm_batched(x_batch, &weights.output_norm, &normed, m, dim, eps)?;
+    let logits_all = gpu.alloc_owned(&[m * vocab], DType::F32)?;
+    prefill_linear(gpu, &weights.output, &normed, &logits_all, m)?;
+    let host = gpu.download_f32(&logits_all)?;
+
+    gpu.reclaim_pending();
+    state.next_pos = start_pos + m;
+    Ok(host)
 }
 
 /// Greedy variant: run a step, then return argmax of the resulting logits.

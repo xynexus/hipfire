@@ -1298,6 +1298,7 @@ dependencies = [
  "hipfire-hneurons",
  "hipfire-rdna",
  "hipfire-runtime",
+ "hipfire-specdecode-dspark",
  "hipfire-steer",
  "serde_json",
 ]

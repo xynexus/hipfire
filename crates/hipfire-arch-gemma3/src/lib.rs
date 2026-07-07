@@ -29,6 +29,7 @@ pub mod arch;
 pub mod calibration;
 pub mod config;
 pub mod forward;
+pub mod spec_impl;
 pub mod weights;
 
 pub use arch::{Gemma3, Gemma3Backend};

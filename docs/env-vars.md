@@ -220,8 +220,8 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS` | Runtime variable controlling gemma3 calib layers per pass in hipfire | `crates/hipfire-arch-gemma3/src/calibration.rs:88` |
 | `HIPFIRE_GEMMA3_CALIB_MICROBATCH` | Runtime variable controlling gemma3 calib microbatch in hipfire | `crates/hipfire-arch-gemma3/src/calibration.rs:120` |
 | `HIPFIRE_GEMMA3_CALIB_NO_BATCH` | Enabled when set to 1 | `crates/hipfire-arch-gemma3/src/calibration.rs:111` |
-| `HIPFIRE_GEMMA3_NO_BATCHED_PREFILL` | Runtime variable controlling gemma3 no batched prefill in hipfire | `crates/hipfire-arch-gemma3/src/arch.rs:100` |
-| `HIPFIRE_GEMMA3_PREFILL_MICROBATCH` | Runtime variable controlling gemma3 prefill microbatch in hipfire | `crates/hipfire-arch-gemma3/src/arch.rs:106` |
+| `HIPFIRE_GEMMA3_NO_BATCHED_PREFILL` | Runtime variable controlling gemma3 no batched prefill in hipfire | `crates/hipfire-arch-gemma3/src/arch.rs:106` |
+| `HIPFIRE_GEMMA3_PREFILL_MICROBATCH` | Runtime variable controlling gemma3 prefill microbatch in hipfire | `crates/hipfire-arch-gemma3/src/arch.rs:112` |
 | `HIPFIRE_GEMMA3_VISION_NOWMMA` | Runtime variable controlling gemma3 vision nowmma in hipfire | `crates/hipfire-arch-gemma3-vl/src/forward.rs:204` |
 | `HIPFIRE_GEMM_DUMP` | Enabled when set to 1 | `crates/hipfire-rdna/src/feature_flags.rs:292` |
 | `HIPFIRE_GEMV_ROWS` | Runtime variable controlling gemv rows in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:172` |
@@ -293,7 +293,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_LLOYD_GFX12` | Used to configure runtime execution by explicitly setting "HIPFIRE_LLOYD_GFX12" | `crates/hipfire-runtime/examples/prefill_microbench.rs:167` |
 | `HIPFIRE_LLOYD_K3` | Fallback to HFQ2-G128 for non-256-aligned (no rotation) | `crates/hipfire-quantize/src/main.rs:8153` |
 | `HIPFIRE_LLOYD_MB4` | Force MB4=0 to skip the size-gated routing | `crates/hipfire-rdna/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs:274` |
-| `HIPFIRE_LM_DUMP` | Selects behavior from recognized values | `crates/hipfire-arch-gemma3/src/forward.rs:343` |
+| `HIPFIRE_LM_DUMP` | Selects behavior from recognized values | `crates/hipfire-arch-gemma3/src/forward.rs:364` |
 | `HIPFIRE_LM_HEAD_F16` | Runtime variable controlling lm head f16 in hipfire | `crates/hipfire-runtime/src/config.rs:108` |
 | `HIPFIRE_LM_HEAD_OVERWRITE` | Environment toggle value controls runtime behavior | `crates/hipfire-rdna/src/feature_flags.rs:222` |
 | `HIPFIRE_LM_HEAD_WMMA` | Runtime variable controlling lm head wmma in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:220` |
