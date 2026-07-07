@@ -26,7 +26,7 @@ use hipfire_train::dspark_train::{
     init_dspark_model, load_dslb, load_dspark_ckpt, load_weights_into, save_dspark_ckpt,
     train_dspark_loop, DsparkDrafterCfg, DsparkTrainCfg,
 };
-use hipfire_train::loader::load_llama_from_hfq;
+use hipfire_train::loader::load_target_f32;
 use hipfire_train::optim::AdamW;
 use std::path::Path;
 
@@ -140,8 +140,8 @@ fn main() -> HipResult<()> {
 
     // ── GPU + frozen target (shared embed + lm-head) ─────────────────────────
     let mut gpu = Gpu::init().expect("GPU init");
-    let (target_cfg, target) = load_llama_from_hfq(&mut gpu, Path::new(&target_path))
-        .unwrap_or_else(|e| {
+    let (target_cfg, target) =
+        load_target_f32(&mut gpu, Path::new(&target_path)).unwrap_or_else(|e| {
             eprintln!("load target {target_path}: {e}");
             std::process::exit(1);
         });
