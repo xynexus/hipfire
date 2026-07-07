@@ -143,6 +143,40 @@ fn decode_hfq_tensor(quant_type: u8, data: &[u8], n: usize) -> Result<Vec<f32>, 
     }
 }
 
+/// Parallel HFQ Q8F16 dequant (34-byte blocks: f16 scale + 32×i8). The gemma3
+/// embedding table is ~671M elements and the serial `dequant_q8f16` is a
+/// multi-minute single-threaded startup tax on every training run; blocks are
+/// independent, so split the block stream across cores. Falls back to the serial
+/// path if the byte length doesn't match the 34-B block layout (layout guard).
+fn dequant_q8f16_parallel(data: &[u8], n: usize) -> Vec<f32> {
+    const BYTES_PER_BLOCK: usize = 34;
+    if n % 32 != 0 || data.len() != (n / 32) * BYTES_PER_BLOCK {
+        return hipfire_runtime::quant::dequant_q8f16(data, n);
+    }
+    let total_blocks = n / 32;
+    let threads = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(8)
+        .clamp(1, total_blocks.max(1));
+    let blocks_per = total_blocks.div_ceil(threads);
+    let mut out = vec![0.0f32; n];
+    std::thread::scope(|s| {
+        let mut rest = out.as_mut_slice();
+        let mut b0 = 0usize;
+        while b0 < total_blocks {
+            let nb = blocks_per.min(total_blocks - b0);
+            let (chunk, tail) = rest.split_at_mut(nb * 32);
+            rest = tail;
+            let dslice = &data[b0 * BYTES_PER_BLOCK..(b0 + nb) * BYTES_PER_BLOCK];
+            s.spawn(move || {
+                chunk.copy_from_slice(&hipfire_runtime::quant::dequant_q8f16(dslice, nb * 32));
+            });
+            b0 += nb;
+        }
+    });
+    out
+}
+
 /// Load a dense LLaMA model's base weights directly from a `.hfq` artifact,
 /// decoded to fp32 — so the training "student" IS the served model (no
 /// re-quantize / format-matching). Config comes from the HFQM metadata.
@@ -284,8 +318,14 @@ pub fn load_gemma3_target_f32(
         .ok_or_else(|| format!("gemma3: missing tensor {embed_name}"))?;
     let data = &bytes[e.data_offset..e.data_offset + e.data_size];
     let n = vocab_size * hidden_size;
-    let f32s =
-        decode_hfq_tensor(e.quant_type, data, n).map_err(|x| format!("{embed_name}: {x}"))?;
+    // Q8F16 (the common embed format) uses the parallel dequant to avoid a
+    // multi-minute single-threaded startup; other formats go through the shared
+    // decoder.
+    let f32s = if e.quant_type == 3 {
+        dequant_q8f16_parallel(data, n)
+    } else {
+        decode_hfq_tensor(e.quant_type, data, n).map_err(|x| format!("{embed_name}: {x}"))?
+    };
     if f32s.len() != n {
         return Err(format!("{embed_name}: {} elems != {n}", f32s.len()));
     }
