@@ -417,6 +417,78 @@ impl Gpu {
             )
         }
     }
+    /// BF16-compute forward of the training linear op:
+    /// `y[m,n] = x[m,k] · w[n,k]^T` (NT). Reads `x`/`w` as F32, casts to BF16
+    /// in-register for a WMMA f32-accumulate multiply, writes F32 `y`. Same
+    /// numerics contract as `gemm_f32_train(x, w, y, m, n, k, k, k, false, true)`
+    /// but on the matrix cores; leaves the F32 master weights/activations and the
+    /// F32 backward untouched. Args mirror `linear_forward`'s `(x, w, y, m, k, n)`.
+    pub fn gemm_bf16c_train_nt(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_bf16c_train_nt",
+            kernels::GEMM_BF16C_TRAIN_NT_SRC,
+            "gemm_bf16c_train_nt",
+        )?;
+        // Kernel computes Y[B,M] = X[B,K]·A[M,K]^T. Map A=w (kernel M=n_out),
+        // X=x (kernel B=m_tok), Y=y stored row-major [B=m, M=n].
+        let ap = w.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = n as i32; // kernel M = output cols = n
+        let ki = k as i32;
+        let bi = m as i32; // kernel B = tokens = m
+        let grid_m = ((n + 15) / 16) as u32;
+        let grid_b = ((m + 15) / 16) as u32;
+        self.launch_kernargs(
+            "gemm_bf16c_train_nt",
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        )
+    }
+    /// F16-compute forward of the training linear op (see `gemm_bf16c_train_nt`);
+    /// casts to `_Float16` for higher forward precision at the same WMMA speed.
+    pub fn gemm_f16c_train_nt(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f16c_train_nt",
+            kernels::GEMM_F16C_TRAIN_NT_SRC,
+            "gemm_f16c_train_nt",
+        )?;
+        let ap = w.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = n as i32;
+        let ki = k as i32;
+        let bi = m as i32;
+        let grid_m = ((n + 15) / 16) as u32;
+        let grid_b = ((m + 15) / 16) as u32;
+        self.launch_kernargs(
+            "gemm_f16c_train_nt",
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        )
+    }
     pub fn gemm_f16_wmma_mb4(
         &mut self,
         w: &GpuTensor,

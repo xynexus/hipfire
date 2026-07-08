@@ -290,7 +290,7 @@ pub const ENV_HIPFIRE_BENCH_QWEN35_SPEED_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_BF16_DENSE_M128: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16_DENSE_M128",
     description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-rdna/src/dispatch/gemm_base.rs:662",
+    source: "crates/hipfire-rdna/src/dispatch/gemm_base.rs:734",
 };
 
 /// `HIPFIRE_BF16_MOE_M256` — Enabled when set to 1
@@ -3670,6 +3670,13 @@ pub const ENV_HIPFIRE_TP_USE_RCCL: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/src/config.rs:90",
 };
 
+/// `HIPFIRE_TRAIN_LOWP` — Selects behavior from recognized values
+pub const ENV_HIPFIRE_TRAIN_LOWP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_TRAIN_LOWP",
+    description: "Selects behavior from recognized values",
+    source: "crates/hipfire-train/src/ops/linear.rs:33",
+};
+
 /// `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` — Runtime variable controlling uniform vram tolerance gb in hipfire
 pub const ENV_HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB",
@@ -4466,6 +4473,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_TP_BENCH_N,
     ENV_HIPFIRE_TP_EXPERT_ASSIGN,
     ENV_HIPFIRE_TP_USE_RCCL,
+    ENV_HIPFIRE_TRAIN_LOWP,
     ENV_HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB,
     ENV_HIPFIRE_VERIFY_GRAPH,
     ENV_HIPFIRE_VERIFY_GRAPH_TIMING,

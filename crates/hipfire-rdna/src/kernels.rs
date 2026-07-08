@@ -3406,6 +3406,19 @@ pub const GEMM_F32_SRC: &str = include_str!("../../../kernels/src/gemm_f32.hip")
 /// See `kernels/src/gemm_f32_train.hip` and the hipfire-train Phase 0 plan.
 pub const GEMM_F32_TRAIN_SRC: &str = include_str!("../../../kernels/src/gemm_f32_train.hip");
 
+/// BF16-compute training GEMM forward (NT): `Y[B,M] = X[B,K]·A[M,K]^T`, A/X read
+/// as F32 and cast to BF16 in-register, F32 accumulate + output. Drop-in
+/// bf16-compute replacement for the `gemm_f32_train` forward matmul; leaves
+/// master weights/activations in F32. See `kernels/src/gemm_bf16c_train_nt.hip`.
+pub const GEMM_BF16C_TRAIN_NT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16c_train_nt.hip");
+
+/// F16-compute training GEMM forward (NT): like `GEMM_BF16C_TRAIN_NT_SRC` but
+/// casts to `_Float16` (10 mantissa bits vs bf16's 7) for higher forward
+/// precision at the same WMMA throughput. See `kernels/src/gemm_f16c_train_nt.hip`.
+pub const GEMM_F16C_TRAIN_NT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16c_train_nt.hip");
+
 /// RMSNorm forward+backward (fp32) for the un-fused training path.
 /// `rmsnorm_train_fwd` saves `1/r` per row for `rmsnorm_train_bwd`.
 pub const RMSNORM_TRAIN_SRC: &str = include_str!("../../../kernels/src/rmsnorm_train.hip");
