@@ -210,21 +210,53 @@ impl Gpu {
             kernels::RMSNORM_TRAIN_SRC,
             "rmsnorm_train_bwd",
         )?;
-        let func = &self.functions["rmsnorm_train_bwd"];
+        // dx (one block per row, deterministic).
+        {
+            let func = &self.functions["rmsnorm_train_bwd"];
+            let mut dyp = dy.buf.as_ptr();
+            let mut xp = x.buf.as_ptr();
+            let mut wp = w.buf.as_ptr();
+            let mut rp = rinv.buf.as_ptr();
+            let mut dxp = dx.buf.as_ptr();
+            let mut rowsi = rows as i32;
+            let mut hi = h as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut dyp as *mut _ as *mut c_void,
+                &mut xp as *mut _ as *mut c_void,
+                &mut wp as *mut _ as *mut c_void,
+                &mut rp as *mut _ as *mut c_void,
+                &mut dxp as *mut _ as *mut c_void,
+                &mut rowsi as *mut _ as *mut c_void,
+                &mut hi as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [rows as u32, 1, 1],
+                    [64, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        // dw (one thread per weight column, deterministic accumulation).
+        self.ensure_kernel(
+            "rmsnorm_train_dw",
+            kernels::RMSNORM_TRAIN_SRC,
+            "rmsnorm_train_dw",
+        )?;
+        let func = &self.functions["rmsnorm_train_dw"];
         let mut dyp = dy.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
-        let mut wp = w.buf.as_ptr();
         let mut rp = rinv.buf.as_ptr();
-        let mut dxp = dx.buf.as_ptr();
         let mut dwp = dw.buf.as_ptr();
         let mut rowsi = rows as i32;
         let mut hi = h as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut dyp as *mut _ as *mut c_void,
             &mut xp as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void,
             &mut rp as *mut _ as *mut c_void,
-            &mut dxp as *mut _ as *mut c_void,
             &mut dwp as *mut _ as *mut c_void,
             &mut rowsi as *mut _ as *mut c_void,
             &mut hi as *mut _ as *mut c_void,
@@ -232,8 +264,8 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [rows as u32, 1, 1],
-                [64, 1, 1],
+                [((h + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,

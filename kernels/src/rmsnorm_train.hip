@@ -7,8 +7,12 @@
 //   dx[t,i] = (1/r[t]) * ( dy[t,i]*w[i] - x[t,i]*c[t] / (H * r[t]^2) )
 //   dw[i]   = Σ_t dy[t,i] * x[t,i] / r[t]      (accumulated across rows)
 //
-// One block per row, wave32-strided reduction over H. dw uses atomicAdd since
-// every row contributes to every weight element.
+// One block per row, wave32-strided reduction over H. `dx` is deterministic
+// (each block owns its row). `dw` is a reduction OVER rows into every weight
+// element — it used atomicAdd, whose float summation order is nondeterministic,
+// which made f32 training diverge run-to-run (chaotic amplification of the ~1e-4
+// jitter). It is now a separate deterministic kernel `rmsnorm_train_dw`: one
+// thread owns weight column i and sums the rows in fixed order.
 
 #include <hip/hip_runtime.h>
 
@@ -42,6 +46,8 @@ __global__ void rmsnorm_train_fwd(
     for (int i = tid; i < H; i += nthreads) yr[i] = xr[i] * ri * w[i];
 }
 
+// dx only (one block per row, deterministic). dw is computed by
+// `rmsnorm_train_dw` below.
 extern "C" __launch_bounds__(64)
 __global__ void rmsnorm_train_bwd(
     const float* __restrict__ dy,   // [rows, H]
@@ -49,7 +55,6 @@ __global__ void rmsnorm_train_bwd(
     const float* __restrict__ w,    // [H]
     const float* __restrict__ rinv, // [rows]  (1/r from forward)
     float* __restrict__ dx,         // [rows, H]  out
-    float* __restrict__ dw,         // [H]        out (atomic-accumulated)
     int rows, int H
 ) {
     int t = blockIdx.x;
@@ -75,8 +80,29 @@ __global__ void rmsnorm_train_bwd(
     float coef = csum * ri * ri / (float)H; // c / (H r^2)
 
     for (int i = tid; i < H; i += nthreads) {
-        float dxi = ri * (dyr[i] * w[i] - xr[i] * coef);
-        dxr[i] = dxi;
-        if (dw) atomicAdd(&dw[i], dyr[i] * xr[i] * ri);
+        dxr[i] = ri * (dyr[i] * w[i] - xr[i] * coef);
     }
+}
+
+// Deterministic weight-gradient accumulation, replacing the atomicAdd above.
+// One thread owns weight column i and sums over rows in FIXED order, so the
+// result is bit-reproducible run-to-run. A single non-atomic `+=` into dw[i]
+// (each column owned by exactly one thread → no race) preserves the accumulate
+// contract: callers zero dw before the first backward, so `+=` yields the plain
+// sum on a single call and accumulates correctly across calls.
+//   dw[i] += Σ_t dy[t,i] * x[t,i] * rinv[t]
+extern "C" __global__ void rmsnorm_train_dw(
+    const float* __restrict__ dy,   // [rows, H]
+    const float* __restrict__ x,    // [rows, H]
+    const float* __restrict__ rinv, // [rows]
+    float* __restrict__ dw,         // [H]  out (accumulated)
+    int rows, int H
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= H) return;
+    float acc = 0.0f;
+    for (int t = 0; t < rows; t++) {
+        acc += dy[(size_t)t * H + i] * x[(size_t)t * H + i] * rinv[t];
+    }
+    dw[i] += acc;
 }

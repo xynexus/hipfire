@@ -42,7 +42,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_BASELINE_ARCH` | Runtime variable controlling baseline arch in hipfire | `crates/hipfire-runtime/examples/coherence_probe.rs:423` |
 | `HIPFIRE_BATCHES_STATE_MAX` | Parses "HIPFIRE_BATCHES_STATE_MAX" with fallback defaults | `crates/hipfire-server/src/routes/batches.rs:687` |
 | `HIPFIRE_BENCH_QWEN35_SPEED_BIN` | Runtime variable controlling bench qwen35 speed bin in hipfire | `crates/hipfire-eval/src/lib.rs:1162` |
-| `HIPFIRE_BF16_DENSE_M128` | Enabled by default; set to 0 to disable | `crates/hipfire-rdna/src/dispatch/gemm_base.rs:789` |
+| `HIPFIRE_BF16_DENSE_M128` | Enabled by default; set to 0 to disable | `crates/hipfire-rdna/src/dispatch/gemm_base.rs:870` |
 | `HIPFIRE_BF16_MOE_M256` | Enabled when set to 1 | `crates/hipfire-rdna/src/dispatch/overlays/gfx1151.rs:161` |
 | `HIPFIRE_BF16_WEIGHTS` | Runtime variable controlling bf16 weights in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:222` |
 | `HIPFIRE_BLOB_FORCE` | Graph / capture / deterministic | `crates/hipfire-rdna/src/feature_flags.rs:291` |
@@ -519,8 +519,9 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_TP_BENCH_N` | Runtime variable controlling tp bench n in hipfire | `crates/hip-bridge/examples/rccl_smoke.rs:36` |
 | `HIPFIRE_TP_EXPERT_ASSIGN` | Selects behavior from recognized values | `crates/hipfire-runtime/src/tp_shard.rs:57` |
 | `HIPFIRE_TP_USE_RCCL` | Runtime variable controlling tp use rccl in hipfire | `crates/hipfire-runtime/src/config.rs:90` |
-| `HIPFIRE_TRAIN_HEADS` | Selects behavior from recognized values | `crates/hipfire-train/src/ops/linear.rs:87` |
-| `HIPFIRE_TRAIN_LOWP` | Selects behavior from recognized values | `crates/hipfire-train/src/ops/linear.rs:53` |
+| `HIPFIRE_TRAIN_BWD` | Selects behavior from recognized values | `crates/hipfire-train/src/ops/linear.rs:139` |
+| `HIPFIRE_TRAIN_HEADS` | Selects behavior from recognized values | `crates/hipfire-train/src/ops/linear.rs:97` |
+| `HIPFIRE_TRAIN_LOWP` | Selects behavior from recognized values | `crates/hipfire-train/src/ops/linear.rs:63` |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Runtime variable controlling uniform vram tolerance gb in hipfire | `crates/hipfire-runtime/src/config.rs:105` |
 | `HIPFIRE_VERIFY_GRAPH` | Runtime variable controlling verify graph in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:6200` |
 | `HIPFIRE_VERIFY_GRAPH_TIMING` | (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the | `crates/hipfire-arch-qwen35/src/speculative.rs:6215` |
@@ -561,6 +562,6 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `USERPROFILE` | Runtime variable controlling userprofile in hipfire | `crates/hipfire-rdna/src/compiler.rs:228` |
 | `USE_SAMPLE` | Enabled when set to 1 | `crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:138` |
 
-- Total env vars: **556**
-- `HIPFIRE_*` vars: **510**
+- Total env vars: **557**
+- `HIPFIRE_*` vars: **511**
 - non-`HIPFIRE_*` vars: **46**
