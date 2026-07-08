@@ -296,12 +296,29 @@ Open perf work (correctness/quality proven; these are speedups, not blockers):
   | **f16sc2** | **156 ms** | **6.8× faster** | **~parity** |
 
   So f16sc2 is an **oracle-class (bit-equal to f16s) 1-pass backward at
-  f32-competitive speed** — the transpose passes WERE the entire overhead.
-  Remaining headroom to go *below* f32: C2 still does 2 standalone `abs_max`
-  reductions per matmul (no transpose left to fuse them into) — on-device /
-  delayed / carried scale would drop those. No-LDS strided reads keep it off the
-  gfx1103 HIP-719 fault; an LDS-coalesced variant is a later tuning. TN/NN for
-  bf16x2 (if ≥16-bit gradients are ever needed) is a mechanical copy.
+  f32-competitive speed** — the transpose passes WERE the entire overhead. But
+  force-C2 is NOT uniformly best: for the lm-head (N=vocab~262k) the strided
+  reads are massively UNCOALESCED and lose to the transpose (heads_bwd: transpose
+  173 < C2 240). C2 wins the body (many small matmuls, overhead-bound); transpose
+  wins the lm-head (few huge matmuls, coalescing amortizes).
+
+* **Hybrid dispatch — BELOW f32 (2026-07-09).** `HIPFIRE_TRAIN_BWD=f16s` now
+  dispatches per matmul on N (`F16S_STRIDED_MAX = 65536`): strided C2 kernels for
+  small N (body), transpose+NT for huge N (lm-head). `f16sc2` forces all-strided
+  (bench/tuning). Measured total backward (body+heads):
+
+  | mode           | body_bwd | heads_bwd | total |
+  |----------------|---------:|----------:|------:|
+  | f32            | 161 ms   | 254 ms    | 415   |
+  | **f16s hybrid**| 155 ms   | 173 ms    | **328** (1.27× vs f32) |
+  | f16sc2 (all-C2)| 156 ms   | 240 ms    | 396   |
+
+  Hybrid f16s is the fast default: below f32, best of both regimes, bit-equal to
+  the transpose f16s (parity unchanged), converges identically. Further headroom:
+  C2 still does 2 standalone `abs_max` per matmul (on-device/delayed/carried scale
+  would drop them); an LDS-coalesced strided variant could push the lm-head C2
+  below transpose. No-LDS keeps it off the gfx1103 HIP-719 fault. TN/NN for bf16x2
+  is a mechanical copy if ≥16-bit gradients are ever needed.
 
 ## 5. Plan: full forward + backward on WMMA
 

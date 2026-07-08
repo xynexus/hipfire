@@ -189,6 +189,102 @@ fn f16s_scale(gpu: &mut Gpu, x: &GpuTensor) -> HipResult<f32> {
     Ok(pow2_from_amax(gpu.abs_max_f32(x)?))
 }
 
+/// f16s backward strategy crossover (measured, gfx1151): when the strided
+/// operand's contract/output axis exceeds this, the C2 no-transpose kernels'
+/// UNCOALESCED strided reads lose to the transpose path (coalesced read + write +
+/// read, whose overhead amortizes over the few huge matmuls) — the lm-head regime
+/// (N=vocab~262k). Below it (the body's many small matmuls) the transpose
+/// overhead dominates and the strided C2 kernels win ~6.8×. Measured: body_bwd
+/// 1059→156 ms (C2) vs heads_bwd 174 (transpose) < 238 (C2).
+const F16S_STRIDED_MAX: usize = 65536;
+
+/// dX = dY·W (contract N). `force_c2` pins the strided kernel; otherwise dispatch
+/// on N: C2 NN (strided, no transpose) for small N, transpose+NT for huge N.
+#[allow(clippy::too_many_arguments)]
+fn f16s_backward_x(
+    gpu: &mut Gpu,
+    dy: &GpuTensor,
+    w: &GpuTensor,
+    dx: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+    accumulate: bool,
+    force_c2: bool,
+) -> HipResult<()> {
+    let s_dy = f16s_scale(gpu, dy)?;
+    if force_c2 || n <= F16S_STRIDED_MAX {
+        // C2 NN: read W strided, no transpose pass.
+        let s_w = f16s_scale(gpu, w)?;
+        if accumulate {
+            let scratch = gpu.zeros(&[m * k], DType::F32)?;
+            gpu.gemm_f16s_nn_train(dy, w, &scratch, m, n, k, s_dy, s_w)?;
+            gpu.add_inplace_f32(dx, &scratch)?;
+            gpu.free_tensor(scratch)
+        } else {
+            gpu.gemm_f16s_nn_train(dy, w, dx, m, n, k, s_dy, s_w)
+        }
+    } else {
+        // Huge N (lm-head): transpose W (abs-max fused) then NT — coalesced.
+        let wt = gpu.zeros(&[k * n], DType::F32)?;
+        let s_wt = pow2_from_amax(gpu.transpose_f32_amax(w, &wt, n, k)?);
+        if accumulate {
+            let scratch = gpu.zeros(&[m * k], DType::F32)?;
+            gpu.gemm_f16s_train_nt(dy, &wt, &scratch, m, n, k, s_dy, s_wt)?;
+            gpu.add_inplace_f32(dx, &scratch)?;
+            gpu.free_tensor(scratch)?;
+        } else {
+            gpu.gemm_f16s_train_nt(dy, &wt, dx, m, n, k, s_dy, s_wt)?;
+        }
+        gpu.free_tensor(wt)
+    }
+}
+
+/// dW = dYᵀ·X (contract M). `force_c2` pins the strided kernel; otherwise
+/// dispatch on the output-row axis N: C2 TN for small N, transpose+NT for huge N.
+#[allow(clippy::too_many_arguments)]
+fn f16s_backward_w(
+    gpu: &mut Gpu,
+    dy: &GpuTensor,
+    x: &GpuTensor,
+    dw: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+    accumulate: bool,
+    force_c2: bool,
+) -> HipResult<()> {
+    if force_c2 || n <= F16S_STRIDED_MAX {
+        // C2 TN: read both operands strided, no transpose passes.
+        let s_dy = f16s_scale(gpu, dy)?;
+        let s_x = f16s_scale(gpu, x)?;
+        if accumulate {
+            let scratch = gpu.zeros(&[n * k], DType::F32)?;
+            gpu.gemm_f16s_tn_train(dy, x, &scratch, m, n, k, s_dy, s_x)?;
+            gpu.add_inplace_f32(dw, &scratch)?;
+            gpu.free_tensor(scratch)
+        } else {
+            gpu.gemm_f16s_tn_train(dy, x, dw, m, n, k, s_dy, s_x)
+        }
+    } else {
+        // Huge N: transpose dY/X (abs-max fused) then NT.
+        let dyt = gpu.zeros(&[n * m], DType::F32)?;
+        let s_dyt = pow2_from_amax(gpu.transpose_f32_amax(dy, &dyt, m, n)?);
+        let xt = gpu.zeros(&[k * m], DType::F32)?;
+        let s_xt = pow2_from_amax(gpu.transpose_f32_amax(x, &xt, m, k)?);
+        if accumulate {
+            let scratch = gpu.zeros(&[n * k], DType::F32)?;
+            gpu.gemm_f16s_train_nt(&dyt, &xt, &scratch, n, m, k, s_dyt, s_xt)?;
+            gpu.add_inplace_f32(dw, &scratch)?;
+            gpu.free_tensor(scratch)?;
+        } else {
+            gpu.gemm_f16s_train_nt(&dyt, &xt, dw, n, m, k, s_dyt, s_xt)?;
+        }
+        gpu.free_tensor(dyt)?;
+        gpu.free_tensor(xt)
+    }
+}
+
 /// Gradient w.r.t. the input: `dx = dy · w`. `dy:[m*n]`, `w:[n*k]`, `dx:[m*k]`.
 /// When `accumulate`, does `dx += dy·w` (for inputs feeding multiple consumers,
 /// e.g. the rmsnorm output that fans into q/k/v).
@@ -210,38 +306,10 @@ pub fn linear_backward_x(
                 gpu.gemm_f32_train(dy, w, dx, m, k, n, n, k, false, false)
             }
         }
-        // Phase C2: dX = dY·W via the dedicated NN kernel — reads W strided, NO
-        // transpose pass (see gemm_f16s_backward.hip). Both operands still need a
-        // standalone abs-max (no transpose to fuse it into).
-        LowpBwd::F16sC2 => {
-            let s_dy = f16s_scale(gpu, dy)?;
-            let s_w = f16s_scale(gpu, w)?;
-            if accumulate {
-                let scratch = gpu.zeros(&[m * k], DType::F32)?;
-                gpu.gemm_f16s_nn_train(dy, w, &scratch, m, n, k, s_dy, s_w)?;
-                gpu.add_inplace_f32(dx, &scratch)?;
-                gpu.free_tensor(scratch)
-            } else {
-                gpu.gemm_f16s_nn_train(dy, w, dx, m, n, k, s_dy, s_w)
-            }
-        }
-        // Scaled f16: same reformulation, per-tensor scale on each operand.
-        // wt's abs-max is fused into its transpose; dy (not transposed) uses a
-        // standalone reduction.
-        LowpBwd::F16s => {
-            let wt = gpu.zeros(&[k * n], DType::F32)?;
-            let s_wt = pow2_from_amax(gpu.transpose_f32_amax(w, &wt, n, k)?); // w[n,k]→[k,n]
-            let s_dy = f16s_scale(gpu, dy)?;
-            if accumulate {
-                let scratch = gpu.zeros(&[m * k], DType::F32)?;
-                gpu.gemm_f16s_train_nt(dy, &wt, &scratch, m, n, k, s_dy, s_wt)?;
-                gpu.add_inplace_f32(dx, &scratch)?;
-                gpu.free_tensor(scratch)?;
-            } else {
-                gpu.gemm_f16s_train_nt(dy, &wt, dx, m, n, k, s_dy, s_wt)?;
-            }
-            gpu.free_tensor(wt)
-        }
+        // Scaled f16: dispatch strided-C2 vs transpose by N (see f16s_backward_x).
+        LowpBwd::F16s => f16s_backward_x(gpu, dy, w, dx, m, k, n, accumulate, false),
+        // Force the strided C2 kernels everywhere (tuning / bench).
+        LowpBwd::F16sC2 => f16s_backward_x(gpu, dy, w, dx, m, k, n, accumulate, true),
         // dX[m,k] = Σ_n dY[m,n]·W[n,k] (contract N). NT form: dX = NT(dY, Wᵀ),
         // Wᵀ = transpose(w[n,k]) → [k,n]; bwd_gemm_nt(dY, Wᵀ, ·, m, n, k).
         mode => {
@@ -279,38 +347,10 @@ pub fn linear_backward_w(
                 gpu.gemm_f32_train(dy, x, dw, n, k, m, n, k, true, false)
             }
         }
-        // Phase C2: dW = dYᵀ·X via the dedicated TN kernel — reads both operands
-        // strided, NO transpose passes (see gemm_f16s_backward.hip).
-        LowpBwd::F16sC2 => {
-            let s_dy = f16s_scale(gpu, dy)?;
-            let s_x = f16s_scale(gpu, x)?;
-            if accumulate {
-                let scratch = gpu.zeros(&[n * k], DType::F32)?;
-                gpu.gemm_f16s_tn_train(dy, x, &scratch, m, n, k, s_dy, s_x)?;
-                gpu.add_inplace_f32(dw, &scratch)?;
-                gpu.free_tensor(scratch)
-            } else {
-                gpu.gemm_f16s_tn_train(dy, x, dw, m, n, k, s_dy, s_x)
-            }
-        }
-        // Scaled f16: both operands come from transposes, so both abs-maxes are
-        // fused in — no standalone reduction.
-        LowpBwd::F16s => {
-            let dyt = gpu.zeros(&[n * m], DType::F32)?;
-            let s_dyt = pow2_from_amax(gpu.transpose_f32_amax(dy, &dyt, m, n)?); // dy[m,n]→[n,m]
-            let xt = gpu.zeros(&[k * m], DType::F32)?;
-            let s_xt = pow2_from_amax(gpu.transpose_f32_amax(x, &xt, m, k)?); // x[m,k]→[k,m]
-            if accumulate {
-                let scratch = gpu.zeros(&[n * k], DType::F32)?;
-                gpu.gemm_f16s_train_nt(&dyt, &xt, &scratch, n, m, k, s_dyt, s_xt)?;
-                gpu.add_inplace_f32(dw, &scratch)?;
-                gpu.free_tensor(scratch)?;
-            } else {
-                gpu.gemm_f16s_train_nt(&dyt, &xt, dw, n, m, k, s_dyt, s_xt)?;
-            }
-            gpu.free_tensor(dyt)?;
-            gpu.free_tensor(xt)
-        }
+        // Scaled f16: dispatch strided-C2 vs transpose by N (see f16s_backward_w).
+        LowpBwd::F16s => f16s_backward_w(gpu, dy, x, dw, m, k, n, accumulate, false),
+        // Force the strided C2 kernels everywhere (tuning / bench).
+        LowpBwd::F16sC2 => f16s_backward_w(gpu, dy, x, dw, m, k, n, accumulate, true),
         // dW[n,k] = Σ_m dY[m,n]·X[m,k] (contract M). NT form: dW = NT(dYᵀ, Xᵀ),
         // dYᵀ = transpose(dy)[n,m], Xᵀ = transpose(x)[k,m];
         // bwd_gemm_nt(dYᵀ, Xᵀ, ·, n, m, k).
