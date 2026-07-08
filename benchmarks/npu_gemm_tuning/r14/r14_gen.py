@@ -24,6 +24,22 @@ CJ = 4 * CB              # joined C per column
 INF = 9223372036854775807
 G = range(4)             # 4 cols, 4 block-rows
 
+# npu1 (aie2) DMA BDs cap each dimension size at 1023 (10-bit). The contiguous
+# per-block stripe (AB/WB/CJ) exceeds that, so split it into two <=1023 dims. A
+# contiguous run of `blk` elements laid out as [<o, inner>, <inner, 1>] (o*inner ==
+# blk) is byte-identical to a single <blk, 1> dim, but lowers on stricter mlir-aie
+# versions. Total BD dims stay <= 4 (block dim + the two split dims).
+def _split(blk):
+    for inner in range(min(blk, 1023), 0, -1):
+        if blk % inner == 0 and blk // inner <= 1023:
+            return blk // inner, inner
+    raise ValueError(f"cannot split {blk} into two <=1023 dims")
+
+def _bd_dims(nblk, blk):
+    o, inner = _split(blk)
+    return (f"[<size = {nblk}, stride = {blk}>, "
+            f"<size = {o}, stride = {inner}>, <size = {inner}, stride = 1>]")
+
 out = ["module {", "  aie.device(npu1) {"]
 for c in G:
     out.append(f"    %shim{c} = aie.tile({c}, 0)")
@@ -80,19 +96,19 @@ args = ", ".join([f"%A: memref<{4*At}xi8>", f"%W: memref<{4*Wt}xi8>", f"%C: memr
 out.append(f"    aie.runtime_sequence({args}) {{")
 for i in G:
     out.append(f'''      %ta{i} = aiex.dma_configure_task_for @ash{i} {{
-        aie.dma_bd(%A : memref<{4*At}xi8>, {i*At}, {At}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = {NBLK}, stride = {AB}>, <size = {AB}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%A : memref<{4*At}xi8>, {i*At}, {At}, {_bd_dims(NBLK, AB)}) {{burst_length = 0 : i32}}
         aie.end
       }}
       aiex.dma_start_task(%ta{i})''')
 for j in G:
     out.append(f'''      %tw{j} = aiex.dma_configure_task_for @wsh{j} {{
-        aie.dma_bd(%W : memref<{4*Wt}xi8>, {j*Wt}, {Wt}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = {NBLK}, stride = {WB}>, <size = {WB}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%W : memref<{4*Wt}xi8>, {j*Wt}, {Wt}, {_bd_dims(NBLK, WB)}) {{burst_length = 0 : i32}}
         aie.end
       }}
       aiex.dma_start_task(%tw{j})''')
 for j in G:
     out.append(f'''      %tc{j} = aiex.dma_configure_task_for @csh{j} {{
-        aie.dma_bd(%C : memref<{4*Ct}xi32>, {j*Ct}, {Ct}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = {NBLK}, stride = {CJ}>, <size = {CJ}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%C : memref<{4*Ct}xi32>, {j*Ct}, {Ct}, {_bd_dims(NBLK, CJ)}) {{burst_length = 0 : i32}}
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%tc{j})''')

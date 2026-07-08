@@ -27,16 +27,40 @@ use hipfire_rdna::Gpu;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
 
+/// amdgpu hwmon `power1_average` (SoC package power, µW) — the same rail the NPU
+/// bench reads, for a fair GPU-vs-NPU tok/joule comparison.
+fn amdgpu_power_path() -> Option<std::path::PathBuf> {
+    for e in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
+        let p = e.path();
+        if std::fs::read_to_string(p.join("name")).map(|s| s.trim() == "amdgpu").unwrap_or(false) {
+            let pw = p.join("power1_average");
+            if pw.exists() {
+                return Some(pw);
+            }
+        }
+    }
+    None
+}
+fn read_watts(path: &std::path::Path) -> Option<f64> {
+    std::fs::read_to_string(path).ok()?.trim().parse::<f64>().ok().map(|uw: f64| uw / 1e6)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hfq_path: Option<String> = None;
     let mut dims: Option<usize> = None;
+    let mut bench_m: usize = 0;
+    let mut bench_iters: usize = 50;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--hfq" => hfq_path = it.next(),
             "--dims" => dims = it.next().and_then(|s| s.parse().ok()),
+            // --bench-m <M>: skip the sanity docs and instead time embed_forward on a
+            // synthetic M-token sequence (the GPU tok/s baseline for the NPU comparison).
+            "--bench-m" => bench_m = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            "--bench-iters" => bench_iters = it.next().and_then(|s| s.parse().ok()).unwrap_or(50),
             "-h" | "--help" => {
-                eprintln!("usage: embed_e2e --hfq <path.hfq> [--dims N]");
+                eprintln!("usage: embed_e2e --hfq <path.hfq> [--dims N] [--bench-m M --bench-iters N]");
                 return Ok(());
             }
             other => return Err(format!("unknown arg: {other}").into()),
@@ -87,6 +111,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[4/4] loading weights + Gpu");
     let mut gpu = Gpu::init()?;
     let weights = eg::EmbeddingGemmaWeights::load(&mut hfq, &cfg, &mut gpu)?;
+
+    // GPU throughput baseline: time embed_forward on a synthetic M-token sequence,
+    // reporting steady-state tok/s (sample SoC package power externally for tok/J).
+    if bench_m > 0 {
+        // Real token ids (avoid pad/eos); cycle a small ascii-ish range.
+        let toks: Vec<u32> = (0..bench_m).map(|i| 100 + (i as u32 % 2000)).collect();
+        let pw_path = amdgpu_power_path();
+        // idle baseline
+        let mut idle_w = f64::NAN;
+        if let Some(p) = &pw_path {
+            let (mut s, mut n) = (0.0, 0.0);
+            for _ in 0..15 {
+                if let Some(w) = read_watts(p) { s += w; n += 1.0; }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            if n > 0.0 { idle_w = s / n; }
+        }
+        for _ in 0..3 {
+            let _ = eg::embed_forward(&mut gpu, &weights, &cfg, &toks)?; // warm
+        }
+        let (mut pw_sum, mut pw_n, mut pw_peak) = (0.0f64, 0.0f64, 0.0f64);
+        let t0 = std::time::Instant::now();
+        for _ in 0..bench_iters {
+            let _ = eg::embed_forward(&mut gpu, &weights, &cfg, &toks)?;
+            if let Some(p) = &pw_path {
+                if let Some(w) = read_watts(p) { pw_sum += w; pw_n += 1.0; pw_peak = pw_peak.max(w); }
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let tok_s = (bench_m * bench_iters) as f64 / dt;
+        let pkg_w = if pw_n > 0.0 { pw_sum / pw_n } else { f64::NAN };
+        let dyn_w = pkg_w - idle_w;
+        eprintln!(
+            "[gpu-bench] m={bench_m} iters={bench_iters}  {:.1} ms/encode  => {tok_s:.0} tok/s",
+            dt / bench_iters as f64 * 1e3
+        );
+        eprintln!(
+            "  SoC package power: idle={idle_w:.2} W  active={pkg_w:.2} W  peak={pw_peak:.2} W  (GPU-dynamic ≈ {dyn_w:.2} W)"
+        );
+        eprintln!("  efficiency (pkg)= {:.0} tok/joule   (dyn)= {:.0} tok/joule", tok_s / pkg_w, tok_s / dyn_w);
+        println!("gpu_tok_s={tok_s:.0} pkg_w={pkg_w:.2} dyn_w={dyn_w:.2}");
+        return Ok(());
+    }
 
     // Two semantically-close sentences + one unrelated; encoded as documents.
     let docs = [
