@@ -25,9 +25,21 @@
 #define KT 16              // K-depth in base-op (k=16) tiles
 #endif
 
+// Weight precision: default W4 (int4, packed 2/byte — the throughput-optimal
+// Phoenix path). -DW8 selects int8 weights (W8A8): near-lossless on small models
+// where int4 fails the quality gate, at ~half the mac rate + double the W-DMA.
+#ifdef W8
+using WT = int8;
+using MMUL = aie::mmul<4, 16, 8, int8, int8>;
+#define WPTR(p) (p)                           // int8 stored directly
+static constexpr int SBb = MMUL::size_B;      // 128 bytes / W-tile (int8, 1 B/w)
+#else
+using WT = int4;
 using MMUL = aie::mmul<4, 16, 8, int8, int4>;
+#define WPTR(p) (reinterpret_cast<const int4 *>(p))
+static constexpr int SBb = MMUL::size_B / 2;  // 64 bytes / W-tile (int4, packed 2/byte)
+#endif
 static constexpr int SA = MMUL::size_A;       // 64 int8 / A-tile
-static constexpr int SBb = MMUL::size_B / 2;  // 64 bytes / W-tile
 static constexpr int SC = MMUL::size_C;       // 32 i32 / C-tile
 
 extern "C" void r11_gemm(const int8 *__restrict A, const int8 *__restrict Wb,
@@ -39,11 +51,11 @@ extern "C" void r11_gemm(const int8 *__restrict A, const int8 *__restrict Wb,
       MMUL c[MT][NT];
       {                                        // seed k=0
         aie::vector<int8, SA> a[MT];
-        aie::vector<int4, MMUL::size_B> w[NT];
+        aie::vector<WT, MMUL::size_B> w[NT];
 #pragma unroll
         for (int i = 0; i < MT; i++) a[i] = aie::load_v<SA>(A + ((im + i) * KT) * SA);
 #pragma unroll
-        for (int j = 0; j < NT; j++) w[j] = aie::load_v<MMUL::size_B>(reinterpret_cast<const int4 *>(Wb + ((jn + j) * KT) * SBb));
+        for (int j = 0; j < NT; j++) w[j] = aie::load_v<MMUL::size_B>(WPTR(Wb + ((jn + j) * KT) * SBb));
 #pragma unroll
         for (int i = 0; i < MT; i++)
 #pragma unroll
@@ -52,11 +64,11 @@ extern "C" void r11_gemm(const int8 *__restrict A, const int8 *__restrict Wb,
       for (int k = 1; k < KT; k++)
           chess_prepare_for_pipelining {
         aie::vector<int8, SA> a[MT];
-        aie::vector<int4, MMUL::size_B> w[NT];
+        aie::vector<WT, MMUL::size_B> w[NT];
 #pragma unroll
         for (int i = 0; i < MT; i++) a[i] = aie::load_v<SA>(A + ((im + i) * KT + k) * SA);
 #pragma unroll
-        for (int j = 0; j < NT; j++) w[j] = aie::load_v<MMUL::size_B>(reinterpret_cast<const int4 *>(Wb + ((jn + j) * KT + k) * SBb));
+        for (int j = 0; j < NT; j++) w[j] = aie::load_v<MMUL::size_B>(WPTR(Wb + ((jn + j) * KT + k) * SBb));
 #pragma unroll
         for (int i = 0; i < MT; i++)
 #pragma unroll

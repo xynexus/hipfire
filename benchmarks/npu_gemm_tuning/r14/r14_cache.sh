@@ -24,12 +24,17 @@ for B in "$HOME/.cache/hipfire-npu-deps/lib" "$HOME/.cache/hipfire-npu-deps/extr
   [ -e "$B/libboost_program_options.so.1.83.0" ] && export LD_LIBRARY_PATH="$B:${LD_LIBRARY_PATH:-}" && break
 done
 
-OUT="$HOME/.hipfire/npu/r14_${LM}x${LN}x${KT}_nb${NBLK}"
+# R14_W8=1 selects int8 weights (W8A8, quality-preserving) — doubles the per-W-tile
+# bytes (64→128), so halve LN (or KT) to keep the W-stripe within the 32 KB tile SRAM
+# (e.g. LM=6 LN=6 KT=16). Default is int4 weights (W4A8, throughput-optimal).
+W8="${R14_W8:-0}"
+if [ "$W8" = 1 ]; then WDEF="-DW8"; WBYTES=128; TAG="_w8"; else WDEF=""; WBYTES=64; TAG=""; fi
+OUT="$HOME/.hipfire/npu/r14_${LM}x${LN}x${KT}_nb${NBLK}${TAG}"
 rm -rf "$OUT"; mkdir -p "$OUT"
 "$PEANO/bin/clang++" "$HERE/../r11/r11_gemm.cc" -c -o "$OUT/r11.o" -I"$MA_ROOT/include" \
   -std=c++20 -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
-  -O2 -DNDEBUG --target=aie2-none-unknown-elf -DLM="$LM" -DLN="$LN" -DKT="$KT"
-python3 "$HERE/r14_gen.py" "$LM" "$LN" "$KT" "$NBLK" > "$OUT/aie.mlir"
+  -O2 -DNDEBUG --target=aie2-none-unknown-elf -DLM="$LM" -DLN="$LN" -DKT="$KT" $WDEF
+python3 "$HERE/r14_gen.py" "$LM" "$LN" "$KT" "$NBLK" "$WBYTES" > "$OUT/aie.mlir"
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge --peano="$PEANO" \
   --aie-generate-npu-insts --npu-insts-name="$OUT/insts.bin" \
   --aie-generate-xclbin --xclbin-name="$OUT/final.xclbin" --tmpdir="$OUT" >/dev/null

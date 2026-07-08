@@ -17,8 +17,10 @@ LM  = int(sys.argv[1]) if len(sys.argv) > 1 else 6
 LN  = int(sys.argv[2]) if len(sys.argv) > 2 else 12
 KT  = int(sys.argv[3]) if len(sys.argv) > 3 else 16
 NBLK = int(sys.argv[4]) if len(sys.argv) > 4 else 256
+# Per-W-tile bytes: 64 for int4 weights (packed 2/byte, default), 128 for int8 (W8A8).
+WBYTES = int(sys.argv[5]) if len(sys.argv) > 5 else 64
 AB = LM * KT * 64        # A-stripe bytes (shared by a physical row)
-WB = LN * KT * 64        # W-stripe bytes (shared by a physical column)
+WB = LN * KT * WBYTES    # W-stripe bytes (shared by a physical column)
 CB = LM * LN * 32        # per-core C i32
 CJ = 4 * CB              # joined C per column
 INF = 9223372036854775807
