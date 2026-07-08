@@ -77,7 +77,6 @@ pub(crate) fn blend_subseed_latents(
     Ok(())
 }
 
-
 pub fn denoise_latents_with_cfg(
     latents: LatentBatch,
     schedule: &DiffusionSchedule,
@@ -215,7 +214,9 @@ pub(crate) fn concat_batch_dim(a: &CpuTensor, b: &CpuTensor) -> DiffusionResult<
 
 /// Split a batched CFG prediction `[2N, ...]` back into the positive `[0..N]`
 /// and negative `[N..2N]` halves.
-pub(crate) fn split_batched_cfg_prediction(batched: &CpuTensor) -> DiffusionResult<(CpuTensor, CpuTensor)> {
+pub(crate) fn split_batched_cfg_prediction(
+    batched: &CpuTensor,
+) -> DiffusionResult<(CpuTensor, CpuTensor)> {
     if batched.shape.first().copied().unwrap_or(0) % 2 != 0 || batched.shape.is_empty() {
         return Err(DiffusionError::InvalidMetadata(format!(
             "batched CFG prediction must have an even leading dim, got {:?}",
@@ -374,10 +375,22 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
         // GEMMs. SDXL / mixed-mask cases fall back to the sequential path.
         let masks_batchable =
             positive_attention_mask.is_none() == negative_attention_mask.is_none();
+        // Batching stacks the two conditioning tensors (and their masks) along the
+        // batch dim, so their trailing dims must match. Prompts that tokenize to
+        // different sequence lengths (e.g. a short/empty negative vs a longer
+        // positive) are not batch-compatible and fall back to the sequential path
+        // below instead of hitting the `concat_batch_dim` shape error.
+        let conditioning_batchable = positive_embeddings.shape[1..]
+            == negative_embeddings.shape[1..]
+            && match (positive_attention_mask, negative_attention_mask) {
+                (Some(p), Some(n)) => p.shape[1..] == n.shape[1..],
+                _ => true,
+            };
         let batched_cfg = !cfg_is_identity
             && positive_sdxl_conditioning.is_none()
             && negative_sdxl_conditioning.is_none()
-            && masks_batchable;
+            && masks_batchable
+            && conditioning_batchable;
         let guided = if cfg_is_identity {
             let positive_pred = predict_noise(
                 &model_sample,
@@ -453,7 +466,12 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
         if let Ok(dir) = std::env::var("HIPFIRE_DUMP_VELOCITY") {
             if !dir.is_empty() {
                 let mut bytes = Vec::with_capacity(16 + guided.data.len() * 4);
-                for dim in [latents.batch, latents.channels, latents.height, latents.width] {
+                for dim in [
+                    latents.batch,
+                    latents.channels,
+                    latents.height,
+                    latents.width,
+                ] {
                     bytes.extend_from_slice(&(dim as u32).to_le_bytes());
                 }
                 for v in &guided.data {
@@ -724,7 +742,10 @@ pub(crate) fn apply_masked_denoise_reference_with_runtime_context(
     )
 }
 
-pub(crate) fn validate_noise_prediction(latents: &LatentBatch, noise: &CpuTensor) -> DiffusionResult<()> {
+pub(crate) fn validate_noise_prediction(
+    latents: &LatentBatch,
+    noise: &CpuTensor,
+) -> DiffusionResult<()> {
     let expected = [
         latents.batch,
         latents.channels,

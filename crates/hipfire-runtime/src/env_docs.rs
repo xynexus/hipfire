@@ -1088,7 +1088,7 @@ pub const ENV_HIPFIRE_DIFFUSION_DUMP_DIR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIFFUSION_LAYER_RUNG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_LAYER_RUNG",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-diffusion/src/denoise.rs:289",
+    source: "crates/hipfire-diffusion/src/denoise.rs:290",
 };
 
 /// `HIPFIRE_DIFFUSION_OQ8` — Enabled when set to 1
@@ -1320,7 +1320,7 @@ pub const ENV_HIPFIRE_DUMP_REQUEST: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DUMP_VELOCITY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_VELOCITY",
     description: "Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model",
-    source: "crates/hipfire-diffusion/src/denoise.rs:453",
+    source: "crates/hipfire-diffusion/src/denoise.rs:466",
 };
 
 /// `HIPFIRE_EMIT_TOKEN_IDS` — or "\" in it would corrupt the line, breaking the client's JSONL

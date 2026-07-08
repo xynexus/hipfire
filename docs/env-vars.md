@@ -156,7 +156,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DIFFUSION_ATTN_QTILE` | Enabled by default; set to 0 to disable | `crates/hipfire-diffusion/src/gpu_ops.rs:3975` |
 | `HIPFIRE_DIFFUSION_CPU_REFERENCE` | Runtime variable controlling diffusion cpu reference in hipfire | `crates/hipfire-diffusion/src/lib.rs:181` |
 | `HIPFIRE_DIFFUSION_DUMP_DIR` | Runtime variable controlling diffusion dump dir in hipfire | `crates/hipfire-diffusion/src/lib.rs:1016` |
-| `HIPFIRE_DIFFUSION_LAYER_RUNG` | Selects behavior from recognized values | `crates/hipfire-diffusion/src/denoise.rs:289` |
+| `HIPFIRE_DIFFUSION_LAYER_RUNG` | Selects behavior from recognized values | `crates/hipfire-diffusion/src/denoise.rs:290` |
 | `HIPFIRE_DIFFUSION_OQ8` | Enabled when set to 1 | `crates/hipfire-diffusion/src/gpu_ops.rs:2208` |
 | `HIPFIRE_DIFFUSION_TILED_GEMM` | Enabled by default; set to 0 to disable | `crates/hipfire-diffusion/src/gpu_ops.rs:2340` |
 | `HIPFIRE_DIFFUSION_W4A8` | W8A8 (oq8) path: int8 weight (½ bf16 footprint) × dynamic-int8 activation, | `crates/hipfire-diffusion/src/gpu_ops.rs:2203` |
@@ -189,7 +189,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DUMP_HIDDEN_POS` | Runtime variable controlling dump hidden pos in hipfire | `crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:1683` |
 | `HIPFIRE_DUMP_LATENT` | Debug hook: when HIPFIRE_DUMP_LATENT names a path, write the final latent | `crates/hipfire-diffusion/src/lib.rs:1501` |
 | `HIPFIRE_DUMP_REQUEST` | a strace. Off by default — gigantic for typical agent prompts | `crates/hipfire-server/src/routes/chat.rs:85` |
-| `HIPFIRE_DUMP_VELOCITY` | Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model | `crates/hipfire-diffusion/src/denoise.rs:453` |
+| `HIPFIRE_DUMP_VELOCITY` | Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model | `crates/hipfire-diffusion/src/denoise.rs:466` |
 | `HIPFIRE_EMIT_TOKEN_IDS` | or "\" in it would corrupt the line, breaking the client's JSONL | `crates/hipfire-serving-core/src/events.rs:111` |
 | `HIPFIRE_EP_DECODE_TIMING` | 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd) | `crates/hipfire-arch-minimax/src/forward.rs:1697` |
 | `HIPFIRE_EP_DUMP_IDX` | top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable | `crates/hipfire-arch-deepseek4/src/forward.rs:2432` |
