@@ -43,6 +43,7 @@ and 4 are historically retired and must not be reused.
 | 14 | `ARCH_ID_NEMOTRON_H`        | nemotron_h   | `hipfire-arch-nemotron` | `nemotron_h` |
 | 15 | `ARCH_ID_MAMBA2`            | mamba2       | `hipfire-arch-nemotron` | `mamba2` (+ `is_mamba2_config`) |
 | 16 | `ARCH_ID_ZAYA`             | zaya         | `hipfire-arch-zaya`     | `zaya` |
+| 19 | `ARCH_ID_EMBEDDINGGEMMA`   | embeddinggemma | `hipfire-arch-embeddinggemma` | `gemma3_text`/`gemma3` bidirectional encoder w/ ST pooling+Dense modules (embeddinggemma) |
 
 The per-arch capability matrix (prefill / dflash / mtp / kv / vision support)
 lives in `docs/model-support.toml`, keyed by these same ids.

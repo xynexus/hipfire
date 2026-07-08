@@ -32,6 +32,7 @@ hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
 hipfire-arch-gemma3-vl = { path = "../hipfire-arch-gemma3-vl" }
+hipfire-arch-embeddinggemma = { path = "../hipfire-arch-embeddinggemma" }
 hipfire-media = { path = "../hipfire-media" }
 hipfire-vision-cache = { path = "../hipfire-vision-cache" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe", optional = true }

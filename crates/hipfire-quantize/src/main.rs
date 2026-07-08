@@ -55,10 +55,10 @@ use hipfire_quantize::hfq_out::{parameter_counts_metadata, Xxh64};
 // (hipfire-gguf) — off the inference dependency surface. Alias keeps the
 // import pipeline's `gguf_input::` references source-compatible.
 use hipfire_arch_api::{
-    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
-    ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
-    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY,
-    ARCH_ID_ZAYA,
+    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_TEXT,
+    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2,
+    ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE,
+    ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
 };
 use hipfire_gguf as gguf_input;
 // Quant-format/K-map planning + the GGUF import pipeline now live in the
@@ -5773,6 +5773,14 @@ fn main() {
             // sliding-window interleave, GeGLU gelu-tanh. Crate hipfire-arch-gemma3.
             // See docs/plans/2026-06-19-gemma3-bringup.md.
             "gemma3_text" | "gemma3" => ARCH_ID_GEMMA3_TEXT,
+            // embeddinggemma (bidirectional Gemma3 encoder + sentence-transformers
+            // mean-pool + Matryoshka Dense heads). The hipfire importer/prep step
+            // tags `model_type: "embeddinggemma"`, renames the Gemma3TextModel
+            // tensors to the `model.*` convention, folds the ST Dense heads in as
+            // `dense.{0,1}.weight`, and carries the ST block in config.json. Shares
+            // the gemma (1+w) RMSNorm bake below. Crate hipfire-arch-embeddinggemma
+            // (arch_id 17); served for embeddings, not autoregressive generation.
+            "embeddinggemma" => ARCH_ID_EMBEDDINGGEMMA,
             // nemotron_h (NVIDIA Nemotron-3): Mamba-2 + GQA-attn + ReLU²-MLP hybrid
             // (Nano-4B dense; Nano-30B adds MoE). Crate hipfire-arch-nemotron
             // (arch_id 14). Quantizes the linear projections; keeps conv1d/A_log/D/
@@ -5995,7 +6003,7 @@ fn main() {
     // rmsnorm kernel — which applies plain `w` — is numerically correct at
     // runtime, with no per-layer special-casing in the gemma3 forward. Record
     // the offset for provenance and to make a re-quantize double-bake detectable.
-    if arch_id == ARCH_ID_GEMMA3_TEXT {
+    if arch_id == ARCH_ID_GEMMA3_TEXT || arch_id == ARCH_ID_EMBEDDINGGEMMA {
         if let serde_json::Value::Object(ref mut m) = metadata {
             m.insert("gemma_norm_offset".to_string(), serde_json::json!(1.0_f32));
         }
@@ -9995,7 +10003,10 @@ fn main() {
     // gemma3 forward. Norms ship at source precision (F32/F16/BF16); convert,
     // offset, convert back to the same dtype. The `gemma_norm_offset=1.0`
     // metadata marker records that this happened.
-    if arch_id == ARCH_ID_GEMMA3_TEXT || arch_id == ARCH_ID_GEMMA3_VL {
+    if arch_id == ARCH_ID_GEMMA3_TEXT
+        || arch_id == ARCH_ID_GEMMA3_VL
+        || arch_id == ARCH_ID_EMBEDDINGGEMMA
+    {
         let mut n_baked = 0usize;
         for t in hfq_tensors.iter_mut() {
             // Bake the gemma (1+w) RMSNorms (text norms + the projector's

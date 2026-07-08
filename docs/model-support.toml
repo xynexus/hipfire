@@ -100,6 +100,18 @@ mtp = "none"
 kv = "fp32+q8"
 vision = "full"
 
+# embeddinggemma-300m — bidirectional Gemma3 encoder for text embeddings. Not an
+# autoregressive generator: one batched bidirectional prefill → mean-pool → Dense
+# heads. No KV cache, no dflash/mtp/vision. `prefill` = the encode pass.
+[[arch]]
+ids = [19]
+label = "embeddinggemma"
+prefill = "full"
+dflash = "none"
+mtp = "none"
+kv = "none"
+vision = "none"
+
 [[arch]]
 ids = [7]
 label = "qwen2"

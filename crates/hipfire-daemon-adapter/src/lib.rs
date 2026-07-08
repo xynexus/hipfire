@@ -16,9 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
     CettCaptureRequest, CettLoadColnormsRequest, CollectRequest, CollectResponse, DaemonRequest,
-    DaemonResponse, HneuronInterveneRequest, KldChunkEvent, KldEvalRequest, KldEvalResponse,
-    LoraLoadRequest, LoraSetScaleRequest, LoraUnloadRequest, RequestControl, SteerApplyRequest,
-    SteerBeginCaptureRequest, SteerCaptureRequest,
+    DaemonResponse, EmbedRequest, EmbeddingVector, HneuronInterveneRequest, KldChunkEvent,
+    KldEvalRequest, KldEvalResponse, LoraLoadRequest, LoraSetScaleRequest, LoraUnloadRequest,
+    RerankRequest, RerankResult, RequestControl, SteerApplyRequest, SteerBeginCaptureRequest,
+    SteerCaptureRequest,
 };
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{
@@ -348,6 +349,38 @@ impl DaemonEngine {
                 DaemonResponse::Unknown => {}
                 other => {
                     tracing::warn!("unexpected response during model_registry: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `embed` and wait for the pooled, L2-normalized embedding vectors — one
+    /// per input text, in request order.
+    pub async fn embed(&mut self, req: EmbedRequest) -> anyhow::Result<Vec<EmbeddingVector>> {
+        self.send(&DaemonRequest::Embed(req)).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::Embeddings { embeddings } => return Ok(embeddings),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon embed error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during embed: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `rerank` and wait for the per-document relevance scores (input order;
+    /// the caller sorts for the client response).
+    pub async fn rerank(&mut self, req: RerankRequest) -> anyhow::Result<Vec<RerankResult>> {
+        self.send(&DaemonRequest::Rerank(req)).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::RerankScores { results } => return Ok(results),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon rerank error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during rerank: {other:?}");
                 }
             }
         }

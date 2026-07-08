@@ -113,6 +113,17 @@ pub const ARCH_ROWS: &[ArchRow] = &[
         },
     },
     ArchRow {
+        ids: &[19],
+        features: ArchFeatures {
+            label: "embeddinggemma",
+            prefill: FeatureSupport::Full,
+            dflash: FeatureSupport::None,
+            mtp: FeatureSupport::None,
+            kv: "none",
+            vision: FeatureSupport::None,
+        },
+    },
+    ArchRow {
         ids: &[7],
         features: ArchFeatures {
             label: "qwen2",

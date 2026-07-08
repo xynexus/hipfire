@@ -150,10 +150,10 @@ pub fn has_worker_or_model_identity(msg: &Value) -> bool {
 // Re-exported here so existing `hipfire_model::ARCH_ID_*` callers are unchanged.
 // See `docs/architecture-ids.md` for the id table and where the constants live.
 pub use hipfire_arch_api::{
-    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
-    ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
-    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE,
-    ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
+    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_TEXT,
+    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2,
+    ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN35_DENSE,
+    ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
 };
 
 /// Runtime model arch IDs that must appear in `docs/model-support.toml`.
@@ -172,6 +172,7 @@ pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
     (ARCH_ID_NEMOTRON_H, "nemotron_h"),
     (ARCH_ID_MAMBA2, "mamba2"),
     (ARCH_ID_ZAYA, "zaya"),
+    (ARCH_ID_EMBEDDINGGEMMA, "embeddinggemma"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +191,7 @@ pub enum ModelArchFamily {
     NemotronH,
     Mamba2,
     Zaya,
+    EmbeddingGemma,
     Unknown,
 }
 
@@ -209,6 +211,7 @@ pub fn model_arch_family(arch_id: u32) -> ModelArchFamily {
         ARCH_ID_NEMOTRON_H => ModelArchFamily::NemotronH,
         ARCH_ID_MAMBA2 => ModelArchFamily::Mamba2,
         ARCH_ID_ZAYA => ModelArchFamily::Zaya,
+        ARCH_ID_EMBEDDINGGEMMA => ModelArchFamily::EmbeddingGemma,
         _ => ModelArchFamily::Unknown,
     }
 }

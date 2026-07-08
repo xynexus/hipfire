@@ -38,6 +38,7 @@ pub mod load;
 pub mod memory;
 pub mod model;
 pub mod output_filter;
+pub mod pooling;
 pub mod qwen35_decode;
 pub mod qwen35_prefill;
 pub mod request;

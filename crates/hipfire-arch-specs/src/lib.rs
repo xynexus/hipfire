@@ -23,6 +23,7 @@
 
 use hipfire_arch_deepseek4_spec as _;
 use hipfire_arch_dots_ocr_spec as _;
+use hipfire_arch_embeddinggemma_spec as _;
 use hipfire_arch_gemma3_spec as _;
 use hipfire_arch_gemma3_vl_spec as _;
 use hipfire_arch_krea2_spec as _;
@@ -44,7 +45,7 @@ mod tests {
         let reg = ArchRegistry::build();
         // Every migrated arch id must be reachable with an Ingest policy through the
         // bundle (the path the quantizer uses).
-        for id in [0u16, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16] {
+        for id in [0u16, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19] {
             let a = reg
                 .get(ArchId(id))
                 .unwrap_or_else(|| panic!("arch id {id} not registered in the specs bundle"));

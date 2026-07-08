@@ -82,6 +82,11 @@ pub const ARCH_ID_QWEN_IMAGE: u32 = 18;
 /// Legacy generic-diffusion container marker (ASCII-ish "DIF0"), pre-A2. Still
 /// recognized as diffusion for backward compat; never written for new containers.
 pub const ARCH_ID_DIFFUSION_LEGACY: u32 = 0x3046_4944;
+/// embeddinggemma-300m and siblings: a **bidirectional** Gemma3 encoder (non-causal
+/// attention, mean-pooling, Matryoshka dense projection heads). Serves text
+/// embeddings, not autoregressive logits — see `docs/architecture-ids.md`.
+/// (17/18 are the diffusion denoisers KREA2/QWEN_IMAGE upstream; 19 is next free.)
+pub const ARCH_ID_EMBEDDINGGEMMA: u32 = 19;
 // Speculative-decode drafter sidecar ids (NOT loadable base architectures — a
 // `.hfq` header carries one of these only when the file is a draft sidecar
 // discovered next to a base target). DFlash draft = 20 and the Qwen3.5 MTP head

@@ -293,6 +293,41 @@ fn default_bench_tokens() -> usize {
     128
 }
 
+/// Non-autoregressive **embedding** request. Runs one (bidirectional for encoders,
+/// causal for decoder-pooling models) prefill over each text and returns the pooled,
+/// L2-normalized hidden vector — no token sampling. `dims`, when set, truncates the
+/// output to a Matryoshka prefix (embeddinggemma supports 128/256/512/768).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmbedRequest {
+    pub texts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dims: Option<usize>,
+}
+
+/// Non-autoregressive **rerank** request. Scores each `document` against `query`.
+/// For a yes/no-logit reranker (e.g. Qwen3-Reranker) the score is the softmax
+/// probability of the "yes" token at the final position; for an embedding model it
+/// falls back to cosine similarity of the pooled vectors.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RerankRequest {
+    pub query: String,
+    pub documents: Vec<String>,
+}
+
+/// One embedding vector plus its position in the request batch.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmbeddingVector {
+    pub index: usize,
+    pub embedding: Vec<f32>,
+}
+
+/// One rerank result: the document's original index and its relevance score.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RerankResult {
+    pub index: usize,
+    pub relevance_score: f32,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -303,6 +338,8 @@ pub enum DaemonRequest {
     Inventory,
     ModelRegistry,
     Generate(GenerateTextRequest),
+    Embed(EmbedRequest),
+    Rerank(RerankRequest),
     Abort(RequestControl),
     ForceAnswer(RequestControl),
     Collect(CollectRequest),
@@ -366,6 +403,15 @@ pub enum DaemonResponse {
     LoadProgress(LoadProgressEvent),
     Token(TokenEvent),
     ToolCalls(ToolCallsEvent),
+    /// Result of an [`DaemonRequest::Embed`] — one vector per input text, in order.
+    Embeddings {
+        embeddings: Vec<EmbeddingVector>,
+    },
+    /// Result of a [`DaemonRequest::Rerank`] — one score per document, in input order
+    /// (the server sorts for the response).
+    RerankScores {
+        results: Vec<RerankResult>,
+    },
     Done(DoneEvent),
     Error(ErrorEvent),
     Collected(CollectResponse),
