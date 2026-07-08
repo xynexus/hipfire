@@ -42,6 +42,9 @@ const HD: usize = 8;
 const INTER: usize = 32;
 const BLOCK: usize = 3;
 const CTX: usize = 4;
+// Phase A: run the whole body gradcheck window-batched (n_win>1) so the block
+// ops contract wb*block and the per-window attention isolation is exercised.
+const NWIN: usize = 2;
 const NT: usize = 2; // n_targets → fc input = NT*H
 const QD: usize = NH * HD;
 const KVD: usize = NKV * HD;
@@ -136,22 +139,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ctx_pos: Vec<f32> = (0..CTX).map(|t| t as f32).collect();
     let blk_pos: Vec<f32> = (0..BLOCK).map(|t| (CTX + t) as f32).collect();
-    let mhh: Vec<f32> = (0..CTX * FIN)
+    // Window-batched inputs: distinct per-window data (index-varying) so any
+    // cross-window contamination in the batched body would break the gradcheck.
+    let mhh: Vec<f32> = (0..NWIN * CTX * FIN)
         .map(|i| ((i * 13 % 7) as f32) * 0.1 - 0.3)
         .collect();
-    let beh: Vec<f32> = (0..BLOCK * H)
+    let beh: Vec<f32> = (0..NWIN * BLOCK * H)
         .map(|i| ((i * 17 % 11) as f32) * 0.1 - 0.4)
         .collect();
-    let gh: Vec<f32> = (0..BLOCK * H)
+    let gh: Vec<f32> = (0..NWIN * BLOCK * H)
         .map(|i| ((i * 7 % 5) as f32) * 0.2 - 0.3)
         .collect();
 
     let weights = build(&mut gpu)?;
-    let block_embeds = gpu.upload_f32(&beh, &[BLOCK * H])?;
+    let block_embeds = gpu.upload_f32(&beh, &[NWIN * BLOCK * H])?;
 
     // Loss L = Σ x_head ∘ G, rebuilding main_hidden each call (host-perturbable).
     let loss = |gpu: &mut Gpu, w: &DsparkDrafterWeights, mh: &[f32]| -> HipResult<f32> {
-        let main_hidden = gpu.upload_f32(mh, &[CTX * FIN])?;
+        let main_hidden = gpu.upload_f32(mh, &[NWIN * CTX * FIN])?;
         let acts = dspark_drafter_forward_train(
             gpu,
             w,
@@ -161,6 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &ctx_pos,
             &blk_pos,
             None,
+            NWIN,
         )?;
         let xv = gpu.download_f32(acts.x_head())?;
         let l = xv.iter().zip(&gh).map(|(a, b)| a * b).sum();
@@ -170,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Analytic grads.
-    let main_hidden = gpu.upload_f32(&mhh, &[CTX * FIN])?;
+    let main_hidden = gpu.upload_f32(&mhh, &[NWIN * CTX * FIN])?;
     let acts = dspark_drafter_forward_train(
         &mut gpu,
         &weights,
@@ -180,9 +186,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &ctx_pos,
         &blk_pos,
         None,
+        NWIN,
     )?;
-    let d_x_head = gpu.upload_f32(&gh, &[BLOCK * H])?;
-    let grads = dspark_drafter_backward(&mut gpu, &weights, &c, &main_hidden, &acts, &d_x_head)?;
+    let d_x_head = gpu.upload_f32(&gh, &[NWIN * BLOCK * H])?;
+    let grads =
+        dspark_drafter_backward(&mut gpu, &weights, &c, &main_hidden, &acts, &d_x_head, NWIN)?;
     let gflat = grads.flat();
     let pflat = weights.params();
     assert_eq!(gflat.len(), pflat.len());

@@ -257,18 +257,41 @@ Open perf work (correctness/quality proven; these are speedups, not blockers):
   of this (unstable) overfit regime. Drops the per-step reduction to ~free.
 * Per-channel scale only if a wider-spread operand ever needs it (transpose layout
   makes per-column amax natural).
-* **The body backward is overhead-bound (Blocker 2), not compute-bound**: its
-  GEMMs contract M = block = 7, so no low-precision format speeds them up — the
-  transpose + amax + launch dominate. The f16s/bf16x2 *compute* win only lands
-  after **Phase A** raises M (7 → wb·7). Profile (f16s, wb=1): body_bwd ~1.6 s
-  vs heads_bwd ~0.17 s — the body is the overhead-bound part Phase A targets.
+* **Phase A landed and DISPROVED the "raise M" framing (2026-07-09).** Batching
+  the body across windows (M = block = 7 → wb·block = 56) is done, correct
+  (bit-exact batched-vs-looped equivalence at wb=1; forward+d_main_hidden
+  byte-identical at wb=2/4, grads differ only by FP re-association ~1e-13; both
+  gradchecks pass; overfit converges) — but the low-precision backward is STILL
+  ~5–6× slower than f32 at M=56:
+
+  | wb=2 overfit | body_bwd |
+  |--------------|---------:|
+  | f32          | ~162 ms  |
+  | bf16x2       | ~756 ms  |
+  | f16s         | ~1014 ms |
+
+  So the body backward was never *compute*-bound — the bottleneck is the
+  **wrapper**: per-matmul `transpose_f32` passes + amax reduction + host scale
+  readback, while the actual GEMM (large K/N) is bandwidth-bound on gfx1151.
+  Raising M amortizes f32 per-op overhead (body_bwd scales sub-linearly, 4×
+  windows → 2.3× time) but does nothing for the wrapper cost that dominates the
+  low-precision path. ⇒ The real backward-speedup lever is **Phase C2** (dedicated
+  NN/TN split-WMMA kernels that consume the strided operand directly — NO
+  `transpose_f32` pass — plus on-device scale to drop the readback), NOT further
+  M-batching. Phase A is a correct prerequisite and an f32 amortization win, not
+  the speedup itself.
 
 ## 5. Plan: full forward + backward on WMMA
 
 Ordered; each phase is independently shippable and gated behind an env toggle
 (default f32) until validated.
 
-### Phase A — batch the drafter body across windows *(prerequisite for the backward)*
+### Phase A — batch the drafter body across windows — DONE (see §4.1)
+
+Landed 2026-07-09: correct + validated (bit-exact equivalence gate
+`examples/dspark_batch_equiv`, gradchecks at n_win>1, overfit converges). It
+amortizes f32 per-op overhead but does NOT speed up the low-precision backward —
+that needs Phase C2 (§4.1). Original plan below.
 
 Today `forward_loss_batch` runs the body **per window** (M = ctx_len=128 for the
 ingest/ctx-K·V ops, M = block=7 for the block/MLP ops). Batching `wb` windows

@@ -115,7 +115,7 @@ fn loss(
     let ctx = gpu.upload_f32(ctxh, &[CTX * H])?;
     let wt = upload_all(gpu, wh)?;
     let (x_out, _acts) =
-        dspark_block_forward(gpu, &x, &ctx, &view(&wt), &dims(), q_pos, k_pos, None)?;
+        dspark_block_forward(gpu, &x, &ctx, &view(&wt), &dims(), q_pos, k_pos, None, 1)?;
     let ov = gpu.download_f32(&x_out)?;
     Ok(ov.iter().zip(g).map(|(p, q)| p * q).sum())
 }
@@ -144,6 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &q_pos,
         &k_pos,
         None,
+        1,
     )?;
     let d_x_out = gpu.upload_f32(&gh, &[BLOCK * H])?;
     let (d_x, d_ctx, wg) =

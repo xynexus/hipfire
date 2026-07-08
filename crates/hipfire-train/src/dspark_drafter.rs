@@ -130,6 +130,97 @@ fn clone_tensor(gpu: &mut Gpu, t: &GpuTensor) -> HipResult<GpuTensor> {
     Ok(c)
 }
 
+// ── Phase-A window-batching helpers ─────────────────────────────────────────────
+
+/// Repeat a per-window position vector `n_win` times (block-query positions are
+/// identical for every window). `[block] → [n_win*block]`.
+fn tile_pos(base: &[f32], n_win: usize) -> Vec<f32> {
+    let mut v = Vec::with_capacity(base.len() * n_win);
+    for _ in 0..n_win {
+        v.extend_from_slice(base);
+    }
+    v
+}
+
+/// Build the phase-major K RoPE positions from a per-window `[ctx_len+block]`
+/// position vector: `[ctx_pos×n_win ++ block_pos×n_win]` (`[n_win*(ctx+block)]`).
+/// Matches the phase-major `kcat`/`k_rope` layout (all ctx rows then all block
+/// rows). At `n_win==1` this equals the input.
+fn tile_kpos(k_pos_host: &[f32], ctx_len: usize, block: usize, n_win: usize) -> Vec<f32> {
+    let (ctx_pos, blk_pos) = k_pos_host.split_at(ctx_len);
+    debug_assert_eq!(blk_pos.len(), block);
+    let mut v = Vec::with_capacity((ctx_len + block) * n_win);
+    for _ in 0..n_win {
+        v.extend_from_slice(ctx_pos);
+    }
+    for _ in 0..n_win {
+        v.extend_from_slice(blk_pos);
+    }
+    v
+}
+
+/// Gather window `i`'s contiguous `[ctx_len ++ block]` rows out of a phase-major
+/// K/V slab (`[n_win*ctx_len ctx-rows ++ n_win*block block-rows] × kvd`) into a
+/// per-window `dst` `[(ctx_len+block)*kvd]` for the isolated attention call.
+fn assemble_window_kv(
+    gpu: &mut Gpu,
+    src: &GpuTensor,
+    dst: &GpuTensor,
+    i: usize,
+    ctx_len: usize,
+    block: usize,
+    rctx: usize,
+    kvd: usize,
+) -> HipResult<()> {
+    // ctx rows of window i: src[i*ctx_len ..] → dst[0 ..]
+    gpu.memcpy_dtod_at_auto(
+        &dst.buf,
+        0,
+        &src.buf,
+        i * ctx_len * kvd * 4,
+        ctx_len * kvd * 4,
+    )?;
+    // block rows of window i: src[(rctx + i*block) ..] → dst[ctx_len ..]
+    gpu.memcpy_dtod_at_auto(
+        &dst.buf,
+        ctx_len * kvd * 4,
+        &src.buf,
+        (rctx + i * block) * kvd * 4,
+        block * kvd * 4,
+    )?;
+    Ok(())
+}
+
+/// Inverse of [`assemble_window_kv`]: scatter a per-window `[(ctx_len+block)*kvd]`
+/// gradient back into its phase-major slot in `dst`. Each window writes disjoint
+/// rows, so plain copies (no accumulation) are correct.
+fn scatter_window_kv(
+    gpu: &mut Gpu,
+    dst: &GpuTensor,
+    src: &GpuTensor,
+    i: usize,
+    ctx_len: usize,
+    block: usize,
+    rctx: usize,
+    kvd: usize,
+) -> HipResult<()> {
+    gpu.memcpy_dtod_at_auto(
+        &dst.buf,
+        i * ctx_len * kvd * 4,
+        &src.buf,
+        0,
+        ctx_len * kvd * 4,
+    )?;
+    gpu.memcpy_dtod_at_auto(
+        &dst.buf,
+        (rctx + i * block) * kvd * 4,
+        &src.buf,
+        ctx_len * kvd * 4,
+        block * kvd * 4,
+    )?;
+    Ok(())
+}
+
 // ── Weights ───────────────────────────────────────────────────────────────────
 
 /// One drafter layer's owned fp32 weights (HF row-major `[out, in]`).
@@ -290,6 +381,7 @@ impl DsparkDrafterGrads {
 /// the ctx/block halves of the K/V grads.
 pub struct DsparkBlockActivations {
     pub ctx_len: usize,
+    pub n_win: usize,
     pub xn1: GpuTensor,
     pub rinv1: GpuTensor,
     pub qp: GpuTensor,
@@ -315,6 +407,7 @@ pub struct DsparkBlockActivations {
 pub fn free_dspark_block_acts(gpu: &mut Gpu, a: DsparkBlockActivations) -> HipResult<()> {
     let DsparkBlockActivations {
         ctx_len: _,
+        n_win: _,
         xn1,
         rinv1,
         qp,
@@ -346,14 +439,25 @@ pub fn free_dspark_block_acts(gpu: &mut Gpu, a: DsparkBlockActivations) -> HipRe
 
 // ── Block forward ─────────────────────────────────────────────────────────────
 
-/// One drafter block. `x_block` `[block*h]`; `ctx` (`main_x`) `[ctx_len*h]`
-/// (shared context, same tensor every layer). `q_pos_host` `[block]`,
-/// `k_pos_host` `[ctx_len+block]` are the RoPE positions (Q at block positions;
-/// K at `[ctx_positions ++ block_positions]`). `bias` (`Some([block*(ctx_len+
-/// block)])`) is the additive attention mask (bidirectional/valid); `None` =
-/// fully bidirectional over all `[ctx ++ block]` keys.
+/// One drafter block, **batched across `n_win` windows** (Phase A). `x_block`
+/// `[n_win*block*h]` and `ctx` (`main_x`) `[n_win*ctx_len*h]` are window-major
+/// (window `i` at rows `[i*block..]` / `[i*ctx_len..]`). All row-wise ops
+/// (rmsnorm, projections, qk-norm, rope, swiglu) run once over the full
+/// `n_win*block` (or `n_win*ctx_len`) stack; **attention stays strictly
+/// per-window** — window `i`'s block queries attend only to window `i`'s
+/// `[ctx ++ block]` keys, looped `n_win` times. `q_pos_host` `[block]`,
+/// `k_pos_host` `[ctx_len+block]` are the PER-WINDOW RoPE positions (repeated
+/// across windows internally). `bias` (`Some([block*(ctx_len+block)])`) is the
+/// per-window additive attention mask; `None` = fully bidirectional.
 ///
-/// Returns `x_out` `[block*h]` and the saved activations.
+/// The K/V activations (`kcat`,`k_rope`,`all_v`) are stored **phase-major**:
+/// all windows' `ctx` rows (`n_win*ctx_len`) then all windows' `block` rows
+/// (`n_win*block`), so the ctx / block projections write contiguous slabs and
+/// the K weight-grad contracts the full `n_win*ctx_len` (resp. `n_win*block`).
+/// At `n_win==1` this layout and every op are byte-identical to the original
+/// per-window path.
+///
+/// Returns `x_out` `[n_win*block*h]` and the saved activations.
 #[allow(clippy::too_many_arguments)]
 pub fn dspark_block_forward(
     gpu: &mut Gpu,
@@ -364,136 +468,132 @@ pub fn dspark_block_forward(
     q_pos_host: &[f32],
     k_pos_host: &[f32],
     bias: Option<&GpuTensor>,
+    n_win: usize,
 ) -> HipResult<(GpuTensor, DsparkBlockActivations)> {
     let (h, inter) = (dims.h, dims.inter);
     let (qd, kvd) = (dims.q_dim(), dims.kv_dim());
     let (nh, nkv, hd) = (dims.n_heads, dims.n_kv, dims.head_dim);
-    let block = x_block.shape.iter().product::<usize>() / h;
-    let ctx_len = ctx.shape.iter().product::<usize>() / h;
+    debug_assert!(n_win >= 1);
+    let block = x_block.shape.iter().product::<usize>() / (n_win * h);
+    let ctx_len = ctx.shape.iter().product::<usize>() / (n_win * h);
     let kv_rows = ctx_len + block;
     debug_assert_eq!(q_pos_host.len(), block);
     debug_assert_eq!(k_pos_host.len(), kv_rows);
+    // Batched row counts.
+    let rblk = n_win * block; // stacked block rows
+    let rctx = n_win * ctx_len; // stacked ctx rows
+    let rkv = n_win * kv_rows; // phase-major kv rows (rctx ctx rows ++ rblk block rows)
 
-    // 1. xn1 = input_layernorm(x_block)
-    let xn1 = gpu.zeros(&[block * h], DType::F32)?;
-    let rinv1 = gpu.zeros(&[block], DType::F32)?;
-    rmsnorm_forward(gpu, x_block, w.input_ln, &xn1, &rinv1, block, h, dims.eps)?;
+    // 1. xn1 = input_layernorm(x_block)   — row-wise over all n_win*block rows
+    let xn1 = gpu.zeros(&[rblk * h], DType::F32)?;
+    let rinv1 = gpu.zeros(&[rblk], DType::F32)?;
+    rmsnorm_forward(gpu, x_block, w.input_ln, &xn1, &rinv1, rblk, h, dims.eps)?;
 
     // 2. qp = q_proj(xn1)
-    let qp = gpu.zeros(&[block * qd], DType::F32)?;
-    linear_forward(gpu, &xn1, w.wq, &qp, block, h, qd)?;
+    let qp = gpu.zeros(&[rblk * qd], DType::F32)?;
+    linear_forward(gpu, &xn1, w.wq, &qp, rblk, h, qd)?;
 
-    // 3. qn = q_norm(qp) per head (rows = block*n_heads, h = head_dim), BEFORE rope
-    let qn = gpu.zeros(&[block * qd], DType::F32)?;
-    let q_rinv = gpu.zeros(&[block * nh], DType::F32)?;
+    // 3. qn = q_norm(qp) per head (rows = rblk*n_heads, h = head_dim), BEFORE rope
+    let qn = gpu.zeros(&[rblk * qd], DType::F32)?;
+    let q_rinv = gpu.zeros(&[rblk * nh], DType::F32)?;
     if dims.qk_norm {
-        rmsnorm_forward(gpu, &qp, w.q_norm, &qn, &q_rinv, block * nh, hd, dims.eps)?;
+        rmsnorm_forward(gpu, &qp, w.q_norm, &qn, &q_rinv, rblk * nh, hd, dims.eps)?;
     } else {
-        gpu.memcpy_dtod_auto(&qn.buf, &qp.buf, block * qd * 4)?;
+        gpu.memcpy_dtod_auto(&qn.buf, &qp.buf, rblk * qd * 4)?;
     }
 
-    // 4. q_rope = rope(qn, block_positions)
-    let q_pos = gpu.upload_f32(q_pos_host, &[block])?;
-    let q_rope = gpu.zeros(&[block * qd], DType::F32)?;
-    rope_forward(
-        gpu,
-        &qn,
-        &q_rope,
-        &q_pos,
-        block * nh,
-        nh,
-        hd,
-        dims.rope_base,
-    )?;
+    // 4. q_rope = rope(qn, block_positions repeated per window)
+    let q_pos_tiled = tile_pos(q_pos_host, n_win);
+    let q_pos = gpu.upload_f32(&q_pos_tiled, &[rblk])?;
+    let q_rope = gpu.zeros(&[rblk * qd], DType::F32)?;
+    rope_forward(gpu, &qn, &q_rope, &q_pos, rblk * nh, nh, hd, dims.rope_base)?;
 
-    // 5. kcat = [k_proj(ctx) ++ k_proj(xn1)]  (ctx rows 0..ctx_len, block rows after)
-    let kcat = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
+    // 5. kcat = [k_proj(all-ctx) ++ k_proj(all-block)]  (phase-major)
+    let kcat = gpu.zeros(&[rkv * kvd], DType::F32)?;
     {
-        let k_ctx = kcat.sub_offset(0, ctx_len * kvd);
-        linear_forward(gpu, ctx, w.wk, &k_ctx, ctx_len, h, kvd)?;
-        let k_blk = kcat.sub_offset(ctx_len * kvd, block * kvd);
-        linear_forward(gpu, &xn1, w.wk, &k_blk, block, h, kvd)?;
+        let k_ctx = kcat.sub_offset(0, rctx * kvd);
+        linear_forward(gpu, ctx, w.wk, &k_ctx, rctx, h, kvd)?;
+        let k_blk = kcat.sub_offset(rctx * kvd, rblk * kvd);
+        linear_forward(gpu, &xn1, w.wk, &k_blk, rblk, h, kvd)?;
     }
 
-    // 6. kn = k_norm(kcat) per head (rows = kv_rows*n_kv, h = head_dim), BEFORE rope
-    let kn = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
-    let k_rinv = gpu.zeros(&[kv_rows * nkv], DType::F32)?;
+    // 6. kn = k_norm(kcat) per head (rows = rkv*n_kv, h = head_dim), BEFORE rope
+    let kn = gpu.zeros(&[rkv * kvd], DType::F32)?;
+    let k_rinv = gpu.zeros(&[rkv * nkv], DType::F32)?;
     if dims.qk_norm {
-        rmsnorm_forward(
+        rmsnorm_forward(gpu, &kcat, w.k_norm, &kn, &k_rinv, rkv * nkv, hd, dims.eps)?;
+    } else {
+        gpu.memcpy_dtod_auto(&kn.buf, &kcat.buf, rkv * kvd * 4)?;
+    }
+
+    // 7. k_rope = rope(kn, [ctx_positions×n_win ++ block_positions×n_win])
+    //    (phase-major: the ctx section uses ctx positions, the block section
+    //    block positions, each tiled across windows).
+    let k_pos_tiled = tile_kpos(k_pos_host, ctx_len, block, n_win);
+    let k_pos = gpu.upload_f32(&k_pos_tiled, &[rkv])?;
+    let k_rope = gpu.zeros(&[rkv * kvd], DType::F32)?;
+    rope_forward(gpu, &kn, &k_rope, &k_pos, rkv * nkv, nkv, hd, dims.rope_base)?;
+
+    // 8. all_v = [v_proj(all-ctx) ++ v_proj(all-block)]  (phase-major, no norm/rope)
+    let all_v = gpu.zeros(&[rkv * kvd], DType::F32)?;
+    {
+        let v_ctx = all_v.sub_offset(0, rctx * kvd);
+        linear_forward(gpu, ctx, w.wv, &v_ctx, rctx, h, kvd)?;
+        let v_blk = all_v.sub_offset(rctx * kvd, rblk * kvd);
+        linear_forward(gpu, &xn1, w.wv, &v_blk, rblk, h, kvd)?;
+    }
+
+    // 9. bidirectional masked GQA over [ctx ++ block] — PER WINDOW.
+    //    Assemble each window's contiguous keys/values from the phase-major
+    //    slabs, then write ctx/p_all directly into that window's slice.
+    let p_all = gpu.zeros(&[n_win * nh * block * kv_rows], DType::F32)?;
+    let ctx_attn = gpu.zeros(&[rblk * qd], DType::F32)?;
+    let kwin = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
+    let vwin = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
+    for i in 0..n_win {
+        assemble_window_kv(gpu, &k_rope, &kwin, i, ctx_len, block, rctx, kvd)?;
+        assemble_window_kv(gpu, &all_v, &vwin, i, ctx_len, block, rctx, kvd)?;
+        let q_i = q_rope.sub_offset(i * block * qd, block * qd);
+        let ctx_i = ctx_attn.sub_offset(i * block * qd, block * qd);
+        let p_i = p_all.sub_offset(i * nh * block * kv_rows, nh * block * kv_rows);
+        gqa_forward_masked(
             gpu,
-            &kcat,
-            w.k_norm,
-            &kn,
-            &k_rinv,
-            kv_rows * nkv,
+            &q_i,
+            &kwin,
+            &vwin,
+            &p_i,
+            &ctx_i,
+            block,
+            kv_rows,
+            nh,
+            nkv,
             hd,
-            dims.eps,
+            dims.attn_scale(),
+            bias,
         )?;
-    } else {
-        gpu.memcpy_dtod_auto(&kn.buf, &kcat.buf, kv_rows * kvd * 4)?;
     }
-
-    // 7. k_rope = rope(kn, [ctx_positions ++ block_positions])
-    let k_pos = gpu.upload_f32(k_pos_host, &[kv_rows])?;
-    let k_rope = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
-    rope_forward(
-        gpu,
-        &kn,
-        &k_rope,
-        &k_pos,
-        kv_rows * nkv,
-        nkv,
-        hd,
-        dims.rope_base,
-    )?;
-
-    // 8. all_v = [v_proj(ctx) ++ v_proj(xn1)]  (no norm, no rope)
-    let all_v = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
-    {
-        let v_ctx = all_v.sub_offset(0, ctx_len * kvd);
-        linear_forward(gpu, ctx, w.wv, &v_ctx, ctx_len, h, kvd)?;
-        let v_blk = all_v.sub_offset(ctx_len * kvd, block * kvd);
-        linear_forward(gpu, &xn1, w.wv, &v_blk, block, h, kvd)?;
-    }
-
-    // 9. bidirectional masked GQA over [ctx ++ block]
-    let p_all = gpu.zeros(&[nh * block * kv_rows], DType::F32)?;
-    let ctx_attn = gpu.zeros(&[block * qd], DType::F32)?;
-    gqa_forward_masked(
-        gpu,
-        &q_rope,
-        &k_rope,
-        &all_v,
-        &p_all,
-        &ctx_attn,
-        block,
-        kv_rows,
-        nh,
-        nkv,
-        hd,
-        dims.attn_scale(),
-        bias,
-    )?;
+    gpu.free_tensor(kwin)?;
+    gpu.free_tensor(vwin)?;
 
     // 10. attn = o_proj(ctx_attn); x_mid = x_block + attn
-    let attn = gpu.zeros(&[block * h], DType::F32)?;
-    linear_forward(gpu, &ctx_attn, w.wo, &attn, block, qd, h)?;
-    let x_mid = gpu.zeros(&[block * h], DType::F32)?;
+    let attn = gpu.zeros(&[rblk * h], DType::F32)?;
+    linear_forward(gpu, &ctx_attn, w.wo, &attn, rblk, qd, h)?;
+    let x_mid = gpu.zeros(&[rblk * h], DType::F32)?;
     gpu.add_f32(x_block, &attn, &x_mid)?;
 
     // 11. xn2 = post_attention_layernorm(x_mid); MLP; residual
-    let xn2 = gpu.zeros(&[block * h], DType::F32)?;
-    let rinv2 = gpu.zeros(&[block], DType::F32)?;
-    rmsnorm_forward(gpu, &x_mid, w.post_ln, &xn2, &rinv2, block, h, dims.eps)?;
-    let gate = gpu.zeros(&[block * inter], DType::F32)?;
-    linear_forward(gpu, &xn2, w.wgate, &gate, block, h, inter)?;
-    let up = gpu.zeros(&[block * inter], DType::F32)?;
-    linear_forward(gpu, &xn2, w.wup, &up, block, h, inter)?;
-    let act = gpu.zeros(&[block * inter], DType::F32)?;
-    swiglu_forward(gpu, &gate, &up, &act, block * inter)?;
-    let mlp = gpu.zeros(&[block * h], DType::F32)?;
-    linear_forward(gpu, &act, w.wdown, &mlp, block, inter, h)?;
-    let x_out = gpu.zeros(&[block * h], DType::F32)?;
+    let xn2 = gpu.zeros(&[rblk * h], DType::F32)?;
+    let rinv2 = gpu.zeros(&[rblk], DType::F32)?;
+    rmsnorm_forward(gpu, &x_mid, w.post_ln, &xn2, &rinv2, rblk, h, dims.eps)?;
+    let gate = gpu.zeros(&[rblk * inter], DType::F32)?;
+    linear_forward(gpu, &xn2, w.wgate, &gate, rblk, h, inter)?;
+    let up = gpu.zeros(&[rblk * inter], DType::F32)?;
+    linear_forward(gpu, &xn2, w.wup, &up, rblk, h, inter)?;
+    let act = gpu.zeros(&[rblk * inter], DType::F32)?;
+    swiglu_forward(gpu, &gate, &up, &act, rblk * inter)?;
+    let mlp = gpu.zeros(&[rblk * h], DType::F32)?;
+    linear_forward(gpu, &act, w.wdown, &mlp, rblk, inter, h)?;
+    let x_out = gpu.zeros(&[rblk * h], DType::F32)?;
     gpu.add_f32(&x_mid, &mlp, &x_out)?;
 
     // Transients the backward never reads → back to the pool (no Drop).
@@ -505,6 +605,7 @@ pub fn dspark_block_forward(
         x_out,
         DsparkBlockActivations {
             ctx_len,
+            n_win,
             xn1,
             rinv1,
             qp,
@@ -530,10 +631,15 @@ pub fn dspark_block_forward(
 
 // ── Block backward ────────────────────────────────────────────────────────────
 
-/// One drafter block backward. `d_x_out` `[block*h]` upstream. Returns
-/// `(d_x_block [block*h], d_ctx [ctx_len*h], weight grads)`. `d_ctx` is this
-/// layer's contribution to the shared context grad (the caller accumulates it
-/// across layers). `x_block`/`ctx` are the same tensors passed to the forward.
+/// One drafter block backward, **batched across `n_win` windows** (Phase A).
+/// `d_x_out` `[n_win*block*h]` upstream (window-major). Returns
+/// `(d_x_block [n_win*block*h], d_ctx [n_win*ctx_len*h], weight grads)`. `d_ctx`
+/// is this layer's contribution to the shared per-window context grad. Row-wise
+/// backward ops run once over the full `n_win*block`/`n_win*ctx_len` stacks
+/// (raising the dW contract dim from `block` to `n_win*block`); attention stays
+/// per-window (its `dq`/`dk`/`dv` scatter back into the phase-major slabs).
+/// `x_block`/`ctx` are the same tensors passed to the forward. At `n_win==1`
+/// every op is byte-identical to the original per-window backward.
 #[allow(clippy::too_many_arguments)]
 pub fn dspark_block_backward(
     gpu: &mut Gpu,
@@ -548,8 +654,12 @@ pub fn dspark_block_backward(
     let (qd, kvd) = (dims.q_dim(), dims.kv_dim());
     let (nh, nkv, hd) = (dims.n_heads, dims.n_kv, dims.head_dim);
     let ctx_len = acts.ctx_len;
-    let block = x_block.shape.iter().product::<usize>() / h;
+    let n_win = acts.n_win;
+    let block = x_block.shape.iter().product::<usize>() / (n_win * h);
     let kv_rows = ctx_len + block;
+    let rblk = n_win * block;
+    let rctx = n_win * ctx_len;
+    let rkv = n_win * kv_rows;
 
     // Trainable norm grads (rmsnorm_backward atomic-accumulates → zero first).
     let dinput_ln = gpu.zeros(&[h], DType::F32)?;
@@ -558,10 +668,10 @@ pub fn dspark_block_backward(
     let dk_norm = gpu.zeros(&[hd], DType::F32)?;
 
     // ── MLP branch: x_out = x_mid + mlp ⇒ d_mlp = d_x_out, d_x_mid starts = d_x_out.
-    let d_act = gpu.zeros(&[block * inter], DType::F32)?;
-    linear_backward_x(gpu, d_x_out, w.wdown, &d_act, block, inter, h, false)?;
-    let d_gate = gpu.zeros(&[block * inter], DType::F32)?;
-    let d_up = gpu.zeros(&[block * inter], DType::F32)?;
+    let d_act = gpu.zeros(&[rblk * inter], DType::F32)?;
+    linear_backward_x(gpu, d_x_out, w.wdown, &d_act, rblk, inter, h, false)?;
+    let d_gate = gpu.zeros(&[rblk * inter], DType::F32)?;
+    let d_up = gpu.zeros(&[rblk * inter], DType::F32)?;
     swiglu_backward(
         gpu,
         &d_act,
@@ -569,14 +679,14 @@ pub fn dspark_block_backward(
         &acts.up,
         &d_gate,
         &d_up,
-        block * inter,
+        rblk * inter,
     )?;
-    let d_xn2 = gpu.zeros(&[block * h], DType::F32)?;
-    linear_backward_x(gpu, &d_gate, w.wgate, &d_xn2, block, h, inter, false)?;
-    linear_backward_x(gpu, &d_up, w.wup, &d_xn2, block, h, inter, true)?;
-    let d_x_mid = gpu.zeros(&[block * h], DType::F32)?;
-    gpu.memcpy_dtod_auto(&d_x_mid.buf, &d_x_out.buf, block * h * 4)?; // residual
-    let d_xmid_norm = gpu.zeros(&[block * h], DType::F32)?;
+    let d_xn2 = gpu.zeros(&[rblk * h], DType::F32)?;
+    linear_backward_x(gpu, &d_gate, w.wgate, &d_xn2, rblk, h, inter, false)?;
+    linear_backward_x(gpu, &d_up, w.wup, &d_xn2, rblk, h, inter, true)?;
+    let d_x_mid = gpu.zeros(&[rblk * h], DType::F32)?;
+    gpu.memcpy_dtod_auto(&d_x_mid.buf, &d_x_out.buf, rblk * h * 4)?; // residual
+    let d_xmid_norm = gpu.zeros(&[rblk * h], DType::F32)?;
     rmsnorm_backward(
         gpu,
         &d_xn2,
@@ -585,53 +695,84 @@ pub fn dspark_block_backward(
         &acts.rinv2,
         &d_xmid_norm,
         &dpost_ln,
-        block,
+        rblk,
         h,
     )?;
     gpu.add_inplace_f32(&d_x_mid, &d_xmid_norm)?;
 
     // ── Attention branch: x_mid = x_block + attn ⇒ d_attn = d_x_mid.
-    let d_ctx_attn = gpu.zeros(&[block * qd], DType::F32)?;
-    linear_backward_x(gpu, &d_x_mid, w.wo, &d_ctx_attn, block, qd, h, false)?;
-    let d_q_rope = gpu.zeros(&[block * qd], DType::F32)?;
-    let d_k_rope = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
-    let d_all_v = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
-    gqa_backward_masked(
-        gpu,
-        &d_ctx_attn,
-        &acts.q_rope,
-        &acts.k_rope,
-        &acts.all_v,
-        &acts.p_all,
-        &d_q_rope,
-        &d_k_rope,
-        &d_all_v,
-        block,
-        kv_rows,
-        nh,
-        nkv,
-        hd,
-        dims.attn_scale(),
-    )?;
+    let d_ctx_attn = gpu.zeros(&[rblk * qd], DType::F32)?;
+    linear_backward_x(gpu, &d_x_mid, w.wo, &d_ctx_attn, rblk, qd, h, false)?;
+    let d_q_rope = gpu.zeros(&[rblk * qd], DType::F32)?;
+    let d_k_rope = gpu.zeros(&[rkv * kvd], DType::F32)?; // phase-major
+    let d_all_v = gpu.zeros(&[rkv * kvd], DType::F32)?; // phase-major
+                                                        // Per-window attention backward: re-assemble each window's contiguous
+                                                        // keys/values, run the isolated GQA backward, scatter dq/dk/dv back.
+    let kwin = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
+    let vwin = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
+    let dqwin = gpu.zeros(&[block * qd], DType::F32)?;
+    let dkwin = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
+    let dvwin = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
+    for i in 0..n_win {
+        assemble_window_kv(gpu, &acts.k_rope, &kwin, i, ctx_len, block, rctx, kvd)?;
+        assemble_window_kv(gpu, &acts.all_v, &vwin, i, ctx_len, block, rctx, kvd)?;
+        // dk/dv are scatter-add accumulators inside GQA → zero per window.
+        gpu.fill_f32(&dkwin, 0.0)?;
+        gpu.fill_f32(&dvwin, 0.0)?;
+        let d_ctx_i = d_ctx_attn.sub_offset(i * block * qd, block * qd);
+        let q_i = acts.q_rope.sub_offset(i * block * qd, block * qd);
+        let p_i = acts
+            .p_all
+            .sub_offset(i * nh * block * kv_rows, nh * block * kv_rows);
+        gqa_backward_masked(
+            gpu,
+            &d_ctx_i,
+            &q_i,
+            &kwin,
+            &vwin,
+            &p_i,
+            &dqwin,
+            &dkwin,
+            &dvwin,
+            block,
+            kv_rows,
+            nh,
+            nkv,
+            hd,
+            dims.attn_scale(),
+        )?;
+        gpu.memcpy_dtod_at_auto(
+            &d_q_rope.buf,
+            i * block * qd * 4,
+            &dqwin.buf,
+            0,
+            block * qd * 4,
+        )?;
+        scatter_window_kv(gpu, &d_k_rope, &dkwin, i, ctx_len, block, rctx, kvd)?;
+        scatter_window_kv(gpu, &d_all_v, &dvwin, i, ctx_len, block, rctx, kvd)?;
+    }
+    for t in [kwin, vwin, dqwin, dkwin, dvwin] {
+        gpu.free_tensor(t)?;
+    }
 
     // d_xn1 accumulates q/k-block/v-block contributions; d_ctx accumulates
     // k-ctx/v-ctx contributions.
-    let d_xn1 = gpu.zeros(&[block * h], DType::F32)?;
-    let d_ctx = gpu.zeros(&[ctx_len * h], DType::F32)?;
+    let d_xn1 = gpu.zeros(&[rblk * h], DType::F32)?;
+    let d_ctx = gpu.zeros(&[rctx * h], DType::F32)?;
 
     // ── Q path: rope⁻¹ → q_norm⁻¹ → q_proj⁻¹
-    let d_qn = gpu.zeros(&[block * qd], DType::F32)?;
+    let d_qn = gpu.zeros(&[rblk * qd], DType::F32)?;
     rope_backward(
         gpu,
         &d_q_rope,
         &d_qn,
         &acts.q_pos,
-        block * nh,
+        rblk * nh,
         nh,
         hd,
         dims.rope_base,
     )?;
-    let d_qp = gpu.zeros(&[block * qd], DType::F32)?;
+    let d_qp = gpu.zeros(&[rblk * qd], DType::F32)?;
     if dims.qk_norm {
         rmsnorm_backward(
             gpu,
@@ -641,29 +782,29 @@ pub fn dspark_block_backward(
             &acts.q_rinv,
             &d_qp,
             &dq_norm,
-            block * nh,
+            rblk * nh,
             hd,
         )?;
     } else {
-        gpu.memcpy_dtod_auto(&d_qp.buf, &d_qn.buf, block * qd * 4)?;
+        gpu.memcpy_dtod_auto(&d_qp.buf, &d_qn.buf, rblk * qd * 4)?;
     }
     let dwq = gpu.zeros(&[qd * h], DType::F32)?;
-    linear_backward_w(gpu, &d_qp, &acts.xn1, &dwq, block, h, qd, false)?;
-    linear_backward_x(gpu, &d_qp, w.wq, &d_xn1, block, h, qd, false)?; // first writer → overwrite
+    linear_backward_w(gpu, &d_qp, &acts.xn1, &dwq, rblk, h, qd, false)?;
+    linear_backward_x(gpu, &d_qp, w.wq, &d_xn1, rblk, h, qd, false)?; // first writer → overwrite
 
     // ── K path: rope⁻¹ → k_norm⁻¹ → split ctx/block → k_proj⁻¹
-    let d_kn = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
+    let d_kn = gpu.zeros(&[rkv * kvd], DType::F32)?;
     rope_backward(
         gpu,
         &d_k_rope,
         &d_kn,
         &acts.k_pos,
-        kv_rows * nkv,
+        rkv * nkv,
         nkv,
         hd,
         dims.rope_base,
     )?;
-    let d_kcat = gpu.zeros(&[kv_rows * kvd], DType::F32)?;
+    let d_kcat = gpu.zeros(&[rkv * kvd], DType::F32)?;
     if dims.qk_norm {
         rmsnorm_backward(
             gpu,
@@ -673,33 +814,34 @@ pub fn dspark_block_backward(
             &acts.k_rinv,
             &d_kcat,
             &dk_norm,
-            kv_rows * nkv,
+            rkv * nkv,
             hd,
         )?;
     } else {
-        gpu.memcpy_dtod_auto(&d_kcat.buf, &d_kn.buf, kv_rows * kvd * 4)?;
+        gpu.memcpy_dtod_auto(&d_kcat.buf, &d_kn.buf, rkv * kvd * 4)?;
     }
-    let d_k_ctx = d_kcat.sub_offset(0, ctx_len * kvd);
-    let d_k_blk = d_kcat.sub_offset(ctx_len * kvd, block * kvd);
+    // Phase-major split: all ctx rows, then all block rows.
+    let d_k_ctx = d_kcat.sub_offset(0, rctx * kvd);
+    let d_k_blk = d_kcat.sub_offset(rctx * kvd, rblk * kvd);
     let dwk = gpu.zeros(&[kvd * h], DType::F32)?;
-    linear_backward_w(gpu, &d_k_ctx, ctx, &dwk, ctx_len, h, kvd, false)?;
-    linear_backward_w(gpu, &d_k_blk, &acts.xn1, &dwk, block, h, kvd, true)?;
-    linear_backward_x(gpu, &d_k_ctx, w.wk, &d_ctx, ctx_len, h, kvd, false)?; // first writer → overwrite
-    linear_backward_x(gpu, &d_k_blk, w.wk, &d_xn1, block, h, kvd, true)?;
+    linear_backward_w(gpu, &d_k_ctx, ctx, &dwk, rctx, h, kvd, false)?;
+    linear_backward_w(gpu, &d_k_blk, &acts.xn1, &dwk, rblk, h, kvd, true)?;
+    linear_backward_x(gpu, &d_k_ctx, w.wk, &d_ctx, rctx, h, kvd, false)?; // first writer → overwrite
+    linear_backward_x(gpu, &d_k_blk, w.wk, &d_xn1, rblk, h, kvd, true)?;
 
     // ── V path: split ctx/block → v_proj⁻¹
-    let d_v_ctx = d_all_v.sub_offset(0, ctx_len * kvd);
-    let d_v_blk = d_all_v.sub_offset(ctx_len * kvd, block * kvd);
+    let d_v_ctx = d_all_v.sub_offset(0, rctx * kvd);
+    let d_v_blk = d_all_v.sub_offset(rctx * kvd, rblk * kvd);
     let dwv = gpu.zeros(&[kvd * h], DType::F32)?;
-    linear_backward_w(gpu, &d_v_ctx, ctx, &dwv, ctx_len, h, kvd, false)?;
-    linear_backward_w(gpu, &d_v_blk, &acts.xn1, &dwv, block, h, kvd, true)?;
-    linear_backward_x(gpu, &d_v_ctx, w.wv, &d_ctx, ctx_len, h, kvd, true)?;
-    linear_backward_x(gpu, &d_v_blk, w.wv, &d_xn1, block, h, kvd, true)?;
+    linear_backward_w(gpu, &d_v_ctx, ctx, &dwv, rctx, h, kvd, false)?;
+    linear_backward_w(gpu, &d_v_blk, &acts.xn1, &dwv, rblk, h, kvd, true)?;
+    linear_backward_x(gpu, &d_v_ctx, w.wv, &d_ctx, rctx, h, kvd, true)?;
+    linear_backward_x(gpu, &d_v_blk, w.wv, &d_xn1, rblk, h, kvd, true)?;
 
     // ── input_ln backward: x_mid = x_block + attn ⇒ d_x_block residual = d_x_mid.
-    let d_x_block = gpu.zeros(&[block * h], DType::F32)?;
-    gpu.memcpy_dtod_auto(&d_x_block.buf, &d_x_mid.buf, block * h * 4)?; // residual
-    let d_x_norm = gpu.zeros(&[block * h], DType::F32)?;
+    let d_x_block = gpu.zeros(&[rblk * h], DType::F32)?;
+    gpu.memcpy_dtod_auto(&d_x_block.buf, &d_x_mid.buf, rblk * h * 4)?; // residual
+    let d_x_norm = gpu.zeros(&[rblk * h], DType::F32)?;
     rmsnorm_backward(
         gpu,
         &d_xn1,
@@ -708,20 +850,20 @@ pub fn dspark_block_backward(
         &acts.rinv1,
         &d_x_norm,
         &dinput_ln,
-        block,
+        rblk,
         h,
     )?;
     gpu.add_inplace_f32(&d_x_block, &d_x_norm)?;
 
     // ── weight grads for o/gate/up/down (single-input linears)
     let dwo = gpu.zeros(&[h * qd], DType::F32)?;
-    linear_backward_w(gpu, &d_x_mid, &acts.ctx_attn, &dwo, block, qd, h, false)?;
+    linear_backward_w(gpu, &d_x_mid, &acts.ctx_attn, &dwo, rblk, qd, h, false)?;
     let dwgate = gpu.zeros(&[inter * h], DType::F32)?;
-    linear_backward_w(gpu, &d_gate, &acts.xn2, &dwgate, block, h, inter, false)?;
+    linear_backward_w(gpu, &d_gate, &acts.xn2, &dwgate, rblk, h, inter, false)?;
     let dwup = gpu.zeros(&[inter * h], DType::F32)?;
-    linear_backward_w(gpu, &d_up, &acts.xn2, &dwup, block, h, inter, false)?;
+    linear_backward_w(gpu, &d_up, &acts.xn2, &dwup, rblk, h, inter, false)?;
     let dwdown = gpu.zeros(&[h * inter], DType::F32)?;
-    linear_backward_w(gpu, d_x_out, &acts.act, &dwdown, block, inter, h, false)?;
+    linear_backward_w(gpu, d_x_out, &acts.act, &dwdown, rblk, inter, h, false)?;
 
     // Return internal temporaries to the pool (no Drop). Only the returned grads
     // (d_x_block, d_ctx, DsparkBlockWeightGrad) survive.
@@ -951,11 +1093,13 @@ pub fn dspark_drafter_forward_train(
     ctx_positions: &[f32],
     block_positions: &[f32],
     bias: Option<&GpuTensor>,
+    n_win: usize,
 ) -> HipResult<DsparkDrafterActs> {
     let dims = cfg.dims();
     let h = cfg.h;
+    debug_assert!(n_win >= 1);
 
-    // ingest
+    // ingest (row-wise over the n_win*ctx_len stacked context rows)
     let (main_x, fc_out, rinv_hn) = dspark_ingest_forward(
         gpu,
         &weights.fc,
@@ -965,35 +1109,38 @@ pub fn dspark_drafter_forward_train(
         cfg.n_targets,
     )?;
 
-    // RoPE positions: q at block positions, k at [ctx ++ block].
+    // PER-WINDOW RoPE positions: q at block positions, k at [ctx ++ block].
+    // The block forward repeats these across the n_win windows internally.
     let q_pos = block_positions.to_vec();
     let mut k_pos = ctx_positions.to_vec();
     k_pos.extend_from_slice(block_positions);
 
     // blocks
+    let rblk = block_positions.len() * n_win;
     let mut layer_inputs = Vec::with_capacity(cfg.n_layers);
     let mut layer_acts = Vec::with_capacity(cfg.n_layers);
     let mut x = clone_tensor(gpu, block_embeds)?;
     for l in &weights.layers {
         layer_inputs.push(clone_tensor(gpu, &x)?);
         let bw = l.view();
-        let (x_out, a) = dspark_block_forward(gpu, &x, &main_x, &bw, &dims, &q_pos, &k_pos, bias)?;
+        let (x_out, a) =
+            dspark_block_forward(gpu, &x, &main_x, &bw, &dims, &q_pos, &k_pos, bias, n_win)?;
         gpu.free_tensor(x)?;
         layer_acts.push(a);
         x = x_out;
     }
     let x_last = x;
 
-    // out_norm → x_head
-    let xn_out = gpu.zeros(&[block_positions.len() * h], DType::F32)?;
-    let rinv_out = gpu.zeros(&[block_positions.len()], DType::F32)?;
+    // out_norm → x_head (row-wise over all n_win*block rows)
+    let xn_out = gpu.zeros(&[rblk * h], DType::F32)?;
+    let rinv_out = gpu.zeros(&[rblk], DType::F32)?;
     rmsnorm_forward(
         gpu,
         &x_last,
         &weights.out_norm,
         &xn_out,
         &rinv_out,
-        block_positions.len(),
+        rblk,
         h,
         dims.eps,
     )?;
@@ -1020,14 +1167,16 @@ pub fn dspark_drafter_backward(
     main_hidden: &GpuTensor,
     acts: &DsparkDrafterActs,
     d_x_head: &GpuTensor,
+    n_win: usize,
 ) -> HipResult<DsparkDrafterGrads> {
     let dims = cfg.dims();
     let h = cfg.h;
-    let block = d_x_head.shape.iter().product::<usize>() / h;
-    let ctx_len = acts.main_x.shape.iter().product::<usize>() / h;
+    debug_assert!(n_win >= 1);
+    let rblk = d_x_head.shape.iter().product::<usize>() / h; // = n_win*block
+    let rctx = acts.main_x.shape.iter().product::<usize>() / h; // = n_win*ctx_len
 
-    // out_norm backward → d_x_last
-    let d_x_last = gpu.zeros(&[block * h], DType::F32)?;
+    // out_norm backward → d_x_last (row-wise over all n_win*block rows)
+    let d_x_last = gpu.zeros(&[rblk * h], DType::F32)?;
     let d_out_norm = gpu.zeros(&[h], DType::F32)?;
     rmsnorm_backward(
         gpu,
@@ -1037,12 +1186,12 @@ pub fn dspark_drafter_backward(
         &acts.rinv_out,
         &d_x_last,
         &d_out_norm,
-        block,
+        rblk,
         h,
     )?;
 
-    // blocks in reverse; accumulate the shared context grad.
-    let d_main_x = gpu.zeros(&[ctx_len * h], DType::F32)?;
+    // blocks in reverse; accumulate the shared per-window context grad.
+    let d_main_x = gpu.zeros(&[rctx * h], DType::F32)?;
     let mut layer_grads: Vec<DsparkBlockWeightGrad> = Vec::with_capacity(cfg.n_layers);
     let mut d_x = d_x_last;
     for i in (0..cfg.n_layers).rev() {
@@ -1597,6 +1746,7 @@ pub fn dspark_drafter_forward_full(
     ctx_positions: &[f32],
     block_positions: &[f32],
     bias: Option<&GpuTensor>,
+    n_win: usize,
 ) -> HipResult<DsparkFullActs> {
     let body = dspark_drafter_forward_train(
         gpu,
@@ -1607,6 +1757,7 @@ pub fn dspark_drafter_forward_full(
         ctx_positions,
         block_positions,
         bias,
+        n_win,
     )?;
     let heads = dspark_heads_forward(
         gpu,
@@ -1632,6 +1783,7 @@ pub fn dspark_drafter_backward_full(
     acts: &DsparkFullActs,
     d_draft_logits: &GpuTensor,
     d_confidence_pred: &GpuTensor,
+    n_win: usize,
 ) -> HipResult<DsparkFullGrads> {
     let (d_x_head, heads) = dspark_heads_backward(
         gpu,
@@ -1643,8 +1795,15 @@ pub fn dspark_drafter_backward_full(
         &weights.heads,
         heads_cfg,
     )?;
-    let body =
-        dspark_drafter_backward(gpu, &weights.body, cfg, main_hidden, &acts.body, &d_x_head)?;
+    let body = dspark_drafter_backward(
+        gpu,
+        &weights.body,
+        cfg,
+        main_hidden,
+        &acts.body,
+        &d_x_head,
+        n_win,
+    )?;
     gpu.free_tensor(d_x_head)?;
     Ok(DsparkFullGrads { body, heads })
 }
