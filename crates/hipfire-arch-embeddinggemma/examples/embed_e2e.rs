@@ -47,6 +47,7 @@ fn read_watts(path: &std::path::Path) -> Option<f64> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hfq_path: Option<String> = None;
+    let mut ref_hfq: Option<String> = None;
     let mut dims: Option<usize> = None;
     let mut bench_m: usize = 0;
     let mut bench_iters: usize = 50;
@@ -59,8 +60,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // synthetic M-token sequence (the GPU tok/s baseline for the NPU comparison).
             "--bench-m" => bench_m = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             "--bench-iters" => bench_iters = it.next().and_then(|s| s.parse().ok()).unwrap_or(50),
+            // --ref-hfq <path>: quality gate. Encode the sanity docs with both the
+            // primary and the reference model, print per-doc cosine(primary, ref) and
+            // the mean; PASS if mean >= 0.99. Used to check int4/W4A8 vs bf16.
+            "--ref-hfq" => ref_hfq = it.next(),
             "-h" | "--help" => {
-                eprintln!("usage: embed_e2e --hfq <path.hfq> [--dims N] [--bench-m M --bench-iters N]");
+                eprintln!("usage: embed_e2e --hfq <path.hfq> [--dims N] [--bench-m M --bench-iters N] [--ref-hfq <bf16.hfq>]");
                 return Ok(());
             }
             other => return Err(format!("unknown arg: {other}").into()),
@@ -111,6 +116,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[4/4] loading weights + Gpu");
     let mut gpu = Gpu::init()?;
     let weights = eg::EmbeddingGemmaWeights::load(&mut hfq, &cfg, &mut gpu)?;
+
+    // Quality gate: encode the sanity docs with the primary model and a reference
+    // model, and report per-doc cosine(primary, ref). Used to check W4A8 (int4) vs
+    // the bf16 baseline — embeddings are unit-norm, so cosine == dot product.
+    if let Some(ref_path) = &ref_hfq {
+        let docs = [
+            "The cat sat on the warm windowsill in the afternoon sun.",
+            "A feline rested by the sunny window during the day.",
+            "Quarterly revenue grew twelve percent driven by cloud services.",
+        ];
+        let mut prim: Vec<Vec<f32>> = Vec::new();
+        for text in &docs {
+            let ids = tok.encode(&format!("{}{}", cfg.document_prompt, text));
+            prim.push(eg::embed_forward(&mut gpu, &weights, &cfg, &ids)?);
+        }
+        weights.free_gpu(&mut gpu);
+
+        let mut rhfq = HfqFile::open(Path::new(ref_path))?;
+        let rcfg = eg::config_from_metadata_json(&rhfq.metadata_json)
+            .ok_or("ref: failed to parse config")?;
+        let rtok = Tokenizer::from_hfq_metadata(&rhfq.metadata_json)
+            .map_err(|e| format!("ref tokenizer: {e}"))?;
+        let rweights = eg::EmbeddingGemmaWeights::load(&mut rhfq, &rcfg, &mut gpu)?;
+
+        let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let mut sum = 0.0f32;
+        println!("=== W4A8 quality gate: cosine(primary, ref) per doc ===");
+        for (i, text) in docs.iter().enumerate() {
+            let ids = rtok.encode(&format!("{}{}", rcfg.document_prompt, text));
+            let re = eg::embed_forward(&mut gpu, &rweights, &rcfg, &ids)?;
+            let c = cos(&prim[i], &re);
+            sum += c;
+            println!("  doc[{i}] cosine = {c:.5}");
+        }
+        let mean = sum / docs.len() as f32;
+        println!(
+            "mean cosine = {mean:.5}  =>  {}",
+            if mean >= 0.99 { "PASS (>=0.99)" } else { "FAIL (<0.99)" }
+        );
+        return Ok(());
+    }
 
     // GPU throughput baseline: time embed_forward on a synthetic M-token sequence,
     // reporting steady-state tok/s (sample SoC package power externally for tok/J).
