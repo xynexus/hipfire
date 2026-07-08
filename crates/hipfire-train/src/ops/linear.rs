@@ -11,6 +11,16 @@
 use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 use std::sync::OnceLock;
 
+// NOTE (2026-07-08): a WMMA backward — reformulating dX (contracts N) and dW
+// (contracts M) as NT via `transpose_f32` + `gemm_bf16x2_train_nt` — was tried
+// and REVERTED. It is numerically correct (all gradchecks pass at bf16x2), but a
+// net loss: the body backward is dominated by small-M GEMMs (contract dim =
+// block = 7), where the transpose passes + 3-pass split + per-call scratch
+// allocation dwarf the tiny scalar-f32 cost (body_bwd ~5x SLOWER), and the
+// noisier gradients destabilized the overfit (best 4.24 vs 1.79 fwd-only). The
+// backward stays f32; the real win needs batching the drafter body across
+// windows first (raises the backward's M), then revisiting.
+
 /// Low-precision compute mode for the linear FORWARD, selected by
 /// `HIPFIRE_TRAIN_LOWP` (`f16` | `bf16`; anything else / unset = f32).
 #[derive(Clone, Copy, PartialEq)]
