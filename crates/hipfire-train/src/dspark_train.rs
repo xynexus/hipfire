@@ -37,6 +37,93 @@ use crate::loader::LlamaWeightsF32;
 use crate::optim::AdamW;
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 use std::io::{self, Read, Write};
+use std::time::Instant;
+
+/// Time `$body` into the `$p` profiler's `$field` accumulator (milliseconds),
+/// bracketing it with device syncs so the wall time reflects the GPU work — but
+/// ONLY when profiling is enabled, so the hot path pays nothing when it is off.
+/// Must be used inside a `-> HipResult<_>` fn (the syncs propagate with `?`).
+macro_rules! timed {
+    ($gpu:expr, $p:expr, $field:ident, $body:expr) => {{
+        if $p.on {
+            $gpu.device_synchronize()?;
+        }
+        let __t = Instant::now();
+        let __r = $body;
+        if $p.on {
+            $gpu.device_synchronize()?;
+            $p.ms.$field += __t.elapsed().as_secs_f64() * 1000.0;
+        }
+        __r
+    }};
+}
+
+/// Per-phase wall-time accumulator (milliseconds) for one reporting interval.
+/// Populated only when [`Prof::on`]; the phases sum (roughly) to minibatch time.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct DsparkPhaseMs {
+    /// Per-window body forward (`dspark_drafter_forward_train` × window_batch).
+    pub body_fwd: f64,
+    /// Batched vocab heads forward (`dspark_heads_forward`).
+    pub heads_fwd: f64,
+    /// Batched loss forward+backward (`dspark_loss_forward_backward`).
+    pub loss: f64,
+    /// Batched vocab heads backward (`dspark_heads_backward`).
+    pub heads_bwd: f64,
+    /// Per-window body backward + grad accumulation.
+    pub body_bwd: f64,
+    /// AdamW step.
+    pub opt_step: f64,
+    /// Returning the minibatch's tensors to the pool.
+    pub free: f64,
+}
+
+impl DsparkPhaseMs {
+    pub fn total(&self) -> f64 {
+        self.body_fwd
+            + self.heads_fwd
+            + self.loss
+            + self.heads_bwd
+            + self.body_bwd
+            + self.opt_step
+            + self.free
+    }
+}
+
+/// Profiling toggle + accumulator threaded through the minibatch. When `on` is
+/// false the `timed!` sites compile to just the inner work (no syncs, no cost).
+struct Prof {
+    on: bool,
+    ms: DsparkPhaseMs,
+}
+
+impl Prof {
+    fn new(on: bool) -> Self {
+        Self {
+            on,
+            ms: DsparkPhaseMs::default(),
+        }
+    }
+}
+
+/// Intra-epoch progress report, passed to the `on_progress` callback every
+/// `progress_updates_per_epoch`-th slice of the train split.
+pub struct DsparkProgress {
+    pub epoch: usize,
+    /// Minibatches completed this epoch (1-based) and the total for the epoch.
+    pub minibatch: usize,
+    pub n_minibatches: usize,
+    /// Windows processed so far this epoch.
+    pub windows_done: usize,
+    /// Running mean train loss over the epoch so far.
+    pub running_train_loss: f32,
+    /// Throughput since the last progress tick.
+    pub windows_per_sec: f32,
+    /// Per-phase ms accumulated since the last tick (all-zero when profiling off).
+    pub phase_ms: DsparkPhaseMs,
+    /// Whether per-phase timing was enabled (`HIPFIRE_DSPARK_PROFILE`).
+    pub profiling: bool,
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Random init helpers (deterministic LCG — mirrors src/drafter.rs)
@@ -406,6 +493,10 @@ pub struct DsparkTrainCfg {
     /// of the minibatch-mean loss (not an approximation). `1` = one window per
     /// step. Larger values trade activation VRAM for throughput.
     pub window_batch: usize,
+    /// How many intra-epoch progress ticks to fire over the train split (the
+    /// `on_progress` callback). `0` disables intra-epoch progress. Clamped to the
+    /// number of minibatches, so tiny caches still get one tick.
+    pub progress_updates_per_epoch: usize,
     pub seed: u64,
 }
 
@@ -420,6 +511,7 @@ impl Default for DsparkTrainCfg {
             eval_frac: 0.1,
             checkpoint_every: 10,
             window_batch: 8,
+            progress_updates_per_epoch: 20,
             seed: 0,
         }
     }
@@ -478,6 +570,7 @@ fn forward_loss_batch(
     windows: &[&DsparkWindow],
     cache: &DsparkLabelCache,
     loss_cfg: &DsparkLossCfg,
+    prof: &mut Prof,
 ) -> HipResult<BatchStep> {
     let h = model.body_cfg.h;
     let block = cache.block;
@@ -495,47 +588,51 @@ fn forward_loss_batch(
     let mut mask_host: Vec<f32> = Vec::with_capacity(rows);
     let mut tgt_host: Vec<f32> = Vec::with_capacity(rows * vocab);
 
-    for (wi, win) in windows.iter().enumerate() {
-        let main_hidden = gpu.upload_f32(&win.main_hidden, &[main_len])?;
-        let block_embeds = embed_block_tokens(gpu, embed, &win.block_tokens, h)?;
-        let body = dspark_drafter_forward_train(
-            gpu,
-            &model.weights.body,
-            &model.body_cfg,
-            &main_hidden,
-            &block_embeds,
-            ctx_pos,
-            block_pos,
-            None,
-        )?;
-        // block_embeds is cloned inside the forward → safe to reclaim now.
-        gpu.free_tensor(block_embeds)?;
-        // Copy this window's x_head [block*h] into its slice of the batch.
-        gpu.memcpy_dtod_at_auto(
-            &x_head_batch.buf,
-            wi * block * h * 4,
-            &body.x_head().buf,
-            0,
-            block * h * 4,
-        )?;
-        bodies.push(body);
-        main_hiddens.push(main_hidden);
+    timed!(gpu, prof, body_fwd, {
+        for (wi, win) in windows.iter().enumerate() {
+            let main_hidden = gpu.upload_f32(&win.main_hidden, &[main_len])?;
+            let block_embeds = embed_block_tokens(gpu, embed, &win.block_tokens, h)?;
+            let body = dspark_drafter_forward_train(
+                gpu,
+                &model.weights.body,
+                &model.body_cfg,
+                &main_hidden,
+                &block_embeds,
+                ctx_pos,
+                block_pos,
+                None,
+            )?;
+            // block_embeds is cloned inside the forward → safe to reclaim now.
+            gpu.free_tensor(block_embeds)?;
+            // Copy this window's x_head [block*h] into its slice of the batch.
+            gpu.memcpy_dtod_at_auto(
+                &x_head_batch.buf,
+                wi * block * h * 4,
+                &body.x_head().buf,
+                0,
+                block * h * 4,
+            )?;
+            bodies.push(body);
+            main_hiddens.push(main_hidden);
 
-        prev_tokens.extend_from_slice(&win.prev_tokens);
-        next_host.extend(win.next_tokens.iter().map(|&t| t as f32));
-        mask_host.extend(win.eval_mask.iter().map(|&m| m as f32));
-        tgt_host.extend_from_slice(&win.target_logits);
-    }
+            prev_tokens.extend_from_slice(&win.prev_tokens);
+            next_host.extend(win.next_tokens.iter().map(|&t| t as f32));
+            mask_host.extend(win.eval_mask.iter().map(|&m| m as f32));
+            tgt_host.extend_from_slice(&win.target_logits);
+        }
+    });
 
     // One heads pass over the batched x_head → draft_logits/confidence [rows,·].
-    let heads = dspark_heads_forward(
-        gpu,
-        &x_head_batch,
-        &prev_tokens,
-        lm_head,
-        &model.weights.heads,
-        &model.heads_cfg,
-    )?;
+    let heads = timed!(gpu, prof, heads_fwd, {
+        dspark_heads_forward(
+            gpu,
+            &x_head_batch,
+            &prev_tokens,
+            lm_head,
+            &model.weights.heads,
+            &model.heads_cfg,
+        )?
+    });
 
     let target_logits = gpu.upload_f32(&tgt_host, &[rows * vocab])?;
     let next_tokens = gpu.upload_f32(&next_host, &[rows])?;
@@ -544,15 +641,17 @@ fn forward_loss_batch(
     // One loss pass over the batched rows. NOTE: the loss operates on the
     // confidence LOGIT (BCE-with-logits) and returns d/d(logit); the head's
     // confidence path is linear from that logit.
-    let loss = dspark_loss_forward_backward(
-        gpu,
-        &heads.draft_logits,
-        &heads.confidence_logit,
-        &target_logits,
-        &next_tokens,
-        &eval_mask,
-        loss_cfg,
-    )?;
+    let loss = timed!(gpu, prof, loss, {
+        dspark_loss_forward_backward(
+            gpu,
+            &heads.draft_logits,
+            &heads.confidence_logit,
+            &target_logits,
+            &next_tokens,
+            &eval_mask,
+            loss_cfg,
+        )?
+    });
 
     Ok(BatchStep {
         bodies,
@@ -621,11 +720,17 @@ pub fn train_dspark_loop(
     cfg: &DsparkTrainCfg,
     ckpt_path: Option<&str>,
     mut on_epoch: impl FnMut(usize, f32, f32, f32, usize, f32),
+    mut on_progress: impl FnMut(&DsparkProgress),
 ) -> HipResult<DsparkTrainReport> {
     let embed = &target.embed_tokens;
     let lm_head = target.lm_head.as_ref().unwrap_or(&target.embed_tokens);
     let h = model.body_cfg.h;
     let block = cache.block;
+    // Per-phase timing is opt-in (adds device syncs); intra-epoch progress logging
+    // is always on (cheap).
+    let profile = std::env::var("HIPFIRE_DSPARK_PROFILE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
 
     let n = cache.n_windows();
     assert!(n > 0, "dspark train: empty label cache");
@@ -658,7 +763,18 @@ pub fn train_dspark_loop(
         // the concatenated rows, then sums the per-window body grads onto the
         // single batched heads grads for one AdamW step. Because the body params
         // are shared, this sum IS the exact gradient of the minibatch-mean loss.
+        let n_minibatches = n_train.div_ceil(wb);
+        // Fire ~progress_updates_per_epoch ticks over the epoch (>=1 minibatch apart).
+        let progress_stride = if cfg.progress_updates_per_epoch == 0 {
+            usize::MAX
+        } else {
+            (n_minibatches / cfg.progress_updates_per_epoch).max(1)
+        };
         let mut train_loss = 0.0f32;
+        let mut prof = Prof::new(profile);
+        let mut tick_t = Instant::now();
+        let mut tick_windows = 0usize;
+        let mut mb = 0usize;
         let mut start = 0usize;
         while start < n_train {
             let end = (start + wb).min(n_train);
@@ -666,6 +782,7 @@ pub fn train_dspark_loop(
             let nb = end - start;
             let step = forward_loss_batch(
                 gpu, model, embed, lm_head, &ctx_pos, &block_pos, &windows, cache, &loss_cfg,
+                &mut prof,
             )?;
             // Weight the minibatch-mean loss by its window count so the reported
             // epoch mean matches a per-window average.
@@ -673,64 +790,94 @@ pub fn train_dspark_loop(
 
             // Heads backward once over the batch → d_x_head [wb*block*h] + the
             // (already batch-summed) heads grads.
-            let (d_x_head_batch, head_grads) = dspark_heads_backward(
-                gpu,
-                &step.loss.d_draft_logits,
-                &step.loss.d_confidence_logit,
-                &step.heads,
-                &step.x_head_batch,
-                lm_head,
-                &model.weights.heads,
-                &model.heads_cfg,
-            )?;
+            let (d_x_head_batch, head_grads) = timed!(gpu, prof, heads_bwd, {
+                dspark_heads_backward(
+                    gpu,
+                    &step.loss.d_draft_logits,
+                    &step.loss.d_confidence_logit,
+                    &step.heads,
+                    &step.x_head_batch,
+                    lm_head,
+                    &model.weights.heads,
+                    &model.heads_cfg,
+                )?
+            });
 
             // Per-window body backward from each window's slice of d_x_head,
             // accumulating the body grads (shared params ⇒ the sum is exact).
-            let mut body_grad_acc: Option<DsparkDrafterGrads> = None;
-            for (wi, body) in step.bodies.iter().enumerate() {
-                let d_xh = gpu.zeros(&[block * h], DType::F32)?;
-                gpu.memcpy_dtod_at_auto(
-                    &d_xh.buf,
-                    0,
-                    &d_x_head_batch.buf,
-                    wi * block * h * 4,
-                    block * h * 4,
-                )?;
-                let g = dspark_drafter_backward(
-                    gpu,
-                    &model.weights.body,
-                    &model.body_cfg,
-                    &step.main_hiddens[wi],
-                    body,
-                    &d_xh,
-                )?;
-                gpu.free_tensor(d_xh)?;
-                if let Some(acc) = body_grad_acc.as_ref() {
-                    let af = acc.flat();
-                    let gf = g.flat();
-                    for (a, b) in af.iter().zip(gf.iter()) {
-                        gpu.add_inplace_f32(a, b)?;
+            let body_grads = timed!(gpu, prof, body_bwd, {
+                let mut body_grad_acc: Option<DsparkDrafterGrads> = None;
+                for (wi, body) in step.bodies.iter().enumerate() {
+                    let d_xh = gpu.zeros(&[block * h], DType::F32)?;
+                    gpu.memcpy_dtod_at_auto(
+                        &d_xh.buf,
+                        0,
+                        &d_x_head_batch.buf,
+                        wi * block * h * 4,
+                        block * h * 4,
+                    )?;
+                    let g = dspark_drafter_backward(
+                        gpu,
+                        &model.weights.body,
+                        &model.body_cfg,
+                        &step.main_hiddens[wi],
+                        body,
+                        &d_xh,
+                    )?;
+                    gpu.free_tensor(d_xh)?;
+                    if let Some(acc) = body_grad_acc.as_ref() {
+                        let af = acc.flat();
+                        let gf = g.flat();
+                        for (a, b) in af.iter().zip(gf.iter()) {
+                            gpu.add_inplace_f32(a, b)?;
+                        }
+                        drop(af);
+                        drop(gf);
+                        free_dspark_drafter_grads(gpu, g)?;
+                    } else {
+                        body_grad_acc = Some(g);
                     }
-                    drop(af);
-                    drop(gf);
-                    free_dspark_drafter_grads(gpu, g)?;
-                } else {
-                    body_grad_acc = Some(g);
                 }
-            }
+                body_grad_acc.expect("minibatch has >=1 window")
+            });
             gpu.free_tensor(d_x_head_batch)?;
 
             // One AdamW step over (summed body grads ++ batched heads grads).
             let grads = DsparkFullGrads {
-                body: body_grad_acc.expect("minibatch has >=1 window"),
+                body: body_grads,
                 heads: head_grads,
             };
-            opt.step(gpu, &model.weights.params(), &grads.flat())?;
-            free_dspark_drafter_grads(gpu, grads.body)?;
-            free_dspark_heads_grads(gpu, grads.heads)?;
-            free_batch_step(gpu, step)?;
+            timed!(gpu, prof, opt_step, {
+                opt.step(gpu, &model.weights.params(), &grads.flat())?;
+            });
+            timed!(gpu, prof, free, {
+                free_dspark_drafter_grads(gpu, grads.body)?;
+                free_dspark_heads_grads(gpu, grads.heads)?;
+                free_batch_step(gpu, step)?;
+            });
 
             start = end;
+            mb += 1;
+            tick_windows += nb;
+
+            // ── intra-epoch progress tick ────────────────────────────────────
+            if mb % progress_stride == 0 || start >= n_train {
+                let dt = tick_t.elapsed().as_secs_f32().max(1e-6);
+                let report = DsparkProgress {
+                    epoch: ep,
+                    minibatch: mb,
+                    n_minibatches,
+                    windows_done: start,
+                    running_train_loss: train_loss / start as f32,
+                    windows_per_sec: tick_windows as f32 / dt,
+                    phase_ms: prof.ms,
+                    profiling: profile,
+                };
+                on_progress(&report);
+                prof.ms = DsparkPhaseMs::default();
+                tick_t = Instant::now();
+                tick_windows = 0;
+            }
         }
         let train_loss = train_loss / n_train as f32;
         final_train_loss = train_loss;
@@ -743,13 +890,23 @@ pub fn train_dspark_loop(
         };
         let mut eval_loss = 0.0f32;
         let mut eval_l1 = 0.0f32;
+        let mut eval_prof = Prof::new(false); // eval throughput not profiled
         let mut start = estart;
         while start < eend {
             let end = (start + wb).min(eend);
             let windows: Vec<&DsparkWindow> = (start..end).map(|i| cache.window(i)).collect();
             let nb = end - start;
             let step = forward_loss_batch(
-                gpu, model, embed, lm_head, &ctx_pos, &block_pos, &windows, cache, &loss_cfg,
+                gpu,
+                model,
+                embed,
+                lm_head,
+                &ctx_pos,
+                &block_pos,
+                &windows,
+                cache,
+                &loss_cfg,
+                &mut eval_prof,
             )?;
             eval_loss += step.loss.total * nb as f32;
             eval_l1 += step.loss.l1 * nb as f32;

@@ -1215,7 +1215,7 @@ pub const ENV_HIPFIRE_DSPARK_HFQ4_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DSPARK_PROFILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DSPARK_PROFILE",
     description: "Runtime variable controlling dspark profile in hipfire",
-    source: "crates/hipfire-specdecode-dspark/src/dspark_core.rs:25",
+    source: "crates/hipfire-train/src/dspark_train.rs:731",
 };
 
 /// `HIPFIRE_DSPARK_Q8_4W` — Environment toggle value controls runtime behavior

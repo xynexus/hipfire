@@ -174,7 +174,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DSPARK` | Disabled when set to 0 | `crates/hipfire-serving-core/src/load.rs:3302` |
 | `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` | Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today) | `crates/hipfire-specdecode-dspark/src/dspark_core.rs:1426` |
 | `HIPFIRE_DSPARK_HFQ4_WMMA` | Runtime variable controlling dspark hfQ4 wmma in hipfire | `crates/hipfire-specdecode-dspark/src/dspark_core.rs:463` |
-| `HIPFIRE_DSPARK_PROFILE` | Runtime variable controlling dspark profile in hipfire | `crates/hipfire-specdecode-dspark/src/dspark_core.rs:25` |
+| `HIPFIRE_DSPARK_PROFILE` | Runtime variable controlling dspark profile in hipfire | `crates/hipfire-train/src/dspark_train.rs:731` |
 | `HIPFIRE_DSPARK_Q8_4W` | Environment toggle value controls runtime behavior | `crates/hipfire-specdecode-dspark/src/dspark_core.rs:420` |
 | `HIPFIRE_DSPARK_Q8_WMMA` | Runtime variable controlling dspark Q8 wmma in hipfire | `crates/hipfire-specdecode-dspark/src/dspark_core.rs:391` |
 | `HIPFIRE_DTOH_DUMP` | Enabled when set to 1 | `crates/hip-bridge/src/ffi.rs:1060` |

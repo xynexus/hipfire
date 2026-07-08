@@ -41,6 +41,7 @@ struct Args {
     eval_frac: f32,
     checkpoint_every: usize,
     window_batch: usize,
+    progress_updates: usize,
     resume: bool,
     overfit: bool,
 }
@@ -56,6 +57,7 @@ fn parse_args() -> Args {
     let mut eval_frac = 0.1f32;
     let mut checkpoint_every = 10usize;
     let mut window_batch = 8usize;
+    let mut progress_updates = 20usize;
     let mut resume = false;
     let mut overfit = false;
 
@@ -85,6 +87,9 @@ fn parse_args() -> Args {
                 checkpoint_every = next().parse().expect("bad --checkpoint-every")
             }
             "--window-batch" => window_batch = next().parse().expect("bad --window-batch"),
+            "--progress-updates" => {
+                progress_updates = next().parse().expect("bad --progress-updates")
+            }
             "--resume" => resume = true,
             "--overfit" => overfit = true,
             other => {
@@ -114,6 +119,7 @@ fn parse_args() -> Args {
         eval_frac,
         checkpoint_every,
         window_batch,
+        progress_updates,
         resume,
         overfit,
     }
@@ -212,6 +218,7 @@ fn main() -> HipResult<()> {
         eval_frac,
         checkpoint_every: args.checkpoint_every,
         window_batch: args.window_batch,
+        progress_updates_per_epoch: args.progress_updates,
         seed: 0,
     };
 
@@ -247,6 +254,49 @@ fn main() -> HipResult<()> {
                     best_eval,
                     best_epoch,
                     accept,
+                );
+            }
+        },
+        |p| {
+            // Intra-epoch progress: several updates per epoch (running loss +
+            // throughput). With HIPFIRE_DSPARK_PROFILE set, also the per-phase
+            // ms breakdown that locates the bottleneck.
+            let eta_epoch_s = if p.windows_per_sec > 0.0 {
+                (p.n_minibatches as f32 * p.windows_done as f32 / p.minibatch as f32
+                    - p.windows_done as f32)
+                    / p.windows_per_sec
+            } else {
+                0.0
+            };
+            if p.profiling {
+                let m = &p.phase_ms;
+                eprintln!(
+                    "    ep {:>3} mb {:>4}/{}  loss {:.4}  {:.1} win/s  eta_ep {:.0}s  \
+                     | body_fwd {:.0} heads_fwd {:.0} loss {:.0} heads_bwd {:.0} \
+                     body_bwd {:.0} opt {:.0} free {:.0} ms",
+                    p.epoch + 1,
+                    p.minibatch,
+                    p.n_minibatches,
+                    p.running_train_loss,
+                    p.windows_per_sec,
+                    eta_epoch_s,
+                    m.body_fwd,
+                    m.heads_fwd,
+                    m.loss,
+                    m.heads_bwd,
+                    m.body_bwd,
+                    m.opt_step,
+                    m.free,
+                );
+            } else {
+                eprintln!(
+                    "    ep {:>3} mb {:>4}/{}  loss {:.4}  {:.1} win/s  eta_ep {:.0}s",
+                    p.epoch + 1,
+                    p.minibatch,
+                    p.n_minibatches,
+                    p.running_train_loss,
+                    p.windows_per_sec,
+                    eta_epoch_s,
                 );
             }
         },
