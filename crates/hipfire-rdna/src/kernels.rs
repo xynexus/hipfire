@@ -3419,6 +3419,13 @@ pub const GEMM_BF16C_TRAIN_NT_SRC: &str =
 pub const GEMM_F16C_TRAIN_NT_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16c_train_nt.hip");
 
+/// Split-precision ("2xbf16") training GEMM forward (NT): near-f32 accuracy on
+/// the WMMA cores by splitting each f32 operand into bf16 hi+lo and accumulating
+/// 3 WMMA passes (~16 mantissa bits). For the precision-sensitive vocab-head
+/// logits. See `kernels/src/gemm_bf16x2_train_nt.hip`.
+pub const GEMM_BF16X2_TRAIN_NT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16x2_train_nt.hip");
+
 /// RMSNorm forward+backward (fp32) for the un-fused training path.
 /// `rmsnorm_train_fwd` saves `1/r` per row for `rmsnorm_train_bwd`.
 pub const RMSNORM_TRAIN_SRC: &str = include_str!("../../../kernels/src/rmsnorm_train.hip");

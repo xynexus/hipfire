@@ -46,7 +46,7 @@
 
 use crate::ops::attention::{gqa_backward_masked, gqa_forward_masked};
 use crate::ops::linear::{
-    linear_backward_w, linear_backward_x, linear_forward, linear_forward_f32,
+    linear_backward_w, linear_backward_x, linear_forward, linear_forward_heads,
 };
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use crate::ops::rope::{rope_backward, rope_forward};
@@ -1320,13 +1320,14 @@ pub fn dspark_heads_forward(
 
     // markov_bias = markov_latent @ markov_w2ᵀ  [block, vocab].
     let markov_bias = gpu.zeros(&[block * v], DType::F32)?;
-    // Heads GEMMs are kept f32: their logits feed the softmax/CE loss and are
-    // precision-sensitive (the low-precision forward is scoped to the body).
-    linear_forward_f32(gpu, &markov_latent, &w.markov_w2, &markov_bias, block, r, v)?;
+    // Heads GEMMs stay high-precision (f32, or split-precision WMMA via
+    // HIPFIRE_TRAIN_HEADS=bf16x2): their logits feed the softmax/CE loss. The
+    // low-precision body forward (HIPFIRE_TRAIN_LOWP) is scoped away from here.
+    linear_forward_heads(gpu, &markov_latent, &w.markov_w2, &markov_bias, block, r, v)?;
 
     // base_logits = x_head @ lm_headᵀ  [block, vocab]  (lm_head frozen).
     let base_logits = gpu.zeros(&[block * v], DType::F32)?;
-    linear_forward_f32(gpu, x_head, lm_head, &base_logits, block, h, v)?;
+    linear_forward_heads(gpu, x_head, lm_head, &base_logits, block, h, v)?;
 
     // draft_logits = base_logits + markov_bias.
     let draft_logits = gpu.zeros(&[block * v], DType::F32)?;
@@ -1335,7 +1336,7 @@ pub fn dspark_heads_forward(
     // confidence: features = concat(x_head, markov_latent) → proj + bias → sigmoid.
     let feat = concat_feat(gpu, x_head, &markov_latent, block, h, r)?;
     let confidence_logit = gpu.zeros(&[block], DType::F32)?;
-    linear_forward_f32(
+    linear_forward_heads(
         gpu,
         &feat,
         &w.confidence_proj,

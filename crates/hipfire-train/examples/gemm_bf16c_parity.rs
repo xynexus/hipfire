@@ -49,10 +49,13 @@ fn main() -> HipResult<()> {
         gpu.gemm_bf16c_train_nt(&x, &w, &y_bf, m, k, n)?;
         let y_f16 = gpu.zeros(&[m * n], DType::F32)?;
         gpu.gemm_f16c_train_nt(&x, &w, &y_f16, m, k, n)?;
+        let y_x2 = gpu.zeros(&[m * n], DType::F32)?;
+        gpu.gemm_bf16x2_train_nt(&x, &w, &y_x2, m, k, n)?;
 
         let a = gpu.download_f32(&y_ref)?;
         let b = gpu.download_f32(&y_bf)?;
         let c = gpu.download_f32(&y_f16)?;
+        let d = gpu.download_f32(&y_x2)?;
 
         let metrics = |cand: &[f32]| -> (f64, f64) {
             let (mut dot, mut na, mut nb, mut max_rel) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
@@ -65,15 +68,17 @@ fn main() -> HipResult<()> {
             }
             (dot / (na.sqrt() * nb.sqrt() + 1e-30), max_rel)
         };
-        let (cos_bf, rel_bf) = metrics(&b);
-        let (cos_f16, rel_f16) = metrics(&c);
-        worst_cos = worst_cos.min(cos_bf).min(cos_f16);
+        let (_, rel_bf) = metrics(&b);
+        let (_, rel_f16) = metrics(&c);
+        let (cos_x2, rel_x2) = metrics(&d);
+        // bf16x2 is the near-f32 path we care about; gate on its cosine.
+        worst_cos = worst_cos.min(cos_x2);
         println!(
-            "  m={:>4} k={:>5} n={:>6}  bf16 cos={:.6} rel={:.4}  |  f16 cos={:.6} rel={:.4}",
-            m, k, n, cos_bf, rel_bf, cos_f16, rel_f16
+            "  m={:>4} k={:>5} n={:>6}  bf16 rel={:.2e}  f16 rel={:.2e}  bf16x2 rel={:.2e} (cos={:.7})",
+            m, k, n, rel_bf, rel_f16, rel_x2, cos_x2
         );
 
-        for t in [x, w, y_ref, y_bf, y_f16] {
+        for t in [x, w, y_ref, y_bf, y_f16, y_x2] {
             gpu.free_tensor(t)?;
         }
     }

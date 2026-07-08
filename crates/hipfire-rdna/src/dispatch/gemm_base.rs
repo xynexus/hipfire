@@ -456,6 +456,61 @@ impl Gpu {
             &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
         )
     }
+    /// Split-precision ("2xbf16") forward of the training linear op:
+    /// `y[m,n] = x[m,k] · w[n,k]^T` (NT) at near-f32 accuracy on the WMMA cores.
+    /// Splits each f32 operand into bf16 hi+lo and accumulates 3 WMMA passes
+    /// (~16 mantissa bits vs bf16's 8). Same args as `gemm_bf16c_train_nt`; used
+    /// for the precision-sensitive vocab heads in place of the scalar f32 path.
+    pub fn gemm_bf16x2_train_nt(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let ap = w.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = n as i32; // kernel M = output cols = n
+        let ki = k as i32;
+        let bi = m as i32; // kernel B = tokens = m
+                           // gfx1151 M-heavy path (e.g. the vocab head: huge n, small batch): stage
+                           // the split activation in LDS and reuse across warps. Falls back to the
+                           // LDS-free kernel otherwise.
+        if self.arch == "gfx1151" && n >= 128 && m >= 16 && k % 16 == 0 {
+            self.ensure_kernel(
+                "gemm_bf16x2_train_nt_gfx1151_m128",
+                kernels::GEMM_BF16X2_TRAIN_NT_SRC,
+                "gemm_bf16x2_train_nt_gfx1151_m128",
+            )?;
+            let grid_m = ((n + 127) / 128) as u32;
+            let grid_b = ((m + 15) / 16) as u32;
+            return self.launch_kernargs(
+                "gemm_bf16x2_train_nt_gfx1151_m128",
+                [grid_m, grid_b, 1],
+                [256, 1, 1],
+                0,
+                &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+            );
+        }
+        self.ensure_kernel(
+            "gemm_bf16x2_train_nt",
+            kernels::GEMM_BF16X2_TRAIN_NT_SRC,
+            "gemm_bf16x2_train_nt",
+        )?;
+        let grid_m = ((n + 15) / 16) as u32;
+        let grid_b = ((m + 15) / 16) as u32;
+        self.launch_kernargs(
+            "gemm_bf16x2_train_nt",
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        )
+    }
     /// F16-compute forward of the training linear op (see `gemm_bf16c_train_nt`);
     /// casts to `_Float16` for higher forward precision at the same WMMA speed.
     pub fn gemm_f16c_train_nt(

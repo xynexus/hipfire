@@ -54,11 +54,29 @@ pub fn linear_forward(
     }
 }
 
-/// `y = x · wᵀ`, ALWAYS f32 — ignores `HIPFIRE_TRAIN_LOWP`. Used by the vocab
-/// heads (lm-head / markov / confidence), whose logits feed the softmax/CE loss
-/// and are precision-sensitive: the low-precision forward is scoped to the
-/// rmsnorm-bounded body, where it is safe, and kept off the loss-critical logits.
-pub fn linear_forward_f32(
+/// Precision mode for the vocab-head forward, selected by `HIPFIRE_TRAIN_HEADS`
+/// (`bf16x2` = split-precision WMMA; anything else / unset = f32).
+#[derive(Clone, Copy, PartialEq)]
+enum HeadsFwd {
+    F32,
+    Bf16x2,
+}
+
+fn heads_forward_mode() -> HeadsFwd {
+    static MODE: OnceLock<HeadsFwd> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("HIPFIRE_TRAIN_HEADS").as_deref() {
+        Ok("bf16x2") => HeadsFwd::Bf16x2,
+        _ => HeadsFwd::F32,
+    })
+}
+
+/// `y = x · wᵀ` for the vocab heads (lm-head / markov / confidence). Their logits
+/// feed the softmax/CE loss and are precision-sensitive, so plain bf16 is off the
+/// table (it degrades convergence); the choice is f32 (default — also what the
+/// gradchecks need) vs `HIPFIRE_TRAIN_HEADS=bf16x2`, the split-precision WMMA GEMM
+/// that reaches ~f32 accuracy (~16 mantissa bits) on the matrix cores. The
+/// low-precision *body* forward (`HIPFIRE_TRAIN_LOWP`) is independent of this.
+pub fn linear_forward_heads(
     gpu: &mut Gpu,
     x: &GpuTensor,
     w: &GpuTensor,
@@ -67,7 +85,10 @@ pub fn linear_forward_f32(
     k: usize,
     n: usize,
 ) -> HipResult<()> {
-    gpu.gemm_f32_train(x, w, y, m, n, k, k, k, false, true)
+    match heads_forward_mode() {
+        HeadsFwd::Bf16x2 => gpu.gemm_bf16x2_train_nt(x, w, y, m, k, n),
+        HeadsFwd::F32 => gpu.gemm_f32_train(x, w, y, m, n, k, k, k, false, true),
+    }
 }
 
 /// Gradient w.r.t. the input: `dx = dy · w`. `dy:[m*n]`, `w:[n*k]`, `dx:[m*k]`.
