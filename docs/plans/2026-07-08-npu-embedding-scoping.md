@@ -1,25 +1,53 @@
 # NPU offload scoping for embeddinggemma-300m
 
-Status: **scoping only — no NPU execution exists for this model yet.** GPU path is
-landed and validated (see `crates/hipfire-arch-embeddinggemma`, example `embed_e2e`).
-This doc records what an NPU embedding path would take, why it isn't runnable today,
-and the phased plan to get there.
+Status: **toolchain works and is validated on-device; GEMM path needs a version
+port before a representative bench.** GPU path is landed and validated (see
+`crates/hipfire-arch-embeddinggemma`, example `embed_e2e`). This doc records the NPU
+environment state, a real on-device measurement, why embeddinggemma isn't served on
+the NPU yet, and the phased plan.
 
-## Why we cannot bench on the NPU today (nix1, gfx1103 Phoenix + XDNA1)
+## NPU environment state (nix1, gfx1103 Phoenix + XDNA1 / NPU1 / AIE2)
 
-The NPU **hardware** is present and healthy (`/dev/accel/accel0`, amdxdna driver
-fw 1.5.5.391), but every software prerequisite for running a kernel is missing:
+The NPU is **present, accessible, and the toolchain compiles + runs kernels
+end-to-end** (an earlier draft of this doc wrongly reported the toolchain absent —
+that was a probe error: `aiecc.py` vs `aiecc`, and the system python vs the
+`~/.venv` toolchain):
 
-- **No compiled AIE kernels.** The R6-TS W4A8 GEMM (`benchmarks/npu_gemm_tuning/r6/
-  r6_gemm_ts.cc` + `r6_gen_mp.py`) ships as *source*; there is no `final.xclbin` /
-  `insts.bin` in the repo, `~/.hipfire`, or `/tmp`. `NpuKernel::load` needs both.
-- **No MLIR-AIE toolchain.** `aiecc`, the `aie` Python package, and peano/llvm-aie
-  are not installed, so `r6_cache.sh` cannot compile a kernel. See the
-  `npu-kernel-build` skill for the toolchain bring-up.
-- **No XRT xdna runtime** (`libxrt_driver_xdna.so`) and `HIPFIRE_XDNA1_LIB` is unset.
-- **No encoder NPU path.** `embed_forward` runs entirely on HIP/GPU kernels. The only
-  NPU offload wired into hipfire inference anywhere is a single SwiGLU FFN op
-  (`XDNA_SWIGLU_BACKEND`, qwen35). There is no transformer-on-NPU execution loop.
+- Hardware: `/dev/accel/accel0` readable (user in `render`); pyxrt reports
+  `RyzenAI-npu1`. amdxdna driver fw 1.5.5.391.
+- Toolchain (in `~/.venv`, per the `npu-kernel-build` skill): `aiecc`, Peano
+  clang++ (`llvm-aie`), `mlir_aie` **1.3.1**, `xclbinutil` (`/opt/xilinx/xrt/bin`,
+  prepend to PATH), pyxrt — all functional.
+- **Validated on-device:** built `qwen35-rmsnorm-768.xclbin` via
+  `tools/npu/build_qwen35_rmsnorm.py --hidden-size 768` and ran
+  `test_rmsnorm_npu.py` → PASS (max_abs_err 0.031, within tol), **NPU mean 184 µs,
+  p50 180 µs**. This proves aiecc → xclbin → hw_context → dispatch works.
+
+### The key result: small ops are dispatch-bound
+
+184 µs for a 768-element RMSNorm is almost entirely the **~180 µs NPU dispatch
+floor** — the actual compute is negligible. This is the crux of the offload
+question: embeddinggemma's per-op work (a 768-wide norm, a rope, one projection over
+a few hundred tokens) is small, so **only batched GEMM** (B tokens amortizing the
+floor) can plausibly win. Per-op offload of norms/rope/softmax loses to the GPU.
+
+## Blockers to an embeddinggemma NPU bench
+
+1. **GEMM script is version-drifted.** `tools/npu/oq_gemm_design.py` (the int8/OQ8
+   NPU GEMM) targets a newer IRON API — `CompileTime`, `In`/`Out`, `kernels.mm`,
+   `aie.iron.controlflow.range_`, `aie.helpers.taplib.TensorTiler2D`,
+   `aie.utils.benchmark.run_iters` — none of which the installed `mlir_aie 1.3.1`
+   exports (1.3.1 uses `Program`/`Runtime`/`Worker`/`ObjectFifo`/`ExternalFunction`).
+   The elementwise/reduction scripts (rmsnorm, rope, softmax, swiglu) DO work on
+   1.3.1. So the dominant-cost GEMM bench needs either (a) installing the mlir_aie
+   version `oq_gemm_design.py` targets (the wheel index
+   `github.com/Xilinx/mlir-aie/releases/.../latest-wheels` is reachable — HTTP 200 —
+   but a version bump risks desyncing from the pinned Peano), or (b) porting
+   `oq_gemm_design.py` to the 1.3.1 `Worker`/`ObjectFifo` matmul API.
+2. **No encoder NPU path.** `embed_forward` is HIP-only; the only NPU offload wired
+   into hipfire inference is a single SwiGLU op (`XDNA_SWIGLU_BACKEND`, qwen35).
+3. **dtype.** Weights are bf16/f16; the NPU GEMM is int8 (OQ8) / W4A8 — offload
+   needs an int8-activation + int-weight path, with the cosine-quality gate re-checked.
 
 ## What the NPU *can* do (once artifacts exist)
 
@@ -65,20 +93,67 @@ Attention itself (QKᵀ, softmax, ·V), the 6 norms/layer, RoPE, and GeGLU stay 
 
 ## Phased plan
 
-- **P0 — toolchain.** Install MLIR-AIE/aiecc + XRT xdna (npu-kernel-build skill);
-  compile one W4A8 GEMM via `r6_cache.sh`; smoke `npu_gemm_verify` /
-  `npu_gemm_bench` to confirm the device path end-to-end.
+- **P0 — toolchain. DONE.** MLIR-AIE/aiecc + XRT + pyxrt present in `~/.venv`;
+  validated by compiling + running `qwen35-rmsnorm-768` on the NPU (PASS, 184 µs).
+- **P0.5 — unblock the GEMM.** Port `tools/npu/oq_gemm_design.py` to the installed
+  `mlir_aie 1.3.1` `Worker`/`ObjectFifo` matmul API (or install the matching
+  mlir_aie version — wheel index reachable, but watch Peano pin). Then
+  `bench_oq_gemm_npu.py` compiles.
 - **P1 — op bench.** Bench the model's actual GEMM shapes (768×768, 1152×768,
-  3072×768) on NPU via `npu_gemm_bench` vs the GPU `weight_gemm` equivalent at
-  M ∈ {32, 128, 512}. Decide per-shape whether NPU wins after transfer overhead.
+  3072×768, 768×3072) on NPU via `bench_oq_gemm_npu.py` vs the GPU `weight_gemm`
+  equivalent at B ∈ {32, 128, 512} tokens. The RMSNorm result (184 µs dispatch
+  floor) predicts small-M GEMMs lose; the question is the crossover B.
 - **P2 — offload the Dense heads.** They run once per encode and are the largest
   single GEMMs (3072×768, 768×3072); requantize to W4A8, validate the cosine gate,
   route through `NpuGemmMp`, measure NPU vs GPU + the CPU host-matmul baseline.
 - **P3 — offload per-layer projections** if P1/P2 show a real win, with a zero-copy
   dmabuf path to kill the round-trips.
 
+## Prior hipfire NPU-GEMM findings (already answer most of this)
+
+hipfire already characterized the W4A8 int8×int4 GEMM on **both** NPU generations
+(`benchmarks/npu_gemm_tuning/r6/README.md`):
+- **R5 on this Phoenix box (XDNA1/gfx1103):** a working streaming K-cascade W4A8
+  GEMM, but the int8×int4 mmul-op throughput **ceilings at ~0.6 TOPS** (~32
+  cycles/mmul on AIE-ML gen1). That is the op-rate wall on this NPU.
+- **R6 targets NPU2/aie2p (halo/Strix Halo)** — `r6_gen.py` emits `aie.device(npu2)`
+  and `r6_cache.sh` compiles `--target=aie2p` — to test whether Strix runs the same
+  op faster. It does **not** build for this Phoenix box as-is.
+
+Combine that with the on-device dispatch floor measured here (~180 µs/op) and the
+embeddinggemma GEMM inventory: the largest single GEMM (dense.0, 3072×768 ≈ 2.36M
+MACs) is ~8 µs of compute at 0.6 TOPS but pays the ~180 µs dispatch floor, and the
+encode has dozens of GEMMs. Offloading them individually to the Phoenix NPU is
+strictly slower than the GPU's ~18 ms whole-encode. **On this box the answer is
+already "no."** The open question R6 chases — does Strix/NPU2 clear the op ceiling —
+is a **halo** experiment, not a nix1 one.
+
+## Why a live GEMM bench is blocked on this box (for the record)
+
+Two independent blockers, both real:
+1. **iron-API GEMM script (`tools/npu/oq_gemm_design.py`) is version-orphaned.** It
+   needs `aie.iron.kernels.linalg.mm` + `CompileTime`/`In`/`Out`/`run_iters` — absent
+   from `mlir_aie 1.3.1`, from the newest dev wheel (2026-02, verified by inspection),
+   and from the current source-tree path (`python/aie/iron` 404s). It targets a
+   specific historical mlir-aie branch/commit.
+2. **The R6 GEMM kernel targets NPU2/aie2p (halo), not NPU1/aie2 (this Phoenix box).**
+   Running it here would need an aie2 port of `r6_gemm*.cc` + `r6_gen.py` device.
+
+The rmsnorm path works because it uses the `transform_*` helpers that DO exist in
+1.3.1 and compiles for `aie2` (npu1).
+
 ## Recommendation
 
-Keep embeddinggemma on the GPU (validated, ~18 ms warm encode). Treat NPU offload as
-a separate, measurement-driven effort gated on P0 toolchain bring-up. Do not claim an
-NPU number until P1 produces one — the current answer is "not runnable," not "slow."
+Keep embeddinggemma on the **GPU** (validated, ~18 ms warm encode). This is now a
+data-backed call, not a punt:
+- On-device measurement here: RMSNorm on the NPU = 184 µs, ~180 µs of it the dispatch
+  floor. Small per-op offload loses.
+- Prior hipfire finding: the Phoenix NPU W4A8 GEMM op ceilings at **~0.6 TOPS** (R5).
+- embeddinggemma's GEMMs are small (a few hundred tokens × ≤3072 dims); dozens of them
+  each paying the ~180 µs floor is strictly worse than the GPU's 18 ms whole encode.
+
+**Do not invest in an NPU embedding path on this Phoenix box.** If NPU embedding is
+ever revisited, do it on **halo (Strix Halo / NPU2 / aie2p)** where the R6 GEMM already
+targets and might clear the op ceiling — a separate, halo-hosted experiment. The
+`oq_gemm_design.py` iron-API port is not worth doing: no wheel ships its API, and the
+answer on Phoenix is already "no."
