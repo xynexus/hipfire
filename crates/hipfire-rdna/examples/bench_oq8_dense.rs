@@ -12,7 +12,7 @@
 //   cargo run --release -p hipfire-rdna --example bench_oq8_dense ; \
 //   hipfire lock release
 
-use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu};
 use std::time::Instant;
 
 const GROUP: usize = 256;
