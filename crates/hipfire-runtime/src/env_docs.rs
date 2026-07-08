@@ -3674,14 +3674,14 @@ pub const ENV_HIPFIRE_TP_USE_RCCL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TRAIN_HEADS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TRAIN_HEADS",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-train/src/ops/linear.rs:77",
+    source: "crates/hipfire-train/src/ops/linear.rs:87",
 };
 
 /// `HIPFIRE_TRAIN_LOWP` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_TRAIN_LOWP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TRAIN_LOWP",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-train/src/ops/linear.rs:43",
+    source: "crates/hipfire-train/src/ops/linear.rs:53",
 };
 
 /// `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` — Runtime variable controlling uniform vram tolerance gb in hipfire

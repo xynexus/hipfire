@@ -519,8 +519,8 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_TP_BENCH_N` | Runtime variable controlling tp bench n in hipfire | `crates/hip-bridge/examples/rccl_smoke.rs:36` |
 | `HIPFIRE_TP_EXPERT_ASSIGN` | Selects behavior from recognized values | `crates/hipfire-runtime/src/tp_shard.rs:57` |
 | `HIPFIRE_TP_USE_RCCL` | Runtime variable controlling tp use rccl in hipfire | `crates/hipfire-runtime/src/config.rs:90` |
-| `HIPFIRE_TRAIN_HEADS` | Selects behavior from recognized values | `crates/hipfire-train/src/ops/linear.rs:77` |
-| `HIPFIRE_TRAIN_LOWP` | Selects behavior from recognized values | `crates/hipfire-train/src/ops/linear.rs:43` |
+| `HIPFIRE_TRAIN_HEADS` | Selects behavior from recognized values | `crates/hipfire-train/src/ops/linear.rs:87` |
+| `HIPFIRE_TRAIN_LOWP` | Selects behavior from recognized values | `crates/hipfire-train/src/ops/linear.rs:53` |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Runtime variable controlling uniform vram tolerance gb in hipfire | `crates/hipfire-runtime/src/config.rs:105` |
 | `HIPFIRE_VERIFY_GRAPH` | Runtime variable controlling verify graph in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:6200` |
 | `HIPFIRE_VERIFY_GRAPH_TIMING` | (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the | `crates/hipfire-arch-qwen35/src/speculative.rs:6215` |

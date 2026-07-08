@@ -13,13 +13,23 @@ use std::sync::OnceLock;
 
 // NOTE (2026-07-08): a WMMA backward — reformulating dX (contracts N) and dW
 // (contracts M) as NT via `transpose_f32` + `gemm_bf16x2_train_nt` — was tried
-// and REVERTED. It is numerically correct (all gradchecks pass at bf16x2), but a
-// net loss: the body backward is dominated by small-M GEMMs (contract dim =
-// block = 7), where the transpose passes + 3-pass split + per-call scratch
-// allocation dwarf the tiny scalar-f32 cost (body_bwd ~5x SLOWER), and the
-// noisier gradients destabilized the overfit (best 4.24 vs 1.79 fwd-only). The
-// backward stays f32; the real win needs batching the drafter body across
-// windows first (raises the backward's M), then revisiting.
+// and REVERTED for TWO independent reasons:
+//   1. It DIVERGES training. Isolated (f32 forward + bf16x2 backward), the
+//      overfit reached best_eval 3.60 then climbed to 8.5 (vs f32's 1.63). This
+//      is NOT a precision problem: the bf16x2 GEMM matches f32 to ~1e-5 on every
+//      shape incl. the backward mappings (see gemm_bf16c_parity), so more split
+//      terms would not help. It is a SCALE-ONLY bug in the backward wrapper
+//      (transpose_f32 / the scratch+add accumulate / the gfx1151 LDS m128 GEMM
+//      variant used with the backward's large m,k,n) that BOTH the gradcheck
+//      (small toy dims → only the simple GEMM variant, no LDS) AND the GEMM
+//      parity (GEMM output only, not the wrapper) miss. Root-cause it against the
+//      real training tensors (large dims + sub_offset slices) before retrying.
+//   2. Even correct, it is ~5x SLOWER: the body backward is dominated by small-M
+//      GEMMs (contract = block = 7) where the transpose + 3-pass split + per-call
+//      scratch alloc dwarf the tiny scalar-f32 cost.
+// So the backward stays f32. The real win needs batching the drafter body across
+// windows first (raises the backward's M, amortizes the transposes), which also
+// makes the divergence easier to bisect. Revisit the two together.
 
 /// Low-precision compute mode for the linear FORWARD, selected by
 /// `HIPFIRE_TRAIN_LOWP` (`f16` | `bf16`; anything else / unset = f32).
