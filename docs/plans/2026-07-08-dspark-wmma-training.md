@@ -275,11 +275,33 @@ Open perf work (correctness/quality proven; these are speedups, not blockers):
   readback, while the actual GEMM (large K/N) is bandwidth-bound on gfx1151.
   Raising M amortizes f32 per-op overhead (body_bwd scales sub-linearly, 4×
   windows → 2.3× time) but does nothing for the wrapper cost that dominates the
-  low-precision path. ⇒ The real backward-speedup lever is **Phase C2** (dedicated
-  NN/TN split-WMMA kernels that consume the strided operand directly — NO
-  `transpose_f32` pass — plus on-device scale to drop the readback), NOT further
-  M-batching. Phase A is a correct prerequisite and an f32 amortization win, not
-  the speedup itself.
+  low-precision path. ⇒ The real backward-speedup lever is **Phase C2**, NOT
+  further M-batching. Phase A is a correct prerequisite and an f32 amortization
+  win, not the speedup itself.
+
+* **Phase C2 landed and DELIVERS the speedup (2026-07-09).** Dedicated NN/TN
+  scaled-f16 WMMA kernels (`gemm_f16s_backward.hip`, `HIPFIRE_TRAIN_BWD=f16sc2`)
+  read the strided operand DIRECTLY — the transpose is folded into the WMMA
+  fragment load as a strided global read, so W/dY/X are streamed once instead of
+  the transpose path's 3× (read + write Wt + read Wt), and there's no Wt scratch.
+  dX = dY·W is NN (W read strided along contract N); dW = dYᵀ·X is TN (both
+  operands strided along contract M). Parity: bit-for-bit the same rel-err as the
+  transpose-based f16s on every shape (my WMMA layout is correct). Profile (40ep
+  overfit, same harness as above):
+
+  | backward | body_bwd | vs f16s | vs f32 |
+  |----------|---------:|--------:|-------:|
+  | f32      | 161 ms   | —       | 1.0×   |
+  | f16s     | 1059 ms  | 1.0×    | 6.6× slower |
+  | **f16sc2** | **156 ms** | **6.8× faster** | **~parity** |
+
+  So f16sc2 is an **oracle-class (bit-equal to f16s) 1-pass backward at
+  f32-competitive speed** — the transpose passes WERE the entire overhead.
+  Remaining headroom to go *below* f32: C2 still does 2 standalone `abs_max`
+  reductions per matmul (no transpose left to fuse them into) — on-device /
+  delayed / carried scale would drop those. No-LDS strided reads keep it off the
+  gfx1103 HIP-719 fault; an LDS-coalesced variant is a later tuning. TN/NN for
+  bf16x2 (if ≥16-bit gradients are ever needed) is a mechanical copy.
 
 ## 5. Plan: full forward + backward on WMMA
 

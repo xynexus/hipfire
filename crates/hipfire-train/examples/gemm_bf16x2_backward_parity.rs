@@ -141,6 +141,20 @@ fn main() -> HipResult<()> {
         let (cws, rws) = metrics(&gpu.download_f32(&dw_ref)?, &gpu.download_f32(&dw_f16s)?);
         report("dW f16s   (1-pass,scaled)", cws, rws);
 
+        // Phase C2: dedicated NN/TN kernels — NO transpose pass (read strided).
+        let s_w = pow2_scale(&mut gpu, &w)?;
+        let dx_nn = gpu.zeros(&[m * k], DType::F32)?;
+        gpu.gemm_f16s_nn_train(&dy, &w, &dx_nn, m, n, k, s_dy, s_w)?;
+        let (cxn, rxn) = metrics(&gpu.download_f32(&dx_ref)?, &gpu.download_f32(&dx_nn)?);
+        report("dX f16s NN (C2,no-transpose)", cxn, rxn);
+        let s_x = pow2_scale(&mut gpu, &x)?;
+        let dw_tn = gpu.zeros(&[n * k], DType::F32)?;
+        gpu.gemm_f16s_tn_train(&dy, &x, &dw_tn, m, n, k, s_dy, s_x)?;
+        let (cwt, rwt) = metrics(&gpu.download_f32(&dw_ref)?, &gpu.download_f32(&dw_tn)?);
+        report("dW f16s TN (C2,no-transpose)", cwt, rwt);
+        gpu.free_tensor(dx_nn)?;
+        gpu.free_tensor(dw_tn)?;
+
         // ---- accumulate fan-in: dX += dY·W onto a pre-seeded partial ----
         let seed = rand_vec(m * k, 0x400 + i as u64, 1.0 / (k as f32).sqrt());
         let dx_acc_ref = gpu.upload_f32(&seed, &[m, k])?;

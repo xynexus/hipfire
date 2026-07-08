@@ -131,6 +131,7 @@ enum LowpBwd {
     Bf16,
     F16,
     F16s,
+    F16sC2,
     Bf16x2,
 }
 
@@ -140,6 +141,7 @@ fn bwd_mode() -> LowpBwd {
         Ok("bf16") => LowpBwd::Bf16,
         Ok("f16") | Ok("fp16") => LowpBwd::F16,
         Ok("f16s") | Ok("fp16s") => LowpBwd::F16s,
+        Ok("f16sc2") => LowpBwd::F16sC2,
         Ok("bf16x2") => LowpBwd::Bf16x2,
         _ => LowpBwd::F32,
     })
@@ -163,7 +165,9 @@ fn bwd_gemm_nt(
         LowpBwd::Bf16 => gpu.gemm_bf16c_train_nt(x, w, y, m, k, n),
         LowpBwd::F16 => gpu.gemm_f16c_train_nt(x, w, y, m, k, n),
         LowpBwd::Bf16x2 => gpu.gemm_bf16x2_train_nt(x, w, y, m, k, n),
-        LowpBwd::F32 | LowpBwd::F16s => unreachable!("bwd_gemm_nt: unscaled path only"),
+        LowpBwd::F32 | LowpBwd::F16s | LowpBwd::F16sC2 => {
+            unreachable!("bwd_gemm_nt: unscaled path only")
+        }
     }
 }
 
@@ -204,6 +208,21 @@ pub fn linear_backward_x(
                 gpu.gemm_f32_train_accum(dy, w, dx, m, k, n, n, k, false, false, 1.0)
             } else {
                 gpu.gemm_f32_train(dy, w, dx, m, k, n, n, k, false, false)
+            }
+        }
+        // Phase C2: dX = dY·W via the dedicated NN kernel — reads W strided, NO
+        // transpose pass (see gemm_f16s_backward.hip). Both operands still need a
+        // standalone abs-max (no transpose to fuse it into).
+        LowpBwd::F16sC2 => {
+            let s_dy = f16s_scale(gpu, dy)?;
+            let s_w = f16s_scale(gpu, w)?;
+            if accumulate {
+                let scratch = gpu.zeros(&[m * k], DType::F32)?;
+                gpu.gemm_f16s_nn_train(dy, w, &scratch, m, n, k, s_dy, s_w)?;
+                gpu.add_inplace_f32(dx, &scratch)?;
+                gpu.free_tensor(scratch)
+            } else {
+                gpu.gemm_f16s_nn_train(dy, w, dx, m, n, k, s_dy, s_w)
             }
         }
         // Scaled f16: same reformulation, per-tensor scale on each operand.
@@ -258,6 +277,20 @@ pub fn linear_backward_w(
                 gpu.gemm_f32_train_accum(dy, x, dw, n, k, m, n, k, true, false, 1.0)
             } else {
                 gpu.gemm_f32_train(dy, x, dw, n, k, m, n, k, true, false)
+            }
+        }
+        // Phase C2: dW = dYᵀ·X via the dedicated TN kernel — reads both operands
+        // strided, NO transpose passes (see gemm_f16s_backward.hip).
+        LowpBwd::F16sC2 => {
+            let s_dy = f16s_scale(gpu, dy)?;
+            let s_x = f16s_scale(gpu, x)?;
+            if accumulate {
+                let scratch = gpu.zeros(&[n * k], DType::F32)?;
+                gpu.gemm_f16s_tn_train(dy, x, &scratch, m, n, k, s_dy, s_x)?;
+                gpu.add_inplace_f32(dw, &scratch)?;
+                gpu.free_tensor(scratch)
+            } else {
+                gpu.gemm_f16s_tn_train(dy, x, dw, m, n, k, s_dy, s_x)
             }
         }
         // Scaled f16: both operands come from transposes, so both abs-maxes are

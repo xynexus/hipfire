@@ -625,6 +625,91 @@ impl Gpu {
             )
         }
     }
+    /// Phase C2 scaled-f16 backward dX: `dX[m,k] = Σ_n dY[m,n]·W[n,k]` (contract
+    /// N) on the f16 WMMA cores, reading W strided (no transpose pass). `dy`/`w`
+    /// scaled by `s_dy`/`s_w` before the f16 cast; output unscaled by 1/(s_dy·s_w).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16s_nn_train(
+        &mut self,
+        dy: &GpuTensor,
+        w: &GpuTensor,
+        dx: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        s_dy: f32,
+        s_w: f32,
+    ) -> HipResult<()> {
+        self.gemm_f16s_backward_launch("gemm_f16s_nn_train", dy, w, dx, m, n, k, s_dy, s_w)
+    }
+    /// Phase C2 scaled-f16 backward dW: `dW[n,k] = Σ_m dY[m,n]·X[m,k]` (contract
+    /// M) on the f16 WMMA cores, reading both operands strided (no transposes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16s_tn_train(
+        &mut self,
+        dy: &GpuTensor,
+        x: &GpuTensor,
+        dw: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        s_dy: f32,
+        s_x: f32,
+    ) -> HipResult<()> {
+        self.gemm_f16s_backward_launch("gemm_f16s_tn_train", dy, x, dw, m, n, k, s_dy, s_x)
+    }
+    /// Shared launcher for the C2 backward kernels: both take
+    /// `(op_a[.,.], op_b[.,.], out, M, N, K, sa, sb)` and grid over (K, out-rows).
+    /// NN out-rows = M; TN out-rows = N; the kernel's blockIdx.y bound handles it.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_f16s_backward_launch(
+        &mut self,
+        kernel: &'static str,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        out: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        sa: f32,
+        sb: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(kernel, kernels::GEMM_F16S_BACKWARD_SRC, kernel)?;
+        let func = &self.functions[kernel];
+        let mut ap = a.buf.as_ptr();
+        let mut bp = b.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ni = n as i32;
+        let mut ki = k as i32;
+        let mut saf = sa;
+        let mut sbf = sb;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut saf as *mut _ as *mut c_void,
+            &mut sbf as *mut _ as *mut c_void,
+        ];
+        // grid.x tiles K (b-rows); grid.y tiles the a-rows (M for NN, N for TN).
+        let out_rows = if kernel == "gemm_f16s_tn_train" { n } else { m };
+        let grid_k = k.div_ceil(16) as u32;
+        let grid_r = out_rows.div_ceil(16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_k, grid_r, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
     pub fn gemm_f16_wmma_mb4(
         &mut self,
         w: &GpuTensor,
