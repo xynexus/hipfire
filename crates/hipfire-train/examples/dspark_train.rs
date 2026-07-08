@@ -40,6 +40,7 @@ struct Args {
     markov_rank: usize,
     eval_frac: f32,
     checkpoint_every: usize,
+    window_batch: usize,
     resume: bool,
     overfit: bool,
 }
@@ -54,6 +55,7 @@ fn parse_args() -> Args {
     let mut markov_rank = 256usize;
     let mut eval_frac = 0.1f32;
     let mut checkpoint_every = 10usize;
+    let mut window_batch = 8usize;
     let mut resume = false;
     let mut overfit = false;
 
@@ -82,6 +84,7 @@ fn parse_args() -> Args {
             "--checkpoint-every" => {
                 checkpoint_every = next().parse().expect("bad --checkpoint-every")
             }
+            "--window-batch" => window_batch = next().parse().expect("bad --window-batch"),
             "--resume" => resume = true,
             "--overfit" => overfit = true,
             other => {
@@ -110,6 +113,7 @@ fn parse_args() -> Args {
         markov_rank,
         eval_frac,
         checkpoint_every,
+        window_batch,
         resume,
         overfit,
     }
@@ -207,6 +211,7 @@ fn main() -> HipResult<()> {
         loss: DsparkLossCfg::with_block_size(cache.block),
         eval_frac,
         checkpoint_every: args.checkpoint_every,
+        window_batch: args.window_batch,
         seed: 0,
     };
 
