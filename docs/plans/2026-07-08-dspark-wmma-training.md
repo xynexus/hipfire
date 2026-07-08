@@ -1,9 +1,11 @@
-# DSpark drafter training on the WMMA matrix cores (forward done, backward blocked)
+# DSpark drafter training on the WMMA matrix cores (forward done, backward correct)
 
-Status: **forward landed and validated; backward is a documented dead-end with two
-concrete blockers.** This doc explains the backward problem in detail and outlines
-the path to running the full training step (forward *and* backward) in bf16/fp16
-WMMA math.
+Status: **forward landed and validated; backward is now proven CORRECT and wired
+behind `HIPFIRE_TRAIN_BWD=bf16x2` — the earlier "divergence bug" (§3.3) was a
+misdiagnosis (chaos + atomic nondeterminism, not a defect).** One blocker remains:
+the backward is not yet a net *speed* win at the body's small-M shapes (§3.4),
+which needs Phase A window-batching. This doc explains the backward in detail and
+outlines the path to a full bf16/fp16 WMMA training step.
 
 Target hardware: gfx1151 (Strix Halo, RDNA3.5, wave32, `v_wmma_*_16x16x16_*`).
 All measurements below are on halo, gemma3-4b DSpark drafter (639M params),
@@ -112,34 +114,55 @@ scratch buffer, then `add_inplace_f32` into the destination. Gated by
 The math is right (`dX[m,k']=Σ_n dY[m,n]·W[n,k']`, `dW[n,k']=Σ_m dY[m,n]·X[m,k']`
 both verified by hand and by the GEMM parity at backward shapes).
 
-### 3.3 Blocker 1 — it DIVERGES training (a scale-only bug, NOT precision)
+### 3.3 Blocker 1 — RESOLVED: never a bug; the overfit end-loss is chaos-dominated
 
-Isolated (f32 forward + **bf16x2 backward only**), the overfit reaches best_eval
-**3.60 @ epoch 60 then climbs to 8.5** (f32 baseline: 1.63). Key evidence that
-this is a *bug*, not lossy gradients:
+The original claim was that f32-fwd + **bf16x2-backward** diverges (best_eval
+3.60 @ ep60 → 8.5) vs an f32 run's 1.63, and that this was a "scale-only bug" in
+`transpose_f32` / the scratch+add accumulate / the m128 LDS variant. **That was a
+misdiagnosis.** Re-investigated 2026-07-08 (halo, `gemma3-4b-2k.dslb`, 2-window
+overfit); three independent results show the backward is correct and the
+divergence was chaotic amplification, not a defect:
 
-* **The GEMM is numerically ~f32.** `gemm_bf16c_parity` extended to the backward
-  m/k/n mappings (incl. the LDS m128 variant): bf16x2 rel-err **~1e-5** on every
-  shape. bf16's own 8-bit gradients are used in production training and converge,
-  so 16-bit gradients diverging is implausible → not precision. **More split
-  terms would not help** (3×bf16 = full f32; the split ceiling — bf16 stays the
-  base since fp16's exponent overflows regardless of split count).
-* **The gradchecks are blind to it.** `gradcheck_dspark_body/block` use *small
-  toy dims*, so their GEMMs fall to the **simple** (LDS-free) variant — they never
-  exercise the LDS m128 variant, sub-16 batch tiling, sub_offset slices at scale,
-  or the accumulate wrapper on large tensors. They "pass" while the training path
-  breaks.
-* **The GEMM parity is also blind to it** — it validates the GEMM *output* on
-  clean contiguous tensors, not the *wrapper* (transpose_f32 on large / sliced
-  tensors, the scratch+add accumulate, the LDS variant driven with the backward's
-  large `m`).
+1. **Per-op gradient parity at training dims** (`examples/gemm_bf16x2_backward_
+   parity`): each backward piece vs the f32 reference — dX via the m128 variant
+   (M≥16) and the LDS-free variant (M<16), dW via the two transposes, the
+   scratch+add accumulate, and `sub_offset` views of a padded parent — all match
+   to **≤1.2e-3, cos 1.0**. The wrappers the NOTE feared are individually exact.
+   (dX contracting the 262k vocab tops out at ~1.2e-3, not ~1e-5, purely from the
+   long bf16x2 reduction; cos still 1.0.)
+2. **The loss curve tracks to the precision floor, then chaos.** f32-vs-bf16x2
+   overfit train loss is **bit-identical for the first ~5 epochs**, then differs
+   only in the **last decimal (~1e-4, bf16x2's rounding floor)** through ~ep11,
+   before the two curves wander apart. Meanwhile the f32 loss itself **spikes
+   16.8→23.9 at ep5 and bounces** (8→14→19→14) — the regime is unstable, so any
+   ~1e-4 perturbation is amplified exponentially into a different trajectory.
+3. **f32 is nondeterministic; it diverges from itself just as much.** Two
+   *identical* f32 runs (same binary/config) go bit-identical for 5 epochs then
+   diverge, ending best **5.70 vs 4.25** — the same spread as f32-vs-bf16x2 (3.65
+   vs 4.71 at lr 3e-4; 7.54 vs 5.11 at lr 1e-4; the winner flips with LR). Source:
+   `rmsnorm_train.hip` accumulates `dw` with `atomicAdd` (order-dependent), plus
+   `pflash_score_f32_train.hip`. So the overfit end-loss **cannot discriminate** a
+   correct low-precision backward from f32 — it is noise at this magnitude.
 
-So the bug lives in the **backward wrapper at training scale**: prime suspects
-are (a) `transpose_f32` on the real training tensors — several backward operands
-are `sub_offset` views of a parent buffer (e.g. `d_k_ctx`/`d_k_blk` split from
-`d_kcat`); (b) the LDS m128 GEMM variant driven with the backward mapping (large
-kernel-`B`, small contract); (c) the scratch+add accumulate. gradcheck passes
-because none of these are in its regime.
+**Takeaway:** validate a low-precision backward by (a) per-op gradient parity and
+(b) curve-tracking to the precision floor over the deterministic prefix — NOT the
+overfit end-loss, which is chaos+atomic-nondeterminism dominated here. The WMMA
+backward is now wired behind `HIPFIRE_TRAIN_BWD=bf16x2` in the single
+`linear_backward_{x,w}` seam and passes both. What remains is **Blocker 2 only**
+(perf), below.
+
+**f32 is now a deterministic oracle (2026-07-08).** The nondeterminism was the
+`rmsnorm_train_bwd` `dw` reduction: one block per row `atomicAdd`-ing into every
+weight element, whose float order is run-dependent. Replaced with a dedicated
+`rmsnorm_train_dw` kernel — one thread owns weight column `i` and sums the rows in
+fixed order, then a single non-atomic `+=` (no race; preserves the zero-then-
+accumulate contract). Result: **two identical f32 runs are now bit-identical for
+all 40 epochs** (finals match to every digit), and `gradcheck_rmsnorm` (dW err
+1.98e-5) + `gradcheck_dspark_body` still PASS — deterministic *and* correct. This
+gives a stable reference to measure any low-precision format against directly
+(per-step gradient/loss deltas), instead of comparing noise. (A stable *overfit*
+gate would still want LR warmup / grad-clip so the f32 curve stops spiking — but
+that is a training-recipe concern, separate from the now-deterministic engine.)
 
 ### 3.4 Blocker 2 — it is ~5× SLOWER even when correct
 
@@ -189,6 +212,44 @@ logic bf16x2 (≈f32) should be safe for gradients.
 
 ---
 
+## 4.1 Backward low-precision formats — MEASURED (2026-07-09)
+
+All backward matmuls behind `HIPFIRE_TRAIN_BWD` (default f32), reformulated NT in
+the single `linear_backward_{x,w}` seam. Measured against the now-deterministic
+f32 oracle (§3.3): per-op rel-err (`examples/gemm_bf16x2_backward_parity`) and the
+2-window overfit best_eval (chaotic tail — read as "oracle-class vs not", f32-vs-
+f32 spread is ~4.25–5.70).
+
+| `HIPFIRE_TRAIN_BWD` | passes | dW rel-err | overfit best | verdict |
+|---------------------|-------:|-----------:|-------------:|---------|
+| f32 (oracle)        | —      | 0          | 4.12         | reference |
+| `bf16`              | 1      | 2–6e-3     | 6.28         | 8-bit mantissa too coarse for dW |
+| `f16`               | 1      | 3e-4       | **NaN@ep2**  | 10-bit mantissa great, 5-bit exponent overflows real operands |
+| `f16s` (scaled)     | 1      | 3e-4       | **4.08**     | **oracle-class at ONE pass** ✅ |
+| `bf16x2`            | 3      | 5e-6       | 4.31         | oracle-class, 3× the passes |
+
+**Key finding: `f16s` (per-tensor-scaled f16) matches bf16x2's convergence at 1/3
+the passes.** dW (weight gradient) is the precision-critical matmul — it contracts
+M and feeds the update — and 8-bit bf16 is too coarse there (2–6e-3), while f16's
+10-bit mantissa (3e-4) is plenty. Plain f16 dies on *range* (activations/gradients
+> 65504 → NaN on the first step), not precision. `f16s` fixes range with a
+per-tensor power-of-two scale applied around the f16 WMMA (`gemm_f16s_train_nt`):
+`max|op|·scale ≈ 2^14`, unscale the f32 accumulator by `1/(sx·sw)`. Per-tensor was
+sufficient for this drafter (no per-channel outliers beyond f16's 30-binade window
+after centering). Scale from a deterministic `abs_max_f32` (atomicMax on bit
+patterns — order-independent, preserves the oracle).
+
+Open perf work (correctness/quality proven; these are speedups, not blockers):
+* **Fuse the amax into the transpose** (which already streams `dY`/`X`) via a DPP/
+  `permlane16` wave-max, instead of the current standalone reduction + host
+  readback per call. Use `permlane16`/DPP, NOT `__shfl` (→ `ds_bpermute`, ~6–8×
+  slower on gfx1151 per the iu4 tuning history).
+* **Delayed/carried scale**: reuse the previous step's amax (operand ranges drift
+  slowly) with an amax-history window + safety margin to survive the loss spikes
+  of this (unstable) overfit regime. Drops the per-step reduction to ~free.
+* Per-channel scale only if a wider-spread operand ever needs it (transpose layout
+  makes per-column amax natural).
+
 ## 5. Plan: full forward + backward on WMMA
 
 Ordered; each phase is independently shippable and gated behind an env toggle
@@ -217,21 +278,25 @@ improve. The real payoff is enabling the backward WMMA and shrinking per-op
 launch/alloc overhead. Validate: `gradcheck_dspark_*` with `n_win>1`, then the
 overfit (must still reach ~0.1).
 
-### Phase B — root-cause the backward wrapper bug (§3.3)
+### Phase B — root-cause the backward "bug" (§3.3) — DONE (no bug found)
 
-Before re-enabling the backward WMMA, close the validation blind spots so the bug
-is reproducible in a test:
+Completed 2026-07-08. The backward WMMA is correct; there was no wrapper defect
+to fix (see §3.3). What was actually built/learned:
 
-1. **Extend the gradchecks to TRAINING dims** (or add a large-dim gradcheck) so
-   the LDS m128 variant + real slice/accumulate patterns are exercised. A
-   gradcheck that fails at large dims but passes at small dims localizes the bug.
-2. **Parity-test `transpose_f32` on `sub_offset` views** and on the exact large
-   shapes (e.g. lm-head `[262208, 2560]`, ctx `[128, 2560]`). Check for i32 index
-   overflow and offset handling.
-3. **Bisect the wrapper**: force the *simple* GEMM variant for the backward
-   (disable the LDS gate) and re-run the isolation overfit — if it converges, the
-   bug is in the LDS-variant-for-backward mapping; if it still diverges, it is the
-   transpose or the accumulate.
+1. **`examples/gemm_bf16x2_backward_parity`** — the backward-shape parity both the
+   gradcheck (toy dims) and forward parity (clean output) were missing. Exercises
+   dX (m128 + LDS-free), dW (transposes), the scratch+add accumulate, and
+   `sub_offset` views at training dims. All ≤1.2e-3, cos 1.0. **This is the
+   regression gate for the backward — run it, not the overfit.**
+2. **`transpose_f32` on `sub_offset` views is fine**: `sub_offset` bakes the byte
+   offset into the pointer, so views read correctly; the lm-head `[262208,2560]`
+   (671M elts) is under i32 max and the GEMMs index in 64-bit — no overflow.
+3. **The overfit end-loss is NOT a valid gate here** — it is chaos- +
+   atomic-nondeterminism-dominated (f32 diverges from itself by the same spread).
+   A stable gate needs LR warmup / grad-clip first (orthogonal).
+
+The reformulation is wired in the single `linear_backward_{x,w}` seam behind
+`HIPFIRE_TRAIN_BWD=bf16x2` (default f32).
 
 ### Phase C — backward kernels
 

@@ -3419,6 +3419,12 @@ pub const GEMM_BF16C_TRAIN_NT_SRC: &str =
 pub const GEMM_F16C_TRAIN_NT_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16c_train_nt.hip");
 
+/// Scaled f16-compute training GEMM (NT) + `abs_max_f32`: f16's 10-bit mantissa
+/// without its range trap, via a per-tensor scale applied around the f16 WMMA
+/// (MXFP16-style software microscaling). See `kernels/src/gemm_f16s_train_nt.hip`.
+pub const GEMM_F16S_TRAIN_NT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16s_train_nt.hip");
+
 /// Split-precision ("2xbf16") training GEMM forward (NT): near-f32 accuracy on
 /// the WMMA cores by splitting each f32 operand into bf16 hi+lo and accumulating
 /// 3 WMMA passes (~16 mantissa bits). For the precision-sensitive vocab-head

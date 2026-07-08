@@ -544,6 +544,87 @@ impl Gpu {
             &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
         )
     }
+    /// Deterministic per-tensor abs-max `max_i |x[i]|`, read back as a scalar.
+    /// Used to pick the per-tensor scale for [`Self::gemm_f16s_train_nt`]. `max`
+    /// is order-independent, so this stays bit-reproducible.
+    pub fn abs_max_f32(&mut self, x: &GpuTensor) -> HipResult<f32> {
+        self.bind_thread()?;
+        self.ensure_kernel("abs_max_f32", kernels::GEMM_F16S_TRAIN_NT_SRC, "abs_max_f32")?;
+        let n = x.numel();
+        // Holds float_as_uint(amax); reinterpreted as f32 on download IS amax.
+        let out = self.zeros(&[1], DType::F32)?;
+        let xptr = x.buf.as_ptr();
+        let outptr = out.buf.as_ptr();
+        let ni = n as i32;
+        let blocks = (n.div_ceil(256)).clamp(1, 1024) as u32;
+        self.launch_kernargs(
+            "abs_max_f32",
+            [blocks, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr xptr, ptr outptr, i32 ni],
+        )?;
+        let v = self.download_f32(&out)?;
+        self.free_tensor(out)?;
+        Ok(v[0])
+    }
+    /// Scaled f16-compute training GEMM (NT): `y[m,n] = x[m,k]·w[n,k]^T` on the
+    /// f16 WMMA cores, but each operand is multiplied by a per-tensor scale
+    /// (`sx`/`sw`) before the f16 cast and the f32 accumulator is unscaled by
+    /// `1/(sx·sw)` — f16's 10-bit mantissa without its range trap. Same args as
+    /// `gemm_f16c_train_nt` plus the scales (pass powers of two for exactness).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16s_train_nt(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        sx: f32,
+        sw: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f16s_train_nt",
+            kernels::GEMM_F16S_TRAIN_NT_SRC,
+            "gemm_f16s_train_nt",
+        )?;
+        let func = &self.functions["gemm_f16s_train_nt"];
+        // Kernel: Y[B,M] = X[B,K]·A[M,K]^T with A=w (M=n), X=x (B=m), scale A by
+        // sw, X by sx.
+        let mut ap = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = n as i32;
+        let mut ki = k as i32;
+        let mut bi = m as i32;
+        let mut saf = sw;
+        let mut sxf = sx;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut saf as *mut _ as *mut c_void,
+            &mut sxf as *mut _ as *mut c_void,
+        ];
+        let grid_m = n.div_ceil(16) as u32;
+        let grid_b = m.div_ceil(16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
     pub fn gemm_f16_wmma_mb4(
         &mut self,
         w: &GpuTensor,
