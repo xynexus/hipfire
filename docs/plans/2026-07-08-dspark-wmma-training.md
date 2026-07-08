@@ -240,15 +240,28 @@ after centering). Scale from a deterministic `abs_max_f32` (atomicMax on bit
 patterns — order-independent, preserves the oracle).
 
 Open perf work (correctness/quality proven; these are speedups, not blockers):
-* **Fuse the amax into the transpose** (which already streams `dY`/`X`) via a DPP/
-  `permlane16` wave-max, instead of the current standalone reduction + host
-  readback per call. Use `permlane16`/DPP, NOT `__shfl` (→ `ds_bpermute`, ~6–8×
-  slower on gfx1151 per the iu4 tuning history).
+* **Fuse the amax into the transpose — DONE.** `transpose_f32_amax` computes
+  `max|in|` (block-reduce + `atomicMax` on bit patterns; order-independent, so
+  deterministic) in the same pass that already streams the operand, since
+  `max|transpose(T)| == max|T|`. The f16s backward now gets `wt`/`dyt`/`xt`'s
+  abs-max for free; only `dY` in `linear_backward_x` (not transposed, and small)
+  keeps a standalone `abs_max_f32`. Saves re-streaming the operand — biggest on
+  the lm-head weight (~2.7 GB). Validated: parity unchanged, overfit best 4.08
+  (bit-equal to the pre-fuse f16s). A DPP/`permlane16` wave-max would shave the
+  block-reduce further but is not the bottleneck (avoid `__shfl` → `ds_bpermute`,
+  ~6–8× slower on gfx1151 per the iu4 tuning history).
+* **On-device scale (drop the readback)**: compute the pow2 scale on-device and
+  pass it to the GEMM by pointer, removing the last small host sync per call.
 * **Delayed/carried scale**: reuse the previous step's amax (operand ranges drift
   slowly) with an amax-history window + safety margin to survive the loss spikes
   of this (unstable) overfit regime. Drops the per-step reduction to ~free.
 * Per-channel scale only if a wider-spread operand ever needs it (transpose layout
   makes per-column amax natural).
+* **The body backward is overhead-bound (Blocker 2), not compute-bound**: its
+  GEMMs contract M = block = 7, so no low-precision format speeds them up — the
+  transpose + amax + launch dominate. The f16s/bf16x2 *compute* win only lands
+  after **Phase A** raises M (7 → wb·7). Profile (f16s, wb=1): body_bwd ~1.6 s
+  vs heads_bwd ~0.17 s — the body is the overhead-bound part Phase A targets.
 
 ## 5. Plan: full forward + backward on WMMA
 

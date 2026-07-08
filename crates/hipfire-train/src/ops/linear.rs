@@ -170,13 +170,19 @@ fn bwd_gemm_nt(
 /// Per-tensor power-of-two scale for the scaled-f16 (`f16s`) backward: bring
 /// `max|x|` up to ~2^14 (one bit under f16's 2^15 ceiling) so the whole operand
 /// fits f16 range with headroom. Power-of-two ⇒ the scale is an exact, reversible
-/// `ldexp` (no rounding); `max` reduction ⇒ deterministic. Empty/zero ⇒ 1.0.
-fn f16s_scale(gpu: &mut Gpu, x: &GpuTensor) -> HipResult<f32> {
-    let amax = gpu.abs_max_f32(x)?;
+/// `ldexp` (no rounding). Zero/negative ⇒ 1.0.
+fn pow2_from_amax(amax: f32) -> f32 {
     if !(amax > 0.0) {
-        return Ok(1.0);
+        return 1.0;
     }
-    Ok((16384.0_f32 / amax).log2().floor().exp2())
+    (16384.0_f32 / amax).log2().floor().exp2()
+}
+
+/// [`pow2_from_amax`] from a standalone abs-max reduction, for the one f16s
+/// operand not produced by a transpose (dY in `linear_backward_x`). Operands that
+/// come out of a transpose get their abs-max fused into it (`transpose_f32_amax`).
+fn f16s_scale(gpu: &mut Gpu, x: &GpuTensor) -> HipResult<f32> {
+    Ok(pow2_from_amax(gpu.abs_max_f32(x)?))
 }
 
 /// Gradient w.r.t. the input: `dx = dy · w`. `dy:[m*n]`, `w:[n*k]`, `dx:[m*k]`.
@@ -201,11 +207,12 @@ pub fn linear_backward_x(
             }
         }
         // Scaled f16: same reformulation, per-tensor scale on each operand.
+        // wt's abs-max is fused into its transpose; dy (not transposed) uses a
+        // standalone reduction.
         LowpBwd::F16s => {
             let wt = gpu.zeros(&[k * n], DType::F32)?;
-            gpu.transpose_f32(w, &wt, n, k)?; // w [n,k] → [k,n]
+            let s_wt = pow2_from_amax(gpu.transpose_f32_amax(w, &wt, n, k)?); // w[n,k]→[k,n]
             let s_dy = f16s_scale(gpu, dy)?;
-            let s_wt = f16s_scale(gpu, &wt)?;
             if accumulate {
                 let scratch = gpu.zeros(&[m * k], DType::F32)?;
                 gpu.gemm_f16s_train_nt(dy, &wt, &scratch, m, n, k, s_dy, s_wt)?;
@@ -253,14 +260,13 @@ pub fn linear_backward_w(
                 gpu.gemm_f32_train(dy, x, dw, n, k, m, n, k, true, false)
             }
         }
-        // Scaled f16: same reformulation, per-tensor scale on each operand.
+        // Scaled f16: both operands come from transposes, so both abs-maxes are
+        // fused in — no standalone reduction.
         LowpBwd::F16s => {
             let dyt = gpu.zeros(&[n * m], DType::F32)?;
-            gpu.transpose_f32(dy, &dyt, m, n)?; // dy [m,n] → [n,m]
+            let s_dyt = pow2_from_amax(gpu.transpose_f32_amax(dy, &dyt, m, n)?); // dy[m,n]→[n,m]
             let xt = gpu.zeros(&[k * m], DType::F32)?;
-            gpu.transpose_f32(x, &xt, m, k)?; // x [m,k] → [k,m]
-            let s_dyt = f16s_scale(gpu, &dyt)?;
-            let s_xt = f16s_scale(gpu, &xt)?;
+            let s_xt = pow2_from_amax(gpu.transpose_f32_amax(x, &xt, m, k)?); // x[m,k]→[k,m]
             if accumulate {
                 let scratch = gpu.zeros(&[n * k], DType::F32)?;
                 gpu.gemm_f16s_train_nt(&dyt, &xt, &scratch, n, m, k, s_dyt, s_xt)?;

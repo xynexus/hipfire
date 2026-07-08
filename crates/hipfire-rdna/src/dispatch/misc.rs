@@ -980,6 +980,54 @@ impl Gpu {
             )
         }
     }
+    /// Transpose `src` (`[rows,cols]` → `[cols,rows]`) AND return `max|src|` in one
+    /// pass — since transpose permutes elements, that equals the transposed
+    /// tensor's abs-max, so the caller gets the f16s scale input for free instead
+    /// of re-streaming the operand. Deterministic (`max` is order-independent).
+    pub fn transpose_f32_amax(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        rows: usize,
+        cols: usize,
+    ) -> HipResult<f32> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "transpose_f32_amax",
+            kernels::TRANSPOSE_SRC,
+            "transpose_f32_amax",
+        )?;
+        // Holds float_as_uint(amax); reinterpreted as f32 on download IS amax.
+        let amax = self.zeros(&[1], DType::F32)?;
+        let func = &self.functions["transpose_f32_amax"];
+        let mut sp = src.buf.as_ptr();
+        let mut dp = dst.buf.as_ptr();
+        let mut ri = rows as i32;
+        let mut ci = cols as i32;
+        let mut mp = amax.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut ri as *mut _ as *mut c_void,
+            &mut ci as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+        ];
+        let total = rows * cols;
+        let blocks = ((total + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [blocks, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )?;
+        }
+        let v = self.download_f32(&amax)?;
+        self.free_tensor(amax)?;
+        Ok(v[0])
+    }
     /// Cast an F32 tensor to BF16 (round-to-nearest-even, top 16 bits). Mirrors
     /// [`Self::cast_f32_to_f16`]; used to stage activations (e.g. the fused qkv)
     /// into bf16 for the bf16 attention/GEMM path.
