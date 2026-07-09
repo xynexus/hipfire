@@ -886,6 +886,9 @@ pub(crate) fn daemon_profile_skip_rows(
 }
 
 pub(crate) fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    if let Some(server_url) = eval_server_url() {
+        return run_server_smoke_rows(config, ctx, &server_url);
+    }
     if !Path::new(&config.model).exists() {
         return daemon_smoke_skip_rows(
             config,
@@ -974,6 +977,9 @@ pub(crate) fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> V
 }
 
 pub(crate) fn run_daemon_speed_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    if let Some(server_url) = eval_server_url() {
+        return run_server_speed_rows(config, ctx, &server_url);
+    }
     if resolve_eval_model_path(&config.model).is_none() {
         return daemon_speed_skip_rows(
             config,
@@ -1036,6 +1042,398 @@ pub(crate) fn run_daemon_speed_rows(config: &EvalConfig, ctx: &EvalContext) -> V
                 )
             })
             .collect(),
+    }
+}
+
+fn run_server_smoke_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    server_url: &str,
+) -> Vec<EvalResult> {
+    let started = SystemTime::now();
+    let prompt_path = "benchmarks/prompts/qwen2_smoke.txt";
+    let prompt_text = match read_repo_prompt_text(prompt_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return daemon_smoke_skip_rows(config, ctx, &err.to_string(), &err.to_string());
+        }
+    };
+    let first = server_chat_completion(
+        server_url,
+        &config.model,
+        &prompt_text,
+        None,
+        None,
+        config.max_tokens,
+    );
+    let elapsed_ms = elapsed_since_ms(started);
+    let result = match first {
+        Ok(result) => result,
+        Err(err) => {
+            return vec![
+                row(
+                    BatteryId::Smoke,
+                    None,
+                    "load_metadata",
+                    None,
+                    EvalStatus::Fail,
+                    Some(format!("server-backed smoke executor failed: {err}")),
+                    BTreeMap::from([
+                        ("executor".to_string(), json!("server")),
+                        ("server_url".to_string(), json!(server_url)),
+                    ]),
+                    config,
+                    ctx,
+                    None,
+                    elapsed_ms,
+                ),
+                skip_row_with_metrics(
+                    BatteryId::Smoke,
+                    None,
+                    "finite_greedy_decode",
+                    None,
+                    "server-backed load failed before decode",
+                    config,
+                    ctx,
+                    prompt(prompt_path),
+                    BTreeMap::from([("executor".to_string(), json!("server"))]),
+                ),
+                skip_row_with_metrics(
+                    BatteryId::Smoke,
+                    None,
+                    "multi_turn_reset_recall",
+                    None,
+                    "server-backed load failed before session reset/recall",
+                    config,
+                    ctx,
+                    prompt("benchmarks/prompts/trains-meet.txt"),
+                    BTreeMap::from([("executor".to_string(), json!("server"))]),
+                ),
+            ];
+        }
+    };
+    let finite = !result.text.is_empty() && !result.text.contains('\u{fffd}');
+    let decode_status = if finite {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let decode_reason =
+        (!finite).then(|| "server returned empty or replacement-character output".to_string());
+    let mut decode_metrics = BTreeMap::from([
+        ("executor".to_string(), json!("server")),
+        ("server_url".to_string(), json!(server_url)),
+        (
+            "tokens".to_string(),
+            json!(timing_u64(&result.timings, "tokens")),
+        ),
+        ("text_bytes".to_string(), json!(result.text.len())),
+        ("max_tokens".to_string(), json!(config.max_tokens)),
+    ]);
+    insert_timing_metrics(&mut decode_metrics, &result.timings);
+    let session_row = server_reset_recall_row(config, ctx, server_url, started);
+    vec![
+        row(
+            BatteryId::Smoke,
+            None,
+            "load_metadata",
+            None,
+            EvalStatus::Pass,
+            None,
+            BTreeMap::from([
+                ("executor".to_string(), json!("server")),
+                ("server_url".to_string(), json!(server_url)),
+            ]),
+            config,
+            ctx,
+            None,
+            elapsed_ms,
+        ),
+        row(
+            BatteryId::Smoke,
+            None,
+            "finite_greedy_decode",
+            None,
+            decode_status,
+            decode_reason,
+            decode_metrics,
+            config,
+            ctx,
+            prompt(prompt_path),
+            elapsed_ms,
+        ),
+        session_row,
+    ]
+}
+
+fn server_reset_recall_row(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    server_url: &str,
+    started: SystemTime,
+) -> EvalResult {
+    let session_prompt_path = "benchmarks/prompts/trains-meet.txt";
+    let session_prompt_text = match read_repo_prompt_text(session_prompt_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return skip_row_with_metrics(
+                BatteryId::Smoke,
+                None,
+                "multi_turn_reset_recall",
+                None,
+                &err.to_string(),
+                config,
+                ctx,
+                prompt(session_prompt_path),
+                BTreeMap::from([
+                    ("executor".to_string(), json!("server")),
+                    ("implemented".to_string(), json!(true)),
+                    ("server_url".to_string(), json!(server_url)),
+                ]),
+            );
+        }
+    };
+    let fail = |reason: String| {
+        row(
+            BatteryId::Smoke,
+            None,
+            "multi_turn_reset_recall",
+            None,
+            EvalStatus::Fail,
+            Some(reason),
+            BTreeMap::from([
+                ("executor".to_string(), json!("server")),
+                ("implemented".to_string(), json!(true)),
+                ("server_url".to_string(), json!(server_url)),
+                ("reset_count".to_string(), json!(2)),
+                ("kv_reset".to_string(), json!(true)),
+                ("dn_state_reset".to_string(), json!(true)),
+                ("max_tokens".to_string(), json!(config.max_tokens)),
+            ]),
+            config,
+            ctx,
+            prompt(session_prompt_path),
+            elapsed_since_ms(started),
+        )
+    };
+    if let Err(err) = server_reset(server_url) {
+        return fail(format!(
+            "server reset failed before first session turn: {err}"
+        ));
+    }
+    let first = match server_chat_completion(
+        server_url,
+        &config.model,
+        &session_prompt_text,
+        None,
+        None,
+        config.max_tokens,
+    ) {
+        Ok(result) => result,
+        Err(err) => return fail(format!("first session turn failed: {err}")),
+    };
+    let distractor = match server_chat_completion(
+        server_url,
+        &config.model,
+        "Remember this unrelated code word for the next turn: orchid. Reply with only OK.",
+        None,
+        None,
+        config.max_tokens,
+    ) {
+        Ok(result) => result,
+        Err(err) => return fail(format!("distractor session turn failed: {err}")),
+    };
+    if let Err(err) = server_reset(server_url) {
+        return fail(format!(
+            "server reset failed before repeated session turn: {err}"
+        ));
+    }
+    let second = match server_chat_completion(
+        server_url,
+        &config.model,
+        &session_prompt_text,
+        None,
+        None,
+        config.max_tokens,
+    ) {
+        Ok(result) => result,
+        Err(err) => return fail(format!("repeated session turn failed: {err}")),
+    };
+    let session_finite = !first.text.is_empty()
+        && !second.text.is_empty()
+        && !first.text.contains('\u{fffd}')
+        && !second.text.contains('\u{fffd}');
+    let session_match = first.text == second.text;
+    let status = if session_finite && session_match {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let reason = if !session_finite {
+        Some(
+            "server session reset smoke returned empty or replacement-character output".to_string(),
+        )
+    } else if !session_match {
+        Some("server repeated greedy session request produced different output".to_string())
+    } else {
+        None
+    };
+    row(
+        BatteryId::Smoke,
+        None,
+        "multi_turn_reset_recall",
+        None,
+        status,
+        reason,
+        BTreeMap::from([
+            ("executor".to_string(), json!("server")),
+            ("implemented".to_string(), json!(true)),
+            ("server_url".to_string(), json!(server_url)),
+            ("reset_count".to_string(), json!(2)),
+            ("kv_reset".to_string(), json!(true)),
+            ("dn_state_reset".to_string(), json!(true)),
+            ("session_turns".to_string(), json!(3)),
+            (
+                "first_tokens".to_string(),
+                json!(timing_u64(&first.timings, "tokens")),
+            ),
+            (
+                "distractor_tokens".to_string(),
+                json!(timing_u64(&distractor.timings, "tokens")),
+            ),
+            (
+                "second_tokens".to_string(),
+                json!(timing_u64(&second.timings, "tokens")),
+            ),
+            (
+                "first_text_hash".to_string(),
+                json!(stable_hash_bytes(first.text.as_bytes())),
+            ),
+            (
+                "second_text_hash".to_string(),
+                json!(stable_hash_bytes(second.text.as_bytes())),
+            ),
+            (
+                "distractor_text_hash".to_string(),
+                json!(stable_hash_bytes(distractor.text.as_bytes())),
+            ),
+            ("outputs_match".to_string(), json!(session_match)),
+            ("max_tokens".to_string(), json!(config.max_tokens)),
+        ]),
+        config,
+        ctx,
+        prompt(session_prompt_path),
+        elapsed_since_ms(started),
+    )
+}
+
+fn run_server_speed_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    server_url: &str,
+) -> Vec<EvalResult> {
+    let started = SystemTime::now();
+    let prompt_path = "benchmarks/prompts/lru_cache_single_blank.txt";
+    let prompt_text = match read_repo_prompt_text(prompt_path) {
+        Ok(text) => text,
+        Err(err) => return daemon_speed_skip_rows(config, ctx, &err.to_string()),
+    };
+    let max_tokens = config.max_tokens.max(50);
+    daemon_speed_cases()
+        .iter()
+        .map(|case| {
+            let result = server_chat_completion(
+                server_url,
+                &config.model,
+                &prompt_text,
+                None,
+                None,
+                max_tokens,
+            );
+            match result {
+                Ok(result) => {
+                    let tokens = timing_u64(&result.timings, "tokens").unwrap_or(0);
+                    let finite = !result.text.is_empty()
+                        && !result.text.contains('\u{fffd}')
+                        && tokens > 0
+                        && (timing_f64(&result.timings, "decode_tok_s")
+                            .or_else(|| timing_f64(&result.timings, "tok_s")))
+                        .is_some_and(|value| value.is_finite() && value > 0.0);
+                    let status = if finite {
+                        EvalStatus::Pass
+                    } else {
+                        EvalStatus::Fail
+                    };
+                    let reason = (!finite).then(|| {
+                        "server speed anchor returned empty output or missing throughput metrics"
+                            .to_string()
+                    });
+                    let mut metrics = BTreeMap::from([
+                        ("implemented".to_string(), json!(true)),
+                        ("executor".to_string(), json!("server")),
+                        ("suite".to_string(), json!("daemon_speed_anchor")),
+                        ("server_url".to_string(), json!(server_url)),
+                        ("max_tokens".to_string(), json!(max_tokens)),
+                        ("tokens".to_string(), json!(tokens)),
+                        ("text_bytes".to_string(), json!(result.text.len())),
+                    ]);
+                    insert_timing_metrics(&mut metrics, &result.timings);
+                    row_for_model(
+                        BatteryId::Speed,
+                        None,
+                        case.label,
+                        None,
+                        status,
+                        reason,
+                        metrics,
+                        config,
+                        ctx,
+                        prompt(prompt_path),
+                        elapsed_since_ms(started),
+                        config.model.clone(),
+                    )
+                }
+                Err(err) => row_for_model(
+                    BatteryId::Speed,
+                    None,
+                    case.label,
+                    None,
+                    EvalStatus::Fail,
+                    Some(format!("server-backed speed executor failed: {err}")),
+                    BTreeMap::from([
+                        ("implemented".to_string(), json!(true)),
+                        ("executor".to_string(), json!("server")),
+                        ("suite".to_string(), json!("daemon_speed_anchor")),
+                        ("server_url".to_string(), json!(server_url)),
+                    ]),
+                    config,
+                    ctx,
+                    prompt(prompt_path),
+                    elapsed_since_ms(started),
+                    config.model.clone(),
+                ),
+            }
+        })
+        .collect()
+}
+
+fn insert_timing_metrics(metrics: &mut BTreeMap<String, Value>, timings: &Value) {
+    for key in [
+        "tok_s",
+        "prefill_tokens",
+        "prefill_ms",
+        "prefill_tok_s",
+        "decode_tok_s",
+        "ttft_ms",
+    ] {
+        if let Some(value) = timings.get(key) {
+            metrics.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(value) = timings.get("decode_tok_s") {
+        metrics
+            .entry("gen_tok_s".to_string())
+            .or_insert(value.clone());
     }
 }
 

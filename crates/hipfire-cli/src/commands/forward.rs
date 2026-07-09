@@ -1,7 +1,10 @@
 use std::{
     ffi::OsString,
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 
 use clap::Args;
@@ -131,13 +134,15 @@ pub struct OptimizeArgs {
 }
 
 pub fn run_eval(args: EvalArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
+    let server_env = running_server_env(&loaded);
     run_forwarded(
         Runner::eval(),
-        resolve_forwarded_model_args(args.args, false, &loaded),
+        resolve_forwarded_model_args(args.args, true, &loaded),
         "HIPFIRE_EVAL_BIN",
         "hipfire-eval",
         EVAL_HELP,
         "cargo build --release -p hipfire-eval",
+        &server_env,
     )
 }
 
@@ -149,6 +154,7 @@ pub fn run_host_profile(args: HostProfileArgs, loaded: LoadedConfig) -> anyhow::
         "hipfire-host-profile",
         HOST_PROFILE_HELP,
         "cargo build --release -p hipfire-runtime --bin hipfire-host-profile",
+        &[],
     )
 }
 
@@ -180,6 +186,7 @@ pub fn run_collect_artifacts(
         "collect_artifacts",
         COLLECT_ARTIFACTS_HELP,
         "cargo build --release -p hipfire-runtime --example collect_artifacts",
+        &[],
     )
 }
 
@@ -191,6 +198,7 @@ pub fn run_optimize(args: OptimizeArgs, loaded: LoadedConfig) -> anyhow::Result<
         "optimize",
         OPTIMIZE_HELP,
         "cargo build --release -p hipfire-runtime --example optimize",
+        &[],
     )
 }
 
@@ -201,6 +209,7 @@ fn run_forwarded(
     bin_name: &str,
     help: &str,
     build_hint: &str,
+    envs: &[(&'static str, String)],
 ) -> anyhow::Result<()> {
     if is_help(&args) {
         println!("{help}");
@@ -209,12 +218,16 @@ fn run_forwarded(
 
     let bin = resolve_runner_binary(&runner, env_var, bin_name)
         .ok_or_else(|| anyhow::anyhow!("{bin_name} not found.\nBuild it with: {build_hint}"))?;
-    let status = Command::new(&bin)
+    let mut command = Command::new(&bin);
+    command
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
+        .stderr(Stdio::inherit());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let status = command.status()?;
 
     if let Some(code) = status.code() {
         if code == 0 {
@@ -225,6 +238,52 @@ fn run_forwarded(
     } else {
         anyhow::bail!("{bin_name} terminated by signal")
     }
+}
+
+fn running_server_env(loaded: &LoadedConfig) -> Vec<(&'static str, String)> {
+    let url = configured_server_url(loaded);
+    if server_health_ok(&url) {
+        vec![("HIPFIRE_EVAL_SERVER_URL", url)]
+    } else {
+        Vec::new()
+    }
+}
+
+fn configured_server_url(loaded: &LoadedConfig) -> String {
+    let host = if loaded.config.host == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        loaded.config.host.as_str()
+    };
+    format!("http://{}:{}", host, loaded.config.port)
+}
+
+fn server_health_ok(url: &str) -> bool {
+    let Some(addr) = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.parse::<SocketAddr>().ok())
+    else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(150)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    if write!(
+        stream,
+        "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        addr
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0_u8; 64];
+    stream
+        .read(&mut buf)
+        .ok()
+        .is_some_and(|n| String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"))
 }
 
 fn is_help(args: &[OsString]) -> bool {
@@ -378,6 +437,30 @@ fn runner_candidates(runner: &Runner, env_var: &str, bin_name: &str) -> Vec<Path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_config::{HipfireConfig, LoadedConfig};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_config() -> LoadedConfig {
+        LoadedConfig::from_config(HipfireConfig::default())
+    }
+
+    fn test_config_with_model(name: &str) -> (LoadedConfig, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-cli-forward-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let model = dir.join(format!("{name}.hfq"));
+        fs::write(&model, b"placeholder").unwrap();
+        let mut config = HipfireConfig::default();
+        config.models_dir = Some(dir.display().to_string());
+        (LoadedConfig::from_config(config), model)
+    }
 
     #[test]
     fn help_matches_empty_and_help_flags() {
@@ -447,6 +530,7 @@ mod tests {
                     OsString::from("speed"),
                 ],
                 false,
+                &test_config(),
             ),
             vec![
                 OsString::from("--model=missing-model"),
@@ -462,11 +546,34 @@ mod tests {
                     OsString::from("gfx1151")
                 ],
                 true,
+                &test_config(),
             ),
             vec![
                 OsString::from("missing-model"),
                 OsString::from("--arch"),
                 OsString::from("gfx1151")
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_resolves_first_positional_model() {
+        let (loaded, model) = test_config_with_model("tiny");
+        let args = resolve_forwarded_model_args(
+            vec![
+                OsString::from("tiny"),
+                OsString::from("--battery"),
+                OsString::from("speed"),
+            ],
+            true,
+            &loaded,
+        );
+        assert_eq!(
+            args,
+            vec![
+                OsString::from(model.display().to_string()),
+                OsString::from("--battery"),
+                OsString::from("speed"),
             ]
         );
     }

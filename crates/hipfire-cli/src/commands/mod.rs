@@ -1,7 +1,10 @@
 pub mod admin;
+pub mod bench;
 pub mod chat;
+pub mod daemon;
 pub mod detect;
 pub mod diffusion;
+pub mod doctor;
 pub mod forward;
 pub mod gen_config_schema;
 pub mod gen_docs;

@@ -1,11 +1,11 @@
-.PHONY: all install link dev-unlink ui serve daemon quant eval tui monitor help
+.PHONY: all install link dev-unlink ui serve daemon quant eval tui monitor priv-helper help
 
 HIPFIRE_DIR ?= $(HOME)/.hipfire
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 TARGET_DIR ?= $(REPO_ROOT)/target/release
 # Binaries symlinked into ~/.hipfire/bin (and that `hipfire serve` resolves the
 # daemon from). Override DEV_BINS to link a different set.
-DEV_BINS ?= hipfire hipfire-daemon hipfire-quantize hipfire-eval hipfire-tui hipfire-system-monitor hipfire-host-profile
+DEV_BINS ?= hipfire hipfire-daemon hipfire-quantize hipfire-eval hipfire-tui hipfire-monitor hipfire-priv-helper hipfire-host-profile
 
 # Embedded browser UIs (Leptos/WASM) baked into the `hipfire` CLI. They require
 # `trunk` + the wasm32-unknown-unknown target; when trunk is absent we build
@@ -71,7 +71,11 @@ tui:
 	@$(MAKE) --no-print-directory link
 
 monitor:
-	cargo build --release -p hipfire-system-monitor
+	cargo build --release -p hipfire-monitor
+	@$(MAKE) --no-print-directory link
+
+priv-helper:
+	cargo build --release -p hipfire-priv-helper
 	@$(MAKE) --no-print-directory link
 
 # ── dev symlink management ──────────────────────────────────────────────
@@ -104,6 +108,7 @@ help:
 	@echo "make quant      rebuild hipfire-quantize, relink"
 	@echo "make eval       rebuild hipfire-eval, relink"
 	@echo "make tui        rebuild hipfire-tui, relink"
-	@echo "make monitor    rebuild hipfire-system-monitor, relink"
+	@echo "make monitor    rebuild hipfire-monitor, relink"
+	@echo "make priv-helper rebuild hipfire-priv-helper, relink"
 	@echo "make link       (re)create the dev symlinks in ~/.hipfire/bin"
 	@echo "make dev-unlink remove the dev symlinks"

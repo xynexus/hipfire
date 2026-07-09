@@ -93,6 +93,8 @@ mod result;
 use result::*;
 mod run;
 pub use run::*;
+mod server_client;
+use server_client::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

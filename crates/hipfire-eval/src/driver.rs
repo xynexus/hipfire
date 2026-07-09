@@ -126,6 +126,9 @@ pub(crate) fn run_eval_batteries(
 }
 
 pub(crate) fn daemon_shared_model_load_enabled(config: &EvalConfig) -> bool {
+    if eval_server_url().is_some() {
+        return false;
+    }
     matches!(
         config.executor,
         EvalExecutorMode::Auto | EvalExecutorMode::Daemon
@@ -155,6 +158,15 @@ pub(crate) fn daemon_shared_model_load_battery(battery: BatteryId) -> bool {
 }
 
 pub(crate) fn coherence_shared_model_load_enabled(config: &EvalConfig) -> bool {
+    if eval_server_url().is_some() {
+        return config.runs == 1
+            && config.warmup_runs == 0
+            && !config.benchmark
+            && config
+                .batteries
+                .iter()
+                .any(|battery| coherence_shared_model_load_battery(*battery));
+    }
     matches!(
         config.executor,
         EvalExecutorMode::Auto | EvalExecutorMode::Daemon | EvalExecutorMode::Examples

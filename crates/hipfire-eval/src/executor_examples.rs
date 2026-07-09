@@ -311,6 +311,12 @@ fn run_shared_prepared_coherence_cases(
     ctx: &EvalContext,
     cases: Vec<SharedCoherenceEvalCase>,
 ) -> Vec<EvalResult> {
+    if let Some(server_url) = eval_server_url() {
+        return cases
+            .into_iter()
+            .map(|case| run_prepared_server_coherence_case(config, ctx, &case, &server_url))
+            .collect();
+    }
     let daemon = hipfire_daemon_adapter::find_daemon_bin();
     let mut max_seq_by_key: BTreeMap<(String, bool), usize> = BTreeMap::new();
     for case in &cases {
@@ -357,6 +363,131 @@ fn run_shared_prepared_coherence_cases(
         }
     }
     rows
+}
+
+fn run_prepared_server_coherence_case(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    case: &SharedCoherenceEvalCase,
+    server_url: &str,
+) -> EvalResult {
+    let mut metrics = case.metrics.clone();
+    metrics.insert("executor".to_string(), json!("server"));
+    metrics.insert("runtime_path".to_string(), json!("server_http"));
+    metrics.insert("server_url".to_string(), json!(server_url));
+    metrics.insert("implemented".to_string(), json!(true));
+    metrics.insert("shared_coherence_session".to_string(), json!(true));
+    let Some(resolved_prompt) = resolve_repo_path(&case.prompt_path) else {
+        return prepared_daemon_coherence_failure_row(
+            config,
+            ctx,
+            case,
+            &format!("prompt not found: {}", case.prompt_path),
+        );
+    };
+    let prompt_text = match fs::read_to_string(&resolved_prompt) {
+        Ok(text) => text,
+        Err(err) => {
+            return prepared_daemon_coherence_failure_row(
+                config,
+                ctx,
+                case,
+                &format!("read prompt {}: {err}", resolved_prompt.display()),
+            );
+        }
+    };
+    let system_text = if let Some(path) = case.system_path {
+        let Some(resolved_system) = resolve_repo_path(path) else {
+            return prepared_daemon_coherence_failure_row(
+                config,
+                ctx,
+                case,
+                &format!("system prompt not found: {path}"),
+            );
+        };
+        match fs::read_to_string(&resolved_system) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                return prepared_daemon_coherence_failure_row(
+                    config,
+                    ctx,
+                    case,
+                    &format!("read system prompt {}: {err}", resolved_system.display()),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let profile = case.profile.clone().unwrap_or_else(|| {
+        hipfire_coherence::DetectorProfile::default_for_prompt(&prompt_text, system_text.as_deref())
+    });
+    let run_config = hipfire_coherence::CoherenceRunConfig {
+        model: case.model.clone(),
+        prompt: prompt_text.clone(),
+        prompt_label: case.prompt_path.clone(),
+        system: system_text.clone(),
+        tools: case.tools.clone(),
+        assistant_prefix: case.assistant_prefix.map(str::to_string),
+        force_jinja_chat: case.force_jinja_chat,
+        max_tokens: case.max_tokens,
+        temperature: 0.0,
+        repeat_penalty: None,
+        repeat_window: None,
+        max_seq: case.max_seq,
+        state: None,
+        profile,
+    };
+    let started = SystemTime::now();
+    let result = server_chat_completion(
+        server_url,
+        &case.model,
+        &prompt_text,
+        system_text.as_deref(),
+        case.tools.clone(),
+        case.max_tokens,
+    );
+    let chat = match result {
+        Ok(result) => result,
+        Err(err) => {
+            return row_for_model(
+                case.battery,
+                None,
+                &case.case_id,
+                None,
+                EvalStatus::Fail,
+                Some(format!("server coherence probe failed: {err}")),
+                metrics,
+                config,
+                ctx,
+                case.prompt_ref.clone(),
+                elapsed_since_ms(started),
+                case.model.clone(),
+            );
+        }
+    };
+    let output = hipfire_coherence::run_coherence_over_text(
+        &run_config,
+        chat.text,
+        timing_u64(&chat.timings, "tokens").unwrap_or(0) as usize,
+        elapsed_since_ms(started).min(u64::MAX as u128) as u64,
+        timing_f64(&chat.timings, "ttft_ms").unwrap_or(0.0) as u64,
+        timing_f64(&chat.timings, "prefill_ms").unwrap_or(0.0),
+        timing_f64(&chat.timings, "prefill_tok_s").unwrap_or(0.0),
+        timing_f64(&chat.timings, "decode_tok_s").unwrap_or(0.0),
+        timing_f64(&chat.timings, "tok_s").unwrap_or(0.0),
+    );
+    finish_coherence_row(
+        config,
+        ctx,
+        case.battery,
+        &case.case_id,
+        case.prompt_ref.clone(),
+        case.model.clone(),
+        metrics,
+        elapsed_since_ms(started),
+        output,
+    )
 }
 
 fn run_prepared_daemon_coherence_case(
@@ -2458,6 +2589,126 @@ fn run_daemon_coherence_anchor_inner(
         }
     };
     let elapsed_ms = elapsed_since_ms(started);
+    let artifact_dir = config.out_dir.join("artifacts").join("coherence");
+    if let Err(err) = fs::create_dir_all(&artifact_dir) {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Fail,
+            Some(format!("create coherence artifact dir: {err}")),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            elapsed_ms,
+            model,
+        );
+    }
+    let artifact_name = format!(
+        "{}-{}.json",
+        sanitize_path_component(case_id),
+        stable_hash_bytes(model.as_bytes())
+    );
+    let artifact_path = artifact_dir.join(artifact_name);
+    let artifact_value = output.artifact_value();
+    if let Err(err) = write_json_pretty(&artifact_path, &artifact_value) {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Fail,
+            Some(format!("write coherence artifact: {err}")),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            elapsed_ms,
+            model,
+        );
+    }
+    metrics.insert("hard_fails".to_string(), json!(output.hard_fails() as f64));
+    metrics.insert("soft_warns".to_string(), json!(output.soft_warns() as f64));
+    metrics.insert(
+        "detector_count".to_string(),
+        json!(output.report.rows.len() as f64),
+    );
+    metrics.insert(
+        "detectors".to_string(),
+        json!(hipfire_coherence::detector_rows(&output.report)),
+    );
+    metrics.insert(
+        "generated_text_hash".to_string(),
+        json!(stable_hash_bytes(output.generated_text.as_bytes())),
+    );
+    metrics.insert(
+        "generated_visible_bytes".to_string(),
+        json!(output.generated_text.len()),
+    );
+    metrics.insert(
+        "generated_tokens".to_string(),
+        json!(output.token_ids.len()),
+    );
+    metrics.insert("tok_s".to_string(), json!(output.report.header.tok_s));
+    metrics.insert(
+        "gen_tok_s".to_string(),
+        json!(output.report.header.gen_tok_s),
+    );
+    metrics.insert("ttft_ms".to_string(), json!(output.report.header.ttft_ms));
+    metrics.insert(
+        "daemon_prefill_ms".to_string(),
+        json!(output.report.header.daemon_prefill_ms),
+    );
+    metrics.insert(
+        "daemon_decode_tok_s".to_string(),
+        json!(output.report.header.daemon_decode_tok_s),
+    );
+    metrics.insert(
+        "coherence_artifact_path".to_string(),
+        json!(artifact_path.display().to_string()),
+    );
+    metrics.insert(
+        "coherence_status".to_string(),
+        json!(if output.hard_fails() > 0 {
+            "fail"
+        } else {
+            "pass"
+        }),
+    );
+    let status = if output.hard_fails() > 0 {
+        EvalStatus::Fail
+    } else {
+        EvalStatus::Pass
+    };
+    let reason = if output.hard_fails() > 0 {
+        Some(format!(
+            "{} detector hard fail(s); see {}",
+            output.hard_fails(),
+            artifact_path.display()
+        ))
+    } else {
+        None
+    };
+    row_for_model(
+        battery, None, case_id, None, status, reason, metrics, config, ctx, prompt_ref, elapsed_ms,
+        model,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_coherence_row(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    battery: BatteryId,
+    case_id: &str,
+    prompt_ref: Option<PromptRef>,
+    model: String,
+    mut metrics: BTreeMap<String, Value>,
+    elapsed_ms: u128,
+    output: hipfire_coherence::CoherenceRunOutput,
+) -> EvalResult {
     let artifact_dir = config.out_dir.join("artifacts").join("coherence");
     if let Err(err) = fs::create_dir_all(&artifact_dir) {
         return row_for_model(

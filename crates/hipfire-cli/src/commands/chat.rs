@@ -12,6 +12,9 @@ use uuid::Uuid;
 use crate::model::find_model;
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  hipfire chat --model Qwen3.5-30B-A3B \"Explain ROCm in one paragraph\"\n  hipfire chat \"hello\" --max-tokens 64\n  hipfire chat --attach image.png \"describe this image\"\n"
+)]
 pub struct ChatArgs {
     /// Model name, shorthand, alias, or path. Falls back to the
     /// `default_model` config value when omitted.

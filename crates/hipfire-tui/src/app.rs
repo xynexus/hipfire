@@ -15,7 +15,9 @@ use crate::hipfire::{
     chat::{stream_chat, ChatEvent, ChatMessage},
     config::{ConfigEditDirection, ConfigState},
     registry::{RegistryAction, RegistryState},
-    status::{start_background_serve, stop_pids, StatusState},
+    status::{
+        restart_background_serve, start_background_serve, stop_background_serve, StatusState,
+    },
     training::TrainingState,
     HipfirePaths,
 };
@@ -181,17 +183,15 @@ impl App {
                 self.status = StatusState::load(&self.paths, &self.config);
             }
             ControlAction::StopServe => {
-                match stop_pids(&self.status.serve_pids) {
-                    Ok(n) => self.last_reload = format!("sent SIGTERM to {n} serve process(es)"),
+                match stop_background_serve() {
+                    Ok(()) => self.last_reload = "requested background serve stop".into(),
                     Err(err) => self.last_reload = format!("{err}"),
                 }
                 self.status = StatusState::load(&self.paths, &self.config);
             }
             ControlAction::RestartServe => {
-                let _ = stop_pids(&self.status.serve_pids);
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                match start_background_serve() {
-                    Ok(()) => self.last_reload = "serve restart requested (stop + start)".into(),
+                match restart_background_serve() {
+                    Ok(()) => self.last_reload = "requested background serve restart".into(),
                     Err(err) => self.last_reload = format!("restart: {err}"),
                 }
                 self.status = StatusState::load(&self.paths, &self.config);

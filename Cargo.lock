@@ -1584,6 +1584,7 @@ dependencies = [
  "clap",
  "clap-markdown",
  "clap_mangen",
+ "hip-bridge",
  "hipfire-arch-api",
  "hipfire-archs",
  "hipfire-build-info",
@@ -1597,6 +1598,9 @@ dependencies = [
  "hipfire-model",
  "hipfire-runtime",
  "hipfire-server",
+ "hipfire-sysinfo",
+ "hipfire-tui",
+ "hipfire-xdna",
  "image",
  "indicatif",
  "libc",
@@ -1796,6 +1800,7 @@ dependencies = [
  "hipfire-model",
  "hipfire-sysinfo",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -1916,6 +1921,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-monitor"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "hipfire-admin-types",
+ "hipfire-sysinfo",
+ "libc",
+ "libdrm_amdgpu_sys",
+ "ratatui",
+]
+
+[[package]]
 name = "hipfire-npu"
 version = "0.3.0"
 dependencies = [
@@ -1936,6 +1954,16 @@ dependencies = [
 [[package]]
 name = "hipfire-primitives"
 version = "0.3.0"
+
+[[package]]
+name = "hipfire-priv-helper"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hipfire-prompt"
@@ -2222,19 +2250,6 @@ dependencies = [
  "hipfire-evidence",
  "hipfire-xdna",
  "libc",
-]
-
-[[package]]
-name = "hipfire-system-monitor"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "hipfire-admin-types",
- "hipfire-sysinfo",
- "libc",
- "libdrm_amdgpu_sys",
- "ratatui",
 ]
 
 [[package]]
@@ -3519,6 +3534,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",

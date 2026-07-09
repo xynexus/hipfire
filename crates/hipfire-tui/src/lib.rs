@@ -20,9 +20,9 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-fn main() -> Result<()> {
+pub fn run() -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = run(&mut terminal);
+    let result = run_event_loop(&mut terminal);
     restore_terminal(&mut terminal)?;
     result
 }
@@ -54,7 +54,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     Ok(())
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::load()?;
 
     loop {

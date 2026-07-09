@@ -1,5 +1,5 @@
 [package]
-name = "hipfire-system-monitor"
+name = "hipfire-monitor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

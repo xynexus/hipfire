@@ -5,10 +5,17 @@ This document contains the help content for the `hipfire` command-line program.
 **Command Overview:**
 
 * [`hipfire`↴](#hipfire)
+* [`hipfire tui`↴](#hipfire-tui)
+* [`hipfire start`↴](#hipfire-start)
+* [`hipfire stop`↴](#hipfire-stop)
+* [`hipfire restart`↴](#hipfire-restart)
+* [`hipfire status`↴](#hipfire-status)
 * [`hipfire serve`↴](#hipfire-serve)
 * [`hipfire chat`↴](#hipfire-chat)
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire eval`↴](#hipfire-eval)
+* [`hipfire bench`↴](#hipfire-bench)
+* [`hipfire doctor`↴](#hipfire-doctor)
 * [`hipfire host-profile`↴](#hipfire-host-profile)
 * [`hipfire collect-artifacts`↴](#hipfire-collect-artifacts)
 * [`hipfire optimize`↴](#hipfire-optimize)
@@ -45,16 +52,33 @@ This document contains the help content for the `hipfire` command-line program.
 
 ## `hipfire`
 
-hipfire LLM inference CLI
+hipfire runs the local operator TUI, OpenAI-compatible HTTP server, model chat, eval, benchmark, diagnostics, and artifact tools.
 
-**Usage:** `hipfire <COMMAND>`
+**Usage:** `hipfire [COMMAND]`
+
+Examples:
+  hipfire                         Open the operator TUI
+  hipfire help                    Show the command summary
+  hipfire start                   Start the background server
+  hipfire status                  Show background server status
+  hipfire chat Qwen3.5-30B-A3B "hello"
+  hipfire bench --model Qwen3.5-30B-A3B
+
+Use `hipfire <command> help` or `hipfire <command> --help` for detailed command help.
 
 ###### **Subcommands:**
 
+* `tui` — Open the local operator TUI
+* `start` — Start the background hipfire server
+* `stop` — Stop the background hipfire server
+* `restart` — Restart the background hipfire server
+* `status` — Show background server status
 * `serve` — Start the hipfire HTTP server (OpenAI-compatible)
 * `chat` — Load a model and generate a response (one-shot)
 * `list` — List locally available models
 * `eval` — Run the quant admission/model evaluation harness
+* `bench` — Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
+* `doctor` — Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
 * `optimize` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
@@ -66,11 +90,101 @@ hipfire LLM inference CLI
 
 
 
+## `hipfire tui`
+
+Open the local operator TUI
+
+**Usage:** `hipfire tui`
+
+
+
+## `hipfire start`
+
+Start the background hipfire server
+
+**Usage:** `hipfire start [OPTIONS]`
+
+Examples:
+  hipfire start
+  hipfire start --model Qwen3.5-30B-A3B --port 11435
+  hipfire start --host 0.0.0.0
+
+
+###### **Options:**
+
+* `--host <HOST>` — Override bind host for the background server
+* `-p`, `--port <PORT>` — Override bind port for the background server
+* `-m`, `--model <MODEL>` — Pre-load a model on startup by name, shorthand, alias, or path
+* `--debug-chat` — Log full raw chat requests and raw model replies
+* `--wait-secs <WAIT_SECS>` — Seconds to wait for /health before returning. Default 0 returns immediately
+
+  Default value: `0`
+
+
+
+## `hipfire stop`
+
+Stop the background hipfire server
+
+**Usage:** `hipfire stop [OPTIONS]`
+
+Examples:
+  hipfire stop
+  hipfire stop --force
+
+
+###### **Options:**
+
+* `-f`, `--force` — Skip the graceful wait and send SIGKILL immediately
+
+
+
+## `hipfire restart`
+
+Restart the background hipfire server
+
+**Usage:** `hipfire restart [OPTIONS]`
+
+Examples:
+  hipfire restart
+  hipfire restart --model Qwen3.5-30B-A3B
+
+
+###### **Options:**
+
+* `--host <HOST>` — Override bind host for the restarted background server
+* `-p`, `--port <PORT>` — Override bind port for the restarted background server
+* `-m`, `--model <MODEL>` — Pre-load a model on startup by name, shorthand, alias, or path
+* `--debug-chat` — Log full raw chat requests and raw model replies
+* `--wait-secs <WAIT_SECS>` — Seconds to wait for /health before returning. Default 0 returns immediately
+
+  Default value: `0`
+
+
+
+## `hipfire status`
+
+Show background server status
+
+**Usage:** `hipfire status`
+
+Examples:
+  hipfire status
+
+
+
+
 ## `hipfire serve`
 
 Start the hipfire HTTP server (OpenAI-compatible)
 
 **Usage:** `hipfire serve [OPTIONS]`
+
+Examples:
+  hipfire serve
+  hipfire serve --host 0.0.0.0 --port 11435
+  hipfire serve --model Qwen3.5-30B-A3B
+
 
 ###### **Options:**
 
@@ -86,6 +200,12 @@ Start the hipfire HTTP server (OpenAI-compatible)
 Load a model and generate a response (one-shot)
 
 **Usage:** `hipfire chat [OPTIONS] <PROMPT>`
+
+Examples:
+  hipfire chat --model Qwen3.5-30B-A3B "Explain ROCm in one paragraph"
+  hipfire chat "hello" --max-tokens 64
+  hipfire chat --attach image.png "describe this image"
+
 
 ###### **Arguments:**
 
@@ -117,6 +237,57 @@ Run the quant admission/model evaluation harness
 ###### **Arguments:**
 
 * `<ARGS>` — Arguments forwarded to hipfire-eval. Use positional <model>; common flags include --compare, --reference, --battery, --suite, --benchmark, --runs, --force, and --regenerate
+
+
+
+## `hipfire bench`
+
+Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
+
+**Usage:** `hipfire bench [OPTIONS] [MODEL]`
+
+Examples:
+  hipfire bench Qwen3.5-30B-A3B
+  hipfire bench --pp-tokens 512 --tg-tokens 128 --repetitions 5
+  hipfire bench Qwen3.5-30B-A3B --json
+
+
+###### **Arguments:**
+
+* `<MODEL>` — Model name, shorthand, alias, or path. Falls back to default_model
+
+###### **Options:**
+
+* `--pp-tokens <PP_TOKENS>` — Target prompt/prefill token count. The daemon reports the actual count
+
+  Default value: `512`
+* `--tg-tokens <TG_TOKENS>` — Generated token count for the decode-throughput sample
+
+  Default value: `128`
+* `-r`, `--repetitions <REPETITIONS>` — Number of measured repetitions, matching llama-bench's default
+
+  Default value: `5`
+* `--no-warmup` — Skip warmup runs before measuring
+* `--json` — Print JSON instead of a compact text report
+
+
+
+## `hipfire doctor`
+
+Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
+
+**Usage:** `hipfire doctor [OPTIONS]`
+
+Examples:
+  hipfire doctor
+  hipfire doctor --json
+  hipfire doctor --fix
+
+
+###### **Options:**
+
+* `--fix` — Apply safe user-space fixes and invoke hipfire-priv-helper for privileged fixes
+* `--json` — Emit the full report as JSON
 
 
 
@@ -198,7 +369,7 @@ Split a bundled `.hfq` back into its base + sidecar files
 
 ###### **Options:**
 
-* `--infer` — Heuristically split a bundle that has no `hipfire_compose` manifest, using the filename's role dot-groups + tensor-name prefixes. Lossy: output files are not byte-identical to any originals. Bundles that DO carry a manifest still take the exact, lossless path
+* `--infer` — Heuristically split a bundle that has no `hipfire_compose` manifest, using the filename's role dot-groups + tensor-name prefixes. Legacy bundles with a plain filename fall back to inferring roles from tensor names alone. Lossy: output files are not byte-identical to any originals. Bundles that DO carry a manifest still take the exact, lossless path
 
 
 
@@ -615,10 +786,12 @@ Reads an existing diffusion .hfq (weights stored as f32/f16/bf16 source), re-enc
 ###### **Options:**
 
 * `-o`, `--output <OUTPUT>` — Output quantized .hfq artifact path
-* `--format <FORMAT>` — Quant format: q8, q4, q4k, q4+ (data-free) or oq4/oq4++/oq8 (Opus, calibrated)
+* `--format <FORMAT>` — Quant format: q8, q4, q4k, q4+, oq4/oq4++/oq8 (rotated), or oq4p/oq8p/oq4.25 (plain, loaded directly by the tiled Opus kernels)
 
   Default value: `q8`
 * `--calib <CALIB>` — Optional .calib.hfq sidecar (from `diffusion calibrate`); enables oq4++ LDLQ
+* `--mix-fraction <MIX_FRACTION>` — For plain-Opus mixed precision: fraction (0.0–1.0) of quantized parameters to place at int8 (highest fan-in first), the rest int4. Overrides the format to mixed; achieved average ≈ 4 + 4·fraction bits. The output name is rewritten to the achieved `oq<avg>` token
+* `--arch-importance` — Rank the int8 promotion by the arch's structural importance prior (embedders/attention/modulation/output over the FFN bulk) instead of the default highest-fan-in heuristic. Same bit budget; different tensor selection. Only affects `--mix-fraction` (plain-Opus mixed)
 
 
 
