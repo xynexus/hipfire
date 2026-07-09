@@ -2,6 +2,7 @@ pub mod admin;
 pub mod batches;
 pub mod chat;
 pub mod chat_ui;
+pub mod embeddings;
 pub mod files;
 pub mod health;
 pub mod models;

@@ -5779,7 +5779,7 @@ fn main() {
             // tensors to the `model.*` convention, folds the ST Dense heads in as
             // `dense.{0,1}.weight`, and carries the ST block in config.json. Shares
             // the gemma (1+w) RMSNorm bake below. Crate hipfire-arch-embeddinggemma
-            // (arch_id 17); served for embeddings, not autoregressive generation.
+            // (arch_id 19); served for embeddings, not autoregressive generation.
             "embeddinggemma" => ARCH_ID_EMBEDDINGGEMMA,
             // nemotron_h (NVIDIA Nemotron-3): Mamba-2 + GQA-attn + ReLU²-MLP hybrid
             // (Nano-4B dense; Nano-30B adds MoE). Crate hipfire-arch-nemotron

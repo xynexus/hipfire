@@ -4,6 +4,7 @@
 
 //! Async daemon JSONL process adapter.
 
+pub use hipfire_daemon_protocol::{EmbedRequest, EmbeddingVector, RerankRequest, RerankResult};
 /// Re-exported so resource-lock status consumers (admin API, TUI) can match the
 /// live flock state without a direct `hipfire-lock` dependency.
 pub use hipfire_lock::LockState;
@@ -16,10 +17,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
     CettCaptureRequest, CettLoadColnormsRequest, CollectRequest, CollectResponse, DaemonRequest,
-    DaemonResponse, EmbedRequest, EmbeddingVector, HneuronInterveneRequest, KldChunkEvent,
-    KldEvalRequest, KldEvalResponse, LoraLoadRequest, LoraSetScaleRequest, LoraUnloadRequest,
-    RerankRequest, RerankResult, RequestControl, SteerApplyRequest, SteerBeginCaptureRequest,
-    SteerCaptureRequest,
+    DaemonResponse, HneuronInterveneRequest, KldChunkEvent, KldEvalRequest, KldEvalResponse,
+    LoraLoadRequest, LoraSetScaleRequest, LoraUnloadRequest, RequestControl, SteerApplyRequest,
+    SteerBeginCaptureRequest, SteerCaptureRequest,
 };
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{
@@ -370,8 +370,8 @@ impl DaemonEngine {
         }
     }
 
-    /// Send `rerank` and wait for the per-document relevance scores (input order;
-    /// the caller sorts for the client response).
+    /// Send `rerank` and wait for the daemon-sorted relevance scores. Each result
+    /// preserves the document's original input index.
     pub async fn rerank(&mut self, req: RerankRequest) -> anyhow::Result<Vec<RerankResult>> {
         self.send(&DaemonRequest::Rerank(req)).await?;
         loop {

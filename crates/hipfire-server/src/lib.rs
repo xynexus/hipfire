@@ -6,6 +6,7 @@
 
 pub mod admin_ui;
 pub mod auth;
+pub mod deferred_jobs;
 pub mod model;
 pub mod routes;
 pub mod scheduler;
@@ -130,6 +131,8 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             "/v1/chat/completions",
             post(routes::chat::post_chat_completions),
         )
+        .route("/v1/embeddings", post(routes::embeddings::post_embeddings))
+        .route("/v1/rerank", post(routes::embeddings::post_rerank))
         .route("/v1/responses", post(routes::responses::post_responses))
         .route("/sdapi/v1/txt2img", post(routes::sdapi::post_txt2img))
         .route("/sdapi/v1/img2img", post(routes::sdapi::post_img2img))
@@ -260,6 +263,8 @@ pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
     // target the same resolved device (CPU reference only via env opt-in).
     state.resolve_diffusion_runtime_default();
 
+    deferred_jobs::spawn_deferred_job_runner(state.clone());
+
     prewarm_default_model(&state).await;
 
     let idle_state = state.clone();
@@ -291,6 +296,8 @@ fn request_counts_for_idle(method: &Method, path: &str) -> bool {
     matches!(
         (method, path),
         (&Method::POST, "/v1/chat/completions")
+            | (&Method::POST, "/v1/embeddings")
+            | (&Method::POST, "/v1/rerank")
             | (&Method::POST, "/v1/responses")
             | (&Method::POST, "/v1/batches")
             | (&Method::POST, "/sdapi/v1/txt2img")

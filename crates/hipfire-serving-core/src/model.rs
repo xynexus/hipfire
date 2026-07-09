@@ -14,6 +14,7 @@
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_embeddinggemma as embeddinggemma;
 use hipfire_arch_gemma3::Gemma3Backend;
 use hipfire_arch_gemma3_vl::Gemma3VlBackend;
 #[cfg(feature = "arch-lfm2moe")]
@@ -135,6 +136,12 @@ pub struct DflashState {
 /// speculator's GPU buffers are released in `unload_model` via `Speculator::free`.
 pub struct DsparkState {
     pub speculator: Box<dyn hipfire_specdecode_dspark::spec::Speculator>,
+}
+
+/// Resident non-autoregressive embedding model state (arch_id=19).
+pub struct EmbeddingGemmaState {
+    pub config: embeddinggemma::EmbeddingGemmaConfig,
+    pub weights: embeddinggemma::EmbeddingGemmaWeights,
 }
 
 /// Optional LFM2 DFlash speculative-decoding state. LFM2 has no DeltaNet
@@ -389,6 +396,9 @@ pub struct LoadedModel {
     // behind the same `ServingBackend::serve` seam (delegates to `run_simple_ar`);
     // its KV/decode state lives inside `Gemma3Backend`. None on every other arch.
     pub gemma3_text: Option<Gemma3Backend>,
+    // embeddinggemma (arch_id=19). Bidirectional encoder for embeddings/rerank;
+    // no KV cache and no autoregressive decode state.
+    pub embeddinggemma: Option<EmbeddingGemmaState>,
     // Shared
     pub tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
     /// Advertised context window — client-facing capacity, the upper bound on

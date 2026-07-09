@@ -9,7 +9,7 @@
 //! supplies the loaded model, the tokenizer, and the task-prompt prefixing, then
 //! maps the results onto the wire protocol. Two model shapes are supported:
 //!
-//! * **Encoder embeddings** (embeddinggemma, arch_id 17) — a bidirectional prefill
+//! * **Encoder embeddings** (embeddinggemma, arch_id 19) — a bidirectional prefill
 //!   + mean-pool + Dense heads, via [`hipfire_arch_embeddinggemma::embed_forward`].
 //! * **Decoder pooling / yes-no rerank** (Qwen3, Gemma3-text, …) — last-token or
 //!   mean pooling of the final hidden state, or the softmax of a yes/no token pair

@@ -31,8 +31,8 @@ use hipfire_arch_qwen35::speculative::{
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_model::{
     arch_features, is_qwen35_dense_arch_id, is_qwen35_family_arch_id, FeatureSupport,
-    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
-    ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
+    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_TEXT,
+    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
     ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
 };
 use hipfire_prompt as prompt_frame;
@@ -48,7 +48,10 @@ use crate::memory::{hfq_model_memory, unknown_model_memory};
 use crate::model::CaskConfig;
 #[cfg(feature = "arch-lfm2moe")]
 use crate::model::Lfm2DflashState;
-use crate::model::{DdtreeState, DflashState, DsparkState, Eviction, LoadedModel, ResidentSession};
+use crate::model::{
+    DdtreeState, DflashState, DsparkState, EmbeddingGemmaState, Eviction, LoadedModel,
+    ResidentSession,
+};
 use crate::session::{
     next_qwen35_state_allocation_epoch, SessionRegistry, QWEN35_LEGACY_SESSION_ID,
 };
@@ -651,6 +654,111 @@ pub fn load_model(
         requested.clamp(512.min(max_seq), max_seq)
     };
 
+    if hfq.arch_id == ARCH_ID_EMBEDDINGGEMMA {
+        // embeddinggemma is a non-autoregressive encoder: no KV cache, no
+        // decode loop, and no speculative drafter/eviction state.
+        if draft_path.is_some() {
+            return Err(
+                "DFlash not supported on arch_id=19 (embeddinggemma). Reload without a draft."
+                    .to_string(),
+            );
+        }
+        if cask.sidecar.is_some() {
+            return Err(
+                "CASK eviction not supported on arch_id=19 (embeddinggemma). \
+                 Reload without --cask-sidecar."
+                    .to_string(),
+            );
+        }
+        let _ = (kv_mode.as_str(), state_quant_override);
+        let cfg = hipfire_arch_embeddinggemma::config_from_metadata_json(&hfq.metadata_json)
+            .ok_or("embeddinggemma: failed to parse config from HFQ metadata")?;
+        eprintln!(
+            "  embeddinggemma: hidden={}, layers={}, heads={}, kv_heads={}, vocab={}, embedding_dim={}, matryoshka={:?}",
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.vocab_size,
+            cfg.embedding_dim,
+            cfg.matryoshka_dims,
+        );
+        let weights = hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load(&mut hfq, &cfg, gpu)
+            .map_err(|e| format!("embeddinggemma weights: {e}"))?;
+        let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_registry: SessionRegistry::default(),
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            llama_backend: None,
+            nemotron_backend: None,
+            zaya_backend: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            qwen2_backend: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_config: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_weights: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_registry: SessionRegistry::default(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_eos_tok: 0,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            gemma3_vl: None,
+            gemma3_text: None,
+            embeddinggemma: Some(EmbeddingGemmaState {
+                config: cfg,
+                weights,
+            }),
+            tokenizer: Some(tokenizer),
+            active: ResidentSession::default(),
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            asst_turn_cache: std::collections::HashMap::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
+            dflash: None,
+            dspark: None,
+            chat_template,
+            chat_template_profile,
+        });
+    }
+
     if hfq.arch_id == ARCH_ID_QWEN2 {
         // Qwen2 dense (hipfire-arch-qwen2). Standalone bring-up — no
         // eviction, no DFlash, no PFlash, no VL. The Architecture
@@ -731,6 +839,7 @@ pub fn load_model(
             vision_weights: None,
             gemma3_vl: None,
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -822,6 +931,7 @@ pub fn load_model(
             vision_weights: None,
             gemma3_vl: None,
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -948,6 +1058,7 @@ pub fn load_model(
             vision_weights: None,
             gemma3_vl: None,
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1046,6 +1157,7 @@ pub fn load_model(
             vision_weights: None,
             gemma3_vl: None,
             gemma3_text: Some(backend),
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1157,6 +1269,7 @@ pub fn load_model(
             vision_weights: None,
             gemma3_vl: Some(backend),
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1255,6 +1368,7 @@ pub fn load_model(
             vision_weights: None,
             gemma3_vl: None,
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1374,6 +1488,7 @@ pub fn load_model(
             vision_weights: None,
             gemma3_vl: None,
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1499,6 +1614,7 @@ pub fn load_model(
             vision_weights: None,
             gemma3_vl: None,
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1729,6 +1845,7 @@ pub fn load_model(
                 vision_weights: None,
                 gemma3_vl: None,
                 gemma3_text: None,
+                embeddinggemma: None,
                 tokenizer: Some(tokenizer),
                 active: ResidentSession {
                     lfm2moe_state: Some(state),
@@ -2083,6 +2200,7 @@ pub fn load_model(
             vision_weights,
             gemma3_vl: None,
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession {
                 sequence_state,
@@ -2212,6 +2330,7 @@ pub fn load_model(
             vision_weights: None,
             gemma3_vl: None,
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -2402,6 +2521,7 @@ pub fn load_model_safetensors(
             vision_weights: None,
             gemma3_vl: None,
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -2517,6 +2637,7 @@ pub fn load_model_safetensors(
             vision_weights: None,
             gemma3_vl: None,
             gemma3_text: None,
+            embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -2655,6 +2776,7 @@ pub fn load_model_safetensors(
         vision_weights: None,
         gemma3_vl: None,
         gemma3_text: None,
+        embeddinggemma: None,
         tokenizer: Some(tokenizer),
         active: ResidentSession {
             sequence_state,
@@ -2950,6 +3072,7 @@ pub fn load_model_pp(
         vision_weights: None,
         gemma3_vl: None,
         gemma3_text: None,
+        embeddinggemma: None,
         tokenizer: Some(tokenizer),
         active: ResidentSession {
             sequence_state,
@@ -3190,6 +3313,10 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut hipfire_rdna::Gpu) {
     if let Some(b) = m.gemma3_text {
         b.weights.free_gpu(gpu);
         b.state.free_gpu(gpu);
+    }
+    // embeddinggemma (arch_id=19): owns a Gemma3 backbone plus host Dense heads.
+    if let Some(e) = m.embeddinggemma {
+        e.weights.free_gpu(gpu);
     }
     if let Some(w) = m.deepseek4_weights {
         w.free_gpu(gpu);

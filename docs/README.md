@@ -15,6 +15,7 @@ Do not add one-off experiments here unless they are accepted as canonical. Those
 
 - [OVERVIEW.md](./OVERVIEW.md) — one-page statement of the current documentation organization.
 - [CHAT.md](./CHAT.md) — active `hipfire chat` keybinding and slash-command reference.
+- [DEFERRED-JOBS.md](./DEFERRED-JOBS.md) — startup deferred job queue for image generation, HTTP work, and training commands.
 - [QUANTIZE.md](./QUANTIZE.md) — canonical quantization names, MQ/OQ format semantics, and activation-path reuse.
 - [ARCHIVE-INDEX.md](./ARCHIVE-INDEX.md) — complete catalog of everything moved to `docs-old` with stable links.
 - [plans/ARCHITECTURE-PLAN.md](./plans/ARCHITECTURE-PLAN.md) — current architecture + modularization plan.

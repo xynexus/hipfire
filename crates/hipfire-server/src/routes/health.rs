@@ -76,6 +76,7 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         "prefill_batch": prefill_batch,
         "decode_batch": server_decode_batch_health_json(&scheduler_env),
         "state_cache": server_state_cache_health_json(&scheduler_env),
+        "deferred_jobs": crate::deferred_jobs::deferred_jobs_health_json(),
         "runtime_workers": runtime_workers_health_payload(&accelerator_inventory),
         "batches": batch_health_payload(&state).await,
     }))
@@ -161,7 +162,12 @@ async fn batch_health_payload(state: &SharedState) -> serde_json::Value {
         "cancelled": cancelled,
         "completed": completed,
         "completion_window_supported": true,
-        "supported_endpoints": ["/v1/chat/completions", "/v1/responses"],
+        "supported_endpoints": [
+            "/v1/chat/completions",
+            "/v1/embeddings",
+            "/v1/rerank",
+            "/v1/responses"
+        ],
         "execution_mode": "serial_fallback",
         "last_fallback_reason": "daemon_serialized_request_path",
         "batch_capability": "supported",
@@ -194,6 +200,7 @@ mod tests {
             "prefill_batch": server_prefill_batch_health_json(&SchedulerPolicyEnv::empty()),
             "decode_batch": server_decode_batch_health_json(&SchedulerPolicyEnv::empty()),
             "state_cache": server_state_cache_health_json(&SchedulerPolicyEnv::empty()),
+            "deferred_jobs": crate::deferred_jobs::deferred_jobs_health_json(),
             "runtime_workers": runtime_workers_health_payload(&AcceleratorInventory::not_probed()),
             "batches": json!({ "enabled": true }),
         });
@@ -201,6 +208,10 @@ mod tests {
         assert_eq!(payload["prefill_batch"], json!({ "enabled": false }));
         assert_eq!(payload["decode_batch"], json!({ "enabled": false }));
         assert_eq!(payload["state_cache"], json!({ "enabled": false }));
+        assert_eq!(
+            payload["deferred_jobs"]["execution_mode"],
+            "startup_sequential"
+        );
         assert_eq!(payload["runtime_workers"]["resident_workers"], 0);
         assert_eq!(payload["runtime_workers"]["state_arena_backend"], "none");
         assert_eq!(

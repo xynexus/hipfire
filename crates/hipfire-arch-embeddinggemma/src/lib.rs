@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — embeddinggemma text-embedding encoder arch crate. See LICENSE / NOTICE.
 
-//! embeddinggemma (text embeddings) — `arch_id = 17`.
+//! embeddinggemma (text embeddings) — `arch_id = 19`.
 //!
 //! A **bidirectional** Gemma-3 encoder that emits pooled sentence embeddings rather
 //! than autoregressive logits. It shares the Gemma-3 backbone (see

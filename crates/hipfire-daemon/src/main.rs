@@ -38,7 +38,7 @@ use hipfire_generate::{
 };
 use hipfire_model::{
     build_local_llm_registry, is_qwen35_family_arch_id, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR,
-    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_MINIMAX_M2, ARCH_ID_QWEN2,
+    ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_MINIMAX_M2, ARCH_ID_QWEN2,
 };
 use hipfire_prompt as prompt_frame;
 use hipfire_state::{
@@ -69,7 +69,7 @@ use dummy::{
 use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
 use generate::*;
 use generate_vl::{decode_vl_frames, generate_vl, generate_vl_dots_ocr, generate_vl_gemma3};
-use hipfire_daemon_protocol::DaemonRequest;
+use hipfire_daemon_protocol::{DaemonRequest, EmbeddingVector, RerankResult};
 #[cfg(feature = "arch-lfm2moe")]
 use hipfire_serving_core::lfm2_prefill;
 use hipfire_serving_core::{
@@ -79,7 +79,7 @@ use hipfire_serving_core::{
 #[cfg(feature = "arch-lfm2moe")]
 use lfm2_prefill::*;
 use load::*;
-use model::{CaskConfig, LoadedModel, RAW_OVERRIDE};
+use model::{CaskConfig, EmbeddingGemmaState, LoadedModel, RAW_OVERRIDE};
 use output_filter::{normalize_daemon_prompt, normalize_request_stop_sequences};
 use qwen35_decode::*;
 use qwen35_prefill::*;
@@ -107,6 +107,117 @@ fn emit_load_progress(current: u32, total: u32, phase: &str) {
         r#"{{"type":"load_progress","current":{current},"total":{total},"phase":"{phase}"}}"#
     );
     let _ = out.flush();
+}
+
+fn embeddinggemma_parts<'a>(
+    m: &'a LoadedModel,
+    op: &str,
+) -> Result<
+    (
+        &'a EmbeddingGemmaState,
+        &'a hipfire_model::tokenizer::Tokenizer,
+    ),
+    String,
+> {
+    let state = m.embeddinggemma.as_ref().ok_or_else(|| {
+        format!(
+            "{op}: loaded model is arch_id={}, expected embeddinggemma arch_id=19",
+            m.arch_id
+        )
+    })?;
+    let tokenizer = m
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| format!("{op}: loaded embeddinggemma model has no tokenizer"))?;
+    Ok((state, tokenizer))
+}
+
+fn embeddinggemma_encode_prefixed(
+    gpu: &mut hipfire_rdna::Gpu,
+    state: &EmbeddingGemmaState,
+    tokenizer: &hipfire_model::tokenizer::Tokenizer,
+    texts: &[String],
+    prefix: &str,
+    dims: Option<usize>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let tokenized = texts
+        .iter()
+        .map(|text| {
+            if prefix.is_empty() {
+                tokenizer.encode(text)
+            } else {
+                tokenizer.encode(&format!("{prefix}{text}"))
+            }
+        })
+        .collect::<Vec<_>>();
+    let dims = state.config.resolve_dims(dims);
+    hipfire_serving_core::pooling::embed_batch_embeddinggemma(
+        gpu,
+        &state.weights,
+        &state.config,
+        &tokenized,
+        dims,
+    )
+}
+
+fn embeddinggemma_embed(
+    gpu: &mut hipfire_rdna::Gpu,
+    m: &LoadedModel,
+    texts: &[String],
+    dims: Option<usize>,
+) -> Result<Vec<EmbeddingVector>, String> {
+    let (state, tokenizer) = embeddinggemma_parts(m, "embed")?;
+    let embeddings = embeddinggemma_encode_prefixed(
+        gpu,
+        state,
+        tokenizer,
+        texts,
+        &state.config.document_prompt,
+        dims,
+    )?;
+    Ok(embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| EmbeddingVector { index, embedding })
+        .collect())
+}
+
+fn embeddinggemma_rerank(
+    gpu: &mut hipfire_rdna::Gpu,
+    m: &LoadedModel,
+    query: &str,
+    documents: &[String],
+) -> Result<Vec<RerankResult>, String> {
+    let (state, tokenizer) = embeddinggemma_parts(m, "rerank")?;
+    let query_texts = vec![query.to_string()];
+    let query_embedding = embeddinggemma_encode_prefixed(
+        gpu,
+        state,
+        tokenizer,
+        &query_texts,
+        &state.config.query_prompt,
+        None,
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| "rerank: query produced no embedding".to_string())?;
+    let doc_embeddings = embeddinggemma_encode_prefixed(
+        gpu,
+        state,
+        tokenizer,
+        documents,
+        &state.config.document_prompt,
+        None,
+    )?;
+    Ok(
+        hipfire_serving_core::pooling::rank_by_cosine(&query_embedding, &doc_embeddings)
+            .into_iter()
+            .map(|(index, relevance_score)| RerankResult {
+                index,
+                relevance_score,
+            })
+            .collect(),
+    )
 }
 
 fn json_u64(meta: &serde_json::Value, key: &str) -> std::io::Result<u64> {
@@ -3140,6 +3251,7 @@ fn main() {
                             14 => "nemotron_h",
                             15 => "mamba2",
                             16 => "zaya",
+                            ARCH_ID_EMBEDDINGGEMMA => "embeddinggemma",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some()
@@ -3150,6 +3262,12 @@ fn main() {
                                 b.text_cfg.hidden_size,
                                 b.text_cfg.num_hidden_layers,
                                 b.text_cfg.vocab_size,
+                            )
+                        } else if let Some(ref e) = m.embeddinggemma {
+                            (
+                                e.config.max_output_dim(),
+                                e.config.num_hidden_layers,
+                                e.config.vocab_size,
                             )
                         } else if let Some(ref b) = m.gemma3_text {
                             (
@@ -3422,6 +3540,112 @@ fn main() {
                     }
                 }
                 let _ = stdout.flush();
+            }
+
+            DaemonRequest::Embed(req) => {
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let target_worker_id = message_worker_id(&msg);
+                if dummy_model.is_some() {
+                    emit_error_with_id(
+                        &mut stdout,
+                        id,
+                        "embed is not supported for the dummy model",
+                    );
+                    continue;
+                }
+                match activate_model_worker(
+                    &target_worker_id,
+                    &mut active_worker_id,
+                    &mut model,
+                    &mut gpu,
+                    &mut resident_models,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            id,
+                            format!("unknown model worker {target_worker_id}"),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, id, format!("worker switch failed: {e}"));
+                        continue;
+                    }
+                }
+                let Some(m) = model.as_ref() else {
+                    emit_error_with_id(&mut stdout, id, "no model loaded");
+                    continue;
+                };
+                match embeddinggemma_embed(&mut gpu, m, &req.texts, req.dims) {
+                    Ok(embeddings) => {
+                        let _ = serde_json::to_writer(
+                            &mut stdout,
+                            &serde_json::json!({
+                                "type": "embeddings",
+                                "id": id,
+                                "embeddings": embeddings,
+                            }),
+                        );
+                        let _ = writeln!(stdout);
+                        let _ = stdout.flush();
+                    }
+                    Err(e) => emit_error_with_id(&mut stdout, id, e),
+                }
+            }
+
+            DaemonRequest::Rerank(req) => {
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let target_worker_id = message_worker_id(&msg);
+                if dummy_model.is_some() {
+                    emit_error_with_id(
+                        &mut stdout,
+                        id,
+                        "rerank is not supported for the dummy model",
+                    );
+                    continue;
+                }
+                match activate_model_worker(
+                    &target_worker_id,
+                    &mut active_worker_id,
+                    &mut model,
+                    &mut gpu,
+                    &mut resident_models,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            id,
+                            format!("unknown model worker {target_worker_id}"),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, id, format!("worker switch failed: {e}"));
+                        continue;
+                    }
+                }
+                let Some(m) = model.as_ref() else {
+                    emit_error_with_id(&mut stdout, id, "no model loaded");
+                    continue;
+                };
+                match embeddinggemma_rerank(&mut gpu, m, &req.query, &req.documents) {
+                    Ok(results) => {
+                        let _ = serde_json::to_writer(
+                            &mut stdout,
+                            &serde_json::json!({
+                                "type": "rerank_scores",
+                                "id": id,
+                                "results": results,
+                            }),
+                        );
+                        let _ = writeln!(stdout);
+                        let _ = stdout.flush();
+                    }
+                    Err(e) => emit_error_with_id(&mut stdout, id, e),
+                }
             }
 
             DaemonRequest::Generate(_) => {
