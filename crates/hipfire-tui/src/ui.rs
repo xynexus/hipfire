@@ -721,9 +721,9 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         "Advanced settings"
     };
     let note = if app.settings_easy {
-        "Read-only prototype. Press a for advanced."
+        "Left/Right cycle, Enter apply model, Del unset, a advanced."
     } else {
-        "Raw config view. Press e for easy."
+        "All schema rows. Left/Right cycle bool/enum, Del unset, e easy."
     };
     frame.render_widget(
         Paragraph::new(format!("{mode}    {note}"))
@@ -745,13 +745,11 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             .skip(start)
             .take(visible_rows(chunks[1].height, 3))
             .map(|(idx, (label, value, desc))| {
-                Row::new([label.to_string(), value, desc.to_string()]).style(
-                    if idx == app.settings_selected {
-                        Style::default().fg(ACCENT).bg(PANEL_2)
-                    } else {
-                        Style::default().fg(TEXT).bg(PANEL)
-                    },
-                )
+                Row::new([label, value, desc]).style(if idx == app.settings_selected {
+                    Style::default().fg(ACCENT).bg(PANEL_2)
+                } else {
+                    Style::default().fg(TEXT).bg(PANEL)
+                })
             })
             .collect::<Vec<_>>();
         frame.render_widget(
@@ -763,20 +761,36 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
                     Constraint::Min(30),
                 ],
             )
-            .header(Row::new(["Setting", "Value", "Meaning"]).style(Style::default().fg(MUTED)))
+            .header(Row::new(["Setting", "Local", "Meaning"]).style(Style::default().fg(MUTED)))
             .block(block("User-safe controls"))
             .style(Style::default().fg(TEXT).bg(PANEL)),
             chunks[1],
         );
     } else {
-        let rows_all = app.config.values.iter().enumerate().collect::<Vec<_>>();
+        let rows_all = app
+            .config
+            .advanced_rows()
+            .iter()
+            .enumerate()
+            .collect::<Vec<_>>();
         let start = scroll_start(app.settings_selected, chunks[1].height, 3);
         let rows = rows_all
             .into_iter()
             .skip(start)
             .take(visible_rows(chunks[1].height, 3))
-            .map(|(idx, (k, v))| {
-                Row::new([k.clone(), v.clone()]).style(if idx == app.settings_selected {
+            .map(|(idx, row)| {
+                let impact = if row.pending {
+                    format!("{}; active {}", row.impact, row.active_value)
+                } else {
+                    row.impact.clone()
+                };
+                Row::new([
+                    row.label.clone(),
+                    row.value.clone(),
+                    row.active_value.clone(),
+                    impact,
+                ])
+                .style(if idx == app.settings_selected {
                     Style::default().fg(ACCENT).bg(PANEL_2)
                 } else {
                     Style::default().fg(TEXT).bg(PANEL)
@@ -784,10 +798,20 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             })
             .collect::<Vec<_>>();
         frame.render_widget(
-            Table::new(rows, [Constraint::Length(28), Constraint::Min(20)])
-                .header(Row::new(["Key", "Value"]).style(Style::default().fg(MUTED)))
-                .block(block("Advanced config.json view"))
-                .style(Style::default().fg(TEXT).bg(PANEL)),
+            Table::new(
+                rows,
+                [
+                    Constraint::Length(28),
+                    Constraint::Length(20),
+                    Constraint::Length(20),
+                    Constraint::Min(20),
+                ],
+            )
+            .header(
+                Row::new(["Key", "Local", "Active", "Applies"]).style(Style::default().fg(MUTED)),
+            )
+            .block(block("Advanced schema view"))
+            .style(Style::default().fg(TEXT).bg(PANEL)),
             chunks[1],
         );
     }
