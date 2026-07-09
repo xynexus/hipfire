@@ -61,13 +61,13 @@
 
 use crate::qwen35::Qwen35Weights;
 use hip_bridge::{DeviceBuffer, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{
     self, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for, rotate_x_mq_for,
     weight_gemv, EmbeddingFormat, WeightTensor,
 };
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
 // ─── Config ──────────────────────────────────────────────────────────────

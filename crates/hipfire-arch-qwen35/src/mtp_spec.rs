@@ -41,8 +41,8 @@ use hipfire_runtime::multi_gpu::Gpus;
 // MERGE-COMBINE: union of OUR EmbeddingFormat (hetero drafter embed) + #352
 // Event/Graph/GraphExec/Stream (proposal-graph device-token-chain helpers).
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
-use hipfire_runtime::weights::{self, EmbeddingFormat};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::weights::{self, EmbeddingFormat};
 use std::time::Instant;
 
 // ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────

@@ -57,9 +57,9 @@ use crate::speculative::{
     VerifyScratch,
 };
 use hip_bridge::HipResult;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::weights;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 // ─── Public state ────────────────────────────────────────────────────────
 

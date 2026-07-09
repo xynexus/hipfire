@@ -18,10 +18,10 @@
 
 use hip_bridge::HipResult;
 use hipfire_model::tokenizer::Tokenizer;
+use hipfire_rdna::{DType, Gpu};
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
-use hipfire_rdna::{DType, Gpu};
 use std::path::Path;
 
 #[cfg(feature = "deltanet")]
