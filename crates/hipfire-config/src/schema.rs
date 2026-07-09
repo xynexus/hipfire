@@ -7,7 +7,7 @@
 
 use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigScope {
     Global,
@@ -21,7 +21,7 @@ pub enum ConfigScope {
     Request,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigMutability {
     Static,
@@ -30,7 +30,7 @@ pub enum ConfigMutability {
     RequestOnly,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartImpact {
     None,
@@ -40,7 +40,7 @@ pub enum RestartImpact {
     ReconnectClients,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigType {
     Bool,
@@ -55,7 +55,7 @@ pub enum ConfigType {
     Json,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "condition", rename_all = "snake_case")]
 pub enum Requirement {
     Optional,

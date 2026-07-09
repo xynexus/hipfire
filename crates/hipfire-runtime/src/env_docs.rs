@@ -104,13 +104,6 @@ pub const ENV_CARGO_PKG_VERSION: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-build-info/build.rs:24",
 };
 
-/// `COLORTERM` — Runtime variable controlling colorterm in hipfire
-pub const ENV_COLORTERM: EnvVarDoc = EnvVarDoc {
-    name: "COLORTERM",
-    description: "Runtime variable controlling colorterm in hipfire",
-    source: "crates/hipfire-system-monitor/src/lib.rs:316",
-};
-
 /// `DDTREE_TIMING` — pre_verify / verify. The draft and top-K are fused into one GPU-
 pub const ENV_DDTREE_TIMING: EnvVarDoc = EnvVarDoc {
     name: "DDTREE_TIMING",
@@ -185,7 +178,7 @@ pub const ENV_HFQ_TEST_ZP_MAX: EnvVarDoc = EnvVarDoc {
 pub const ENV_HF_HOME: EnvVarDoc = EnvVarDoc {
     name: "HF_HOME",
     description: "Runtime variable controlling hf home in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:4303",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:4314",
 };
 
 /// `HIPFIRE_ADAPTIVE_B_DOWN` — Runtime variable controlling adaptive b down in hipfire
@@ -283,14 +276,14 @@ pub const ENV_HIPFIRE_BATCHES_STATE_MAX: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_BENCH_QWEN35_SPEED_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BENCH_QWEN35_SPEED_BIN",
     description: "Runtime variable controlling bench qwen35 speed bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1162",
+    source: "crates/hipfire-eval/src/lib.rs:1170",
 };
 
 /// `HIPFIRE_BF16_DENSE_M128` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_BF16_DENSE_M128: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16_DENSE_M128",
     description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-rdna/src/dispatch/gemm_base.rs:870",
+    source: "crates/hipfire-rdna/src/dispatch/gemm_base.rs:955",
 };
 
 /// `HIPFIRE_BF16_MOE_M256` — Enabled when set to 1
@@ -360,7 +353,7 @@ pub const ENV_HIPFIRE_CHAT_TEMPLATE_FILE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_COLLECT_ARTIFACTS_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_COLLECT_ARTIFACTS_BIN",
     description: "Runtime variable controlling collect artifacts bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1209",
+    source: "crates/hipfire-eval/src/lib.rs:1217",
 };
 
 /// `HIPFIRE_COMP_DUMP` — Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each
@@ -381,7 +374,7 @@ pub const ENV_HIPFIRE_CONV1D_TREE_GFX1151: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DAEMON_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_BIN",
     description: "Runtime variable controlling daemon bin in hipfire",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1262",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1281",
 };
 
 /// `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` — Runtime variable controlling daemon resident state budget mb in hipfire
@@ -395,7 +388,7 @@ pub const ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DDTREE_BUDGET: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_BUDGET",
     description: "Runtime variable controlling DDTree budget in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:3463",
+    source: "crates/hipfire-serving-core/src/load.rs:3590",
 };
 
 /// `HIPFIRE_DDTREE_FORCE_SLOW` — HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when
@@ -451,7 +444,7 @@ pub const ENV_HIPFIRE_DDTREE_TAPE_DUMP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DDTREE_TOPK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_TOPK",
     description: "Runtime variable controlling DDTree topk in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:3535",
+    source: "crates/hipfire-serving-core/src/load.rs:3662",
 };
 
 /// `HIPFIRE_DDTREE_TREE_LA` — Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected
@@ -766,7 +759,7 @@ pub const ENV_HIPFIRE_DEEPSEEK4_POST_SCALE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_PP_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_PP_BATCH",
     description: "on 2026-05-26). PP_BATCH sweep on the 2.1k-tok bench (3 trials/cell):",
-    source: "crates/hipfire-serving-core/src/load.rs:1310",
+    source: "crates/hipfire-serving-core/src/load.rs:1424",
 };
 
 /// `HIPFIRE_DEEPSEEK4_Q8_4W` — Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis
@@ -844,6 +837,27 @@ pub const ENV_HIPFIRE_DEEPSEEK4_WO_Q8_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_WO_Q8_WMMA",
     description: "Runtime variable controlling deepseek4 wo Q8 wmma in hipfire",
     source: "crates/hipfire-rdna/src/dispatch/deepseek4.rs:2864",
+};
+
+/// `HIPFIRE_DEFERRED_ALLOW_COMMANDS` — Runtime variable controlling deferred allow commands in hipfire
+pub const ENV_HIPFIRE_DEFERRED_ALLOW_COMMANDS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DEFERRED_ALLOW_COMMANDS",
+    description: "Runtime variable controlling deferred allow commands in hipfire",
+    source: "crates/hipfire-server/src/deferred_jobs.rs:748",
+};
+
+/// `HIPFIRE_DEFERRED_JOBS` — Runtime variable controlling deferred jobs in hipfire
+pub const ENV_HIPFIRE_DEFERRED_JOBS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DEFERRED_JOBS",
+    description: "Runtime variable controlling deferred jobs in hipfire",
+    source: "crates/hipfire-server/src/deferred_jobs.rs:737",
+};
+
+/// `HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES` — Parses "HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES" with fallback defaults
+pub const ENV_HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES",
+    description: "Parses \"HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES\" with fallback defaults",
+    source: "crates/hipfire-server/src/deferred_jobs.rs:729",
 };
 
 /// `HIPFIRE_DELTANET_STATE` — Interprets "HIPFIRE_DELTANET_STATE" from environment to select behavior
@@ -1032,7 +1046,7 @@ pub const ENV_HIPFIRE_DFLASH_SERIAL_TAPE_X_IN_COMPARE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DFLASH_SPEC_DEMO_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_SPEC_DEMO_BIN",
     description: "Runtime variable controlling dflash spec demo bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1147",
+    source: "crates/hipfire-eval/src/lib.rs:1155",
 };
 
 /// `HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN` — Runtime variable controlling dflash trace expected token in hipfire
@@ -1194,7 +1208,7 @@ pub const ENV_HIPFIRE_DRAFT_SUBPHASE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DSPARK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DSPARK",
     description: "Disabled when set to 0",
-    source: "crates/hipfire-serving-core/src/load.rs:3302",
+    source: "crates/hipfire-serving-core/src/load.rs:3429",
 };
 
 /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` — Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today)
@@ -1215,7 +1229,7 @@ pub const ENV_HIPFIRE_DSPARK_HFQ4_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DSPARK_PROFILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DSPARK_PROFILE",
     description: "Runtime variable controlling dspark profile in hipfire",
-    source: "crates/hipfire-train/src/dspark_train.rs:735",
+    source: "crates/hipfire-train/src/dspark_train.rs:785",
 };
 
 /// `HIPFIRE_DSPARK_Q8_4W` — Environment toggle value controls runtime behavior
@@ -1411,28 +1425,28 @@ pub const ENV_HIPFIRE_EVAL_EVIDENCE_DIR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EVAL_KLDREF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_KLDREF",
     description: "Runtime variable controlling eval kldref in hipfire",
-    source: "crates/hipfire-eval/src/executor_examples.rs:678",
+    source: "crates/hipfire-eval/src/executor_examples.rs:809",
 };
 
 /// `HIPFIRE_EVAL_PERPLEXITY_CORPUS` — Runtime variable controlling eval perplexity corpus in hipfire
 pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CORPUS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_PERPLEXITY_CORPUS",
     description: "Runtime variable controlling eval perplexity corpus in hipfire",
-    source: "crates/hipfire-eval/src/run.rs:175",
+    source: "crates/hipfire-eval/src/run.rs:168",
 };
 
 /// `HIPFIRE_EVAL_PERPLEXITY_CTX` — Parses "HIPFIRE_EVAL_PERPLEXITY_CTX" with fallback defaults
 pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CTX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_PERPLEXITY_CTX",
     description: "Parses \"HIPFIRE_EVAL_PERPLEXITY_CTX\" with fallback defaults",
-    source: "crates/hipfire-eval/src/executor_examples.rs:764",
+    source: "crates/hipfire-eval/src/executor_examples.rs:895",
 };
 
 /// `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` — cache so the model "sees" them as part of its own trajectory,
 pub const ENV_HIPFIRE_EXPERIMENTAL_BUDGET_ALERT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EXPERIMENTAL_BUDGET_ALERT",
     description: "cache so the model \"sees\" them as part of its own trajectory,",
-    source: "crates/hipfire-daemon/src/main.rs:3778",
+    source: "crates/hipfire-daemon/src/main.rs:4002",
 };
 
 /// `HIPFIRE_FILES_STATE_MAX` — Parses "HIPFIRE_FILES_STATE_MAX" with fallback defaults
@@ -1614,7 +1628,7 @@ pub const ENV_HIPFIRE_GPTQ_DAMPING: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GPU_SLAB_LOAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_SLAB_LOAD",
     description: "Runtime variable controlling gpu slab load in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:3601",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:3636",
 };
 
 /// `HIPFIRE_GPU_SLAB_MIB` — Parses "HIPFIRE_GPU_SLAB_MIB" with fallback defaults
@@ -1768,7 +1782,7 @@ pub const ENV_HIPFIRE_HIP_WAIT: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_HOST_PROFILE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HOST_PROFILE_BIN",
     description: "Runtime variable controlling host profile bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1239",
+    source: "crates/hipfire-eval/src/lib.rs:1247",
 };
 
 /// `HIPFIRE_HOST_TIMING` — HIPFIRE_HOST_TIMING=1: dump per-cycle host-side wall-clock breakdown
@@ -1966,14 +1980,14 @@ pub const ENV_HIPFIRE_KV_MIGRATE_BATCH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KV_MODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_MODE",
     description: "Runtime variable controlling KV mode in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:2697",
+    source: "crates/hipfire-serving-core/src/load.rs:2819",
 };
 
 /// `HIPFIRE_KV_PHYSICAL_CAP` — Parses "HIPFIRE_KV_PHYSICAL_CAP" with fallback defaults
 pub const ENV_HIPFIRE_KV_PHYSICAL_CAP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_PHYSICAL_CAP",
     description: "Parses \"HIPFIRE_KV_PHYSICAL_CAP\" with fallback defaults",
-    source: "crates/hipfire-serving-core/src/load.rs:646",
+    source: "crates/hipfire-serving-core/src/load.rs:649",
 };
 
 /// `HIPFIRE_KV_POS_LOCAL` — Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,
@@ -1994,7 +2008,7 @@ pub const ENV_HIPFIRE_LFM2_CAPTURE_POSTMIXER: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_LFM2_DFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LFM2_DFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-serving-core/src/load.rs:513",
+    source: "crates/hipfire-serving-core/src/load.rs:516",
 };
 
 /// `HIPFIRE_LFM2_DFLASH_F16` — Enabled when set to 1
@@ -2108,7 +2122,7 @@ pub const ENV_HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE",
     description:
         "Interprets \"HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE\" from environment to select behavior",
-    source: "crates/hipfire-serving-core/src/load.rs:332",
+    source: "crates/hipfire-serving-core/src/load.rs:335",
 };
 
 /// `HIPFIRE_MEMCPY_DUMP` — Enabled when set to 1
@@ -2199,7 +2213,7 @@ pub const ENV_HIPFIRE_MMQ_SCREEN_THRESHOLD: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_MODELS_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MODELS_DIR",
     description: "Runtime variable controlling models dir in hipfire",
-    source: "crates/hipfire-eval/src/run.rs:416",
+    source: "crates/hipfire-eval/src/lib.rs:58",
 };
 
 /// `HIPFIRE_MOE_GROUPED_GEMM` — Runtime variable controlling moe grouped gemm in hipfire
@@ -2647,21 +2661,21 @@ pub const ENV_HIPFIRE_PARO_SWIGLU_FUSED: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PERF_BASELINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERF_BASELINE",
     description: "Runtime variable controlling perf baseline in hipfire",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1325",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1456",
 };
 
 /// `HIPFIRE_PERF_BASELINE_DIR` — Runtime variable controlling perf baseline dir in hipfire
 pub const ENV_HIPFIRE_PERF_BASELINE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERF_BASELINE_DIR",
     description: "Runtime variable controlling perf baseline dir in hipfire",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1338",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1469",
 };
 
 /// `HIPFIRE_PERPLEXITY_BIN` — Runtime variable controlling perplexity bin in hipfire
 pub const ENV_HIPFIRE_PERPLEXITY_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERPLEXITY_BIN",
     description: "Runtime variable controlling perplexity bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1224",
+    source: "crates/hipfire-eval/src/lib.rs:1232",
 };
 
 /// `HIPFIRE_PFLASH_DAEMON_LABELS` — Runtime variable controlling pflash daemon labels in hipfire
@@ -2703,7 +2717,7 @@ pub const ENV_HIPFIRE_PFLASH_FRESH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PFLASH_NIAH_BENCH_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_NIAH_BENCH_BIN",
     description: "Runtime variable controlling pflash niah bench bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1179",
+    source: "crates/hipfire-eval/src/lib.rs:1187",
 };
 
 /// `HIPFIRE_PFLASH_REPORT_TRAIN` — Runtime variable controlling pflash report train in hipfire
@@ -2724,14 +2738,14 @@ pub const ENV_HIPFIRE_PFLASH_SCORE_LAYER: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PP_DFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_DFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-daemon/src/main.rs:3069",
+    source: "crates/hipfire-daemon/src/main.rs:3180",
 };
 
 /// `HIPFIRE_PP_LAYERS` — Runtime variable controlling pp layers in hipfire
 pub const ENV_HIPFIRE_PP_LAYERS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_LAYERS",
     description: "Runtime variable controlling pp layers in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:2749",
+    source: "crates/hipfire-serving-core/src/load.rs:2871",
 };
 
 /// `HIPFIRE_PP_PARITY_MODEL` — Runtime variable controlling pp parity model in hipfire
@@ -2745,7 +2759,7 @@ pub const ENV_HIPFIRE_PP_PARITY_MODEL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PP_PFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_PFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-daemon/src/main.rs:3087",
+    source: "crates/hipfire-daemon/src/main.rs:3198",
 };
 
 /// `HIPFIRE_PREFILL_ALPHA` — Runtime variable controlling prefill alpha in hipfire
@@ -3147,7 +3161,7 @@ pub const ENV_HIPFIRE_QWEN35_EXPERT_CACHE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_EXPERT_CACHE_TRACE",
     description:
         "Interprets \"HIPFIRE_QWEN35_EXPERT_CACHE_TRACE\" from environment to select behavior",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:3872",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/loading.rs:3907",
 };
 
 /// `HIPFIRE_QWEN35_FFN_BF16` — Selects behavior from recognized values
@@ -3231,7 +3245,7 @@ pub const ENV_HIPFIRE_QWEN35_XDNA1_XCLBIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD",
     description: "conf_threshold ladder: env > 0.1 default (source's sweep-tuned default)",
-    source: "crates/hipfire-serving-core/src/load.rs:3365",
+    source: "crates/hipfire-serving-core/src/load.rs:3492",
 };
 
 /// `HIPFIRE_RDNA2_VARIANT` — Runtime variable controlling rdna2 variant in hipfire
@@ -3266,14 +3280,14 @@ pub const ENV_HIPFIRE_REPLAY_GRAPH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RESOURCE_LOCK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK",
     description: "HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1115",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1134",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_CPU_CORES` — HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores
 pub const ENV_HIPFIRE_RESOURCE_LOCK_CPU_CORES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_CPU_CORES",
     description: "HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1000",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1019",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_DIR` — HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory
@@ -3288,7 +3302,7 @@ pub const ENV_HIPFIRE_RESOURCE_LOCK_NPUS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_NPUS",
     description:
         "HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:965",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:984",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_WAIT_MS` — HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup
@@ -3296,7 +3310,7 @@ pub const ENV_HIPFIRE_RESOURCE_LOCK_WAIT_MS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_WAIT_MS",
     description:
         "HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1133",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1152",
 };
 
 /// `HIPFIRE_RESPONSES_STATE_MAX` — Runtime variable controlling responses state max in hipfire
@@ -3513,7 +3527,7 @@ pub const ENV_HIPFIRE_RQ_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RUN_EXAMPLE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RUN_EXAMPLE_BIN",
     description: "Runtime variable controlling run example bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1194",
+    source: "crates/hipfire-eval/src/lib.rs:1202",
 };
 
 /// `HIPFIRE_SAMPLE_COMPARE` — Enabled when set to 1
@@ -3639,7 +3653,7 @@ pub const ENV_HIPFIRE_TINY_QUANT_PROBE_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TINY_SD_HFQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TINY_SD_HFQ",
     description: "Runtime variable controlling tiny sd hfq in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:4478",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:4489",
 };
 
 /// `HIPFIRE_TP_BENCH_ITERS` — Runtime variable controlling tp bench iters in hipfire
@@ -3674,7 +3688,21 @@ pub const ENV_HIPFIRE_TP_USE_RCCL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TRAIN_BWD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TRAIN_BWD",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-train/src/ops/linear.rs:139",
+    source: "crates/hipfire-train/src/ops/linear.rs:140",
+};
+
+/// `HIPFIRE_TRAIN_GRAD_CLIP` — Runtime variable controlling train grad clip in hipfire
+pub const ENV_HIPFIRE_TRAIN_GRAD_CLIP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_TRAIN_GRAD_CLIP",
+    description: "Runtime variable controlling train grad clip in hipfire",
+    source: "crates/hipfire-train/src/dspark_train.rs:476",
+};
+
+/// `HIPFIRE_TRAIN_GRAD_LOG` — Runtime variable controlling train grad log in hipfire
+pub const ENV_HIPFIRE_TRAIN_GRAD_LOG: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_TRAIN_GRAD_LOG",
+    description: "Runtime variable controlling train grad log in hipfire",
+    source: "crates/hipfire-train/src/optim.rs:87",
 };
 
 /// `HIPFIRE_TRAIN_HEADS` — Selects behavior from recognized values
@@ -3823,7 +3851,7 @@ pub const ENV_HIP_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "HIP_VISIBLE_DEVICES",
     description:
         "Used to configure runtime execution by explicitly setting \"HIP_VISIBLE_DEVICES\"",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1544",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1576",
 };
 
 /// `HOME` — Runtime variable controlling home in hipfire
@@ -3844,7 +3872,7 @@ pub const ENV_HOSTNAME: EnvVarDoc = EnvVarDoc {
 pub const ENV_HUGGINGFACE_HUB_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HUGGINGFACE_HUB_CACHE",
     description: "Runtime variable controlling huggingface hub cache in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:4306",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:4317",
 };
 
 /// `MAX_TOKENS` — Parses "MAX_TOKENS" with fallback defaults
@@ -3880,13 +3908,6 @@ pub const ENV_NEMO_TOKENS: EnvVarDoc = EnvVarDoc {
     name: "NEMO_TOKENS",
     description: "Selects behavior from recognized values",
     source: "crates/hipfire-arch-nemotron/examples/test_load_nano30b_hfq.rs:45",
-};
-
-/// `NO_COLOR` — Runtime variable controlling no color in hipfire
-pub const ENV_NO_COLOR: EnvVarDoc = EnvVarDoc {
-    name: "NO_COLOR",
-    description: "Runtime variable controlling no color in hipfire",
-    source: "crates/hipfire-system-monitor/src/lib.rs:315",
 };
 
 /// `NO_NGRAM` — Disabled for perf measurement — re-enable after implementing GPU n-gram kernel
@@ -3935,14 +3956,7 @@ pub const ENV_ROCM_PATH: EnvVarDoc = EnvVarDoc {
 pub const ENV_ROCR_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "ROCR_VISIBLE_DEVICES",
     description: "Runtime variable controlling rocr visible devices in hipfire",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:924",
-};
-
-/// `TERM` — Runtime variable controlling term in hipfire
-pub const ENV_TERM: EnvVarDoc = EnvVarDoc {
-    name: "TERM",
-    description: "Runtime variable controlling term in hipfire",
-    source: "crates/hipfire-system-monitor/src/lib.rs:317",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:943",
 };
 
 /// `TRIALS` — Runtime variable controlling trials in hipfire
@@ -3980,7 +3994,6 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_CARGO_FEATURE_NPU_KERNELS,
     ENV_CARGO_MANIFEST_DIR,
     ENV_CARGO_PKG_VERSION,
-    ENV_COLORTERM,
     ENV_DDTREE_TIMING,
     ENV_DEBUG_LAYERS,
     ENV_DFLASH_LIVE_TAU,
@@ -4086,6 +4099,9 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS,
     ENV_HIPFIRE_DEEPSEEK4_WO_MULTIROW,
     ENV_HIPFIRE_DEEPSEEK4_WO_Q8_WMMA,
+    ENV_HIPFIRE_DEFERRED_ALLOW_COMMANDS,
+    ENV_HIPFIRE_DEFERRED_JOBS,
+    ENV_HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES,
     ENV_HIPFIRE_DELTANET_STATE,
     ENV_HIPFIRE_DETERMINISTIC,
     ENV_HIPFIRE_DEVICES,
@@ -4488,6 +4504,8 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_TP_EXPERT_ASSIGN,
     ENV_HIPFIRE_TP_USE_RCCL,
     ENV_HIPFIRE_TRAIN_BWD,
+    ENV_HIPFIRE_TRAIN_GRAD_CLIP,
+    ENV_HIPFIRE_TRAIN_GRAD_LOG,
     ENV_HIPFIRE_TRAIN_HEADS,
     ENV_HIPFIRE_TRAIN_LOWP,
     ENV_HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB,
@@ -4517,7 +4535,6 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_NANO30B_DIR,
     ENV_NANO4B_DIR,
     ENV_NEMO_TOKENS,
-    ENV_NO_COLOR,
     ENV_NO_NGRAM,
     ENV_PATH,
     ENV_PROMPT_MODE,
@@ -4525,7 +4542,6 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_ROCM_DEVICE_LIB_PATH,
     ENV_ROCM_PATH,
     ENV_ROCR_VISIBLE_DEVICES,
-    ENV_TERM,
     ENV_TRIALS,
     ENV_USERPROFILE,
     ENV_USE_SAMPLE,
