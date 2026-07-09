@@ -344,10 +344,6 @@ impl DiffusionSchedule {
         })
     }
 
-    pub(crate) fn flow_match_euler(config: &SchedulerConfig, steps: u32) -> DiffusionResult<Self> {
-        Self::flow_match_euler_with_image_seq_len(config, steps, None)
-    }
-
     /// FlowMatchEuler schedule. When `use_dynamic_shifting` is set, the shift is
     /// resolution-dependent: `mu` is interpolated between `base_shift`/`max_shift`
     /// over `[base_image_seq_len, max_image_seq_len]` and applied as an
@@ -481,7 +477,11 @@ impl DiffusionSchedule {
                 .collect::<Vec<f32>>();
             let last = *shifted_vals.last().unwrap();
             let span = shifted_vals[0] - last;
-            let span = if span.abs() <= f32::EPSILON { 1.0 } else { span };
+            let span = if span.abs() <= f32::EPSILON {
+                1.0
+            } else {
+                span
+            };
             for value in &mut shifted_vals {
                 *value = (*value - last) / span * first_sigma;
             }
@@ -1366,7 +1366,7 @@ mod flow_match_dynamic_tests {
     fn flow_match_static_shift_one_is_linear() {
         let mut config = dynamic_config();
         config.use_dynamic_shifting = Some(false);
-        let sched = DiffusionSchedule::flow_match_euler(&config, 3).unwrap();
+        let sched = DiffusionSchedule::from_config(&config, 3).unwrap();
         // shift 1.0, no dynamic shifting -> sigma == frac (linear schedule). The
         // ramp is linspace(1, 1/num_train, 3), so the mid frac is 1-0.5*(1-1/1000).
         let mid = 1.0 - 0.5 * (1.0 - 1.0 / 1000.0);
