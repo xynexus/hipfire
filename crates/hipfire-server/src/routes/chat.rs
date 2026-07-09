@@ -1,4 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -635,10 +635,47 @@ async fn plan_residency_for_load(
                 estimated_full.vram_bytes
             },
         });
-    let resident_workers = state
-        .loaded_models
-        .lock()
-        .await
+    let resident_workers = resident_workers_for_planning(state).await;
+    plan_model_residency(
+        budget,
+        ModelResidencyRequest {
+            worker_key_id: worker_key_id.to_string(),
+            model_path: model_path.to_string(),
+            requested_mode,
+            estimated_full,
+            estimated_qwen_moe_modules,
+        },
+        &resident_workers,
+    )
+}
+
+async fn resident_workers_for_planning(state: &SharedState) -> Vec<ResidentWorkerLedgerEntry> {
+    let loaded_models = state.loaded_models.lock().await.clone();
+    let daemon_status = {
+        let mut engine = state.engine.lock().await;
+        match engine.as_mut() {
+            Some(engine) => match engine.resource_status().await {
+                Ok(status) => Some(status),
+                Err(err) => {
+                    tracing::warn!(
+                        "daemon resource_status failed during residency planning; falling back to server ledger: {err}"
+                    );
+                    None
+                }
+            },
+            None => None,
+        }
+    };
+    daemon_status
+        .as_ref()
+        .and_then(|status| resident_workers_from_daemon_resource_status(status, &loaded_models))
+        .unwrap_or_else(|| resident_workers_from_loaded_models(&loaded_models))
+}
+
+fn resident_workers_from_loaded_models(
+    loaded_models: &HashMap<String, LoadedModelState>,
+) -> Vec<ResidentWorkerLedgerEntry> {
+    loaded_models
         .iter()
         .filter_map(|(path, loaded)| {
             Some(ResidentWorkerLedgerEntry {
@@ -652,18 +689,62 @@ async fn plan_residency_for_load(
                 last_used_seq: u64::from(loaded.max_seq),
             })
         })
-        .collect::<Vec<_>>();
-    plan_model_residency(
-        budget,
-        ModelResidencyRequest {
-            worker_key_id: worker_key_id.to_string(),
-            model_path: model_path.to_string(),
-            requested_mode,
-            estimated_full,
-            estimated_qwen_moe_modules,
-        },
-        &resident_workers,
-    )
+        .collect()
+}
+
+fn resident_workers_from_daemon_resource_status(
+    status: &Value,
+    loaded_models: &HashMap<String, LoadedModelState>,
+) -> Option<Vec<ResidentWorkerLedgerEntry>> {
+    let workers = status.get("workers")?.as_array()?;
+    let loaded_by_worker = loaded_models
+        .iter()
+        .filter_map(|(path, loaded)| {
+            Some((
+                loaded.worker_key_id.as_deref()?.to_string(),
+                (path.clone(), u64::from(loaded.max_seq)),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut resident = Vec::with_capacity(workers.len());
+    for (index, worker) in workers.iter().enumerate() {
+        let worker_key_id = worker
+            .get("worker_key_id")
+            .and_then(Value::as_str)?
+            .to_string();
+        let (fallback_path, fallback_seq) = loaded_by_worker
+            .get(&worker_key_id)
+            .cloned()
+            .unwrap_or_else(|| (worker_key_id.clone(), index as u64));
+        let model_path = worker
+            .get("model_path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or(fallback_path);
+        let residency_mode = worker
+            .get("residency_mode")
+            .and_then(Value::as_str)
+            .and_then(ResidencyMode::parse)
+            .unwrap_or(ResidencyMode::Full);
+        resident.push(ResidentWorkerLedgerEntry {
+            worker_key_id,
+            model_path,
+            residency_mode,
+            resource_usage: ResourceUsage {
+                system_memory_bytes: worker
+                    .get("system_memory_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                vram_bytes: worker
+                    .get("vram_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            },
+            last_used_seq: fallback_seq,
+        });
+    }
+    Some(resident)
 }
 
 fn model_file_bytes(model_path: &str) -> u64 {
@@ -3113,6 +3194,74 @@ mod tests {
 
         assert_eq!(plan.residency_mode, ResidencyMode::Full);
         assert_eq!(plan.unload_worker_key_ids, vec!["worker-old"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn daemon_resource_status_builds_authoritative_resident_ledger() {
+        let mut loaded_models = HashMap::new();
+        loaded_models.insert(
+            "/tmp/stale-size.hfq".to_string(),
+            LoadedModelState {
+                worker_key_id: Some("worker-old".to_string()),
+                cache_capable: false,
+                max_seq: 4096,
+            },
+        );
+        let status = json!({
+            "type": "resource_status",
+            "workers": [{
+                "worker_key_id": "worker-old",
+                "model_path": "/tmp/actual.hfq",
+                "residency_mode": "qwen_moe_modules",
+                "system_memory_bytes": 32,
+                "vram_bytes": 256
+            }]
+        });
+
+        let workers =
+            resident_workers_from_daemon_resource_status(&status, &loaded_models).unwrap();
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].worker_key_id, "worker-old");
+        assert_eq!(workers[0].model_path, "/tmp/actual.hfq");
+        assert_eq!(workers[0].residency_mode, ResidencyMode::QwenMoeModules);
+        assert_eq!(
+            workers[0].resource_usage,
+            ResourceUsage {
+                system_memory_bytes: 32,
+                vram_bytes: 256,
+            }
+        );
+        assert_eq!(workers[0].last_used_seq, 4096);
+    }
+
+    #[test]
+    fn server_loaded_models_fallback_builds_resident_ledger_from_file_size() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-server-residency-fallback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let model = root.join("resident.hfq");
+        std::fs::write(&model, vec![0u8; 321]).unwrap();
+        let mut loaded_models = HashMap::new();
+        loaded_models.insert(
+            model.to_string_lossy().into_owned(),
+            LoadedModelState {
+                worker_key_id: Some("worker-resident".to_string()),
+                cache_capable: false,
+                max_seq: 2048,
+            },
+        );
+
+        let workers = resident_workers_from_loaded_models(&loaded_models);
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].worker_key_id, "worker-resident");
+        assert_eq!(workers[0].resource_usage.vram_bytes, 321);
+        assert_eq!(workers[0].last_used_seq, 2048);
         let _ = std::fs::remove_dir_all(&root);
     }
 

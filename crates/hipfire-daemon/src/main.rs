@@ -302,6 +302,7 @@ const VRAM_RESERVATION_CHUNK_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 struct ResidentResourceUsage {
+    model_path: String,
     system_memory_bytes: u64,
     vram_bytes: u64,
     residency_mode: String,
@@ -399,6 +400,7 @@ impl ResourceReservationManager {
             file_bytes
         };
         ResidentResourceUsage {
+            model_path: path.to_string(),
             system_memory_bytes: 0,
             vram_bytes,
             residency_mode,
@@ -495,6 +497,7 @@ impl ResourceReservationManager {
             .map(|(worker_id, usage)| {
                 serde_json::json!({
                     "worker_key_id": worker_id,
+                    "model_path": usage.model_path,
                     "residency_mode": usage.residency_mode,
                     "system_memory_bytes": usage.system_memory_bytes,
                     "vram_bytes": usage.vram_bytes,
