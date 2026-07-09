@@ -56,60 +56,11 @@ bf16+q8-KV on gfx1103 ✅. Quantized-weight models (MQ4/MQ6) unaffected.
   streaming drops the daemon when it detects a closed SSE channel after a
   daemon event. Effective mid-prefill cancellation and force-answer still need
   split write/read transport ownership plus generation-loop checkpoints.
-- Qwen3.5-397B-A17B HFQM v2 paged-expert forced serial prefill can panic when
-  `HIPFIRE_QWEN35_EXPERT_CACHE_MB` is too small for the per-layer routed set;
-  observed with 64 MB as `patch_expert_module_ptr_table: layer=0 expert=9 not
-  resident` after same-layer LRU eviction. `auto` now routes paged K_TOP=10
-  MQ6 models through the grouped-MoE bucket backend instead of this forced
-  serial diagnostic path.
-- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE B=4 suffix replay previously
-  OOMed while paging an expert module with `HIPFIRE_QWEN35_EXPERT_CACHE_MB=16`
-  or 64 when scratch over-reserved rows; keep this covered by live-row scratch
-  sizing tests.
-- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE prefill was reserving the default
-  256-row `PrefillBatchScratch` envelope for much smaller live batches; this
-  reduces expert-paging headroom and should stay live-row-sized unless
-  `HIPFIRE_PREFILL_MAX_BATCH` is explicitly set.
-- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE B=2 suffix replay with 16 tokens
-  per session previously OOMed at `HIPFIRE_QWEN35_EXPERT_CACHE_MB=16` when
-  scratch over-reserved rows; keep this covered by live-row scratch sizing
-  tests.
-- Qwen3.5-397B-A17B HFQM v2 post-prefill AR decode previously used the old
-  per-token paged expert path and could panic or hit the
-  `paged Qwen35-MoE decode requires GPU top-k indexed dispatch` gate; cache128
-  now reaches the indexed MQ6 decode path, but decode batching/orchestration is
-  still not complete.
-- Qwen3.5-397B-A17B HFQM v2 paged AR decode requires enough expert-cache
-  budget to hold the K_TOP routed expert module set for a token; cache16 is too
-  small for K_TOP=10 and should reject before streaming, while cache128 can run
-  the indexed MQ6 decode path.
-- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE smoke matrix exposed a daemon
-  exit when issuing a second independent `generate_batch_prefill` request in
-  the same daemon process after the first batch completed; fresh-process
-  per-case smokes are still needed until repeated prefill lifecycle is audited.
 - Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE fresh-process prefill still fails
   for B=8 with 8 suffix tokens/session: cache16/cache64 report `hipMalloc: out
   of memory` while paging an expert module, and cache128 was SIGKILLed during
   the run. B=4 with 16 suffix tokens/session passes, so session fanout pressure
   needs a separate audit from total live-row scratch sizing.
-- **[CRASH — FIXED] Qwen3.5-397B-A17B load on RDNA3.5 APU caused kernel
-  deadlock requiring hard reboot** (2026-06-11). Root cause: `HfqFile::open`
-  called `mmap.advise(Sequential)` + `posix_fadvise(SEQUENTIAL)`, triggering
-  291 GiB of kernel readahead. The slab loader then opened a second O_DIRECT fd
-  to the same inode; the readahead kworker (`kworker/6:0`) held an inode lock
-  that the O_DIRECT I/Os also needed → deadlock. For 35B (26 GiB) the readahead
-  completes in ~6 s before O_DIRECT starts; for 397B (291 GiB) it ran for ~70 s
-  concurrently. Fixed in `crates/hipfire-runtime/src/hfq.rs`: Sequential advice
-  is skipped for files > 64 GiB, and `drop_mmap()` now calls `FADV_DONTNEED` to
-  cancel any in-flight readahead before the O_DIRECT path starts.
-
-## [High] crates/rdna-compute/src/dispatch.rs is excessively large
-- Category: Maintainability
-- Location: crates/rdna-compute/src/dispatch.rs
-- Summary: The file is ~1.67MB, acting as a massive god-file for kernel dispatching.
-- Suggested fix: Split dispatch logic by architecture or kernel family into smaller files.
-- Scope: Architectural
-- Confidence: High
 
 ## [High] Excessive use of .unwrap() leading to potential panics
 - Category: Reliability / Maintainability
@@ -121,24 +72,16 @@ bf16+q8-KV on gfx1103 ✅. Quantized-weight models (MQ4/MQ6) unaffected.
 
 ## [Medium] Excessive global state via OnceLock and thread_local!
 - Category: Architecture / Maintainability
-- Location: Project-wide (e.g., crates/hipfire-arch-qwen35/src/qwen35.rs, crates/rdna-compute/src/dispatch.rs)
+- Location: Project-wide (e.g., crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-rdna/src/dispatch/mod.rs)
 - Summary: Global variables and thread-locals are used extensively for caching and environment configuration, making testing difficult and hiding dependencies.
 - Suggested fix: Inject configuration and state through structs/context objects instead of relying on global statics.
 - Scope: Architectural
 - Confidence: High
 
-## [High] Missing unit tests for critical path logic in dispatch.rs
-- Category: Testing
-- Location: crates/rdna-compute/src/dispatch.rs
-- Summary: A 46,000-line file that manages critical GPU dispatch logic contains only a single test (`mq_signs_128_deterministic`).
-- Suggested fix: Add unit tests for routing logic, fallback choices, and error handling.
-- Scope: Local (but high impact)
-- Confidence: High
-
-## [High] Unsafe block memory mapping and unchecked aliasing in llama.rs
+## [High] Unchecked rotated-scratch aliasing in runtime weight dispatch
 - Category: Reliability / Security
-- Location: crates/hipfire-runtime/src/llama.rs
-- Summary: Usage of `unsafe` with `gpu.mq_x_rot.as_ref().unwrap().buf.alias()` combines panics and unsafe pointer aliasing.
+- Location: crates/hipfire-runtime/src/weights.rs
+- Summary: Repeated usage of `unsafe` with `gpu.mq_x_rot.as_ref().unwrap().buf.alias()` combines panics and unsafe pointer aliasing.
 - Suggested fix: Validate buffer initialization before attempting unsafe aliasing and provide safe abstractions for GPU memory management.
 - Scope: Architectural
 - Confidence: High
@@ -146,12 +89,12 @@ bf16+q8-KV on gfx1103 ✅. Quantized-weight models (MQ4/MQ6) unaffected.
 ## Collated Findings from Gemini/Docs Review
 
 - [Critical] Global state coupling is spreading across runtime and architecture crates:
-  - `OnceLock` / `thread_local!` are used for environment-derived behavior in hot and shared code paths (`crates/hipfire-arch-deepseek4/src/forward.rs`, `crates/rdna-compute/src/dispatch.rs`, `crates/hipfire-arch-qwen35/src/qwen35.rs`, `crates/hip-bridge/src/ffi.rs`).
+  - `OnceLock` / `thread_local!` are used for environment-derived behavior in hot and shared code paths (`crates/hipfire-arch-deepseek4/src/forward.rs`, `crates/hipfire-rdna/src/dispatch/mod.rs`, `crates/hipfire-arch-qwen35/src/qwen35.rs`, `crates/hip-bridge/src/ffi.rs`).
   - This hides explicit configuration inputs and increases hidden coupling.
   - Suggested triage: list all env-backed globals and move them behind explicit config contexts when touching module boundaries.
 
 - [High] Unchecked `unwrap()`/`as_ref().unwrap()` patterns are still concentrated in project-critical paths:
-  - `crates/hipfire-runtime/src/llama.rs` around unsafe blocks.
+  - `crates/hipfire-runtime/src/weights.rs` around unsafe rotated-scratch aliasing.
   - Recommended: replace with explicit `Option`/`Result` handling and actionable error messages before crash.
 
 - [High] Architectural correctness bug candidates remain explicitly referenced in comments:
