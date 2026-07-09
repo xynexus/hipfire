@@ -43,9 +43,10 @@ Used to calibrate Qwen3.5-A3B / Qwen3.6-A3B sidecars per
 `project_carnice_hermes_niche.md`. Generate with:
 
 ```
+mkdir -p ~/.hipfire/corpora/aureth/aureth-raw
 hf download --repo-type dataset OusiaResearch/Aureth-Corpus-Hermes4.3-Generated \
-  compiled_corpus.jsonl --local-dir benchmarks/calib/aureth-raw
-python3 scripts/aureth_to_corpus.py \
-  benchmarks/calib/aureth-raw/compiled_corpus.jsonl \
-  benchmarks/calib/aureth-corpus.txt
+  compiled_corpus.jsonl --local-dir ~/.hipfire/corpora/aureth/aureth-raw
+python3 scripts/adhoc/aureth_to_corpus.py \
+  ~/.hipfire/corpora/aureth/aureth-raw/compiled_corpus.jsonl \
+  ~/.hipfire/corpora/aureth/aureth-corpus.txt
 ```
