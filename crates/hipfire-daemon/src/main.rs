@@ -253,6 +253,50 @@ fn json_opt_usize(meta: &serde_json::Value, key: &str) -> Option<usize> {
     })
 }
 
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+fn qwen_residency_load_env(params: Option<&hipfire_model::ModelLoadParams>) -> Vec<ScopedEnvVar> {
+    let mut guards = Vec::new();
+    let Some(params) = params else {
+        return guards;
+    };
+    if let Some(mode) = params
+        .residency_mode
+        .as_deref()
+        .filter(|mode| !mode.is_empty())
+    {
+        guards.push(ScopedEnvVar::set("HIPFIRE_QWEN35_RESIDENCY_MODE", mode));
+    }
+    if let Some(bytes) = params.module_vram_budget_bytes.filter(|bytes| *bytes > 0) {
+        guards.push(ScopedEnvVar::set(
+            "HIPFIRE_QWEN35_EXPERT_CACHE_BYTES",
+            bytes.to_string(),
+        ));
+    }
+    guards
+}
+
 fn le_u32_vec(bytes: &[u8], name: &str, expected: usize) -> std::io::Result<Vec<u32>> {
     if bytes.len() != expected * 4 {
         return Err(invalid_kld_ref(format!(
@@ -3224,6 +3268,8 @@ fn main() {
                 hipfire_runtime::load_progress::set_sink(Some(Box::new(
                     |current, total, phase| emit_load_progress(current, total, phase),
                 )));
+                let _qwen_residency_env =
+                    qwen_residency_load_env(protocol_load.as_ref().map(|req| &req.params));
                 let load_result = load_model(
                     path,
                     max_seq,

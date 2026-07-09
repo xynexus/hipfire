@@ -178,6 +178,7 @@ fn type_label(ty: ConfigType) -> String {
         ConfigType::U8 => "u8".to_string(),
         ConfigType::U16 => "u16".to_string(),
         ConfigType::U32 => "u32".to_string(),
+        ConfigType::U64 => "u64".to_string(),
         ConfigType::I32 => "i32".to_string(),
         ConfigType::F64 => "f64".to_string(),
         ConfigType::String => "string".to_string(),

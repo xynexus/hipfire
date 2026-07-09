@@ -18,10 +18,8 @@ pub use state::{AppState, SharedState};
 use std::collections::BTreeMap;
 
 use axum::{
-    body::Body,
-    http::{HeaderValue, Method, Request},
-    middleware::{self, Next},
-    response::Response,
+    http::HeaderValue,
+    middleware,
     routing::{get, post},
     Router,
 };
@@ -73,6 +71,14 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
         )
         .route("/admin/logs", get(routes::admin::get_admin_logs))
         .route("/admin/stats", get(routes::admin::get_admin_stats))
+        .route(
+            "/admin/runtime/reset",
+            post(routes::admin::post_runtime_reset),
+        )
+        .route(
+            "/admin/runtime/unload-worker",
+            post(routes::admin::post_runtime_unload_worker),
+        )
         .route(
             "/admin/models/registry",
             get(routes::models::get_model_registry),
@@ -248,12 +254,7 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
         Some(cors) => router.layer(cors),
         None => router,
     };
-    router
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            touch_last_request,
-        ))
-        .with_state(state)
+    router.with_state(state)
 }
 
 pub async fn serve(config: HipfireConfig) -> anyhow::Result<()> {
@@ -265,16 +266,13 @@ pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
     let cors_allowed_origins = config.config.cors_allowed_origins.clone();
     let state = AppState::new_loaded(config);
 
-    // HIP/ROCm-first: detect the GPU once at daemon launch so diffusion requests
-    // target the same resolved device (CPU reference only via env opt-in).
+    spawn_daemon_for_serving(&state).await?;
+
+    // HIP/ROCm-first: detect the GPU once at server launch so diffusion requests
+    // target the same resolved device (CPU reference only via env opt-in). This
+    // runs after daemon startup so the daemon owns resource leases first.
     state.resolve_diffusion_runtime_default();
-
     deferred_jobs::spawn_deferred_job_runner(state.clone());
-
-    let idle_state = state.clone();
-    tokio::spawn(async move {
-        idle_unload_loop(idle_state).await;
-    });
 
     let app = build_router(state.clone(), &cors_allowed_origins);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -286,119 +284,46 @@ pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn touch_last_request(
-    axum::extract::State(state): axum::extract::State<SharedState>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    if request_counts_for_idle(request.method(), request.uri().path()) {
-        *state.last_request_unix_secs.lock().await = now_secs();
-    }
-    next.run(request).await
+async fn spawn_daemon_for_serving(state: &SharedState) -> anyhow::Result<()> {
+    let cfg = state.config.lock().await.clone();
+    apply_daemon_startup_env(&cfg);
+    let bin = hipfire_daemon_adapter::find_daemon_bin_or_error()?;
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(&bin).await?;
+    engine.ping().await?;
+    *state.engine.lock().await = Some(engine);
+    Ok(())
 }
 
-fn request_counts_for_idle(method: &Method, path: &str) -> bool {
-    matches!(
-        (method, path),
-        (&Method::POST, "/v1/chat/completions")
-            | (&Method::POST, "/v1/embeddings")
-            | (&Method::POST, "/v1/rerank")
-            | (&Method::POST, "/v1/responses")
-            | (&Method::POST, "/v1/batches")
-            | (&Method::POST, "/sdapi/v1/txt2img")
-            | (&Method::POST, "/sdapi/v1/img2img")
-    )
+fn apply_daemon_startup_env(cfg: &HipfireConfig) {
+    std::env::set_var(
+        "HIPFIRE_RESOURCE_LOCK",
+        if cfg.resource_lock_enabled { "1" } else { "0" },
+    );
+    std::env::set_var(
+        "HIPFIRE_RESOURCE_LOCK_WAIT_MS",
+        cfg.resource_lock_wait_ms.to_string(),
+    );
+    apply_resource_list_env("HIPFIRE_DEVICES", &cfg.resource_lock_gpus, true);
+    apply_resource_list_env("HIPFIRE_RESOURCE_LOCK_NPUS", &cfg.resource_lock_npus, false);
 }
 
-async fn idle_unload_loop(state: SharedState) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    loop {
-        interval.tick().await;
-        idle_unload_once(&state).await;
-    }
-}
-
-async fn idle_unload_once(state: &SharedState) -> bool {
-    let idle_timeout = {
-        let cfg = state.config.lock().await;
-        u64::from(cfg.idle_timeout)
-    };
-    if idle_timeout == 0 || !idle_timeout_elapsed(state, idle_timeout).await {
-        return false;
-    }
-    if sdapi_generation_active(state) {
-        return false;
-    }
-
-    let has_daemon_model = !state.loaded_models.lock().await.is_empty();
-    let has_diffusion_pipelines = !state.diffusion_pipelines.lock().await.is_empty();
-    if !has_daemon_model && !has_diffusion_pipelines {
-        return false;
-    }
-
-    let mut engine = state.engine.lock().await;
-    if !idle_timeout_elapsed(state, idle_timeout).await || sdapi_generation_active(state) {
-        return false;
-    }
-
-    let mut unloaded = false;
-    let diffusion_count = clear_diffusion_pipeline_cache(state).await;
-    if diffusion_count > 0 {
-        tracing::info!("idle timeout reached; unloaded {diffusion_count} diffusion pipeline(s)");
-        unloaded = true;
-    }
-
-    if !state.loaded_models.lock().await.is_empty() {
-        if let Some(engine) = engine.as_mut() {
-            tracing::info!("idle timeout reached; unloading daemon model");
-            match engine.unload().await {
-                Ok(()) => {
-                    clear_loaded_model_state(state).await;
-                }
-                Err(e) => {
-                    tracing::warn!("idle unload failed: {e}");
-                    *engine = match hipfire_daemon_adapter::find_daemon_bin_or_error() {
-                        Ok(bin) => match hipfire_daemon_adapter::DaemonEngine::spawn(&bin).await {
-                            Ok(new_engine) => new_engine,
-                            Err(spawn_err) => {
-                                tracing::warn!(
-                                    "failed to respawn daemon after idle unload error: {spawn_err}"
-                                );
-                                clear_loaded_model_state(state).await;
-                                return true;
-                            }
-                        },
-                        Err(bin_err) => {
-                            tracing::warn!(
-                                "failed to locate daemon after idle unload error: {bin_err}"
-                            );
-                            clear_loaded_model_state(state).await;
-                            return true;
-                        }
-                    };
-                    clear_loaded_model_state(state).await;
-                }
-            }
+fn apply_resource_list_env(key: &str, values: &[String], auto_removes: bool) {
+    let values = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        std::env::remove_var(key);
+    } else if values.len() == 1 && values[0].eq_ignore_ascii_case("auto") {
+        if auto_removes {
+            std::env::remove_var(key);
         } else {
-            clear_loaded_model_state(state).await;
+            std::env::set_var(key, "1");
         }
-        unloaded = true;
+    } else {
+        std::env::set_var(key, values.join(","));
     }
-
-    unloaded
-}
-
-async fn idle_timeout_elapsed(state: &SharedState, idle_timeout: u64) -> bool {
-    let last_request = *state.last_request_unix_secs.lock().await;
-    now_secs().saturating_sub(last_request) >= idle_timeout
-}
-
-fn sdapi_generation_active(state: &SharedState) -> bool {
-    state
-        .sdapi_progress
-        .lock()
-        .map(|progress| progress.active)
-        .unwrap_or(false)
 }
 
 async fn clear_loaded_model_state(state: &SharedState) {
@@ -449,13 +374,6 @@ async fn shutdown_signal(state: SharedState) {
         }
     }
     clear_loaded_model_state(&state).await;
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn spawn_deferred_prewarm(state: SharedState) {
@@ -588,6 +506,10 @@ async fn prewarm_diffusion_model(state: &SharedState, model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Method, Request},
+    };
     use hipfire_diffusion::{
         DiffusionBatchMetadata, DiffusionHfqMetadata, DiffusionPipelineMetadata,
         DiffusionQuantizationMetadata, DiffusionTokenizerMetadata, DIFFUSION_ARTIFACT_KIND,
@@ -608,20 +530,6 @@ mod tests {
     fn cors_layer_present_for_wildcard_and_allowlist() {
         assert!(cors_layer(&["*".to_string()]).is_some());
         assert!(cors_layer(&["http://localhost:8080".to_string()]).is_some());
-    }
-
-    #[test]
-    fn idle_touch_ignores_probe_routes() {
-        assert!(!request_counts_for_idle(&Method::GET, "/health"));
-        assert!(!request_counts_for_idle(&Method::GET, "/v1/models"));
-        assert!(request_counts_for_idle(
-            &Method::POST,
-            "/v1/chat/completions"
-        ));
-        assert!(request_counts_for_idle(&Method::POST, "/v1/responses"));
-        assert!(request_counts_for_idle(&Method::POST, "/v1/batches"));
-        assert!(request_counts_for_idle(&Method::POST, "/sdapi/v1/txt2img"));
-        assert!(request_counts_for_idle(&Method::POST, "/sdapi/v1/img2img"));
     }
 
     #[tokio::test]
@@ -730,51 +638,36 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn idle_unload_once_clears_diffusion_cache_without_daemon_model() {
-        let state = metadata_only_diffusion_state("hipfire-diffusion-idle-unload-test").await;
-        *state.last_request_unix_secs.lock().await = now_secs().saturating_sub(10);
+    #[test]
+    fn daemon_startup_env_maps_resource_lock_config() {
+        let mut config = HipfireConfig::default();
+        config.resource_lock_gpus = vec!["0".to_string(), "2".to_string()];
+        config.resource_lock_npus = vec!["auto".to_string()];
+        config.resource_lock_wait_ms = 250;
 
-        let unloaded = idle_unload_once(&state).await;
+        apply_daemon_startup_env(&config);
 
-        assert!(unloaded);
-        assert!(state.loaded_model_path.lock().await.is_none());
-        assert!(state.diffusion_pipelines.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn idle_unload_once_keeps_diffusion_cache_while_sdapi_generation_is_active() {
-        let state =
-            metadata_only_diffusion_state("hipfire-diffusion-idle-active-generation-test").await;
-        *state.last_request_unix_secs.lock().await = now_secs().saturating_sub(10);
-        state.sdapi_progress.lock().unwrap().active = true;
-
-        let unloaded = idle_unload_once(&state).await;
-
-        assert!(!unloaded);
-        assert_eq!(state.diffusion_pipelines.lock().await.len(), 1);
-    }
-
-    async fn metadata_only_diffusion_state(name: &str) -> SharedState {
-        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let hfq_path = dir.join("metadata-only-diffusion.hfq");
-        write_metadata_only_diffusion_hfq(&hfq_path);
-
-        let mut config = HipfireConfig {
-            idle_timeout: 1,
-            ..HipfireConfig::default()
-        };
-        config.models_network_dir = Some(dir.to_string_lossy().into_owned());
-        config.model_overrides.insert(
-            hfq_path.file_name().unwrap().to_string_lossy().into_owned(),
-            json!({"prewarm_priority": 1}),
+        assert_eq!(std::env::var("HIPFIRE_RESOURCE_LOCK").unwrap(), "1");
+        assert_eq!(
+            std::env::var("HIPFIRE_RESOURCE_LOCK_WAIT_MS").unwrap(),
+            "250"
         );
-        let state = AppState::new(config);
-        prewarm_configured_models(&state).await;
-        assert_eq!(state.diffusion_pipelines.lock().await.len(), 1);
-        state
+        assert_eq!(std::env::var("HIPFIRE_DEVICES").unwrap(), "0,2");
+        assert_eq!(std::env::var("HIPFIRE_RESOURCE_LOCK_NPUS").unwrap(), "1");
+    }
+
+    #[test]
+    fn daemon_startup_env_auto_gpu_uses_daemon_default_resolution() {
+        let mut config = HipfireConfig::default();
+        config.resource_lock_enabled = false;
+        config.resource_lock_gpus = vec!["auto".to_string()];
+        config.resource_lock_npus = Vec::new();
+
+        apply_daemon_startup_env(&config);
+
+        assert_eq!(std::env::var("HIPFIRE_RESOURCE_LOCK").unwrap(), "0");
+        assert!(std::env::var("HIPFIRE_DEVICES").is_err());
+        assert!(std::env::var("HIPFIRE_RESOURCE_LOCK_NPUS").is_err());
     }
 
     fn write_metadata_only_diffusion_hfq(path: &Path) {

@@ -18,6 +18,220 @@ pub const SCHED_PRIORITY_DEFAULT: u8 = 64;
 pub const SCHED_PRIORITY_OPPORTUNISTIC: u8 = 255;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceBudget {
+    pub system_memory_budget_bytes: u64,
+    pub system_memory_headroom_bytes: u64,
+    pub vram_budget_bytes: u64,
+    pub vram_headroom_bytes: u64,
+}
+
+impl ResourceBudget {
+    pub fn disabled() -> Self {
+        Self {
+            system_memory_budget_bytes: 0,
+            system_memory_headroom_bytes: 0,
+            vram_budget_bytes: 0,
+            vram_headroom_bytes: 0,
+        }
+    }
+
+    fn effective_system_limit(self) -> Option<u64> {
+        effective_limit(
+            self.system_memory_budget_bytes,
+            self.system_memory_headroom_bytes,
+        )
+    }
+
+    fn effective_vram_limit(self) -> Option<u64> {
+        effective_limit(self.vram_budget_bytes, self.vram_headroom_bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceUsage {
+    pub system_memory_bytes: u64,
+    pub vram_bytes: u64,
+}
+
+impl ResourceUsage {
+    pub fn zero() -> Self {
+        Self {
+            system_memory_bytes: 0,
+            vram_bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencyMode {
+    Auto,
+    Full,
+    QwenMoeModules,
+}
+
+impl ResidencyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Full => "full",
+            Self::QwenMoeModules => "qwen_moe_modules",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "full" => Some(Self::Full),
+            "qwen_moe_modules" | "qwen35_moe_modules" | "qwen3.5_moe_modules" => {
+                Some(Self::QwenMoeModules)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResidentWorkerLedgerEntry {
+    pub worker_key_id: String,
+    pub model_path: String,
+    pub residency_mode: ResidencyMode,
+    pub resource_usage: ResourceUsage,
+    pub last_used_seq: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelResidencyRequest {
+    pub worker_key_id: String,
+    pub model_path: String,
+    pub requested_mode: ResidencyMode,
+    pub estimated_full: ResourceUsage,
+    pub estimated_qwen_moe_modules: Option<ResourceUsage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelResidencyPlan {
+    pub worker_key_id: String,
+    pub residency_mode: ResidencyMode,
+    pub module_vram_budget_bytes: Option<u64>,
+    pub resource_usage: ResourceUsage,
+    pub unload_worker_key_ids: Vec<String>,
+    pub reason: String,
+}
+
+fn effective_limit(budget: u64, headroom: u64) -> Option<u64> {
+    (budget > 0).then_some(budget.saturating_sub(headroom))
+}
+
+fn usage_fits(budget: ResourceBudget, usage: ResourceUsage) -> bool {
+    budget
+        .effective_system_limit()
+        .is_none_or(|limit| usage.system_memory_bytes <= limit)
+        && budget
+            .effective_vram_limit()
+            .is_none_or(|limit| usage.vram_bytes <= limit)
+}
+
+fn add_usage(a: ResourceUsage, b: ResourceUsage) -> ResourceUsage {
+    ResourceUsage {
+        system_memory_bytes: a.system_memory_bytes.saturating_add(b.system_memory_bytes),
+        vram_bytes: a.vram_bytes.saturating_add(b.vram_bytes),
+    }
+}
+
+fn subtract_usage(a: ResourceUsage, b: ResourceUsage) -> ResourceUsage {
+    ResourceUsage {
+        system_memory_bytes: a.system_memory_bytes.saturating_sub(b.system_memory_bytes),
+        vram_bytes: a.vram_bytes.saturating_sub(b.vram_bytes),
+    }
+}
+
+fn ledger_usage(workers: &[ResidentWorkerLedgerEntry]) -> ResourceUsage {
+    workers.iter().fold(ResourceUsage::zero(), |sum, worker| {
+        add_usage(sum, worker.resource_usage)
+    })
+}
+
+pub fn plan_model_residency(
+    budget: ResourceBudget,
+    request: ModelResidencyRequest,
+    resident_workers: &[ResidentWorkerLedgerEntry],
+) -> Result<ModelResidencyPlan, String> {
+    if resident_workers
+        .iter()
+        .any(|worker| worker.worker_key_id == request.worker_key_id)
+    {
+        return Ok(ModelResidencyPlan {
+            worker_key_id: request.worker_key_id,
+            residency_mode: ResidencyMode::Full,
+            module_vram_budget_bytes: None,
+            resource_usage: ResourceUsage::zero(),
+            unload_worker_key_ids: Vec::new(),
+            reason: "worker_already_resident".to_string(),
+        });
+    }
+
+    let (mode, usage) = match request.requested_mode {
+        ResidencyMode::Full => (ResidencyMode::Full, request.estimated_full),
+        ResidencyMode::QwenMoeModules => {
+            let Some(usage) = request.estimated_qwen_moe_modules else {
+                return Err(
+                    "qwen_moe_modules residency requested but module metadata is unavailable"
+                        .to_string(),
+                );
+            };
+            (ResidencyMode::QwenMoeModules, usage)
+        }
+        ResidencyMode::Auto => {
+            if usage_fits(
+                budget,
+                add_usage(ledger_usage(resident_workers), request.estimated_full),
+            ) {
+                (ResidencyMode::Full, request.estimated_full)
+            } else if let Some(module_usage) = request.estimated_qwen_moe_modules {
+                (ResidencyMode::QwenMoeModules, module_usage)
+            } else {
+                (ResidencyMode::Full, request.estimated_full)
+            }
+        }
+    };
+
+    if !usage_fits(budget, usage) {
+        return Err(format!(
+            "requested {} residency exceeds configured budget/headroom",
+            mode.as_str()
+        ));
+    }
+
+    let mut current = ledger_usage(resident_workers);
+    let mut unload = Vec::new();
+    if !usage_fits(budget, add_usage(current, usage)) {
+        let mut victims = resident_workers.to_vec();
+        victims.sort_by_key(|worker| worker.last_used_seq);
+        for victim in victims {
+            current = subtract_usage(current, victim.resource_usage);
+            unload.push(victim.worker_key_id);
+            if usage_fits(budget, add_usage(current, usage)) {
+                break;
+            }
+        }
+    }
+
+    if !usage_fits(budget, add_usage(current, usage)) {
+        return Err("insufficient budget after evicting all eligible resident workers".to_string());
+    }
+
+    Ok(ModelResidencyPlan {
+        worker_key_id: request.worker_key_id,
+        residency_mode: mode,
+        module_vram_budget_bytes: (mode == ResidencyMode::QwenMoeModules)
+            .then_some(usage.vram_bytes),
+        resource_usage: usage,
+        unload_worker_key_ids: unload,
+        reason: "admitted".to_string(),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerPriorityClass {
     Realtime,
     High,
@@ -1861,5 +2075,77 @@ mod tests {
             decode_ids(fused.next_decode_batch(NextBatchInput { now_ms: 0 })),
             vec!["fused-a", "fused-b"]
         );
+    }
+
+    #[test]
+    fn residency_planner_selects_modules_when_full_does_not_fit_auto() {
+        let budget = ResourceBudget {
+            system_memory_budget_bytes: 0,
+            system_memory_headroom_bytes: 0,
+            vram_budget_bytes: 1_000,
+            vram_headroom_bytes: 100,
+        };
+        let request = ModelResidencyRequest {
+            worker_key_id: "worker-new".to_string(),
+            model_path: "qwen.hfq".to_string(),
+            requested_mode: ResidencyMode::Auto,
+            estimated_full: ResourceUsage {
+                system_memory_bytes: 0,
+                vram_bytes: 1_200,
+            },
+            estimated_qwen_moe_modules: Some(ResourceUsage {
+                system_memory_bytes: 0,
+                vram_bytes: 700,
+            }),
+        };
+
+        let plan = plan_model_residency(budget, request, &[]).unwrap();
+        assert_eq!(plan.residency_mode, ResidencyMode::QwenMoeModules);
+        assert_eq!(plan.module_vram_budget_bytes, Some(700));
+    }
+
+    #[test]
+    fn residency_planner_evicts_oldest_workers_for_budget() {
+        let budget = ResourceBudget {
+            system_memory_budget_bytes: 0,
+            system_memory_headroom_bytes: 0,
+            vram_budget_bytes: 1_000,
+            vram_headroom_bytes: 0,
+        };
+        let resident_workers = vec![
+            ResidentWorkerLedgerEntry {
+                worker_key_id: "old".to_string(),
+                model_path: "old.hfq".to_string(),
+                residency_mode: ResidencyMode::Full,
+                resource_usage: ResourceUsage {
+                    system_memory_bytes: 0,
+                    vram_bytes: 500,
+                },
+                last_used_seq: 1,
+            },
+            ResidentWorkerLedgerEntry {
+                worker_key_id: "newer".to_string(),
+                model_path: "newer.hfq".to_string(),
+                residency_mode: ResidencyMode::Full,
+                resource_usage: ResourceUsage {
+                    system_memory_bytes: 0,
+                    vram_bytes: 300,
+                },
+                last_used_seq: 2,
+            },
+        ];
+        let request = ModelResidencyRequest {
+            worker_key_id: "incoming".to_string(),
+            model_path: "incoming.hfq".to_string(),
+            requested_mode: ResidencyMode::Full,
+            estimated_full: ResourceUsage {
+                system_memory_bytes: 0,
+                vram_bytes: 600,
+            },
+            estimated_qwen_moe_modules: None,
+        };
+
+        let plan = plan_model_residency(budget, request, &resident_workers).unwrap();
+        assert_eq!(plan.unload_worker_key_ids, vec!["old"]);
     }
 }

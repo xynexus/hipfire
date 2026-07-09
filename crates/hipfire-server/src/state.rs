@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
 
 use hipfire_config::{HipfireConfig, LoadedConfig};
@@ -103,7 +102,6 @@ pub struct AppState {
     /// `/sdapi/v1/options` that do not map to native Hipfire config fields.
     pub sdapi_options: Mutex<HashMap<String, serde_json::Value>>,
     pub sdapi_progress: Arc<StdMutex<SdapiProgressState>>,
-    pub last_request_unix_secs: Mutex<u64>,
     pub training_runs_dir: PathBuf,
     /// Server-owned root for images saved by the SD API routes. Derived from
     /// config at construction; request `outdir_*` overrides never reach it.
@@ -174,7 +172,6 @@ impl AppState {
             ),
             sdapi_options: Mutex::new(HashMap::new()),
             sdapi_progress: Arc::new(StdMutex::new(SdapiProgressState::default())),
-            last_request_unix_secs: Mutex::new(now_secs()),
             training_runs_dir,
             sdapi_output_root,
             sdapi_geometry_limits,
@@ -220,10 +217,3 @@ impl AppState {
 }
 
 pub type SharedState = Arc<AppState>;
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}

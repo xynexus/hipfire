@@ -42,13 +42,11 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     let active_model = loaded
         .clone()
         .or_else(|| diffusion_active_model(&diffusion));
-    let idle_timeout_sec = {
-        let cfg = state.config.lock().await;
-        cfg.idle_timeout
-    };
+    let scheduler_resources = scheduler_resource_health_payload(&state).await;
     let prefill_queue_size = state.prefill_scheduler.lock().await.size();
     let selected_prefill_requests = state.selected_prefill_requests.lock().await.len();
     let accelerator_inventory = server_accelerator_inventory(&state).await;
+    let runtime_workers = runtime_workers_health_payload(&state, &accelerator_inventory).await;
     let scheduler_env = scheduler_env_from_process();
     let mut prefill_batch = server_prefill_batch_health_json(&scheduler_env);
     if let Some(obj) = prefill_batch.as_object_mut() {
@@ -71,13 +69,13 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         "model": loaded,
         "active_model": active_model,
         "diffusion": diffusion,
-        "idle_timeout_sec": idle_timeout_sec,
         "pid": std::process::id(),
+        "scheduler_resources": scheduler_resources,
         "prefill_batch": prefill_batch,
         "decode_batch": server_decode_batch_health_json(&scheduler_env),
         "state_cache": server_state_cache_health_json(&scheduler_env),
         "deferred_jobs": crate::deferred_jobs::deferred_jobs_health_json(),
-        "runtime_workers": runtime_workers_health_payload(&accelerator_inventory),
+        "runtime_workers": runtime_workers,
         "batches": batch_health_payload(&state).await,
     }))
 }
@@ -125,7 +123,50 @@ fn scheduler_env_from_process() -> SchedulerPolicyEnv {
     SchedulerPolicyEnv::from_pairs(env::vars())
 }
 
-fn runtime_workers_health_payload(inventory: &AcceleratorInventory) -> serde_json::Value {
+async fn scheduler_resource_health_payload(state: &SharedState) -> serde_json::Value {
+    let cfg = state.config.lock().await.clone();
+    let locks = hipfire_daemon_adapter::resource_lock_report(&hipfire_lock::resource_lock_root())
+        .into_iter()
+        .map(|(resource, path, state)| {
+            let (locked, holder) = match state {
+                hipfire_daemon_adapter::LockState::Free => (false, String::new()),
+                hipfire_daemon_adapter::LockState::Busy(holder) => (true, holder),
+            };
+            json!({
+                "resource": resource,
+                "path": path,
+                "locked": locked,
+                "holder": holder,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "resource_lock_enabled": cfg.resource_lock_enabled,
+        "resource_lock_gpus": cfg.resource_lock_gpus,
+        "resource_lock_npus": cfg.resource_lock_npus,
+        "resource_lock_wait_ms": cfg.resource_lock_wait_ms,
+        "system_memory_budget_bytes": cfg.scheduler_system_memory_budget_bytes,
+        "system_memory_headroom_bytes": cfg.scheduler_system_memory_headroom_bytes,
+        "vram_budget_bytes": cfg.scheduler_vram_budget_bytes,
+        "vram_headroom_bytes": cfg.scheduler_vram_headroom_bytes,
+        "model_residency_mode": cfg.model_residency_mode,
+        "locks": locks,
+    })
+}
+
+async fn runtime_workers_health_payload(
+    state: &SharedState,
+    inventory: &AcceleratorInventory,
+) -> serde_json::Value {
+    let mut engine = state.engine.lock().await;
+    if let Some(engine) = engine.as_mut() {
+        match engine.list_workers().await {
+            Ok(status) => return status,
+            Err(err) => {
+                tracing::warn!("daemon worker_status failed for health route: {err}");
+            }
+        }
+    }
     runtime_workers_health_json_with_inventory(&[], 0, None, 0, 0, "none", inventory)
 }
 
@@ -196,12 +237,21 @@ mod tests {
 
     #[test]
     fn health_route_uses_disabled_shared_scheduler_payloads() {
+        let runtime_workers = runtime_workers_health_json_with_inventory(
+            &[],
+            0,
+            None,
+            0,
+            0,
+            "none",
+            &AcceleratorInventory::not_probed(),
+        );
         let payload = json!({
             "prefill_batch": server_prefill_batch_health_json(&SchedulerPolicyEnv::empty()),
             "decode_batch": server_decode_batch_health_json(&SchedulerPolicyEnv::empty()),
             "state_cache": server_state_cache_health_json(&SchedulerPolicyEnv::empty()),
             "deferred_jobs": crate::deferred_jobs::deferred_jobs_health_json(),
-            "runtime_workers": runtime_workers_health_payload(&AcceleratorInventory::not_probed()),
+            "runtime_workers": runtime_workers,
             "batches": json!({ "enabled": true }),
         });
 
@@ -239,7 +289,8 @@ mod tests {
                 Some("HIP 6.4".to_string()),
             )],
         );
-        let payload = runtime_workers_health_payload(&inventory);
+        let payload =
+            runtime_workers_health_json_with_inventory(&[], 0, None, 0, 0, "none", &inventory);
 
         assert_eq!(payload["accelerator_inventory"]["source"], "daemon");
         assert_eq!(payload["accelerator_inventory"]["device_count"], 1);

@@ -200,6 +200,7 @@ pub fn encode_editor_value(field: &ConfigField, raw: &Value) -> Result<Value, St
         ConfigType::U8 => encode_unsigned(field.key, raw, u8::MAX as u64),
         ConfigType::U16 => encode_unsigned(field.key, raw, u16::MAX as u64),
         ConfigType::U32 => encode_unsigned(field.key, raw, u32::MAX as u64),
+        ConfigType::U64 => encode_unsigned(field.key, raw, u64::MAX),
         ConfigType::I32 => {
             let value = raw_i64(raw).ok_or_else(|| format!("{} expects an integer", field.key))?;
             if value < i32::MIN as i64 || value > i32::MAX as i64 {
@@ -614,6 +615,10 @@ mod tests {
             .iter()
             .find(|field| field.key == "prompt_normalize")
             .unwrap();
+        let vram_budget = config_schema()
+            .iter()
+            .find(|field| field.key == "scheduler_vram_budget_bytes")
+            .unwrap();
 
         assert_eq!(encode_editor_value(kv, &json!("q8")).unwrap(), json!("q8"));
         assert!(encode_editor_value(kv, &json!("bad")).is_err());
@@ -629,6 +634,10 @@ mod tests {
         assert_eq!(
             encode_editor_value(prompt_normalize, &json!("false")).unwrap(),
             json!(false)
+        );
+        assert_eq!(
+            encode_editor_value(vram_budget, &json!("18446744073709551615")).unwrap(),
+            json!(u64::MAX)
         );
     }
 

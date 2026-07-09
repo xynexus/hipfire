@@ -2371,6 +2371,10 @@ pub struct ModelLoadParams {
     pub mtp_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtp_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residency_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_vram_budget_bytes: Option<u64>,
 }
 
 impl ModelLoadParams {
@@ -2411,6 +2415,9 @@ impl ModelLoadParams {
         }
         params.mtp_mode = non_empty_value(&config.mtp_mode);
         params.mtp_k = Some(config.mtp_k);
+        params.residency_mode = non_empty_value(&config.model_residency_mode);
+        params.module_vram_budget_bytes =
+            (config.scheduler_vram_budget_bytes > 0).then_some(config.scheduler_vram_budget_bytes);
         params
     }
 

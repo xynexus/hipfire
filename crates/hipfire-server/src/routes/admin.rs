@@ -53,6 +53,106 @@ pub async fn get_admin_stats() -> Json<hipfire_admin_types::AdminStats> {
     Json(hipfire_sysinfo::snapshot(now_unix_secs()))
 }
 
+pub async fn post_runtime_reset(State(state): State<SharedState>) -> impl IntoResponse {
+    let mut engine = state.engine.lock().await;
+    match engine.as_mut() {
+        Some(engine) => match engine.reset().await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ok",
+                    "reset": true,
+                })),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "message": format!("daemon reset failed: {error}"),
+                        "type": "runtime_reset_failed",
+                    }
+                })),
+            ),
+        },
+        None => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "reset": false,
+                "reason": "no daemon engine is loaded",
+            })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RuntimeUnloadWorkerRequest {
+    pub worker_key_id: String,
+}
+
+pub async fn post_runtime_unload_worker(
+    State(state): State<SharedState>,
+    Json(request): Json<RuntimeUnloadWorkerRequest>,
+) -> impl IntoResponse {
+    let worker_key_id = request.worker_key_id.trim().to_string();
+    if worker_key_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": "worker_key_id is required",
+                    "type": "invalid_request_error",
+                }
+            })),
+        );
+    }
+
+    let mut engine = state.engine.lock().await;
+    let Some(engine) = engine.as_mut() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "message": "daemon engine is not running",
+                    "type": "daemon_unavailable",
+                }
+            })),
+        );
+    };
+
+    match engine.unload_worker(&worker_key_id).await {
+        Ok(done) => {
+            let active_path_still_loaded = {
+                let mut loaded_models = state.loaded_models.lock().await;
+                loaded_models.retain(|_, loaded| {
+                    loaded.worker_key_id.as_deref() != Some(worker_key_id.as_str())
+                });
+                state
+                    .loaded_model_path
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|path| loaded_models.contains_key(path))
+            };
+            if !active_path_still_loaded {
+                *state.loaded_model_path.lock().await = None;
+                *state.loaded_model_cache_capable.lock().await = None;
+                *state.loaded_model_max_seq.lock().await = None;
+            }
+            (StatusCode::OK, Json(done))
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": format!("daemon unload_worker failed: {error}"),
+                    "type": "runtime_unload_failed",
+                }
+            })),
+        ),
+    }
+}
+
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -705,7 +805,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       </div>
       <section class="summary" aria-label="Runtime summary">
         <div class="metric"><span>Status</span><strong id="runtime-status">-</strong></div>
-        <div class="metric"><span>Idle Timeout</span><strong id="runtime-idle">-</strong></div>
+        <div class="metric"><span>Residency</span><strong id="runtime-residency">-</strong></div>
         <div class="metric"><span>Prefill Queue</span><strong id="runtime-prefill">-</strong></div>
         <div class="metric"><span>Batches</span><strong id="runtime-batches">-</strong></div>
       </section>
@@ -843,7 +943,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     const modelsLoadedEl = document.getElementById("models-loaded");
     const modelsRowsEl = document.getElementById("models-rows");
     const runtimeStatusEl = document.getElementById("runtime-status");
-    const runtimeIdleEl = document.getElementById("runtime-idle");
+    const runtimeResidencyEl = document.getElementById("runtime-residency");
     const runtimePrefillEl = document.getElementById("runtime-prefill");
     const runtimeBatchesEl = document.getElementById("runtime-batches");
     const runtimeJsonEl = document.getElementById("runtime-json");
@@ -1051,7 +1151,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       overviewTrainingEl.textContent = `${runs.filter(isActiveRun).length} active / ${runs.length} runs`;
       overviewRuntimeEl.replaceChildren(...keyValueRows([
         ["Bind", location.origin],
-        ["Idle timeout", `${health.idle_timeout_sec || 0}s`],
+        ["Residency", health.scheduler_resources && health.scheduler_resources.model_residency_mode],
         ["Prefill queue", health.prefill_batch && (health.prefill_batch.queue_size ?? health.prefill_batch.queued)],
         ["Batches", health.batches && `${health.batches.queued || 0} queued / ${health.batches.total || 0} total`],
         ["Kernel caches", (diagnostics.kernel_caches || []).map((k) => `${k.arch}:${k.hsaco}/${k.hash}`).join(", ") || "none"],
@@ -1113,7 +1213,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       statusEl.textContent = "loading runtime";
       const health = await fetchJson("/health");
       runtimeStatusEl.textContent = health.status || "-";
-      runtimeIdleEl.textContent = `${health.idle_timeout_sec || 0}s`;
+      runtimeResidencyEl.textContent = health.scheduler_resources ? (health.scheduler_resources.model_residency_mode || "-") : "-";
       runtimePrefillEl.textContent = health.prefill_batch ? `${health.prefill_batch.queue_size || health.prefill_batch.queued || 0}` : "-";
       runtimeBatchesEl.textContent = health.batches ? `${health.batches.queued || 0} queued / ${health.batches.total || 0} total` : "-";
       runtimeJsonEl.textContent = JSON.stringify(health, null, 2);

@@ -16,10 +16,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
-    CettCaptureRequest, CettLoadColnormsRequest, CollectRequest, CollectResponse, DaemonRequest,
-    DaemonResponse, HneuronInterveneRequest, KldChunkEvent, KldEvalRequest, KldEvalResponse,
-    LoraLoadRequest, LoraSetScaleRequest, LoraUnloadRequest, RequestControl, SteerApplyRequest,
-    SteerBeginCaptureRequest, SteerCaptureRequest,
+    BenchPrefillRequest, BenchPrefillResponse, CettCaptureRequest, CettLoadColnormsRequest,
+    CollectRequest, CollectResponse, DaemonRequest, DaemonResponse, HneuronInterveneRequest,
+    KldChunkEvent, KldEvalRequest, KldEvalResponse, LoraLoadRequest, LoraSetScaleRequest,
+    LoraUnloadRequest, RequestControl, SteerApplyRequest, SteerBeginCaptureRequest,
+    SteerCaptureRequest,
 };
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{
@@ -102,6 +103,10 @@ trait DaemonTransport: Send {
     #[cfg(test)]
     fn as_any(&self) -> &dyn std::any::Any;
     fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>>;
+    fn send_value<'a>(
+        &'a mut self,
+        value: &'a serde_json::Value,
+    ) -> BoxFuture<'a, anyhow::Result<()>>;
     fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>>;
 }
 
@@ -147,6 +152,20 @@ impl DaemonTransport for StdioTransport {
     fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let line = serde_json::to_string(req)?;
+            debug!("> {line}");
+            self.stdin.write_all(line.as_bytes()).await?;
+            self.stdin.write_all(b"\n").await?;
+            self.stdin.flush().await?;
+            Ok(())
+        })
+    }
+
+    fn send_value<'a>(
+        &'a mut self,
+        value: &'a serde_json::Value,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let line = serde_json::to_string(value)?;
             debug!("> {line}");
             self.stdin.write_all(line.as_bytes()).await?;
             self.stdin.write_all(b"\n").await?;
@@ -202,6 +221,10 @@ impl DaemonEngine {
 
     async fn send(&mut self, req: &DaemonRequest) -> anyhow::Result<()> {
         self.transport.send_json(req).await
+    }
+
+    async fn send_value(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
+        self.transport.send_value(value).await
     }
 
     async fn recv(&mut self) -> anyhow::Result<DaemonResponse> {
@@ -304,6 +327,63 @@ impl DaemonEngine {
         }
     }
 
+    /// Send `worker_status` / `list_workers` and return the daemon's resident
+    /// worker status payload.
+    pub async fn list_workers(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.send(&DaemonRequest::WorkerStatus).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::WorkerStatus(status) => return Ok(status),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon worker_status error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during worker_status: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `unload_worker` for one resident worker and return the daemon's
+    /// unload acknowledgement.
+    pub async fn unload_worker(
+        &mut self,
+        worker_key_id: impl Into<String>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let worker_key_id = worker_key_id.into();
+        self.send_value(&serde_json::json!({
+            "type": "unload_worker",
+            "worker_key_id": worker_key_id,
+        }))
+        .await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::UnloadWorkerDone(done) => {
+                    if done
+                        .get("worker_key_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|actual| actual != worker_key_id)
+                    {
+                        tracing::warn!(
+                            "stale unload_worker response: got worker_key_id={:?} expected={worker_key_id}",
+                            done.get("worker_key_id")
+                        );
+                        continue;
+                    }
+                    return Ok(done);
+                }
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon unload_worker error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during unload_worker: {other:?}");
+                }
+            }
+        }
+    }
+
     /// Send `reset` and wait for the daemon to confirm state reset.
     pub async fn reset(&mut self) -> anyhow::Result<()> {
         self.send(&DaemonRequest::Reset).await?;
@@ -314,6 +394,24 @@ impl DaemonEngine {
                 DaemonResponse::Unknown => {}
                 other => {
                     tracing::warn!("unexpected response during reset: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Run the daemon's synthetic exact-token prefill benchmark.
+    pub async fn bench_prefill(&mut self, tokens: usize) -> anyhow::Result<BenchPrefillResponse> {
+        self.send(&DaemonRequest::BenchPrefill(BenchPrefillRequest { tokens }))
+            .await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::PrefillResult(result) => return Ok(result),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon bench_prefill error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during bench_prefill: {other:?}");
                 }
             }
         }
@@ -1247,6 +1345,16 @@ mod tests {
             })
         }
 
+        fn send_value<'a>(
+            &'a mut self,
+            value: &'a serde_json::Value,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                self.sent.push(serde_json::to_string(value)?);
+                Ok(())
+            })
+        }
+
         fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>> {
             Box::pin(async move {
                 self.responses
@@ -1429,6 +1537,52 @@ mod tests {
     async fn reset_waits_for_reset_response() {
         let mut engine = mock_engine(vec![DaemonResponse::Reset]);
         engine.reset().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bench_prefill_waits_for_prefill_result() {
+        let mut engine = mock_engine(vec![DaemonResponse::PrefillResult(BenchPrefillResponse {
+            tokens: 512,
+            ms: 10.0,
+            tok_s: 51_200.0,
+        })]);
+        let result = engine.bench_prefill(512).await.unwrap();
+        assert_eq!(result.tokens, 512);
+        assert_eq!(result.ms, 10.0);
+        assert_eq!(result.tok_s, 51_200.0);
+    }
+
+    #[tokio::test]
+    async fn worker_status_and_unload_worker_use_worker_control_protocol() {
+        let mut engine = mock_engine(vec![
+            DaemonResponse::WorkerStatus(serde_json::json!({
+                "type": "worker_status",
+                "resident_workers": 1,
+                "workers": []
+            })),
+            DaemonResponse::UnloadWorkerDone(serde_json::json!({
+                "type": "unload_worker_done",
+                "worker_key_id": "worker-a",
+                "unloaded": true,
+                "resident_workers": 0
+            })),
+        ]);
+
+        let status = engine.list_workers().await.unwrap();
+        assert_eq!(status["resident_workers"], 1);
+        let done = engine.unload_worker("worker-a").await.unwrap();
+        assert_eq!(done["unloaded"], true);
+
+        let mock = engine
+            .transport
+            .as_any()
+            .downcast_ref::<MockTransport>()
+            .unwrap();
+        assert_eq!(mock.sent[0], r#"{"type":"worker_status"}"#);
+        assert_eq!(
+            mock.sent[1],
+            r#"{"type":"unload_worker","worker_key_id":"worker-a"}"#
+        );
     }
 
     #[tokio::test]

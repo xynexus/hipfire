@@ -80,8 +80,23 @@ fn default_top_p() -> f64 {
 fn default_repeat_penalty() -> f64 {
     1.05
 }
-fn default_idle_timeout() -> u32 {
-    300
+fn default_resource_lock_enabled() -> bool {
+    true
+}
+fn default_resource_lock_gpus() -> Vec<String> {
+    vec!["auto".to_string()]
+}
+fn default_resource_lock_npus() -> Vec<String> {
+    Vec::new()
+}
+fn default_resource_lock_wait_ms() -> u32 {
+    0
+}
+fn default_scheduler_memory_budget_bytes() -> u64 {
+    0
+}
+fn default_model_residency_mode() -> String {
+    "auto".to_string()
 }
 fn default_kv_cache() -> String {
     "auto".to_string()
@@ -229,8 +244,24 @@ pub struct HipfireConfig {
     pub top_p: f64,
     #[serde(default = "default_repeat_penalty")]
     pub repeat_penalty: f64,
-    #[serde(default = "default_idle_timeout")]
-    pub idle_timeout: u32,
+    #[serde(default = "default_resource_lock_enabled")]
+    pub resource_lock_enabled: bool,
+    #[serde(default = "default_resource_lock_gpus")]
+    pub resource_lock_gpus: Vec<String>,
+    #[serde(default = "default_resource_lock_npus")]
+    pub resource_lock_npus: Vec<String>,
+    #[serde(default = "default_resource_lock_wait_ms")]
+    pub resource_lock_wait_ms: u32,
+    #[serde(default = "default_scheduler_memory_budget_bytes")]
+    pub scheduler_system_memory_budget_bytes: u64,
+    #[serde(default = "default_scheduler_memory_budget_bytes")]
+    pub scheduler_system_memory_headroom_bytes: u64,
+    #[serde(default = "default_scheduler_memory_budget_bytes")]
+    pub scheduler_vram_budget_bytes: u64,
+    #[serde(default = "default_scheduler_memory_budget_bytes")]
+    pub scheduler_vram_headroom_bytes: u64,
+    #[serde(default = "default_model_residency_mode")]
+    pub model_residency_mode: String,
     #[serde(default = "default_kv_cache")]
     pub kv_cache: String,
     #[serde(default = "default_kv_adaptive")]
@@ -403,7 +434,15 @@ impl Default for HipfireConfig {
             temperature: default_temperature(),
             top_p: default_top_p(),
             repeat_penalty: default_repeat_penalty(),
-            idle_timeout: default_idle_timeout(),
+            resource_lock_enabled: default_resource_lock_enabled(),
+            resource_lock_gpus: default_resource_lock_gpus(),
+            resource_lock_npus: default_resource_lock_npus(),
+            resource_lock_wait_ms: default_resource_lock_wait_ms(),
+            scheduler_system_memory_budget_bytes: default_scheduler_memory_budget_bytes(),
+            scheduler_system_memory_headroom_bytes: default_scheduler_memory_budget_bytes(),
+            scheduler_vram_budget_bytes: default_scheduler_memory_budget_bytes(),
+            scheduler_vram_headroom_bytes: default_scheduler_memory_budget_bytes(),
+            model_residency_mode: default_model_residency_mode(),
             kv_cache: default_kv_cache(),
             kv_adaptive: default_kv_adaptive(),
             flash_mode: default_flash_mode(),
@@ -790,7 +829,15 @@ mod tests {
         assert_eq!(cfg.temperature, 0.3);
         assert_eq!(cfg.top_p, 0.8);
         assert_eq!(cfg.repeat_penalty, 1.05);
-        assert_eq!(cfg.idle_timeout, 300);
+        assert!(cfg.resource_lock_enabled);
+        assert_eq!(cfg.resource_lock_gpus, vec!["auto".to_string()]);
+        assert!(cfg.resource_lock_npus.is_empty());
+        assert_eq!(cfg.resource_lock_wait_ms, 0);
+        assert_eq!(cfg.scheduler_system_memory_budget_bytes, 0);
+        assert_eq!(cfg.scheduler_system_memory_headroom_bytes, 0);
+        assert_eq!(cfg.scheduler_vram_budget_bytes, 0);
+        assert_eq!(cfg.scheduler_vram_headroom_bytes, 0);
+        assert_eq!(cfg.model_residency_mode, "auto");
         assert_eq!(cfg.kv_cache, "auto");
         assert_eq!(cfg.kv_adaptive, "off");
         assert_eq!(cfg.flash_mode, "auto");

@@ -47,6 +47,7 @@ pub enum ConfigType {
     U8,
     U16,
     U32,
+    U64,
     I32,
     F64,
     String,
@@ -311,13 +312,87 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         validation: "0.0.."
     ),
     field!(
-        "idle_timeout",
+        "resource_lock_enabled",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("true"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Whether hipfire serve asks the daemon to acquire physical accelerator resource locks at startup."
+    ),
+    field!(
+        "resource_lock_gpus",
+        ConfigType::Json,
+        Requirement::Optional,
+        Some("[\"auto\"]"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "GPU resources to lease before HIP initialization. [\"auto\"] maps to the daemon's detected/visible HIP device."
+    ),
+    field!(
+        "resource_lock_npus",
+        ConfigType::Json,
+        Requirement::Optional,
+        Some("[]"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "NPU resources to lease before accelerator initialization. [] disables NPU leases; [\"auto\"] leases every detected NPU."
+    ),
+    field!(
+        "resource_lock_wait_ms",
         ConfigType::U32,
         Requirement::Optional,
-        Some("300"),
+        Some("0"),
         GLOBAL_RUNTIME,
-        ConfigMutability::RuntimeReloadable,
-        "Seconds of inactivity before the server may evict an idle model."
+        ConfigMutability::Static,
+        "Milliseconds to wait for busy resource leases during daemon startup; 0 fails fast."
+    ),
+    field!(
+        "scheduler_system_memory_budget_bytes",
+        ConfigType::U64,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "System-memory budget claimed by the residency scheduler. 0 disables the budget guard."
+    ),
+    field!(
+        "scheduler_system_memory_headroom_bytes",
+        ConfigType::U64,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "System-memory headroom preserved by residency admission. 0 disables the headroom guard."
+    ),
+    field!(
+        "scheduler_vram_budget_bytes",
+        ConfigType::U64,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "VRAM budget claimed by the residency scheduler. 0 disables the budget guard."
+    ),
+    field!(
+        "scheduler_vram_headroom_bytes",
+        ConfigType::U64,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "VRAM headroom preserved by residency admission. 0 disables the headroom guard."
+    ),
+    field!(
+        "model_residency_mode",
+        ConfigType::Enum {
+            values: &["auto", "full", "qwen_moe_modules"]
+        },
+        Requirement::Optional,
+        Some("auto"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Model residency strategy selected by the scheduler."
     ),
     field!(
         "kv_cache",

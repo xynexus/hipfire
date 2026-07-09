@@ -2584,12 +2584,22 @@ fn slab_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
 fn build_slab_banks(hfq: &HfqFile, bank_size: usize) -> Vec<SlabPlanBank> {
     let mut banks = Vec::new();
     let mut cur: Option<SlabPlanBank> = None;
-    let skip_routed_experts = matches!(
-        std::env::var("HIPFIRE_QWEN35_PAGED_EXPERTS")
-            .ok()
-            .as_deref(),
-        Some("1" | "true" | "on" | "yes")
-    );
+    let skip_routed_experts = std::env::var("HIPFIRE_QWEN35_RESIDENCY_MODE")
+        .ok()
+        .map(|mode| {
+            matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "qwen_moe_modules" | "qwen35_moe_modules" | "qwen3.5_moe_modules"
+            )
+        })
+        .unwrap_or_else(|| {
+            matches!(
+                std::env::var("HIPFIRE_QWEN35_PAGED_EXPERTS")
+                    .ok()
+                    .as_deref(),
+                Some("1" | "true" | "on" | "yes")
+            )
+        });
     for (idx, info) in hfq.tensors().iter().enumerate() {
         if skip_routed_experts && is_qwen35_routed_expert_tensor(&info.name) {
             continue;
@@ -3193,6 +3203,20 @@ impl Default for CalibOpts {
     }
 }
 
+fn format_calib_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// Summary of a calibration pass after the `.calib.hfq` has been streamed to
 /// disk (re-exported from the shared driver). The tensors themselves are NOT
 /// returned — they are written one at a time (see
@@ -3474,6 +3498,8 @@ pub fn collect_calibration_artifacts(
                 .map_err(|e| format!("qwen35 calib scratch: {e}"))?;
 
             let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+            let progress_started = std::time::Instant::now();
+            let mut last_progress = progress_started;
             for (pos, &tok) in tokens.iter().enumerate() {
                 forward_scratch(gpu, weights, config, tok, pos, &mut kv, &mut dn, &scratch)
                     .map_err(|e| format!("qwen35 calib forward: {e}"))?;
@@ -3482,6 +3508,25 @@ pub fn collect_calibration_artifacts(
                         .download_f32(&scratch.logits)
                         .map_err(|e| format!("qwen35 calib logits: {e}"))?;
                     kldref.push((logsumexp(&lg), topk_logits(&lg, opts.kldref_topk)));
+                }
+                let done = pos + 1;
+                if done == 1
+                    || done == n_tok
+                    || last_progress.elapsed() >= std::time::Duration::from_secs(10)
+                {
+                    let elapsed = progress_started.elapsed();
+                    let elapsed_secs = elapsed.as_secs_f64().max(1e-9);
+                    let rate = done as f64 / elapsed_secs;
+                    let remaining = n_tok.saturating_sub(done);
+                    let eta = std::time::Duration::from_secs_f64(remaining as f64 / rate.max(1e-9));
+                    eprintln!(
+                        "  calib capture: {done}/{n_tok} tokens ({:.1}%) elapsed={} rate={:.2} tok/s eta={}",
+                        (done as f64 * 100.0) / n_tok.max(1) as f64,
+                        format_calib_duration(elapsed),
+                        rate,
+                        format_calib_duration(eta)
+                    );
+                    last_progress = std::time::Instant::now();
                 }
             }
 

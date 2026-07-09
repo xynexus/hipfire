@@ -30,8 +30,9 @@ use hipfire_generate::{
 use hipfire_model::{discover_dflash_draft_for_model, ModelLoadParams, ModelWorkerKey};
 use hipfire_prompt::{Message as PromptMessage, Role, ToolCall as PromptToolCall};
 use hipfire_scheduler::{
-    create_request_session_draft, server_prefill_batch_enabled, CreateRequestSessionInput,
-    NextBatchInput, SchedulerPolicyEnv,
+    create_request_session_draft, plan_model_residency, server_prefill_batch_enabled,
+    CreateRequestSessionInput, ModelResidencyRequest, NextBatchInput, ResidencyMode,
+    ResidentWorkerLedgerEntry, ResourceBudget, ResourceUsage, SchedulerPolicyEnv,
 };
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -491,7 +492,7 @@ pub(crate) async fn ensure_model_loaded(
     .ok_or_else(|| format!("model not found: {model_arg}"))?;
     let model_str = model_path.to_string_lossy().into_owned();
 
-    let (params, daemon_spawn_env) = {
+    let (mut params, daemon_spawn_env) = {
         let cfg = state.config.lock().await;
         let resolved_cfg = cfg.resolve_for_model(model_arg);
         let mut params = load_params_for_model_config(&cfg, model_arg, Some(&model_path));
@@ -505,6 +506,11 @@ pub(crate) async fn ensure_model_loaded(
     };
 
     let requested_worker_key_id = server_model_worker_key_id(&model_str);
+    let residency_plan = plan_residency_for_load(state, &model_str, &requested_worker_key_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    params.residency_mode = Some(residency_plan.residency_mode.as_str().to_string());
+    params.module_vram_budget_bytes = residency_plan.module_vram_budget_bytes;
     let mut engine_guard = state.engine.lock().await;
 
     if let Some(eng) = engine_guard.as_mut() {
@@ -525,6 +531,7 @@ pub(crate) async fn ensure_model_loaded(
                         "reloading model worker with larger max_seq for request"
                     );
                 }
+                apply_residency_evictions(state, eng, &residency_plan).await?;
                 let loaded = eng
                     .load_with_worker_key_id(
                         &model_str,
@@ -562,6 +569,7 @@ pub(crate) async fn ensure_model_loaded(
     let bin = find_daemon_bin_or_error().map_err(|e| e.to_string())?;
     daemon_spawn_env.apply();
     let mut engine = DaemonEngine::spawn(&bin).await.map_err(|e| e.to_string())?;
+    apply_residency_evictions(state, &mut engine, &residency_plan).await?;
     let loaded = engine
         .load_with_worker_key_id(
             &model_str,
@@ -595,6 +603,96 @@ fn server_model_worker_key_id(model_path: &str) -> String {
     let mut hasher = DefaultHasher::new();
     model_path.hash(&mut hasher);
     format!("server-model:{:016x}", hasher.finish())
+}
+
+async fn plan_residency_for_load(
+    state: &SharedState,
+    model_path: &str,
+    worker_key_id: &str,
+) -> Result<hipfire_scheduler::ModelResidencyPlan, String> {
+    let cfg = state.config.lock().await.clone();
+    let budget = ResourceBudget {
+        system_memory_budget_bytes: cfg.scheduler_system_memory_budget_bytes,
+        system_memory_headroom_bytes: cfg.scheduler_system_memory_headroom_bytes,
+        vram_budget_bytes: cfg.scheduler_vram_budget_bytes,
+        vram_headroom_bytes: cfg.scheduler_vram_headroom_bytes,
+    };
+    let requested_mode = ResidencyMode::parse(&cfg.model_residency_mode)
+        .ok_or_else(|| format!("invalid model_residency_mode {}", cfg.model_residency_mode))?;
+    let estimated_full = ResourceUsage {
+        system_memory_bytes: 0,
+        vram_bytes: model_file_bytes(model_path),
+    };
+    let effective_module_budget = cfg
+        .scheduler_vram_budget_bytes
+        .saturating_sub(cfg.scheduler_vram_headroom_bytes);
+    let estimated_qwen_moe_modules =
+        qwen_moe_module_capable_model(model_path).then_some(ResourceUsage {
+            system_memory_bytes: 0,
+            vram_bytes: if effective_module_budget > 0 {
+                effective_module_budget
+            } else {
+                estimated_full.vram_bytes
+            },
+        });
+    let resident_workers = state
+        .loaded_models
+        .lock()
+        .await
+        .iter()
+        .filter_map(|(path, loaded)| {
+            Some(ResidentWorkerLedgerEntry {
+                worker_key_id: loaded.worker_key_id.clone()?,
+                model_path: path.clone(),
+                residency_mode: ResidencyMode::Full,
+                resource_usage: ResourceUsage {
+                    system_memory_bytes: 0,
+                    vram_bytes: model_file_bytes(path),
+                },
+                last_used_seq: u64::from(loaded.max_seq),
+            })
+        })
+        .collect::<Vec<_>>();
+    plan_model_residency(
+        budget,
+        ModelResidencyRequest {
+            worker_key_id: worker_key_id.to_string(),
+            model_path: model_path.to_string(),
+            requested_mode,
+            estimated_full,
+            estimated_qwen_moe_modules,
+        },
+        &resident_workers,
+    )
+}
+
+fn model_file_bytes(model_path: &str) -> u64 {
+    std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn qwen_moe_module_capable_model(model_path: &str) -> bool {
+    let lower = model_path.to_ascii_lowercase();
+    (lower.contains("qwen3.5") || lower.contains("qwen35") || lower.contains("qwen3"))
+        && (lower.contains("a") || lower.contains("moe"))
+}
+
+async fn apply_residency_evictions(
+    state: &SharedState,
+    engine: &mut DaemonEngine,
+    plan: &hipfire_scheduler::ModelResidencyPlan,
+) -> Result<(), String> {
+    for worker_key_id in &plan.unload_worker_key_ids {
+        engine
+            .unload_worker(worker_key_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        state
+            .loaded_models
+            .lock()
+            .await
+            .retain(|_, loaded| loaded.worker_key_id.as_deref() != Some(worker_key_id.as_str()));
+    }
+    Ok(())
 }
 
 async fn set_loaded_model_state(state: &SharedState, model_path: String, loaded: LoadedModelState) {
@@ -923,7 +1021,8 @@ pub(crate) fn openai_chat_completion_response_with_tool_calls_json(
         "created": created,
         "model": model,
         "choices": [choice],
-        "usage": openai_nonstream_usage_json(done)
+        "usage": openai_nonstream_usage_json(done),
+        "timings": openai_timings_json(done)
     });
     if tool_calls.is_empty() {
         if let Some(truncation) = detect_tool_call_truncation(text, done.tokens, request_max_tokens)
@@ -2953,6 +3052,68 @@ mod tests {
 
         assert_eq!(request_max_tokens, 8192);
         assert_eq!(required_max_seq, 16384);
+    }
+
+    #[tokio::test]
+    async fn residency_plan_passes_qwen_module_mode_and_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-server-residency-modules-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let model = root.join("Qwen3.5-122B-A10B.mq4.hfq");
+        std::fs::write(&model, vec![0u8; 128]).unwrap();
+        let cfg = HipfireConfig {
+            model_residency_mode: "qwen_moe_modules".to_string(),
+            scheduler_vram_budget_bytes: 1024,
+            scheduler_vram_headroom_bytes: 256,
+            ..Default::default()
+        };
+        let state = crate::AppState::new(cfg);
+
+        let plan = plan_residency_for_load(&state, model.to_str().unwrap(), "worker-qwen")
+            .await
+            .unwrap();
+
+        assert_eq!(plan.residency_mode, ResidencyMode::QwenMoeModules);
+        assert_eq!(plan.module_vram_budget_bytes, Some(768));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn residency_plan_selects_loaded_worker_victims_under_budget_pressure() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-server-residency-victims-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let old = root.join("old.hfq");
+        let incoming = root.join("incoming.hfq");
+        std::fs::write(&old, vec![0u8; 700]).unwrap();
+        std::fs::write(&incoming, vec![0u8; 500]).unwrap();
+        let cfg = HipfireConfig {
+            scheduler_vram_budget_bytes: 1000,
+            ..Default::default()
+        };
+        let state = crate::AppState::new(cfg);
+        state.loaded_models.lock().await.insert(
+            old.to_string_lossy().into_owned(),
+            LoadedModelState {
+                worker_key_id: Some("worker-old".to_string()),
+                cache_capable: false,
+                max_seq: 1024,
+            },
+        );
+
+        let plan = plan_residency_for_load(&state, incoming.to_str().unwrap(), "worker-new")
+            .await
+            .unwrap();
+
+        assert_eq!(plan.residency_mode, ResidencyMode::Full);
+        assert_eq!(plan.unload_worker_key_ids, vec!["worker-old"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -293,6 +293,13 @@ fn default_bench_tokens() -> usize {
     128
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BenchPrefillResponse {
+    pub tokens: usize,
+    pub ms: f64,
+    pub tok_s: f64,
+}
+
 /// Non-autoregressive **embedding** request. Runs one (bidirectional for encoders,
 /// causal for decoder-pooling models) prefill over each text and returns the pooled,
 /// L2-normalized hidden vector — no token sampling. `dims`, when set, truncates the
@@ -421,6 +428,7 @@ pub enum DaemonResponse {
     Collected(CollectResponse),
     KldChunk(KldChunkEvent),
     KldEvaled(KldEvalResponse),
+    PrefillResult(BenchPrefillResponse),
     SteerCaptured(SteerMeansResponse),
     SteerOk,
     LoraListed(LoraListResponse),
@@ -434,6 +442,8 @@ pub enum DaemonResponse {
         #[serde(default)]
         count: usize,
     },
+    WorkerStatus(serde_json::Value),
+    UnloadWorkerDone(serde_json::Value),
     HneuronOk {
         n_intervened: usize,
         gain: f32,
