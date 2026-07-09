@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 hipfire-coherence = { path = "../hipfire-coherence" }
+hipfire-config = { path = "../hipfire-config" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-evidence = { path = "../hipfire-evidence" }

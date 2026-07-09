@@ -5,13 +5,13 @@
 //! Measured host capability profiling for eval reports.
 //!
 //! This runner complements static hardware buckets with direct measurements:
-//! CPU memory copy bandwidth, the storage path used for `~/.hipfire/models`,
+//! CPU memory copy bandwidth, the configured model storage path,
 //! and optional HIP copy bandwidth when a GPU is available.
 
 use hip_bridge::HipRuntime;
 use hipfire_evidence::HostProfile;
-use hipfire_sysinfo::collect_default_host_profile;
 use hipfire_rdna::KernelCompiler;
+use hipfire_sysinfo::collect_default_host_profile;
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
@@ -205,7 +205,7 @@ pub fn usage() -> String {
     "Usage:\n  hipfire-host-profile [--out <path>] [--models-dir <dir>] [--runs N]\n\n\
      Options:\n\
        --out <path>              output JSON path (default: ~/.hipfire/eval-results/host-profile/<stamp>.json)\n\
-       --models-dir <dir>        model storage directory to test (default: ~/.hipfire/models)\n\
+       --models-dir <dir>        model storage directory to test (default: configured models_dir)\n\
        --size-mib <N>            CPU/GPU copy test size in MiB (default: 128)\n\
        --storage-size-mib <N>    storage test size in MiB (default: 128)\n\
        --runs <N>                samples per test (default: 3)\n\
@@ -213,7 +213,7 @@ pub fn usage() -> String {
        --gpu-max-size-mib <N>    cap largest GPU read/write sweep payload size in MiB\n\
        --gpu-sweep-mib-step <N>  override default GPU MiB payload spacing\n\
        --skip-gpu                skip HIP copy tests\n\
-       --skip-storage            skip ~/.hipfire/models storage tests\n\
+       --skip-storage            skip model storage tests\n\
        --json                    print report JSON to stdout in addition to writing --out\n"
         .to_string()
 }
@@ -1280,7 +1280,8 @@ fn parse_usize(raw: &str, flag: &str) -> Result<usize, String> {
 }
 
 fn default_models_dir() -> PathBuf {
-    home_dir().join(".hipfire").join("models")
+    let loaded = hipfire_config::load_config_bundle();
+    hipfire_config::configured_models_dir(&loaded.config)
 }
 
 fn default_output_path() -> PathBuf {

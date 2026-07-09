@@ -45,19 +45,12 @@ pub fn run_from_env() -> Result<(), String> {
 }
 
 /// Expand a `--models` spec (comma-separated globs / prefixes / paths) against
-/// the model directory (HIPFIRE_MODELS_DIR or ~/.hipfire/models). A token with
+/// the model directory (HIPFIRE_MODELS_DIR or configured models_dir). A token with
 /// `/` or an existing `.hfq` path is taken literally; otherwise it matches model
 /// filenames by simple `*` glob, falling back to substring match when it has no
 /// `*` (so `qwen3.5` matches every `*qwen3.5*.hfq`).
 fn expand_models(spec: &str) -> Result<Vec<String>, String> {
-    let models_dir = std::env::var_os("HIPFIRE_MODELS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".hipfire")
-                .join("models")
-        });
+    let models_dir = eval_models_dir();
     let entries: Vec<(String, PathBuf)> = std::fs::read_dir(&models_dir)
         .map_err(|e| format!("read models dir {}: {e}", models_dir.display()))?
         .filter_map(|e| e.ok())
@@ -413,14 +406,7 @@ fn print_eval_status(config: &EvalConfig) {
                 .count()
         })
         .unwrap_or(0);
-    let models_dir = std::env::var_os("HIPFIRE_MODELS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".hipfire")
-                .join("models")
-        });
+    let models_dir = eval_models_dir();
     let model_count = std::fs::read_dir(&models_dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok())

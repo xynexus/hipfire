@@ -54,6 +54,15 @@ use hipfire_model::{
     ModelLoadParams, ModelLoadedResponse, ModelManifestEntry,
 };
 
+pub(crate) fn eval_models_dir() -> PathBuf {
+    std::env::var_os("HIPFIRE_MODELS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let loaded = hipfire_config::load_config_bundle();
+            hipfire_config::configured_models_dir(&loaded.config)
+        })
+}
+
 mod config;
 pub use config::*;
 mod datasets;
@@ -1003,10 +1012,7 @@ fn run_host_capability_profile_anchor(config: &EvalConfig, ctx: &EvalContext) ->
         );
     };
     let out = config.out_dir.join("artifacts").join("host_profile.json");
-    let models_dir = home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".hipfire")
-        .join("models");
+    let models_dir = eval_models_dir();
     let started = SystemTime::now();
     let output = match Command::new(&bin)
         .args([

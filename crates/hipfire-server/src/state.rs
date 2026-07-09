@@ -102,8 +102,11 @@ pub struct AppState {
     /// Admin-configured DoS ceiling on SD API request geometry. Derived from
     /// config at construction; clients may request smaller, never larger.
     pub(crate) sdapi_geometry_limits: crate::routes::sdapi::SdapiGeometryLimits,
+    /// Primary local model root. Derived from config at construction; network
+    /// model resolution is confined to this root plus `models_network_dir`.
+    pub models_dir: PathBuf,
     /// Optional admin-configured extra read-only model root (e.g. an NFS
-    /// share). Network model resolution is confined to `~/.hipfire/models`
+    /// share). Network model resolution is confined to `models_dir`
     /// plus this root; unset by default. Derived from config at construction.
     pub models_network_dir: Option<PathBuf>,
     /// Local admin bearer secret (`~/.hipfire/admin.secret`); same-box
@@ -132,6 +135,7 @@ impl AppState {
         let config = loaded_config.config.clone();
         let sdapi_output_root = PathBuf::from(&config.sdapi_output_root);
         let sdapi_geometry_limits = crate::routes::sdapi::SdapiGeometryLimits::from_config(&config);
+        let models_dir = hipfire_config::configured_models_dir(&config);
         let models_network_dir = config
             .models_network_dir
             .as_deref()
@@ -164,6 +168,7 @@ impl AppState {
             training_runs_dir,
             sdapi_output_root,
             sdapi_geometry_limits,
+            models_dir,
             models_network_dir,
             admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
             admin_sessions: Mutex::new(HashMap::new()),

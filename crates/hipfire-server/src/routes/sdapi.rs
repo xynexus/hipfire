@@ -4,7 +4,6 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use base64::Engine;
-use hipfire_config::models_dir;
 use hipfire_diffusion::{
     encode_rgb_batch_png_base64, inspect_hfq, inspect_hfq_with_runtime_support,
     resize_rgb_batch_nearest, resize_rgb_batch_to_contain_fill_nearest,
@@ -255,7 +254,7 @@ async fn execute_sd_generation(
         };
     }
 
-    if requested_model_is_diffusers_pipeline(requested_model.as_deref()) {
+    if requested_model_is_diffusers_pipeline(requested_model.as_deref(), &state.models_dir) {
         return diffusion_backend_missing_response();
     }
 
@@ -392,22 +391,27 @@ async fn resolve_diffusion_hfq_for_request(
             cfg.default_model.clone()
         }
     }?;
-    resolve_diffusion_hfq_candidate(&candidate, state.models_network_dir.as_deref())
+    resolve_diffusion_hfq_candidate(
+        &candidate,
+        &state.models_dir,
+        state.models_network_dir.as_deref(),
+    )
 }
 
 pub(crate) fn resolve_diffusion_hfq_candidate(
     candidate: &str,
+    models_dir: &Path,
     network_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     if candidate.is_empty() {
         return None;
     }
-    if let Some(path) = find_model(candidate, network_dir) {
+    if let Some(path) = find_model(candidate, models_dir, network_dir) {
         if inspect_hfq(&path).is_ok() {
             return Some(path);
         }
     }
-    discover_diffusion_hfq_models()
+    discover_diffusion_hfq_models(models_dir)
         .into_iter()
         .find(|inspection| diffusion_summary_matches_candidate(&inspection.summary, candidate))
         .map(|inspection| inspection.summary.path)
@@ -4022,7 +4026,7 @@ pub async fn get_sd_models(State(state): State<SharedState>) -> Json<Value> {
         .collect::<Vec<_>>();
 
     models.extend(
-        discover_diffusion_hfq_models()
+        discover_diffusion_hfq_models(&state.models_dir)
             .into_iter()
             .filter_map(|inspection| {
                 let filename = inspection.summary.path.to_string_lossy().into_owned();
@@ -4053,7 +4057,7 @@ pub async fn get_sd_models(State(state): State<SharedState>) -> Json<Value> {
     }));
 
     models.extend(
-        discover_diffusion_checkpoint_models()
+        discover_diffusion_checkpoint_models(&state.models_dir)
             .into_iter()
             .map(|model| {
                 json!({
@@ -4067,16 +4071,21 @@ pub async fn get_sd_models(State(state): State<SharedState>) -> Json<Value> {
             }),
     );
 
-    models.extend(local_llm_registry().models.into_iter().map(|model| {
-        json!({
-            "title": model.id,
-            "model_name": model.id,
-            "hash": null,
-            "sha256": null,
-            "filename": model.path,
-            "config": null,
-        })
-    }));
+    models.extend(
+        local_llm_registry(&state.models_dir)
+            .models
+            .into_iter()
+            .map(|model| {
+                json!({
+                    "title": model.id,
+                    "model_name": model.id,
+                    "hash": null,
+                    "sha256": null,
+                    "filename": model.path,
+                    "config": null,
+                })
+            }),
+    );
     Json(Value::Array(models))
 }
 
@@ -4166,9 +4175,11 @@ pub async fn post_reload_checkpoint(State(state): State<SharedState>) -> Respons
         }))
         .into_response();
     };
-    let Some(path) =
-        resolve_diffusion_hfq_candidate(&requested_model, state.models_network_dir.as_deref())
-    else {
+    let Some(path) = resolve_diffusion_hfq_candidate(
+        &requested_model,
+        &state.models_dir,
+        state.models_network_dir.as_deref(),
+    ) else {
         return diffusion_error_response(DiffusionError::InvalidRequest(format!(
             "sd_model_checkpoint {requested_model:?} could not be resolved"
         )));
@@ -4259,7 +4270,7 @@ struct DiffusersModel {
     pipeline_class: String,
 }
 
-fn requested_model_is_diffusers_pipeline(model: Option<&str>) -> bool {
+fn requested_model_is_diffusers_pipeline(model: Option<&str>, models_dir: &Path) -> bool {
     let Some(model) = model.filter(|model| !model.is_empty()) else {
         return false;
     };
@@ -4271,7 +4282,7 @@ fn requested_model_is_diffusers_pipeline(model: Option<&str>) -> bool {
             || model == entry.model_name
             || model == entry.path
             || model == entry.pipeline_class
-    }) || discover_diffusion_checkpoint_models()
+    }) || discover_diffusion_checkpoint_models(models_dir)
         .into_iter()
         .any(|entry| model == entry.title || model == entry.model_name || model == entry.path)
 }
@@ -4289,8 +4300,8 @@ fn diffusion_backend_missing_response() -> Response {
         .into_response()
 }
 
-fn discover_diffusion_hfq_models() -> Vec<DiffusionHfqInspection> {
-    let mut models = list_local_models()
+fn discover_diffusion_hfq_models(models_dir: &Path) -> Vec<DiffusionHfqInspection> {
+    let mut models = list_local_models(models_dir)
         .into_iter()
         .filter_map(|path| inspect_hfq_with_runtime_support(path).ok())
         .collect::<Vec<_>>();
@@ -4321,9 +4332,9 @@ fn discover_diffusers_models() -> Vec<DiffusersModel> {
     models
 }
 
-fn discover_diffusion_checkpoint_models() -> Vec<DiffusersModel> {
+fn discover_diffusion_checkpoint_models(models_dir: &Path) -> Vec<DiffusersModel> {
     let mut models = Vec::new();
-    collect_checkpoint_models_from_root(&models_dir(), &mut models);
+    collect_checkpoint_models_from_root(models_dir, &mut models);
     models.sort_by(|a, b| a.model_name.cmp(&b.model_name));
     models.dedup_by(|a, b| a.path == b.path);
     models
@@ -4502,7 +4513,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -4585,7 +4596,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-override.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -4625,7 +4636,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-infotext.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -4747,7 +4758,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-webui-ignored-fields-diffusion.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -4882,7 +4893,7 @@ mod tests {
         let hfq_path = dir.join("tiny-route-diffusion-save.hfq");
         let output_dir = dir.join("outputs");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -4933,7 +4944,7 @@ mod tests {
         let hfq_path = dir.join("tiny-route-diffusion-do-not-save.hfq");
         let output_dir = dir.join("outputs");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5034,7 +5045,7 @@ mod tests {
         let hfq_path = dir.join("tiny-route-diffusion-no-grid-save.hfq");
         let output_dir = dir.join("outputs");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5078,7 +5089,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-highres.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5213,7 +5224,7 @@ mod tests {
         let second_hfq_path = dir.join("tiny-route-diffusion-highres-second.hfq");
         write_tiny_diffusion_hfq(&first_hfq_path);
         write_tiny_diffusion_hfq(&second_hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5275,7 +5286,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-highres-checkpoint.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5311,7 +5322,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5358,7 +5369,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-include-init.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5401,7 +5412,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-batch.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5451,7 +5462,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-niter.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5495,7 +5506,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-mask.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5539,7 +5550,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-resize.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5590,7 +5601,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-latent-upscale.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5642,7 +5653,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-full-res-inpaint.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5750,7 +5761,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-resize-mask.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -5969,7 +5980,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -6016,7 +6027,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-return-grid.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -6064,7 +6075,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-niter.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let mut cfg = hipfire_config::HipfireConfig::default();
+        let cfg = hipfire_config::HipfireConfig::default();
         let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
         loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
         let state = crate::AppState::new_loaded(loaded);
@@ -7262,9 +7273,10 @@ mod tests {
         assert!(models
             .iter()
             .all(|model| model.pipeline_class == "StableDiffusionCheckpoint"));
-        assert!(requested_model_is_diffusers_pipeline(Some(
-            direct.to_str().unwrap()
-        )));
+        assert!(requested_model_is_diffusers_pipeline(
+            Some(direct.to_str().unwrap()),
+            &dir
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

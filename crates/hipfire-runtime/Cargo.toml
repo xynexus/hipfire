@@ -64,6 +64,7 @@ hipfire-evidence = { path = "../hipfire-evidence" }
 # the inference hot path for one symbol (collect_default_host_profile).
 hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-generate = { path = "../hipfire-generate" }
+hipfire-config = { path = "../hipfire-config" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }

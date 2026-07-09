@@ -504,9 +504,11 @@ async fn prewarm_default_model(state: &SharedState) {
 }
 
 async fn prewarm_diffusion_model(state: &SharedState, model: &str) -> bool {
-    let Some(path) =
-        routes::sdapi::resolve_diffusion_hfq_candidate(model, state.models_network_dir.as_deref())
-    else {
+    let Some(path) = routes::sdapi::resolve_diffusion_hfq_candidate(
+        model,
+        &state.models_dir,
+        state.models_network_dir.as_deref(),
+    ) else {
         return false;
     };
 

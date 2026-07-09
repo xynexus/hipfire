@@ -833,14 +833,7 @@ pub(crate) fn daemon_speed_failure_rows_for_model(
 }
 
 pub(crate) fn resolve_eval_model_path(model: &str) -> Option<PathBuf> {
-    let models_dir = std::env::var_os("HIPFIRE_MODELS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".hipfire")
-                .join("models")
-        });
+    let models_dir = eval_models_dir();
     find_model_in(model, &models_dir, None)
 }
 

@@ -184,17 +184,19 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => commands::serve::run(args, loaded_config).await,
         Command::Chat(args) => commands::chat::run(args, loaded_config).await,
         Command::List => {
-            commands::list::run();
+            commands::list::run(loaded_config);
             Ok(())
         }
-        Command::Eval(args) => commands::forward::run_eval(args),
-        Command::HostProfile(args) => commands::forward::run_host_profile(args),
-        Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
-        Command::Optimize(args) => commands::forward::run_optimize(args),
-        Command::Model(args) => commands::model::run(args),
+        Command::Eval(args) => commands::forward::run_eval(args, loaded_config),
+        Command::HostProfile(args) => commands::forward::run_host_profile(args, loaded_config),
+        Command::CollectArtifacts(args) => {
+            commands::forward::run_collect_artifacts(args, loaded_config)
+        }
+        Command::Optimize(args) => commands::forward::run_optimize(args, loaded_config),
+        Command::Model(args) => commands::model::run(args, loaded_config),
         Command::Lock(args) => commands::lock::run(args),
         Command::Detect(args) => commands::detect::run(args),
-        Command::Diffusion(args) => commands::diffusion::run(args),
+        Command::Diffusion(args) => commands::diffusion::run(args, loaded_config),
         Command::Admin(args) => commands::admin::run(args, config).await,
         Command::GenDocs(args) => commands::gen_docs::run(args),
         Command::GenConfigSchema(args) => commands::gen_config_schema::run(args),

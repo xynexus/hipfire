@@ -196,9 +196,13 @@ pub struct HipfireConfig {
     /// Upper bound on `batch_size × n_iter` (total images per request).
     #[serde(default = "default_sdapi_max_total_batches")]
     pub sdapi_max_total_batches: u32,
+    /// Primary local model root. When unset, Hipfire uses
+    /// `~/.hipfire/models`.
+    #[serde(default)]
+    pub models_dir: Option<String>,
     /// Optional extra read-only model root (e.g. an NFS share such as
     /// `/srv/hipfire`). When set, the network-facing server routes resolve
-    /// model identifiers within this root in addition to `~/.hipfire/models`.
+    /// model identifiers within this root in addition to `models_dir`.
     /// Unset by default; local CLI/eval callers are unaffected.
     #[serde(default)]
     pub models_network_dir: Option<String>,
@@ -379,6 +383,7 @@ impl Default for HipfireConfig {
             sdapi_max_batch_size: default_sdapi_max_batch_size(),
             sdapi_max_n_iter: default_sdapi_max_n_iter(),
             sdapi_max_total_batches: default_sdapi_max_total_batches(),
+            models_dir: None,
             models_network_dir: None,
             default_model: None,
             max_seq: default_max_seq(),
@@ -440,6 +445,15 @@ pub fn host_config_path() -> PathBuf {
 
 pub fn models_dir() -> PathBuf {
     hipfire_dir().join("models")
+}
+
+pub fn configured_models_dir(config: &HipfireConfig) -> PathBuf {
+    config
+        .models_dir
+        .as_deref()
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(models_dir)
 }
 
 /// Path to the local admin bearer secret. Same-box clients (CLI/TUI) read
@@ -800,14 +814,16 @@ mod tests {
         assert_eq!(cfg.sdapi_max_batch_size, 8);
         assert_eq!(cfg.sdapi_max_n_iter, 16);
         assert_eq!(cfg.sdapi_max_total_batches, 32);
+        assert_eq!(cfg.models_dir, None);
         assert_eq!(cfg.models_network_dir, None);
+        assert_eq!(configured_models_dir(&cfg), models_dir());
     }
 
     #[test]
-    fn loaded_config_preserves_sdapi_caps_and_network_dir() {
+    fn loaded_config_preserves_sdapi_caps_and_model_dirs() {
         // Regression: these fields must be registered in `config_schema()`, or
         // the schema-driven `from_config` round-trip silently drops any
-        // admin-set value and the SD API caps / network model root never take
+        // admin-set value and the SD API caps / model roots never take
         // effect. Set non-default values and require they survive.
         let mut cfg = HipfireConfig::default();
         cfg.sdapi_max_dimension = 2048;
@@ -815,6 +831,7 @@ mod tests {
         cfg.sdapi_max_batch_size = 4;
         cfg.sdapi_max_n_iter = 4;
         cfg.sdapi_max_total_batches = 8;
+        cfg.models_dir = Some("/data/hipfire/models".to_string());
         cfg.models_network_dir = Some("/srv/hipfire".to_string());
 
         let loaded = LoadedConfig::from_config(cfg);
@@ -824,8 +841,16 @@ mod tests {
         assert_eq!(loaded.config.sdapi_max_n_iter, 4);
         assert_eq!(loaded.config.sdapi_max_total_batches, 8);
         assert_eq!(
+            loaded.config.models_dir.as_deref(),
+            Some("/data/hipfire/models")
+        );
+        assert_eq!(
             loaded.config.models_network_dir.as_deref(),
             Some("/srv/hipfire")
+        );
+        assert_eq!(
+            configured_models_dir(&loaded.config),
+            PathBuf::from("/data/hipfire/models")
         );
     }
 

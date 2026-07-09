@@ -2,7 +2,7 @@ use axum::{
     extract::{Query, State},
     response::{Html, Json},
 };
-use hipfire_config::{config_schema, LoadedConfig};
+use hipfire_config::{config_schema, configured_models_dir, LoadedConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{fs, path::Path};
@@ -22,7 +22,7 @@ pub async fn get_admin_diagnostics(State(state): State<SharedState>) -> Json<Val
         "host_config_path": loaded.host_config_path.display().to_string(),
         "config_read_error": loaded.read_error,
         "host_config_read_error": loaded.host_read_error,
-        "paths": path_statuses(&root),
+        "paths": path_statuses(&root, &configured_models_dir(&loaded.config)),
         "binaries": binary_statuses(&root.join("bin")),
         "kernel_caches": kernel_cache_statuses(&root.join("kernels")),
         "resource_locks": resource_lock_statuses(&hipfire_lock::resource_lock_root()),
@@ -116,10 +116,10 @@ fn resolved_config_json(loaded: &LoadedConfig, model: Option<&str>) -> Value {
     })
 }
 
-fn path_statuses(root: &Path) -> Vec<Value> {
+fn path_statuses(root: &Path, models_dir: &Path) -> Vec<Value> {
     [
         ("hipfire_dir", root.to_path_buf()),
-        ("models", root.join("models")),
+        ("models", models_dir.to_path_buf()),
         ("config", root.join("config.json")),
         ("host_config", root.join("config.local.json")),
         ("per_model_config", root.join("per_model_config.json")),

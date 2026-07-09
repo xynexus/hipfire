@@ -26,7 +26,8 @@
 | `mmq_screen` | `enum(auto|off|on)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | MMQ safety screening mode. |
 | `mmq_screen_threshold` | `f64` | optional | `0.10` | `global`, `model`, `runtime` | `load_time` | `none` | MMQ screening rejection threshold. |
 | `model_overrides` | `json` | optional | `{}` | `global`, `model` | `load_time` | `reload_model` | Sparse per-model override map layered on top of global config. |
-| `models_network_dir` | `path` | optional | - | `global`, `runtime` | `static` | `none` | Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to ~/.hipfire/models. Unset by default; local CLI/eval callers are unaffected. |
+| `models_dir` | `path` | optional | - | `global`, `runtime` | `static` | `none` | Primary local model root. When unset, Hipfire uses ~/.hipfire/models. |
+| `models_network_dir` | `path` | optional | - | `global`, `runtime` | `static` | `none` | Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to models_dir. Unset by default; local CLI/eval callers are unaffected. |
 | `mtp_k` | `u32` | optional | `3` | `global`, `model`, `runtime` | `load_time` | `none` | Number of MTP candidate tokens to consider. |
 | `mtp_mode` | `enum(auto|off|on)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | Multi-token prediction sidecar mode. |
 | `port` | `u16` | optional | `11435` | `global`, `runtime` | `static` | `none` | Bind port for the OpenAI-compatible HTTP server. |

@@ -227,13 +227,22 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Upper bound on batch_size × n_iter (total images generated per request)."
     ),
     field!(
+        "models_dir",
+        ConfigType::Path,
+        Requirement::Optional,
+        None,
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Primary local model root. When unset, Hipfire uses ~/.hipfire/models."
+    ),
+    field!(
         "models_network_dir",
         ConfigType::Path,
         Requirement::Optional,
         None,
         GLOBAL_RUNTIME,
         ConfigMutability::Static,
-        "Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to ~/.hipfire/models. Unset by default; local CLI/eval callers are unaffected."
+        "Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to models_dir. Unset by default; local CLI/eval callers are unaffected."
     ),
     field!(
         "default_model",

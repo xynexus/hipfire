@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use hipfire_arch_api::ArchId;
+use hipfire_config::LoadedConfig;
 use hipfire_runtime::hfq::HfqPackage;
 use hipfire_runtime::hfq_compose::{
     compose_hfq_with_config_keys, decompose_hfq_auto_with_config_keys, sidecar_tag_from_filename,
@@ -83,21 +84,21 @@ pub struct DecomposeArgs {
     infer: bool,
 }
 
-pub fn run(args: ModelArgs) -> anyhow::Result<()> {
+pub fn run(args: ModelArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     match args.command {
-        ModelCommand::Compose(a) => run_compose(a),
-        ModelCommand::Decompose(a) => run_decompose(a),
+        ModelCommand::Compose(a) => run_compose(a, &loaded),
+        ModelCommand::Decompose(a) => run_decompose(a, &loaded),
     }
 }
 
 /// Resolve an argument to a concrete path: an existing file path wins, else it
 /// is treated as a model alias resolved against the models directory.
-fn resolve(arg: &str) -> anyhow::Result<PathBuf> {
+fn resolve(arg: &str, loaded: &LoadedConfig) -> anyhow::Result<PathBuf> {
     let direct = PathBuf::from(arg);
     if direct.exists() {
         return Ok(direct);
     }
-    find_model(arg).ok_or_else(|| anyhow::anyhow!("no such file or model: {arg}"))
+    find_model(arg, &loaded.config).ok_or_else(|| anyhow::anyhow!("no such file or model: {arg}"))
 }
 
 /// Default bundle path: insert sorted, de-duplicated sidecar feature tags as
@@ -140,11 +141,11 @@ fn default_bundle_path(inputs: &[PathBuf]) -> PathBuf {
     }
 }
 
-fn run_compose(a: ComposeArgs) -> anyhow::Result<()> {
+fn run_compose(a: ComposeArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
     let inputs: Vec<PathBuf> = a
         .inputs
         .iter()
-        .map(|s| resolve(s))
+        .map(|s| resolve(s, loaded))
         .collect::<anyhow::Result<_>>()?;
     let out = a.output.unwrap_or_else(|| default_bundle_path(&inputs));
     // Arch owns which config keys belong to each sidecar; the base (first input)
@@ -155,8 +156,8 @@ fn run_compose(a: ComposeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_decompose(a: DecomposeArgs) -> anyhow::Result<()> {
-    let bundle = resolve(&a.bundle)?;
+fn run_decompose(a: DecomposeArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
+    let bundle = resolve(&a.bundle, loaded)?;
     let role_keys = role_config_keys_for(&bundle);
     let written = decompose_hfq_auto_with_config_keys(&bundle, &a.output_dir, a.infer, &role_keys)?;
     println!(

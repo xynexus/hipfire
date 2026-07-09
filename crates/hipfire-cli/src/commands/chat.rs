@@ -155,8 +155,8 @@ pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
             )
         })?
         .to_string();
-    let model_path =
-        find_model(&model).ok_or_else(|| anyhow::anyhow!("model not found: {model}"))?;
+    let model_path = find_model(&model, &loaded.config)
+        .ok_or_else(|| anyhow::anyhow!("model not found: {model}"))?;
     let config: HipfireConfig = loaded.resolve_for_model(&model).config;
 
     // Validate attachments up front so an unsupported file type fails before the

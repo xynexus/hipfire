@@ -6,9 +6,9 @@
 
 use std::path::Path;
 
-use hipfire_config::models_dir;
+use hipfire_config::{configured_models_dir, LoadedConfig};
 use hipfire_model::{
-    build_local_llm_registry, model_card, ArchFeatures, FeatureSupport, LlmModelRegistryEntry,
+    build_llm_registry_in, model_card, ArchFeatures, FeatureSupport, LlmModelRegistryEntry,
     ModelCard, Sidecars,
 };
 
@@ -84,10 +84,17 @@ fn row_from_registry_entry(entry: &LlmModelRegistryEntry) -> ListRow {
     }
 }
 
-pub fn run() {
-    let registry = build_local_llm_registry();
+pub fn run(loaded: LoadedConfig) {
+    let models_dir = configured_models_dir(&loaded.config);
+    let hipfire = hipfire_config::hipfire_dir();
+    let registry = build_llm_registry_in(
+        &models_dir,
+        &hipfire.join("triattn"),
+        &hipfire.join("drafts"),
+        &hipfire.join("templates"),
+    );
     if registry.models.is_empty() {
-        println!("No valid HFQ models found in {}", models_dir().display());
+        println!("No valid HFQ models found in {}", models_dir.display());
         return;
     }
 

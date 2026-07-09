@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use base64::Engine;
 use clap::{Args, Subcommand, ValueEnum};
+use hipfire_config::LoadedConfig;
 use hipfire_diffusion::DiffusionHipRuntimeOptions;
 // GGUF-style split: the diffusers/checkpoint importer (pickle + zip parsing)
 // now lives in the offline hipfire-diffusion-coexist crate, out of the
@@ -538,7 +539,7 @@ pub struct DiffusionSmokeArgs {
     pub skip_masked_img2img: bool,
 }
 
-pub fn run(args: DiffusionArgs) -> anyhow::Result<()> {
+pub fn run(args: DiffusionArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     match args.command {
         DiffusionCommand::Import(args) => {
             let summary = import_diffusers_to_hfq(DiffusersImportOptions {
@@ -556,17 +557,18 @@ pub fn run(args: DiffusionArgs) -> anyhow::Result<()> {
             Ok(())
         }
         DiffusionCommand::Inspect(args) => {
-            let inspection = inspect_hfq_with_runtime_support(resolve_model_path(args.model))?;
+            let inspection =
+                inspect_hfq_with_runtime_support(resolve_model_path(args.model, &loaded))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&inspection_json(inspection))?
             );
             Ok(())
         }
-        DiffusionCommand::Preflight(args) => run_preflight(args),
-        DiffusionCommand::Txt2Img(args) => run_txt2img(args),
-        DiffusionCommand::Img2Img(args) => run_img2img(args),
-        DiffusionCommand::Smoke(args) => run_smoke(args),
+        DiffusionCommand::Preflight(args) => run_preflight(args, &loaded),
+        DiffusionCommand::Txt2Img(args) => run_txt2img(args, &loaded),
+        DiffusionCommand::Img2Img(args) => run_img2img(args, &loaded),
+        DiffusionCommand::Smoke(args) => run_smoke(args, &loaded),
         DiffusionCommand::Quantize(args) => run_quantize(args),
         DiffusionCommand::Calibrate(args) => run_calibrate(args),
     }
@@ -723,7 +725,7 @@ fn inspection_json(inspection: DiffusionHfqInspection) -> serde_json::Value {
     })
 }
 
-fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
+fn run_preflight(args: DiffusionPreflightArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
     let prompts = build_diffusion_prompts(
         &args.prompt,
         &args.negative_prompt,
@@ -752,7 +754,7 @@ fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
         send_images: false,
         save_images: false,
     };
-    let model = resolve_model_path(args.model);
+    let model = resolve_model_path(args.model, loaded);
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let memory_plan = pipeline.hip_memory_plan(&request)?;
     let rocm = match pipeline.preflight_hip_runtime(
@@ -784,7 +786,7 @@ fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
+fn run_txt2img(args: DiffusionTxt2ImgArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
     let prompts = build_diffusion_prompts(
         &args.prompt,
         &args.negative_prompt,
@@ -813,13 +815,13 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
         send_images: true,
         save_images: false,
     };
-    let model = resolve_model_path(args.model.clone());
+    let model = resolve_model_path(args.model.clone(), loaded);
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let runtime_options = resolve_runtime_options(args.rocm_device_id)?;
     let batch_images = request.prompts.len();
     let wall_start = Instant::now();
     let output = if let Some(preset) = args.mrflow {
-        generate_mrflow_txt2img(&pipeline, request, &args, preset, runtime_options)?
+        generate_mrflow_txt2img(&pipeline, request, &args, preset, runtime_options, loaded)?
     } else if args.enable_hr {
         generate_highres_txt2img(&pipeline, request, &args, runtime_options)?
     } else if let Some(preview_dir) = args.preview_dir.clone() {
@@ -899,6 +901,7 @@ fn generate_mrflow_txt2img(
     args: &DiffusionTxt2ImgArgs,
     preset: MrFlowPreset,
     runtime_options: DiffusionGenerationRuntimeOptions,
+    loaded: &LoadedConfig,
 ) -> anyhow::Result<hipfire_diffusion::DiffusionBatchOutput> {
     let params = preset.params();
     let target_width = args.width;
@@ -938,6 +941,7 @@ fn generate_mrflow_txt2img(
     let (upscaled, sr_label) = if let Some(sr_path) = args.mrflow_sr.as_ref() {
         let sr_model = hipfire_diffusion::DiffusionSuperResModel::open_hfq(&resolve_model_path(
             sr_path.clone(),
+            loaded,
         ))?;
         let sr_start = Instant::now();
         let sr_upscaled = sr_model.upscale_rgb_batch(&decoded, args.rocm_device_id)?;
@@ -1193,7 +1197,7 @@ fn aspect_scaled_dimension(
     u32::try_from(value).map_err(|_| anyhow::anyhow!("high-res target {label} is out of range"))
 }
 
-fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
+fn run_img2img(args: DiffusionImg2ImgArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
     let init_image = load_rgb_image_batch(&args.init_image)?;
     let prompt_batch_size = args.batch_size.max(init_image.batch);
     let prompts = build_diffusion_prompts(
@@ -1243,7 +1247,7 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
         denoising_strength: args.denoising_strength,
         refine_sigma: None,
     };
-    let model = resolve_model_path(args.model);
+    let model = resolve_model_path(args.model, loaded);
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let batch_images = request.batch.prompts.len();
     let runtime_options = resolve_runtime_options(args.rocm_device_id)?;
@@ -1286,15 +1290,17 @@ fn resolve_runtime_options(
     Ok(DiffusionGenerationRuntimeOptions::rocm_hybrid(device))
 }
 
-fn resolve_model_path(path: PathBuf) -> PathBuf {
+fn resolve_model_path(path: PathBuf, loaded: &LoadedConfig) -> PathBuf {
     if path.exists() {
         return path;
     }
-    path.to_str().and_then(find_model).unwrap_or(path)
+    path.to_str()
+        .and_then(|path| find_model(path, &loaded.config))
+        .unwrap_or(path)
 }
 
-fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
-    let model = resolve_model_path(args.model.clone());
+fn run_smoke(args: DiffusionSmokeArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
+    let model = resolve_model_path(args.model.clone(), loaded);
     let inspection = inspect_hfq_with_runtime_support(&model)?;
     if !inspection.runtime_support.supported {
         let reason = inspection

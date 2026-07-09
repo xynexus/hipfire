@@ -151,9 +151,9 @@ pub fn has_worker_or_model_identity(msg: &Value) -> bool {
 // See `docs/architecture-ids.md` for the id table and where the constants live.
 pub use hipfire_arch_api::{
     ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_TEXT,
-    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2,
-    ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN35_DENSE,
-    ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
+    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
+    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE,
+    ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
 };
 
 /// Runtime model arch IDs that must appear in `docs/model-support.toml`.
@@ -1210,8 +1210,9 @@ fn path_confined_to_root(candidate: &Path, root: &Path) -> bool {
 /// Unlike [`find_model_in`], this NEVER honors an arbitrary absolute path or a
 /// `..`-escaping identifier, and every returned path is canonicalized and
 /// confirmed to live inside one of `roots`. It is the resolver for **untrusted
-/// (network) callers**, which must only reach models under `~/.hipfire/models`
-/// and any admin-configured extra root — not arbitrary filesystem locations.
+/// (network) callers**, which must only reach models under the configured local
+/// model root and any admin-configured extra root — not arbitrary filesystem
+/// locations.
 /// Local CLI/eval callers keep using [`find_model_in`], where naming an
 /// explicit `./path` or absolute path is expected UX.
 ///
@@ -1613,8 +1614,10 @@ fn metadata_artifact_arch(metadata: &Value) -> Option<String> {
 
 pub fn build_local_llm_registry() -> LlmModelRegistry {
     let hipfire = hipfire_config::hipfire_dir();
+    let loaded = hipfire_config::load_config_bundle();
+    let models_dir = hipfire_config::configured_models_dir(&loaded.config);
     build_llm_registry_in(
-        &hipfire_config::models_dir(),
+        &models_dir,
         &hipfire.join("triattn"),
         &hipfire.join("drafts"),
         &hipfire.join("templates"),
@@ -1958,8 +1961,9 @@ pub fn discover_dflash_draft_for_model(model: &Path) -> Option<PathBuf> {
 fn dflash_draft_search_dirs(model_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![model_dir.to_path_buf()];
     let hipfire = hipfire_config::hipfire_dir();
+    let loaded = hipfire_config::load_config_bundle();
     dirs.push(hipfire.join("drafts"));
-    dirs.push(hipfire.join("models"));
+    dirs.push(hipfire_config::configured_models_dir(&loaded.config));
     if let Ok(cwd) = std::env::current_dir() {
         dirs.push(cwd.join("models"));
         dirs.push(cwd.join("../../models"));

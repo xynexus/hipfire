@@ -5,6 +5,7 @@ use std::{
 };
 
 use clap::Args;
+use hipfire_config::LoadedConfig;
 
 use crate::model::find_model;
 
@@ -44,7 +45,7 @@ Usage:
 
 Common options:
   --out <path>              Write report JSON there
-  --models-dir <dir>        Model storage directory to test, default ~/.hipfire/models
+  --models-dir <dir>        Model storage directory to test, default configured models_dir
   --size-mib <N>            CPU/GPU copy test size in MiB, default 128
   --storage-size-mib <N>    Storage test size in MiB, default 128
   --runs <N>                Samples per test, default 3
@@ -52,7 +53,7 @@ Common options:
   --gpu-max-size-mib <N>    Cap largest GPU read/write sweep payload size
   --gpu-sweep-mib-step <N>  Override default GPU MiB payload spacing
   --skip-gpu                Skip HIP copy tests
-  --skip-storage            Skip ~/.hipfire/models storage tests
+  --skip-storage            Skip model storage tests
   --json                    Print report JSON to stdout
 
 Build runner:
@@ -129,10 +130,10 @@ pub struct OptimizeArgs {
     pub args: Vec<OsString>,
 }
 
-pub fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
+pub fn run_eval(args: EvalArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     run_forwarded(
         Runner::eval(),
-        resolve_forwarded_model_args(args.args, false),
+        resolve_forwarded_model_args(args.args, false, &loaded),
         "HIPFIRE_EVAL_BIN",
         "hipfire-eval",
         EVAL_HELP,
@@ -140,10 +141,10 @@ pub fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
     )
 }
 
-pub fn run_host_profile(args: HostProfileArgs) -> anyhow::Result<()> {
+pub fn run_host_profile(args: HostProfileArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     run_forwarded(
         Runner::host_profile(),
-        args.args,
+        host_profile_args_with_models_dir(args.args, &loaded),
         "HIPFIRE_HOST_PROFILE_BIN",
         "hipfire-host-profile",
         HOST_PROFILE_HELP,
@@ -151,10 +152,30 @@ pub fn run_host_profile(args: HostProfileArgs) -> anyhow::Result<()> {
     )
 }
 
-pub fn run_collect_artifacts(args: CollectArtifactsArgs) -> anyhow::Result<()> {
+fn host_profile_args_with_models_dir(
+    mut args: Vec<OsString>,
+    loaded: &LoadedConfig,
+) -> Vec<OsString> {
+    let has_models_dir = args.iter().any(|arg| {
+        arg == "--models-dir"
+            || arg
+                .to_str()
+                .is_some_and(|value| value.starts_with("--models-dir="))
+    });
+    if !has_models_dir {
+        args.push("--models-dir".into());
+        args.push(hipfire_config::configured_models_dir(&loaded.config).into_os_string());
+    }
+    args
+}
+
+pub fn run_collect_artifacts(
+    args: CollectArtifactsArgs,
+    loaded: LoadedConfig,
+) -> anyhow::Result<()> {
     run_forwarded(
         Runner::collect_artifacts(),
-        resolve_forwarded_model_args(args.args, false),
+        resolve_forwarded_model_args(args.args, false, &loaded),
         "HIPFIRE_COLLECT_ARTIFACTS_BIN",
         "collect_artifacts",
         COLLECT_ARTIFACTS_HELP,
@@ -162,10 +183,10 @@ pub fn run_collect_artifacts(args: CollectArtifactsArgs) -> anyhow::Result<()> {
     )
 }
 
-pub fn run_optimize(args: OptimizeArgs) -> anyhow::Result<()> {
+pub fn run_optimize(args: OptimizeArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     run_forwarded(
         Runner::optimize(),
-        resolve_forwarded_model_args(args.args, true),
+        resolve_forwarded_model_args(args.args, true, &loaded),
         "HIPFIRE_OPTIMIZE_BIN",
         "optimize",
         OPTIMIZE_HELP,
@@ -213,6 +234,7 @@ fn is_help(args: &[OsString]) -> bool {
 fn resolve_forwarded_model_args(
     args: Vec<OsString>,
     resolve_first_positional: bool,
+    loaded: &LoadedConfig,
 ) -> Vec<OsString> {
     const MODEL_VALUE_FLAGS: &[&str] = &["--model", "--baseline", "--reference", "--draft"];
     let mut out = Vec::with_capacity(args.len());
@@ -221,7 +243,7 @@ fn resolve_forwarded_model_args(
 
     for arg in args {
         if resolve_next {
-            out.push(resolve_model_os(arg));
+            out.push(resolve_model_os(arg, loaded));
             resolve_next = false;
             continue;
         }
@@ -239,14 +261,14 @@ fn resolve_forwarded_model_args(
 
         if let Some((flag, value)) = s.split_once('=') {
             if MODEL_VALUE_FLAGS.contains(&flag) {
-                let resolved = resolve_model_str(value);
+                let resolved = resolve_model_str(value, loaded);
                 out.push(OsString::from(format!("{flag}={resolved}")));
                 continue;
             }
         }
 
         if resolve_first_positional && !resolved_positional && !s.starts_with('-') {
-            out.push(resolve_model_str(s).into());
+            out.push(resolve_model_str(s, loaded).into());
             resolved_positional = true;
             continue;
         }
@@ -257,15 +279,15 @@ fn resolve_forwarded_model_args(
     out
 }
 
-fn resolve_model_os(arg: OsString) -> OsString {
+fn resolve_model_os(arg: OsString, loaded: &LoadedConfig) -> OsString {
     arg.to_str()
-        .map(resolve_model_str)
+        .map(|value| resolve_model_str(value, loaded))
         .map(OsString::from)
         .unwrap_or(arg)
 }
 
-fn resolve_model_str(value: &str) -> String {
-    find_model(value)
+fn resolve_model_str(value: &str, loaded: &LoadedConfig) -> String {
+    find_model(value, &loaded.config)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| value.to_string())
 }
