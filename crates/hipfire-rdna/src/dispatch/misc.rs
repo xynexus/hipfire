@@ -859,6 +859,35 @@ impl Gpu {
         }
         result
     }
+    /// Accumulate `Σ x[i]²` into `out[0]` (caller pre-zeros `out`; call over every
+    /// gradient tensor to get the global sum-of-squares, whose sqrt is the L2 norm
+    /// for gradient clipping). Grid-stride so any `n` fits a bounded grid.
+    pub fn sum_sq_accum_f32(&mut self, x: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("sum_sq_f32", kernels::GRAD_REDUCE_SRC, "sum_sq_f32")?;
+        let func = &self.functions["sum_sq_f32"];
+        let n = x.numel();
+        let mut xp = x.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut nv = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (n.div_ceil(256)).clamp(1, 4096) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
     /// Compute cross-entropy loss for a single token on GPU.
     /// Returns -log(softmax(logits)[target]). Downloads 4 bytes instead of 600KB.
     pub fn cross_entropy_loss(

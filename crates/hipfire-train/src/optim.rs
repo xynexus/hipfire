@@ -54,6 +54,45 @@ impl AdamW {
         self.lr = lr;
     }
 
+    /// Global-norm gradient clipping: if the L2 norm over ALL `grads` exceeds
+    /// `max_norm`, scale every grad by `max_norm / norm` in place. Returns the
+    /// pre-clip global norm (for logging). `max_norm <= 0` disables (returns 0).
+    ///
+    /// Essential for a bigger drafter whose conditioning input (target hidden
+    /// states) carries gemma-style ~1e6 activation outliers — without it the
+    /// fc-ingest gradient explodes and training diverges at every LR.
+    pub fn clip_grad_global_norm(
+        &self,
+        gpu: &mut Gpu,
+        grads: &[&GpuTensor],
+        max_norm: f32,
+    ) -> HipResult<f32> {
+        if !(max_norm > 0.0) {
+            return Ok(0.0);
+        }
+        let acc = gpu.zeros(&[1], DType::F32)?;
+        for g in grads {
+            gpu.sum_sq_accum_f32(g, &acc)?;
+        }
+        let total = gpu.download_f32(&acc)?[0];
+        gpu.free_tensor(acc)?;
+        let norm = total.sqrt();
+        let clipped = norm.is_finite() && norm > max_norm;
+        if clipped {
+            let factor = max_norm / norm;
+            for g in grads {
+                gpu.scale_f32(g, factor)?;
+            }
+        }
+        if std::env::var("HIPFIRE_TRAIN_GRAD_LOG").is_ok() {
+            eprintln!(
+                "  grad_global_norm = {norm:.4}  sumsq = {total:.4e}  clip@{max_norm} -> {}",
+                if clipped { "CLIPPED" } else { "no-op" }
+            );
+        }
+        Ok(norm)
+    }
+
     /// One step over all params. `params[i]` is updated in place from
     /// `grads[i]`; both must match the construction order/sizes.
     pub fn step(

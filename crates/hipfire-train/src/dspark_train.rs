@@ -467,6 +467,56 @@ pub fn load_dslb(path: &str) -> io::Result<DsparkLabelCache> {
     })
 }
 
+/// `HIPFIRE_TRAIN_GRAD_CLIP` — global-norm gradient-clip threshold (default 1.0;
+/// `<= 0` disables). Cached (read once).
+fn grad_clip_max_norm() -> f32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_TRAIN_GRAD_CLIP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0)
+    })
+}
+
+/// Read an `f32` env knob once, clamped to `[lo, hi]`, defaulting to `def`.
+fn env_frac(name: &str, def: f32, lo: f32, hi: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(def)
+        .clamp(lo, hi)
+}
+
+/// Per-epoch learning-rate multiplier: linear warmup for the first
+/// `HIPFIRE_DSPARK_WARMUP` fraction of epochs (default 5%), then cosine decay
+/// from the peak down to a `HIPFIRE_DSPARK_MIN_LR_FRAC` floor (default 0.1) over
+/// the remainder. Returns a factor in `[min_frac, 1.0]` to scale `cfg.lr`.
+///
+/// The drafter descends into a good basin then a *constant*-size AdamW step
+/// limit-cycles back out (the 27b target's ~1e6 activation outliers make the
+/// fc-ingest curvature wildly anisotropic). A decaying LR lets it settle instead
+/// of oscillating. Set `HIPFIRE_DSPARK_WARMUP=0` + `MIN_LR_FRAC=1` for the old
+/// flat schedule.
+fn lr_factor(ep: usize, epochs: usize) -> f32 {
+    let warmup_frac = env_frac("HIPFIRE_DSPARK_WARMUP", 0.05, 0.0, 0.9);
+    let min_frac = env_frac("HIPFIRE_DSPARK_MIN_LR_FRAC", 0.1, 0.0, 1.0);
+    if epochs <= 1 {
+        return 1.0;
+    }
+    let warmup = ((epochs as f32) * warmup_frac).round().max(0.0) as usize;
+    if ep < warmup {
+        // Linear warmup 0 -> 1 over `warmup` epochs (avoid a zero LR at ep 0).
+        return ((ep + 1) as f32) / ((warmup + 1) as f32);
+    }
+    // Cosine decay 1 -> min_frac over the post-warmup epochs.
+    let denom = (epochs - 1).saturating_sub(warmup).max(1) as f32;
+    let t = ((ep - warmup) as f32 / denom).clamp(0.0, 1.0);
+    let cos = 0.5 * (1.0 + (std::f32::consts::PI * t).cos()); // 1 -> 0
+    min_frac + (1.0 - min_frac) * cos
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Training config / report
 // ═══════════════════════════════════════════════════════════════════════════
@@ -762,6 +812,13 @@ pub fn train_dspark_loop(
     let wb = cfg.window_batch.max(1);
 
     for ep in 0..cfg.epochs {
+        // Linear-warmup + cosine-decay LR (peak = cfg.lr). A flat LR overshoots
+        // and diverges once the drafter reaches its basin; decay lets it settle.
+        let cur_lr = cfg.lr * lr_factor(ep, cfg.epochs);
+        opt.set_lr(cur_lr);
+        if std::env::var("HIPFIRE_TRAIN_GRAD_LOG").is_ok() {
+            eprintln!("  epoch {ep} lr = {cur_lr:.3e}");
+        }
         // ── train split (minibatches of `wb` windows) ───────────────────────
         // Each minibatch runs the body per window and ONE heads+loss pass over
         // the concatenated rows, then sums the per-window body grads onto the
@@ -830,7 +887,14 @@ pub fn train_dspark_loop(
                 heads: head_grads,
             };
             timed!(gpu, prof, opt_step, {
-                opt.step(gpu, &model.weights.params(), &grads.flat())?;
+                let flat = grads.flat();
+                // Global-norm gradient clipping BEFORE the step. Mandatory for the
+                // bigger drafters: the target's gemma-style ~1e6 hidden-state
+                // outliers make the fc-ingest gradient explode, diverging training
+                // at every LR without a clip. `HIPFIRE_TRAIN_GRAD_CLIP` (default 1.0;
+                // 0 disables).
+                opt.clip_grad_global_norm(gpu, &flat, grad_clip_max_norm())?;
+                opt.step(gpu, &model.weights.params(), &flat)?;
             });
             timed!(gpu, prof, free, {
                 free_dspark_drafter_grads(gpu, grads.body)?;

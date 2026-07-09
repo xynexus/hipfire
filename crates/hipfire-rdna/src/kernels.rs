@@ -3431,6 +3431,10 @@ pub const GEMM_F16S_TRAIN_NT_SRC: &str =
 pub const GEMM_F16S_BACKWARD_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16s_backward.hip");
 
+/// Sum-of-squares reduction for global-norm gradient clipping (training).
+/// See `kernels/src/grad_reduce.hip`.
+pub const GRAD_REDUCE_SRC: &str = include_str!("../../../kernels/src/grad_reduce.hip");
+
 /// Split-precision ("2xbf16") training GEMM forward (NT): near-f32 accuracy on
 /// the WMMA cores by splitting each f32 operand into bf16 hi+lo and accumulating
 /// 3 WMMA passes (~16 mantissa bits). For the precision-sensitive vocab-head
