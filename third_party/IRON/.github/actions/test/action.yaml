@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: "Run test suite"
+
+inputs:
+  test_flags:
+    required: false
+    default: ""
+  env_name:
+    required: false
+    default: "ci_env"
+  extensive:
+    required: false
+    default: "false"
+  test_suite:
+    required: false
+    default: "operators"
+    description: "Which tests to run: 'operators', 'applications', or 'both'"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Test
+      env:
+        HOME: /workspace
+      shell: "bash"
+      run: |
+        source ${{ inputs.env_name }}/bin/activate
+
+        case "${{ inputs.test_suite }}" in
+          operators)
+            TEST_PATH="iron/operators/"
+            ;;
+          applications)
+            TEST_PATH="iron/applications/"
+            ;;
+          *)
+            echo "Invalid test_suite: ${{ inputs.test_suite }}"
+            exit 1
+            ;;
+        esac
+
+        if [ "${{ inputs.extensive }}" = "true" ]; then
+          pytest $TEST_PATH --csv-output=tests_latest.csv --log-cli-level=DEBUG ${{ inputs.test_flags }}
+        else
+          pytest -m "not extensive" $TEST_PATH --csv-output=tests_latest.csv --log-cli-level=DEBUG ${{ inputs.test_flags }}
+        fi

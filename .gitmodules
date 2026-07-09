@@ -37,9 +37,6 @@
 [submodule "third_party/DeepSpec"]
 	path = third_party/DeepSpec
 	url = https://github.com/deepseek-ai/DeepSpec.git
-[submodule "third_party/IRON"]
-	path = third_party/IRON
-	url = https://github.com/amd/IRON
 [submodule "third_party/amdgpu_top"]
 	path = third_party/amdgpu_top
 	url = https://github.com/Umio-Yasuno/amdgpu_top.git
