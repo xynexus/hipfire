@@ -2302,6 +2302,8 @@ pub struct ModelLoadRequest {
     pub model: String,
     pub params: ModelLoadParams,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
 
@@ -3158,6 +3160,7 @@ mod tests {
                 mtp_k: Some(3),
                 ..Default::default()
             },
+            worker_key_id: Some("worker-a".to_string()),
             request_id: Some("load-1".to_string()),
         };
 
@@ -3172,6 +3175,7 @@ mod tests {
         assert_eq!(value["params"]["mtp_mode"], "auto");
         assert_eq!(value["params"]["mtp_k"], 3);
         assert!(value["params"].get("flash_mode").is_none());
+        assert_eq!(value["worker_key_id"], "worker-a");
         assert_eq!(value["request_id"], "load-1");
     }
 

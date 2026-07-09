@@ -302,6 +302,8 @@ pub struct EmbedRequest {
     pub texts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dims: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_key_id: Option<String>,
 }
 
 /// Non-autoregressive **rerank** request. Scores each `document` against `query`.
@@ -312,6 +314,8 @@ pub struct EmbedRequest {
 pub struct RerankRequest {
     pub query: String,
     pub documents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_key_id: Option<String>,
 }
 
 /// One embedding vector plus its position in the request batch.

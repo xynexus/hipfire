@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +19,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::model::discovery::find_model;
-use crate::state::SharedState;
+use crate::state::{LoadedModelState, SharedState};
 use hipfire_config::HipfireConfig;
 use hipfire_daemon_adapter::{
     find_daemon_bin_or_error, DaemonEngine, GenerateStreamControl, GenerateStreamEvent,
@@ -502,61 +504,58 @@ pub(crate) async fn ensure_model_loaded(
         )
     };
 
+    let requested_worker_key_id = server_model_worker_key_id(&model_str);
     let mut engine_guard = state.engine.lock().await;
-    let mut loaded_guard = state.loaded_model_path.lock().await;
-
-    if loaded_guard.as_deref() == Some(&model_str) {
-        if let Some(eng) = engine_guard.as_mut() {
-            if eng.ping().await.is_ok() {
-                let cache_capable = state
-                    .loaded_model_cache_capable
-                    .lock()
-                    .await
-                    .unwrap_or(false);
-                let loaded_max_seq = state.loaded_model_max_seq.lock().await.unwrap_or(0);
-                if loaded_max_seq >= params.max_seq {
-                    return Ok(LoadedModelContext {
-                        model_path: model_str,
-                        worker_key_id: eng.worker_key_id.clone(),
-                        cache_capable,
-                    });
-                }
-                tracing::info!(
-                    model = %model_arg,
-                    loaded_max_seq,
-                    required_max_seq = params.max_seq,
-                    "reloading model with larger max_seq for request"
-                );
-                eng.unload().await.map_err(|e| e.to_string())?;
-                *loaded_guard = None;
-                *state.loaded_model_cache_capable.lock().await = None;
-                *state.loaded_model_max_seq.lock().await = None;
-            }
-        }
-    }
 
     if let Some(eng) = engine_guard.as_mut() {
-        if eng.ping().await.is_ok() {
-            if loaded_guard.is_some() {
-                eng.unload().await.map_err(|e| e.to_string())?;
-                *loaded_guard = None;
-                *state.loaded_model_cache_capable.lock().await = None;
-                *state.loaded_model_max_seq.lock().await = None;
+        match eng.ping().await {
+            Ok(()) => {
+                if let Some(loaded) = state.loaded_models.lock().await.get(&model_str).cloned() {
+                    if loaded.max_seq >= params.max_seq {
+                        return Ok(LoadedModelContext {
+                            model_path: model_str,
+                            worker_key_id: loaded.worker_key_id,
+                            cache_capable: loaded.cache_capable,
+                        });
+                    }
+                    tracing::info!(
+                        model = %model_arg,
+                        loaded_max_seq = loaded.max_seq,
+                        required_max_seq = params.max_seq,
+                        "reloading model worker with larger max_seq for request"
+                    );
+                }
+                let loaded = eng
+                    .load_with_worker_key_id(
+                        &model_str,
+                        params.clone(),
+                        Some(requested_worker_key_id.clone()),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let cache_capable = loaded_response_cache_capable(&loaded);
+                let worker_key_id = Some(loaded.worker_key_id);
+                set_loaded_model_state(
+                    state,
+                    model_str.clone(),
+                    LoadedModelState {
+                        worker_key_id: worker_key_id.clone(),
+                        cache_capable,
+                        max_seq: params.max_seq,
+                    },
+                )
+                .await;
+                return Ok(LoadedModelContext {
+                    model_path: model_str,
+                    worker_key_id,
+                    cache_capable,
+                });
             }
-            let loaded = eng
-                .load(&model_str, params.clone())
-                .await
-                .map_err(|e| e.to_string())?;
-            let cache_capable = loaded_response_cache_capable(&loaded);
-            let worker_key_id = Some(loaded.worker_key_id);
-            *loaded_guard = Some(model_str.clone());
-            *state.loaded_model_cache_capable.lock().await = Some(cache_capable);
-            *state.loaded_model_max_seq.lock().await = Some(params.max_seq);
-            return Ok(LoadedModelContext {
-                model_path: model_str,
-                worker_key_id,
-                cache_capable,
-            });
+            Err(e) => {
+                tracing::warn!("daemon ping failed before model load: {e}; respawning daemon");
+                *engine_guard = None;
+                clear_loaded_model_state_for_failed_daemon(state).await;
+            }
         }
     }
 
@@ -564,24 +563,56 @@ pub(crate) async fn ensure_model_loaded(
     daemon_spawn_env.apply();
     let mut engine = DaemonEngine::spawn(&bin).await.map_err(|e| e.to_string())?;
     let loaded = engine
-        .load(&model_str, params.clone())
+        .load_with_worker_key_id(
+            &model_str,
+            params.clone(),
+            Some(requested_worker_key_id.clone()),
+        )
         .await
         .map_err(|e| e.to_string())?;
 
     let cache_capable = loaded_response_cache_capable(&loaded);
     let worker_key_id = Some(loaded.worker_key_id);
-    *loaded_guard = Some(model_str);
-    *state.loaded_model_cache_capable.lock().await = Some(cache_capable);
-    *state.loaded_model_max_seq.lock().await = Some(params.max_seq);
+    set_loaded_model_state(
+        state,
+        model_str.clone(),
+        LoadedModelState {
+            worker_key_id: worker_key_id.clone(),
+            cache_capable,
+            max_seq: params.max_seq,
+        },
+    )
+    .await;
     *engine_guard = Some(engine);
     Ok(LoadedModelContext {
-        model_path: loaded_guard
-            .as_ref()
-            .expect("loaded model path set")
-            .clone(),
+        model_path: model_str,
         worker_key_id,
         cache_capable,
     })
+}
+
+fn server_model_worker_key_id(model_path: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    model_path.hash(&mut hasher);
+    format!("server-model:{:016x}", hasher.finish())
+}
+
+async fn set_loaded_model_state(state: &SharedState, model_path: String, loaded: LoadedModelState) {
+    state
+        .loaded_models
+        .lock()
+        .await
+        .insert(model_path.clone(), loaded.clone());
+    *state.loaded_model_path.lock().await = Some(model_path);
+    *state.loaded_model_cache_capable.lock().await = Some(loaded.cache_capable);
+    *state.loaded_model_max_seq.lock().await = Some(loaded.max_seq);
+}
+
+async fn clear_loaded_model_state_for_failed_daemon(state: &SharedState) {
+    state.loaded_models.lock().await.clear();
+    *state.loaded_model_path.lock().await = None;
+    *state.loaded_model_cache_capable.lock().await = None;
+    *state.loaded_model_max_seq.lock().await = None;
 }
 
 fn loaded_response_cache_capable(loaded: &hipfire_model::ModelLoadedResponse) -> bool {

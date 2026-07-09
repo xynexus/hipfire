@@ -236,10 +236,21 @@ impl DaemonEngine {
         model_path: &str,
         params: ModelLoadParams,
     ) -> anyhow::Result<ModelLoadedResponse> {
+        self.load_with_worker_key_id(model_path, params, None).await
+    }
+
+    /// Send `load` for a specific daemon worker and wait for `loaded`.
+    pub async fn load_with_worker_key_id(
+        &mut self,
+        model_path: &str,
+        params: ModelLoadParams,
+        worker_key_id: Option<String>,
+    ) -> anyhow::Result<ModelLoadedResponse> {
         let request_id = uuid::Uuid::new_v4().to_string();
         self.send(&DaemonRequest::Load(ModelLoadRequest {
             model: model_path.to_string(),
             params,
+            worker_key_id,
             request_id: Some(request_id.clone()),
         }))
         .await?;

@@ -68,6 +68,9 @@ fn default_max_seq() -> u32 {
 fn default_max_tokens() -> u32 {
     512
 }
+fn default_prewarm_priority() -> u32 {
+    0
+}
 fn default_temperature() -> f64 {
     0.3
 }
@@ -214,6 +217,8 @@ pub struct HipfireConfig {
     pub models_network_dir: Option<String>,
     #[serde(default)]
     pub default_model: Option<String>,
+    #[serde(default = "default_prewarm_priority")]
+    pub prewarm_priority: u32,
     #[serde(default = "default_max_seq")]
     pub max_seq: u32,
     #[serde(default = "default_max_tokens")]
@@ -392,6 +397,7 @@ impl Default for HipfireConfig {
             models_dir: None,
             models_network_dir: None,
             default_model: None,
+            prewarm_priority: default_prewarm_priority(),
             max_seq: default_max_seq(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),

@@ -68,14 +68,22 @@ pub async fn post_embeddings(
     if texts.iter().any(|text| text.is_empty()) {
         return bad_request("embedding input entries must be non-empty");
     }
-    if let Err(e) = ensure_model_loaded(&state, &model, 0).await {
-        return server_error(format!("load failed: {e}"));
-    }
+    let loaded = match ensure_model_loaded(&state, &model, 0).await {
+        Ok(loaded) => loaded,
+        Err(e) => return server_error(format!("load failed: {e}")),
+    };
     let mut engine_guard = state.engine.lock().await;
     let Some(engine) = engine_guard.as_mut() else {
         return server_error("daemon engine unavailable after model load");
     };
-    let embeddings = match engine.embed(EmbedRequest { texts, dims }).await {
+    let embeddings = match engine
+        .embed(EmbedRequest {
+            texts,
+            dims,
+            worker_key_id: loaded.worker_key_id,
+        })
+        .await
+    {
         Ok(embeddings) => embeddings,
         Err(e) => return server_error(e.to_string()),
     };
@@ -118,9 +126,10 @@ pub async fn post_rerank(
     if documents.iter().any(|text| text.is_empty()) {
         return bad_request("rerank documents must be non-empty");
     }
-    if let Err(e) = ensure_model_loaded(&state, &model, 0).await {
-        return server_error(format!("load failed: {e}"));
-    }
+    let loaded = match ensure_model_loaded(&state, &model, 0).await {
+        Ok(loaded) => loaded,
+        Err(e) => return server_error(format!("load failed: {e}")),
+    };
     let mut engine_guard = state.engine.lock().await;
     let Some(engine) = engine_guard.as_mut() else {
         return server_error("daemon engine unavailable after model load");
@@ -129,6 +138,7 @@ pub async fn post_rerank(
         .rerank(RerankRequest {
             query,
             documents: documents.clone(),
+            worker_key_id: loaded.worker_key_id,
         })
         .await
     {

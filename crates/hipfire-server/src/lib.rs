@@ -15,6 +15,8 @@ pub mod telemetry;
 
 pub use state::{AppState, SharedState};
 
+use std::collections::BTreeMap;
+
 use axum::{
     body::Body,
     http::{HeaderValue, Method, Request},
@@ -269,16 +271,15 @@ pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
 
     deferred_jobs::spawn_deferred_job_runner(state.clone());
 
-    prewarm_default_model(&state).await;
-
     let idle_state = state.clone();
     tokio::spawn(async move {
         idle_unload_loop(idle_state).await;
     });
 
     let app = build_router(state.clone(), &cors_allowed_origins);
-    tracing::info!("hipfire listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("hipfire listening on http://{addr}");
+    spawn_deferred_prewarm(state.clone());
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(state))
         .await?;
@@ -329,7 +330,7 @@ async fn idle_unload_once(state: &SharedState) -> bool {
         return false;
     }
 
-    let has_daemon_model = state.loaded_model_path.lock().await.is_some();
+    let has_daemon_model = !state.loaded_models.lock().await.is_empty();
     let has_diffusion_pipelines = !state.diffusion_pipelines.lock().await.is_empty();
     if !has_daemon_model && !has_diffusion_pipelines {
         return false;
@@ -347,7 +348,7 @@ async fn idle_unload_once(state: &SharedState) -> bool {
         unloaded = true;
     }
 
-    if state.loaded_model_path.lock().await.is_some() {
+    if !state.loaded_models.lock().await.is_empty() {
         if let Some(engine) = engine.as_mut() {
             tracing::info!("idle timeout reached; unloading daemon model");
             match engine.unload().await {
@@ -401,6 +402,7 @@ fn sdapi_generation_active(state: &SharedState) -> bool {
 }
 
 async fn clear_loaded_model_state(state: &SharedState) {
+    state.loaded_models.lock().await.clear();
     *state.loaded_model_path.lock().await = None;
     *state.loaded_model_cache_capable.lock().await = None;
     *state.loaded_model_max_seq.lock().await = None;
@@ -456,25 +458,72 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-async fn prewarm_default_model(state: &SharedState) {
-    let model = {
-        let cfg = state.config.lock().await;
-        cfg.default_model.clone()
-    };
-    let Some(model) = model else {
-        return;
-    };
+fn spawn_deferred_prewarm(state: SharedState) {
+    tokio::spawn(async move {
+        prewarm_configured_models(&state).await;
+    });
+}
 
-    tracing::info!("pre-warming {model}");
-    if prewarm_diffusion_model(state, &model).await {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrewarmTarget {
+    model: String,
+    priority: u32,
+}
+
+fn prewarm_targets_from_config(cfg: &HipfireConfig) -> Vec<PrewarmTarget> {
+    let mut targets = BTreeMap::<String, u32>::new();
+    if cfg.prewarm_priority > 0 {
+        if let Some(model) = cfg
+            .default_model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+        {
+            targets.insert(model.to_string(), cfg.prewarm_priority);
+        }
+    }
+    for model in cfg.model_overrides.keys() {
+        let resolved = cfg.resolve_for_model(model);
+        if resolved.prewarm_priority > 0 {
+            targets
+                .entry(model.clone())
+                .and_modify(|priority| *priority = (*priority).max(resolved.prewarm_priority))
+                .or_insert(resolved.prewarm_priority);
+        }
+    }
+    let mut targets = targets
+        .into_iter()
+        .map(|(model, priority)| PrewarmTarget { model, priority })
+        .collect::<Vec<_>>();
+    targets.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    targets
+}
+
+async fn prewarm_configured_models(state: &SharedState) {
+    let targets = {
+        let cfg = state.config.lock().await;
+        prewarm_targets_from_config(&cfg)
+    };
+    for target in targets {
+        prewarm_model(state, &target).await;
+    }
+}
+
+async fn prewarm_model(state: &SharedState, target: &PrewarmTarget) {
+    let model = &target.model;
+    tracing::info!(model = %model, priority = target.priority, "pre-warming model");
+    if prewarm_diffusion_model(state, model).await {
         return;
     }
 
     let required_max_seq = {
         let cfg = state.config.lock().await;
-        cfg.max_seq
+        cfg.resolve_for_model(model).max_seq
     };
-    match routes::chat::ensure_model_loaded(state, &model, required_max_seq).await {
+    match routes::chat::ensure_model_loaded(state, model, required_max_seq).await {
         Ok(loaded) => {
             let mut engine_guard = state.engine.lock().await;
             let Some(engine) = engine_guard.as_mut() else {
@@ -499,10 +548,10 @@ async fn prewarm_default_model(state: &SharedState) {
                 );
                 return;
             }
-            tracing::info!("warm-up complete");
+            tracing::info!(model = %model, "warm-up complete");
         }
         Err(e) => {
-            tracing::warn!("pre-warm load failed: {e}; will load on first request");
+            tracing::warn!(model = %model, "pre-warm load failed: {e}; will load on first request");
         }
     }
 }
@@ -545,7 +594,7 @@ mod tests {
         DIFFUSION_SCHEMA_VERSION, HFQ_ARCH_DIFFUSION,
     };
     use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::path::Path;
     use tower::ServiceExt;
@@ -612,7 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prewarm_default_model_routes_diffusion_hfq_to_diffusion_cache() {
+    async fn prewarm_priority_routes_diffusion_hfq_to_diffusion_cache() {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-diffusion-prewarm-test-{}",
             std::process::id()
@@ -623,14 +672,62 @@ mod tests {
 
         let mut config = HipfireConfig::default();
         config.models_network_dir = Some(dir.to_string_lossy().into_owned());
-        config.default_model = Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned());
+        let model = hfq_path.file_name().unwrap().to_string_lossy().into_owned();
+        config
+            .model_overrides
+            .insert(model.clone(), json!({"prewarm_priority": 10}));
         let state = AppState::new(config);
 
-        prewarm_default_model(&state).await;
+        prewarm_configured_models(&state).await;
 
         assert!(state.engine.lock().await.is_none());
         assert!(state.loaded_model_path.lock().await.is_none());
         assert_eq!(state.diffusion_pipelines.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn default_model_does_not_prewarm_without_priority() {
+        let config = HipfireConfig {
+            default_model: Some("qwen".to_string()),
+            ..HipfireConfig::default()
+        };
+
+        assert!(prewarm_targets_from_config(&config).is_empty());
+    }
+
+    #[test]
+    fn prewarm_targets_sort_by_priority_and_include_multiple_models() {
+        let mut config = HipfireConfig {
+            default_model: Some("default-model".to_string()),
+            prewarm_priority: 5,
+            ..HipfireConfig::default()
+        };
+        config
+            .model_overrides
+            .insert("low".to_string(), json!({"prewarm_priority": 1}));
+        config
+            .model_overrides
+            .insert("high".to_string(), json!({"prewarm_priority": 20}));
+
+        let targets = prewarm_targets_from_config(&config);
+
+        assert_eq!(
+            targets,
+            vec![
+                PrewarmTarget {
+                    model: "high".to_string(),
+                    priority: 20,
+                },
+                PrewarmTarget {
+                    model: "default-model".to_string(),
+                    priority: 5,
+                },
+                PrewarmTarget {
+                    model: "low".to_string(),
+                    priority: 1,
+                },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -670,9 +767,12 @@ mod tests {
             ..HipfireConfig::default()
         };
         config.models_network_dir = Some(dir.to_string_lossy().into_owned());
-        config.default_model = Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned());
+        config.model_overrides.insert(
+            hfq_path.file_name().unwrap().to_string_lossy().into_owned(),
+            json!({"prewarm_priority": 1}),
+        );
         let state = AppState::new(config);
-        prewarm_default_model(&state).await;
+        prewarm_configured_models(&state).await;
         assert_eq!(state.diffusion_pipelines.lock().await.len(), 1);
         state
     }

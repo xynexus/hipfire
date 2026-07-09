@@ -58,6 +58,13 @@ pub struct SdapiProgressState {
     pub completed_at_unix_secs: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct LoadedModelState {
+    pub worker_key_id: Option<String>,
+    pub cache_capable: bool,
+    pub max_seq: u32,
+}
+
 pub struct AppState {
     /// Serializes all daemon I/O. Phase A: one request at a time.
     pub engine: Mutex<Option<DaemonEngine>>,
@@ -69,6 +76,8 @@ pub struct AppState {
     pub loaded_model_cache_capable: Mutex<Option<bool>>,
     /// Effective max_seq used when the current model was loaded.
     pub loaded_model_max_seq: Mutex<Option<u32>>,
+    /// Loaded daemon workers keyed by resolved model path.
+    pub loaded_models: Mutex<HashMap<String, LoadedModelState>>,
     /// Shared prefill scheduler used by Rust request paths when enabled.
     pub prefill_scheduler: Mutex<PriorityPrefillScheduler>,
     /// Request IDs selected by the scheduler and ready to enter daemon I/O.
@@ -148,6 +157,7 @@ impl AppState {
             loaded_model_path: Mutex::new(None),
             loaded_model_cache_capable: Mutex::new(None),
             loaded_model_max_seq: Mutex::new(None),
+            loaded_models: Mutex::new(HashMap::new()),
             prefill_scheduler: Mutex::new(PriorityPrefillScheduler::new(scheduler_env)),
             selected_prefill_requests: Mutex::new(HashSet::new()),
             prefill_dispatch: Mutex::new(()),

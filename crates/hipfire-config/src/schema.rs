@@ -251,7 +251,16 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         None,
         GLOBAL_RUNTIME,
         ConfigMutability::LoadTime,
-        "Model tag, alias, or path to pre-load or use by default."
+        "Model tag, alias, or path to use when a request omits the model."
+    ),
+    field!(
+        "prewarm_priority",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Startup background prewarm priority for a model. Set per model under model_overrides; 0 disables prewarm, higher values load earlier."
     ),
     field!(
         "max_seq",
