@@ -303,6 +303,22 @@ fn apply_daemon_startup_env(cfg: &HipfireConfig) {
         "HIPFIRE_RESOURCE_LOCK_WAIT_MS",
         cfg.resource_lock_wait_ms.to_string(),
     );
+    std::env::set_var(
+        "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_BUDGET_BYTES",
+        cfg.scheduler_system_memory_budget_bytes.to_string(),
+    );
+    std::env::set_var(
+        "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_HEADROOM_BYTES",
+        cfg.scheduler_system_memory_headroom_bytes.to_string(),
+    );
+    std::env::set_var(
+        "HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES",
+        cfg.scheduler_vram_budget_bytes.to_string(),
+    );
+    std::env::set_var(
+        "HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES",
+        cfg.scheduler_vram_headroom_bytes.to_string(),
+    );
     apply_resource_list_env("HIPFIRE_DEVICES", &cfg.resource_lock_gpus, true);
     apply_resource_list_env("HIPFIRE_RESOURCE_LOCK_NPUS", &cfg.resource_lock_npus, false);
 }
@@ -519,7 +535,13 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
     use tower::ServiceExt;
+
+    fn daemon_startup_env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn cors_layer_disabled_when_no_origins() {
@@ -640,10 +662,15 @@ mod tests {
 
     #[test]
     fn daemon_startup_env_maps_resource_lock_config() {
+        let _guard = daemon_startup_env_test_guard();
         let mut config = HipfireConfig::default();
         config.resource_lock_gpus = vec!["0".to_string(), "2".to_string()];
         config.resource_lock_npus = vec!["auto".to_string()];
         config.resource_lock_wait_ms = 250;
+        config.scheduler_system_memory_budget_bytes = 1024;
+        config.scheduler_system_memory_headroom_bytes = 128;
+        config.scheduler_vram_budget_bytes = 2048;
+        config.scheduler_vram_headroom_bytes = 256;
 
         apply_daemon_startup_env(&config);
 
@@ -654,10 +681,27 @@ mod tests {
         );
         assert_eq!(std::env::var("HIPFIRE_DEVICES").unwrap(), "0,2");
         assert_eq!(std::env::var("HIPFIRE_RESOURCE_LOCK_NPUS").unwrap(), "1");
+        assert_eq!(
+            std::env::var("HIPFIRE_SCHEDULER_SYSTEM_MEMORY_BUDGET_BYTES").unwrap(),
+            "1024"
+        );
+        assert_eq!(
+            std::env::var("HIPFIRE_SCHEDULER_SYSTEM_MEMORY_HEADROOM_BYTES").unwrap(),
+            "128"
+        );
+        assert_eq!(
+            std::env::var("HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES").unwrap(),
+            "2048"
+        );
+        assert_eq!(
+            std::env::var("HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES").unwrap(),
+            "256"
+        );
     }
 
     #[test]
     fn daemon_startup_env_auto_gpu_uses_daemon_default_resolution() {
+        let _guard = daemon_startup_env_test_guard();
         let mut config = HipfireConfig::default();
         config.resource_lock_enabled = false;
         config.resource_lock_gpus = vec!["auto".to_string()];

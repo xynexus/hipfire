@@ -140,7 +140,21 @@ async fn scheduler_resource_health_payload(state: &SharedState) -> serde_json::V
             })
         })
         .collect::<Vec<_>>();
-    json!({
+    let daemon_resource_status = {
+        let mut engine = state.engine.lock().await;
+        if let Some(engine) = engine.as_mut() {
+            match engine.resource_status().await {
+                Ok(status) => Some(status),
+                Err(err) => {
+                    tracing::warn!("daemon resource_status failed for health route: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+    let mut payload = json!({
         "resource_lock_enabled": cfg.resource_lock_enabled,
         "resource_lock_gpus": cfg.resource_lock_gpus,
         "resource_lock_npus": cfg.resource_lock_npus,
@@ -151,7 +165,24 @@ async fn scheduler_resource_health_payload(state: &SharedState) -> serde_json::V
         "vram_headroom_bytes": cfg.scheduler_vram_headroom_bytes,
         "model_residency_mode": cfg.model_residency_mode,
         "locks": locks,
-    })
+    });
+    if let Some(status) = daemon_resource_status {
+        for key in [
+            "system_memory_target_bytes",
+            "held_system_memory_placeholder_bytes",
+            "resident_system_memory_bytes",
+            "vram_target_bytes",
+            "held_vram_placeholder_bytes",
+            "resident_vram_bytes",
+            "resident_workers",
+        ] {
+            if let Some(value) = status.get(key).cloned() {
+                payload[key] = value;
+            }
+        }
+        payload["daemon_resource_status"] = status;
+    }
+    payload
 }
 
 async fn runtime_workers_health_payload(

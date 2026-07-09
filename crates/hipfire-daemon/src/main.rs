@@ -297,6 +297,273 @@ fn qwen_residency_load_env(params: Option<&hipfire_model::ModelLoadParams>) -> V
     guards
 }
 
+const SYSTEM_RESERVATION_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const VRAM_RESERVATION_CHUNK_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default)]
+struct ResidentResourceUsage {
+    system_memory_bytes: u64,
+    vram_bytes: u64,
+    residency_mode: String,
+}
+
+struct ResourceReservationManager {
+    system_memory_budget_bytes: u64,
+    system_memory_headroom_bytes: u64,
+    vram_budget_bytes: u64,
+    vram_headroom_bytes: u64,
+    system_chunks: Vec<Vec<u8>>,
+    vram_chunks: Vec<hip_bridge::DeviceBuffer>,
+    resident_usage: std::collections::HashMap<String, ResidentResourceUsage>,
+}
+
+impl ResourceReservationManager {
+    fn from_env() -> Self {
+        Self::from_env_reader(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_reader(mut get: impl FnMut(&str) -> Option<String>) -> Self {
+        Self {
+            system_memory_budget_bytes: parse_env_u64(get(
+                "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_BUDGET_BYTES",
+            )),
+            system_memory_headroom_bytes: parse_env_u64(get(
+                "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_HEADROOM_BYTES",
+            )),
+            vram_budget_bytes: parse_env_u64(get("HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES")),
+            vram_headroom_bytes: parse_env_u64(get("HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES")),
+            system_chunks: Vec::new(),
+            vram_chunks: Vec::new(),
+            resident_usage: std::collections::HashMap::new(),
+        }
+    }
+
+    fn system_target_bytes(&self) -> u64 {
+        reservation_target_bytes(
+            self.system_memory_budget_bytes,
+            self.system_memory_headroom_bytes,
+        )
+    }
+
+    fn vram_target_bytes(&self) -> u64 {
+        reservation_target_bytes(self.vram_budget_bytes, self.vram_headroom_bytes)
+    }
+
+    fn resident_system_memory_bytes(&self) -> u64 {
+        self.resident_usage
+            .values()
+            .map(|usage| usage.system_memory_bytes)
+            .sum()
+    }
+
+    fn resident_vram_bytes(&self) -> u64 {
+        self.resident_usage
+            .values()
+            .map(|usage| usage.vram_bytes)
+            .sum()
+    }
+
+    fn held_system_memory_placeholder_bytes(&self) -> u64 {
+        self.system_chunks
+            .iter()
+            .map(|chunk| chunk.len() as u64)
+            .sum()
+    }
+
+    fn held_vram_placeholder_bytes(&self) -> u64 {
+        self.vram_chunks
+            .iter()
+            .map(|chunk| chunk.size() as u64)
+            .sum()
+    }
+
+    fn planned_usage_for_load(
+        &self,
+        path: &str,
+        params: Option<&hipfire_model::ModelLoadParams>,
+    ) -> ResidentResourceUsage {
+        let residency_mode = params
+            .and_then(|params| params.residency_mode.as_deref())
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or("full")
+            .to_string();
+        let file_bytes = std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let module_budget = params
+            .and_then(|params| params.module_vram_budget_bytes)
+            .filter(|bytes| *bytes > 0);
+        let vram_bytes = if residency_mode == "qwen_moe_modules" {
+            module_budget.unwrap_or(file_bytes)
+        } else {
+            file_bytes
+        };
+        ResidentResourceUsage {
+            system_memory_bytes: 0,
+            vram_bytes,
+            residency_mode,
+        }
+    }
+
+    fn set_worker_usage(&mut self, worker_id: impl Into<String>, usage: ResidentResourceUsage) {
+        self.resident_usage.insert(worker_id.into(), usage);
+    }
+
+    fn remove_worker(&mut self, worker_id: &str) {
+        self.resident_usage.remove(worker_id);
+    }
+
+    fn clear_workers(&mut self) {
+        self.resident_usage.clear();
+    }
+
+    fn release_placeholders(&mut self, gpu: &mut hipfire_rdna::Gpu) -> Result<(), String> {
+        self.system_chunks.clear();
+        let mut errors = Vec::new();
+        for chunk in self.vram_chunks.drain(..) {
+            if let Err(err) = gpu.hip.free(chunk) {
+                errors.push(err.to_string());
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed to release {} VRAM reservation chunk(s): {}",
+                errors.len(),
+                errors.join("; ")
+            ))
+        }
+    }
+
+    fn reacquire_placeholders(&mut self, gpu: &mut hipfire_rdna::Gpu) -> Result<(), String> {
+        self.release_placeholders(gpu)?;
+        let system_target = self
+            .system_target_bytes()
+            .saturating_sub(self.resident_system_memory_bytes());
+        let vram_target = self
+            .vram_target_bytes()
+            .saturating_sub(self.resident_vram_bytes());
+        self.allocate_system_placeholders(system_target)?;
+        self.allocate_vram_placeholders(gpu, vram_target)?;
+        Ok(())
+    }
+
+    fn allocate_system_placeholders(&mut self, mut bytes: u64) -> Result<(), String> {
+        while bytes > 0 {
+            let chunk_len = bytes.min(SYSTEM_RESERVATION_CHUNK_BYTES as u64);
+            let chunk_len = usize::try_from(chunk_len).map_err(|_| {
+                format!("system reservation chunk {chunk_len} exceeds addressable usize")
+            })?;
+            let mut chunk = vec![0u8; chunk_len];
+            touch_system_memory(&mut chunk);
+            self.system_chunks.push(chunk);
+            bytes = bytes.saturating_sub(chunk_len as u64);
+        }
+        Ok(())
+    }
+
+    fn allocate_vram_placeholders(
+        &mut self,
+        gpu: &mut hipfire_rdna::Gpu,
+        mut bytes: u64,
+    ) -> Result<(), String> {
+        while bytes > 0 {
+            let chunk_len = bytes.min(VRAM_RESERVATION_CHUNK_BYTES as u64);
+            let chunk_len = usize::try_from(chunk_len)
+                .map_err(|_| format!("VRAM reservation chunk {chunk_len} exceeds usize"))?;
+            let chunk = gpu
+                .hip
+                .malloc(chunk_len)
+                .map_err(|err| format!("hipMalloc reservation {chunk_len} bytes: {err}"))?;
+            if let Err(err) = gpu.hip.memset(&chunk, 0, chunk_len) {
+                let _ = gpu.hip.free(chunk);
+                return Err(format!(
+                    "hipMemset reservation {chunk_len} bytes failed: {err}"
+                ));
+            }
+            self.vram_chunks.push(chunk);
+            bytes = bytes.saturating_sub(chunk_len as u64);
+        }
+        Ok(())
+    }
+
+    fn status_json(&self) -> serde_json::Value {
+        let mut workers = self
+            .resident_usage
+            .iter()
+            .map(|(worker_id, usage)| {
+                serde_json::json!({
+                    "worker_key_id": worker_id,
+                    "residency_mode": usage.residency_mode,
+                    "system_memory_bytes": usage.system_memory_bytes,
+                    "vram_bytes": usage.vram_bytes,
+                })
+            })
+            .collect::<Vec<_>>();
+        workers.sort_by(|a, b| {
+            a.get("worker_key_id")
+                .and_then(|value| value.as_str())
+                .cmp(&b.get("worker_key_id").and_then(|value| value.as_str()))
+        });
+        serde_json::json!({
+            "type": "resource_status",
+            "system_memory_budget_bytes": self.system_memory_budget_bytes,
+            "system_memory_headroom_bytes": self.system_memory_headroom_bytes,
+            "system_memory_target_bytes": self.system_target_bytes(),
+            "held_system_memory_placeholder_bytes": self.held_system_memory_placeholder_bytes(),
+            "resident_system_memory_bytes": self.resident_system_memory_bytes(),
+            "vram_budget_bytes": self.vram_budget_bytes,
+            "vram_headroom_bytes": self.vram_headroom_bytes,
+            "vram_target_bytes": self.vram_target_bytes(),
+            "held_vram_placeholder_bytes": self.held_vram_placeholder_bytes(),
+            "resident_vram_bytes": self.resident_vram_bytes(),
+            "resident_workers": workers.len(),
+            "workers": workers,
+        })
+    }
+}
+
+fn parse_env_u64(value: Option<String>) -> u64 {
+    value
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn reservation_target_bytes(budget_bytes: u64, headroom_bytes: u64) -> u64 {
+    budget_bytes.saturating_sub(headroom_bytes)
+}
+
+fn touch_system_memory(bytes: &mut [u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        bytes[offset] = bytes[offset].wrapping_add(1);
+        offset = offset.saturating_add(4096);
+    }
+    let last = bytes.len() - 1;
+    bytes[last] = bytes[last].wrapping_add(1);
+}
+
+fn reset_has_no_resident_model(
+    dummy_model: &Option<DummyModelState>,
+    model: &Option<LoadedModel>,
+    resident_models: &std::collections::HashMap<String, LoadedModel>,
+) -> bool {
+    dummy_model.is_none() && model.is_none() && resident_models.is_empty()
+}
+
+fn reset_target_worker_id(msg: &serde_json::Value, active_worker_id: &str) -> String {
+    if hipfire_model::has_worker_or_model_identity(msg) {
+        message_worker_id(msg)
+    } else {
+        active_worker_id.to_string()
+    }
+}
+
 fn le_u32_vec(bytes: &[u8], name: &str, expected: usize) -> std::io::Result<Vec<u32>> {
     if bytes.len() != expected * 4 {
         return Err(invalid_kld_ref(format!(
@@ -500,6 +767,92 @@ fn acquire_daemon_lock() -> hipfire_lock::FlockGuard {
     // open fd, so rewriting the contents doesn't drop the lock.
     let _ = guard.write_holder(&std::process::id().to_string());
     guard
+}
+
+#[cfg(test)]
+mod resource_reservation_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn resource_reservation_env_applies_budget_headroom_targets() {
+        let values = HashMap::from([
+            (
+                "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_BUDGET_BYTES",
+                "4096".to_string(),
+            ),
+            (
+                "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_HEADROOM_BYTES",
+                "512".to_string(),
+            ),
+            ("HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES", "8192".to_string()),
+            ("HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES", "1024".to_string()),
+        ]);
+        let manager = ResourceReservationManager::from_env_reader(|key| values.get(key).cloned());
+
+        assert_eq!(manager.system_target_bytes(), 3584);
+        assert_eq!(manager.vram_target_bytes(), 7168);
+        assert_eq!(
+            manager.status_json()["held_system_memory_placeholder_bytes"],
+            0
+        );
+    }
+
+    #[test]
+    fn resource_reservation_usage_prefers_module_budget_for_qwen_moe_modules() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-resource-reservation-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model_path = dir.join("Qwen3.5-122B-A10B.mq4.hfq");
+        std::fs::write(&model_path, vec![0u8; 1234]).unwrap();
+
+        let manager = ResourceReservationManager::from_env_reader(|_| None);
+        let params = hipfire_model::ModelLoadParams {
+            residency_mode: Some("qwen_moe_modules".to_string()),
+            module_vram_budget_bytes: Some(256),
+            ..Default::default()
+        };
+        let usage = manager.planned_usage_for_load(model_path.to_str().unwrap(), Some(&params));
+
+        assert_eq!(usage.residency_mode, "qwen_moe_modules");
+        assert_eq!(usage.vram_bytes, 256);
+
+        let _ = std::fs::remove_file(&model_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn reset_without_resident_model_is_idempotent() {
+        let dummy_model = None;
+        let model = None;
+        let resident_models = HashMap::new();
+
+        assert!(reset_has_no_resident_model(
+            &dummy_model,
+            &model,
+            &resident_models
+        ));
+    }
+
+    #[test]
+    fn bare_reset_targets_active_worker() {
+        let msg = serde_json::json!({"type": "reset"});
+        assert_eq!(
+            reset_target_worker_id(&msg, "server-model:active"),
+            "server-model:active"
+        );
+    }
+
+    #[test]
+    fn explicit_reset_worker_overrides_active_worker() {
+        let msg = serde_json::json!({"type": "reset", "worker_key_id": "worker-a"});
+        assert_eq!(
+            reset_target_worker_id(&msg, "server-model:active"),
+            "worker-a"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2792,6 +3145,13 @@ fn main() {
     // None means the drafter shares the target gpu (single-card, unchanged).
     let mut pflash_drafter_gpu: Option<hipfire_rdna::Gpu> = None;
     let mut dummy_model: Option<DummyModelState> = None;
+    let mut resource_reservations = ResourceReservationManager::from_env();
+    if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+        hipfire_daemon_adapter::fatal_startup_error(
+            &format!("failed to claim configured resource reservations: {err}"),
+            None,
+        );
+    }
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -2881,6 +3241,7 @@ fn main() {
                     if let Some(m) = model.take() {
                         unload_model(m, &mut gpu);
                     }
+                    resource_reservations.remove_worker(&requested_worker_id);
                 } else {
                     if let Err(e) = park_active_model(
                         &mut model,
@@ -2897,6 +3258,7 @@ fn main() {
                 if let Some(m) = resident_models.remove(&requested_worker_id) {
                     generic_state_arena.release_worker(&requested_worker_id);
                     unload_model(m, &mut gpu);
+                    resource_reservations.remove_worker(&requested_worker_id);
                 }
                 dummy_model = None;
 
@@ -2912,6 +3274,15 @@ fn main() {
                     .unwrap_or(false);
                 if dummy_requested {
                     dummy_model = Some(DummyModelState::default());
+                    if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                        write_error(
+                            &mut stdout,
+                            "",
+                            &format!("dummy load resource reservation failed: {err}"),
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
                     tracing::info!(
                         model = "hipfire:dummy",
                         arch = "qwen35_dummy",
@@ -3270,6 +3641,18 @@ fn main() {
                 )));
                 let _qwen_residency_env =
                     qwen_residency_load_env(protocol_load.as_ref().map(|req| &req.params));
+                let planned_resource_usage = resource_reservations
+                    .planned_usage_for_load(path, protocol_load.as_ref().map(|req| &req.params));
+                if let Err(err) = resource_reservations.release_placeholders(&mut gpu) {
+                    hipfire_runtime::load_progress::set_sink(None);
+                    write_error(
+                        &mut stdout,
+                        "",
+                        &format!("resource reservation release failed before load: {err}"),
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 let load_result = load_model(
                     path,
                     max_seq,
@@ -3284,6 +3667,20 @@ fn main() {
                 hipfire_runtime::load_progress::set_sink(None);
                 match load_result {
                     Ok(mut m) => {
+                        resource_reservations
+                            .set_worker_usage(requested_worker_id.clone(), planned_resource_usage);
+                        if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                            resource_reservations.remove_worker(&requested_worker_id);
+                            unload_model(m, &mut gpu);
+                            let _ = resource_reservations.reacquire_placeholders(&mut gpu);
+                            write_error(
+                                &mut stdout,
+                                "",
+                                &format!("resource reservation reacquire failed after load: {err}"),
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
@@ -3576,6 +3973,11 @@ fn main() {
                         model = Some(m);
                     }
                     Err(e) => {
+                        if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                            eprintln!(
+                                "[hipfire-daemon] failed to restore resource reservations after load failure: {err}"
+                            );
+                        }
                         let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                         let free_mb = vram_free / (1024 * 1024);
                         let total_mb = vram_total / (1024 * 1024);
@@ -4863,6 +5265,12 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            DaemonRequest::ResourceStatus => {
+                let status = resource_reservations.status_json();
+                let _ = writeln!(stdout, "{status}");
+                let _ = stdout.flush();
+            }
+
             DaemonRequest::Inventory => {
                 let inventory = daemon_accelerator_inventory(&mut gpu);
                 let mut payload = serde_json::to_value(inventory)
@@ -4873,7 +5281,13 @@ fn main() {
             }
 
             DaemonRequest::Reset => {
-                let target_worker_id = message_worker_id(&msg);
+                let target_worker_id = reset_target_worker_id(&msg, &active_worker_id);
+                if reset_has_no_resident_model(&dummy_model, &model, &resident_models) {
+                    generic_state_arena.release_worker(&target_worker_id);
+                    let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if dummy_model.is_none() {
                     match activate_model_worker(
                         &target_worker_id,
@@ -5082,6 +5496,12 @@ fn main() {
                 for (_, m) in resident_models.drain() {
                     unload_model(m, &mut gpu);
                 }
+                resource_reservations.clear_workers();
+                if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                    eprintln!(
+                        "[hipfire-daemon] failed to restore resource reservations after unload: {err}"
+                    );
+                }
                 generic_state_arena.clear();
                 dummy_model = None;
                 active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
@@ -5119,6 +5539,14 @@ fn main() {
                 } else if let Some(m) = resident_models.remove(&worker_id) {
                     unload_model(m, &mut gpu);
                     unloaded = true;
+                }
+                if unloaded {
+                    resource_reservations.remove_worker(&worker_id);
+                    if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                        eprintln!(
+                            "[hipfire-daemon] failed to restore resource reservations after worker unload: {err}"
+                        );
+                    }
                 }
                 let done = unload_worker_done_json(
                     id,

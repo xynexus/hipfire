@@ -392,6 +392,7 @@ pub enum DaemonRequest {
     /// Wire tag `worker_status` or `list_workers` (identical handler).
     #[serde(alias = "list_workers")]
     WorkerStatus,
+    ResourceStatus,
     UnloadWorker,
     PflashLabels(PflashLabelsRequest),
     TrainDrafter,
@@ -443,6 +444,7 @@ pub enum DaemonResponse {
         count: usize,
     },
     WorkerStatus(serde_json::Value),
+    ResourceStatus(serde_json::Value),
     UnloadWorkerDone(serde_json::Value),
     HneuronOk {
         n_intervened: usize,
@@ -773,6 +775,9 @@ mod tests {
             ),
             (json!({"type": "unload_worker", "worker_id": "w"}), |r| {
                 matches!(r, DaemonRequest::UnloadWorker)
+            }),
+            (json!({"type": "resource_status"}), |r| {
+                matches!(r, DaemonRequest::ResourceStatus)
             }),
             (json!({"type": "train_drafter", "output": "d.hfq"}), |r| {
                 matches!(r, DaemonRequest::TrainDrafter)

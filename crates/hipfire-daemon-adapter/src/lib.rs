@@ -345,6 +345,24 @@ impl DaemonEngine {
         }
     }
 
+    /// Send `resource_status` and return the daemon's resource reservation
+    /// payload.
+    pub async fn resource_status(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.send(&DaemonRequest::ResourceStatus).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::ResourceStatus(status) => return Ok(status),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon resource_status error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during resource_status: {other:?}");
+                }
+            }
+        }
+    }
+
     /// Send `unload_worker` for one resident worker and return the daemon's
     /// unload acknowledgement.
     pub async fn unload_worker(
@@ -1553,10 +1571,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_status_and_unload_worker_use_worker_control_protocol() {
+    async fn worker_status_resource_status_and_unload_worker_use_worker_control_protocol() {
         let mut engine = mock_engine(vec![
             DaemonResponse::WorkerStatus(serde_json::json!({
                 "type": "worker_status",
+                "resident_workers": 1,
+                "workers": []
+            })),
+            DaemonResponse::ResourceStatus(serde_json::json!({
+                "type": "resource_status",
+                "held_vram_placeholder_bytes": 256,
                 "resident_workers": 1,
                 "workers": []
             })),
@@ -1570,6 +1594,8 @@ mod tests {
 
         let status = engine.list_workers().await.unwrap();
         assert_eq!(status["resident_workers"], 1);
+        let resources = engine.resource_status().await.unwrap();
+        assert_eq!(resources["held_vram_placeholder_bytes"], 256);
         let done = engine.unload_worker("worker-a").await.unwrap();
         assert_eq!(done["unloaded"], true);
 
@@ -1579,8 +1605,9 @@ mod tests {
             .downcast_ref::<MockTransport>()
             .unwrap();
         assert_eq!(mock.sent[0], r#"{"type":"worker_status"}"#);
+        assert_eq!(mock.sent[1], r#"{"type":"resource_status"}"#);
         assert_eq!(
-            mock.sent[1],
+            mock.sent[2],
             r#"{"type":"unload_worker","worker_key_id":"worker-a"}"#
         );
     }
