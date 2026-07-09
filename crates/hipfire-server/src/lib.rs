@@ -62,6 +62,10 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             get(routes::admin::get_resolved_config),
         )
         .route(
+            "/admin/config/editor",
+            get(routes::admin::get_config_editor).patch(routes::admin::patch_config_editor),
+        )
+        .route(
             "/admin/diagnostics",
             get(routes::admin::get_admin_diagnostics),
         )
