@@ -118,6 +118,25 @@ pub fn build_config_editor_snapshot(
     build_snapshot_from_loaded(&paths, &local, active, selected_model)
 }
 
+pub fn build_config_editor_snapshot_from_paths(
+    paths: &ConfigEditorPaths,
+    active: &LoadedConfig,
+    selected_model: Option<&str>,
+) -> ConfigEditorSnapshot {
+    let (global, global_error) = read_document(&paths.global);
+    let (host, host_error) = read_document(&paths.host);
+    let local = loaded_config_from_documents(
+        paths.global.clone(),
+        global,
+        global_error,
+        paths.host.clone(),
+        host,
+        host_error,
+        Vec::new(),
+    );
+    build_snapshot_from_loaded(paths, &local, active, selected_model)
+}
+
 pub fn apply_config_edit(
     paths: &ConfigEditorPaths,
     request: &ConfigEditRequest,

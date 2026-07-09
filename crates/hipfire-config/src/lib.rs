@@ -14,9 +14,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 pub use editor::{
-    apply_config_edit, build_config_editor_snapshot, cycle_editor_value, encode_editor_value,
-    ConfigEditOperation, ConfigEditRequest, ConfigEditTarget, ConfigEditorPaths, ConfigEditorRow,
-    ConfigEditorSnapshot,
+    apply_config_edit, build_config_editor_snapshot, build_config_editor_snapshot_from_paths,
+    cycle_editor_value, encode_editor_value, ConfigEditOperation, ConfigEditRequest,
+    ConfigEditTarget, ConfigEditorPaths, ConfigEditorRow, ConfigEditorSnapshot,
 };
 pub use resolve::{
     config_layers_from_document, config_layers_from_documents, resolve_config_layers, ConfigLayer,
