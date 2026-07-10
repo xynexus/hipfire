@@ -16,6 +16,13 @@ use hipfire_admin_types::{
     fmt_bytes, AdminStats, ClientUsage, GpuTelemetry, HostMemory, MemPool, NpuTelemetry,
 };
 use leptos::prelude::*;
+use serde::Serialize;
+
+mod access;
+mod usage;
+
+use access::AccessPanel;
+use usage::UsagePanel;
 
 /// Poll cadence and how many samples the trailing window keeps (~3 min @ 2s).
 const POLL_MS: u32 = 2000;
@@ -25,6 +32,16 @@ fn main() {
     console_error_panic_hook::set_once();
     leptos::mount::mount_to_body(App);
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Overview,
+    Access,
+    Usage,
+}
+
+#[derive(Clone, Copy)]
+struct AuthState(RwSignal<bool>);
 
 /// One polled sample, reduced to the scalars the sparklines plot. Keyed series
 /// are rebuilt per render by matching `card` names against the live GPU list,
@@ -62,14 +79,21 @@ fn App() -> impl IntoView {
     // Latest snapshot (or error), plus the rolling history that backs charts.
     let (stats, set_stats) = signal(None::<Result<AdminStats, String>>);
     let (history, set_history) = signal(VecDeque::<Sample>::new());
+    let (tab, set_tab) = signal(Tab::Overview);
+    let auth = AuthState(RwSignal::new(false));
+    provide_context(auth);
 
     // Poll forever. Errors surface but never clear the chart history, so a
     // transient blip shows "reconnecting…" over the last-known trend instead
     // of wiping the page.
     leptos::task::spawn_local(async move {
         loop {
-            let result = fetch_stats().await;
+            let result = hipfire_web_ui::get_json_typed::<AdminStats>("/admin/stats").await;
+            if result.as_ref().is_err_and(|error| error.is_unauthorized()) {
+                auth.0.set(true);
+            }
             if let Ok(s) = &result {
+                auth.0.set(false);
                 set_history.update(|h| {
                     h.push_back(sample_from(s));
                     while h.len() > HISTORY {
@@ -77,35 +101,128 @@ fn App() -> impl IntoView {
                     }
                 });
             }
-            set_stats.set(Some(result));
+            set_stats.set(Some(result.map_err(|error| error.to_string())));
             gloo_timers::future::TimeoutFuture::new(POLL_MS).await;
         }
     });
 
     view! {
-        <div class="wrap">
-            <h1>"hipfire admin console"</h1>
-            <p class="sub">"compute & memory — /admin/stats (live)"</p>
-            {move || {
-                let history = history.get();
-                match stats.get() {
-                    None => view! { <p class="sub">"loading…"</p> }.into_any(),
-                    // Fresh success: render the rich snapshot with real bytes.
-                    Some(Ok(s)) => {
-                        view! { <Dashboard stats=Some(s) history=history stale=false/> }.into_any()
+        <div class="app-shell">
+            <header class="topbar">
+                <a class="brand" href="/admin/ui/" aria-label="hipfire admin home">
+                    <span class="brand-mark">"hf"</span>
+                    <span><strong>"hipfire"</strong><small>"admin console"</small></span>
+                </a>
+                <nav aria-label="Admin sections">
+                    <button class:active=move || tab.get() == Tab::Overview on:click=move |_| set_tab.set(Tab::Overview)>"Overview"</button>
+                    <button class:active=move || tab.get() == Tab::Access on:click=move |_| set_tab.set(Tab::Access)>"Access"</button>
+                    <button class:active=move || tab.get() == Tab::Usage on:click=move |_| set_tab.set(Tab::Usage)>"Usage"</button>
+                </nav>
+                <a class="legacy-link" href="/admin">"Legacy controls ↗"</a>
+            </header>
+            <main class="wrap">
+                {move || if auth.0.get() {
+                    view! { <LoginPanel/> }.into_any()
+                } else {
+                    match tab.get() {
+                        Tab::Overview => view! {
+                            <PageHead eyebrow="Operations" title="System overview" description="Live compute, memory, and process telemetry."/>
+                            {move || {
+                                let history = history.get();
+                                match stats.get() {
+                                    None => view! { <LoadingCards/> }.into_any(),
+                                    Some(Ok(s)) => view! { <Dashboard stats=Some(s) history=history stale=false/> }.into_any(),
+                                    Some(Err(e)) if history.is_empty() => view! { <ErrorPanel message=e/> }.into_any(),
+                                    Some(Err(_)) => view! { <Dashboard stats=None history=history stale=true/> }.into_any(),
+                                }
+                            }}
+                        }.into_any(),
+                        Tab::Access => view! { <AccessPanel/> }.into_any(),
+                        Tab::Usage => view! { <UsagePanel/> }.into_any(),
                     }
-                    // Errored with no data yet: show the error outright.
-                    Some(Err(e)) if history.is_empty() => {
-                        view! { <p class="err">{e}</p> }.into_any()
-                    }
-                    // Transient error with prior data: keep drawing, flag stale.
-                    Some(Err(_)) => {
-                        view! { <Dashboard stats=None history=history stale=true/> }.into_any()
-                    }
-                }
-            }}
+                }}
+            </main>
         </div>
     }
+}
+
+#[component]
+fn PageHead(
+    eyebrow: &'static str,
+    title: &'static str,
+    description: &'static str,
+) -> impl IntoView {
+    view! {
+        <div class="page-head">
+            <p class="eyebrow">{eyebrow}</p>
+            <h1>{title}</h1>
+            <p>{description}</p>
+        </div>
+    }
+}
+
+#[derive(Serialize)]
+struct LoginBody {
+    user: String,
+    password: String,
+}
+
+#[component]
+fn LoginPanel() -> impl IntoView {
+    let auth = use_context::<AuthState>().expect("auth context");
+    let (user, set_user) = signal("admin".to_string());
+    let (password, set_password) = signal(String::new());
+    let (busy, set_busy) = signal(false);
+    let (error, set_error) = signal(None::<String>);
+    let submit = move || {
+        if busy.get_untracked() {
+            return;
+        }
+        set_busy.set(true);
+        set_error.set(None);
+        let body = LoginBody {
+            user: user.get_untracked(),
+            password: password.get_untracked(),
+        };
+        leptos::task::spawn_local(async move {
+            match hipfire_web_ui::post_json_typed::<_, serde_json::Value>("/admin/login", &body)
+                .await
+            {
+                Ok(_) => {
+                    auth.0.set(false);
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.location().reload();
+                    }
+                }
+                Err(err) => set_error.set(Some(err.to_string())),
+            }
+            set_busy.set(false);
+        });
+    };
+    view! {
+        <section class="login-card" aria-labelledby="login-title">
+            <span class="brand-mark large">"hf"</span>
+            <p class="eyebrow">"Restricted surface"</p>
+            <h1 id="login-title">"Admin sign in"</h1>
+            <p class="sub">"Use the local administrator credentials configured for this server."</p>
+            <form on:submit=move |event: leptos::ev::SubmitEvent| { event.prevent_default(); submit(); }>
+                <label>"User"<input autocomplete="username" prop:value=move || user.get() on:input=move |event| set_user.set(event_target_value(&event))/></label>
+                <label>"Password"<input type="password" autocomplete="current-password" prop:value=move || password.get() on:input=move |event| set_password.set(event_target_value(&event))/></label>
+                {move || error.get().map(|message| view! { <p class="form-error" role="alert">{message}</p> })}
+                <button class="primary" type="submit" disabled=move || busy.get()>{move || if busy.get() { "Signing in…" } else { "Sign in" }}</button>
+            </form>
+        </section>
+    }
+}
+
+#[component]
+fn LoadingCards() -> impl IntoView {
+    view! { <div class="grid" aria-label="Loading system telemetry"><div class="skeleton tall"></div><div class="skeleton tall"></div><div class="skeleton tall"></div></div> }
+}
+
+#[component]
+fn ErrorPanel(message: String) -> impl IntoView {
+    view! { <div class="error-panel" role="alert"><strong>"Could not load this view"</strong><p>{message}</p></div> }
 }
 
 /// Top-level layout: one section per device class. GPUs and the host today;
@@ -506,8 +623,4 @@ fn chip(value: Option<f64>, prefix: &str, unit: &str) -> AnyView {
         Some(v) => view! { <span class="chip">{format!("{prefix}{v:.1}{unit}")}</span> }.into_any(),
         None => ().into_any(),
     }
-}
-
-async fn fetch_stats() -> Result<AdminStats, String> {
-    hipfire_web_ui::get_json::<AdminStats>("/admin/stats").await
 }

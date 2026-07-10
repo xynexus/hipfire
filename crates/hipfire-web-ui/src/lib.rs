@@ -9,7 +9,7 @@
 //! trunk builds that path-depend on this one.
 
 use js_sys::{Reflect, Uint8Array};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -31,19 +31,125 @@ pub fn js_error(value: JsValue) -> String {
         .unwrap_or_else(|| "JavaScript error".to_string())
 }
 
-/// `GET url` and deserialize the JSON body into `T`.
-pub async fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
-    let resp = gloo_net::http::Request::get(url)
+/// Structured browser-facing HTTP failure. Admin surfaces use the status to
+/// distinguish an expired login from validation and server failures while the
+/// message remains suitable for inline display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiError {
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+impl ApiError {
+    pub fn is_unauthorized(&self) -> bool {
+        self.status == Some(401)
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn error_message(status: u16, text: &str) -> String {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| {
+                    error
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| error.get("message")?.as_str().map(str::to_owned))
+                })
+                .or_else(|| value.get("message")?.as_str().map(str::to_owned))
+        })
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| format!("request returned HTTP {status}"))
+}
+
+async fn decode_json<T: DeserializeOwned>(
+    response: gloo_net::http::Response,
+) -> Result<T, ApiError> {
+    let status = response.status();
+    let text = response.text().await.map_err(|error| ApiError {
+        status: Some(status),
+        message: error.to_string(),
+    })?;
+    if !(200..300).contains(&status) {
+        return Err(ApiError {
+            status: Some(status),
+            message: error_message(status, &text),
+        });
+    }
+    serde_json::from_str(&text).map_err(|error| ApiError {
+        status: Some(status),
+        message: format!("invalid JSON response: {error}"),
+    })
+}
+
+/// Typed JSON helpers for authenticated same-origin applications.
+pub async fn get_json_typed<T: DeserializeOwned>(url: &str) -> Result<T, ApiError> {
+    let response = gloo_net::http::Request::get(url)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
-    if resp.status() == 401 {
-        return Err("authentication required".to_string());
-    }
-    if !resp.ok() {
-        return Err(format!("{url} returned HTTP {}", resp.status()));
-    }
-    resp.json::<T>().await.map_err(|e| e.to_string())
+        .map_err(|error| ApiError {
+            status: None,
+            message: error.to_string(),
+        })?;
+    decode_json(response).await
+}
+
+pub async fn post_json_typed<B: Serialize, T: DeserializeOwned>(
+    url: &str,
+    body: &B,
+) -> Result<T, ApiError> {
+    let request = gloo_net::http::Request::post(url)
+        .json(body)
+        .map_err(|error| ApiError {
+            status: None,
+            message: error.to_string(),
+        })?;
+    let response = request.send().await.map_err(|error| ApiError {
+        status: None,
+        message: error.to_string(),
+    })?;
+    decode_json(response).await
+}
+
+pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
+    url: &str,
+    body: &B,
+) -> Result<T, ApiError> {
+    let request = gloo_net::http::Request::patch(url)
+        .json(body)
+        .map_err(|error| ApiError {
+            status: None,
+            message: error.to_string(),
+        })?;
+    let response = request.send().await.map_err(|error| ApiError {
+        status: None,
+        message: error.to_string(),
+    })?;
+    decode_json(response).await
+}
+
+pub async fn delete_json<T: DeserializeOwned>(url: &str) -> Result<T, ApiError> {
+    let response = gloo_net::http::Request::delete(url)
+        .send()
+        .await
+        .map_err(|error| ApiError {
+            status: None,
+            message: error.to_string(),
+        })?;
+    decode_json(response).await
+}
+
+/// `GET url` and deserialize the JSON body into `T`.
+pub async fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
+    get_json_typed(url).await.map_err(|error| error.to_string())
 }
 
 /// `POST url` with a JSON body, returning the parsed JSON response (regardless

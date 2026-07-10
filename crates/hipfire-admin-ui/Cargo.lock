@@ -494,8 +494,11 @@ dependencies = [
  "gloo-timers",
  "hipfire-admin-types",
  "hipfire-web-ui",
+ "js-sys",
  "leptos",
  "serde",
+ "serde_json",
+ "web-sys",
 ]
 
 [[package]]
