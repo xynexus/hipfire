@@ -380,6 +380,162 @@ impl CalibCollector {
     }
 }
 
+/// Upload a small host-resident activation matrix and feed it through the
+/// currently armed calibration collector. Embedding projection heads use this
+/// seam because their inputs are pooled host vectors rather than GPU GEMM
+/// scratch tensors.
+pub fn capture_host_activations(
+    gpu: &mut Gpu,
+    tensor_name: &str,
+    activations: &[f32],
+    rows: usize,
+    width: usize,
+) -> Result<(), String> {
+    validate_host_activations(tensor_name, activations, rows, width)?;
+    let collector = gpu
+        .active_capture
+        .clone()
+        .ok_or_else(|| "calib: no active collector for host activation".to_string())?;
+    let input = gpu
+        .upload_f32(activations, &[rows, width])
+        .map_err(|e| format!("calib: upload host activation {tensor_name}: {e}"))?;
+    collector.capture(gpu, tensor_name, &input, rows, width);
+    gpu.device_synchronize()
+        .map_err(|e| format!("calib: synchronize host activation {tensor_name}: {e}"))?;
+    gpu.free_tensor(input)
+        .map_err(|e| format!("calib: free host activation {tensor_name}: {e}"))?;
+    Ok(())
+}
+
+fn validate_host_activations(
+    tensor_name: &str,
+    activations: &[f32],
+    rows: usize,
+    width: usize,
+) -> Result<(), String> {
+    if tensor_name.is_empty() {
+        return Err("calib: host activation tensor name is empty".to_string());
+    }
+    if rows == 0 || width == 0 {
+        return Err("calib: host activation shape must be non-zero".to_string());
+    }
+    let expected = rows
+        .checked_mul(width)
+        .ok_or_else(|| "calib: host activation shape overflow".to_string())?;
+    if activations.len() != expected {
+        return Err(format!(
+            "calib: host activation {tensor_name} has {} values, expected {expected} ({rows}x{width})",
+            activations.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Tokenize a text corpus into independent embedding samples. Blank lines
+/// delimit paragraphs; when the corpus has no blank lines, each non-empty line
+/// is a sample. Samples are never truncated or concatenated: collection stops
+/// before the first sample that would exceed `max_tokens`.
+pub fn tokenize_embedding_samples<F>(text: &str, max_tokens: usize, mut encode: F) -> Vec<Vec<u32>>
+where
+    F: FnMut(&str) -> Vec<u32>,
+{
+    if max_tokens == 0 {
+        return Vec::new();
+    }
+
+    let has_blank_line = text.lines().any(|line| line.trim().is_empty());
+    let mut texts = Vec::new();
+    if has_blank_line {
+        let mut paragraph = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                if !paragraph.is_empty() {
+                    texts.push(paragraph.join("\n"));
+                    paragraph.clear();
+                }
+            } else {
+                paragraph.push(line);
+            }
+        }
+        if !paragraph.is_empty() {
+            texts.push(paragraph.join("\n"));
+        }
+    } else {
+        texts.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string),
+        );
+    }
+
+    let mut samples = Vec::new();
+    let mut total_tokens = 0usize;
+    for text in texts {
+        let tokens = encode(&text);
+        if tokens.is_empty() {
+            continue;
+        }
+        if total_tokens + tokens.len() > max_tokens {
+            break;
+        }
+        total_tokens += tokens.len();
+        samples.push(tokens);
+    }
+    samples
+}
+
+/// Sample-oriented wrapper around [`collect_grouped`]. Each layer group reruns
+/// every independent embedding sample, preserving per-sample pooling semantics
+/// while retaining the grouped Hessian memory bound.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_embedding_grouped<C, F>(
+    gpu: &mut Gpu,
+    arch_id: u32,
+    num_layers: usize,
+    group_size: usize,
+    output: &std::path::Path,
+    samples: &[Vec<u32>],
+    static_meta: &[(&str, serde_json::Value)],
+    capture_names_for: C,
+    mut forward_sample: F,
+) -> Result<CalibSummary, String>
+where
+    C: FnMut(usize, usize) -> HashMap<usize, String>,
+    F: FnMut(&mut Gpu, usize, usize, &[u32]) -> Result<(), String>,
+{
+    if samples.is_empty() {
+        return Err("calib: embedding sample set is empty".to_string());
+    }
+    if samples.iter().any(Vec::is_empty) {
+        return Err("calib: embedding samples must be non-empty".to_string());
+    }
+    let total_tokens: usize = samples.iter().map(Vec::len).sum();
+    let max_sample_length = samples.iter().map(Vec::len).max().unwrap_or(0);
+    let mut metadata = static_meta.to_vec();
+    metadata.push(("sample_count", serde_json::json!(samples.len())));
+    metadata.push(("total_tokens", serde_json::json!(total_tokens)));
+    metadata.push(("max_sample_length", serde_json::json!(max_sample_length)));
+
+    collect_grouped(
+        gpu,
+        arch_id,
+        num_layers,
+        group_size,
+        Vec::new(),
+        output,
+        &metadata,
+        capture_names_for,
+        |gpu, group_idx| {
+            for (sample_idx, sample) in samples.iter().enumerate() {
+                forward_sample(gpu, group_idx, sample_idx, sample)?;
+            }
+            Ok(CalibForward::default())
+        },
+    )
+}
+
 /// Memory-bounded variant of [`collect`] for dense arches whose full Hessians
 /// for ALL layers do not fit at once. Captures the layers in groups of
 /// `group_size` — each group re-runs the arch forward but registers only that
@@ -863,5 +1019,100 @@ mod tests {
         assert_eq!(read_bf16(12), 0.5);
         assert_eq!(read_bf16(14), -0.25);
         assert_eq!(read_bf16(16), 0.75);
+    }
+
+    #[test]
+    fn embedding_sample_split_preserves_boundaries_and_budget() {
+        let text = " first paragraph \ncontinues here\n\n\nsecond\n\nthird";
+        let samples = tokenize_embedding_samples(text, 5, |sample| {
+            sample
+                .split_whitespace()
+                .enumerate()
+                .map(|(i, _)| i as u32)
+                .collect()
+        });
+        assert_eq!(samples.iter().map(Vec::len).collect::<Vec<_>>(), [4, 1]);
+
+        let lines = tokenize_embedding_samples("one two\nthree\nfour five", 3, |sample| {
+            sample
+                .split_whitespace()
+                .enumerate()
+                .map(|(i, _)| i as u32)
+                .collect()
+        });
+        assert_eq!(lines.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1]);
+    }
+
+    #[test]
+    fn embedding_sample_split_drops_empty_encodings() {
+        let samples = tokenize_embedding_samples("skip\nkeep", 2, |sample| {
+            if sample == "skip" {
+                Vec::new()
+            } else {
+                vec![7]
+            }
+        });
+        assert_eq!(samples, vec![vec![7]]);
+    }
+
+    #[test]
+    fn host_activation_validation_rejects_bad_shapes_before_gpu_use() {
+        assert!(validate_host_activations("dense.0", &[], 0, 3).is_err());
+        assert!(validate_host_activations("dense.0", &[1.0, 2.0], 1, 3).is_err());
+        assert!(validate_host_activations("", &[1.0], 1, 1).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires working ROCm calibration kernels"]
+    fn host_activation_capture_writes_expected_imatrix_and_hessian() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) => gpu,
+            Err(_) => return,
+        };
+        let collector = std::sync::Arc::new(CalibCollector::new());
+        gpu.active_capture = Some(collector.clone());
+        capture_host_activations(&mut gpu, "dense.0", &[1.0, 2.0, 3.0, 4.0], 2, 2).unwrap();
+        gpu.active_capture = None;
+
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-host-calib-{}-{}.calib.hfq",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        collector
+            .write_streaming(&mut gpu, &path, 19, "{}", &[])
+            .unwrap();
+        collector.free_gpu(&mut gpu);
+
+        let hfq = crate::hfq::HfqFile::open(&path).unwrap();
+        let (_, imatrix) = hfq.tensor_data_vec("dense.0.imatrix").unwrap();
+        let read_f32 = |data: &[u8], offset: usize| {
+            f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+        };
+        assert!((read_f32(&imatrix, 0) - 5.0).abs() < 1e-6);
+        assert!((read_f32(&imatrix, 4) - 10.0).abs() < 1e-6);
+
+        let (hessian_info, hessian) = hfq.tensor_data_vec("dense.0.hessian").unwrap();
+        match hessian_info.quant_type {
+            2 => {
+                assert!((read_f32(&hessian, 0) - 5.0).abs() < 1e-6);
+                assert!((read_f32(&hessian, 4) - 7.0).abs() < 1e-6);
+                assert!((read_f32(&hessian, 12) - 10.0).abs() < 1e-6);
+            }
+            QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32 => {
+                assert!((read_f32(&hessian, 0) - 5.0).abs() < 1e-6);
+                assert!((read_f32(&hessian, 4) - 10.0).abs() < 1e-6);
+                let lower = hipfire_primitives::conv::bf16_bits_to_f32(u16::from_le_bytes(
+                    hessian[8..10].try_into().unwrap(),
+                ));
+                assert!((lower - 7.0).abs() < 1e-3);
+            }
+            quant_type => panic!("unexpected Hessian quant type {quant_type}"),
+        }
+        drop(hfq);
+        let _ = std::fs::remove_file(path);
     }
 }

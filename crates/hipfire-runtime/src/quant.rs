@@ -76,6 +76,75 @@ pub fn dequant_oq8g256(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantize canonical on-disk Oq4G256 blocks to plain, unrotated f32.
+pub fn dequant_oq4g256(data: &[u8], n: usize) -> Vec<f32> {
+    use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+    const GROUP: usize = 256;
+    const BLOCK: usize = 130;
+    let signs1 = gen_fwht_signs(42, GROUP);
+    let signs2 = gen_fwht_signs(1042, GROUP);
+    let mut out = vec![0.0f32; n];
+
+    for block_idx in 0..n / GROUP {
+        let offset = block_idx * BLOCK;
+        if offset + BLOCK > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([data[offset], data[offset + 1]]));
+        let mut group = [0.0f32; GROUP];
+        for packed_idx in 0..128 {
+            let packed = data[offset + 2 + packed_idx];
+            let low = (packed & 0x0f) as i8;
+            let high = (packed >> 4) as i8;
+            group[2 * packed_idx] = (if low > 7 { low - 16 } else { low }) as f32 * scale;
+            group[2 * packed_idx + 1] = (if high > 7 { high - 16 } else { high }) as f32 * scale;
+        }
+        cpu_fwht_256(&mut group, &signs2, &signs1);
+        out[block_idx * GROUP..(block_idx + 1) * GROUP].copy_from_slice(&group);
+    }
+    out
+}
+
+/// Dequantize compact mixed-precision Opus blocks to plain, unrotated f32.
+pub fn dequant_oqplus_compact(data: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+    const GROUP: usize = 256;
+    assert_eq!(
+        cols % GROUP,
+        0,
+        "compact mixed Opus requires columns divisible by 256"
+    );
+    let groups = rows * (cols / GROUP);
+    assert!(groups > 0 && data.len() % groups == 0);
+    let block_bytes = data.len() / groups;
+    assert!(block_bytes >= 132 && (block_bytes - 130) % 2 == 0);
+    let outlier_count = (block_bytes - 130) / 2;
+    let signs1 = gen_fwht_signs(42, GROUP);
+    let signs2 = gen_fwht_signs(1042, GROUP);
+    let mut out = vec![0.0f32; rows * cols];
+
+    for block_idx in 0..groups {
+        let offset = block_idx * block_bytes;
+        let scale = f16_to_f32(u16::from_le_bytes([data[offset], data[offset + 1]]));
+        let mut group = [0.0f32; GROUP];
+        for packed_idx in 0..128 {
+            let packed = data[offset + 2 + packed_idx];
+            let low = (packed & 0x0f) as i8;
+            let high = (packed >> 4) as i8;
+            group[2 * packed_idx] = (if low > 7 { low - 16 } else { low }) as f32 * scale;
+            group[2 * packed_idx + 1] = (if high > 7 { high - 16 } else { high }) as f32 * scale;
+        }
+        for outlier_idx in 0..outlier_count {
+            let table_offset = offset + 130 + 2 * outlier_idx;
+            let index = data[table_offset] as usize;
+            group[index] = (data[table_offset + 1] as i8) as f32 * scale;
+        }
+        cpu_fwht_256(&mut group, &signs2, &signs1);
+        out[block_idx * GROUP..(block_idx + 1) * GROUP].copy_from_slice(&group);
+    }
+    out
+}
+
 // f16↔f32 conversions are now the canonical implementations in the shared
 // `hipfire-primitives` leaf (they were byte-identical copies). Re-exported here
 // so the ~20 arch/loader call sites importing `hipfire_runtime::quant::*` stay
@@ -235,5 +304,41 @@ mod tests {
         let nb: f32 = orig.iter().map(|b| b * b).sum::<f32>().sqrt();
         let cos = dot / (na * nb);
         assert!(cos > 0.999, "dequant_oq8g256 not un-rotating: cosine={cos}");
+    }
+
+    #[test]
+    fn dequant_oq4g256_inverts_the_fwht_rotation() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let original: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.031 - 1.0).sin()).collect();
+        let mut rotated = [0.0f32; 256];
+        rotated.copy_from_slice(&original);
+        cpu_fwht_256(&mut rotated, &signs1, &signs2);
+        let scale = rotated
+            .iter()
+            .fold(0.0f32, |max, &value| max.max(value.abs()))
+            / 7.0;
+        let mut block = vec![0u8; 130];
+        block[..2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+        for packed_idx in 0..128 {
+            let low = (rotated[2 * packed_idx] / scale).round().clamp(-7.0, 7.0) as i8;
+            let high = (rotated[2 * packed_idx + 1] / scale)
+                .round()
+                .clamp(-7.0, 7.0) as i8;
+            block[2 + packed_idx] = (low as u8 & 0x0f) | ((high as u8 & 0x0f) << 4);
+        }
+        let decoded = dequant_oq4g256(&block, 256);
+        let dot: f32 = decoded.iter().zip(&original).map(|(a, b)| a * b).sum();
+        let decoded_norm = decoded
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        let original_norm = original
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!(dot / (decoded_norm * original_norm) > 0.99);
     }
 }

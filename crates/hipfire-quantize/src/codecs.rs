@@ -496,6 +496,81 @@ pub fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
     }
 }
 
+fn mixed_overlay_indices(group: &[f32; 256], scale: f32, n_out: usize) -> [usize; 256] {
+    let inv = 1.0 / scale.max(1e-12);
+    let gain = |index: usize| -> f32 {
+        let value = group[index];
+        let q4 = (value * inv).round().clamp(-7.0, 7.0);
+        let q8 = (value * inv).round().clamp(-127.0, 127.0);
+        let error4 = value - q4 * scale;
+        let error8 = value - q8 * scale;
+        error4 * error4 - error8 * error8
+    };
+    let mut indices: [usize; 256] = core::array::from_fn(|index| index);
+    indices[..].sort_unstable_by(|&left, &right| {
+        gain(right)
+            .partial_cmp(&gain(left))
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    debug_assert!((1..=255).contains(&n_out));
+    indices
+}
+
+fn mixed_overlay_error(
+    group: &[f32; 256],
+    scale: f32,
+    indices: &[usize; 256],
+    n_out: usize,
+) -> f32 {
+    let inv = 1.0 / scale.max(1e-12);
+    let mut is_w8 = [false; 256];
+    for &index in &indices[..n_out] {
+        is_w8[index] = true;
+    }
+    group
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| {
+            let limit = if is_w8[index] { 127.0 } else { 7.0 };
+            let quantized = (value * inv).round().clamp(-limit, limit);
+            let error = value - quantized * scale;
+            error * error
+        })
+        .sum()
+}
+
+fn refit_mixed_scale(
+    group: &[f32; 256],
+    indices: &[usize; 256],
+    n_out: usize,
+    fallback: f32,
+) -> f32 {
+    const CLIP_GRID: [f32; 14] = [
+        1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35,
+    ];
+    let amax = group.iter().fold(0.0f32, |max, value| max.max(value.abs()));
+    let mut best_scale = fallback.max(1e-12);
+    let mut best_error = mixed_overlay_error(group, best_scale, indices, n_out);
+    for clip in CLIP_GRID {
+        let scale = (clip * amax / 7.0).max(1e-12);
+        let error = mixed_overlay_error(group, scale, indices, n_out);
+        if error < best_error {
+            best_scale = scale;
+            best_error = error;
+        }
+    }
+    best_scale
+}
+
+fn mixed_clipsearch(group: &[f32; 256], n_out: usize) -> (f32, [usize; 256]) {
+    let initial_scale = symmetric_clipsearch(group, 7.0);
+    let initial_indices = mixed_overlay_indices(group, initial_scale, n_out);
+    let first_scale = refit_mixed_scale(group, &initial_indices, n_out, initial_scale);
+    let refined_indices = mixed_overlay_indices(group, first_scale, n_out);
+    let refined_scale = refit_mixed_scale(group, &refined_indices, n_out, first_scale);
+    (refined_scale, refined_indices)
+}
+
 /// MQ6+ : MQ6G256 with clip-searched affine range (identical 200-byte layout).
 pub fn quantize_mq6g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, bb(QuantType::MQ6G256));
@@ -968,23 +1043,8 @@ pub fn quantize_oqplus_compact(
         let mut group = [0.0f32; 256];
         group[..end - start].copy_from_slice(&f32_data[start..end]);
         cpu_fwht_256(&mut group, signs1, signs2);
-        let scale = symmetric_clipsearch(&group, 7.0);
+        let (scale, idx) = mixed_clipsearch(&group, n_out);
         let inv = 1.0 / scale;
-        // Top n_out by int8-upgrade gain (= the tiered codec's criterion).
-        let gain = |i: usize| -> f32 {
-            let v = group[i];
-            let q4 = (v * inv).round().clamp(-7.0, 7.0);
-            let q8 = (v * inv).round().clamp(-127.0, 127.0);
-            let e4 = v - q4 * scale;
-            let e8 = v - q8 * scale;
-            e4 * e4 - e8 * e8
-        };
-        let mut idx: [usize; 256] = core::array::from_fn(|i| i);
-        idx.sort_unstable_by(|&a, &c| {
-            gain(c)
-                .partial_cmp(&gain(a))
-                .unwrap_or(core::cmp::Ordering::Equal)
-        });
         let out_off = b * block_bytes;
         let scale_f16 = f32_to_f16(scale);
         output[out_off] = (scale_f16 & 0xFF) as u8;
@@ -2616,5 +2676,24 @@ mod tests {
         assert!(one.is_finite() && one >= 0.0);
         let zeros = symmetric_clipsearch(&[0.0; 256], 7.0);
         assert!(zeros.is_finite());
+    }
+
+    #[test]
+    fn mixed_clipsearch_never_worsens_q4_seeded_overlay_error() {
+        let mut group = [0.0f32; 256];
+        for (index, value) in group.iter_mut().enumerate() {
+            *value = ((index as f32 * 0.173).sin() * 1.7) + if index % 47 == 0 { 9.0 } else { 0.0 };
+        }
+        for n_out in [1, 3, 7, 15] {
+            let initial_scale = symmetric_clipsearch(&group, 7.0);
+            let initial_indices = mixed_overlay_indices(&group, initial_scale, n_out);
+            let initial_error = mixed_overlay_error(&group, initial_scale, &initial_indices, n_out);
+            let (refined_scale, refined_indices) = mixed_clipsearch(&group, n_out);
+            let refined_error = mixed_overlay_error(&group, refined_scale, &refined_indices, n_out);
+            assert!(
+                refined_error <= initial_error + 1e-6,
+                "n_out={n_out}: refined {refined_error} > initial {initial_error}"
+            );
+        }
     }
 }

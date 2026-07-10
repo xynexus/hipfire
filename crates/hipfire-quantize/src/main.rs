@@ -56,9 +56,9 @@ use hipfire_quantize::hfq_out::{parameter_counts_metadata, Xxh64};
 // import pipeline's `gguf_input::` references source-compatible.
 use hipfire_arch_api::{
     ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_TEXT,
-    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2,
-    ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE,
-    ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
+    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
+    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY,
+    ARCH_ID_ZAYA,
 };
 use hipfire_gguf as gguf_input;
 // Quant-format/K-map planning + the GGUF import pipeline now live in the
@@ -2687,13 +2687,53 @@ enum OqCalibrationRecipe {
     AwqLdlq,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OpusMixedSpec {
+    storage_bits: f32,
+    outliers_per_group: usize,
+    w8_frac: f32,
+    recipe: OqCalibrationRecipe,
+}
+
+fn parse_opus_mixed_format(format: &str) -> Option<OpusMixedSpec> {
+    let (base, recipe) = if let Some(base) = format.strip_suffix("++") {
+        (base, OqCalibrationRecipe::AwqLdlq)
+    } else if let Some(base) = format.strip_suffix('+') {
+        (base, OqCalibrationRecipe::Awq)
+    } else {
+        (format, OqCalibrationRecipe::Plain)
+    };
+    let bits_text = base.strip_prefix("oq")?;
+    if !bits_text.contains('.') {
+        return None;
+    }
+    let requested_bits = bits_text.parse::<f32>().ok()?;
+    let outliers_exact = (requested_bits - 4.0625) * 16.0;
+    let outliers_per_group = outliers_exact.round() as isize;
+    if !(1..=62).contains(&outliers_per_group)
+        || (outliers_exact - outliers_per_group as f32).abs() > 1e-4
+    {
+        return None;
+    }
+    let outliers_per_group = outliers_per_group as usize;
+    Some(OpusMixedSpec {
+        storage_bits: 4.0625 + outliers_per_group as f32 / 16.0,
+        outliers_per_group,
+        w8_frac: outliers_per_group as f32 / 256.0,
+        recipe,
+    })
+}
+
 fn oq4_calibration_recipe(format: &str) -> OqCalibrationRecipe {
+    if let Some(spec) = parse_opus_mixed_format(format) {
+        return spec.recipe;
+    }
     match format {
-        "oq4+" => OqCalibrationRecipe::Awq,
+        "oq4+" | "oq4.25+" => OqCalibrationRecipe::Awq,
         // Legacy OP plus spellings predate the positional OQ+ / OQ++ taxonomy.
         // Keep parsing them as the older LDLQ recipe, but emit canonical OQ names
         // in docs and artifacts.
-        "oq4++" | "op4+" | "op4-4+" | "op4-8+" => OqCalibrationRecipe::AwqLdlq,
+        "oq4++" | "oq4.25++" | "op4+" | "op4-4+" | "op4-8+" => OqCalibrationRecipe::AwqLdlq,
         _ => OqCalibrationRecipe::Plain,
     }
 }
@@ -2760,6 +2800,13 @@ enum HfqInputFormat {
     Oq8Plus,
 }
 
+#[derive(Clone, Debug)]
+struct TensorFormatOverride {
+    pattern: String,
+    format: HfqInputFormat,
+    format_label: String,
+}
+
 impl HfqInputFormat {
     fn from_flag(flag: &str) -> Option<Self> {
         match flag {
@@ -2780,11 +2827,74 @@ impl HfqInputFormat {
             "opplus" | "op4-plus" => Some(Self::OqPlus),
             "op4+t" | "opplus-tiered" | "op4-tiered" => Some(Self::OqPlusTiered),
             "op4+c" | "opplus-compact" | "op4-compact" => Some(Self::OqPlusCompact),
+            _ if parse_opus_mixed_format(flag).is_some() => Some(Self::OqPlusCompact),
             "op8" | "op8-16" | "op8g256" | "oq8" | "oq8g256" => Some(Self::Oq8),
             "op8+" | "op8-16+" | "op8-plus" | "oq8+" | "oq8++" | "oq8-plus" => Some(Self::Oq8Plus),
             _ => None,
         }
     }
+}
+
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let mut previous = vec![false; text.len() + 1];
+    previous[0] = true;
+    for &token in pattern {
+        let mut current = vec![false; text.len() + 1];
+        if token == b'*' {
+            current[0] = previous[0];
+            for index in 1..=text.len() {
+                current[index] = previous[index] || current[index - 1];
+            }
+        } else {
+            for index in 1..=text.len() {
+                current[index] = previous[index - 1] && token == text[index - 1];
+            }
+        }
+        previous = current;
+    }
+    previous[text.len()]
+}
+
+fn parse_tensor_format_overrides(args: &[String]) -> Result<Vec<TensorFormatOverride>, String> {
+    let mut overrides = Vec::new();
+    for index in 0..args.len() {
+        if args[index] != "--tensor-format" {
+            continue;
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| "--tensor-format requires GLOB=FORMAT".to_string())?;
+        let (pattern, format_label) = value
+            .split_once('=')
+            .ok_or_else(|| format!("invalid --tensor-format {value:?}; want GLOB=FORMAT"))?;
+        if pattern.is_empty() || format_label.is_empty() {
+            return Err(format!(
+                "invalid --tensor-format {value:?}; glob and format must be non-empty"
+            ));
+        }
+        let normalized = normalize_format_flag(format_label);
+        let format = HfqInputFormat::from_flag(&normalized).ok_or_else(|| {
+            format!("invalid --tensor-format codec {format_label:?} for glob {pattern:?}")
+        })?;
+        overrides.push(TensorFormatOverride {
+            pattern: pattern.to_string(),
+            format,
+            format_label: normalized,
+        });
+    }
+    Ok(overrides)
+}
+
+fn tensor_format_override<'a>(
+    overrides: &'a [TensorFormatOverride],
+    tensor_name: &str,
+) -> Option<&'a TensorFormatOverride> {
+    overrides
+        .iter()
+        .rev()
+        .find(|entry| glob_matches(&entry.pattern, tensor_name))
 }
 
 fn hfq_source_dtype(qt: u8) -> Option<&'static str> {
@@ -3648,6 +3758,9 @@ fn run_hfq_source_pipeline(
     output: &Path,
     format: HfqInputFormat,
     format_label: &str,
+    awq_enabled: bool,
+    awq_alpha_explicit: Option<f32>,
+    tensor_overrides: &[TensorFormatOverride],
 ) -> Result<(), String> {
     let hfq = HfqInputFile::open(input).map_err(|e| format!("open HFQ input: {e}"))?;
     eprintln!(
@@ -3655,6 +3768,25 @@ fn run_hfq_source_pipeline(
         hfq.arch_id,
         hfq.tensors.len()
     );
+    if awq_enabled {
+        let default_alpha = if hfq.arch_id == ARCH_ID_NEMOTRON_H {
+            0.1f32
+        } else {
+            0.55f32
+        };
+        let awq_alpha = awq_alpha_explicit.unwrap_or(default_alpha);
+        if !(0.0..=1.0).contains(&awq_alpha) {
+            eprintln!(
+                "warning: --awq-alpha {awq_alpha} outside typical [0, 1] range; using anyway"
+            );
+        }
+        AWQ_ALPHA
+            .set(awq_alpha)
+            .expect("AWQ_ALPHA set twice — should not happen");
+        eprintln!(
+            "AWQ pre-scaling: ENABLED for HFQ source (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)"
+        );
+    }
 
     let mut metadata: serde_json::Value =
         serde_json::from_str(&hfq.metadata_json).unwrap_or_else(|_| serde_json::json!({}));
@@ -3668,6 +3800,22 @@ fn run_hfq_source_pipeline(
                 "accepted_quant_types": ["F16", "F32", "BF16"],
             }),
         );
+        if !tensor_overrides.is_empty() {
+            map.insert(
+                "tensor_format_overrides".to_string(),
+                serde_json::Value::Array(
+                    tensor_overrides
+                        .iter()
+                        .map(|entry| {
+                            serde_json::json!({
+                                "glob": entry.pattern,
+                                "format": entry.format_label,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
     }
 
     let mut hfq_tensors = Vec::with_capacity(hfq.tensors.len());
@@ -3677,18 +3825,29 @@ fn run_hfq_source_pipeline(
         let raw = hfq.tensor_data(t);
         let n_elements = t.shape.iter().map(|&d| d as u64).product::<u64>();
         total_params += n_elements;
-        let (data, qt, group_size, label) =
-            quantize_hfq_source_tensor(&t.name, hfq.arch_id, raw, t.quant_type, &t.shape, format)?;
+        let tensor_override = tensor_format_override(tensor_overrides, &t.name);
+        let tensor_format = tensor_override.map_or(format, |entry| entry.format);
+        let (data, qt, group_size, label) = quantize_hfq_source_tensor(
+            &t.name,
+            hfq.arch_id,
+            raw,
+            t.quant_type,
+            &t.shape,
+            tensor_format,
+        )?;
         if qt as u8 != t.quant_type || group_size != t.group_size {
             quantized_params += n_elements;
         }
         eprintln!(
-            "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB)",
+            "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB){}",
             t.name,
             t.shape,
             n_elements,
             raw.len() as f64 / 1024.0,
-            data.len() as f64 / 1024.0
+            data.len() as f64 / 1024.0,
+            tensor_override.map_or_else(String::new, |entry| {
+                format!(" [override {}={}]", entry.pattern, entry.format_label)
+            })
         );
         hfq_tensors.push(HfqTensor {
             name: t.name.clone(),
@@ -4398,7 +4557,7 @@ INPUT SOURCES (--input):
     <file.hfq>    an existing .hfq (e.g. a bf16 .hfq) for requantization.
                   The .hfq-source path supports --format
                   bf16 / fp16 / q8f16 / hfq4 / hfq6 / mq4 / mq6 / mq3 / qtip3 /
-                  qtip4 / oq4 (opus; legacy op4 aliases) / oq4+ / oq8 (opus8) / oq8+.
+                  qtip4 / oq4 (opus; legacy op4 aliases) / oq4+ / mixed oq<BITS> / oq8 / oq8+.
                   Other formats (roughquant, lloyd-*, mfp4, …) require a HF/GGUF source.
 
 REQUIRED:
@@ -4414,6 +4573,10 @@ FORMAT (--format <FMT>):
                        calibration; it requires --imatrix or --hessian.
                        oq4++ adds full-Hessian LDLQ feedback and requires
                        --hessian. Legacy op4+ spellings remain aliases for oq4++.
+                       Mixed oq<BITS> / oq<BITS>+ / oq<BITS>++ use compact
+                       int4-plus-sparse-int8 storage with the same suffix recipes.
+                       BITS must equal 4.0625 + N/16 for N=1..62; examples:
+                       oq4.125 (1 overlay), oq4.25 (3), oq4.5 (7).
                        oq8 / op8 / op8-16 (alias: opus8) — 8-bit Opus Quant.
                        oq8+ is oq8 plus activation-aware AWQ/SmoothQuant
                        calibration; oq8++ adds full-Hessian LDLQ feedback.
@@ -4451,6 +4614,8 @@ OPTIONS:
 
   Tensor selection:
     --include-prefix <P>       ingest ONLY tensors whose name starts with <P> (build sidecars, e.g. mtp.)
+    --tensor-format <GLOB=FMT> override selected tensor formats during HFQ requantization;
+                               repeatable, with later matches taking precedence
     --include-vision           include vision-tower tensors (default: skipped)
     --vision-quant <FMT>       format for vision tensors when --include-vision is set
 
@@ -4653,6 +4818,10 @@ fn main() {
         print_help();
         std::process::exit(0);
     }
+    let tensor_format_overrides = parse_tensor_format_overrides(&args).unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(2);
+    });
 
     // `--emit-fixture <arch>`: write a tiny random-init HF model (safetensors +
     // config.json) for gating, then exit. Flows through the normal `--input`
@@ -4730,13 +4899,15 @@ fn main() {
         );
         std::process::exit(2);
     });
-    let mut format_storage = normalize_format_flag(format_arg);
+    let requested_format = normalize_format_flag(format_arg);
+    let opus_mixed_spec = parse_opus_mixed_format(&requested_format);
+    let mut format_storage = requested_format.clone();
     // OQ4+/OQ4++ are not separate storage tags: they use OQ4 bytes plus
     // calibration sidecars/packing. Normalize to OQ4, then enforce the recipe
     // after argument parsing has loaded calibration sidecars.
     let oq4_recipe = oq4_calibration_recipe(format_storage.as_str());
     let oq4_plus_recipe = oq4_recipe != OqCalibrationRecipe::Plain;
-    if oq4_plus_recipe {
+    if oq4_plus_recipe && opus_mixed_spec.is_none() {
         format_storage = "oq4".to_string();
     }
     // OQ8+/OQ8++ are calibrated OQ8 (same Oq8G256 runtime format). Keep a
@@ -4989,6 +5160,7 @@ fn main() {
         || format == "oq4"
         || format == "oq4g256"
         || format == "opus";
+    let use_opus_mixed = opus_mixed_spec.is_some();
     let use_oq8 = format == "op8"
         || format == "op8-16"
         || format == "op8g256"
@@ -5488,18 +5660,29 @@ fn main() {
         );
     }
     // --w8-top <frac>: OQ+ magnitude-tiered top-frac weights kept at W8A8.
-    if let Some(i) = args.iter().position(|a| a == "--w8-top") {
-        let frac = args
-            .get(i + 1)
+    let explicit_w8_frac = args.iter().position(|a| a == "--w8-top").map(|i| {
+        args.get(i + 1)
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|f| *f > 0.0 && *f < 1.0)
-            .unwrap_or(0.01);
+            .unwrap_or(0.01)
+    });
+    if let (Some(spec), Some(explicit)) = (opus_mixed_spec, explicit_w8_frac) {
+        if (spec.w8_frac - explicit).abs() > 0.5 / 256.0 {
+            eprintln!(
+                "error: --format {} fixes {} sparse W8 overlays/group ({:.4} stored bits/weight); --w8-top {explicit} conflicts",
+                requested_format, spec.outliers_per_group, spec.storage_bits
+            );
+            std::process::exit(2);
+        }
+    }
+    if let Some(frac) = explicit_w8_frac.or(opus_mixed_spec.map(|spec| spec.w8_frac)) {
         OQPLUS_W8_FRAC
             .set(frac)
             .expect("OQPLUS_W8_FRAC set twice — should not happen");
+        let outliers = ((frac * 256.0).round() as usize).clamp(1, 255);
         eprintln!(
-            "OQ+ magnitude-tiering: ENABLED (top-{:.2}% weights/group kept at W8A8, bulk W4A8, single iu8 kernel)",
-            frac * 100.0
+            "OQ+ magnitude-tiering: ENABLED ({outliers} sparse W8 overlays/group, {:.4} stored bits/weight, bulk W4)",
+            4.0625 + outliers as f32 / 16.0
         );
     }
 
@@ -5667,11 +5850,23 @@ fn main() {
                 std::process::exit(2);
             });
             let out = Path::new(output_path);
-            if let Err(e) = run_hfq_source_pipeline(raw_input, out, hfq_format, format) {
+            if let Err(e) = run_hfq_source_pipeline(
+                raw_input,
+                out,
+                hfq_format,
+                &requested_format,
+                awq_enabled,
+                awq_alpha_explicit,
+                &tensor_format_overrides,
+            ) {
                 eprintln!("HFQ input pipeline failed: {e}");
                 std::process::exit(2);
             }
             return;
+        }
+        if !tensor_format_overrides.is_empty() {
+            eprintln!("error: --tensor-format currently requires an HFQ input");
+            std::process::exit(2);
         }
         if is_gguf_input(raw_input) {
             // GGUF import moved out of the inference-adjacent quantize binary.
@@ -7612,7 +7807,7 @@ fn main() {
                     // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                } else if (use_oq4 || use_oq8 || use_oq8_plus) && is_embed {
+                } else if (use_oq4 || use_opus_mixed || use_oq8 || use_oq8_plus) && is_embed {
                     // Embedding lookup has its own loader path. It supports Q8
                     // directly, while OQ4/OQ8 are GEMV/GEMM weight formats.
                     let q = quantize_q8f16(&f32_data);
@@ -8302,6 +8497,22 @@ fn main() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
+                    } else if use_opus_mixed && meta.shape.len() == 2 {
+                        let f32_bytes: Vec<u8> = f32_data
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect();
+                        let result = quantize_hfq_source_tensor(
+                            name,
+                            arch_id,
+                            &f32_bytes,
+                            2,
+                            &shape,
+                            HfqInputFormat::OqPlusCompact,
+                        )
+                        .unwrap_or_else(|error| panic!("mixed Opus quantize {name}: {error}"));
+                        awq_sidecar_scales = OQ4_AWQ_SIDECAR.with(|cell| cell.borrow_mut().take());
+                        result
                     } else if use_oq4 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
@@ -12239,11 +12450,46 @@ mod tests {
     }
 
     #[test]
+    fn tensor_format_overrides_support_globs_and_last_match_wins() {
+        let args = vec![
+            "hipfire-quantize".to_string(),
+            "--tensor-format".to_string(),
+            "dense.*=f16".to_string(),
+            "--tensor-format".to_string(),
+            "dense.1.weight=oq8".to_string(),
+        ];
+        let overrides = parse_tensor_format_overrides(&args).unwrap();
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(
+            tensor_format_override(&overrides, "dense.0.weight")
+                .unwrap()
+                .format,
+            HfqInputFormat::F16
+        );
+        assert_eq!(
+            tensor_format_override(&overrides, "dense.1.weight")
+                .unwrap()
+                .format,
+            HfqInputFormat::Oq8
+        );
+        assert!(tensor_format_override(&overrides, "model.layers.0.mlp.up_proj.weight").is_none());
+        assert!(glob_matches(
+            "model.layers.*.self_attn.*_proj.weight",
+            "model.layers.23.self_attn.q_proj.weight"
+        ));
+    }
+
+    #[test]
     fn oq_plus_recipe_keeps_awq_and_ldlq_levels_distinct() {
         assert_eq!(oq4_calibration_recipe("oq4"), OqCalibrationRecipe::Plain);
         assert_eq!(oq4_calibration_recipe("oq4+"), OqCalibrationRecipe::Awq);
+        assert_eq!(oq4_calibration_recipe("oq4.25+"), OqCalibrationRecipe::Awq);
         assert_eq!(
             oq4_calibration_recipe("oq4++"),
+            OqCalibrationRecipe::AwqLdlq
+        );
+        assert_eq!(
+            oq4_calibration_recipe("oq4.25++"),
             OqCalibrationRecipe::AwqLdlq
         );
         assert_eq!(oq4_calibration_recipe("op4+"), OqCalibrationRecipe::AwqLdlq);
@@ -12254,6 +12500,26 @@ mod tests {
             OqCalibrationRecipe::AwqLdlq
         );
         assert_eq!(oq8_calibration_recipe("op8+"), OqCalibrationRecipe::AwqLdlq);
+    }
+
+    #[test]
+    fn mixed_opus_format_maps_storage_bits_to_sparse_overlays() {
+        for (format, outliers, bits, recipe) in [
+            ("oq4.125", 1, 4.125, OqCalibrationRecipe::Plain),
+            ("oq4.25+", 3, 4.25, OqCalibrationRecipe::Awq),
+            ("oq4.375++", 5, 4.375, OqCalibrationRecipe::AwqLdlq),
+            ("oq4.5", 7, 4.5, OqCalibrationRecipe::Plain),
+        ] {
+            let spec = parse_opus_mixed_format(format).unwrap();
+            assert_eq!(spec.outliers_per_group, outliers);
+            assert!((spec.storage_bits - bits).abs() < 1e-6);
+            assert!((spec.w8_frac - outliers as f32 / 256.0).abs() < 1e-6);
+            assert_eq!(spec.recipe, recipe);
+        }
+        assert!(parse_opus_mixed_format("oq4").is_none());
+        assert!(parse_opus_mixed_format("oq4.2").is_none());
+        assert!(parse_opus_mixed_format("oq8").is_none());
+        assert!(parse_opus_mixed_format("oq8.0").is_none());
     }
 
     #[test]
@@ -12296,6 +12562,30 @@ mod tests {
         );
         assert_eq!(
             HfqInputFormat::from_flag("op4+c"),
+            Some(HfqInputFormat::OqPlusCompact)
+        );
+        assert_eq!(
+            HfqInputFormat::from_flag("oq4.25"),
+            Some(HfqInputFormat::OqPlusCompact)
+        );
+        assert_eq!(
+            HfqInputFormat::from_flag("oq4.25+"),
+            Some(HfqInputFormat::OqPlusCompact)
+        );
+        assert_eq!(
+            HfqInputFormat::from_flag("oq4.25++"),
+            Some(HfqInputFormat::OqPlusCompact)
+        );
+        assert_eq!(
+            HfqInputFormat::from_flag("oq4.125"),
+            Some(HfqInputFormat::OqPlusCompact)
+        );
+        assert_eq!(
+            HfqInputFormat::from_flag("oq4.375++"),
+            Some(HfqInputFormat::OqPlusCompact)
+        );
+        assert_eq!(
+            HfqInputFormat::from_flag("oq4.5+"),
             Some(HfqInputFormat::OqPlusCompact)
         );
         assert_eq!(HfqInputFormat::from_flag("op8"), Some(HfqInputFormat::Oq8));
