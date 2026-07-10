@@ -8,14 +8,18 @@ use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::State,
-    http::{header, Request, StatusCode},
+    http::{header, HeaderName, HeaderValue, Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
-use hipfire_auth::{CredentialError, RequestPrincipal, Scope};
+use futures::StreamExt;
+use hipfire_auth::{
+    CredentialError, RateLimitError, RateLimitStatus, RequestPrincipal, ReservationCost, Scope,
+    WorkloadClass,
+};
 use hipfire_config::{ApiAuthMode, HipfireConfig};
 use serde_json::json;
 
@@ -54,7 +58,7 @@ pub fn validate_api_auth_config(config: &HipfireConfig) -> Result<ApiAuthPolicy,
 
 pub async fn api_gate(
     State(state): State<SharedState>,
-    mut request: Request<Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
     if !is_api_path(request.uri().path()) {
@@ -70,8 +74,7 @@ pub async fn api_gate(
         if let Some(response) = enforce_scope(&principal, request.uri().path()) {
             return response;
         }
-        request.extensions_mut().insert(principal);
-        return next.run(request).await;
+        return admit_request(state, request, next, principal).await;
     }
 
     let presented = match request.headers().get(header::AUTHORIZATION) {
@@ -80,8 +83,7 @@ pub async fn api_gate(
             if let Some(response) = enforce_scope(&principal, request.uri().path()) {
                 return response;
             }
-            request.extensions_mut().insert(principal);
-            return next.run(request).await;
+            return admit_request(state, request, next, principal).await;
         }
         None => return unauthorized("API credential required"),
         Some(value) => match value
@@ -108,8 +110,7 @@ pub async fn api_gate(
             if let Some(response) = enforce_scope(&principal, request.uri().path()) {
                 return response;
             }
-            request.extensions_mut().insert(principal);
-            next.run(request).await
+            admit_request(state, request, next, principal).await
         }
         Err(error) => unauthorized(match error {
             CredentialError::Invalid => "invalid API credential",
@@ -118,6 +119,173 @@ pub async fn api_gate(
             CredentialError::UserDisabled => "API user disabled",
         }),
     }
+}
+
+async fn admit_request(
+    state: SharedState,
+    request: Request<Body>,
+    next: Next,
+    principal: RequestPrincipal,
+) -> Response {
+    let (mut request, cost) = match estimate_request(request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let (user_policy, token_policy) = if principal.token_id.is_some() {
+        match state
+            .access
+            .credentials()
+            .ok()
+            .and_then(|snapshot| snapshot.rate_policies(&principal))
+        {
+            Some(policies) => policies,
+            None => return service_unavailable(),
+        }
+    } else {
+        Default::default()
+    };
+    let reservation = match state.rate_limiter.reserve_at(
+        now_secs_f64(),
+        &principal,
+        &user_policy,
+        &token_policy,
+        cost,
+    ) {
+        Ok(reservation) => reservation,
+        Err(error) => return rate_limited(error),
+    };
+    let status = reservation.status();
+    request.extensions_mut().insert(principal);
+    request.extensions_mut().insert(reservation.reporter());
+    let mut response = next.run(request).await;
+    add_rate_headers(response.headers_mut(), status);
+    if response.status().is_client_error() || response.status().is_server_error() {
+        reservation.cancel();
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let stream = async_stream::stream! {
+        let reservation = reservation;
+        let mut data = body.into_data_stream();
+        while let Some(item) = data.next().await {
+            match item {
+                Ok(bytes) => yield Ok::<_, axum::Error>(bytes),
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+        reservation.complete();
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+async fn estimate_request(
+    request: Request<Body>,
+) -> Result<(Request<Body>, ReservationCost), Response> {
+    let path = request.uri().path().to_string();
+    let method = request.method().clone();
+    let workload = workload_class(&method, &path);
+    let mut cost = ReservationCost::request(workload);
+    if method == Method::GET || method == Method::DELETE {
+        return Ok((request, cost));
+    }
+    let is_json = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        return Ok((request, cost));
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = to_bytes(body, 16 * 1024 * 1024).await.map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": {
+                "message": "request body exceeds the admission limit",
+                "type": "invalid_request_error",
+                "code": "request_too_large"
+            }})),
+        )
+            .into_response()
+    })?;
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    match workload {
+        WorkloadClass::Text => {
+            let input_estimate = (bytes.len() as f64 / 4.0).ceil();
+            let output_estimate = value
+                .as_ref()
+                .and_then(|value| {
+                    value
+                        .get("max_output_tokens")
+                        .or_else(|| value.get("max_tokens"))
+                        .and_then(|value| value.as_u64())
+                })
+                .unwrap_or(512) as f64;
+            cost.text_tokens = input_estimate + output_estimate;
+        }
+        WorkloadClass::Image => {
+            let value = value.as_ref();
+            let width = json_u64(value, "width", 512) as f64;
+            let height = json_u64(value, "height", 512) as f64;
+            let steps = json_u64(value, "steps", 20) as f64;
+            let images = json_u64(value, "batch_size", 1)
+                .saturating_mul(json_u64(value, "n_iter", 1)) as f64;
+            cost.megapixel_steps = (width * height / 1_000_000.0) * steps * images;
+            if value
+                .and_then(|value| value.get("enable_hr"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                let scale = value
+                    .and_then(|value| value.get("hr_scale"))
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(2.0);
+                let second_steps = json_u64(value, "hr_second_pass_steps", steps as u64) as f64;
+                cost.megapixel_steps +=
+                    (width * scale * height * scale / 1_000_000.0) * second_steps * images;
+            }
+        }
+        WorkloadClass::Other | WorkloadClass::Training => {}
+    }
+    Ok((Request::from_parts(parts, Body::from(bytes)), cost))
+}
+
+fn json_u64(value: Option<&serde_json::Value>, key: &str, default: u64) -> u64 {
+    value
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(default)
+}
+
+fn workload_class(method: &Method, path: &str) -> WorkloadClass {
+    if method != Method::POST {
+        return WorkloadClass::Other;
+    }
+    if path.starts_with("/sdapi/v1/create/") || path.starts_with("/sdapi/v1/train/") {
+        return WorkloadClass::Training;
+    }
+    if matches!(
+        path,
+        "/sdapi/v1/txt2img"
+            | "/sdapi/v1/img2img"
+            | "/sdapi/v1/extra-single-image"
+            | "/sdapi/v1/extra-batch-images"
+            | "/sdapi/v1/interrogate"
+    ) {
+        return WorkloadClass::Image;
+    }
+    if matches!(
+        path,
+        "/v1/chat/completions" | "/v1/responses" | "/v1/embeddings" | "/v1/rerank"
+    ) {
+        return WorkloadClass::Text;
+    }
+    WorkloadClass::Other
 }
 
 fn is_api_path(path: &str) -> bool {
@@ -199,11 +367,80 @@ fn forbidden(scope: Scope) -> Response {
         .into_response()
 }
 
+fn rate_limited(error: RateLimitError) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": {
+                "message": format!("rate limit exceeded for {}", error.resource),
+                "type": "rate_limit_error",
+                "code": "rate_limit_exceeded"
+            }
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_str(&error.retry_after_secs.to_string()).unwrap(),
+    );
+    let suffix = match error.resource {
+        "text_tokens" => "tokens",
+        "megapixel_steps" => "megapixel-steps",
+        other => other,
+    };
+    let limit_name =
+        HeaderName::from_bytes(format!("x-ratelimit-limit-{suffix}").as_bytes()).unwrap();
+    let remaining_name =
+        HeaderName::from_bytes(format!("x-ratelimit-remaining-{suffix}").as_bytes()).unwrap();
+    response
+        .headers_mut()
+        .insert(limit_name, decimal_header(error.limit));
+    response
+        .headers_mut()
+        .insert(remaining_name, decimal_header(error.remaining));
+    response
+}
+
+fn add_rate_headers(headers: &mut axum::http::HeaderMap, status: RateLimitStatus) {
+    headers.insert(
+        "x-ratelimit-limit-requests",
+        decimal_header(status.request_limit),
+    );
+    headers.insert(
+        "x-ratelimit-remaining-requests",
+        decimal_header(status.request_remaining),
+    );
+    headers.insert(
+        "x-ratelimit-limit-tokens",
+        decimal_header(status.text_token_limit),
+    );
+    headers.insert(
+        "x-ratelimit-remaining-tokens",
+        decimal_header(status.text_token_remaining),
+    );
+}
+
+fn decimal_header(value: f64) -> HeaderValue {
+    let rendered = if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.3}")
+    };
+    HeaderValue::from_str(&rendered).unwrap()
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn now_secs_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 #[cfg(test)]
@@ -225,12 +462,20 @@ mod tests {
     }
 
     fn bearer_for(state: &SharedState, scopes: BTreeSet<Scope>) -> String {
+        bearer_for_with_policy(state, scopes, RatePolicyOverride::default())
+    }
+
+    fn bearer_for_with_policy(
+        state: &SharedState,
+        scopes: BTreeSet<Scope>,
+        rate_policy: RatePolicyOverride,
+    ) -> String {
         let store = state.access.store().unwrap();
         let user = store
             .create_user(
                 NewUser {
                     name: "api-user".into(),
-                    rate_policy: RatePolicyOverride::default(),
+                    rate_policy,
                 },
                 1,
             )
@@ -383,5 +628,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn completed_request_exhausts_bucket_with_openai_429_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(
+            HipfireConfig {
+                host: "0.0.0.0".into(),
+                ..Default::default()
+            },
+            directory.path(),
+        );
+        let bearer = bearer_for_with_policy(
+            &state,
+            BTreeSet::from([Scope::Images]),
+            RatePolicyOverride {
+                requests_per_minute: Some(0),
+                request_burst: Some(1),
+                ..Default::default()
+            },
+        );
+        let app = crate::build_router(state, &[]);
+        let first = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()["x-ratelimit-limit-requests"], "1");
+        axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let second = app
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.headers()[header::RETRY_AFTER], "60");
+        assert_eq!(second.headers()["x-ratelimit-limit-requests"], "1");
+        let body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
     }
 }

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify};
 
-use hipfire_auth::{AccessStore, CredentialSnapshot};
+use hipfire_auth::{AccessStore, CredentialSnapshot, RateLimiter};
 use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_daemon_adapter::DaemonEngine;
 use hipfire_diffusion::{DiffusionGenerationRuntimeOptions, DiffusionPipeline};
@@ -125,6 +125,7 @@ pub struct AppState {
     /// Durable API identities plus the immutable verification snapshot used by
     /// request middleware. Database errors remain visible and fail closed.
     pub access: AccessRuntime,
+    pub rate_limiter: RateLimiter,
 }
 
 pub struct AccessRuntime {
@@ -261,6 +262,7 @@ impl AppState {
             admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
             admin_sessions: Mutex::new(HashMap::new()),
             access: AccessRuntime::open(&access_dir),
+            rate_limiter: RateLimiter::default(),
         })
     }
 
