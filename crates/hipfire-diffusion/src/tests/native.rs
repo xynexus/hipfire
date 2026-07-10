@@ -179,6 +179,16 @@ fn native_transformer_io_projects_krea_final_layer_tokens() {
                 &[4],
                 &[0.0, 1.0, 0.0, -1.0],
             ),
+            f32_mem_tensor(
+                "transformer/tensors/final_layer.norm.weight",
+                &[2],
+                &[0.0, 0.0],
+            ),
+            f32_mem_tensor(
+                "transformer/tensors/final_layer.scale_shift_table",
+                &[2, 2],
+                &[10.0, 20.0, 0.5, 1.0],
+            ),
         ],
     )
     .unwrap();
@@ -231,7 +241,14 @@ fn native_transformer_io_projects_krea_final_layer_tokens() {
             &mut runtime_context,
         )
         .unwrap();
-    assert_eq!(output.data, vec![7.25, 2.25, 6.0, 7.5]);
+    assert_eq!(output.data.len(), 4);
+    let expected = [34.73378, 16.791616, 18.942163, 49.525398];
+    for (index, (actual, expected)) in output.data.iter().zip(expected).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 1e-4,
+            "Krea final scale/shift order mismatch at {index}: got {actual}, expected {expected}"
+        );
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 

@@ -379,10 +379,9 @@ impl NativeTransformerDenoiserIo {
     ) -> DiffusionResult<CpuTensor> {
         // Krea2 final adaLN: RMSNorm(hidden) then modulate by the [2, hidden]
         // scale/shift table combined with the timestep embedding. Chunk order is
-        // [scale, shift] (row 0 = scale, row 1 = shift), per the Krea2 source
-        // (Krea2FinalLayer.forward: `scale, shift = (temb + table).chunk(2)` then
-        // `(1 + scale) * norm(x) + shift`). The same timestep embedding is added
-        // to both rows, matching the source (temb broadcasts over the 2 rows).
+        // [scale, shift] (row 0 = scale, row 1 = shift), per the official Krea2
+        // SimpleModulation.forward. The same timestep embedding is added to both
+        // rows, matching the source (temb broadcasts over the 2 rows).
         if matches!(self.family, TransformerDenoiserFamily::Krea2) {
             let Some(norm_weight) = self.krea_final_norm_weight.as_ref() else {
                 return Ok(hidden.clone());

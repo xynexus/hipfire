@@ -9,6 +9,15 @@
 
 use super::*;
 
+fn is_krea2_turbo_pipeline(metadata: &DiffusionHfqMetadata) -> bool {
+    metadata.pipeline.class_name == "Krea2Pipeline"
+        && metadata
+            .pipeline
+            .model_name
+            .to_ascii_lowercase()
+            .contains("turbo")
+}
+
 impl DiffusionPipeline {
     pub(crate) fn native_runtime(&self) -> DiffusionResult<&NativeDiffusionRuntime> {
         self.native_runtime.as_ref().ok_or_else(|| {
@@ -91,8 +100,13 @@ impl DiffusionPipeline {
             .and_then(|t| t.patch_size)
             .unwrap_or(1)
             .max(1);
-        let image_seq_len =
+        let mut image_seq_len =
             (latent_shape.height / patch_size).max(1) * (latent_shape.width / patch_size).max(1);
+        if is_krea2_turbo_pipeline(&self.metadata) {
+            if let Some(max_seq) = scheduler_config.max_image_seq_len {
+                image_seq_len = max_seq;
+            }
+        }
         let schedule = DiffusionSchedule::from_config_with_image_seq_len(
             &scheduler_config,
             request.steps,
