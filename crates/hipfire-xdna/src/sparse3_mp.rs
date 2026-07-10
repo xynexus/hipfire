@@ -21,6 +21,11 @@ pub struct NpuSparse3Mp {
     w_loaded: bool,
 }
 
+/// One sparse-overlay slab held persistently in XDNA-accessible memory.
+pub struct NpuSparse3ResidentWeights {
+    buffer: DeviceBuffer,
+}
+
 impl NpuSparse3Mp {
     pub fn load_cached(dir: &str) -> Result<Self, XdnaError> {
         let xclbin = std::fs::read(format!("{dir}/final.xclbin")).map_err(XdnaError::Open)?;
@@ -90,6 +95,47 @@ impl NpuSparse3Mp {
         self.w_loaded = true;
     }
 
+    /// Upload one sparse overlay chunk once for reuse across forwards.
+    pub fn upload_resident_weights(
+        &self,
+        sparse: &[u8],
+    ) -> Result<NpuSparse3ResidentWeights, XdnaError> {
+        assert_eq!(sparse.len(), self.n() * BYTES_PER_COLUMN);
+        let mut buffer = self.kernel.alloc_arg(sparse.len())?;
+        buffer.as_mut_slice().copy_from_slice(sparse);
+        self.kernel.sync_to_device(&buffer)?;
+        Ok(NpuSparse3ResidentWeights { buffer })
+    }
+
+    /// Run with a resident sparse-overlay slab. No weight bytes are copied.
+    pub fn run_resident(
+        &mut self,
+        weights: &NpuSparse3ResidentWeights,
+        m: usize,
+        k: usize,
+        n: usize,
+        activations: &[i8],
+        output: &mut [i32],
+    ) -> Result<(), XdnaError> {
+        assert_eq!(weights.buffer.len(), self.n() * BYTES_PER_COLUMN);
+        assert_eq!(k, K);
+        assert_eq!(n, self.n());
+        assert_eq!(activations.len(), m * K);
+        assert_eq!(output.len(), m * n);
+        let rows_per = self.rows_per_dispatch();
+        assert_eq!(m % rows_per, 0);
+        for dispatch in 0..m / rows_per {
+            let row0 = dispatch * rows_per;
+            self.copy_activations(row0, activations);
+            self.kernel.dispatch_synced(
+                &[&self.a_buf, &weights.buffer, &self.c_buf],
+                &[true, false, true],
+            )?;
+            self.read_output(row0, n, output);
+        }
+        Ok(())
+    }
+
     pub fn run(
         &mut self,
         m: usize,
@@ -107,22 +153,26 @@ impl NpuSparse3Mp {
         assert_eq!(m % rows_per, 0);
         for dispatch in 0..m / rows_per {
             let row0 = dispatch * rows_per;
-            let a = self.a_buf.as_mut_slice();
-            for core in 0..self.cols {
-                for local_row in 0..self.mt * MR {
-                    let source_row = row0 + core * self.mt * MR + local_row;
-                    let source = source_row * K;
-                    let destination = (core * self.mt * MR + local_row) * K;
-                    for inner in 0..K {
-                        a[destination + inner] = activations[source + inner] as u8;
-                    }
-                }
-            }
+            self.copy_activations(row0, activations);
             self.kernel
                 .dispatch(&[&self.a_buf, &self.w_buf, &self.c_buf])?;
             self.read_output(row0, n, output);
         }
         Ok(())
+    }
+
+    fn copy_activations(&mut self, row0: usize, activations: &[i8]) {
+        let a = self.a_buf.as_mut_slice();
+        for core in 0..self.cols {
+            for local_row in 0..self.mt * MR {
+                let source_row = row0 + core * self.mt * MR + local_row;
+                let source = source_row * K;
+                let destination = (core * self.mt * MR + local_row) * K;
+                for inner in 0..K {
+                    a[destination + inner] = activations[source + inner] as u8;
+                }
+            }
+        }
     }
 
     fn read_output(&self, row0: usize, n: usize, output: &mut [i32]) {

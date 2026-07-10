@@ -33,7 +33,119 @@ pub struct NpuGemmMp {
     a_buf: DeviceBuffer, // COLS M-blocks (row-major), one per core, per dispatch
     w_buf: DeviceBuffer, // NB broadcast weight slabs (tile-major W4/W8), loaded once
     c_buf: DeviceBuffer, // COLS*NB output blocks (row-major)
+    batch_slots: Vec<NpuGemmBatchSlot>,
     w_loaded: bool,
+}
+
+struct NpuGemmBatchSlot {
+    a: DeviceBuffer,
+    c: DeviceBuffer,
+}
+
+/// Packed weights held in their own XDNA-accessible buffer. A model can keep
+/// one of these per matrix/K-group and dispatch it without copying weights into
+/// the executor's compatibility buffer on every forward.
+pub struct NpuGemmResidentWeights {
+    buffer: DeviceBuffer,
+}
+
+#[derive(Clone, Copy)]
+struct GemmLayout {
+    cols: usize,
+    mt: usize,
+    kchunk: usize,
+    nb: usize,
+    mr: usize,
+    mk: usize,
+    mn: usize,
+    weight_bits: usize,
+}
+
+impl From<&NpuGemmMp> for GemmLayout {
+    fn from(gemm: &NpuGemmMp) -> Self {
+        Self {
+            cols: gemm.cols,
+            mt: gemm.mt,
+            kchunk: gemm.kchunk,
+            nb: gemm.nb,
+            mr: gemm.mr,
+            mk: gemm.mk,
+            mn: gemm.mn,
+            weight_bits: gemm.weight_bits,
+        }
+    }
+}
+
+impl GemmLayout {
+    fn aw(self) -> usize {
+        self.mt * self.kchunk * self.mr * self.mk
+    }
+
+    fn cw(self) -> usize {
+        self.mt * NT * self.mr * self.mn
+    }
+
+    fn copy_a_tile_to(self, row0: usize, k: usize, a: &[i8], buffer: &mut DeviceBuffer) {
+        let aw = self.aw();
+        let s = buffer.as_mut_slice();
+        match self.weight_bits {
+            4 => {
+                // COLS row-major M-blocks -> A buffer. The W4 tensor stream tiles in-core.
+                for ci in 0..self.cols {
+                    for lr in 0..self.mt * self.mr {
+                        let src = (row0 + ci * self.mt * self.mr + lr) * k;
+                        for kk in 0..k {
+                            s[ci * aw + lr * k + kk] = a[src + kk] as u8;
+                        }
+                    }
+                }
+            }
+            8 => {
+                // Dense AIE2P W8 stores each A tile as contiguous 8-wide K halves.
+                for ci in 0..self.cols {
+                    for mi in 0..self.mt {
+                        for ki in 0..self.kchunk {
+                            let k_halves = self.mk / 8;
+                            for half in 0..k_halves {
+                                for r in 0..self.mr {
+                                    let src_row = row0 + ci * self.mt * self.mr + mi * self.mr + r;
+                                    for kk in 0..8 {
+                                        let src = src_row * k + ki * self.mk + half * 8 + kk;
+                                        let dst = ci * aw
+                                            + (mi * self.kchunk + ki) * self.mr * self.mk
+                                            + half * self.mr * 8
+                                            + r * 8
+                                            + kk;
+                                        s[dst] = a[src] as u8;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            bits => panic!("unsupported NpuGemmMp weight bits: {bits}"),
+        }
+    }
+
+    fn read_c_tile_from(self, row0: usize, n: usize, buffer: &DeviceBuffer, c: &mut [i32]) {
+        let cw = self.cw();
+        let out: &[i32] = unsafe {
+            std::slice::from_raw_parts(
+                buffer.as_slice().as_ptr() as *const i32,
+                self.cols * self.nb * cw,
+            )
+        };
+        for ci in 0..self.cols {
+            for j in 0..self.nb {
+                for lr in 0..self.mt * self.mr {
+                    let base = (ci * self.nb + j) * cw + lr * (NT * self.mn);
+                    let dst = (row0 + ci * self.mt * self.mr + lr) * n + j * NT * self.mn;
+                    c[dst..dst + NT * self.mn].copy_from_slice(&out[base..base + NT * self.mn]);
+                }
+            }
+        }
+    }
 }
 
 impl NpuGemmMp {
@@ -137,6 +249,7 @@ impl NpuGemmMp {
             a_buf,
             w_buf,
             c_buf,
+            batch_slots: Vec::new(),
             w_loaded: false,
         })
     }
@@ -281,6 +394,114 @@ impl NpuGemmMp {
         self.w_loaded = true;
     }
 
+    /// Upload one prepacked weight slab into a persistent XDNA argument buffer.
+    /// The returned handle owns the buffer and may be reused across forwards.
+    pub fn upload_resident_weights(
+        &self,
+        packed_w: &[u8],
+    ) -> Result<NpuGemmResidentWeights, XdnaError> {
+        assert_eq!(packed_w.len(), self.nb * self.ww(), "packed weight bytes");
+        let mut buffer = self.kernel.alloc_arg(packed_w.len())?;
+        buffer.as_mut_slice().copy_from_slice(packed_w);
+        self.kernel.sync_to_device(&buffer)?;
+        Ok(NpuGemmResidentWeights { buffer })
+    }
+
+    /// Dispatch with a persistent weight handle created by
+    /// [`Self::upload_resident_weights`]. No weight bytes are copied here.
+    pub fn run_resident(
+        &mut self,
+        weights: &NpuGemmResidentWeights,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[i8],
+        c: &mut [i32],
+    ) -> Result<(), XdnaError> {
+        assert_eq!(
+            weights.buffer.len(),
+            self.nb * self.ww(),
+            "resident weight bytes"
+        );
+        assert_eq!(k, self.k(), "K");
+        assert_eq!(n, self.n(), "N");
+        let rows_per = self.rows_per_dispatch();
+        assert!(m % rows_per == 0, "M must be a multiple of {rows_per}");
+        let (cols, mt, aw) = (self.cols, self.mt, self.aw());
+        for dispatch in 0..m / rows_per {
+            let row0 = dispatch * rows_per;
+            self.copy_a_tile(row0, k, a, cols, mt, aw);
+            self.kernel.dispatch_synced(
+                &[&self.a_buf, &weights.buffer, &self.c_buf],
+                &[true, false, true],
+            )?;
+            self.read_c_tile(row0, n, c);
+        }
+        Ok(())
+    }
+
+    /// Enqueue all K-group/M-tile partial products and wait once on the final
+    /// timeline point. Each group uses a distinct resident weight handle and
+    /// each command uses reusable private A/C buffers, so queued commands cannot
+    /// overwrite one another before execution. Outputs remain one int32 matrix
+    /// per K group for the caller's format-independent scale reconstruction.
+    pub fn run_resident_batch(
+        &mut self,
+        weights: &[&NpuGemmResidentWeights],
+        m: usize,
+        k: usize,
+        n: usize,
+        activations: &[&[i8]],
+        outputs: &mut [&mut [i32]],
+    ) -> Result<(), XdnaError> {
+        assert!(!weights.is_empty(), "resident batch requires weights");
+        assert_eq!(weights.len(), activations.len(), "activation group count");
+        assert_eq!(weights.len(), outputs.len(), "output group count");
+        assert_eq!(k, self.k(), "K");
+        assert_eq!(n, self.n(), "N");
+        let rows_per = self.rows_per_dispatch();
+        assert_eq!(m % rows_per, 0, "M must be a multiple of {rows_per}");
+        let tiles = m / rows_per;
+        let command_count = weights.len() * tiles;
+        let a_buf_bytes = self.cols * self.aw();
+        let c_buf_bytes = self.c_buf_bytes();
+        while self.batch_slots.len() < command_count {
+            self.batch_slots.push(NpuGemmBatchSlot {
+                a: self.kernel.alloc_arg(a_buf_bytes)?,
+                c: self.kernel.alloc_arg(c_buf_bytes)?,
+            });
+        }
+
+        let layout = GemmLayout::from(&*self);
+        for (group, activation) in activations.iter().enumerate() {
+            assert_eq!(activation.len(), m * k, "activation elements");
+            assert_eq!(outputs[group].len(), m * n, "output elements");
+            for tile in 0..tiles {
+                let slot = &mut self.batch_slots[group * tiles + tile];
+                layout.copy_a_tile_to(tile * rows_per, k, activation, &mut slot.a);
+            }
+        }
+
+        let mut arg_sets = Vec::with_capacity(command_count);
+        for (group, weight) in weights.iter().enumerate() {
+            assert_eq!(weight.buffer.len(), self.nb * self.ww());
+            for tile in 0..tiles {
+                let slot = &self.batch_slots[group * tiles + tile];
+                arg_sets.push(vec![&slot.a, &weight.buffer, &slot.c]);
+            }
+        }
+        self.kernel
+            .dispatch_batch_synced(&arg_sets, Some(&[true, false, true]))?;
+
+        for group in 0..weights.len() {
+            for tile in 0..tiles {
+                let slot = &self.batch_slots[group * tiles + tile];
+                layout.read_c_tile_from(tile * rows_per, n, &slot.c, outputs[group]);
+            }
+        }
+        Ok(())
+    }
+
     /// Full GEMM `C[M,N] = A[M,K] · W[K,N]` (W4A8/W8A8), tiling M over blocking dispatches. `a`
     /// row-major `M×K` int8, `c` row-major `M×N` int32. Requires `load_weights` first,
     /// `K == k()`, `N == n()`, and `M % rows_per_dispatch() == 0`.
@@ -309,65 +530,15 @@ impl NpuGemmMp {
     }
 
     fn copy_a_tile(&mut self, row0: usize, k: usize, a: &[i8], cols: usize, mt: usize, aw: usize) {
-        let s = self.a_buf.as_mut_slice();
-        match self.weight_bits {
-            4 => {
-                // COLS row-major M-blocks -> a_buf (the W4 kernel's A tensor stream tiles in-core).
-                for ci in 0..cols {
-                    for lr in 0..mt * self.mr {
-                        let src = (row0 + ci * mt * self.mr + lr) * k;
-                        for kk in 0..k {
-                            s[ci * aw + lr * k + kk] = a[src + kk] as u8;
-                        }
-                    }
-                }
-            }
-            8 => {
-                // Dense AIE2P W8 stores each A tile as contiguous 8-wide K halves.
-                for ci in 0..cols {
-                    for mi in 0..mt {
-                        for ki in 0..self.kchunk {
-                            let k_halves = self.mk / 8;
-                            for half in 0..k_halves {
-                                for r in 0..self.mr {
-                                    let src_row = row0 + ci * mt * self.mr + mi * self.mr + r;
-                                    for kk in 0..8 {
-                                        let src = src_row * k + ki * self.mk + half * 8 + kk;
-                                        let dst = ci * aw
-                                            + (mi * self.kchunk + ki) * self.mr * self.mk
-                                            + half * self.mr * 8
-                                            + r * 8
-                                            + kk;
-                                        s[dst] = a[src] as u8;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            bits => panic!("unsupported NpuGemmMp weight bits: {bits}"),
-        }
+        let layout = GemmLayout::from(&*self);
+        debug_assert_eq!((cols, mt, aw), (layout.cols, layout.mt, layout.aw()));
+        layout.copy_a_tile_to(row0, k, a, &mut self.a_buf);
     }
 
     // De-block the current c_buf (COLS*NB blocks, each (MT·MR)×(NT·MN) row-major) into rows
-    // [row0, row0+rows_per_dispatch()) of a row-major `c` `M×N`. This host copy is exactly
-    // what zero-copy avoids — a GPU consumer reads the block layout from the shared buffer
-    // directly (see `run_into_shared` + `c_block_offset`).
+    // [row0, row0+rows_per_dispatch()) of a row-major c M×N.
     fn read_c_tile(&self, row0: usize, n: usize, c: &mut [i32]) {
-        let (cols, mt, nb, cw) = (self.cols, self.mt, self.nb, self.cw());
-        let out: &[i32] = unsafe {
-            std::slice::from_raw_parts(self.c_buf.as_slice().as_ptr() as *const i32, cols * nb * cw)
-        };
-        for ci in 0..cols {
-            for j in 0..nb {
-                for lr in 0..mt * self.mr {
-                    let base = (ci * nb + j) * cw + lr * (NT * self.mn);
-                    let dst = (row0 + ci * mt * self.mr + lr) * n + j * NT * self.mn;
-                    c[dst..dst + NT * self.mn].copy_from_slice(&out[base..base + NT * self.mn]);
-                }
-            }
-        }
+        GemmLayout::from(self).read_c_tile_from(row0, n, &self.c_buf, c);
     }
 
     /// Byte size the output buffer must be for one dispatch's C: `COLS·NB·(MT·NT·MR·MN)·4`.

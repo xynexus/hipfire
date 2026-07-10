@@ -101,6 +101,13 @@ impl NpuKernel {
         self.dev.alloc_buffer(size, AMDXDNA_BO_SHMEM)
     }
 
+    /// Make host-written argument bytes visible to the NPU. Resident weights
+    /// call this once at upload time and skip repeated flushes during dispatch.
+    pub fn sync_to_device(&self, buffer: &DeviceBuffer) -> Result<(), XdnaError> {
+        self.dev
+            .sync_bo(buffer.handle(), submit::SYNC_DIRECT_TO_DEVICE, buffer.len())
+    }
+
     /// Import an external dma-buf (e.g. an amdgpu GTT BO) as an argument buffer, zero-copy:
     /// the kernel then reads/writes the *same physical pages* as the exporting engine (the
     /// GPU) — no host round-trip. See [`crate::XdnaDevice::import_dmabuf`].
@@ -120,6 +127,34 @@ impl NpuKernel {
     pub fn dispatch(&self, args: &[&DeviceBuffer]) -> Result<(), XdnaError> {
         let seq = self.submit(args)?;
         self.wait(seq)
+    }
+
+    /// Blocking dispatch with explicit host-to-device synchronization flags.
+    pub fn dispatch_synced(&self, args: &[&DeviceBuffer], sync: &[bool]) -> Result<(), XdnaError> {
+        let seq = self.submit_synced(args, Some(sync))?;
+        self.wait(seq)
+    }
+
+    /// Enqueue several fixed-buffer invocations and wait once for the final
+    /// timeline point. The installed amdxdna driver accepts one command BO per
+    /// submit ioctl, but commands on a hardware context execute in order, so
+    /// waiting for the last submission also completes every earlier one.
+    pub fn dispatch_batch(&self, arg_sets: &[Vec<&DeviceBuffer>]) -> Result<(), XdnaError> {
+        self.dispatch_batch_synced(arg_sets, None)
+    }
+
+    /// Batched counterpart to [`Self::dispatch_synced`]. The same sync mask
+    /// applies to every argument set.
+    pub fn dispatch_batch_synced(
+        &self,
+        arg_sets: &[Vec<&DeviceBuffer>],
+        sync: Option<&[bool]>,
+    ) -> Result<(), XdnaError> {
+        let mut final_sequence = None;
+        for args in arg_sets {
+            final_sequence = Some(self.submit_synced(args, sync)?);
+        }
+        final_sequence.map_or(Ok(()), |sequence| self.wait(sequence))
     }
 
     /// Non-blocking submit: flush inputs and enqueue the command, returning the

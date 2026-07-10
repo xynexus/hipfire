@@ -381,7 +381,7 @@ pub const ENV_HIPFIRE_CONV1D_TREE_GFX1151: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DAEMON_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_BIN",
     description: "Runtime variable controlling daemon bin in hipfire",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1399",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1555",
 };
 
 /// `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` — Runtime variable controlling daemon resident state budget mb in hipfire
@@ -850,21 +850,28 @@ pub const ENV_HIPFIRE_DEEPSEEK4_WO_Q8_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEFERRED_ALLOW_COMMANDS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEFERRED_ALLOW_COMMANDS",
     description: "Runtime variable controlling deferred allow commands in hipfire",
-    source: "crates/hipfire-server/src/deferred_jobs.rs:748",
+    source: "crates/hipfire-server/src/deferred_jobs.rs:768",
 };
 
 /// `HIPFIRE_DEFERRED_JOBS` — Runtime variable controlling deferred jobs in hipfire
 pub const ENV_HIPFIRE_DEFERRED_JOBS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEFERRED_JOBS",
     description: "Runtime variable controlling deferred jobs in hipfire",
-    source: "crates/hipfire-server/src/deferred_jobs.rs:737",
+    source: "crates/hipfire-server/src/deferred_jobs.rs:757",
+};
+
+/// `HIPFIRE_DEFERRED_POLL_MS` — Parses "HIPFIRE_DEFERRED_POLL_MS" with fallback defaults
+pub const ENV_HIPFIRE_DEFERRED_POLL_MS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DEFERRED_POLL_MS",
+    description: "Parses \"HIPFIRE_DEFERRED_POLL_MS\" with fallback defaults",
+    source: "crates/hipfire-server/src/deferred_jobs.rs:779",
 };
 
 /// `HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES` — Parses "HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES" with fallback defaults
 pub const ENV_HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES",
     description: "Parses \"HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES\" with fallback defaults",
-    source: "crates/hipfire-server/src/deferred_jobs.rs:729",
+    source: "crates/hipfire-server/src/deferred_jobs.rs:749",
 };
 
 /// `HIPFIRE_DELTANET_STATE` — Interprets "HIPFIRE_DELTANET_STATE" from environment to select behavior
@@ -1109,7 +1116,7 @@ pub const ENV_HIPFIRE_DIFFUSION_DUMP_DIR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIFFUSION_LAYER_RUNG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_LAYER_RUNG",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-diffusion/src/denoise.rs:290",
+    source: "crates/hipfire-diffusion/src/denoise.rs:306",
 };
 
 /// `HIPFIRE_DIFFUSION_OQ8` — Enabled when set to 1
@@ -1285,7 +1292,7 @@ pub const ENV_HIPFIRE_DUMP_COND: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DUMP_GATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_GATE",
     description: "Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate",
-    source: "crates/hipfire-diffusion/src/transformer.rs:1557",
+    source: "crates/hipfire-diffusion/src/transformer.rs:1556",
 };
 
 /// `HIPFIRE_DUMP_HIDDEN` — DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
@@ -1341,7 +1348,7 @@ pub const ENV_HIPFIRE_DUMP_REQUEST: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DUMP_VELOCITY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_VELOCITY",
     description: "Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model",
-    source: "crates/hipfire-diffusion/src/denoise.rs:466",
+    source: "crates/hipfire-diffusion/src/denoise.rs:482",
 };
 
 /// `HIPFIRE_EMBEDDING_CALIB_LAYERS_PER_PASS` — Runtime variable controlling embedding calib layers per pass in hipfire
@@ -3343,7 +3350,7 @@ pub const ENV_HIPFIRE_RESOURCE_LOCK: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RESOURCE_LOCK_CPU_CORES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_CPU_CORES",
     description: "HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1127",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1279",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_DIR` — HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory
@@ -3935,7 +3942,7 @@ pub const ENV_HIP_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "HIP_VISIBLE_DEVICES",
     description:
         "Used to configure runtime execution by explicitly setting \"HIP_VISIBLE_DEVICES\"",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1736",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1980",
 };
 
 /// `HOME` — Runtime variable controlling home in hipfire
@@ -4047,7 +4054,7 @@ pub const ENV_ROCM_PATH: EnvVarDoc = EnvVarDoc {
 pub const ENV_ROCR_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "ROCR_VISIBLE_DEVICES",
     description: "Runtime variable controlling rocr visible devices in hipfire",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1051",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1203",
 };
 
 /// `TERM` — Runtime variable controlling term in hipfire
@@ -4200,6 +4207,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DEEPSEEK4_WO_Q8_WMMA,
     ENV_HIPFIRE_DEFERRED_ALLOW_COMMANDS,
     ENV_HIPFIRE_DEFERRED_JOBS,
+    ENV_HIPFIRE_DEFERRED_POLL_MS,
     ENV_HIPFIRE_DEFERRED_RESPONSE_MAX_BYTES,
     ENV_HIPFIRE_DELTANET_STATE,
     ENV_HIPFIRE_DETERMINISTIC,

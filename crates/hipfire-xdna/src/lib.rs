@@ -50,8 +50,8 @@ pub enum XdnaError {
     /// A cache directory name did not match the expected `..._{MT}x{NT}x{KCHUNK}_c{COLS}_nb{NB}`
     /// shape (or was a whole-GEMM `_r{ROUNDS}` build the primitive can't consume).
     BadCacheName(String),
-    /// Compact mixed-precision Opus bytes, dimensions, or NPU cache shapes were invalid.
-    InvalidOpusMixed(String),
+    /// Opus bytes, dimensions, encoding, or NPU cache shapes were invalid.
+    InvalidOpus(String),
 }
 
 impl From<xclbin::XclbinError> for XdnaError {
@@ -77,8 +77,8 @@ impl fmt::Display for XdnaError {
                     "cache dir '{n}' not a NpuGemmMp config (want ..._MTxNTxKCHUNK_cCOLS_nbNB)"
                 )
             }
-            XdnaError::InvalidOpusMixed(message) => {
-                write!(f, "invalid mixed-precision Opus input: {message}")
+            XdnaError::InvalidOpus(message) => {
+                write!(f, "invalid Opus input: {message}")
             }
         }
     }
@@ -172,17 +172,17 @@ pub use gemm::NpuGemm;
 #[cfg(target_os = "linux")]
 pub mod gemm_mp;
 #[cfg(target_os = "linux")]
-pub use gemm_mp::NpuGemmMp;
+pub use gemm_mp::{NpuGemmMp, NpuGemmResidentWeights};
 
 #[cfg(target_os = "linux")]
-pub mod opus_mixed;
+pub mod opus;
 #[cfg(target_os = "linux")]
-pub use opus_mixed::{NpuOpusMixedExecutor, NpuOpusMixedGemmMp, OpusMixedPackedMatrix};
+pub use opus::{NpuOpusExecutor, NpuOpusGemmMp, OpusMatrixEncoding, OpusPackedMatrix};
 
 #[cfg(target_os = "linux")]
 pub mod sparse3_mp;
 #[cfg(target_os = "linux")]
-pub use sparse3_mp::NpuSparse3Mp;
+pub use sparse3_mp::{NpuSparse3Mp, NpuSparse3ResidentWeights};
 
 #[cfg(target_os = "linux")]
 mod imp {
