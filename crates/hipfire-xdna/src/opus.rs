@@ -511,6 +511,25 @@ impl NpuOpusExecutor {
             .run_resident_shared(weights)
     }
 
+    /// Projection-to-device-chain counterpart to
+    /// [`Self::run_whole_scaled_shared`]. It skips the producer-side output
+    /// readback reconciliation because the next device consumer owns it.
+    pub fn run_whole_scaled_shared_to_device(
+        &mut self,
+        matrix: &OpusPackedMatrix,
+    ) -> Result<(), XdnaError> {
+        let mode = whole_mode(matrix.encoding)
+            .ok_or_else(|| invalid("mixed matrix has no scaled whole-array shared path"))?;
+        let weights = matrix
+            .whole_scaled_weights
+            .as_ref()
+            .ok_or_else(|| invalid("matrix has no scaled whole-array resident weights"))?;
+        self.whole_scaled
+            .get_mut(&(mode, matrix.groups.len() * GROUP))
+            .ok_or_else(|| invalid("missing scaled whole-array cache for shared I/O"))?
+            .run_resident_shared_to_device(weights)
+    }
+
     fn rows_per_dispatch_for(&self, encoding: OpusMatrixEncoding) -> usize {
         match encoding {
             OpusMatrixEncoding::W4 => self
@@ -969,6 +988,11 @@ impl NpuOpusGemmMp {
 
     pub fn run_whole_scaled_shared(&mut self) -> Result<(), XdnaError> {
         self.executor.run_whole_scaled_shared(&self.matrix)
+    }
+
+    pub fn run_whole_scaled_shared_to_device(&mut self) -> Result<(), XdnaError> {
+        self.executor
+            .run_whole_scaled_shared_to_device(&self.matrix)
     }
 
     pub fn run_f32(&mut self, m: usize, x: &[f32], c: &mut [f32]) -> Result<(), XdnaError> {

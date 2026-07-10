@@ -130,7 +130,9 @@ extern "C" __global__ void opus_npu_unpack_output(
     int cols,
     int n_macros,
     int outblocks,
-    int mode_w8
+    int mode_w8,
+    int row_major_output,
+    int padded_n
 ) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= rows * N) return;
@@ -157,10 +159,12 @@ extern "C" __global__ void opus_npu_unpack_output(
     const int local_col = within_col_stripe - ln * 16;
     const int outblock = m_macro * n_macros + n_macro;
     const int c_join = 4 * c_core;
-    const long long source = ((long long)col_stripe * outblocks + outblock) * c_join
-        + row_stripe * c_core
-        + (lm * ln_count + ln) * mr * 16
-        + local_row * 16 + local_col;
+    const long long source = row_major_output
+        ? (long long)row * padded_n + col
+        : ((long long)col_stripe * outblocks + outblock) * c_join
+            + row_stripe * c_core
+            + (lm * ln_count + ln) * mr * 16
+            + local_row * 16 + local_col;
     const float value = packed[source];
 
     if (col < width0) {

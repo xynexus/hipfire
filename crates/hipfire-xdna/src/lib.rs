@@ -161,6 +161,11 @@ pub mod kernel;
 #[cfg(target_os = "linux")]
 pub use kernel::{NpuInFlight, NpuKernel};
 
+#[cfg(target_os = "linux")]
+pub mod geglu;
+#[cfg(target_os = "linux")]
+pub use geglu::NpuGeGlu;
+
 // Wire-in step 2: NpuGemm — W4A8 GEMM primitive over the R6 kernel (tile marshaling).
 #[cfg(target_os = "linux")]
 pub mod gemm;

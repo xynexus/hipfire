@@ -423,3 +423,40 @@ materializing the full intermediate or crossing engines; the attention block
 needs an analogous qkv -> headnorm/RoPE -> bidirectional attention -> o pipeline.
 Arbitrary mixed Opus overlays must join that same schedule rather than falling
 back to the host or multiplying per-overlay dispatches.
+
+### Row-major and first resident-FFN checkpoint
+
+R16 changes the scaled whole-array output contract from core-block order to a
+padded row-major dma-buf. Hardware parity remains exact for W4, W8, AWQ
+`+/++`, and padded-K inputs. The M256 projection inventory is effectively
+latency-neutral (about 1.70 ms per W4 layer and 1.76 ms per W8 layer), but the
+row-major boundary lets another AIE program consume a projection without a GPU
+deblock kernel.
+
+R17 adds an all-32-core row-major GeGLU stage. Its standalone M256/I1152 gate
+reports cosine 0.99999825, maximum absolute error 0.02594, and 0.2425 ms per
+resident dispatch. A shared-dma-buf projection -> GeGLU chain is correct for
+both W4+/++ and W8+/++, but separate XDNA contexts spend roughly 5.3-5.6 ms
+per chain on imported-buffer cache reconciliation. That chain is a zero-copy
+boundary proof, not a performance path.
+
+R18 removes that boundary by interleaving gate/up weight columns within each
+projection stripe and applying GeGLU to the retained scaled accumulator before
+the tile is released. The full `[256,2304]` gate/up intermediate never leaves
+the array. Independent production-packer projection output and a CPU
+integer/scaling oracle agree before the nonlinear comparison.
+
+| fused kernel | cosine | max abs | resident dispatch |
+|---|---:|---:|---:|
+| W4 gate/up + GeGLU | 0.99999978 | 0.0001497 | 0.5808 ms (0.5709-0.5829) |
+| W8 gate/up + GeGLU | 0.99995608 | 0.0296386 | 0.6750 ms (0.6667-0.6929) |
+
+W8 uses 24 logical columns in a 32-lane physical output stripe. An 8-lane
+compacted store was not stable with the surrounding W8 MMUL program, and
+inlined vector-argument nonlinear helpers corrupted live registers. Explicit
+padding plus pointer-based `noinline` 16/8-lane helpers is correct. This is a
+fused resident kernel result, not a complete FFN or full-model result: the down
+projection, its AWQ/FWHT activation preprocessing, arbitrary mixed overlays,
+attention, norms/residuals, pooling, Dense heads, end-to-end throughput, and
+package tokens/J remain open. The 10k/15k input-token targets are therefore not
+yet admitted.

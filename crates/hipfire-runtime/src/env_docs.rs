@@ -3318,6 +3318,13 @@ pub const ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-serving-core/src/load.rs:3492",
 };
 
+/// `HIPFIRE_R17_PROBE` — Runtime variable controlling r17 probe in hipfire
+pub const ENV_HIPFIRE_R17_PROBE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R17_PROBE",
+    description: "Runtime variable controlling r17 probe in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_geglu_verify.rs:25",
+};
+
 /// `HIPFIRE_RDNA2_VARIANT` — Runtime variable controlling rdna2 variant in hipfire
 pub const ENV_HIPFIRE_RDNA2_VARIANT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RDNA2_VARIANT",
@@ -4563,6 +4570,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_QWEN35_XDNA1_INSTR,
     ENV_HIPFIRE_QWEN35_XDNA1_XCLBIN,
     ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD,
+    ENV_HIPFIRE_R17_PROBE,
     ENV_HIPFIRE_RDNA2_VARIANT,
     ENV_HIPFIRE_RECOVER_MODE,
     ENV_HIPFIRE_RECOVER_NOISE,

@@ -77,6 +77,9 @@ pub struct NpuWholeScaledIoLayout {
     n: usize,
     n_macros: usize,
     outblocks: usize,
+    row_major_output: bool,
+    padded_rows: usize,
+    padded_n: usize,
     input_bytes: usize,
     output_bytes: usize,
 }
@@ -90,8 +93,11 @@ impl NpuWholeScaledIoLayout {
         n: usize,
         n_macros: usize,
         outblocks: usize,
+        row_major_output: bool,
     ) -> Self {
         let layout = Layout::for_mode(mode);
+        let padded_rows = outblocks / n_macros * MACRO_M;
+        let padded_n = n_macros * layout.macro_n(cols);
         Self {
             mode,
             cols,
@@ -100,8 +106,15 @@ impl NpuWholeScaledIoLayout {
             n,
             n_macros,
             outblocks,
+            row_major_output,
+            padded_rows,
+            padded_n,
             input_bytes: ROW_STRIPES * outblocks * groups * A_BLOCK,
-            output_bytes: cols * outblocks * layout.c_join() * size_of::<f32>(),
+            output_bytes: if row_major_output {
+                padded_rows * padded_n * size_of::<f32>()
+            } else {
+                cols * outblocks * layout.c_join() * size_of::<f32>()
+            },
         }
     }
 
@@ -137,6 +150,18 @@ impl NpuWholeScaledIoLayout {
         self.outblocks
     }
 
+    pub fn row_major_output(self) -> bool {
+        self.row_major_output
+    }
+
+    pub fn padded_rows(self) -> usize {
+        self.padded_rows
+    }
+
+    pub fn padded_n(self) -> usize {
+        self.padded_n
+    }
+
     pub fn input_bytes(self) -> usize {
         self.input_bytes
     }
@@ -156,6 +181,7 @@ pub struct NpuGemmWholeScaled {
     m_macros: usize,
     n_macros: usize,
     outblocks: usize,
+    row_major_output: bool,
     input: DeviceBuffer,
     output: DeviceBuffer,
 }
@@ -181,6 +207,9 @@ impl NpuGemmWholeScaled {
         let n_macros = required(&shape, "nm")?;
         let groups = required(&shape, "kg")?;
         let outblocks = required(&shape, "outblocks")?;
+        let row_major_output = manifest.lines().any(|line| line == "output=rowmajor");
+        let padded_rows = m_macros * MACRO_M;
+        let padded_n = n_macros * layout.macro_n(cols);
         if rows == 0
             || n == 0
             || !matches!(cols, 4 | 8)
@@ -188,6 +217,9 @@ impl NpuGemmWholeScaled {
             || m_macros != rows.div_ceil(MACRO_M)
             || n_macros != n.div_ceil(layout.macro_n(cols))
             || outblocks != m_macros * n_macros
+            || (row_major_output
+                && (shape.get("pm").copied() != Some(padded_rows)
+                    || shape.get("pn").copied() != Some(padded_n)))
         {
             return Err(invalid("invalid scaled whole-array cache geometry"));
         }
@@ -196,7 +228,12 @@ impl NpuGemmWholeScaled {
         let kernel = NpuKernel::load(&xclbin, &insts)?;
         let inblocks = outblocks * groups;
         let input = kernel.alloc_arg(ROW_STRIPES * inblocks * A_BLOCK)?;
-        let output = kernel.alloc_arg(cols * outblocks * layout.c_join() * size_of::<f32>())?;
+        let output_bytes = if row_major_output {
+            padded_rows * padded_n * size_of::<f32>()
+        } else {
+            cols * outblocks * layout.c_join() * size_of::<f32>()
+        };
+        let output = kernel.alloc_arg(output_bytes)?;
         Ok(Self {
             kernel,
             layout,
@@ -207,6 +244,7 @@ impl NpuGemmWholeScaled {
             m_macros,
             n_macros,
             outblocks,
+            row_major_output,
             input,
             output,
         })
@@ -237,6 +275,7 @@ impl NpuGemmWholeScaled {
             self.n,
             self.n_macros,
             self.outblocks,
+            self.row_major_output,
         )
     }
 
@@ -345,6 +384,31 @@ impl NpuGemmWholeScaled {
         Ok(NpuWholeScaledResidentWeights { buffer })
     }
 
+    /// Marshal already-quantized `[rows,K]` activations and per-group row
+    /// scales into the shared whole-array physical input contract.
+    pub fn prepack_activations(
+        &self,
+        activations: &[i8],
+        scales: &[f32],
+    ) -> Result<Vec<u8>, XdnaError> {
+        if activations.len() != self.rows * self.k() || scales.len() != self.groups * self.rows {
+            return Err(invalid("scaled whole-array activation geometry mismatch"));
+        }
+        let mut packed = vec![0u8; self.io_layout().input_bytes()];
+        Self::pack_activations_into(
+            self.layout,
+            self.rows,
+            self.groups,
+            self.m_macros,
+            self.n_macros,
+            self.outblocks,
+            activations,
+            scales,
+            &mut packed,
+        );
+        Ok(packed)
+    }
+
     pub fn run_resident(
         &mut self,
         weights: &NpuWholeScaledResidentWeights,
@@ -387,6 +451,10 @@ impl NpuGemmWholeScaled {
         }
         self.input = self.kernel.import_dmabuf(input_fd, input_bytes, true)?;
         self.output = self.kernel.import_dmabuf(output_fd, output_bytes, true)?;
+        // Establish the pure-output imported BO once. Subsequent projection
+        // dispatches do not need to clean the entire output before overwriting
+        // it; device-chain consumers reconcile the produced pages themselves.
+        self.kernel.sync_to_device(&self.output)?;
         Ok(())
     }
 
@@ -406,48 +474,86 @@ impl NpuGemmWholeScaled {
         self.kernel.sync_output(&self.output)
     }
 
+    /// Device-chain variant: wait for the projection to complete but leave the
+    /// shared output device-resident for the next imported-buffer consumer.
+    /// The consumer performs the cross-context cache reconciliation.
+    pub fn run_resident_shared_to_device(
+        &mut self,
+        weights: &NpuWholeScaledResidentWeights,
+    ) -> Result<(), XdnaError> {
+        if weights.buffer.len() != self.packed_weight_bytes() {
+            return Err(invalid("scaled whole-array resident weight size mismatch"));
+        }
+        self.kernel.dispatch_synced(
+            &[&self.input, &weights.buffer, &self.output],
+            &[true, false, false],
+        )
+    }
+
     fn pack_activations(&mut self, activations: &[i8], scales: &[f32]) {
-        self.input.as_mut_slice().fill(0);
+        Self::pack_activations_into(
+            self.layout,
+            self.rows,
+            self.groups,
+            self.m_macros,
+            self.n_macros,
+            self.outblocks,
+            activations,
+            scales,
+            self.input.as_mut_slice(),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pack_activations_into(
+        layout: Layout,
+        rows: usize,
+        groups: usize,
+        m_macros: usize,
+        n_macros: usize,
+        outblocks: usize,
+        activations: &[i8],
+        scales: &[f32],
+        packed: &mut [u8],
+    ) {
+        packed.fill(0);
         for stripe in 0..ROW_STRIPES {
-            for m_macro in 0..self.m_macros {
-                for n_macro in 0..self.n_macros {
-                    let outblock = m_macro * self.n_macros + n_macro;
-                    for group in 0..self.groups {
-                        let block = outblock * self.groups + group;
-                        let base = (stripe * self.inblocks() + block) * A_BLOCK;
-                        for lm in 0..self.layout.lm {
-                            for kt in 0..GROUP_K / self.layout.inner_k {
-                                for local_row in 0..self.layout.mr {
+            for m_macro in 0..m_macros {
+                for n_macro in 0..n_macros {
+                    let outblock = m_macro * n_macros + n_macro;
+                    for group in 0..groups {
+                        let block = outblock * groups + group;
+                        let base = (stripe * outblocks * groups + block) * A_BLOCK;
+                        for lm in 0..layout.lm {
+                            for kt in 0..GROUP_K / layout.inner_k {
+                                for local_row in 0..layout.mr {
                                     let row = m_macro * MACRO_M
-                                        + stripe * self.layout.rows_stripe()
-                                        + lm * self.layout.mr
+                                        + stripe * layout.rows_stripe()
+                                        + lm * layout.mr
                                         + local_row;
-                                    if row < self.rows {
-                                        let source = row * self.k()
+                                    if row < rows {
+                                        let source = row * groups * GROUP_K
                                             + group * GROUP_K
-                                            + kt * self.layout.inner_k;
+                                            + kt * layout.inner_k;
                                         let target = base
-                                            + (lm * (GROUP_K / self.layout.inner_k) + kt) * 64
-                                            + local_row * self.layout.inner_k;
-                                        self.input.as_mut_slice()
-                                            [target..target + self.layout.inner_k]
-                                            .copy_from_slice(as_bytes(
-                                                &activations[source..source + self.layout.inner_k],
-                                            ));
+                                            + (lm * (GROUP_K / layout.inner_k) + kt) * 64
+                                            + local_row * layout.inner_k;
+                                        packed[target..target + layout.inner_k].copy_from_slice(
+                                            as_bytes(&activations[source..source + layout.inner_k]),
+                                        );
                                     }
                                 }
                             }
                         }
-                        for local_row in 0..self.layout.rows_stripe() {
-                            let row =
-                                m_macro * MACRO_M + stripe * self.layout.rows_stripe() + local_row;
-                            let scale = if row < self.rows {
-                                scales[group * self.rows + row]
+                        for local_row in 0..layout.rows_stripe() {
+                            let row = m_macro * MACRO_M + stripe * layout.rows_stripe() + local_row;
+                            let scale = if row < rows {
+                                scales[group * rows + row]
                             } else {
                                 0.0
                             };
                             let offset = base + A_DATA + local_row * size_of::<f32>();
-                            self.input.as_mut_slice()[offset..offset + size_of::<f32>()]
+                            packed[offset..offset + size_of::<f32>()]
                                 .copy_from_slice(&scale.to_ne_bytes());
                         }
                     }
@@ -458,6 +564,14 @@ impl NpuGemmWholeScaled {
 
     fn unpack_output(&self, output: &mut [f32]) {
         let physical = as_f32(self.output.as_slice());
+        if self.row_major_output {
+            let padded_n = self.n_macros * self.layout.macro_n(self.cols);
+            for row in 0..self.rows {
+                output[row * self.n..(row + 1) * self.n]
+                    .copy_from_slice(&physical[row * padded_n..row * padded_n + self.n]);
+            }
+            return;
+        }
         for col_stripe in 0..self.cols {
             for m_macro in 0..self.m_macros {
                 for n_macro in 0..self.n_macros {
@@ -544,7 +658,7 @@ mod tests {
 
     #[test]
     fn shared_io_layout_describes_the_exact_whole_array_buffers() {
-        let w4 = NpuWholeScaledIoLayout::new(NpuWholeMode::W4, 8, 256, 3, 768, 1, 3);
+        let w4 = NpuWholeScaledIoLayout::new(NpuWholeMode::W4, 8, 256, 3, 768, 1, 3, false);
         assert_eq!(w4.input_bytes(), 4 * 3 * 3 * A_BLOCK);
         assert_eq!(w4.output_bytes(), 8 * 3 * 4 * 2304 * size_of::<f32>());
         assert_eq!(w4.rows(), 256);
@@ -555,9 +669,14 @@ mod tests {
         assert_eq!(w4.n_macros(), 1);
         assert_eq!(w4.outblocks(), 3);
 
-        let w8 = NpuWholeScaledIoLayout::new(NpuWholeMode::W8, 8, 256, 5, 768, 2, 6);
+        let w8 = NpuWholeScaledIoLayout::new(NpuWholeMode::W8, 8, 256, 5, 768, 2, 6, false);
         assert_eq!(w8.input_bytes(), 4 * 30 * A_BLOCK);
         assert_eq!(w8.output_bytes(), 8 * 6 * 4 * 1152 * size_of::<f32>());
         assert_eq!(w8.k(), 1280);
+
+        let rowmajor = NpuWholeScaledIoLayout::new(NpuWholeMode::W4, 8, 256, 3, 1280, 2, 6, true);
+        assert!(rowmajor.row_major_output());
+        assert_eq!((rowmajor.padded_rows(), rowmajor.padded_n()), (288, 1536));
+        assert_eq!(rowmajor.output_bytes(), 288 * 1536 * size_of::<f32>());
     }
 }

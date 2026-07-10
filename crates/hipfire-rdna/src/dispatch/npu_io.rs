@@ -19,6 +19,8 @@ pub struct OpusNpuIoLayout {
     outblocks: usize,
     input_bytes: usize,
     output_bytes: usize,
+    row_major_output: bool,
+    padded_n: usize,
 }
 
 impl OpusNpuIoLayout {
@@ -33,6 +35,8 @@ impl OpusNpuIoLayout {
         outblocks: usize,
         input_bytes: usize,
         output_bytes: usize,
+        row_major_output: bool,
+        padded_n: usize,
     ) -> Self {
         Self {
             mode_w8,
@@ -44,6 +48,8 @@ impl OpusNpuIoLayout {
             outblocks,
             input_bytes,
             output_bytes,
+            row_major_output,
+            padded_n,
         }
     }
 }
@@ -168,6 +174,8 @@ impl Gpu {
                 i32 layout.n_macros as i32,
                 i32 layout.outblocks as i32,
                 i32 mode,
+                i32 i32::from(layout.row_major_output),
+                i32 layout.padded_n as i32,
             ],
         )
     }

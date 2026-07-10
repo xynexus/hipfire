@@ -252,6 +252,8 @@ fn rdna_layout(layout: hipfire_xdna::NpuWholeScaledIoLayout) -> hipfire_rdna::Op
         layout.outblocks(),
         layout.input_bytes(),
         layout.output_bytes(),
+        layout.row_major_output(),
+        layout.padded_n(),
     )
 }
 

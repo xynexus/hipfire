@@ -118,11 +118,17 @@ impl NpuOpusProjector {
                     .iter()
                     .filter(|(mode, _)| matches!(*mode, "w4" | "w8"))
                     .map(|(mode, padded_k)| {
+                        let resident = cache_root.join(format!(
+                            "embgemma_aie2p_rowmajor_whole8_{mode}-scaled_m256_kg{}_n{width}",
+                            padded_k / 256
+                        ));
                         let fast = cache_root.join(format!(
                             "embgemma_aie2p_whole8_{mode}-scaled_m256_kg{}_n{width}",
                             padded_k / 256
                         ));
-                        if fast.join("final.xclbin").is_file() {
+                        if resident.join("final.xclbin").is_file() {
+                            resident
+                        } else if fast.join("final.xclbin").is_file() {
                             fast
                         } else {
                             cache_root.join(format!(
@@ -218,11 +224,17 @@ impl NpuOpusProjector {
                 .map(|(mode, _)| *mode)
                 .ok_or_else(|| "embeddinggemma NPU: empty projection requirements".to_string())?;
             for width in [q_dim + 2 * kv_dim, 2 * cfg.intermediate_size] {
+                let resident = cache_root.join(format!(
+                    "embgemma_aie2p_rowmajor_whole8_{mode}-scaled_m256_kg{}_n{width}",
+                    cfg.hidden_size.div_ceil(256)
+                ));
                 let fast = cache_root.join(format!(
                     "embgemma_aie2p_whole8_{mode}-scaled_m256_kg{}_n{width}",
                     cfg.hidden_size.div_ceil(256)
                 ));
-                let path = if fast.join("final.xclbin").is_file() {
+                let path = if resident.join("final.xclbin").is_file() {
+                    resident
+                } else if fast.join("final.xclbin").is_file() {
                     fast
                 } else {
                     cache_root.join(format!(
@@ -422,6 +434,8 @@ fn rdna_io_layout(layout: NpuWholeScaledIoLayout) -> OpusNpuIoLayout {
         layout.outblocks(),
         layout.input_bytes(),
         layout.output_bytes(),
+        layout.row_major_output(),
+        layout.padded_n(),
     )
 }
 
