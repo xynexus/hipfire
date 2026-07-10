@@ -11,6 +11,19 @@ secret = false
 restart_impact = "none"
 
 [[field]]
+key = "api_auth_mode"
+type = "enum(auto|off|optional|required)"
+requirement = "optional"
+default = "auto"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "API credential policy. auto allows anonymous API calls only on loopback and requires credentials on non-loopback binds; off, optional, and required are explicit overrides."
+validation = "one of: auto, off, optional, required"
+secret = false
+restart_impact = "none"
+
+[[field]]
 key = "cask"
 type = "bool"
 requirement = "optional"
@@ -114,7 +127,7 @@ requirement = "optional"
 scopes = ["global", "runtime"]
 mutability = "load_time"
 owner = "hipfire-config"
-description = "Model tag, alias, or path to pre-load or use by default."
+description = "Model tag, alias, or path to use when a request omits the model."
 secret = false
 restart_impact = "none"
 
@@ -188,18 +201,6 @@ mutability = "static"
 owner = "hipfire-config"
 description = "Bind host for the OpenAI-compatible HTTP server. Defaults to loopback; set to 0.0.0.0 to expose on all interfaces."
 validation = "valid IP address or hostname"
-secret = false
-restart_impact = "none"
-
-[[field]]
-key = "idle_timeout"
-type = "u32"
-requirement = "optional"
-default = "300"
-scopes = ["global", "runtime"]
-mutability = "runtime_reloadable"
-owner = "hipfire-config"
-description = "Seconds of inactivity before the server may evict an idle model."
 secret = false
 restart_impact = "none"
 
@@ -288,6 +289,18 @@ description = "Sparse per-model override map layered on top of global config."
 validation = "object keyed by model tag"
 secret = false
 restart_impact = "reload_model"
+
+[[field]]
+key = "model_residency_mode"
+type = "enum(auto|full|qwen_moe_modules)"
+requirement = "optional"
+default = "auto"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Model residency strategy selected by the scheduler."
+secret = false
+restart_impact = "none"
 
 [[field]]
 key = "models_dir"
@@ -493,6 +506,18 @@ secret = false
 restart_impact = "none"
 
 [[field]]
+key = "prewarm_priority"
+type = "u32"
+requirement = "optional"
+default = "0"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Startup background prewarm priority for a model. Set per model under model_overrides; 0 disables prewarm, higher values load earlier."
+secret = false
+restart_impact = "none"
+
+[[field]]
 key = "prompt_normalize"
 type = "bool"
 requirement = "optional"
@@ -514,6 +539,102 @@ mutability = "request_only"
 owner = "hipfire-config"
 description = "Default repeat penalty for generated text."
 validation = "0.0.."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "resource_lock_enabled"
+type = "bool"
+requirement = "optional"
+default = "true"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Whether hipfire serve asks the daemon to acquire physical accelerator resource locks at startup."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "resource_lock_gpus"
+type = "json"
+requirement = "optional"
+default = "[\"auto\"]"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "GPU resources to lease before HIP initialization. [\"auto\"] maps to the daemon's detected/visible HIP device."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "resource_lock_npus"
+type = "json"
+requirement = "optional"
+default = "[]"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "NPU resources to lease before accelerator initialization. [] disables NPU leases; [\"auto\"] leases every detected NPU."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "resource_lock_wait_ms"
+type = "u32"
+requirement = "optional"
+default = "0"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Milliseconds to wait for busy resource leases during daemon startup; 0 fails fast."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "scheduler_system_memory_budget_bytes"
+type = "u64"
+requirement = "optional"
+default = "0"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "System-memory budget claimed by the residency scheduler. 0 disables the budget guard."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "scheduler_system_memory_headroom_bytes"
+type = "u64"
+requirement = "optional"
+default = "0"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "System-memory headroom preserved by residency admission. 0 disables the headroom guard."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "scheduler_vram_budget_bytes"
+type = "u64"
+requirement = "optional"
+default = "0"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "VRAM budget claimed by the residency scheduler. 0 disables the budget guard."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "scheduler_vram_headroom_bytes"
+type = "u64"
+requirement = "optional"
+default = "0"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "VRAM headroom preserved by residency admission. 0 disables the headroom guard."
 secret = false
 restart_impact = "none"
 
@@ -624,5 +745,17 @@ mutability = "request_only"
 owner = "hipfire-config"
 description = "Default nucleus sampling probability."
 validation = "0.0..=1.0"
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "unsafe_allow_unauthenticated_remote"
+type = "bool"
+requirement = "optional"
+default = "false"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Explicit acknowledgement required before off or optional API authentication may bind to a non-loopback address."
 secret = false
 restart_impact = "none"

@@ -21,6 +21,33 @@
     "env": []
   },
   {
+    "key": "api_auth_mode",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "auto",
+        "off",
+        "optional",
+        "required"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "auto",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "API credential policy. auto allows anonymous API calls only on loopback and requires credentials on non-loopback binds; off, optional, and required are explicit overrides.",
+    "validation": "one of: auto, off, optional, required",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
     "key": "cask",
     "type": {
       "kind": "bool"
@@ -211,7 +238,7 @@
     ],
     "mutability": "load_time",
     "owner": "hipfire-config",
-    "description": "Model tag, alias, or path to pre-load or use by default.",
+    "description": "Model tag, alias, or path to use when a request omits the model.",
     "validation": null,
     "secret": false,
     "restart_impact": "none",
@@ -359,27 +386,6 @@
     "owner": "hipfire-config",
     "description": "Bind host for the OpenAI-compatible HTTP server. Defaults to loopback; set to 0.0.0.0 to expose on all interfaces.",
     "validation": "valid IP address or hostname",
-    "secret": false,
-    "restart_impact": "none",
-    "env": []
-  },
-  {
-    "key": "idle_timeout",
-    "type": {
-      "kind": "u32"
-    },
-    "requirement": {
-      "kind": "optional"
-    },
-    "default": "300",
-    "scopes": [
-      "global",
-      "runtime"
-    ],
-    "mutability": "runtime_reloadable",
-    "owner": "hipfire-config",
-    "description": "Seconds of inactivity before the server may evict an idle model.",
-    "validation": null,
     "secret": false,
     "restart_impact": "none",
     "env": []
@@ -555,6 +561,33 @@
     "validation": "object keyed by model tag",
     "secret": false,
     "restart_impact": "reload_model",
+    "env": []
+  },
+  {
+    "key": "model_residency_mode",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "auto",
+        "full",
+        "qwen_moe_modules"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "auto",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Model residency strategy selected by the scheduler.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
     "env": []
   },
   {
@@ -941,6 +974,28 @@
     "env": []
   },
   {
+    "key": "prewarm_priority",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Startup background prewarm priority for a model. Set per model under model_overrides; 0 disables prewarm, higher values load earlier.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
     "key": "prompt_normalize",
     "type": {
       "kind": "bool"
@@ -980,6 +1035,174 @@
     "owner": "hipfire-config",
     "description": "Default repeat penalty for generated text.",
     "validation": "0.0..",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "resource_lock_enabled",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "true",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Whether hipfire serve asks the daemon to acquire physical accelerator resource locks at startup.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "resource_lock_gpus",
+    "type": {
+      "kind": "json"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "[\"auto\"]",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "GPU resources to lease before HIP initialization. [\"auto\"] maps to the daemon's detected/visible HIP device.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "resource_lock_npus",
+    "type": {
+      "kind": "json"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "[]",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "NPU resources to lease before accelerator initialization. [] disables NPU leases; [\"auto\"] leases every detected NPU.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "resource_lock_wait_ms",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Milliseconds to wait for busy resource leases during daemon startup; 0 fails fast.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "scheduler_system_memory_budget_bytes",
+    "type": {
+      "kind": "u64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "System-memory budget claimed by the residency scheduler. 0 disables the budget guard.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "scheduler_system_memory_headroom_bytes",
+    "type": {
+      "kind": "u64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "System-memory headroom preserved by residency admission. 0 disables the headroom guard.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "scheduler_vram_budget_bytes",
+    "type": {
+      "kind": "u64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "VRAM budget claimed by the residency scheduler. 0 disables the budget guard.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "scheduler_vram_headroom_bytes",
+    "type": {
+      "kind": "u64"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "0",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "VRAM headroom preserved by residency admission. 0 disables the headroom guard.",
+    "validation": null,
     "secret": false,
     "restart_impact": "none",
     "env": []
@@ -1176,6 +1399,27 @@
     "owner": "hipfire-config",
     "description": "Default nucleus sampling probability.",
     "validation": "0.0..=1.0",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "unsafe_allow_unauthenticated_remote",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "false",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Explicit acknowledgement required before off or optional API authentication may bind to a non-loopback address.",
+    "validation": null,
     "secret": false,
     "restart_impact": "none",
     "env": []

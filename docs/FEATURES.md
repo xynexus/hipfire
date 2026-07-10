@@ -204,6 +204,10 @@ attention families included. Layer composition is described by `hipfire-mixer`
 - **Tool / function calling** — OpenAI-native + inline-XML parsers, streamed tool-
   call chunks, defensive repair of known attractor malformations. `runtime/src/tool_call.rs`.
 - **Models / Batches / Files** — `GET /v1/models`, `/v1/batches/{id}`, `/v1/files`.
+- **API identities and limits** — admin-managed users, scoped expiring bearer
+  tokens, user aggregate plus stricter token limits, fair scheduling ownership,
+  and privacy-safe hourly usage. Loopback remains backward compatible while
+  non-loopback `auto` binds require credentials. See `API_ACCESS.md`.
 - **AUTOMATIC1111-compatible diffusion API** — full `/sdapi/v1/*`: `txt2img`,
   `img2img`, `progress`, `interrupt`, `skip`, plus `samplers`, `schedulers`,
   `sd-models`, `sd-vae`, `loras`, `embeddings`, `options`, `png-info`, `upscalers`,
@@ -215,9 +219,10 @@ attention families included. Layer composition is described by `hipfire-mixer`
 
 ### Web UIs, terminal, daemon
 
-- **Admin WebUI** — Leptos/WASM console at `/admin/ui` (legacy `/admin`): config
-  schema + resolved config, diagnostics, logs, stats, model registry, training
-  runs; bearer/session gated. `hipfire-admin-ui`.
+- **Admin WebUI** — Leptos/WASM console at `/admin/ui` with Overview, API Access,
+  and Usage workflows. User/token lifecycle, workload limits, hourly rollups,
+  and live bucket state are bearer/session gated; legacy controls remain linked
+  at `/admin`. `hipfire-admin-ui`.
 - **Chat WebUI** — Leptos/WASM chat at `/` and `/chat`, image attachments.
   `hipfire-chat-ui`.
 - **TUI** — ratatui app: chat, model picker, config tabs (GPU/scheduler/training),

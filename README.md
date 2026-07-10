@@ -5,7 +5,7 @@ in the hot path. Ollama-style UX.
 
 ```bash
 hipfire chat -m qwen3.5:9b "What is the capital of France?"
-hipfire serve              # OpenAI-compatible API on 0.0.0.0:11435
+hipfire serve              # OpenAI-compatible API on 127.0.0.1:11435
 ```
 
 Current release: **v0.3.0** — chaingun runtime, Opus quantization, hierarchical KV, and operator surfaces. DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
@@ -117,6 +117,7 @@ the prefill MMQ redesign log is at
 | [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
 | [CONFIG.md](docs/CONFIG.md) | Every config key, CASK sidecar / KV eviction policies, env overrides |
 | [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
+| [API_ACCESS.md](docs/API_ACCESS.md) | API users, scoped tokens, limits, usage, and remote bootstrap |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
 | [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |
