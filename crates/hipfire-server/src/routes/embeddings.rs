@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
@@ -60,10 +60,12 @@ impl RerankDocumentInput {
 
 pub async fn post_embeddings(
     State(state): State<SharedState>,
+    accounting: Option<Extension<crate::accounting::RequestAccounting>>,
     Json(body): Json<EmbeddingsRequest>,
 ) -> Response {
     let model = body.model;
     let texts = body.input.into_texts();
+    let input_tokens = estimate_text_tokens(texts.iter().map(String::as_str));
     let dims = body.dimensions.or(body.dims);
     if texts.iter().any(|text| text.is_empty()) {
         return bad_request("embedding input entries must be non-empty");
@@ -97,13 +99,16 @@ pub async fn post_embeddings(
             })
         })
         .collect::<Vec<_>>();
+    if let Some(Extension(accounting)) = accounting {
+        accounting.report_text(input_tokens, 0, 0);
+    }
     Json(json!({
         "object": "list",
         "data": data,
         "model": model,
         "usage": {
-            "prompt_tokens": 0,
-            "total_tokens": 0,
+            "prompt_tokens": input_tokens,
+            "total_tokens": input_tokens,
         },
     }))
     .into_response()
@@ -111,6 +116,7 @@ pub async fn post_embeddings(
 
 pub async fn post_rerank(
     State(state): State<SharedState>,
+    accounting: Option<Extension<crate::accounting::RequestAccounting>>,
     Json(body): Json<RerankHttpRequest>,
 ) -> Response {
     let model = body.model;
@@ -120,6 +126,9 @@ pub async fn post_rerank(
         .into_iter()
         .map(RerankDocumentInput::into_text)
         .collect::<Vec<_>>();
+    let input_tokens = estimate_text_tokens(
+        std::iter::once(query.as_str()).chain(documents.iter().map(String::as_str)),
+    );
     if query.is_empty() {
         return bad_request("rerank query must be non-empty");
     }
@@ -157,12 +166,21 @@ pub async fn post_rerank(
             })
         })
         .collect::<Vec<_>>();
+    if let Some(Extension(accounting)) = accounting {
+        accounting.report_text(input_tokens, 0, 0);
+    }
     Json(json!({
         "object": "list",
         "results": results,
         "model": model,
     }))
     .into_response()
+}
+
+fn estimate_text_tokens<'a>(texts: impl Iterator<Item = &'a str>) -> u64 {
+    texts
+        .map(|text| (text.len() as u64).saturating_add(3) / 4)
+        .sum()
 }
 
 fn bad_request(message: impl Into<String>) -> Response {

@@ -4,6 +4,7 @@
     clippy::too_many_arguments
 )]
 
+pub mod accounting;
 pub mod admin_ui;
 pub mod api_auth;
 pub mod auth;

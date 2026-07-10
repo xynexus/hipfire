@@ -23,6 +23,7 @@ use hipfire_auth::{
 use hipfire_config::{ApiAuthMode, HipfireConfig};
 use serde_json::json;
 
+use crate::accounting::{record_rate_limit_hit, RequestAccounting};
 use crate::SharedState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +128,7 @@ async fn admit_request(
     next: Next,
     principal: RequestPrincipal,
 ) -> Response {
-    let (mut request, cost) = match estimate_request(request).await {
+    let (mut request, cost, estimated_images) = match estimate_request(request).await {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -152,14 +153,25 @@ async fn admit_request(
         cost,
     ) {
         Ok(reservation) => reservation,
-        Err(error) => return rate_limited(error),
+        Err(error) => {
+            record_rate_limit_hit(state.usage_writer.as_ref(), &principal, cost.workload);
+            return rate_limited(error);
+        }
     };
     let status = reservation.status();
+    let accounting = RequestAccounting::new(
+        principal.clone(),
+        cost,
+        reservation.reporter(),
+        state.usage_writer.clone(),
+        estimated_images,
+    );
     request.extensions_mut().insert(principal);
-    request.extensions_mut().insert(reservation.reporter());
+    request.extensions_mut().insert(accounting.clone());
     let mut response = next.run(request).await;
     add_rate_headers(response.headers_mut(), status);
     if response.status().is_client_error() || response.status().is_server_error() {
+        accounting.fail();
         reservation.cancel();
         return response;
     }
@@ -177,6 +189,7 @@ async fn admit_request(
                 }
             }
         }
+        accounting.complete();
         reservation.complete();
     };
     Response::from_parts(parts, Body::from_stream(stream))
@@ -184,13 +197,14 @@ async fn admit_request(
 
 async fn estimate_request(
     request: Request<Body>,
-) -> Result<(Request<Body>, ReservationCost), Response> {
+) -> Result<(Request<Body>, ReservationCost, u64), Response> {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
     let workload = workload_class(&method, &path);
     let mut cost = ReservationCost::request(workload);
+    let mut estimated_images = 0;
     if method == Method::GET || method == Method::DELETE {
-        return Ok((request, cost));
+        return Ok((request, cost, estimated_images));
     }
     let is_json = request
         .headers()
@@ -199,7 +213,7 @@ async fn estimate_request(
         .map(|value| value.starts_with("application/json"))
         .unwrap_or(false);
     if !is_json {
-        return Ok((request, cost));
+        return Ok((request, cost, estimated_images));
     }
     let (parts, body) = request.into_parts();
     let bytes = to_bytes(body, 16 * 1024 * 1024).await.map_err(|_| {
@@ -233,8 +247,10 @@ async fn estimate_request(
             let width = json_u64(value, "width", 512) as f64;
             let height = json_u64(value, "height", 512) as f64;
             let steps = json_u64(value, "steps", 20) as f64;
-            let images = json_u64(value, "batch_size", 1)
-                .saturating_mul(json_u64(value, "n_iter", 1)) as f64;
+            let images =
+                json_u64(value, "batch_size", 1).saturating_mul(json_u64(value, "n_iter", 1));
+            estimated_images = images;
+            let images = images as f64;
             cost.megapixel_steps = (width * height / 1_000_000.0) * steps * images;
             if value
                 .and_then(|value| value.get("enable_hr"))
@@ -252,7 +268,11 @@ async fn estimate_request(
         }
         WorkloadClass::Other | WorkloadClass::Training => {}
     }
-    Ok((Request::from_parts(parts, Body::from(bytes)), cost))
+    Ok((
+        Request::from_parts(parts, Body::from(bytes)),
+        cost,
+        estimated_images,
+    ))
 }
 
 fn json_u64(value: Option<&serde_json::Value>, key: &str, default: u64) -> u64 {
@@ -649,6 +669,8 @@ mod tests {
                 ..Default::default()
             },
         );
+        let store = state.access.store().unwrap();
+        let usage_writer = state.usage_writer.clone().unwrap();
         let app = crate::build_router(state, &[]);
         let first = app
             .clone()
@@ -683,5 +705,11 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "rate_limit_error");
+        usage_writer.flush(now_secs()).unwrap();
+        let usage = store.list_usage().unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].counters.requests, 2);
+        assert_eq!(usage[0].counters.errors, 1);
+        assert_eq!(usage[0].counters.rate_limit_hits, 1);
     }
 }

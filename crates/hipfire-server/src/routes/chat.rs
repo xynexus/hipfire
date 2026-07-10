@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::{Body, Bytes},
-    extract::State,
+    extract::{Extension, State},
     http::{header, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -74,13 +74,15 @@ pub struct ChatMessage {
 
 pub async fn post_chat_completions(
     State(state): State<SharedState>,
+    accounting: Option<Extension<crate::accounting::RequestAccounting>>,
     Json(body): Json<ChatRequest>,
 ) -> Response {
+    let accounting = accounting.map(|Extension(accounting)| accounting);
     maybe_dump_request(&body);
     if body.stream {
-        stream_chat(state, body).await.into_response()
+        stream_chat(state, body, accounting).await.into_response()
     } else {
-        blocking_chat(state, body).await
+        blocking_chat(state, body, accounting).await
     }
 }
 
@@ -1832,7 +1834,11 @@ fn blocking_chat_response_json(result: Result<BlockingChatResult, Value>) -> Val
     }
 }
 
-async fn blocking_chat(state: SharedState, body: ChatRequest) -> Response {
+async fn blocking_chat(
+    state: SharedState,
+    body: ChatRequest,
+    accounting: Option<crate::accounting::RequestAccounting>,
+) -> Response {
     if let Some((status, error)) = blocking_chat_preflight_error(&state, &body).await {
         return (status, Json(error)).into_response();
     }
@@ -1841,6 +1847,9 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> Response {
     tokio::spawn(async move {
         match execute_blocking_chat_cancellable(state, body, || tx.is_closed()).await {
             Ok(Some(result)) => {
+                if let Some(accounting) = &accounting {
+                    report_done_usage(accounting, &result.done);
+                }
                 let payload = blocking_chat_response_json(Ok(result));
                 if let Ok(bytes) = serde_json::to_vec(&payload) {
                     let _ = tx.send(bytes).await;
@@ -1950,7 +1959,11 @@ async fn blocking_chat_buffered_for_tests(state: SharedState, body: ChatRequest)
     }
 }
 
-async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse {
+async fn stream_chat(
+    state: SharedState,
+    body: ChatRequest,
+    accounting: Option<crate::accounting::RequestAccounting>,
+) -> impl IntoResponse {
     let (tx, mut rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
@@ -2161,6 +2174,9 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
 
         match result {
             Ok(Some(done)) => {
+                if let Some(accounting) = &accounting {
+                    report_done_usage(accounting, &done);
+                }
                 *engine_guard = Some(engine);
                 let mut final_chunk = if has_tools {
                     if !structured_tool_calls_emitted {
@@ -2283,6 +2299,16 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
             .interval(Duration::from_secs(10))
             .text("prefill"),
     )
+}
+
+fn report_done_usage(
+    accounting: &crate::accounting::RequestAccounting,
+    done: &hipfire_generate::DoneEvent,
+) {
+    let cached_tokens = done_extra_u64(done, "cached_tokens").unwrap_or(0);
+    let input_tokens = done_extra_u64(done, "prompt_tokens")
+        .unwrap_or(cached_tokens + done.prefill_tokens.unwrap_or(0) as u64);
+    accounting.report_text(input_tokens, done.tokens as u64, cached_tokens);
 }
 
 fn sse_error(msg: &str) -> Event {

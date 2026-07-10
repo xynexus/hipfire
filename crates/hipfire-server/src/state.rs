@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify};
 
-use hipfire_auth::{AccessStore, CredentialSnapshot, RateLimiter};
+use hipfire_auth::{AccessStore, CredentialSnapshot, RateLimiter, UsageWriter};
 use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_daemon_adapter::DaemonEngine;
 use hipfire_diffusion::{DiffusionGenerationRuntimeOptions, DiffusionPipeline};
@@ -126,6 +126,7 @@ pub struct AppState {
     /// request middleware. Database errors remain visible and fail closed.
     pub access: AccessRuntime,
     pub rate_limiter: RateLimiter,
+    pub usage_writer: Option<UsageWriter>,
 }
 
 pub struct AccessRuntime {
@@ -230,6 +231,8 @@ impl AppState {
             .as_deref()
             .filter(|dir| !dir.is_empty())
             .map(PathBuf::from);
+        let access = AccessRuntime::open(&access_dir);
+        let usage_writer = access.store().ok().map(UsageWriter::spawn);
         Arc::new(Self {
             engine: Mutex::new(None),
             loaded_config: Mutex::new(loaded_config),
@@ -261,8 +264,9 @@ impl AppState {
             models_network_dir,
             admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
             admin_sessions: Mutex::new(HashMap::new()),
-            access: AccessRuntime::open(&access_dir),
+            access,
             rate_limiter: RateLimiter::default(),
+            usage_writer,
         })
     }
 

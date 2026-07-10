@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -45,13 +45,22 @@ pub struct ResponsesRequest {
 
 pub async fn post_responses(
     State(state): State<SharedState>,
+    accounting: Option<Extension<crate::accounting::RequestAccounting>>,
     Json(body): Json<ResponsesRequest>,
 ) -> Response {
+    let accounting = accounting.map(|Extension(accounting)| accounting);
     if body.stream {
-        return stream_responses(state, body).await.into_response();
+        return stream_responses(state, body, accounting)
+            .await
+            .into_response();
     }
     match execute_responses(state, body).await {
-        Ok(body) => Json(body).into_response(),
+        Ok(body) => {
+            if let Some(accounting) = &accounting {
+                report_response_usage(accounting, &body);
+            }
+            Json(body).into_response()
+        }
         Err(error) => (error_status(&error), Json(error)).into_response(),
     }
 }
@@ -188,7 +197,11 @@ fn response_json(
     })
 }
 
-async fn stream_responses(state: SharedState, body: ResponsesRequest) -> impl IntoResponse {
+async fn stream_responses(
+    state: SharedState,
+    body: ResponsesRequest,
+    accounting: Option<crate::accounting::RequestAccounting>,
+) -> impl IntoResponse {
     let (tx, mut rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
@@ -393,6 +406,13 @@ async fn stream_responses(state: SharedState, body: ResponsesRequest) -> impl In
 
         match result {
             Ok(Some(done)) => {
+                if let Some(accounting) = &accounting {
+                    accounting.report_text(
+                        done.prefill_tokens.unwrap_or(0) as u64,
+                        done.tokens as u64,
+                        0,
+                    );
+                }
                 *engine_guard = Some(engine);
                 let output_text = strip_visible_thinking(output_text, false, true);
                 let mut stored = messages;
@@ -455,6 +475,15 @@ async fn stream_responses(state: SharedState, body: ResponsesRequest) -> impl In
             .interval(std::time::Duration::from_secs(10))
             .text("prefill"),
     )
+}
+
+fn report_response_usage(accounting: &crate::accounting::RequestAccounting, body: &Value) {
+    let usage = &body["usage"];
+    accounting.report_text(
+        usage["input_tokens"].as_u64().unwrap_or(0),
+        usage["output_tokens"].as_u64().unwrap_or(0),
+        0,
+    );
 }
 
 fn sse_json_event(event: &str, data: Value) -> Event {
