@@ -32,7 +32,7 @@ use hipfire_prompt::{Message as PromptMessage, Role, ToolCall as PromptToolCall}
 use hipfire_scheduler::{
     create_request_session_draft, plan_model_residency, server_prefill_batch_enabled,
     CreateRequestSessionInput, ModelResidencyRequest, NextBatchInput, ResidencyMode,
-    ResidentWorkerLedgerEntry, ResourceBudget, ResourceUsage, SchedulerPolicyEnv,
+    ResidentWorkerLedgerEntry, ResourceBudget, ResourceUsage, SchedulerPolicyEnv, WorkloadOwner,
 };
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -78,11 +78,17 @@ pub async fn post_chat_completions(
     Json(body): Json<ChatRequest>,
 ) -> Response {
     let accounting = accounting.map(|Extension(accounting)| accounting);
+    let owner = accounting
+        .as_ref()
+        .map(|accounting| scheduler_owner_from_principal(&accounting.principal()))
+        .unwrap_or_default();
     maybe_dump_request(&body);
     if body.stream {
-        stream_chat(state, body, accounting).await.into_response()
+        stream_chat(state, body, owner, accounting)
+            .await
+            .into_response()
     } else {
-        blocking_chat(state, body, accounting).await
+        blocking_chat(state, body, owner, accounting).await
     }
 }
 
@@ -1581,6 +1587,7 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
     model_path: &str,
     messages: &[ChatMessage],
     priority: Option<i64>,
+    owner: WorkloadOwner,
 ) -> Result<(), String> {
     let env = SchedulerPolicyEnv::from_pairs(std::env::vars());
     if !server_prefill_batch_enabled(&env) {
@@ -1593,6 +1600,7 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
     };
     let session = create_request_session_draft(CreateRequestSessionInput {
         id: req_id.to_string(),
+        owner,
         worker_key,
         prompt_tokens: estimated_prompt_tokens(messages),
         cached_prefix_tokens: None,
@@ -1649,7 +1657,15 @@ pub(crate) async fn execute_blocking_chat(
     state: SharedState,
     body: ChatRequest,
 ) -> Result<BlockingChatResult, Value> {
-    match execute_blocking_chat_cancellable(state, body, || false).await? {
+    execute_blocking_chat_owned(state, body, WorkloadOwner::default()).await
+}
+
+pub(crate) async fn execute_blocking_chat_owned(
+    state: SharedState,
+    body: ChatRequest,
+    owner: WorkloadOwner,
+) -> Result<BlockingChatResult, Value> {
+    match execute_blocking_chat_cancellable(state, body, owner, || false).await? {
         Some(result) => Ok(result),
         None => Err(json!({"error": {"message": "request cancelled", "type": "server_error"}})),
     }
@@ -1658,6 +1674,7 @@ pub(crate) async fn execute_blocking_chat(
 async fn execute_blocking_chat_cancellable<F>(
     state: SharedState,
     body: ChatRequest,
+    owner: WorkloadOwner,
     mut should_cancel: F,
 ) -> Result<Option<BlockingChatResult>, Value>
 where
@@ -1711,6 +1728,7 @@ where
         &loaded.model_path,
         &body.messages,
         body.priority,
+        owner,
     )
     .await
     {
@@ -1837,6 +1855,7 @@ fn blocking_chat_response_json(result: Result<BlockingChatResult, Value>) -> Val
 async fn blocking_chat(
     state: SharedState,
     body: ChatRequest,
+    owner: WorkloadOwner,
     accounting: Option<crate::accounting::RequestAccounting>,
 ) -> Response {
     if let Some((status, error)) = blocking_chat_preflight_error(&state, &body).await {
@@ -1845,7 +1864,7 @@ async fn blocking_chat(
 
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
     tokio::spawn(async move {
-        match execute_blocking_chat_cancellable(state, body, || tx.is_closed()).await {
+        match execute_blocking_chat_cancellable(state, body, owner, || tx.is_closed()).await {
             Ok(Some(result)) => {
                 if let Some(accounting) = &accounting {
                     report_done_usage(accounting, &result.done);
@@ -1962,6 +1981,7 @@ async fn blocking_chat_buffered_for_tests(state: SharedState, body: ChatRequest)
 async fn stream_chat(
     state: SharedState,
     body: ChatRequest,
+    owner: WorkloadOwner,
     accounting: Option<crate::accounting::RequestAccounting>,
 ) -> impl IntoResponse {
     let (tx, mut rx) = mpsc::channel::<Result<Event, Infallible>>(64);
@@ -2030,6 +2050,7 @@ async fn stream_chat(
             &loaded.model_path,
             &body.messages,
             body.priority,
+            owner,
         )
         .await
         {
@@ -2309,6 +2330,16 @@ fn report_done_usage(
     let input_tokens = done_extra_u64(done, "prompt_tokens")
         .unwrap_or(cached_tokens + done.prefill_tokens.unwrap_or(0) as u64);
     accounting.report_text(input_tokens, done.tokens as u64, cached_tokens);
+}
+
+pub(crate) fn scheduler_owner_from_principal(
+    principal: &hipfire_auth::RequestPrincipal,
+) -> WorkloadOwner {
+    principal
+        .user_id
+        .as_ref()
+        .map(|user_id| WorkloadOwner::authenticated(user_id.clone(), principal.token_id.clone()))
+        .unwrap_or_default()
 }
 
 fn sse_error(msg: &str) -> Event {

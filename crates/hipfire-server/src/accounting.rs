@@ -63,6 +63,10 @@ impl RequestAccounting {
         });
     }
 
+    pub fn principal(&self) -> RequestPrincipal {
+        self.inner.principal.clone()
+    }
+
     pub fn report_images(&self, images: u64, megapixel_steps: f64) {
         let mut usage = self.inner.usage.lock().unwrap();
         usage.images = images;

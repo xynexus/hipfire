@@ -244,6 +244,27 @@ pub enum WorkloadClass {
     Maintenance,
 }
 
+/// Opaque scheduler attribution. Identity influences fairness and queued
+/// cancellation, never runtime compatibility or model inputs.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct WorkloadOwner {
+    pub user_id: Option<String>,
+    pub token_id: Option<String>,
+}
+
+impl WorkloadOwner {
+    pub fn authenticated(user_id: impl Into<String>, token_id: Option<String>) -> Self {
+        Self {
+            user_id: Some(user_id.into()),
+            token_id,
+        }
+    }
+
+    pub fn fairness_key(&self) -> &str {
+        self.user_id.as_deref().unwrap_or("anonymous-local")
+    }
+}
+
 impl WorkloadClass {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -314,6 +335,7 @@ pub struct WorkloadSpec {
     pub priority: u8,
     pub enqueued_at_ms: u64,
     pub resources: WorkloadResources,
+    pub owner: WorkloadOwner,
     /// Stable caller-defined compatibility key. It must include every property
     /// that affects a shared runtime invocation, such as worker, model, shape,
     /// quant/state mode, sampler, and precision.
@@ -336,6 +358,7 @@ impl WorkloadSpec {
             priority,
             enqueued_at_ms,
             resources,
+            owner: WorkloadOwner::default(),
             microbatch_key: None,
             max_microbatch_size: 1,
             exclusive: class == WorkloadClass::Training,
@@ -357,10 +380,16 @@ impl WorkloadSpec {
             priority,
             enqueued_at_ms,
             resources,
+            owner: WorkloadOwner::default(),
             microbatch_key: Some(microbatch_key.into()),
             max_microbatch_size: max_microbatch_size.max(1),
             exclusive: false,
         }
+    }
+
+    pub fn with_owner(mut self, owner: WorkloadOwner) -> Self {
+        self.owner = owner;
+        self
     }
 }
 
@@ -395,6 +424,7 @@ pub struct ContinuousWorkScheduler {
     queued_ids: HashSet<String>,
     active: BTreeMap<u64, WorkloadBatchLease>,
     next_lease_id: u64,
+    last_scheduled_owner: Vec<Option<String>>,
 }
 
 impl ContinuousWorkScheduler {
@@ -407,6 +437,7 @@ impl ContinuousWorkScheduler {
             queued_ids: HashSet::new(),
             active: BTreeMap::new(),
             next_lease_id: 1,
+            last_scheduled_owner: vec![None; 256],
         }
     }
 
@@ -463,6 +494,34 @@ impl ContinuousWorkScheduler {
         }
         self.queued_ids.remove(id);
         false
+    }
+
+    pub fn cancel_pending_by_user(&mut self, user_id: &str) -> Vec<WorkloadSpec> {
+        self.cancel_pending_where(|owner| owner.user_id.as_deref() == Some(user_id))
+    }
+
+    pub fn cancel_pending_by_token(&mut self, token_id: &str) -> Vec<WorkloadSpec> {
+        self.cancel_pending_where(|owner| owner.token_id.as_deref() == Some(token_id))
+    }
+
+    fn cancel_pending_where(
+        &mut self,
+        predicate: impl Fn(&WorkloadOwner) -> bool,
+    ) -> Vec<WorkloadSpec> {
+        let mut removed = Vec::new();
+        for bucket in &mut self.buckets {
+            let mut index = 0;
+            while index < bucket.len() {
+                if predicate(&bucket[index].owner) {
+                    let workload = bucket.remove(index);
+                    self.queued_ids.remove(&workload.id);
+                    removed.push(workload);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        removed
     }
 
     pub fn next_batch(&mut self, now_ms: u64) -> Option<WorkloadBatchLease> {
@@ -527,6 +586,7 @@ impl ContinuousWorkScheduler {
         };
         self.next_lease_id = self.next_lease_id.saturating_add(1);
         self.active.insert(lease.lease_id, lease.clone());
+        self.last_scheduled_owner[priority] = Some(seed.owner.fairness_key().to_string());
         Some(lease)
     }
 
@@ -580,8 +640,34 @@ impl ContinuousWorkScheduler {
         self.buckets
             .iter()
             .enumerate()
-            .find_map(|(priority, bucket)| (!bucket.is_empty()).then_some((priority, 0)))
+            .find_map(|(priority, bucket)| {
+                if bucket.is_empty() {
+                    return None;
+                }
+                let owners = distinct_owner_keys(bucket);
+                let selected_index = self.last_scheduled_owner[priority]
+                    .as_ref()
+                    .and_then(|last| owners.iter().position(|owner| owner == last))
+                    .map(|index| (index + 1) % owners.len())
+                    .unwrap_or(0);
+                let selected = &owners[selected_index];
+                bucket
+                    .iter()
+                    .position(|workload| workload.owner.fairness_key() == selected)
+                    .map(|index| (priority, index))
+            })
     }
+}
+
+fn distinct_owner_keys(bucket: &[WorkloadSpec]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    bucket
+        .iter()
+        .filter_map(|workload| {
+            let owner = workload.owner.fairness_key().to_string();
+            seen.insert(owner.clone()).then_some(owner)
+        })
+        .collect()
 }
 
 fn workloads_microbatch_compatible(a: &WorkloadSpec, b: &WorkloadSpec) -> bool {
@@ -687,6 +773,7 @@ pub struct SessionStateHandle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestSessionDraft {
     pub id: String,
+    pub owner: WorkloadOwner,
     pub worker_key: ModelWorkerKey,
     pub priority: u8,
     pub prompt_tokens: Vec<u32>,
@@ -698,6 +785,7 @@ pub struct RequestSessionDraft {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateRequestSessionInput {
     pub id: String,
+    pub owner: WorkloadOwner,
     pub worker_key: ModelWorkerKey,
     pub prompt_tokens: Vec<u32>,
     pub cached_prefix_tokens: Option<usize>,
@@ -721,6 +809,49 @@ pub struct PreviewPrefillBatchInput {
     pub now_ms: u64,
     pub incoming_session: Option<RequestSessionDraft>,
     pub incoming_enqueued_at_ms: Option<u64>,
+}
+
+fn fair_ordered_prefill_bucket(
+    bucket: &[QueuedPrefillRequest],
+    last_owner: Option<&str>,
+) -> Vec<QueuedPrefillRequest> {
+    let mut owners = Vec::<String>::new();
+    for entry in bucket {
+        let owner = entry.session.owner.fairness_key().to_string();
+        if !owners.contains(&owner) {
+            owners.push(owner);
+        }
+    }
+    if owners.len() <= 1 {
+        return bucket.to_vec();
+    }
+    let start = last_owner
+        .and_then(|last| owners.iter().position(|owner| owner == last))
+        .map(|index| (index + 1) % owners.len())
+        .unwrap_or(0);
+    owners.rotate_left(start);
+
+    let mut offsets = vec![0usize; owners.len()];
+    let mut ordered = Vec::with_capacity(bucket.len());
+    while ordered.len() < bucket.len() {
+        let mut progressed = false;
+        for (owner_index, owner) in owners.iter().enumerate() {
+            let Some(entry) = bucket
+                .iter()
+                .filter(|entry| entry.session.owner.fairness_key() == owner)
+                .nth(offsets[owner_index])
+            else {
+                continue;
+            };
+            offsets[owner_index] += 1;
+            ordered.push(entry.clone());
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    ordered
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1111,6 +1242,7 @@ pub fn create_request_session_draft(input: CreateRequestSessionInput) -> Request
         .unwrap_or(SCHED_PRIORITY_DEFAULT);
     RequestSessionDraft {
         id: input.id,
+        owner: input.owner,
         worker_key: worker_key.clone(),
         priority,
         prompt_tokens: input.prompt_tokens,
@@ -1329,6 +1461,7 @@ pub struct PriorityPrefillScheduler {
     buckets: Vec<Vec<QueuedPrefillRequest>>,
     queued_ids: HashSet<String>,
     queued_count: usize,
+    last_scheduled_owner: Vec<Option<String>>,
 }
 
 impl Default for PriorityPrefillScheduler {
@@ -1345,6 +1478,7 @@ impl PriorityPrefillScheduler {
             buckets: (0..=255).map(|_| Vec::new()).collect(),
             queued_ids: HashSet::new(),
             queued_count: 0,
+            last_scheduled_owner: vec![None; 256],
         }
     }
 
@@ -1439,8 +1573,41 @@ impl PriorityPrefillScheduler {
         false
     }
 
+    pub fn cancel_by_user(&mut self, user_id: &str) -> Vec<RequestSessionDraft> {
+        self.cancel_where(|owner| owner.user_id.as_deref() == Some(user_id))
+    }
+
+    pub fn cancel_by_token(&mut self, token_id: &str) -> Vec<RequestSessionDraft> {
+        self.cancel_where(|owner| owner.token_id.as_deref() == Some(token_id))
+    }
+
+    fn cancel_where(
+        &mut self,
+        predicate: impl Fn(&WorkloadOwner) -> bool,
+    ) -> Vec<RequestSessionDraft> {
+        let mut removed = Vec::new();
+        for bucket in &mut self.buckets {
+            let mut index = 0;
+            while index < bucket.len() {
+                if predicate(&bucket[index].session.owner) {
+                    let entry = bucket.remove(index);
+                    self.queued_ids.remove(&entry.session.id);
+                    self.queued_count = self.queued_count.saturating_sub(1);
+                    removed.push(entry.session);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        removed
+    }
+
     pub fn next_prefill_batch(&mut self, input: NextBatchInput) -> Option<PrefillBatchSelection> {
         if let Some(aged) = self.select_aged_candidate(input.now_ms) {
+            if let Some(first) = aged.sessions.first() {
+                self.last_scheduled_owner[first.priority as usize] =
+                    Some(first.owner.fairness_key().to_string());
+            }
             self.remove_selected(&aged.sessions);
             return Some(aged);
         }
@@ -1449,9 +1616,16 @@ impl PriorityPrefillScheduler {
             if self.buckets[priority].is_empty() {
                 continue;
             }
-            let candidate =
-                self.select_from_bucket(priority as u8, &self.buckets[priority], input.now_ms)?;
+            let ordered = fair_ordered_prefill_bucket(
+                &self.buckets[priority],
+                self.last_scheduled_owner[priority].as_deref(),
+            );
+            let candidate = self.select_from_bucket(priority as u8, &ordered, input.now_ms)?;
             self.remove_selected(&candidate.sessions);
+            self.last_scheduled_owner[priority] = candidate
+                .sessions
+                .first()
+                .map(|session| session.owner.fairness_key().to_string());
             return Some(candidate);
         }
         None
@@ -1479,7 +1653,11 @@ impl PriorityPrefillScheduler {
             if bucket.is_empty() {
                 continue;
             }
-            let candidate = self.select_from_bucket(priority as u8, &bucket, input.now_ms)?;
+            let ordered = fair_ordered_prefill_bucket(
+                &bucket,
+                self.last_scheduled_owner[priority].as_deref(),
+            );
+            let candidate = self.select_from_bucket(priority as u8, &ordered, input.now_ms)?;
             let Some(incoming) = input.incoming_session.as_ref() else {
                 return Some(candidate);
             };
@@ -1771,6 +1949,12 @@ mod tests {
         )
     }
 
+    fn owned_session(id: &str, user: &str, token: &str, priority: u8) -> RequestSessionDraft {
+        let mut session = session(id, priority, 8);
+        session.owner = WorkloadOwner::authenticated(user, Some(token.to_string()));
+        session
+    }
+
     fn session_with(
         id: &str,
         priority: u8,
@@ -1781,6 +1965,7 @@ mod tests {
     ) -> RequestSessionDraft {
         create_request_session_draft(CreateRequestSessionInput {
             id: id.to_string(),
+            owner: WorkloadOwner::default(),
             worker_key,
             prompt_tokens: (1..=tokens as u32).collect(),
             cached_prefix_tokens: Some(cached_prefix_tokens),
@@ -2511,6 +2696,60 @@ mod tests {
         assert_eq!(plan.unload_worker_key_ids, vec!["old"]);
     }
 
+    #[test]
+    fn prefill_scheduler_round_robins_users_and_microbatches_across_them() {
+        let mut fair =
+            PriorityPrefillScheduler::new(env(&[("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "1")]));
+        fair.enqueue(owned_session("a1", "alice", "ta", 0), 0)
+            .unwrap();
+        fair.enqueue(owned_session("a2", "alice", "ta", 0), 1)
+            .unwrap();
+        fair.enqueue(owned_session("b1", "bob", "tb", 0), 2)
+            .unwrap();
+        let first = fair
+            .next_prefill_batch(NextBatchInput { now_ms: 10 })
+            .unwrap();
+        let second = fair
+            .next_prefill_batch(NextBatchInput { now_ms: 11 })
+            .unwrap();
+        assert_eq!(first.sessions[0].owner.user_id.as_deref(), Some("alice"));
+        assert_eq!(second.sessions[0].owner.user_id.as_deref(), Some("bob"));
+
+        let mut batched =
+            PriorityPrefillScheduler::new(env(&[("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "2")]));
+        batched
+            .enqueue(owned_session("a", "alice", "ta", 64), 0)
+            .unwrap();
+        batched
+            .enqueue(owned_session("b", "bob", "tb", 64), 0)
+            .unwrap();
+        let batch = batched
+            .next_prefill_batch(NextBatchInput { now_ms: 10 })
+            .unwrap();
+        assert_eq!(batch.sessions.len(), 2);
+        assert_ne!(
+            batch.sessions[0].owner.user_id,
+            batch.sessions[1].owner.user_id
+        );
+    }
+
+    #[test]
+    fn prefill_scheduler_cancels_pending_credential_owners() {
+        let mut scheduler = PriorityPrefillScheduler::default();
+        scheduler
+            .enqueue(owned_session("a1", "alice", "ta", 64), 0)
+            .unwrap();
+        scheduler
+            .enqueue(owned_session("a2", "alice", "other", 64), 0)
+            .unwrap();
+        scheduler
+            .enqueue(owned_session("b", "bob", "tb", 64), 0)
+            .unwrap();
+        assert_eq!(scheduler.cancel_by_token("ta").len(), 1);
+        assert_eq!(scheduler.cancel_by_user("alice").len(), 1);
+        assert_eq!(scheduler.size(), 1);
+    }
+
     fn continuous_capacity() -> WorkloadResources {
         WorkloadResources {
             system_memory_bytes: 64_000,
@@ -2535,6 +2774,17 @@ mod tests {
             "worker:qwen|state:q8+deltanet|decode",
             4,
         )
+    }
+
+    fn owned_token_workload(
+        id: &str,
+        user: &str,
+        token: &str,
+        priority: u8,
+        enqueued_at_ms: u64,
+    ) -> WorkloadSpec {
+        token_workload(id, priority, enqueued_at_ms)
+            .with_owner(WorkloadOwner::authenticated(user, Some(token.to_string())))
     }
 
     #[test]
@@ -2655,5 +2905,55 @@ mod tests {
             },
         );
         assert!(scheduler.enqueue(oversized).is_err());
+    }
+
+    #[test]
+    fn continuous_scheduler_round_robins_users_within_priority() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        for workload in [
+            owned_token_workload("a1", "alice", "ta", 64, 0),
+            owned_token_workload("a2", "alice", "ta", 64, 1),
+            owned_token_workload("b1", "bob", "tb", 64, 2),
+        ] {
+            let mut workload = workload;
+            workload.max_microbatch_size = 1;
+            scheduler.enqueue(workload).unwrap();
+        }
+        let first = scheduler.next_batch(10).unwrap();
+        scheduler.complete(first.lease_id).unwrap();
+        let second = scheduler.next_batch(11).unwrap();
+        assert_eq!(first.workloads[0].owner.user_id.as_deref(), Some("alice"));
+        assert_eq!(second.workloads[0].owner.user_id.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn continuous_scheduler_microbatches_across_users_and_cancels_by_owner() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        scheduler
+            .enqueue(owned_token_workload("a", "alice", "ta", 64, 0))
+            .unwrap();
+        scheduler
+            .enqueue(owned_token_workload("b", "bob", "tb", 64, 1))
+            .unwrap();
+        let lease = scheduler.next_batch(10).unwrap();
+        assert_eq!(lease.workloads.len(), 2);
+        assert_ne!(
+            lease.workloads[0].owner.user_id,
+            lease.workloads[1].owner.user_id
+        );
+        scheduler.complete(lease.lease_id).unwrap();
+
+        scheduler
+            .enqueue(owned_token_workload("a2", "alice", "ta", 64, 2))
+            .unwrap();
+        scheduler
+            .enqueue(owned_token_workload("a3", "alice", "other", 64, 3))
+            .unwrap();
+        scheduler
+            .enqueue(owned_token_workload("b2", "bob", "tb", 64, 4))
+            .unwrap();
+        assert_eq!(scheduler.cancel_pending_by_token("ta").len(), 1);
+        assert_eq!(scheduler.cancel_pending_by_user("alice").len(), 1);
+        assert_eq!(scheduler.snapshot().queued, 1);
     }
 }

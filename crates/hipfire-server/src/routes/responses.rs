@@ -14,10 +14,11 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::routes::chat::{
-    effective_request_max_tokens, ensure_model_loaded, execute_blocking_chat,
+    effective_request_max_tokens, ensure_model_loaded, execute_blocking_chat_owned,
     extract_request_image_base64, generate_request_from_chat, normalize_stop_sequences,
-    request_generation_controls, required_load_max_seq, strip_visible_thinking,
-    wait_for_prefill_scheduler_turn, AssistantDelta, ChatMessage, ChatRequest, ThinkStreamFilter,
+    request_generation_controls, required_load_max_seq, scheduler_owner_from_principal,
+    strip_visible_thinking, wait_for_prefill_scheduler_turn, AssistantDelta, ChatMessage,
+    ChatRequest, ThinkStreamFilter,
 };
 use crate::state::{SharedState, StoredResponsesContext};
 use hipfire_auth::{RequestPrincipal, ResponseContextRecord};
@@ -70,13 +71,17 @@ pub async fn post_responses(
     Json(body): Json<ResponsesRequest>,
 ) -> Response {
     let accounting = accounting.map(|Extension(accounting)| accounting);
+    let scheduler_owner = principal
+        .as_ref()
+        .map(|Extension(principal)| scheduler_owner_from_principal(principal))
+        .unwrap_or_default();
     let owner = ResponsesOwner::from_principal(principal);
     if body.stream {
-        return stream_responses(state, body, owner, accounting)
+        return stream_responses(state, body, owner, scheduler_owner, accounting)
             .await
             .into_response();
     }
-    match execute_responses_owned(state, body, owner).await {
+    match execute_responses_owned(state, body, owner, scheduler_owner).await {
         Ok(body) => {
             if let Some(accounting) = &accounting {
                 report_response_usage(accounting, &body);
@@ -104,13 +109,20 @@ pub(crate) async fn execute_responses(
     state: SharedState,
     body: ResponsesRequest,
 ) -> Result<Value, Value> {
-    execute_responses_owned(state, body, ResponsesOwner::AnonymousLocal).await
+    execute_responses_owned(
+        state,
+        body,
+        ResponsesOwner::AnonymousLocal,
+        hipfire_scheduler::WorkloadOwner::default(),
+    )
+    .await
 }
 
 async fn execute_responses_owned(
     state: SharedState,
     body: ResponsesRequest,
     owner: ResponsesOwner,
+    scheduler_owner: hipfire_scheduler::WorkloadOwner,
 ) -> Result<Value, Value> {
     let messages = prepare_response_messages(&state, &body, &owner).await?;
 
@@ -141,10 +153,11 @@ async fn execute_responses_owned(
     // execute_blocking_chat.
     apply_vision_content(&mut chat_body.messages, &body.input);
 
-    let generated = match execute_blocking_chat(state.clone(), chat_body).await {
-        Ok(generated) => generated,
-        Err(error) => return Err(error),
-    };
+    let generated =
+        match execute_blocking_chat_owned(state.clone(), chat_body, scheduler_owner).await {
+            Ok(generated) => generated,
+            Err(error) => return Err(error),
+        };
 
     let response_id = format!("resp_{}", Uuid::new_v4().simple());
     let mut stored = messages;
@@ -240,6 +253,7 @@ async fn stream_responses(
     state: SharedState,
     body: ResponsesRequest,
     owner: ResponsesOwner,
+    scheduler_owner: hipfire_scheduler::WorkloadOwner,
     accounting: Option<crate::accounting::RequestAccounting>,
 ) -> impl IntoResponse {
     let (tx, mut rx) = mpsc::channel::<Result<Event, Infallible>>(64);
@@ -331,6 +345,7 @@ async fn stream_responses(
             &loaded.model_path,
             &chat_messages,
             None,
+            scheduler_owner,
         )
         .await
         {
