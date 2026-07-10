@@ -20,6 +20,7 @@ CW = int(sys.argv[5]) if len(sys.argv) > 5 else 2048   # C i32 elements per (M-b
 # dispatch compute COLS*ROUNDS M-blocks continuously — no inter-dispatch host stall, one
 # exec, one C read-back. ROUNDS=1 is the per-dispatch form.
 ROUNDS = int(sys.argv[6]) if len(sys.argv) > 6 else 1
+W_DEPTH = int(sys.argv[7]) if len(sys.argv) > 7 else 2
 INF = 9223372036854775807
 
 out = ["module {", "  aie.device(npu2) {"]
@@ -34,8 +35,8 @@ for c in range(COLS):
     out.append(f"    aie.objectfifo @fa{c}(%shim{c}, {{%t{c}}}, 1 : i32) : !aie.objectfifo<memref<{AW}xi8>>")
 # W: broadcast. shim0 -> memtile (fw_in), memtile -> all cores (fw), linked.
 cores = ", ".join(f"%t{c}" for c in range(COLS))
-out.append(f"    aie.objectfifo @fw_in(%shim0, {{%mt}}, 2 : i32) : !aie.objectfifo<memref<{WW}xi8>>")
-out.append(f"    aie.objectfifo @fw(%mt, {{{cores}}}, 2 : i32) : !aie.objectfifo<memref<{WW}xi8>>")
+out.append(f"    aie.objectfifo @fw_in(%shim0, {{%mt}}, {W_DEPTH} : i32) : !aie.objectfifo<memref<{WW}xi8>>")
+out.append(f"    aie.objectfifo @fw(%mt, {{{cores}}}, {W_DEPTH} : i32) : !aie.objectfifo<memref<{WW}xi8>>")
 out.append("    aie.objectfifo.link [@fw_in] -> [@fw]([] [])")
 # C: per-core, NB blocks.
 for c in range(COLS):

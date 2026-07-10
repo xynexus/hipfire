@@ -20,6 +20,7 @@ CW = int(sys.argv[5]) if len(sys.argv) > 5 else 2048   # C i32 elements per core
 # so feeding ROUNDS A-blocks (+ ROUNDS*NB W slabs, C blocks) computes ROUNDS M-blocks
 # continuously — no inter-dispatch host stall. ROUNDS=1 is the per-dispatch form.
 ROUNDS = int(sys.argv[6]) if len(sys.argv) > 6 else 1
+W_DEPTH = int(sys.argv[7]) if len(sys.argv) > 7 else 2
 INF = 9223372036854775807
 
 out = ["module {", "  aie.device(npu2) {"]
@@ -28,7 +29,7 @@ for c in range(COLS):
     out.append(f"    %t{c} = aie.tile({c}, 2)")
 for c in range(COLS):
     out.append(f"    aie.objectfifo @fa{c}(%shim{c}, {{%t{c}}}, 1 : i32) : !aie.objectfifo<memref<{AW}xi8>>")  # A resident (single-buffer)
-    out.append(f"    aie.objectfifo @fw{c}(%shim{c}, {{%t{c}}}, 2 : i32) : !aie.objectfifo<memref<{WW}xi8>>")
+    out.append(f"    aie.objectfifo @fw{c}(%shim{c}, {{%t{c}}}, {W_DEPTH} : i32) : !aie.objectfifo<memref<{WW}xi8>>")
     out.append(f"    aie.objectfifo @fc{c}(%t{c}, {{%shim{c}}}, 1 : i32) : !aie.objectfifo<memref<{CW}xi32>>")
 out.append(f'    func.func private @r6_mac(memref<{AW}xi8>, memref<{WW}xi8>, memref<{CW}xi32>) attributes {{link_with = "r6_mac.o"}}')
 for c in range(COLS):

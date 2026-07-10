@@ -13,6 +13,11 @@
 use crate::submit::{self, QosInfo, AMDXDNA_BO_CMD, AMDXDNA_BO_SHMEM};
 use crate::xclbin::Axlf;
 use crate::{DeviceBuffer, XdnaDevice, XdnaError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const DEV_HEAP_BASE_VA: usize = 0x7000_0000_0000;
+const DEV_HEAP_STRIDE: usize = 128 * 1024 * 1024;
+static NEXT_HEAP_SLOT: AtomicUsize = AtomicUsize::new(0);
 
 /// A prepared ERT command BO for a fixed set of argument buffers. Building it costs
 /// a CREATE_BO + GET_BO_INFO + mmap (~tens of µs); caching it across dispatches with
@@ -49,7 +54,16 @@ impl NpuKernel {
     /// instruction stream. Sets up the hwctx and loads the program on hardware.
     pub fn load(xclbin: &[u8], insts: &[u8]) -> Result<Self, XdnaError> {
         let dev = XdnaDevice::open_default()?;
-        let mut heap = dev.alloc_dev_heap(Self::HEAP_BYTES)?;
+        let heap_slot = NEXT_HEAP_SLOT.fetch_add(1, Ordering::Relaxed);
+        let heap_va = DEV_HEAP_BASE_VA
+            .checked_add(heap_slot * DEV_HEAP_STRIDE)
+            .ok_or_else(|| {
+                XdnaError::Ioctl(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "NPU device heap VA slots exhausted",
+                ))
+            })?;
+        let mut heap = dev.alloc_dev_heap_at(Self::HEAP_BYTES, heap_va)?;
 
         let axlf = Axlf::parse(xclbin)?;
         let part = axlf.aie_partition().ok_or(XdnaError::NoAiePartition)?;

@@ -37,16 +37,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     g.attach_output_dmabuf(c_shared.dmabuf_fd(), cbytes)?;
 
     // Weights + one M-block of A written into the shared input buffer (CPU producer proxy).
-    let rnd = |i: usize| -> i8 {
+    let weight_bits = g.weight_bits();
+    let rnd_a = |i: usize| -> i8 {
         let s = (i as u32)
             .wrapping_mul(2654435761)
             .wrapping_add(0x9e37_79b9);
-        (((s >> 13) & 0xf) as i32 - 8) as i8
+        (((s >> 13) & 0x7f) as i32 - 63) as i8
     };
-    let wv: Vec<i8> = (0..k * n).map(|i| rnd(7_777_777 + i)).collect();
+    let rnd_w = |i: usize| -> i8 {
+        let s = (i as u32)
+            .wrapping_mul(2654435761)
+            .wrapping_add(0x9e37_79b9);
+        if weight_bits == 8 {
+            (((s >> 9) & 0xff) as i32 - 128) as i8
+        } else {
+            (((s >> 13) & 0xf) as i32 - 8) as i8
+        }
+    };
+    let wv: Vec<i8> = (0..k * n).map(|i| rnd_w(7_777_777 + i)).collect();
     g.load_weights(&g.prepack_weights(k, n, &wv));
     let m = rows_per;
-    let av: Vec<i8> = (0..m * k).map(rnd).collect();
+    let av: Vec<i8> = (0..m * k).map(rnd_a).collect();
     for (dst, &v) in a_shared.as_mut_slice().iter_mut().zip(av.iter()) {
         *dst = v as u8;
     }

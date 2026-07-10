@@ -50,6 +50,8 @@ pub enum XdnaError {
     /// A cache directory name did not match the expected `..._{MT}x{NT}x{KCHUNK}_c{COLS}_nb{NB}`
     /// shape (or was a whole-GEMM `_r{ROUNDS}` build the primitive can't consume).
     BadCacheName(String),
+    /// Compact mixed-precision Opus bytes, dimensions, or NPU cache shapes were invalid.
+    InvalidOpusMixed(String),
 }
 
 impl From<xclbin::XclbinError> for XdnaError {
@@ -74,6 +76,9 @@ impl fmt::Display for XdnaError {
                     f,
                     "cache dir '{n}' not a NpuGemmMp config (want ..._MTxNTxKCHUNK_cCOLS_nbNB)"
                 )
+            }
+            XdnaError::InvalidOpusMixed(message) => {
+                write!(f, "invalid mixed-precision Opus input: {message}")
             }
         }
     }
@@ -168,6 +173,16 @@ pub use gemm::NpuGemm;
 pub mod gemm_mp;
 #[cfg(target_os = "linux")]
 pub use gemm_mp::NpuGemmMp;
+
+#[cfg(target_os = "linux")]
+pub mod opus_mixed;
+#[cfg(target_os = "linux")]
+pub use opus_mixed::{NpuOpusMixedExecutor, NpuOpusMixedGemmMp, OpusMixedPackedMatrix};
+
+#[cfg(target_os = "linux")]
+pub mod sparse3_mp;
+#[cfg(target_os = "linux")]
+pub use sparse3_mp::NpuSparse3Mp;
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -683,6 +698,22 @@ mod imp {
         /// the firmware host-buffer map in aie2_hwctx_init succeeds. Returns the
         /// mapped DeviceBuffer (keep it alive for the hwctx's lifetime).
         pub fn alloc_dev_heap(&self, size: usize) -> Result<DeviceBuffer, XdnaError> {
+            self.alloc_dev_heap_at(size, DEV_HEAP_VA)
+        }
+
+        /// Allocate a device heap at a caller-selected, firmware-safe fixed VA.
+        /// Distinct live NPU kernels must not map their heaps over one another.
+        pub fn alloc_dev_heap_at(
+            &self,
+            size: usize,
+            fixed_va: usize,
+        ) -> Result<DeviceBuffer, XdnaError> {
+            if fixed_va % (2 * 1024 * 1024) != 0 {
+                return Err(XdnaError::Ioctl(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "NPU device heap VA must be 2 MiB aligned",
+                )));
+            }
             let mut cb = submit::CreateBo {
                 size: size as u64,
                 bo_type: submit::AMDXDNA_BO_DEV_HEAP,
@@ -707,7 +738,7 @@ mod imp {
             // (~0x7f..) and `aie2_hwctx_init`'s firmware host-buffer map is rejected;
             // any moderate 2 MiB-aligned VA (~0x70..-0x7b..) is accepted — XRT does the
             // same. Confirmed against the driver (dev_addr = AIE2_DEVM_BASE, 64-bit DMA).
-            let fixed_va = DEV_HEAP_VA as *mut libc::c_void;
+            let fixed_va = fixed_va as *mut libc::c_void;
             let ptr = unsafe {
                 libc::mmap(
                     fixed_va,

@@ -115,19 +115,30 @@ fn main() {
         }
 
         // Weights.
-        let rnd = |i: usize| -> i8 {
+        let weight_bits = g.weight_bits();
+        let rnd_a = |i: usize| -> i8 {
             let s = (i as u32)
                 .wrapping_mul(2654435761)
                 .wrapping_add(0x9e37_79b9);
-            (((s >> 13) & 0xf) as i32 - 8) as i8
+            (((s >> 13) & 0x7f) as i32 - 63) as i8
         };
-        let wv: Vec<i8> = (0..k * n).map(|i| rnd(7_777_777 + i)).collect();
+        let rnd_w = |i: usize| -> i8 {
+            let s = (i as u32)
+                .wrapping_mul(2654435761)
+                .wrapping_add(0x9e37_79b9);
+            if weight_bits == 8 {
+                (((s >> 9) & 0xff) as i32 - 128) as i8
+            } else {
+                (((s >> 13) & 0xf) as i32 - 8) as i8
+            }
+        };
+        let wv: Vec<i8> = (0..k * n).map(|i| rnd_w(7_777_777 + i)).collect();
         g.load_weights(&g.prepack_weights(k, n, &wv));
 
         // Producer writes A row-major [rows_per][K] into the INPUT GTT buffer (a_buf layout
         // == row-major A, no reshuffle). Done via the GPU mapping to model a GPU producer.
         let m = rows_per;
-        let av: Vec<i8> = (0..m * k).map(rnd).collect();
+        let av: Vec<i8> = (0..m * k).map(rnd_a).collect();
         let a_gpu = unsafe { std::slice::from_raw_parts_mut(a_ptr as *mut i8, abytes) };
         a_gpu.copy_from_slice(&av);
 

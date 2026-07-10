@@ -1,4 +1,4 @@
-//! `NpuGemmMp` — the M-parallel W-broadcast W4A8 GEMM primitive (productionized
+//! `NpuGemmMp` — the M-parallel W-broadcast W4A8/W8A8 GEMM primitive (productionized
 //! `r6_gen_mp.py` array + `r6_gemm_ts.cc` tensor-stream kernel). This is the best
 //! runtime-callable NPU GEMM path: one xclbin handles any M, weights are packed and loaded
 //! ONCE and broadcast to all cores, and A/C move ROW-MAJOR (the kernel's tensor streams
@@ -26,8 +26,12 @@ pub struct NpuGemmMp {
     mt: usize,
     kchunk: usize,
     nb: usize,
+    mr: usize,
+    mk: usize,
+    mn: usize,
+    weight_bits: usize,
     a_buf: DeviceBuffer, // COLS M-blocks (row-major), one per core, per dispatch
-    w_buf: DeviceBuffer, // NB broadcast weight slabs (tile-major int4), loaded once
+    w_buf: DeviceBuffer, // NB broadcast weight slabs (tile-major W4/W8), loaded once
     c_buf: DeviceBuffer, // COLS*NB output blocks (row-major)
     w_loaded: bool,
 }
@@ -35,25 +39,34 @@ pub struct NpuGemmMp {
 impl NpuGemmMp {
     /// M rows computed per dispatch (`COLS` M-blocks of `MT·MR` rows).
     pub fn rows_per_dispatch(&self) -> usize {
-        self.cols * self.mt * MR
+        self.cols * self.mt * self.mr
     }
     /// N this kernel computes (full N in one dispatch): `NB·NT·MN`.
     pub fn n(&self) -> usize {
-        self.nb * NT * MN
+        self.nb * NT * self.mn
     }
     /// K contracted per dispatch (single chunk): `KCHUNK·MK`.
     pub fn k(&self) -> usize {
-        self.kchunk * MK
+        self.kchunk * self.mk
+    }
+    /// Weight precision this xclbin consumes: 4 for packed signed int4, 8 for signed int8.
+    pub fn weight_bits(&self) -> usize {
+        self.weight_bits
     }
 
     fn aw(&self) -> usize {
-        self.mt * self.kchunk * MR * MK
+        self.mt * self.kchunk * self.mr * self.mk
     }
     fn ww(&self) -> usize {
-        NT * self.kchunk * MK * MN / 2
+        let elems = NT * self.kchunk * self.mk * self.mn;
+        match self.weight_bits {
+            4 => elems / 2,
+            8 => elems,
+            bits => panic!("unsupported NpuGemmMp weight bits: {bits}"),
+        }
     }
     fn cw(&self) -> usize {
-        self.mt * NT * MR * MN
+        self.mt * NT * self.mr * self.mn
     }
 
     /// Load an M-parallel xclbin built with `r6_gen_mp.py` (COLS cores, ROUNDS=1) for
@@ -67,10 +80,47 @@ impl NpuGemmMp {
         kchunk: usize,
         nb: usize,
     ) -> Result<Self, XdnaError> {
+        Self::load_with_tile(xclbin, insts, cols, mt, kchunk, nb, 4, MR, MK, MN)
+    }
+
+    /// Load an M-parallel xclbin with an explicit weight width. `weight_bits=4` matches
+    /// the original W4A8 R6 kernel; `weight_bits=8` matches the W8A8 tensor-stream kernel.
+    pub fn load_with_weight_bits(
+        xclbin: &[u8],
+        insts: &[u8],
+        cols: usize,
+        mt: usize,
+        kchunk: usize,
+        nb: usize,
+        weight_bits: usize,
+    ) -> Result<Self, XdnaError> {
+        Self::load_with_tile(xclbin, insts, cols, mt, kchunk, nb, weight_bits, MR, MK, MN)
+    }
+
+    fn load_with_tile(
+        xclbin: &[u8],
+        insts: &[u8],
+        cols: usize,
+        mt: usize,
+        kchunk: usize,
+        nb: usize,
+        weight_bits: usize,
+        mr: usize,
+        mk: usize,
+        mn: usize,
+    ) -> Result<Self, XdnaError> {
+        assert!(
+            weight_bits == 4 || weight_bits == 8,
+            "NpuGemmMp weight_bits must be 4 or 8"
+        );
         let kernel = NpuKernel::load(xclbin, insts)?;
-        let aw = mt * kchunk * MR * MK;
-        let ww = NT * kchunk * MK * MN / 2;
-        let cw = mt * NT * MR * MN;
+        let aw = mt * kchunk * mr * mk;
+        let ww = match weight_bits {
+            4 => NT * kchunk * mk * mn / 2,
+            8 => NT * kchunk * mk * mn,
+            _ => unreachable!(),
+        };
+        let cw = mt * NT * mr * mn;
         let a_buf = kernel.alloc_arg(cols * aw)?;
         let w_buf = kernel.alloc_arg(nb * ww)?;
         let c_buf = kernel.alloc_arg(cols * nb * cw * 4)?;
@@ -80,6 +130,10 @@ impl NpuGemmMp {
             mt,
             kchunk,
             nb,
+            mr,
+            mk,
+            mn,
+            weight_bits,
             a_buf,
             w_buf,
             c_buf,
@@ -89,7 +143,8 @@ impl NpuGemmMp {
 
     /// Load from a standard `r6_cache.sh` cache dir, parsing (COLS, MT, KCHUNK, NB) from its
     /// name (`..._{MT}x{NT}x{KCHUNK}_c{COLS}_nb{NB}`) so the config can't silently mismatch
-    /// the xclbin. Rejects whole-GEMM `_r{ROUNDS}` builds (different layout) and any NT≠4.
+    /// the xclbin. A `_w8` token selects the W8A8 variant; otherwise W4A8 is assumed.
+    /// Rejects whole-GEMM `_r{ROUNDS}` builds (different layout) and any NT≠4.
     pub fn load_cached(dir: &str) -> Result<Self, XdnaError> {
         let xclbin = std::fs::read(format!("{dir}/final.xclbin")).map_err(XdnaError::Open)?;
         let insts = std::fs::read(format!("{dir}/insts.bin")).map_err(XdnaError::Open)?;
@@ -120,31 +175,101 @@ impl NpuGemmMp {
         if d.len() != 3 || d[1] != NT {
             return Err(bad());
         }
-        Self::load(&xclbin, &insts, cols, d[0], d[2], nb)
+        let weight_bits = if toks.contains(&"w8") { 8 } else { 4 };
+        let (mr, mk, mn) = if toks.contains(&"m8k8") {
+            (8, 8, 16)
+        } else {
+            (MR, MK, MN)
+        };
+        Self::load_with_tile(
+            &xclbin,
+            &insts,
+            cols,
+            d[0],
+            d[2],
+            nb,
+            weight_bits,
+            mr,
+            mk,
+            mn,
+        )
     }
 
-    /// Pack a full `K×N` int4 weight matrix (`-8..=7`, one value per byte, row-major) into
-    /// the broadcast slab layout — the slow bit-packing that must NOT happen per inference
-    /// (weights are static). Returns `NB·ww` bytes for [`Self::load_weights`].
-    pub fn prepack_weights(&self, k: usize, n: usize, w_int4: &[i8]) -> Vec<u8> {
+    /// Pack a full `K×N` weight matrix into the broadcast slab layout. For W4 xclbins,
+    /// values must fit `-8..=7` and are packed as two signed nibbles per byte. For W8
+    /// xclbins, values are copied as signed int8. This slow packing is an offline/load-time
+    /// step; weights are static once loaded.
+    pub fn prepack_weights(&self, k: usize, n: usize, weights: &[i8]) -> Vec<u8> {
         assert_eq!(k, self.k(), "K");
         assert_eq!(n, self.n(), "N");
+        assert_eq!(weights.len(), k * n, "weight element count");
         let (kc, nb, ww) = (self.kchunk, self.nb, self.ww());
         let mut out = vec![0u8; nb * ww];
-        for j in 0..nb {
-            for nt in 0..NT {
-                for ki in 0..kc {
-                    for kk in 0..MK {
-                        for nn in 0..MN {
-                            let kg = ki * MK + kk;
-                            let ng = j * NT * MN + nt * MN + nn;
-                            let idx = (nt * kc + ki) * (MK * MN) + kk * MN + nn;
-                            let u = (w_int4[kg * n + ng] & 0xf) as u8;
-                            out[j * ww + idx / 2] |= if idx % 2 == 0 { u } else { u << 4 };
+        match self.weight_bits {
+            4 => {
+                assert_eq!((self.mr, self.mk, self.mn), (MR, MK, MN));
+                for j in 0..nb {
+                    for nt in 0..NT {
+                        for ki in 0..kc {
+                            for kk in 0..self.mk {
+                                for nn in 0..self.mn {
+                                    let kg = ki * self.mk + kk;
+                                    let ng = j * NT * self.mn + nt * self.mn + nn;
+                                    let idx =
+                                        (nt * kc + ki) * (self.mk * self.mn) + kk * self.mn + nn;
+                                    let w = weights[kg * n + ng];
+                                    assert!((-8..=7).contains(&w), "W4 value {w} outside -8..=7");
+                                    let u = (w & 0xf) as u8;
+                                    out[j * ww + idx / 2] |= if idx % 2 == 0 { u } else { u << 4 };
+                                }
+                            }
                         }
                     }
                 }
             }
+            8 => {
+                for j in 0..nb {
+                    for nt in 0..NT {
+                        for ki in 0..kc {
+                            if self.mk == 16 {
+                                for k_half in 0..2 {
+                                    for n_half in 0..2 {
+                                        for kk in 0..8 {
+                                            for nn in 0..8 {
+                                                let kg = ki * self.mk + k_half * 8 + kk;
+                                                let ng = j * NT * self.mn
+                                                    + nt * self.mn
+                                                    + n_half * 8
+                                                    + nn;
+                                                let idx =
+                                                    ((nt * kc + ki) * 4 + k_half * 2 + n_half) * 64
+                                                        + kk * 8
+                                                        + nn;
+                                                out[j * ww + idx] = weights[kg * n + ng] as u8;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                assert_eq!((self.mr, self.mk, self.mn), (8, 8, 16));
+                                for n_half in 0..2 {
+                                    for kk in 0..8 {
+                                        for nn in 0..8 {
+                                            let kg = ki * self.mk + kk;
+                                            let ng =
+                                                j * NT * self.mn + nt * self.mn + n_half * 8 + nn;
+                                            let idx =
+                                                ((nt * kc + ki) * 2 + n_half) * 64 + kk * 8 + nn;
+                                            out[j * ww + idx] = weights[kg * n + ng] as u8;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            bits => panic!("unsupported NpuGemmMp weight bits: {bits}"),
         }
         out
     }
@@ -156,7 +281,7 @@ impl NpuGemmMp {
         self.w_loaded = true;
     }
 
-    /// Full GEMM `C[M,N] = A[M,K] · W[K,N]` (W4A8), tiling M over blocking dispatches. `a`
+    /// Full GEMM `C[M,N] = A[M,K] · W[K,N]` (W4A8/W8A8), tiling M over blocking dispatches. `a`
     /// row-major `M×K` int8, `c` row-major `M×N` int32. Requires `load_weights` first,
     /// `K == k()`, `N == n()`, and `M % rows_per_dispatch() == 0`.
     pub fn run(
@@ -175,23 +300,54 @@ impl NpuGemmMp {
         let (cols, mt, aw) = (self.cols, self.mt, self.aw());
         for d in 0..(m / rows_per) {
             let row0 = d * rows_per;
-            // COLS row-major M-blocks -> a_buf (the kernel's A tensor stream tiles in-core).
-            {
-                let s = self.a_buf.as_mut_slice();
+            self.copy_a_tile(row0, k, a, cols, mt, aw);
+            self.kernel
+                .dispatch(&[&self.a_buf, &self.w_buf, &self.c_buf])?;
+            self.read_c_tile(row0, n, c); // de-block c_buf -> rows [row0,+) of row-major c
+        }
+        Ok(())
+    }
+
+    fn copy_a_tile(&mut self, row0: usize, k: usize, a: &[i8], cols: usize, mt: usize, aw: usize) {
+        let s = self.a_buf.as_mut_slice();
+        match self.weight_bits {
+            4 => {
+                // COLS row-major M-blocks -> a_buf (the W4 kernel's A tensor stream tiles in-core).
                 for ci in 0..cols {
-                    for lr in 0..mt * MR {
-                        let src = (row0 + ci * mt * MR + lr) * k;
+                    for lr in 0..mt * self.mr {
+                        let src = (row0 + ci * mt * self.mr + lr) * k;
                         for kk in 0..k {
                             s[ci * aw + lr * k + kk] = a[src + kk] as u8;
                         }
                     }
                 }
             }
-            self.kernel
-                .dispatch(&[&self.a_buf, &self.w_buf, &self.c_buf])?;
-            self.read_c_tile(row0, n, c); // de-block c_buf -> rows [row0,+) of row-major c
+            8 => {
+                // Dense AIE2P W8 stores each A tile as contiguous 8-wide K halves.
+                for ci in 0..cols {
+                    for mi in 0..mt {
+                        for ki in 0..self.kchunk {
+                            let k_halves = self.mk / 8;
+                            for half in 0..k_halves {
+                                for r in 0..self.mr {
+                                    let src_row = row0 + ci * mt * self.mr + mi * self.mr + r;
+                                    for kk in 0..8 {
+                                        let src = src_row * k + ki * self.mk + half * 8 + kk;
+                                        let dst = ci * aw
+                                            + (mi * self.kchunk + ki) * self.mr * self.mk
+                                            + half * self.mr * 8
+                                            + r * 8
+                                            + kk;
+                                        s[dst] = a[src] as u8;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            bits => panic!("unsupported NpuGemmMp weight bits: {bits}"),
         }
-        Ok(())
     }
 
     // De-block the current c_buf (COLS*NB blocks, each (MT·MR)×(NT·MN) row-major) into rows
@@ -205,10 +361,10 @@ impl NpuGemmMp {
         };
         for ci in 0..cols {
             for j in 0..nb {
-                for lr in 0..mt * MR {
-                    let base = (ci * nb + j) * cw + lr * (NT * MN);
-                    let dst = (row0 + ci * mt * MR + lr) * n + j * NT * MN;
-                    c[dst..dst + NT * MN].copy_from_slice(&out[base..base + NT * MN]);
+                for lr in 0..mt * self.mr {
+                    let base = (ci * nb + j) * cw + lr * (NT * self.mn);
+                    let dst = (row0 + ci * mt * self.mr + lr) * n + j * NT * self.mn;
+                    c[dst..dst + NT * self.mn].copy_from_slice(&out[base..base + NT * self.mn]);
                 }
             }
         }
@@ -253,17 +409,7 @@ impl NpuGemmMp {
         let rows_per = self.rows_per_dispatch();
         assert_eq!(a.len(), rows_per * k, "A must be exactly one M-block");
         let (cols, mt, aw) = (self.cols, self.mt, self.aw());
-        {
-            let s = self.a_buf.as_mut_slice();
-            for ci in 0..cols {
-                for lr in 0..mt * MR {
-                    let src = (ci * mt * MR + lr) * k;
-                    for kk in 0..k {
-                        s[ci * aw + lr * k + kk] = a[src + kk] as u8;
-                    }
-                }
-            }
-        }
+        self.copy_a_tile(0, k, a, cols, mt, aw);
         self.kernel
             .dispatch(&[&self.a_buf, &self.w_buf, &self.c_buf])?;
         Ok(()) // C is now in the shared dma-buf; no host copy

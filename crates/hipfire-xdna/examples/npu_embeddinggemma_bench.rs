@@ -154,8 +154,14 @@ fn main() {
             MAC_PER_TOKEN / 1e9
         );
         println!("  throughput      = {tok_s:.0} tok/s");
-        println!("  efficiency (pkg)= {:.0} tok/joule  (active package power)", tok_s / pkg_w);
-        println!("  efficiency (dyn)= {:.0} tok/joule  (idle-subtracted NPU power)", tok_s / dyn_w);
+        println!(
+            "  efficiency (pkg)= {:.0} tok/joule  (active package power)",
+            tok_s / pkg_w
+        );
+        println!(
+            "  efficiency (dyn)= {:.0} tok/joule  (idle-subtracted NPU power)",
+            tok_s / dyn_w
+        );
     }
     #[cfg(not(target_os = "linux"))]
     eprintln!("amdxdna is Linux-only");
