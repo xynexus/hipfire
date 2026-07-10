@@ -174,6 +174,12 @@ pub mod gemm_mp;
 #[cfg(target_os = "linux")]
 pub use gemm_mp::{NpuGemmMp, NpuGemmResidentWeights};
 
+// One AIE/XRT dispatch over every K=256 group in a complete projection.
+#[cfg(target_os = "linux")]
+pub mod gemm_fullk;
+#[cfg(target_os = "linux")]
+pub use gemm_fullk::{NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK};
+
 #[cfg(target_os = "linux")]
 pub mod opus;
 #[cfg(target_os = "linux")]
