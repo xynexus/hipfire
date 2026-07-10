@@ -146,20 +146,25 @@ fn dynamic_threshold_sample(
 
     let ratio = normalize_dynamic_thresholding_ratio(Some(ratio));
     let sample_max_value = normalize_dynamic_thresholding_sample_max(Some(sample_max_value));
-    let mut sorted_abs = Vec::with_capacity(values_per_batch);
+    let mut abs_values = Vec::with_capacity(values_per_batch);
     for chunk in data.chunks_mut(values_per_batch) {
-        sorted_abs.clear();
-        sorted_abs.extend(chunk.iter().map(|value| value.abs()));
-        sorted_abs.sort_by(|left, right| left.total_cmp(right));
+        abs_values.clear();
+        abs_values.extend(chunk.iter().map(|value| value.abs()));
 
-        let threshold = if sorted_abs.len() == 1 {
-            sorted_abs[0]
+        let threshold = if abs_values.len() == 1 {
+            abs_values[0]
         } else {
-            let rank = ratio * (sorted_abs.len() - 1) as f32;
+            let rank = ratio * (abs_values.len() - 1) as f32;
             let lower = rank.floor() as usize;
             let upper = rank.ceil() as usize;
             let frac = rank - lower as f32;
-            sorted_abs[lower] + (sorted_abs[upper] - sorted_abs[lower]) * frac
+            let lower_value = select_order_stat(&mut abs_values, lower);
+            let upper_value = if upper == lower {
+                lower_value
+            } else {
+                select_order_stat(&mut abs_values, upper)
+            };
+            lower_value + (upper_value - lower_value) * frac
         };
         let threshold = threshold.clamp(1.0, sample_max_value);
         for value in chunk {
@@ -168,6 +173,11 @@ fn dynamic_threshold_sample(
     }
 
     Ok(())
+}
+
+fn select_order_stat(values: &mut [f32], rank: usize) -> f32 {
+    let (_, value, _) = values.select_nth_unstable_by(rank, |left, right| left.total_cmp(right));
+    *value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

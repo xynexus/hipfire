@@ -538,6 +538,40 @@ fn dpm_solver_dynamic_thresholding_clips_predicted_original_sample() {
 }
 
 #[test]
+fn dpm_solver_dynamic_thresholding_interpolates_quantile_without_sorting() {
+    let schedule = DiffusionSchedule {
+        timesteps: vec![0.0],
+        sigmas: vec![0.0, 0.0],
+        prediction_type: SchedulerPredictionType::Sample,
+        input_scaling: SchedulerInputScaling::None,
+        solver: SchedulerSolver::DpmSolverMultistep {
+            algorithm_type: DpmSolverAlgorithm::DpmSolverPlusPlus,
+            solver_order: 2,
+            solver_type: DpmSolverType::Midpoint,
+            lower_order_final: true,
+            thresholding: true,
+            dynamic_thresholding_ratio: 0.5,
+            sample_max_value: 4.0,
+        },
+        train_timesteps: vec![0],
+        alpha_t: vec![1.0],
+        sigma_t: vec![0.0],
+        lambda_t: vec![0.0],
+    };
+    let sample = CpuTensor {
+        shape: vec![1, 1, 1, 4],
+        data: vec![0.0; 4],
+    };
+    let model_output = [-0.5, 0.5, 2.0, -4.0];
+
+    let output = schedule
+        .dpm_convert_model_output(&model_output, 0, &sample)
+        .unwrap();
+
+    assert_eq!(output, vec![-0.4, 0.4, 1.0, -1.0]);
+}
+
+#[test]
 fn dpm_solver_third_order_update_matches_diffusers_formula() {
     let lambda = |alpha: f32, sigma: f32| alpha.ln() - sigma.ln();
     let schedule = DiffusionSchedule {
