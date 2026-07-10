@@ -460,3 +460,26 @@ projection, its AWQ/FWHT activation preprocessing, arbitrary mixed overlays,
 attention, norms/residuals, pooling, Dense heads, end-to-end throughput, and
 package tokens/J remain open. The 10k/15k input-token targets are therefore not
 yet admitted.
+
+### Canonical down-activation checkpoint
+
+R19 adds an all-32-core AIE2P baseline for the exact activation contract between
+GeGLU and the padded `K=1280` Opus down projection: AWQ division, seed-42
+pre-signs, five Hadamard-256 transforms, `1/16` normalization with seed-1042
+post-signs, five symmetric int8 scales, and divide-then-`roundf` quantization.
+Quantized values and scales share a 1312-byte row record because separate
+output FIFOs exceed the memory tile input-DMA channel count.
+
+The AIE compiler produced infinities for a naive indexed AWQ division loop and
+silently truncated scalar float-to-int8 conversions despite the nearest-round
+mode. Fixed-width pointer helpers repair division; an explicit signed half bias
+plus toward-zero saturated conversion exactly reproduces `roundf`.
+
+Three independent M256, 100-iteration hardware runs agree with the CPU oracle
+for all 327,680 int8 values, with maximum scale error `7e-9`. Dispatches were
+6.9405, 6.9061, and 6.8772 ms (median 6.9061 ms), or about 37k rows/s for this
+stage alone. This is correctness evidence for standalone preprocessing, not a
+resident GeGLU-to-down chain: R18 output still needs an in-array layout bridge,
+the scalar FWHT/quant path must be vectorized or fused, and the down projection
+has not yet consumed R19 output. Full-FFN, full-model, 10k/15k input-token, and
+package tokens/J claims remain open.
