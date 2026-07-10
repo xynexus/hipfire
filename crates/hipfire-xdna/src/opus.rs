@@ -14,8 +14,10 @@ use hipfire_primitives::{
 };
 
 use crate::{
-    NpuGemmMp, NpuGemmResidentWeights, NpuSparse3Mp, NpuSparse3ResidentWeights, XdnaError,
+    NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK, NpuGemmMp, NpuGemmResidentWeights,
+    NpuSparse3Mp, NpuSparse3ResidentWeights, XdnaError,
 };
+use std::collections::HashMap;
 
 const GROUP: usize = 256;
 
@@ -39,12 +41,12 @@ impl OpusMatrixEncoding {
         k: usize,
         n: usize,
     ) -> Result<Self, XdnaError> {
-        if k == 0 || n == 0 || k % GROUP != 0 {
+        if k == 0 || n == 0 {
             return Err(invalid(format!(
-                "Opus matrix wants non-zero K%256=0 and N>0, got K={k} N={n}"
+                "Opus matrix wants non-zero K and N, got K={k} N={n}"
             )));
         }
-        let blocks = n * (k / GROUP);
+        let blocks = n * k.div_ceil(GROUP);
         if data_len % blocks != 0 {
             return Err(invalid(format!(
                 "{data_len} payload bytes not divisible by {blocks} Opus blocks"
@@ -79,7 +81,7 @@ enum ResidentBaseWeights {
 }
 
 struct OpusGroup {
-    resident_base: ResidentBaseWeights,
+    resident_base: Option<ResidentBaseWeights>,
     resident_sparse: Vec<NpuSparse3ResidentWeights>,
     scales: Vec<f32>,
     base: Vec<i8>,
@@ -100,6 +102,7 @@ pub struct OpusPackedMatrix {
     awq_scale: Option<Vec<f32>>,
     k: usize,
     n: usize,
+    fullk_weights: Option<NpuFullKResidentWeights>,
 }
 
 impl OpusPackedMatrix {
@@ -118,11 +121,12 @@ impl OpusPackedMatrix {
 
 /// Resident W4, W8, and sparse-overlay kernels shared by Opus matrices with one `N`.
 pub struct NpuOpusExecutor {
-    w4: NpuGemmMp,
-    w8: NpuGemmMp,
-    residual_sparse3: NpuSparse3Mp,
+    w4: Option<NpuGemmMp>,
+    w8: Option<NpuGemmMp>,
+    residual_sparse3: Option<NpuSparse3Mp>,
     n: usize,
     rows_per_dispatch: usize,
+    fullk: HashMap<(NpuFullKMode, usize), NpuGemmFullK>,
 }
 
 impl NpuOpusExecutor {
@@ -167,12 +171,48 @@ impl NpuOpusExecutor {
             residual_sparse3.rows_per_dispatch(),
         );
         Ok(Self {
-            w4,
-            w8,
-            residual_sparse3,
+            w4: Some(w4),
+            w8: Some(w8),
+            residual_sparse3: Some(residual_sparse3),
             n,
             rows_per_dispatch,
+            fullk: HashMap::new(),
         })
+    }
+
+    /// Load only complete-projection caches. This avoids allocating legacy
+    /// per-group W4/W8/sparse hardware contexts in a resident full-K model.
+    pub fn load_fullk_cached(caches: &[(&str, usize)], n: usize) -> Result<Self, XdnaError> {
+        if n == 0 || caches.is_empty() {
+            return Err(invalid("full-K executor wants non-zero N and caches"));
+        }
+        let mut executor = Self {
+            w4: None,
+            w8: None,
+            residual_sparse3: None,
+            n,
+            rows_per_dispatch: 0,
+            fullk: HashMap::new(),
+        };
+        for &(cache, cols) in caches {
+            executor.enable_fullk_cache(cache, cols)?;
+        }
+        Ok(executor)
+    }
+
+    /// Add a one-dispatch projection cache. Multiple K widths and formats may
+    /// coexist for this executor's output width.
+    pub fn enable_fullk_cache(&mut self, cache: &str, cols: usize) -> Result<(), XdnaError> {
+        let fullk = NpuGemmFullK::load_cached(cache, cols)?;
+        if fullk.n() != self.n {
+            return Err(invalid(format!(
+                "full-K cache N={} does not match executor N={}",
+                fullk.n(),
+                self.n
+            )));
+        }
+        self.fullk.insert((fullk.mode(), fullk.k()), fullk);
+        Ok(())
     }
 
     /// Decode, prepack, and upload a row-major `[N,K]` Opus matrix.
@@ -184,9 +224,9 @@ impl NpuOpusExecutor {
         payload: &[u8],
         awq_scale: Option<Vec<f32>>,
     ) -> Result<OpusPackedMatrix, XdnaError> {
-        if k == 0 || n == 0 || k % GROUP != 0 || n != self.n {
+        if k == 0 || n == 0 || n != self.n {
             return Err(invalid(format!(
-                "want non-zero K%256=0 and executor N={}, got K={k} N={n}",
+                "want non-zero K and executor N={}, got K={k} N={n}",
                 self.n
             )));
         }
@@ -195,21 +235,67 @@ impl NpuOpusExecutor {
         }
         let encoding = OpusMatrixEncoding::classify(quant_type, payload.len(), k, n)?;
         let decoded = decode_opus_groups(encoding, payload, k, n)?;
+        let mode = fullk_mode(encoding);
+        let padded_k = decoded.len() * GROUP;
+        let fullk_weights = if let Some(fullk) = self.fullk.get(&(mode, padded_k)) {
+            let base: Vec<&[i8]> = decoded.iter().map(|group| group.base.as_slice()).collect();
+            let residual: Vec<&[i8]> = if mode == NpuFullKMode::Mixed {
+                decoded
+                    .iter()
+                    .map(|group| group.residual.as_slice())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let packed = fullk.prepack_weights(&base, &residual)?;
+            Some(fullk.upload_resident_weights(&packed)?)
+        } else {
+            None
+        };
+        let fullk_only = self.w4.is_none() && self.w8.is_none() && self.residual_sparse3.is_none();
+        if fullk_only && fullk_weights.is_none() {
+            return Err(invalid(format!(
+                "no {:?} full-K cache for padded K={padded_k} N={n}",
+                mode
+            )));
+        }
         let mut groups = Vec::with_capacity(decoded.len());
         for decoded in decoded {
-            let resident_base = match encoding {
-                OpusMatrixEncoding::W4 | OpusMatrixEncoding::Mixed { .. } => {
-                    let packed = self.w4.prepack_weights(GROUP, n, &decoded.base);
-                    ResidentBaseWeights::W4(self.w4.upload_resident_weights(&packed)?)
-                }
-                OpusMatrixEncoding::W8 => {
-                    let packed = self.w8.prepack_weights(GROUP, n, &decoded.base);
-                    ResidentBaseWeights::W8(self.w8.upload_resident_weights(&packed)?)
-                }
+            let resident_base = if fullk_weights.is_some() {
+                None
+            } else {
+                Some(match encoding {
+                    OpusMatrixEncoding::W4 | OpusMatrixEncoding::Mixed { .. } => {
+                        let w4 = self
+                            .w4
+                            .as_ref()
+                            .ok_or_else(|| invalid("missing W4 cache"))?;
+                        let packed = w4.prepack_weights(GROUP, n, &decoded.base);
+                        ResidentBaseWeights::W4(w4.upload_resident_weights(&packed)?)
+                    }
+                    OpusMatrixEncoding::W8 => {
+                        let w8 = self
+                            .w8
+                            .as_ref()
+                            .ok_or_else(|| invalid("missing W8 cache"))?;
+                        let packed = w8.prepack_weights(GROUP, n, &decoded.base);
+                        ResidentBaseWeights::W8(w8.upload_resident_weights(&packed)?)
+                    }
+                })
             };
-            let mut resident_sparse = Vec::with_capacity(decoded.sparse_residual_chunks.len());
-            for sparse in &decoded.sparse_residual_chunks {
-                resident_sparse.push(self.residual_sparse3.upload_resident_weights(sparse)?);
+            let mut resident_sparse = if fullk_weights.is_some() {
+                Vec::new()
+            } else {
+                Vec::with_capacity(decoded.sparse_residual_chunks.len())
+            };
+            if !decoded.sparse_residual_chunks.is_empty() && fullk_weights.is_none() {
+                let sparse_kernel = self
+                    .residual_sparse3
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing sparse residual cache"))?;
+                for sparse in &decoded.sparse_residual_chunks {
+                    resident_sparse.push(sparse_kernel.upload_resident_weights(sparse)?);
+                }
             }
             groups.push(OpusGroup {
                 resident_base,
@@ -225,6 +311,7 @@ impl NpuOpusExecutor {
             awq_scale,
             k,
             n,
+            fullk_weights,
         })
     }
 
@@ -238,13 +325,33 @@ impl NpuOpusExecutor {
 
     fn rows_per_dispatch_for(&self, encoding: OpusMatrixEncoding) -> usize {
         match encoding {
-            OpusMatrixEncoding::W4 => self.w4.rows_per_dispatch(),
+            OpusMatrixEncoding::W4 => self
+                .w4
+                .as_ref()
+                .map_or(self.rows_per_dispatch, NpuGemmMp::rows_per_dispatch),
             OpusMatrixEncoding::Mixed { .. } => lcm(
-                self.w4.rows_per_dispatch(),
-                self.residual_sparse3.rows_per_dispatch(),
+                self.w4.as_ref().map_or(1, NpuGemmMp::rows_per_dispatch),
+                self.residual_sparse3
+                    .as_ref()
+                    .map_or(1, NpuSparse3Mp::rows_per_dispatch),
             ),
-            OpusMatrixEncoding::W8 => self.w8.rows_per_dispatch(),
+            OpusMatrixEncoding::W8 => self
+                .w8
+                .as_ref()
+                .map_or(self.rows_per_dispatch, NpuGemmMp::rows_per_dispatch),
         }
+    }
+
+    fn rows_per_dispatch_for_matrix(&self, matrix: &OpusPackedMatrix) -> usize {
+        if matrix.fullk_weights.is_some() {
+            if let Some(fullk) = self
+                .fullk
+                .get(&(fullk_mode(matrix.encoding), matrix.groups.len() * GROUP))
+            {
+                return fullk.rows();
+            }
+        }
+        self.rows_per_dispatch_for(matrix.encoding)
     }
 
     /// Run `C[M,N] = X[M,K]·Wᵀ` with activation AWQ, FWHT-256, and int8 quantization.
@@ -267,9 +374,46 @@ impl NpuOpusExecutor {
             matrix.k,
             x,
             matrix.awq_scale.as_deref(),
-            self.rows_per_dispatch_for(matrix.encoding),
+            self.rows_per_dispatch_for_matrix(matrix),
         );
         c.fill(0.0);
+        let padded_k = matrix.groups.len() * GROUP;
+        let fullk_key = (fullk_mode(matrix.encoding), padded_k);
+        if let (Some(fullk), Some(weights)) =
+            (self.fullk.get_mut(&fullk_key), &matrix.fullk_weights)
+        {
+            let chunk_rows = fullk.rows();
+            if prepared.padded_rows % chunk_rows == 0 {
+                let mut activations = vec![0i8; chunk_rows * padded_k];
+                let mut partials = vec![0i32; matrix.groups.len() * chunk_rows * matrix.n];
+                for row0 in (0..prepared.padded_rows).step_by(chunk_rows) {
+                    activations.fill(0);
+                    for row in 0..chunk_rows {
+                        let source_row = row0 + row;
+                        for (group_idx, group) in prepared.groups.iter().enumerate() {
+                            let source = source_row * GROUP;
+                            let destination = row * padded_k + group_idx * GROUP;
+                            activations[destination..destination + GROUP]
+                                .copy_from_slice(&group[source..source + GROUP]);
+                        }
+                    }
+                    fullk.run_resident(weights, &activations, &mut partials)?;
+                    let valid_rows = (m - row0.min(m)).min(chunk_rows);
+                    for (group_idx, group) in matrix.groups.iter().enumerate() {
+                        for row in 0..valid_rows {
+                            for col in 0..matrix.n {
+                                let partial =
+                                    partials[(group_idx * chunk_rows + row) * matrix.n + col];
+                                c[(row0 + row) * matrix.n + col] += partial as f32
+                                    * prepared.scales[group_idx][row0 + row]
+                                    * group.scales[col];
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
         let output_elements = prepared.padded_rows * matrix.n;
         let mut base_outputs = vec![vec![0i32; output_elements]; matrix.groups.len()];
         let activation_groups: Vec<&[i8]> = prepared.groups.iter().map(Vec::as_slice).collect();
@@ -280,37 +424,55 @@ impl NpuOpusExecutor {
                 let weights: Vec<&NpuGemmResidentWeights> = matrix
                     .groups
                     .iter()
-                    .map(|group| match &group.resident_base {
-                        ResidentBaseWeights::W4(weights) => weights,
-                        ResidentBaseWeights::W8(_) => unreachable!("W4 matrix has W8 weights"),
+                    .map(|group| {
+                        match group
+                            .resident_base
+                            .as_ref()
+                            .expect("fallback W4 matrix has resident weights")
+                        {
+                            ResidentBaseWeights::W4(weights) => weights,
+                            ResidentBaseWeights::W8(_) => unreachable!("W4 matrix has W8 weights"),
+                        }
                     })
                     .collect();
-                self.w4.run_resident_batch(
-                    &weights,
-                    prepared.padded_rows,
-                    GROUP,
-                    matrix.n,
-                    &activation_groups,
-                    &mut output_groups,
-                )?;
+                self.w4
+                    .as_mut()
+                    .ok_or_else(|| invalid("missing W4 fallback cache"))?
+                    .run_resident_batch(
+                        &weights,
+                        prepared.padded_rows,
+                        GROUP,
+                        matrix.n,
+                        &activation_groups,
+                        &mut output_groups,
+                    )?;
             }
             OpusMatrixEncoding::W8 => {
                 let weights: Vec<&NpuGemmResidentWeights> = matrix
                     .groups
                     .iter()
-                    .map(|group| match &group.resident_base {
-                        ResidentBaseWeights::W8(weights) => weights,
-                        ResidentBaseWeights::W4(_) => unreachable!("W8 matrix has W4 weights"),
+                    .map(|group| {
+                        match group
+                            .resident_base
+                            .as_ref()
+                            .expect("fallback W8 matrix has resident weights")
+                        {
+                            ResidentBaseWeights::W8(weights) => weights,
+                            ResidentBaseWeights::W4(_) => unreachable!("W8 matrix has W4 weights"),
+                        }
                     })
                     .collect();
-                self.w8.run_resident_batch(
-                    &weights,
-                    prepared.padded_rows,
-                    GROUP,
-                    matrix.n,
-                    &activation_groups,
-                    &mut output_groups,
-                )?;
+                self.w8
+                    .as_mut()
+                    .ok_or_else(|| invalid("missing W8 fallback cache"))?
+                    .run_resident_batch(
+                        &weights,
+                        prepared.padded_rows,
+                        GROUP,
+                        matrix.n,
+                        &activation_groups,
+                        &mut output_groups,
+                    )?;
             }
         }
         drop(output_groups);
@@ -326,14 +488,17 @@ impl NpuOpusExecutor {
                 c,
             );
             for sparse_weights in &group.resident_sparse {
-                self.residual_sparse3.run_resident(
-                    sparse_weights,
-                    prepared.padded_rows,
-                    GROUP,
-                    matrix.n,
-                    &prepared.groups[group_idx],
-                    &mut residual,
-                )?;
+                self.residual_sparse3
+                    .as_mut()
+                    .ok_or_else(|| invalid("missing sparse fallback cache"))?
+                    .run_resident(
+                        sparse_weights,
+                        prepared.padded_rows,
+                        GROUP,
+                        matrix.n,
+                        &prepared.groups[group_idx],
+                        &mut residual,
+                    )?;
                 accumulate_scaled(
                     m,
                     matrix.n,
@@ -390,6 +555,21 @@ pub struct NpuOpusGemmMp {
 }
 
 impl NpuOpusGemmMp {
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fullk_only(
+        fullk_cache: &str,
+        fullk_cols: usize,
+        quant_type: u8,
+        k: usize,
+        n: usize,
+        payload: &[u8],
+        awq_scale: Option<Vec<f32>>,
+    ) -> Result<Self, XdnaError> {
+        let executor = NpuOpusExecutor::load_fullk_cached(&[(fullk_cache, fullk_cols)], n)?;
+        let matrix = executor.pack_matrix(quant_type, k, n, payload, awq_scale)?;
+        Ok(Self { executor, matrix })
+    }
+
     pub fn load_cached(
         w4_cache: &str,
         w8_cache: &str,
@@ -405,6 +585,25 @@ impl NpuOpusGemmMp {
         Ok(Self { executor, matrix })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_cached_fullk(
+        w4_cache: &str,
+        w8_cache: &str,
+        sparse3_cache: &str,
+        fullk_cache: &str,
+        fullk_cols: usize,
+        quant_type: u8,
+        k: usize,
+        n: usize,
+        payload: &[u8],
+        awq_scale: Option<Vec<f32>>,
+    ) -> Result<Self, XdnaError> {
+        let mut executor = NpuOpusExecutor::load_cached(w4_cache, w8_cache, sparse3_cache, n)?;
+        executor.enable_fullk_cache(fullk_cache, fullk_cols)?;
+        let matrix = executor.pack_matrix(quant_type, k, n, payload, awq_scale)?;
+        Ok(Self { executor, matrix })
+    }
+
     pub fn k(&self) -> usize {
         self.matrix.k()
     }
@@ -414,7 +613,7 @@ impl NpuOpusGemmMp {
     }
 
     pub fn rows_per_dispatch(&self) -> usize {
-        self.executor.rows_per_dispatch_for(self.matrix.encoding())
+        self.executor.rows_per_dispatch_for_matrix(&self.matrix)
     }
 
     pub fn run_f32(&mut self, m: usize, x: &[f32], c: &mut [f32]) -> Result<(), XdnaError> {
@@ -439,7 +638,7 @@ fn decode_opus_groups(
     k: usize,
     n: usize,
 ) -> Result<Vec<DecodedGroup>, XdnaError> {
-    let group_count = k / GROUP;
+    let group_count = k.div_ceil(GROUP);
     let blocks = n * group_count;
     if blocks == 0 || payload.len() % blocks != 0 {
         return Err(invalid(format!(
@@ -529,7 +728,7 @@ fn prepare_activations(
     awq_scale: Option<&[f32]>,
     rows_per_dispatch: usize,
 ) -> PreparedActivations {
-    let group_count = k / GROUP;
+    let group_count = k.div_ceil(GROUP);
     let padded_rows = m.div_ceil(rows_per_dispatch) * rows_per_dispatch;
     let signs1 = gen_fwht_signs(42, GROUP);
     let signs2 = gen_fwht_signs(1042, GROUP);
@@ -540,9 +739,11 @@ fn prepare_activations(
             let mut rotated = [0.0f32; GROUP];
             for inner in 0..GROUP {
                 let column = group_idx * GROUP + inner;
-                rotated[inner] = awq_scale.map_or(x[row * k + column], |scale| {
-                    x[row * k + column] / scale[column]
-                });
+                if column < k {
+                    rotated[inner] = awq_scale.map_or(x[row * k + column], |scale| {
+                        x[row * k + column] / scale[column]
+                    });
+                }
             }
             cpu_fwht_256(&mut rotated, &signs1, &signs2);
             let scale = rotated
@@ -614,6 +815,14 @@ fn invalid(message: impl Into<String>) -> XdnaError {
     XdnaError::InvalidOpus(message.into())
 }
 
+fn fullk_mode(encoding: OpusMatrixEncoding) -> NpuFullKMode {
+    match encoding {
+        OpusMatrixEncoding::W4 => NpuFullKMode::W4,
+        OpusMatrixEncoding::Mixed { .. } => NpuFullKMode::Mixed,
+        OpusMatrixEncoding::W8 => NpuFullKMode::W8,
+    }
+}
+
 fn gcd(mut left: usize, mut right: usize) -> usize {
     while right != 0 {
         (left, right) = (right, left % right);
@@ -651,6 +860,10 @@ mod tests {
         assert!(OpusMatrixEncoding::classify(36, 130, 256, 1).is_err());
         assert!(OpusMatrixEncoding::classify(35, 257, 256, 1).is_err());
         assert!(OpusMatrixEncoding::classify(7, 130, 256, 1).is_err());
+        assert_eq!(
+            OpusMatrixEncoding::classify(34, 5 * 130, 1152, 1).unwrap(),
+            OpusMatrixEncoding::W4
+        );
     }
 
     #[test]
@@ -732,5 +945,14 @@ mod tests {
         assert!(prepared.scales[0][0].is_finite());
         assert!(prepared.groups[0][..256].iter().any(|value| *value != 0));
         assert!(prepared.groups[0][256..].iter().all(|value| *value == 0));
+    }
+
+    #[test]
+    fn activation_preparation_zero_pads_a_tail_k_group_before_rotation() {
+        let x = vec![1.0f32; 1152];
+        let prepared = prepare_activations(1, 1152, &x, None, 1);
+        assert_eq!(prepared.groups.len(), 5);
+        assert_eq!(prepared.groups[4].len(), 256);
+        assert!(prepared.groups[4].iter().any(|value| *value != 0));
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! Usage:
 //! `npu_opus_verify <w4-cache> <w8-cache> <sparse3-cache> <N> \
-//!    [--encoding w4|mixed|w8] [--outliers N] [--awq]`
+//!    [--encoding w4|mixed|w8] [--outliers N] [--awq]
+//!    [--k K --fullk CACHE --fullk-cols N]`
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -16,47 +17,61 @@ fn main() {
     let n: usize = args.next().expect("N").parse().expect("numeric N");
     let options: Vec<String> = args.collect();
     let use_awq = options.iter().any(|arg| arg == "--awq");
+    let option = |name: &str| {
+        options
+            .iter()
+            .position(|arg| arg == name)
+            .and_then(|index| options.get(index + 1))
+    };
     let encoding = options
         .iter()
         .position(|arg| arg == "--encoding")
         .and_then(|index| options.get(index + 1))
         .map(String::as_str)
         .unwrap_or("mixed");
-    let outlier_count = options
-        .iter()
-        .position(|arg| arg == "--outliers")
-        .and_then(|index| options.get(index + 1))
+    let outlier_count = option("--outliers")
         .map(|value| value.parse::<usize>().expect("numeric outlier count"))
         .unwrap_or(3);
     assert!((1..=255).contains(&outlier_count));
-    let k = 256usize;
+    let k = option("--k")
+        .map(|value| value.parse::<usize>().expect("numeric K"))
+        .unwrap_or(256);
+    let fullk_cache = option("--fullk");
+    let fullk_cols = option("--fullk-cols")
+        .map(|value| value.parse::<usize>().expect("numeric full-K columns"))
+        .unwrap_or(8);
     let (quant_type, block_bytes) = match encoding {
         "w4" => (34u8, 130usize),
         "mixed" => (36u8, 130 + 2 * outlier_count),
         "w8" => (35u8, 258usize),
         other => panic!("unknown --encoding {other}; want w4|mixed|w8"),
     };
-    let mut payload = vec![0u8; n * block_bytes];
+    let groups = k.div_ceil(256);
+    let mut payload = vec![0u8; n * groups * block_bytes];
     for col in 0..n {
-        let block = &mut payload[col * block_bytes..(col + 1) * block_bytes];
-        let scale = 0.01 + (col % 11) as f32 * 0.0005;
-        block[..2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
-        if encoding == "w8" {
-            for inner in 0..256 {
-                block[2 + inner] = (((inner * 29 + col) % 241) as i16 - 120) as i8 as u8;
-            }
-        } else {
-            for packed_idx in 0..128 {
-                let low = ((packed_idx + col) % 15) as i8 - 7;
-                let high = ((packed_idx * 3 + col) % 15) as i8 - 7;
-                block[2 + packed_idx] = (low as u8 & 0x0f) | ((high as u8 & 0x0f) << 4);
-            }
-            if encoding == "mixed" {
-                for index in 0..outlier_count {
-                    let position = (index * 47 % 256) as u8;
-                    let replacement = ((index * 29 + col) % 201) as i16 - 100;
-                    block[130 + 2 * index] = position;
-                    block[131 + 2 * index] = replacement as i8 as u8;
+        for group in 0..groups {
+            let block_index = col * groups + group;
+            let block = &mut payload[block_index * block_bytes..(block_index + 1) * block_bytes];
+            let scale = 0.01 + ((col + group * 3) % 11) as f32 * 0.0005;
+            block[..2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+            if encoding == "w8" {
+                for inner in 0..256 {
+                    block[2 + inner] =
+                        (((inner * 29 + col + group * 7) % 241) as i16 - 120) as i8 as u8;
+                }
+            } else {
+                for packed_idx in 0..128 {
+                    let low = ((packed_idx + col + group) % 15) as i8 - 7;
+                    let high = ((packed_idx * 3 + col + group) % 15) as i8 - 7;
+                    block[2 + packed_idx] = (low as u8 & 0x0f) | ((high as u8 & 0x0f) << 4);
+                }
+                if encoding == "mixed" {
+                    for index in 0..outlier_count {
+                        let position = (index * 47 % 256) as u8;
+                        let replacement = ((index * 29 + col + group * 11) % 201) as i16 - 100;
+                        block[130 + 2 * index] = position;
+                        block[131 + 2 * index] = replacement as i8 as u8;
+                    }
                 }
             }
         }
@@ -66,16 +81,28 @@ fn main() {
             .map(|index| 0.75 + (index % 17) as f32 * 0.025)
             .collect::<Vec<_>>()
     });
-    let mut gemm = NpuOpusGemmMp::load_cached(
-        &w4_cache,
-        &w8_cache,
-        &sparse3_cache,
-        quant_type,
-        k,
-        n,
-        &payload,
-        awq_scale,
-    )
+    let mut gemm = if let Some(fullk_cache) = fullk_cache {
+        NpuOpusGemmMp::load_fullk_only(
+            fullk_cache,
+            fullk_cols,
+            quant_type,
+            k,
+            n,
+            &payload,
+            awq_scale,
+        )
+    } else {
+        NpuOpusGemmMp::load_cached(
+            &w4_cache,
+            &w8_cache,
+            &sparse3_cache,
+            quant_type,
+            k,
+            n,
+            &payload,
+            awq_scale,
+        )
+    }
     .expect("load Opus matrix");
     let m = gemm.rows_per_dispatch();
     let x: Vec<f32> = (0..m * k)
@@ -96,8 +123,9 @@ fn main() {
         }
     }
     println!(
-        "opus-{encoding}{} bits={:.4} outliers={} sparse_dispatches={} M={m} K={k} N={n}: mismatches={mismatches} max_abs={max_abs:.6}",
+        "opus-{encoding}{}{} bits={:.4} outliers={} sparse_dispatches={} M={m} K={k} N={n}: mismatches={mismatches} max_abs={max_abs:.6}",
         if use_awq { "+/++" } else { "" },
+        if fullk_cache.is_some() { "-fullk" } else { "" },
         block_bytes as f32 * 8.0 / 256.0,
         if encoding == "mixed" { outlier_count } else { 0 },
         if encoding == "mixed" { outlier_count.div_ceil(3) } else { 0 },

@@ -1,5 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 use hip_bridge::{HipError, HipResult};
 use hipfire_rdna::{Gpu, GpuTensor};
@@ -38,6 +38,26 @@ impl NpuOpusProjector {
     ) -> Result<Self, String> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let requirements = fullk_requirements(hfq, cfg)?;
+        let fullk_paths: BTreeMap<usize, Vec<PathBuf>> = requirements
+            .iter()
+            .map(|(&width, shapes)| {
+                let paths = shapes
+                    .iter()
+                    .map(|(mode, padded_k)| {
+                        cache_root.join(format!(
+                            "embgemma_aie2p_fullk_submit_{mode}_m256_kg{}_n{width}",
+                            padded_k / 256
+                        ))
+                    })
+                    .collect();
+                (width, paths)
+            })
+            .collect();
+        let use_fullk = fullk_paths
+            .values()
+            .flatten()
+            .all(|path| path.join("final.xclbin").is_file() && path.join("insts.bin").is_file());
         let widths = BTreeSet::from([q_dim, kv_dim, cfg.hidden_size, cfg.intermediate_size]);
         let mut executors = HashMap::with_capacity(widths.len());
         for width in widths {
@@ -46,18 +66,29 @@ impl NpuOpusProjector {
                     "embeddinggemma NPU: unsupported output width {width}"
                 ));
             }
-            let blocks = width / 64;
-            let w4 = cache_root.join(format!("embgemma_aie2p_w4_4x4x16_c8_nb{blocks}"));
-            let w8 = cache_root.join(format!("embgemma_aie2p_w8_4x4x32_c8_nb{blocks}_m8k8_w8"));
-            let sparse3 = cache_root.join(format!(
-                "embgemma_aie2p_sparse3_4x4x16_c8_nb{blocks}_sparse3"
-            ));
-            let executor = NpuOpusExecutor::load_cached(
-                &w4.to_string_lossy(),
-                &w8.to_string_lossy(),
-                &sparse3.to_string_lossy(),
-                width,
-            )
+            let executor = if use_fullk {
+                let paths = fullk_paths
+                    .get(&width)
+                    .ok_or_else(|| format!("embeddinggemma NPU: no full-K N={width} shapes"))?;
+                let caches: Vec<(&str, usize)> = paths
+                    .iter()
+                    .map(|path| (path.to_str().expect("UTF-8 cache path"), 8))
+                    .collect();
+                NpuOpusExecutor::load_fullk_cached(&caches, width)
+            } else {
+                let blocks = width / 64;
+                let w4 = cache_root.join(format!("embgemma_aie2p_w4_4x4x16_c8_nb{blocks}"));
+                let w8 = cache_root.join(format!("embgemma_aie2p_w8_4x4x32_c8_nb{blocks}_m8k8_w8"));
+                let sparse3 = cache_root.join(format!(
+                    "embgemma_aie2p_sparse3_4x4x16_c8_nb{blocks}_sparse3"
+                ));
+                NpuOpusExecutor::load_cached(
+                    &w4.to_string_lossy(),
+                    &w8.to_string_lossy(),
+                    &sparse3.to_string_lossy(),
+                    width,
+                )
+            }
             .map_err(|error| format!("embeddinggemma NPU: load N={width} caches: {error}"))?;
             executors.insert(width, executor);
         }
@@ -112,6 +143,60 @@ impl NpuOpusProjector {
 
     pub fn executor_count(&self) -> usize {
         self.executors.len()
+    }
+}
+
+fn fullk_requirements(
+    hfq: &HfqFile,
+    cfg: &EmbeddingGemmaConfig,
+) -> Result<BTreeMap<usize, BTreeSet<(&'static str, usize)>>, String> {
+    let mut requirements: BTreeMap<usize, BTreeSet<(&'static str, usize)>> = BTreeMap::new();
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let prefix = format!("model.layers.{layer_idx}");
+        for suffix in [
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ] {
+            let name = format!("{prefix}.{suffix}");
+            let info = hfq
+                .find_tensor_info(&name)
+                .ok_or_else(|| format!("embeddinggemma NPU: missing tensor {name}"))?;
+            let Some(mode) = fullk_mode_tag(info.quant_type) else {
+                if suffix == "mlp.down_proj.weight" {
+                    continue;
+                }
+                return Err(format!(
+                    "embeddinggemma NPU: {name} qt={} is not Opus",
+                    info.quant_type
+                ));
+            };
+            if info.shape.len() != 2 {
+                return Err(format!("embeddinggemma NPU: {name} must be rank-2"));
+            }
+            let n = info.shape[0] as usize;
+            let k = info.shape[1] as usize;
+            OpusMatrixEncoding::classify(info.quant_type, info.data_size, k, n)
+                .map_err(|error| format!("embeddinggemma NPU: classify {name}: {error}"))?;
+            requirements
+                .entry(n)
+                .or_default()
+                .insert((mode, k.div_ceil(256) * 256));
+        }
+    }
+    Ok(requirements)
+}
+
+fn fullk_mode_tag(quant_type: u8) -> Option<&'static str> {
+    match quant_type {
+        33 | 34 => Some("w4"),
+        35 => Some("w8"),
+        36 => Some("mixed"),
+        _ => None,
     }
 }
 

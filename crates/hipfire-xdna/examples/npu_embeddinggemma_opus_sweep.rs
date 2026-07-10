@@ -1,9 +1,11 @@
 //! EmbeddingGemma-300M Opus GEMM sweep on AIE2P through `NpuGemmMp`.
 //!
 //! This is a benchmark/quality-gate building block, not a serving path. It runs the
-//! model's projection shapes as cache-width Opus groups, padding tail groups:
-//!   C[M,N] += A[M,group_k] * W[group_k,N]
-//! and repeats that per group to account for K=768/1152/3072.
+//! model's projection shapes as cache-width Opus groups, padding tail groups.
+//! Packed groups are uploaded once, then all group/M-tile commands are queued
+//! with resident weights and one final timeline wait. The per-group int32
+//! outputs remain separate; this is a projection-inventory dispatch benchmark,
+//! not the scaled full-K reconstruction or a full-model result.
 //!
 //! Usage:
 //!   cargo run --release -p hipfire-xdna --example npu_embeddinggemma_opus_sweep -- \
@@ -250,7 +252,7 @@ fn main() {
                     "cache tag does not match xclbin weight bits"
                 );
 
-                let mut packed_groups = Vec::with_capacity(groups);
+                let mut resident_groups = Vec::with_capacity(groups);
                 for group in 0..groups {
                     let effective_k = (shape.k - group * group_k).min(group_k);
                     let weights: Vec<i8> = (0..group_k * shape.n)
@@ -262,7 +264,11 @@ fn main() {
                             }
                         })
                         .collect();
-                    packed_groups.push(gemm.prepack_weights(group_k, shape.n, &weights));
+                    let packed = gemm.prepack_weights(group_k, shape.n, &weights);
+                    resident_groups.push(
+                        gemm.upload_resident_weights(&packed)
+                            .expect("upload resident weights"),
+                    );
                 }
                 let acts: Vec<Vec<i8>> = (0..groups)
                     .map(|group| {
@@ -278,22 +284,41 @@ fn main() {
                             .collect()
                     })
                     .collect();
-                let mut c = vec![0i32; padded_batch * shape.n];
+                let activation_groups: Vec<&[i8]> = acts.iter().map(Vec::as_slice).collect();
+                let mut outputs = vec![vec![0i32; padded_batch * shape.n]; groups];
 
                 for _ in 0..warmup {
-                    for group in 0..groups {
-                        gemm.load_weights(&packed_groups[group]);
-                        gemm.run(padded_batch, group_k, shape.n, &acts[group], &mut c)
-                            .expect("warmup");
-                    }
+                    let resident_refs = resident_groups.iter().collect::<Vec<_>>();
+                    let mut output_refs = outputs
+                        .iter_mut()
+                        .map(Vec::as_mut_slice)
+                        .collect::<Vec<_>>();
+                    gemm.run_resident_batch(
+                        &resident_refs,
+                        padded_batch,
+                        group_k,
+                        shape.n,
+                        &activation_groups,
+                        &mut output_refs,
+                    )
+                    .expect("warmup");
                 }
                 let t0 = Instant::now();
                 for _ in 0..iters {
-                    for group in 0..groups {
-                        gemm.load_weights(&packed_groups[group]);
-                        gemm.run(padded_batch, group_k, shape.n, &acts[group], &mut c)
-                            .expect("bench");
-                    }
+                    let resident_refs = resident_groups.iter().collect::<Vec<_>>();
+                    let mut output_refs = outputs
+                        .iter_mut()
+                        .map(Vec::as_mut_slice)
+                        .collect::<Vec<_>>();
+                    gemm.run_resident_batch(
+                        &resident_refs,
+                        padded_batch,
+                        group_k,
+                        shape.n,
+                        &activation_groups,
+                        &mut output_refs,
+                    )
+                    .expect("bench");
                 }
                 let dt = t0.elapsed().as_secs_f64() / iters as f64;
                 let macs = padded_batch as f64 * shape.n as f64 * shape.k as f64;
