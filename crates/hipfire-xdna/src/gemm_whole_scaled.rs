@@ -3,22 +3,63 @@
 
 use std::collections::HashMap;
 
-use crate::{DeviceBuffer, NpuKernel, XdnaError};
+use crate::{DeviceBuffer, NpuKernel, NpuWholeMode, XdnaError};
 
 const ARRAY: usize = 4;
-const LM: usize = 6;
-const LN: usize = 6;
 const GROUP_K: usize = 256;
-const ROWS_STRIPE: usize = 24;
-const COLS_STRIPE: usize = 96;
 const MACRO_M: usize = 96;
-const MACRO_N: usize = 384;
 const A_DATA: usize = 6144;
 const W_DATA: usize = 12288;
 const A_BLOCK: usize = 8192;
 const W_BLOCK: usize = 16384;
-const C_CORE: usize = 2304;
-const C_JOIN: usize = 9216;
+
+#[derive(Clone, Copy)]
+struct Layout {
+    mode: NpuWholeMode,
+    lm: usize,
+    ln: usize,
+    mr: usize,
+    inner_k: usize,
+    cols_stripe: usize,
+    c_core: usize,
+}
+
+impl Layout {
+    fn for_mode(mode: NpuWholeMode) -> Self {
+        match mode {
+            NpuWholeMode::W4 => Self {
+                mode,
+                lm: 6,
+                ln: 6,
+                mr: 4,
+                inner_k: 16,
+                cols_stripe: 96,
+                c_core: 2304,
+            },
+            NpuWholeMode::W8 => Self {
+                mode,
+                lm: 3,
+                ln: 3,
+                mr: 8,
+                inner_k: 8,
+                cols_stripe: 48,
+                c_core: 1152,
+            },
+        }
+    }
+
+    fn rows_stripe(self) -> usize {
+        self.lm * self.mr
+    }
+
+    fn macro_n(self) -> usize {
+        ARRAY * self.cols_stripe
+    }
+
+    fn c_join(self) -> usize {
+        ARRAY * self.c_core
+    }
+}
 
 pub struct NpuWholeScaledResidentWeights {
     buffer: DeviceBuffer,
@@ -26,6 +67,7 @@ pub struct NpuWholeScaledResidentWeights {
 
 pub struct NpuGemmWholeScaled {
     kernel: NpuKernel,
+    layout: Layout,
     rows: usize,
     groups: usize,
     n: usize,
@@ -40,9 +82,14 @@ impl NpuGemmWholeScaled {
     pub fn load_cached(dir: &str) -> Result<Self, XdnaError> {
         let manifest =
             std::fs::read_to_string(format!("{dir}/shape.txt")).map_err(XdnaError::Open)?;
-        if !manifest.lines().any(|line| line == "mode=w4-scaled") {
-            return Err(invalid("scaled whole-array cache must be mode=w4-scaled"));
-        }
+        let mode = if manifest.lines().any(|line| line == "mode=w4-scaled") {
+            NpuWholeMode::W4
+        } else if manifest.lines().any(|line| line == "mode=w8-scaled") {
+            NpuWholeMode::W8
+        } else {
+            return Err(invalid("scaled whole-array cache must be W4 or W8"));
+        };
+        let layout = Layout::for_mode(mode);
         let shape = parse_shape(&manifest);
         let rows = required(&shape, "m")?;
         let k = required(&shape, "k")?;
@@ -55,7 +102,7 @@ impl NpuGemmWholeScaled {
             || n == 0
             || k != groups * GROUP_K
             || m_macros != rows.div_ceil(MACRO_M)
-            || n_macros != n.div_ceil(MACRO_N)
+            || n_macros != n.div_ceil(layout.macro_n())
             || outblocks != m_macros * n_macros
         {
             return Err(invalid("invalid scaled whole-array cache geometry"));
@@ -65,9 +112,10 @@ impl NpuGemmWholeScaled {
         let kernel = NpuKernel::load(&xclbin, &insts)?;
         let inblocks = outblocks * groups;
         let input = kernel.alloc_arg(ARRAY * inblocks * A_BLOCK)?;
-        let output = kernel.alloc_arg(ARRAY * outblocks * C_JOIN * size_of::<f32>())?;
+        let output = kernel.alloc_arg(ARRAY * outblocks * layout.c_join() * size_of::<f32>())?;
         Ok(Self {
             kernel,
+            layout,
             rows,
             groups,
             n,
@@ -81,6 +129,10 @@ impl NpuGemmWholeScaled {
 
     pub fn rows(&self) -> usize {
         self.rows
+    }
+
+    pub fn mode(&self) -> NpuWholeMode {
+        self.layout.mode
     }
 
     pub fn k(&self) -> usize {
@@ -122,32 +174,51 @@ impl NpuGemmWholeScaled {
                     for group in 0..self.groups {
                         let block = outblock * self.groups + group;
                         let base = (stripe * self.inblocks() + block) * W_BLOCK;
-                        for ln in 0..LN {
-                            for kt in 0..16 {
-                                for kk in 0..16 {
+                        for ln in 0..self.layout.ln {
+                            for kt in 0..GROUP_K / self.layout.inner_k {
+                                for kk in 0..self.layout.inner_k {
                                     for nn in 0..16 {
-                                        let col =
-                                            n_macro * MACRO_N + stripe * COLS_STRIPE + ln * 16 + nn;
+                                        let col = n_macro * self.layout.macro_n()
+                                            + stripe * self.layout.cols_stripe
+                                            + ln * 16
+                                            + nn;
                                         let value = if col < self.n {
-                                            weights[group][(kt * 16 + kk) * self.n + col]
+                                            weights[group]
+                                                [(kt * self.layout.inner_k + kk) * self.n + col]
                                         } else {
                                             0
                                         };
-                                        if !(-8..=7).contains(&value) {
-                                            return Err(invalid(format!(
-                                                "W4 value {value} outside -8..=7"
-                                            )));
+                                        match self.layout.mode {
+                                            NpuWholeMode::W4 => {
+                                                if !(-8..=7).contains(&value) {
+                                                    return Err(invalid(format!(
+                                                        "W4 value {value} outside -8..=7"
+                                                    )));
+                                                }
+                                                let index = (ln * 16 + kt) * 256 + kk * 16 + nn;
+                                                let nibble = (value & 0x0f) as u8;
+                                                packed[base + index / 2] |= if index % 2 == 0 {
+                                                    nibble
+                                                } else {
+                                                    nibble << 4
+                                                };
+                                            }
+                                            NpuWholeMode::W8 => {
+                                                let index = (ln * 32 + kt) * 128
+                                                    + (nn / 8) * 64
+                                                    + kk * 8
+                                                    + nn % 8;
+                                                packed[base + index] = value as u8;
+                                            }
                                         }
-                                        let index = (ln * 16 + kt) * 256 + kk * 16 + nn;
-                                        let nibble = (value & 0x0f) as u8;
-                                        packed[base + index / 2] |=
-                                            if index % 2 == 0 { nibble } else { nibble << 4 };
                                     }
                                 }
                             }
                         }
-                        for local_col in 0..COLS_STRIPE {
-                            let col = n_macro * MACRO_N + stripe * COLS_STRIPE + local_col;
+                        for local_col in 0..self.layout.cols_stripe {
+                            let col = n_macro * self.layout.macro_n()
+                                + stripe * self.layout.cols_stripe
+                                + local_col;
                             let scale = if col < self.n {
                                 scales[group][col]
                             } else {
@@ -212,26 +283,32 @@ impl NpuGemmWholeScaled {
                     for group in 0..self.groups {
                         let block = outblock * self.groups + group;
                         let base = (stripe * self.inblocks() + block) * A_BLOCK;
-                        for lm in 0..LM {
-                            for kt in 0..16 {
-                                for local_row in 0..4 {
+                        for lm in 0..self.layout.lm {
+                            for kt in 0..GROUP_K / self.layout.inner_k {
+                                for local_row in 0..self.layout.mr {
                                     let row = m_macro * MACRO_M
-                                        + stripe * ROWS_STRIPE
-                                        + lm * 4
+                                        + stripe * self.layout.rows_stripe()
+                                        + lm * self.layout.mr
                                         + local_row;
                                     if row < self.rows {
-                                        let source = row * self.k() + group * GROUP_K + kt * 16;
-                                        let target = base + (lm * 16 + kt) * 64 + local_row * 16;
-                                        self.input.as_mut_slice()[target..target + 16]
+                                        let source = row * self.k()
+                                            + group * GROUP_K
+                                            + kt * self.layout.inner_k;
+                                        let target = base
+                                            + (lm * (GROUP_K / self.layout.inner_k) + kt) * 64
+                                            + local_row * self.layout.inner_k;
+                                        self.input.as_mut_slice()
+                                            [target..target + self.layout.inner_k]
                                             .copy_from_slice(as_bytes(
-                                                &activations[source..source + 16],
+                                                &activations[source..source + self.layout.inner_k],
                                             ));
                                     }
                                 }
                             }
                         }
-                        for local_row in 0..ROWS_STRIPE {
-                            let row = m_macro * MACRO_M + stripe * ROWS_STRIPE + local_row;
+                        for local_row in 0..self.layout.rows_stripe() {
+                            let row =
+                                m_macro * MACRO_M + stripe * self.layout.rows_stripe() + local_row;
                             let scale = if row < self.rows {
                                 scales[group * self.rows + row]
                             } else {
@@ -254,26 +331,26 @@ impl NpuGemmWholeScaled {
                 for n_macro in 0..self.n_macros {
                     let outblock = m_macro * self.n_macros + n_macro;
                     for row_stripe in 0..ARRAY {
-                        let core =
-                            (col_stripe * self.outblocks + outblock) * C_JOIN + row_stripe * C_CORE;
-                        for lm in 0..LM {
-                            for ln in 0..LN {
-                                for local_row in 0..4 {
+                        let core = (col_stripe * self.outblocks + outblock) * self.layout.c_join()
+                            + row_stripe * self.layout.c_core;
+                        for lm in 0..self.layout.lm {
+                            for ln in 0..self.layout.ln {
+                                for local_row in 0..self.layout.mr {
                                     let row = m_macro * MACRO_M
-                                        + row_stripe * ROWS_STRIPE
-                                        + lm * 4
+                                        + row_stripe * self.layout.rows_stripe()
+                                        + lm * self.layout.mr
                                         + local_row;
                                     if row >= self.rows {
                                         continue;
                                     }
                                     for local_col in 0..16 {
-                                        let col = n_macro * MACRO_N
-                                            + col_stripe * COLS_STRIPE
+                                        let col = n_macro * self.layout.macro_n()
+                                            + col_stripe * self.layout.cols_stripe
                                             + ln * 16
                                             + local_col;
                                         if col < self.n {
                                             let source = core
-                                                + (lm * LN + ln) * 64
+                                                + (lm * self.layout.ln + ln) * self.layout.mr * 16
                                                 + local_row * 16
                                                 + local_col;
                                             output[row * self.n + col] = physical[source];
@@ -326,7 +403,10 @@ mod tests {
     fn padded_streams_preserve_exact_prefix_and_scale_tails() {
         assert_eq!((A_DATA, A_BLOCK), (6144, 8192));
         assert_eq!((W_DATA, W_BLOCK), (12288, 16384));
-        assert!(A_DATA + ROWS_STRIPE * 4 <= A_BLOCK);
-        assert!(W_DATA + COLS_STRIPE * 4 <= W_BLOCK);
+        for mode in [NpuWholeMode::W4, NpuWholeMode::W8] {
+            let layout = Layout::for_mode(mode);
+            assert!(A_DATA + layout.rows_stripe() * 4 <= A_BLOCK);
+            assert!(W_DATA + layout.cols_stripe * 4 <= W_BLOCK);
+        }
     }
 }

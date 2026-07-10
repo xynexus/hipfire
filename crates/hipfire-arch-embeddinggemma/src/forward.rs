@@ -55,6 +55,49 @@ pub trait LinearProjector {
         output: &GpuTensor,
         rows: usize,
     ) -> HipResult<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_qkv(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        wq: &WeightTensor,
+        wk: &WeightTensor,
+        wv: &WeightTensor,
+        input: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.project(gpu, layer_idx, Projection::Query, wq, input, q, rows)?;
+        self.project(gpu, layer_idx, Projection::Key, wk, input, k, rows)?;
+        self.project(gpu, layer_idx, Projection::Value, wv, input, v, rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_gate_up(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        gate_weight: &WeightTensor,
+        up_weight: &WeightTensor,
+        input: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.project(
+            gpu,
+            layer_idx,
+            Projection::Gate,
+            gate_weight,
+            input,
+            gate,
+            rows,
+        )?;
+        self.project(gpu, layer_idx, Projection::Up, up_weight, input, up, rows)
+    }
 }
 
 pub struct GpuLinearProjector;
@@ -208,9 +251,9 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
 
         // ── Attention block (bidirectional) ──
         gpu.rmsnorm_batched(&x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
-        projector.project(gpu, layer_idx, Projection::Query, &layer.wq, &tmp, &q, m)?;
-        projector.project(gpu, layer_idx, Projection::Key, &layer.wk, &tmp, &k, m)?;
-        projector.project(gpu, layer_idx, Projection::Value, &layer.wv, &tmp, &v, m)?;
+        projector.project_qkv(
+            gpu, layer_idx, &layer.wq, &layer.wk, &layer.wv, &tmp, &q, &k, &v, m,
+        )?;
 
         // Per-head QK-norm (q_norm carries the baked Q pre-scale, 1.0 here).
         gpu.rmsnorm_batched(&q, &layer.q_norm, &q, m * n_heads, head_dim, eps)?;
@@ -244,16 +287,16 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
 
         // ── FFN block (GeGLU) ──
         gpu.rmsnorm_batched(&x_batch, &layer.pre_ffn_norm, &tmp, m, dim, eps)?;
-        projector.project(
+        projector.project_gate_up(
             gpu,
             layer_idx,
-            Projection::Gate,
             &layer.w_gate,
+            &layer.w_up,
             &tmp,
             &gate,
+            &up,
             m,
         )?;
-        projector.project(gpu, layer_idx, Projection::Up, &layer.w_up, &tmp, &up, m)?;
         gpu.gelu_mul_f32(&gate, &up, &ffn)?;
         projector.project(gpu, layer_idx, Projection::Down, &layer.w_down, &ffn, &o, m)?;
         gpu.rmsnorm_batched(&o, &layer.post_ffn_norm, &tmp, m, dim, eps)?;

@@ -12,12 +12,14 @@ use crate::config::EmbeddingGemmaConfig;
 use crate::forward::{LinearProjector, Projection};
 
 struct LayerMatrices {
+    qkv: Option<OpusPackedMatrix>,
     query: OpusPackedMatrix,
     key: OpusPackedMatrix,
     value: OpusPackedMatrix,
     attention_output: OpusPackedMatrix,
     gate: OpusPackedMatrix,
     up: OpusPackedMatrix,
+    gate_up: Option<OpusPackedMatrix>,
     down: Option<OpusPackedMatrix>,
 }
 
@@ -75,10 +77,10 @@ impl NpuOpusProjector {
             .map(|(&width, shapes)| {
                 let paths = shapes
                     .iter()
-                    .filter(|(mode, _)| *mode == "w4")
-                    .map(|(_, padded_k)| {
+                    .filter(|(mode, _)| matches!(*mode, "w4" | "w8"))
+                    .map(|(mode, padded_k)| {
                         cache_root.join(format!(
-                            "embgemma_aie2p_whole_w4-scaled_m256_kg{}_n{width}",
+                            "embgemma_aie2p_whole_{mode}-scaled_m256_kg{}_n{width}",
                             padded_k / 256
                         ))
                     })
@@ -89,7 +91,7 @@ impl NpuOpusProjector {
         let scaled_compatible = requirements
             .values()
             .flatten()
-            .all(|(mode, _)| *mode == "w4");
+            .all(|(mode, _)| matches!(*mode, "w4" | "w8"));
         let use_whole_scaled = scaled_compatible
             && whole_scaled_paths.values().all(|paths| !paths.is_empty())
             && whole_scaled_paths.values().flatten().all(|path| {
@@ -161,11 +163,42 @@ impl NpuOpusProjector {
             .map_err(|error| format!("embeddinggemma NPU: load N={width} caches: {error}"))?;
             executors.insert(width, executor);
         }
+        if use_whole_scaled {
+            let mode = requirements
+                .values()
+                .flatten()
+                .next()
+                .map(|(mode, _)| *mode)
+                .ok_or_else(|| "embeddinggemma NPU: empty projection requirements".to_string())?;
+            for width in [q_dim + 2 * kv_dim, 2 * cfg.intermediate_size] {
+                let path = cache_root.join(format!(
+                    "embgemma_aie2p_whole_{mode}-scaled_m256_kg{}_n{width}",
+                    cfg.hidden_size.div_ceil(256)
+                ));
+                if path.join("final.xclbin").is_file() && path.join("insts.bin").is_file() {
+                    let cache = path.to_str().expect("UTF-8 cache path");
+                    let executor = NpuOpusExecutor::load_whole_scaled_cached(&[cache], width)
+                        .map_err(|error| {
+                            format!("embeddinggemma NPU: load combined N={width}: {error}")
+                        })?;
+                    executors.insert(width, executor);
+                }
+            }
+        }
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
             let prefix = format!("model.layers.{layer_idx}");
             layers.push(LayerMatrices {
+                qkv: load_concat_matrix(
+                    hfq,
+                    executors.get(&(q_dim + 2 * kv_dim)),
+                    &[
+                        format!("{prefix}.self_attn.q_proj.weight"),
+                        format!("{prefix}.self_attn.k_proj.weight"),
+                        format!("{prefix}.self_attn.v_proj.weight"),
+                    ],
+                )?,
                 query: load_matrix(
                     hfq,
                     executor(&executors, q_dim)?,
@@ -195,6 +228,14 @@ impl NpuOpusProjector {
                     hfq,
                     executor(&executors, cfg.intermediate_size)?,
                     &format!("{prefix}.mlp.up_proj.weight"),
+                )?,
+                gate_up: load_concat_matrix(
+                    hfq,
+                    executors.get(&(2 * cfg.intermediate_size)),
+                    &[
+                        format!("{prefix}.mlp.gate_proj.weight"),
+                        format!("{prefix}.mlp.up_proj.weight"),
+                    ],
                 )?,
                 down: load_optional_matrix(
                     hfq,
@@ -319,6 +360,119 @@ impl LinearProjector for NpuOpusProjector {
         gpu.free_tensor(uploaded)?;
         Ok(())
     }
+
+    fn project_qkv(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        wq: &WeightTensor,
+        wk: &WeightTensor,
+        wv: &WeightTensor,
+        input: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
+        if self
+            .layers
+            .get(layer_idx)
+            .and_then(|layer| layer.qkv.as_ref())
+            .is_none()
+        {
+            self.project(gpu, layer_idx, Projection::Query, wq, input, q, rows)?;
+            self.project(gpu, layer_idx, Projection::Key, wk, input, k, rows)?;
+            return self.project(gpu, layer_idx, Projection::Value, wv, input, v, rows);
+        }
+        let matrix = self.layers[layer_idx].qkv.as_ref().unwrap();
+        let widths = [wq.m, wk.m, wv.m];
+        if wq.k != matrix.k()
+            || wk.k != matrix.k()
+            || wv.k != matrix.k()
+            || widths.iter().sum::<usize>() != matrix.n()
+        {
+            return Err(hip_error("combined q/k/v projection geometry mismatch"));
+        }
+        let input_host = gpu.download_f32(input)?;
+        let mut combined = vec![0.0f32; rows * matrix.n()];
+        self.executors
+            .get_mut(&matrix.n())
+            .ok_or_else(|| hip_error("missing combined q/k/v executor"))?
+            .run_f32(matrix, rows, &input_host, &mut combined)
+            .map_err(|error| hip_error(format!("combined q/k/v failed: {error}")))?;
+        let outputs = [q, k, v];
+        let mut offset = 0usize;
+        for (output, width) in outputs.into_iter().zip(widths) {
+            let mut role = Vec::with_capacity(rows * width);
+            for row in 0..rows {
+                let start = row * matrix.n() + offset;
+                role.extend_from_slice(&combined[start..start + width]);
+            }
+            copy_host_output(gpu, output, &role)?;
+            offset += width;
+        }
+        Ok(())
+    }
+
+    fn project_gate_up(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        gate_weight: &WeightTensor,
+        up_weight: &WeightTensor,
+        input: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
+        if self
+            .layers
+            .get(layer_idx)
+            .and_then(|layer| layer.gate_up.as_ref())
+            .is_none()
+        {
+            self.project(
+                gpu,
+                layer_idx,
+                Projection::Gate,
+                gate_weight,
+                input,
+                gate,
+                rows,
+            )?;
+            return self.project(gpu, layer_idx, Projection::Up, up_weight, input, up, rows);
+        }
+        let matrix = self.layers[layer_idx].gate_up.as_ref().unwrap();
+        if gate_weight.k != matrix.k()
+            || up_weight.k != matrix.k()
+            || gate_weight.m + up_weight.m != matrix.n()
+        {
+            return Err(hip_error("combined gate/up projection geometry mismatch"));
+        }
+        let input_host = gpu.download_f32(input)?;
+        let mut combined = vec![0.0f32; rows * matrix.n()];
+        self.executors
+            .get_mut(&matrix.n())
+            .ok_or_else(|| hip_error("missing combined gate/up executor"))?
+            .run_f32(matrix, rows, &input_host, &mut combined)
+            .map_err(|error| hip_error(format!("combined gate/up failed: {error}")))?;
+        let width = gate_weight.m;
+        let mut gate_host = Vec::with_capacity(rows * width);
+        let mut up_host = Vec::with_capacity(rows * up_weight.m);
+        for row in 0..rows {
+            let start = row * matrix.n();
+            gate_host.extend_from_slice(&combined[start..start + width]);
+            up_host.extend_from_slice(&combined[start + width..start + matrix.n()]);
+        }
+        copy_host_output(gpu, gate, &gate_host)?;
+        copy_host_output(gpu, up, &up_host)
+    }
+}
+
+fn copy_host_output(gpu: &mut Gpu, output: &GpuTensor, values: &[f32]) -> HipResult<()> {
+    let uploaded = gpu.upload_f32(values, &[values.len()])?;
+    gpu.memcpy_dtod_at_auto(&output.buf, 0, &uploaded.buf, 0, values.len() * 4)?;
+    gpu.free_tensor(uploaded)
 }
 
 fn executor(
@@ -357,6 +511,57 @@ fn load_matrix(
             load_awq_scale(hfq, name, k)?,
         )
         .map_err(|error| format!("embeddinggemma NPU: pack {name}: {error}"))
+}
+
+fn load_concat_matrix(
+    hfq: &HfqFile,
+    executor: Option<&NpuOpusExecutor>,
+    names: &[String],
+) -> Result<Option<OpusPackedMatrix>, String> {
+    let Some(executor) = executor else {
+        return Ok(None);
+    };
+    let mut quant_type = None;
+    let mut k = None;
+    let mut n = 0usize;
+    let mut payload = Vec::new();
+    let mut shared_awq: Option<Option<Vec<f32>>> = None;
+    for name in names {
+        let (info, bytes) = hfq
+            .tensor_data_vec(name)
+            .ok_or_else(|| format!("embeddinggemma NPU: missing tensor {name}"))?;
+        if info.shape.len() != 2 {
+            return Ok(None);
+        }
+        let matrix_n = info.shape[0] as usize;
+        let matrix_k = info.shape[1] as usize;
+        if quant_type.is_some_and(|value| value != info.quant_type)
+            || k.is_some_and(|value| value != matrix_k)
+        {
+            return Ok(None);
+        }
+        OpusMatrixEncoding::classify(info.quant_type, bytes.len(), matrix_k, matrix_n)
+            .map_err(|error| format!("embeddinggemma NPU: classify {name}: {error}"))?;
+        let awq = load_awq_scale(hfq, name, matrix_k)?;
+        if shared_awq.as_ref().is_some_and(|value| value != &awq) {
+            return Ok(None);
+        }
+        shared_awq.get_or_insert_with(|| awq.clone());
+        quant_type = Some(info.quant_type);
+        k = Some(matrix_k);
+        n += matrix_n;
+        // Opus payloads are column-major blocks, so role concatenation is byte
+        // concatenation when quant type and K agree.
+        payload.extend_from_slice(&bytes);
+    }
+    let Some(quant_type) = quant_type else {
+        return Ok(None);
+    };
+    let k = k.expect("non-empty concatenated matrix has K");
+    executor
+        .pack_matrix(quant_type, k, n, &payload, shared_awq.unwrap_or(None))
+        .map(Some)
+        .map_err(|error| format!("embeddinggemma NPU: pack concatenated roles: {error}"))
 }
 
 fn load_optional_matrix(

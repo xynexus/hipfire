@@ -2,8 +2,14 @@
 """4x4 AIE2P W4 schedule retaining scaled C across all K groups."""
 import sys
 
-GROUPS, OUTBLOCKS = map(int, sys.argv[1:3])
-AB, WB, CB, CJ = 8192, 16384, 2304, 9216
+MODE = sys.argv[1]
+GROUPS, OUTBLOCKS = map(int, sys.argv[2:4])
+if MODE == "w4":
+    AB, WB, CB, CJ = 8192, 16384, 2304, 9216
+elif MODE == "w8":
+    AB, WB, CB, CJ = 8192, 16384, 1152, 4608
+else:
+    raise SystemExit("MODE must be w4 or w8")
 INBLOCKS, INF, G = GROUPS * OUTBLOCKS, 9223372036854775807, range(4)
 
 def dims(count, block):
@@ -30,7 +36,7 @@ for col in G:
     for row in G: out.append(f"    aie.objectfifo @cc{col}_{row}(%c{col}_{row}, {{%mt{col}}}, 1 : i32) : !aie.objectfifo<memref<{CB}xi32>>")
     out += [f"    aie.objectfifo @csh{col}(%mt{col}, {{%shim{col}}}, 1 : i32) : !aie.objectfifo<memref<{CJ}xi32>>",
             f"    aie.objectfifo.link [{inputs}] -> [@csh{col}] ([{offsets}] [])"]
-for name in ("r15_w4_scaled_init", "r15_w4_scaled_accum"):
+for name in (f"r15_{MODE}_scaled_init", f"r15_{MODE}_scaled_accum"):
     out.append(f'    func.func private @{name}(memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>) attributes {{link_with = "r15.o"}}')
 for col in G:
   for row in G:
@@ -44,14 +50,14 @@ for col in G:
             f"        %av0 = aie.objectfifo.subview.access %a0[0] : !aie.objectfifosubview<memref<{AB}xi8>> -> memref<{AB}xi8>",
             f"        %w0 = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
             f"        %wv0 = aie.objectfifo.subview.access %w0[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
-            f"        func.call @r15_w4_scaled_init(%av0, %wv0, %cv) : (memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>) -> ()",
+            f"        func.call @r15_{MODE}_scaled_init(%av0, %wv0, %cv) : (memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>) -> ()",
             f"        aie.objectfifo.release @abc{row}(Consume, 1)", f"        aie.objectfifo.release @wbc{col}(Consume, 1)",
             "        scf.for %group = %o to %groups step %o {",
             f"          %a = aie.objectfifo.acquire @abc{row}(Consume, 1) : !aie.objectfifosubview<memref<{AB}xi8>>",
             f"          %av = aie.objectfifo.subview.access %a[0] : !aie.objectfifosubview<memref<{AB}xi8>> -> memref<{AB}xi8>",
             f"          %w = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
             f"          %wv = aie.objectfifo.subview.access %w[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
-            f"          func.call @r15_w4_scaled_accum(%av, %wv, %cv) : (memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>) -> ()",
+            f"          func.call @r15_{MODE}_scaled_accum(%av, %wv, %cv) : (memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>) -> ()",
             f"          aie.objectfifo.release @abc{row}(Consume, 1)", f"          aie.objectfifo.release @wbc{col}(Consume, 1)",
             "        }", f"        aie.objectfifo.release @cc{col}_{row}(Produce, 1)",
             "      }", "      aie.end", "    }"]

@@ -329,6 +329,30 @@ host-side batching: q/k/v and gate/up should share activation preprocessing and
 submission, followed by resident attention, residual, normalization, and FFN
 operations so projection outputs stop crossing back to the GPU.
 
+### Dense W8 and combined-role checkpoint
+
+R15 now applies the same resident, group-retaining scaled contract to dense
+W8. W4/W8 share one runtime and cache-selection path; W8, W8+, and W8++ match
+the CPU scaling oracle across all model shapes with maximum absolute error
+1.7e-5.
+
+For plain artifacts with identical/no AWQ input sidecars, the projector also
+concatenates q/k/v into one N=1280 matrix and gate/up into one N=2304 matrix.
+This reduces seven projection calls per layer to four while preserving exact
+role ordering. Full hybrid checks remain stable:
+
+- OQ4: 92.4 actual input tok/s, minimum GPU/NPU cosine 0.984162;
+- OQ8: 80.7 actual input tok/s, minimum GPU/NPU cosine 0.999904.
+
+This is a useful crossing reduction, not a path to the M256 target by itself.
+M256 shared-Opus wrapper timing (activation FWHT/quantization, allocations,
+packing, dispatch, and readback) is 10.46 ms per W4 layer and 11.09 ms per W8
+layer across combined qkv, o, combined gate/up, and down. That is much larger
+than the raw scaled-dispatch inventory because activation preprocessing and
+host marshalling still repeat for every role. FWHT/quantization must move onto
+AIE, and layer intermediates must remain resident, before further role fusion
+can translate into 10,000 input tok/s.
+
 Measured status is still below admission: W4 projection inventory is 73.083 ms
 at M=256 (about 3.5k input tok/s before non-projection work). The real hybrid
 model is 130.9 input tok/s and 5.6 package tok/J, and its GPU cosine gate remains

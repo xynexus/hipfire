@@ -36,6 +36,9 @@ fn main() {
     let k = option("--k")
         .map(|value| value.parse::<usize>().expect("numeric K"))
         .unwrap_or(256);
+    let iterations = option("--iters")
+        .map(|value| value.parse::<usize>().expect("numeric iteration count"))
+        .unwrap_or(0);
     let fullk_cache = option("--fullk");
     let whole_cache = option("--whole");
     let whole_scaled_cache = option("--whole-scaled");
@@ -149,6 +152,19 @@ fn main() {
         println!("first_mismatch index={index} got={got} expected={expected} abs={error}");
     }
     assert_eq!(mismatches, 0, "NPU mixed Opus parity failed");
+    if iterations > 0 {
+        for _ in 0..2 {
+            gemm.run_f32(m, &x, &mut output).expect("NPU warmup");
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            gemm.run_f32(m, &x, &mut output).expect("NPU timing");
+        }
+        println!(
+            "iters={iterations} wrapper_ms={:.4}",
+            started.elapsed().as_secs_f64() * 1e3 / iterations as f64
+        );
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

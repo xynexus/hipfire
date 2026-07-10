@@ -131,7 +131,7 @@ pub struct NpuOpusExecutor {
     rows_per_dispatch: usize,
     fullk: HashMap<(NpuFullKMode, usize), NpuGemmFullK>,
     whole: HashMap<(NpuWholeMode, usize), NpuGemmWholeArray>,
-    whole_scaled: HashMap<usize, NpuGemmWholeScaled>,
+    whole_scaled: HashMap<(NpuWholeMode, usize), NpuGemmWholeScaled>,
 }
 
 impl NpuOpusExecutor {
@@ -264,7 +264,7 @@ impl NpuOpusExecutor {
                 self.n
             )));
         }
-        self.whole_scaled.insert(whole.k(), whole);
+        self.whole_scaled.insert((whole.mode(), whole.k()), whole);
         Ok(())
     }
 
@@ -319,8 +319,8 @@ impl NpuOpusExecutor {
         let mode = fullk_mode(encoding);
         let whole_mode = whole_mode(encoding);
         let padded_k = decoded.len() * GROUP;
-        let whole_scaled_weights = if encoding == OpusMatrixEncoding::W4 {
-            if let Some(whole) = self.whole_scaled.get(&padded_k) {
+        let whole_scaled_weights = if let Some(mode) = whole_mode {
+            if let Some(whole) = self.whole_scaled.get(&(mode, padded_k)) {
                 let base: Vec<&[i8]> = decoded.iter().map(|group| group.base.as_slice()).collect();
                 let scales: Vec<&[f32]> = decoded
                     .iter()
@@ -477,8 +477,10 @@ impl NpuOpusExecutor {
 
     fn rows_per_dispatch_for_matrix(&self, matrix: &OpusPackedMatrix) -> usize {
         if matrix.whole_scaled_weights.is_some() {
-            if let Some(whole) = self.whole_scaled.get(&(matrix.groups.len() * GROUP)) {
-                return whole.rows();
+            if let Some(mode) = whole_mode(matrix.encoding) {
+                if let Some(whole) = self.whole_scaled.get(&(mode, matrix.groups.len() * GROUP)) {
+                    return whole.rows();
+                }
             }
         }
         if matrix.whole_weights.is_some() {
@@ -524,7 +526,9 @@ impl NpuOpusExecutor {
         c.fill(0.0);
         let padded_k = matrix.groups.len() * GROUP;
         if let Some(weights) = &matrix.whole_scaled_weights {
-            if let Some(whole) = self.whole_scaled.get_mut(&padded_k) {
+            let mode = whole_mode(matrix.encoding)
+                .ok_or_else(|| invalid("mixed matrix cannot use dense scaled whole-array"))?;
+            if let Some(whole) = self.whole_scaled.get_mut(&(mode, padded_k)) {
                 let chunk_rows = whole.rows();
                 if prepared.padded_rows % chunk_rows == 0 {
                     let mut activations = vec![0i8; chunk_rows * padded_k];
