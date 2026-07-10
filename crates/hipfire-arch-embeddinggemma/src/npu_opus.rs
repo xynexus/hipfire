@@ -6,29 +6,31 @@ use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
-use hipfire_xdna::{NpuOpusMixedExecutor, OpusMixedPackedMatrix};
+use hipfire_xdna::{NpuOpusExecutor, OpusMatrixEncoding, OpusPackedMatrix};
 
 use crate::config::EmbeddingGemmaConfig;
 use crate::forward::{LinearProjector, Projection};
 
 struct LayerMatrices {
-    query: OpusMixedPackedMatrix,
-    key: OpusMixedPackedMatrix,
-    value: OpusMixedPackedMatrix,
-    attention_output: OpusMixedPackedMatrix,
-    gate: OpusMixedPackedMatrix,
-    up: OpusMixedPackedMatrix,
+    query: OpusPackedMatrix,
+    key: OpusPackedMatrix,
+    value: OpusPackedMatrix,
+    attention_output: OpusPackedMatrix,
+    gate: OpusPackedMatrix,
+    up: OpusPackedMatrix,
+    down: Option<OpusPackedMatrix>,
 }
 
-/// Hybrid EmbeddingGemma projector for compact mixed Opus matrices.
-/// Q/K/V/O/gate/up execute on XDNA while attention, norms, residuals, and the
-/// Q8 fallback down projection remain on the GPU.
-pub struct NpuOpusMixedProjector {
-    executors: HashMap<usize, NpuOpusMixedExecutor>,
+/// Format-generic EmbeddingGemma projector for W4, mixed, and W8 Opus matrices.
+/// All q/k/v/o/gate/up and Opus-encoded down projections execute on XDNA while
+/// the surrounding attention, norms, residuals, and activations remain on the
+/// GPU bridge.
+pub struct NpuOpusProjector {
+    executors: HashMap<usize, NpuOpusExecutor>,
     layers: Vec<LayerMatrices>,
 }
 
-impl NpuOpusMixedProjector {
+impl NpuOpusProjector {
     pub fn load_cached(
         hfq: &HfqFile,
         cfg: &EmbeddingGemmaConfig,
@@ -46,11 +48,13 @@ impl NpuOpusMixedProjector {
             }
             let blocks = width / 64;
             let w4 = cache_root.join(format!("embgemma_aie2p_w4_4x4x16_c8_nb{blocks}"));
+            let w8 = cache_root.join(format!("embgemma_aie2p_w8_4x4x32_c8_nb{blocks}_m8k8_w8"));
             let sparse3 = cache_root.join(format!(
                 "embgemma_aie2p_sparse3_4x4x16_c8_nb{blocks}_sparse3"
             ));
-            let executor = NpuOpusMixedExecutor::load_cached(
+            let executor = NpuOpusExecutor::load_cached(
                 &w4.to_string_lossy(),
+                &w8.to_string_lossy(),
                 &sparse3.to_string_lossy(),
                 width,
             )
@@ -92,6 +96,11 @@ impl NpuOpusMixedProjector {
                     executor(&executors, cfg.intermediate_size)?,
                     &format!("{prefix}.mlp.up_proj.weight"),
                 )?,
+                down: load_optional_matrix(
+                    hfq,
+                    executor(&executors, cfg.hidden_size)?,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                )?,
             });
         }
         Ok(Self { executors, layers })
@@ -106,7 +115,7 @@ impl NpuOpusMixedProjector {
     }
 }
 
-impl LinearProjector for NpuOpusMixedProjector {
+impl LinearProjector for NpuOpusProjector {
     fn project(
         &mut self,
         gpu: &mut Gpu,
@@ -117,9 +126,6 @@ impl LinearProjector for NpuOpusMixedProjector {
         output: &GpuTensor,
         rows: usize,
     ) -> HipResult<()> {
-        if projection == Projection::Down {
-            return weight_gemm(gpu, weight, input, output, rows);
-        }
         let Self { executors, layers } = self;
         let layer = layers
             .get(layer_idx)
@@ -131,7 +137,10 @@ impl LinearProjector for NpuOpusMixedProjector {
             Projection::AttentionOutput => &layer.attention_output,
             Projection::Gate => &layer.gate,
             Projection::Up => &layer.up,
-            Projection::Down => unreachable!(),
+            Projection::Down => match &layer.down {
+                Some(matrix) => matrix,
+                None => return weight_gemm(gpu, weight, input, output, rows),
+            },
         };
         if matrix.k() != weight.k || matrix.n() != weight.m {
             return Err(hip_error(format!(
@@ -150,7 +159,7 @@ impl LinearProjector for NpuOpusMixedProjector {
             .ok_or_else(|| hip_error(format!("missing N={width} executor")))?;
         executor
             .run_f32(matrix, rows, &input_host, &mut output_host)
-            .map_err(|error| hip_error(format!("NPU mixed Opus projection failed: {error}")))?;
+            .map_err(|error| hip_error(format!("NPU Opus projection failed: {error}")))?;
         let uploaded = gpu.upload_f32(&output_host, &[rows * width])?;
         gpu.memcpy_dtod_at_auto(&output.buf, 0, &uploaded.buf, 0, output_host.len() * 4)?;
         gpu.free_tensor(uploaded)?;
@@ -159,9 +168,9 @@ impl LinearProjector for NpuOpusMixedProjector {
 }
 
 fn executor(
-    executors: &HashMap<usize, NpuOpusMixedExecutor>,
+    executors: &HashMap<usize, NpuOpusExecutor>,
     width: usize,
-) -> Result<&NpuOpusMixedExecutor, String> {
+) -> Result<&NpuOpusExecutor, String> {
     executors
         .get(&width)
         .ok_or_else(|| format!("embeddinggemma NPU: missing N={width} executor"))
@@ -169,22 +178,63 @@ fn executor(
 
 fn load_matrix(
     hfq: &HfqFile,
-    executor: &NpuOpusMixedExecutor,
+    executor: &NpuOpusExecutor,
     name: &str,
-) -> Result<OpusMixedPackedMatrix, String> {
-    let (info, compact) = hfq
+) -> Result<OpusPackedMatrix, String> {
+    let (info, payload) = hfq
         .tensor_data_vec(name)
         .ok_or_else(|| format!("embeddinggemma NPU: missing tensor {name}"))?;
-    if info.quant_type != 36 || info.shape.len() != 2 {
+    if info.shape.len() != 2 {
         return Err(format!(
-            "embeddinggemma NPU: {name} must use the supported compact mixed Opus qt=36 rank-2 layout, got qt={} shape={:?}",
+            "embeddinggemma NPU: {name} must be a rank-2 Opus matrix, got qt={} shape={:?}",
             info.quant_type, info.shape
         ));
     }
     let n = info.shape[0] as usize;
     let k = info.shape[1] as usize;
+    OpusMatrixEncoding::classify(info.quant_type, payload.len(), k, n)
+        .map_err(|error| format!("embeddinggemma NPU: classify {name}: {error}"))?;
     executor
-        .pack_matrix(k, n, &compact, load_awq_scale(hfq, name, k)?)
+        .pack_matrix(
+            info.quant_type,
+            k,
+            n,
+            &payload,
+            load_awq_scale(hfq, name, k)?,
+        )
+        .map_err(|error| format!("embeddinggemma NPU: pack {name}: {error}"))
+}
+
+fn load_optional_matrix(
+    hfq: &HfqFile,
+    executor: &NpuOpusExecutor,
+    name: &str,
+) -> Result<Option<OpusPackedMatrix>, String> {
+    let (info, payload) = hfq
+        .tensor_data_vec(name)
+        .ok_or_else(|| format!("embeddinggemma NPU: missing tensor {name}"))?;
+    if !matches!(info.quant_type, 33..=36) {
+        return Ok(None);
+    }
+    if info.shape.len() != 2 {
+        return Err(format!(
+            "embeddinggemma NPU: {name} must be rank-2, got shape={:?}",
+            info.shape
+        ));
+    }
+    let n = info.shape[0] as usize;
+    let k = info.shape[1] as usize;
+    OpusMatrixEncoding::classify(info.quant_type, payload.len(), k, n)
+        .map_err(|error| format!("embeddinggemma NPU: classify {name}: {error}"))?;
+    executor
+        .pack_matrix(
+            info.quant_type,
+            k,
+            n,
+            &payload,
+            load_awq_scale(hfq, name, k)?,
+        )
+        .map(Some)
         .map_err(|error| format!("embeddinggemma NPU: pack {name}: {error}"))
 }
 

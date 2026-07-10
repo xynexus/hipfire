@@ -28,7 +28,7 @@ pub mod calibration;
 pub mod config;
 pub mod forward;
 #[cfg(target_os = "linux")]
-pub mod npu_opus_mixed;
+pub mod npu_opus;
 pub mod weights;
 
 pub use config::{config_from_metadata_json, DenseHead, EmbeddingGemmaConfig, PoolingMode};
@@ -36,5 +36,5 @@ pub use forward::{
     embed_forward, embed_forward_with_projector, GpuLinearProjector, LinearProjector, Projection,
 };
 #[cfg(target_os = "linux")]
-pub use npu_opus_mixed::NpuOpusMixedProjector;
+pub use npu_opus::NpuOpusProjector;
 pub use weights::{DenseHeadHost, EmbeddingGemmaWeights};

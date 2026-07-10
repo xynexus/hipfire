@@ -74,8 +74,8 @@ sparse-overlay counts. Plain, `+`, and `++` names are generic and canonical.
 
 - `crates/hipfire-xdna/src/gemm_mp.rs`: per-dispatch W4A8/W8A8 GEMM with K=256.
 - `crates/hipfire-xdna/src/sparse3_mp.rs`: sparse-three residual dispatch.
-- `crates/hipfire-xdna/src/opus_mixed.rs`: generic variable-overlay compact
-  mixed decoder and exact W4 plus sparse residual execution.
+- `crates/hipfire-xdna/src/opus.rs`: generic W4, variable-overlay mixed, and W8
+  decoder/executor with resident K-group buffers and ordered queued base dispatch.
 - `benchmarks/npu_gemm_tuning/r6/r6_gemm_ts_w8m8.cc`: AIE2P W8A8 kernel.
 - `benchmarks/npu_gemm_tuning/r6/r6_gen_mp.py`: M-parallel W-broadcast array.
 
@@ -86,17 +86,18 @@ batch.
 
 ### EmbeddingGemma bridge
 
-`crates/hipfire-arch-embeddinggemma/src/npu_opus_mixed.rs` currently:
+`crates/hipfire-arch-embeddinggemma/src/npu_opus.rs` currently:
 
-- only admits compact mixed `qt=36` rank-two tensors;
+- admits pure W4 (`qt=33/34`), compact mixed (`qt=36`), and pure W8 (`qt=35`)
+  rank-two tensors through one generic projector;
 - downloads each GPU input to host;
 - runs the host-driven NPU executor;
 - uploads each output back to GPU;
-- leaves attention, norms, residuals, pooling, Dense heads, and unsupported
-  down projections on GPU/host.
+- leaves attention, norms, residuals, pooling, Dense heads, and non-Opus down
+  projections on GPU/host.
 
-This module should become a generic `NpuOpusProjector` or equivalent. Avoid
-format-specific names such as `425`.
+The generic `NpuOpusProjector` is the correctness bridge. Full-K fused kernels,
+resident layer state, and removal of per-projection host crossings remain open.
 
 ## Required Architecture
 

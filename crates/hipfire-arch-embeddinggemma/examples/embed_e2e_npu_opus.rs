@@ -1,7 +1,7 @@
-//! Hybrid GPU/XDNA parity and latency probe for mixed-precision Opus artifacts.
+//! Hybrid GPU/XDNA parity and latency probe for generic Opus artifacts.
 //!
 //! `hipfire lock acquire embeddinggemma-npu && cargo run --release -p \
-//! hipfire-arch-embeddinggemma --example embed_e2e_npu_opus_mixed -- MODEL.hfq \
+//! hipfire-arch-embeddinggemma --example embed_e2e_npu_opus -- MODEL.hfq \
 //! [CACHE_ROOT] [ITERS]; hipfire lock release`
 
 #[cfg(target_os = "linux")]
@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !(1..=3).contains(&args.len()) {
-        return Err("usage: embed_e2e_npu_opus_mixed MODEL.hfq [CACHE_ROOT] [ITERS]".into());
+        return Err("usage: embed_e2e_npu_opus MODEL.hfq [CACHE_ROOT] [ITERS]".into());
     }
     let cache_root = args
         .get(1)
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init()?;
     let weights = embeddinggemma::EmbeddingGemmaWeights::load(&mut hfq, &config, &mut gpu)?;
     let mut projector =
-        embeddinggemma::NpuOpusMixedProjector::load_cached(&hfq, &config, Path::new(&cache_root))?;
+        embeddinggemma::NpuOpusProjector::load_cached(&hfq, &config, Path::new(&cache_root))?;
     eprintln!(
         "loaded {} layers across {} resident NPU executor widths",
         projector.layer_count(),
@@ -117,5 +117,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("EmbeddingGemma XDNA mixed Opus execution is Linux-only");
+    eprintln!("EmbeddingGemma XDNA Opus execution is Linux-only");
 }

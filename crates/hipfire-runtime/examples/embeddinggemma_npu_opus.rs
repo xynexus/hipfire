@@ -1,36 +1,37 @@
-//! Verify one real compact mixed Opus HFQ tensor through paired NPU kernels.
+//! Verify one real W4, mixed, or W8 Opus HFQ tensor through AIE2P kernels.
 //!
 //! Usage:
-//! `embeddinggemma_npu_opus_mixed MODEL.hfq TENSOR_NAME W4_CACHE SPARSE3_CACHE`
+//! `embeddinggemma_npu_opus MODEL.hfq TENSOR_NAME W4_CACHE W8_CACHE SPARSE3_CACHE`
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use hipfire_primitives::conv::f16_to_f32;
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_xdna::NpuOpusMixedGemmMp;
+    use hipfire_xdna::{NpuOpusGemmMp, OpusMatrixEncoding};
     use std::path::Path;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if !(4..=5).contains(&args.len()) {
+    if !(5..=6).contains(&args.len()) {
         return Err(
-            "usage: embeddinggemma_npu_opus_mixed MODEL.hfq TENSOR_NAME W4_CACHE SPARSE3_CACHE [ROWS]"
+            "usage: embeddinggemma_npu_opus MODEL.hfq TENSOR_NAME W4_CACHE W8_CACHE SPARSE3_CACHE [ROWS]"
                 .into(),
         );
     }
     let hfq = HfqFile::open(Path::new(&args[0]))?;
     let tensor_name = &args[1];
-    let (info, compact) = hfq
+    let (info, payload) = hfq
         .tensor_data_vec(tensor_name)
         .ok_or_else(|| format!("missing tensor {tensor_name}"))?;
-    if info.quant_type != 36 || info.shape.len() != 2 {
+    if info.shape.len() != 2 {
         return Err(format!(
-            "{tensor_name} must use the supported compact mixed Opus qt=36 rank-2 layout, got qt={} shape={:?}",
+            "{tensor_name} must use a rank-2 Opus layout, got qt={} shape={:?}",
             info.quant_type, info.shape
         )
         .into());
     }
     let n = info.shape[0] as usize;
     let k = info.shape[1] as usize;
+    let encoding = OpusMatrixEncoding::classify(info.quant_type, payload.len(), k, n)?;
     let sidecar_name = tensor_name.strip_suffix(".weight").map_or_else(
         || format!("{tensor_name}.awq_scale.weight"),
         |stem| format!("{stem}.awq_scale.weight"),
@@ -42,10 +43,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|bytes| f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])))
             .collect::<Vec<_>>()
     });
-    let mut gemm =
-        NpuOpusMixedGemmMp::load_cached(&args[2], &args[3], k, n, &compact, awq_scale.clone())?;
+    let mut gemm = NpuOpusGemmMp::load_cached(
+        &args[2],
+        &args[3],
+        &args[4],
+        info.quant_type,
+        k,
+        n,
+        &payload,
+        awq_scale.clone(),
+    )?;
     let m = args
-        .get(4)
+        .get(5)
         .map(|rows| rows.parse::<usize>())
         .transpose()?
         .unwrap_or_else(|| gemm.rows_per_dispatch());
@@ -73,11 +82,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "model={} tensor={} variant={} M={} K={} N={} mismatches={} max_abs={:.6} elapsed_ms={:.3}",
         args[0],
         tensor_name,
-        if awq_scale.is_some() {
-            "mixed-opus-awq"
-        } else {
-            "mixed-opus"
-        },
+        format!(
+            "{encoding:?}{}",
+            if awq_scale.is_some() { "+/++" } else { "" }
+        ),
         m,
         k,
         n,
@@ -86,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         elapsed_ms
     );
     if mismatches != 0 {
-        return Err("real HFQ mixed Opus NPU parity failed".into());
+        return Err("real HFQ Opus NPU parity failed".into());
     }
     Ok(())
 }

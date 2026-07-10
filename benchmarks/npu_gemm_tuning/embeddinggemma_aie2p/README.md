@@ -134,10 +134,11 @@ Mean cosine was `0.95540`. This is a high-drift operating point that needs
 selection-level evaluation before it can be considered for embedding use. Log:
 `~/.hipfire/eval-results/embeddinggemma-w4a8-quality-20260710T054926Z.log`.
 
-## Exact Mixed Opus Runtime
+## Generic Opus Runtime
 
-`hipfire_xdna::NpuOpusMixedGemmMp` implements the current compact mixed Opus
-qt=36 layout used by plain `oq4.25`, `oq4.25+`, and `oq4.25++` tensors:
+`hipfire_xdna::NpuOpusGemmMp` implements one runtime contract for pure W4
+(`qt=33/34`), compact mixed (`qt=36`), and pure W8 (`qt=35`) tensors. Plain,
+`+`, and `++` artifacts use the same dispatch surface:
 
 1. Decode each `[f16 scale][128 int4 nibbles][3 × (index, int8)]` group.
 2. Run the int4 bulk through the verified AIE2P W4A8 cache.
@@ -163,16 +164,21 @@ The quantizer accepts any exactly representable mixed name from `oq4.125`
 through `oq7.9375`, including `+` and `++` suffixes, and derives `--w8-top`
 from that name. An explicitly conflicting `--w8-top` is rejected.
 
-The two kernels stay resident in separate hardware contexts. `NpuKernel` now
+The W4, W8, and sparse kernels stay resident in separate hardware contexts.
+Matrix K-group weights are uploaded into persistent XDNA buffers at pack/load
+time, and the W4/W8 base commands are enqueued in order with one final timeline
+wait. `NpuKernel` now
 assigns each live kernel a distinct, firmware-safe fixed device-heap VA; this
 fixes the previous overlapping-map corruption. Hardware parity is exact for
 synthetic compact groups and real EmbeddingGemma q/K/FFN/Dense projection
 tensors for all three suffix levels and every cache width.
 
 ```bash
-cargo run --release -p hipfire-xdna --example npu_opus_mixed_verify -- \
+cargo run --release -p hipfire-xdna --example npu_opus_verify -- \
   ~/.hipfire/npu/embgemma_aie2p_w4_4x4x16_c8_nb4 \
-  ~/.hipfire/npu/embgemma_aie2p_sparse3_4x4x16_c8_nb4_sparse3 256 --awq
+  ~/.hipfire/npu/embgemma_aie2p_w8_4x4x32_c8_nb4_m8k8_w8 \
+  ~/.hipfire/npu/embgemma_aie2p_sparse3_4x4x16_c8_nb4_sparse3 \
+  256 --encoding mixed --outliers 3 --awq
 ```
 
 The sparse3 kernel vectorizes the three residual MACs across all 16 resident
@@ -181,9 +187,9 @@ storage. A first int8-vector attempt compiled but corrupted 224/256 columns;
 that unsupported 16-lane shape was rejected and is not retained. The int16
 kernel passes exact synthetic and real-model parity.
 
-`hipfire_arch_embeddinggemma::NpuOpusMixedProjector` now wires all 24 layers through
+`hipfire_arch_embeddinggemma::NpuOpusProjector` now wires all 24 layers through
 three resident output-width executors. Q/K/V/O/gate/up use XDNA; attention,
-norms, residuals, pooling, Dense heads, and the qt=35 down-projection fallback
+norms, residuals, pooling, Dense heads, and non-Opus down-projection fallback
 remain on GPU/host. This is a correctness-first hybrid path, not yet a serving
 default.
 
