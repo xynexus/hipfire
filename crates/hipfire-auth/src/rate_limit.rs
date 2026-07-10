@@ -289,6 +289,30 @@ impl RateLimiter {
             .copied()
             .unwrap_or(0)
     }
+
+    pub fn status_at(
+        &self,
+        now_secs: f64,
+        principal: &RequestPrincipal,
+        user_override: &RatePolicyOverride,
+        token_override: &RatePolicyOverride,
+    ) -> RateLimitStatus {
+        let user_policy = RatePolicy::default().with_override(user_override);
+        let token_policy = user_policy.stricter_token_policy(token_override);
+        let owners = owner_policies(principal, user_policy, token_policy);
+        let state = self.inner.state.lock().unwrap();
+        let user = status_for(&state, &owners[0], now_secs);
+        let Some(token) = owners.get(1) else {
+            return user;
+        };
+        let token = status_for(&state, token, now_secs);
+        RateLimitStatus {
+            request_limit: token.request_limit,
+            request_remaining: user.request_remaining.min(token.request_remaining),
+            text_token_limit: token.text_token_limit,
+            text_token_remaining: user.text_token_remaining.min(token.text_token_remaining),
+        }
+    }
 }
 
 #[derive(Debug)]

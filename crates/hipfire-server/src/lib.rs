@@ -4,6 +4,7 @@
     clippy::too_many_arguments
 )]
 
+pub mod access_admin;
 pub mod accounting;
 pub mod admin_ui;
 pub mod api_auth;
@@ -74,6 +75,28 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
         .route("/admin/logs", get(routes::admin::get_admin_logs))
         .route("/admin/stats", get(routes::admin::get_admin_stats))
         .route(
+            "/admin/access/users",
+            get(access_admin::list_users).post(access_admin::create_user),
+        )
+        .route(
+            "/admin/access/users/{id}",
+            get(access_admin::get_user).patch(access_admin::patch_user),
+        )
+        .route(
+            "/admin/access/users/{id}/tokens",
+            get(access_admin::list_user_tokens).post(access_admin::create_token),
+        )
+        .route(
+            "/admin/access/tokens/{id}",
+            axum::routing::delete(access_admin::revoke_token),
+        )
+        .route("/admin/access/usage", get(access_admin::get_usage))
+        .route(
+            "/admin/access/rate-limits",
+            get(access_admin::get_rate_limits),
+        )
+        .route("/admin/access/audit", get(access_admin::get_audit))
+        .route(
             "/admin/runtime/reset",
             post(routes::admin::post_runtime_reset),
         )
@@ -100,7 +123,8 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::admin_gate,
-        ));
+        ))
+        .route_layer(middleware::from_fn(auth::admin_mutation_same_origin));
 
     let router = Router::new()
         .route("/", get(routes::chat_ui::get_chat_index))

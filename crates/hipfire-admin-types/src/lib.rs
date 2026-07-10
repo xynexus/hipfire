@@ -10,6 +10,166 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CursorPage<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessUserStatus {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessScope {
+    Text,
+    Embeddings,
+    Images,
+    Training,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessRatePolicy {
+    pub requests_per_minute: Option<u64>,
+    pub request_burst: Option<u64>,
+    pub text_tokens_per_minute: Option<u64>,
+    pub text_token_burst: Option<u64>,
+    pub max_in_flight_text: Option<u32>,
+    pub max_in_flight_images: Option<u32>,
+    pub megapixel_steps_per_minute: Option<u64>,
+    pub megapixel_step_burst: Option<u64>,
+    pub max_in_flight_training: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessUser {
+    pub id: String,
+    pub name: String,
+    pub status: AccessUserStatus,
+    pub rate_policy: AccessRatePolicy,
+    pub token_count: usize,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateAccessUserRequest {
+    pub name: String,
+    #[serde(default)]
+    pub rate_policy: AccessRatePolicy,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PatchAccessUserRequest {
+    pub status: Option<AccessUserStatus>,
+    pub rate_policy: Option<AccessRatePolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessToken {
+    pub id: String,
+    pub user_id: String,
+    pub label: String,
+    pub scopes: Vec<AccessScope>,
+    pub rate_policy: AccessRatePolicy,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub revoked_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateAccessTokenRequest {
+    pub label: String,
+    pub scopes: Vec<AccessScope>,
+    #[serde(default)]
+    pub rate_policy: AccessRatePolicy,
+    /// Optional absolute Unix expiry. Omit for the server's 90-day default.
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreatedAccessToken {
+    pub token: AccessToken,
+    pub secret: String,
+}
+
+impl std::fmt::Debug for CreatedAccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedAccessToken")
+            .field("token", &self.token)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessUsageCounters {
+    pub requests: u64,
+    pub errors: u64,
+    pub rate_limit_hits: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_tokens: u64,
+    pub images: u64,
+    pub megapixel_steps: u64,
+    pub training_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessUsageRow {
+    pub hour_start: u64,
+    pub user_id: String,
+    pub token_id: String,
+    pub workload: String,
+    pub counters: AccessUsageCounters,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessUsageResponse {
+    pub rows: CursorPage<AccessUsageRow>,
+    pub totals: AccessUsageCounters,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AccessRateLimitRow {
+    pub user_id: String,
+    pub token_id: Option<String>,
+    pub effective_policy: EffectiveAccessRatePolicy,
+    pub request_remaining: f64,
+    pub text_token_remaining: f64,
+    pub active_text: u32,
+    pub active_images: u32,
+    pub active_training: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EffectiveAccessRatePolicy {
+    pub requests_per_minute: f64,
+    pub request_burst: f64,
+    pub text_tokens_per_minute: f64,
+    pub text_token_burst: f64,
+    pub max_in_flight_text: u32,
+    pub max_in_flight_images: u32,
+    pub megapixel_steps_per_minute: f64,
+    pub megapixel_step_burst: f64,
+    pub max_in_flight_training: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessAuditEvent {
+    pub sequence: u64,
+    pub created_at: u64,
+    pub actor: String,
+    pub action: String,
+    pub user_id: Option<String>,
+    pub token_id: Option<String>,
+    pub detail: Option<String>,
+}
+
 /// A single addressable GPU memory pool (VRAM or GTT) reduced to the two
 /// numbers a UI actually renders, plus a human label. Derived from
 /// [`GpuTelemetry`]; not collected directly.

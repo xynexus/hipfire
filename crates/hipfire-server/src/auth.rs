@@ -29,6 +29,57 @@ use crate::SharedState;
 const SESSION_COOKIE: &str = "hipfire_admin_session";
 const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 
+/// Reject browser cross-site admin mutations while preserving same-origin UI
+/// requests and non-browser local bearer clients (which do not send Origin or
+/// Sec-Fetch-Site). Authentication remains the separate `admin_gate` layer.
+pub async fn admin_mutation_same_origin(request: Request<Body>, next: Next) -> Response {
+    if matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return next.run(request).await;
+    }
+    if request
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !matches!(value, "same-origin" | "none"))
+    {
+        return cross_site_forbidden();
+    }
+    if let Some(origin) = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok());
+        if host.is_none_or(|host| origin_authority(origin) != Some(host)) {
+            return cross_site_forbidden();
+        }
+    }
+    next.run(request).await
+}
+
+fn origin_authority(origin: &str) -> Option<&str> {
+    let (_, rest) = origin.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    (!authority.is_empty()).then_some(authority)
+}
+
+fn cross_site_forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": {
+            "message": "same-origin admin mutation required",
+            "type": "permission_error"
+        }})),
+    )
+        .into_response()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub user: String,
@@ -162,6 +213,7 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use tower::ServiceExt;
 
     fn headers_with(name: header::HeaderName, value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -203,5 +255,49 @@ mod tests {
         prune_expired(&mut sessions);
         assert!(sessions.contains_key("live"));
         assert!(!sessions.contains_key("dead"));
+    }
+
+    #[tokio::test]
+    async fn admin_mutations_reject_cross_site_browser_requests() {
+        let app = axum::Router::new()
+            .route(
+                "/admin/test",
+                axum::routing::post(|| async { StatusCode::OK }),
+            )
+            .route_layer(axum::middleware::from_fn(admin_mutation_same_origin));
+
+        let cross = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/test")
+                    .header(header::HOST, "localhost:11435")
+                    .header(header::ORIGIN, "https://evil.example")
+                    .header("sec-fetch-site", "cross-site")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross.status(), StatusCode::FORBIDDEN);
+
+        let same = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/test")
+                    .header(header::HOST, "localhost:11435")
+                    .header(header::ORIGIN, "http://localhost:11435")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(same.status(), StatusCode::OK);
+
+        let local_bearer_client = app
+            .oneshot(Request::post("/admin/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(local_bearer_client.status(), StatusCode::OK);
     }
 }
