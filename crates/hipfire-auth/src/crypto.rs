@@ -77,16 +77,15 @@ pub(crate) fn mint_token(token_id: &str, pepper: &Pepper) -> Result<(String, [u8
 }
 
 pub fn parse_token(raw: &str) -> Option<(&str, &str)> {
-    let mut parts = raw.split('_');
+    // Base64url secrets may contain `_`, so only the first two separators are
+    // structural. Splitting every underscore rejects valid random secrets.
+    let mut parts = raw.splitn(3, '_');
     if parts.next()? != TOKEN_PREFIX {
         return None;
     }
     let token_id = parts.next()?;
     let secret = parts.next()?;
-    if parts.next().is_some()
-        || token_id.len() != 32
-        || !token_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if token_id.len() != 32 || !token_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let decoded = URL_SAFE_NO_PAD.decode(secret).ok()?;
@@ -130,6 +129,20 @@ pub(crate) fn create_private_file(path: &Path) -> Result<(), std::io::Error> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => set_file_private(path),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_parser_accepts_base64url_underscore() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let secret = URL_SAFE_NO_PAD.encode([0xff; TOKEN_SECRET_LEN]);
+        assert!(secret.contains('_'));
+        let raw = format!("hfr_{id}_{secret}");
+        assert_eq!(parse_token(&raw), Some((id, secret.as_str())));
     }
 }
 

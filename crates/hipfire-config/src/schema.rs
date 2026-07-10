@@ -174,6 +174,27 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Username for the /admin console login. The password is set separately with `hipfire admin set-password` (argon2id hash stored in ~/.hipfire/admin.passwd, never in config)."
     ),
     field!(
+        "api_auth_mode",
+        ConfigType::Enum {
+            values: &["auto", "off", "optional", "required"]
+        },
+        Requirement::Optional,
+        Some("auto"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "API credential policy. auto allows anonymous API calls only on loopback and requires credentials on non-loopback binds; off, optional, and required are explicit overrides.",
+        validation: "one of: auto, off, optional, required"
+    ),
+    field!(
+        "unsafe_allow_unauthenticated_remote",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Explicit acknowledgement required before off or optional API authentication may bind to a non-loopback address."
+    ),
+    field!(
         "sdapi_output_root",
         ConfigType::String,
         Requirement::Optional,

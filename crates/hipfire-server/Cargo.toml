@@ -35,6 +35,7 @@ futures = "0.3"
 async-stream = "0.3"
 anyhow.workspace = true
 hipfire-admin-types = { path = "../hipfire-admin-types" }
+hipfire-auth = { path = "../hipfire-auth" }
 hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-build-info = { path = "../hipfire-build-info" }
 hipfire-config = { path = "../hipfire-config" }
@@ -55,3 +56,4 @@ image = { version = "0.25", default-features = false, features = [
 
 [dev-dependencies]
 tower = "0.5"
+tempfile = "3"

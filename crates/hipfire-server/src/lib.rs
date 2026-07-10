@@ -5,6 +5,7 @@
 )]
 
 pub mod admin_ui;
+pub mod api_auth;
 pub mod auth;
 pub mod deferred_jobs;
 pub mod model;
@@ -250,6 +251,10 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             "/sdapi/v1/server-stop",
             post(routes::sdapi::post_server_stop_noop),
         );
+    let router = router.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        api_auth::api_gate,
+    ));
     let router = match cors_layer(cors_allowed_origins) {
         Some(cors) => router.layer(cors),
         None => router,
@@ -262,9 +267,11 @@ pub async fn serve(config: HipfireConfig) -> anyhow::Result<()> {
 }
 
 pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
+    api_auth::validate_api_auth_config(&config.config).map_err(anyhow::Error::msg)?;
     let addr = format!("{}:{}", config.config.host, config.config.port);
     let cors_allowed_origins = config.config.cors_allowed_origins.clone();
     let state = AppState::new_loaded(config);
+    state.access.ensure_ready().map_err(anyhow::Error::msg)?;
 
     spawn_daemon_for_serving(&state).await?;
 

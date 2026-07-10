@@ -39,6 +39,9 @@ fn default_cors_allowed_origins() -> Vec<String> {
 fn default_admin_user() -> String {
     "admin".to_string()
 }
+fn default_api_auth_mode() -> ApiAuthMode {
+    ApiAuthMode::Auto
+}
 fn default_sdapi_output_root() -> String {
     "/tmp/hipfire-sdapi".to_string()
 }
@@ -183,6 +186,26 @@ fn default_prefill_sparse_threshold() -> u32 {
     32768
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiAuthMode {
+    Auto,
+    Off,
+    Optional,
+    Required,
+}
+
+impl std::fmt::Display for ApiAuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HipfireConfig {
     #[serde(default = "default_host")]
@@ -199,6 +222,14 @@ pub struct HipfireConfig {
     /// lands in `~/.hipfire/admin.passwd`).
     #[serde(default = "default_admin_user")]
     pub admin_user: String,
+    /// API credential rollout policy. `auto` preserves anonymous loopback
+    /// compatibility and requires credentials for non-loopback binds.
+    #[serde(default = "default_api_auth_mode")]
+    pub api_auth_mode: ApiAuthMode,
+    /// Explicitly acknowledge an unauthenticated non-loopback bind when
+    /// `api_auth_mode` is `off` or `optional`.
+    #[serde(default)]
+    pub unsafe_allow_unauthenticated_remote: bool,
     /// Root directory for images saved by the SD API compatibility routes
     /// (`save_images: true`). Client-supplied `outdir_*` override_settings
     /// are ignored; every SD API image write stays under this root.
@@ -419,6 +450,8 @@ impl Default for HipfireConfig {
             port: default_port(),
             cors_allowed_origins: default_cors_allowed_origins(),
             admin_user: default_admin_user(),
+            api_auth_mode: default_api_auth_mode(),
+            unsafe_allow_unauthenticated_remote: false,
             sdapi_output_root: default_sdapi_output_root(),
             sdapi_max_dimension: default_sdapi_max_dimension(),
             sdapi_max_steps: default_sdapi_max_steps(),
@@ -824,6 +857,8 @@ mod tests {
         assert_eq!(cfg.port, 11435);
         assert!(cfg.cors_allowed_origins.is_empty());
         assert_eq!(cfg.admin_user, "admin");
+        assert_eq!(cfg.api_auth_mode, ApiAuthMode::Auto);
+        assert!(!cfg.unsafe_allow_unauthenticated_remote);
         assert_eq!(cfg.max_seq, 8192);
         assert_eq!(cfg.max_tokens, 512);
         assert_eq!(cfg.temperature, 0.3);
@@ -890,6 +925,8 @@ mod tests {
         cfg.sdapi_max_batch_size = 4;
         cfg.sdapi_max_n_iter = 4;
         cfg.sdapi_max_total_batches = 8;
+        cfg.api_auth_mode = ApiAuthMode::Required;
+        cfg.unsafe_allow_unauthenticated_remote = true;
         cfg.models_dir = Some("/data/hipfire/models".to_string());
         cfg.models_network_dir = Some("/srv/hipfire".to_string());
 
@@ -899,6 +936,8 @@ mod tests {
         assert_eq!(loaded.config.sdapi_max_batch_size, 4);
         assert_eq!(loaded.config.sdapi_max_n_iter, 4);
         assert_eq!(loaded.config.sdapi_max_total_batches, 8);
+        assert_eq!(loaded.config.api_auth_mode, ApiAuthMode::Required);
+        assert!(loaded.config.unsafe_allow_unauthenticated_remote);
         assert_eq!(
             loaded.config.models_dir.as_deref(),
             Some("/data/hipfire/models")

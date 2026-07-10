@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify};
 
+use hipfire_auth::{AccessStore, CredentialSnapshot};
 use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_daemon_adapter::DaemonEngine;
 use hipfire_diffusion::{DiffusionGenerationRuntimeOptions, DiffusionPipeline};
@@ -121,6 +122,74 @@ pub struct AppState {
     pub admin_secret: String,
     /// Active `/admin` browser sessions: token -> expiry (unix secs).
     pub admin_sessions: Mutex<HashMap<String, u64>>,
+    /// Durable API identities plus the immutable verification snapshot used by
+    /// request middleware. Database errors remain visible and fail closed.
+    pub access: AccessRuntime,
+}
+
+pub struct AccessRuntime {
+    store: std::sync::RwLock<Option<AccessStore>>,
+    credentials: std::sync::RwLock<Option<Arc<CredentialSnapshot>>>,
+    init_error: std::sync::RwLock<Option<String>>,
+}
+
+impl AccessRuntime {
+    fn open(directory: &std::path::Path) -> Self {
+        match AccessStore::open_in(directory) {
+            Ok(store) => match CredentialSnapshot::load(&store) {
+                Ok(snapshot) => Self {
+                    store: std::sync::RwLock::new(Some(store)),
+                    credentials: std::sync::RwLock::new(Some(Arc::new(snapshot))),
+                    init_error: std::sync::RwLock::new(None),
+                },
+                Err(error) => Self::failed(error.to_string()),
+            },
+            Err(error) => Self::failed(error.to_string()),
+        }
+    }
+
+    fn failed(error: String) -> Self {
+        Self {
+            store: std::sync::RwLock::new(None),
+            credentials: std::sync::RwLock::new(None),
+            init_error: std::sync::RwLock::new(Some(error)),
+        }
+    }
+
+    pub fn ensure_ready(&self) -> Result<(), String> {
+        if let Some(error) = self.init_error.read().unwrap().clone() {
+            return Err(format!("API access store unavailable: {error}"));
+        }
+        if self.store.read().unwrap().is_none() || self.credentials.read().unwrap().is_none() {
+            return Err("API access store unavailable".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn store(&self) -> Result<AccessStore, String> {
+        self.ensure_ready()?;
+        self.store
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "API access store unavailable".to_string())
+    }
+
+    pub fn credentials(&self) -> Result<Arc<CredentialSnapshot>, String> {
+        self.ensure_ready()?;
+        self.credentials
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "API credential cache unavailable".to_string())
+    }
+
+    pub fn refresh_credentials(&self) -> Result<(), String> {
+        let store = self.store()?;
+        let snapshot = CredentialSnapshot::load(&store).map_err(|error| error.to_string())?;
+        *self.credentials.write().unwrap() = Some(Arc::new(snapshot));
+        Ok(())
+    }
 }
 
 impl AppState {
@@ -137,6 +206,18 @@ impl AppState {
     pub fn new_loaded_with_training_runs_dir(
         loaded_config: LoadedConfig,
         training_runs_dir: PathBuf,
+    ) -> Arc<Self> {
+        Self::new_loaded_with_directories(
+            loaded_config,
+            training_runs_dir,
+            hipfire_config::hipfire_dir(),
+        )
+    }
+
+    pub fn new_loaded_with_directories(
+        loaded_config: LoadedConfig,
+        training_runs_dir: PathBuf,
+        access_dir: PathBuf,
     ) -> Arc<Self> {
         let scheduler_env = SchedulerPolicyEnv::from_pairs(std::env::vars());
         let config = loaded_config.config.clone();
@@ -179,6 +260,7 @@ impl AppState {
             models_network_dir,
             admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
             admin_sessions: Mutex::new(HashMap::new()),
+            access: AccessRuntime::open(&access_dir),
         })
     }
 
