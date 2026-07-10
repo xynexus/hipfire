@@ -118,6 +118,28 @@ pub(crate) async fn execute_responses(
     .await
 }
 
+pub(crate) async fn execute_responses_for_principal(
+    state: SharedState,
+    body: ResponsesRequest,
+    principal: &RequestPrincipal,
+    accounting: &crate::accounting::RequestAccounting,
+) -> Result<Value, Value> {
+    let owner = principal
+        .user_id
+        .clone()
+        .map(ResponsesOwner::User)
+        .unwrap_or(ResponsesOwner::AnonymousLocal);
+    let result = execute_responses_owned(
+        state,
+        body,
+        owner,
+        scheduler_owner_from_principal(principal),
+    )
+    .await?;
+    report_response_usage(accounting, &result);
+    Ok(result)
+}
+
 async fn execute_responses_owned(
     state: SharedState,
     body: ResponsesRequest,

@@ -690,6 +690,10 @@ mod tests {
         http::Request,
     };
     use hipfire_config::{HipfireConfig, LoadedConfig};
+    use hipfire_model::ModelWorkerKey;
+    use hipfire_scheduler::{
+        create_request_session_draft, CreateRequestSessionInput, WorkloadOwner,
+    };
     use tower::ServiceExt;
 
     fn state(directory: &std::path::Path) -> SharedState {
@@ -702,6 +706,32 @@ mod tests {
 
     async fn json_body(response: Response) -> serde_json::Value {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    fn queued_session(
+        id: &str,
+        user_id: &str,
+        token_id: &str,
+    ) -> hipfire_scheduler::RequestSessionDraft {
+        create_request_session_draft(CreateRequestSessionInput {
+            id: id.into(),
+            owner: WorkloadOwner::authenticated(user_id, Some(token_id.to_string())),
+            worker_key: ModelWorkerKey {
+                artifact_path: "/models/test.hfq".into(),
+                artifact_digest: Some("sha256:test".into()),
+                arch_id: "qwen35".into(),
+                quant_family: "mq4".into(),
+                state_mode: "attention".into(),
+                max_seq_bucket: 4096,
+                accelerator_kind: None,
+                device_id: None,
+                feature_flags: vec!["prefill_batch".into()],
+            },
+            prompt_tokens: vec![1, 2, 3],
+            cached_prefix_tokens: Some(0),
+            priority: Some(0),
+            state_kinds: vec!["attention_kv".into()],
+        })
     }
 
     #[tokio::test]
@@ -749,10 +779,26 @@ mod tests {
         assert_eq!(listed["items"].as_array().unwrap().len(), 1);
         assert!(listed.to_string().find(secret).is_none());
 
+        state
+            .prefill_scheduler
+            .lock()
+            .await
+            .enqueue(queued_session("revoke-me", &user_id, &token_id), 0)
+            .unwrap();
+        assert_eq!(state.prefill_scheduler.lock().await.size(), 1);
+
         let first = revoke_token(State(state.clone()), Path(token_id.clone())).await;
         assert_eq!(json_body(first).await["revoked"], true);
+        assert_eq!(state.prefill_scheduler.lock().await.size(), 0);
         let second = revoke_token(State(state.clone()), Path(token_id)).await;
         assert_eq!(json_body(second).await["revoked"], true);
+
+        state
+            .prefill_scheduler
+            .lock()
+            .await
+            .enqueue(queued_session("disable-me", &user_id, "other-token"), 0)
+            .unwrap();
 
         let disabled = patch_user(
             State(state.clone()),
@@ -764,6 +810,7 @@ mod tests {
         )
         .await;
         assert_eq!(json_body(disabled).await["status"], "disabled");
+        assert_eq!(state.prefill_scheduler.lock().await.size(), 0);
 
         let audit = get_audit(State(state), Query(PageQuery::default())).await;
         let audit = json_body(audit).await;

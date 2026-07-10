@@ -17,8 +17,8 @@ use axum::{
 };
 use futures::StreamExt;
 use hipfire_auth::{
-    CredentialError, RateLimitError, RateLimitStatus, RequestPrincipal, ReservationCost, Scope,
-    WorkloadClass,
+    CredentialError, RateLimitError, RateLimitStatus, RateReservation, RequestPrincipal,
+    ReservationCost, Scope, WorkloadClass,
 };
 use hipfire_config::{ApiAuthMode, HipfireConfig};
 use serde_json::json;
@@ -201,8 +201,8 @@ async fn estimate_request(
     let path = request.uri().path().to_string();
     let method = request.method().clone();
     let workload = workload_class(&method, &path);
-    let mut cost = ReservationCost::request(workload);
-    let mut estimated_images = 0;
+    let cost = ReservationCost::request(workload);
+    let estimated_images = 0;
     if method == Method::GET || method == Method::DELETE {
         return Ok((request, cost, estimated_images));
     }
@@ -228,11 +228,25 @@ async fn estimate_request(
             .into_response()
     })?;
     let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    let (cost, estimated_images) = estimate_json_cost(workload, bytes.len(), value.as_ref());
+    Ok((
+        Request::from_parts(parts, Body::from(bytes)),
+        cost,
+        estimated_images,
+    ))
+}
+
+fn estimate_json_cost(
+    workload: WorkloadClass,
+    body_bytes: usize,
+    value: Option<&serde_json::Value>,
+) -> (ReservationCost, u64) {
+    let mut cost = ReservationCost::request(workload);
+    let mut estimated_images = 0;
     match workload {
         WorkloadClass::Text => {
-            let input_estimate = (bytes.len() as f64 / 4.0).ceil();
+            let input_estimate = (body_bytes as f64 / 4.0).ceil();
             let output_estimate = value
-                .as_ref()
                 .and_then(|value| {
                     value
                         .get("max_output_tokens")
@@ -243,7 +257,6 @@ async fn estimate_request(
             cost.text_tokens = input_estimate + output_estimate;
         }
         WorkloadClass::Image => {
-            let value = value.as_ref();
             let width = json_u64(value, "width", 512) as f64;
             let height = json_u64(value, "height", 512) as f64;
             let steps = json_u64(value, "steps", 20) as f64;
@@ -268,11 +281,48 @@ async fn estimate_request(
         }
         WorkloadClass::Other | WorkloadClass::Training => {}
     }
-    Ok((
-        Request::from_parts(parts, Body::from(bytes)),
+    (cost, estimated_images)
+}
+
+/// Reserve and account for an API item executed outside the Axum middleware
+/// path (currently file batches). Each item remains owned and metered exactly
+/// like a direct request instead of inheriting only the outer control call.
+pub(crate) fn reserve_internal_json(
+    state: &SharedState,
+    principal: &RequestPrincipal,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<(RateReservation, RequestAccounting), RateLimitError> {
+    let bytes = serde_json::to_vec(body)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    let workload = workload_class(&Method::POST, path);
+    let (cost, estimated_images) = estimate_json_cost(workload, bytes, Some(body));
+    let (user_policy, token_policy) = if principal.token_id.is_some() {
+        state
+            .access
+            .credentials()
+            .ok()
+            .and_then(|snapshot| snapshot.rate_policies(principal))
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let reservation = state.rate_limiter.reserve_at(
+        now_secs_f64(),
+        principal,
+        &user_policy,
+        &token_policy,
         cost,
+    )?;
+    let accounting = RequestAccounting::new(
+        principal.clone(),
+        cost,
+        reservation.reporter(),
+        state.usage_writer.clone(),
         estimated_images,
-    ))
+    );
+    Ok((reservation, accounting))
 }
 
 fn json_u64(value: Option<&serde_json::Value>, key: &str, default: u64) -> u64 {
@@ -328,6 +378,10 @@ fn required_scope(path: &str) -> Option<Scope> {
 fn enforce_scope(principal: &RequestPrincipal, path: &str) -> Option<Response> {
     let scope = required_scope(path)?;
     (!principal.has_scope(scope)).then(|| forbidden(scope))
+}
+
+pub(crate) fn principal_has_scope_for_path(principal: &RequestPrincipal, path: &str) -> bool {
+    required_scope(path).is_none_or(|scope| principal.has_scope(scope))
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -472,6 +526,26 @@ mod tests {
     use hipfire_auth::{NewToken, NewUser, RatePolicyOverride};
     use hipfire_config::LoadedConfig;
     use tower::ServiceExt;
+
+    async fn accounted_stream(
+        axum::extract::Extension(accounting): axum::extract::Extension<RequestAccounting>,
+    ) -> Response {
+        accounting.report_text(7, 3, 2);
+        let chunks = futures::stream::iter([Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"done"),
+        )]);
+        Body::from_stream(chunks).into_response()
+    }
+
+    fn streaming_test_router(state: SharedState) -> axum::Router {
+        axum::Router::new()
+            .route("/v1/test", axum::routing::post(accounted_stream))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_gate,
+            ))
+            .with_state(state)
+    }
 
     fn state(config: HipfireConfig, directory: &std::path::Path) -> SharedState {
         crate::AppState::new_loaded_with_directories(
@@ -633,6 +707,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embeddings_images_and_training_routes_require_distinct_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(HipfireConfig::default(), directory.path());
+        let bearer = bearer_for(&state, BTreeSet::from([Scope::Text]));
+        let app = crate::build_router(state, &[]);
+        for (method, path, body) in [
+            (Method::POST, "/v1/embeddings", "{}"),
+            (Method::GET, "/sdapi/v1/options", ""),
+            (Method::POST, "/sdapi/v1/train/embedding", "{}"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    #[test]
+    fn text_image_and_training_costs_are_workload_aware() {
+        let text = json!({"max_tokens": 64});
+        let (text_cost, images) = estimate_json_cost(WorkloadClass::Text, 40, Some(&text));
+        assert_eq!(text_cost.text_tokens, 74.0);
+        assert_eq!(images, 0);
+
+        let image = json!({
+            "width": 1024,
+            "height": 512,
+            "steps": 10,
+            "batch_size": 2,
+            "n_iter": 1
+        });
+        let (image_cost, images) = estimate_json_cost(WorkloadClass::Image, 0, Some(&image));
+        assert!((image_cost.megapixel_steps - 10.48576).abs() < 1e-6);
+        assert_eq!(images, 2);
+
+        assert_eq!(
+            workload_class(&Method::POST, "/sdapi/v1/train/embedding"),
+            WorkloadClass::Training
+        );
+        assert_eq!(
+            workload_class(&Method::POST, "/v1/embeddings"),
+            WorkloadClass::Text
+        );
+    }
+
+    #[tokio::test]
     async fn api_token_never_authorizes_admin_routes() {
         let directory = tempfile::tempdir().unwrap();
         let state = state(HipfireConfig::default(), directory.path());
@@ -711,5 +841,115 @@ mod tests {
         assert_eq!(usage[0].counters.requests, 2);
         assert_eq!(usage[0].counters.errors, 1);
         assert_eq!(usage[0].counters.rate_limit_hits, 1);
+    }
+
+    #[test]
+    fn batch_items_are_checked_against_their_own_route_scope() {
+        let principal = RequestPrincipal {
+            user_id: Some("user-a".into()),
+            token_id: Some("token-a".into()),
+            scopes: BTreeSet::from([Scope::Images]),
+            auth_kind: hipfire_auth::AuthKind::ApiToken,
+        };
+        assert!(!principal_has_scope_for_path(
+            &principal,
+            "/v1/chat/completions"
+        ));
+        assert!(principal_has_scope_for_path(
+            &principal,
+            "/sdapi/v1/txt2img"
+        ));
+    }
+
+    #[test]
+    fn internal_batch_items_reserve_and_settle_independently() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(HipfireConfig::default(), directory.path());
+        let bearer = bearer_for_with_policy(
+            &state,
+            BTreeSet::from([Scope::Text]),
+            RatePolicyOverride {
+                requests_per_minute: Some(0),
+                request_burst: Some(1),
+                ..Default::default()
+            },
+        );
+        let principal = state
+            .access
+            .credentials()
+            .unwrap()
+            .verify(&bearer, 2)
+            .unwrap();
+        let body = json!({"model": "test", "messages": [], "max_tokens": 4});
+        let (reservation, accounting) =
+            reserve_internal_json(&state, &principal, "/v1/chat/completions", &body).unwrap();
+        accounting.report_text(2, 1, 0);
+        accounting.complete();
+        reservation.complete();
+
+        let second = reserve_internal_json(&state, &principal, "/v1/chat/completions", &body);
+        assert_eq!(second.unwrap_err().resource, "requests");
+
+        state
+            .usage_writer
+            .as_ref()
+            .unwrap()
+            .flush(now_secs())
+            .unwrap();
+        let usage = state.access.store().unwrap().list_usage().unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].counters.requests, 1);
+        assert_eq!(usage[0].counters.input_tokens, 2);
+        assert_eq!(usage[0].counters.output_tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn response_stream_eof_settles_usage_and_disconnect_refunds() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(HipfireConfig::default(), directory.path());
+        let bearer = bearer_for_with_policy(
+            &state,
+            BTreeSet::from([Scope::Text]),
+            RatePolicyOverride {
+                requests_per_minute: Some(0),
+                request_burst: Some(1),
+                ..Default::default()
+            },
+        );
+        let app = streaming_test_router(state.clone());
+        let request = || {
+            Request::post("/v1/test")
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+
+        let disconnected = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(disconnected.status(), StatusCode::OK);
+        drop(disconnected);
+
+        let completed = app.oneshot(request()).await.unwrap();
+        assert_eq!(completed.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(completed.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "done"
+        );
+
+        state
+            .usage_writer
+            .as_ref()
+            .unwrap()
+            .flush(now_secs())
+            .unwrap();
+        let usage = state.access.store().unwrap().list_usage().unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].counters.requests, 2);
+        assert_eq!(usage[0].counters.errors, 1);
+        assert_eq!(usage[0].counters.input_tokens, 14);
+        assert_eq!(usage[0].counters.output_tokens, 6);
+        assert_eq!(usage[0].counters.cache_tokens, 4);
     }
 }

@@ -1671,6 +1671,18 @@ pub(crate) async fn execute_blocking_chat_owned(
     }
 }
 
+pub(crate) async fn execute_blocking_chat_for_principal(
+    state: SharedState,
+    body: ChatRequest,
+    principal: &hipfire_auth::RequestPrincipal,
+    accounting: &crate::accounting::RequestAccounting,
+) -> Result<BlockingChatResult, Value> {
+    let result =
+        execute_blocking_chat_owned(state, body, scheduler_owner_from_principal(principal)).await?;
+    report_done_usage(accounting, &result.done);
+    Ok(result)
+}
+
 async fn execute_blocking_chat_cancellable<F>(
     state: SharedState,
     body: ChatRequest,

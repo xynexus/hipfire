@@ -111,4 +111,39 @@ impl CredentialSnapshot {
             credential.token.rate_policy.clone(),
         ))
     }
+
+    /// Revalidate an already-authenticated principal before admitting delayed
+    /// work. This intentionally does not require the one-time raw secret: the
+    /// HTTP boundary already proved it, while this check catches later expiry,
+    /// revocation, or user disablement between queued items.
+    pub fn validate_principal(
+        &self,
+        principal: &RequestPrincipal,
+        now: u64,
+    ) -> Result<(), CredentialError> {
+        if principal.auth_kind == AuthKind::AnonymousLocal {
+            return Ok(());
+        }
+        let token_id = principal
+            .token_id
+            .as_deref()
+            .ok_or(CredentialError::Invalid)?;
+        let credential = self
+            .by_token_id
+            .get(token_id)
+            .ok_or(CredentialError::Invalid)?;
+        if principal.user_id.as_deref() != Some(credential.token.user_id.as_str()) {
+            return Err(CredentialError::Invalid);
+        }
+        if credential.user_status == UserStatus::Disabled {
+            return Err(CredentialError::UserDisabled);
+        }
+        if credential.token.revoked_at.is_some() {
+            return Err(CredentialError::Revoked);
+        }
+        if credential.token.expires_at <= now {
+            return Err(CredentialError::Expired);
+        }
+        Ok(())
+    }
 }

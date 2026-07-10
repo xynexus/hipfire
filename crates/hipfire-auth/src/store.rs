@@ -869,6 +869,7 @@ mod tests {
         let created = token(&store, &user.id);
         let snapshot = CredentialSnapshot::load(&store).unwrap();
         let principal = snapshot.verify(&created.secret, 999).unwrap();
+        snapshot.validate_principal(&principal, 999).unwrap();
         assert!(principal.has_scope(Scope::Text));
         assert!(!principal.has_scope(Scope::Images));
         assert_eq!(
@@ -878,6 +879,10 @@ mod tests {
 
         store.revoke_token(&created.token.id, 500).unwrap();
         let snapshot = CredentialSnapshot::load(&store).unwrap();
+        assert_eq!(
+            snapshot.validate_principal(&principal, 600),
+            Err(CredentialError::Revoked)
+        );
         assert_eq!(
             snapshot.verify(&created.secret, 600),
             Err(CredentialError::Revoked)
