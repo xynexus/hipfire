@@ -271,3 +271,61 @@ fn wan_qwen_image_decoder_smooth_latent_is_smooth() {
         "decoder produces high-frequency output from a constant latent (mean|Δright|={smoothness}) — decoder is broken"
     );
 }
+
+#[test]
+fn wan_qwen_image_decoder_resident_matches_cpu_reference_on_smooth_latent() {
+    let model = std::path::Path::new("/home/sadara/.hipfire/models/Krea2-Turbo.hfq");
+    if !model.exists() {
+        eprintln!("skip: Krea2-Turbo.hfq not present");
+        return;
+    }
+    let hfq = hipfire_runtime::hfq::HfqFile::open_index_only(model).unwrap();
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+    let decoder = NativeVaeDecoder::from_hfq(&hfq, &config.vae).unwrap();
+
+    let (channels, height, width) = (16usize, 8usize, 8usize);
+    let mut data = vec![0.0f32; channels * height * width];
+    for c in 0..channels {
+        for y in 0..height {
+            for x in 0..width {
+                data[(c * height + y) * width + x] =
+                    c as f32 * 0.01 + y as f32 * 0.02 - x as f32 * 0.015;
+            }
+        }
+    }
+    let latents = LatentBatch {
+        batch: 1,
+        channels,
+        height,
+        width,
+        data,
+    };
+
+    let cpu = decoder.decode_latents(&latents).unwrap();
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::rocm_hybrid(0));
+    let gpu = match decoder.decode_latents_with_runtime_context(&latents, &mut runtime_context) {
+        Ok(gpu) => gpu,
+        Err(DiffusionError::BackendUnavailable(error)) => {
+            eprintln!("skip: ROCm GPU unavailable for Krea2 resident VAE oracle test: {error}");
+            return;
+        }
+        Err(error) => panic!("resident VAE decode failed: {error}"),
+    };
+    assert_eq!(gpu.shape, cpu.shape);
+
+    let mut max_abs = 0.0f32;
+    let mut sum_sq = 0.0f64;
+    for (actual, expected) in gpu.data.iter().zip(&cpu.data) {
+        let diff = (actual - expected).abs();
+        max_abs = max_abs.max(diff);
+        sum_sq += (diff as f64) * (diff as f64);
+    }
+    let rmse = (sum_sq / cpu.data.len().max(1) as f64).sqrt();
+    eprintln!("resident Krea2 VAE vs CPU oracle: max_abs={max_abs:.6} rmse={rmse:.6}");
+    assert!(
+        max_abs <= 0.05 && rmse <= 0.01,
+        "resident Krea2 VAE decode diverged from CPU oracle: max_abs={max_abs:.6} rmse={rmse:.6}"
+    );
+}
