@@ -101,3 +101,51 @@ Repro: `R5_ARCH=aie2 ./r6_intensity.sh 4 4 1024 300 16 32 64 128`; NACC/INNER vi
 > ~15 TOPS array)** — ~25× above the streaming result. XDNA1 GEMM is **load-bound**
 > (no data reuse), not op-bound. NACC's weak ~1.35× is because it can't cut loads/mac.
 > The real fix is load-reuse register tiling (R9), not anything in R5–R7.
+
+## AIE2P EmbeddingGemma full-K submission (2026-07-10)
+
+`r6_gen_mp_fullk.py` and `r6_gen_mp_fullk_mixed.py` stream every K=256
+group and N slab through one AIE runtime sequence. `r6_fullk_cache.sh` builds
+W4, W8, or mixed caches under `~/.hipfire/npu`; the EmbeddingGemma inventory
+wrapper builds padded K=768/1280/3072 and N=256/768/1152/3072 shapes.
+
+Correctness on halo/gfx1151:
+
+- W4, arbitrary mixed W4+dense-W8 residual, and W8 return exact int32 group
+  partials for K-group counts 3, 5, and 12.
+- The Opus executor matches its CPU integer/scaling oracle exactly, including
+  AWQ sidecars and variable mixed overlay counts.
+- K=1152 uses five groups after zero-padding the pre-rotation activation to
+  K=1280; W4, mixed, and W8 all passed exact hardware parity.
+- Groups 3 and 5 use direct group-major output DMA. The shim task queue cannot
+  hold twelve per-group output tasks, so K=3072 records `physical` in
+  `output-layout.txt` and uses the correctness-preserving host transpose.
+
+Mixed residual experiments narrowed two dead ends:
+
+- A scalar sparse-overlay AIE kernel was exact but took 5.76 ms for
+  M=256/K=768/N=768. Densifying the arbitrary residual into W8 and accumulating
+  it into the W4 int32 tile on AIE reduced submission time to about 0.53 ms.
+- Fusing BF16 group scaling into the AIE core produced corrupt/NaN output. DMA
+  and constant BF16 stores were correct; the failure isolated to the current
+  Peano AIE2P acc32/int32-to-float lane conversion path. Group partials remain
+  int32 and scaling stays in the caller until that conversion is proven.
+
+The production seam includes activation packing, one dispatch, and output
+layout reconstruction, but excludes FWHT/quantization, group scaling,
+attention, norms, pooling, and Dense activation. At M=256 its weighted
+EmbeddingGemma projection inventory was:
+
+| mode | weighted hybrid projection ms | aggregate logical TOPS |
+|---|---:|---:|
+| W4 | 73.083 | 0.744 |
+| mixed | 131.275 | 0.414 |
+| W8 | 108.765 | 0.500 |
+
+These are hybrid projection measurements, not model throughput. The local
+OQ4++ hybrid model control and full-K path produced identical embeddings
+(minimum GPU cosine 0.98601860), so full-K preserved the legacy NPU result, but
+the existing 0.999 GPU-parity gate still failed. The measured full-K hybrid was
+130.9 input tok/s at 23.19 W package power, or 5.6 package tok/J. The remaining
+10k tok/s objective requires projection fusion plus resident attention/norm/
+residual/pooling/Dense execution; it is not satisfied by this slice.

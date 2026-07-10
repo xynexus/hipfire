@@ -246,3 +246,22 @@ Start with a correctness-preserving unified projector:
 
 Then optimize the shared path rather than producing separate one-off W4, OQ4.25,
 or W8 implementations.
+
+## Progress checkpoint — 2026-07-10
+
+Completed in the full-K projection slice:
+
+- generic W4, arbitrary mixed, and W8 admission with shared AWQ/FWHT/scaling;
+- resident complete-projection weights and reusable argument buffers;
+- one XRT/AIE dispatch per projection for 3, padded-5, and 12 K groups;
+- AIE-side mixed W4+dense-W8 residual accumulation;
+- resumable M=256 cache generation under `~/.hipfire/npu`;
+- exact CPU-oracle hardware parity across formats and extreme K/N shapes;
+- automatic full-K-only cache selection in the EmbeddingGemma projector.
+
+Measured status is still below admission: W4 projection inventory is 73.083 ms
+at M=256 (about 3.5k input tok/s before non-projection work). The real hybrid
+model is 130.9 input tok/s and 5.6 package tok/J, and its GPU cosine gate remains
+below threshold at 0.98601860. Attention, norms, residuals, activations, pooling,
+Dense heads, and final normalization remain GPU/host resident. Do not promote
+this checkpoint as a full-NPU or 10k tok/s result.
