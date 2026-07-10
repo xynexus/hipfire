@@ -45,6 +45,7 @@ impl NpuFullKMode {
 /// Device-resident packed weights for one complete projection.
 pub struct NpuFullKResidentWeights {
     buffer: DeviceBuffer,
+    scales: Vec<f32>,
 }
 
 /// Reusable activation/output buffers and one compiled full-K AIE schedule.
@@ -56,7 +57,10 @@ pub struct NpuGemmFullK {
     groups: usize,
     n: usize,
     direct_output: bool,
+    scaled_output: bool,
+    combined_input: bool,
     input: DeviceBuffer,
+    scale_input: Option<DeviceBuffer>,
     output: DeviceBuffer,
 }
 
@@ -77,7 +81,7 @@ impl NpuGemmFullK {
             NpuFullKMode::Mixed
         } else if tokens.contains(&"w8") {
             NpuFullKMode::W8
-        } else if tokens.contains(&"w4") {
+        } else if tokens.contains(&"w4") || tokens.contains(&"w4-scaled") {
             NpuFullKMode::W4
         } else {
             return Err(bad_cache(base));
@@ -88,12 +92,40 @@ impl NpuGemmFullK {
 
         let xclbin = std::fs::read(format!("{dir}/final.xclbin")).map_err(XdnaError::Open)?;
         let instructions = std::fs::read(format!("{dir}/insts.bin")).map_err(XdnaError::Open)?;
-        let direct_output = std::fs::read_to_string(format!("{dir}/output-layout.txt"))
-            .is_ok_and(|layout| layout.trim() == "direct");
+        let output_layout =
+            std::fs::read_to_string(format!("{dir}/output-layout.txt")).unwrap_or_default();
+        let direct_output = matches!(output_layout.trim(), "direct" | "scaled-f32-direct");
+        let scaled_output = output_layout.trim().starts_with("scaled-f32");
+        let combined_input = scaled_output
+            && std::fs::read_to_string(format!("{dir}/input-layout.txt"))
+                .is_ok_and(|layout| layout.trim() == "combined");
         let kernel = NpuKernel::load(&xclbin, &instructions)?;
-        let input = kernel.alloc_arg(rows * groups * GROUP_K)?;
-        let output = kernel
-            .alloc_arg(rows * groups * n * mode.output_components() * std::mem::size_of::<i32>())?;
+        let input_bytes = if combined_input {
+            let rows_per_core = rows / cols;
+            cols * (n / SLAB_N)
+                * groups
+                * (rows_per_core * GROUP_K + (rows_per_core + SLAB_N) * std::mem::size_of::<f32>())
+        } else {
+            rows * groups * GROUP_K
+        };
+        let output_elements = if scaled_output {
+            rows * n
+        } else {
+            rows * groups * n * mode.output_components()
+        };
+        let input = kernel.alloc_arg(input_bytes)?;
+        let scale_input = if scaled_output && !combined_input {
+            let rows_per_core = rows / cols;
+            Some(kernel.alloc_arg(
+                cols * (n / SLAB_N)
+                    * groups
+                    * (rows_per_core + SLAB_N)
+                    * std::mem::size_of::<f32>(),
+            )?)
+        } else {
+            None
+        };
+        let output = kernel.alloc_arg(output_elements * std::mem::size_of::<i32>())?;
         Ok(Self {
             kernel,
             mode,
@@ -102,7 +134,10 @@ impl NpuGemmFullK {
             groups,
             n,
             direct_output,
+            scaled_output,
+            combined_input,
             input,
+            scale_input,
             output,
         })
     }
@@ -123,8 +158,21 @@ impl NpuGemmFullK {
         self.n
     }
 
+    pub fn scaled_output(&self) -> bool {
+        self.scaled_output
+    }
+
+    fn packed_weight_entry_bytes(&self) -> usize {
+        self.mode.weight_entries() * self.mode.weight_bytes()
+    }
+
+    fn device_weight_bytes(&self) -> usize {
+        self.groups * (self.n / SLAB_N) * self.packed_weight_entry_bytes()
+    }
+
     pub fn packed_weight_bytes(&self) -> usize {
-        self.groups * (self.n / SLAB_N) * self.mode.weight_entries() * self.mode.weight_bytes()
+        self.device_weight_bytes()
+            + usize::from(self.scaled_output) * self.groups * self.n * std::mem::size_of::<f32>()
     }
 
     pub fn upload_resident_weights(
@@ -138,10 +186,18 @@ impl NpuGemmFullK {
                 packed.len()
             )));
         }
-        let mut buffer = self.kernel.alloc_arg(packed.len())?;
-        buffer.as_mut_slice().copy_from_slice(packed);
+        let device_bytes = self.device_weight_bytes();
+        let mut buffer = self.kernel.alloc_arg(device_bytes)?;
+        buffer
+            .as_mut_slice()
+            .copy_from_slice(&packed[..device_bytes]);
         self.kernel.sync_to_device(&buffer)?;
-        Ok(NpuFullKResidentWeights { buffer })
+        let scales = if self.scaled_output {
+            as_f32(&packed[device_bytes..]).to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(NpuFullKResidentWeights { buffer, scales })
     }
 
     /// Pack row-major K-group matrices into the generated broadcast schedule.
@@ -151,6 +207,15 @@ impl NpuGemmFullK {
         &self,
         base: &[&[i8]],
         residual: &[&[i8]],
+    ) -> Result<Vec<u8>, XdnaError> {
+        self.prepack_weights_with_scales(base, residual, &[])
+    }
+
+    pub fn prepack_weights_with_scales(
+        &self,
+        base: &[&[i8]],
+        residual: &[&[i8]],
+        scales: &[&[f32]],
     ) -> Result<Vec<u8>, XdnaError> {
         if base.len() != self.groups || base.iter().any(|weights| weights.len() != GROUP_K * self.n)
         {
@@ -167,15 +232,28 @@ impl NpuGemmFullK {
         } else if !residual.is_empty() {
             return Err(invalid("residual weights require mixed full-K mode"));
         }
+        if self.scaled_output {
+            if scales.len() != self.groups || scales.iter().any(|scale| scale.len() != self.n) {
+                return Err(invalid("scaled full-K weight-scale geometry mismatch"));
+            }
+        } else if !scales.is_empty() {
+            return Err(invalid("weight scales require a scaled full-K cache"));
+        }
 
         let entry_bytes = self.mode.weight_bytes();
-        let entries = self.mode.weight_entries();
+        let packed_entry_bytes = self.packed_weight_entry_bytes();
         let nb = self.n / SLAB_N;
+        let device_bytes = self.device_weight_bytes();
         let mut packed = vec![0u8; self.packed_weight_bytes()];
         for group in 0..self.groups {
             for slab in 0..nb {
-                let entry = (group * nb + slab) * entries;
-                let base_out = &mut packed[entry * entry_bytes..(entry + 1) * entry_bytes];
+                let entry_index = if self.scaled_output {
+                    slab * self.groups + group
+                } else {
+                    group * nb + slab
+                };
+                let entry_offset = entry_index * packed_entry_bytes;
+                let base_out = &mut packed[entry_offset..entry_offset + entry_bytes];
                 match self.mode {
                     NpuFullKMode::W4 | NpuFullKMode::Mixed => {
                         pack_w4_slab(base[group], self.n, slab, &mut base_out[..8192])?;
@@ -185,9 +263,17 @@ impl NpuGemmFullK {
                     }
                 }
                 if self.mode == NpuFullKMode::Mixed {
-                    let residual_out =
-                        &mut packed[(entry + 1) * entry_bytes..(entry + 2) * entry_bytes];
+                    let residual_offset = entry_offset + entry_bytes;
+                    let residual_out = &mut packed[residual_offset..residual_offset + entry_bytes];
                     pack_w8_slab(residual[group], self.n, slab, residual_out);
+                }
+                if self.scaled_output {
+                    let scale_offset = device_bytes
+                        + (group * self.n + slab * SLAB_N) * std::mem::size_of::<f32>();
+                    packed[scale_offset..scale_offset + SLAB_N * std::mem::size_of::<f32>()]
+                        .copy_from_slice(as_bytes_f32(
+                            &scales[group][slab * SLAB_N..(slab + 1) * SLAB_N],
+                        ));
                 }
             }
         }
@@ -203,6 +289,9 @@ impl NpuGemmFullK {
         activations: &[i8],
         partials: &mut [i32],
     ) -> Result<(), XdnaError> {
+        if self.scaled_output {
+            return Err(invalid("scaled full-K cache requires run_resident_scaled"));
+        }
         if activations.len() != self.rows * self.k() {
             return Err(invalid(format!(
                 "full-K activations want {} elements, got {}",
@@ -217,7 +306,7 @@ impl NpuGemmFullK {
                 partials.len()
             )));
         }
-        if weights.buffer.len() != self.packed_weight_bytes() {
+        if weights.buffer.len() != self.device_weight_bytes() {
             return Err(invalid("resident full-K weight shape changed"));
         }
 
@@ -267,6 +356,152 @@ impl NpuGemmFullK {
         }
         Ok(())
     }
+
+    /// Run a scaled full-K projection. Activation scales are group-major
+    /// `[K/256,M]`; resident weight scale tails are applied on AIE and the
+    /// returned output is already accumulated row-major `[M,N]` f32.
+    pub fn run_resident_scaled(
+        &mut self,
+        weights: &NpuFullKResidentWeights,
+        activations: &[i8],
+        activation_scales: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), XdnaError> {
+        if !self.scaled_output {
+            return Err(invalid(
+                "run_resident_scaled requires a scaled full-K cache",
+            ));
+        }
+        if activations.len() != self.rows * self.k()
+            || activation_scales.len() != self.groups * self.rows
+            || output.len() != self.rows * self.n
+        {
+            return Err(invalid("scaled full-K activation/output geometry mismatch"));
+        }
+        if weights.buffer.len() != self.device_weight_bytes()
+            || weights.scales.len() != self.groups * self.n
+        {
+            return Err(invalid("resident scaled full-K weight shape changed"));
+        }
+
+        let rows_per_core = self.rows / self.cols;
+        let scale_bytes = (rows_per_core + SLAB_N) * std::mem::size_of::<f32>();
+        if self.combined_input {
+            let activation_bytes = rows_per_core * GROUP_K;
+            let entry_bytes = activation_bytes + scale_bytes;
+            for core in 0..self.cols {
+                for slab in 0..self.n / SLAB_N {
+                    for group in 0..self.groups {
+                        let entry =
+                            ((core * (self.n / SLAB_N) + slab) * self.groups + group) * entry_bytes;
+                        for local_row in 0..rows_per_core {
+                            let row = core * rows_per_core + local_row;
+                            let source = row * self.k() + group * GROUP_K;
+                            let destination = entry + local_row * GROUP_K;
+                            self.input.as_mut_slice()[destination..destination + GROUP_K]
+                                .copy_from_slice(as_bytes(&activations[source..source + GROUP_K]));
+                        }
+                        copy_scale_payload(
+                            &mut self.input.as_mut_slice()
+                                [entry + activation_bytes..entry + activation_bytes + scale_bytes],
+                            activation_scales,
+                            &weights.scales,
+                            group,
+                            core,
+                            slab,
+                            self.rows,
+                            self.n,
+                            rows_per_core,
+                        );
+                    }
+                }
+            }
+            self.kernel.dispatch_synced(
+                &[&self.input, &weights.buffer, &self.output],
+                &[true, false, true],
+            )?;
+        } else {
+            for core in 0..self.cols {
+                for group in 0..self.groups {
+                    let entry = (core * self.groups + group) * rows_per_core * GROUP_K;
+                    for local_row in 0..rows_per_core {
+                        let row = core * rows_per_core + local_row;
+                        let source = row * self.k() + group * GROUP_K;
+                        let destination = entry + local_row * GROUP_K;
+                        self.input.as_mut_slice()[destination..destination + GROUP_K]
+                            .copy_from_slice(as_bytes(&activations[source..source + GROUP_K]));
+                    }
+                }
+            }
+            let scale_input = self
+                .scale_input
+                .as_mut()
+                .ok_or_else(|| invalid("scaled full-K cache has no scale input"))?;
+            for core in 0..self.cols {
+                for slab in 0..self.n / SLAB_N {
+                    for group in 0..self.groups {
+                        let offset =
+                            ((core * (self.n / SLAB_N) + slab) * self.groups + group) * scale_bytes;
+                        copy_scale_payload(
+                            &mut scale_input.as_mut_slice()[offset..offset + scale_bytes],
+                            activation_scales,
+                            &weights.scales,
+                            group,
+                            core,
+                            slab,
+                            self.rows,
+                            self.n,
+                            rows_per_core,
+                        );
+                    }
+                }
+            }
+            self.kernel.dispatch_synced(
+                &[&self.input, &weights.buffer, scale_input, &self.output],
+                &[true, false, true, true],
+            )?;
+        }
+        let physical = as_f32(self.output.as_slice());
+        if self.direct_output {
+            output.copy_from_slice(physical);
+        } else {
+            let nb = self.n / SLAB_N;
+            for core in 0..self.cols {
+                for slab in 0..nb {
+                    for local_row in 0..rows_per_core {
+                        let row = core * rows_per_core + local_row;
+                        let source = ((core * nb + slab) * rows_per_core + local_row) * SLAB_N;
+                        let destination = row * self.n + slab * SLAB_N;
+                        output[destination..destination + SLAB_N]
+                            .copy_from_slice(&physical[source..source + SLAB_N]);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_scale_payload(
+    destination: &mut [u8],
+    activation_scales: &[f32],
+    weight_scales: &[f32],
+    group: usize,
+    core: usize,
+    slab: usize,
+    rows: usize,
+    n: usize,
+    rows_per_core: usize,
+) {
+    let activation_bytes = rows_per_core * std::mem::size_of::<f32>();
+    destination[..activation_bytes].copy_from_slice(as_bytes_f32(
+        &activation_scales
+            [group * rows + core * rows_per_core..group * rows + (core + 1) * rows_per_core],
+    ));
+    destination[activation_bytes..].copy_from_slice(as_bytes_f32(
+        &weight_scales[group * n + slab * SLAB_N..group * n + (slab + 1) * SLAB_N],
+    ));
 }
 
 fn parse_prefixed(name: &str, prefix: &str) -> Option<usize> {
@@ -326,6 +561,21 @@ fn as_i32(values: &[u8]) -> &[i32] {
             values.as_ptr().cast::<i32>(),
             values.len() / std::mem::size_of::<i32>(),
         )
+    }
+}
+
+fn as_f32(values: &[u8]) -> &[f32] {
+    unsafe {
+        std::slice::from_raw_parts(
+            values.as_ptr().cast::<f32>(),
+            values.len() / std::mem::size_of::<f32>(),
+        )
+    }
+}
+
+fn as_bytes_f32(values: &[f32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
 }
 

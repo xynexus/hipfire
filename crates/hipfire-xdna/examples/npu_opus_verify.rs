@@ -114,12 +114,14 @@ fn main() {
 
     let mut mismatches = 0usize;
     let mut max_abs = 0.0f32;
-    for (got, expected) in output.iter().zip(&reference) {
+    let mut first_mismatch = None;
+    for (index, (got, expected)) in output.iter().zip(&reference).enumerate() {
         let error = (got - expected).abs();
         max_abs = max_abs.max(error);
         let tolerance = 1e-4 + expected.abs() * 1e-5;
         if error > tolerance {
             mismatches += 1;
+            first_mismatch.get_or_insert((index, *got, *expected, error));
         }
     }
     println!(
@@ -130,6 +132,9 @@ fn main() {
         if encoding == "mixed" { outlier_count } else { 0 },
         if encoding == "mixed" { outlier_count.div_ceil(3) } else { 0 },
     );
+    if let Some((index, got, expected, error)) = first_mismatch {
+        println!("first_mismatch index={index} got={got} expected={expected} abs={error}");
+    }
     assert_eq!(mismatches, 0, "NPU mixed Opus parity failed");
 }
 

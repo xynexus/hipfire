@@ -247,7 +247,15 @@ impl NpuOpusExecutor {
             } else {
                 Vec::new()
             };
-            let packed = fullk.prepack_weights(&base, &residual)?;
+            let scales: Vec<&[f32]> = decoded
+                .iter()
+                .map(|group| group.scales.as_slice())
+                .collect();
+            let packed = if fullk.scaled_output() {
+                fullk.prepack_weights_with_scales(&base, &residual, &scales)?
+            } else {
+                fullk.prepack_weights(&base, &residual)?
+            };
             Some(fullk.upload_resident_weights(&packed)?)
         } else {
             None
@@ -386,6 +394,8 @@ impl NpuOpusExecutor {
             if prepared.padded_rows % chunk_rows == 0 {
                 let mut activations = vec![0i8; chunk_rows * padded_k];
                 let mut partials = vec![0i32; matrix.groups.len() * chunk_rows * matrix.n];
+                let mut activation_scales = vec![0.0f32; matrix.groups.len() * chunk_rows];
+                let mut scaled_output = vec![0.0f32; chunk_rows * matrix.n];
                 for row0 in (0..prepared.padded_rows).step_by(chunk_rows) {
                     activations.fill(0);
                     for row in 0..chunk_rows {
@@ -396,6 +406,28 @@ impl NpuOpusExecutor {
                             activations[destination..destination + GROUP]
                                 .copy_from_slice(&group[source..source + GROUP]);
                         }
+                    }
+                    if fullk.scaled_output() {
+                        for group_idx in 0..matrix.groups.len() {
+                            activation_scales[group_idx * chunk_rows..(group_idx + 1) * chunk_rows]
+                                .copy_from_slice(
+                                    &prepared.scales[group_idx][row0..row0 + chunk_rows],
+                                );
+                        }
+                        fullk.run_resident_scaled(
+                            weights,
+                            &activations,
+                            &activation_scales,
+                            &mut scaled_output,
+                        )?;
+                        let valid_rows = (m - row0.min(m)).min(chunk_rows);
+                        for row in 0..valid_rows {
+                            c[(row0 + row) * matrix.n..(row0 + row + 1) * matrix.n]
+                                .copy_from_slice(
+                                    &scaled_output[row * matrix.n..(row + 1) * matrix.n],
+                                );
+                        }
+                        continue;
                     }
                     fullk.run_resident(weights, &activations, &mut partials)?;
                     let valid_rows = (m - row0.min(m)).min(chunk_rows);
@@ -526,7 +558,7 @@ impl NpuOpusExecutor {
             matrix.k,
             x,
             matrix.awq_scale.as_deref(),
-            self.rows_per_dispatch_for(matrix.encoding),
+            self.rows_per_dispatch_for_matrix(matrix),
         );
         for (group_idx, group) in matrix.groups.iter().enumerate() {
             for row in 0..m {
