@@ -180,6 +180,13 @@ pub mod gemm_fullk;
 #[cfg(target_os = "linux")]
 pub use gemm_fullk::{NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK};
 
+// AIE2P 4x4 whole-array W4A8 GEMM. Each dispatch reuses four activation and
+// four weight stripes across all 16 compute tiles and returns K-group partials.
+#[cfg(target_os = "linux")]
+pub mod gemm_whole;
+#[cfg(target_os = "linux")]
+pub use gemm_whole::{NpuGemmWholeArray, NpuWholeMode, NpuWholeResidentWeights};
+
 #[cfg(target_os = "linux")]
 pub mod opus;
 #[cfg(target_os = "linux")]

@@ -19,9 +19,12 @@ KT  = int(sys.argv[3]) if len(sys.argv) > 3 else 16
 NBLK = int(sys.argv[4]) if len(sys.argv) > 4 else 256
 # Per-W-tile bytes: 64 for int4 weights (packed 2/byte, default), 128 for int8 (W8A8).
 WBYTES = int(sys.argv[5]) if len(sys.argv) > 5 else 64
+DEVICE = sys.argv[6] if len(sys.argv) > 6 else "npu1"
+CBASE = int(sys.argv[7]) if len(sys.argv) > 7 else 32
+DEPTH = int(sys.argv[8]) if len(sys.argv) > 8 else 2
 AB = LM * KT * 64        # A-stripe bytes (shared by a physical row)
 WB = LN * KT * WBYTES    # W-stripe bytes (shared by a physical column)
-CB = LM * LN * 32        # per-core C i32
+CB = LM * LN * CBASE     # per-core C i32
 CJ = 4 * CB              # joined C per column
 INF = 9223372036854775807
 G = range(4)             # 4 cols, 4 block-rows
@@ -42,7 +45,7 @@ def _bd_dims(nblk, blk):
     return (f"[<size = {nblk}, stride = {blk}>, "
             f"<size = {o}, stride = {inner}>, <size = {inner}, stride = 1>]")
 
-out = ["module {", "  aie.device(npu1) {"]
+out = ["module {", f"  aie.device({DEVICE}) {{"]
 for c in G:
     out.append(f"    %shim{c} = aie.tile({c}, 0)")
     out.append(f"    %mt{c} = aie.tile({c}, 1)")
@@ -52,22 +55,22 @@ for c in G:
 # W: per column j, shim -> memtile -> broadcast to the 4 cores of column j
 for j in G:
     cores = ", ".join(f"%c{j}_{i}" for i in G)
-    out.append(f"    aie.objectfifo @wsh{j}(%shim{j}, {{%mt{j}}}, 2 : i32) : !aie.objectfifo<memref<{WB}xi8>>")
-    out.append(f"    aie.objectfifo @wbc{j}(%mt{j}, {{{cores}}}, 2 : i32) : !aie.objectfifo<memref<{WB}xi8>>")
+    out.append(f"    aie.objectfifo @wsh{j}(%shim{j}, {{%mt{j}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{WB}xi8>>")
+    out.append(f"    aie.objectfifo @wbc{j}(%mt{j}, {{{cores}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{WB}xi8>>")
     out.append(f"    aie.objectfifo.link [@wsh{j}] -> [@wbc{j}] ([] [0])")
 # A: per block-row i, shim_i -> memtile_i -> broadcast to core (c, 2+i) across all columns
 for i in G:
     cores = ", ".join(f"%c{c}_{i}" for c in G)
-    out.append(f"    aie.objectfifo @ash{i}(%shim{i}, {{%mt{i}}}, 2 : i32) : !aie.objectfifo<memref<{AB}xi8>>")
-    out.append(f"    aie.objectfifo @abc{i}(%mt{i}, {{{cores}}}, 2 : i32) : !aie.objectfifo<memref<{AB}xi8>>")
+    out.append(f"    aie.objectfifo @ash{i}(%shim{i}, {{%mt{i}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{AB}xi8>>")
+    out.append(f"    aie.objectfifo @abc{i}(%mt{i}, {{{cores}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{AB}xi8>>")
     out.append(f"    aie.objectfifo.link [@ash{i}] -> [@abc{i}] ([] [0])")
 # C: per column j, 4 cores -> memtile -> shim (join)
 for j in G:
     ins = ", ".join(f"@cc{j}_{i}" for i in G)
     offs = ", ".join(str(i * CB) for i in G)
     for i in G:
-        out.append(f"    aie.objectfifo @cc{j}_{i}(%c{j}_{i}, {{%mt{j}}}, 2 : i32) : !aie.objectfifo<memref<{CB}xi32>>")
-    out.append(f"    aie.objectfifo @csh{j}(%mt{j}, {{%shim{j}}}, 2 : i32) : !aie.objectfifo<memref<{CJ}xi32>>")
+        out.append(f"    aie.objectfifo @cc{j}_{i}(%c{j}_{i}, {{%mt{j}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{CB}xi32>>")
+    out.append(f"    aie.objectfifo @csh{j}(%mt{j}, {{%shim{j}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{CJ}xi32>>")
     out.append(f"    aie.objectfifo.link [{ins}] -> [@csh{j}] ([{offs}] [])")
 
 out.append(f'    func.func private @r11_gemm(memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>) attributes {{link_with = "r11.o"}}')

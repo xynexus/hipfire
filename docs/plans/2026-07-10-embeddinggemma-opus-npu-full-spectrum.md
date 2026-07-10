@@ -259,6 +259,28 @@ Completed in the full-K projection slice:
 - exact CPU-oracle hardware parity across formats and extreme K/N shapes;
 - automatic full-K-only cache selection in the EmbeddingGemma projector.
 
+### Whole-array reuse checkpoint
+
+The R14 schedule is now ported from Phoenix to AIE2P and reusable through the
+Rust XDNA runtime. It broadcasts four activation stripes across array rows and
+four weight stripes down array columns, so all 16 compute tiles share both
+operands. Generated caches and xclbins remain under `~/.hipfire/npu`.
+
+- W4 uses native `4x16x16` int8/int4 MMULs with 96x384 macro tiles.
+- W8 uses paired `8x8x8` int8 MMULs with 96x192 macro tiles. A first 96-column
+  stripe exceeded AIE core memory even at FIFO depth one; 48-column stripes
+  restore double buffering and exact execution.
+- Patterned signed hardware parity is exact for both modes at
+  `M=256 K=768 N=768`.
+- Reusable Rust wrapper timing, including host matrix marshaling and readback,
+  is 0.630 ms W4 (0.479 logical TOPS) and 0.651 ms W8 (0.464 logical TOPS).
+- Raw W4 schedule timing at the same q/o geometry is 0.135 ms (2.51 TOPS), so
+  host packing/unpacking—not AIE compute—is now the dominant projection seam.
+
+These are projection-kernel results, not full-model throughput. Mixed Opus
+overlays, scaled accumulation, shared buffers, and resident layer operations
+still need to be moved onto the same whole-array scheduling contract.
+
 Measured status is still below admission: W4 projection inventory is 73.083 ms
 at M=256 (about 3.5k input tok/s before non-projection work). The real hybrid
 model is 130.9 input tok/s and 5.6 package tok/J, and its GPU cosine gate remains
