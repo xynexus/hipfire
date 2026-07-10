@@ -5,6 +5,7 @@ members = [
     "crates/hsa-bridge",
     "crates/hipfire-rdna",
     "crates/hipfire-admin-types",
+    "crates/hipfire-auth",
     "crates/hipfire-coherence",
     "crates/hipfire-config",
     "crates/hipfire-cpu",
