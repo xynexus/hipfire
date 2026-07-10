@@ -32,8 +32,8 @@
 //!
 //! Exit 0 = gate works (clean unsupported error). Exit 1 = regression.
 
-use hipfire_runtime::weights::{weight_gemv, WeightTensor};
 use hipfire_rdna::{DType, Gpu};
+use hipfire_runtime::weights::{weight_gemv, WeightTensor};
 
 fn main() {
     let mut gpu = match Gpu::init() {

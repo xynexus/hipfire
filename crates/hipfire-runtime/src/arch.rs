@@ -46,11 +46,11 @@
 //!      time.
 
 use crate::hfq::HfqFile;
+use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_state::{
     SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateForkRequest,
     SequenceStatePageDescriptor,
 };
-use hipfire_rdna::{Gpu, GpuTensor};
 use std::time::Instant;
 
 /// Bring-up contract for a hipfire architecture.

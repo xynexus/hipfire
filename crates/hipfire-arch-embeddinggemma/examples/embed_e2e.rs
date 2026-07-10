@@ -32,7 +32,10 @@ use hipfire_runtime::tokenizer::Tokenizer;
 fn amdgpu_power_path() -> Option<std::path::PathBuf> {
     for e in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
         let p = e.path();
-        if std::fs::read_to_string(p.join("name")).map(|s| s.trim() == "amdgpu").unwrap_or(false) {
+        if std::fs::read_to_string(p.join("name"))
+            .map(|s| s.trim() == "amdgpu")
+            .unwrap_or(false)
+        {
             let pw = p.join("power1_average");
             if pw.exists() {
                 return Some(pw);
@@ -42,7 +45,12 @@ fn amdgpu_power_path() -> Option<std::path::PathBuf> {
     None
 }
 fn read_watts(path: &std::path::Path) -> Option<f64> {
-    std::fs::read_to_string(path).ok()?.trim().parse::<f64>().ok().map(|uw: f64| uw / 1e6)
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|uw: f64| uw / 1e6)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -77,7 +85,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hfq = HfqFile::open(Path::new(&hfq_path))?;
     eprintln!("      arch_id (header) = {}", hfq.arch_id);
     if hfq.arch_id != 19 {
-        eprintln!("      warning: arch_id={} (embeddinggemma expects 19)", hfq.arch_id);
+        eprintln!(
+            "      warning: arch_id={} (embeddinggemma expects 19)",
+            hfq.arch_id
+        );
     }
 
     eprintln!("[2/4] parsing EmbeddingGemmaConfig");
@@ -153,7 +164,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mean = sum / docs.len() as f32;
         println!(
             "mean cosine = {mean:.5}  =>  {}",
-            if mean >= 0.99 { "PASS (>=0.99)" } else { "FAIL (<0.99)" }
+            if mean >= 0.99 {
+                "PASS (>=0.99)"
+            } else {
+                "FAIL (<0.99)"
+            }
         );
         return Ok(());
     }
@@ -169,10 +184,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(p) = &pw_path {
             let (mut s, mut n) = (0.0, 0.0);
             for _ in 0..15 {
-                if let Some(w) = read_watts(p) { s += w; n += 1.0; }
+                if let Some(w) = read_watts(p) {
+                    s += w;
+                    n += 1.0;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(40));
             }
-            if n > 0.0 { idle_w = s / n; }
+            if n > 0.0 {
+                idle_w = s / n;
+            }
         }
         for _ in 0..3 {
             let _ = eg::embed_forward(&mut gpu, &weights, &cfg, &toks)?; // warm
@@ -182,7 +202,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..bench_iters {
             let _ = eg::embed_forward(&mut gpu, &weights, &cfg, &toks)?;
             if let Some(p) = &pw_path {
-                if let Some(w) = read_watts(p) { pw_sum += w; pw_n += 1.0; pw_peak = pw_peak.max(w); }
+                if let Some(w) = read_watts(p) {
+                    pw_sum += w;
+                    pw_n += 1.0;
+                    pw_peak = pw_peak.max(w);
+                }
             }
         }
         let dt = t0.elapsed().as_secs_f64();
@@ -196,8 +220,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  SoC package power: idle={idle_w:.2} W  active={pkg_w:.2} W  peak={pw_peak:.2} W  (GPU-dynamic ≈ {dyn_w:.2} W)"
         );
-        eprintln!("  efficiency (pkg)= {:.0} tok/joule   (dyn)= {:.0} tok/joule", tok_s / pkg_w, tok_s / dyn_w);
-        println!("gpu_tok_s={tok_s:.0} pkg_w={pkg_w:.2} dyn_w={dyn_w:.2}");
+        eprintln!(
+            "  efficiency (pkg)= {:.0} tok/joule   (dyn)= {:.0} tok/joule",
+            tok_s / pkg_w,
+            tok_s / dyn_w
+        );
+        println!(
+            "gpu_tok_s={tok_s:.6} idle_w={idle_w:.6} pkg_w={pkg_w:.6} dyn_w={dyn_w:.6} pkg_tok_j={:.6} dyn_tok_j={:.6}",
+            tok_s / pkg_w,
+            tok_s / dyn_w
+        );
         return Ok(());
     }
 
@@ -214,7 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t0 = std::time::Instant::now();
         let mut e = eg::embed_forward(&mut gpu, &weights, &cfg, &ids)?;
         eg::forward::l2_normalize(&mut e); // already normed; harmless
-        // Matryoshka truncation for display.
+                                           // Matryoshka truncation for display.
         if out_dims < e.len() {
             e.truncate(out_dims);
             let n = e.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -236,9 +268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         embs.push(e);
     }
 
-    let cos = |a: &[f32], b: &[f32]| -> f32 {
-        a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
-    };
+    let cos = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>() };
     println!("\n=== cosine similarity matrix (dim={out_dims}) ===");
     for i in 0..embs.len() {
         let row: Vec<String> = (0..embs.len())

@@ -25,6 +25,8 @@
 //! unified `<model>.calib.hfq` bundling the per-tensor Hessian + imatrix (+
 //! MoE router histogram for MoE models, + KLDREF with `--kldref`). Gemma3-VL
 //! (`arch_id=13`) is collected text-only through the `language_model.` prefix.
+//! EmbeddingGemma (`arch_id=19`) preserves independent corpus samples and
+//! captures its bidirectional backbone plus host-side Dense projection heads.
 //!
 //! Run:
 //!   cargo run --release -p hipfire-runtime --example collect_artifacts -- \
@@ -32,6 +34,7 @@
 //!     --corpus benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
 //!     --output /tmp/qwen3.5-0.8b.calib.hfq --max-tokens 256 [--kldref]
 
+use hipfire_arch_embeddinggemma::{self as embeddinggemma, calibration as embeddinggemma_calib};
 use hipfire_arch_gemma3::calibration as gemma3_calib;
 use hipfire_arch_gemma3::weights as gemma3_weights;
 use hipfire_arch_gemma3::{self as gemma3};
@@ -43,6 +46,7 @@ use hipfire_arch_nemotron::{calibration as nemotron_calib, model::NemotronModel,
 use hipfire_arch_qwen35::qwen35::{self, CalibOpts as QwenCalibOpts};
 use hipfire_arch_zaya::{calibration as zaya_calib, ZayaConfig};
 use hipfire_rdna::Gpu;
+use hipfire_runtime::calibration::tokenize_embedding_samples;
 use std::path::Path;
 
 fn arg(flag: &str, default: Option<String>) -> Option<String> {
@@ -79,6 +83,13 @@ fn main() {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(hfq.arch_id);
 
+    if source_arch_id == 19 && synthetic {
+        panic!("EmbeddingGemma calibration requires --corpus sample boundaries; --synthetic-tokens is unsupported");
+    }
+    if source_arch_id == 19 && want_kldref {
+        panic!("EmbeddingGemma calibration does not produce autoregressive KLDREF artifacts");
+    }
+
     // Loaded lazily — synthetic mode has no usable tokenizer; only the gemma3
     // text-only arm actually consumes it (asserts Some below).
     let tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer> = if synthetic {
@@ -90,7 +101,24 @@ fn main() {
         )
     };
 
-    let tokens_owned: Vec<u32> = if synthetic {
+    let embedding_samples: Vec<Vec<u32>> = if source_arch_id == 19 {
+        let text = std::fs::read_to_string(&corpus).expect("read embedding corpus as UTF-8");
+        let samples = tokenize_embedding_samples(&text, max_tokens, |sample| {
+            tokenizer.as_ref().unwrap().encode(sample)
+        });
+        if samples.is_empty() {
+            panic!(
+                "EmbeddingGemma corpus produced no complete non-empty samples within --max-tokens"
+            );
+        }
+        samples
+    } else {
+        Vec::new()
+    };
+
+    let tokens_owned: Vec<u32> = if source_arch_id == 19 {
+        Vec::new()
+    } else if synthetic {
         // Parse vocab_size from the hfq metadata (flat or under `config`).
         let meta: serde_json::Value =
             serde_json::from_str(&hfq.metadata_json).expect("metadata json");
@@ -115,9 +143,24 @@ fn main() {
         let text = String::from_utf8_lossy(&raw[..take]).to_string();
         tokenizer.as_ref().unwrap().encode(&text)
     };
-    let n_tok = tokens_owned.len().min(max_tokens);
-    let tokens = &tokens_owned[..n_tok];
-    eprintln!("calibrating on {n_tok} tokens (kldref={want_kldref}, synthetic={synthetic})");
+    let n_tok = if source_arch_id == 19 {
+        embedding_samples.iter().map(Vec::len).sum()
+    } else {
+        tokens_owned.len().min(max_tokens)
+    };
+    let tokens = if source_arch_id == 19 {
+        &[][..]
+    } else {
+        &tokens_owned[..n_tok]
+    };
+    eprintln!(
+        "calibrating on {n_tok} tokens across {} sample(s) (kldref={want_kldref}, synthetic={synthetic})",
+        if source_arch_id == 19 {
+            embedding_samples.len()
+        } else {
+            1
+        }
+    );
 
     let mut gpu = Gpu::init().expect("gpu");
     eprintln!("GPU: {}", gpu.arch);
@@ -192,6 +235,29 @@ fn main() {
                 } else {
                     "gemma3-text"
                 },
+            )
+        }
+        19 => {
+            let config = embeddinggemma::config_from_metadata_json(&hfq.metadata_json)
+                .expect("embeddinggemma config");
+            let weights = embeddinggemma::EmbeddingGemmaWeights::load_for_calibration(
+                &mut hfq, &config, &mut gpu,
+            )
+            .expect("load_weights");
+            let summary = embeddinggemma_calib::collect_calibration_artifacts(
+                &mut gpu,
+                &weights,
+                &config,
+                &embedding_samples,
+                Path::new(&output),
+                &provenance,
+            )
+            .expect("collect");
+            (
+                summary.n_hessian,
+                summary.n_imatrix,
+                summary.max_consistency,
+                "embeddinggemma",
             )
         }
         11 => {
@@ -308,7 +374,9 @@ fn main() {
             )
         }
         other => {
-            panic!("collect_artifacts: unsupported arch_id {other}; handled 5/6/10/11/12/13/14/16")
+            panic!(
+                "collect_artifacts: unsupported arch_id {other}; handled 5/6/10/11/12/13/14/16/19"
+            )
         }
     };
     eprintln!(

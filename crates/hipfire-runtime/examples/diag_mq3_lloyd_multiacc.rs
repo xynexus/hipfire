@@ -27,8 +27,8 @@
 //! drift on REAL Qwen3.5-9B MQ3-Lloyd weights — directly comparable to
 //! the MQ4-Lloyd diag's output for the same model and tensor name.
 
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_rdna::Gpu;
+use hipfire_runtime::hfq::HfqFile;
 use std::path::Path;
 
 fn f16_to_f32(bits: u16) -> f32 {

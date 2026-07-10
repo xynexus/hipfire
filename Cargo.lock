@@ -1279,6 +1279,7 @@ dependencies = [
  "hipfire-arch-gemma3",
  "hipfire-rdna",
  "hipfire-runtime",
+ "hipfire-xdna",
  "serde_json",
 ]
 
@@ -2030,6 +2031,7 @@ dependencies = [
  "base64",
  "csv",
  "hip-bridge",
+ "hipfire-arch-embeddinggemma",
  "hipfire-arch-gemma3",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
@@ -2058,6 +2060,7 @@ dependencies = [
  "hipfire-rdna",
  "hipfire-state",
  "hipfire-sysinfo",
+ "hipfire-xdna",
  "libc",
  "memmap2",
  "minijinja",
@@ -2297,6 +2300,7 @@ dependencies = [
 name = "hipfire-xdna"
 version = "0.3.0"
 dependencies = [
+ "hipfire-primitives",
  "libc",
 ]
 

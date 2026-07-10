@@ -27,11 +27,52 @@
 //! proceed (still exact on the global layers, an approximation on the local ones).
 
 use hip_bridge::HipResult;
-use hipfire_rdna::{DType, Gpu};
-use hipfire_runtime::weights::weight_gemm;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 
 use crate::config::{EmbeddingGemmaConfig, PoolingMode};
 use crate::weights::EmbeddingGemmaWeights;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Projection {
+    Query,
+    Key,
+    Value,
+    AttentionOutput,
+    Gate,
+    Up,
+    Down,
+}
+
+pub trait LinearProjector {
+    fn project(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        projection: Projection,
+        weight: &WeightTensor,
+        input: &GpuTensor,
+        output: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()>;
+}
+
+pub struct GpuLinearProjector;
+
+impl LinearProjector for GpuLinearProjector {
+    fn project(
+        &mut self,
+        gpu: &mut Gpu,
+        _layer_idx: usize,
+        _projection: Projection,
+        weight: &WeightTensor,
+        input: &GpuTensor,
+        output: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
+        weight_gemm(gpu, weight, input, output, rows)
+    }
+}
 
 /// Encode `tokens` into the native-dimension, L2-normalized sentence embedding.
 /// The caller is responsible for prepending any task prompt and for Matryoshka
@@ -45,25 +86,62 @@ pub fn embed_forward(
     if tokens.is_empty() {
         return Err("embeddinggemma: empty token sequence".to_string());
     }
-    let hidden = encode_pooled_hidden(gpu, weights, cfg, tokens)
-        .map_err(|e| format!("embeddinggemma: encode failed: {e:?}"))?;
-
-    // Sentence-transformers head: Dense projections (Identity activation) then L2.
-    let mut v = hidden;
-    for head in &weights.dense_heads {
-        v = head.apply(&v);
-    }
-    l2_normalize(&mut v);
-    Ok(v)
+    let mut projector = GpuLinearProjector;
+    embed_forward_with_projector(gpu, weights, cfg, tokens, &mut projector)
 }
 
-/// Run the bidirectional transformer stack + final norm + mean pooling, returning
-/// the pooled (but not yet projected) hidden vector `[hidden_size]`.
-fn encode_pooled_hidden(
+pub fn embed_forward_with_projector<P: LinearProjector>(
     gpu: &mut Gpu,
     weights: &EmbeddingGemmaWeights,
     cfg: &EmbeddingGemmaConfig,
     tokens: &[u32],
+    projector: &mut P,
+) -> Result<Vec<f32>, String> {
+    if tokens.is_empty() {
+        return Err("embeddinggemma: empty token sequence".to_string());
+    }
+    let hidden = encode_pooled_hidden_with_projector(gpu, weights, cfg, tokens, projector)
+        .map_err(|e| format!("embeddinggemma: encode failed: {e:?}"))?;
+    project_dense_with_capture(&weights.dense_heads, hidden, |_, _| Ok(()))
+}
+
+/// Apply the ordered sentence-transformers Dense heads, exposing each head's
+/// input before projection. Calibration uses this to capture host-resident
+/// linear activations without changing the serving path.
+pub(crate) fn project_dense_with_capture<F>(
+    dense_heads: &[crate::weights::DenseHeadHost],
+    mut hidden: Vec<f32>,
+    mut capture: F,
+) -> Result<Vec<f32>, String>
+where
+    F: FnMut(usize, &[f32]) -> Result<(), String>,
+{
+    for (head_idx, head) in dense_heads.iter().enumerate() {
+        capture(head_idx, &hidden)?;
+        hidden = head.apply(&hidden);
+    }
+    l2_normalize(&mut hidden);
+    Ok(hidden)
+}
+
+/// Run the bidirectional transformer stack + final norm + mean pooling, returning
+/// the pooled (but not yet projected) hidden vector `[hidden_size]`.
+pub(crate) fn encode_pooled_hidden(
+    gpu: &mut Gpu,
+    weights: &EmbeddingGemmaWeights,
+    cfg: &EmbeddingGemmaConfig,
+    tokens: &[u32],
+) -> HipResult<Vec<f32>> {
+    let mut projector = GpuLinearProjector;
+    encode_pooled_hidden_with_projector(gpu, weights, cfg, tokens, &mut projector)
+}
+
+fn encode_pooled_hidden_with_projector<P: LinearProjector>(
+    gpu: &mut Gpu,
+    weights: &EmbeddingGemmaWeights,
+    cfg: &EmbeddingGemmaConfig,
+    tokens: &[u32],
+    projector: &mut P,
 ) -> HipResult<Vec<f32>> {
     let dim = cfg.hidden_size;
     let n_heads = cfg.num_attention_heads;
@@ -90,8 +168,21 @@ fn encode_pooled_hidden(
     let x_batch = gpu.alloc_owned(&[m * dim], DType::F32)?;
     let embed_tmp = gpu.alloc_owned(&[dim], DType::F32)?;
     for (i, &tok) in tokens.iter().enumerate() {
-        hipfire_arch_gemma3::forward::embed_token(gpu, backbone, &g3, &embed_tmp, tok)?;
-        gpu.memcpy_dtod_at_auto(&x_batch.buf, i * dim * 4, &embed_tmp.buf, 0, dim * 4)?;
+        if let Some(host_embedding) = &weights.host_embedding {
+            let mut row = host_embedding
+                .row(tok, dim)
+                .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            let scale = cfg.embed_scale();
+            for value in &mut row {
+                *value *= scale;
+            }
+            let uploaded = gpu.upload_f32(&row, &[dim])?;
+            gpu.memcpy_dtod_at_auto(&x_batch.buf, i * dim * 4, &uploaded.buf, 0, dim * 4)?;
+            gpu.free_tensor(uploaded)?;
+        } else {
+            hipfire_arch_gemma3::forward::embed_token(gpu, backbone, &g3, &embed_tmp, tok)?;
+            gpu.memcpy_dtod_at_auto(&x_batch.buf, i * dim * 4, &embed_tmp.buf, 0, dim * 4)?;
+        }
     }
 
     // Encoder positions 0..m as an i32 device table.
@@ -117,9 +208,9 @@ fn encode_pooled_hidden(
 
         // ── Attention block (bidirectional) ──
         gpu.rmsnorm_batched(&x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
-        weight_gemm(gpu, &layer.wq, &tmp, &q, m)?;
-        weight_gemm(gpu, &layer.wk, &tmp, &k, m)?;
-        weight_gemm(gpu, &layer.wv, &tmp, &v, m)?;
+        projector.project(gpu, layer_idx, Projection::Query, &layer.wq, &tmp, &q, m)?;
+        projector.project(gpu, layer_idx, Projection::Key, &layer.wk, &tmp, &k, m)?;
+        projector.project(gpu, layer_idx, Projection::Value, &layer.wv, &tmp, &v, m)?;
 
         // Per-head QK-norm (q_norm carries the baked Q pre-scale, 1.0 here).
         gpu.rmsnorm_batched(&q, &layer.q_norm, &q, m * n_heads, head_dim, eps)?;
@@ -137,20 +228,34 @@ fn encode_pooled_hidden(
         )?;
 
         // Bidirectional self-attention: B = L = m, no causal mask.
-        gpu.attention_dflash_f32(
-            &q, &k, &v, &attn_out, m, m, n_heads, n_kv_heads, head_dim,
-        )?;
+        gpu.attention_dflash_f32(&q, &k, &v, &attn_out, m, m, n_heads, n_kv_heads, head_dim)?;
 
-        weight_gemm(gpu, &layer.wo, &attn_out, &o, m)?;
+        projector.project(
+            gpu,
+            layer_idx,
+            Projection::AttentionOutput,
+            &layer.wo,
+            &attn_out,
+            &o,
+            m,
+        )?;
         gpu.rmsnorm_batched(&o, &layer.post_attn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(&x_batch, &tmp, &x_batch)?;
 
         // ── FFN block (GeGLU) ──
         gpu.rmsnorm_batched(&x_batch, &layer.pre_ffn_norm, &tmp, m, dim, eps)?;
-        weight_gemm(gpu, &layer.w_gate, &tmp, &gate, m)?;
-        weight_gemm(gpu, &layer.w_up, &tmp, &up, m)?;
+        projector.project(
+            gpu,
+            layer_idx,
+            Projection::Gate,
+            &layer.w_gate,
+            &tmp,
+            &gate,
+            m,
+        )?;
+        projector.project(gpu, layer_idx, Projection::Up, &layer.w_up, &tmp, &up, m)?;
         gpu.gelu_mul_f32(&gate, &up, &ffn)?;
-        weight_gemm(gpu, &layer.w_down, &ffn, &o, m)?;
+        projector.project(gpu, layer_idx, Projection::Down, &layer.w_down, &ffn, &o, m)?;
         gpu.rmsnorm_batched(&o, &layer.post_ffn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(&x_batch, &tmp, &x_batch)?;
     }
@@ -221,5 +326,33 @@ mod tests {
         assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
         let n = (v[0] * v[0] + v[1] * v[1]).sqrt();
         assert!((n - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dense_capture_observes_inputs_in_projection_order() {
+        use crate::weights::DenseHeadHost;
+
+        let dense_heads = vec![
+            DenseHeadHost {
+                in_features: 2,
+                out_features: 2,
+                w: vec![1.0, 0.0, 0.0, 2.0],
+                awq_scale: None,
+            },
+            DenseHeadHost {
+                in_features: 2,
+                out_features: 1,
+                w: vec![1.0, 1.0],
+                awq_scale: None,
+            },
+        ];
+        let mut captured = Vec::new();
+        let output = project_dense_with_capture(&dense_heads, vec![3.0, 4.0], |idx, input| {
+            captured.push((idx, input.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(captured, vec![(0, vec![3.0, 4.0]), (1, vec![3.0, 8.0])]);
+        assert!((output[0] - 1.0).abs() < 1e-6);
     }
 }

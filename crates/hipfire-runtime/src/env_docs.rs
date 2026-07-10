@@ -1344,6 +1344,13 @@ pub const ENV_HIPFIRE_DUMP_VELOCITY: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-diffusion/src/denoise.rs:466",
 };
 
+/// `HIPFIRE_EMBEDDING_CALIB_LAYERS_PER_PASS` — Runtime variable controlling embedding calib layers per pass in hipfire
+pub const ENV_HIPFIRE_EMBEDDING_CALIB_LAYERS_PER_PASS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_EMBEDDING_CALIB_LAYERS_PER_PASS",
+    description: "Runtime variable controlling embedding calib layers per pass in hipfire",
+    source: "crates/hipfire-arch-embeddinggemma/src/calibration.rs:93",
+};
+
 /// `HIPFIRE_EMIT_TOKEN_IDS` — or "\" in it would corrupt the line, breaking the client's JSONL
 pub const ENV_HIPFIRE_EMIT_TOKEN_IDS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMIT_TOKEN_IDS",
@@ -4262,6 +4269,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DUMP_LATENT,
     ENV_HIPFIRE_DUMP_REQUEST,
     ENV_HIPFIRE_DUMP_VELOCITY,
+    ENV_HIPFIRE_EMBEDDING_CALIB_LAYERS_PER_PASS,
     ENV_HIPFIRE_EMIT_TOKEN_IDS,
     ENV_HIPFIRE_EP_DECODE_TIMING,
     ENV_HIPFIRE_EP_DUMP_IDX,

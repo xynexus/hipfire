@@ -160,8 +160,16 @@ impl Gpu {
         nb: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(k % group, 0, "gemm_opus_tiled_wmma: K must be a multiple of group");
-        assert_eq!(group % 16, 0, "gemm_opus_tiled_wmma: group must be a multiple of 16");
+        assert_eq!(
+            k % group,
+            0,
+            "gemm_opus_tiled_wmma: K must be a multiple of group"
+        );
+        assert_eq!(
+            group % 16,
+            0,
+            "gemm_opus_tiled_wmma: group must be a multiple of 16"
+        );
         let kname = match (w_bits, mb, nb) {
             (8, 2, 2) => "gemm_opus_w8a8_tiled_wmma_2x2",
             (8, 2, 4) => "gemm_opus_w8a8_tiled_wmma_2x4",

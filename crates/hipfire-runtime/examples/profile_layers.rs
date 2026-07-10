@@ -26,12 +26,12 @@
 //! Measures every kernel with hipDeviceSynchronize barriers.
 //! Usage: cargo run --release --example profile_layers <model.hfq> [n_tokens]
 
+use hipfire_rdna::Gpu;
 use hipfire_runtime::dispatch::{gemv_family, DispatchCtx};
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama::{self, ForwardScratch};
 use hipfire_runtime::weights;
-use hipfire_rdna::Gpu;
 use std::path::Path;
 use std::time::Instant;
 

@@ -21,7 +21,10 @@ const GROUP: usize = 256;
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 33) as f32 / (1u64 << 31) as f32) - 1.0
     }
 }
@@ -115,7 +118,8 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize) {
     let y_bf16 = gpu.alloc_tensor(&[b, m], DType::F32).unwrap();
 
     let bf16_s = time_kernel(gpu, 3, 15, |g| {
-        g.gemm_bf16_x_bf16_wmma(&w_bf16, &x_f32, &y_bf16, m, k, b).unwrap();
+        g.gemm_bf16_x_bf16_wmma(&w_bf16, &x_f32, &y_bf16, m, k, b)
+            .unwrap();
     });
 
     // ---- register-tiled bf16 WMMA (the ILP/reuse fix), several tilings ----
@@ -140,7 +144,8 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize) {
     let y_oq8 = gpu.alloc_tensor(&[b, m], DType::F32).unwrap();
 
     let oq8_s = time_kernel(gpu, 3, 15, |g| {
-        g.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
+        g.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP)
+            .unwrap();
         g.gemm_oq8_grouped_wmma(&w_i8, &w_scales, &xq_i8, &xs, &y_oq8, m, k, b, GROUP)
             .unwrap();
     });
@@ -149,9 +154,12 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize) {
     let mut oq8_tiled = Vec::new();
     for &(mb, nb) in &[(2usize, 2usize), (2, 4)] {
         let s = time_kernel(gpu, 3, 15, |g| {
-            g.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
-            g.gemm_opus_tiled_wmma(8, &w_i8, &w_scales, &xq_i8, &xs, &y_oq8, m, k, b, GROUP, mb, nb)
+            g.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP)
                 .unwrap();
+            g.gemm_opus_tiled_wmma(
+                8, &w_i8, &w_scales, &xq_i8, &xs, &y_oq8, m, k, b, GROUP, mb, nb,
+            )
+            .unwrap();
         });
         oq8_tiled.push(((mb, nb), s));
     }
@@ -163,23 +171,32 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize) {
     let mut w4a8_tiled = Vec::new();
     for &(mb, nb) in &[(2usize, 2usize), (2, 4)] {
         let s = time_kernel(gpu, 3, 15, |g| {
-            g.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
-            g.gemm_opus_tiled_wmma(4, &w_i4, &w4_scales, &xq_i8, &xs, &y_w4a8, m, k, b, GROUP, mb, nb)
+            g.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP)
                 .unwrap();
+            g.gemm_opus_tiled_wmma(
+                4, &w_i4, &w4_scales, &xq_i8, &xs, &y_w4a8, m, k, b, GROUP, mb, nb,
+            )
+            .unwrap();
         });
         w4a8_tiled.push(((mb, nb), s));
     }
 
     // validate the 2x4 oq8-tiled config numerics (the fastest, at the 255-VGPR
     // edge); reuses the sampled f32 reference below via y_oq8.
-    gpu.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
-    gpu.gemm_opus_tiled_wmma(8, &w_i8, &w_scales, &xq_i8, &xs, &y_oq8, m, k, b, GROUP, 2, 4)
+    gpu.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP)
         .unwrap();
+    gpu.gemm_opus_tiled_wmma(
+        8, &w_i8, &w_scales, &xq_i8, &xs, &y_oq8, m, k, b, GROUP, 2, 4,
+    )
+    .unwrap();
     gpu.device_synchronize().unwrap();
     // W4A8 2x4 numerics into its own reference-checked buffer.
-    gpu.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
-    gpu.gemm_opus_tiled_wmma(4, &w_i4, &w4_scales, &xq_i8, &xs, &y_w4a8, m, k, b, GROUP, 2, 4)
+    gpu.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP)
         .unwrap();
+    gpu.gemm_opus_tiled_wmma(
+        4, &w_i4, &w4_scales, &xq_i8, &xs, &y_w4a8, m, k, b, GROUP, 2, 4,
+    )
+    .unwrap();
     gpu.device_synchronize().unwrap();
 
     // ---- accuracy vs an exact f32 reference on a sampled set of outputs ----

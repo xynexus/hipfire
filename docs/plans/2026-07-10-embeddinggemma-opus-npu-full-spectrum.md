@@ -1,0 +1,247 @@
+# EmbeddingGemma 300M Full-Spectrum Opus NPU Pull-Up
+
+## Goal
+
+Implement and optimize a format-generic, resident AIE2P/XDNA2 execution path
+for EmbeddingGemma 300M across the complete Opus quant spectrum:
+
+- pure OQ4 through the W4A8 kernel;
+- arbitrary mixed OQ bitwidths through W4A8 plus variable sparse W8 overlays;
+- pure OQ8 through the W8A8 kernel;
+- `+` variants through activation-aware/AWQ sidecars;
+- `++` variants through the same runtime encoding with offline Hessian/LDLQ
+  error feedback.
+
+Do not design names or APIs around one mixed precision such as OQ4.25. W8A8 is
+the upper-quality/performance anchor, not the architecture of the solution.
+
+The intended performance target on the Ryzen AI Max+ 395 AIE2P NPU is at least
+10,000 input embedding tokens/s at M=256, with 15,000+ tokens/s as the stretch
+target for W8A8 and competitive mixed formats. Report package tokens/joule from
+the shared `amdgpu power1_average` SoC rail.
+
+## Important Correction
+
+The existing 2026-07-10 throughput chart is GPU-only:
+
+- BF16: about 14,120 input tokens/s on the Radeon 8060S (`gfx1151`);
+- compressed GPU Opus: about 4,655-4,801 input tokens/s.
+
+Those numbers are valid GPU diagnostics but are not NPU results and must not be
+used as evidence of NPU progress.
+
+Historical Phoenix measurements from this codebase were NPU kernel results:
+
+| precision | quality vs BF16 | throughput | package power | package tokens/J |
+|---|---:|---:|---:|---:|
+| W4A8 | 0.955 | 5,854 tok/s | 6.76 W | 866 |
+| W8A8 | 0.9998 | 5,171 tok/s | 6.20 W | 834 |
+| GPU BF16 | 1.0 | 3,978 tok/s | 28.4 W | 140 |
+
+The Phoenix NPU benchmark is a GEMM-ceiling estimate derived from measured
+GMAC/s divided by 0.11 GMAC/token. It excludes attention, norms, and full-model
+dispatch overhead. See
+`crates/hipfire-xdna/examples/npu_embeddinggemma_bench.rs`.
+
+## Current AIE2P Baseline
+
+The current Strix Halo W8A8 projection-inventory benchmark at M=256 reports:
+
+- projection time: 146.586 ms per encode;
+- projection-only throughput: about 1,746 input tokens/s;
+- aggregate throughput: 0.371 TOPS;
+- 10,000 tok/s requires 25.6 ms total, a 5.73x reduction;
+- 15,000 tok/s requires 17.07 ms total, an 8.59x reduction.
+
+Result:
+`benchmarks/npu_gemm_tuning/results/embeddinggemma-aie2p-w8-m256-baseline-20260710.csv`.
+
+The current end-to-end mixed projector is a correctness bridge, not a
+performance path. It performs about 144 synchronous GPU-to-host-to-NPU-to-host-
+to-GPU projection crossings per encode. Three 16-18-token documents take
+roughly 667-849 ms. See
+`benchmarks/npu_gemm_tuning/results/embeddinggemma-aie2p-opus-mixed-hybrid-e2e.csv`.
+
+## Existing Implementation
+
+### Quant producer
+
+`crates/hipfire-quantize/src/main.rs` parses generic mixed names from OQ4.125
+through OQ7.9375. Mixed storage uses compact `qt=36` blocks with variable
+sparse-overlay counts. Plain, `+`, and `++` names are generic and canonical.
+
+### NPU primitives
+
+- `crates/hipfire-xdna/src/gemm_mp.rs`: per-dispatch W4A8/W8A8 GEMM with K=256.
+- `crates/hipfire-xdna/src/sparse3_mp.rs`: sparse-three residual dispatch.
+- `crates/hipfire-xdna/src/opus_mixed.rs`: generic variable-overlay compact
+  mixed decoder and exact W4 plus sparse residual execution.
+- `benchmarks/npu_gemm_tuning/r6/r6_gemm_ts_w8m8.cc`: AIE2P W8A8 kernel.
+- `benchmarks/npu_gemm_tuning/r6/r6_gen_mp.py`: M-parallel W-broadcast array.
+
+The existing `_rN` whole-GEMM caches fuse multiple M blocks into one dispatch.
+They do not fuse K=256 groups, so merely enabling `_rN` does not solve the
+EmbeddingGemma bottleneck at M=256, where one M dispatch already covers the
+batch.
+
+### EmbeddingGemma bridge
+
+`crates/hipfire-arch-embeddinggemma/src/npu_opus_mixed.rs` currently:
+
+- only admits compact mixed `qt=36` rank-two tensors;
+- downloads each GPU input to host;
+- runs the host-driven NPU executor;
+- uploads each output back to GPU;
+- leaves attention, norms, residuals, pooling, Dense heads, and unsupported
+  down projections on GPU/host.
+
+This module should become a generic `NpuOpusProjector` or equivalent. Avoid
+format-specific names such as `425`.
+
+## Required Architecture
+
+### 1. Unified Opus matrix contract
+
+Introduce a generic packed matrix enum or trait representing:
+
+- pure W4 (`qt=34`, and `qt=33` where applicable);
+- compact mixed (`qt=36`, arbitrary overlay count);
+- pure W8 (`qt=35`).
+
+Each matrix carries K, N, scales, optional AWQ input scale, and resident packed
+weights. `++` must not require a separate runtime path because its difference is
+offline error feedback.
+
+### 2. Shared preprocessing contract
+
+Use one activation contract for all formats:
+
+- optional AWQ input scaling;
+- the exact existing FWHT sign/order convention;
+- per-row/per-group int8 activation quantization;
+- format-independent output-scale reconstruction.
+
+Do not duplicate or subtly change the rotation/scaling maths between W4, mixed,
+and W8 paths.
+
+### 3. Resident weights and reusable buffers
+
+The timed path currently reloads packed weights for every K group and matrix.
+Move packed model weights into persistent XDNA-accessible buffers and reuse
+activation/output buffers. Weight upload and xclbin/context creation must be
+outside measured forwards.
+
+### 4. Full-K projection accumulation
+
+Current kernels contract one K=256 group. EmbeddingGemma projections require
+3, 5, or 12 groups. Add a full-K projection path that accumulates those groups
+without returning to the host between groups. The preferred progression is:
+
+1. one XRT dispatch per complete projection;
+2. multiple projection roles per layer per dispatch where practical;
+3. resident layer or full-encoder scheduling.
+
+The W4 base and sparse residual must accumulate under the same scheduling
+contract so arbitrary mixed bitwidths do not multiply host dispatch overhead.
+
+### 5. Remove GPU/host crossings
+
+Use existing dma-buf/shared-buffer support in `NpuGemmMp` as an intermediate
+step, but the end target is NPU-resident execution of:
+
+- q/k/v/o projections;
+- bidirectional attention;
+- RMSNorm and residual operations;
+- gate/up/down FFN;
+- mean/last/CLS pooling;
+- Dense projection heads;
+- final normalization.
+
+Do not claim full NPU throughput while attention, norms, or every projection
+crosses back to GPU.
+
+## Implementation Order
+
+1. Add tests for generic OQ tensor admission and matrix classification.
+2. Refactor the mixed-only projector into a unified Opus projector.
+3. Add correctness support for pure OQ4 and pure OQ8 beside mixed `qt=36`.
+4. Preserve `+` AWQ and `++` offline-value semantics across every encoding.
+5. Add persistent weight and reusable activation/output buffers.
+6. Implement full-K accumulation for W4, W8, and sparse overlays.
+7. Measure projection-inventory throughput at M=32, 128, 256, and 512.
+8. Replace per-projection GPU round trips with shared buffers.
+9. Move non-linear layer operations onto AIE2P and build a resident layer path.
+10. Run full end-to-end quality, throughput, and package-energy sweeps.
+
+## Format Test Matrix
+
+At minimum test these local artifacts under
+`~/.hipfire/models/embeddinggemma-300m/`:
+
+- `EmbeddingGemma-300M.oq4.hfq`
+- `EmbeddingGemma-300M.oq4+.hfq`
+- `EmbeddingGemma-300M.oq4++.hfq`
+- `EmbeddingGemma-300M.oq4.25.hfq`
+- `EmbeddingGemma-300M.oq4.25+.hfq`
+- `EmbeddingGemma-300M.oq4.25++.hfq`
+- `EmbeddingGemma-300M.oq4.5.hfq`
+- `EmbeddingGemma-300M.oq8.hfq`
+- `EmbeddingGemma-300M.oq8+.hfq`
+- `EmbeddingGemma-300M.oq8++.hfq`
+- joint-scale and Dense/tail promotion candidates already in that directory.
+
+Also generate/test at least one lower and one higher arbitrary mixed point, for
+example OQ4.125 and OQ6.5, to prove the runtime is not hardcoded to OQ4.25.
+
+## Verification
+
+### Correctness
+
+- CPU integer/scaling oracle parity for W4, mixed, and W8 matrices.
+- Hardware parity for multiple K/N/M shapes and variable overlay counts.
+- GPU-versus-NPU full embedding cosine and max-absolute-error checks.
+- Existing selection-stability metrics against BF16.
+- `./tests/coherence-gate-dflash.sh` after quant/kernel/dispatch changes.
+
+### Performance
+
+- Acquire `hipfire lock` for every NPU/GPU run.
+- Separate kernel ceilings, projection-inventory estimates, hybrid correctness
+  runs, and fully resident end-to-end results.
+- Time only after contexts, weights, and reusable buffers are resident.
+- Report median and range across at least three independent runs.
+- Use input embedding tokens/s, never decode tokens/s.
+
+### Energy
+
+- Record active package watts from `amdgpu power1_average`.
+- Report package tokens/J as the primary cross-backend metric.
+- Record idle-subtracted dynamic tokens/J as supplementary evidence.
+- Keep workload, host, sequence length, and power rail identical within charts.
+
+## Guardrails
+
+- HIP/ROCm remains the GPU backend; XDNA/MLIR-AIE remains the NPU backend.
+- No Python in inference hot paths; Python is allowed for kernel generation and
+  plotting.
+- Keep generated xclbins, model files, and sidecars under `~/.hipfire`, not in
+  the repository.
+- Preserve RDNA portability for shared GPU code.
+- Preserve unrelated dirty worktree changes.
+- Use generic Opus names; do not create `425` files, functions, or types.
+- Do not present GPU results as NPU results.
+- Do not present GEMM ceilings or projection inventories as full-model results.
+
+## First Concrete Slice
+
+Start with a correctness-preserving unified projector:
+
+1. classify OQ4, compact mixed, and OQ8 tensors from HFQ quant types;
+2. load optional AWQ sidecars generically;
+3. reuse one activation preprocessing implementation;
+4. run all three encodings through current AIE2P primitives;
+5. add tests proving arbitrary mixed overlay counts and `+`/`++` admission;
+6. establish hardware parity before beginning full-K/residency optimization.
+
+Then optimize the shared path rather than producing separate one-off W4, OQ4.25,
+or W8 implementations.

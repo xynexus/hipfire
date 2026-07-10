@@ -549,7 +549,11 @@ impl Gpu {
     /// is order-independent, so this stays bit-reproducible.
     pub fn abs_max_f32(&mut self, x: &GpuTensor) -> HipResult<f32> {
         self.bind_thread()?;
-        self.ensure_kernel("abs_max_f32", kernels::GEMM_F16S_TRAIN_NT_SRC, "abs_max_f32")?;
+        self.ensure_kernel(
+            "abs_max_f32",
+            kernels::GEMM_F16S_TRAIN_NT_SRC,
+            "abs_max_f32",
+        )?;
         let n = x.numel();
         // Holds float_as_uint(amax); reinterpreted as f32 on download IS amax.
         let out = self.zeros(&[1], DType::F32)?;
@@ -1026,7 +1030,11 @@ impl Gpu {
         nb: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(a_bf16.dtype, DType::BF16, "gemm_bf16_tiled_wmma: weights BF16");
+        assert_eq!(
+            a_bf16.dtype,
+            DType::BF16,
+            "gemm_bf16_tiled_wmma: weights BF16"
+        );
         let kname = match (mb, nb) {
             (2, 2) => "gemm_bf16_tiled_wmma_2x2",
             (4, 2) => "gemm_bf16_tiled_wmma_4x2",

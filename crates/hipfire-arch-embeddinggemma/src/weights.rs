@@ -32,6 +32,7 @@ pub struct DenseHeadHost {
     pub in_features: usize,
     pub out_features: usize,
     pub w: Vec<f32>,
+    pub awq_scale: Option<Vec<f32>>,
 }
 
 impl DenseHeadHost {
@@ -41,7 +42,15 @@ impl DenseHeadHost {
         let mut y = vec![0.0f32; self.out_features];
         for (o, y_o) in y.iter_mut().enumerate() {
             let row = &self.w[o * self.in_features..(o + 1) * self.in_features];
-            *y_o = row.iter().zip(x).map(|(w, xi)| w * xi).sum();
+            *y_o = row
+                .iter()
+                .zip(x)
+                .enumerate()
+                .map(|(i, (w, xi))| {
+                    let input = self.awq_scale.as_ref().map_or(*xi, |scale| *xi / scale[i]);
+                    w * input
+                })
+                .sum();
         }
         y
     }
@@ -52,6 +61,37 @@ impl DenseHeadHost {
 pub struct EmbeddingGemmaWeights {
     pub backbone: Gemma3Weights,
     pub dense_heads: Vec<DenseHeadHost>,
+    pub(crate) host_embedding: Option<HostEmbedding>,
+}
+
+pub(crate) enum HostEmbedding {
+    F16(Vec<u8>),
+    Bf16(Vec<u8>),
+}
+
+impl HostEmbedding {
+    pub(crate) fn row(&self, token: u32, dim: usize) -> Result<Vec<f32>, String> {
+        let start = token as usize * dim * 2;
+        let data = match self {
+            Self::F16(data) | Self::Bf16(data) => data,
+        };
+        let end = start + dim * 2;
+        if end > data.len() {
+            return Err(format!(
+                "embeddinggemma: token {token} exceeds host embedding table"
+            ));
+        }
+        Ok(data[start..end]
+            .chunks_exact(2)
+            .map(|bytes| {
+                let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                match self {
+                    Self::F16(_) => f16_to_f32(bits),
+                    Self::Bf16(_) => f32::from_bits((bits as u32) << 16),
+                }
+            })
+            .collect())
+    }
 }
 
 impl EmbeddingGemmaWeights {
@@ -80,12 +120,61 @@ impl EmbeddingGemmaWeights {
                 in_features: h.in_features,
                 out_features: h.out_features,
                 w,
+                awq_scale: load_dense_awq_scale(hfq, &name, h.in_features)?,
             });
         }
 
         Ok(Self {
             backbone,
             dense_heads,
+            host_embedding: None,
+        })
+    }
+
+    pub fn load_for_calibration(
+        hfq: &mut HfqFile,
+        cfg: &EmbeddingGemmaConfig,
+        gpu: &mut Gpu,
+    ) -> Result<Self, String> {
+        let (embedding_info, embedding_data) = hfq
+            .tensor_data_vec("model.embed_tokens.weight")
+            .ok_or_else(|| "embeddinggemma: model.embed_tokens.weight not found".to_string())?;
+        let host_embedding = match embedding_info.quant_type {
+            1 => HostEmbedding::F16(embedding_data),
+            16 => HostEmbedding::Bf16(embedding_data),
+            quant_type => {
+                return Err(format!(
+                    "embeddinggemma calibration: host embedding requires f16/bf16 source, got qt={quant_type}"
+                ))
+            }
+        };
+        let g3 = gemma3_config(cfg);
+        let backbone =
+            hipfire_arch_gemma3::weights::load_encoder_weights_prefixed(hfq, &g3, gpu, "")
+                .map_err(|e| format!("embeddinggemma: load encoder weights failed: {e:?}"))?;
+
+        let mut dense_heads = Vec::with_capacity(cfg.dense_heads.len());
+        for (i, head) in cfg.dense_heads.iter().enumerate() {
+            let name = format!("dense.{i}.weight");
+            let weights = load_dense_head_f32(hfq, &name, head.out_features, head.in_features)?;
+            if head.activation != "identity" {
+                return Err(format!(
+                    "embeddinggemma: Dense head {i} activation {:?} unsupported (only Identity is implemented)",
+                    head.activation
+                ));
+            }
+            dense_heads.push(DenseHeadHost {
+                in_features: head.in_features,
+                out_features: head.out_features,
+                w: weights,
+                awq_scale: load_dense_awq_scale(hfq, &name, head.in_features)?,
+            });
+        }
+
+        Ok(Self {
+            backbone,
+            dense_heads,
+            host_embedding: Some(host_embedding),
         })
     }
 
@@ -145,9 +234,12 @@ fn load_dense_head_f32(
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
+        34 => hipfire_runtime::quant::dequant_oq4g256(&data, expected),
+        35 => hipfire_runtime::quant::dequant_oq8g256(&data, expected),
+        36 => hipfire_runtime::quant::dequant_oqplus_compact(&data, out_features, in_features),
         qt => {
             return Err(format!(
-                "embeddinggemma: Dense head {name} must be f16/f32/bf16, got qt={qt}"
+                "embeddinggemma: Dense head {name} must be f16/f32/bf16/OQ4/OQ4.25/OQ8, got qt={qt}"
             ))
         }
     };
@@ -161,6 +253,30 @@ fn load_dense_head_f32(
     Ok(w)
 }
 
+fn load_dense_awq_scale(
+    hfq: &HfqFile,
+    weight_name: &str,
+    in_features: usize,
+) -> Result<Option<Vec<f32>>, String> {
+    let sidecar_name = weight_name.strip_suffix(".weight").map_or_else(
+        || format!("{weight_name}.awq_scale.weight"),
+        |stem| format!("{stem}.awq_scale.weight"),
+    );
+    let Some((info, data)) = hfq.tensor_data_vec(&sidecar_name) else {
+        return Ok(None);
+    };
+    if info.quant_type != 1 || data.len() != in_features * 2 {
+        return Err(format!(
+            "embeddinggemma: Dense AWQ sidecar {sidecar_name} must be f16[{in_features}]"
+        ));
+    }
+    Ok(Some(
+        data.chunks_exact(2)
+            .map(|bytes| f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])))
+            .collect(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,8 +288,20 @@ mod tests {
             in_features: 3,
             out_features: 2,
             w: vec![1.0, 0.0, 0.0, /* row0 */ 0.0, 1.0, 1.0 /* row1 */],
+            awq_scale: None,
         };
         let y = h.apply(&[2.0, 3.0, 4.0]);
         assert_eq!(y, vec![2.0, 7.0]);
+    }
+
+    #[test]
+    fn dense_head_applies_awq_input_scale() {
+        let head = DenseHeadHost {
+            in_features: 2,
+            out_features: 1,
+            w: vec![4.0, 9.0],
+            awq_scale: Some(vec![2.0, 3.0]),
+        };
+        assert_eq!(head.apply(&[2.0, 3.0]), vec![13.0]);
     }
 }

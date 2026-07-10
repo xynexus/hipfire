@@ -107,13 +107,22 @@ fn main() {
     let mut fails = 0;
 
     // (n, batch)
-    let cases: &[(usize, usize)] = &[(128, 1), (256, 1), (2048, 1), (5120, 1), (3072, 5), (896, 11)];
+    let cases: &[(usize, usize)] = &[
+        (128, 1),
+        (256, 1),
+        (2048, 1),
+        (5120, 1),
+        (3072, 5),
+        (896, 11),
+    ];
 
     // ── rmsnorm ──────────────────────────────────────────────────────────
     for &(n, batch) in cases {
         let total = n * batch;
         let x: Vec<f32> = (0..total).map(|_| pseudo(&mut seed)).collect();
-        let w: Vec<f32> = (0..n).map(|_| 0.5 + 0.5 * pseudo(&mut seed).abs()).collect();
+        let w: Vec<f32> = (0..n)
+            .map(|_| 0.5 + 0.5 * pseudo(&mut seed).abs())
+            .collect();
         let refv = cpu_rmsnorm(&x, &w, n, eps);
         let xg = gpu.upload_f32(&x, &[batch, n]).unwrap();
         let wg = gpu.upload_f32(&w, &[n]).unwrap();
@@ -127,26 +136,35 @@ fn main() {
         worst = worst.max(err);
         let ok = err < tol;
         fails += !ok as i32;
-        println!("  rmsnorm    n={n:5} batch={batch:3} err={err:.3e} {}", if ok { "ok" } else { "FAIL" });
+        println!(
+            "  rmsnorm    n={n:5} batch={batch:3} err={err:.3e} {}",
+            if ok { "ok" } else { "FAIL" }
+        );
     }
 
     // ── layernorm (batched API; batch=1 too) ─────────────────────────────
     for &(n, batch) in cases {
         let total = n * batch;
         let x: Vec<f32> = (0..total).map(|_| pseudo(&mut seed)).collect();
-        let g: Vec<f32> = (0..n).map(|_| 0.5 + 0.5 * pseudo(&mut seed).abs()).collect();
+        let g: Vec<f32> = (0..n)
+            .map(|_| 0.5 + 0.5 * pseudo(&mut seed).abs())
+            .collect();
         let b: Vec<f32> = (0..n).map(|_| pseudo(&mut seed)).collect();
         let refv = cpu_layernorm(&x, &g, &b, n, eps);
         let xg = gpu.upload_f32(&x, &[batch, n]).unwrap();
         let gg = gpu.upload_f32(&g, &[n]).unwrap();
         let bg = gpu.upload_f32(&b, &[n]).unwrap();
         let og = gpu.upload_f32(&vec![0.0; total], &[batch, n]).unwrap();
-        gpu.layernorm_batched(&xg, &gg, &bg, &og, batch, n, eps).unwrap();
+        gpu.layernorm_batched(&xg, &gg, &bg, &og, batch, n, eps)
+            .unwrap();
         let err = max_abs_err(&gpu.download_f32(&og).unwrap(), &refv);
         worst = worst.max(err);
         let ok = err < tol;
         fails += !ok as i32;
-        println!("  layernorm  n={n:5} batch={batch:3} err={err:.3e} {}", if ok { "ok" } else { "FAIL" });
+        println!(
+            "  layernorm  n={n:5} batch={batch:3} err={err:.3e} {}",
+            if ok { "ok" } else { "FAIL" }
+        );
     }
 
     // ── softmax (in-place, per row) ──────────────────────────────────────
@@ -161,7 +179,10 @@ fn main() {
         worst = worst.max(err);
         let ok = err < tol;
         fails += !ok as i32;
-        println!("  softmax    n={n:5} batch={batch:3} err={err:.3e} {}", if ok { "ok" } else { "FAIL" });
+        println!(
+            "  softmax    n={n:5} batch={batch:3} err={err:.3e} {}",
+            if ok { "ok" } else { "FAIL" }
+        );
     }
 
     // ── max_prob (single block over vocab) ───────────────────────────────
@@ -177,7 +198,10 @@ fn main() {
         // max_prob is a probability in (0,1]; relative tol is what matters
         let ok = err < 3e-5 * refv.max(1e-6);
         fails += !ok as i32;
-        println!("  max_prob   vocab={vocab:6}     ref={refv:.6} got={got:.6} err={err:.2e} {}", if ok { "ok" } else { "FAIL" });
+        println!(
+            "  max_prob   vocab={vocab:6}     ref={refv:.6} got={got:.6} err={err:.2e} {}",
+            if ok { "ok" } else { "FAIL" }
+        );
     }
 
     // ── argmax (value+index; lowest index on ties) ──────────────────────
@@ -199,7 +223,10 @@ fn main() {
         let got = gpu.argmax_f32(&dg, n).unwrap();
         let ok = got == refv;
         fails += !ok as i32;
-        println!("  argmax     n={n:6}     ref={refv} got={got} {}", if ok { "ok" } else { "FAIL" });
+        println!(
+            "  argmax     n={n:6}     ref={refv} got={got} {}",
+            if ok { "ok" } else { "FAIL" }
+        );
     }
     // crafted tie: two equal maxima; lowest index must win (matches generic)
     {
@@ -211,7 +238,10 @@ fn main() {
         let got = gpu.argmax_f32(&dg, n).unwrap();
         let ok = got == 900;
         fails += !ok as i32;
-        println!("  argmax-tie n={n:6}     ref=900 got={got} {}", if ok { "ok" } else { "FAIL" });
+        println!(
+            "  argmax-tie n={n:6}     ref=900 got={got} {}",
+            if ok { "ok" } else { "FAIL" }
+        );
     }
     // batched argmax
     {
@@ -234,7 +264,10 @@ fn main() {
             .collect();
         let ok = got == refs;
         fails += !ok as i32;
-        println!("  argmax-bat batch={batch} n={n}   ref={refs:?} got={got:?} {}", if ok { "ok" } else { "FAIL" });
+        println!(
+            "  argmax-bat batch={batch} n={n}   ref={refs:?} got={got:?} {}",
+            if ok { "ok" } else { "FAIL" }
+        );
     }
 
     if fails == 0 {

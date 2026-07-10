@@ -16,7 +16,9 @@ fn lcg(seed: u64, n: usize) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
         })
         .collect()
@@ -91,7 +93,9 @@ fn main() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     let mag = refv.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-    println!("attention_swa_gqa_batched  max_abs_err={err:.3e}  mag={mag:.4}  (n_valid={n_valid:?})");
+    println!(
+        "attention_swa_gqa_batched  max_abs_err={err:.3e}  mag={mag:.4}  (n_valid={n_valid:?})"
+    );
     if err < 3e-4 {
         println!("OK");
     } else {

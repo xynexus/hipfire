@@ -21,7 +21,9 @@ fn lcg(seed: u64, n: usize) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
         })
         .collect()
@@ -34,11 +36,19 @@ fn f16_to_f32(bits: u16) -> f32 {
     let val = if exp == 0 {
         (frac as f32) * 2f32.powi(-24)
     } else if exp == 0x1f {
-        if frac == 0 { f32::INFINITY } else { f32::NAN }
+        if frac == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
     } else {
         (1.0 + frac as f32 / 1024.0) * 2f32.powi(exp as i32 - 15)
     };
-    if sign == 1 { -val } else { val }
+    if sign == 1 {
+        -val
+    } else {
+        val
+    }
 }
 
 fn main() {
@@ -82,7 +92,9 @@ fn main() {
 
     let pos_i32 = (seq_len - 1) as i32;
     let pos_buf = gpu.hip.malloc(4).unwrap();
-    gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes()).unwrap();
+    gpu.hip
+        .memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())
+        .unwrap();
 
     gpu.attention_q8_0_kv(
         &d_q, &d_kq8, &d_vq8, &d_out, &pos_buf, seq_len, n_heads, n_kv_heads, head_dim, max_seq,

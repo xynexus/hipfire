@@ -39,9 +39,9 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4State};
+    use hipfire_rdna::profile;
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_rdna::profile;
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::time::Instant;

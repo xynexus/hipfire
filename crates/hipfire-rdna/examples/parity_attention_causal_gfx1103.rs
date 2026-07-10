@@ -16,7 +16,9 @@ fn lcg(seed: u64, n: usize) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
         })
         .collect()
@@ -30,7 +32,11 @@ fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     println!(
         "force_generic={forced} (path: {})  nh={nh} nkv={nkv} hd={hd} seq={seq}",
-        if forced { "generic LDS" } else { "arch-selected" }
+        if forced {
+            "generic LDS"
+        } else {
+            "arch-selected"
+        }
     );
 
     let qh = lcg(0x11, seq * q_stride);
@@ -41,7 +47,8 @@ fn main() {
     let dv = gpu.upload_f32(&vh, &[seq * kv_stride]).unwrap();
     let dout = gpu.zeros(&[seq * q_stride], DType::F32).unwrap();
 
-    gpu.attention_causal_batched(&dq, &dk, &dv, &dout, seq, nh, nkv, hd).unwrap();
+    gpu.attention_causal_batched(&dq, &dk, &dv, &dout, seq, nh, nkv, hd)
+        .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let got = gpu.download_f32(&dout).unwrap();
 
@@ -64,7 +71,10 @@ fn main() {
                 mx = mx.max(*s);
             }
             let mut den = 0f64;
-            for s in sc.iter_mut() { *s = (*s - mx).exp(); den += *s; }
+            for s in sc.iter_mut() {
+                *s = (*s - mx).exp();
+                den += *s;
+            }
             for d in 0..hd {
                 let mut acc = 0f64;
                 for (t, &s) in sc.iter().enumerate() {
@@ -74,7 +84,11 @@ fn main() {
             }
         }
     }
-    let err = got.iter().zip(&refv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let err = got
+        .iter()
+        .zip(&refv)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     let mag = refv.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     println!("  attention_causal_batched  max_abs_err={err:.3e}  mag={mag:.4}");
     if err < 3e-4 {

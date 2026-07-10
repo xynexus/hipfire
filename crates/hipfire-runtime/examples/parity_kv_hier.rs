@@ -30,8 +30,8 @@
 //!   cargo run --release -p hipfire-runtime --example parity_kv_hier [n_tokens]
 
 use hipfire_kvquant::kvarn::{dequantize_tile, unpack_kvarn_tile_bits};
-use hipfire_runtime::kv_hier::HierKvState;
 use hipfire_rdna::{DType, Gpu};
+use hipfire_runtime::kv_hier::HierKvState;
 
 const NH: usize = 8;
 const NKV: usize = 2;

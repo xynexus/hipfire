@@ -151,6 +151,54 @@ pub fn load_weights_prefixed(
     })
 }
 
+/// Load only the Gemma3 transformer encoder weights. The token embedding table
+/// and tied LM head are replaced with tiny unused placeholders so encoder-only
+/// callers can provide embeddings through another seam without allocating the
+/// full vocabulary table twice.
+pub fn load_encoder_weights_prefixed(
+    hfq: &mut HfqFile,
+    cfg: &Gemma3Config,
+    gpu: &mut Gpu,
+    prefix: &str,
+) -> HipResult<Gemma3Weights> {
+    #[cfg(unix)]
+    hfq.drop_mmap();
+
+    eprintln!("gemma3: loading encoder without token_embd/lm_head...");
+    let token_embd = gpu.zeros(&[1], DType::F32)?;
+    let output_norm = load_norm_weight_raw(
+        hfq,
+        gpu,
+        &format!("{prefix}model.norm.weight"),
+        cfg.hidden_size,
+    )?;
+    let output = weight_tensor(gpu.zeros(&[1], DType::F32)?, DType::F32, 1, 1);
+
+    let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+    for i in 0..cfg.num_hidden_layers {
+        eprintln!(
+            "gemma3: loading layer {}/{}...",
+            i + 1,
+            cfg.num_hidden_layers
+        );
+        hipfire_runtime::load_progress::report(
+            i as u32 + 1,
+            cfg.num_hidden_layers as u32,
+            "weights",
+        );
+        layers.push(load_layer(hfq, gpu, cfg, i, prefix)?);
+    }
+
+    Ok(Gemma3Weights {
+        token_embd,
+        embd_format: EmbeddingFormat::F32,
+        output_norm,
+        output,
+        layers,
+        tied_lm_head: false,
+    })
+}
+
 // ─── Per-tensor loaders (replicated from qwen2; see module doc) ──────────────
 
 fn load_embed_tokens(
