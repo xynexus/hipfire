@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{body::to_bytes, extract::State, response::Response, Json};
@@ -83,23 +83,13 @@ pub fn spawn_deferred_job_runner(state: SharedState) {
     }
     let root = deferred_jobs_root();
     tokio::spawn(async move {
-        match run_startup_deferred_jobs(state, root.clone()).await {
-            Ok(summary) => {
-                if summary.queued > 0 {
-                    tracing::info!(
-                        root = %root.display(),
-                        queued = summary.queued,
-                        completed = summary.completed,
-                        failed = summary.failed,
-                        "deferred startup jobs finished"
-                    );
-                }
-            }
+        match run_continuous_deferred_jobs(state, root.clone(), deferred_poll_interval()).await {
+            Ok(()) => {}
             Err(error) => {
                 tracing::error!(
                     root = %root.display(),
                     error = %error,
-                    "deferred startup job scan failed"
+                    "continuous deferred job runner stopped"
                 );
             }
         }
@@ -118,7 +108,8 @@ fn deferred_jobs_health_json_at(root: &Path) -> Value {
         "running": count_json_files(&root.join(RUNNING_DIR)),
         "done": count_terminal_job_files(&root.join(DONE_DIR)),
         "failed": count_terminal_job_files(&root.join(FAILED_DIR)),
-        "execution_mode": "startup_sequential",
+        "execution_mode": "continuous_sequential",
+        "poll_interval_ms": deferred_poll_interval().as_millis() as u64,
         "supported_kinds": [
             "sdapi_txt2img",
             "sdapi_img2img",
@@ -135,6 +126,35 @@ pub async fn run_startup_deferred_jobs(
     ensure_deferred_dirs(&root)?;
     recover_running_jobs(&root)?;
 
+    run_deferred_jobs_pass(state, &root).await
+}
+
+async fn run_continuous_deferred_jobs(
+    state: SharedState,
+    root: PathBuf,
+    poll_interval: Duration,
+) -> Result<(), String> {
+    ensure_deferred_dirs(&root)?;
+    recover_running_jobs(&root)?;
+    loop {
+        let summary = run_deferred_jobs_pass(state.clone(), &root).await?;
+        if summary.queued > 0 {
+            tracing::info!(
+                root = %root.display(),
+                queued = summary.queued,
+                completed = summary.completed,
+                failed = summary.failed,
+                "continuous deferred job pass finished"
+            );
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn run_deferred_jobs_pass(
+    state: SharedState,
+    root: &Path,
+) -> Result<DeferredStartupSummary, String> {
     let mut summary = DeferredStartupSummary::default();
     loop {
         let Some(path) = next_queued_job(&root)? else {
@@ -754,6 +774,16 @@ fn deferred_command_jobs_enabled() -> bool {
     )
 }
 
+fn deferred_poll_interval() -> Duration {
+    Duration::from_millis(
+        std::env::var("HIPFIRE_DEFERRED_POLL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(250)
+            .clamp(10, 60_000),
+    )
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -823,6 +853,36 @@ mod tests {
         assert_eq!(count_terminal_job_files(&root.join(FAILED_DIR)), 1);
         assert_eq!(count_json_files(&root.join(FAILED_DIR)), 2);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn continuous_runner_processes_jobs_added_after_startup() {
+        let root = temp_root("deferred-continuous");
+        fs::create_dir_all(root.join(QUEUED_DIR)).unwrap();
+        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let runner = tokio::spawn(run_continuous_deferred_jobs(
+            state,
+            root.clone(),
+            Duration::from_millis(10),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        fs::write(root.join(QUEUED_DIR).join("late.json"), "{not-json").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if count_terminal_job_files(&root.join(FAILED_DIR)) == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        runner.abort();
+        let _ = runner.await;
         let _ = fs::remove_dir_all(root);
     }
 

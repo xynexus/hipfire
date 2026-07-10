@@ -1,8 +1,8 @@
 # Deferred Jobs
 
-Hipfire can execute local deferred jobs at server startup. This is intended for
-heavy work that should begin as soon as `hipfire serve` starts, before any client
-re-submits requests manually.
+Hipfire continuously executes local deferred jobs while `hipfire serve` is
+running. This is intended for heavy image, HTTP, and training work that should
+survive client disconnects and server restarts.
 
 The startup runner scans:
 
@@ -13,11 +13,14 @@ The startup runner scans:
 
 Jobs are claimed by moving them into `running/`, executed sequentially, then
 moved into `done/` or `failed/`. Each terminal state also gets a
-`*.result.json` record. Existing `running/*.json` files are retried on startup,
+`*.result.json` record. The runner keeps polling for newly queued files after
+the startup drain. Existing `running/*.json` files are retried on startup,
 which handles a previous server crash.
 
-Set `HIPFIRE_DEFERRED_JOBS=0` to disable the startup scan. Command jobs can be
-disabled separately with `HIPFIRE_DEFERRED_ALLOW_COMMANDS=0`.
+Set `HIPFIRE_DEFERRED_JOBS=0` to disable the runner. Set
+`HIPFIRE_DEFERRED_POLL_MS` to control the polling interval (default 250 ms,
+clamped to 10 ms through 60 seconds). Command jobs can be disabled separately
+with `HIPFIRE_DEFERRED_ALLOW_COMMANDS=0`.
 
 ## Image Generation
 
