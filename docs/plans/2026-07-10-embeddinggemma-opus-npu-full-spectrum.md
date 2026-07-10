@@ -300,6 +300,35 @@ contract. The next kernel slice should retain a row/column output tile across
 all K groups, apply activation and weight scales on AIE, and emit one final f32
 tile instead of group-major int32 partials.
 
+### Group-retaining scaled W4 checkpoint
+
+R15 now implements that next W4 slice. Each core retains its output tile across
+all K=256 groups, reconstructs each group with the exact activation and weight
+scales on AIE, and emits one final f32 tile. The resident Rust runtime and
+shared Opus executor select these caches automatically for pure OQ4 artifacts,
+including `+` and `++`.
+
+- Appending scale tails directly to the 6,240/12,672-byte A/W payloads corrupted
+  integer dots. A separate scale input exceeded shim/core DMA-channel limits.
+  The working contract preserves the exact 6,144/12,288-byte R14 prefixes and
+  pads their containing payloads to 8 KiB/16 KiB before the scale tails.
+- Scaled hardware parity is exact across `K=768/1280` and
+  `N=256/768/1152`; maximum absolute error is at most 8e-7.
+- M256 dispatch measurements are 0.300 ms for K768/N256, 0.341 ms for
+  K768/N768, 0.538 ms for K768/N1152, and 0.532 ms for K1280/N768.
+- The resulting 24-layer projection inventory is still about 69.3 ms per
+  M256 encode (roughly 3,690 projection-only input tok/s), so it does not meet
+  the 25.6 ms / 10,000 tok/s target.
+- The short-document GPU/XDNA hybrid improved from 68.4 to 77.2 actual input
+  tok/s, but still performs every projection crossing and remains only a
+  hybrid correctness/performance diagnostic. Its OQ4 GPU/NPU minimum cosine is
+  0.984162, consistent with the previously recorded OQ4 discrepancy.
+
+The next performance lever is projection-role and layer scheduling, not more
+host-side batching: q/k/v and gate/up should share activation preprocessing and
+submission, followed by resident attention, residual, normalization, and FFN
+operations so projection outputs stop crossing back to the GPU.
+
 Measured status is still below admission: W4 projection inventory is 73.083 ms
 at M=256 (about 3.5k input tok/s before non-projection work). The real hybrid
 model is 130.9 input tok/s and 5.6 package tok/J, and its GPU cosine gate remains

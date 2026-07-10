@@ -2580,6 +2580,13 @@ pub const ENV_HIPFIRE_NPU_TARGETS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/build.rs:60",
 };
 
+/// `HIPFIRE_NPU_VERIFY_UNIT_SCALES` — Runtime variable controlling npu verify unit scales in hipfire
+pub const ENV_HIPFIRE_NPU_VERIFY_UNIT_SCALES: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_NPU_VERIFY_UNIT_SCALES",
+    description: "Runtime variable controlling npu verify unit scales in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_gemm_whole_scaled_verify.rs:50",
+};
+
 /// `HIPFIRE_OQ4_BATCHED_PREFILL` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_OQ4_BATCHED_PREFILL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_BATCHED_PREFILL",
@@ -4452,6 +4459,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_NPU_ROPE_CONFIGS,
     ENV_HIPFIRE_NPU_SOFTMAX_CONFIGS,
     ENV_HIPFIRE_NPU_TARGETS,
+    ENV_HIPFIRE_NPU_VERIFY_UNIT_SCALES,
     ENV_HIPFIRE_OQ4_BATCHED_PREFILL,
     ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS,
     ENV_HIPFIRE_OQ4_TRACE,

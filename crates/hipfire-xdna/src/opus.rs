@@ -15,8 +15,8 @@ use hipfire_primitives::{
 
 use crate::{
     NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK, NpuGemmMp, NpuGemmResidentWeights,
-    NpuGemmWholeArray, NpuSparse3Mp, NpuSparse3ResidentWeights, NpuWholeMode,
-    NpuWholeResidentWeights, XdnaError,
+    NpuGemmWholeArray, NpuGemmWholeScaled, NpuSparse3Mp, NpuSparse3ResidentWeights, NpuWholeMode,
+    NpuWholeResidentWeights, NpuWholeScaledResidentWeights, XdnaError,
 };
 use std::collections::HashMap;
 
@@ -105,6 +105,7 @@ pub struct OpusPackedMatrix {
     n: usize,
     fullk_weights: Option<NpuFullKResidentWeights>,
     whole_weights: Option<NpuWholeResidentWeights>,
+    whole_scaled_weights: Option<NpuWholeScaledResidentWeights>,
 }
 
 impl OpusPackedMatrix {
@@ -130,6 +131,7 @@ pub struct NpuOpusExecutor {
     rows_per_dispatch: usize,
     fullk: HashMap<(NpuFullKMode, usize), NpuGemmFullK>,
     whole: HashMap<(NpuWholeMode, usize), NpuGemmWholeArray>,
+    whole_scaled: HashMap<usize, NpuGemmWholeScaled>,
 }
 
 impl NpuOpusExecutor {
@@ -181,6 +183,7 @@ impl NpuOpusExecutor {
             rows_per_dispatch,
             fullk: HashMap::new(),
             whole: HashMap::new(),
+            whole_scaled: HashMap::new(),
         })
     }
 
@@ -198,6 +201,7 @@ impl NpuOpusExecutor {
             rows_per_dispatch: 0,
             fullk: HashMap::new(),
             whole: HashMap::new(),
+            whole_scaled: HashMap::new(),
         };
         for &(cache, cols) in caches {
             executor.enable_fullk_cache(cache, cols)?;
@@ -219,11 +223,49 @@ impl NpuOpusExecutor {
             rows_per_dispatch: 0,
             fullk: HashMap::new(),
             whole: HashMap::new(),
+            whole_scaled: HashMap::new(),
         };
         for &cache in caches {
             executor.enable_whole_cache(cache)?;
         }
         Ok(executor)
+    }
+
+    /// Load group-retaining scaled W4 whole-array caches. These emit final f32
+    /// projections and avoid group-major int32 readback/reconstruction.
+    pub fn load_whole_scaled_cached(caches: &[&str], n: usize) -> Result<Self, XdnaError> {
+        if n == 0 || caches.is_empty() {
+            return Err(invalid(
+                "scaled whole-array executor wants non-zero N and caches",
+            ));
+        }
+        let mut executor = Self {
+            w4: None,
+            w8: None,
+            residual_sparse3: None,
+            n,
+            rows_per_dispatch: 0,
+            fullk: HashMap::new(),
+            whole: HashMap::new(),
+            whole_scaled: HashMap::new(),
+        };
+        for &cache in caches {
+            executor.enable_whole_scaled_cache(cache)?;
+        }
+        Ok(executor)
+    }
+
+    pub fn enable_whole_scaled_cache(&mut self, cache: &str) -> Result<(), XdnaError> {
+        let whole = NpuGemmWholeScaled::load_cached(cache)?;
+        if whole.n() != self.n {
+            return Err(invalid(format!(
+                "scaled whole-array cache N={} does not match executor N={}",
+                whole.n(),
+                self.n
+            )));
+        }
+        self.whole_scaled.insert(whole.k(), whole);
+        Ok(())
     }
 
     pub fn enable_whole_cache(&mut self, cache: &str) -> Result<(), XdnaError> {
@@ -277,6 +319,21 @@ impl NpuOpusExecutor {
         let mode = fullk_mode(encoding);
         let whole_mode = whole_mode(encoding);
         let padded_k = decoded.len() * GROUP;
+        let whole_scaled_weights = if encoding == OpusMatrixEncoding::W4 {
+            if let Some(whole) = self.whole_scaled.get(&padded_k) {
+                let base: Vec<&[i8]> = decoded.iter().map(|group| group.base.as_slice()).collect();
+                let scales: Vec<&[f32]> = decoded
+                    .iter()
+                    .map(|group| group.scales.as_slice())
+                    .collect();
+                let packed = whole.prepack_weights(&base, &scales)?;
+                Some(whole.upload_resident_weights(&packed)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let whole_weights = if let Some(mode) = whole_mode {
             if let Some(whole) = self.whole.get(&(mode, padded_k)) {
                 let base: Vec<&[i8]> = decoded.iter().map(|group| group.base.as_slice()).collect();
@@ -313,7 +370,11 @@ impl NpuOpusExecutor {
         };
         let resident_only =
             self.w4.is_none() && self.w8.is_none() && self.residual_sparse3.is_none();
-        if resident_only && fullk_weights.is_none() && whole_weights.is_none() {
+        if resident_only
+            && fullk_weights.is_none()
+            && whole_weights.is_none()
+            && whole_scaled_weights.is_none()
+        {
             return Err(invalid(format!(
                 "no {:?} full-K cache for padded K={padded_k} N={n}",
                 mode
@@ -321,7 +382,10 @@ impl NpuOpusExecutor {
         }
         let mut groups = Vec::with_capacity(decoded.len());
         for decoded in decoded {
-            let resident_base = if fullk_weights.is_some() || whole_weights.is_some() {
+            let resident_base = if fullk_weights.is_some()
+                || whole_weights.is_some()
+                || whole_scaled_weights.is_some()
+            {
                 None
             } else {
                 Some(match encoding {
@@ -343,7 +407,10 @@ impl NpuOpusExecutor {
                     }
                 })
             };
-            let mut resident_sparse = if fullk_weights.is_some() || whole_weights.is_some() {
+            let mut resident_sparse = if fullk_weights.is_some()
+                || whole_weights.is_some()
+                || whole_scaled_weights.is_some()
+            {
                 Vec::new()
             } else {
                 Vec::with_capacity(decoded.sparse_residual_chunks.len())
@@ -351,6 +418,7 @@ impl NpuOpusExecutor {
             if !decoded.sparse_residual_chunks.is_empty()
                 && fullk_weights.is_none()
                 && whole_weights.is_none()
+                && whole_scaled_weights.is_none()
             {
                 let sparse_kernel = self
                     .residual_sparse3
@@ -376,6 +444,7 @@ impl NpuOpusExecutor {
             n,
             fullk_weights,
             whole_weights,
+            whole_scaled_weights,
         })
     }
 
@@ -407,6 +476,11 @@ impl NpuOpusExecutor {
     }
 
     fn rows_per_dispatch_for_matrix(&self, matrix: &OpusPackedMatrix) -> usize {
+        if matrix.whole_scaled_weights.is_some() {
+            if let Some(whole) = self.whole_scaled.get(&(matrix.groups.len() * GROUP)) {
+                return whole.rows();
+            }
+        }
         if matrix.whole_weights.is_some() {
             if let Some(mode) = whole_mode(matrix.encoding) {
                 if let Some(whole) = self.whole.get(&(mode, matrix.groups.len() * GROUP)) {
@@ -449,6 +523,48 @@ impl NpuOpusExecutor {
         );
         c.fill(0.0);
         let padded_k = matrix.groups.len() * GROUP;
+        if let Some(weights) = &matrix.whole_scaled_weights {
+            if let Some(whole) = self.whole_scaled.get_mut(&padded_k) {
+                let chunk_rows = whole.rows();
+                if prepared.padded_rows % chunk_rows == 0 {
+                    let mut activations = vec![0i8; chunk_rows * padded_k];
+                    let mut activation_scales = vec![0.0f32; matrix.groups.len() * chunk_rows];
+                    let mut scaled_output = vec![0.0f32; chunk_rows * matrix.n];
+                    for row0 in (0..prepared.padded_rows).step_by(chunk_rows) {
+                        activations.fill(0);
+                        for row in 0..chunk_rows {
+                            let source_row = row0 + row;
+                            for (group_idx, group) in prepared.groups.iter().enumerate() {
+                                let source = source_row * GROUP;
+                                let destination = row * padded_k + group_idx * GROUP;
+                                activations[destination..destination + GROUP]
+                                    .copy_from_slice(&group[source..source + GROUP]);
+                            }
+                        }
+                        for group_idx in 0..matrix.groups.len() {
+                            activation_scales[group_idx * chunk_rows..(group_idx + 1) * chunk_rows]
+                                .copy_from_slice(
+                                    &prepared.scales[group_idx][row0..row0 + chunk_rows],
+                                );
+                        }
+                        whole.run_resident(
+                            weights,
+                            &activations,
+                            &activation_scales,
+                            &mut scaled_output,
+                        )?;
+                        let valid_rows = (m - row0.min(m)).min(chunk_rows);
+                        for row in 0..valid_rows {
+                            c[(row0 + row) * matrix.n..(row0 + row + 1) * matrix.n]
+                                .copy_from_slice(
+                                    &scaled_output[row * matrix.n..(row + 1) * matrix.n],
+                                );
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
         if let (Some(mode), Some(weights)) = (whole_mode(matrix.encoding), &matrix.whole_weights) {
             if let Some(whole) = self.whole.get_mut(&(mode, padded_k)) {
                 let chunk_rows = whole.rows();
@@ -685,6 +801,19 @@ pub struct NpuOpusGemmMp {
 }
 
 impl NpuOpusGemmMp {
+    pub fn load_whole_scaled_only(
+        cache: &str,
+        quant_type: u8,
+        k: usize,
+        n: usize,
+        payload: &[u8],
+        awq_scale: Option<Vec<f32>>,
+    ) -> Result<Self, XdnaError> {
+        let executor = NpuOpusExecutor::load_whole_scaled_cached(&[cache], n)?;
+        let matrix = executor.pack_matrix(quant_type, k, n, payload, awq_scale)?;
+        Ok(Self { executor, matrix })
+    }
+
     pub fn load_whole_only(
         whole_cache: &str,
         quant_type: u8,

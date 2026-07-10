@@ -70,11 +70,37 @@ impl NpuOpusProjector {
                 (width, paths)
             })
             .collect();
+        let whole_scaled_paths: BTreeMap<usize, Vec<PathBuf>> = requirements
+            .iter()
+            .map(|(&width, shapes)| {
+                let paths = shapes
+                    .iter()
+                    .filter(|(mode, _)| *mode == "w4")
+                    .map(|(_, padded_k)| {
+                        cache_root.join(format!(
+                            "embgemma_aie2p_whole_w4-scaled_m256_kg{}_n{width}",
+                            padded_k / 256
+                        ))
+                    })
+                    .collect();
+                (width, paths)
+            })
+            .collect();
+        let scaled_compatible = requirements
+            .values()
+            .flatten()
+            .all(|(mode, _)| *mode == "w4");
+        let use_whole_scaled = scaled_compatible
+            && whole_scaled_paths.values().all(|paths| !paths.is_empty())
+            && whole_scaled_paths.values().flatten().all(|path| {
+                path.join("final.xclbin").is_file() && path.join("insts.bin").is_file()
+            });
         let whole_compatible = requirements
             .values()
             .flatten()
             .all(|(mode, _)| matches!(*mode, "w4" | "w8"));
-        let use_whole = whole_compatible
+        let use_whole = !use_whole_scaled
+            && whole_compatible
             && whole_paths.values().all(|paths| !paths.is_empty())
             && whole_paths.values().flatten().all(|path| {
                 path.join("final.xclbin").is_file() && path.join("insts.bin").is_file()
@@ -91,7 +117,16 @@ impl NpuOpusProjector {
                     "embeddinggemma NPU: unsupported output width {width}"
                 ));
             }
-            let executor = if use_whole {
+            let executor = if use_whole_scaled {
+                let paths = whole_scaled_paths.get(&width).ok_or_else(|| {
+                    format!("embeddinggemma NPU: no scaled whole-array N={width} shapes")
+                })?;
+                let caches: Vec<&str> = paths
+                    .iter()
+                    .map(|path| path.to_str().expect("UTF-8 cache path"))
+                    .collect();
+                NpuOpusExecutor::load_whole_scaled_cached(&caches, width)
+            } else if use_whole {
                 let paths = whole_paths.get(&width).ok_or_else(|| {
                     format!("embeddinggemma NPU: no whole-array N={width} shapes")
                 })?;

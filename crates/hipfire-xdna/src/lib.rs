@@ -188,6 +188,11 @@ pub mod gemm_whole;
 pub use gemm_whole::{NpuGemmWholeArray, NpuWholeMode, NpuWholeResidentWeights};
 
 #[cfg(target_os = "linux")]
+pub mod gemm_whole_scaled;
+#[cfg(target_os = "linux")]
+pub use gemm_whole_scaled::{NpuGemmWholeScaled, NpuWholeScaledResidentWeights};
+
+#[cfg(target_os = "linux")]
 pub mod opus;
 #[cfg(target_os = "linux")]
 pub use opus::{NpuOpusExecutor, NpuOpusGemmMp, OpusMatrixEncoding, OpusPackedMatrix};
