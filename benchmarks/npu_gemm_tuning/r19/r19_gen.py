@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """All-32-core canonical AWQ/FWHT/int8 activation preprocessing at M=256."""
 
+import sys
+
+FUNCTION = sys.argv[1] if len(sys.argv) == 2 else "r19_fwht_quant"
+if not FUNCTION.replace("_", "").isalnum():
+    raise SystemExit("kernel function must contain only letters, digits, and underscores")
+
 COLS = 8
 CORE_ROWS = 4
 ROWS_PER_CORE = 8
@@ -59,7 +65,7 @@ for col in range(COLS):
     ]
 
 out.append(
-    f'    func.func private @r19_fwht_quant(memref<{PAD_K}xf32>, memref<{PARAM}xf32>, memref<{ROW_OUT}xi8>, memref<256xf32>) attributes {{link_with = "r19.o"}}'
+    f'    func.func private @{FUNCTION}(memref<{PAD_K}xf32>, memref<{PARAM}xf32>, memref<{ROW_OUT}xi8>, memref<256xf32>) attributes {{link_with = "r19.o"}}'
 )
 for col in range(COLS):
     for row in range(CORE_ROWS):
@@ -77,7 +83,7 @@ for col in range(COLS):
             f"          %xv = aie.objectfifo.subview.access %x[0] : !aie.objectfifosubview<memref<{PAD_K}xf32>> -> memref<{PAD_K}xf32>",
             f"          %o = aie.objectfifo.acquire @ocore{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{ROW_OUT}xi8>>",
             f"          %ov = aie.objectfifo.subview.access %o[0] : !aie.objectfifosubview<memref<{ROW_OUT}xi8>> -> memref<{ROW_OUT}xi8>",
-            f"          func.call @r19_fwht_quant(%xv, %pv, %ov, %scratch{col}_{row}) : (memref<{PAD_K}xf32>, memref<{PARAM}xf32>, memref<{ROW_OUT}xi8>, memref<256xf32>) -> ()",
+            f"          func.call @{FUNCTION}(%xv, %pv, %ov, %scratch{col}_{row}) : (memref<{PAD_K}xf32>, memref<{PARAM}xf32>, memref<{ROW_OUT}xi8>, memref<256xf32>) -> ()",
             f"          aie.objectfifo.release @xcore{col}_{row}(Consume, 1)",
             f"          aie.objectfifo.release @ocore{col}_{row}(Produce, 1)",
             "        }",

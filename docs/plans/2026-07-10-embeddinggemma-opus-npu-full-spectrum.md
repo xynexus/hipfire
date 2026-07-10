@@ -483,3 +483,20 @@ resident GeGLU-to-down chain: R18 output still needs an in-array layout bridge,
 the scalar FWHT/quant path must be vectorized or fused, and the down projection
 has not yet consumed R19 output. Full-FFN, full-model, 10k/15k input-token, and
 package tokens/J claims remain open.
+
+### Vector down-activation checkpoint
+
+R20 vectorizes the R19 contract without changing its physical output: 16-lane
+AWQ divide/sign, filter/interleave FWHT butterflies for strides 1 through 8,
+16-lane add/sub butterflies for strides 16 through 128, vector post-sign/max,
+and vector normalization/int8 conversion. The vector reciprocal paths were
+accepted only after all 327,680 physical int8 values matched the exact R19 CPU
+oracle; maximum scale error is `1.1e-8`.
+
+Three independent 100-iteration M256 runs measure 0.3106, 0.3221, and 0.3246
+ms (median 0.3221 ms), 21.4 times faster than R19's 6.9061 ms median and about
+795k rows/s for the standalone stage. Summed serially over 24 layers, 0.3221 ms
+is about 7.73 ms, so preprocessing alone no longer exhausts the 25.6 ms
+full-model budget. The GeGLU-to-down integration gate remains pending; this is
+still not a complete FFN, overlap proof, full-model throughput result, or
+package tokens/J result.
