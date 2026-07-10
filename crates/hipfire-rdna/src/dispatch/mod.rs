@@ -64,6 +64,8 @@ mod mamba2;
 mod misc;
 mod moe;
 mod norm;
+mod npu_io;
+pub use npu_io::OpusNpuIoLayout;
 mod overlays;
 mod quant;
 mod rocblas;

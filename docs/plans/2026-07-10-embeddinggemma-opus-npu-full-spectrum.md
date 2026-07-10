@@ -378,3 +378,48 @@ does not satisfy mixed/OQ8 scaling, full-model residency, quality admission, or
 the 10k tok/s target. The next useful boundary is a single resident layer/model
 schedule that removes per-projection XRT and GPU round trips, not another
 projection-only scale micro-optimization.
+
+### Shared GPU/AIE physical-I/O checkpoint
+
+The production scaled whole-array W4/W8 path now accepts GPU-exported dma-bufs
+for both activation and output arguments. A HIP producer applies optional AWQ,
+the canonical signed FWHT-256, and per-row/group int8 quantization directly into
+the AIE physical activation layout. After the blocking AIE dispatch, a HIP
+consumer deblocks the physical f32 output directly into one, two, or three
+row-major role tensors. There is no CPU activation packing, output unpacking,
+GPU download, or GPU upload in this projection seam. Weight and shared-buffer
+imports remain resident after lazy initialization.
+
+The direct GPU -> dma-buf -> AIE2P -> dma-buf -> GPU oracle gate is exact at
+M=256 for W4, W8, AWQ `+`/`++`, and a non-multiple-of-256 K tail:
+
+- W4 K768/N768: maximum absolute error 4e-7;
+- W8 K768/N1280: maximum absolute error 7.6e-6;
+- W4+ K1152/padded-K1280/N768: maximum absolute error 4e-7;
+- W8+ K1152/padded-K1280/N768: maximum absolute error 1.34e-5.
+
+The tail test caught a one-code activation discrepancy caused by multiplying by
+a reciprocal before rounding. Matching the CPU contract's exact divide-then-
+round order removed it; the gate also compares the physical packed activation
+bytes and scales against the CPU oracle before timing.
+
+One warmed 20-iteration M256 projection inventory measured:
+
+| mode | combined qkv | o | combined gate/up | down | 24-layer total | projection-only tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| W4 | 0.4296 ms | 0.2937 ms | 0.5714 ms | 0.3663 ms | 39.86 ms | about 6,422 |
+| W8 | 0.4617 ms | 0.3007 ms | 0.6254 ms | 0.4037 ms | 43.00 ms | about 5,954 |
+
+These are shared-boundary projection inventories, not fully resident model
+results, and are still above the 25.6 ms total-model budget for 10,000 input
+tokens/s before attention or norms. The short-document OQ8+ hybrid remained
+stable at minimum GPU/NPU cosine 0.99991620 and 79.7 input tok/s after warmup;
+it still runs attention, norms, residuals, activations, pooling, Dense heads,
+and final normalization on GPU/host.
+
+The next required slice is a resident layer schedule. In particular, the FFN
+can stream combined gate/up tiles through GeGLU and the down projection without
+materializing the full intermediate or crossing engines; the attention block
+needs an analogous qkv -> headnorm/RoPE -> bidirectional attention -> o pipeline.
+Arbitrary mixed Opus overlays must join that same schedule rather than falling
+back to the host or multiplying per-overlay dispatches.

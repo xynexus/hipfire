@@ -1277,6 +1277,7 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-gemma3",
+ "hipfire-primitives",
  "hipfire-rdna",
  "hipfire-runtime",
  "hipfire-xdna",

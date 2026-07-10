@@ -2,11 +2,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use hip_bridge::{HipError, HipResult};
-use hipfire_rdna::{Gpu, GpuTensor};
+use hipfire_rdna::{
+    DType, Gpu, GpuTensor, ImportedTensor, OpusNpuIoLayout, OwnedTensor, SharedGttBuffer,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
-use hipfire_xdna::{NpuOpusExecutor, OpusMatrixEncoding, OpusPackedMatrix};
+use hipfire_xdna::{
+    NpuOpusExecutor, NpuWholeMode, NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix,
+};
 
 use crate::config::EmbeddingGemmaConfig;
 use crate::forward::{LinearProjector, Projection};
@@ -30,6 +34,41 @@ struct LayerMatrices {
 pub struct NpuOpusProjector {
     executors: HashMap<usize, NpuOpusExecutor>,
     layers: Vec<LayerMatrices>,
+    shared_io: HashMap<SharedIoKey, SharedProjectionIo>,
+    awq_gpu: HashMap<MatrixGpuKey, OwnedTensor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SharedIoKey {
+    mode: NpuWholeMode,
+    k: usize,
+    n: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum MatrixRole {
+    Qkv,
+    Query,
+    Key,
+    Value,
+    AttentionOutput,
+    Gate,
+    Up,
+    GateUp,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct MatrixGpuKey {
+    layer: usize,
+    role: MatrixRole,
+}
+
+struct SharedProjectionIo {
+    input_gpu: ImportedTensor,
+    output_gpu: ImportedTensor,
+    _input_buffer: SharedGttBuffer,
+    _output_buffer: SharedGttBuffer,
 }
 
 impl NpuOpusProjector {
@@ -260,7 +299,12 @@ impl NpuOpusProjector {
                 )?,
             });
         }
-        Ok(Self { executors, layers })
+        Ok(Self {
+            executors,
+            layers,
+            shared_io: HashMap::new(),
+            awq_gpu: HashMap::new(),
+        })
     }
 
     pub fn layer_count(&self) -> usize {
@@ -326,6 +370,137 @@ fn fullk_mode_tag(quant_type: u8) -> Option<&'static str> {
     }
 }
 
+impl SharedProjectionIo {
+    fn allocate(
+        gpu: &mut Gpu,
+        executor: &mut NpuOpusExecutor,
+        matrix: &OpusPackedMatrix,
+        layout: NpuWholeScaledIoLayout,
+    ) -> HipResult<Self> {
+        let mut input_buffer = gpu.alloc_shared_gtt(layout.input_bytes())?;
+        let mut output_buffer = gpu.alloc_shared_gtt(layout.output_bytes())?;
+        input_buffer.as_mut_slice().fill(0);
+        output_buffer.as_mut_slice().fill(0);
+        let input_gpu = gpu.import_dmabuf(
+            input_buffer.dmabuf_fd(),
+            layout.input_bytes(),
+            &[layout.input_bytes()],
+            DType::Raw,
+        )?;
+        let output_gpu = gpu.import_dmabuf(
+            output_buffer.dmabuf_fd(),
+            layout.output_bytes(),
+            &[layout.output_bytes()],
+            DType::Raw,
+        )?;
+        executor
+            .attach_whole_scaled_shared_io(
+                matrix,
+                input_buffer.dmabuf_fd(),
+                layout.input_bytes(),
+                output_buffer.dmabuf_fd(),
+                layout.output_bytes(),
+            )
+            .map_err(|error| hip_error(format!("attach shared Opus I/O: {error}")))?;
+        Ok(Self {
+            input_gpu,
+            output_gpu,
+            _input_buffer: input_buffer,
+            _output_buffer: output_buffer,
+        })
+    }
+}
+
+fn rdna_io_layout(layout: NpuWholeScaledIoLayout) -> OpusNpuIoLayout {
+    OpusNpuIoLayout::new(
+        layout.mode() == NpuWholeMode::W8,
+        layout.cols(),
+        layout.rows(),
+        layout.groups(),
+        layout.n(),
+        layout.n_macros(),
+        layout.outblocks(),
+        layout.input_bytes(),
+        layout.output_bytes(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_shared_projection(
+    gpu: &mut Gpu,
+    executors: &mut HashMap<usize, NpuOpusExecutor>,
+    shared_io: &mut HashMap<SharedIoKey, SharedProjectionIo>,
+    awq_gpu: &mut HashMap<MatrixGpuKey, OwnedTensor>,
+    matrix_key: MatrixGpuKey,
+    matrix: &OpusPackedMatrix,
+    input: &GpuTensor,
+    outputs: &[(&GpuTensor, usize)],
+    rows: usize,
+) -> HipResult<bool> {
+    let Some(layout) = executors
+        .get(&matrix.n())
+        .and_then(|executor| executor.whole_scaled_io_layout(matrix))
+    else {
+        return Ok(false);
+    };
+    if rows > layout.rows() || outputs.is_empty() || outputs.len() > 3 {
+        return Ok(false);
+    }
+    let key = SharedIoKey {
+        mode: layout.mode(),
+        k: layout.k(),
+        n: layout.n(),
+    };
+    if !shared_io.contains_key(&key) {
+        let io = SharedProjectionIo::allocate(
+            gpu,
+            executors
+                .get_mut(&matrix.n())
+                .ok_or_else(|| hip_error("missing shared Opus executor"))?,
+            matrix,
+            layout,
+        )?;
+        shared_io.insert(key, io);
+    }
+    if !awq_gpu.contains_key(&matrix_key) {
+        if let Some(scale) = matrix.awq_scale() {
+            awq_gpu.insert(matrix_key, gpu.upload_owned_f32(scale, &[scale.len()])?);
+        }
+    }
+    let io = shared_io
+        .get(&key)
+        .ok_or_else(|| hip_error("missing allocated shared Opus I/O"))?;
+    let input_view = io.input_gpu.view();
+    let output_view = io.output_gpu.view();
+    gpu.pack_opus_npu_activations(
+        input,
+        awq_gpu.get(&matrix_key).map(OwnedTensor::view),
+        &input_view,
+        rows,
+        matrix.k(),
+        rdna_io_layout(layout),
+    )?;
+    // The NPU cannot observe an in-flight HIP stream; make the shared producer
+    // completion explicit before the XDNA cache reconciliation and submit.
+    gpu.device_synchronize()?;
+    executors
+        .get_mut(&matrix.n())
+        .ok_or_else(|| hip_error("missing shared Opus executor"))?
+        .run_whole_scaled_shared(matrix)
+        .map_err(|error| hip_error(format!("shared NPU Opus projection failed: {error}")))?;
+    let (out0, width0) = outputs[0];
+    gpu.unpack_opus_npu_output(
+        &output_view,
+        out0,
+        width0,
+        outputs.get(1).copied(),
+        outputs.get(2).copied(),
+        rows,
+        rdna_io_layout(layout),
+    )?;
+    Ok(true)
+}
+
 impl LinearProjector for NpuOpusProjector {
     fn project(
         &mut self,
@@ -337,7 +512,12 @@ impl LinearProjector for NpuOpusProjector {
         output: &GpuTensor,
         rows: usize,
     ) -> HipResult<()> {
-        let Self { executors, layers } = self;
+        let Self {
+            executors,
+            layers,
+            shared_io,
+            awq_gpu,
+        } = self;
         let layer = layers
             .get(layer_idx)
             .ok_or_else(|| hip_error(format!("missing packed layer {layer_idx}")))?;
@@ -363,6 +543,31 @@ impl LinearProjector for NpuOpusProjector {
             )));
         }
         let width = matrix.n();
+        let role = match projection {
+            Projection::Query => MatrixRole::Query,
+            Projection::Key => MatrixRole::Key,
+            Projection::Value => MatrixRole::Value,
+            Projection::AttentionOutput => MatrixRole::AttentionOutput,
+            Projection::Gate => MatrixRole::Gate,
+            Projection::Up => MatrixRole::Up,
+            Projection::Down => MatrixRole::Down,
+        };
+        if try_shared_projection(
+            gpu,
+            executors,
+            shared_io,
+            awq_gpu,
+            MatrixGpuKey {
+                layer: layer_idx,
+                role,
+            },
+            matrix,
+            input,
+            &[(output, width)],
+            rows,
+        )? {
+            return Ok(());
+        }
         let input_host = gpu.download_f32(input)?;
         let mut output_host = vec![0.0f32; rows * width];
         let executor = executors
@@ -400,7 +605,13 @@ impl LinearProjector for NpuOpusProjector {
             self.project(gpu, layer_idx, Projection::Key, wk, input, k, rows)?;
             return self.project(gpu, layer_idx, Projection::Value, wv, input, v, rows);
         }
-        let matrix = self.layers[layer_idx].qkv.as_ref().unwrap();
+        let Self {
+            executors,
+            layers,
+            shared_io,
+            awq_gpu,
+        } = self;
+        let matrix = layers[layer_idx].qkv.as_ref().unwrap();
         let widths = [wq.m, wk.m, wv.m];
         if wq.k != matrix.k()
             || wk.k != matrix.k()
@@ -409,9 +620,25 @@ impl LinearProjector for NpuOpusProjector {
         {
             return Err(hip_error("combined q/k/v projection geometry mismatch"));
         }
+        if try_shared_projection(
+            gpu,
+            executors,
+            shared_io,
+            awq_gpu,
+            MatrixGpuKey {
+                layer: layer_idx,
+                role: MatrixRole::Qkv,
+            },
+            matrix,
+            input,
+            &[(q, widths[0]), (k, widths[1]), (v, widths[2])],
+            rows,
+        )? {
+            return Ok(());
+        }
         let input_host = gpu.download_f32(input)?;
         let mut combined = vec![0.0f32; rows * matrix.n()];
-        self.executors
+        executors
             .get_mut(&matrix.n())
             .ok_or_else(|| hip_error("missing combined q/k/v executor"))?
             .run_f32(matrix, rows, &input_host, &mut combined)
@@ -458,16 +685,38 @@ impl LinearProjector for NpuOpusProjector {
             )?;
             return self.project(gpu, layer_idx, Projection::Up, up_weight, input, up, rows);
         }
-        let matrix = self.layers[layer_idx].gate_up.as_ref().unwrap();
+        let Self {
+            executors,
+            layers,
+            shared_io,
+            awq_gpu,
+        } = self;
+        let matrix = layers[layer_idx].gate_up.as_ref().unwrap();
         if gate_weight.k != matrix.k()
             || up_weight.k != matrix.k()
             || gate_weight.m + up_weight.m != matrix.n()
         {
             return Err(hip_error("combined gate/up projection geometry mismatch"));
         }
+        if try_shared_projection(
+            gpu,
+            executors,
+            shared_io,
+            awq_gpu,
+            MatrixGpuKey {
+                layer: layer_idx,
+                role: MatrixRole::GateUp,
+            },
+            matrix,
+            input,
+            &[(gate, gate_weight.m), (up, up_weight.m)],
+            rows,
+        )? {
+            return Ok(());
+        }
         let input_host = gpu.download_f32(input)?;
         let mut combined = vec![0.0f32; rows * matrix.n()];
-        self.executors
+        executors
             .get_mut(&matrix.n())
             .ok_or_else(|| hip_error("missing combined gate/up executor"))?
             .run_f32(matrix, rows, &input_host, &mut combined)

@@ -65,6 +65,87 @@ pub struct NpuWholeScaledResidentWeights {
     buffer: DeviceBuffer,
 }
 
+/// Physical argument-buffer contract for one group-retaining whole-array
+/// projection. GPU producers/consumers use this metadata to address the AIE
+/// block layout directly in imported dma-bufs without a host pack/unpack pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NpuWholeScaledIoLayout {
+    mode: NpuWholeMode,
+    cols: usize,
+    rows: usize,
+    groups: usize,
+    n: usize,
+    n_macros: usize,
+    outblocks: usize,
+    input_bytes: usize,
+    output_bytes: usize,
+}
+
+impl NpuWholeScaledIoLayout {
+    fn new(
+        mode: NpuWholeMode,
+        cols: usize,
+        rows: usize,
+        groups: usize,
+        n: usize,
+        n_macros: usize,
+        outblocks: usize,
+    ) -> Self {
+        let layout = Layout::for_mode(mode);
+        Self {
+            mode,
+            cols,
+            rows,
+            groups,
+            n,
+            n_macros,
+            outblocks,
+            input_bytes: ROW_STRIPES * outblocks * groups * A_BLOCK,
+            output_bytes: cols * outblocks * layout.c_join() * size_of::<f32>(),
+        }
+    }
+
+    pub fn mode(self) -> NpuWholeMode {
+        self.mode
+    }
+
+    pub fn cols(self) -> usize {
+        self.cols
+    }
+
+    pub fn rows(self) -> usize {
+        self.rows
+    }
+
+    pub fn groups(self) -> usize {
+        self.groups
+    }
+
+    pub fn k(self) -> usize {
+        self.groups * GROUP_K
+    }
+
+    pub fn n(self) -> usize {
+        self.n
+    }
+
+    pub fn n_macros(self) -> usize {
+        self.n_macros
+    }
+
+    pub fn outblocks(self) -> usize {
+        self.outblocks
+    }
+
+    pub fn input_bytes(self) -> usize {
+        self.input_bytes
+    }
+
+    pub fn output_bytes(self) -> usize {
+        self.output_bytes
+    }
+}
+
 pub struct NpuGemmWholeScaled {
     kernel: NpuKernel,
     layout: Layout,
@@ -145,6 +226,18 @@ impl NpuGemmWholeScaled {
 
     pub fn n(&self) -> usize {
         self.n
+    }
+
+    pub fn io_layout(&self) -> NpuWholeScaledIoLayout {
+        NpuWholeScaledIoLayout::new(
+            self.layout.mode,
+            self.cols,
+            self.rows,
+            self.groups,
+            self.n,
+            self.n_macros,
+            self.outblocks,
+        )
     }
 
     fn inblocks(&self) -> usize {
@@ -276,6 +369,41 @@ impl NpuGemmWholeScaled {
         self.kernel.sync_output(&self.output)?;
         self.unpack_output(output);
         Ok(())
+    }
+
+    /// Replace the private argument BOs with GPU-exported dma-bufs. The input
+    /// buffer must already use the AIE activation layout and the output remains
+    /// in the AIE physical tile layout until a GPU consumer deblocks it.
+    pub fn attach_shared_io(
+        &mut self,
+        input_fd: i32,
+        input_bytes: usize,
+        output_fd: i32,
+        output_bytes: usize,
+    ) -> Result<(), XdnaError> {
+        let layout = self.io_layout();
+        if input_bytes != layout.input_bytes() || output_bytes != layout.output_bytes() {
+            return Err(invalid("scaled whole-array shared dma-buf size mismatch"));
+        }
+        self.input = self.kernel.import_dmabuf(input_fd, input_bytes, true)?;
+        self.output = self.kernel.import_dmabuf(output_fd, output_bytes, true)?;
+        Ok(())
+    }
+
+    /// Dispatch using prepacked activations and physical output pages shared
+    /// with the GPU. No CPU-side activation copy or output deblocking occurs.
+    pub fn run_resident_shared(
+        &mut self,
+        weights: &NpuWholeScaledResidentWeights,
+    ) -> Result<(), XdnaError> {
+        if weights.buffer.len() != self.packed_weight_bytes() {
+            return Err(invalid("scaled whole-array resident weight size mismatch"));
+        }
+        self.kernel.dispatch_synced(
+            &[&self.input, &weights.buffer, &self.output],
+            &[true, false, true],
+        )?;
+        self.kernel.sync_output(&self.output)
     }
 
     fn pack_activations(&mut self, activations: &[i8], scales: &[f32]) {
@@ -412,5 +540,24 @@ mod tests {
             assert!(A_DATA + layout.rows_stripe() * 4 <= A_BLOCK);
             assert!(W_DATA + layout.cols_stripe * 4 <= W_BLOCK);
         }
+    }
+
+    #[test]
+    fn shared_io_layout_describes_the_exact_whole_array_buffers() {
+        let w4 = NpuWholeScaledIoLayout::new(NpuWholeMode::W4, 8, 256, 3, 768, 1, 3);
+        assert_eq!(w4.input_bytes(), 4 * 3 * 3 * A_BLOCK);
+        assert_eq!(w4.output_bytes(), 8 * 3 * 4 * 2304 * size_of::<f32>());
+        assert_eq!(w4.rows(), 256);
+        assert_eq!(w4.k(), 768);
+        assert_eq!(w4.n(), 768);
+        assert_eq!(w4.cols(), 8);
+        assert_eq!(w4.groups(), 3);
+        assert_eq!(w4.n_macros(), 1);
+        assert_eq!(w4.outblocks(), 3);
+
+        let w8 = NpuWholeScaledIoLayout::new(NpuWholeMode::W8, 8, 256, 5, 768, 2, 6);
+        assert_eq!(w8.input_bytes(), 4 * 30 * A_BLOCK);
+        assert_eq!(w8.output_bytes(), 8 * 6 * 4 * 1152 * size_of::<f32>());
+        assert_eq!(w8.k(), 1280);
     }
 }

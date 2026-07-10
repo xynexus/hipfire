@@ -17,7 +17,7 @@ use rayon::prelude::*;
 use crate::{
     NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK, NpuGemmMp, NpuGemmResidentWeights,
     NpuGemmWholeArray, NpuGemmWholeScaled, NpuSparse3Mp, NpuSparse3ResidentWeights, NpuWholeMode,
-    NpuWholeResidentWeights, NpuWholeScaledResidentWeights, XdnaError,
+    NpuWholeResidentWeights, NpuWholeScaledIoLayout, NpuWholeScaledResidentWeights, XdnaError,
 };
 use std::collections::HashMap;
 
@@ -120,6 +120,10 @@ impl OpusPackedMatrix {
 
     pub fn n(&self) -> usize {
         self.n
+    }
+
+    pub fn awq_scale(&self) -> Option<&[f32]> {
+        self.awq_scale.as_deref()
     }
 }
 
@@ -455,6 +459,56 @@ impl NpuOpusExecutor {
 
     pub fn rows_per_dispatch(&self) -> usize {
         self.rows_per_dispatch
+    }
+
+    /// Return the physical dma-buf contract for a matrix backed by the scaled
+    /// whole-array kernel. `None` means this matrix is on a compatibility path.
+    pub fn whole_scaled_io_layout(
+        &self,
+        matrix: &OpusPackedMatrix,
+    ) -> Option<NpuWholeScaledIoLayout> {
+        let mode = whole_mode(matrix.encoding)?;
+        matrix.whole_scaled_weights.as_ref()?;
+        self.whole_scaled
+            .get(&(mode, matrix.groups.len() * GROUP))
+            .map(NpuGemmWholeScaled::io_layout)
+    }
+
+    /// Import one GPU-owned input/output dma-buf pair for the matrix's scaled
+    /// whole-array kernel. The pair may be reused by every sequential projection
+    /// with the same `(mode,K,N)` executor key.
+    pub fn attach_whole_scaled_shared_io(
+        &mut self,
+        matrix: &OpusPackedMatrix,
+        input_fd: i32,
+        input_bytes: usize,
+        output_fd: i32,
+        output_bytes: usize,
+    ) -> Result<(), XdnaError> {
+        let mode = whole_mode(matrix.encoding)
+            .ok_or_else(|| invalid("mixed matrix has no scaled whole-array shared path"))?;
+        if matrix.whole_scaled_weights.is_none() {
+            return Err(invalid("matrix has no scaled whole-array resident weights"));
+        }
+        self.whole_scaled
+            .get_mut(&(mode, matrix.groups.len() * GROUP))
+            .ok_or_else(|| invalid("missing scaled whole-array cache for shared I/O"))?
+            .attach_shared_io(input_fd, input_bytes, output_fd, output_bytes)
+    }
+
+    /// Run one scaled whole-array projection whose activation/output pages are
+    /// already shared with the GPU in the physical AIE layouts.
+    pub fn run_whole_scaled_shared(&mut self, matrix: &OpusPackedMatrix) -> Result<(), XdnaError> {
+        let mode = whole_mode(matrix.encoding)
+            .ok_or_else(|| invalid("mixed matrix has no scaled whole-array shared path"))?;
+        let weights = matrix
+            .whole_scaled_weights
+            .as_ref()
+            .ok_or_else(|| invalid("matrix has no scaled whole-array resident weights"))?;
+        self.whole_scaled
+            .get_mut(&(mode, matrix.groups.len() * GROUP))
+            .ok_or_else(|| invalid("missing scaled whole-array cache for shared I/O"))?
+            .run_resident_shared(weights)
     }
 
     fn rows_per_dispatch_for(&self, encoding: OpusMatrixEncoding) -> usize {
@@ -891,6 +945,30 @@ impl NpuOpusGemmMp {
 
     pub fn rows_per_dispatch(&self) -> usize {
         self.executor.rows_per_dispatch_for_matrix(&self.matrix)
+    }
+
+    pub fn whole_scaled_io_layout(&self) -> Option<NpuWholeScaledIoLayout> {
+        self.executor.whole_scaled_io_layout(&self.matrix)
+    }
+
+    pub fn attach_whole_scaled_shared_io(
+        &mut self,
+        input_fd: i32,
+        input_bytes: usize,
+        output_fd: i32,
+        output_bytes: usize,
+    ) -> Result<(), XdnaError> {
+        self.executor.attach_whole_scaled_shared_io(
+            &self.matrix,
+            input_fd,
+            input_bytes,
+            output_fd,
+            output_bytes,
+        )
+    }
+
+    pub fn run_whole_scaled_shared(&mut self) -> Result<(), XdnaError> {
+        self.executor.run_whole_scaled_shared(&self.matrix)
     }
 
     pub fn run_f32(&mut self, m: usize, x: &[f32], c: &mut [f32]) -> Result<(), XdnaError> {

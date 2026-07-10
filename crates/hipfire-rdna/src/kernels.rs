@@ -1091,6 +1091,10 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str =
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
 /// (W·s) · (x/s) = W·x — divide before FWHT mirrors the offline pre-scaling.
 pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_x_mq_awq.hip");
+/// GPU side of the shared EmbeddingGemma Opus projection boundary. Packs
+/// AWQ/FWHT/Q8 activations directly into the AIE whole-array input layout and
+/// deblocks the physical f32 output into one to three row-major GPU tensors.
+pub const OPUS_NPU_IO_SRC: &str = include_str!("../../../kernels/src/opus_npu_io.hip");
 /// Phase A Stage A — F2: AWQ-aware variant of `fused_silu_mul_mq_rotate`
 /// for the down_proj / w_down input stage. Dispatched when down_proj
 /// carries an `awq_scale`. Divide happens AFTER silu*up reduction, BEFORE

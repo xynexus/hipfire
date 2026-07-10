@@ -190,7 +190,9 @@ pub use gemm_whole::{NpuGemmWholeArray, NpuWholeMode, NpuWholeResidentWeights};
 #[cfg(target_os = "linux")]
 pub mod gemm_whole_scaled;
 #[cfg(target_os = "linux")]
-pub use gemm_whole_scaled::{NpuGemmWholeScaled, NpuWholeScaledResidentWeights};
+pub use gemm_whole_scaled::{
+    NpuGemmWholeScaled, NpuWholeScaledIoLayout, NpuWholeScaledResidentWeights,
+};
 
 #[cfg(target_os = "linux")]
 pub mod opus;
