@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("mode,shape,m,k,padded_k,n,repeats,ms,logical_tops,physical_tops");
     for mode_name in modes {
         let expected_mode = match mode_name {
-            "w4" => NpuFullKMode::W4,
+            "w4" | "w4-scaled" => NpuFullKMode::W4,
             "mixed" => NpuFullKMode::Mixed,
             "w8" => NpuFullKMode::W8,
             _ => return Err(format!("unknown mode {mode_name}").into()),
@@ -147,16 +147,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let base_refs: Vec<&[i8]> = base.iter().map(Vec::as_slice).collect();
             let residual_refs: Vec<&[i8]> = residual.iter().map(Vec::as_slice).collect();
-            let packed = gemm.prepack_weights(&base_refs, &residual_refs)?;
+            let weight_scales = vec![vec![1.0f32; shape.n]; groups];
+            let scale_refs: Vec<&[f32]> = weight_scales.iter().map(Vec::as_slice).collect();
+            let packed = if gemm.scaled_output() {
+                gemm.prepack_weights_with_scales(&base_refs, &residual_refs, &scale_refs)?
+            } else {
+                gemm.prepack_weights(&base_refs, &residual_refs)?
+            };
             let resident = gemm.upload_resident_weights(&packed)?;
             let activations: Vec<i8> = (0..rows * padded_k).map(pseudo).collect();
             let mut partials = vec![0i32; groups * rows * shape.n];
+            let activation_scales = vec![1.0f32; groups * rows];
+            let mut scaled = vec![0.0f32; rows * shape.n];
             for _ in 0..2 {
-                gemm.run_resident(&resident, &activations, &mut partials)?;
+                if gemm.scaled_output() {
+                    gemm.run_resident_scaled(
+                        &resident,
+                        &activations,
+                        &activation_scales,
+                        &mut scaled,
+                    )?;
+                } else {
+                    gemm.run_resident(&resident, &activations, &mut partials)?;
+                }
             }
             let started = Instant::now();
             for _ in 0..iterations {
-                gemm.run_resident(&resident, &activations, &mut partials)?;
+                if gemm.scaled_output() {
+                    gemm.run_resident_scaled(
+                        &resident,
+                        &activations,
+                        &activation_scales,
+                        &mut scaled,
+                    )?;
+                } else {
+                    gemm.run_resident(&resident, &activations, &mut partials)?;
+                }
             }
             let seconds = started.elapsed().as_secs_f64() / iterations as f64;
             let logical_macs = rows as f64 * shape.k as f64 * shape.n as f64;
