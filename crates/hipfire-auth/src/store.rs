@@ -478,15 +478,52 @@ impl AccessStore {
     }
 
     pub fn put_response(&self, record: &ResponseContextRecord) -> Result<(), AuthError> {
+        self.put_response_bounded(record, usize::MAX)
+    }
+
+    pub fn put_response_bounded(
+        &self,
+        record: &ResponseContextRecord,
+        max_per_user: usize,
+    ) -> Result<(), AuthError> {
         if record.payload.len() > MAX_RESPONSE_CONTEXT_BYTES {
             return Err(AuthError::Invalid(format!(
                 "response context exceeds {MAX_RESPONSE_CONTEXT_BYTES} bytes"
             )));
         }
+        if max_per_user == 0 {
+            return Err(AuthError::Invalid(
+                "response context capacity must be non-zero".into(),
+            ));
+        }
         let key = response_key(&record.user_id, &record.response_id);
         let expiry = response_expiry_key(record.expires_at, &record.user_id, &record.response_id);
         let encoded = encode(record)?;
         let write = self.database.begin_write().map_err(db)?;
+        let evicted = {
+            let table = write.open_table(RESPONSES).map_err(db)?;
+            let mut owned = Vec::new();
+            for entry in table.iter().map_err(db)? {
+                let (stored_key, value) = entry.map_err(db)?;
+                let stored: ResponseContextRecord = decode(value.value())?;
+                if stored.user_id == record.user_id && stored_key.value() != key {
+                    owned.push((stored.created_at, stored_key.value().to_string()));
+                }
+            }
+            owned.sort_by(|left, right| left.cmp(right));
+            let evict = owned.len().saturating_add(1).saturating_sub(max_per_user);
+            owned
+                .into_iter()
+                .take(evict)
+                .map(|(_, key)| key)
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut table = write.open_table(RESPONSES).map_err(db)?;
+            for key in evicted {
+                table.remove(key.as_str()).map_err(db)?;
+            }
+        }
         write
             .open_table(RESPONSES)
             .map_err(db)?
@@ -517,6 +554,29 @@ impl AccessStore {
             .into_iter()
             .filter(|record| record.user_id == user_id)
             .collect())
+    }
+
+    pub fn prune_responses_expired(&self, now: u64) -> Result<u64, AuthError> {
+        let write = self.database.begin_write().map_err(db)?;
+        let expired = {
+            let table = write.open_table(RESPONSES).map_err(db)?;
+            let mut expired = Vec::new();
+            for entry in table.iter().map_err(db)? {
+                let (key, value) = entry.map_err(db)?;
+                let record: ResponseContextRecord = decode(value.value())?;
+                if record.expires_at <= now {
+                    expired.push(key.value().to_string());
+                }
+            }
+            expired
+        };
+        let mut table = write.open_table(RESPONSES).map_err(db)?;
+        for key in &expired {
+            table.remove(key.as_str()).map_err(db)?;
+        }
+        drop(table);
+        write.commit().map_err(db)?;
+        Ok(expired.len() as u64)
     }
 
     pub fn append_audit(&self, event: AuditEvent) -> Result<AuditEvent, AuthError> {
@@ -892,6 +952,32 @@ mod tests {
             .unwrap();
         assert!(store.get_response("alice", "resp_1").unwrap().is_some());
         assert!(store.get_response("bob", "resp_1").unwrap().is_none());
+    }
+
+    #[test]
+    fn responses_are_bounded_per_user_and_expiry_is_pruned() {
+        let (_dir, store) = open();
+        for index in 0..3 {
+            store
+                .put_response_bounded(
+                    &ResponseContextRecord {
+                        user_id: "alice".into(),
+                        response_id: format!("resp_{index}"),
+                        parent_response_id: None,
+                        created_at: index,
+                        updated_at: index,
+                        expires_at: if index == 2 { 10 } else { 100 },
+                        payload: vec![index as u8],
+                    },
+                    2,
+                )
+                .unwrap();
+        }
+        let rows = store.list_user_responses("alice").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.response_id != "resp_0"));
+        assert_eq!(store.prune_responses_expired(10).unwrap(), 1);
+        assert!(store.get_response("alice", "resp_2").unwrap().is_none());
     }
 
     #[test]

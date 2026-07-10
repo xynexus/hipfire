@@ -12,13 +12,28 @@ enum Command {
         now: u64,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    Shutdown,
 }
 
 /// Cloneable, non-blocking handle to the dedicated redb usage writer.
 #[derive(Clone)]
 pub struct UsageWriter {
+    inner: Arc<UsageWriterInner>,
+}
+
+struct UsageWriterInner {
     sender: mpsc::Sender<Command>,
     last_error: Arc<Mutex<Option<String>>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Drop for UsageWriterInner {
+    fn drop(&mut self) {
+        let _ = self.sender.send(Command::Shutdown);
+        if let Some(thread) = self.thread.lock().unwrap().take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl std::fmt::Debug for UsageWriter {
@@ -48,7 +63,7 @@ impl UsageWriter {
         let (sender, receiver) = mpsc::channel();
         let last_error = Arc::new(Mutex::new(None));
         let actor_error = last_error.clone();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("hipfire-usage-store".to_string())
             .spawn(move || {
                 run_actor(
@@ -61,18 +76,26 @@ impl UsageWriter {
                 )
             })
             .expect("failed to spawn hipfire usage storage actor");
-        Self { sender, last_error }
+        Self {
+            inner: Arc::new(UsageWriterInner {
+                sender,
+                last_error,
+                thread: Mutex::new(Some(thread)),
+            }),
+        }
     }
 
     pub fn record(&self, record: HourlyUsageRecord) -> Result<(), String> {
-        self.sender
+        self.inner
+            .sender
             .send(Command::Record(record))
             .map_err(|_| "usage storage actor stopped".to_string())
     }
 
     pub fn flush(&self, now: u64) -> Result<(), String> {
         let (reply, response) = mpsc::sync_channel(1);
-        self.sender
+        self.inner
+            .sender
             .send(Command::Flush { now, reply })
             .map_err(|_| "usage storage actor stopped".to_string())?;
         response
@@ -81,7 +104,7 @@ impl UsageWriter {
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.last_error.lock().unwrap().clone()
+        self.inner.last_error.lock().unwrap().clone()
     }
 }
 
@@ -114,6 +137,13 @@ fn run_actor(
                     .map_err(|error| error.to_string());
                 remember_string_result(&last_error, &result);
                 let _ = reply.send(result);
+            }
+            Ok(Command::Shutdown) => {
+                remember_result(
+                    &last_error,
+                    flush_pending(&store, &mut pending, now_secs(), retention_secs),
+                );
+                break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => remember_result(
                 &last_error,

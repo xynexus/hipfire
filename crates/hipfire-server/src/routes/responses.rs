@@ -20,8 +20,28 @@ use crate::routes::chat::{
     wait_for_prefill_scheduler_turn, AssistantDelta, ChatMessage, ChatRequest, ThinkStreamFilter,
 };
 use crate::state::{SharedState, StoredResponsesContext};
+use hipfire_auth::{RequestPrincipal, ResponseContextRecord};
 use hipfire_daemon_adapter::{GenerateStreamControl, GenerateStreamEvent};
 use hipfire_generate::GenerationSamplingPolicy;
+
+const AUTHENTICATED_RESPONSE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+const AUTHENTICATED_RESPONSE_MAX: usize = 128;
+const RESPONSE_CHAIN_MAX_DEPTH: usize = 128;
+
+#[derive(Debug, Clone)]
+enum ResponsesOwner {
+    AnonymousLocal,
+    User(String),
+}
+
+impl ResponsesOwner {
+    fn from_principal(principal: Option<Extension<RequestPrincipal>>) -> Self {
+        principal
+            .and_then(|Extension(principal)| principal.user_id)
+            .map(Self::User)
+            .unwrap_or(Self::AnonymousLocal)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ResponsesRequest {
@@ -45,16 +65,18 @@ pub struct ResponsesRequest {
 
 pub async fn post_responses(
     State(state): State<SharedState>,
+    principal: Option<Extension<RequestPrincipal>>,
     accounting: Option<Extension<crate::accounting::RequestAccounting>>,
     Json(body): Json<ResponsesRequest>,
 ) -> Response {
     let accounting = accounting.map(|Extension(accounting)| accounting);
+    let owner = ResponsesOwner::from_principal(principal);
     if body.stream {
-        return stream_responses(state, body, accounting)
+        return stream_responses(state, body, owner, accounting)
             .await
             .into_response();
     }
-    match execute_responses(state, body).await {
+    match execute_responses_owned(state, body, owner).await {
         Ok(body) => {
             if let Some(accounting) = &accounting {
                 report_response_usage(accounting, &body);
@@ -82,7 +104,15 @@ pub(crate) async fn execute_responses(
     state: SharedState,
     body: ResponsesRequest,
 ) -> Result<Value, Value> {
-    let messages = prepare_response_messages(&state, &body).await?;
+    execute_responses_owned(state, body, ResponsesOwner::AnonymousLocal).await
+}
+
+async fn execute_responses_owned(
+    state: SharedState,
+    body: ResponsesRequest,
+    owner: ResponsesOwner,
+) -> Result<Value, Value> {
+    let messages = prepare_response_messages(&state, &body, &owner).await?;
 
     let mut chat_body = ChatRequest {
         model: body.model.clone(),
@@ -124,7 +154,14 @@ pub(crate) async fn execute_responses(
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
-    store_responses_context(&state, response_id.clone(), stored).await;
+    store_responses_context(
+        &state,
+        &owner,
+        response_id.clone(),
+        body.previous_response_id.clone(),
+        stored,
+    )
+    .await?;
 
     Ok(response_json(
         &response_id,
@@ -137,6 +174,7 @@ pub(crate) async fn execute_responses(
 async fn prepare_response_messages(
     state: &SharedState,
     body: &ResponsesRequest,
+    owner: &ResponsesOwner,
 ) -> Result<Vec<Message>, Value> {
     let mut messages = match responses_input_to_chat_messages(&body.input) {
         Ok(messages) => messages,
@@ -146,12 +184,12 @@ async fn prepare_response_messages(
     };
 
     if let Some(previous_id) = &body.previous_response_id {
-        match load_responses_context(state, previous_id).await {
-            Some(mut previous) => {
+        match load_responses_context(state, owner, previous_id).await {
+            Ok(Some(mut previous)) => {
                 previous.extend(messages);
                 messages = previous;
             }
-            None => {
+            Ok(None) => {
                 return Err(json!({
                     "error": {
                         "message": format!("previous_response_id not found: {previous_id}"),
@@ -159,6 +197,7 @@ async fn prepare_response_messages(
                     }
                 }));
             }
+            Err(error) => return Err(server_context_error(error)),
         }
     }
     Ok(messages)
@@ -200,6 +239,7 @@ fn response_json(
 async fn stream_responses(
     state: SharedState,
     body: ResponsesRequest,
+    owner: ResponsesOwner,
     accounting: Option<crate::accounting::RequestAccounting>,
 ) -> impl IntoResponse {
     let (tx, mut rx) = mpsc::channel::<Result<Event, Infallible>>(64);
@@ -209,7 +249,7 @@ async fn stream_responses(
         let message_id = format!("msg_{response_id}");
         let req_id = response_id.clone();
 
-        let messages = match prepare_response_messages(&state, &body).await {
+        let messages = match prepare_response_messages(&state, &body, &owner).await {
             Ok(messages) => messages,
             Err(error) => {
                 let _ = tx.send(Ok(sse_json_event("error", error))).await;
@@ -422,7 +462,18 @@ async fn stream_responses(
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
-                store_responses_context(&state, response_id.clone(), stored).await;
+                if let Err(error) = store_responses_context(
+                    &state,
+                    &owner,
+                    response_id.clone(),
+                    body.previous_response_id.clone(),
+                    stored,
+                )
+                .await
+                {
+                    let _ = tx.send(Ok(sse_json_event("error", error))).await;
+                    return;
+                }
 
                 let _ = tx
                     .send(Ok(sse_json_event(
@@ -710,32 +761,178 @@ fn prompt_message_to_chat_message(message: &Message) -> ChatMessage {
     }
 }
 
-async fn load_responses_context(state: &SharedState, response_id: &str) -> Option<Vec<Message>> {
-    state
-        .responses_contexts
-        .lock()
-        .await
-        .get(response_id)
-        .map(|ctx| ctx.messages.clone())
-}
-
-async fn store_responses_context(state: &SharedState, response_id: String, messages: Vec<Message>) {
-    let max = responses_state_max();
-    if max == 0 {
-        return;
-    }
-    {
-        let mut contexts = state.responses_contexts.lock().await;
-        contexts.insert(response_id.clone(), StoredResponsesContext { messages });
-    }
-    let mut order = state.responses_order.lock().await;
-    order.retain(|id| id != &response_id);
-    order.push_back(response_id);
-    while order.len() > max {
-        if let Some(evicted) = order.pop_front() {
-            state.responses_contexts.lock().await.remove(&evicted);
+async fn load_responses_context(
+    state: &SharedState,
+    owner: &ResponsesOwner,
+    response_id: &str,
+) -> Result<Option<Vec<Message>>, String> {
+    match owner {
+        ResponsesOwner::AnonymousLocal => Ok(state
+            .responses_contexts
+            .lock()
+            .await
+            .get(response_id)
+            .map(|ctx| ctx.messages.clone())),
+        ResponsesOwner::User(user_id) => {
+            let store = state.access.store()?;
+            let user_id = user_id.clone();
+            let response_id = response_id.to_string();
+            let record = tokio::task::spawn_blocking(move || {
+                let now = response_now_secs();
+                store.prune_responses_expired(now)?;
+                load_owned_record_with_chain(&store, &user_id, &response_id, now)
+            })
+            .await
+            .map_err(|error| format!("Responses storage task failed: {error}"))?
+            .map_err(|error| error.to_string())?;
+            record
+                .map(|record| {
+                    serde_json::from_slice::<Vec<Message>>(&record.payload)
+                        .map_err(|error| format!("persisted Responses context is invalid: {error}"))
+                })
+                .transpose()
         }
     }
+}
+
+async fn store_responses_context(
+    state: &SharedState,
+    owner: &ResponsesOwner,
+    response_id: String,
+    parent_response_id: Option<String>,
+    messages: Vec<Message>,
+) -> Result<(), Value> {
+    match owner {
+        ResponsesOwner::AnonymousLocal => {
+            let max = responses_state_max();
+            if max == 0 {
+                return Ok(());
+            }
+            {
+                let mut contexts = state.responses_contexts.lock().await;
+                contexts.insert(response_id.clone(), StoredResponsesContext { messages });
+            }
+            let mut order = state.responses_order.lock().await;
+            order.retain(|id| id != &response_id);
+            order.push_back(response_id);
+            while order.len() > max {
+                if let Some(evicted) = order.pop_front() {
+                    state.responses_contexts.lock().await.remove(&evicted);
+                }
+            }
+            Ok(())
+        }
+        ResponsesOwner::User(user_id) => {
+            let payload = serde_json::to_vec(&messages).map_err(|error| {
+                server_context_error(format!("failed to serialize Responses context: {error}"))
+            })?;
+            let store = state.access.store().map_err(server_context_error)?;
+            let user_id = user_id.clone();
+            let now = response_now_secs();
+            tokio::task::spawn_blocking(move || {
+                if let Some(parent) = &parent_response_id {
+                    ensure_chain_can_extend(&store, &user_id, parent, now)?;
+                }
+                store.put_response_bounded(
+                    &ResponseContextRecord {
+                        user_id,
+                        response_id,
+                        parent_response_id,
+                        created_at: now,
+                        updated_at: now,
+                        expires_at: now.saturating_add(AUTHENTICATED_RESPONSE_TTL_SECS),
+                        payload,
+                    },
+                    AUTHENTICATED_RESPONSE_MAX,
+                )
+            })
+            .await
+            .map_err(|error| {
+                server_context_error(format!("Responses storage task failed: {error}"))
+            })?
+            .map_err(context_store_error)
+        }
+    }
+}
+
+fn load_owned_record_with_chain(
+    store: &hipfire_auth::AccessStore,
+    user_id: &str,
+    response_id: &str,
+    now: u64,
+) -> Result<Option<ResponseContextRecord>, hipfire_auth::AuthError> {
+    let Some(root) = store.get_response(user_id, response_id)? else {
+        return Ok(None);
+    };
+    if root.expires_at <= now {
+        return Ok(None);
+    }
+    let mut parent = root.parent_response_id.clone();
+    let mut depth = 1usize;
+    while let Some(parent_id) = parent {
+        depth += 1;
+        if depth > RESPONSE_CHAIN_MAX_DEPTH {
+            return Ok(None);
+        }
+        let Some(record) = store.get_response(user_id, &parent_id)? else {
+            return Ok(None);
+        };
+        if record.expires_at <= now {
+            return Ok(None);
+        }
+        parent = record.parent_response_id;
+    }
+    Ok(Some(root))
+}
+
+fn ensure_chain_can_extend(
+    store: &hipfire_auth::AccessStore,
+    user_id: &str,
+    parent_id: &str,
+    now: u64,
+) -> Result<(), hipfire_auth::AuthError> {
+    let Some(parent) = load_owned_record_with_chain(store, user_id, parent_id, now)? else {
+        return Err(hipfire_auth::AuthError::Invalid(
+            "previous_response_id not found".into(),
+        ));
+    };
+    let mut depth = 1usize;
+    let mut cursor = parent.parent_response_id;
+    while let Some(parent_id) = cursor {
+        depth += 1;
+        if depth >= RESPONSE_CHAIN_MAX_DEPTH {
+            return Err(hipfire_auth::AuthError::Invalid(format!(
+                "Responses chain depth exceeds {RESPONSE_CHAIN_MAX_DEPTH}"
+            )));
+        }
+        let Some(record) = store.get_response(user_id, &parent_id)? else {
+            return Err(hipfire_auth::AuthError::Invalid(
+                "previous_response_id not found".into(),
+            ));
+        };
+        cursor = record.parent_response_id;
+    }
+    Ok(())
+}
+
+fn context_store_error(error: hipfire_auth::AuthError) -> Value {
+    match error {
+        hipfire_auth::AuthError::Invalid(message) => json!({
+            "error": {"message": message, "type": "invalid_request_error"}
+        }),
+        other => server_context_error(other.to_string()),
+    }
+}
+
+fn server_context_error(message: impl Into<String>) -> Value {
+    json!({"error": {"message": message.into(), "type": "server_error"}})
+}
+
+fn response_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn responses_state_max() -> usize {
@@ -748,6 +945,34 @@ fn responses_state_max() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    use hipfire_auth::{AuthKind, NewUser, RatePolicyOverride, Scope};
+    use hipfire_config::{HipfireConfig, LoadedConfig};
+
+    fn test_state(directory: &std::path::Path) -> SharedState {
+        crate::AppState::new_loaded_with_directories(
+            LoadedConfig::from_config(HipfireConfig::default()),
+            directory.join("training"),
+            directory.join("access"),
+        )
+    }
+
+    fn create_user(state: &SharedState, name: &str) -> String {
+        state
+            .access
+            .store()
+            .unwrap()
+            .create_user(
+                NewUser {
+                    name: name.into(),
+                    rate_policy: RatePolicyOverride::default(),
+                },
+                1,
+            )
+            .unwrap()
+            .id
+    }
 
     #[test]
     fn responses_string_input_becomes_user_message() {
@@ -833,5 +1058,197 @@ mod tests {
         assert_eq!(done["type"], "response.output_item.done");
         assert_eq!(done["item"]["status"], "completed");
         assert_eq!(done["item"]["content"][0]["text"], "hello");
+    }
+
+    #[tokio::test]
+    async fn authenticated_contexts_are_user_scoped_and_survive_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
+        let alice = create_user(&state, "alice");
+        let bob = create_user(&state, "bob");
+        let messages = vec![Message {
+            role: Role::User,
+            content: "private".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }];
+        store_responses_context(
+            &state,
+            &ResponsesOwner::User(alice.clone()),
+            "resp_private".into(),
+            None,
+            messages.clone(),
+        )
+        .await
+        .unwrap();
+        let loaded =
+            load_responses_context(&state, &ResponsesOwner::User(alice.clone()), "resp_private")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, "private");
+        assert!(
+            load_responses_context(&state, &ResponsesOwner::User(bob), "resp_private")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(state);
+        let restarted = test_state(directory.path());
+        let loaded =
+            load_responses_context(&restarted, &ResponsesOwner::User(alice), "resp_private")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, "private");
+    }
+
+    #[tokio::test]
+    async fn anonymous_contexts_remain_memory_only_and_missing_parents_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
+        store_responses_context(
+            &state,
+            &ResponsesOwner::AnonymousLocal,
+            "resp_local".into(),
+            None,
+            vec![Message {
+                role: Role::User,
+                content: "local".into(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(state
+            .access
+            .store()
+            .unwrap()
+            .list_user_responses("anonymous-local")
+            .unwrap()
+            .is_empty());
+        drop(state);
+        let restarted = test_state(directory.path());
+        assert!(
+            load_responses_context(&restarted, &ResponsesOwner::AnonymousLocal, "resp_local")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let user = create_user(&restarted, "owner");
+        let now = response_now_secs();
+        restarted
+            .access
+            .store()
+            .unwrap()
+            .put_response(&ResponseContextRecord {
+                user_id: user.clone(),
+                response_id: "resp_orphan".into(),
+                parent_response_id: Some("resp_missing".into()),
+                created_at: now,
+                updated_at: now,
+                expires_at: now + 60,
+                payload: serde_json::to_vec(&Vec::<Message>::new()).unwrap(),
+            })
+            .unwrap();
+        assert!(
+            load_responses_context(&restarted, &ResponsesOwner::User(user), "resp_orphan")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn token_rotation_keeps_the_same_response_owner() {
+        let principal = |token: &str| RequestPrincipal {
+            user_id: Some("user-1".into()),
+            token_id: Some(token.into()),
+            scopes: BTreeSet::from([Scope::Text]),
+            auth_kind: AuthKind::ApiToken,
+        };
+        assert!(matches!(
+            ResponsesOwner::from_principal(Some(Extension(principal("old")))),
+            ResponsesOwner::User(ref id) if id == "user-1"
+        ));
+        assert!(matches!(
+            ResponsesOwner::from_principal(Some(Extension(principal("new")))),
+            ResponsesOwner::User(ref id) if id == "user-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cross_user_and_unknown_parent_return_the_same_error_shape() {
+        fn request(previous_response_id: &str) -> ResponsesRequest {
+            serde_json::from_value(json!({
+                "input": "next",
+                "previous_response_id": previous_response_id
+            }))
+            .unwrap()
+        }
+
+        let with_record = tempfile::tempdir().unwrap();
+        let state = test_state(with_record.path());
+        let alice = create_user(&state, "alice");
+        store_responses_context(
+            &state,
+            &ResponsesOwner::User(alice),
+            "resp_same".into(),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let cross_user = prepare_response_messages(
+            &state,
+            &request("resp_same"),
+            &ResponsesOwner::User("bob".into()),
+        )
+        .await
+        .unwrap_err();
+
+        let without_record = tempfile::tempdir().unwrap();
+        let empty_state = test_state(without_record.path());
+        let unknown = prepare_response_messages(
+            &empty_state,
+            &request("resp_same"),
+            &ResponsesOwner::User("bob".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cross_user, unknown);
+        assert_eq!(cross_user["error"]["type"], "invalid_request_error");
+    }
+
+    #[test]
+    fn authenticated_chain_depth_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = hipfire_auth::AccessStore::open_in(directory.path()).unwrap();
+        let user = "owner";
+        let now = response_now_secs();
+        let mut parent = None;
+        for index in 0..RESPONSE_CHAIN_MAX_DEPTH {
+            let id = format!("resp_{index}");
+            store
+                .put_response(&ResponseContextRecord {
+                    user_id: user.into(),
+                    response_id: id.clone(),
+                    parent_response_id: parent,
+                    created_at: now,
+                    updated_at: now,
+                    expires_at: now + 60,
+                    payload: Vec::new(),
+                })
+                .unwrap();
+            parent = Some(id);
+        }
+        let error =
+            ensure_chain_can_extend(&store, user, parent.as_deref().unwrap(), now).unwrap_err();
+        assert!(matches!(error, hipfire_auth::AuthError::Invalid(_)));
     }
 }
