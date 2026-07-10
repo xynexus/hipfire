@@ -231,6 +231,368 @@ pub fn plan_model_residency(
     })
 }
 
+/// Work classes coordinated by the long-lived accelerator orchestrator.
+///
+/// Token and image work may be microbatched when callers provide the same
+/// compatibility key. Training and maintenance remain singleton operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkloadClass {
+    TokenPrefill,
+    TokenDecode,
+    ImageGeneration,
+    Training,
+    Maintenance,
+}
+
+impl WorkloadClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenPrefill => "token_prefill",
+            Self::TokenDecode => "token_decode",
+            Self::ImageGeneration => "image_generation",
+            Self::Training => "training",
+            Self::Maintenance => "maintenance",
+        }
+    }
+
+    fn supports_microbatching(self) -> bool {
+        matches!(
+            self,
+            Self::TokenPrefill | Self::TokenDecode | Self::ImageGeneration
+        )
+    }
+}
+
+/// Conservatively additive resources used for admission and active leases.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkloadResources {
+    pub system_memory_bytes: u64,
+    pub vram_bytes: u64,
+    pub gpu_slots: u32,
+    pub npu_slots: u32,
+    pub cpu_threads: u32,
+}
+
+impl WorkloadResources {
+    fn add(self, other: Self) -> Self {
+        Self {
+            system_memory_bytes: self
+                .system_memory_bytes
+                .saturating_add(other.system_memory_bytes),
+            vram_bytes: self.vram_bytes.saturating_add(other.vram_bytes),
+            gpu_slots: self.gpu_slots.saturating_add(other.gpu_slots),
+            npu_slots: self.npu_slots.saturating_add(other.npu_slots),
+            cpu_threads: self.cpu_threads.saturating_add(other.cpu_threads),
+        }
+    }
+
+    fn subtract(self, other: Self) -> Self {
+        Self {
+            system_memory_bytes: self
+                .system_memory_bytes
+                .saturating_sub(other.system_memory_bytes),
+            vram_bytes: self.vram_bytes.saturating_sub(other.vram_bytes),
+            gpu_slots: self.gpu_slots.saturating_sub(other.gpu_slots),
+            npu_slots: self.npu_slots.saturating_sub(other.npu_slots),
+            cpu_threads: self.cpu_threads.saturating_sub(other.cpu_threads),
+        }
+    }
+
+    fn fits_within(self, capacity: Self) -> bool {
+        self.system_memory_bytes <= capacity.system_memory_bytes
+            && self.vram_bytes <= capacity.vram_bytes
+            && self.gpu_slots <= capacity.gpu_slots
+            && self.npu_slots <= capacity.npu_slots
+            && self.cpu_threads <= capacity.cpu_threads
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkloadSpec {
+    pub id: String,
+    pub class: WorkloadClass,
+    pub priority: u8,
+    pub enqueued_at_ms: u64,
+    pub resources: WorkloadResources,
+    /// Stable caller-defined compatibility key. It must include every property
+    /// that affects a shared runtime invocation, such as worker, model, shape,
+    /// quant/state mode, sampler, and precision.
+    pub microbatch_key: Option<String>,
+    pub max_microbatch_size: usize,
+    pub exclusive: bool,
+}
+
+impl WorkloadSpec {
+    pub fn singleton(
+        id: impl Into<String>,
+        class: WorkloadClass,
+        priority: u8,
+        enqueued_at_ms: u64,
+        resources: WorkloadResources,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            class,
+            priority,
+            enqueued_at_ms,
+            resources,
+            microbatch_key: None,
+            max_microbatch_size: 1,
+            exclusive: class == WorkloadClass::Training,
+        }
+    }
+
+    pub fn microbatchable(
+        id: impl Into<String>,
+        class: WorkloadClass,
+        priority: u8,
+        enqueued_at_ms: u64,
+        resources: WorkloadResources,
+        microbatch_key: impl Into<String>,
+        max_microbatch_size: usize,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            class,
+            priority,
+            enqueued_at_ms,
+            resources,
+            microbatch_key: Some(microbatch_key.into()),
+            max_microbatch_size: max_microbatch_size.max(1),
+            exclusive: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkloadBatchLease {
+    pub lease_id: u64,
+    pub class: WorkloadClass,
+    pub workloads: Vec<WorkloadSpec>,
+    pub resources: WorkloadResources,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContinuousSchedulerSnapshot {
+    pub queued: usize,
+    pub active_batches: usize,
+    pub active_workloads: usize,
+    pub active_resources: WorkloadResources,
+    pub exclusive_active: bool,
+}
+
+/// Priority scheduler for continuous heterogeneous accelerator work.
+///
+/// The scheduler owns admission and leases, not execution. A server-owned
+/// orchestrator repeatedly calls [`Self::next_batch`], dispatches the returned
+/// work through the appropriate runtime, and completes the lease afterward.
+#[derive(Debug)]
+pub struct ContinuousWorkScheduler {
+    capacity: WorkloadResources,
+    max_queued: usize,
+    aging_ms: u64,
+    buckets: Vec<Vec<WorkloadSpec>>,
+    queued_ids: HashSet<String>,
+    active: BTreeMap<u64, WorkloadBatchLease>,
+    next_lease_id: u64,
+}
+
+impl ContinuousWorkScheduler {
+    pub fn new(capacity: WorkloadResources, max_queued: usize, aging_ms: u64) -> Self {
+        Self {
+            capacity,
+            max_queued,
+            aging_ms,
+            buckets: (0..=255).map(|_| Vec::new()).collect(),
+            queued_ids: HashSet::new(),
+            active: BTreeMap::new(),
+            next_lease_id: 1,
+        }
+    }
+
+    pub fn enqueue(&mut self, mut workload: WorkloadSpec) -> Result<(), String> {
+        if workload.id.trim().is_empty() {
+            return Err("workload id must not be empty".to_string());
+        }
+        if self.queued_ids.contains(&workload.id)
+            || self
+                .active
+                .values()
+                .any(|lease| lease.workloads.iter().any(|item| item.id == workload.id))
+        {
+            return Err(format!(
+                "workload is already queued or active: {}",
+                workload.id
+            ));
+        }
+        if self.max_queued > 0 && self.queued_ids.len() >= self.max_queued {
+            return Err(format!(
+                "continuous scheduler backpressure: queued={} max={}",
+                self.queued_ids.len(),
+                self.max_queued
+            ));
+        }
+        if !workload.resources.fits_within(self.capacity) {
+            return Err(format!(
+                "workload {} resource request exceeds scheduler capacity",
+                workload.id
+            ));
+        }
+        if workload.class == WorkloadClass::Training {
+            workload.exclusive = true;
+            workload.microbatch_key = None;
+            workload.max_microbatch_size = 1;
+        }
+        workload.max_microbatch_size = workload.max_microbatch_size.max(1);
+        let id = workload.id.clone();
+        self.buckets[workload.priority as usize].push(workload);
+        self.queued_ids.insert(id);
+        Ok(())
+    }
+
+    pub fn cancel_pending(&mut self, id: &str) -> bool {
+        if !self.queued_ids.contains(id) {
+            return false;
+        }
+        for bucket in &mut self.buckets {
+            if let Some(index) = bucket.iter().position(|workload| workload.id == id) {
+                bucket.remove(index);
+                self.queued_ids.remove(id);
+                return true;
+            }
+        }
+        self.queued_ids.remove(id);
+        false
+    }
+
+    pub fn next_batch(&mut self, now_ms: u64) -> Option<WorkloadBatchLease> {
+        if self
+            .active
+            .values()
+            .any(|lease| lease.workloads.iter().any(|workload| workload.exclusive))
+        {
+            return None;
+        }
+
+        let (priority, seed_index) = self.next_seed(now_ms)?;
+        let seed = self.buckets[priority].get(seed_index)?.clone();
+        if seed.exclusive && !self.active.is_empty() {
+            return None;
+        }
+
+        let available = self.capacity.subtract(self.active_resources());
+        if !seed.resources.fits_within(available) {
+            return None;
+        }
+
+        let mut selected_indices = vec![seed_index];
+        let mut resources = seed.resources;
+        let mut microbatch_limit = seed.max_microbatch_size;
+        if seed.class.supports_microbatching() && seed.microbatch_key.is_some() {
+            for (index, candidate) in self.buckets[priority].iter().enumerate() {
+                if selected_indices.len() >= microbatch_limit || index == seed_index {
+                    continue;
+                }
+                if !workloads_microbatch_compatible(&seed, candidate) {
+                    continue;
+                }
+                let candidate_limit = microbatch_limit.min(candidate.max_microbatch_size);
+                if selected_indices.len() >= candidate_limit {
+                    continue;
+                }
+                let combined = resources.add(candidate.resources);
+                if combined.fits_within(available) {
+                    resources = combined;
+                    microbatch_limit = candidate_limit;
+                    selected_indices.push(index);
+                }
+            }
+        }
+
+        selected_indices.sort_unstable();
+        let mut workloads = Vec::with_capacity(selected_indices.len());
+        for index in selected_indices.into_iter().rev() {
+            workloads.push(self.buckets[priority].remove(index));
+        }
+        workloads.reverse();
+        for workload in &workloads {
+            self.queued_ids.remove(&workload.id);
+        }
+
+        let lease = WorkloadBatchLease {
+            lease_id: self.next_lease_id,
+            class: seed.class,
+            workloads,
+            resources,
+        };
+        self.next_lease_id = self.next_lease_id.saturating_add(1);
+        self.active.insert(lease.lease_id, lease.clone());
+        Some(lease)
+    }
+
+    pub fn complete(&mut self, lease_id: u64) -> Option<WorkloadBatchLease> {
+        self.active.remove(&lease_id)
+    }
+
+    pub fn snapshot(&self) -> ContinuousSchedulerSnapshot {
+        ContinuousSchedulerSnapshot {
+            queued: self.queued_ids.len(),
+            active_batches: self.active.len(),
+            active_workloads: self
+                .active
+                .values()
+                .map(|lease| lease.workloads.len())
+                .sum(),
+            active_resources: self.active_resources(),
+            exclusive_active: self
+                .active
+                .values()
+                .any(|lease| lease.workloads.iter().any(|workload| workload.exclusive)),
+        }
+    }
+
+    fn active_resources(&self) -> WorkloadResources {
+        self.active
+            .values()
+            .fold(WorkloadResources::default(), |total, lease| {
+                total.add(lease.resources)
+            })
+    }
+
+    fn next_seed(&self, now_ms: u64) -> Option<(usize, usize)> {
+        if self.aging_ms > 0 {
+            let mut oldest: Option<(u64, usize, usize)> = None;
+            for (priority, bucket) in self.buckets.iter().enumerate() {
+                for (index, workload) in bucket.iter().enumerate() {
+                    if now_ms.saturating_sub(workload.enqueued_at_ms) < self.aging_ms {
+                        continue;
+                    }
+                    let candidate = (workload.enqueued_at_ms, priority, index);
+                    if oldest.is_none_or(|current| candidate < current) {
+                        oldest = Some(candidate);
+                    }
+                }
+            }
+            if let Some((_, priority, index)) = oldest {
+                return Some((priority, index));
+            }
+        }
+        self.buckets
+            .iter()
+            .enumerate()
+            .find_map(|(priority, bucket)| (!bucket.is_empty()).then_some((priority, 0)))
+    }
+}
+
+fn workloads_microbatch_compatible(a: &WorkloadSpec, b: &WorkloadSpec) -> bool {
+    !a.exclusive
+        && !b.exclusive
+        && a.class == b.class
+        && a.class.supports_microbatching()
+        && a.microbatch_key.is_some()
+        && a.microbatch_key == b.microbatch_key
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerPriorityClass {
     Realtime,
@@ -2147,5 +2509,151 @@ mod tests {
 
         let plan = plan_model_residency(budget, request, &resident_workers).unwrap();
         assert_eq!(plan.unload_worker_key_ids, vec!["old"]);
+    }
+
+    fn continuous_capacity() -> WorkloadResources {
+        WorkloadResources {
+            system_memory_bytes: 64_000,
+            vram_bytes: 24_000,
+            gpu_slots: 4,
+            npu_slots: 1,
+            cpu_threads: 16,
+        }
+    }
+
+    fn token_workload(id: &str, priority: u8, enqueued_at_ms: u64) -> WorkloadSpec {
+        WorkloadSpec::microbatchable(
+            id,
+            WorkloadClass::TokenDecode,
+            priority,
+            enqueued_at_ms,
+            WorkloadResources {
+                vram_bytes: 1_000,
+                gpu_slots: 1,
+                ..WorkloadResources::default()
+            },
+            "worker:qwen|state:q8+deltanet|decode",
+            4,
+        )
+    }
+
+    #[test]
+    fn continuous_scheduler_microbatches_compatible_token_work() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        scheduler.enqueue(token_workload("a", 64, 0)).unwrap();
+        scheduler.enqueue(token_workload("b", 64, 1)).unwrap();
+        let mut incompatible = token_workload("c", 64, 2);
+        incompatible.microbatch_key = Some("worker:other|decode".to_string());
+        scheduler.enqueue(incompatible).unwrap();
+        let mut singleton_limit = token_workload("d", 64, 3);
+        singleton_limit.max_microbatch_size = 1;
+        scheduler.enqueue(singleton_limit).unwrap();
+
+        let lease = scheduler.next_batch(10).unwrap();
+
+        assert_eq!(
+            lease
+                .workloads
+                .iter()
+                .map(|workload| workload.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(lease.resources.gpu_slots, 2);
+        assert_eq!(scheduler.snapshot().queued, 2);
+        scheduler.complete(lease.lease_id).unwrap();
+        assert_eq!(scheduler.snapshot().active_batches, 0);
+    }
+
+    #[test]
+    fn continuous_scheduler_microbatches_compatible_image_work() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        for id in ["image-a", "image-b"] {
+            scheduler
+                .enqueue(WorkloadSpec::microbatchable(
+                    id,
+                    WorkloadClass::ImageGeneration,
+                    128,
+                    0,
+                    WorkloadResources {
+                        vram_bytes: 4_000,
+                        gpu_slots: 1,
+                        ..WorkloadResources::default()
+                    },
+                    "krea2|1024x1024|flow_match|20|bf16",
+                    2,
+                ))
+                .unwrap();
+        }
+
+        let lease = scheduler.next_batch(0).unwrap();
+
+        assert_eq!(lease.class, WorkloadClass::ImageGeneration);
+        assert_eq!(lease.workloads.len(), 2);
+    }
+
+    #[test]
+    fn continuous_scheduler_drains_before_exclusive_training() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        scheduler.enqueue(token_workload("decode", 0, 0)).unwrap();
+        let decode = scheduler.next_batch(0).unwrap();
+        scheduler
+            .enqueue(WorkloadSpec::singleton(
+                "train",
+                WorkloadClass::Training,
+                1,
+                1,
+                WorkloadResources {
+                    vram_bytes: 20_000,
+                    gpu_slots: 4,
+                    cpu_threads: 8,
+                    ..WorkloadResources::default()
+                },
+            ))
+            .unwrap();
+
+        assert!(scheduler.next_batch(2).is_none());
+        scheduler.complete(decode.lease_id).unwrap();
+        let training = scheduler.next_batch(3).unwrap();
+        assert_eq!(training.class, WorkloadClass::Training);
+        assert!(scheduler.snapshot().exclusive_active);
+        assert!(scheduler.next_batch(4).is_none());
+    }
+
+    #[test]
+    fn continuous_scheduler_ages_waiting_background_work() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 100);
+        scheduler
+            .enqueue(token_workload("background", 192, 0))
+            .unwrap();
+        scheduler
+            .enqueue(token_workload("interactive", 64, 150))
+            .unwrap();
+
+        let lease = scheduler.next_batch(200).unwrap();
+
+        assert_eq!(lease.workloads[0].id, "background");
+    }
+
+    #[test]
+    fn continuous_scheduler_rejects_duplicate_and_over_capacity_work() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 1, 0);
+        scheduler.enqueue(token_workload("a", 64, 0)).unwrap();
+        assert!(scheduler.enqueue(token_workload("a", 64, 0)).is_err());
+        assert!(scheduler.enqueue(token_workload("b", 64, 0)).is_err());
+
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 0, 0);
+        let oversized = WorkloadSpec::singleton(
+            "oversized",
+            WorkloadClass::ImageGeneration,
+            64,
+            0,
+            WorkloadResources {
+                vram_bytes: 25_000,
+                gpu_slots: 1,
+                ..WorkloadResources::default()
+            },
+        );
+        assert!(scheduler.enqueue(oversized).is_err());
     }
 }
