@@ -446,6 +446,42 @@ pub enum DaemonResponse {
     WorkerStatus(serde_json::Value),
     ResourceStatus(serde_json::Value),
     UnloadWorkerDone(serde_json::Value),
+    GenerateBatchPrefillReady {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    GenerateBatchPrefillUnsupported {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    GenerateBatchPrefillSessionDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    GenerateBatchPrefillDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    GenerateBatchDecodeStepSessionDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    GenerateBatchDecodeStepDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    ReserveSessionStateDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    ReserveSessionStateRejected {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    ReleaseSessionsDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
     HneuronOk {
         n_intervened: usize,
         gain: f32,
@@ -793,6 +829,54 @@ mod tests {
             let req: DaemonRequest = serde_json::from_value(value.clone())
                 .unwrap_or_else(|e| panic!("deserialize {value} failed: {e}"));
             assert!(check(&req), "unexpected variant for {value}");
+        }
+    }
+
+    #[test]
+    fn batch_and_session_events_remain_typed() {
+        let cases: &[(serde_json::Value, fn(&DaemonResponse) -> bool)] = &[
+            (
+                json!({"type": "generate_batch_prefill_ready", "id": "p", "supported": true}),
+                |response| matches!(response, DaemonResponse::GenerateBatchPrefillReady { .. }),
+            ),
+            (
+                json!({"type": "generate_batch_prefill_session_done", "id": "p", "session_id": "s"}),
+                |response| {
+                    matches!(
+                        response,
+                        DaemonResponse::GenerateBatchPrefillSessionDone { .. }
+                    )
+                },
+            ),
+            (
+                json!({"type": "generate_batch_prefill_done", "id": "p", "sessions": 1}),
+                |response| matches!(response, DaemonResponse::GenerateBatchPrefillDone { .. }),
+            ),
+            (
+                json!({"type": "generate_batch_decode_step_session_done", "id": "d", "session_id": "s"}),
+                |response| {
+                    matches!(
+                        response,
+                        DaemonResponse::GenerateBatchDecodeStepSessionDone { .. }
+                    )
+                },
+            ),
+            (
+                json!({"type": "generate_batch_decode_step_done", "id": "d", "sessions": 1}),
+                |response| matches!(response, DaemonResponse::GenerateBatchDecodeStepDone { .. }),
+            ),
+            (
+                json!({"type": "reserve_session_state_done", "id": "r", "session_id": "s"}),
+                |response| matches!(response, DaemonResponse::ReserveSessionStateDone { .. }),
+            ),
+            (
+                json!({"type": "release_sessions_done", "id": "x", "released": 1}),
+                |response| matches!(response, DaemonResponse::ReleaseSessionsDone { .. }),
+            ),
+        ];
+        for (value, matches) in cases {
+            let response: DaemonResponse = serde_json::from_value(value.clone()).unwrap();
+            assert!(matches(&response), "wrong response variant for {value}");
         }
     }
 

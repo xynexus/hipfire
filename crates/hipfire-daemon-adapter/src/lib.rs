@@ -402,6 +402,133 @@ impl DaemonEngine {
         }
     }
 
+    /// Execute one daemon batch-prefill envelope and retain every per-session
+    /// event plus the terminal batch event. The caller owns compatibility and
+    /// scheduling; the adapter owns the JSONL request/response transaction.
+    pub async fn generate_batch_prefill(
+        &mut self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        require_extended_request_type(&request, "generate_batch_prefill")?;
+        self.send_value(&request).await?;
+        let mut events = Vec::new();
+        loop {
+            match self.recv().await? {
+                DaemonResponse::GenerateBatchPrefillSessionDone { payload } => events.push(
+                    tagged_extended_event("generate_batch_prefill_session_done", payload),
+                ),
+                DaemonResponse::GenerateBatchPrefillDone { payload } => {
+                    events.push(tagged_extended_event(
+                        "generate_batch_prefill_done",
+                        payload,
+                    ));
+                    return Ok(events);
+                }
+                DaemonResponse::GenerateBatchPrefillReady { payload } => {
+                    events.push(tagged_extended_event(
+                        "generate_batch_prefill_ready",
+                        payload,
+                    ));
+                    return Ok(events);
+                }
+                DaemonResponse::GenerateBatchPrefillUnsupported { payload } => {
+                    events.push(tagged_extended_event(
+                        "generate_batch_prefill_unsupported",
+                        payload,
+                    ));
+                    return Ok(events);
+                }
+                DaemonResponse::Error(error) => {
+                    anyhow::bail!("daemon generate_batch_prefill error: {}", error.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during generate_batch_prefill: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Execute one continuous-batching decode step for already-resident
+    /// sessions and return the terminal per-session token payload.
+    pub async fn generate_batch_decode_step(
+        &mut self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        require_extended_request_type(&request, "generate_batch_decode_step")?;
+        self.send_value(&request).await?;
+        let mut events = Vec::new();
+        loop {
+            match self.recv().await? {
+                DaemonResponse::GenerateBatchDecodeStepSessionDone { payload } => events.push(
+                    tagged_extended_event("generate_batch_decode_step_session_done", payload),
+                ),
+                DaemonResponse::GenerateBatchDecodeStepDone { payload } => {
+                    events.push(tagged_extended_event(
+                        "generate_batch_decode_step_done",
+                        payload,
+                    ));
+                    return Ok(events);
+                }
+                DaemonResponse::Error(error) => {
+                    anyhow::bail!("daemon generate_batch_decode_step error: {}", error.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!(
+                    "unexpected response during generate_batch_decode_step: {other:?}"
+                ),
+            }
+        }
+    }
+
+    pub async fn reserve_session_state(
+        &mut self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        require_extended_request_type(&request, "reserve_session_state")?;
+        self.send_value(&request).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::ReserveSessionStateDone { payload } => {
+                    return Ok(tagged_extended_event("reserve_session_state_done", payload));
+                }
+                DaemonResponse::ReserveSessionStateRejected { payload } => {
+                    return Ok(tagged_extended_event(
+                        "reserve_session_state_rejected",
+                        payload,
+                    ));
+                }
+                DaemonResponse::Error(error) => {
+                    anyhow::bail!("daemon reserve_session_state error: {}", error.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during reserve_session_state: {other:?}")
+                }
+            }
+        }
+    }
+
+    pub async fn release_sessions(
+        &mut self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        require_extended_request_type(&request, "release_sessions")?;
+        self.send_value(&request).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::ReleaseSessionsDone { payload } => {
+                    return Ok(tagged_extended_event("release_sessions_done", payload));
+                }
+                DaemonResponse::Error(error) => {
+                    anyhow::bail!("daemon release_sessions error: {}", error.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!("unexpected response during release_sessions: {other:?}"),
+            }
+        }
+    }
+
     /// Send `reset` and wait for the daemon to confirm state reset.
     pub async fn reset(&mut self) -> anyhow::Result<()> {
         self.send(&DaemonRequest::Reset).await?;
@@ -911,6 +1038,31 @@ impl DaemonEngine {
     }
 }
 
+fn require_extended_request_type(
+    request: &serde_json::Value,
+    expected: &str,
+) -> anyhow::Result<()> {
+    let actual = request
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if actual != expected {
+        anyhow::bail!("expected daemon request type {expected}, got {actual:?}");
+    }
+    Ok(())
+}
+
+fn tagged_extended_event(
+    event_type: &str,
+    mut payload: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    payload.insert(
+        "type".to_string(),
+        serde_json::Value::String(event_type.to_string()),
+    );
+    serde_json::Value::Object(payload)
+}
+
 /// Locate the daemon binary. Priority:
 /// 1. `HIPFIRE_DAEMON_BIN` env var
 /// 2. `~/.hipfire/bin/daemon`
@@ -1392,6 +1544,10 @@ mod tests {
         }
     }
 
+    fn event_payload(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().cloned().unwrap()
+    }
+
     #[test]
     fn daemon_binary_candidates_include_env_home_and_repo_targets() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -1469,6 +1625,94 @@ mod tests {
         assert_eq!(inventory.devices.len(), 1);
         assert_eq!(inventory.devices[0].device_id, "0");
         assert_eq!(inventory.devices[0].device_class(), "discrete");
+    }
+
+    #[tokio::test]
+    async fn batch_prefill_collects_session_and_terminal_events() {
+        let mut engine = mock_engine(vec![
+            DaemonResponse::GenerateBatchPrefillSessionDone {
+                payload: event_payload(serde_json::json!({
+                    "id": "request-a",
+                    "batch_id": "batch-a",
+                    "session_id": "session-a"
+                })),
+            },
+            DaemonResponse::GenerateBatchPrefillDone {
+                payload: event_payload(serde_json::json!({
+                    "id": "request-a",
+                    "batch_id": "batch-a",
+                    "sessions": 1
+                })),
+            },
+        ]);
+
+        let events = engine
+            .generate_batch_prefill(serde_json::json!({
+                "type": "generate_batch_prefill",
+                "id": "request-a",
+                "batch_id": "batch-a",
+                "worker_key_id": "worker-a",
+                "sessions": [{"id": "session-a"}]
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "generate_batch_prefill_session_done");
+        assert_eq!(events[1]["type"], "generate_batch_prefill_done");
+    }
+
+    #[tokio::test]
+    async fn decode_and_session_lifecycle_ops_return_typed_events() {
+        let mut decode = mock_engine(vec![
+            DaemonResponse::GenerateBatchDecodeStepSessionDone {
+                payload: event_payload(serde_json::json!({
+                    "id": "decode-a",
+                    "batch_id": "batch-a",
+                    "session_id": "a",
+                    "token": 42
+                })),
+            },
+            DaemonResponse::GenerateBatchDecodeStepDone {
+                payload: event_payload(serde_json::json!({
+                    "id": "decode-a",
+                    "batch_id": "batch-a",
+                    "sessions": 2
+                })),
+            },
+        ]);
+        let decoded = decode
+            .generate_batch_decode_step(serde_json::json!({
+                "type": "generate_batch_decode_step",
+                "id": "decode-a",
+                "batch_id": "batch-a",
+                "sessions": [{"id": "a"}, {"id": "b"}]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(
+            decoded[0]["type"],
+            "generate_batch_decode_step_session_done"
+        );
+        assert_eq!(decoded[0]["token"], 42);
+        assert_eq!(decoded[1]["type"], "generate_batch_decode_step_done");
+
+        let mut release = mock_engine(vec![DaemonResponse::ReleaseSessionsDone {
+            payload: event_payload(serde_json::json!({
+                "id": "release-a",
+                "released": 2
+            })),
+        }]);
+        let released = release
+            .release_sessions(serde_json::json!({
+                "type": "release_sessions",
+                "id": "release-a",
+                "sessions": ["a", "b"]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(released["type"], "release_sessions_done");
     }
 
     #[tokio::test]
