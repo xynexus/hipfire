@@ -265,3 +265,22 @@ model is 130.9 input tok/s and 5.6 package tok/J, and its GPU cosine gate remain
 below threshold at 0.98601860. Attention, norms, residuals, activations, pooling,
 Dense heads, and final normalization remain GPU/host resident. Do not promote
 this checkpoint as a full-NPU or 10k tok/s result.
+
+### Scaled full-K experiment
+
+The next slice proved that AIE2P int32-to-f32 conversion and f32 multiply are
+correct in isolation, then added an experimental `w4-scaled` cache. Row 2 keeps
+the exact W4 GEMM unchanged; row 3 applies activation/weight scales and performs
+f32 K-group accumulation. Resident weights remain device-backed. The final
+eight-column M=256/K=768/N=256 path passed all-ones and AWQ `+/++` CPU-oracle
+parity (maximum absolute error 1e-6) and measured 0.3675 ms for the production
+projection seam.
+
+It is deliberately not selected by the default projector. A complete local
+OQ4++ hybrid run with the scaled cache inventory regressed to 237.632 ms per
+short encode, 71.5 input tok/s, and 3.6 package tok/J; minimum GPU cosine was
+0.98575091, still below 0.999. The experiment proves scaled projection math but
+does not satisfy mixed/OQ8 scaling, full-model residency, quality admission, or
+the 10k tok/s target. The next useful boundary is a single resident layer/model
+schedule that removes per-projection XRT and GPU round trips, not another
+projection-only scale micro-optimization.

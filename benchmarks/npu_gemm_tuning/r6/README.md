@@ -126,10 +126,27 @@ Mixed residual experiments narrowed two dead ends:
 - A scalar sparse-overlay AIE kernel was exact but took 5.76 ms for
   M=256/K=768/N=768. Densifying the arbitrary residual into W8 and accumulating
   it into the W4 int32 tile on AIE reduced submission time to about 0.53 ms.
-- Fusing BF16 group scaling into the AIE core produced corrupt/NaN output. DMA
-  and constant BF16 stores were correct; the failure isolated to the current
-  Peano AIE2P acc32/int32-to-float lane conversion path. Group partials remain
-  int32 and scaling stays in the caller until that conversion is proven.
+- Fusing BF16 group scaling into the GEMM function produced corrupt/NaN output.
+  The standalone `r6_fix2float_probe.cc` subsequently proved exact AIE2P
+  int32-to-f32 conversion and f32 multiply on adversarial lanes. The corruption
+  came from adding scale payloads/vector work to the longest-lived MMUL
+  function, not from `aie::to_float` itself.
+
+The follow-up `w4-scaled` experiment therefore leaves the exact row-2 GEMM
+unchanged and consumes its int32 stream on row 3. The scale row applies per-row
+activation and per-column weight scales, accumulates all K groups in f32, and
+returns one output matrix. Task-level DMA `repeat_count` is required to publish
+all N slabs with one output task; a tensor repeat dimension alone returned only
+the first slab. The final eight-column schedule passed exact all-ones parity and
+the Opus CPU oracle for K=768/N=256/AWQ, with maximum absolute error 1e-6. Its
+production-seam time for that projection was 0.3675 ms at M=256.
+
+This is not promoted into the default EmbeddingGemma cache resolver. A complete
+OQ4++ hybrid run using the experimental scaled cache inventory took 237.632 ms
+per short encode (71.5 input tok/s, 3.6 package tok/J) and still failed the GPU
+quality gate at minimum cosine 0.98575091. That is worse than the unscaled
+full-K hybrid below: per-projection XRT/context and GPU round trips dominate,
+and moving scale reconstruction alone does not create a resident model.
 
 The production seam includes activation packing, one dispatch, and output
 layout reconstruction, but excludes FWHT/quantization, group scaling,
