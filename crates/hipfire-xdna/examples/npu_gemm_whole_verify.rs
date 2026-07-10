@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
     use hipfire_xdna::NpuGemmWholeArray;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -19,13 +20,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (m, k, n) = (gemm.rows(), gemm.k(), gemm.n());
     let groups = k / 256;
 
-    let activations: Vec<i8> = (0..m * k)
-        .map(|index| ((index * 17 + index / k * 3) % 15) as i8 - 7)
-        .collect();
+    let mut activations = vec![0i8; m * k];
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+    for row in 0..m {
+        for group in 0..groups {
+            let mut rotated = [0.0f32; 256];
+            for inner in 0..256 {
+                let index = row * k + group * 256 + inner;
+                rotated[inner] =
+                    ((index as f32 * 0.013).sin() * 2.0) + ((index % 7) as f32 - 3.0) * 0.1;
+            }
+            cpu_fwht_256(&mut rotated, &signs1, &signs2);
+            let scale = rotated
+                .iter()
+                .fold(0.0f32, |max, value| max.max(value.abs()))
+                / 127.0;
+            for inner in 0..256 {
+                activations[row * k + group * 256 + inner] =
+                    (rotated[inner] / scale).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+    }
     let matrices: Vec<Vec<i8>> = (0..groups)
         .map(|group| {
             (0..256 * n)
-                .map(|index| ((index * 11 + index / n * 5 + group * 7) % 15) as i8 - 7)
+                .map(|index| {
+                    if gemm.mode() == hipfire_xdna::NpuWholeMode::W4 {
+                        let inner = index / n;
+                        let col = index % n;
+                        let packed = inner / 2;
+                        if inner % 2 == 0 {
+                            ((packed + col + group) % 15) as i8 - 7
+                        } else {
+                            ((packed * 3 + col + group) % 15) as i8 - 7
+                        }
+                    } else {
+                        (((index * 29 + index / n * 7 + group * 11) % 241) as i16 - 120) as i8
+                    }
+                })
                 .collect()
         })
         .collect();

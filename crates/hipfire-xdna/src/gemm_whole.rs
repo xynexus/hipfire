@@ -288,8 +288,12 @@ impl NpuGemmWholeArray {
         self.pack_activations(activations);
         self.kernel.dispatch_synced(
             &[&self.input, &weights.buffer, &self.output],
-            &[true, false, false],
+            &[true, false, true],
         )?;
+        // Whole-array outputs are multi-megabyte streams. The pre-submit sync
+        // above clears host-dirty allocation lines; this post-submit invalidate
+        // makes the complete device stream visible before CPU readback.
+        self.kernel.sync_output(&self.output)?;
         self.unpack_output(partials);
         Ok(())
     }

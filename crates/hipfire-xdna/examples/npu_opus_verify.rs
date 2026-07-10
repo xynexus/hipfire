@@ -3,7 +3,7 @@
 //! Usage:
 //! `npu_opus_verify <w4-cache> <w8-cache> <sparse3-cache> <N> \
 //!    [--encoding w4|mixed|w8] [--outliers N] [--awq]
-//!    [--k K --fullk CACHE --fullk-cols N]`
+//!    [--k K --fullk CACHE --fullk-cols N] [--whole CACHE]`
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -37,6 +37,11 @@ fn main() {
         .map(|value| value.parse::<usize>().expect("numeric K"))
         .unwrap_or(256);
     let fullk_cache = option("--fullk");
+    let whole_cache = option("--whole");
+    assert!(
+        fullk_cache.is_none() || whole_cache.is_none(),
+        "choose only one of --fullk and --whole"
+    );
     let fullk_cols = option("--fullk-cols")
         .map(|value| value.parse::<usize>().expect("numeric full-K columns"))
         .unwrap_or(8);
@@ -81,7 +86,9 @@ fn main() {
             .map(|index| 0.75 + (index % 17) as f32 * 0.025)
             .collect::<Vec<_>>()
     });
-    let mut gemm = if let Some(fullk_cache) = fullk_cache {
+    let mut gemm = if let Some(whole_cache) = whole_cache {
+        NpuOpusGemmMp::load_whole_only(whole_cache, quant_type, k, n, &payload, awq_scale)
+    } else if let Some(fullk_cache) = fullk_cache {
         NpuOpusGemmMp::load_fullk_only(
             fullk_cache,
             fullk_cols,
@@ -127,7 +134,7 @@ fn main() {
     println!(
         "opus-{encoding}{}{} bits={:.4} outliers={} sparse_dispatches={} M={m} K={k} N={n}: mismatches={mismatches} max_abs={max_abs:.6}",
         if use_awq { "+/++" } else { "" },
-        if fullk_cache.is_some() { "-fullk" } else { "" },
+        if fullk_cache.is_some() { "-fullk" } else if whole_cache.is_some() { "-whole" } else { "" },
         block_bytes as f32 * 8.0 / 256.0,
         if encoding == "mixed" { outlier_count } else { 0 },
         if encoding == "mixed" { outlier_count.div_ceil(3) } else { 0 },

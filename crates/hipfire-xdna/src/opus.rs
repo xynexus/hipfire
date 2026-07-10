@@ -15,7 +15,8 @@ use hipfire_primitives::{
 
 use crate::{
     NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK, NpuGemmMp, NpuGemmResidentWeights,
-    NpuSparse3Mp, NpuSparse3ResidentWeights, XdnaError,
+    NpuGemmWholeArray, NpuSparse3Mp, NpuSparse3ResidentWeights, NpuWholeMode,
+    NpuWholeResidentWeights, XdnaError,
 };
 use std::collections::HashMap;
 
@@ -103,6 +104,7 @@ pub struct OpusPackedMatrix {
     k: usize,
     n: usize,
     fullk_weights: Option<NpuFullKResidentWeights>,
+    whole_weights: Option<NpuWholeResidentWeights>,
 }
 
 impl OpusPackedMatrix {
@@ -127,6 +129,7 @@ pub struct NpuOpusExecutor {
     n: usize,
     rows_per_dispatch: usize,
     fullk: HashMap<(NpuFullKMode, usize), NpuGemmFullK>,
+    whole: HashMap<(NpuWholeMode, usize), NpuGemmWholeArray>,
 }
 
 impl NpuOpusExecutor {
@@ -177,6 +180,7 @@ impl NpuOpusExecutor {
             n,
             rows_per_dispatch,
             fullk: HashMap::new(),
+            whole: HashMap::new(),
         })
     }
 
@@ -193,11 +197,46 @@ impl NpuOpusExecutor {
             n,
             rows_per_dispatch: 0,
             fullk: HashMap::new(),
+            whole: HashMap::new(),
         };
         for &(cache, cols) in caches {
             executor.enable_fullk_cache(cache, cols)?;
         }
         Ok(executor)
+    }
+
+    /// Load only AIE2P whole-array caches. W4 and W8 projections share this
+    /// executor; mixed matrices still require a mixed/full-K fallback.
+    pub fn load_whole_cached(caches: &[&str], n: usize) -> Result<Self, XdnaError> {
+        if n == 0 || caches.is_empty() {
+            return Err(invalid("whole-array executor wants non-zero N and caches"));
+        }
+        let mut executor = Self {
+            w4: None,
+            w8: None,
+            residual_sparse3: None,
+            n,
+            rows_per_dispatch: 0,
+            fullk: HashMap::new(),
+            whole: HashMap::new(),
+        };
+        for &cache in caches {
+            executor.enable_whole_cache(cache)?;
+        }
+        Ok(executor)
+    }
+
+    pub fn enable_whole_cache(&mut self, cache: &str) -> Result<(), XdnaError> {
+        let whole = NpuGemmWholeArray::load_cached(cache)?;
+        if whole.n() != self.n {
+            return Err(invalid(format!(
+                "whole-array cache N={} does not match executor N={}",
+                whole.n(),
+                self.n
+            )));
+        }
+        self.whole.insert((whole.mode(), whole.k()), whole);
+        Ok(())
     }
 
     /// Add a one-dispatch projection cache. Multiple K widths and formats may
@@ -236,7 +275,19 @@ impl NpuOpusExecutor {
         let encoding = OpusMatrixEncoding::classify(quant_type, payload.len(), k, n)?;
         let decoded = decode_opus_groups(encoding, payload, k, n)?;
         let mode = fullk_mode(encoding);
+        let whole_mode = whole_mode(encoding);
         let padded_k = decoded.len() * GROUP;
+        let whole_weights = if let Some(mode) = whole_mode {
+            if let Some(whole) = self.whole.get(&(mode, padded_k)) {
+                let base: Vec<&[i8]> = decoded.iter().map(|group| group.base.as_slice()).collect();
+                let packed = whole.prepack_weights(&base)?;
+                Some(whole.upload_resident_weights(&packed)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let fullk_weights = if let Some(fullk) = self.fullk.get(&(mode, padded_k)) {
             let base: Vec<&[i8]> = decoded.iter().map(|group| group.base.as_slice()).collect();
             let residual: Vec<&[i8]> = if mode == NpuFullKMode::Mixed {
@@ -260,8 +311,9 @@ impl NpuOpusExecutor {
         } else {
             None
         };
-        let fullk_only = self.w4.is_none() && self.w8.is_none() && self.residual_sparse3.is_none();
-        if fullk_only && fullk_weights.is_none() {
+        let resident_only =
+            self.w4.is_none() && self.w8.is_none() && self.residual_sparse3.is_none();
+        if resident_only && fullk_weights.is_none() && whole_weights.is_none() {
             return Err(invalid(format!(
                 "no {:?} full-K cache for padded K={padded_k} N={n}",
                 mode
@@ -269,7 +321,7 @@ impl NpuOpusExecutor {
         }
         let mut groups = Vec::with_capacity(decoded.len());
         for decoded in decoded {
-            let resident_base = if fullk_weights.is_some() {
+            let resident_base = if fullk_weights.is_some() || whole_weights.is_some() {
                 None
             } else {
                 Some(match encoding {
@@ -291,12 +343,15 @@ impl NpuOpusExecutor {
                     }
                 })
             };
-            let mut resident_sparse = if fullk_weights.is_some() {
+            let mut resident_sparse = if fullk_weights.is_some() || whole_weights.is_some() {
                 Vec::new()
             } else {
                 Vec::with_capacity(decoded.sparse_residual_chunks.len())
             };
-            if !decoded.sparse_residual_chunks.is_empty() && fullk_weights.is_none() {
+            if !decoded.sparse_residual_chunks.is_empty()
+                && fullk_weights.is_none()
+                && whole_weights.is_none()
+            {
                 let sparse_kernel = self
                     .residual_sparse3
                     .as_ref()
@@ -320,6 +375,7 @@ impl NpuOpusExecutor {
             k,
             n,
             fullk_weights,
+            whole_weights,
         })
     }
 
@@ -351,6 +407,13 @@ impl NpuOpusExecutor {
     }
 
     fn rows_per_dispatch_for_matrix(&self, matrix: &OpusPackedMatrix) -> usize {
+        if matrix.whole_weights.is_some() {
+            if let Some(mode) = whole_mode(matrix.encoding) {
+                if let Some(whole) = self.whole.get(&(mode, matrix.groups.len() * GROUP)) {
+                    return whole.rows();
+                }
+            }
+        }
         if matrix.fullk_weights.is_some() {
             if let Some(fullk) = self
                 .fullk
@@ -386,6 +449,41 @@ impl NpuOpusExecutor {
         );
         c.fill(0.0);
         let padded_k = matrix.groups.len() * GROUP;
+        if let (Some(mode), Some(weights)) = (whole_mode(matrix.encoding), &matrix.whole_weights) {
+            if let Some(whole) = self.whole.get_mut(&(mode, padded_k)) {
+                let chunk_rows = whole.rows();
+                if prepared.padded_rows % chunk_rows == 0 {
+                    let mut activations = vec![0i8; chunk_rows * padded_k];
+                    let mut partials = vec![0i32; matrix.groups.len() * chunk_rows * matrix.n];
+                    for row0 in (0..prepared.padded_rows).step_by(chunk_rows) {
+                        activations.fill(0);
+                        for row in 0..chunk_rows {
+                            let source_row = row0 + row;
+                            for (group_idx, group) in prepared.groups.iter().enumerate() {
+                                let source = source_row * GROUP;
+                                let destination = row * padded_k + group_idx * GROUP;
+                                activations[destination..destination + GROUP]
+                                    .copy_from_slice(&group[source..source + GROUP]);
+                            }
+                        }
+                        whole.run_resident(weights, &activations, &mut partials)?;
+                        let valid_rows = (m - row0.min(m)).min(chunk_rows);
+                        for (group_idx, group) in matrix.groups.iter().enumerate() {
+                            for row in 0..valid_rows {
+                                for col in 0..matrix.n {
+                                    let partial =
+                                        partials[(group_idx * chunk_rows + row) * matrix.n + col];
+                                    c[(row0 + row) * matrix.n + col] += partial as f32
+                                        * prepared.scales[group_idx][row0 + row]
+                                        * group.scales[col];
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let fullk_key = (fullk_mode(matrix.encoding), padded_k);
         if let (Some(fullk), Some(weights)) =
             (self.fullk.get_mut(&fullk_key), &matrix.fullk_weights)
@@ -587,6 +685,19 @@ pub struct NpuOpusGemmMp {
 }
 
 impl NpuOpusGemmMp {
+    pub fn load_whole_only(
+        whole_cache: &str,
+        quant_type: u8,
+        k: usize,
+        n: usize,
+        payload: &[u8],
+        awq_scale: Option<Vec<f32>>,
+    ) -> Result<Self, XdnaError> {
+        let executor = NpuOpusExecutor::load_whole_cached(&[whole_cache], n)?;
+        let matrix = executor.pack_matrix(quant_type, k, n, payload, awq_scale)?;
+        Ok(Self { executor, matrix })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn load_fullk_only(
         fullk_cache: &str,
@@ -852,6 +963,14 @@ fn fullk_mode(encoding: OpusMatrixEncoding) -> NpuFullKMode {
         OpusMatrixEncoding::W4 => NpuFullKMode::W4,
         OpusMatrixEncoding::Mixed { .. } => NpuFullKMode::Mixed,
         OpusMatrixEncoding::W8 => NpuFullKMode::W8,
+    }
+}
+
+fn whole_mode(encoding: OpusMatrixEncoding) -> Option<NpuWholeMode> {
+    match encoding {
+        OpusMatrixEncoding::W4 => Some(NpuWholeMode::W4),
+        OpusMatrixEncoding::W8 => Some(NpuWholeMode::W8),
+        OpusMatrixEncoding::Mixed { .. } => None,
     }
 }
 

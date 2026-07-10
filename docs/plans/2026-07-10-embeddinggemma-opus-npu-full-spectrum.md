@@ -270,16 +270,35 @@ operands. Generated caches and xclbins remain under `~/.hipfire/npu`.
 - W8 uses paired `8x8x8` int8 MMULs with 96x192 macro tiles. A first 96-column
   stripe exceeded AIE core memory even at FIFO depth one; 48-column stripes
   restore double buffering and exact execution.
-- Patterned signed hardware parity is exact for both modes at
-  `M=256 K=768 N=768`.
-- Reusable Rust wrapper timing, including host matrix marshaling and readback,
-  is 0.630 ms W4 (0.479 logical TOPS) and 0.651 ms W8 (0.464 logical TOPS).
+- Patterned signed hardware parity is exact for both modes across the model's
+  `K=768/1280` and `N=256/768/1152` projection geometries.
+- The hardware gate now uses normal FWHT-derived int8 activations and full W8
+  values. This exposed two bugs hidden by the first low-amplitude oracle: long
+  native int8/int4 MMUL chains become invalid above about signed-i16 range, and
+  multi-megabyte output buffers need explicit pre/post host-cache sync. W4 now
+  accumulates exact K=32 segments as int32 vectors.
+- Reusable q/o wrapper timing, including host matrix marshaling, explicit cache
+  reconciliation, and readback, is about 0.76 ms W4 and 1.39 ms W8 in the
+  realistic-range gate. These timings vary enough that a median sweep remains
+  required before using them as a performance baseline.
 - Raw W4 schedule timing at the same q/o geometry is 0.135 ms (2.51 TOPS), so
   host packing/unpacking—not AIE compute—is now the dominant projection seam.
 
-These are projection-kernel results, not full-model throughput. Mixed Opus
-overlays, scaled accumulation, shared buffers, and resident layer operations
-still need to be moved onto the same whole-array scheduling contract.
+The shared Opus executor and EmbeddingGemma projector now select resident
+whole-array caches automatically for pure OQ4/OQ8, including `+` and `++`.
+CPU-scaling-oracle parity is exact for all four runtime cases. The current
+GPU/XDNA hybrid still performs every projection crossing and host scaling:
+short-document probes measured 68.4 actual input tok/s for OQ4 and 62.2 tok/s
+for OQ8. OQ8 matched the GPU path at minimum cosine 0.999893; OQ4 reproduced
+the earlier approximately 0.985 GPU/NPU discrepancy and is not a 0.999 parity
+result.
+
+These are projection-kernel or hybrid results, not full-model NPU throughput.
+Mixed Opus overlays, scaled group accumulation, shared buffers, and resident
+layer operations still need to be moved onto the same whole-array scheduling
+contract. The next kernel slice should retain a row/column output tile across
+all K groups, apply activation and weight scales on AIE, and emit one final f32
+tile instead of group-major int32 partials.
 
 Measured status is still below admission: W4 projection inventory is 73.083 ms
 at M=256 (about 3.5k input tok/s before non-projection work). The real hybrid
