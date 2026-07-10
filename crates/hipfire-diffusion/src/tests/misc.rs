@@ -302,6 +302,83 @@ fn cpu_reference_env_toggle_defaults_to_gpu() {
 }
 
 #[test]
+fn batched_cfg_prediction_slices_guide_without_split_tensors() {
+    let latents = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 2,
+        data: vec![0.0, 0.0],
+    };
+    let batched = CpuTensor {
+        shape: vec![2, 1, 1, 2],
+        // The batched CFG path predicts `[positive; negative]`.
+        data: vec![0.5, -0.5, 0.0, 0.25],
+    };
+
+    let (shape, positive, negative) = batched_cfg_prediction_slices(&latents, &batched).unwrap();
+
+    assert_eq!(shape, vec![1, 1, 1, 2]);
+    assert_eq!(positive, &[0.5, -0.5]);
+    assert_eq!(negative, &[0.0, 0.25]);
+
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+    let (guided, runtime_kind) = cfg_guidance_slices_with_runtime_context(
+        shape,
+        negative,
+        positive,
+        2.0,
+        &mut runtime_context,
+    )
+    .unwrap();
+
+    assert_eq!(runtime_kind, DiffusionRuntimeKind::CpuSourceReference);
+    assert_eq!(guided.shape, vec![1, 1, 1, 2]);
+    assert_eq!(guided.data, vec![1.0, -1.25]);
+}
+
+#[test]
+fn classifier_free_guidance_identity_covers_disabled_and_unit_scales() {
+    assert!(classifier_free_guidance_is_identity(0.0));
+    assert!(classifier_free_guidance_is_identity(-1.0));
+    assert!(classifier_free_guidance_is_identity(1.0));
+    assert!(!classifier_free_guidance_is_identity(0.5));
+    assert!(!classifier_free_guidance_is_identity(2.0));
+}
+
+#[test]
+fn batched_cfg_prediction_slices_reject_malformed_data_length() {
+    let latents = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 2,
+        data: vec![0.0, 0.0],
+    };
+    let batched = CpuTensor {
+        shape: vec![2, 1, 1, 2],
+        data: vec![0.5, -0.5, 0.0],
+    };
+
+    let error = batched_cfg_prediction_slices(&latents, &batched).unwrap_err();
+
+    assert!(error.to_string().contains("expects 4"));
+}
+
+#[test]
+fn cfg_guidance_rejects_shape_data_length_mismatch() {
+    let pred = CpuTensor {
+        shape: vec![1, 1, 1, 2],
+        data: vec![0.5],
+    };
+
+    let error = cfg_guidance(&pred, &pred, 2.0).unwrap_err();
+
+    assert!(error.to_string().contains("do not match shape"));
+}
+
+#[test]
 fn append_inpaint_conditioning_concatenates_latents_mask_and_masked_latents() {
     let sample = CpuTensor {
         shape: vec![1, 2, 1, 2],

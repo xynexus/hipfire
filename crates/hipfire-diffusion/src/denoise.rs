@@ -212,29 +212,45 @@ pub(crate) fn concat_batch_dim(a: &CpuTensor, b: &CpuTensor) -> DiffusionResult<
     Ok(CpuTensor { shape, data })
 }
 
-/// Split a batched CFG prediction `[2N, ...]` back into the positive `[0..N]`
-/// and negative `[N..2N]` halves.
-pub(crate) fn split_batched_cfg_prediction(
-    batched: &CpuTensor,
-) -> DiffusionResult<(CpuTensor, CpuTensor)> {
-    if batched.shape.first().copied().unwrap_or(0) % 2 != 0 || batched.shape.is_empty() {
+/// Borrow the positive `[0..N]` and negative `[N..2N]` halves of a batched CFG
+/// prediction without materializing two temporary tensors.
+pub(crate) fn batched_cfg_prediction_slices<'a>(
+    latents: &LatentBatch,
+    batched: &'a CpuTensor,
+) -> DiffusionResult<(Vec<usize>, &'a [f32], &'a [f32])> {
+    let [batch, channels, height, width] = shape4(batched)?;
+    if batch % 2 != 0 {
         return Err(DiffusionError::InvalidMetadata(format!(
             "batched CFG prediction must have an even leading dim, got {:?}",
             batched.shape
         )));
     }
-    let mut half_shape = batched.shape.clone();
-    half_shape[0] = batched.shape[0] / 2;
-    let half = batched.data.len() / 2;
-    let positive = CpuTensor {
-        shape: half_shape.clone(),
-        data: batched.data[..half].to_vec(),
-    };
-    let negative = CpuTensor {
-        shape: half_shape,
-        data: batched.data[half..].to_vec(),
-    };
-    Ok((positive, negative))
+    let half_shape = vec![batch / 2, channels, height, width];
+    let expected = [
+        latents.batch,
+        latents.channels,
+        latents.height,
+        latents.width,
+    ];
+    if half_shape.as_slice() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "batched CFG prediction half shape {:?} != latent shape {:?}",
+            half_shape, expected
+        )));
+    }
+    let half = checked_shape_elements("batched CFG half prediction", &half_shape)?;
+    let expected_len = half.checked_mul(2).ok_or_else(|| {
+        DiffusionError::InvalidRequest("batched CFG prediction length overflows".to_string())
+    })?;
+    if batched.data.len() != expected_len {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "batched CFG prediction has {} values but shape {:?} expects {expected_len}",
+            batched.data.len(),
+            batched.shape
+        )));
+    }
+    let (positive, negative) = batched.data.split_at(half);
+    Ok((half_shape, positive, negative))
 }
 
 /// Resolve the resident-linear activation precision for denoise `step` of
@@ -356,7 +372,7 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
             linear_precision_for_step(step, total_steps);
         let (sample, scale_runtime_kind) = scale_model_input_with_runtime_context(
             schedule,
-            &latents.as_nchw_tensor(),
+            latents.as_nchw_tensor(),
             step,
             runtime_context,
         )?;
@@ -419,12 +435,12 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
                 None,
                 runtime_context,
             )?;
-            let (positive_pred, negative_pred) = split_batched_cfg_prediction(&batched_pred)?;
-            validate_noise_prediction(&latents, &positive_pred)?;
-            validate_noise_prediction(&latents, &negative_pred)?;
-            let (guided, guidance_runtime_kind) = cfg_guidance_with_runtime_context(
-                &negative_pred,
-                &positive_pred,
+            let (prediction_shape, positive_pred, negative_pred) =
+                batched_cfg_prediction_slices(&latents, &batched_pred)?;
+            let (guided, guidance_runtime_kind) = cfg_guidance_slices_with_runtime_context(
+                prediction_shape,
+                negative_pred,
+                positive_pred,
                 cfg_scale,
                 runtime_context,
             )?;
@@ -773,6 +789,15 @@ pub(crate) fn cfg_guidance(
             negative_pred.shape, positive_pred.shape
         )));
     }
+    let expected = checked_shape_elements("CFG prediction", &negative_pred.shape)?;
+    if negative_pred.data.len() != expected || positive_pred.data.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "CFG prediction data lengths {}/{} do not match shape {:?} ({expected} values)",
+            negative_pred.data.len(),
+            positive_pred.data.len(),
+            negative_pred.shape
+        )));
+    }
     Ok(CpuTensor {
         shape: negative_pred.shape.clone(),
         data: negative_pred
@@ -785,7 +810,7 @@ pub(crate) fn cfg_guidance(
 }
 
 pub(crate) fn classifier_free_guidance_is_identity(cfg_scale: f32) -> bool {
-    (cfg_scale - 1.0).abs() <= f32::EPSILON
+    cfg_scale <= 0.0 || (cfg_scale - 1.0).abs() <= f32::EPSILON
 }
 
 /// Stack per-prompt Krea2 conditioning `[1, seq, hidden]` tensors into a

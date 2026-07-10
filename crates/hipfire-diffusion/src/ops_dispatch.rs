@@ -14,20 +14,19 @@ use crate::gpu_ops::*;
 
 pub(crate) fn scale_model_input_with_runtime_context(
     schedule: &DiffusionSchedule,
-    sample: &CpuTensor,
+    sample: CpuTensor,
     step: usize,
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(CpuTensor, DiffusionRuntimeKind)> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return Ok((
-            schedule.scale_model_input(sample, step)?,
-            DiffusionRuntimeKind::CpuSourceReference,
-        ));
+        let sample = match schedule.input_scaling {
+            SchedulerInputScaling::None => sample,
+            SchedulerInputScaling::Sigma => schedule.scale_model_input(&sample, step)?,
+        };
+        return Ok((sample, DiffusionRuntimeKind::CpuSourceReference));
     };
     match schedule.input_scaling {
-        SchedulerInputScaling::None => {
-            Ok((sample.clone(), DiffusionRuntimeKind::CpuSourceReference))
-        }
+        SchedulerInputScaling::None => Ok((sample, DiffusionRuntimeKind::CpuSourceReference)),
         SchedulerInputScaling::Sigma => {
             let sigma = *schedule.sigmas.get(step).ok_or_else(|| {
                 DiffusionError::InvalidRequest(format!("missing sigma for step {step}"))
@@ -37,7 +36,7 @@ pub(crate) fn scale_model_input_with_runtime_context(
                 .with_rocm_gpu(|gpu| scale_model_input_hip_on_gpu(gpu, &sample.data, scale))?;
             Ok((
                 CpuTensor {
-                    shape: sample.shape.clone(),
+                    shape: sample.shape,
                     data,
                 },
                 DiffusionRuntimeKind::RocmHybridReference,
@@ -52,30 +51,67 @@ pub(crate) fn cfg_guidance_with_runtime_context(
     cfg_scale: f32,
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(CpuTensor, DiffusionRuntimeKind)> {
-    let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return Ok((
-            cfg_guidance(negative_pred, positive_pred, cfg_scale)?,
-            DiffusionRuntimeKind::CpuSourceReference,
-        ));
-    };
     if negative_pred.shape != positive_pred.shape {
         return Err(DiffusionError::InvalidRequest(format!(
             "CFG prediction shape mismatch {:?} vs {:?}",
             negative_pred.shape, positive_pred.shape
         )));
     }
-    {
-        let data = runtime_context.with_rocm_gpu(|gpu| {
-            cfg_guidance_hip_on_gpu(gpu, &negative_pred.data, &positive_pred.data, cfg_scale)
-        })?;
-        Ok((
-            CpuTensor {
-                shape: negative_pred.shape.clone(),
-                data,
-            },
-            DiffusionRuntimeKind::RocmHybridReference,
-        ))
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
+        return Ok((
+            cfg_guidance(negative_pred, positive_pred, cfg_scale)?,
+            DiffusionRuntimeKind::CpuSourceReference,
+        ));
+    };
+    cfg_guidance_slices_with_runtime_context(
+        negative_pred.shape.clone(),
+        &negative_pred.data,
+        &positive_pred.data,
+        cfg_scale,
+        runtime_context,
+    )
+}
+
+pub(crate) fn cfg_guidance_slices_with_runtime_context(
+    shape: Vec<usize>,
+    negative_pred: &[f32],
+    positive_pred: &[f32],
+    cfg_scale: f32,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<(CpuTensor, DiffusionRuntimeKind)> {
+    if negative_pred.len() != positive_pred.len() {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "CFG prediction length mismatch {} vs {}",
+            negative_pred.len(),
+            positive_pred.len()
+        )));
     }
+    let expected = checked_shape_elements("CFG prediction", &shape)?;
+    if negative_pred.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "CFG prediction has {} values but shape {:?} expects {expected}",
+            negative_pred.len(),
+            shape
+        )));
+    }
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
+        let data = negative_pred
+            .iter()
+            .zip(positive_pred)
+            .map(|(negative, positive)| negative + cfg_scale * (positive - negative))
+            .collect();
+        return Ok((
+            CpuTensor { shape, data },
+            DiffusionRuntimeKind::CpuSourceReference,
+        ));
+    };
+    let data = runtime_context.with_rocm_gpu(|gpu| {
+        cfg_guidance_hip_on_gpu(gpu, negative_pred, positive_pred, cfg_scale)
+    })?;
+    Ok((
+        CpuTensor { shape, data },
+        DiffusionRuntimeKind::RocmHybridReference,
+    ))
 }
 
 pub(crate) fn scheduler_step_with_runtime_context(

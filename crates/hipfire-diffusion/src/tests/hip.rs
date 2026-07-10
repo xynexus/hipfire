@@ -729,7 +729,7 @@ fn hip_denoise_vector_runtime_context_reuses_single_gpu() {
         DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::rocm_hybrid(0));
 
     let (_scaled, scale_kind) =
-        scale_model_input_with_runtime_context(&schedule, &sample, 0, &mut runtime_context)
+        scale_model_input_with_runtime_context(&schedule, sample, 0, &mut runtime_context)
             .unwrap();
     let (guided, guidance_kind) = cfg_guidance_with_runtime_context(
         &negative_pred,
