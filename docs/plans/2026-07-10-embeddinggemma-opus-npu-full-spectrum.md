@@ -500,3 +500,26 @@ is about 7.73 ms, so preprocessing alone no longer exhausts the 25.6 ms
 full-model budget. The GeGLU-to-down integration gate remains pending; this is
 still not a complete FFN, overlap proof, full-model throughput result, or
 package tokens/J result.
+
+### First combined pack-to-down checkpoint
+
+R21 combines vector canonical activation preprocessing and the resident scaled
+W4 `K=1280, N=768` down MMUL in one AIE2P dispatch. Each 16 KiB weight block
+stores its group's 3,072-byte AWQ/sign payload in the unused tail, avoiding an
+illegal third input DMA channel. A packer core column produces each 24-row
+activation block, consumes it locally, and broadcasts it directly to the other
+seven compute columns without using the memory tile's already-full input DMA
+budget. The compact group stream also removes R21's initial fivefold redundant
+full-row traffic.
+
+The combined hardware gate reports zero mismatches across 196,608 W4 outputs
+and maximum absolute error `1.4e-6`. Three 100-iteration runs measure 2.6385,
+2.5797, and 2.4033 ms (median 2.5797 ms). A redundant per-core pack variant
+measured 2.4386 ms in one 20-iteration run, showing that direct broadcast is
+cleaner but serial 24-row packing and synchronization remain the latency
+problem. R21 is a combined pack/down projection result, not a complete FFN:
+its group stream is still host-arranged rather than emitted directly by R18,
+only W4 is integrated, arbitrary mixed overlays are absent, and attention,
+full-model throughput, 10k/15k admission, and package tokens/J remain open.
+The next schedule must stripe the 24 rows across columns and gather one packed
+activation block before the down MMUL.
