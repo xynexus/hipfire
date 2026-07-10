@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::{DeviceBuffer, NpuKernel, NpuWholeMode, XdnaError};
 
-const ARRAY: usize = 4;
+const ROW_STRIPES: usize = 4;
 const GROUP_K: usize = 256;
 const MACRO_M: usize = 96;
 const A_DATA: usize = 6144;
@@ -52,12 +52,12 @@ impl Layout {
         self.lm * self.mr
     }
 
-    fn macro_n(self) -> usize {
-        ARRAY * self.cols_stripe
+    fn macro_n(self, cols: usize) -> usize {
+        cols * self.cols_stripe
     }
 
     fn c_join(self) -> usize {
-        ARRAY * self.c_core
+        ROW_STRIPES * self.c_core
     }
 }
 
@@ -68,6 +68,7 @@ pub struct NpuWholeScaledResidentWeights {
 pub struct NpuGemmWholeScaled {
     kernel: NpuKernel,
     layout: Layout,
+    cols: usize,
     rows: usize,
     groups: usize,
     n: usize,
@@ -94,15 +95,17 @@ impl NpuGemmWholeScaled {
         let rows = required(&shape, "m")?;
         let k = required(&shape, "k")?;
         let n = required(&shape, "n")?;
+        let cols = shape.get("cols").copied().unwrap_or(4);
         let m_macros = required(&shape, "mm")?;
         let n_macros = required(&shape, "nm")?;
         let groups = required(&shape, "kg")?;
         let outblocks = required(&shape, "outblocks")?;
         if rows == 0
             || n == 0
+            || !matches!(cols, 4 | 8)
             || k != groups * GROUP_K
             || m_macros != rows.div_ceil(MACRO_M)
-            || n_macros != n.div_ceil(layout.macro_n())
+            || n_macros != n.div_ceil(layout.macro_n(cols))
             || outblocks != m_macros * n_macros
         {
             return Err(invalid("invalid scaled whole-array cache geometry"));
@@ -111,11 +114,12 @@ impl NpuGemmWholeScaled {
         let insts = std::fs::read(format!("{dir}/insts.bin")).map_err(XdnaError::Open)?;
         let kernel = NpuKernel::load(&xclbin, &insts)?;
         let inblocks = outblocks * groups;
-        let input = kernel.alloc_arg(ARRAY * inblocks * A_BLOCK)?;
-        let output = kernel.alloc_arg(ARRAY * outblocks * layout.c_join() * size_of::<f32>())?;
+        let input = kernel.alloc_arg(ROW_STRIPES * inblocks * A_BLOCK)?;
+        let output = kernel.alloc_arg(cols * outblocks * layout.c_join() * size_of::<f32>())?;
         Ok(Self {
             kernel,
             layout,
+            cols,
             rows,
             groups,
             n,
@@ -148,7 +152,7 @@ impl NpuGemmWholeScaled {
     }
 
     pub fn packed_weight_bytes(&self) -> usize {
-        ARRAY * self.inblocks() * W_BLOCK
+        self.cols * self.inblocks() * W_BLOCK
     }
 
     /// Pack W4 `[256,N]` groups and their per-column scales into persistent,
@@ -167,7 +171,7 @@ impl NpuGemmWholeScaled {
             return Err(invalid("scaled whole-array weight geometry mismatch"));
         }
         let mut packed = vec![0u8; self.packed_weight_bytes()];
-        for stripe in 0..ARRAY {
+        for stripe in 0..self.cols {
             for m_macro in 0..self.m_macros {
                 for n_macro in 0..self.n_macros {
                     let outblock = m_macro * self.n_macros + n_macro;
@@ -178,7 +182,7 @@ impl NpuGemmWholeScaled {
                             for kt in 0..GROUP_K / self.layout.inner_k {
                                 for kk in 0..self.layout.inner_k {
                                     for nn in 0..16 {
-                                        let col = n_macro * self.layout.macro_n()
+                                        let col = n_macro * self.layout.macro_n(self.cols)
                                             + stripe * self.layout.cols_stripe
                                             + ln * 16
                                             + nn;
@@ -216,7 +220,7 @@ impl NpuGemmWholeScaled {
                             }
                         }
                         for local_col in 0..self.layout.cols_stripe {
-                            let col = n_macro * self.layout.macro_n()
+                            let col = n_macro * self.layout.macro_n(self.cols)
                                 + stripe * self.layout.cols_stripe
                                 + local_col;
                             let scale = if col < self.n {
@@ -276,7 +280,7 @@ impl NpuGemmWholeScaled {
 
     fn pack_activations(&mut self, activations: &[i8], scales: &[f32]) {
         self.input.as_mut_slice().fill(0);
-        for stripe in 0..ARRAY {
+        for stripe in 0..ROW_STRIPES {
             for m_macro in 0..self.m_macros {
                 for n_macro in 0..self.n_macros {
                     let outblock = m_macro * self.n_macros + n_macro;
@@ -326,11 +330,11 @@ impl NpuGemmWholeScaled {
 
     fn unpack_output(&self, output: &mut [f32]) {
         let physical = as_f32(self.output.as_slice());
-        for col_stripe in 0..ARRAY {
+        for col_stripe in 0..self.cols {
             for m_macro in 0..self.m_macros {
                 for n_macro in 0..self.n_macros {
                     let outblock = m_macro * self.n_macros + n_macro;
-                    for row_stripe in 0..ARRAY {
+                    for row_stripe in 0..ROW_STRIPES {
                         let core = (col_stripe * self.outblocks + outblock) * self.layout.c_join()
                             + row_stripe * self.layout.c_core;
                         for lm in 0..self.layout.lm {
@@ -344,7 +348,7 @@ impl NpuGemmWholeScaled {
                                         continue;
                                     }
                                     for local_col in 0..16 {
-                                        let col = n_macro * self.layout.macro_n()
+                                        let col = n_macro * self.layout.macro_n(self.cols)
                                             + col_stripe * self.layout.cols_stripe
                                             + ln * 16
                                             + local_col;

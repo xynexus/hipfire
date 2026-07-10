@@ -12,6 +12,7 @@ use hipfire_primitives::{
     conv::f16_to_f32,
     fwht::{cpu_fwht_256, gen_fwht_signs},
 };
+use rayon::prelude::*;
 
 use crate::{
     NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK, NpuGemmMp, NpuGemmResidentWeights,
@@ -516,13 +517,6 @@ impl NpuOpusExecutor {
             )));
         }
         validate_run_shapes(m, matrix.k, matrix.n, x, c)?;
-        let prepared = prepare_activations(
-            m,
-            matrix.k,
-            x,
-            matrix.awq_scale.as_deref(),
-            self.rows_per_dispatch_for_matrix(matrix),
-        );
         c.fill(0.0);
         let padded_k = matrix.groups.len() * GROUP;
         if let Some(weights) = &matrix.whole_scaled_weights {
@@ -530,30 +524,30 @@ impl NpuOpusExecutor {
                 .ok_or_else(|| invalid("mixed matrix cannot use dense scaled whole-array"))?;
             if let Some(whole) = self.whole_scaled.get_mut(&(mode, padded_k)) {
                 let chunk_rows = whole.rows();
-                if prepared.padded_rows % chunk_rows == 0 {
-                    let mut activations = vec![0i8; chunk_rows * padded_k];
+                let (activations, scales, padded_rows) = prepare_interleaved_activations(
+                    m,
+                    matrix.k,
+                    padded_k,
+                    x,
+                    matrix.awq_scale.as_deref(),
+                    chunk_rows,
+                );
+                if padded_rows % chunk_rows == 0 {
                     let mut activation_scales = vec![0.0f32; matrix.groups.len() * chunk_rows];
                     let mut scaled_output = vec![0.0f32; chunk_rows * matrix.n];
-                    for row0 in (0..prepared.padded_rows).step_by(chunk_rows) {
-                        activations.fill(0);
-                        for row in 0..chunk_rows {
-                            let source_row = row0 + row;
-                            for (group_idx, group) in prepared.groups.iter().enumerate() {
-                                let source = source_row * GROUP;
-                                let destination = row * padded_k + group_idx * GROUP;
-                                activations[destination..destination + GROUP]
-                                    .copy_from_slice(&group[source..source + GROUP]);
-                            }
-                        }
+                    for row0 in (0..padded_rows).step_by(chunk_rows) {
                         for group_idx in 0..matrix.groups.len() {
                             activation_scales[group_idx * chunk_rows..(group_idx + 1) * chunk_rows]
                                 .copy_from_slice(
-                                    &prepared.scales[group_idx][row0..row0 + chunk_rows],
+                                    &scales[group_idx * padded_rows + row0
+                                        ..group_idx * padded_rows + row0 + chunk_rows],
                                 );
                         }
+                        let activation_start = row0 * padded_k;
                         whole.run_resident(
                             weights,
-                            &activations,
+                            &activations
+                                [activation_start..activation_start + chunk_rows * padded_k],
                             &activation_scales,
                             &mut scaled_output,
                         )?;
@@ -569,6 +563,13 @@ impl NpuOpusExecutor {
                 }
             }
         }
+        let prepared = prepare_activations(
+            m,
+            matrix.k,
+            x,
+            matrix.awq_scale.as_deref(),
+            self.rows_per_dispatch_for_matrix(matrix),
+        );
         if let (Some(mode), Some(weights)) = (whole_mode(matrix.encoding), &matrix.whole_weights) {
             if let Some(whole) = self.whole.get_mut(&(mode, padded_k)) {
                 let chunk_rows = whole.rows();
@@ -1010,36 +1011,102 @@ fn prepare_activations(
     let signs2 = gen_fwht_signs(1042, GROUP);
     let mut groups = vec![vec![0i8; padded_rows * GROUP]; group_count];
     let mut scales = vec![vec![1.0f32; padded_rows]; group_count];
-    for row in 0..m {
-        for group_idx in 0..group_count {
-            let mut rotated = [0.0f32; GROUP];
-            for inner in 0..GROUP {
-                let column = group_idx * GROUP + inner;
-                if column < k {
-                    rotated[inner] = awq_scale.map_or(x[row * k + column], |scale| {
-                        x[row * k + column] / scale[column]
-                    });
-                }
-            }
-            cpu_fwht_256(&mut rotated, &signs1, &signs2);
-            let scale = rotated
-                .iter()
-                .fold(0.0f32, |max, value| max.max(value.abs()))
-                / 127.0;
-            scales[group_idx][row] = if scale > 0.0 { scale } else { 1.0 };
-            for inner in 0..GROUP {
-                groups[group_idx][row * GROUP + inner] = (rotated[inner] / scales[group_idx][row])
-                    .round()
-                    .clamp(-127.0, 127.0)
-                    as i8;
-            }
-        }
-    }
+    groups
+        .par_iter_mut()
+        .zip(scales.par_iter_mut())
+        .enumerate()
+        .for_each(|(group_idx, (group, group_scales))| {
+            group
+                .par_chunks_mut(GROUP)
+                .zip(group_scales.par_iter_mut())
+                .enumerate()
+                .for_each(|(row, (quantized, output_scale))| {
+                    if row >= m {
+                        return;
+                    }
+                    let mut rotated = [0.0f32; GROUP];
+                    for inner in 0..GROUP {
+                        let column = group_idx * GROUP + inner;
+                        if column < k {
+                            rotated[inner] = awq_scale.map_or(x[row * k + column], |scale| {
+                                x[row * k + column] / scale[column]
+                            });
+                        }
+                    }
+                    cpu_fwht_256(&mut rotated, &signs1, &signs2);
+                    let scale = rotated
+                        .iter()
+                        .fold(0.0f32, |max, value| max.max(value.abs()))
+                        / 127.0;
+                    *output_scale = if scale > 0.0 { scale } else { 1.0 };
+                    for inner in 0..GROUP {
+                        quantized[inner] = (rotated[inner] / *output_scale)
+                            .round()
+                            .clamp(-127.0, 127.0) as i8;
+                    }
+                });
+        });
     PreparedActivations {
         groups,
         scales,
         padded_rows,
     }
+}
+
+/// Prepare the row-major activation layout consumed directly by grouped
+/// whole-array kernels, avoiding the group-major staging and gather used by
+/// compatibility paths.
+fn prepare_interleaved_activations(
+    m: usize,
+    k: usize,
+    padded_k: usize,
+    x: &[f32],
+    awq_scale: Option<&[f32]>,
+    rows_per_dispatch: usize,
+) -> (Vec<i8>, Vec<f32>, usize) {
+    let groups = padded_k / GROUP;
+    let padded_rows = m.div_ceil(rows_per_dispatch) * rows_per_dispatch;
+    let signs1 = gen_fwht_signs(42, GROUP);
+    let signs2 = gen_fwht_signs(1042, GROUP);
+    let mut activations = vec![0i8; padded_rows * padded_k];
+    let mut row_scales = vec![1.0f32; padded_rows * groups];
+    activations
+        .par_chunks_mut(padded_k)
+        .zip(row_scales.par_chunks_mut(groups))
+        .enumerate()
+        .for_each(|(row, (quantized_row, scale_row))| {
+            if row >= m {
+                return;
+            }
+            for group in 0..groups {
+                let mut rotated = [0.0f32; GROUP];
+                for inner in 0..GROUP {
+                    let column = group * GROUP + inner;
+                    if column < k {
+                        rotated[inner] = awq_scale.map_or(x[row * k + column], |scale| {
+                            x[row * k + column] / scale[column]
+                        });
+                    }
+                }
+                cpu_fwht_256(&mut rotated, &signs1, &signs2);
+                let scale = rotated
+                    .iter()
+                    .fold(0.0f32, |max, value| max.max(value.abs()))
+                    / 127.0;
+                scale_row[group] = if scale > 0.0 { scale } else { 1.0 };
+                let destination = &mut quantized_row[group * GROUP..(group + 1) * GROUP];
+                for (output, value) in destination.iter_mut().zip(rotated) {
+                    *output = (value / scale_row[group]).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+        });
+    let mut group_scales = vec![1.0f32; groups * padded_rows];
+    for row in 0..padded_rows {
+        for group in 0..groups {
+            group_scales[group * padded_rows + row] = row_scales[row * groups + group];
+        }
+    }
+    (activations, group_scales, padded_rows)
 }
 
 #[allow(clippy::too_many_arguments)]

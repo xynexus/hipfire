@@ -2302,6 +2302,7 @@ version = "0.3.0"
 dependencies = [
  "hipfire-primitives",
  "libc",
+ "rayon",
 ]
 
 [[package]]
