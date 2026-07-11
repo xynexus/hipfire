@@ -1,0 +1,282 @@
+{
+  "admission_thresholds": {
+    "frozen_before_heldout": true,
+    "heldout_evaluated": false,
+    "max_static_vs_oracle_kld_delta": 0.05,
+    "max_static_vs_oracle_ppl_ratio": 1.05
+  },
+  "artifact_sha256": "4cf9c6df5673771de7621ef7304f0a5e2e57e780ba8c79788aa4bb3612c2b569",
+  "calibration_contract": {
+    "calibration_lengths": [
+      32,
+      64
+    ],
+    "calibration_max_relative_offset": 63,
+    "calibration_position_offsets": [
+      0,
+      64
+    ],
+    "methods": {
+      "keys_queries": "post_rope_gqa_stacked_kq_svd",
+      "refinement": "measured_recal_kv_alternating_closed_form",
+      "same_cache_oracle": "per_cache_kq_svd_same_rank_same_capture",
+      "values": "kq_svd_closed_form_stacked_wo"
+    },
+    "prefix_stable": true,
+    "project_after_rope": true,
+    "ranks": [
+      32,
+      64,
+      96
+    ],
+    "stack_all_gqa_output_slices": true,
+    "stack_all_gqa_query_heads": true,
+    "stripe_width": 32,
+    "temperature_denominator": "sqrt(256)",
+    "validation_lengths": [
+      128,
+      256
+    ],
+    "validation_max_relative_offset": 255,
+    "validation_position_offsets": [
+      0,
+      256
+    ]
+  },
+  "created_at": "2026-07-10T19:38:18.630401+00:00",
+  "dataset": {
+    "calibration": {
+      "bytes": 46765,
+      "path": "/home/sadara/hipfire/benchmarks/prompts/longcode_pflash.jsonl",
+      "sha256": "d5414d539c7e69166c72c4ef67865ed196d9137a07f359d1bda5d3208ab4e37d"
+    },
+    "strict_split": true,
+    "validation": {
+      "bytes": 45311,
+      "path": "/home/sadara/hipfire/benchmarks/prompts/longprose_multidoc.jsonl",
+      "sha256": "3de89b2e811900a35174af85730d95c8fcd10d89a7b6634d5267932d00242d62"
+    }
+  },
+  "engine": {
+    "captured_at_utc": "2026-07-10T19:38:17Z",
+    "env": {
+      "HIPFIRE_ROPE_INTERLEAVED_LEGACY": null
+    },
+    "fingerprint_id": "7cfc66d05eeeb248945b33b75e9581ec6851ed2fc684011e154f684790271a4e",
+    "git": {
+      "branch": "chaingun",
+      "dirty": true,
+      "dirty_paths": [
+        "M .agents/skills/astrea/SKILL.md",
+        " M crates/hipfire-monitor/src/lib.rs",
+        " M scripts/astrea.py",
+        " M tests/test_astrea.py",
+        "?? benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/",
+        "?? docs/plans/2026-07-10-hierarchical-calibrated-latent-kv.md",
+        "?? scripts/astrea_latent_kv.py",
+        "?? test.png"
+      ],
+      "sha": "b0104d20fa28a3846fe7a08fb2ee85d5c6925cf6",
+      "short": "b0104d20f"
+    },
+    "root": ".",
+    "rope_convention_default": "halfsplit",
+    "schema": "hipfire.astrea.engine_fingerprint.v0",
+    "source_hashes": {
+      "crates/hipfire-arch-qwen35/src/qwen35/mod.rs": "05f175596aff95460b0909b03440b48447e16831d3274e331af83398a87c9759",
+      "crates/hipfire-rdna/src/dispatch/rope.rs": "7eaa882fbb477d30b387df14f66c7bbe92ce55330bb0b679d4d5a6f3e33223d0",
+      "crates/hipfire-rdna/src/kernels.rs": "1bf8fc0d1f59c630b1485a484f53df430deba894caeddb28558afe147ae6c28b",
+      "kernels/src/rope_partial_halfsplit.hip": "f7fed145f0b497e0e7100de678c2606ca0f80ff3b118ce342734526ac02182a1",
+      "kernels/src/rope_partial_halfsplit_batched.hip": "064c73d5919f4304ec88f1caf3a112a5924fc613853f1442b9640b9e7b4f4e62",
+      "kernels/src/rope_partial_interleaved.hip": "361c340a8244ef10190b5b8d9ae30fa70919656e7fa161995ce8ea0551c8f356",
+      "kernels/src/rope_partial_interleaved_batched.hip": "4084d575124df9a7bfc4c74599ec3e4335a41ec091bd2e49f890adfa21e6a4cc"
+    }
+  },
+  "model": {
+    "combined_sha256": "c67aa0d5072cd9569d6adf48eeb1e27d3fdab8d4b59c0a7cc0ce5ceab08e398b",
+    "config": {
+      "bytes": 2907,
+      "path": "/srv/huggingface/models--Qwen--Qwen3.5-0.8B/blobs/715f0448b9d38103211f0ad88bbb4d6e4f4be8c9",
+      "sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+    },
+    "files": [
+      {
+        "bytes": 2907,
+        "path": "/srv/huggingface/models--Qwen--Qwen3.5-0.8B/blobs/715f0448b9d38103211f0ad88bbb4d6e4f4be8c9",
+        "sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204"
+      },
+      {
+        "bytes": 50900,
+        "path": "/srv/huggingface/models--Qwen--Qwen3.5-0.8B/blobs/f691cefdb79d73270895ebd6d9594ddcecfc1838",
+        "sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e"
+      },
+      {
+        "bytes": 1746942600,
+        "path": "/srv/huggingface/models--Qwen--Qwen3.5-0.8B/blobs/04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+        "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+      }
+    ],
+    "path": "/srv/huggingface/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17"
+  },
+  "model_contract": {
+    "attention_output_gate": true,
+    "family": "Qwen3.5",
+    "full_attention_layers": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23
+    ],
+    "gqa_query_heads_per_kv_head": 4,
+    "head_dim": 256,
+    "layer_types": [
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention"
+    ],
+    "num_attention_heads": 8,
+    "num_key_value_heads": 2,
+    "unsupported_contracts_fail_closed": true,
+    "value_output_contract": "gated_current_output_reconstruction"
+  },
+  "offline_engine": {
+    "evaluator_files": [
+      {
+        "bytes": 165675,
+        "path": "/home/sadara/hipfire/scripts/astrea.py",
+        "sha256": "3c9d08bcd66496a3e3c5e549c9f22d774491f7ec7abfc291c57ee7c997a590f9"
+      },
+      {
+        "bytes": 60492,
+        "path": "/home/sadara/hipfire/scripts/astrea_latent_kv.py",
+        "sha256": "2f5a968e4a347a8b972fe0e55541446a56cae9cc5213d57a56ea437711d60729"
+      }
+    ],
+    "fingerprint_id": "72c04624c23de608da459f077c64684ad6378d2f2702a2f14017c0705655d871",
+    "kind": "transformers_cpu_text_reference",
+    "packages": {
+      "numpy": "1.26.4",
+      "safetensors": "0.8.0",
+      "torch": "2.9.0a0+gite101411",
+      "transformers": "5.10.2"
+    },
+    "torchvision_policy": "process_local_disabled_text_only"
+  },
+  "plan_id": "qwen3.5-0.8b-latent-kv-r32-phase0-20260710",
+  "reproducibility": {
+    "command_argv": [
+      "python3",
+      "scripts/astrea.py",
+      "latent-kv-plan",
+      "--model",
+      "/srv/huggingface/models--Qwen--Qwen3.5-0.8B",
+      "--calibration-dataset",
+      "benchmarks/prompts/longcode_pflash.jsonl",
+      "--validation-dataset",
+      "benchmarks/prompts/longprose_multidoc.jsonl",
+      "--calibration-length",
+      "32",
+      "--calibration-length",
+      "64",
+      "--validation-length",
+      "128",
+      "--validation-length",
+      "256",
+      "--calibration-position-offset",
+      "0",
+      "--calibration-position-offset",
+      "64",
+      "--validation-position-offset",
+      "0",
+      "--validation-position-offset",
+      "256",
+      "--rank",
+      "32",
+      "--rank",
+      "64",
+      "--rank",
+      "96",
+      "--max-static-vs-oracle-kld-delta",
+      "0.05",
+      "--max-static-vs-oracle-ppl-ratio",
+      "1.05",
+      "--engine-root",
+      ".",
+      "--plan-id",
+      "qwen3.5-0.8b-latent-kv-r32-phase0-20260710",
+      "--pretty",
+      "--out",
+      "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/plan.json"
+    ],
+    "command_shell": "python3 scripts/astrea.py latent-kv-plan --model /srv/huggingface/models--Qwen--Qwen3.5-0.8B --calibration-dataset benchmarks/prompts/longcode_pflash.jsonl --validation-dataset benchmarks/prompts/longprose_multidoc.jsonl --calibration-length 32 --calibration-length 64 --validation-length 128 --validation-length 256 --calibration-position-offset 0 --calibration-position-offset 64 --validation-position-offset 0 --validation-position-offset 256 --rank 32 --rank 64 --rank 96 --max-static-vs-oracle-kld-delta 0.05 --max-static-vs-oracle-ppl-ratio 1.05 --engine-root . --plan-id qwen3.5-0.8b-latent-kv-r32-phase0-20260710 --pretty --out benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/plan.json",
+    "evaluator_files": [
+      {
+        "bytes": 165675,
+        "path": "/home/sadara/hipfire/scripts/astrea.py",
+        "sha256": "3c9d08bcd66496a3e3c5e549c9f22d774491f7ec7abfc291c57ee7c997a590f9"
+      },
+      {
+        "bytes": 60492,
+        "path": "/home/sadara/hipfire/scripts/astrea_latent_kv.py",
+        "sha256": "2f5a968e4a347a8b972fe0e55541446a56cae9cc5213d57a56ea437711d60729"
+      }
+    ],
+    "evaluator_sha256": "8f34c8fa87bfd5777e14f3965233589bf2ed6cc6431f687469ea04be6e92404b",
+    "python": "3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]"
+  },
+  "rope": {
+    "attention_temperature": "1/sqrt(head_dim)",
+    "engine_convention": "halfsplit",
+    "mrope_interleaved": true,
+    "mrope_section": [
+      11,
+      11,
+      10
+    ],
+    "partial_rotary_factor": 0.25,
+    "projection_position": "post_rope",
+    "rope_theta": 10000000,
+    "rope_type": "default",
+    "sha256": "7044372884c06b70ab7c941da48acbece7628f9cc026cd4605e96e834006483e"
+  },
+  "runtime_contract": {
+    "cache_representation": "latent_only",
+    "default_enabled": false,
+    "full_context_kv_reconstruction_forbidden": true,
+    "gated_exception": {
+      "enabled": true,
+      "order": [
+        "latent_attention",
+        "R_v",
+        "sigmoid_gate",
+        "W_o"
+      ],
+      "scope": "current_query_head_attention_result_only"
+    }
+  },
+  "schema": "hipfire.astrea.latent_kv_plan.v0",
+  "status": "planned_pre_heldout"
+}

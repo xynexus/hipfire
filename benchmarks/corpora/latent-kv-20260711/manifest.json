@@ -1,0 +1,47 @@
+{
+  "schema": "hipfire.latent_kv_corpus.v0",
+  "strict_split": true,
+  "sources": {
+    "calibration": {
+      "dataset": "HuggingFaceFW/fineweb",
+      "revision": "9bb295ddab0e05d785b879661af7260fed5140fc",
+      "config": "sample-10BT",
+      "split": "train",
+      "viewer_offset": 40000,
+      "license": "ODC-By-1.0; also subject to CommonCrawl Terms of Use",
+      "raw": {
+        "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-20260711/raw/fineweb-sample-10BT-offset40000-length100.rows.json",
+        "bytes": 305482,
+        "sha256": "f18992d6655e937b17e7264cec5437610dbc2661bb0ba2bbb580494df6cb6f9b",
+        "records": 100
+      }
+    },
+    "validation": {
+      "dataset": "Salesforce/wikitext",
+      "revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+      "config": "wikitext-103-raw-v1",
+      "split": "test",
+      "license": "CC-BY-SA-3.0 and GFDL",
+      "raw": {
+        "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-20260711/raw/wikitext-103-raw-v1-test.parquet",
+        "bytes": 732610,
+        "sha256": "5f1bea067869d04849c0f975a2b29c4ff47d867f484f5010ea5e861eab246d91",
+        "records": 4358
+      }
+    }
+  },
+  "outputs": {
+    "calibration": {
+      "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-20260711/fineweb-calibration.jsonl",
+      "bytes": 218419,
+      "sha256": "6172c7e70c514303f00501ad0c7f945e22f28fb6b0734100670a62cc8a5d2dab",
+      "records": 64
+    },
+    "validation": {
+      "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-20260711/wikitext103-test-validation.jsonl",
+      "bytes": 362931,
+      "sha256": "8cdf5c685c98391addcb03343a7d05617b85b00f59a78b9b9d4c0ddfcf131ca2",
+      "records": 16
+    }
+  }
+}

@@ -1,0 +1,1894 @@
+#!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
+"""Hierarchical calibrated latent-KV planning and offline reference math.
+
+This module is imported lazily by scripts/astrea.py. Python is used only for
+offline calibration, capture, and comparison oracles; no function here is part
+of hipfire's inference hot path.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.metadata
+import json
+import math
+import shlex
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+
+LATENT_KV_PLAN_SCHEMA = "hipfire.astrea.latent_kv_plan.v0"
+LATENT_KV_CAPTURE_SCHEMA = "hipfire.astrea.latent_kv_capture.v0"
+LATENT_KV_CALIBRATION_SCHEMA = "hipfire.astrea.latent_kv_calibration.v0"
+LATENT_KV_REFERENCE_SCHEMA = "hipfire.astrea.latent_kv_reference.v0"
+LATENT_KV_MODEL_EVAL_SCHEMA = "hipfire.astrea.latent_kv_model_eval.v0"
+LATENT_KV_FEASIBILITY_SCHEMA = "hipfire.astrea.latent_kv_feasibility.v0"
+
+SUPPORTED_RANKS = (32, 64, 96)
+VALUE_CONTRACT_FUSED = "static_rv_wo"
+VALUE_CONTRACT_GATED = "gated_current_output_reconstruction"
+
+
+def _require_numpy():
+    if np is None:
+        raise RuntimeError("NumPy is required for latent-KV calibration")
+    return np
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sha256_file(path, *, chunk_bytes=8 * 1024 * 1024):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_bytes)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(payload):
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _artifact_with_fingerprint(payload):
+    result = dict(payload)
+    result["artifact_sha256"] = _canonical_sha256(payload)
+    return result
+
+
+def _resolve_model_root(path):
+    root = Path(path).expanduser().resolve()
+    if (root / "config.json").is_file():
+        return root
+    ref = root / "refs" / "main"
+    if ref.is_file():
+        revision = ref.read_text(encoding="utf-8").strip()
+        snapshot = root / "snapshots" / revision
+        if (snapshot / "config.json").is_file():
+            return snapshot.resolve()
+    raise ValueError(f"latent-KV model path has no config.json or refs/main snapshot: {root}")
+
+
+def _file_fingerprint(path):
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"required fingerprint input is not a file: {path}")
+    return {
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "sha256": _sha256_file(path),
+    }
+
+
+def _model_fingerprint(model):
+    root = _resolve_model_root(model)
+    config_path = root / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    index_path = root / "model.safetensors.index.json"
+    files = [config_path]
+    if index_path.is_file():
+        files.append(index_path)
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        files.extend(root / name for name in sorted(set(index.get("weight_map", {}).values())))
+    else:
+        files.extend(sorted(root.glob("*.safetensors")))
+    if not any(path.suffix == ".safetensors" for path in files):
+        raise ValueError(f"no safetensors weights found under {root}")
+    summaries = [_file_fingerprint(path) for path in files]
+    return {
+        "path": str(root),
+        "config": summaries[0],
+        "files": summaries,
+        "combined_sha256": _canonical_sha256(summaries),
+        "config_json": config,
+    }
+
+
+def _dataset_fingerprint(path):
+    return _file_fingerprint(path)
+
+
+def _offline_engine_fingerprint(evaluator_fingerprints):
+    packages = {}
+    for name in ("numpy", "torch", "transformers", "safetensors"):
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    stable = {
+        "kind": "transformers_cpu_text_reference",
+        "packages": packages,
+        "evaluator_files": evaluator_fingerprints,
+        "torchvision_policy": "process_local_disabled_text_only",
+    }
+    return {**stable, "fingerprint_id": _canonical_sha256(stable)}
+
+
+def _text_config(config):
+    value = config.get("text_config")
+    return value if isinstance(value, dict) else config
+
+
+def _full_attention_layers(config):
+    tc = _text_config(config)
+    layer_types = tc.get("layer_types")
+    if not isinstance(layer_types, list):
+        interval = int(tc.get("full_attention_interval", 1))
+        count = int(tc.get("num_hidden_layers", 0))
+        layer_types = [
+            "full_attention" if interval <= 1 or (index + 1) % interval == 0 else "linear_attention"
+            for index in range(count)
+        ]
+    return [index for index, kind in enumerate(layer_types) if kind == "full_attention"], layer_types
+
+
+def _rope_contract(config, engine):
+    tc = _text_config(config)
+    rope = tc.get("rope_parameters")
+    if not isinstance(rope, dict):
+        rope = tc.get("rope_scaling")
+    if not isinstance(rope, dict):
+        rope = {}
+    contract = {
+        "projection_position": "post_rope",
+        "attention_temperature": "1/sqrt(head_dim)",
+        "rope_type": rope.get("rope_type", "default"),
+        "rope_theta": rope.get("rope_theta", tc.get("rope_theta")),
+        "partial_rotary_factor": rope.get("partial_rotary_factor", tc.get("partial_rotary_factor")),
+        "mrope_interleaved": rope.get("mrope_interleaved", tc.get("mrope_interleaved", False)),
+        "mrope_section": rope.get("mrope_section", tc.get("mrope_section")),
+        "engine_convention": (engine or {}).get("rope_convention_default"),
+    }
+    contract["sha256"] = _canonical_sha256(contract)
+    return contract
+
+
+def _normalize_int_list(values, *, name, minimum=0):
+    if not values:
+        raise ValueError(f"{name} must not be empty")
+    normalized = sorted({int(value) for value in values})
+    if normalized[0] < minimum:
+        raise ValueError(f"{name} values must be >= {minimum}: {normalized}")
+    return normalized
+
+
+def _validate_extrapolation(calibration_lengths, validation_lengths):
+    calibration_max = max(calibration_lengths)
+    validation_max = max(validation_lengths)
+    if validation_max < calibration_max * 4:
+        raise ValueError(
+            "validation sequence lengths must reach at least 4x calibration: "
+            f"calibration_max={calibration_max}, validation_max={validation_max}"
+        )
+    calibration_relative = calibration_max - 1
+    validation_relative = validation_max - 1
+    if calibration_relative > 0 and validation_relative < calibration_relative * 4:
+        raise ValueError(
+            "validation relative offsets must reach at least 4x calibration: "
+            f"calibration_max={calibration_relative}, validation_max={validation_relative}"
+        )
+
+
+def build_plan(
+    *,
+    model,
+    calibration_dataset,
+    validation_dataset,
+    calibration_lengths,
+    validation_lengths,
+    calibration_position_offsets,
+    validation_position_offsets,
+    calibration_samples_per_stratum=1,
+    validation_samples_per_stratum=1,
+    max_static_vs_oracle_kld_delta,
+    max_static_vs_oracle_ppl_ratio,
+    engine,
+    evaluator_files,
+    command=None,
+    plan_id=None,
+    ranks=SUPPORTED_RANKS,
+):
+    """Build the immutable pre-held-out latent-KV experiment contract."""
+
+    model_fp = _model_fingerprint(model)
+    config = model_fp.pop("config_json")
+    tc = _text_config(config)
+    full_layers, layer_types = _full_attention_layers(config)
+    if not full_layers:
+        raise ValueError("target model has no full_attention layers")
+    head_dim = int(tc.get("head_dim") or int(tc["hidden_size"]) // int(tc["num_attention_heads"]))
+    n_heads = int(tc["num_attention_heads"])
+    n_kv_heads = int(tc["num_key_value_heads"])
+    if n_heads % n_kv_heads:
+        raise ValueError(f"GQA head ratio is not integral: n_heads={n_heads}, n_kv_heads={n_kv_heads}")
+
+    ranks = _normalize_int_list(ranks, name="ranks", minimum=1)
+    if ranks[0] != 32 or any(rank not in SUPPORTED_RANKS for rank in ranks):
+        raise ValueError(f"initial latent-KV ranks must be an ordered subset starting at 32: {ranks}")
+    if ranks[-1] > head_dim:
+        raise ValueError(f"maximum rank {ranks[-1]} exceeds head_dim {head_dim}")
+    calibration_lengths = _normalize_int_list(calibration_lengths, name="calibration_lengths", minimum=2)
+    validation_lengths = _normalize_int_list(validation_lengths, name="validation_lengths", minimum=2)
+    _validate_extrapolation(calibration_lengths, validation_lengths)
+    calibration_position_offsets = _normalize_int_list(
+        calibration_position_offsets, name="calibration_position_offsets", minimum=0
+    )
+    validation_position_offsets = _normalize_int_list(
+        validation_position_offsets, name="validation_position_offsets", minimum=0
+    )
+    calibration_samples_per_stratum = int(calibration_samples_per_stratum)
+    validation_samples_per_stratum = int(validation_samples_per_stratum)
+    if calibration_samples_per_stratum < 1 or validation_samples_per_stratum < 1:
+        raise ValueError("samples per stratum must be >= 1")
+    calibration_position_max = max(calibration_position_offsets)
+    if calibration_position_max > 0 and max(validation_position_offsets) < calibration_position_max * 4:
+        raise ValueError("validation absolute-position offsets must reach at least 4x calibration offsets")
+
+    kld_delta = float(max_static_vs_oracle_kld_delta)
+    ppl_ratio = float(max_static_vs_oracle_ppl_ratio)
+    if not math.isfinite(kld_delta) or kld_delta < 0:
+        raise ValueError("max_static_vs_oracle_kld_delta must be a finite non-negative number")
+    if not math.isfinite(ppl_ratio) or ppl_ratio < 1:
+        raise ValueError("max_static_vs_oracle_ppl_ratio must be finite and >= 1")
+
+    gated = bool(tc.get("attn_output_gate", True)) if tc.get("model_type") == "qwen3_5_text" else False
+    value_contract = VALUE_CONTRACT_GATED if gated else VALUE_CONTRACT_FUSED
+    evaluator_fingerprints = [_file_fingerprint(path) for path in evaluator_files]
+    offline_engine = _offline_engine_fingerprint(evaluator_fingerprints)
+    calibration_fp = _dataset_fingerprint(calibration_dataset)
+    validation_fp = _dataset_fingerprint(validation_dataset)
+    plan_id = plan_id or f"latent-kv-{model_fp['combined_sha256'][:12]}-r32"
+    command = list(command or sys.argv)
+    payload = {
+        "schema": LATENT_KV_PLAN_SCHEMA,
+        "created_at": _utc_now(),
+        "plan_id": plan_id,
+        "status": "planned_pre_heldout",
+        "model": model_fp,
+        "engine": engine,
+        "offline_engine": offline_engine,
+        "rope": _rope_contract(config, engine),
+        "dataset": {
+            "calibration": calibration_fp,
+            "validation": validation_fp,
+            "strict_split": calibration_fp["sha256"] != validation_fp["sha256"],
+        },
+        "model_contract": {
+            "family": "Qwen3.5" if tc.get("model_type") == "qwen3_5_text" else tc.get("model_type"),
+            "head_dim": head_dim,
+            "num_attention_heads": n_heads,
+            "num_key_value_heads": n_kv_heads,
+            "gqa_query_heads_per_kv_head": n_heads // n_kv_heads,
+            "full_attention_layers": full_layers,
+            "layer_types": layer_types,
+            "attention_output_gate": gated,
+            "value_output_contract": value_contract,
+            "unsupported_contracts_fail_closed": True,
+        },
+        "calibration_contract": {
+            "methods": {
+                "keys_queries": "post_rope_gqa_stacked_kq_svd",
+                "values": "kq_svd_closed_form_stacked_wo",
+                "refinement": "measured_recal_kv_alternating_closed_form",
+                "same_cache_oracle": "per_cache_kq_svd_same_rank_same_capture",
+            },
+            "ranks": ranks,
+            "prefix_stable": True,
+            "stripe_width": 32,
+            "calibration_lengths": calibration_lengths,
+            "validation_lengths": validation_lengths,
+            "calibration_max_relative_offset": max(calibration_lengths) - 1,
+            "validation_max_relative_offset": max(validation_lengths) - 1,
+            "calibration_position_offsets": calibration_position_offsets,
+            "validation_position_offsets": validation_position_offsets,
+            "calibration_samples_per_stratum": calibration_samples_per_stratum,
+            "validation_samples_per_stratum": validation_samples_per_stratum,
+            "project_after_rope": True,
+            "temperature_denominator": f"sqrt({head_dim})",
+            "stack_all_gqa_query_heads": True,
+            "stack_all_gqa_output_slices": True,
+        },
+        "admission_thresholds": {
+            "frozen_before_heldout": True,
+            "heldout_evaluated": False,
+            "max_static_vs_oracle_kld_delta": kld_delta,
+            "max_static_vs_oracle_ppl_ratio": ppl_ratio,
+        },
+        "runtime_contract": {
+            "default_enabled": False,
+            "cache_representation": "latent_only",
+            "full_context_kv_reconstruction_forbidden": True,
+            "gated_exception": {
+                "enabled": gated,
+                "scope": "current_query_head_attention_result_only" if gated else None,
+                "order": ["latent_attention", "R_v", "sigmoid_gate", "W_o"] if gated else None,
+            },
+        },
+        "reproducibility": {
+            "command_argv": command,
+            "command_shell": shlex.join(command),
+            "python": sys.version,
+            "evaluator_files": evaluator_fingerprints,
+            "evaluator_sha256": _canonical_sha256(evaluator_fingerprints),
+        },
+    }
+    if not payload["dataset"]["strict_split"]:
+        raise ValueError("calibration and validation datasets must have different fingerprints")
+    return _artifact_with_fingerprint(payload)
+
+
+def _thin_qr(matrix):
+    xp = _require_numpy()
+    return xp.linalg.qr(xp.asarray(matrix, dtype=xp.float64), mode="reduced")
+
+
+def _product_svd(left, right, max_rank):
+    """Thin SVD of left @ right without materializing the large product."""
+
+    xp = _require_numpy()
+    left = xp.asarray(left, dtype=xp.float64)
+    right = xp.asarray(right, dtype=xp.float64)
+    if left.ndim != 2 or right.ndim != 2 or left.shape[1] != right.shape[0]:
+        raise ValueError(f"product factor shapes do not align: {left.shape} @ {right.shape}")
+    q_left, r_left = _thin_qr(left)
+    q_right, r_right = _thin_qr(right.T)
+    u_core, singular, vh_core = xp.linalg.svd(r_left @ r_right.T, full_matrices=False)
+    tolerance = (
+        xp.finfo(xp.float64).eps
+        * max(left.shape[0], right.shape[1], left.shape[1])
+        * (float(singular[0]) if singular.size else 0.0)
+    )
+    effective_rank = int(xp.count_nonzero(singular > tolerance))
+    if effective_rank < max_rank:
+        raise ValueError(
+            f"captured product has effective rank {effective_rank}, below required maximum rank {max_rank}"
+        )
+    u = q_left @ u_core[:, :max_rank]
+    v_rows = vh_core[:max_rank, :] @ q_right.T
+    return u, singular[:max_rank], v_rows
+
+
+def kq_svd_factors(keys, stacked_queries, max_rank):
+    """KQ-SVD factors for post-RoPE K and all GQA-sharing query heads."""
+
+    xp = _require_numpy()
+    keys = xp.asarray(keys, dtype=xp.float64)
+    queries = xp.asarray(stacked_queries, dtype=xp.float64)
+    if keys.ndim != 2 or queries.ndim != 2 or keys.shape[1] != queries.shape[1]:
+        raise ValueError(f"K/Q capture shapes do not align: K={keys.shape}, Q={queries.shape}")
+    u, singular, v_rows = _product_svd(keys, queries.T, max_rank)
+    k_down = (queries.T @ v_rows.T) * (1.0 / singular)[None, :]
+    q_down = keys.T @ u
+    return {
+        "k_down": k_down.astype(xp.float32),
+        "q_down": q_down.astype(xp.float32),
+        "singular_values": singular.astype(xp.float64),
+    }
+
+
+def _relative_error(reference, candidate):
+    xp = _require_numpy()
+    denominator = float(xp.linalg.norm(reference))
+    if denominator == 0:
+        return 0.0 if float(xp.linalg.norm(candidate)) == 0 else math.inf
+    return float(xp.linalg.norm(reference - candidate) / denominator)
+
+
+def _value_errors(values, stacked_wo, v_down, v_up):
+    raw_approx = values @ v_down @ v_up
+    output = values @ stacked_wo
+    output_approx = raw_approx @ stacked_wo
+    return {
+        "raw_relative_error": _relative_error(values, raw_approx),
+        "output_relative_error": _relative_error(output, output_approx),
+    }
+
+
+def _recal_value_refinement(values, v_down, v_up):
+    """One ReCalKV-style alternating closed-form refinement on captured V."""
+
+    xp = _require_numpy()
+    values = xp.asarray(values, dtype=xp.float64)
+    r = xp.asarray(v_up, dtype=xp.float64)
+    gram = values.T @ values
+    middle = r @ gram @ r.T
+    d_new = gram @ r.T @ xp.linalg.pinv(middle, rcond=1e-10)
+    r_new = (
+        xp.linalg.pinv(d_new.T @ gram @ d_new, rcond=1e-10)
+        @ d_new.T
+        @ gram
+    )
+    return d_new.astype(xp.float32), r_new.astype(xp.float32)
+
+
+def value_output_factors(values, stacked_wo, max_rank, *, run_recal=True):
+    """KQ-SVD closed-form V/output factors with measured ReCal refinement."""
+
+    xp = _require_numpy()
+    values = xp.asarray(values, dtype=xp.float64)
+    stacked_wo = xp.asarray(stacked_wo, dtype=xp.float64)
+    if values.ndim != 2 or stacked_wo.ndim != 2 or values.shape[1] != stacked_wo.shape[0]:
+        raise ValueError(
+            f"V/stacked-Wo shapes do not align: V={values.shape}, Wo={stacked_wo.shape}"
+        )
+    u, singular, v_rows = _product_svd(values, stacked_wo, max_rank)
+    v_down = (stacked_wo @ v_rows.T) * (1.0 / singular)[None, :]
+    v_up = (values.T @ u).T
+    v_down = v_down.astype(xp.float32)
+    v_up = v_up.astype(xp.float32)
+    closed_errors = _value_errors(values, stacked_wo, v_down, v_up)
+    refinement = {
+        "attempted": bool(run_recal),
+        "accepted": False,
+        "closed_form": closed_errors,
+        "candidate": None,
+        "acceptance_rule": "strictly lower stacked-W_o output relative error",
+    }
+    if run_recal:
+        candidate_down, candidate_up = _recal_value_refinement(values, v_down, v_up)
+        candidate_errors = _value_errors(values, stacked_wo, candidate_down, candidate_up)
+        refinement["candidate"] = candidate_errors
+        if candidate_errors["output_relative_error"] < closed_errors["output_relative_error"]:
+            v_down, v_up = candidate_down, candidate_up
+            refinement["accepted"] = True
+    return {
+        "v_down": v_down,
+        "v_up": v_up,
+        "singular_values": singular.astype(xp.float64),
+        "refinement": refinement,
+        "selected_errors": _value_errors(values, stacked_wo, v_down, v_up),
+    }
+
+
+def causal_attention(query, keys, values, *, head_dim):
+    """Float64 causal attention preserving the original 1/sqrt(head_dim)."""
+
+    xp = _require_numpy()
+    query = xp.asarray(query, dtype=xp.float64)
+    keys = xp.asarray(keys, dtype=xp.float64)
+    values = xp.asarray(values, dtype=xp.float64)
+    scores = query @ keys.T / math.sqrt(int(head_dim))
+    if query.shape[0] == keys.shape[0]:
+        upper = xp.triu(xp.ones(scores.shape, dtype=bool), k=1)
+        scores = xp.where(upper, -xp.inf, scores)
+    row_max = xp.max(scores, axis=-1, keepdims=True)
+    weights = xp.exp(scores - row_max)
+    weights /= xp.sum(weights, axis=-1, keepdims=True)
+    return weights, weights @ values
+
+
+def attention_kld(reference_probabilities, candidate_probabilities):
+    xp = _require_numpy()
+    p = xp.asarray(reference_probabilities, dtype=xp.float64)
+    q = xp.asarray(candidate_probabilities, dtype=xp.float64)
+    epsilon = xp.finfo(xp.float64).tiny
+    value = xp.sum(
+        p * (xp.log(xp.maximum(p, epsilon)) - xp.log(xp.maximum(q, epsilon))),
+        axis=-1,
+    )
+    if not bool(xp.all(xp.isfinite(value))):
+        raise ValueError("non-finite attention KLD")
+    return float(xp.mean(value))
+
+
+def evaluate_capture_group(
+    *,
+    query_heads,
+    keys,
+    values,
+    wo_slices,
+    static_factors,
+    rank,
+    gates=None,
+):
+    """Compare full, static, and same-cache oracle on one captured GQA group."""
+
+    xp = _require_numpy()
+    query_heads = xp.asarray(query_heads, dtype=xp.float64)
+    keys = xp.asarray(keys, dtype=xp.float64)
+    values = xp.asarray(values, dtype=xp.float64)
+    wo_slices = xp.asarray(wo_slices, dtype=xp.float64)
+    if query_heads.ndim != 3:
+        raise ValueError(f"query_heads must be [m,t,d], got {query_heads.shape}")
+    m, tokens, head_dim = query_heads.shape
+    if wo_slices.shape[0] != m or wo_slices.shape[1] != head_dim:
+        raise ValueError(f"W_o slices do not match query heads: {wo_slices.shape}")
+    stacked_queries = query_heads.reshape(m * tokens, head_dim)
+    stacked_wo = xp.concatenate([wo_slices[index] for index in range(m)], axis=1)
+    oracle_kq = kq_svd_factors(keys, stacked_queries, rank)
+    oracle_v = value_output_factors(values, stacked_wo, rank, run_recal=False)
+    arms = {
+        "static": {
+            "k_down": static_factors["k_down"][:, :rank],
+            "q_down": static_factors["q_down"][:, :rank],
+            "v_down": static_factors["v_down"][:, :rank],
+            "v_up": static_factors["v_up"][:rank, :],
+        },
+        "oracle": {
+            "k_down": oracle_kq["k_down"][:, :rank],
+            "q_down": oracle_kq["q_down"][:, :rank],
+            "v_down": oracle_v["v_down"][:, :rank],
+            "v_up": oracle_v["v_up"][:rank, :],
+        },
+    }
+    output = {"head_dim": head_dim, "rank": rank, "arms": {}}
+    full_hidden = xp.zeros((tokens, wo_slices.shape[2]), dtype=xp.float64)
+    full_probs = []
+    for head in range(m):
+        probs, attn = causal_attention(query_heads[head], keys, values, head_dim=head_dim)
+        full_probs.append(probs)
+        if gates is not None:
+            gate = 1.0 / (1.0 + xp.exp(-xp.asarray(gates[head], dtype=xp.float64)))
+            attn = attn * gate
+        full_hidden += attn @ wo_slices[head]
+    for name, factors in arms.items():
+        hidden = xp.zeros_like(full_hidden)
+        k_lat = keys @ factors["k_down"]
+        v_lat = values @ factors["v_down"]
+        klds = []
+        for head in range(m):
+            q_lat = query_heads[head] @ factors["q_down"]
+            probs, z_lat = causal_attention(q_lat, k_lat, v_lat, head_dim=head_dim)
+            klds.append(attention_kld(full_probs[head], probs))
+            attn = z_lat @ factors["v_up"]
+            if gates is not None:
+                gate = 1.0 / (1.0 + xp.exp(-xp.asarray(gates[head], dtype=xp.float64)))
+                attn = attn * gate
+            hidden += attn @ wo_slices[head]
+        output["arms"][name] = {
+            "attention_kld": float(sum(klds) / len(klds)),
+            "gated_output_relative_error": _relative_error(full_hidden, hidden),
+            "finite": bool(xp.all(xp.isfinite(hidden))),
+        }
+    output["static_vs_oracle"] = {
+        "attention_kld_delta": (
+            output["arms"]["static"]["attention_kld"]
+            - output["arms"]["oracle"]["attention_kld"]
+        ),
+        "gated_output_relative_error_delta": (
+            output["arms"]["static"]["gated_output_relative_error"]
+            - output["arms"]["oracle"]["gated_output_relative_error"]
+        ),
+    }
+    return output
+
+
+def _load_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _verify_artifact(payload, schema):
+    if payload.get("schema") != schema:
+        raise ValueError(f"expected schema {schema}, got {payload.get('schema')}")
+    expected = payload.get("artifact_sha256")
+    if not isinstance(expected, str):
+        raise ValueError(f"{schema} artifact is missing artifact_sha256")
+    body = dict(payload)
+    body.pop("artifact_sha256", None)
+    actual = _canonical_sha256(body)
+    if actual != expected:
+        raise ValueError(f"{schema} artifact fingerprint mismatch: expected {expected}, got {actual}")
+
+
+def _verify_plan_evaluator(plan):
+    records = plan.get("reproducibility", {}).get("evaluator_files")
+    if not isinstance(records, list) or not records:
+        raise ValueError("latent-KV plan is missing evaluator file fingerprints")
+    current = []
+    for record in records:
+        path = Path(record["path"])
+        fingerprint = _file_fingerprint(path)
+        if fingerprint["sha256"] != record["sha256"]:
+            raise ValueError(
+                "latent-KV evaluator changed after plan creation: "
+                f"{path} expected={record['sha256']} current={fingerprint['sha256']}"
+            )
+        current.append(fingerprint)
+    expected = plan["reproducibility"].get("evaluator_sha256")
+    actual = _canonical_sha256(current)
+    if actual != expected:
+        raise ValueError(
+            f"latent-KV evaluator aggregate changed: expected={expected} current={actual}"
+        )
+
+
+def _dataset_texts(path):
+    source = Path(path)
+    if source.suffix.lower() == ".jsonl":
+        texts = []
+        for line_number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if isinstance(value.get("text"), str):
+                text = value["text"]
+            elif isinstance(value.get("prompt"), str):
+                text = value["prompt"]
+            elif isinstance(value.get("filler_text"), str):
+                text = value["filler_text"]
+                if isinstance(value.get("question"), str):
+                    text += "\n\n" + value["question"]
+            elif isinstance(value.get("context"), str):
+                text = value["context"]
+            else:
+                raise ValueError(f"no supported text field in {source}:{line_number}")
+            texts.append({"line": line_number, "text": text})
+        if not texts:
+            raise ValueError(f"dataset has no non-empty JSONL records: {source}")
+        return texts
+    text = source.read_text(encoding="utf-8")
+    if not text:
+        raise ValueError(f"dataset is empty: {source}")
+    return [{"line": 1, "text": text}]
+
+
+def _disable_broken_torchvision_for_text_only_transformers():
+    import transformers.utils as transformers_utils
+    import transformers.utils.import_utils as import_utils
+
+    import_utils.is_torchvision_available = lambda: False
+    transformers_utils.is_torchvision_available = lambda: False
+
+
+def _load_qwen35_text_model(model_path, *, threads=None):
+    """Load only Qwen3.5 text weights from a composite checkpoint."""
+
+    _disable_broken_torchvision_for_text_only_transformers()
+    import gc
+    import torch
+    from safetensors import safe_open
+    from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM
+
+    if threads is not None:
+        torch.set_num_threads(max(1, int(threads)))
+    model_root = _resolve_model_root(model_path)
+    composite = AutoConfig.from_pretrained(model_root, local_files_only=True)
+    config = composite.text_config if hasattr(composite, "text_config") else composite
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        model = Qwen3_5ForCausalLM(config)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+    index = _load_json(model_root / "model.safetensors.index.json")
+    state = {}
+    for filename in sorted(set(index.get("weight_map", {}).values())):
+        with safe_open(model_root / filename, framework="pt", device="cpu") as handle:
+            for name in handle.keys():
+                if name.startswith("model.language_model."):
+                    state["model." + name[len("model.language_model.") :]] = handle.get_tensor(name)
+                elif name == "lm_head.weight":
+                    state[name] = handle.get_tensor(name)
+    missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
+    allowed_missing = {"lm_head.weight"}
+    if set(missing) - allowed_missing or unexpected:
+        raise ValueError(
+            "Qwen3.5 text-only state load mismatch: "
+            f"missing={sorted(set(missing) - allowed_missing)}, unexpected={unexpected}"
+        )
+    model.tie_weights()
+    model.eval()
+    del state
+    gc.collect()
+    tokenizer = AutoTokenizer.from_pretrained(model_root, local_files_only=True)
+    return torch, model, tokenizer
+
+
+def _capture_hook(layer_index, destination):
+    def hook(module, args, kwargs):
+        import torch
+        from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+
+        hidden_states = kwargs.get("hidden_states")
+        if hidden_states is None:
+            hidden_states = args[0]
+        position_embeddings = kwargs.get("position_embeddings")
+        if position_embeddings is None:
+            raise ValueError(f"full-attention layer {layer_index} capture missing position_embeddings")
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, module.head_dim)
+        query_states, gate = torch.chunk(
+            module.q_proj(hidden_states).view(*input_shape, -1, module.head_dim * 2),
+            2,
+            dim=-1,
+        )
+        query_states = module.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = module.k_norm(module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, position_embeddings[0], position_embeddings[1]
+        )
+        destination[layer_index] = {
+            "q": query_states[0].detach().float().cpu().numpy(),
+            "k": key_states[0].detach().float().cpu().numpy(),
+            "v": value_states[0].detach().float().cpu().numpy(),
+            "gate": gate[0].transpose(0, 1).detach().float().cpu().numpy(),
+        }
+
+    return hook
+
+
+def capture_hf(
+    plan_path,
+    *,
+    split,
+    output_dir,
+    threads=None,
+    command=None,
+):
+    """Capture post-RoPE Q/K plus V/gates for every full-attention layer."""
+
+    xp = _require_numpy()
+
+    plan = _load_json(plan_path)
+    _verify_artifact(plan, LATENT_KV_PLAN_SCHEMA)
+    _verify_plan_evaluator(plan)
+    if split not in {"calibration", "validation"}:
+        raise ValueError("latent-KV capture split must be calibration or validation")
+    dataset = plan["dataset"][split]
+    if _sha256_file(dataset["path"]) != dataset["sha256"]:
+        raise ValueError(f"{split} dataset fingerprint changed after plan creation")
+    lengths = plan["calibration_contract"][f"{split}_lengths"]
+    offsets = plan["calibration_contract"][f"{split}_position_offsets"]
+    model_contract = plan["model_contract"]
+    torch, model, tokenizer = _load_qwen35_text_model(plan["model"]["path"], threads=threads)
+    text_model = model.model
+    full_layers = model_contract["full_attention_layers"]
+    captures = {}
+    handles = []
+    for layer_index in full_layers:
+        attention = text_model.layers[layer_index].self_attn
+        handles.append(
+            attention.register_forward_pre_hook(
+                _capture_hook(layer_index, captures), with_kwargs=True
+            )
+        )
+
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    records_root = output_root / "records"
+    records_root.mkdir(parents=True, exist_ok=True)
+    texts = _dataset_texts(dataset["path"])
+    tokenized = [
+        tokenizer(item["text"], add_special_tokens=True, return_attention_mask=False)["input_ids"]
+        for item in texts
+    ]
+    records = []
+    weights = {}
+    for layer_index in full_layers:
+        attention = text_model.layers[layer_index].self_attn
+        matrix = attention.o_proj.weight.detach().float().cpu().numpy()
+        n_heads = model_contract["num_attention_heads"]
+        head_dim = model_contract["head_dim"]
+        weights[f"layer_{layer_index}_wo"] = xp.stack(
+            [
+                matrix[:, head * head_dim : (head + 1) * head_dim].T
+                for head in range(n_heads)
+            ],
+            axis=0,
+        ).astype(xp.float32)
+    weights_path = output_root / "static_weights.npz"
+    xp.savez(weights_path, **weights)
+
+    try:
+        stratum = 0
+        samples_per_stratum = int(
+            plan["calibration_contract"].get(f"{split}_samples_per_stratum", 1)
+        )
+        for length in lengths:
+            for position_offset in offsets:
+                for sample_index in range(samples_per_stratum):
+                    source_index = stratum % len(tokenized)
+                    ids = tokenized[source_index]
+                    if len(ids) < length:
+                        raise ValueError(
+                            f"{split} dataset record {texts[source_index]['line']} has {len(ids)} tokens, "
+                            f"below requested stratum length {length}"
+                        )
+                    span = len(ids) - length + 1
+                    content_start = (stratum * max(1, length // 2)) % span
+                    window = ids[content_start : content_start + length]
+                    input_ids = torch.tensor([window], dtype=torch.long)
+                    position_ids = torch.arange(
+                        position_offset, position_offset + length, dtype=torch.long
+                    ).unsqueeze(0)
+                    captures.clear()
+                    with torch.no_grad():
+                        text_model(
+                            input_ids=input_ids,
+                            position_ids=position_ids,
+                            use_cache=False,
+                        )
+                    if sorted(captures) != sorted(full_layers):
+                        raise ValueError(
+                            f"capture missed full-attention layers: got {sorted(captures)}, expected {full_layers}"
+                        )
+                    for layer_index in full_layers:
+                        path = records_root / (
+                            f"{split}.s{stratum:03d}.l{layer_index}.n{length}.p{position_offset}.npz"
+                        )
+                        xp.savez(
+                            path,
+                            **captures[layer_index],
+                            positions=position_ids[0].numpy(),
+                            token_ids=input_ids[0].numpy(),
+                        )
+                        records.append(
+                            {
+                                "stratum": stratum,
+                                "sample_index": sample_index,
+                                "dataset_line": texts[source_index]["line"],
+                                "content_start": content_start,
+                                "layer": layer_index,
+                                "length": length,
+                                "position_offset": position_offset,
+                                "max_relative_offset": length - 1,
+                                "path": str(path),
+                                "bytes": path.stat().st_size,
+                                "sha256": _sha256_file(path),
+                                "shapes": {
+                                    name: list(value.shape)
+                                    for name, value in captures[layer_index].items()
+                                },
+                            }
+                        )
+                    stratum += 1
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    payload = {
+        "schema": LATENT_KV_CAPTURE_SCHEMA,
+        "created_at": _utc_now(),
+        "status": "captured",
+        "split": split,
+        "plan_path": str(Path(plan_path).expanduser().resolve()),
+        "plan_sha256": plan["artifact_sha256"],
+        "dataset": dataset,
+        "model_sha256": plan["model"]["combined_sha256"],
+        "engine_sha256": (plan.get("engine") or {}).get("fingerprint_id"),
+        "offline_engine_sha256": plan["offline_engine"]["fingerprint_id"],
+        "rope_sha256": plan["rope"]["sha256"],
+        "weights": _file_fingerprint(weights_path),
+        "records": records,
+        "strata": len(lengths) * len(offsets) * samples_per_stratum,
+        "command_argv": list(command or sys.argv),
+    }
+    artifact = _artifact_with_fingerprint(payload)
+    manifest_path = output_root / f"{split}.capture.json"
+    write_json(artifact, manifest_path)
+    return artifact
+
+
+def _load_npz_verified(record):
+    xp = _require_numpy()
+    path = Path(record["path"])
+    if _sha256_file(path) != record["sha256"]:
+        raise ValueError(f"capture array fingerprint mismatch: {path}")
+    with xp.load(path, allow_pickle=False) as data:
+        return {name: data[name] for name in data.files}
+
+
+def calibrate_capture(plan_path, capture_manifest_path, *, output_dir, command=None):
+    """Fit prefix-stable maximum-rank factors from a calibration capture."""
+
+    xp = _require_numpy()
+    plan = _load_json(plan_path)
+    _verify_artifact(plan, LATENT_KV_PLAN_SCHEMA)
+    _verify_plan_evaluator(plan)
+    capture = _load_json(capture_manifest_path)
+    _verify_artifact(capture, LATENT_KV_CAPTURE_SCHEMA)
+    if capture["split"] != "calibration":
+        raise ValueError("static factors may only be fit from a calibration capture")
+    if capture["plan_sha256"] != plan["artifact_sha256"]:
+        raise ValueError("capture was produced from a different latent-KV plan")
+    weights_record = capture["weights"]
+    if _sha256_file(weights_record["path"]) != weights_record["sha256"]:
+        raise ValueError("captured static weight fingerprint mismatch")
+    with xp.load(weights_record["path"], allow_pickle=False) as handle:
+        weights = {name: handle[name] for name in handle.files}
+
+    model_contract = plan["model_contract"]
+    max_rank = max(plan["calibration_contract"]["ranks"])
+    n_heads = model_contract["num_attention_heads"]
+    n_kv_heads = model_contract["num_key_value_heads"]
+    heads_per_group = model_contract["gqa_query_heads_per_kv_head"]
+    head_dim = model_contract["head_dim"]
+    output_arrays = {}
+    layer_metrics = []
+    for layer_index in model_contract["full_attention_layers"]:
+        layer_records = [
+            _load_npz_verified(record)
+            for record in capture["records"]
+            if record["layer"] == layer_index
+        ]
+        if not layer_records:
+            raise ValueError(f"calibration capture has no records for layer {layer_index}")
+        q = xp.concatenate([record["q"] for record in layer_records], axis=1)
+        k = xp.concatenate([record["k"] for record in layer_records], axis=1)
+        v = xp.concatenate([record["v"] for record in layer_records], axis=1)
+        wo = weights[f"layer_{layer_index}_wo"]
+        if q.shape[0] != n_heads or k.shape[0] != n_kv_heads or v.shape[0] != n_kv_heads:
+            raise ValueError(f"layer {layer_index} capture head geometry mismatch")
+        k_down = xp.empty((n_kv_heads, head_dim, max_rank), dtype=xp.float32)
+        q_down = xp.empty_like(k_down)
+        v_down = xp.empty_like(k_down)
+        v_up = xp.empty((n_kv_heads, max_rank, head_dim), dtype=xp.float32)
+        kq_singular = xp.empty((n_kv_heads, max_rank), dtype=xp.float64)
+        value_singular = xp.empty_like(kq_singular)
+        groups = []
+        for group in range(n_kv_heads):
+            q_start = group * heads_per_group
+            q_stop = q_start + heads_per_group
+            stacked_queries = q[q_start:q_stop].reshape(-1, head_dim)
+            wo_slices = wo[q_start:q_stop]
+            stacked_wo = xp.concatenate(list(wo_slices), axis=1)
+            kq = kq_svd_factors(k[group], stacked_queries, max_rank)
+            value = value_output_factors(v[group], stacked_wo, max_rank, run_recal=True)
+            k_down[group] = kq["k_down"]
+            q_down[group] = kq["q_down"]
+            v_down[group] = value["v_down"]
+            v_up[group] = value["v_up"]
+            kq_singular[group] = kq["singular_values"]
+            value_singular[group] = value["singular_values"]
+            groups.append(
+                {
+                    "gqa_group": group,
+                    "query_heads": list(range(q_start, q_stop)),
+                    "captured_key_tokens": int(k[group].shape[0]),
+                    "captured_query_rows": int(stacked_queries.shape[0]),
+                    "captured_value_tokens": int(v[group].shape[0]),
+                    "value_refinement": value["refinement"],
+                    "selected_value_errors": value["selected_errors"],
+                }
+            )
+        prefix = f"layer_{layer_index}"
+        output_arrays[f"{prefix}_k_down"] = k_down
+        output_arrays[f"{prefix}_q_down"] = q_down
+        output_arrays[f"{prefix}_v_down"] = v_down
+        output_arrays[f"{prefix}_v_up"] = v_up
+        output_arrays[f"{prefix}_kq_singular"] = kq_singular
+        output_arrays[f"{prefix}_value_singular"] = value_singular
+        layer_metrics.append({"layer": layer_index, "groups": groups})
+
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    factors_path = output_root / "latent_kv_factors.f32.npz"
+    xp.savez(factors_path, **output_arrays)
+    factor_bytes = sum(array.nbytes for array in output_arrays.values())
+    payload = {
+        "schema": LATENT_KV_CALIBRATION_SCHEMA,
+        "created_at": _utc_now(),
+        "status": "calibrated_not_heldout_evaluated",
+        "plan_path": str(Path(plan_path).expanduser().resolve()),
+        "plan_sha256": plan["artifact_sha256"],
+        "capture_path": str(Path(capture_manifest_path).expanduser().resolve()),
+        "capture_sha256": capture["artifact_sha256"],
+        "model_sha256": plan["model"]["combined_sha256"],
+        "engine_sha256": (plan.get("engine") or {}).get("fingerprint_id"),
+        "offline_engine_sha256": plan["offline_engine"]["fingerprint_id"],
+        "rope_sha256": plan["rope"]["sha256"],
+        "ranks": plan["calibration_contract"]["ranks"],
+        "prefix_stable": True,
+        "factor_dtype": "float32_reference",
+        "factors": _file_fingerprint(factors_path),
+        "factor_array_bytes": factor_bytes,
+        "net_static_basis_bytes_reference": factor_bytes,
+        "value_output_contract": model_contract["value_output_contract"],
+        "layers": layer_metrics,
+        "admission_thresholds": plan["admission_thresholds"],
+        "heldout_evaluated": False,
+        "command_argv": list(command or sys.argv),
+    }
+    artifact = _artifact_with_fingerprint(payload)
+    write_json(artifact, output_root / "calibration.json")
+    return artifact
+
+
+def evaluate_reference(
+    plan_path,
+    calibration_path,
+    validation_capture_path,
+    *,
+    output_dir,
+    command=None,
+):
+    """Run static and same-cache oracle arms on identical held-out captures."""
+
+    xp = _require_numpy()
+    plan = _load_json(plan_path)
+    _verify_artifact(plan, LATENT_KV_PLAN_SCHEMA)
+    _verify_plan_evaluator(plan)
+    calibration = _load_json(calibration_path)
+    _verify_artifact(calibration, LATENT_KV_CALIBRATION_SCHEMA)
+    capture = _load_json(validation_capture_path)
+    _verify_artifact(capture, LATENT_KV_CAPTURE_SCHEMA)
+    if capture["split"] != "validation":
+        raise ValueError("latent-KV reference evaluation requires a validation capture")
+    if calibration["plan_sha256"] != plan["artifact_sha256"]:
+        raise ValueError("calibration was produced from a different latent-KV plan")
+    if capture["plan_sha256"] != plan["artifact_sha256"]:
+        raise ValueError("validation capture was produced from a different latent-KV plan")
+    if _sha256_file(calibration["factors"]["path"]) != calibration["factors"]["sha256"]:
+        raise ValueError("calibrated factor fingerprint mismatch")
+    if _sha256_file(capture["weights"]["path"]) != capture["weights"]["sha256"]:
+        raise ValueError("validation weight fingerprint mismatch")
+
+    with xp.load(calibration["factors"]["path"], allow_pickle=False) as handle:
+        factors = {name: handle[name] for name in handle.files}
+    with xp.load(capture["weights"]["path"], allow_pickle=False) as handle:
+        weights = {name: handle[name] for name in handle.files}
+
+    contract = plan["model_contract"]
+    heads_per_group = contract["gqa_query_heads_per_kv_head"]
+    ranks = plan["calibration_contract"]["ranks"]
+    rows = []
+    for record_meta in capture["records"]:
+        record = _load_npz_verified(record_meta)
+        layer = record_meta["layer"]
+        prefix = f"layer_{layer}"
+        wo = weights[f"{prefix}_wo"]
+        for group in range(contract["num_key_value_heads"]):
+            head_start = group * heads_per_group
+            head_stop = head_start + heads_per_group
+            static = {
+                "k_down": factors[f"{prefix}_k_down"][group],
+                "q_down": factors[f"{prefix}_q_down"][group],
+                "v_down": factors[f"{prefix}_v_down"][group],
+                "v_up": factors[f"{prefix}_v_up"][group],
+            }
+            for rank in ranks:
+                metrics = evaluate_capture_group(
+                    query_heads=record["q"][head_start:head_stop],
+                    keys=record["k"][group],
+                    values=record["v"][group],
+                    wo_slices=wo[head_start:head_stop],
+                    gates=record["gate"][head_start:head_stop],
+                    static_factors=static,
+                    rank=rank,
+                )
+                rows.append(
+                    {
+                        "stratum": record_meta["stratum"],
+                        "layer": layer,
+                        "gqa_group": group,
+                        "length": record_meta["length"],
+                        "position_offset": record_meta["position_offset"],
+                        "max_relative_offset": record_meta["max_relative_offset"],
+                        **metrics,
+                    }
+                )
+    finite = all(
+        row["arms"][arm]["finite"]
+        for row in rows
+        for arm in ("static", "oracle")
+    )
+    rank32 = [row for row in rows if row["rank"] == 32]
+    aggregate = {
+        "rank32_static_attention_kld": float(
+            sum(row["arms"]["static"]["attention_kld"] for row in rank32) / len(rank32)
+        ),
+        "rank32_oracle_attention_kld": float(
+            sum(row["arms"]["oracle"]["attention_kld"] for row in rank32) / len(rank32)
+        ),
+        "rank32_static_vs_oracle_attention_kld_delta": float(
+            sum(row["static_vs_oracle"]["attention_kld_delta"] for row in rank32)
+            / len(rank32)
+        ),
+        "rank32_static_gated_output_relative_error": float(
+            sum(row["arms"]["static"]["gated_output_relative_error"] for row in rank32)
+            / len(rank32)
+        ),
+        "rank32_oracle_gated_output_relative_error": float(
+            sum(row["arms"]["oracle"]["gated_output_relative_error"] for row in rank32)
+            / len(rank32)
+        ),
+    }
+    payload = {
+        "schema": LATENT_KV_REFERENCE_SCHEMA,
+        "created_at": _utc_now(),
+        "status": "component_reference_complete",
+        "plan_sha256": plan["artifact_sha256"],
+        "calibration_sha256": calibration["artifact_sha256"],
+        "validation_capture_sha256": capture["artifact_sha256"],
+        "model_sha256": plan["model"]["combined_sha256"],
+        "engine_sha256": (plan.get("engine") or {}).get("fingerprint_id"),
+        "offline_engine_sha256": plan["offline_engine"]["fingerprint_id"],
+        "rope_sha256": plan["rope"]["sha256"],
+        "same_cache_oracle": True,
+        "temperature_denominator": plan["calibration_contract"]["temperature_denominator"],
+        "finite": finite,
+        "rows": rows,
+        "aggregate": aggregate,
+        "admission": {
+            "kind": "component_proxy_only",
+            "thresholds_applied": False,
+            "reason": "attention KLD and gated-output error are not end-to-end logit KLD/PPL",
+            "requires_model_evaluation": True,
+        },
+        "command_argv": list(command or sys.argv),
+    }
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    artifact = _artifact_with_fingerprint(payload)
+    write_json(artifact, output_root / "reference.json")
+    return artifact
+
+
+def _layer_factor_map_from_static(factors, contract, rank):
+    result = {}
+    for layer in contract["full_attention_layers"]:
+        prefix = f"layer_{layer}"
+        result[layer] = []
+        for group in range(contract["num_key_value_heads"]):
+            result[layer].append(
+                {
+                    "k_down": factors[f"{prefix}_k_down"][group, :, :rank],
+                    "q_down": factors[f"{prefix}_q_down"][group, :, :rank],
+                    "v_down": factors[f"{prefix}_v_down"][group, :, :rank],
+                    "v_up": factors[f"{prefix}_v_up"][group, :rank, :],
+                }
+            )
+    return result
+
+
+def _layer_factor_map_from_capture(records, weights, contract, rank):
+    xp = _require_numpy()
+    result = {}
+    heads_per_group = contract["gqa_query_heads_per_kv_head"]
+    head_dim = contract["head_dim"]
+    for layer, record in records.items():
+        wo = weights[f"layer_{layer}_wo"]
+        groups = []
+        for group in range(contract["num_key_value_heads"]):
+            head_start = group * heads_per_group
+            head_stop = head_start + heads_per_group
+            queries = record["q"][head_start:head_stop].reshape(-1, head_dim)
+            stacked_wo = xp.concatenate(list(wo[head_start:head_stop]), axis=1)
+            kq = kq_svd_factors(record["k"][group], queries, rank)
+            value = value_output_factors(
+                record["v"][group], stacked_wo, rank, run_recal=False
+            )
+            groups.append(
+                {
+                    "k_down": kq["k_down"],
+                    "q_down": kq["q_down"],
+                    "v_down": value["v_down"],
+                    "v_up": value["v_up"],
+                }
+            )
+        result[layer] = groups
+    return result
+
+
+def _global_factor_map_from_capture(records_by_stratum, weights, contract, rank):
+    """Fit one shared basis directly on every cache in a capture.
+
+    This helper exists for a deliberately post-hoc feasibility ceiling. Its
+    output must never be packaged or treated as held-out admission evidence.
+    """
+
+    xp = _require_numpy()
+    heads_per_group = contract["gqa_query_heads_per_kv_head"]
+    head_dim = contract["head_dim"]
+    result = {}
+    for layer in contract["full_attention_layers"]:
+        layer_records = [records[layer] for records in records_by_stratum.values()]
+        wo = weights[f"layer_{layer}_wo"]
+        groups = []
+        for group in range(contract["num_key_value_heads"]):
+            head_start = group * heads_per_group
+            head_stop = head_start + heads_per_group
+            keys = xp.concatenate([record["k"][group] for record in layer_records], axis=0)
+            queries = xp.concatenate(
+                [
+                    record["q"][head_start:head_stop].reshape(-1, head_dim)
+                    for record in layer_records
+                ],
+                axis=0,
+            )
+            values = xp.concatenate(
+                [record["v"][group] for record in layer_records], axis=0
+            )
+            stacked_wo = xp.concatenate(list(wo[head_start:head_stop]), axis=1)
+            kq = kq_svd_factors(keys, queries, rank)
+            value = value_output_factors(
+                values, stacked_wo, rank, run_recal=False
+            )
+            groups.append(
+                {
+                    "k_down": kq["k_down"],
+                    "q_down": kq["q_down"],
+                    "v_down": value["v_down"],
+                    "v_up": value["v_up"],
+                }
+            )
+        result[layer] = groups
+    return result
+
+
+def _latent_attention_forward_factory(layer_index, group_factors):
+    def latent_forward(
+        module,
+        hidden_states,
+        position_embeddings,
+        attention_mask,
+        past_key_values=None,
+        **kwargs,
+    ):
+        if past_key_values is not None:
+            raise RuntimeError(
+                "Astrea latent-KV model evaluator fails closed when past_key_values is supplied"
+            )
+        import torch
+        from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, module.head_dim)
+        query_states, gate = torch.chunk(
+            module.q_proj(hidden_states).view(*input_shape, -1, module.head_dim * 2),
+            2,
+            dim=-1,
+        )
+        query_states = module.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = module.k_norm(module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, position_embeddings[0], position_embeddings[1]
+        )
+        batch, n_heads, tokens, head_dim = query_states.shape
+        heads_per_group = module.num_key_value_groups
+        outputs = []
+        for head in range(n_heads):
+            group = head // heads_per_group
+            factor = group_factors[group]
+            dtype = torch.float32
+            k_down = torch.as_tensor(factor["k_down"], device=hidden_states.device, dtype=dtype)
+            q_down = torch.as_tensor(factor["q_down"], device=hidden_states.device, dtype=dtype)
+            v_down = torch.as_tensor(factor["v_down"], device=hidden_states.device, dtype=dtype)
+            v_up = torch.as_tensor(factor["v_up"], device=hidden_states.device, dtype=dtype)
+            q_lat = query_states[:, head].float() @ q_down
+            k_lat = key_states[:, group].float() @ k_down
+            v_lat = value_states[:, group].float() @ v_down
+            scores = torch.matmul(q_lat, k_lat.transpose(1, 2)) / math.sqrt(head_dim)
+            causal_mask = torch.triu(
+                torch.full(
+                    (tokens, tokens),
+                    float("-inf"),
+                    device=scores.device,
+                    dtype=scores.dtype,
+                ),
+                diagonal=1,
+            )
+            scores = scores + causal_mask
+            if attention_mask is not None:
+                if attention_mask.ndim != 4:
+                    raise RuntimeError(
+                        f"latent evaluator expected 4D attention mask, got {attention_mask.shape}"
+                    )
+                scores = scores + attention_mask[:, 0, :tokens, :tokens].float()
+            probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
+            current_output = torch.matmul(probabilities, v_lat) @ v_up
+            outputs.append(current_output)
+        attention_output = torch.stack(outputs, dim=2).reshape(batch, tokens, n_heads * head_dim)
+        gate = gate.reshape(batch, tokens, n_heads * head_dim).float()
+        attention_output = attention_output * torch.sigmoid(gate)
+        attention_output = module.o_proj(attention_output.to(hidden_states.dtype))
+        return attention_output, None
+
+    latent_forward.__name__ = f"astrea_latent_forward_layer_{layer_index}"
+    return latent_forward
+
+
+def _run_model_arm(torch, model, token_ids, positions, factors_by_layer=None):
+    import types
+
+    originals = {}
+    try:
+        if factors_by_layer is not None:
+            for layer, group_factors in factors_by_layer.items():
+                module = model.model.layers[layer].self_attn
+                originals[layer] = module.forward
+                module.forward = types.MethodType(
+                    _latent_attention_forward_factory(layer, group_factors),
+                    module,
+                )
+        ids = torch.as_tensor(token_ids, dtype=torch.long).unsqueeze(0)
+        pos = torch.as_tensor(positions, dtype=torch.long).unsqueeze(0)
+        with torch.no_grad():
+            hidden = model.model(
+                input_ids=ids,
+                position_ids=pos,
+                use_cache=False,
+            ).last_hidden_state
+            logits = model.lm_head(hidden).float()[0].cpu()
+        return logits
+    finally:
+        for layer, original in originals.items():
+            model.model.layers[layer].self_attn.forward = original
+
+
+def _logit_metrics(torch, baseline_logits, candidate_logits, token_ids):
+    import torch.nn.functional as torch_functional
+
+    if baseline_logits.shape != candidate_logits.shape:
+        raise ValueError(
+            f"logit shape mismatch: baseline={baseline_logits.shape}, candidate={candidate_logits.shape}"
+        )
+    finite = bool(torch.isfinite(candidate_logits).all())
+    if not finite:
+        return {"finite": False, "mean_kld": math.inf, "mean_nll": math.inf, "ppl": math.inf}
+    baseline_logp = torch.log_softmax(baseline_logits[:-1], dim=-1)
+    candidate_logp = torch.log_softmax(candidate_logits[:-1], dim=-1)
+    probabilities = torch.exp(baseline_logp)
+    kld = torch.sum(probabilities * (baseline_logp - candidate_logp), dim=-1).mean()
+    labels = torch.as_tensor(token_ids[1:], dtype=torch.long)
+    nll = torch_functional.cross_entropy(candidate_logits[:-1], labels)
+    nll_value = float(nll)
+    return {
+        "finite": True,
+        "mean_kld": float(kld),
+        "mean_nll": nll_value,
+        "ppl": math.exp(nll_value),
+    }
+
+
+def evaluate_model(
+    plan_path,
+    calibration_path,
+    validation_capture_path,
+    *,
+    output_dir,
+    rank=32,
+    threads=None,
+    command=None,
+):
+    """Run full-model baseline/static/same-cache-oracle KLD and PPL."""
+
+    xp = _require_numpy()
+    plan = _load_json(plan_path)
+    _verify_artifact(plan, LATENT_KV_PLAN_SCHEMA)
+    _verify_plan_evaluator(plan)
+    calibration = _load_json(calibration_path)
+    _verify_artifact(calibration, LATENT_KV_CALIBRATION_SCHEMA)
+    capture = _load_json(validation_capture_path)
+    _verify_artifact(capture, LATENT_KV_CAPTURE_SCHEMA)
+    if capture["split"] != "validation":
+        raise ValueError("model evaluation requires a validation capture")
+    if calibration["plan_sha256"] != plan["artifact_sha256"]:
+        raise ValueError("calibration was produced from a different latent-KV plan")
+    if capture["plan_sha256"] != plan["artifact_sha256"]:
+        raise ValueError("validation capture was produced from a different latent-KV plan")
+    rank = int(rank)
+    if rank != 32:
+        raise ValueError("Phase-0 admission is fixed to rank 32")
+    if _sha256_file(calibration["factors"]["path"]) != calibration["factors"]["sha256"]:
+        raise ValueError("calibrated factor fingerprint mismatch")
+    if _sha256_file(capture["weights"]["path"]) != capture["weights"]["sha256"]:
+        raise ValueError("validation weight fingerprint mismatch")
+
+    with xp.load(calibration["factors"]["path"], allow_pickle=False) as handle:
+        factor_arrays = {name: handle[name] for name in handle.files}
+    with xp.load(capture["weights"]["path"], allow_pickle=False) as handle:
+        weights = {name: handle[name] for name in handle.files}
+    contract = plan["model_contract"]
+    static_map = _layer_factor_map_from_static(factor_arrays, contract, rank)
+    records_by_stratum = {}
+    metadata_by_stratum = {}
+    for record_meta in capture["records"]:
+        stratum = record_meta["stratum"]
+        records_by_stratum.setdefault(stratum, {})[record_meta["layer"]] = _load_npz_verified(record_meta)
+        metadata_by_stratum.setdefault(stratum, record_meta)
+
+    torch, model, _tokenizer = _load_qwen35_text_model(plan["model"]["path"], threads=threads)
+    rows = []
+    for stratum in sorted(records_by_stratum):
+        records = records_by_stratum[stratum]
+        meta = metadata_by_stratum[stratum]
+        first = records[contract["full_attention_layers"][0]]
+        token_ids = first["token_ids"]
+        positions = first["positions"]
+        oracle_map = _layer_factor_map_from_capture(records, weights, contract, rank)
+        baseline_logits = _run_model_arm(torch, model, token_ids, positions, None)
+        static_logits = _run_model_arm(torch, model, token_ids, positions, static_map)
+        oracle_logits = _run_model_arm(torch, model, token_ids, positions, oracle_map)
+        baseline_metrics = _logit_metrics(torch, baseline_logits, baseline_logits, token_ids)
+        static_metrics = _logit_metrics(torch, baseline_logits, static_logits, token_ids)
+        oracle_metrics = _logit_metrics(torch, baseline_logits, oracle_logits, token_ids)
+        rows.append(
+            {
+                "stratum": stratum,
+                "length": meta["length"],
+                "position_offset": meta["position_offset"],
+                "max_relative_offset": meta["max_relative_offset"],
+                "tokens_scored": int(len(token_ids) - 1),
+                "baseline": baseline_metrics,
+                "static": static_metrics,
+                "oracle": oracle_metrics,
+                "static_vs_oracle": {
+                    "kld_delta": static_metrics["mean_kld"] - oracle_metrics["mean_kld"],
+                    "ppl_ratio": static_metrics["ppl"] / oracle_metrics["ppl"],
+                },
+            }
+        )
+    total_tokens = sum(row["tokens_scored"] for row in rows)
+
+    def weighted(arm, metric):
+        return sum(row[arm][metric] * row["tokens_scored"] for row in rows) / total_tokens
+
+    aggregate = {}
+    for arm in ("baseline", "static", "oracle"):
+        nll = weighted(arm, "mean_nll")
+        aggregate[arm] = {
+            "finite": all(row[arm]["finite"] for row in rows),
+            "mean_kld": weighted(arm, "mean_kld"),
+            "mean_nll": nll,
+            "ppl": math.exp(nll),
+        }
+    aggregate["static_vs_oracle"] = {
+        "kld_delta": aggregate["static"]["mean_kld"] - aggregate["oracle"]["mean_kld"],
+        "ppl_ratio": aggregate["static"]["ppl"] / aggregate["oracle"]["ppl"],
+    }
+    thresholds = plan["admission_thresholds"]
+    finite = aggregate["static"]["finite"] and aggregate["oracle"]["finite"]
+    kld_pass = (
+        aggregate["static_vs_oracle"]["kld_delta"]
+        <= thresholds["max_static_vs_oracle_kld_delta"]
+    )
+    ppl_pass = (
+        aggregate["static_vs_oracle"]["ppl_ratio"]
+        <= thresholds["max_static_vs_oracle_ppl_ratio"]
+    )
+    admitted = finite and kld_pass and ppl_pass
+    payload = {
+        "schema": LATENT_KV_MODEL_EVAL_SCHEMA,
+        "created_at": _utc_now(),
+        "status": "admitted" if admitted else "rejected",
+        "rank": rank,
+        "plan_sha256": plan["artifact_sha256"],
+        "calibration_sha256": calibration["artifact_sha256"],
+        "validation_capture_sha256": capture["artifact_sha256"],
+        "model_sha256": plan["model"]["combined_sha256"],
+        "engine_sha256": (plan.get("engine") or {}).get("fingerprint_id"),
+        "offline_engine_sha256": plan["offline_engine"]["fingerprint_id"],
+        "rope_sha256": plan["rope"]["sha256"],
+        "value_output_contract": contract["value_output_contract"],
+        "same_cache_oracle": True,
+        "finite_logits": finite,
+        "rows": rows,
+        "aggregate": aggregate,
+        "admission": {
+            "thresholds_frozen_before_heldout": thresholds["frozen_before_heldout"],
+            "max_static_vs_oracle_kld_delta": thresholds[
+                "max_static_vs_oracle_kld_delta"
+            ],
+            "max_static_vs_oracle_ppl_ratio": thresholds[
+                "max_static_vs_oracle_ppl_ratio"
+            ],
+            "finite_logits_pass": finite,
+            "kld_pass": kld_pass,
+            "ppl_pass": ppl_pass,
+            "admitted": admitted,
+        },
+        "command_argv": list(command or sys.argv),
+    }
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    artifact = _artifact_with_fingerprint(payload)
+    write_json(artifact, output_root / "model_eval.json")
+    return artifact
+
+
+def evaluate_feasibility_ceiling(
+    plan_path,
+    validation_capture_path,
+    *,
+    output_dir,
+    rank=32,
+    threads=None,
+    command=None,
+):
+    """Fit on held-out caches to test the shared-basis family's best-case ceiling.
+
+    This intentionally contaminates held-out data and is never admission
+    evidence. It answers a narrower question after a failed experiment: could
+    any one global KQ-SVD basis fit to this exact distribution meet the frozen
+    full-model numeric limits relative to per-cache SVD?
+    """
+
+    xp = _require_numpy()
+    plan = _load_json(plan_path)
+    _verify_artifact(plan, LATENT_KV_PLAN_SCHEMA)
+    capture = _load_json(validation_capture_path)
+    _verify_artifact(capture, LATENT_KV_CAPTURE_SCHEMA)
+    if capture["split"] != "validation":
+        raise ValueError("feasibility ceiling requires an already-consumed validation capture")
+    if capture["plan_sha256"] != plan["artifact_sha256"]:
+        raise ValueError("validation capture was produced from a different latent-KV plan")
+    rank = int(rank)
+    if rank != 32:
+        raise ValueError("Phase-0 feasibility ceiling is fixed to rank 32")
+    if _sha256_file(capture["weights"]["path"]) != capture["weights"]["sha256"]:
+        raise ValueError("validation weight fingerprint mismatch")
+
+    with xp.load(capture["weights"]["path"], allow_pickle=False) as handle:
+        weights = {name: handle[name] for name in handle.files}
+    contract = plan["model_contract"]
+    records_by_stratum = {}
+    metadata_by_stratum = {}
+    for record_meta in capture["records"]:
+        stratum = record_meta["stratum"]
+        records_by_stratum.setdefault(stratum, {})[record_meta["layer"]] = (
+            _load_npz_verified(record_meta)
+        )
+        metadata_by_stratum.setdefault(stratum, record_meta)
+
+    global_map = _global_factor_map_from_capture(
+        records_by_stratum, weights, contract, rank
+    )
+    heads_per_group = contract["gqa_query_heads_per_kv_head"]
+
+    def component_for_assignment(expert_maps, assignment):
+        rows = []
+        for stratum in sorted(records_by_stratum):
+            factor_map = expert_maps[assignment[stratum]]
+            for layer, record in records_by_stratum[stratum].items():
+                wo = weights[f"layer_{layer}_wo"]
+                for group in range(contract["num_key_value_heads"]):
+                    head_start = group * heads_per_group
+                    head_stop = head_start + heads_per_group
+                    metrics = evaluate_capture_group(
+                        query_heads=record["q"][head_start:head_stop],
+                        keys=record["k"][group],
+                        values=record["v"][group],
+                        wo_slices=wo[head_start:head_stop],
+                        gates=record["gate"][head_start:head_stop],
+                        static_factors=factor_map[layer][group],
+                        rank=rank,
+                    )
+                    rows.append(
+                        {
+                            "stratum": stratum,
+                            "layer": layer,
+                            "gqa_group": group,
+                            **metrics,
+                        }
+                    )
+        return {
+            "rows": len(rows),
+            "static_attention_kld": float(
+                sum(row["arms"]["static"]["attention_kld"] for row in rows)
+                / len(rows)
+            ),
+            "oracle_attention_kld": float(
+                sum(row["arms"]["oracle"]["attention_kld"] for row in rows)
+                / len(rows)
+            ),
+            "static_vs_oracle_attention_kld_delta": float(
+                sum(row["static_vs_oracle"]["attention_kld_delta"] for row in rows)
+                / len(rows)
+            ),
+            "static_gated_output_relative_error": float(
+                sum(
+                    row["arms"]["static"]["gated_output_relative_error"]
+                    for row in rows
+                )
+                / len(rows)
+            ),
+            "oracle_gated_output_relative_error": float(
+                sum(
+                    row["arms"]["oracle"]["gated_output_relative_error"]
+                    for row in rows
+                )
+                / len(rows)
+            ),
+        }
+
+    global_assignment = {stratum: 0 for stratum in records_by_stratum}
+    component = component_for_assignment({0: global_map}, global_assignment)
+    selector_specs = {
+        "length_regime": {
+            "assignment": {
+                stratum: metadata_by_stratum[stratum]["length"]
+                for stratum in records_by_stratum
+            },
+            "runtime_stable_at_page_seal": False,
+        },
+        "position_offset": {
+            "assignment": {
+                stratum: metadata_by_stratum[stratum]["position_offset"]
+                for stratum in records_by_stratum
+            },
+            "runtime_stable_at_page_seal": True,
+        },
+        "sample_index_control": {
+            "assignment": {
+                stratum: metadata_by_stratum[stratum].get("sample_index", stratum % 2)
+                for stratum in records_by_stratum
+            },
+            "runtime_stable_at_page_seal": False,
+        },
+        "length_x_position_control": {
+            "assignment": {
+                stratum: (
+                    metadata_by_stratum[stratum]["length"],
+                    metadata_by_stratum[stratum]["position_offset"],
+                )
+                for stratum in records_by_stratum
+            },
+            "runtime_stable_at_page_seal": False,
+        },
+        "per_stratum_oracle_control": {
+            "assignment": {stratum: stratum for stratum in records_by_stratum},
+            "runtime_stable_at_page_seal": False,
+            "per_stratum_oracle_control": True,
+        },
+    }
+    selector_results = {}
+    selector_maps = {}
+    for name, spec in selector_specs.items():
+        assignment = spec["assignment"]
+        labels = sorted(set(assignment.values()))
+        if spec.get("per_stratum_oracle_control"):
+            expert_maps = {
+                label: _layer_factor_map_from_capture(
+                    records_by_stratum[label], weights, contract, rank
+                )
+                for label in labels
+            }
+        else:
+            expert_maps = {
+                label: _global_factor_map_from_capture(
+                    {
+                        stratum: records_by_stratum[stratum]
+                        for stratum in records_by_stratum
+                        if assignment[stratum] == label
+                    },
+                    weights,
+                    contract,
+                    rank,
+                )
+                for label in labels
+            }
+        selector_maps[name] = expert_maps
+        selector_results[name] = {
+            "experts": len(labels),
+            "runtime_stable_at_page_seal": spec["runtime_stable_at_page_seal"],
+            "assignments": {str(key): value for key, value in assignment.items()},
+            "component": component_for_assignment(expert_maps, assignment),
+        }
+    stable_selectors = [
+        name
+        for name, result in selector_results.items()
+        if result["runtime_stable_at_page_seal"]
+    ]
+    best_selector = min(
+        stable_selectors,
+        key=lambda name: selector_results[name]["component"][
+            "static_vs_oracle_attention_kld_delta"
+        ],
+    )
+    torch, model, _tokenizer = _load_qwen35_text_model(
+        plan["model"]["path"], threads=threads
+    )
+    model_rows = []
+    for stratum in sorted(records_by_stratum):
+        records = records_by_stratum[stratum]
+        meta = metadata_by_stratum[stratum]
+        first = records[contract["full_attention_layers"][0]]
+        token_ids = first["token_ids"]
+        positions = first["positions"]
+        oracle_map = _layer_factor_map_from_capture(
+            records, weights, contract, rank
+        )
+        baseline_logits = _run_model_arm(torch, model, token_ids, positions, None)
+        global_logits = _run_model_arm(torch, model, token_ids, positions, global_map)
+        selector_metrics = {}
+        for selector_name, expert_maps in selector_maps.items():
+            assignment = selector_specs[selector_name]["assignment"]
+            selector_logits = _run_model_arm(
+                torch,
+                model,
+                token_ids,
+                positions,
+                expert_maps[assignment[stratum]],
+            )
+            selector_metrics[selector_name] = _logit_metrics(
+                torch, baseline_logits, selector_logits, token_ids
+            )
+        oracle_logits = _run_model_arm(torch, model, token_ids, positions, oracle_map)
+        global_metrics = _logit_metrics(
+            torch, baseline_logits, global_logits, token_ids
+        )
+        oracle_metrics = _logit_metrics(
+            torch, baseline_logits, oracle_logits, token_ids
+        )
+        mixture_metrics = selector_metrics[best_selector]
+        model_rows.append(
+            {
+                "stratum": stratum,
+                "length": meta["length"],
+                "position_offset": meta["position_offset"],
+                "tokens_scored": int(len(token_ids) - 1),
+                "global": global_metrics,
+                "mixture": mixture_metrics,
+                "selectors": selector_metrics,
+                "oracle": oracle_metrics,
+            }
+        )
+    total_tokens = sum(row["tokens_scored"] for row in model_rows)
+
+    def weighted(arm, metric):
+        return sum(
+            row[arm][metric] * row["tokens_scored"] for row in model_rows
+        ) / total_tokens
+
+    global_nll = weighted("global", "mean_nll")
+    oracle_nll = weighted("oracle", "mean_nll")
+    mixture_nll = weighted("mixture", "mean_nll")
+    model_aggregate = {
+        "global": {
+            "finite": all(row["global"]["finite"] for row in model_rows),
+            "mean_kld": weighted("global", "mean_kld"),
+            "mean_nll": global_nll,
+            "ppl": math.exp(global_nll),
+        },
+        "oracle": {
+            "finite": all(row["oracle"]["finite"] for row in model_rows),
+            "mean_kld": weighted("oracle", "mean_kld"),
+            "mean_nll": oracle_nll,
+            "ppl": math.exp(oracle_nll),
+        },
+        "mixture": {
+            "finite": all(row["mixture"]["finite"] for row in model_rows),
+            "mean_kld": weighted("mixture", "mean_kld"),
+            "mean_nll": mixture_nll,
+            "ppl": math.exp(mixture_nll),
+        },
+    }
+    model_aggregate["global_vs_oracle"] = {
+        "kld_delta": (
+            model_aggregate["global"]["mean_kld"]
+            - model_aggregate["oracle"]["mean_kld"]
+        ),
+        "ppl_ratio": (
+            model_aggregate["global"]["ppl"] / model_aggregate["oracle"]["ppl"]
+        ),
+    }
+    model_aggregate["mixture_vs_oracle"] = {
+        "kld_delta": (
+            model_aggregate["mixture"]["mean_kld"]
+            - model_aggregate["oracle"]["mean_kld"]
+        ),
+        "ppl_ratio": (
+            model_aggregate["mixture"]["ppl"] / model_aggregate["oracle"]["ppl"]
+        ),
+    }
+    selector_aggregates = {}
+    for selector_name in selector_maps:
+        selector_nll = sum(
+            row["selectors"][selector_name]["mean_nll"] * row["tokens_scored"]
+            for row in model_rows
+        ) / total_tokens
+        selector_kld = sum(
+            row["selectors"][selector_name]["mean_kld"] * row["tokens_scored"]
+            for row in model_rows
+        ) / total_tokens
+        selector_ppl = math.exp(selector_nll)
+        selector_aggregates[selector_name] = {
+            "experts": selector_results[selector_name]["experts"],
+            "runtime_stable_at_page_seal": selector_results[selector_name][
+                "runtime_stable_at_page_seal"
+            ],
+            "finite": all(
+                row["selectors"][selector_name]["finite"] for row in model_rows
+            ),
+            "mean_kld": selector_kld,
+            "mean_nll": selector_nll,
+            "ppl": selector_ppl,
+            "vs_oracle": {
+                "kld_delta": selector_kld - model_aggregate["oracle"]["mean_kld"],
+                "ppl_ratio": selector_ppl / model_aggregate["oracle"]["ppl"],
+            },
+        }
+    model_aggregate["selectors"] = selector_aggregates
+    thresholds = plan["admission_thresholds"]
+    numeric_limits_met = (
+        model_aggregate["global"]["finite"]
+        and model_aggregate["oracle"]["finite"]
+        and model_aggregate["global_vs_oracle"]["kld_delta"]
+        <= thresholds["max_static_vs_oracle_kld_delta"]
+        and model_aggregate["global_vs_oracle"]["ppl_ratio"]
+        <= thresholds["max_static_vs_oracle_ppl_ratio"]
+    )
+    mixture_numeric_limits_met = (
+        model_aggregate["mixture"]["finite"]
+        and model_aggregate["oracle"]["finite"]
+        and model_aggregate["mixture_vs_oracle"]["kld_delta"]
+        <= thresholds["max_static_vs_oracle_kld_delta"]
+        and model_aggregate["mixture_vs_oracle"]["ppl_ratio"]
+        <= thresholds["max_static_vs_oracle_ppl_ratio"]
+    )
+    payload = {
+        "schema": LATENT_KV_FEASIBILITY_SCHEMA,
+        "created_at": _utc_now(),
+        "status": "posthoc_non_admission",
+        "rank": rank,
+        "plan_sha256": plan["artifact_sha256"],
+        "validation_capture_sha256": capture["artifact_sha256"],
+        "heldout_contaminated_by_fit": True,
+        "admission_eligible": False,
+        "diagnostic_evaluator": _file_fingerprint(__file__),
+        "component": component,
+        "selector_candidates": selector_results,
+        "selected_runtime_stable_selector": best_selector,
+        "selector_rule": "lowest component KLD among runtime-stable-at-page-seal selectors",
+        "model_rows": model_rows,
+        "model_aggregate": model_aggregate,
+        "frozen_numeric_limits": {
+            "max_static_vs_oracle_kld_delta": thresholds[
+                "max_static_vs_oracle_kld_delta"
+            ],
+            "max_static_vs_oracle_ppl_ratio": thresholds[
+                "max_static_vs_oracle_ppl_ratio"
+            ],
+            "met_by_in_sample_global_ceiling": numeric_limits_met,
+            "met_by_selected_runtime_stable_selector": mixture_numeric_limits_met,
+        },
+        "interpretation": (
+            "This is an optimistic in-sample ceiling for shared KQ-SVD basis "
+            "families, not held-out evidence and never a promotion artifact."
+        ),
+        "command_argv": list(command or sys.argv),
+    }
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    artifact = _artifact_with_fingerprint(payload)
+    write_json(artifact, output_root / "feasibility.json")
+    return artifact
+
+
+def write_json(payload, path, *, pretty=True):
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(payload, indent=2 if pretty else None, sort_keys=pretty) + "\n",
+        encoding="utf-8",
+    )

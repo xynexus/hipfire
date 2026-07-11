@@ -1,0 +1,188 @@
+{
+  "admission": {
+    "admitted": false,
+    "finite_logits_pass": true,
+    "kld_pass": false,
+    "max_static_vs_oracle_kld_delta": 0.05,
+    "max_static_vs_oracle_ppl_ratio": 1.05,
+    "ppl_pass": false,
+    "thresholds_frozen_before_heldout": true
+  },
+  "aggregate": {
+    "baseline": {
+      "finite": true,
+      "mean_kld": 0.0,
+      "mean_nll": 6.705150085594018,
+      "ppl": 816.6005770983996
+    },
+    "oracle": {
+      "finite": true,
+      "mean_kld": 0.29526286150928566,
+      "mean_nll": 4.2970453017045065,
+      "ppl": 73.48235443667457
+    },
+    "static": {
+      "finite": true,
+      "mean_kld": 0.8158064940212909,
+      "mean_nll": 7.335584505066198,
+      "ppl": 1533.9241043727743
+    },
+    "static_vs_oracle": {
+      "kld_delta": 0.5205436325120052,
+      "ppl_ratio": 20.874727220324377
+    }
+  },
+  "artifact_sha256": "5efb3e6edd490ce4dfb21661448dd4d8801a568520f495f9bb5bdd1fc36e70e5",
+  "calibration_sha256": "9ed479b97e3f464c58fadcdef3afe4784689b1c5a628ee52e29a62d87ddb285c",
+  "command_argv": [
+    "python3",
+    "scripts/astrea.py",
+    "latent-kv-model-eval",
+    "--plan",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/plan.json",
+    "--calibration",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration/calibration.json",
+    "--validation-capture",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/validation-capture/result.json",
+    "--output-dir",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/model-eval",
+    "--rank",
+    "32",
+    "--threads",
+    "8",
+    "--pretty",
+    "--out",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/model-eval/model-eval.json"
+  ],
+  "created_at": "2026-07-10T19:41:39.778614+00:00",
+  "engine_sha256": "7cfc66d05eeeb248945b33b75e9581ec6851ed2fc684011e154f684790271a4e",
+  "finite_logits": true,
+  "model_sha256": "c67aa0d5072cd9569d6adf48eeb1e27d3fdab8d4b59c0a7cc0ce5ceab08e398b",
+  "offline_engine_sha256": "72c04624c23de608da459f077c64684ad6378d2f2702a2f14017c0705655d871",
+  "plan_sha256": "4cf9c6df5673771de7621ef7304f0a5e2e57e780ba8c79788aa4bb3612c2b569",
+  "rank": 32,
+  "rope_sha256": "7044372884c06b70ab7c941da48acbece7628f9cc026cd4605e96e834006483e",
+  "rows": [
+    {
+      "baseline": {
+        "finite": true,
+        "mean_kld": 0.0,
+        "mean_nll": 7.032064914703369,
+        "ppl": 1132.3664378210426
+      },
+      "length": 128,
+      "max_relative_offset": 127,
+      "oracle": {
+        "finite": true,
+        "mean_kld": 0.3075026273727417,
+        "mean_nll": 3.960571765899658,
+        "ppl": 52.48732783547444
+      },
+      "position_offset": 0,
+      "static": {
+        "finite": true,
+        "mean_kld": 0.6475550532341003,
+        "mean_nll": 7.411384582519531,
+        "ppl": 1654.7158521378929
+      },
+      "static_vs_oracle": {
+        "kld_delta": 0.34005242586135864,
+        "ppl_ratio": 31.526006759664483
+      },
+      "stratum": 0,
+      "tokens_scored": 127
+    },
+    {
+      "baseline": {
+        "finite": true,
+        "mean_kld": 0.0,
+        "mean_nll": 6.954652309417725,
+        "ppl": 1048.014089969217
+      },
+      "length": 128,
+      "max_relative_offset": 127,
+      "oracle": {
+        "finite": true,
+        "mean_kld": 0.2520498037338257,
+        "mean_nll": 3.9822165966033936,
+        "ppl": 53.63579147361354
+      },
+      "position_offset": 256,
+      "static": {
+        "finite": true,
+        "mean_kld": 0.5928524136543274,
+        "mean_nll": 7.405782222747803,
+        "ppl": 1645.4714580041739
+      },
+      "static_vs_oracle": {
+        "kld_delta": 0.3408026099205017,
+        "ppl_ratio": 30.678608682668063
+      },
+      "stratum": 1,
+      "tokens_scored": 127
+    },
+    {
+      "baseline": {
+        "finite": true,
+        "mean_kld": 0.0,
+        "mean_nll": 6.5524139404296875,
+        "ppl": 700.934146523367
+      },
+      "length": 256,
+      "max_relative_offset": 255,
+      "oracle": {
+        "finite": true,
+        "mean_kld": 0.2978266477584839,
+        "mean_nll": 4.392166614532471,
+        "ppl": 80.81532509278638
+      },
+      "position_offset": 0,
+      "static": {
+        "finite": true,
+        "mean_kld": 0.8943499326705933,
+        "mean_nll": 7.353895664215088,
+        "ppl": 1562.2707708859407
+      },
+      "static_vs_oracle": {
+        "kld_delta": 0.5965232849121094,
+        "ppl_ratio": 19.3313677708065
+      },
+      "stratum": 2,
+      "tokens_scored": 255
+    },
+    {
+      "baseline": {
+        "finite": true,
+        "mean_kld": 0.0,
+        "mean_nll": 6.570807933807373,
+        "ppl": 713.9464316376041
+      },
+      "length": 256,
+      "max_relative_offset": 255,
+      "oracle": {
+        "finite": true,
+        "mean_kld": 0.30812498927116394,
+        "mean_nll": 4.5262980461120605,
+        "ppl": 92.41580798579007
+      },
+      "position_offset": 256,
+      "static": {
+        "finite": true,
+        "mean_kld": 0.9320987462997437,
+        "mean_nll": 7.244560718536377,
+        "ppl": 1400.4665618318065
+      },
+      "static_vs_oracle": {
+        "kld_delta": 0.6239737570285797,
+        "ppl_ratio": 15.153971948685916
+      },
+      "stratum": 3,
+      "tokens_scored": 255
+    }
+  ],
+  "same_cache_oracle": true,
+  "schema": "hipfire.astrea.latent_kv_model_eval.v0",
+  "status": "rejected",
+  "validation_capture_sha256": "1fe45eb16eee82e9d77082b248513951e50c9a1a5185edeb03424540371765e2",
+  "value_output_contract": "gated_current_output_reconstruction"
+}

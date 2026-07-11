@@ -139,6 +139,8 @@ benchmarks/results/**/*.out
 benchmarks/results/**/*.stderr
 benchmarks/results/**/*.stdout
 benchmarks/results/**/*.bak
+# ignore large captured/calibrated binaries; keep JSON verdicts + manifests
+benchmarks/results/**/*.npz
 benchmarks/calib/aureth-corpus.txt
 benchmarks/calib/aureth-raw/
 

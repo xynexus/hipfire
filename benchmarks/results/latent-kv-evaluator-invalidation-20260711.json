@@ -1,0 +1,33 @@
+{
+  "schema": "hipfire.astrea.latent_kv_evaluator_invalidation.v0",
+  "status": "invalidated",
+  "discovered_at_utc": "2026-07-11T05:15:52Z",
+  "defect": "The replacement Qwen3.5 attention path applied causality only when Transformers supplied an explicit 4D attention mask. The real text model may pass no mask and rely on the backend is_causal contract, so compressed full-model arms could attend to future tokens.",
+  "affected_artifacts": [
+    {
+      "path": "latent-kv-qwen3.5-0.8b-r32-20260710/model-eval/model-eval.json",
+      "artifact_sha256": "5efb3e6edd490ce4dfb21661448dd4d8801a568520f495f9bb5bdd1fc36e70e5"
+    },
+    {
+      "path": "latent-kv-qwen3.5-0.8b-r32-fineweb-wikitext-20260711/model-eval/model-eval.json",
+      "artifact_sha256": "fe95145097f60117e378241fe1d8fb28fcd9f991e5188309ba9ccb8e02516b44"
+    }
+  ],
+  "unaffected_evidence": [
+    "capture artifacts",
+    "calibration factors",
+    "component reference artifacts, which use an explicit causal mask",
+    "dataset, model, engine, and RoPE fingerprints"
+  ],
+  "corrected_evaluator": {
+    "astrea_sha256": "b44a1ca64311f811fb39e7e0c5c7d01d8cf6e36f97675e26799e16c22b2f4c9e",
+    "astrea_latent_kv_sha256": "8308dd5fd915eb081c26e09c33f68a0e52363d70a495db1f4e646224cd3532db",
+    "causal_identity_test": "test_latent_qwen35_forward_identity_preserves_gate_and_wo"
+  },
+  "corrected_posthoc_feasibility": {
+    "path": "latent-kv-qwen3.5-0.8b-r32-fineweb-wikitext-20260711/feasibility/feasibility.json",
+    "artifact_sha256": "97956b948cc8e6eef62610d676e5f667e61c8e241581a8ceaa680b1eafe99a4d",
+    "admission_eligible": false
+  },
+  "required_resolution": "Seal a new plan with the corrected evaluator fingerprint and use a new untouched validation split. Never reinterpret or promote the affected artifacts."
+}
