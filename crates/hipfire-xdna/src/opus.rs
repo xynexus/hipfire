@@ -120,6 +120,42 @@ pub struct OpusPackedMatrix {
 }
 
 impl OpusPackedMatrix {
+    /// Decode one complete Opus matrix without binding it to a projection
+    /// kernel. Resident fused operators use this path because they upload the
+    /// decoded groups into their own array-wide weight layout.
+    pub fn from_payload(
+        quant_type: u8,
+        k: usize,
+        n: usize,
+        payload: &[u8],
+        awq_scale: Option<Vec<f32>>,
+    ) -> Result<Self, XdnaError> {
+        if awq_scale.as_ref().is_some_and(|scale| scale.len() != k) {
+            return Err(invalid(format!("AWQ scale length must be K={k}")));
+        }
+        let encoding = OpusMatrixEncoding::classify(quant_type, payload.len(), k, n)?;
+        let groups = decode_opus_groups(encoding, payload, k, n)?
+            .into_iter()
+            .map(|decoded| OpusGroup {
+                resident_base: None,
+                resident_sparse: Vec::new(),
+                scales: decoded.scales,
+                base: decoded.base,
+                residual: decoded.residual,
+            })
+            .collect();
+        Ok(Self {
+            encoding,
+            groups,
+            awq_scale,
+            k,
+            n,
+            fullk_weights: None,
+            whole_weights: None,
+            whole_scaled_weights: None,
+        })
+    }
+
     pub fn encoding(&self) -> OpusMatrixEncoding {
         self.encoding
     }
@@ -160,6 +196,45 @@ impl OpusPackedMatrix {
     /// base once during upload, so overlay count never enters the dispatch API.
     pub fn group_dense_i8(&self, group: usize) -> Cow<'_, [i8]> {
         dense_group_i8(self.encoding, &self.groups[group])
+    }
+
+    /// CPU oracle for the integer activation transform and scaling contract
+    /// shared by projection kernels and resident fused operators.
+    pub fn reference_f32(&self, m: usize, x: &[f32]) -> Result<Vec<f32>, XdnaError> {
+        let mut output = vec![0.0f32; m * self.n];
+        validate_run_shapes(m, self.k, self.n, x, &output)?;
+        let prepared = prepare_activations(m, self.k, x, self.awq_scale.as_deref(), 1);
+        let groups = self
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.base.as_slice(),
+                    group.residual.as_slice(),
+                    group.scales.as_slice(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let n = self.n;
+        output
+            .par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(row, output_row)| {
+                for (group_idx, &(base, residual, scales)) in groups.iter().enumerate() {
+                    for (col, destination) in output_row.iter_mut().enumerate() {
+                        let dot: i32 = (0..GROUP)
+                            .map(|inner| {
+                                let activation =
+                                    prepared.groups[group_idx][row * GROUP + inner] as i32;
+                                let index = inner * n + col;
+                                activation * (base[index] as i32 + residual[index] as i32)
+                            })
+                            .sum();
+                        *destination += dot as f32 * prepared.scales[group_idx][row] * scales[col];
+                    }
+                }
+            });
+        Ok(output)
     }
 }
 
@@ -897,31 +972,7 @@ impl NpuOpusExecutor {
         m: usize,
         x: &[f32],
     ) -> Result<Vec<f32>, XdnaError> {
-        let mut output = vec![0.0f32; m * matrix.n];
-        validate_run_shapes(m, matrix.k, matrix.n, x, &output)?;
-        let prepared = prepare_activations(
-            m,
-            matrix.k,
-            x,
-            matrix.awq_scale.as_deref(),
-            self.rows_per_dispatch_for_matrix(matrix),
-        );
-        for (group_idx, group) in matrix.groups.iter().enumerate() {
-            for row in 0..m {
-                for col in 0..matrix.n {
-                    let dot: i32 = (0..GROUP)
-                        .map(|inner| {
-                            let activation = prepared.groups[group_idx][row * GROUP + inner] as i32;
-                            let index = inner * matrix.n + col;
-                            activation * (group.base[index] as i32 + group.residual[index] as i32)
-                        })
-                        .sum();
-                    output[row * matrix.n + col] +=
-                        dot as f32 * prepared.scales[group_idx][row] * group.scales[col];
-                }
-            }
-        }
-        Ok(output)
+        matrix.reference_f32(m, x)
     }
 }
 
@@ -1091,7 +1142,7 @@ fn decode_opus_groups(
         _ => {
             return Err(invalid(format!(
                 "block size {block_bytes} does not match {encoding:?}"
-            )))
+            )));
         }
     };
     let sparse_chunk_count = outlier_count.div_ceil(3);
@@ -1371,6 +1422,21 @@ mod tests {
             OpusMatrixEncoding::classify(34, 5 * 130, 1152, 1).unwrap(),
             OpusMatrixEncoding::W4
         );
+    }
+
+    #[test]
+    fn standalone_matrix_decodes_w8_for_resident_fused_upload() {
+        let mut payload = vec![0u8; 258];
+        payload[..2].copy_from_slice(&f32_to_f16(0.25).to_le_bytes());
+        payload[2] = (-7i8) as u8;
+        payload[257] = 11;
+        let matrix = OpusPackedMatrix::from_payload(35, 256, 1, &payload, None).unwrap();
+        assert_eq!(matrix.encoding(), OpusMatrixEncoding::W8);
+        assert_eq!(matrix.resident_mode(), OpusResidentMode::DenseW8);
+        assert_eq!(matrix.group_scales(0), &[0.25]);
+        let dense = matrix.group_dense_i8(0);
+        assert_eq!(dense[0], -7);
+        assert_eq!(dense[255], 11);
     }
 
     #[test]

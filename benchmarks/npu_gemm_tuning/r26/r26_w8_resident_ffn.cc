@@ -121,25 +121,91 @@ r26_geglu16(aie::vector<float, 16> gate, aie::vector<float, 16> up) {
 // unstable live-register 8-lane store attempted in R18.
 extern "C" __attribute__((noinline, minsize)) void
 r26_geglu_padded(const int32 *__restrict accumulator_bits,
+#ifdef R35_CANONICAL_BF16
+                 int8 *__restrict output_bytes) {
+  bfloat16 *output = reinterpret_cast<bfloat16 *>(output_bytes);
+#else
                  float *__restrict output) {
+#endif
   const float *accumulator = reinterpret_cast<const float *>(accumulator_bits);
   for (int im = 0; im < 3; im++)
     for (int row = 0; row < 8; row++) {
       const int j0 = (im * 3) * R26_SC + row * 16;
       const int j1 = (im * 3 + 1) * R26_SC + row * 16;
       const int j2 = (im * 3 + 2) * R26_SC + row * 16;
-      float *destination = output + (im * 8 + row) * 96;
+      auto *destination = output + (im * 8 + row) *
+#ifdef R35_CANONICAL_BF16
+                                      32;
+#else
+                                      96;
+#endif
+#ifdef R35_CANONICAL_BF16
+      const auto head_bf16 =
+          aie::mul(r26_geglu16(aie::load_v<16>(accumulator + j0),
+                               aie::load_v<16>(accumulator + j1)),
+                   1.0f)
+              .template to_vector<bfloat16>();
+      aie::store_v(destination, head_bf16);
+#else
       aie::store_v(destination,
                    r26_geglu16(aie::load_v<16>(accumulator + j0),
                                aie::load_v<16>(accumulator + j1)));
+#endif
       auto gate = aie::concat(aie::load_v<8>(accumulator + j2),
                               aie::zeros<float, 8>());
       auto up = aie::concat(aie::load_v<8>(accumulator + j2 + 8),
                             aie::zeros<float, 8>());
       auto tail = r26_geglu16(gate, up);
-      for (int lane = 0; lane < 8; lane++) destination[16 + lane] = tail[lane];
+#ifdef R35_CANONICAL_BF16
+      const auto tail_bf16 = aie::mul(tail, 1.0f).to_vector<bfloat16>();
+      const auto bridge = aie::concat(head_bf16.template extract<8>(1),
+                                      tail_bf16.template extract<8>(0));
+      aie::store_v(destination + 16, bridge);
+#else
+      for (int lane = 0; lane < 8; lane++)
+        destination[16 + lane] = tail[lane];
+#endif
+  }
+}
+
+#ifdef R35_CANONICAL_BF16
+extern "C" __attribute__((noinline, minsize)) void
+r35_finish_down48_bf16(const int32 *__restrict accumulator_bits,
+                       int8 *__restrict output_bytes, int lane) {
+  const float *accumulator = reinterpret_cast<const float *>(accumulator_bits);
+  bfloat16 *output = reinterpret_cast<bfloat16 *>(output_bytes);
+  for (int im = 0; im < 3; ++im)
+    for (int row = 0; row < 8; ++row) {
+      bfloat16 *destination = output + (im * 8 + row) * 32;
+      const int j0 = (im * 3) * R26_SC + row * 16;
+      const int j1 = (im * 3 + 1) * R26_SC + row * 16;
+      const int j2 = (im * 3 + 2) * R26_SC + row * 16;
+      if (lane == 0) {
+        const auto head =
+            aie::mul(aie::load_v<16>(accumulator + j0), 1.0f)
+                .template to_vector<bfloat16>();
+        const auto j1_values =
+            aie::mul(aie::load_v<16>(accumulator + j1), 1.0f)
+                .template to_vector<bfloat16>();
+        const auto bridge = aie::concat(head.template extract<8>(1),
+                                        j1_values.template extract<8>(0));
+        aie::store_v(destination, head);
+        aie::store_v(destination + 16, bridge);
+      } else {
+        const auto j1_values =
+            aie::mul(aie::load_v<16>(accumulator + j1), 1.0f)
+                .template to_vector<bfloat16>();
+        const auto j2_values =
+            aie::mul(aie::load_v<16>(accumulator + j2), 1.0f)
+                .template to_vector<bfloat16>();
+        const auto head = aie::concat(j1_values.template extract<8>(1),
+                                      j2_values.template extract<8>(0));
+        aie::store_v(destination, head);
+        aie::store_v(destination + 16, j2_values);
+      }
     }
 }
+#endif
 
 template <unsigned STRIDE>
 __attribute__((noinline)) static void r26_fwht16(float *__restrict scratch) {
@@ -153,7 +219,12 @@ __attribute__((noinline)) static void r26_fwht16(float *__restrict scratch) {
   }
 }
 
-static void r26_pack_row(const float *__restrict input,
+static void r26_pack_row(
+#ifdef R35_CANONICAL_BF16
+                         const int8 *__restrict input_bytes,
+#else
+                         const float *__restrict input,
+#endif
                          const int8 *__restrict weight_payload,
                          int8 *__restrict quantized, float *__restrict scratch,
                          float &scale) {
@@ -163,9 +234,19 @@ static void r26_pack_row(const float *__restrict input,
   const float *signs1 = awq + R26_GROUP;
   const float *signs2 = signs1 + R26_GROUP;
   for (int i = 0; i < R26_GROUP; i += 16) {
+#ifdef R35_CANONICAL_BF16
+    aie::vector<float, 16> input =
+        aie::mul(aie::load_unaligned_v<16>(
+                     reinterpret_cast<const bfloat16 *>(input_bytes) + i),
+                 aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+            .template to_vector<float>();
+    auto divided = aie::div(input, aie::load_v<16>(awq + i))
+                       .template to_vector<float>();
+#else
     auto divided = aie::div(aie::load_unaligned_v<16>(input + i),
                             aie::load_v<16>(awq + i))
                        .template to_vector<float>();
+#endif
     aie::store_v(scratch + i,
                  aie::mul(divided, aie::load_v<16>(signs1 + i))
                      .template to_vector<float>());
@@ -215,13 +296,25 @@ r26_pack3(const int8 *__restrict input_bytes,
           int8 *__restrict activation_payload, float *__restrict scratch,
           int8 *__restrict fragment, int owner, int group) {
   (void)activation_payload;
+#ifdef R35_CANONICAL_BF16
+  (void)group;
+  const int8 *owned = input_bytes + owner * R26_FRAGMENT_ROWS * R26_GROUP * 2;
+  constexpr int ROW_BYTES = R26_GROUP * 2;
+#else
   const float *input = reinterpret_cast<const float *>(input_bytes);
   constexpr int ROW_WINDOW = 288;
   const int skip = (group * R26_GROUP) % 24;
   const float *owned = input + (owner & 1) * R26_FRAGMENT_ROWS * ROW_WINDOW;
+#endif
   float *scales = reinterpret_cast<float *>(fragment + 3 * R26_GROUP);
   for (int row = 0; row < R26_FRAGMENT_ROWS; row++)
-    r26_pack_row(owned + row * ROW_WINDOW + skip, weight_payload,
+    r26_pack_row(
+#ifdef R35_CANONICAL_BF16
+                 owned + row * ROW_BYTES,
+#else
+                 owned + row * ROW_WINDOW + skip,
+#endif
+                 weight_payload,
                  fragment + row * R26_GROUP, scratch, scales[row]);
   reinterpret_cast<int *>(fragment)[R26_FRAGMENT_WORDS - 1] = 0;
 }

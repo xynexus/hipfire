@@ -222,7 +222,9 @@ pub use resident_ffn::{NpuResidentFfnW4, NpuResidentFfnW4Weights};
 #[cfg(target_os = "linux")]
 pub mod resident_ffn_w8;
 #[cfg(target_os = "linux")]
-pub use resident_ffn_w8::{NpuResidentFfnDenseW8, NpuResidentFfnDenseW8Weights};
+pub use resident_ffn_w8::{
+    NpuResidentFfnDenseW8, NpuResidentFfnDenseW8IoMode, NpuResidentFfnDenseW8Weights,
+};
 
 #[cfg(target_os = "linux")]
 pub mod resident_attention_w8;

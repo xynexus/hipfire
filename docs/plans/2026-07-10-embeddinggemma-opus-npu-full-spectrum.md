@@ -1273,3 +1273,52 @@ the next step must consume the resident three-block BF16 activation directly in
 the FFN. Both core images are now nearly full, so FFN compute must replace
 diagnostic and phase-specific routines or use a separate role image/context;
 simply appending FFN code cannot fit.
+
+### R35 canonical-BF16 resident dense-W8 FFN checkpoint
+
+R35 admits a second-context FFN image that consumes token-major BF16 instead of
+R26's 7,962,624-byte GPU-prepacked activation representation. Its logical input
+is M256-by-768 BF16, physically padded to 288 rows so every 24-row DMA stripe is
+in bounds. Each memory-tile row broadcasts one 24-by-256 BF16 group to all eight
+cores. Every core quantizes its three owned rows with the existing AWQ/signed-
+FWHT contract, exchanges the eight fragments through the proven ring, and uses
+the resident dense-int8 gate/up and down kernels. The external output is compact
+token-major BF16 with 288 physical rows and 256 logical rows.
+
+The resident Rust executor selects this ABI from
+`mode=dense-w8-canonical-bf16` plus `input=token-major-bf16` in `shape.txt`.
+Legacy R26 geometry and raw generated MLIR remain byte-identical. A new
+format-independent `OpusPackedMatrix::from_payload` path lets fused residents
+decode OQ8 or compact mixed Opus groups without allocating a standalone
+projection context; compact mixed groups still expand once at resident upload.
+The down-weight stream changes only for this ABI, from R26's
+`mblock,group,nmacro` order to `mblock,nmacro,group`.
+
+Two hardware details were required for correctness. First, a 48-byte innermost
+DMA row delivered only one 32-byte beat. Each local 24-column output is now
+encoded as two 32-byte beats: columns 0-15 followed by duplicated columns 8-15
+and columns 16-23. A three-dimensional DMA scatter overlaps the beats by 16
+bytes and reconstructs the compact 48-byte destination row. The same scheme is
+used for GeGLU and both 24-column halves of each 48-column down macro. Second,
+the internal GeGLU tensor uses a 1,280-BF16 physical row stride. Its first 1,152
+values are logical and its final 128 values remain zero, preventing down K group
+4 from spilling into the next token row.
+
+The clean synthetic OQ8 hardware oracle covers every one of the 256-by-768 final
+values and BF16-rounds both resident handoffs. It reaches cosine `0.99984681`,
+maximum absolute error `0.0048828`, and mean absolute error `0.00072746`.
+The retained GeGLU intermediate independently reaches cosine `0.99990001` and
+maximum absolute error `0.0156250`. A 20-run process averages `10.2844 ms` per
+executor call, including canonical host-buffer fill/synchronization, the AIE
+command, output synchronization, and BF16 readback. This is approximately
+24,891 M256 FFN input rows/s for this isolated stage, not an end-to-end model
+throughput claim. Each core image uses 14,908 bytes of program text.
+
+R35 is a correctness and ABI checkpoint, not the complete layer. R34 still
+retains its normalized 768-wide activation in tile-local memory and R35 still
+receives a host-visible argument buffer in a separate context. The next step is
+to replace R34's diagnostic drain with a full canonical BF16 handoff, then
+measure the two-context layer boundary before deciding whether context fusion or
+an explicit zero-copy shared buffer is necessary. Full model execution, generic
+OQ4/mixed/OQ8 +/++ admission, the 10k/15k end-to-end target, and package
+tokens/joule remain open.
