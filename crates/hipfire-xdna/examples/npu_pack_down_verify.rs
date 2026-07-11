@@ -1,4 +1,4 @@
-//! Hardware parity and timing for the R21 vector-pack + W4 down projection.
+//! Hardware parity and timing for combined vector-pack + W4/W8 down projection.
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,18 +15,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const COLS: usize = 8;
     const ROW_STRIPES: usize = 4;
     const ROWS_PER_STRIPE: usize = 24;
-    const OUTBLOCKS: usize = 3;
-    const XBLOCKS: usize = OUTBLOCKS * GROUPS * ROWS_PER_STRIPE;
-    const WBLOCKS: usize = OUTBLOCKS * GROUPS;
     const WB: usize = 16384;
     const W_DATA: usize = 12288;
-    const PARAM_OFFSET: usize = W_DATA + 96 * size_of::<f32>();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !(1..=2).contains(&args.len()) {
         return Err("usage: npu_pack_down_verify CACHE [ITERS]".into());
     }
     let iterations = args.get(1).map(|v| v.parse()).transpose()?.unwrap_or(20);
+    let shape = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
+    let w8 = shape.lines().any(|line| line == "mode=w8");
+    let (outblocks, n_macros, cols_stripe, ln, inner_k) = if w8 {
+        (6, 2, 48, 3, 8)
+    } else {
+        (3, 1, 96, 6, 16)
+    };
+    let xblocks = (outblocks / n_macros) * GROUPS * ROWS_PER_STRIPE;
+    let wblocks = outblocks * GROUPS;
+    let param_offset = W_DATA + cols_stripe * size_of::<f32>();
 
     let mut input = vec![0.0f32; PAD_M * PAD_K];
     for row in 0..M {
@@ -61,17 +67,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let xclbin = std::fs::read(format!("{}/final.xclbin", args[0]))?;
     let insts = std::fs::read(format!("{}/insts.bin", args[0]))?;
     let kernel = NpuKernel::load(&xclbin, &insts)?;
-    let mut x = kernel.alloc_arg(ROW_STRIPES * XBLOCKS * GROUP * size_of::<f32>())?;
-    let mut w = kernel.alloc_arg(COLS * WBLOCKS * WB)?;
+    let mut x = kernel.alloc_arg(ROW_STRIPES * xblocks * GROUP * size_of::<f32>())?;
+    let mut w = kernel.alloc_arg(COLS * wblocks * WB)?;
     let c = kernel.alloc_arg(PAD_M * N * size_of::<f32>())?;
 
     for stripe in 0..ROW_STRIPES {
-        for outblock in 0..OUTBLOCKS {
+        for m_macro in 0..outblocks / n_macros {
             for group in 0..GROUPS {
                 for local_row in 0..ROWS_PER_STRIPE {
-                    let row = outblock * 96 + stripe * ROWS_PER_STRIPE + local_row;
-                    let block = (outblock * GROUPS + group) * ROWS_PER_STRIPE + local_row;
-                    let destination = (stripe * XBLOCKS + block) * GROUP * size_of::<f32>();
+                    let row = m_macro * 96 + stripe * ROWS_PER_STRIPE + local_row;
+                    let block = (m_macro * GROUPS + group) * ROWS_PER_STRIPE + local_row;
+                    let destination = (stripe * xblocks + block) * GROUP * size_of::<f32>();
                     let source = row * PAD_K + group * GROUP;
                     x.as_mut_slice()[destination..destination + GROUP * size_of::<f32>()]
                         .copy_from_slice(unsafe { as_bytes(&input[source..source + GROUP]) });
@@ -82,26 +88,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     w.as_mut_slice().fill(0);
     for stripe in 0..COLS {
-        for outblock in 0..OUTBLOCKS {
+        for outblock in 0..outblocks {
+            let m_macro = outblock / n_macros;
+            let n_macro = outblock % n_macros;
             for group in 0..GROUPS {
-                let block = outblock * GROUPS + group;
-                let base = (stripe * WBLOCKS + block) * WB;
-                for ln in 0..6 {
-                    for kt in 0..16 {
-                        for kk in 0..16 {
+                let block = (m_macro * GROUPS + group) * n_macros + n_macro;
+                let base = (stripe * wblocks + block) * WB;
+                for ln_index in 0..ln {
+                    for kt in 0..GROUP / inner_k {
+                        for kk in 0..inner_k {
                             for nn in 0..16 {
-                                let col = stripe * 96 + ln * 16 + nn;
-                                let value = weights[group][(kt * 16 + kk) * N + col];
-                                let index = (ln * 16 + kt) * 256 + kk * 16 + nn;
-                                let nibble = (value & 0x0f) as u8;
-                                w.as_mut_slice()[base + index / 2] |=
-                                    if index % 2 == 0 { nibble } else { nibble << 4 };
+                                let col = n_macro * COLS * cols_stripe
+                                    + stripe * cols_stripe
+                                    + ln_index * 16
+                                    + nn;
+                                let value = weights[group][(kt * inner_k + kk) * N + col];
+                                if w8 {
+                                    let index = (ln_index * 32 + kt) * 128
+                                        + (nn / 8) * 64
+                                        + kk * 8
+                                        + nn % 8;
+                                    w.as_mut_slice()[base + index] = value as u8;
+                                } else {
+                                    let index = (ln_index * 16 + kt) * 256 + kk * 16 + nn;
+                                    let nibble = (value & 0x0f) as u8;
+                                    w.as_mut_slice()[base + index / 2] |=
+                                        if index % 2 == 0 { nibble } else { nibble << 4 };
+                                }
                             }
                         }
                     }
                 }
-                for local_col in 0..96 {
-                    let col = stripe * 96 + local_col;
+                for local_col in 0..cols_stripe {
+                    let col = n_macro * COLS * cols_stripe + stripe * cols_stripe + local_col;
                     let offset = base + W_DATA + local_col * size_of::<f32>();
                     w.as_mut_slice()[offset..offset + 4]
                         .copy_from_slice(&weight_scales[group][col].to_ne_bytes());
@@ -110,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 params.extend_from_slice(&awq[group * GROUP..(group + 1) * GROUP]);
                 params.extend_from_slice(&signs1);
                 params.extend_from_slice(&signs2);
-                w.as_mut_slice()[base + PARAM_OFFSET..base + PARAM_OFFSET + 3 * GROUP * 4]
+                w.as_mut_slice()[base + param_offset..base + param_offset + 3 * GROUP * 4]
                     .copy_from_slice(unsafe { as_bytes(&params) });
             }
         }
@@ -152,9 +171,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let nonzero = output.iter().filter(|&&value| value != 0.0).count();
         eprintln!("nonzero physical outputs: {nonzero}/{}", output.len());
         eprintln!("first physical outputs: {:?}", &output[..16]);
-        return Err(
-            format!("R21 parity failed: mismatches={mismatches} max_abs={max_abs:.7}").into(),
-        );
+        return Err(format!(
+            "combined pack/down parity failed: mismatches={mismatches} max_abs={max_abs:.7}"
+        )
+        .into());
     }
 
     for _ in 0..3 {
@@ -165,8 +185,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         kernel.dispatch_synced(&[&x, &w, &c], &[false, false, true])?;
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
+    let mode = if w8 { "W8" } else { "W4" };
     println!(
-        "vector-pack-down-W4 M={M} K={K} padded_K={PAD_K} N={N}: mismatches=0 max_abs={max_abs:.7} dispatch_ms={dispatch_ms:.4}"
+        "vector-pack-down-{mode} M={M} K={K} padded_K={PAD_K} N={N}: mismatches=0 max_abs={max_abs:.7} dispatch_ms={dispatch_ms:.4}"
     );
     Ok(())
 }

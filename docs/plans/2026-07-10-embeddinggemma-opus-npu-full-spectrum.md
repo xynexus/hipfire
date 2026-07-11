@@ -548,3 +548,25 @@ ms median. This is still a combined pack/down projection rather than a complete
 FFN: R22 consumes a host-arranged group stream instead of R18's in-array GeGLU
 output, and W8, arbitrary mixed overlays, attention, full-model 10k/15k
 admission, and package tokens/J remain open.
+
+### W8 combined pack-to-down checkpoint
+
+R23 applies R22's exact three-row vector pack and acyclic token broadcasts to
+the W8 down projection. W8 uses `LM=3`, `MR=8`, 48 columns per compute column,
+and two N-macros for `N=768`. Linking the original separate W8 init/accumulate
+functions with the packer overflowed 128 KiB program memory, so R23 uses one
+compact MMUL body with a runtime accumulate flag.
+
+The first correct W8 schedule repeated packing and broadcasts for both
+N-macros and measured 3.8961 ms. Replacing byte-at-a-time physical activation
+insertion with aligned 32-bit copies reduced that to 1.6915 ms. The admitted
+schedule retains each complete activation block and applies both N-macro weight
+blocks into two output FIFO slots, packing and broadcasting each group once.
+
+Three independent 100-iteration M256 runs agree with the CPU oracle for all
+196,608 outputs, with maximum absolute error `1.4e-6`. Dispatches are 1.1953,
+1.2100, and 0.9956 ms (median 1.1953 ms). The shared generator rebuilds R22 W4
+with exact parity at 1.0052 ms in a 20-iteration regression run. R23 is combined
+OQ8 preprocessing/down evidence, not a complete FFN: R18-to-R23 in-array GeGLU
+streaming, arbitrary mixed overlays, attention, full-model 10k/15k admission,
+and package tokens/J remain open.
