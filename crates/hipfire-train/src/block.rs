@@ -104,6 +104,7 @@ pub fn block_forward(
     lora: &BlockLora,
     dims: &BlockDims,
     pos_host: &[f32],
+    layer_idx: usize,
 ) -> HipResult<(GpuTensor, BlockActivations)> {
     let (seq, h, inter) = (dims.seq, dims.h, dims.inter);
     let (qd, kvd, r) = (dims.q_dim(), dims.kv_dim(), dims.lora_rank);
@@ -188,6 +189,11 @@ pub fn block_forward(
         kvd,
         dims.head_dim,
     )?;
+
+    // Static rank-r latent-KV sim (forward-only STE) on post-RoPE K and V —
+    // no-op unless calibrated projectors are installed. See crate::latent_kv.
+    let (k_r, v) =
+        crate::latent_kv::maybe_project(layer_idx, gpu, k_r, v, seq, kvd, dims.head_dim)?;
 
     // attention
     let p_all = gpu.zeros(&[dims.n_heads * seq * seq], DType::F32)?;

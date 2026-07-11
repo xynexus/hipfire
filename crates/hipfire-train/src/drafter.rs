@@ -380,7 +380,7 @@ pub fn drafter_forward_train(
     for (lw, ll) in &d.layers {
         layer_inputs.push(clone_tensor(gpu, &x)?);
         let (bw, bl) = block_views(lw, ll);
-        let (x_out, acts) = block_forward(gpu, &x, &bw, &bl, &d.dims, pos_host)?;
+        let (x_out, acts) = block_forward(gpu, &x, &bw, &bl, &d.dims, pos_host, 0)?;
         layer_acts.push(acts);
         x = x_out;
     }
@@ -583,7 +583,7 @@ pub fn drafter_forward(
             av: &ll.av,
             bv: &ll.bv,
         };
-        let (x_out, acts) = block_forward(gpu, &x, &bw, &bl, &d.dims, pos_host)?;
+        let (x_out, acts) = block_forward(gpu, &x, &bw, &bl, &d.dims, pos_host, 0)?;
         last_k = Some(acts.k_r);
         x = x_out;
     }

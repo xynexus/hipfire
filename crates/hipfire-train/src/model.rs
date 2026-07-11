@@ -348,6 +348,7 @@ pub fn model_block_activations(
             &ll.as_block(),
             &model.dims,
             pos_host,
+            i,
         )?;
         out.push(acts);
         x = x_out;
@@ -384,7 +385,7 @@ pub fn model_forward(
     let mut layer_inputs = Vec::with_capacity(model.layers.len());
     let mut layer_acts = Vec::with_capacity(model.layers.len());
     let mut x = x0;
-    for (lw, ll) in &model.layers {
+    for (i, (lw, ll)) in model.layers.iter().enumerate() {
         layer_inputs.push(clone_tensor(gpu, &x)?);
         let (x_out, acts) = block_forward(
             gpu,
@@ -393,6 +394,7 @@ pub fn model_forward(
             &ll.as_block(),
             &model.dims,
             pos_host,
+            i,
         )?;
         layer_acts.push(acts);
         x = x_out;
