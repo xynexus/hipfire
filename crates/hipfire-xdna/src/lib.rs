@@ -165,6 +165,11 @@ pub mod embedding_attention;
 pub use embedding_attention::EmbeddingGemmaAttentionLayout;
 
 #[cfg(target_os = "linux")]
+pub mod attention_output_bf16;
+#[cfg(target_os = "linux")]
+pub use attention_output_bf16::{NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights};
+
+#[cfg(target_os = "linux")]
 pub mod geglu;
 #[cfg(target_os = "linux")]
 pub use geglu::NpuGeGlu;

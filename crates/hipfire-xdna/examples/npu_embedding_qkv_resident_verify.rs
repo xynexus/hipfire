@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const K: usize = 768;
     const N: usize = 1280;
     const GROUPS: usize = 3;
-    const W_BYTES: usize = 8 * 45 * 16384;
+    const QKV_W_BYTES: usize = 8 * 45 * 16384;
     const EPSILON: f32 = 1.0e-6;
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -24,22 +24,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("R29 verifier needs at least one iteration".into());
     }
     let manifest = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
-    let attention = manifest
+    let output_projection = manifest
         .lines()
-        .any(|line| line == "op=resident-qkv-attention");
-    let operation = if attention {
+        .any(|line| line == "op=resident-qkv-attention-o");
+    let packed_attention = manifest
+        .lines()
+        .any(|line| line == "op=resident-qkv-attention-packed");
+    let attention = output_projection
+        || packed_attention
+        || manifest
+            .lines()
+            .any(|line| line == "op=resident-qkv-attention");
+    let operation = if output_projection {
+        "op=resident-qkv-attention-o"
+    } else if packed_attention {
+        "op=resident-qkv-attention-packed"
+    } else if attention {
         "op=resident-qkv-attention"
     } else {
         "op=resident-qkv-headnorm-rope-pack"
     };
-    for field in [
-        operation,
-        "mode=w8-scaled",
-        "m=256",
-        "k=768",
-        "n=1280",
-        "roles=q0,q1,q2,k,v",
-    ] {
+    let mode = if output_projection {
+        "mode=w8-qkv-bf16-o"
+    } else {
+        "mode=w8-scaled"
+    };
+    let roles = if output_projection {
+        "roles=q0,q1,q2,k,v,o"
+    } else {
+        "roles=q0,q1,q2,k,v"
+    };
+    for field in [operation, mode, "m=256", "k=768", "n=1280", roles] {
         if !manifest.lines().any(|line| line == field) {
             return Err(format!("R29 cache missing {field}").into());
         }
@@ -47,7 +62,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pair_bytes = if attention { 16384 } else { 10240 };
     let a_bytes = 4 * 45 * pair_bytes;
     let r_stage_bytes = 5 * 48 * pair_bytes;
-    let r_bytes = r_stage_bytes + if attention { Layout::OUTPUT_BYTES } else { 0 };
+    let r_bytes = r_stage_bytes
+        + if attention { Layout::OUTPUT_BYTES } else { 0 }
+        + if output_projection {
+            Layout::OUTPUT_BYTES
+        } else {
+            0
+        };
+    let w_bytes = QKV_W_BYTES + if output_projection { 4 * 18 * 16384 } else { 0 };
 
     let activations = (0..Layout::TOKENS * K)
         .map(|index| (((index * 17 + index / 29) % 15) as i8) - 7)
@@ -76,11 +98,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let projected = cpu_projection(&activations, &activation_scales, &weights, &weight_scales);
 
     let packed_a = pack_activations(&activations, &activation_scales, pair_bytes);
-    let packed_w = pack_weights(&weights, &weight_scales);
-    let mut staged_r = stage_positions_and_params(&cs, &qnorm, &knorm, EPSILON, pair_bytes);
+    let output_weights = output_projection_weights();
+    let mut packed_w = pack_weights(&weights, &weight_scales);
+    if output_projection {
+        packed_w.extend_from_slice(&pack_output_projection(&output_weights));
+    }
+    let raw_staging = stage_positions_and_params(&cs, &qnorm, &knorm, EPSILON, pair_bytes);
+    let raw_base = if packed_attention {
+        Layout::OUTPUT_BYTES
+    } else {
+        0
+    };
+    let mut staged_r = vec![0u8; raw_base];
+    staged_r.extend_from_slice(&raw_staging);
     staged_r.resize(r_bytes, 0);
     assert_eq!(packed_a.len(), a_bytes);
-    assert_eq!(packed_w.len(), W_BYTES);
+    assert_eq!(packed_w.len(), w_bytes);
     assert_eq!(staged_r.len(), r_bytes);
 
     let kernel = NpuKernel::load(
@@ -88,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &std::fs::read(format!("{}/insts.bin", args[0]))?,
     )?;
     let mut a_buffer = kernel.alloc_arg(a_bytes)?;
-    let mut w_buffer = kernel.alloc_arg(W_BYTES)?;
+    let mut w_buffer = kernel.alloc_arg(w_bytes)?;
     let mut r_buffer = kernel.alloc_arg(r_bytes)?;
     let mut q_buffer = kernel.alloc_arg(Layout::Q_BYTES)?;
     let mut kv_buffer = kernel.alloc_arg(Layout::KV_BYTES)?;
@@ -101,6 +134,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dispatch_resident(
         &kernel, &a_buffer, &w_buffer, &r_buffer, &q_buffer, &kv_buffer, true,
     )?;
+    if output_projection || packed_attention {
+        kernel.sync_output(&r_buffer)?;
+        let attention_region = if packed_attention {
+            &r_buffer.as_slice()[..Layout::OUTPUT_BYTES]
+        } else {
+            &r_buffer.as_slice()[r_stage_bytes..r_stage_bytes + Layout::OUTPUT_BYTES]
+        };
+        let prime_output_nonzero = if output_projection {
+            r_buffer.as_slice()
+                [r_stage_bytes + Layout::OUTPUT_BYTES..r_stage_bytes + 2 * Layout::OUTPUT_BYTES]
+                .iter()
+                .filter(|&&byte| byte != 0)
+                .count()
+        } else {
+            0
+        };
+        eprintln!(
+            "R31 prime tails: attention_nonzero={} output_nonzero={}",
+            attention_region.iter().filter(|&&byte| byte != 0).count(),
+            prime_output_nonzero,
+        );
+    }
     r_buffer.as_mut_slice().copy_from_slice(&staged_r);
     q_buffer.as_mut_slice().fill(0);
     kv_buffer.as_mut_slice().fill(0);
@@ -114,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     kernel.sync_output(&q_buffer)?;
     kernel.sync_output(&kv_buffer)?;
 
-    let projected_got = read_projected(r_buffer.as_slice(), pair_bytes);
+    let projected_got = read_projected(&r_buffer.as_slice()[raw_base..], pair_bytes);
     let q_got = read_q(q_buffer.as_slice());
     let k_got = read_kv(kv_buffer.as_slice(), true);
     let v_got = read_kv(kv_buffer.as_slice(), false);
@@ -151,18 +206,106 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    let attention_reference_values = attention_reference(&q_got, &k_got, &v_got);
     let attention_metrics = if attention {
-        let got = unpack_attention(&r_buffer.as_slice()[r_stage_bytes..])?;
-        let reference = attention_reference(&q_got, &k_got, &v_got);
-        let measured = metrics(&got, &reference);
+        let got = if packed_attention {
+            unpack_projection_attention(&r_buffer.as_slice()[..Layout::OUTPUT_BYTES])
+        } else {
+            unpack_attention(
+                &r_buffer.as_slice()[r_stage_bytes..r_stage_bytes + Layout::OUTPUT_BYTES],
+            )?
+        };
+        let measured = metrics(&got, &attention_reference_values);
         if !measured.0.is_finite() || measured.0 < 0.998 || measured.1 > 0.04 {
-            return Err(format!("R30 attention parity failed: {measured:?}").into());
+            let physical = if packed_attention {
+                &r_buffer.as_slice()[..Layout::OUTPUT_BYTES]
+            } else {
+                &r_buffer.as_slice()[r_stage_bytes..r_stage_bytes + Layout::OUTPUT_BYTES]
+            };
+            let output_nonzero = if output_projection {
+                r_buffer.as_slice()
+                    [r_stage_bytes + Layout::OUTPUT_BYTES..r_stage_bytes + 2 * Layout::OUTPUT_BYTES]
+                    .iter()
+                    .filter(|&&byte| byte != 0)
+                    .count()
+            } else {
+                0
+            };
+            return Err(format!(
+                "R30 attention parity failed: {measured:?}; attention_nonzero={} output_nonzero={output_nonzero}",
+                physical.iter().filter(|&&byte| byte != 0).count()
+            )
+            .into());
         }
         Some(measured)
     } else {
         None
     };
-    let runtime_metrics = if attention {
+    let output_reference =
+        output_projection_reference(&attention_reference_values, &output_weights);
+    let output_metrics = if output_projection {
+        let got = r_buffer.as_slice()
+            [r_stage_bytes + Layout::OUTPUT_BYTES..r_stage_bytes + 2 * Layout::OUTPUT_BYTES]
+            .chunks_exact(2)
+            .map(|pair| {
+                hipfire_primitives::conv::bf16_bits_to_f32(u16::from_le_bytes([pair[0], pair[1]]))
+            })
+            .collect::<Vec<_>>();
+        let measured = metrics(&got, &output_reference);
+        if !measured.0.is_finite() || measured.0 < 0.998 || measured.1 > 0.04 {
+            return Err(format!("R31 output projection parity failed: {measured:?}").into());
+        }
+        Some(measured)
+    } else {
+        None
+    };
+    let mut chained_output_dispatch_ms = None;
+    let chained_output_metrics = if attention && !output_projection {
+        if let Ok(cache) = std::env::var("HIPFIRE_R31_O_CACHE") {
+            let mut output_executor = hipfire_xdna::NpuAttentionOutputBf16::load_cached(&cache)?;
+            let output_weights = output_executor.upload_bf16(&output_weights)?;
+            let packed = if packed_attention {
+                r_buffer.as_slice()[..Layout::OUTPUT_BYTES].to_vec()
+            } else {
+                pack_attention_for_output_projection(
+                    &r_buffer.as_slice()[r_stage_bytes..r_stage_bytes + Layout::OUTPUT_BYTES],
+                )
+            };
+            output_executor.set_input(&packed)?;
+            output_executor.run(&output_weights)?;
+            let got = output_executor.read_output_f32()?;
+            let measured = metrics(&got, &output_reference);
+            if !measured.0.is_finite() || measured.0 < 0.998 || measured.1 > 0.04 {
+                return Err(format!(
+                    "R31 chained output parity failed: {measured:?}; nonzero={} got={:?} ref={:?}",
+                    got.iter().filter(|&&value| value != 0.0).count(),
+                    &got[..8],
+                    &output_reference[..8]
+                )
+                .into());
+            }
+            let output_iterations = std::env::var("HIPFIRE_R31_O_ITERS")
+                .ok()
+                .map(|value| value.parse::<usize>())
+                .transpose()?
+                .unwrap_or(20);
+            if output_iterations == 0 {
+                return Err("HIPFIRE_R31_O_ITERS must be non-zero".into());
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..output_iterations {
+                output_executor.run(&output_weights)?;
+            }
+            chained_output_dispatch_ms =
+                Some(started.elapsed().as_secs_f64() * 1e3 / output_iterations as f64);
+            Some(measured)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let runtime_metrics = if attention && !packed_attention && !output_projection {
         let mut resident = hipfire_xdna::NpuResidentAttentionDenseW8::load_cached(&args[0])?;
         let group_refs = weights.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let scale_refs = weight_scales.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -186,8 +329,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         resident.set_prepacked_input(&resident_input)?;
         resident.run_shared_to_device(&resident_weights)?;
         let got = resident.read_output_f32(&resident_weights)?;
-        let reference = attention_reference(&q_got, &k_got, &v_got);
-        let measured = metrics(&got, &reference);
+        let measured = metrics(&got, &attention_reference_values);
         if !measured.0.is_finite() || measured.0 < 0.998 || measured.1 > 0.04 {
             return Err(format!("resident runtime attention parity failed: {measured:?}").into());
         }
@@ -203,9 +345,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
-    if let (Some(attention), Some(runtime)) = (attention_metrics, runtime_metrics) {
+    if let (Some(attention), Some(output), Some(runtime)) =
+        (attention_metrics, output_metrics, runtime_metrics)
+    {
         println!(
-            "resident-w8-qkv-attention M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} attention_cosine={:.8} attention_max={:.7} runtime_cosine={:.8} runtime_max={:.7} dispatch_ms={dispatch_ms:.4}",
+            "resident-w8-qkv-attention-o M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} attention_cosine={:.8} attention_max={:.7} output_cosine={:.8} output_max={:.7} runtime_cosine={:.8} runtime_max={:.7} dispatch_ms={dispatch_ms:.4}",
             projection.0,
             projection.1,
             q.0,
@@ -214,8 +358,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             k.1,
             attention.0,
             attention.1,
+            output.0,
+            output.1,
             runtime.0,
             runtime.1,
+        );
+    } else if let (Some(attention), Some(runtime)) = (attention_metrics, runtime_metrics) {
+        println!(
+            "resident-w8-qkv-attention M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} attention_cosine={:.8} attention_max={:.7} chained_output={:?} chained_output_ms={:?} runtime_cosine={:.8} runtime_max={:.7} dispatch_ms={dispatch_ms:.4}",
+            projection.0,
+            projection.1,
+            q.0,
+            q.1,
+            k.0,
+            k.1,
+            attention.0,
+            attention.1,
+            chained_output_metrics,
+            chained_output_dispatch_ms,
+            runtime.0,
+            runtime.1,
+        );
+    } else if let (Some(attention), Some(chained)) = (attention_metrics, chained_output_metrics) {
+        println!(
+            "resident-w8-qkv-attention-packed M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} attention_cosine={:.8} attention_max={:.7} chained_output_cosine={:.8} chained_output_max={:.7} chained_output_ms={:?} dispatch_ms={dispatch_ms:.4}",
+            projection.0,
+            projection.1,
+            q.0,
+            q.1,
+            k.0,
+            k.1,
+            attention.0,
+            attention.1,
+            chained.0,
+            chained.1,
+            chained_output_dispatch_ms,
         );
     } else {
         println!(
@@ -253,6 +430,32 @@ fn unpack_attention(bytes: &[u8]) -> Result<Vec<f32>, Box<dyn std::error::Error>
 }
 
 #[cfg(target_os = "linux")]
+fn unpack_projection_attention(bytes: &[u8]) -> Vec<f32> {
+    let mut output = vec![0.0f32; 3 * 256 * 256];
+    for head in 0..3 {
+        for token in 0..256 {
+            let linear = head * 256 + token;
+            let group = linear / 128;
+            let remainder = linear % 128;
+            let core = remainder / 4;
+            let core_row = core / 8;
+            let col = core % 8;
+            let query = remainder % 4;
+            let block = (group * 4 + core_row) * 16384;
+            for dim in 0..256 {
+                let offset = block + col * 2048 + (dim / 8 * 4 + query) * 16 + dim % 8 * 2;
+                output[(head * 256 + token) * 256 + dim] =
+                    hipfire_primitives::conv::bf16_bits_to_f32(u16::from_le_bytes([
+                        bytes[offset],
+                        bytes[offset + 1],
+                    ]));
+            }
+        }
+    }
+    output
+}
+
+#[cfg(target_os = "linux")]
 fn attention_reference(q: &[f32], k: &[f32], v: &[f32]) -> Vec<f32> {
     let mut output = vec![0.0f32; q.len()];
     let mut scores = vec![0.0f32; 256];
@@ -283,6 +486,81 @@ fn attention_reference(q: &[f32], k: &[f32], v: &[f32]) -> Vec<f32> {
                     destination[dim] += probability * v[key * 256 + dim];
                 }
             }
+        }
+    }
+    output
+}
+
+#[cfg(target_os = "linux")]
+fn output_projection_weights() -> Vec<u16> {
+    let mut weights = vec![0u16; 768 * 768];
+    for index in 0..768 {
+        weights[index * 768 + index] =
+            hipfire_primitives::conv::f32_to_bf16_bits(0.5 + (index % 17) as f32 * 0.01);
+    }
+    weights
+}
+
+#[cfg(target_os = "linux")]
+fn pack_output_projection(weights: &[u16]) -> Vec<u8> {
+    const BLOCK: usize = 16384;
+    let mut packed = vec![0u8; 4 * 18 * BLOCK];
+    for active_col in 0..4 {
+        for slice in 0..6 {
+            let column_base = active_col * 192 + slice * 32;
+            for group in 0..3 {
+                let block = (active_col * 18 + slice * 3 + group) * BLOCK;
+                for nt in 0..4 {
+                    for kt in 0..32 {
+                        for kk in 0..8 {
+                            for nn in 0..8 {
+                                let k = group * 256 + kt * 8 + kk;
+                                let n = column_base + nt * 8 + nn;
+                                let target = block + ((nt * 32 + kt) * 64 + kk * 8 + nn) * 2;
+                                packed[target..target + 2]
+                                    .copy_from_slice(&weights[k * 768 + n].to_le_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    packed
+}
+
+#[cfg(target_os = "linux")]
+fn pack_attention_for_output_projection(physical: &[u8]) -> Vec<u8> {
+    let mut packed = vec![0u8; 6 * 4 * 16384];
+    for group in 0..6 {
+        for core_row in 0..4 {
+            let block = (group * 4 + core_row) * 16384;
+            for col in 0..8 {
+                for query in 0..4 {
+                    for dim in 0..256 {
+                        let source =
+                            (col * 6 + group) * 8192 + core_row * 2048 + query * 512 + dim * 2;
+                        let target = block + col * 2048 + (dim / 8 * 4 + query) * 16 + dim % 8 * 2;
+                        packed[target..target + 2].copy_from_slice(&physical[source..source + 2]);
+                    }
+                }
+            }
+        }
+    }
+    packed
+}
+
+#[cfg(target_os = "linux")]
+fn output_projection_reference(attention_head_major: &[f32], weights: &[u16]) -> Vec<f32> {
+    use hipfire_primitives::conv::{bf16_bits_to_f32, f32_to_bf16_bits};
+    let mut output = vec![0.0f32; 256 * 768];
+    for token in 0..256 {
+        for dim in 0..768 {
+            let head = dim / 256;
+            let head_dim = dim % 256;
+            let input = attention_head_major[(head * 256 + token) * 256 + head_dim];
+            let weight = bf16_bits_to_f32(weights[dim * 768 + dim]);
+            output[token * 768 + dim] = bf16_bits_to_f32(f32_to_bf16_bits(input * weight));
         }
     }
     output

@@ -44,6 +44,13 @@ pub enum Projection {
     Down,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttentionBoundary {
+    Fallback,
+    AttentionOnly,
+    OutputProjected,
+}
+
 pub trait LinearProjector {
     fn project(
         &mut self,
@@ -64,10 +71,11 @@ pub trait LinearProjector {
         _gpu: &mut Gpu,
         _layer_idx: usize,
         _input: &GpuTensor,
-        _output: &GpuTensor,
+        _attention_output: &GpuTensor,
+        _projected_output: &GpuTensor,
         _rows: usize,
-    ) -> HipResult<bool> {
-        Ok(false)
+    ) -> HipResult<AttentionBoundary> {
+        Ok(AttentionBoundary::Fallback)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -309,8 +317,9 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
 
         // ── Attention block (bidirectional) ──
         gpu.rmsnorm_batched(&x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
-        let resident_attention = projector.project_attention(gpu, layer_idx, &tmp, &attn_out, m)?;
-        if resident_attention {
+        let attention_boundary =
+            projector.project_attention(gpu, layer_idx, &tmp, &attn_out, &o, m)?;
+        if attention_boundary != AttentionBoundary::Fallback {
             if trace_phases {
                 gpu.device_synchronize()?;
                 attention_core_ms += stage_started.elapsed().as_secs_f64() * 1e3;
@@ -349,15 +358,17 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
         }
 
         let stage_started = std::time::Instant::now();
-        projector.project(
-            gpu,
-            layer_idx,
-            Projection::AttentionOutput,
-            &layer.wo,
-            &attn_out,
-            &o,
-            m,
-        )?;
+        if attention_boundary != AttentionBoundary::OutputProjected {
+            projector.project(
+                gpu,
+                layer_idx,
+                Projection::AttentionOutput,
+                &layer.wo,
+                &attn_out,
+                &o,
+                m,
+            )?;
+        }
         gpu.rmsnorm_batched(&o, &layer.post_attn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(&x_batch, &tmp, &x_batch)?;
         if trace_phases {

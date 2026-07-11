@@ -9,13 +9,14 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
-    NpuOpusExecutor, NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights,
-    NpuResidentFfnDenseW8, NpuResidentFfnDenseW8Weights, NpuResidentFfnW4, NpuResidentFfnW4Weights,
-    NpuWholeMode, NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
+    NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuOpusExecutor,
+    NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights, NpuResidentFfnDenseW8,
+    NpuResidentFfnDenseW8Weights, NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode,
+    NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
 };
 
 use crate::config::EmbeddingGemmaConfig;
-use crate::forward::{LinearProjector, Projection};
+use crate::forward::{AttentionBoundary, LinearProjector, Projection};
 
 struct LayerMatrices {
     qkv: Option<OpusPackedMatrix>,
@@ -86,6 +87,19 @@ struct ResidentAttentionState {
     executor: NpuResidentAttentionDenseW8,
     weights: Vec<NpuResidentAttentionDenseW8Weights>,
     input: Option<SharedAttentionInput>,
+    output: Option<ResidentAttentionOutputState>,
+}
+
+struct ResidentAttentionOutputState {
+    executor: NpuAttentionOutputBf16,
+    weights: Vec<NpuAttentionOutputBf16Weights>,
+    staging: Vec<Option<SharedGttBuffer>>,
+    io: Option<SharedAttentionOutput>,
+}
+
+struct SharedAttentionOutput {
+    output_gpu: ImportedTensor,
+    _output_buffer: SharedGttBuffer,
 }
 
 enum ResidentFfnState {
@@ -405,20 +419,36 @@ impl NpuOpusProjector {
         }
         let resident_attention_path =
             cache_root.join("embgemma_aie2p_resident_w8_qkv_attention_m256_k768_n1280");
+        let packed_attention_path =
+            cache_root.join("embgemma_aie2p_resident_w8_qkv_attention_packed_m256_k768_n1280");
+        let attention_output_path =
+            cache_root.join("embgemma_aie2p_attention_o_bf16_m256_k768_n768");
+        let use_packed_attention = packed_attention_path.join("final.xclbin").is_file()
+            && packed_attention_path.join("insts.bin").is_file()
+            && attention_output_path.join("final.xclbin").is_file()
+            && attention_output_path.join("insts.bin").is_file();
+        let selected_attention_path = if use_packed_attention {
+            &packed_attention_path
+        } else {
+            &resident_attention_path
+        };
         let resident_attention = if cfg.hidden_size == 768
             && q_dim == 768
             && kv_dim == 256
-            && resident_attention_path.join("final.xclbin").is_file()
-            && resident_attention_path.join("insts.bin").is_file()
+            && selected_attention_path.join("final.xclbin").is_file()
+            && selected_attention_path.join("insts.bin").is_file()
             && layers
                 .iter()
                 .all(|layer| resident_attention_dense_groups(layer).is_ok())
         {
-            let executor = NpuResidentAttentionDenseW8::load_cached(
-                resident_attention_path
-                    .to_str()
-                    .expect("UTF-8 resident attention cache path"),
-            )
+            let cache = selected_attention_path
+                .to_str()
+                .expect("UTF-8 resident attention cache path");
+            let executor = if use_packed_attention {
+                NpuResidentAttentionDenseW8::load_packed_cached(cache)
+            } else {
+                NpuResidentAttentionDenseW8::load_cached(cache)
+            }
             .map_err(|error| format!("embeddinggemma NPU: load resident attention: {error}"))?;
             let mut weights = Vec::with_capacity(layers.len());
             for (layer_idx, layer) in layers.iter().enumerate() {
@@ -452,10 +482,41 @@ impl NpuOpusProjector {
                         })?,
                 );
             }
+            let output = if use_packed_attention {
+                let output_cache = attention_output_path
+                    .to_str()
+                    .expect("UTF-8 attention output cache path");
+                let output_executor =
+                    NpuAttentionOutputBf16::load_cached(output_cache).map_err(|error| {
+                        format!("embeddinggemma NPU: load attention output: {error}")
+                    })?;
+                let output_weights = layers
+                    .iter()
+                    .enumerate()
+                    .map(|(layer_idx, layer)| {
+                        output_executor
+                            .upload_weights(&layer.attention_output)
+                            .map_err(|error| {
+                                format!(
+                                    "embeddinggemma NPU: upload attention output layer {layer_idx}: {error}"
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(ResidentAttentionOutputState {
+                    executor: output_executor,
+                    weights: output_weights,
+                    staging: (0..layers.len()).map(|_| None).collect(),
+                    io: None,
+                })
+            } else {
+                None
+            };
             Some(ResidentAttentionState {
                 executor,
                 weights,
                 input: None,
+                output,
             })
         } else {
             None
@@ -868,14 +929,15 @@ impl LinearProjector for NpuOpusProjector {
         gpu: &mut Gpu,
         layer_idx: usize,
         input: &GpuTensor,
-        output: &GpuTensor,
+        attention_output: &GpuTensor,
+        projected_output: &GpuTensor,
         rows: usize,
-    ) -> HipResult<bool> {
+    ) -> HipResult<AttentionBoundary> {
         if rows != NpuResidentAttentionDenseW8::rows()
             || self.resident_attention.is_none()
             || !self.resident_attention_selected
         {
-            return Ok(false);
+            return Ok(AttentionBoundary::Fallback);
         }
         let matrix_key = MatrixGpuKey {
             layer: layer_idx,
@@ -939,10 +1001,84 @@ impl LinearProjector for NpuOpusProjector {
             layout,
         )?;
         gpu.device_synchronize()?;
+        let needs_staging = state
+            .output
+            .as_ref()
+            .is_some_and(|output| output.staging[layer_idx].is_none());
+        if needs_staging {
+            let mut staging = gpu.alloc_shared_gtt(NpuResidentAttentionDenseW8::staging_bytes())?;
+            staging.as_mut_slice().fill(0);
+            state
+                .executor
+                .attach_shared_staging(
+                    &mut state.weights[layer_idx],
+                    staging.dmabuf_fd(),
+                    staging.len(),
+                )
+                .map_err(|error| {
+                    hip_error(format!("attach resident attention staging: {error}"))
+                })?;
+            let output_state = state.output.as_mut().expect("checked output state");
+            output_state
+                .executor
+                .attach_shared_layer_input(
+                    &mut output_state.weights[layer_idx],
+                    staging.dmabuf_fd(),
+                    staging.len(),
+                )
+                .map_err(|error| hip_error(format!("attach attention output input: {error}")))?;
+            output_state.staging[layer_idx] = Some(staging);
+        }
+        let needs_output = state
+            .output
+            .as_ref()
+            .is_some_and(|output| output.io.is_none());
+        if needs_output {
+            let mut output_buffer = gpu.alloc_shared_gtt(NpuAttentionOutputBf16::output_bytes())?;
+            output_buffer.as_mut_slice().fill(0);
+            let output_gpu = gpu.import_dmabuf(
+                output_buffer.dmabuf_fd(),
+                output_buffer.len(),
+                &[rows * 768],
+                DType::F32,
+            )?;
+            let output_state = state.output.as_mut().expect("checked output state");
+            output_state
+                .executor
+                .attach_shared_output(output_buffer.dmabuf_fd(), output_buffer.len())
+                .map_err(|error| {
+                    hip_error(format!("attach attention output destination: {error}"))
+                })?;
+            output_state.io = Some(SharedAttentionOutput {
+                output_gpu,
+                _output_buffer: output_buffer,
+            });
+        }
         state
             .executor
             .run_shared_to_device(&state.weights[layer_idx])
             .map_err(|error| hip_error(format!("resident NPU attention failed: {error}")))?;
+
+        if let Some(output_state) = state.output.as_mut() {
+            output_state
+                .executor
+                .run(&output_state.weights[layer_idx])
+                .map_err(|error| hip_error(format!("resident NPU output projection: {error}")))?;
+            let output_view = output_state
+                .io
+                .as_ref()
+                .expect("resident attention output I/O")
+                .output_gpu
+                .view();
+            gpu.memcpy_dtod_at_auto(
+                &projected_output.buf,
+                0,
+                &output_view.buf,
+                0,
+                NpuAttentionOutputBf16::output_bytes(),
+            )?;
+            return Ok(AttentionBoundary::OutputProjected);
+        }
         let head_major = state
             .executor
             .read_output_f32(&state.weights[layer_idx])
@@ -956,8 +1092,8 @@ impl LinearProjector for NpuOpusProjector {
                     .copy_from_slice(&head_major[source..source + 256]);
             }
         }
-        copy_host_output(gpu, output, &token_major)?;
-        Ok(true)
+        copy_host_output(gpu, attention_output, &token_major)?;
+        Ok(AttentionBoundary::AttentionOnly)
     }
 
     fn project(

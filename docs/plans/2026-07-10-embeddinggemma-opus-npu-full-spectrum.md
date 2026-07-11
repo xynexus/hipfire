@@ -1001,3 +1001,68 @@ cross-artifact comparisons are not evidence against the much tighter
 same-artifact resident/fallback comparison. The next admitted boundary must
 remove this output crossing and include output projection plus residual/norm;
 the 10k/15k and fully resident package-efficiency gates remain open.
+
+### R31 packed attention-to-output-projection checkpoint
+
+R31 extends the resident boundary with a full-array BF16 output projection.
+The schedule follows the output-stationary mapping described by Taka et al. in
+"Striking the Balance": A is broadcast across each core row, B across each
+column, K is reduced in time, one C tile remains resident, and multidimensional
+DMA addressing performs layout conversion instead of a separate repack kernel
+(https://arxiv.org/html/2512.13282v1). For M256/K768/N768, all 32 cores process
+32x32 output tiles in three K=256 groups. Each core retains one 1,024-float C
+buffer; the producer and consumer use 16 KiB A/B objects and 2 KiB core output
+objects already proven by R30.
+
+The first attempted single-command append is rejected. It wrote R30 attention
+to the external staging argument and read the same region back through a later
+shim MM2S task. The first command produced 392,563 non-zero attention bytes but
+zero projected bytes; the next command was desynchronized. A separate dense-
+ones diagnostic also returned zero, ruling out sparse-weight packing. In
+addition, a four-dimensional gather initially transferred only one-eighth of
+the intended bytes because the highest BD dimension is a repeat dimension on
+this toolchain. This is not an admitted fused result.
+
+The accepted producer contract writes attention at argument offset zero in the
+exact `mmul<4,8,8>` A layout. Its S2MM scatter uses an explicit four-row task
+repeat, while immutable Q/K position and norm staging follows the 393,216-byte
+attention region. A second resident AIE2P context consumes those contiguous
+blocks and writes canonical token-major F32 output. The AIE objects are kept
+in separate translation units: adding unrelated functions changes Peano's
+inlining and reproduced the known R30 register-lifetime failure.
+
+The packed producer retains R30 attention cosine `0.99997371` and maximum
+absolute error `0.0001469`. A diagonal full-coverage output matrix exercises
+every token, K group, and output column; the production
+`NpuAttentionOutputBf16` wrapper reports output cosine `0.99995894`, maximum
+absolute error `0.0000901`. One hundred sustained output-projection commands
+average `0.9076 ms`. The generic upload accepts any `OpusPackedMatrix`, expands
+native OQ4/OQ8 or arbitrary mixed groups once, inverse-transforms each stored
+signed-FWHT K=256 weight group to the canonical attention basis, and removes
+the AWQ sidecar from the recovered weight because this boundary does not divide
+its input activation. There is no format-specific dispatch branch.
+
+The production runtime now allocates one 4,325,376-byte GPU GTT staging dma-buf
+per layer and imports the same physical pages as R30's output-first staging
+argument and R31's input argument. R31 writes F32 to a reusable GPU-visible
+dma-buf, followed by a device-to-device copy into the encoder's existing `o`
+tensor; there is no CPU read, token/head transpose, or host upload between the
+two contexts. The encoder's attention boundary now distinguishes fallback,
+attention-only, and output-projected results so the established output GEMM is
+skipped when R31 owns it.
+
+On the real OQ8++ artifact, the full 24-layer resident attention+output boundary
+matches the established same-artifact projection fallback at cosine
+`0.99978751` and maximum absolute error `0.00278265`. Arbitrary mixed OQ4.125
+matches at cosine `0.99972636` and maximum absolute error `0.00404532`.
+End-to-end OQ8++ versus BF16 reaches cosine `0.99959564`; OQ4 and OQ4.125 retain
+their expected lower quantized-model cosines (`0.92913818` and `0.92766410`).
+
+This is a zero-CPU-copy QKV/attention/output-projection boundary, not a complete
+resident layer. First-use per-layer dma-buf allocation/import is still visible
+in the first iteration. A three-iteration OQ8++ run reaches `709.7` input tok/s
+and `29.5` package tok/J; its warm phase traces spend about `198.7 ms` across
+the 24 serial R30+R31 boundaries and `131.5 ms` in the still-separate resident
+FFN boundary. This remains far below the final throughput gate. Residual/norm,
+cross-context scheduling/overlap, FFN fusion, tail stages, 10k/15k admission,
+and competitive package tokens/J remain open.

@@ -55,14 +55,31 @@ pub struct NpuResidentAttentionDenseW8 {
     key_values: DeviceBuffer,
     primed: bool,
     context_commands: usize,
+    packed_output: bool,
 }
 
 impl NpuResidentAttentionDenseW8 {
     pub fn load_cached(cache: &str) -> Result<Self, XdnaError> {
+        Self::load_cached_mode(cache, false)
+    }
+
+    /// Load the admitted output-first producer whose staging argument begins
+    /// with projection-packed BF16 attention output. The remaining bytes retain
+    /// the immutable R30 position/norm staging payload.
+    pub fn load_packed_cached(cache: &str) -> Result<Self, XdnaError> {
+        Self::load_cached_mode(cache, true)
+    }
+
+    fn load_cached_mode(cache: &str, packed_output: bool) -> Result<Self, XdnaError> {
         let manifest =
             std::fs::read_to_string(format!("{cache}/shape.txt")).map_err(XdnaError::Open)?;
+        let op = if packed_output {
+            "op=resident-qkv-attention-packed"
+        } else {
+            "op=resident-qkv-attention"
+        };
         for required in [
-            "op=resident-qkv-attention",
+            op,
             "mode=w8-scaled",
             "m=256",
             "k=768",
@@ -89,6 +106,7 @@ impl NpuResidentAttentionDenseW8 {
             key_values,
             primed: false,
             context_commands: 0,
+            packed_output,
         })
     }
 
@@ -188,7 +206,8 @@ impl NpuResidentAttentionDenseW8 {
         weights.as_mut_slice().copy_from_slice(&packed);
         self.kernel.sync_to_device(&weights)?;
 
-        let staged = stage_positions_and_params(qnorm, knorm, epsilon, rope_base);
+        let staged =
+            stage_positions_and_params(qnorm, knorm, epsilon, rope_base, self.packed_output);
         let mut staging = self.kernel.alloc_arg(staged.len())?;
         staging.as_mut_slice().copy_from_slice(&staged);
         self.kernel.sync_to_device(&staging)?;
@@ -197,6 +216,26 @@ impl NpuResidentAttentionDenseW8 {
             staging,
             awq_scale: awq_scale.map(<[f32]>::to_vec),
         })
+    }
+
+    /// Replace one layer's private staging BO with a caller-owned shared
+    /// dma-buf. This preserves the immutable position/norm payload and lets a
+    /// following NPU context consume the output prefix without a host copy.
+    pub fn attach_shared_staging(
+        &self,
+        weights: &mut NpuResidentAttentionDenseW8Weights,
+        staging_fd: i32,
+        staging_bytes: usize,
+    ) -> Result<(), XdnaError> {
+        if staging_bytes != Self::staging_bytes() || weights.staging.len() != staging_bytes {
+            return Err(invalid("resident attention shared staging size mismatch"));
+        }
+        let template = weights.staging.as_slice().to_vec();
+        let mut staging = self.kernel.import_dmabuf(staging_fd, staging_bytes, true)?;
+        staging.as_mut_slice().copy_from_slice(&template);
+        self.kernel.sync_to_device(&staging)?;
+        weights.staging = staging;
+        Ok(())
     }
 
     /// Pack canonical int8/FWHT activations and per-group row scales into R30's
@@ -303,6 +342,11 @@ impl NpuResidentAttentionDenseW8 {
         &self,
         weights: &NpuResidentAttentionDenseW8Weights,
     ) -> Result<Vec<u16>, XdnaError> {
+        if self.packed_output {
+            return Err(invalid(
+                "packed resident attention output must be consumed by the output projection",
+            ));
+        }
         if weights.staging.len() != Self::staging_bytes() {
             return Err(invalid("resident attention staging size mismatch"));
         }
@@ -386,11 +430,17 @@ fn stage_positions_and_params(
     knorm: &[f32],
     epsilon: f32,
     rope_base: f32,
+    packed_output: bool,
 ) -> Vec<u8> {
     let mut staged = vec![0u8; R_STAGE_BYTES + AttentionLayout::OUTPUT_BYTES];
+    let staging_base = if packed_output {
+        AttentionLayout::OUTPUT_BYTES
+    } else {
+        0
+    };
     for role in 0..ROLES {
         for physical_pair in 0..PAIRS_PER_ROLE {
-            let base = (role * PAIRS_PER_ROLE + physical_pair) * R_PAIR;
+            let base = staging_base + (role * PAIRS_PER_ROLE + physical_pair) * R_PAIR;
             let m_macro = physical_pair / 16;
             let within = physical_pair % 16;
             let core_row = within / 4;
@@ -495,7 +545,7 @@ mod tests {
     fn staging_keeps_position_and_parameter_tails_outside_projection_prefixes() {
         let qnorm = vec![0.75; AttentionLayout::HEAD_DIM];
         let knorm = vec![1.25; AttentionLayout::HEAD_DIM];
-        let staged = stage_positions_and_params(&qnorm, &knorm, 1.0e-6, 10_000.0);
+        let staged = stage_positions_and_params(&qnorm, &knorm, 1.0e-6, 10_000.0, false);
         assert_eq!(staged.len(), NpuResidentAttentionDenseW8::staging_bytes());
         for role in 0..ROLES {
             for pair in 0..PAIRS_PER_ROLE {
@@ -517,5 +567,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn packed_staging_reserves_the_projection_prefix() {
+        let qnorm = vec![0.75; AttentionLayout::HEAD_DIM];
+        let knorm = vec![1.25; AttentionLayout::HEAD_DIM];
+        let staged = stage_positions_and_params(&qnorm, &knorm, 1.0e-6, 10_000.0, true);
+        assert!(staged[..AttentionLayout::OUTPUT_BYTES]
+            .iter()
+            .all(|&byte| byte == 0));
+        assert_eq!(
+            u16::from_le_bytes([
+                staged[AttentionLayout::OUTPUT_BYTES + PARAM_OFFSET],
+                staged[AttentionLayout::OUTPUT_BYTES + PARAM_OFFSET + 1]
+            ]),
+            f32_to_bf16_bits(0.75)
+        );
     }
 }
