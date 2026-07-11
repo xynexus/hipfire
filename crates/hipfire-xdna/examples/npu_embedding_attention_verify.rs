@@ -15,6 +15,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const GROUPS: usize = HEADS * M / (CORES * QUERIES);
     const BLOCK_KEYS: usize = 16;
     const BLOCKS: usize = M / BLOCK_KEYS;
+    const MMUL_K: usize = 8;
+    const MMUL_N: usize = 8;
+    const DIM_TILES: usize = D / MMUL_K;
+    const KEY_TILES: usize = BLOCK_KEYS / MMUL_N;
     const Q_TILE: usize = QUERIES * D * 2;
     const Q_JOIN: usize = COLS * Q_TILE;
     const KV_TILE: usize = 2 * BLOCK_KEYS * D * 2;
@@ -79,26 +83,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let lane = remainder % QUERIES;
         let row = core / COLS;
         let col = core % COLS;
-        let destination = (row * GROUPS + group) * Q_JOIN + col * Q_TILE + lane * D * 2;
-        write_bf16(
-            &mut packed_q[destination..destination + D * 2],
-            &q[linear * D..(linear + 1) * D],
-        );
+        let tile = (row * GROUPS + group) * Q_JOIN + col * Q_TILE;
+        for dim_tile in 0..DIM_TILES {
+            for dim_lane in 0..MMUL_K {
+                let destination =
+                    tile + (dim_tile * QUERIES * MMUL_K + lane * MMUL_K + dim_lane) * 2;
+                write_bf16_value(
+                    &mut packed_q,
+                    destination,
+                    q[linear * D + dim_tile * MMUL_K + dim_lane],
+                );
+            }
+        }
     }
     let mut packed_kv = vec![0u8; KV_BYTES];
     for group in 0..GROUPS {
         for block in 0..BLOCKS {
             let destination = (group * BLOCKS + block) * KV_TILE;
-            let first = block * BLOCK_KEYS * D;
-            let last = first + BLOCK_KEYS * D;
-            write_bf16(
-                &mut packed_kv[destination..destination + KV_TILE / 2],
-                &k[first..last],
-            );
-            write_bf16(
-                &mut packed_kv[destination + KV_TILE / 2..destination + KV_TILE],
-                &v[first..last],
-            );
+            for key_tile in 0..KEY_TILES {
+                for dim_tile in 0..DIM_TILES {
+                    for dim_lane in 0..MMUL_K {
+                        for key_lane in 0..MMUL_N {
+                            let key = block * BLOCK_KEYS + key_tile * MMUL_N + key_lane;
+                            let dim = dim_tile * MMUL_K + dim_lane;
+                            let packed = ((key_tile * DIM_TILES + dim_tile) * MMUL_K * MMUL_N)
+                                + dim_lane * MMUL_N
+                                + key_lane;
+                            write_bf16_value(
+                                &mut packed_kv,
+                                destination + packed * 2,
+                                k[key * D + dim],
+                            );
+                        }
+                    }
+                }
+            }
+            let values = destination + BLOCK_KEYS * D * 2;
+            for dim_tile in 0..DIM_TILES {
+                for key_tile in 0..KEY_TILES {
+                    for key_lane in 0..MMUL_K {
+                        for dim_lane in 0..MMUL_N {
+                            let key = block * BLOCK_KEYS + key_tile * MMUL_K + key_lane;
+                            let dim = dim_tile * MMUL_N + dim_lane;
+                            let packed = ((dim_tile * KEY_TILES + key_tile) * MMUL_K * MMUL_N)
+                                + key_lane * MMUL_N
+                                + dim_lane;
+                            write_bf16_value(&mut packed_kv, values + packed * 2, v[key * D + dim]);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -157,10 +191,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_bf16(destination: &mut [u8], values: &[f32]) {
-    for (bytes, &value) in destination.chunks_exact_mut(2).zip(values) {
-        bytes.copy_from_slice(&hipfire_primitives::conv::f32_to_bf16_bits(value).to_le_bytes());
-    }
+fn write_bf16_value(destination: &mut [u8], byte_offset: usize, value: f32) {
+    destination[byte_offset..byte_offset + 2]
+        .copy_from_slice(&hipfire_primitives::conv::f32_to_bf16_bits(value).to_le_bytes());
 }
 
 #[cfg(target_os = "linux")]

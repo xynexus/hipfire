@@ -806,3 +806,30 @@ kernels under `tools/npu/` are reusable arithmetic references; R27 still needs
 resident QK/PV tiling and a layer-level stream schedule. A collection of
 standalone elementwise NPU dispatches would preserve the measured boundary
 cost and is not an admissible substitute.
+
+### R27 BF16 MMUL attention checkpoint
+
+The first 32-core M256 attention schedule established the complete online-
+softmax QK/PV dataflow with four query rows per core and 16-key streamed KV
+blocks. Its scalar vector-dot/PV implementation passed the CPU oracle at
+`0.99999410` cosine, `0.0002527` maximum absolute error, and `0.00005579` mean
+absolute error, but averaged `2.8596 ms` per sustained dispatch.
+
+The admitted arithmetic now uses the AIE2P native BF16 `mmul<4,8,8>` shape for
+both QK and PV. Q is packed as 4x8 head-dimension tiles, K as transposed 8x8
+dimension/key tiles, and V as 8x8 key/dimension tiles. The blockwise online
+maximum, BF16 exponential, running sum, and f32 retained PV accumulator remain
+unchanged. Pairing adjacent 8-column PV results into 16-lane accumulator
+updates also avoids a Peano legalization failure on a scalar sum/reduction
+shape; reducing the concatenated 16 softmax weights in one operation is the
+working compiler contract.
+
+Three independent 100-command hardware processes retain exactly the same
+oracle metrics and measure `0.9074`, `0.9192`, and `0.9405 ms` per dispatch
+(median `0.9192 ms`). This is a 3.11x reduction from the scalar schedule's
+`2.8596 ms`, but it is still standalone BF16 attention-kernel evidence. Summed
+serially over 24 layers it would consume about `22.1 ms`, leaving essentially
+no room in the `25.6 ms`/10k full-model budget for projections, norms, FFN,
+pooling, or dispatch. R27 therefore still requires one resident layer command,
+direct qkv-to-attention layout production, projection/FFN overlap or further
+kernel acceleration, tail stages, end-to-end quality, and package tokens/J.
