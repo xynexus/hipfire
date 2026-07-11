@@ -851,3 +851,34 @@ resident argument falls from `1,572,864` to `262,144` bytes while parity remains
 projection-facing contract: one packed Q tensor, one packed K/V sequence, and
 internal K/V replay; it remains attention-kernel rather than full-layer or
 full-model evidence.
+
+### R28 Q/K headnorm and RoPE pack checkpoint
+
+R28 consumes the physical output staging contract intended for the combined
+QKV projection and produces R27's packed Q plus single-replay packed K/V
+arguments directly. All 32 cores normalize and rotate four Q rows at a time;
+the 16 even-column cores normalize and rotate eight K rows in two waves, while
+V is a bit-exact layout transform. Cosine and sine values are precomputed as
+BF16 in the persistent tails of each raw Q/K row object because the installed
+AIE2P compiler does not accept the documented `aie::sincos` API for this
+target. The future projection can overwrite only the raw prefixes while those
+immutable position tails remain resident.
+
+The initial vector implementation exposed an AIE register-lifetime failure:
+Q lower halves and early K rows were plausible, but live vector arguments and
+two returned rotation vectors corrupted later results. Scalar RMS reduction,
+identity RoPE, and a larger core stack did not remove it, while V stayed
+bit-exact. Pointer-based `noinline` Q lower/upper stores and a 16-value K row
+scratch before the 8x8 transpose eliminated the corruption. Restoring the
+vector RMS reduction then preserved parity and improved timing over the scalar
+diagnostic.
+
+The real precomputed-RoPE CPU oracle reports Q cosine `0.99999121`, Q maximum
+absolute error `0.0078125`, K cosine `0.99999156`, K maximum absolute error
+`0.0078125`, and zero V BF16 mismatches. Three independent fresh-process
+100-command runs measure `0.3514`, `0.3659`, and `0.3688 ms` (median
+`0.3659 ms`). This is a verified projection-output transform and R27 handoff,
+not yet a combined QKV projection or resident attention layer: Q/K/V projection
+accumulation still has to write R28's raw prefixes in the same command, and the
+o projection, residuals, FFN, tail stages, full-model 10k/15k admission, and
+package tokens/J remain open.
