@@ -1,5 +1,5 @@
-//! Hardware parity and timing for the R25 resident EmbeddingGemma W4 FFN.
-//! Usage: `npu_resident_ffn_verify R25_CACHE GATEUP_PACKER R18_CACHE [ITERS]`
+//! Hardware parity and timing for the resident EmbeddingGemma FFN schedules.
+//! Usage: `npu_resident_ffn_verify CACHE GATEUP_PACKER GATE_EXEC_OR_DOWN_PACKER [ITERS]`
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,9 +26,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !(3..=4).contains(&args.len()) {
         return Err(
-            "usage: npu_resident_ffn_verify R25_CACHE GATEUP_PACKER R18_CACHE [ITERS]".into(),
+            "usage: npu_resident_ffn_verify CACHE GATEUP_PACKER GATE_EXEC_OR_DOWN_PACKER [ITERS]"
+                .into(),
         );
     }
+    let resident_shape = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
+    let dense_w8 = resident_shape.lines().any(|line| line == "mode=dense-w8");
     let iterations = args.get(3).map(|v| v.parse()).transpose()?.unwrap_or(20);
     let timing_only = std::env::var_os("HIPFIRE_R25_TIMING_ONLY").is_some();
     let isolated_group = std::env::var("HIPFIRE_R25_GROUP")
@@ -108,6 +111,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let signs1 = gen_fwht_signs(42, GROUP);
     let signs2 = gen_fwht_signs(1042, GROUP);
+
+    if dense_w8 {
+        return run_dense_w8(
+            &args[0],
+            &args[2],
+            iterations,
+            &packed_a,
+            &packed_gate_w,
+            &gate_activations,
+            &gate_activation_scales,
+            &gate_weights,
+            &gate_scales,
+            &down_weights,
+            &down_scales,
+            &awq,
+            &signs1,
+            &signs2,
+        );
+    }
 
     let mut packed_w = vec![0u8; COLS * W_BLOCKS * WB];
     for stripe in 0..COLS {
@@ -603,6 +625,215 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
     println!(
         "resident-ffn-w4 M={M} K={K} I={INTER} N={N} group={isolated_group:?}: gate_cosine={gate_cosine:.8} gate_max_abs={gate_max_abs:.7} cosine={cosine:.8} max_abs={max_abs:.7} mean_abs={mean_abs:.8} dispatch_ms={dispatch_ms:.4}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_dense_w8(
+    cache: &str,
+    down_packer_cache: &str,
+    iterations: usize,
+    packed_gate_a: &[u8],
+    packed_gate_w: &[u8],
+    gate_activations: &[i8],
+    gate_activation_scales: &[f32],
+    gate_weights: &[Vec<i8>],
+    gate_scales: &[Vec<f32>],
+    down_weights: &[Vec<i8>],
+    down_scales: &[Vec<f32>],
+    awq: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use hipfire_xdna::{NpuGemmWholeScaled, NpuKernel, NpuWholeMode};
+
+    const M: usize = 256;
+    const PAD_M: usize = 288;
+    const INTER: usize = 1152;
+    const N: usize = 768;
+    const COLS: usize = 8;
+    const ROW_STRIPES: usize = 4;
+    const GATE_BLOCKS: usize = 54;
+    const DOWN_BLOCKS: usize = 30;
+    const WEIGHT_BLOCKS: usize = GATE_BLOCKS + DOWN_BLOCKS;
+    const PACKED_A_BLOCK: usize = 8192;
+    const DATA_PAIR: usize = 9216;
+    const DATA_JOIN: usize = 4 * DATA_PAIR;
+    const W_BLOCK: usize = 16384;
+    const W_DATA: usize = 12288;
+    const W_COLS: usize = 48;
+    const PARAM_OFFSET: usize = W_DATA + W_COLS * size_of::<f32>();
+    const T_ROWS: usize = 296;
+    const T_STRIDE: usize = 5376;
+
+    if iterations == 0 {
+        return Err("R26 verification needs at least one iteration".into());
+    }
+    if packed_gate_a.len() != ROW_STRIPES * GATE_BLOCKS * PACKED_A_BLOCK
+        || packed_gate_w.len() != COLS * GATE_BLOCKS * W_BLOCK
+    {
+        return Err("R26 gate packer geometry mismatch".into());
+    }
+
+    // Each memory-tile input is linked to four core-column pairs. Replicate the
+    // canonical W8 activation block into those four pair windows, retaining a
+    // 1 KiB tail per pair for the later 288-float down gather.
+    let mut data = vec![0u8; ROW_STRIPES * GATE_BLOCKS * DATA_JOIN];
+    for stripe in 0..ROW_STRIPES {
+        for block in 0..GATE_BLOCKS {
+            let source = (stripe * GATE_BLOCKS + block) * PACKED_A_BLOCK;
+            let destination = (stripe * GATE_BLOCKS + block) * DATA_JOIN;
+            for pair in 0..4 {
+                data[destination + pair * DATA_PAIR
+                    ..destination + pair * DATA_PAIR + PACKED_A_BLOCK]
+                    .copy_from_slice(&packed_gate_a[source..source + PACKED_A_BLOCK]);
+            }
+        }
+    }
+
+    let down_packer = NpuGemmWholeScaled::load_cached(down_packer_cache)?;
+    if down_packer.mode() != NpuWholeMode::W8
+        || down_packer.rows() != M
+        || down_packer.k() != 1280
+        || down_packer.n() != N
+    {
+        return Err("R26 down packer must be W8 M=256 K=1280 N=768".into());
+    }
+    let down_weight_refs = down_weights.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let down_scale_refs = down_scales.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let packed_down_w = down_packer.prepack_weights(&down_weight_refs, &down_scale_refs)?;
+    if packed_down_w.len() != COLS * DOWN_BLOCKS * W_BLOCK {
+        return Err("R26 packed down-weight geometry mismatch".into());
+    }
+
+    // Gate blocks are already in [mblock,nmacro,group] order. R26 consumes the
+    // down blocks as [mblock,group,nmacro], so transpose those two stream axes.
+    let mut weights = vec![0u8; COLS * WEIGHT_BLOCKS * W_BLOCK];
+    for stripe in 0..COLS {
+        let destination = stripe * WEIGHT_BLOCKS * W_BLOCK;
+        for mblock in 0..3 {
+            for nblock in 0..6 {
+                for group in 0..3 {
+                    let block = (mblock * 6 + nblock) * 3 + group;
+                    let base = destination + block * W_BLOCK;
+                    for ln in 0..3 {
+                        for kt in 0..32 {
+                            for kk in 0..8 {
+                                for nn in 0..16 {
+                                    let local = ln * 16 + nn;
+                                    let (role, tail) = match local {
+                                        0..16 => (0, local),
+                                        16..32 => (1, local - 16),
+                                        32..40 => (0, local - 16),
+                                        _ => (1, local - 24),
+                                    };
+                                    let logical_col = (nblock * COLS + stripe) * 24 + tail;
+                                    let physical_col =
+                                        (logical_col / 48) * 96 + role * 48 + logical_col % 48;
+                                    let index =
+                                        (ln * 32 + kt) * 128 + (nn / 8) * 64 + kk * 8 + nn % 8;
+                                    weights[base + index] = gate_weights[group]
+                                        [(kt * 8 + kk) * 2304 + physical_col]
+                                        as u8;
+                                }
+                            }
+                        }
+                    }
+                    for local in 0..48 {
+                        let (role, tail) = match local {
+                            0..16 => (0, local),
+                            16..32 => (1, local - 16),
+                            32..40 => (0, local - 16),
+                            _ => (1, local - 24),
+                        };
+                        let logical_col = (nblock * COLS + stripe) * 24 + tail;
+                        let physical_col = (logical_col / 48) * 96 + role * 48 + logical_col % 48;
+                        let offset = base + W_DATA + local * size_of::<f32>();
+                        weights[offset..offset + size_of::<f32>()]
+                            .copy_from_slice(&gate_scales[group][physical_col].to_ne_bytes());
+                    }
+                }
+            }
+        }
+        for mblock in 0..3 {
+            for group in 0..5 {
+                for nmacro in 0..2 {
+                    let source_block = (mblock * 2 + nmacro) * 5 + group;
+                    let destination_block = GATE_BLOCKS + (mblock * 5 + group) * 2 + nmacro;
+                    let source = (stripe * DOWN_BLOCKS + source_block) * W_BLOCK;
+                    let destination = (stripe * WEIGHT_BLOCKS + destination_block) * W_BLOCK;
+                    weights[destination..destination + W_BLOCK]
+                        .copy_from_slice(&packed_down_w[source..source + W_BLOCK]);
+                    let mut params = Vec::with_capacity(3 * 256);
+                    params.extend_from_slice(&awq[group * 256..(group + 1) * 256]);
+                    params.extend_from_slice(signs1);
+                    params.extend_from_slice(signs2);
+                    weights
+                        [destination + PARAM_OFFSET..destination + PARAM_OFFSET + params.len() * 4]
+                        .copy_from_slice(unsafe { as_bytes(&params) });
+                }
+            }
+        }
+    }
+
+    let gate = gate_reference(
+        gate_activations,
+        gate_activation_scales,
+        gate_weights,
+        gate_scales,
+    );
+    let (down_activations, down_activation_scales) = prepare_down(&gate, awq, signs1, signs2);
+    let reference = down_reference(
+        &down_activations,
+        &down_activation_scales,
+        down_weights,
+        down_scales,
+    );
+
+    let xclbin = std::fs::read(format!("{cache}/final.xclbin"))?;
+    let insts = std::fs::read(format!("{cache}/insts.bin"))?;
+    let mut kernel = NpuKernel::load(&xclbin, &insts)?;
+    let mut d = kernel.alloc_arg(data.len())?;
+    let mut w = kernel.alloc_arg(weights.len())?;
+    let mut t = kernel.alloc_arg(T_ROWS * T_STRIDE * size_of::<f32>())?;
+    let o = kernel.alloc_arg(PAD_M * N * size_of::<f32>())?;
+    d.as_mut_slice().copy_from_slice(&data);
+    w.as_mut_slice().copy_from_slice(&weights);
+    t.as_mut_slice().fill(0);
+
+    kernel.dispatch_synced(&[&d, &w, &t, &o], &[true, true, true, false])?;
+    kernel.sync_output(&t)?;
+    kernel.sync_output(&o)?;
+    let physical_gate = unsafe { as_f32(t.as_slice()) };
+    let mut retained_gate = vec![0.0f32; M * INTER];
+    for row in 0..M {
+        for col in 0..INTER {
+            retained_gate[row * INTER + col] =
+                physical_gate[row * T_STRIDE + (col / 24) * 96 + col % 24];
+        }
+    }
+    let (gate_cosine, gate_max_abs, gate_mean_abs, _) = metrics(&retained_gate, &gate);
+    let output = unsafe { as_f32(o.as_slice()) };
+    let (cosine, max_abs, mean_abs, max_reference) = metrics(&output[..M * N], &reference);
+    if !cosine.is_finite() || cosine < 0.999 || max_abs > max_reference * 0.03 + 1.0e-4 {
+        return Err(format!(
+            "resident dense-W8 FFN parity failed: gate_cosine={gate_cosine:.8} gate_max_abs={gate_max_abs:.7} gate_mean_abs={gate_mean_abs:.8} cosine={cosine:.8} max_abs={max_abs:.7} mean_abs={mean_abs:.8} max_reference={max_reference:.7}"
+        )
+        .into());
+    }
+
+    let started = std::time::Instant::now();
+    for dispatch in 0..iterations {
+        if dispatch != 0 && dispatch % 7 == 0 {
+            kernel.recreate_hwctx()?;
+        }
+        kernel.dispatch_synced(&[&d, &w, &t, &o], &[false, false, false, false])?;
+    }
+    let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
+    println!(
+        "resident-ffn-dense-w8 M={M} I={INTER} N={N}: gate_cosine={gate_cosine:.8} gate_max_abs={gate_max_abs:.7} cosine={cosine:.8} max_abs={max_abs:.7} mean_abs={mean_abs:.8} dispatch_ms={dispatch_ms:.4}"
     );
     Ok(())
 }
