@@ -1356,3 +1356,39 @@ contract, but it still performs a host-visible copy between separately allocated
 buffers. A shared dma-buf or fused-context path, the remaining post-FFN layer
 tail, full model execution, generic OQ4/mixed/OQ8 +/++ admission, end-to-end
 10k/15k throughput, and tokens/joule remain open.
+
+### R37 zero-copy two-context handoff checkpoint
+
+R37 replaces R36's host-visible canonical copy with one PRIME-exported GTT
+dma-buf imported by both NPU contexts. R34's large staging/result argument is
+the shared backing. Once QKV projection has finished, its prefix is dead; the
+full normalized M256-by-768 BF16 result overwrites that prefix. R35 imports the
+same fd as a larger-than-minimum input backing and consumes the canonical prefix
+at offset zero. No activation bytes are repacked or copied between commands.
+The cache advertises this ABI as `handoff=staging-prefix-dmabuf`.
+
+Two rejected layouts establish the hardware constraints. A dedicated sixth
+R34 argument cannot work because the amdxdna DPU regmap admits at most five
+arguments. Reusing Q keeps five arguments but is unsafe: R34 begins draining
+the first normalized wave while later attention groups still consume Q, which
+corrupts the result. Delaying that drain breaks the resident FIFO cadence on
+the following command. Reusing the dead R staging prefix preserves the original
+task schedule and sustained-command behavior.
+
+The shared-buffer hardware oracle retains full parity: Q cosine
+`0.99998086`, K cosine `0.99998099`, V cosine `0.99999192`, full normalized
+output cosine `0.99990598`, and zero-copy FFN cosine `0.99990868`. Isolated
+averages are `5.9156 ms` for R34 and `9.8379 ms` for R35. A three-run loop that
+actually alternates the two hardware contexts averages `21.6999 ms`, or
+11,797 M256 layer-boundary rows/s. The approximately 5.95 ms gap over the two
+isolated averages is context-switch/scheduling overhead, not a memory copy.
+
+This clears the 10k row/s threshold for this one fused attention-plus-FFN layer
+boundary, but it is not the requested full-model 10k input-token result. At the
+current alternating-context cost, repeating the boundary over all encoder
+layers cannot meet the full-model budget. The next execution slice must avoid a
+per-layer R34/R35 context alternation, most likely by fusing the schedules into
+one image or batching layer phases within longer-lived contexts while retaining
+all inter-layer state on shared buffers. The post-FFN residual/tail, full model,
+generic OQ4/mixed/OQ8 +/++ hardware matrix, package-energy sweep, and 10k/15k
+end-to-end gates remain open.

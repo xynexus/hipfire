@@ -172,6 +172,25 @@ impl NpuResidentFfnDenseW8 {
         Ok(())
     }
 
+    /// Replace the canonical input with a caller-owned dma-buf. A preceding
+    /// NPU context can write the same physical pages and this context consumes
+    /// them directly without a host-visible copy.
+    pub fn attach_shared_input(
+        &mut self,
+        input_fd: i32,
+        input_bytes: usize,
+    ) -> Result<(), XdnaError> {
+        if input_bytes < self.loaded_input_bytes() {
+            return Err(invalid(
+                "resident dense-W8 FFN shared input dma-buf is too small",
+            ));
+        }
+        self.input = self.kernel.import_dmabuf(input_fd, input_bytes, true)?;
+        self.primed = false;
+        self.context_commands = 0;
+        Ok(())
+    }
+
     pub fn upload_weights(
         &self,
         gate: &OpusPackedMatrix,

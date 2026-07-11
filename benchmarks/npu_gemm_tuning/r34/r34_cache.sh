@@ -24,5 +24,5 @@ python "$HERE/../r29/r29_gen.py" --residual-norm > "$OUT/aie.mlir"
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge --peano="$PEANO" \
   --aie-generate-npu-insts --npu-insts-name="$OUT/insts.bin" \
   --aie-generate-xclbin --xclbin-name="$OUT/final.xclbin" --tmpdir="$OUT" >/dev/null
-printf 'op=resident-qkv-paired-attention-output-norm\nmode=w8-scaled\nm=256\nk=768\nn=1280\nroles=q0,q1,q2,k,v,o\ntails=post-attn-norm,residual,pre-ffn-norm\noutput=canonical-token-major-bf16\n' > "$OUT/shape.txt"
+printf 'op=resident-qkv-paired-attention-output-norm\nmode=w8-scaled\nm=256\nk=768\nn=1280\nroles=q0,q1,q2,k,v,o\ntails=post-attn-norm,residual,pre-ffn-norm\noutput=canonical-token-major-bf16\nhandoff=staging-prefix-dmabuf\n' > "$OUT/shape.txt"
 echo "$OUT"

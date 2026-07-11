@@ -812,7 +812,7 @@ def start_norm_output_tasks(mwave):
                 out.extend(
                     [
                         f"      %{name} = aiex.dma_configure_task_for @osh{col} {{",
-                        f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {R_STAGE_BYTES + ATT_BYTES + offset}, {OUT_JOIN}, [<size = {ROWS}, stride = {32 * 768 * 2}>, <size = 4, stride = {768 * 2}>, <size = 512, stride = 1>]) {{burst_length = 0 : i32}}",
+                        f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {OUT_JOIN}, [<size = {ROWS}, stride = {32 * 768 * 2}>, <size = 4, stride = {768 * 2}>, <size = 512, stride = 1>]) {{burst_length = 0 : i32}}",
                         "        aie.end",
                         "      } {issue_token = true}",
                         f"      aiex.dma_start_task(%{name})",

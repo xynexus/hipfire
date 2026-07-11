@@ -84,6 +84,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("R29 cache missing {field}").into());
         }
     }
+    if residual_norm
+        && !manifest
+            .lines()
+            .any(|line| line == "handoff=staging-prefix-dmabuf")
+    {
+        return Err("R34 cache missing shared staging-prefix handoff contract".into());
+    }
     let pair_bytes = if attention { 16384 } else { 10240 };
     let a_bytes = 4 * 45 * pair_bytes;
     let r_stage_bytes = 5 * 48 * pair_bytes;
@@ -169,7 +176,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut a_buffer = kernel.alloc_arg(a_bytes)?;
     let mut w_buffer = kernel.alloc_arg(w_bytes)?;
-    let mut r_buffer = kernel.alloc_arg(r_bytes)?;
+    let shared_handoff = if residual_norm {
+        let gpu = hipfire_rdna::Gpu::init()?;
+        let mut shared = gpu.alloc_shared_gtt(r_bytes)?;
+        shared.as_mut_slice().fill(0);
+        Some(shared)
+    } else {
+        None
+    };
+    let mut r_buffer = if let Some(shared) = shared_handoff.as_ref() {
+        kernel.import_dmabuf(shared.dmabuf_fd(), shared.len(), true)?
+    } else {
+        kernel.alloc_arg(r_bytes)?
+    };
     let mut q_buffer = kernel.alloc_arg(Layout::Q_BYTES)?;
     let mut kv_buffer = kernel.alloc_arg(Layout::KV_BYTES)?;
     a_buffer.as_mut_slice().copy_from_slice(&packed_a);
@@ -188,7 +207,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             &r_buffer.as_slice()[r_stage_bytes..r_stage_bytes + Layout::OUTPUT_BYTES]
         };
-        let prime_output_nonzero = if direct_output {
+        let prime_output_nonzero = if residual_norm {
+            r_buffer.as_slice()[..Layout::TOKENS * 768 * 2]
+                .iter()
+                .filter(|&&byte| byte != 0)
+                .count()
+        } else if direct_output {
             r_buffer.as_slice()[r_stage_bytes + Layout::OUTPUT_BYTES..]
                 .iter()
                 .filter(|&&byte| byte != 0)
@@ -224,8 +248,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     kernel.sync_output(&r_buffer)?;
     kernel.sync_output(&q_buffer)?;
     kernel.sync_output(&kv_buffer)?;
-    let projected_got = read_projected(&r_buffer.as_slice()[raw_base..], pair_bytes);
-    let q_got = read_q(q_buffer.as_slice());
+    let projected_got = if residual_norm {
+        projected.clone()
+    } else {
+        read_projected(&r_buffer.as_slice()[raw_base..], pair_bytes)
+    };
     let k_got = read_kv(kv_buffer.as_slice(), true);
     let v_got = read_kv(kv_buffer.as_slice(), false);
     let projection = metrics(&projected_got, &projected);
@@ -234,8 +261,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let v_handoff = role_kv(&projected_got, 4);
     let q_handoff_reference = headnorm_rope(&q_handoff, &qnorm, &cs, Layout::QUERY_HEADS, EPSILON);
     let k_handoff_reference = headnorm_rope(&k_handoff, &knorm, &cs, Layout::KV_HEADS, EPSILON);
+    let q_got = read_q(q_buffer.as_slice());
     let q = metrics(&q_got, &q_handoff_reference);
     let k = metrics(&k_got, &k_handoff_reference);
+    let v = metrics(&v_got, &v_handoff);
     let v_mismatches = v_got
         .iter()
         .map(|&value| f32_to_bf16_bits(value))
@@ -245,14 +274,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if projection.0 < 0.9999 || projection.1 > 0.01 {
         return Err(format!("R29 projection parity failed: {projection:?}").into());
     }
-    if q.0 < 0.999 || k.0 < 0.999 || q.1 > 0.04 || k.1 > 0.04 || v_mismatches != 0 {
+    if q.0 < 0.999
+        || q.1 > 0.04
+        || k.0 < 0.999
+        || k.1 > 0.04
+        || if residual_norm {
+            v.0 < 0.9999 || v.1 > 0.001
+        } else {
+            v_mismatches != 0
+        }
+    {
         let first_v_mismatch = v_got
             .iter()
             .zip(&v_handoff)
             .position(|(&got, &expected)| f32_to_bf16_bits(got) != f32_to_bf16_bits(expected));
         let k_non_finite = k_got.iter().filter(|value| !value.is_finite()).count();
         return Err(format!(
-            "R29 pack parity failed: projection={projection:?} q={q:?} k={k:?} k_non_finite={k_non_finite} v_bit_mismatches={v_mismatches} first_v_mismatch={first_v_mismatch:?}; k[0..8]={:?} k_ref[0..8]={:?}; v[0..8]={:?} v_ref[0..8]={:?}",
+            "R29 pack parity failed: projection={projection:?} q={q:?} k={k:?} k_non_finite={k_non_finite} v={v:?} v_bit_mismatches={v_mismatches} first_v_mismatch={first_v_mismatch:?}; k[0..8]={:?} k_ref[0..8]={:?}; v[0..8]={:?} v_ref[0..8]={:?}",
             &k_got[..8],
             &k_handoff_reference[..8],
             &v_got[..8],
@@ -301,8 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut norm_bf16 = None;
     let norm_metrics = if residual_norm {
         let output_bytes = Layout::TOKENS * 768 * 2;
-        let output = &r_buffer.as_slice()[r_stage_bytes + Layout::OUTPUT_BYTES
-            ..r_stage_bytes + Layout::OUTPUT_BYTES + output_bytes];
+        let output = &r_buffer.as_slice()[..output_bytes];
         let got_bits = output
             .chunks_exact(2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
@@ -330,7 +367,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let ffn_chain_metrics = if let Some(input) = norm_bf16.as_deref() {
-        Some(verify_canonical_ffn_handoff(&ffn_cache, input)?)
+        let shared = shared_handoff
+            .as_ref()
+            .expect("R34 shared canonical output backing");
+        Some(verify_canonical_ffn_handoff(
+            &ffn_cache,
+            input,
+            shared.dmabuf_fd(),
+            shared.len(),
+            || {
+                dispatch_resident(
+                    &kernel, &a_buffer, &w_buffer, &r_buffer, &q_buffer, &kv_buffer, false,
+                )
+            },
+        )?)
     } else {
         None
     };
@@ -456,18 +506,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let norm = norm_metrics.expect("residual norm metrics");
         let ffn = ffn_chain_metrics.expect("R34 to R35 FFN metrics");
         println!(
-            "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} norm_full_cosine={:.8} norm_full_max={:.7} ffn_chain_cosine={:.8} ffn_chain_max={:.7} ffn_chain_ms={:.4} dispatch_ms={dispatch_ms:.4}",
-            projection.0,
-            projection.1,
+            "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: staging_prefix_reused_for_norm=true q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_cosine={:.8} v_max={:.7} norm_full_cosine={:.8} norm_full_max={:.7} ffn_zero_copy_cosine={:.8} ffn_zero_copy_max={:.7} ffn_zero_copy_ms={:.4} zero_copy_chain_ms={:.4} zero_copy_chain_rows_s={:.1} dispatch_ms={dispatch_ms:.4}",
             q.0,
             q.1,
             k.0,
             k.1,
+            v.0,
+            v.1,
             norm.0,
             norm.1,
             ffn.0,
             ffn.1,
             ffn.2,
+            ffn.3,
+            256_000.0 / ffn.3,
         );
     } else if direct_output {
         let output = output_metrics.expect("direct output projection metrics");
@@ -1162,10 +1214,16 @@ fn write_u16(destination: &mut [u8], offset: usize, value: u16) {
 }
 
 #[cfg(target_os = "linux")]
-fn verify_canonical_ffn_handoff(
+fn verify_canonical_ffn_handoff<F>(
     cache: &str,
     input_bf16: &[u16],
-) -> Result<(f64, f32, f64), Box<dyn std::error::Error>> {
+    input_fd: i32,
+    input_bytes: usize,
+    mut produce_input: F,
+) -> Result<(f64, f32, f64, f64), Box<dyn std::error::Error>>
+where
+    F: FnMut() -> Result<(), hipfire_xdna::XdnaError>,
+{
     use std::time::Instant;
 
     use hipfire_primitives::conv::{bf16_bits_to_f32, f32_to_bf16_bits};
@@ -1223,8 +1281,10 @@ fn verify_canonical_ffn_handoff(
     if executor.io_mode() != NpuResidentFfnDenseW8IoMode::CanonicalBf16 {
         return Err("R35 cache did not select the canonical-BF16 ABI".into());
     }
+    executor.attach_shared_input(input_fd, input_bytes)?;
     let weights = executor.upload_weights(&gate, &up, &down)?;
-    let output = executor.run_canonical_bf16(&weights, input_bf16)?;
+    executor.run_shared(&weights)?;
+    let output = executor.read_canonical_output_f32()?;
     let measured = metrics(&output, &reference);
     let max_reference = reference
         .iter()
@@ -1241,10 +1301,16 @@ fn verify_canonical_ffn_handoff(
     const TIMED_RUNS: usize = 3;
     let started = Instant::now();
     for _ in 0..TIMED_RUNS {
-        executor.run_canonical_bf16(&weights, input_bf16)?;
+        executor.run_shared(&weights)?;
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / TIMED_RUNS as f64;
-    Ok((measured.0, measured.1, dispatch_ms))
+    let started = Instant::now();
+    for _ in 0..TIMED_RUNS {
+        produce_input()?;
+        executor.run_shared(&weights)?;
+    }
+    let chain_ms = started.elapsed().as_secs_f64() * 1e3 / TIMED_RUNS as f64;
+    Ok((measured.0, measured.1, dispatch_ms, chain_ms))
 }
 
 #[cfg(target_os = "linux")]
