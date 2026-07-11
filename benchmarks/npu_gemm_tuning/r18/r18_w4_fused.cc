@@ -37,4 +37,6 @@ extern "C" void r18_w4_geglu(const int32 *__restrict accumulator_bits,
         aie::store_v(output + (im * 4 + row) * OUT_WIDTH + jn * 16,
                      r18_geglu16(gate, up));
       }
+  chess_separator_scheduler_local();
+  chess_separator();
 }

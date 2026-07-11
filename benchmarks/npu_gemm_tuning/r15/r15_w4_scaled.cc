@@ -18,6 +18,8 @@ template <bool ACCUMULATE>
 static void scaled_impl(const int8 *__restrict activation_payload,
                         const int8 *__restrict weight_payload,
                         int32 *__restrict output_bits) {
+  aie::set_rounding(aie::rounding_mode::floor);
+  aie::set_saturation(aie::saturation_mode::none);
   const float *activation_scales =
       reinterpret_cast<const float *>(activation_payload + AB);
   const float *weight_scales =
@@ -39,13 +41,11 @@ static void scaled_impl(const int8 *__restrict activation_payload,
         partial.mac(a1, w1);
         sum = aie::add(sum, partial.template to_vector<int32>());
       }
-      alignas(aie::vector_decl_align) int32 partial_values[SC];
-      aie::store_v(partial_values, sum);
       auto weight_scale = aie::load_v<16>(weight_scales + jn * 16);
 #pragma unroll
       for (int row = 0; row < 4; row++) {
         const int offset = (im * LN + jn) * SC + row * 16;
-        auto values = aie::to_float(aie::load_v<16>(partial_values + row * 16));
+        auto values = aie::to_float(sum.template extract<16>(row));
         auto scaled = aie::mul(values, weight_scale).template to_vector<float>();
         scaled = aie::mul(
                      scaled,
