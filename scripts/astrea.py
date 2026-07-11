@@ -210,8 +210,10 @@ MIXED_G256_BYTES_PER_GROUP = {
 
 ENGINE_HASH_PATHS = [
     "crates/hipfire-rdna/src/dispatch.rs",
+    "crates/hipfire-rdna/src/dispatch/rope.rs",
     "crates/hipfire-rdna/src/kernels.rs",
     "crates/hipfire-arch-qwen35/src/qwen35.rs",
+    "crates/hipfire-arch-qwen35/src/qwen35/mod.rs",
     "crates/hipfire-runtime/examples/eval_hipfire.rs",
     "kernels/src/rope_partial_interleaved.hip",
     "kernels/src/rope_partial_interleaved_batched.hip",
@@ -2430,8 +2432,15 @@ def file_sha256(path):
 
 def detect_rope_convention(root):
     root = Path(root)
-    dispatch_path = root / "crates" / "hipfire-rdna" / "src" / "dispatch.rs"
-    text = dispatch_path.read_text(encoding="utf-8", errors="ignore") if dispatch_path.exists() else ""
+    dispatch_paths = [
+        root / "crates" / "hipfire-rdna" / "src" / "dispatch.rs",
+        root / "crates" / "hipfire-rdna" / "src" / "dispatch" / "rope.rs",
+    ]
+    text = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for path in dispatch_paths
+        if path.exists()
+    )
     has_halfsplit_source = (root / "kernels" / "src" / "rope_partial_halfsplit.hip").exists() or (
         root / "kernels" / "src" / "rope_partial_halfsplit_batched.hip"
     ).exists()
@@ -3755,6 +3764,148 @@ def load_paroquant_import_module():
     return module
 
 
+def load_latent_kv_module():
+    try:
+        import astrea_latent_kv
+    except Exception as exc:
+        raise ValueError(f"unable to load Astrea latent-KV module: {exc}") from exc
+    return astrea_latent_kv
+
+
+def build_latent_kv_plan(
+    *,
+    model,
+    calibration_dataset,
+    validation_dataset,
+    calibration_lengths,
+    validation_lengths,
+    calibration_position_offsets,
+    validation_position_offsets,
+    calibration_samples_per_stratum=1,
+    validation_samples_per_stratum=1,
+    max_static_vs_oracle_kld_delta,
+    max_static_vs_oracle_ppl_ratio,
+    ranks=None,
+    engine_root=None,
+    plan_id=None,
+    command=None,
+    basis_family="shared_static_v0",
+    basis_experts=1,
+    basis_selector="kv_layer_head_mean_abs_rms_v1",
+):
+    module = load_latent_kv_module()
+    return module.build_plan(
+        model=model,
+        calibration_dataset=calibration_dataset,
+        validation_dataset=validation_dataset,
+        calibration_lengths=calibration_lengths,
+        validation_lengths=validation_lengths,
+        calibration_position_offsets=calibration_position_offsets,
+        validation_position_offsets=validation_position_offsets,
+        calibration_samples_per_stratum=calibration_samples_per_stratum,
+        validation_samples_per_stratum=validation_samples_per_stratum,
+        max_static_vs_oracle_kld_delta=max_static_vs_oracle_kld_delta,
+        max_static_vs_oracle_ppl_ratio=max_static_vs_oracle_ppl_ratio,
+        ranks=ranks or module.SUPPORTED_RANKS,
+        engine=engine_fingerprint(engine_root),
+        evaluator_files=[Path(__file__), Path(module.__file__)],
+        command=command,
+        plan_id=plan_id,
+        basis_family=basis_family,
+        basis_experts=basis_experts,
+        basis_selector=basis_selector,
+    )
+
+
+def capture_latent_kv(
+    plan,
+    *,
+    split,
+    output_dir,
+    threads=None,
+    command=None,
+):
+    return load_latent_kv_module().capture_hf(
+        plan,
+        split=split,
+        output_dir=output_dir,
+        threads=threads,
+        command=command,
+    )
+
+
+def calibrate_latent_kv(
+    plan,
+    capture,
+    *,
+    output_dir,
+    command=None,
+):
+    return load_latent_kv_module().calibrate_capture(
+        plan,
+        capture,
+        output_dir=output_dir,
+        command=command,
+    )
+
+
+def reference_latent_kv(
+    plan,
+    calibration,
+    validation_capture,
+    *,
+    output_dir,
+    command=None,
+):
+    return load_latent_kv_module().evaluate_reference(
+        plan,
+        calibration,
+        validation_capture,
+        output_dir=output_dir,
+        command=command,
+    )
+
+
+def evaluate_latent_kv_model(
+    plan,
+    calibration,
+    validation_capture,
+    *,
+    output_dir,
+    rank=32,
+    threads=None,
+    command=None,
+):
+    return load_latent_kv_module().evaluate_model(
+        plan,
+        calibration,
+        validation_capture,
+        output_dir=output_dir,
+        rank=rank,
+        threads=threads,
+        command=command,
+    )
+
+
+def evaluate_latent_kv_feasibility(
+    plan,
+    validation_capture,
+    *,
+    output_dir,
+    rank=32,
+    threads=None,
+    command=None,
+):
+    return load_latent_kv_module().evaluate_feasibility_ceiling(
+        plan,
+        validation_capture,
+        output_dir=output_dir,
+        rank=rank,
+        threads=threads,
+        command=command,
+    )
+
+
 def load_paroquant_oracle_module():
     import importlib.util
 
@@ -3901,6 +4052,112 @@ def build_parser():
     promote.add_argument("--pretty", action="store_true")
     promote.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
+    latent_kv_plan = sub.add_parser(
+        "latent-kv-plan",
+        help="Freeze a reproducible hierarchical calibrated latent-KV experiment contract.",
+    )
+    latent_kv_plan.add_argument("--model", required=True)
+    latent_kv_plan.add_argument("--calibration-dataset", required=True)
+    latent_kv_plan.add_argument("--validation-dataset", required=True)
+    latent_kv_plan.add_argument(
+        "--calibration-length", dest="calibration_lengths", type=int, action="append", required=True
+    )
+    latent_kv_plan.add_argument(
+        "--validation-length", dest="validation_lengths", type=int, action="append", required=True
+    )
+    latent_kv_plan.add_argument(
+        "--calibration-position-offset",
+        dest="calibration_position_offsets",
+        type=int,
+        action="append",
+        required=True,
+    )
+    latent_kv_plan.add_argument(
+        "--validation-position-offset",
+        dest="validation_position_offsets",
+        type=int,
+        action="append",
+        required=True,
+    )
+    latent_kv_plan.add_argument("--calibration-samples-per-stratum", type=int, default=1)
+    latent_kv_plan.add_argument("--validation-samples-per-stratum", type=int, default=1)
+    latent_kv_plan.add_argument("--rank", dest="ranks", type=int, action="append", default=[])
+    latent_kv_plan.add_argument("--max-static-vs-oracle-kld-delta", type=float, required=True)
+    latent_kv_plan.add_argument("--max-static-vs-oracle-ppl-ratio", type=float, required=True)
+    latent_kv_plan.add_argument("--engine-root")
+    latent_kv_plan.add_argument("--plan-id")
+    latent_kv_plan.add_argument(
+        "--basis-family",
+        choices=("shared_static_v0", "page_local_mixture_v1"),
+        default="shared_static_v0",
+    )
+    latent_kv_plan.add_argument("--basis-experts", type=int, default=1)
+    latent_kv_plan.add_argument(
+        "--basis-selector",
+        choices=("kv_layer_head_mean_abs_rms_v1", "length_x_position_v1"),
+        default="kv_layer_head_mean_abs_rms_v1",
+        help="Page-mixture selector: kv moments (8 experts) or length x position regime.",
+    )
+    latent_kv_plan.add_argument("--pretty", action="store_true")
+    latent_kv_plan.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_capture = sub.add_parser(
+        "latent-kv-capture",
+        help="Capture post-RoPE Q/K and V/output evidence for a frozen latent-KV plan.",
+    )
+    latent_kv_capture.add_argument("--plan", required=True)
+    latent_kv_capture.add_argument("--split", choices=("calibration", "validation"), required=True)
+    latent_kv_capture.add_argument("--output-dir", required=True)
+    latent_kv_capture.add_argument("--threads", type=int)
+    latent_kv_capture.add_argument("--pretty", action="store_true")
+    latent_kv_capture.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_calibrate = sub.add_parser(
+        "latent-kv-calibrate",
+        help="Fit KQ-SVD/value factors from a calibration capture.",
+    )
+    latent_kv_calibrate.add_argument("--plan", required=True)
+    latent_kv_calibrate.add_argument("--capture", required=True)
+    latent_kv_calibrate.add_argument("--output-dir", required=True)
+    latent_kv_calibrate.add_argument("--pretty", action="store_true")
+    latent_kv_calibrate.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_reference = sub.add_parser(
+        "latent-kv-reference",
+        help="Compare static and same-cache KQ-SVD arms on held-out captures.",
+    )
+    latent_kv_reference.add_argument("--plan", required=True)
+    latent_kv_reference.add_argument("--calibration", required=True)
+    latent_kv_reference.add_argument("--validation-capture", required=True)
+    latent_kv_reference.add_argument("--output-dir", required=True)
+    latent_kv_reference.add_argument("--pretty", action="store_true")
+    latent_kv_reference.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_model_eval = sub.add_parser(
+        "latent-kv-model-eval",
+        help="Run full-model baseline/static/same-cache-oracle KLD and PPL.",
+    )
+    latent_kv_model_eval.add_argument("--plan", required=True)
+    latent_kv_model_eval.add_argument("--calibration", required=True)
+    latent_kv_model_eval.add_argument("--validation-capture", required=True)
+    latent_kv_model_eval.add_argument("--output-dir", required=True)
+    latent_kv_model_eval.add_argument("--rank", type=int, default=32)
+    latent_kv_model_eval.add_argument("--threads", type=int)
+    latent_kv_model_eval.add_argument("--pretty", action="store_true")
+    latent_kv_model_eval.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_feasibility = sub.add_parser(
+        "latent-kv-feasibility",
+        help="Fit the consumed validation caches to measure a non-admission shared-basis ceiling.",
+    )
+    latent_kv_feasibility.add_argument("--plan", required=True)
+    latent_kv_feasibility.add_argument("--validation-capture", required=True)
+    latent_kv_feasibility.add_argument("--output-dir", required=True)
+    latent_kv_feasibility.add_argument("--rank", type=int, default=32)
+    latent_kv_feasibility.add_argument("--threads", type=int)
+    latent_kv_feasibility.add_argument("--pretty", action="store_true")
+    latent_kv_feasibility.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
     kv_profile = sub.add_parser("kv-profile", help="Emit a KV cache policy/profile artifact.")
     kv_profile.add_argument("--model", required=True)
     kv_profile.add_argument("--mode", dest="modes", action="append", default=[])
@@ -3963,7 +4220,8 @@ def build_parser():
 
 
 def run(argv=None):
-    args = build_parser().parse_args(argv)
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    args = build_parser().parse_args(raw_argv)
     if args.command == "inspect":
         write_json(
             inspect_model(args.model, imatrix=args.imatrix, quant_format=args.quant_format),
@@ -4061,6 +4319,93 @@ def run(argv=None):
                 output=args.output,
                 max_tensors=args.max_tensors,
                 tensor_filter=args.tensor_filter,
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-plan":
+        write_json(
+            build_latent_kv_plan(
+                model=args.model,
+                calibration_dataset=args.calibration_dataset,
+                validation_dataset=args.validation_dataset,
+                calibration_lengths=args.calibration_lengths,
+                validation_lengths=args.validation_lengths,
+                calibration_position_offsets=args.calibration_position_offsets,
+                validation_position_offsets=args.validation_position_offsets,
+                calibration_samples_per_stratum=args.calibration_samples_per_stratum,
+                validation_samples_per_stratum=args.validation_samples_per_stratum,
+                max_static_vs_oracle_kld_delta=args.max_static_vs_oracle_kld_delta,
+                max_static_vs_oracle_ppl_ratio=args.max_static_vs_oracle_ppl_ratio,
+                ranks=args.ranks or None,
+                engine_root=args.engine_root,
+                plan_id=args.plan_id,
+                basis_family=args.basis_family,
+                basis_experts=args.basis_experts,
+                basis_selector=args.basis_selector,
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-capture":
+        write_json(
+            capture_latent_kv(
+                args.plan,
+                split=args.split,
+                output_dir=args.output_dir,
+                threads=args.threads,
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-calibrate":
+        write_json(
+            calibrate_latent_kv(
+                args.plan,
+                args.capture,
+                output_dir=args.output_dir,
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-reference":
+        write_json(
+            reference_latent_kv(
+                args.plan,
+                args.calibration,
+                args.validation_capture,
+                output_dir=args.output_dir,
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-model-eval":
+        write_json(
+            evaluate_latent_kv_model(
+                args.plan,
+                args.calibration,
+                args.validation_capture,
+                output_dir=args.output_dir,
+                rank=args.rank,
+                threads=args.threads,
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-feasibility":
+        write_json(
+            evaluate_latent_kv_feasibility(
+                args.plan,
+                args.validation_capture,
+                output_dir=args.output_dir,
+                rank=args.rank,
+                threads=args.threads,
+                command=["python3", "scripts/astrea.py", *raw_argv],
             ),
             pretty=args.pretty,
             out=args.out,

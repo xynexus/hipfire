@@ -32,6 +32,12 @@ python3 scripts/astrea.py eval --plan PLAN.json [--run] --pretty [--out PATH]
 python3 scripts/astrea.py metrics --quality-json result-data.json --candidate-variant NAME [--baseline-variant NAME] [--floor-variant NAME] [--arch ARCH] [--scoring-mode MODE] [--engine-root REPO] --pretty [--out PATH]
 python3 scripts/astrea.py policy --model MODEL --base-format FORMAT --promotion-format FORMAT (--sensitivity-json SCORES.json | --imatrix IMATRIX) --max-extra-bytes N [--method METHOD] [--objective dynamic-tensor-policy|moe-probe|model-ingress|kv-policy] [--domain weights|kv] [--model-family FAMILY] --pretty [--out PATH]
 python3 scripts/astrea.py promote --policy POLICY.json --source-dir BF16_DIR --output CANDIDATE.hfq [--max-tensors N] [--tensor-filter NAME] --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-plan --model MODEL --calibration-dataset CAL.jsonl --validation-dataset VAL.jsonl --calibration-length N --validation-length N4X --calibration-position-offset P --validation-position-offset P4X [--calibration-samples-per-stratum N] [--validation-samples-per-stratum N] --rank 32 --rank 64 --rank 96 --max-static-vs-oracle-kld-delta D --max-static-vs-oracle-ppl-ratio R --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-capture --plan PLAN.json --split calibration|validation --output-dir DIR [--threads N] --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-calibrate --plan PLAN.json --capture CALIBRATION_CAPTURE.json --output-dir DIR --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-reference --plan PLAN.json --calibration CALIBRATION.json --validation-capture VALIDATION_CAPTURE.json --output-dir DIR --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-model-eval --plan PLAN.json --calibration CALIBRATION.json --validation-capture VALIDATION_CAPTURE.json --output-dir DIR [--rank 32] [--threads N] --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-feasibility --plan PLAN.json --validation-capture VALIDATION_CAPTURE.json --output-dir DIR [--rank 32] [--threads N] --pretty [--out PATH]
 python3 scripts/astrea.py kv-profile --model MODEL [--mode q8|asym3|triattn|cask|turbo3|rotor] [--triattn PATH] [--model-family FAMILY] [--engine-root REPO] --pretty [--out PATH]
 python3 scripts/astrea.py bundle-plan --model MODEL --output MODEL.hfq [--include weights|paro|kv-policy|triattn|evidence] [--triattn PATH] [--policy-id ID] --pretty [--out PATH]
 python3 scripts/astrea.py report ARTIFACT.json ... --pretty [--out PATH]
@@ -107,6 +113,23 @@ empty.
    promotion claim.
 13. Use `report` to summarize evidence and recommend promote, reject, or
    iterate.
+
+For hierarchical calibrated latent-KV experiments, write and review the
+`latent-kv-plan` artifact before any held-out capture. Freeze the calibration
+and validation corpora, length/position strata, evaluator fingerprints, rank
+set, and admission thresholds in that plan. Capture calibration and validation
+as separate splits, fit factors from calibration capture only, then run both
+`latent-kv-reference` and `latent-kv-model-eval` on the untouched validation
+capture. The reference result is component-level diagnostic evidence; only the
+full-model KLD/PPL result can satisfy the admission gate. Never loosen a frozen
+threshold after reading validation results.
+
+After a rejected held-out run, `latent-kv-feasibility` may fit one global basis
+directly on the already-consumed validation caches to measure an optimistic
+in-sample ceiling for the shared-basis family. Its artifact is deliberately
+marked held-out-contaminated and admission-ineligible. Use it only to determine
+whether a new untouched experiment is technically justified; never promote or
+package its fitted basis.
 
 ## Format Guidance
 

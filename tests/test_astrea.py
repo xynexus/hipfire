@@ -1841,6 +1841,483 @@ class AstreaTests(unittest.TestCase):
             self.assertEqual(payload["schema"], "hipfire.astrea.plan.v0")
             self.assertEqual(payload["plan_id"], "astrea-out-smoke")
 
+    def test_latent_kv_plan_freezes_thresholds_and_gated_contract(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "text_config": {
+                            "model_type": "qwen3_5_text",
+                            "hidden_size": 128,
+                            "num_hidden_layers": 4,
+                            "num_attention_heads": 4,
+                            "num_key_value_heads": 2,
+                            "head_dim": 64,
+                            "layer_types": [
+                                "linear_attention",
+                                "linear_attention",
+                                "linear_attention",
+                                "full_attention",
+                            ],
+                            "rope_parameters": {
+                                "rope_type": "default",
+                                "rope_theta": 10000000,
+                                "partial_rotary_factor": 0.25,
+                                "mrope_interleaved": True,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (model / "model.safetensors").write_bytes(b"synthetic-latent-kv-model")
+            calibration = root / "calibration.jsonl"
+            validation = root / "validation.jsonl"
+            calibration.write_text('{"text":"calibration"}\n', encoding="utf-8")
+            validation.write_text('{"text":"validation"}\n', encoding="utf-8")
+
+            plan = latent.build_plan(
+                model=model,
+                calibration_dataset=calibration,
+                validation_dataset=validation,
+                calibration_lengths=[16],
+                validation_lengths=[64],
+                calibration_position_offsets=[0, 16],
+                validation_position_offsets=[0, 64],
+                calibration_samples_per_stratum=8,
+                validation_samples_per_stratum=2,
+                max_static_vs_oracle_kld_delta=0.05,
+                max_static_vs_oracle_ppl_ratio=1.05,
+                ranks=[32],
+                engine={"qwen35_fa_rope": "halfsplit", "sha256": "engine"},
+                evaluator_files=[ASTREA_PATH, ROOT / "scripts" / "astrea_latent_kv.py"],
+                command=["python3", "scripts/astrea.py", "latent-kv-plan"],
+                plan_id="latent-kv-test",
+                basis_family=latent.BASIS_PAGE_MIXTURE,
+                basis_experts=8,
+            )
+
+        self.assertEqual(plan["schema"], latent.LATENT_KV_PLAN_SCHEMA)
+        self.assertEqual(plan["status"], "planned_pre_heldout")
+        self.assertTrue(plan["admission_thresholds"]["frozen_before_heldout"])
+        self.assertFalse(plan["admission_thresholds"]["heldout_evaluated"])
+        self.assertEqual(plan["admission_thresholds"]["max_static_vs_oracle_kld_delta"], 0.05)
+        self.assertEqual(plan["admission_thresholds"]["max_static_vs_oracle_ppl_ratio"], 1.05)
+        self.assertEqual(
+            plan["model_contract"]["value_output_contract"],
+            latent.VALUE_CONTRACT_GATED,
+        )
+        self.assertEqual(
+            plan["runtime_contract"]["gated_exception"]["order"],
+            ["latent_attention", "R_v", "sigmoid_gate", "W_o"],
+        )
+        self.assertEqual(plan["calibration_contract"]["calibration_samples_per_stratum"], 8)
+        self.assertEqual(plan["calibration_contract"]["validation_samples_per_stratum"], 2)
+        self.assertEqual(
+            plan["calibration_contract"]["basis_family"]["name"],
+            latent.BASIS_PAGE_MIXTURE,
+        )
+        self.assertEqual(plan["calibration_contract"]["basis_family"]["experts"], 8)
+        self.assertEqual(
+            plan["runtime_contract"]["page_local_basis_exception"]["decision_point"],
+            "page_seal",
+        )
+        self.assertTrue(
+            plan["runtime_contract"]["page_local_basis_exception"][
+                "source_retention_accounting_required"
+            ]
+        )
+        self.assertEqual(len(plan["artifact_sha256"]), 64)
+
+    def test_latent_kv_page_selector_is_calibration_fit_and_deterministic(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        if latent.np is None:
+            self.skipTest("numpy unavailable")
+        contract = {
+            "full_attention_layers": [0],
+            "num_key_value_heads": 1,
+        }
+        records = {}
+        for stratum in range(16):
+            scale = 1.0 + stratum
+            records[stratum] = {
+                0: {
+                    "k": latent.np.full((1, 32, 8), scale, dtype=latent.np.float32),
+                    "v": latent.np.full((1, 32, 8), scale * scale, dtype=latent.np.float32),
+                }
+            }
+        first = latent._fit_selector(records, contract, 8)
+        second = latent._fit_selector(records, contract, 8)
+        self.assertEqual(first["assignment"], second["assignment"])
+        self.assertEqual(sum(first["counts"]), len(records))
+        self.assertEqual(first["counts"], [2] * 8)
+        self.assertTrue(latent.np.array_equal(first["centroids"], second["centroids"]))
+
+    def test_latent_kv_length_position_selector_routes_by_nearest_regime(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        if latent.np is None:
+            self.skipTest("numpy unavailable")
+        # Four calibration regimes: lengths {32, 64} x offsets {0, 64}.
+        records_by_stratum = {}
+        metadata_by_stratum = {}
+        stratum = 0
+        for length in (32, 64):
+            for offset in (0, 64):
+                for _ in range(3):
+                    records_by_stratum[stratum] = {0: {}}
+                    metadata_by_stratum[stratum] = {"length": length, "position_offset": offset}
+                    stratum += 1
+        selector = latent._fit_length_position_selector(
+            records_by_stratum, metadata_by_stratum, 4
+        )
+        # One expert per regime, calibration pages split evenly (3 each).
+        self.assertEqual(selector["counts"], [3, 3, 3, 3])
+        self.assertEqual(sum(selector["counts"]), len(records_by_stratum))
+        factors = {
+            "selector_feature_mean": selector["mean"],
+            "selector_feature_scale": selector["scale"],
+            "selector_centroids": selector["centroids"],
+        }
+        # A held-out page far outside the calibrated range (length 256, offset 256)
+        # routes to the nearest calibrated regime (length 64, offset 64) -> the
+        # last expert, deterministically, using metadata only.
+        expert, _distance = latent._select_expert(
+            {}, {"length": 256, "position_offset": 256}, {}, factors,
+            latent.SELECTOR_LENGTH_POSITION,
+        )
+        combos = sorted({(32, 0), (32, 64), (64, 0), (64, 64)})
+        self.assertEqual(combos[expert], (64, 64))
+
+    def test_latent_kv_plan_rejects_less_than_four_x_extrapolation(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        with self.assertRaisesRegex(ValueError, "at least 4x"):
+            latent._validate_extrapolation([32], [127])
+
+    def test_latent_kv_plan_fails_closed_when_evaluator_changes(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        with tempfile.TemporaryDirectory() as td:
+            evaluator = Path(td) / "evaluator.py"
+            evaluator.write_text("version = 1\n", encoding="utf-8")
+            record = latent._file_fingerprint(evaluator)
+            plan = {
+                "reproducibility": {
+                    "evaluator_files": [record],
+                    "evaluator_sha256": latent._canonical_sha256([record]),
+                }
+            }
+            latent._verify_plan_evaluator(plan)
+            evaluator.write_text("version = 2\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "changed after plan creation"):
+                latent._verify_plan_evaluator(plan)
+
+    def test_kq_svd_matches_best_product_rank_and_stacks_queries(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        if latent.np is None:
+            self.skipTest("numpy unavailable")
+        rng = latent.np.random.default_rng(31)
+        keys = rng.normal(size=(96, 16))
+        query_heads = rng.normal(size=(3, 32, 16))
+        queries = query_heads.reshape(-1, 16)
+        factors = latent.kq_svd_factors(keys, queries, 8)
+        exact = keys @ queries.T
+        approx = (keys @ factors["k_down"]) @ (queries @ factors["q_down"]).T
+        u, s, vh = latent.np.linalg.svd(exact, full_matrices=False)
+        best = (u[:, :8] * s[:8]) @ vh[:8]
+        self.assertEqual(factors["k_down"].shape, (16, 8))
+        self.assertEqual(factors["q_down"].shape, (16, 8))
+        self.assertLess(
+            abs(latent.np.linalg.norm(exact - approx) - latent.np.linalg.norm(exact - best)),
+            1e-8,
+        )
+
+    def test_value_closed_form_uses_stacked_gqa_output_slices(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        if latent.np is None:
+            self.skipTest("numpy unavailable")
+        rng = latent.np.random.default_rng(41)
+        values = rng.normal(size=(80, 16))
+        wo_slices = rng.normal(size=(4, 16, 24))
+        stacked_wo = latent.np.concatenate(list(wo_slices), axis=1)
+        factors = latent.value_output_factors(values, stacked_wo, 8)
+        exact = values @ stacked_wo
+        approx = values @ factors["v_down"] @ factors["v_up"] @ stacked_wo
+        u, s, vh = latent.np.linalg.svd(exact, full_matrices=False)
+        best = (u[:, :8] * s[:8]) @ vh[:8]
+        self.assertEqual(factors["v_down"].shape, (16, 8))
+        self.assertEqual(factors["v_up"].shape, (8, 16))
+        self.assertTrue(factors["refinement"]["attempted"])
+        self.assertIsNotNone(factors["refinement"]["candidate"])
+        self.assertLess(
+            abs(latent.np.linalg.norm(exact - approx) - latent.np.linalg.norm(exact - best)),
+            1e-7,
+        )
+
+    def test_recal_value_update_uses_activation_covariance_and_preserves_shapes(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        if latent.np is None:
+            self.skipTest("numpy unavailable")
+        rng = latent.np.random.default_rng(47)
+        values = rng.normal(size=(96, 20))
+        down = rng.normal(size=(20, 8))
+        up = rng.normal(size=(8, 20))
+        before = latent.np.linalg.norm(values - values @ down @ up)
+        refined_down, refined_up = latent._recal_value_refinement(values, down, up)
+        after = latent.np.linalg.norm(values - values @ refined_down @ refined_up)
+        self.assertEqual(refined_down.shape, down.shape)
+        self.assertEqual(refined_up.shape, up.shape)
+        self.assertLessEqual(after, before + 1e-9)
+
+    def test_gated_current_output_reconstruction_is_exact_at_full_rank(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        if latent.np is None:
+            self.skipTest("numpy unavailable")
+        rng = latent.np.random.default_rng(53)
+        tokens, heads, dim, hidden = 12, 2, 8, 20
+        identity = latent.np.eye(dim, dtype=latent.np.float32)
+        result = latent.evaluate_capture_group(
+            query_heads=rng.normal(size=(heads, tokens, dim)),
+            keys=rng.normal(size=(tokens, dim)),
+            values=rng.normal(size=(tokens, dim)),
+            wo_slices=rng.normal(size=(heads, dim, hidden)),
+            gates=rng.normal(size=(heads, tokens, dim)),
+            static_factors={
+                "k_down": identity,
+                "q_down": identity,
+                "v_down": identity,
+                "v_up": identity,
+            },
+            rank=dim,
+        )
+        self.assertTrue(result["arms"]["static"]["finite"])
+        self.assertLess(abs(result["arms"]["static"]["attention_kld"]), 1e-12)
+        self.assertLess(result["arms"]["static"]["gated_output_relative_error"], 1e-12)
+
+    def test_latent_kv_global_feasibility_basis_uses_every_capture(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        if latent.np is None:
+            self.skipTest("numpy unavailable")
+        rng = latent.np.random.default_rng(59)
+        contract = {
+            "full_attention_layers": [0],
+            "num_key_value_heads": 1,
+            "gqa_query_heads_per_kv_head": 2,
+            "head_dim": 40,
+        }
+        records = {
+            stratum: {
+                0: {
+                    "q": rng.normal(size=(2, 48, 40)).astype(latent.np.float32),
+                    "k": rng.normal(size=(1, 48, 40)).astype(latent.np.float32),
+                    "v": rng.normal(size=(1, 48, 40)).astype(latent.np.float32),
+                }
+            }
+            for stratum in range(2)
+        }
+        weights = {
+            "layer_0_wo": rng.normal(size=(2, 40, 48)).astype(latent.np.float32)
+        }
+        factors = latent._global_factor_map_from_capture(records, weights, contract, 32)
+        self.assertEqual(factors[0][0]["k_down"].shape, (40, 32))
+        self.assertEqual(factors[0][0]["q_down"].shape, (40, 32))
+        self.assertEqual(factors[0][0]["v_down"].shape, (40, 32))
+        self.assertEqual(factors[0][0]["v_up"].shape, (32, 40))
+
+    def test_latent_kv_calibration_artifact_fits_all_gqa_heads(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        if latent.np is None:
+            self.skipTest("numpy unavailable")
+        rng = latent.np.random.default_rng(67)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "text_config": {
+                            "model_type": "qwen3_5_text",
+                            "hidden_size": 48,
+                            "num_hidden_layers": 1,
+                            "num_attention_heads": 2,
+                            "num_key_value_heads": 1,
+                            "head_dim": 40,
+                            "layer_types": ["full_attention"],
+                            "rope_parameters": {"rope_type": "default"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (model / "model.safetensors").write_bytes(b"synthetic-calibration-model")
+            calibration_dataset = root / "calibration.jsonl"
+            validation_dataset = root / "validation.jsonl"
+            calibration_dataset.write_text('{"text":"cal"}\n', encoding="utf-8")
+            validation_dataset.write_text('{"text":"val"}\n', encoding="utf-8")
+            plan = latent.build_plan(
+                model=model,
+                calibration_dataset=calibration_dataset,
+                validation_dataset=validation_dataset,
+                calibration_lengths=[10],
+                validation_lengths=[40],
+                calibration_position_offsets=[0],
+                validation_position_offsets=[0],
+                max_static_vs_oracle_kld_delta=0.05,
+                max_static_vs_oracle_ppl_ratio=1.05,
+                ranks=[32],
+                engine={"fingerprint_id": "engine", "rope_convention_default": "halfsplit"},
+                evaluator_files=[ASTREA_PATH, ROOT / "scripts" / "astrea_latent_kv.py"],
+                command=["astrea", "latent-kv-plan"],
+            )
+            plan_path = root / "plan.json"
+            latent.write_json(plan, plan_path)
+            record_path = root / "record.npz"
+            latent.np.savez(
+                record_path,
+                q=rng.normal(size=(2, 48, 40)).astype(latent.np.float32),
+                k=rng.normal(size=(1, 48, 40)).astype(latent.np.float32),
+                v=rng.normal(size=(1, 48, 40)).astype(latent.np.float32),
+                gate=rng.normal(size=(2, 48, 40)).astype(latent.np.float32),
+                positions=latent.np.arange(48),
+                token_ids=latent.np.arange(48),
+            )
+            weights_path = root / "weights.npz"
+            latent.np.savez(
+                weights_path,
+                layer_0_wo=rng.normal(size=(2, 40, 48)).astype(latent.np.float32),
+            )
+            capture_body = {
+                "schema": latent.LATENT_KV_CAPTURE_SCHEMA,
+                "created_at": "test",
+                "status": "captured",
+                "split": "calibration",
+                "plan_path": str(plan_path),
+                "plan_sha256": plan["artifact_sha256"],
+                "dataset": plan["dataset"]["calibration"],
+                "model_sha256": plan["model"]["combined_sha256"],
+                "engine_sha256": "engine",
+                "rope_sha256": plan["rope"]["sha256"],
+                "weights": latent._file_fingerprint(weights_path),
+                "records": [
+                    {
+                        "layer": 0,
+                        "path": str(record_path),
+                        "sha256": latent._sha256_file(record_path),
+                    }
+                ],
+                "strata": 1,
+                "command_argv": ["astrea", "latent-kv-capture"],
+            }
+            capture = latent._artifact_with_fingerprint(capture_body)
+            capture_path = root / "capture.json"
+            latent.write_json(capture, capture_path)
+            result = latent.calibrate_capture(
+                plan_path,
+                capture_path,
+                output_dir=root / "out",
+                command=["astrea", "latent-kv-calibrate"],
+            )
+            with latent.np.load(result["factors"]["path"], allow_pickle=False) as factors:
+                self.assertEqual(factors["layer_0_k_down"].shape, (1, 40, 32))
+                self.assertEqual(factors["layer_0_q_down"].shape, (1, 40, 32))
+                self.assertEqual(factors["layer_0_v_down"].shape, (1, 40, 32))
+                self.assertEqual(factors["layer_0_v_up"].shape, (1, 32, 40))
+        self.assertEqual(result["schema"], latent.LATENT_KV_CALIBRATION_SCHEMA)
+        self.assertEqual(result["status"], "calibrated_not_heldout_evaluated")
+        self.assertFalse(result["heldout_evaluated"])
+        self.assertTrue(result["layers"][0]["groups"][0]["value_refinement"]["attempted"])
+
+    def test_latent_qwen35_forward_identity_preserves_gate_and_wo(self):
+        astrea = load_astrea()
+        latent = astrea.load_latent_kv_module()
+        latent._disable_broken_torchvision_for_text_only_transformers()
+        import torch
+        from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+        from transformers.models.qwen3_5.modeling_qwen3_5 import (
+            Qwen3_5Attention,
+            Qwen3_5TextRotaryEmbedding,
+        )
+
+        torch.manual_seed(79)
+        config = Qwen3_5TextConfig(
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            intermediate_size=32,
+            layer_types=["full_attention"],
+            partial_rotary_factor=0.5,
+            rope_theta=10000,
+            attention_bias=False,
+        )
+        config._attn_implementation = "eager"
+        module = Qwen3_5Attention(config, layer_idx=0).eval()
+        rotary = Qwen3_5TextRotaryEmbedding(config)
+        hidden = torch.randn(1, 6, 16)
+        position_ids = torch.arange(6).view(1, 1, 6).expand(3, 1, 6)
+        position_embeddings = rotary(hidden, position_ids)
+        mask = torch.zeros(1, 1, 6, 6)
+        mask = mask.masked_fill(
+            torch.triu(torch.ones(6, 6, dtype=torch.bool), diagonal=1),
+            float("-inf"),
+        )
+        with torch.no_grad():
+            reference, _ = module(
+                hidden,
+                position_embeddings=position_embeddings,
+                attention_mask=mask,
+            )
+        identity = torch.eye(8).numpy()
+        replacement = latent._latent_attention_forward_factory(
+            0,
+            [
+                {
+                    "k_down": identity,
+                    "q_down": identity,
+                    "v_down": identity,
+                    "v_up": identity,
+                }
+            ],
+        )
+        with torch.no_grad():
+            candidate, _ = replacement(
+                module,
+                hidden,
+                position_embeddings,
+                mask,
+            )
+            candidate_without_explicit_mask, _ = replacement(
+                module,
+                hidden,
+                position_embeddings,
+                None,
+            )
+        self.assertTrue(torch.isfinite(candidate).all())
+        self.assertTrue(torch.allclose(reference, candidate, atol=2e-6, rtol=2e-6))
+        self.assertTrue(
+            torch.allclose(
+                reference,
+                candidate_without_explicit_mask,
+                atol=2e-6,
+                rtol=2e-6,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
