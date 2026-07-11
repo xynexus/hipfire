@@ -570,3 +570,23 @@ with exact parity at 1.0052 ms in a 20-iteration regression run. R23 is combined
 OQ8 preprocessing/down evidence, not a complete FFN: R18-to-R23 in-array GeGLU
 streaming, arbitrary mixed overlays, attention, full-model 10k/15k admission,
 and package tokens/J remain open.
+
+### Arbitrary mixed combined pack-to-down checkpoint
+
+R24 extends the R22 W4 combined schedule with the existing Opus sparse-overlay
+contract. Canonical compact blocks still store `(index, W8 replacement)`; the
+host decoder already turns these into signed `(index, delta)` chunks, which R24
+applies to the packed int8 activations after each resident W4 group MMUL. Cache
+specialization accepts every legal mixed count from 1 through 62 and grows the
+weight FIFO only when the W4 data, scales, AWQ/sign payload, and overlays exceed
+16 KiB.
+
+The common three-overlay gate (`oq4.25`) agrees with the CPU oracle for all
+196,608 outputs, with maximum absolute error `5.7e-6`, and averages 8.9671 ms
+over 50 dispatches. A maximum-size 62-overlay specialization also compiles,
+runs on AIE2P, and passes all outputs with maximum absolute error `1.53e-5`; its
+single measured dispatch is 36.1533 ms. This proves the full arbitrary mixed
+format range at the combined down seam, but the scalar sparse gathers are a
+large performance regression relative to R22's 0.9967 ms W4 median and remain
+unadmitted for throughput. R18-to-R24 in-array GeGLU handoff, attention,
+full-model 10k/15k admission, and package tokens/J remain open.

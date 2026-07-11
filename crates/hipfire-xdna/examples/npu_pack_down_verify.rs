@@ -15,7 +15,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const COLS: usize = 8;
     const ROW_STRIPES: usize = 4;
     const ROWS_PER_STRIPE: usize = 24;
-    const WB: usize = 16384;
     const W_DATA: usize = 12288;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -25,6 +24,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iterations = args.get(1).map(|v| v.parse()).transpose()?.unwrap_or(20);
     let shape = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
     let w8 = shape.lines().any(|line| line == "mode=w8");
+    let mixed = shape.lines().any(|line| line == "mode=mixed");
+    let overlays = shape
+        .lines()
+        .find_map(|line| line.strip_prefix("overlays="))
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(0usize);
     let (outblocks, n_macros, cols_stripe, ln, inner_k) = if w8 {
         (6, 2, 48, 3, 8)
     } else {
@@ -33,6 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let xblocks = (outblocks / n_macros) * GROUPS * ROWS_PER_STRIPE;
     let wblocks = outblocks * GROUPS;
     let param_offset = W_DATA + cols_stripe * size_of::<f32>();
+    let mixed_offset = param_offset + 3 * GROUP * size_of::<f32>();
+    let used = mixed_offset + 2 * cols_stripe * overlays;
+    let wb = 16384.max(used.div_ceil(256) * 256);
 
     let mut input = vec![0.0f32; PAD_M * PAD_K];
     for row in 0..M {
@@ -55,6 +64,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
         })
         .collect();
+    let mut effective_weights = weights.clone();
+    if mixed {
+        for group in 0..GROUPS {
+            for col in 0..N {
+                for entry in 0..overlays {
+                    let inner = (entry * 37 + col * 13 + group * 11) % GROUP;
+                    effective_weights[group][inner * N + col] =
+                        (((entry * 19 + col * 7 + group * 5) % 201) as i16 - 100) as i8;
+                }
+            }
+        }
+    }
     let weight_scales: Vec<Vec<f32>> = (0..GROUPS)
         .map(|group| {
             (0..N)
@@ -68,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let insts = std::fs::read(format!("{}/insts.bin", args[0]))?;
     let kernel = NpuKernel::load(&xclbin, &insts)?;
     let mut x = kernel.alloc_arg(ROW_STRIPES * xblocks * GROUP * size_of::<f32>())?;
-    let mut w = kernel.alloc_arg(COLS * wblocks * WB)?;
+    let mut w = kernel.alloc_arg(COLS * wblocks * wb)?;
     let c = kernel.alloc_arg(PAD_M * N * size_of::<f32>())?;
 
     for stripe in 0..ROW_STRIPES {
@@ -93,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let n_macro = outblock % n_macros;
             for group in 0..GROUPS {
                 let block = (m_macro * GROUPS + group) * n_macros + n_macro;
-                let base = (stripe * wblocks + block) * WB;
+                let base = (stripe * wblocks + block) * wb;
                 for ln_index in 0..ln {
                     for kt in 0..GROUP / inner_k {
                         for kk in 0..inner_k {
@@ -131,6 +152,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 params.extend_from_slice(&signs2);
                 w.as_mut_slice()[base + param_offset..base + param_offset + 3 * GROUP * 4]
                     .copy_from_slice(unsafe { as_bytes(&params) });
+                if mixed {
+                    for local_col in 0..cols_stripe {
+                        let col = stripe * cols_stripe + local_col;
+                        for entry in 0..overlays {
+                            let inner = (entry * 37 + col * 13 + group * 11) % GROUP;
+                            let offset = base + mixed_offset + (local_col * overlays + entry) * 2;
+                            w.as_mut_slice()[offset] = inner as u8;
+                            w.as_mut_slice()[offset + 1] = (effective_weights[group]
+                                [inner * N + col]
+                                - weights[group][inner * N + col])
+                                as u8;
+                        }
+                    }
+                }
             }
         }
     }
@@ -148,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let dot: i32 = (0..GROUP)
                     .map(|inner| {
                         quantized[row * PAD_K + group * GROUP + inner] as i32
-                            * weights[group][inner * N + col] as i32
+                            * effective_weights[group][inner * N + col] as i32
                     })
                     .sum();
                 expected += dot as f32
@@ -185,7 +220,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         kernel.dispatch_synced(&[&x, &w, &c], &[false, false, true])?;
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
-    let mode = if w8 { "W8" } else { "W4" };
+    let mode = if w8 {
+        "W8".to_string()
+    } else if mixed {
+        format!("mixed-o{overlays}")
+    } else {
+        "W4".to_string()
+    };
     println!(
         "vector-pack-down-{mode} M={M} K={K} padded_K={PAD_K} N={N}: mismatches=0 max_abs={max_abs:.7} dispatch_ms={dispatch_ms:.4}"
     );

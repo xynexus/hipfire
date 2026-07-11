@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""Parallel three-row packing plus direct-stream ring all-gather and W4 down."""
+"""Parallel three-row packing plus direct-stream all-gather and Opus down."""
 
 import sys
 
-MODE = sys.argv[1] if len(sys.argv) == 2 else "w4"
+MODE = sys.argv[1] if len(sys.argv) >= 2 else "w4"
 if MODE == "w4":
     PREFIX, LINK = "r22", "r22.o"
     OUTBLOCKS, CB, LN, MR, COLS_STRIPE, NM = 3, 2304, 6, 4, 96, 1
 elif MODE == "w8":
     PREFIX, LINK = "r23", "r23.o"
     OUTBLOCKS, CB, LN, MR, COLS_STRIPE, NM = 6, 1152, 3, 8, 48, 2
+elif MODE == "mixed":
+    PREFIX, LINK = "r22", "r24.o"
+    OUTBLOCKS, CB, LN, MR, COLS_STRIPE, NM = 3, 2304, 6, 4, 96, 1
 else:
-    raise SystemExit("mode must be w4 or w8")
+    raise SystemExit("mode must be w4, mixed, or w8")
+
+OVERLAYS = int(sys.argv[2]) if MODE == "mixed" and len(sys.argv) == 3 else 0
+if MODE == "mixed" and not 1 <= OVERLAYS <= 62:
+    raise SystemExit("mixed mode requires an overlay count in 1..62")
 
 COLS = 8
 CORE_ROWS = 4
@@ -22,7 +29,8 @@ X_CORE = ROWS_PER_CORE * GROUP
 X_PAIR = 2 * X_CORE
 X_JOIN = COLS * X_CORE
 AB = 8192
-WB = 16384
+WB_USED = 12288 + COLS_STRIPE * 4 + 3 * GROUP * 4 + 2 * COLS_STRIPE * OVERLAYS
+WB = max(16384, (WB_USED + 255) // 256 * 256)
 CJ = CORE_ROWS * CB
 FRAGMENT = ROWS_PER_CORE * GROUP + 16
 PAD_M = 288
@@ -107,9 +115,13 @@ if MODE == "w4":
         f'    func.func private @r15_w4_scaled_init(memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>) attributes {{link_with = "{LINK}"}}',
         f'    func.func private @r15_w4_scaled_accum(memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>) attributes {{link_with = "{LINK}"}}',
     ]
-else:
+elif MODE == "w8":
     out.append(
         f'    func.func private @r23_w8_scaled(memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>, i32) attributes {{link_with = "{LINK}"}}'
+    )
+else:
+    out.append(
+        f'    func.func private @r24_mixed_scaled(memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>, i32, i32) attributes {{link_with = "{LINK}"}}'
     )
 for col in range(COLS):
     for row in range(CORE_ROWS):
@@ -212,10 +224,16 @@ for col in range(COLS):
                 f"              func.call @r15_w4_scaled_accum(%apack{col}_{row}, %wv, %cv) : (memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>) -> ()",
                 "            }",
             ]
-        else:
+        elif MODE == "w8":
             out += [
                 "            %accumulate = arith.index_cast %group : index to i32",
                 f"            func.call @r23_w8_scaled(%apack{col}_{row}, %wv, %cv, %accumulate) : (memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>, i32) -> ()",
+            ]
+        else:
+            out += [
+                "            %accumulate = arith.index_cast %group : index to i32",
+                f"            %overlays = arith.constant {OVERLAYS} : i32",
+                f"            func.call @r24_mixed_scaled(%apack{col}_{row}, %wv, %cv, %accumulate, %overlays) : (memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>, i32, i32) -> ()",
             ]
         out += [
             f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
