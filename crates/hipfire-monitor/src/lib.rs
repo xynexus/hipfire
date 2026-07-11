@@ -7,8 +7,11 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    env, fs, io,
+    env,
+    ffi::CString,
+    fs, io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::ffi::OsStrExt,
     panic,
     path::{Path, PathBuf},
     process::Command,
@@ -32,23 +35,21 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Row, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 
-const BG: Color = Color::Rgb(7, 7, 9);
-const PANEL: Color = Color::Rgb(18, 16, 18);
-const PANEL_2: Color = Color::Rgb(40, 24, 27);
-const TEXT: Color = Color::Rgb(222, 226, 232);
-const MUTED: Color = Color::Rgb(142, 150, 163);
-const ACCENT: Color = Color::Rgb(237, 45, 57);
+const BG: Color = Color::Rgb(17, 20, 23);
+const PANEL: Color = Color::Rgb(23, 27, 32);
+const PANEL_2: Color = Color::Rgb(41, 49, 58);
+const TEXT: Color = Color::Rgb(231, 236, 239);
+const MUTED: Color = Color::Rgb(154, 165, 175);
+const ACCENT: Color = Color::Rgb(45, 212, 191);
 const GREEN: Color = Color::Rgb(102, 217, 139);
 const YELLOW: Color = Color::Rgb(238, 190, 95);
 const RED: Color = Color::Rgb(255, 95, 104);
 
 const DEFAULT_REFRESH: Duration = Duration::from_millis(800);
-const CPU_PANEL_INNER_WIDTH: usize = 17;
-const CPU_PANEL_WIDTH: u16 = 19;
 const METRIC_LABEL_WIDTH: usize = 10;
 const MIN_SPARKLINE_WIDTH: usize = 8;
 const NPU_COLUMN_COUNT: usize = 8;
@@ -60,6 +61,7 @@ const DF_DRAM_BEAT_BYTES: f64 = 32.0;
 
 #[derive(Debug)]
 pub struct MonitorState {
+    pub hostname: String,
     pub snapshot: AdminStats,
     pub dram_bandwidth: Option<DramBandwidth>,
     pub dram_bandwidth_meter: Option<RawMeter>,
@@ -68,12 +70,16 @@ pub struct MonitorState {
     pub gpu_blocks: Vec<GpuBlockMeter>,
     pub npu_columns: Vec<Meter>,
     pub npu_power: Option<RawMeter>,
+    pub network: NetworkTelemetry,
+    pub filesystems: Vec<FilesystemUsage>,
+    pub view: MonitorView,
     pub metric_view: MetricView,
     pub color_support: TerminalColorSupport,
     uncore: Option<AmdUncoreSampler>,
     swap: SwapSampler,
     cpu: CpuSampler,
     npu: NpuSampler,
+    network_sampler: NetworkSampler,
     gpu: Option<GpuBlockSampler>,
     pub last_refresh: Instant,
     pub refresh_interval: Duration,
@@ -100,6 +106,62 @@ pub struct SwapThrash {
     pub total_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MonitorView {
+    Overview,
+    Compute,
+}
+
+impl MonitorView {
+    fn next(self) -> Self {
+        match self {
+            Self::Overview => Self::Compute,
+            Self::Compute => Self::Overview,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Compute => "compute",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NetworkTelemetry {
+    pub receive: Option<RawMeter>,
+    pub transmit: Option<RawMeter>,
+    pub interfaces: Vec<NetworkInterface>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetworkInterface {
+    pub name: String,
+    pub receive_bytes_per_sec: f64,
+    pub transmit_bytes_per_sec: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemUsage {
+    pub mount_point: PathBuf,
+    pub source: String,
+    pub fs_type: String,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl FilesystemUsage {
+    fn percent(&self) -> f64 {
+        if self.total_bytes == 0 {
+            0.0
+        } else {
+            self.used_bytes as f64 / self.total_bytes as f64 * 100.0
+        }
+    }
+}
+
 impl MonitorState {
     pub fn new() -> Self {
         Self::with_interval(DEFAULT_REFRESH)
@@ -107,6 +169,7 @@ impl MonitorState {
 
     pub fn with_interval(refresh_interval: Duration) -> Self {
         let mut state = Self {
+            hostname: read_hostname(),
             snapshot: AdminStats::default(),
             dram_bandwidth: None,
             dram_bandwidth_meter: None,
@@ -115,12 +178,16 @@ impl MonitorState {
             gpu_blocks: gpu_block_meters(),
             npu_columns: Vec::new(),
             npu_power: None,
+            network: NetworkTelemetry::default(),
+            filesystems: Vec::new(),
+            view: MonitorView::Overview,
             metric_view: MetricView::Trend,
             color_support: detect_terminal_color_support(),
             uncore: AmdUncoreSampler::open(),
             swap: SwapSampler::new(),
             cpu: CpuSampler::new(),
             npu: NpuSampler::new(),
+            network_sampler: NetworkSampler::new(),
             gpu: GpuBlockSampler::open(),
             last_refresh: Instant::now() - refresh_interval,
             refresh_interval,
@@ -149,6 +216,8 @@ impl MonitorState {
         let npu_metrics = self.npu.sample(&self.snapshot, elapsed);
         self.npu_columns = npu_metrics.columns;
         self.npu_power = npu_metrics.power;
+        self.network = self.network_sampler.sample(elapsed);
+        self.filesystems = read_filesystems();
         if let Some(sampler) = &mut self.gpu {
             self.gpu_blocks = sampler.sample(elapsed);
         }
@@ -276,6 +345,18 @@ fn handle_key(monitor: &mut MonitorState, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Tab => {
+            monitor.view = monitor.view.next();
+            false
+        }
+        KeyCode::Char('1') => {
+            monitor.view = MonitorView::Overview;
+            false
+        }
+        KeyCode::Char('2') => {
+            monitor.view = MonitorView::Compute;
+            false
+        }
         KeyCode::Char('r') => {
             monitor.refresh();
             false
@@ -379,7 +460,7 @@ pub fn draw(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(10),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -399,30 +480,55 @@ fn draw_header(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
         .unwrap_or_else(|| "RAM unavailable".to_string());
     let title = Line::from(vec![
         Span::styled(
-            "system monitor",
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            format!("{}  ", monitor.hostname),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("    "),
         Span::styled(host, Style::default().fg(MUTED)),
-        Span::raw("    "),
+        Span::styled("  •  ", Style::default().fg(PANEL_2)),
         Span::styled(
             format!("{gpus} GPU  {npus} NPU"),
             Style::default().fg(MUTED),
         ),
+        Span::raw("    "),
+        nav_span("1 overview", monitor.view == MonitorView::Overview),
+        Span::raw("  "),
+        nav_span("2 compute", monitor.view == MonitorView::Compute),
     ]);
+    let header_block = Block::default()
+        .title(Span::styled(
+            " hipfire monitor ",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(PANEL_2))
+        .style(Style::default().bg(PANEL));
     frame.render_widget(
         Paragraph::new(title)
-            .block(block("Live host telemetry"))
-            .style(Style::default().fg(TEXT).bg(BG)),
+            .block(header_block)
+            .style(Style::default().fg(TEXT).bg(PANEL)),
         area,
     );
+}
+
+fn nav_span(label: &str, selected: bool) -> Span<'static> {
+    let style = if selected {
+        Style::default()
+            .fg(BG)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    Span::styled(format!(" {label} "), style)
 }
 
 fn draw_footer(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
     let age = monitor.last_refresh.elapsed().as_secs_f32();
     let help = format!(
-        "z {}  color {}  r refresh  q quit    sample age {age:.1}s",
+        " tab switch  z {}  r refresh  q quit   •   {} view  •   color {}  •   sample {age:.1}s ago",
         monitor.metric_view.label(),
+        monitor.view.label(),
         monitor.color_support.label()
     );
     frame.render_widget(
@@ -433,104 +539,149 @@ fn draw_footer(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
 }
 
 fn draw_body(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
-    let areas = body_areas(area, monitor.cpu_cores.len());
-    draw_cpu_cores(frame, monitor, areas.cpu);
-    draw_gpu_blocks(frame, monitor, areas.gpu_blocks);
-    draw_host(frame, monitor, areas.host);
-    draw_gpus(frame, &monitor.snapshot, areas.gpus);
-    draw_npus(frame, monitor, areas.npus);
-    draw_clients(frame, &monitor.snapshot, areas.clients);
+    match monitor.view {
+        MonitorView::Overview => draw_overview(frame, monitor, area),
+        MonitorView::Compute => draw_compute(frame, monitor, area),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct BodyAreas {
-    cpu: Rect,
-    gpu_blocks: Rect,
+struct OverviewAreas {
     host: Rect,
+    network: Rect,
     gpus: Rect,
     npus: Rect,
     clients: Rect,
 }
 
-fn body_areas(area: Rect, cpu_core_count: usize) -> BodyAreas {
+fn overview_areas(area: Rect) -> OverviewAreas {
     let body = pad(area, 1, 0);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(CPU_PANEL_WIDTH), Constraint::Min(0)])
-        .split(body);
-    let cpu = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    if body.width >= 96 && body.height >= 24 {
+        let rows = Layout::vertical([Constraint::Length(12), Constraint::Min(0)]).split(body);
+        let top = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)])
+            .split(rows[0]);
+        let lower = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(rows[1]);
+        let accelerators =
+            Layout::vertical([Constraint::Percentage(42), Constraint::Percentage(58)])
+                .split(lower[0]);
+        OverviewAreas {
+            host: top[0],
+            network: top[1],
+            gpus: accelerators[0],
+            npus: accelerators[1],
+            clients: lower[1],
+        }
+    } else {
+        let rows = Layout::vertical([
+            Constraint::Length(12),
+            Constraint::Length(9),
             Constraint::Min(0),
-            Constraint::Length(cpu_panel_height(cpu_core_count)),
         ])
-        .split(cols[0])[1];
-    let content = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
-        .split(cols[1]);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(10),
-            Constraint::Min(8),
-            Constraint::Length(npu_panel_height()),
-            Constraint::Min(6),
-        ])
-        .split(content[1]);
-
-    BodyAreas {
-        cpu,
-        gpu_blocks: content[0],
-        host: right[0],
-        gpus: right[1],
-        npus: right[2],
-        clients: right[3],
+        .split(body);
+        let accelerators =
+            Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(rows[2]);
+        OverviewAreas {
+            host: rows[0],
+            network: rows[1],
+            gpus: accelerators[0],
+            npus: accelerators[1],
+            clients: Rect::default(),
+        }
     }
 }
 
-fn cpu_panel_height(core_count: usize) -> u16 {
-    core_count.max(1).saturating_add(2).min(u16::MAX as usize) as u16
+fn draw_overview(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
+    let areas = overview_areas(area);
+    draw_host(frame, monitor, areas.host);
+    draw_network(frame, monitor, areas.network);
+    draw_gpus(frame, &monitor.snapshot, areas.gpus);
+    draw_npu_summary(frame, monitor, areas.npus);
+    if areas.clients.width > 0 && areas.clients.height > 0 {
+        draw_clients(frame, &monitor.snapshot, areas.clients);
+    }
 }
 
-fn npu_panel_height() -> u16 {
-    // Info row + header + power + 8 columns + borders.
-    12
+#[derive(Debug, Clone, Copy)]
+struct ComputeAreas {
+    cpu: Rect,
+    gpu_blocks: Rect,
+    gpus: Rect,
+    npus: Rect,
+}
+
+fn compute_areas(area: Rect) -> ComputeAreas {
+    let body = pad(area, 1, 0);
+    if body.width >= 110 {
+        let cols = Layout::horizontal([
+            Constraint::Percentage(28),
+            Constraint::Percentage(40),
+            Constraint::Percentage(32),
+        ])
+        .split(body);
+        let accelerators =
+            Layout::vertical([Constraint::Percentage(48), Constraint::Percentage(52)])
+                .split(cols[2]);
+        ComputeAreas {
+            cpu: cols[0],
+            gpu_blocks: cols[1],
+            gpus: accelerators[0],
+            npus: accelerators[1],
+        }
+    } else {
+        let rows = Layout::vertical([Constraint::Length(14), Constraint::Min(0)]).split(body);
+        let accelerators =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(rows[0]);
+        let counters = Layout::horizontal([Constraint::Percentage(36), Constraint::Percentage(64)])
+            .split(rows[1]);
+        ComputeAreas {
+            cpu: counters[0],
+            gpu_blocks: counters[1],
+            gpus: accelerators[0],
+            npus: accelerators[1],
+        }
+    }
+}
+
+fn draw_compute(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
+    let areas = compute_areas(area);
+    draw_cpu_cores(frame, monitor, areas.cpu);
+    draw_gpu_blocks(frame, monitor, areas.gpu_blocks);
+    draw_gpus(frame, &monitor.snapshot, areas.gpus);
+    draw_npus(frame, monitor, areas.npus);
 }
 
 fn draw_host(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
     let lines = if let Some(host) = &monitor.snapshot.host {
-        let pool = host.as_pool();
         let mut lines = vec![
-            pool_line(&pool),
+            capacity_line(
+                "RAM",
+                host.percent(),
+                host.used_bytes(),
+                host.total_bytes,
+                area.width.saturating_sub(2) as usize,
+            ),
             Line::from(format!(
-                "available {:>10}    used {:>10}",
+                "available {}  •  used {}",
                 fmt_bytes(host.available_bytes),
                 fmt_bytes(host.used_bytes())
             )),
         ];
         if let Some(dram) = monitor.dram_bandwidth {
             lines.push(Line::from(vec![
-                Span::styled("DF DRAM     ", Style::default().fg(MUTED)),
+                Span::styled("DRAM I/O    ", Style::default().fg(MUTED)),
                 Span::styled(
                     format!(
-                        "r {:>7.0} MiB/s  w {:>7.0} MiB/s  total {:>7.0} MiB/s",
-                        dram.read_mib_s,
-                        dram.write_mib_s,
-                        dram.total_mib_s()
+                        "↓ {}  ↑ {}  total {}",
+                        format_rate(dram.read_mib_s * 1024.0 * 1024.0),
+                        format_rate(dram.write_mib_s * 1024.0 * 1024.0),
+                        format_rate(dram.total_mib_s() * 1024.0 * 1024.0)
                     ),
                     Style::default().fg(TEXT),
                 ),
             ]));
-        }
-        if let Some(meter) = &monitor.dram_bandwidth_meter {
-            let mut spans = vec![Span::styled("BW trend    ", Style::default().fg(MUTED))];
-            spans.extend(raw_meter_sparkline_spans(meter, 28));
-            spans.push(Span::styled(
-                format!(" {:>7.0} MiB/s", meter.current),
-                Style::default().fg(TEXT),
-            ));
-            lines.push(Line::from(spans));
         }
         if monitor.swap_thrash.active {
             lines.push(Line::from(vec![
@@ -561,6 +712,36 @@ fn draw_host(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
                 ),
             ]));
         }
+        lines.push(Line::from(Span::styled(
+            "Storage",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )));
+        let available_rows = area
+            .height
+            .saturating_sub(2)
+            .saturating_sub(lines.len() as u16);
+        if monitor.filesystems.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "no local filesystems discovered",
+                Style::default().fg(YELLOW),
+            )));
+        } else {
+            lines.extend(
+                monitor
+                    .filesystems
+                    .iter()
+                    .take(available_rows as usize)
+                    .map(|filesystem| {
+                        capacity_line(
+                            &mount_label(filesystem),
+                            filesystem.percent(),
+                            filesystem.used_bytes,
+                            filesystem.total_bytes,
+                            area.width.saturating_sub(2) as usize,
+                        )
+                    }),
+            );
+        }
         lines
     } else {
         vec![Line::from(Span::styled(
@@ -568,7 +749,117 @@ fn draw_host(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
             Style::default().fg(YELLOW),
         ))]
     };
-    frame.render_widget(card("Host memory", lines), area);
+    frame.render_widget(card("Memory & storage", lines), area);
+}
+
+fn draw_network(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines = Vec::new();
+    match (&monitor.network.receive, &monitor.network.transmit) {
+        (Some(receive), Some(transmit)) => {
+            lines.push(Line::from(vec![
+                Span::styled("↓ ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    format_rate(receive.current),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" receive    ", Style::default().fg(MUTED)),
+                Span::styled("↑ ", Style::default().fg(YELLOW)),
+                Span::styled(
+                    format_rate(transmit.current),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" transmit", Style::default().fg(MUTED)),
+            ]));
+            lines.push(network_meter_line(
+                "rx",
+                receive,
+                width,
+                monitor.metric_view,
+            ));
+            lines.push(network_meter_line(
+                "tx",
+                transmit,
+                width,
+                monitor.metric_view,
+            ));
+        }
+        _ => lines.push(Line::from(Span::styled(
+            "waiting for second /proc/net/dev sample",
+            Style::default().fg(MUTED),
+        ))),
+    }
+
+    let interface_rows = area
+        .height
+        .saturating_sub(2)
+        .saturating_sub(lines.len() as u16);
+    lines.extend(
+        monitor
+            .network
+            .interfaces
+            .iter()
+            .take(interface_rows as usize)
+            .map(|interface| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<10}", truncate(&interface.name, 10)),
+                        Style::default().fg(MUTED),
+                    ),
+                    Span::styled("↓ ", Style::default().fg(ACCENT)),
+                    Span::styled(
+                        format!("{:>10}", format_rate(interface.receive_bytes_per_sec)),
+                        Style::default().fg(TEXT),
+                    ),
+                    Span::styled("  ↑ ", Style::default().fg(YELLOW)),
+                    Span::styled(
+                        format!("{:>10}", format_rate(interface.transmit_bytes_per_sec)),
+                        Style::default().fg(TEXT),
+                    ),
+                ])
+            }),
+    );
+    frame.render_widget(card("Network", lines), area);
+}
+
+fn network_meter_line(
+    label: &str,
+    meter: &RawMeter,
+    width: usize,
+    view: MetricView,
+) -> Line<'static> {
+    if view == MetricView::Text {
+        return Line::from(vec![
+            Span::styled(format!("{label:<3}"), Style::default().fg(MUTED)),
+            Span::styled(
+                format!(" cur {:>10}", format_rate(meter.current)),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled(
+                format!("  avg {:>10}", format_rate(meter.average_60s)),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                format!("  peak {:>10}", format_rate(meter.peak)),
+                Style::default().fg(MUTED),
+            ),
+        ]);
+    }
+    let value_width = 12;
+    let spark_width = width
+        .saturating_sub(label.len())
+        .saturating_sub(value_width + 2)
+        .max(MIN_SPARKLINE_WIDTH);
+    let mut spans = vec![Span::styled(
+        format!("{label:<3}"),
+        Style::default().fg(MUTED),
+    )];
+    spans.extend(raw_meter_sparkline_spans(meter, spark_width));
+    spans.push(Span::styled(
+        format!(" {:>value_width$}", format_rate(meter.current)),
+        Style::default().fg(TEXT),
+    ));
+    Line::from(spans)
 }
 
 fn draw_gpus(frame: &mut Frame, stats: &AdminStats, area: Rect) {
@@ -736,6 +1027,45 @@ fn draw_npus(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
     );
 }
 
+fn draw_npu_summary(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
+    let mut lines = Vec::new();
+    if monitor.snapshot.npus.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No AMD XDNA NPU visible under /dev/accel.",
+            Style::default().fg(YELLOW),
+        )));
+    } else {
+        for npu in &monitor.snapshot.npus {
+            let utilization = format!("{:.0}% util", npu.mean_util_pct);
+            let power = npu
+                .power_w
+                .map(|value| format!("{value:.1} W"))
+                .unwrap_or_else(|| "power unavailable".to_string());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}  ", npu.node),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(utilization, Style::default().fg(TEXT)),
+                Span::styled("  •  ", Style::default().fg(PANEL_2)),
+                Span::styled(power, Style::default().fg(TEXT)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} / {} TOPS  •  {} / {} tasks  •  {} MHz",
+                    npu.tops_current,
+                    npu.tops_max,
+                    npu.tasks_current,
+                    npu.tasks_max,
+                    npu.mp_npu_mhz
+                ),
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+    frame.render_widget(card("NPU summary", lines), area);
+}
+
 fn draw_gpu_blocks(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
     let line_width = area.width.saturating_sub(2) as usize;
     let mut lines = vec![metric_header(
@@ -766,22 +1096,13 @@ fn draw_gpu_blocks(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
 }
 
 fn draw_cpu_cores(frame: &mut Frame, monitor: &MonitorState, area: Rect) {
-    let panel_width = CPU_PANEL_WIDTH.min(area.width);
-    let area = Rect {
-        x: area
-            .x
-            .saturating_add(area.width.saturating_sub(panel_width)),
-        y: area.y,
-        width: panel_width,
-        height: cpu_panel_height(monitor.cpu_cores.len()).min(area.height),
-    };
     let lines = if monitor.cpu_cores.is_empty() {
         vec![Line::from(Span::styled(
             "waiting for second /proc/stat sample",
             Style::default().fg(MUTED),
         ))]
     } else {
-        let line_width = CPU_PANEL_INNER_WIDTH.min(area.width.saturating_sub(2) as usize);
+        let line_width = area.width.saturating_sub(2) as usize;
         monitor
             .cpu_cores
             .iter()
@@ -992,15 +1313,14 @@ fn pad_spans_to_width(spans: &mut Vec<Span<'static>>, width: usize) {
 }
 
 fn unavailable_metric_line(label: &str, line_width: usize, label_width: usize) -> Line<'static> {
-    let sparkline_width = metric_visual_width(line_width, label_width);
+    let value_width = line_width.saturating_sub(label_width + 1);
     Line::from(vec![
         Span::styled(format!("{label:<label_width$}"), Style::default().fg(MUTED)),
         Span::raw(" "),
         Span::styled(
-            format!("{:<sparkline_width$}", ""),
+            format!("{:<value_width$}", "unavailable"),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled(" unavailable", Style::default().fg(Color::DarkGray)),
     ])
 }
 
@@ -1033,6 +1353,64 @@ fn pool_line(pool: &MemPool) -> Line<'static> {
             Style::default().fg(TEXT),
         ),
     ])
+}
+
+fn capacity_line(
+    label: &str,
+    pct: f64,
+    used_bytes: u64,
+    total_bytes: u64,
+    width: usize,
+) -> Line<'static> {
+    let label_width = 12.min(width.saturating_sub(1)).max(4);
+    let figures = format!("{} / {}", fmt_bytes(used_bytes), fmt_bytes(total_bytes));
+    let fixed = label_width + figures.chars().count() + 8;
+    let bar_width = width.saturating_sub(fixed).clamp(5, 18);
+    Line::from(vec![
+        Span::styled(
+            format!("{:<label_width$}", truncate(label, label_width)),
+            Style::default().fg(MUTED),
+        ),
+        Span::styled(bar(pct, bar_width), Style::default().fg(percent_color(pct))),
+        Span::styled(format!(" {:>4.0}%  ", pct), Style::default().fg(TEXT)),
+        Span::styled(figures, Style::default().fg(TEXT)),
+    ])
+}
+
+fn mount_label(filesystem: &FilesystemUsage) -> String {
+    if filesystem.mount_point == Path::new("/") {
+        "root /".to_string()
+    } else {
+        filesystem.mount_point.display().to_string()
+    }
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut value = text.chars().take(width - 1).collect::<String>();
+    value.push('…');
+    value
+}
+
+fn format_rate(bytes_per_sec: f64) -> String {
+    let value = bytes_per_sec.max(0.0);
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    if value >= GIB {
+        format!("{:.1} GiB/s", value / GIB)
+    } else if value >= MIB {
+        format!("{:.1} MiB/s", value / MIB)
+    } else if value >= KIB {
+        format!("{:.1} KiB/s", value / KIB)
+    } else {
+        format!("{value:.0} B/s")
+    }
 }
 
 fn meter_sparkline_spans(meter: &Meter, width: usize) -> Vec<Span<'static>> {
@@ -1282,6 +1660,221 @@ fn raw_to_pct(value: f64, scale: f64) -> f64 {
     } else {
         (value / scale * 100.0).clamp(0.0, 100.0)
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct NetworkCounters {
+    receive_bytes: u64,
+    transmit_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct NetworkSampler {
+    previous: BTreeMap<String, NetworkCounters>,
+    receive: Option<RawMeter>,
+    transmit: Option<RawMeter>,
+}
+
+impl NetworkSampler {
+    fn new() -> Self {
+        Self {
+            previous: read_network_counters(),
+            receive: None,
+            transmit: None,
+        }
+    }
+
+    fn sample(&mut self, elapsed: Duration) -> NetworkTelemetry {
+        let current = read_network_counters();
+        let interfaces = network_rates(&self.previous, &current, elapsed);
+        self.previous = current;
+        let receive = interfaces
+            .iter()
+            .map(|interface| interface.receive_bytes_per_sec)
+            .sum::<f64>();
+        let transmit = interfaces
+            .iter()
+            .map(|interface| interface.transmit_bytes_per_sec)
+            .sum::<f64>();
+        let now = Instant::now();
+        self.receive
+            .get_or_insert_with(|| RawMeter::new("rx"))
+            .update(receive, now, elapsed);
+        self.transmit
+            .get_or_insert_with(|| RawMeter::new("tx"))
+            .update(transmit, now, elapsed);
+        NetworkTelemetry {
+            receive: self.receive.clone(),
+            transmit: self.transmit.clone(),
+            interfaces,
+        }
+    }
+}
+
+fn read_network_counters() -> BTreeMap<String, NetworkCounters> {
+    fs::read_to_string("/proc/net/dev")
+        .ok()
+        .map(|text| parse_network_counters(&text))
+        .unwrap_or_default()
+}
+
+fn parse_network_counters(text: &str) -> BTreeMap<String, NetworkCounters> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, values) = line.split_once(':')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let values = values
+                .split_whitespace()
+                .filter_map(|value| value.parse::<u64>().ok())
+                .collect::<Vec<_>>();
+            Some((
+                name.to_string(),
+                NetworkCounters {
+                    receive_bytes: *values.first()?,
+                    transmit_bytes: *values.get(8)?,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn network_rates(
+    previous: &BTreeMap<String, NetworkCounters>,
+    current: &BTreeMap<String, NetworkCounters>,
+    elapsed: Duration,
+) -> Vec<NetworkInterface> {
+    let seconds = elapsed.as_secs_f64();
+    let mut rates = current
+        .iter()
+        .filter(|(name, _)| name.as_str() != "lo")
+        .map(|(name, counters)| {
+            let old = previous.get(name).copied().unwrap_or(*counters);
+            NetworkInterface {
+                name: name.clone(),
+                receive_bytes_per_sec: if seconds > 0.0 {
+                    counters.receive_bytes.saturating_sub(old.receive_bytes) as f64 / seconds
+                } else {
+                    0.0
+                },
+                transmit_bytes_per_sec: if seconds > 0.0 {
+                    counters.transmit_bytes.saturating_sub(old.transmit_bytes) as f64 / seconds
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    rates.sort_by(|left, right| {
+        let left_total = left.receive_bytes_per_sec + left.transmit_bytes_per_sec;
+        let right_total = right.receive_bytes_per_sec + right.transmit_bytes_per_sec;
+        right_total
+            .total_cmp(&left_total)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rates
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountInfo {
+    mount_point: PathBuf,
+    fs_type: String,
+    source: String,
+}
+
+fn read_filesystems() -> Vec<FilesystemUsage> {
+    let Ok(text) = fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    let mut filesystems = parse_mountinfo(&text)
+        .into_iter()
+        .filter(is_operator_filesystem)
+        .filter_map(|mount| filesystem_usage(&mount))
+        .collect::<Vec<_>>();
+    filesystems.sort_by(|left, right| {
+        let left_root = left.mount_point == Path::new("/");
+        let right_root = right.mount_point == Path::new("/");
+        right_root
+            .cmp(&left_root)
+            .then_with(|| left.mount_point.cmp(&right.mount_point))
+    });
+    filesystems.dedup_by(|left, right| left.mount_point == right.mount_point);
+    filesystems
+}
+
+fn parse_mountinfo(text: &str) -> Vec<MountInfo> {
+    text.lines()
+        .filter_map(|line| {
+            let (mount, filesystem) = line.split_once(" - ")?;
+            let mount_fields = mount.split_whitespace().collect::<Vec<_>>();
+            let filesystem_fields = filesystem.split_whitespace().collect::<Vec<_>>();
+            Some(MountInfo {
+                mount_point: PathBuf::from(unescape_mount_field(*mount_fields.get(4)?)),
+                fs_type: filesystem_fields.first()?.to_string(),
+                source: unescape_mount_field(*filesystem_fields.get(1)?),
+            })
+        })
+        .collect()
+}
+
+fn unescape_mount_field(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+fn is_operator_filesystem(mount: &MountInfo) -> bool {
+    matches!(
+        mount.fs_type.as_str(),
+        "ext2"
+            | "ext3"
+            | "ext4"
+            | "xfs"
+            | "btrfs"
+            | "zfs"
+            | "f2fs"
+            | "bcachefs"
+            | "nfs"
+            | "nfs4"
+            | "cifs"
+    ) || mount.source.starts_with("/dev/")
+        || (mount.mount_point == Path::new("/") && mount.fs_type == "overlay")
+}
+
+fn filesystem_usage(mount: &MountInfo) -> Option<FilesystemUsage> {
+    let path = CString::new(mount.mount_point.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated path and `statvfs` initializes
+    // the output on a zero return code.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: successful `statvfs` initialized the structure above.
+    let stats = unsafe { stats.assume_init() };
+    let block_size = stats.f_frsize as u64;
+    let total_bytes = (stats.f_blocks as u64).saturating_mul(block_size);
+    let free_bytes = (stats.f_bfree as u64).saturating_mul(block_size);
+    let available_bytes = (stats.f_bavail as u64).saturating_mul(block_size);
+    Some(FilesystemUsage {
+        mount_point: mount.mount_point.clone(),
+        source: mount.source.clone(),
+        fs_type: mount.fs_type.clone(),
+        used_bytes: total_bytes.saturating_sub(free_bytes),
+        available_bytes,
+        total_bytes,
+    })
+}
+
+fn read_hostname() -> String {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "local host".to_string())
 }
 
 #[derive(Debug, Default)]
@@ -2241,21 +2834,20 @@ mod tests {
         meter.peak = 100.0;
         assert_eq!(cpu_panel_title(MetricView::Text), "CPU cur  avg peak");
         assert_eq!(cpu_panel_title(MetricView::Trend), "CPU Utilization");
-        assert_eq!(CPU_PANEL_INNER_WIDTH, 17);
-        assert_eq!(CPU_PANEL_WIDTH, 19);
+        let line_width = 24;
 
-        let text_line = cpu_metric_line(&meter, CPU_PANEL_INNER_WIDTH, MetricView::Text);
+        let text_line = cpu_metric_line(&meter, line_width, MetricView::Text);
         let text = text_line
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert_eq!(text, "00 100% 100% 100%");
-        assert_eq!(text_line.spans[2].style.fg, Some(RED));
-        assert_eq!(text_line.spans[4].style.fg, Some(RED));
-        assert_eq!(text_line.spans[6].style.fg, Some(RED));
+        assert_eq!(text, "       00 100% 100% 100%");
+        assert_eq!(text_line.spans[3].style.fg, Some(RED));
+        assert_eq!(text_line.spans[5].style.fg, Some(RED));
+        assert_eq!(text_line.spans[7].style.fg, Some(RED));
 
-        let trend = cpu_metric_line(&meter, CPU_PANEL_INNER_WIDTH, MetricView::Trend)
+        let trend = cpu_metric_line(&meter, line_width, MetricView::Trend)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2286,6 +2878,27 @@ mod tests {
             )
         ));
         assert_eq!(monitor.metric_view, MetricView::Trend);
+    }
+
+    #[test]
+    fn tab_and_number_keys_switch_monitor_views() {
+        let mut monitor = MonitorState::with_interval(Duration::from_secs(1));
+        monitor.view = MonitorView::Overview;
+        assert!(!handle_key(
+            &mut monitor,
+            KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::empty())
+        ));
+        assert_eq!(monitor.view, MonitorView::Compute);
+        assert!(!handle_key(
+            &mut monitor,
+            KeyEvent::new(KeyCode::Char('1'), crossterm::event::KeyModifiers::empty())
+        ));
+        assert_eq!(monitor.view, MonitorView::Overview);
+        assert!(!handle_key(
+            &mut monitor,
+            KeyEvent::new(KeyCode::Char('2'), crossterm::event::KeyModifiers::empty())
+        ));
+        assert_eq!(monitor.view, MonitorView::Compute);
     }
 
     #[test]
@@ -2401,29 +3014,68 @@ pgpgout 2
     }
 
     #[test]
-    fn cpu_panel_height_fits_stacked_core_rows() {
-        assert_eq!(cpu_panel_height(0), 3);
-        assert_eq!(cpu_panel_height(1), 3);
-        assert_eq!(cpu_panel_height(32), 34);
-        assert_eq!(cpu_panel_height(33), 35);
+    fn parses_network_counters_and_computes_reset_safe_rates() {
+        let previous = parse_network_counters(
+            "Inter-| Receive | Transmit\n eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n lo: 99 0 0 0 0 0 0 0 99 0 0 0 0 0 0 0\n",
+        );
+        let current = parse_network_counters(
+            "eth0: 5096 0 0 0 0 0 0 0 4048 0 0 0 0 0 0 0\n wlan0: 200 0 0 0 0 0 0 0 100 0 0 0 0 0 0 0\n",
+        );
+        let rates = network_rates(&previous, &current, Duration::from_secs(2));
+        assert_eq!(rates.len(), 2);
+        let eth0 = rates.iter().find(|rate| rate.name == "eth0").unwrap();
+        assert_eq!(eth0.receive_bytes_per_sec, 2048.0);
+        assert_eq!(eth0.transmit_bytes_per_sec, 1024.0);
+        let wlan0 = rates.iter().find(|rate| rate.name == "wlan0").unwrap();
+        assert_eq!(wlan0.receive_bytes_per_sec, 0.0);
+        assert!(rates.iter().all(|rate| rate.name != "lo"));
     }
 
     #[test]
-    fn body_layout_uses_fixed_cpu_rail() {
-        let area = Rect::new(0, 0, 140, 42);
-        let body = body_areas(area, 32);
-        assert_eq!(body.cpu.width, CPU_PANEL_WIDTH);
-        assert_eq!(body.cpu.height, cpu_panel_height(32));
-        assert_eq!(body.cpu.x, 1);
-        assert_eq!(body.cpu.y, area.height - body.cpu.height);
-        assert_eq!(body.gpu_blocks.x, 1 + CPU_PANEL_WIDTH);
-        assert!(body.gpu_blocks.width > body.cpu.width);
+    fn parses_local_and_network_mounts_with_escaped_paths() {
+        let mounts = parse_mountinfo(
+            "36 25 0:31 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n37 25 0:32 / /mnt/model\\040cache rw,relatime - nfs4 server:/models rw\n38 25 0:33 / /proc rw,nosuid - proc proc rw\n",
+        );
+        assert_eq!(mounts.len(), 3);
+        assert_eq!(mounts[1].mount_point, Path::new("/mnt/model cache"));
+        assert!(is_operator_filesystem(&mounts[0]));
+        assert!(is_operator_filesystem(&mounts[1]));
+        assert!(!is_operator_filesystem(&mounts[2]));
     }
 
     #[test]
-    fn npu_panel_height_fits_power_and_eight_columns() {
-        assert_eq!(NPU_COLUMN_COUNT, 8);
-        assert_eq!(npu_panel_height(), 12);
+    fn overview_layout_adapts_without_overlapping_panels() {
+        let wide = overview_areas(Rect::new(0, 0, 140, 36));
+        assert_eq!(wide.host.y, wide.network.y);
+        assert!(wide.network.x >= wide.host.x + wide.host.width);
+        assert!(wide.clients.width > 0);
+        assert!(wide.gpus.y >= wide.host.y + wide.host.height);
+
+        let narrow = overview_areas(Rect::new(0, 0, 80, 36));
+        assert_eq!(narrow.clients, Rect::default());
+        assert!(narrow.network.y >= narrow.host.y + narrow.host.height);
+        assert!(narrow.gpus.y >= narrow.network.y + narrow.network.height);
+    }
+
+    #[test]
+    fn compute_layout_keeps_counters_and_accelerators_distinct() {
+        let wide = compute_areas(Rect::new(0, 0, 140, 36));
+        assert!(wide.gpu_blocks.x >= wide.cpu.x + wide.cpu.width);
+        assert!(wide.gpus.x >= wide.gpu_blocks.x + wide.gpu_blocks.width);
+        assert!(wide.npus.y >= wide.gpus.y + wide.gpus.height);
+
+        let narrow = compute_areas(Rect::new(0, 0, 90, 36));
+        assert_eq!(narrow.gpus.y, narrow.npus.y);
+        assert!(narrow.cpu.y >= narrow.gpus.y + narrow.gpus.height);
+        assert!(narrow.gpu_blocks.x >= narrow.cpu.x + narrow.cpu.width);
+    }
+
+    #[test]
+    fn rate_and_capacity_formatters_remain_compact() {
+        assert_eq!(format_rate(0.0), "0 B/s");
+        assert_eq!(format_rate(2048.0), "2.0 KiB/s");
+        assert_eq!(format_rate(5.0 * 1024.0 * 1024.0), "5.0 MiB/s");
+        assert_eq!(truncate("very-long-interface", 8), "very-lo…");
     }
 
     #[test]
