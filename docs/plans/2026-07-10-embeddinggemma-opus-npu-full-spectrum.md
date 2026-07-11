@@ -677,3 +677,34 @@ These results validate the generic producer and established per-projection
 full-K path only. They are not resident-W8/mixed or full-model NPU results. The
 next kernel must consume the dense-W8 resident groups for fused gate/up GeGLU
 and down execution without materializing the intermediate outside AIE2P.
+
+### Dense-W8 complete-FFN R26 checkpoint
+
+R26 compiles one AIE2P command containing resident W8 gate/up, GeGLU, canonical
+AWQ/FWHT activation packing, and the resident W8 down projection. The graph
+uses one shared core output FIFO to stay within the memory tile's two inbound
+DMA channels. A depth-one 16 KiB memory-tile weight FIFO fits only after the
+other core buffers are tightened; the generated xclbin and instruction stream
+live under `~/.hipfire/npu` and are reproducible with `r26_cache.sh`.
+
+Hardware isolation found and fixed three independent layout defects. Gate/up
+weights require a 48-column `gate16,up16,gate8,up8` interleave rather than the
+generic contiguous W8 column order. Group windows beginning 8 or 16 floats into
+a gathered 24-wide chunk require `aie::load_unaligned_v`; aligned `load_v`
+collapsed group 2. Finally, the padded fifth group needs a 56-chunk physical T
+row so its zero tail does not cross into the next token row. With those fixes,
+isolated group 3 reports cosine `0.99986195`, group 4 reports `0.99984475`, and
+one complete all-group run reports cosine `0.99985511`, maximum absolute error
+`0.0089338`, mean absolute error `0.00180048`, and a 3.6269 ms dispatch.
+
+R26 is not admitted yet. Independent fresh-process repeats intermittently lose
+part of the down result, with observed cosine ranging from roughly 0.82 to
+0.99 while the retained gate/GeGLU result remains stable at `0.99989984`.
+Direct shim weight broadcast, scalar output stores, oversized combined output
+DMA, raw contiguous output capture, and an exact six-row input object did not
+remove the variance; the memory-tile weight FIFO and padded 9216-byte pair
+object are the best observed schedule. The current blocker is repeatable
+down-stream/ring delivery, not static resource allocation or the mathematical
+W8 contract. Runtime integration, real OQ8/mixed artifacts, attention and
+remaining model stages, the 10k/15k admission gate, and package tokens/J remain
+pending until this repeatability failure is eliminated.
