@@ -162,6 +162,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let runtime_metrics = if attention {
+        let mut resident = hipfire_xdna::NpuResidentAttentionDenseW8::load_cached(&args[0])?;
+        let group_refs = weights.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let scale_refs = weight_scales.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let awq = vec![1.0f32; K];
+        let resident_weights = resident.upload_dense_groups(
+            &group_refs,
+            &scale_refs,
+            Some(&awq),
+            &qnorm,
+            &knorm,
+            EPSILON,
+            10_000.0,
+        )?;
+        if resident_weights.awq_scale() != Some(awq.as_slice()) {
+            return Err("resident attention did not preserve generic AWQ metadata".into());
+        }
+        let resident_input = hipfire_xdna::NpuResidentAttentionDenseW8::prepack_activations(
+            &activations,
+            &activation_scales,
+        )?;
+        resident.set_prepacked_input(&resident_input)?;
+        resident.run_shared_to_device(&resident_weights)?;
+        let got = resident.read_output_f32(&resident_weights)?;
+        let reference = attention_reference(&q_got, &k_got, &v_got);
+        let measured = metrics(&got, &reference);
+        if !measured.0.is_finite() || measured.0 < 0.998 || measured.1 > 0.04 {
+            return Err(format!("resident runtime attention parity failed: {measured:?}").into());
+        }
+        Some(measured)
+    } else {
+        None
+    };
 
     let started = std::time::Instant::now();
     for _ in 0..iterations {
@@ -170,10 +203,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
-    if let Some(attention) = attention_metrics {
+    if let (Some(attention), Some(runtime)) = (attention_metrics, runtime_metrics) {
         println!(
-            "resident-w8-qkv-attention M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} attention_cosine={:.8} attention_max={:.7} dispatch_ms={dispatch_ms:.4}",
-            projection.0, projection.1, q.0, q.1, k.0, k.1, attention.0, attention.1
+            "resident-w8-qkv-attention M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} attention_cosine={:.8} attention_max={:.7} runtime_cosine={:.8} runtime_max={:.7} dispatch_ms={dispatch_ms:.4}",
+            projection.0,
+            projection.1,
+            q.0,
+            q.1,
+            k.0,
+            k.1,
+            attention.0,
+            attention.1,
+            runtime.0,
+            runtime.1,
         );
     } else {
         println!(

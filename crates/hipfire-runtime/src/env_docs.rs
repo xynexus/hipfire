@@ -1358,6 +1358,13 @@ pub const ENV_HIPFIRE_EMBEDDING_CALIB_LAYERS_PER_PASS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-embeddinggemma/src/calibration.rs:93",
 };
 
+/// `HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION` — Runtime variable controlling embed compare resident attention in hipfire
+pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION",
+    description: "Runtime variable controlling embed compare resident attention in hipfire",
+    source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:52",
+};
+
 /// `HIPFIRE_EMBED_COMPARE_RESIDENT_FFN` — Parses "HIPFIRE_EMBED_COMPARE_RESIDENT_FFN" with fallback defaults
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_FFN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_FFN",
@@ -1369,28 +1376,28 @@ pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_FFN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_E2E_TOKENS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_E2E_TOKENS",
     description: "Runtime variable controlling embed e2e tokens in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:66",
+    source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:68",
 };
 
 /// `HIPFIRE_EMBED_PROFILE` — Runtime variable controlling embed profile in hipfire
 pub const ENV_HIPFIRE_EMBED_PROFILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_PROFILE",
     description: "Runtime variable controlling embed profile in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:148",
+    source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:173",
 };
 
 /// `HIPFIRE_EMBED_REFERENCE_MODEL` — Runtime variable controlling embed reference model in hipfire
 pub const ENV_HIPFIRE_EMBED_REFERENCE_MODEL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_REFERENCE_MODEL",
     description: "Runtime variable controlling embed reference model in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:56",
+    source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:58",
 };
 
 /// `HIPFIRE_EMBED_TRACE_PHASES` — Runtime variable controlling embed trace phases in hipfire
 pub const ENV_HIPFIRE_EMBED_TRACE_PHASES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_TRACE_PHASES",
     description: "Runtime variable controlling embed trace phases in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/forward.rs:226",
+    source: "crates/hipfire-arch-embeddinggemma/src/forward.rs:240",
 };
 
 /// `HIPFIRE_EMIT_TOKEN_IDS` — or "\" in it would corrupt the line, breaking the client's JSONL
@@ -4488,6 +4495,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DUMP_REQUEST,
     ENV_HIPFIRE_DUMP_VELOCITY,
     ENV_HIPFIRE_EMBEDDING_CALIB_LAYERS_PER_PASS,
+    ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION,
     ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_FFN,
     ENV_HIPFIRE_EMBED_E2E_TOKENS,
     ENV_HIPFIRE_EMBED_PROFILE,

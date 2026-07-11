@@ -143,7 +143,7 @@ impl OpusPackedMatrix {
         }
     }
 
-    pub(crate) fn group_count(&self) -> usize {
+    pub fn group_count(&self) -> usize {
         self.groups.len()
     }
 
@@ -151,7 +151,7 @@ impl OpusPackedMatrix {
         &self.groups[group].base
     }
 
-    pub(crate) fn group_scales(&self, group: usize) -> &[f32] {
+    pub fn group_scales(&self, group: usize) -> &[f32] {
         &self.groups[group].scales
     }
 

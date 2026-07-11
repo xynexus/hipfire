@@ -48,6 +48,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(1);
     let compare_resident_ffn =
         std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_FFN").is_ok_and(|value| value != "0");
+    let compare_resident_attention =
+        std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION").is_ok_and(|value| value != "0");
 
     let mut hfq = HfqFile::open(Path::new(&args[0]))?;
     let config = embeddinggemma::config_from_metadata_json(&hfq.metadata_json)
@@ -101,9 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         embeddinggemma::NpuOpusProjector::load_cached(&hfq, &config, Path::new(&cache_root))?;
     let power_path = package_power_path();
     eprintln!(
-        "loaded {} layers across {} resident NPU executor widths; complete_resident_ffn={}",
+        "loaded {} layers across {} resident NPU executor widths; resident_attention={} complete_resident_ffn={}",
         projector.layer_count(),
         projector.executor_count(),
+        projector.resident_attention_enabled(),
         projector.resident_ffn_enabled(),
     );
 
@@ -140,6 +143,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let elapsed_ms = started.elapsed().as_secs_f64() * 1e3 / encodes as f64;
         projector.select_resident_ffn(true)?;
+        (Some(embeddings), Some(elapsed_ms))
+    } else {
+        (None, None)
+    };
+    let (attention_fallback_embeddings, attention_fallback_ms) = if compare_resident_attention {
+        projector.select_resident_attention(false)?;
+        let started = Instant::now();
+        let mut embeddings = Vec::new();
+        for _ in 0..iterations {
+            embeddings.clear();
+            for tokens in &token_batches {
+                embeddings.push(embeddinggemma::embed_forward_with_projector(
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    tokens,
+                    &mut projector,
+                )?);
+            }
+        }
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1e3 / encodes as f64;
+        projector.select_resident_attention(true)?;
         (Some(embeddings), Some(elapsed_ms))
     } else {
         (None, None)
@@ -186,6 +211,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (mean, min, max_abs) = embedding_metrics(fallback, &npu_embeddings);
         println!(
             "resident_ffn_vs_projection_fallback mean_cosine={mean:.8} min_cosine={min:.8} max_abs={max_abs:.8} fallback_ms={fallback_ms:.3} resident_ms={npu_ms:.3}"
+        );
+    }
+    if let (Some(fallback), Some(fallback_ms)) =
+        (&attention_fallback_embeddings, attention_fallback_ms)
+    {
+        let (mean, min, max_abs) = embedding_metrics(fallback, &npu_embeddings);
+        println!(
+            "resident_attention_vs_projection_fallback mean_cosine={mean:.8} min_cosine={min:.8} max_abs={max_abs:.8} fallback_ms={fallback_ms:.3} resident_ms={npu_ms:.3}"
         );
     }
     let token_count = iterations * token_batches.iter().map(Vec::len).sum::<usize>();

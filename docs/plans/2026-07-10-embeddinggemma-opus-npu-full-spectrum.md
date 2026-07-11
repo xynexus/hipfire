@@ -953,3 +953,51 @@ tail stages, W4 and arbitrary dense-mixed dispatch, end-to-end quality,
 current `3.0678 ms` command across 24 layers would already take about
 `73.6 ms`, so code residency alone is insufficient; subsequent schedules must
 fuse the remaining layer roles and recover parallelism or overlap.
+
+### R30 production runtime and generic Opus admission checkpoint
+
+`NpuResidentAttentionDenseW8` now loads the R30 cache as a production runtime,
+owns resident layer-specific QKV weights and Q/K norm/RoPE parameters, shares
+the GPU-visible M256 input allocation, primes once per context, and keeps a
+finite 1,000-command recycle bound. Its upload API accepts an
+`OpusPackedMatrix` or format-neutral dense groups and scales. Native OQ4 and
+OQ8 groups and arbitrary compact mixed groups all pass through
+`group_dense_i8`; mixed sparse overlays are expanded once at upload rather
+than becoming format-specific dispatch branches. AWQ metadata is preserved by
+the same API, so `+` and LDLQ-adjusted `++` values do not introduce execution
+mode names or branches.
+
+The EmbeddingGemma projector concatenates the separately stored Q/K/V roles
+into the physical N=1280 R30 groups, loads per-layer norm and local/global RoPE
+parameters, and exposes one `project_attention` boundary to the encoder. A
+real OQ4 artifact initially failed admission because the loader incorrectly
+required the *source* resident mode to be dense W8 even though the R30 upload
+contract already densifies every Opus encoding. Removing that contradictory
+source-format check, while retaining exact K/N/group and shared-AWQ checks,
+admits OQ4 through the same API.
+
+The raw production runtime reproduces the R30 hardware oracle at cosine
+`0.99997371` and maximum absolute error `0.0001469`. M256 full-encoder probes
+also selected resident attention for every tested source format:
+
+| source format | resident vs established projection fallback cosine | max abs | hybrid ms |
+|---|---:|---:|---:|
+| OQ4 | 0.99979383 | 0.00238923 | 356.324 |
+| OQ4.125 mixed | 0.99954844 | 0.00361437 | 320.116 |
+| OQ6.5 mixed | 0.99976164 | 0.00249144 | 317.656 |
+| OQ8 | 0.99965537 | 0.00363689 | 341.277 |
+| OQ8+ | 0.99975610 | 0.00380161 | 334.099 |
+| OQ8++ | 0.99967772 | 0.00416599 | 335.726 |
+
+These are generic runtime-admission and hybrid correctness results, not a
+fully resident model or performance admission. The temporary bridge reads
+R30's head-major attention output to the CPU, converts it to token-major, and
+uploads it to the GPU for the output projection. Consequently the probes reach
+only `718.4-805.9` input tok/s and `28.6-32.2` package tok/J, substantially
+below both the GPU reference and the target. Low-bit padded NPU artifacts also
+differ materially from their unpadded GPU comparison artifacts (OQ4 cosine
+`0.97213209`, OQ4.125 `0.97449738`, and OQ6.5 `0.98404664`), so those
+cross-artifact comparisons are not evidence against the much tighter
+same-artifact resident/fallback comparison. The next admitted boundary must
+remove this output crossing and include output projection plus residual/norm;
+the 10k/15k and fully resident package-efficiency gates remain open.

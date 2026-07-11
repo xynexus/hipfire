@@ -9,9 +9,9 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
-    NpuOpusExecutor, NpuResidentFfnDenseW8, NpuResidentFfnDenseW8Weights, NpuResidentFfnW4,
-    NpuResidentFfnW4Weights, NpuWholeMode, NpuWholeScaledIoLayout, OpusMatrixEncoding,
-    OpusPackedMatrix, OpusResidentMode,
+    NpuOpusExecutor, NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights,
+    NpuResidentFfnDenseW8, NpuResidentFfnDenseW8Weights, NpuResidentFfnW4, NpuResidentFfnW4Weights,
+    NpuWholeMode, NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
 };
 
 use crate::config::EmbeddingGemmaConfig;
@@ -38,6 +38,8 @@ pub struct NpuOpusProjector {
     layers: Vec<LayerMatrices>,
     shared_io: HashMap<SharedIoKey, SharedProjectionIo>,
     awq_gpu: HashMap<MatrixGpuKey, OwnedTensor>,
+    resident_attention: Option<ResidentAttentionState>,
+    resident_attention_selected: bool,
     resident_ffn: Option<ResidentFfnState>,
     resident_ffn_selected: bool,
 }
@@ -73,6 +75,17 @@ struct SharedProjectionIo {
     output_gpu: ImportedTensor,
     _input_buffer: SharedGttBuffer,
     _output_buffer: SharedGttBuffer,
+}
+
+struct SharedAttentionInput {
+    input_gpu: ImportedTensor,
+    _input_buffer: SharedGttBuffer,
+}
+
+struct ResidentAttentionState {
+    executor: NpuResidentAttentionDenseW8,
+    weights: Vec<NpuResidentAttentionDenseW8Weights>,
+    input: Option<SharedAttentionInput>,
 }
 
 enum ResidentFfnState {
@@ -390,6 +403,64 @@ impl NpuOpusProjector {
                 )?,
             });
         }
+        let resident_attention_path =
+            cache_root.join("embgemma_aie2p_resident_w8_qkv_attention_m256_k768_n1280");
+        let resident_attention = if cfg.hidden_size == 768
+            && q_dim == 768
+            && kv_dim == 256
+            && resident_attention_path.join("final.xclbin").is_file()
+            && resident_attention_path.join("insts.bin").is_file()
+            && layers
+                .iter()
+                .all(|layer| resident_attention_dense_groups(layer).is_ok())
+        {
+            let executor = NpuResidentAttentionDenseW8::load_cached(
+                resident_attention_path
+                    .to_str()
+                    .expect("UTF-8 resident attention cache path"),
+            )
+            .map_err(|error| format!("embeddinggemma NPU: load resident attention: {error}"))?;
+            let mut weights = Vec::with_capacity(layers.len());
+            for (layer_idx, layer) in layers.iter().enumerate() {
+                let (dense_groups, dense_scales, awq_scale) =
+                    resident_attention_dense_groups(layer)?;
+                let group_refs = dense_groups.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let scale_refs = dense_scales.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let prefix = format!("model.layers.{layer_idx}.self_attn");
+                let mut qnorm =
+                    load_vector_f32(hfq, &format!("{prefix}.q_norm.weight"), cfg.head_dim)?;
+                let prescale = cfg.q_prescale();
+                if (prescale - 1.0).abs() > 1.0e-6 {
+                    qnorm.iter_mut().for_each(|value| *value *= prescale);
+                }
+                let knorm = load_vector_f32(hfq, &format!("{prefix}.k_norm.weight"), cfg.head_dim)?;
+                weights.push(
+                    executor
+                        .upload_dense_groups(
+                            &group_refs,
+                            &scale_refs,
+                            awq_scale.as_deref(),
+                            &qnorm,
+                            &knorm,
+                            cfg.rms_norm_eps,
+                            cfg.rope_base_for_layer(layer_idx),
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "embeddinggemma NPU: upload resident attention layer {layer_idx}: {error}"
+                            )
+                        })?,
+                );
+            }
+            Some(ResidentAttentionState {
+                executor,
+                weights,
+                input: None,
+            })
+        } else {
+            None
+        };
+        let resident_attention_selected = resident_attention.is_some();
         let resident_ffn_w4_path =
             cache_root.join("embgemma_aie2p_resident_ffn_w4_m256_k768_i1152_o768");
         let resident_ffn_dense_w8_path =
@@ -474,6 +545,8 @@ impl NpuOpusProjector {
             layers,
             shared_io: HashMap::new(),
             awq_gpu: HashMap::new(),
+            resident_attention,
+            resident_attention_selected,
             resident_ffn,
             resident_ffn_selected,
         })
@@ -489,6 +562,18 @@ impl NpuOpusProjector {
 
     pub fn resident_ffn_enabled(&self) -> bool {
         self.resident_ffn.is_some() && self.resident_ffn_selected
+    }
+
+    pub fn resident_attention_enabled(&self) -> bool {
+        self.resident_attention.is_some() && self.resident_attention_selected
+    }
+
+    pub fn select_resident_attention(&mut self, selected: bool) -> Result<(), String> {
+        if selected && self.resident_attention.is_none() {
+            return Err("embeddinggemma NPU: resident attention is unavailable".to_string());
+        }
+        self.resident_attention_selected = selected;
+        Ok(())
     }
 
     /// Select or bypass the complete resident FFN while retaining all resident
@@ -534,6 +619,59 @@ fn resident_ffn_mode(layers: &[LayerMatrices]) -> Result<OpusResidentMode, Strin
         }
     }
     selected.ok_or_else(|| "model has no FFN layers".to_string())
+}
+
+type ResidentAttentionDenseGroups = (Vec<Vec<i8>>, Vec<Vec<f32>>, Option<Vec<f32>>);
+
+fn resident_attention_dense_groups(
+    layer: &LayerMatrices,
+) -> Result<ResidentAttentionDenseGroups, String> {
+    let roles = [
+        (&layer.query, 768usize),
+        (&layer.key, 256),
+        (&layer.value, 256),
+    ];
+    for (matrix, width) in roles {
+        // R30 is a dense-W8 execution contract, not a source-format
+        // restriction. `group_dense_i8()` expands compact mixed matrices and
+        // exposes native W4/W8 groups through the same upload representation.
+        if matrix.k() != 768 || matrix.n() != width || matrix.group_count() != 3 {
+            return Err(format!(
+                "resident attention role wants Opus K=768 N={width} groups=3, got {:?} K={} N={} groups={}",
+                matrix.encoding(),
+                matrix.k(),
+                matrix.n(),
+                matrix.group_count()
+            ));
+        }
+    }
+    let awq = layer.query.awq_scale();
+    if layer.key.awq_scale() != awq || layer.value.awq_scale() != awq {
+        return Err("resident attention Q/K/V AWQ activation scales differ".to_string());
+    }
+    let mut groups = Vec::with_capacity(3);
+    let mut scales = Vec::with_capacity(3);
+    for group in 0..3 {
+        let query = layer.query.group_dense_i8(group);
+        let key = layer.key.group_dense_i8(group);
+        let value = layer.value.group_dense_i8(group);
+        let mut combined = vec![0i8; 256 * 1280];
+        for inner in 0..256 {
+            let target = inner * 1280;
+            combined[target..target + 768].copy_from_slice(&query[inner * 768..(inner + 1) * 768]);
+            combined[target + 768..target + 1024]
+                .copy_from_slice(&key[inner * 256..(inner + 1) * 256]);
+            combined[target + 1024..target + 1280]
+                .copy_from_slice(&value[inner * 256..(inner + 1) * 256]);
+        }
+        let mut combined_scales = Vec::with_capacity(1280);
+        combined_scales.extend_from_slice(layer.query.group_scales(group));
+        combined_scales.extend_from_slice(layer.key.group_scales(group));
+        combined_scales.extend_from_slice(layer.value.group_scales(group));
+        groups.push(combined);
+        scales.push(combined_scales);
+    }
+    Ok((groups, scales, awq.map(<[f32]>::to_vec)))
 }
 
 fn fullk_requirements(
@@ -725,6 +863,103 @@ fn try_shared_projection(
 }
 
 impl LinearProjector for NpuOpusProjector {
+    fn project_attention(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        input: &GpuTensor,
+        output: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<bool> {
+        if rows != NpuResidentAttentionDenseW8::rows()
+            || self.resident_attention.is_none()
+            || !self.resident_attention_selected
+        {
+            return Ok(false);
+        }
+        let matrix_key = MatrixGpuKey {
+            layer: layer_idx,
+            role: MatrixRole::Qkv,
+        };
+        if !self.awq_gpu.contains_key(&matrix_key) {
+            let scale = self
+                .resident_attention
+                .as_ref()
+                .and_then(|state| state.weights.get(layer_idx))
+                .and_then(NpuResidentAttentionDenseW8Weights::awq_scale)
+                .map(<[f32]>::to_vec);
+            if let Some(scale) = scale {
+                self.awq_gpu
+                    .insert(matrix_key, gpu.upload_owned_f32(&scale, &[scale.len()])?);
+            }
+        }
+        let state = self
+            .resident_attention
+            .as_mut()
+            .expect("checked resident attention");
+        if layer_idx >= state.weights.len() {
+            return Err(hip_error(format!(
+                "missing resident attention layer {layer_idx}"
+            )));
+        }
+        if state.input.is_none() {
+            let mut input_buffer =
+                gpu.alloc_shared_gtt(NpuResidentAttentionDenseW8::input_bytes())?;
+            input_buffer.as_mut_slice().fill(0);
+            let input_gpu = gpu.import_dmabuf(
+                input_buffer.dmabuf_fd(),
+                NpuResidentAttentionDenseW8::input_bytes(),
+                &[NpuResidentAttentionDenseW8::input_bytes()],
+                DType::Raw,
+            )?;
+            state
+                .executor
+                .attach_shared_input(
+                    input_buffer.dmabuf_fd(),
+                    NpuResidentAttentionDenseW8::input_bytes(),
+                )
+                .map_err(|error| hip_error(format!("attach resident attention input: {error}")))?;
+            state.input = Some(SharedAttentionInput {
+                input_gpu,
+                _input_buffer: input_buffer,
+            });
+        }
+        let layout = resident_attention_layout();
+        gpu.pack_opus_npu_activations(
+            input,
+            self.awq_gpu.get(&matrix_key).map(OwnedTensor::view),
+            &state
+                .input
+                .as_ref()
+                .expect("resident attention input")
+                .input_gpu
+                .view(),
+            rows,
+            768,
+            layout,
+        )?;
+        gpu.device_synchronize()?;
+        state
+            .executor
+            .run_shared_to_device(&state.weights[layer_idx])
+            .map_err(|error| hip_error(format!("resident NPU attention failed: {error}")))?;
+        let head_major = state
+            .executor
+            .read_output_f32(&state.weights[layer_idx])
+            .map_err(|error| hip_error(format!("read resident NPU attention: {error}")))?;
+        let mut token_major = vec![0.0f32; head_major.len()];
+        for token in 0..256 {
+            for head in 0..3 {
+                let source = (head * 256 + token) * 256;
+                let target = token * 768 + head * 256;
+                token_major[target..target + 256]
+                    .copy_from_slice(&head_major[source..source + 256]);
+            }
+        }
+        copy_host_output(gpu, output, &token_major)?;
+        Ok(true)
+    }
+
     fn project(
         &mut self,
         gpu: &mut Gpu,
@@ -1091,6 +1326,23 @@ struct ResidentFfnLayout {
     output_bytes: usize,
 }
 
+fn resident_attention_layout() -> OpusNpuIoLayout {
+    OpusNpuIoLayout::new(
+        true,
+        8,
+        256,
+        3,
+        1280,
+        5,
+        15,
+        16384,
+        NpuResidentAttentionDenseW8::input_bytes(),
+        NpuResidentAttentionDenseW8::output_bytes(),
+        false,
+        1280,
+    )
+}
+
 fn resident_ffn_w4_layout() -> ResidentFfnLayout {
     let input_bytes = NpuResidentFfnW4::input_bytes();
     let output_bytes = NpuResidentFfnW4::output_bytes();
@@ -1285,6 +1537,38 @@ fn load_awq_scale(hfq: &HfqFile, name: &str, k: usize) -> Result<Option<Vec<f32>
             .map(|bytes| f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])))
             .collect(),
     ))
+}
+
+fn load_vector_f32(hfq: &HfqFile, name: &str, length: usize) -> Result<Vec<f32>, String> {
+    let (info, data) = hfq
+        .tensor_data_vec(name)
+        .ok_or_else(|| format!("embeddinggemma NPU: missing tensor {name}"))?;
+    let values = match info.quant_type {
+        1 => data
+            .chunks_exact(2)
+            .map(|bytes| f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])))
+            .collect::<Vec<_>>(),
+        2 => data
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|bytes| f32::from_bits((u16::from_le_bytes([bytes[0], bytes[1]]) as u32) << 16))
+            .collect(),
+        quant_type => {
+            return Err(format!(
+                "embeddinggemma NPU: {name} must be f16/f32/bf16, got qt={quant_type}"
+            ));
+        }
+    };
+    if values.len() != length {
+        return Err(format!(
+            "embeddinggemma NPU: {name} has {} values, expected {length}",
+            values.len()
+        ));
+    }
+    Ok(values)
 }
 
 fn hip_error(message: impl AsRef<str>) -> HipError {

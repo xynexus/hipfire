@@ -220,6 +220,11 @@ pub mod resident_ffn_w8;
 pub use resident_ffn_w8::{NpuResidentFfnDenseW8, NpuResidentFfnDenseW8Weights};
 
 #[cfg(target_os = "linux")]
+pub mod resident_attention_w8;
+#[cfg(target_os = "linux")]
+pub use resident_attention_w8::{NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights};
+
+#[cfg(target_os = "linux")]
 pub mod sparse3_mp;
 #[cfg(target_os = "linux")]
 pub use sparse3_mp::{NpuSparse3Mp, NpuSparse3ResidentWeights};

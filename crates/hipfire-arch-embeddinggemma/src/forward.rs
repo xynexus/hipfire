@@ -56,6 +56,20 @@ pub trait LinearProjector {
         rows: usize,
     ) -> HipResult<()>;
 
+    /// Execute the complete QKV projection, Q/K normalization, RoPE, and
+    /// bidirectional attention boundary when a resident backend owns it.
+    /// Returning `false` selects the canonical per-operation fallback below.
+    fn project_attention(
+        &mut self,
+        _gpu: &mut Gpu,
+        _layer_idx: usize,
+        _input: &GpuTensor,
+        _output: &GpuTensor,
+        _rows: usize,
+    ) -> HipResult<bool> {
+        Ok(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn project_qkv(
         &mut self,
@@ -295,35 +309,43 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
 
         // ── Attention block (bidirectional) ──
         gpu.rmsnorm_batched(&x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
-        projector.project_qkv(
-            gpu, layer_idx, &layer.wq, &layer.wk, &layer.wv, &tmp, &q, &k, &v, m,
-        )?;
-        if trace_phases {
-            gpu.device_synchronize()?;
-            qkv_ms += stage_started.elapsed().as_secs_f64() * 1e3;
-        }
+        let resident_attention = projector.project_attention(gpu, layer_idx, &tmp, &attn_out, m)?;
+        if resident_attention {
+            if trace_phases {
+                gpu.device_synchronize()?;
+                attention_core_ms += stage_started.elapsed().as_secs_f64() * 1e3;
+            }
+        } else {
+            projector.project_qkv(
+                gpu, layer_idx, &layer.wq, &layer.wk, &layer.wv, &tmp, &q, &k, &v, m,
+            )?;
+            if trace_phases {
+                gpu.device_synchronize()?;
+                qkv_ms += stage_started.elapsed().as_secs_f64() * 1e3;
+            }
 
-        // Per-head QK-norm (q_norm carries the baked Q pre-scale, 1.0 here).
-        let stage_started = std::time::Instant::now();
-        gpu.rmsnorm_batched(&q, &layer.q_norm, &q, m * n_heads, head_dim, eps)?;
-        gpu.rmsnorm_batched(&k, &layer.k_norm, &k, m * n_kv_heads, head_dim, eps)?;
+            // Per-head QK-norm (q_norm carries the baked Q pre-scale, 1.0 here).
+            let stage_started = std::time::Instant::now();
+            gpu.rmsnorm_batched(&q, &layer.q_norm, &q, m * n_heads, head_dim, eps)?;
+            gpu.rmsnorm_batched(&k, &layer.k_norm, &k, m * n_kv_heads, head_dim, eps)?;
 
-        gpu.rope_batched_f32(
-            &q,
-            &k,
-            &positions,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            cfg.rope_base_for_layer(layer_idx),
-            m,
-        )?;
+            gpu.rope_batched_f32(
+                &q,
+                &k,
+                &positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                cfg.rope_base_for_layer(layer_idx),
+                m,
+            )?;
 
-        // Bidirectional self-attention: B = L = m, no causal mask.
-        gpu.attention_dflash_f32(&q, &k, &v, &attn_out, m, m, n_heads, n_kv_heads, head_dim)?;
-        if trace_phases {
-            gpu.device_synchronize()?;
-            attention_core_ms += stage_started.elapsed().as_secs_f64() * 1e3;
+            // Bidirectional self-attention: B = L = m, no causal mask.
+            gpu.attention_dflash_f32(&q, &k, &v, &attn_out, m, m, n_heads, n_kv_heads, head_dim)?;
+            if trace_phases {
+                gpu.device_synchronize()?;
+                attention_core_ms += stage_started.elapsed().as_secs_f64() * 1e3;
+            }
         }
 
         let stage_started = std::time::Instant::now();
