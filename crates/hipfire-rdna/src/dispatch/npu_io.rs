@@ -18,6 +18,8 @@ pub struct OpusNpuIoLayout {
     n_macros: usize,
     outblocks: usize,
     input_block_bytes: usize,
+    input_repeats: usize,
+    input_repeat_stride: usize,
     input_bytes: usize,
     output_bytes: usize,
     row_major_output: bool,
@@ -49,11 +51,21 @@ impl OpusNpuIoLayout {
             n_macros,
             outblocks,
             input_block_bytes,
+            input_repeats: 1,
+            input_repeat_stride: input_block_bytes,
             input_bytes,
             output_bytes,
             row_major_output,
             padded_n,
         }
+    }
+
+    /// Describe a physical input block that repeats the canonical activation
+    /// tile into several memory-tile consumer windows.
+    pub fn with_input_repetition(mut self, repeats: usize, stride: usize) -> Self {
+        self.input_repeats = repeats;
+        self.input_repeat_stride = stride;
+        self
     }
 }
 
@@ -113,6 +125,8 @@ impl Gpu {
                 i32 layout.n_macros as i32,
                 i32 layout.outblocks as i32,
                 i32 layout.input_block_bytes as i32,
+                i32 layout.input_repeats as i32,
+                i32 layout.input_repeat_stride as i32,
                 i32 mode,
             ],
         )

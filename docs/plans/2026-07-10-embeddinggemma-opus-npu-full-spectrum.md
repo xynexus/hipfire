@@ -708,3 +708,48 @@ down-stream/ring delivery, not static resource allocation or the mathematical
 W8 contract. Runtime integration, real OQ8/mixed artifacts, attention and
 remaining model stages, the 10k/15k admission gate, and package tokens/J remain
 pending until this repeatability failure is eliminated.
+
+### Dense-W8 R26 runtime-admission update
+
+Fresh-context isolation showed that the apparent down-stream variance was a
+hardware-context initialization effect rather than random ring delivery. The
+first R26 command in each newly created context can produce an incomplete down
+result; discarding that command makes subsequent commands bit-for-bit
+repeatable at the established oracle tolerance. Five independent all-group
+processes with one prime command all reported cosine `0.99985511`, maximum
+absolute error `0.0089338`, and mean absolute error `0.00180048`. The reusable
+runtime now counts the prime command, permits at most six commands per context,
+and primes again after bounded context recreation.
+
+The production executor uploads every layer's packed weights once, owns the
+retained-gate scratch buffer, imports reusable GPU/XDNA input and output
+dma-bufs, and accepts either native OQ8 or any compact mixed Opus matrix through
+the same dense-int8 upload contract. Its GPU activation producer replicates the
+canonical W8 tile into the four `9216`-byte memory-tile consumer windows. A
+20-iteration synthetic run, including repeated context recreation and priming,
+passed sustained final-output parity at cosine `0.99985511` and averaged
+`3.9663 ms` per measured complete-FFN dispatch.
+
+Real 24-layer hybrid checks at 32 input tokens selected the resident FFN for
+native OQ8, OQ6.5 (39 overlays per group), calibrated OQ8+, and LDLQ OQ8++.
+Same-process comparisons against the established per-projection NPU path were:
+
+| format | resident vs projection cosine | max abs | resident hybrid ms |
+|---|---:|---:|---:|
+| OQ8 | 0.99981368 | 0.00254846 | 286.408 |
+| OQ6.5 | 0.99985284 | 0.00219250 | 262.117 |
+| OQ8+ | 0.99986529 | 0.00215597 | 283.084 |
+| OQ8++ | 0.99982262 | 0.00257182 | 284.621 |
+
+The OQ8+ and OQ8++ checks used newly generated ragged-padding artifacts under
+`~/.hipfire/models/embeddinggemma-300m/`, with all K=1152 down matrices kept in
+qt=35 and the existing AWQ sidecars consumed generically. `++` introduces no
+runtime branch: its LDLQ-adjusted values use the same OQ8+ resident encoding.
+
+This admits R26 as a reusable complete-FFN correctness path, not as a full-model
+NPU or performance result. These measurements still execute attention, norms,
+residuals, pooling, Dense heads, and final normalization outside AIE2P. The
+32-token OQ8+ hybrid measured only `113.0` input tok/s at `24.01 W`, or `4.7`
+package tok/J; the 10k/15k M256 target remains unproven and cannot be evaluated
+as fully resident throughput until the remaining encoder stages move onto the
+NPU.

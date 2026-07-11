@@ -9,8 +9,9 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
-    NpuOpusExecutor, NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode,
-    NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
+    NpuOpusExecutor, NpuResidentFfnDenseW8, NpuResidentFfnDenseW8Weights, NpuResidentFfnW4,
+    NpuResidentFfnW4Weights, NpuWholeMode, NpuWholeScaledIoLayout, OpusMatrixEncoding,
+    OpusPackedMatrix, OpusResidentMode,
 };
 
 use crate::config::EmbeddingGemmaConfig;
@@ -74,10 +75,79 @@ struct SharedProjectionIo {
     _output_buffer: SharedGttBuffer,
 }
 
-struct ResidentFfnState {
-    executor: NpuResidentFfnW4,
-    weights: Vec<NpuResidentFfnW4Weights>,
-    io: Option<SharedProjectionIo>,
+enum ResidentFfnState {
+    W4 {
+        executor: NpuResidentFfnW4,
+        weights: Vec<NpuResidentFfnW4Weights>,
+        io: Option<SharedProjectionIo>,
+    },
+    DenseW8 {
+        executor: NpuResidentFfnDenseW8,
+        weights: Vec<NpuResidentFfnDenseW8Weights>,
+        io: Option<SharedProjectionIo>,
+    },
+}
+
+impl ResidentFfnState {
+    fn rows(&self) -> usize {
+        match self {
+            Self::W4 { .. } => NpuResidentFfnW4::rows(),
+            Self::DenseW8 { .. } => NpuResidentFfnDenseW8::rows(),
+        }
+    }
+
+    fn layout(&self) -> ResidentFfnLayout {
+        match self {
+            Self::W4 { .. } => resident_ffn_w4_layout(),
+            Self::DenseW8 { .. } => resident_ffn_dense_w8_layout(),
+        }
+    }
+
+    fn io(&self) -> Option<&SharedProjectionIo> {
+        match self {
+            Self::W4 { io, .. } | Self::DenseW8 { io, .. } => io.as_ref(),
+        }
+    }
+
+    fn attach_io(
+        &mut self,
+        input_fd: i32,
+        input_bytes: usize,
+        output_fd: i32,
+        output_bytes: usize,
+        io: SharedProjectionIo,
+    ) -> Result<(), hipfire_xdna::XdnaError> {
+        match self {
+            Self::W4 {
+                executor,
+                io: state_io,
+                ..
+            } => {
+                executor.attach_shared_io(input_fd, input_bytes, output_fd, output_bytes)?;
+                *state_io = Some(io);
+            }
+            Self::DenseW8 {
+                executor,
+                io: state_io,
+                ..
+            } => {
+                executor.attach_shared_io(input_fd, input_bytes, output_fd, output_bytes)?;
+                *state_io = Some(io);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_layer(&mut self, layer: usize) -> Result<(), hipfire_xdna::XdnaError> {
+        match self {
+            Self::W4 {
+                executor, weights, ..
+            } => executor.run_shared(&weights[layer]),
+            Self::DenseW8 {
+                executor, weights, ..
+            } => executor.run_shared(&weights[layer]),
+        }
+    }
 }
 
 impl NpuOpusProjector {
@@ -320,42 +390,83 @@ impl NpuOpusProjector {
                 )?,
             });
         }
-        let resident_ffn_path =
+        let resident_ffn_w4_path =
             cache_root.join("embgemma_aie2p_resident_ffn_w4_m256_k768_i1152_o768");
+        let resident_ffn_dense_w8_path =
+            cache_root.join("embgemma_aie2p_resident_ffn_dense_w8_m256_k768_i1152_o768");
         let resident_mode = resident_ffn_mode(&layers);
         if let Err(reason) = &resident_mode {
             eprintln!("embeddinggemma NPU: resident FFN unavailable: {reason}");
-        } else if resident_mode == Ok(OpusResidentMode::DenseW8) {
-            eprintln!("embeddinggemma NPU: resident FFN unavailable: dense-W8 cache is not built");
         }
-        let resident_ffn = if resident_mode == Ok(OpusResidentMode::W4)
-            && resident_ffn_path.join("final.xclbin").is_file()
-            && resident_ffn_path.join("insts.bin").is_file()
-        {
-            let executor = NpuResidentFfnW4::load_cached(
-                resident_ffn_path
-                    .to_str()
-                    .expect("UTF-8 resident FFN cache path"),
-            )
-            .map_err(|error| format!("embeddinggemma NPU: load resident FFN: {error}"))?;
-            let weights = layers
-                .iter()
-                .map(|layer| {
-                    executor.upload_weights(
-                        &layer.gate,
-                        &layer.up,
-                        layer.down.as_ref().expect("resident FFN down matrix"),
-                    )
+        let resident_ffn = match resident_mode {
+            Ok(OpusResidentMode::W4)
+                if resident_ffn_w4_path.join("final.xclbin").is_file()
+                    && resident_ffn_w4_path.join("insts.bin").is_file() =>
+            {
+                let executor = NpuResidentFfnW4::load_cached(
+                    resident_ffn_w4_path
+                        .to_str()
+                        .expect("UTF-8 resident FFN cache path"),
+                )
+                .map_err(|error| format!("embeddinggemma NPU: load resident W4 FFN: {error}"))?;
+                let weights = layers
+                    .iter()
+                    .map(|layer| {
+                        executor.upload_weights(
+                            &layer.gate,
+                            &layer.up,
+                            layer.down.as_ref().expect("resident FFN down matrix"),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        format!("embeddinggemma NPU: pack resident W4 FFN: {error}")
+                    })?;
+                Some(ResidentFfnState::W4 {
+                    executor,
+                    weights,
+                    io: None,
                 })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("embeddinggemma NPU: pack resident FFN: {error}"))?;
-            Some(ResidentFfnState {
-                executor,
-                weights,
-                io: None,
-            })
-        } else {
-            None
+            }
+            Ok(OpusResidentMode::DenseW8)
+                if resident_ffn_dense_w8_path.join("final.xclbin").is_file()
+                    && resident_ffn_dense_w8_path.join("insts.bin").is_file() =>
+            {
+                let executor = NpuResidentFfnDenseW8::load_cached(
+                    resident_ffn_dense_w8_path
+                        .to_str()
+                        .expect("UTF-8 resident dense-W8 FFN cache path"),
+                )
+                .map_err(|error| {
+                    format!("embeddinggemma NPU: load resident dense-W8 FFN: {error}")
+                })?;
+                let weights = layers
+                    .iter()
+                    .map(|layer| {
+                        executor.upload_weights(
+                            &layer.gate,
+                            &layer.up,
+                            layer.down.as_ref().expect("resident FFN down matrix"),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        format!("embeddinggemma NPU: pack resident dense-W8 FFN: {error}")
+                    })?;
+                Some(ResidentFfnState::DenseW8 {
+                    executor,
+                    weights,
+                    io: None,
+                })
+            }
+            Ok(mode) => {
+                eprintln!(
+                    "embeddinggemma NPU: resident FFN unavailable: {:?} cache is not built",
+                    mode
+                );
+                None
+            }
+            Err(_) => None,
         };
         let resident_ffn_selected = resident_ffn.is_some();
         Ok(Self {
@@ -863,9 +974,11 @@ impl LinearProjector for NpuOpusProjector {
         output: &GpuTensor,
         rows: usize,
     ) -> HipResult<()> {
-        if rows <= NpuResidentFfnW4::rows()
+        if self
+            .resident_ffn
+            .as_ref()
+            .is_some_and(|state| rows <= state.rows())
             && self.resident_ffn_selected
-            && self.resident_ffn.is_some()
         {
             let layer = self
                 .layers
@@ -879,8 +992,8 @@ impl LinearProjector for NpuOpusProjector {
                 && down_weight.m == 768
             {
                 let state = self.resident_ffn.as_mut().expect("checked resident FFN");
-                if state.io.is_none() {
-                    let layout = resident_ffn_layout();
+                let layout = state.layout();
+                if state.io().is_none() {
                     let mut input_buffer = gpu.alloc_shared_gtt(layout.input_bytes)?;
                     let mut output_buffer = gpu.alloc_shared_gtt(layout.output_bytes)?;
                     input_buffer.as_mut_slice().fill(0);
@@ -898,20 +1011,19 @@ impl LinearProjector for NpuOpusProjector {
                         DType::Raw,
                     )?;
                     state
-                        .executor
-                        .attach_shared_io(
+                        .attach_io(
                             input_buffer.dmabuf_fd(),
                             layout.input_bytes,
                             output_buffer.dmabuf_fd(),
                             layout.output_bytes,
+                            SharedProjectionIo {
+                                input_gpu,
+                                output_gpu,
+                                _input_buffer: input_buffer,
+                                _output_buffer: output_buffer,
+                            },
                         )
                         .map_err(|error| hip_error(format!("attach resident FFN I/O: {error}")))?;
-                    state.io = Some(SharedProjectionIo {
-                        input_gpu,
-                        output_gpu,
-                        _input_buffer: input_buffer,
-                        _output_buffer: output_buffer,
-                    });
                 }
                 let matrix_key = MatrixGpuKey {
                     layer: layer_idx,
@@ -923,20 +1035,20 @@ impl LinearProjector for NpuOpusProjector {
                             .insert(matrix_key, gpu.upload_owned_f32(scale, &[scale.len()])?);
                     }
                 }
-                let io = state.io.as_ref().expect("resident FFN I/O allocated");
+                let io = state.io().expect("resident FFN I/O allocated");
                 gpu.pack_opus_npu_activations(
                     input,
                     self.awq_gpu.get(&matrix_key).map(OwnedTensor::view),
                     &io.input_gpu.view(),
                     rows,
                     768,
-                    resident_ffn_layout().rdna,
+                    layout.rdna,
                 )?;
                 gpu.device_synchronize()?;
                 state
-                    .executor
-                    .run_shared(&state.weights[layer_idx])
+                    .run_layer(layer_idx)
                     .map_err(|error| hip_error(format!("resident NPU FFN failed: {error}")))?;
+                let io = state.io().expect("resident FFN I/O allocated");
                 gpu.unpack_opus_npu_output(
                     &io.output_gpu.view(),
                     output,
@@ -944,7 +1056,7 @@ impl LinearProjector for NpuOpusProjector {
                     None,
                     None,
                     rows,
-                    resident_ffn_layout().rdna,
+                    layout.rdna,
                 )?;
                 return Ok(());
             }
@@ -979,7 +1091,7 @@ struct ResidentFfnLayout {
     output_bytes: usize,
 }
 
-fn resident_ffn_layout() -> ResidentFfnLayout {
+fn resident_ffn_w4_layout() -> ResidentFfnLayout {
     let input_bytes = NpuResidentFfnW4::input_bytes();
     let output_bytes = NpuResidentFfnW4::output_bytes();
     ResidentFfnLayout {
@@ -996,6 +1108,33 @@ fn resident_ffn_layout() -> ResidentFfnLayout {
             output_bytes,
             true,
             768,
+        ),
+        input_bytes,
+        output_bytes,
+    }
+}
+
+fn resident_ffn_dense_w8_layout() -> ResidentFfnLayout {
+    let input_bytes = NpuResidentFfnDenseW8::input_bytes();
+    let output_bytes = NpuResidentFfnDenseW8::output_bytes();
+    ResidentFfnLayout {
+        rdna: OpusNpuIoLayout::new(
+            true,
+            8,
+            256,
+            3,
+            768,
+            6,
+            18,
+            NpuResidentFfnDenseW8::input_block_bytes(),
+            input_bytes,
+            output_bytes,
+            true,
+            768,
+        )
+        .with_input_repetition(
+            NpuResidentFfnDenseW8::input_repeats(),
+            NpuResidentFfnDenseW8::input_repeat_stride(),
         ),
         input_bytes,
         output_bytes,

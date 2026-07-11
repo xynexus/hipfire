@@ -798,12 +798,26 @@ fn run_dense_w8(
     let mut d = kernel.alloc_arg(data.len())?;
     let mut w = kernel.alloc_arg(weights.len())?;
     let mut t = kernel.alloc_arg(T_ROWS * T_STRIDE * size_of::<f32>())?;
-    let o = kernel.alloc_arg(PAD_M * N * size_of::<f32>())?;
+    let mut o = kernel.alloc_arg(PAD_M * N * size_of::<f32>())?;
     d.as_mut_slice().copy_from_slice(&data);
     w.as_mut_slice().copy_from_slice(&weights);
     t.as_mut_slice().fill(0);
 
-    kernel.dispatch_synced(&[&d, &w, &t, &o], &[true, true, true, false])?;
+    let warmups = std::env::var("HIPFIRE_R26_WARMUPS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(1);
+    for attempt in 0..=warmups {
+        if attempt != 0 {
+            t.as_mut_slice().fill(0);
+            o.as_mut_slice().fill(0);
+        }
+        kernel.dispatch_synced(
+            &[&d, &w, &t, &o],
+            &[attempt == 0, attempt == 0, true, attempt != 0],
+        )?;
+    }
     kernel.sync_output(&t)?;
     kernel.sync_output(&o)?;
     let physical_gate = unsafe { as_f32(t.as_slice()) };
@@ -825,11 +839,30 @@ fn run_dense_w8(
     }
 
     let started = std::time::Instant::now();
-    for dispatch in 0..iterations {
-        if dispatch != 0 && dispatch % 7 == 0 {
+    let mut context_commands = warmups + 1;
+    for _dispatch in 0..iterations {
+        if context_commands >= 6 {
             kernel.recreate_hwctx()?;
+            t.as_mut_slice().fill(0);
+            o.as_mut_slice().fill(0);
+            kernel.dispatch_synced(&[&d, &w, &t, &o], &[false, false, true, true])?;
+            context_commands = 1;
+            t.as_mut_slice().fill(0);
+            o.as_mut_slice().fill(0);
+            kernel.sync_to_device(&t)?;
+            kernel.sync_to_device(&o)?;
         }
         kernel.dispatch_synced(&[&d, &w, &t, &o], &[false, false, false, false])?;
+        context_commands += 1;
+    }
+    kernel.sync_output(&o)?;
+    let (final_cosine, final_max_abs, _, _) =
+        metrics(&unsafe { as_f32(o.as_slice()) }[..M * N], &reference);
+    if final_cosine < 0.999 || final_max_abs > max_reference * 0.03 + 1.0e-4 {
+        return Err(format!(
+            "resident dense-W8 FFN sustained parity failed: cosine={final_cosine:.8} max_abs={final_max_abs:.7}"
+        )
+        .into());
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
     println!(

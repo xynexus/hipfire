@@ -18,6 +18,8 @@ __global__ void opus_npu_pack_activations(
     int n_macros,
     int outblocks,
     int input_block_bytes,
+    int input_repeats,
+    int input_repeat_stride,
     int mode_w8
 ) {
     const int group = blockIdx.x;
@@ -105,16 +107,19 @@ __global__ void opus_npu_pack_activations(
         const int block = outblock * groups + group;
         const long long base =
             ((long long)stripe * inblocks + block) * input_block_bytes;
-        #pragma unroll
-        for (int lane = 0; lane < 8; ++lane) {
-            const int inner = d0 + lane;
-            const int kt = inner / inner_k;
-            const int kk = inner - kt * inner_k;
-            const int target = (lm * (256 / inner_k) + kt) * 64 + local_row * inner_k + kk;
-            ((signed char*)packed)[base + target] = q[lane];
-        }
-        if (tid == 0) {
-            *(float*)(packed + base + 6144 + within_stripe * 4) = scale;
+        for (int repeat = 0; repeat < input_repeats; ++repeat) {
+            const long long repeat_base = base + (long long)repeat * input_repeat_stride;
+            #pragma unroll
+            for (int lane = 0; lane < 8; ++lane) {
+                const int inner = d0 + lane;
+                const int kt = inner / inner_k;
+                const int kk = inner - kt * inner_k;
+                const int target = (lm * (256 / inner_k) + kt) * 64 + local_row * inner_k + kk;
+                ((signed char*)packed)[repeat_base + target] = q[lane];
+            }
+            if (tid == 0) {
+                *(float*)(packed + repeat_base + 6144 + within_stripe * 4) = scale;
+            }
         }
     }
 }
