@@ -753,3 +753,27 @@ residuals, pooling, Dense heads, and final normalization outside AIE2P. The
 package tok/J; the 10k/15k M256 target remains unproven and cannot be evaluated
 as fully resident throughput until the remaining encoder stages move onto the
 NPU.
+
+### R26 context-lifetime and M256 checkpoint
+
+The initial six-command recycle bound was inherited conservatively from the R25
+W4 stream and was not an R26 limit. After the mandatory first-command prime,
+R26 completed 20, 100, and 1,000 measured commands in one context with unchanged
+final parity (`0.99985511` cosine, `0.0089338` maximum absolute error). Dispatch
+averages improved from `3.9663 ms` with frequent recreation to `2.7431 ms`,
+`2.6567 ms`, and `2.6309 ms` respectively. The runtime now uses a finite
+evidence-backed 1,000-command bound before recreating and priming again.
+
+Ten consecutive real OQ8+ M256 encodes (240 layer-specific weight commands in
+one process) retained the same BF16-reference embedding cosine `0.99975753` and
+maximum absolute error `0.00293646`. The warmed hybrid average was `283.018 ms`,
+or `904.5` input tok/s at `25.43 W` and `35.6` package tok/J.
+
+Three independent one-encode M256 processes measured `294.950-297.011 ms`
+(median `296.073 ms`), `861.9-867.9` input tok/s (median `864.7`), and
+`31.0-33.2` package tok/J. These remain hybrid full-encoder measurements, not
+fully resident NPU results: only each complete FFN is resident, while attention,
+norms, residuals, pooling, and Dense heads still execute elsewhere. Even the
+isolated `2.6309 ms` FFN command would consume about `63.1 ms` over 24 layers,
+so both kernel acceleration and removal of the remaining stage boundaries are
+required for the `25.6 ms`/10k target.

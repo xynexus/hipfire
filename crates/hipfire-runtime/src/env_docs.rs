@@ -3493,6 +3493,13 @@ pub const ENV_HIPFIRE_R25_TIMING_TRACE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:601",
 };
 
+/// `HIPFIRE_R26_RECYCLE_EVERY` — Parses "HIPFIRE_R26_RECYCLE_EVERY" with fallback defaults
+pub const ENV_HIPFIRE_R26_RECYCLE_EVERY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R26_RECYCLE_EVERY",
+    description: "Parses \"HIPFIRE_R26_RECYCLE_EVERY\" with fallback defaults",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:811",
+};
+
 /// `HIPFIRE_R26_WARMUPS` — Runtime variable controlling r26 warmups in hipfire
 pub const ENV_HIPFIRE_R26_WARMUPS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R26_WARMUPS",
@@ -4770,6 +4777,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_R25_RECYCLE_EVERY,
     ENV_HIPFIRE_R25_TIMING_ONLY,
     ENV_HIPFIRE_R25_TIMING_TRACE,
+    ENV_HIPFIRE_R26_RECYCLE_EVERY,
     ENV_HIPFIRE_R26_WARMUPS,
     ENV_HIPFIRE_RDNA2_VARIANT,
     ENV_HIPFIRE_RECOVER_MODE,

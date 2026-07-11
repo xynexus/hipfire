@@ -808,6 +808,16 @@ fn run_dense_w8(
         .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(1);
+    let recycle_every = std::env::var("HIPFIRE_R26_RECYCLE_EVERY")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(6);
+    if recycle_every < 2 {
+        return Err(
+            "HIPFIRE_R26_RECYCLE_EVERY must leave room for prime + measured command".into(),
+        );
+    }
     for attempt in 0..=warmups {
         if attempt != 0 {
             t.as_mut_slice().fill(0);
@@ -841,7 +851,7 @@ fn run_dense_w8(
     let started = std::time::Instant::now();
     let mut context_commands = warmups + 1;
     for _dispatch in 0..iterations {
-        if context_commands >= 6 {
+        if context_commands >= recycle_every {
             kernel.recreate_hwctx()?;
             t.as_mut_slice().fill(0);
             o.as_mut_slice().fill(0);

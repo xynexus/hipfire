@@ -32,9 +32,10 @@ const PARAM_OFFSET: usize = W_DATA + W_COLS * size_of::<f32>();
 const T_ROWS: usize = 296;
 const T_STRIDE: usize = 5376;
 
-// R26 is repeatable for six commands in one context. Count the mandatory
-// context-prime command in that allowance and recreate before command seven.
-const MAX_CONTEXT_COMMANDS: usize = 6;
+// A primed R26 context completed 1,000 measured commands with unchanged final
+// parity. Keep a finite evidence-backed bound, counting the prime command, so
+// long-lived servers still periodically reset array-local state.
+const MAX_CONTEXT_COMMANDS: usize = 1_000;
 
 pub struct NpuResidentFfnDenseW8Weights {
     buffer: DeviceBuffer,
