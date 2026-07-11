@@ -653,3 +653,27 @@ NPU. R25's dispatch and context-recycle costs exceed the projection calls it
 replaces, so the next resident schedule must fuse across layer boundaries and
 add W8/mixed execution rather than treating complete-FFN residency alone as a
 throughput win.
+
+### Dense-W8 resident contract checkpoint
+
+Native OQ8 and compact mixed OQ now expose one resident compute contract.
+Native OQ8 borrows each decoded int8 group directly; compact mixed storage adds
+its sparse signed deltas to the W4 base exactly once during weight upload. The
+result is the original int8 replacement value, so overlay count never enters
+the future AIE dispatch API. OQ4 remains the distinct native-W4 resident mode.
+
+Real padded-down artifacts were generated under `~/.hipfire` for OQ8,
+OQ4.125 (one overlay per group), and OQ6.5 (39 overlays per group). Every layer's
+gate/up/down tensors retained qt=35 or qt=36 respectively, including logical
+`K=1152` down projections. M256 full-K hybrid references against BF16 measured:
+
+| format | BF16 cosine | hybrid ms | input tok/s | package W | package tok/J |
+|---|---:|---:|---:|---:|---:|
+| OQ8 | 0.99962372 | 293.0 | 873.6 | 27.04 | 32.3 |
+| OQ4.125 | 0.92552006 | 370.9 | 690.2 | 28.03 | 24.6 |
+| OQ6.5 | 0.95758063 | 365.1 | 701.2 | 30.01 | 23.4 |
+
+These results validate the generic producer and established per-projection
+full-K path only. They are not resident-W8/mixed or full-model NPU results. The
+next kernel must consume the dense-W8 resident groups for fused gate/up GeGLU
+and down execution without materializing the intermediate outside AIE2P.

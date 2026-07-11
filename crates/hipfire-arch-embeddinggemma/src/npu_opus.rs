@@ -10,7 +10,7 @@ use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
     NpuOpusExecutor, NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode,
-    NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix,
+    NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
 };
 
 use crate::config::EmbeddingGemmaConfig;
@@ -322,16 +322,15 @@ impl NpuOpusProjector {
         }
         let resident_ffn_path =
             cache_root.join("embgemma_aie2p_resident_ffn_w4_m256_k768_i1152_o768");
-        let resident_ffn_rejection = resident_ffn_rejection(&layers);
-        if resident_ffn_path.join("final.xclbin").is_file() && resident_ffn_rejection.is_some() {
-            eprintln!(
-                "embeddinggemma NPU: resident FFN unavailable: {}",
-                resident_ffn_rejection.as_deref().unwrap()
-            );
+        let resident_mode = resident_ffn_mode(&layers);
+        if let Err(reason) = &resident_mode {
+            eprintln!("embeddinggemma NPU: resident FFN unavailable: {reason}");
+        } else if resident_mode == Ok(OpusResidentMode::DenseW8) {
+            eprintln!("embeddinggemma NPU: resident FFN unavailable: dense-W8 cache is not built");
         }
-        let resident_ffn = if resident_ffn_path.join("final.xclbin").is_file()
+        let resident_ffn = if resident_mode == Ok(OpusResidentMode::W4)
+            && resident_ffn_path.join("final.xclbin").is_file()
             && resident_ffn_path.join("insts.bin").is_file()
-            && resident_ffn_rejection.is_none()
         {
             let executor = NpuResidentFfnW4::load_cached(
                 resident_ffn_path
@@ -393,29 +392,37 @@ impl NpuOpusProjector {
     }
 }
 
-fn resident_ffn_rejection(layers: &[LayerMatrices]) -> Option<String> {
+fn resident_ffn_mode(layers: &[LayerMatrices]) -> Result<OpusResidentMode, String> {
+    let mut selected = None;
     for (index, layer) in layers.iter().enumerate() {
         let Some(down) = layer.down.as_ref() else {
-            return Some(format!("layer {index} down projection is not Opus"));
+            return Err(format!("layer {index} down projection is not Opus"));
         };
-        if layer.gate.encoding() != OpusMatrixEncoding::W4
-            || layer.up.encoding() != OpusMatrixEncoding::W4
-            || down.encoding() != OpusMatrixEncoding::W4
-        {
-            return Some(format!(
-                "layer {index} encodings are gate={:?} up={:?} down={:?}",
-                layer.gate.encoding(),
-                layer.up.encoding(),
-                down.encoding()
+        let modes = [
+            layer.gate.resident_mode(),
+            layer.up.resident_mode(),
+            down.resident_mode(),
+        ];
+        if modes[1..].iter().any(|mode| *mode != modes[0]) {
+            return Err(format!(
+                "layer {index} resident modes differ: gate={:?} up={:?} down={:?}",
+                modes[0], modes[1], modes[2]
             ));
         }
+        if selected.is_some_and(|mode| mode != modes[0]) {
+            return Err(format!(
+                "layer {index} resident mode {:?} differs from earlier layers {:?}",
+                modes[0], selected
+            ));
+        }
+        selected = Some(modes[0]);
         if layer.gate.awq_scale() != layer.up.awq_scale() {
-            return Some(format!(
+            return Err(format!(
                 "layer {index} gate/up AWQ activation scales differ"
             ));
         }
     }
-    None
+    selected.ok_or_else(|| "model has no FFN layers".to_string())
 }
 
 fn fullk_requirements(

@@ -202,7 +202,9 @@ pub use gemm_whole_scaled::{
 #[cfg(target_os = "linux")]
 pub mod opus;
 #[cfg(target_os = "linux")]
-pub use opus::{NpuOpusExecutor, NpuOpusGemmMp, OpusMatrixEncoding, OpusPackedMatrix};
+pub use opus::{
+    NpuOpusExecutor, NpuOpusGemmMp, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
+};
 
 #[cfg(target_os = "linux")]
 pub mod resident_ffn;

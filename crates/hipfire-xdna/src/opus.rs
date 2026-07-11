@@ -19,6 +19,7 @@ use crate::{
     NpuGemmWholeArray, NpuGemmWholeScaled, NpuSparse3Mp, NpuSparse3ResidentWeights, NpuWholeMode,
     NpuWholeResidentWeights, NpuWholeScaledIoLayout, NpuWholeScaledResidentWeights, XdnaError,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 const GROUP: usize = 256;
@@ -32,6 +33,15 @@ pub enum OpusMatrixEncoding {
     Mixed { overlays: usize },
     /// Pure signed-int8 groups (`qt=35`).
     W8,
+}
+
+/// Resident compute representation selected independently of the storage
+/// encoding. Compact mixed Opus is losslessly expanded once at upload and then
+/// shares the dense-W8 AIE schedule with native OQ8.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpusResidentMode {
+    W4,
+    DenseW8,
 }
 
 impl OpusMatrixEncoding {
@@ -126,6 +136,13 @@ impl OpusPackedMatrix {
         self.awq_scale.as_deref()
     }
 
+    pub fn resident_mode(&self) -> OpusResidentMode {
+        match self.encoding {
+            OpusMatrixEncoding::W4 => OpusResidentMode::W4,
+            OpusMatrixEncoding::Mixed { .. } | OpusMatrixEncoding::W8 => OpusResidentMode::DenseW8,
+        }
+    }
+
     pub(crate) fn group_count(&self) -> usize {
         self.groups.len()
     }
@@ -137,6 +154,31 @@ impl OpusPackedMatrix {
     pub(crate) fn group_scales(&self, group: usize) -> &[f32] {
         &self.groups[group].scales
     }
+
+    /// Exact dense int8 values for one resident group. Native W8 borrows its
+    /// decoded bytes. Compact mixed storage adds each sparse delta to the W4
+    /// base once during upload, so overlay count never enters the dispatch API.
+    pub fn group_dense_i8(&self, group: usize) -> Cow<'_, [i8]> {
+        dense_group_i8(self.encoding, &self.groups[group])
+    }
+}
+
+fn dense_group_i8(encoding: OpusMatrixEncoding, group: &OpusGroup) -> Cow<'_, [i8]> {
+    if !matches!(encoding, OpusMatrixEncoding::Mixed { .. }) {
+        return Cow::Borrowed(&group.base);
+    }
+    Cow::Owned(
+        group
+            .base
+            .iter()
+            .zip(&group.residual)
+            .map(|(&base, &delta)| {
+                let value = base as i16 + delta as i16;
+                debug_assert!((-128..=127).contains(&value));
+                value as i8
+            })
+            .collect(),
+    )
 }
 
 /// Resident W4, W8, and sparse-overlay kernels shared by Opus matrices with one `N`.
@@ -1370,6 +1412,24 @@ mod tests {
             vec![0, 21, 1, (-37i8) as u8, 255, 100]
         );
         assert!((decoded[0].scales[0] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compact_mixed_expands_exactly_to_the_dense_w8_resident_contract() {
+        let group = OpusGroup {
+            resident_base: None,
+            resident_sparse: Vec::new(),
+            scales: vec![0.25],
+            base: vec![-1, 7, -7, 0],
+            residual: vec![21, -37, 0, 100],
+        };
+        let dense = dense_group_i8(OpusMatrixEncoding::Mixed { overlays: 3 }, &group);
+        assert!(matches!(dense, Cow::Owned(_)));
+        assert_eq!(dense.as_ref(), &[20, -30, -7, 100]);
+
+        let native = dense_group_i8(OpusMatrixEncoding::W8, &group);
+        assert!(matches!(native, Cow::Borrowed(_)));
+        assert_eq!(native.as_ref(), group.base.as_slice());
     }
 
     #[test]
