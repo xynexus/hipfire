@@ -17,6 +17,7 @@ __global__ void opus_npu_pack_activations(
     int groups,
     int n_macros,
     int outblocks,
+    int input_block_bytes,
     int mode_w8
 ) {
     const int group = blockIdx.x;
@@ -102,7 +103,8 @@ __global__ void opus_npu_pack_activations(
     for (int n_macro = 0; n_macro < n_macros; ++n_macro) {
         const int outblock = m_macro * n_macros + n_macro;
         const int block = outblock * groups + group;
-        const long long base = ((long long)stripe * inblocks + block) * 8192;
+        const long long base =
+            ((long long)stripe * inblocks + block) * input_block_bytes;
         #pragma unroll
         for (int lane = 0; lane < 8; ++lane) {
             const int inner = d0 + lane;

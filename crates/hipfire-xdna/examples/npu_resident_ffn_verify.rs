@@ -177,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let xclbin = std::fs::read(format!("{}/final.xclbin", args[0]))?;
     let insts = std::fs::read(format!("{}/insts.bin", args[0]))?;
-    let kernel = NpuKernel::load(&xclbin, &insts)?;
+    let mut kernel = NpuKernel::load(&xclbin, &insts)?;
     let mut a = kernel.alloc_arg(resident_a.len())?;
     let gate_only_stream = std::env::var_os("HIPFIRE_R25_GATE_ONLY_STREAM").is_some();
     let w_payload = if gate_only_stream {
@@ -578,8 +578,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     let trace_timing = std::env::var_os("HIPFIRE_R25_TIMING_TRACE").is_some();
     let fresh_command = std::env::var_os("HIPFIRE_R25_FRESH_COMMAND").is_some();
+    let recycle_every = std::env::var("HIPFIRE_R25_RECYCLE_EVERY")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?;
     for iteration in 0..iterations {
         let dispatch_started = std::time::Instant::now();
+        if recycle_every.is_some_and(|every| every != 0 && iteration % every == 0) {
+            kernel.recreate_hwctx()?;
+        }
         if fresh_command {
             let inflight = kernel.submit_inflight(&[&a, &w, &c])?;
             kernel.wait_inflight(inflight)?;

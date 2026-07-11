@@ -9,7 +9,8 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
-    NpuOpusExecutor, NpuWholeMode, NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix,
+    NpuOpusExecutor, NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode,
+    NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix,
 };
 
 use crate::config::EmbeddingGemmaConfig;
@@ -36,6 +37,8 @@ pub struct NpuOpusProjector {
     layers: Vec<LayerMatrices>,
     shared_io: HashMap<SharedIoKey, SharedProjectionIo>,
     awq_gpu: HashMap<MatrixGpuKey, OwnedTensor>,
+    resident_ffn: Option<ResidentFfnState>,
+    resident_ffn_selected: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -69,6 +72,12 @@ struct SharedProjectionIo {
     output_gpu: ImportedTensor,
     _input_buffer: SharedGttBuffer,
     _output_buffer: SharedGttBuffer,
+}
+
+struct ResidentFfnState {
+    executor: NpuResidentFfnW4,
+    weights: Vec<NpuResidentFfnW4Weights>,
+    io: Option<SharedProjectionIo>,
 }
 
 impl NpuOpusProjector {
@@ -311,11 +320,52 @@ impl NpuOpusProjector {
                 )?,
             });
         }
+        let resident_ffn_path =
+            cache_root.join("embgemma_aie2p_resident_ffn_w4_m256_k768_i1152_o768");
+        let resident_ffn_rejection = resident_ffn_rejection(&layers);
+        if resident_ffn_path.join("final.xclbin").is_file() && resident_ffn_rejection.is_some() {
+            eprintln!(
+                "embeddinggemma NPU: resident FFN unavailable: {}",
+                resident_ffn_rejection.as_deref().unwrap()
+            );
+        }
+        let resident_ffn = if resident_ffn_path.join("final.xclbin").is_file()
+            && resident_ffn_path.join("insts.bin").is_file()
+            && resident_ffn_rejection.is_none()
+        {
+            let executor = NpuResidentFfnW4::load_cached(
+                resident_ffn_path
+                    .to_str()
+                    .expect("UTF-8 resident FFN cache path"),
+            )
+            .map_err(|error| format!("embeddinggemma NPU: load resident FFN: {error}"))?;
+            let weights = layers
+                .iter()
+                .map(|layer| {
+                    executor.upload_weights(
+                        &layer.gate,
+                        &layer.up,
+                        layer.down.as_ref().expect("resident FFN down matrix"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("embeddinggemma NPU: pack resident FFN: {error}"))?;
+            Some(ResidentFfnState {
+                executor,
+                weights,
+                io: None,
+            })
+        } else {
+            None
+        };
+        let resident_ffn_selected = resident_ffn.is_some();
         Ok(Self {
             executors,
             layers,
             shared_io: HashMap::new(),
             awq_gpu: HashMap::new(),
+            resident_ffn,
+            resident_ffn_selected,
         })
     }
 
@@ -326,6 +376,46 @@ impl NpuOpusProjector {
     pub fn executor_count(&self) -> usize {
         self.executors.len()
     }
+
+    pub fn resident_ffn_enabled(&self) -> bool {
+        self.resident_ffn.is_some() && self.resident_ffn_selected
+    }
+
+    /// Select or bypass the complete resident FFN while retaining all resident
+    /// buffers. This is intended for same-process correctness comparisons
+    /// against the established per-projection Opus path.
+    pub fn select_resident_ffn(&mut self, selected: bool) -> Result<(), String> {
+        if selected && self.resident_ffn.is_none() {
+            return Err("embeddinggemma NPU: resident FFN is unavailable".to_string());
+        }
+        self.resident_ffn_selected = selected;
+        Ok(())
+    }
+}
+
+fn resident_ffn_rejection(layers: &[LayerMatrices]) -> Option<String> {
+    for (index, layer) in layers.iter().enumerate() {
+        let Some(down) = layer.down.as_ref() else {
+            return Some(format!("layer {index} down projection is not Opus"));
+        };
+        if layer.gate.encoding() != OpusMatrixEncoding::W4
+            || layer.up.encoding() != OpusMatrixEncoding::W4
+            || down.encoding() != OpusMatrixEncoding::W4
+        {
+            return Some(format!(
+                "layer {index} encodings are gate={:?} up={:?} down={:?}",
+                layer.gate.encoding(),
+                layer.up.encoding(),
+                down.encoding()
+            ));
+        }
+        if layer.gate.awq_scale() != layer.up.awq_scale() {
+            return Some(format!(
+                "layer {index} gate/up AWQ activation scales differ"
+            ));
+        }
+    }
+    None
 }
 
 fn fullk_requirements(
@@ -432,6 +522,7 @@ fn rdna_io_layout(layout: NpuWholeScaledIoLayout) -> OpusNpuIoLayout {
         layout.n(),
         layout.n_macros(),
         layout.outblocks(),
+        8192,
         layout.input_bytes(),
         layout.output_bytes(),
         layout.row_major_output(),
@@ -531,6 +622,7 @@ impl LinearProjector for NpuOpusProjector {
             layers,
             shared_io,
             awq_gpu,
+            ..
         } = self;
         let layer = layers
             .get(layer_idx)
@@ -624,6 +716,7 @@ impl LinearProjector for NpuOpusProjector {
             layers,
             shared_io,
             awq_gpu,
+            ..
         } = self;
         let matrix = layers[layer_idx].qkv.as_ref().unwrap();
         let widths = [wq.m, wk.m, wv.m];
@@ -704,6 +797,7 @@ impl LinearProjector for NpuOpusProjector {
             layers,
             shared_io,
             awq_gpu,
+            ..
         } = self;
         let matrix = layers[layer_idx].gate_up.as_ref().unwrap();
         if gate_weight.k != matrix.k()
@@ -745,6 +839,159 @@ impl LinearProjector for NpuOpusProjector {
         }
         copy_host_output(gpu, gate, &gate_host)?;
         copy_host_output(gpu, up, &up_host)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_ffn(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        gate_weight: &WeightTensor,
+        up_weight: &WeightTensor,
+        down_weight: &WeightTensor,
+        input: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        activated: &GpuTensor,
+        output: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
+        if rows <= NpuResidentFfnW4::rows()
+            && self.resident_ffn_selected
+            && self.resident_ffn.is_some()
+        {
+            let layer = self
+                .layers
+                .get(layer_idx)
+                .ok_or_else(|| hip_error(format!("missing packed layer {layer_idx}")))?;
+            if gate_weight.k == 768
+                && gate_weight.m == 1152
+                && up_weight.k == 768
+                && up_weight.m == 1152
+                && down_weight.k == 1152
+                && down_weight.m == 768
+            {
+                let state = self.resident_ffn.as_mut().expect("checked resident FFN");
+                if state.io.is_none() {
+                    let layout = resident_ffn_layout();
+                    let mut input_buffer = gpu.alloc_shared_gtt(layout.input_bytes)?;
+                    let mut output_buffer = gpu.alloc_shared_gtt(layout.output_bytes)?;
+                    input_buffer.as_mut_slice().fill(0);
+                    output_buffer.as_mut_slice().fill(0);
+                    let input_gpu = gpu.import_dmabuf(
+                        input_buffer.dmabuf_fd(),
+                        layout.input_bytes,
+                        &[layout.input_bytes],
+                        DType::Raw,
+                    )?;
+                    let output_gpu = gpu.import_dmabuf(
+                        output_buffer.dmabuf_fd(),
+                        layout.output_bytes,
+                        &[layout.output_bytes],
+                        DType::Raw,
+                    )?;
+                    state
+                        .executor
+                        .attach_shared_io(
+                            input_buffer.dmabuf_fd(),
+                            layout.input_bytes,
+                            output_buffer.dmabuf_fd(),
+                            layout.output_bytes,
+                        )
+                        .map_err(|error| hip_error(format!("attach resident FFN I/O: {error}")))?;
+                    state.io = Some(SharedProjectionIo {
+                        input_gpu,
+                        output_gpu,
+                        _input_buffer: input_buffer,
+                        _output_buffer: output_buffer,
+                    });
+                }
+                let matrix_key = MatrixGpuKey {
+                    layer: layer_idx,
+                    role: MatrixRole::GateUp,
+                };
+                if !self.awq_gpu.contains_key(&matrix_key) {
+                    if let Some(scale) = layer.gate.awq_scale() {
+                        self.awq_gpu
+                            .insert(matrix_key, gpu.upload_owned_f32(scale, &[scale.len()])?);
+                    }
+                }
+                let io = state.io.as_ref().expect("resident FFN I/O allocated");
+                gpu.pack_opus_npu_activations(
+                    input,
+                    self.awq_gpu.get(&matrix_key).map(OwnedTensor::view),
+                    &io.input_gpu.view(),
+                    rows,
+                    768,
+                    resident_ffn_layout().rdna,
+                )?;
+                gpu.device_synchronize()?;
+                state
+                    .executor
+                    .run_shared(&state.weights[layer_idx])
+                    .map_err(|error| hip_error(format!("resident NPU FFN failed: {error}")))?;
+                gpu.unpack_opus_npu_output(
+                    &io.output_gpu.view(),
+                    output,
+                    768,
+                    None,
+                    None,
+                    rows,
+                    resident_ffn_layout().rdna,
+                )?;
+                return Ok(());
+            }
+        }
+        self.project_gate_up(
+            gpu,
+            layer_idx,
+            gate_weight,
+            up_weight,
+            input,
+            gate,
+            up,
+            rows,
+        )?;
+        gpu.gelu_mul_f32(gate, up, activated)?;
+        self.project(
+            gpu,
+            layer_idx,
+            Projection::Down,
+            down_weight,
+            activated,
+            output,
+            rows,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResidentFfnLayout {
+    rdna: OpusNpuIoLayout,
+    input_bytes: usize,
+    output_bytes: usize,
+}
+
+fn resident_ffn_layout() -> ResidentFfnLayout {
+    let input_bytes = NpuResidentFfnW4::input_bytes();
+    let output_bytes = NpuResidentFfnW4::output_bytes();
+    ResidentFfnLayout {
+        rdna: OpusNpuIoLayout::new(
+            false,
+            8,
+            256,
+            3,
+            768,
+            3,
+            9,
+            NpuResidentFfnW4::input_block_bytes(),
+            input_bytes,
+            output_bytes,
+            true,
+            768,
+        ),
+        input_bytes,
+        output_bytes,
     }
 }
 

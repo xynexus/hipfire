@@ -125,6 +125,18 @@ impl OpusPackedMatrix {
     pub fn awq_scale(&self) -> Option<&[f32]> {
         self.awq_scale.as_deref()
     }
+
+    pub(crate) fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    pub(crate) fn group_base(&self, group: usize) -> &[i8] {
+        &self.groups[group].base
+    }
+
+    pub(crate) fn group_scales(&self, group: usize) -> &[f32] {
+        &self.groups[group].scales
+    }
 }
 
 /// Resident W4, W8, and sparse-overlay kernels shared by Opus matrices with one `N`.

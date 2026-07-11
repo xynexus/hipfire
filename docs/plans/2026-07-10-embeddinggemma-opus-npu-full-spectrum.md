@@ -620,3 +620,36 @@ workaround, but it still must be implemented and timed in the reusable runtime.
 R25 is complete-FFN W4 kernel evidence, not arbitrary-mixed/OQ8 FFN support or
 full-model NPU evidence. Attention, norms/residuals, pooling, Dense heads,
 end-to-end 10k/15k admission, and package tokens/J remain open.
+
+### Real-artifact resident W4 checkpoint
+
+The reusable runtime now uploads all 24 layers of R25 weights once, uses a
+compact shared GPU-to-AIE activation layout, and recycles the XDNA hardware
+context after seven commands. Twenty synthetic full-FFN submissions completed
+without the tenth-command TDR; recycling increased the amortized standalone
+dispatch from roughly 3.8-4.0 ms to 4.25 ms.
+
+The offline Opus producer now zero-pads each ragged matrix row independently to
+`ceil(K/256)` groups while retaining the logical HFQ shape and AWQ sidecar
+length. Its LDLQ path extends the logical Hessian with zero-covariance padded
+coordinates before the block FWHT. This removes the previous Q8 fallback for
+EmbeddingGemma's `[768,1152]` down projection across OQ4, OQ8, arbitrary mixed
+OQ, and their `+`/`++` recipes. A generated
+`EmbeddingGemma-300M.npu.oq4.hfq` therefore carries qt=34 for all 24 gate, up,
+and down matrices; generated artifacts remain under `~/.hipfire`.
+
+That artifact selected the complete resident FFN in a real M=256 hybrid model
+run. A same-process comparison against the established per-projection Opus path
+reported embedding cosine `0.99949509` and maximum absolute error `0.00368346`,
+which admits the R25 integration as a correctness path. The candidate's
+selection cosine against BF16 was only `0.92908514`, so padded OQ4 down weights
+are not a quality promotion over the former Q8-down recipe.
+
+Performance is also not admitted: the per-projection fallback took 288.7 ms per
+M256 hybrid encode, while the resident-W4 path took 310.5 ms (about 824 input
+tokens/s at 24.08 W, or 34.2 package tokens/J). These remain hybrid results:
+attention, norms, residuals, pooling, and Dense heads still execute outside the
+NPU. R25's dispatch and context-recycle costs exceed the projection calls it
+replaces, so the next resident schedule must fuse across layer boundaries and
+add W8/mixed execution rather than treating complete-FFN residency alone as a
+throughput win.

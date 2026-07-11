@@ -37,6 +37,8 @@ pub struct NpuKernel {
     _heap: DeviceBuffer,
     hwctx: u32,
     syncobj: u32,
+    pdi_bo: u32,
+    num_tiles: u32,
     instr_bo: u32,
     instr_addr: u64,
     instr_size: usize,
@@ -88,6 +90,8 @@ impl NpuKernel {
             _heap: heap,
             hwctx,
             syncobj,
+            pdi_bo,
+            num_tiles,
             instr_bo,
             instr_addr,
             instr_size: insts.len(),
@@ -106,6 +110,23 @@ impl NpuKernel {
     pub fn sync_to_device(&self, buffer: &DeviceBuffer) -> Result<(), XdnaError> {
         self.dev
             .sync_bo(buffer.handle(), submit::SYNC_DIRECT_TO_DEVICE, buffer.len())
+    }
+
+    /// Recreate the hardware context while retaining the DRM device, PDI,
+    /// instruction, argument, and imported dma-buf BOs. This resets array-local
+    /// core/FIFO state without changing any command-packet argument addresses.
+    pub fn recreate_hwctx(&mut self) -> Result<(), XdnaError> {
+        self.dev.destroy_hwctx(self.hwctx)?;
+        let (hwctx, syncobj) =
+            self.dev
+                .create_hwctx(self.num_tiles, 0, 0x800, &QosInfo::default())?;
+        if let Err(error) = self.dev.config_hwctx_cu(hwctx, self.pdi_bo) {
+            let _ = self.dev.destroy_hwctx(hwctx);
+            return Err(error);
+        }
+        self.hwctx = hwctx;
+        self.syncobj = syncobj;
+        Ok(())
     }
 
     /// Import an external dma-buf (e.g. an amdgpu GTT BO) as an argument buffer, zero-copy:

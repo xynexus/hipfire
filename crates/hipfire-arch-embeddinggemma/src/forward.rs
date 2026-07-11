@@ -98,6 +98,43 @@ pub trait LinearProjector {
         )?;
         self.project(gpu, layer_idx, Projection::Up, up_weight, input, up, rows)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_ffn(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        gate_weight: &WeightTensor,
+        up_weight: &WeightTensor,
+        down_weight: &WeightTensor,
+        input: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        activated: &GpuTensor,
+        output: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.project_gate_up(
+            gpu,
+            layer_idx,
+            gate_weight,
+            up_weight,
+            input,
+            gate,
+            up,
+            rows,
+        )?;
+        gpu.gelu_mul_f32(gate, up, activated)?;
+        self.project(
+            gpu,
+            layer_idx,
+            Projection::Down,
+            down_weight,
+            activated,
+            output,
+            rows,
+        )
+    }
 }
 
 pub struct GpuLinearProjector;
@@ -287,18 +324,19 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
 
         // ── FFN block (GeGLU) ──
         gpu.rmsnorm_batched(&x_batch, &layer.pre_ffn_norm, &tmp, m, dim, eps)?;
-        projector.project_gate_up(
+        projector.project_ffn(
             gpu,
             layer_idx,
             &layer.w_gate,
             &layer.w_up,
+            &layer.w_down,
             &tmp,
             &gate,
             &up,
+            &ffn,
+            &o,
             m,
         )?;
-        gpu.gelu_mul_f32(&gate, &up, &ffn)?;
-        projector.project(gpu, layer_idx, Projection::Down, &layer.w_down, &ffn, &o, m)?;
         gpu.rmsnorm_batched(&o, &layer.post_ffn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(&x_batch, &tmp, &x_batch)?;
     }
