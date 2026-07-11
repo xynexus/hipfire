@@ -250,6 +250,13 @@ the admission oracle from "within 5% of the frozen model's per-cache SVD" to
 and gate. That is a separate successor plan, opened only if this confirmation
 fails.
 
+A Tier-1 mechanism probe of this lever (LoRA recovery-FT on Supra-50M) is
+recorded in `docs/plans/2026-07-11-latent-kv-retraining-tier1.md`: retraining is
+the only approach with non-zero held-out recovery (~16.5%), but at that scale it
+is modest and limited by data/scale rather than adapter capacity (rank 16 ≈
+rank 64). It justifies a Tier-2 effort (Qwen3.5 support + 4B/9B + real corpora +
+stable optimizer) without prescribing a full weight tune.
+
 ## Provenance
 
 - Supersedes the *verdict* of `2026-07-10-hierarchical-calibrated-latent-kv.md`;
