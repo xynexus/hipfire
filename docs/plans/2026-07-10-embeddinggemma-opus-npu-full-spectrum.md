@@ -916,3 +916,40 @@ not a resident attention layer or full-model result. R27 attention still needs
 to be appended to the command, followed by the o projection, residual/norm
 operations, FFN, tail stages, generic W4 and dense-mixed upload/dispatch,
 end-to-end quality, 10k/15k admission, and package tokens/J.
+
+### R30 resident W8 QKV and attention checkpoint
+
+R30 appends the R27 BF16 MMUL online-softmax attention phase to R29's full-K
+W8 QKV projection and pack. Projection activations, raw position records, the
+complete 16 KiB packed Q row-join, and each 16 KiB packed K/V block all use the
+same phase-ordered activation FIFO; weights retain the other memory-tile input
+channel. Packed Q/K/V are command-local intermediates and attention output is
+written into a tail of the persistent staging argument, keeping the DPU packet
+within its five-argument hardware limit.
+
+Linking projection, Q/K/V transforms, and MMUL attention on every core exceeded
+the 16 KiB AIE program-memory limit (`19.9 KiB` at the first attempt). Collapsing
+the separate W8 projection init/accumulate specializations removed about
+`1.3 KiB` but was not sufficient. The admitted graph partitions code by column:
+even cores retain K/V packing, while each odd core loads both adjacent Q tiles,
+updates two online-softmax accumulators against one streamed K/V block, and
+emits the even result followed by the odd result. Even cores consume the shared
+attention stream without linking the attention arithmetic. This fits at `-Os`
+without changing R27's BF16 MMUL/softmax contract.
+
+The first six-argument runtime attempt was rejected before execution because
+the installed DPU register map accepts at most five arguments. Folding the
+393,216-byte attention output into the staging BO tail removes that ABI error.
+The resulting hardware oracle preserves R29's projection/Q/K/V metrics and
+reports attention cosine `0.99997371` with `0.0001469` maximum absolute error.
+Three independent 100-command processes measure `2.8999`, `3.0678`, and
+`3.0897 ms` (median `3.0678 ms`). The refactored standalone R29 path also
+retains parity and measures `1.2287 ms` in a 20-command regression run.
+
+R30 is resident W8 QKV plus bidirectional attention evidence, not a complete
+layer or full model. The o projection, residual/norm operations, complete FFN,
+tail stages, W4 and arbitrary dense-mixed dispatch, end-to-end quality,
+10k/15k admission, and package tokens/J remain open. Serially repeating the
+current `3.0678 ms` command across 24 layers would already take about
+`73.6 ms`, so code residency alone is insufficient; subsequent schedules must
+fuse the remaining layer roles and recover parallelism or overlap.

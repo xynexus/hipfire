@@ -8,9 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const K: usize = 768;
     const N: usize = 1280;
     const GROUPS: usize = 3;
-    const A_BYTES: usize = 4 * 45 * 10240;
     const W_BYTES: usize = 8 * 45 * 16384;
-    const R_BYTES: usize = 5 * 48 * 10240;
     const EPSILON: f32 = 1.0e-6;
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -26,8 +24,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("R29 verifier needs at least one iteration".into());
     }
     let manifest = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
+    let attention = manifest
+        .lines()
+        .any(|line| line == "op=resident-qkv-attention");
+    let operation = if attention {
+        "op=resident-qkv-attention"
+    } else {
+        "op=resident-qkv-headnorm-rope-pack"
+    };
     for field in [
-        "op=resident-qkv-headnorm-rope-pack",
+        operation,
         "mode=w8-scaled",
         "m=256",
         "k=768",
@@ -38,6 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("R29 cache missing {field}").into());
         }
     }
+    let pair_bytes = if attention { 16384 } else { 10240 };
+    let a_bytes = 4 * 45 * pair_bytes;
+    let r_stage_bytes = 5 * 48 * pair_bytes;
+    let r_bytes = r_stage_bytes + if attention { Layout::OUTPUT_BYTES } else { 0 };
 
     let activations = (0..Layout::TOKENS * K)
         .map(|index| (((index * 17 + index / 29) % 15) as i8) - 7)
@@ -65,20 +75,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let projected = cpu_projection(&activations, &activation_scales, &weights, &weight_scales);
 
-    let packed_a = pack_activations(&activations, &activation_scales);
+    let packed_a = pack_activations(&activations, &activation_scales, pair_bytes);
     let packed_w = pack_weights(&weights, &weight_scales);
-    let staged_r = stage_positions_and_params(&cs, &qnorm, &knorm, EPSILON);
-    assert_eq!(packed_a.len(), A_BYTES);
+    let mut staged_r = stage_positions_and_params(&cs, &qnorm, &knorm, EPSILON, pair_bytes);
+    staged_r.resize(r_bytes, 0);
+    assert_eq!(packed_a.len(), a_bytes);
     assert_eq!(packed_w.len(), W_BYTES);
-    assert_eq!(staged_r.len(), R_BYTES);
+    assert_eq!(staged_r.len(), r_bytes);
 
     let kernel = NpuKernel::load(
         &std::fs::read(format!("{}/final.xclbin", args[0]))?,
         &std::fs::read(format!("{}/insts.bin", args[0]))?,
     )?;
-    let mut a_buffer = kernel.alloc_arg(A_BYTES)?;
+    let mut a_buffer = kernel.alloc_arg(a_bytes)?;
     let mut w_buffer = kernel.alloc_arg(W_BYTES)?;
-    let mut r_buffer = kernel.alloc_arg(R_BYTES)?;
+    let mut r_buffer = kernel.alloc_arg(r_bytes)?;
     let mut q_buffer = kernel.alloc_arg(Layout::Q_BYTES)?;
     let mut kv_buffer = kernel.alloc_arg(Layout::KV_BYTES)?;
     a_buffer.as_mut_slice().copy_from_slice(&packed_a);
@@ -87,9 +98,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     q_buffer.as_mut_slice().fill(0);
     kv_buffer.as_mut_slice().fill(0);
 
-    kernel.dispatch_synced(
-        [&a_buffer, &w_buffer, &r_buffer, &q_buffer, &kv_buffer].as_slice(),
-        &[true, true, true, true, true],
+    dispatch_resident(
+        &kernel, &a_buffer, &w_buffer, &r_buffer, &q_buffer, &kv_buffer, true,
     )?;
     r_buffer.as_mut_slice().copy_from_slice(&staged_r);
     q_buffer.as_mut_slice().fill(0);
@@ -97,15 +107,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     kernel.sync_to_device(&r_buffer)?;
     kernel.sync_to_device(&q_buffer)?;
     kernel.sync_to_device(&kv_buffer)?;
-    kernel.dispatch_synced(
-        [&a_buffer, &w_buffer, &r_buffer, &q_buffer, &kv_buffer].as_slice(),
-        &[false, false, false, false, false],
+    dispatch_resident(
+        &kernel, &a_buffer, &w_buffer, &r_buffer, &q_buffer, &kv_buffer, false,
     )?;
     kernel.sync_output(&r_buffer)?;
     kernel.sync_output(&q_buffer)?;
     kernel.sync_output(&kv_buffer)?;
 
-    let projected_got = read_projected(r_buffer.as_slice());
+    let projected_got = read_projected(r_buffer.as_slice(), pair_bytes);
     let q_got = read_q(q_buffer.as_slice());
     let k_got = read_kv(kv_buffer.as_slice(), true);
     let v_got = read_kv(kv_buffer.as_slice(), false);
@@ -142,19 +151,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    let attention_metrics = if attention {
+        let got = unpack_attention(&r_buffer.as_slice()[r_stage_bytes..])?;
+        let reference = attention_reference(&q_got, &k_got, &v_got);
+        let measured = metrics(&got, &reference);
+        if !measured.0.is_finite() || measured.0 < 0.998 || measured.1 > 0.04 {
+            return Err(format!("R30 attention parity failed: {measured:?}").into());
+        }
+        Some(measured)
+    } else {
+        None
+    };
+
     let started = std::time::Instant::now();
     for _ in 0..iterations {
-        kernel.dispatch_synced(
-            [&a_buffer, &w_buffer, &r_buffer, &q_buffer, &kv_buffer].as_slice(),
-            &[false, false, false, false, false],
+        dispatch_resident(
+            &kernel, &a_buffer, &w_buffer, &r_buffer, &q_buffer, &kv_buffer, false,
         )?;
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
-    println!(
-        "resident-w8-qkv-pack M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} dispatch_ms={dispatch_ms:.4}",
-        projection.0, projection.1, q.0, q.1, k.0, k.1
-    );
+    if let Some(attention) = attention_metrics {
+        println!(
+            "resident-w8-qkv-attention M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} attention_cosine={:.8} attention_max={:.7} dispatch_ms={dispatch_ms:.4}",
+            projection.0, projection.1, q.0, q.1, k.0, k.1, attention.0, attention.1
+        );
+    } else {
+        println!(
+            "resident-w8-qkv-pack M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} dispatch_ms={dispatch_ms:.4}",
+            projection.0, projection.1, q.0, q.1, k.0, k.1
+        );
+    }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn dispatch_resident(
+    kernel: &hipfire_xdna::NpuKernel,
+    activations: &hipfire_xdna::DeviceBuffer,
+    weights: &hipfire_xdna::DeviceBuffer,
+    staging: &hipfire_xdna::DeviceBuffer,
+    queries: &hipfire_xdna::DeviceBuffer,
+    key_values: &hipfire_xdna::DeviceBuffer,
+    sync: bool,
+) -> Result<(), hipfire_xdna::XdnaError> {
+    let args = [activations, weights, staging, queries, key_values];
+    let sync_flags = vec![sync; args.len()];
+    kernel.dispatch_synced(&args, &sync_flags)
+}
+
+#[cfg(target_os = "linux")]
+fn unpack_attention(bytes: &[u8]) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let bits = hipfire_xdna::EmbeddingGemmaAttentionLayout::unpack_output_bf16(bytes)
+        .ok_or("invalid R30 physical attention output")?;
+    Ok(bits
+        .into_iter()
+        .map(hipfire_primitives::conv::bf16_bits_to_f32)
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+fn attention_reference(q: &[f32], k: &[f32], v: &[f32]) -> Vec<f32> {
+    let mut output = vec![0.0f32; q.len()];
+    let mut scores = vec![0.0f32; 256];
+    for head in 0..3 {
+        for query in 0..256 {
+            let qrow = &q[(head * 256 + query) * 256..(head * 256 + query + 1) * 256];
+            for key in 0..256 {
+                scores[key] = qrow
+                    .iter()
+                    .zip(&k[key * 256..(key + 1) * 256])
+                    .map(|(&left, &right)| left * right)
+                    .sum::<f32>()
+                    * 0.0625;
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum = scores
+                .iter_mut()
+                .map(|score| {
+                    *score = (*score - max).exp();
+                    *score
+                })
+                .sum::<f32>();
+            let destination =
+                &mut output[(head * 256 + query) * 256..(head * 256 + query + 1) * 256];
+            for key in 0..256 {
+                let probability = scores[key] / sum;
+                for dim in 0..256 {
+                    destination[dim] += probability * v[key * 256 + dim];
+                }
+            }
+        }
+    }
+    output
 }
 
 #[cfg(target_os = "linux")]
@@ -188,19 +277,18 @@ fn cpu_projection(
 }
 
 #[cfg(target_os = "linux")]
-fn pack_activations(values: &[i8], scales: &[f32]) -> Vec<u8> {
+fn pack_activations(values: &[i8], scales: &[f32], block_bytes: usize) -> Vec<u8> {
     const M: usize = 256;
     const K: usize = 768;
-    const BLOCK: usize = 10240;
     const OUTBLOCKS: usize = 15;
-    let mut packed = vec![0u8; 4 * 45 * BLOCK];
+    let mut packed = vec![0u8; 4 * 45 * block_bytes];
     for stripe in 0..4 {
         for m_macro in 0..3 {
             for n_macro in 0..5 {
                 let outblock = m_macro * 5 + n_macro;
                 for group in 0..3 {
                     let block = outblock * 3 + group;
-                    let base = (stripe * OUTBLOCKS * 3 + block) * BLOCK;
+                    let base = (stripe * OUTBLOCKS * 3 + block) * block_bytes;
                     for lm in 0..3 {
                         for kt in 0..32 {
                             for local_row in 0..8 {
@@ -272,13 +360,18 @@ fn pack_weights(weights: &[Vec<i8>], scales: &[Vec<f32>]) -> Vec<u8> {
 }
 
 #[cfg(target_os = "linux")]
-fn stage_positions_and_params(cs: &[u16], qnorm: &[f32], knorm: &[f32], eps: f32) -> Vec<u8> {
+fn stage_positions_and_params(
+    cs: &[u16],
+    qnorm: &[f32],
+    knorm: &[f32],
+    eps: f32,
+    pair_bytes: usize,
+) -> Vec<u8> {
     use hipfire_primitives::conv::f32_to_bf16_bits;
-    const PAIR: usize = 10240;
-    let mut staged = vec![0u8; 5 * 48 * PAIR];
+    let mut staged = vec![0u8; 5 * 48 * pair_bytes];
     for role in 0..5 {
         for physical_pair in 0..48 {
-            let base = (role * 48 + physical_pair) * PAIR;
+            let base = (role * 48 + physical_pair) * pair_bytes;
             let m_macro = physical_pair / 16;
             let within = physical_pair % 16;
             let core_row = within / 4;
@@ -326,7 +419,7 @@ fn physical_pair(logical_pair: usize) -> usize {
 }
 
 #[cfg(target_os = "linux")]
-fn read_projected(bytes: &[u8]) -> Vec<f32> {
+fn read_projected(bytes: &[u8], pair_bytes: usize) -> Vec<f32> {
     use hipfire_primitives::conv::bf16_bits_to_f32;
     let mut output = vec![0.0; 256 * 1280];
     for role in 0..5 {
@@ -334,7 +427,7 @@ fn read_projected(bytes: &[u8]) -> Vec<f32> {
             let pair = physical_pair(token / 8);
             let row = token % 8;
             for dim in 0..256 {
-                let offset = (role * 48 + pair) * 10240 + (row * 256 + dim) * 2;
+                let offset = (role * 48 + pair) * pair_bytes + (row * 256 + dim) * 2;
                 output[token * 1280 + role * 256 + dim] =
                     bf16_bits_to_f32(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]));
             }

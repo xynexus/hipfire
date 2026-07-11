@@ -48,10 +48,9 @@ join_rows(aie::vector<int32, W8_MMUL::size_C> lo,
   }
 }
 
-template <bool ACCUMULATE>
 void projection_group(const int8_t *restrict activations,
                       const int8_t *restrict weights,
-                      float *restrict output) {
+                      float *restrict output, bool accumulate) {
   const float *activation_scales =
       reinterpret_cast<const float *>(activations + A_DATA);
   const float *weight_scales =
@@ -79,7 +78,7 @@ void projection_group(const int8_t *restrict activations,
                 .to_vector<float>();
         scaled =
             aie::mul(scaled, activation_scales[im * 8 + row]).to_vector<float>();
-        if constexpr (ACCUMULATE)
+        if (accumulate)
           scaled = aie::add(scaled, aie::load_v<16>(output + offset));
         aie::store_v(output + offset, scaled);
       }
@@ -200,10 +199,14 @@ __attribute__((noinline)) void k_upper_store(
 extern "C" {
 
 void r29_w8_projection_init(const int8_t *a, const int8_t *w, float *acc) {
-  projection_group<false>(a, w, acc);
+  projection_group(a, w, acc, false);
 }
 void r29_w8_projection_accum(const int8_t *a, const int8_t *w, float *acc) {
-  projection_group<true>(a, w, acc);
+  projection_group(a, w, acc, true);
+}
+void r29_w8_projection_group(const int8_t *a, const int8_t *w, float *acc,
+                             int32_t accumulate) {
+  projection_group(a, w, acc, accumulate != 0);
 }
 void r29_w8_projection_finish(const float *acc, int8_t *output_bytes) {
   bfloat16 *output = reinterpret_cast<bfloat16 *>(output_bytes);

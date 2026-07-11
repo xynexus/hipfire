@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""Generate one-command W8 QKV projection -> R28 pack for AIE2P."""
+"""Generate resident W8 QKV packing, optionally followed by R27 attention."""
+
+import sys
+
+ATTENTION = "--attention" in sys.argv[1:]
+OBJECT = "r30.o" if ATTENTION else "r29.o"
 
 COLS, ROWS = 8, 4
 GROUPS, M_MACROS, N_MACROS = 3, 3, 5
 OUTBLOCKS = M_MACROS * N_MACROS
-A_BLOCK, W_BLOCK = 10240, 16384
+A_BLOCK, W_BLOCK = (16384 if ATTENTION else 10240), 16384
 ACC_ELEMS = 768
 INBLOCKS = GROUPS * OUTBLOCKS
 A_BYTES = ROWS * INBLOCKS * A_BLOCK
 W_BYTES = COLS * INBLOCKS * W_BLOCK
 
 QUERY_GROUPS = 6
-PAIR, PAIRS_PER_ROLE, ROLES = 10240, 48, 5
-R_BYTES = ROLES * PAIRS_PER_ROLE * PAIR
+PAIR, PAIRS_PER_ROLE, ROLES = A_BLOCK, 48, 5
+R_STAGE_BYTES = ROLES * PAIRS_PER_ROLE * PAIR
 OUT_TILE, OUT_JOIN = 2048, 8192
 Q_BYTES, KV_BYTES = 393216, 262144
 Q_JOIN, KV_TILE, K_HALF = 16384, 16384, 8192
+ATT_ACC, ATT_STATS, ATT_BYTES = 1024, 8, 393216
+R_BYTES = R_STAGE_BYTES + (ATT_BYTES if ATTENTION else 0)
 INF = 9223372036854775807
 
 
@@ -55,6 +62,14 @@ for col in range(COLS):
             f'    %acc{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "acc{col}_{row}"}} : memref<{ACC_ELEMS}xf32>',
             f'    %kinv{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "kinv{col}_{row}"}} : memref<8xf32>',
         ]
+        if ATTENTION and col % 2 == 1:
+            out += [
+                f'    %attacc0{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "attacc0{col}_{row}"}} : memref<{ATT_ACC}xf32>',
+                f'    %attacc1{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "attacc1{col}_{row}"}} : memref<{ATT_ACC}xf32>',
+                f'    %attstats0{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "attstats0{col}_{row}"}} : memref<{ATT_STATS}xf32>',
+                f'    %attstats1{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "attstats1{col}_{row}"}} : memref<{ATT_STATS}xf32>',
+                f'    %attq{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "attq{col}_{row}"}} : memref<{2 * OUT_TILE}xi8>',
+            ]
 
 for col in range(COLS):
     cores = ", ".join(f"%c{col}_{row}" for row in range(ROWS))
@@ -85,13 +100,21 @@ for col in range(COLS):
     ]
 
 out += [
-    f'    func.func private @r29_w8_projection_init(memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>) attributes {{link_with = "r29.o"}}',
-    f'    func.func private @r29_w8_projection_accum(memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>) attributes {{link_with = "r29.o"}}',
-    f'    func.func private @r29_w8_projection_finish(memref<{ACC_ELEMS}xf32>, memref<{OUT_TILE}xi8>) attributes {{link_with = "r29.o"}}',
-    f'    func.func private @r29_pack_q(memref<{PAIR}xi8>, memref<{OUT_TILE}xi8>, i32) attributes {{link_with = "r29.o"}}',
-    f'    func.func private @r29_pack_k(memref<{PAIR}xi8>, memref<{OUT_TILE}xi8>, memref<8xf32>, i32) attributes {{link_with = "r29.o"}}',
-    f'    func.func private @r29_pack_v(memref<{PAIR}xi8>, memref<{OUT_TILE}xi8>, i32) attributes {{link_with = "r29.o"}}',
+    f'    func.func private @r29_w8_projection_init(memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>) attributes {{link_with = "{OBJECT}"}}',
+    f'    func.func private @r29_w8_projection_accum(memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>) attributes {{link_with = "{OBJECT}"}}',
+    f'    func.func private @r29_w8_projection_finish(memref<{ACC_ELEMS}xf32>, memref<{OUT_TILE}xi8>) attributes {{link_with = "{OBJECT}"}}',
+    f'    func.func private @r29_pack_q(memref<{PAIR}xi8>, memref<{OUT_TILE}xi8>, i32) attributes {{link_with = "{OBJECT}"}}',
+    f'    func.func private @r29_pack_k(memref<{PAIR}xi8>, memref<{OUT_TILE}xi8>, memref<8xf32>, i32) attributes {{link_with = "{OBJECT}"}}',
+    f'    func.func private @r29_pack_v(memref<{PAIR}xi8>, memref<{OUT_TILE}xi8>, i32) attributes {{link_with = "{OBJECT}"}}',
 ]
+if ATTENTION:
+    out += [
+        f'    func.func private @r29_w8_projection_group(memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>, i32) attributes {{link_with = "{OBJECT}"}}',
+        f'    func.func private @r30_attention_init(memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>) attributes {{link_with = "{OBJECT}"}}',
+        f'    func.func private @r30_attention_load_q(memref<{A_BLOCK}xi8>, memref<{2 * OUT_TILE}xi8>, i32) attributes {{link_with = "{OBJECT}"}}',
+        f'    func.func private @r30_attention_block(memref<{2 * OUT_TILE}xi8>, memref<{A_BLOCK}xi8>, memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, i32) attributes {{link_with = "{OBJECT}"}}',
+        f'    func.func private @r30_attention_finish(memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{OUT_TILE}xi8>) attributes {{link_with = "{OBJECT}"}}',
+    ]
 
 
 def acquire_a(row, name, indent="        "):
@@ -125,8 +148,10 @@ for col in range(COLS):
             f"      %groups = arith.constant {GROUPS} : index",
             f"      %outblocks = arith.constant {OUTBLOCKS} : index",
             f"      %qgroups = arith.constant {QUERY_GROUPS} : index",
+            "      %attblocks = arith.constant 16 : index",
             "      %waves = arith.constant 2 : index",
             f"      %lane = arith.constant {col % 2} : i32",
+            f"      %corecol = arith.constant {col // 2} : i32",
             "      %h0 = arith.constant 0 : i32",
             "      %h1 = arith.constant 1 : i32",
             "      scf.for %outer = %z to %inf step %one {",
@@ -134,16 +159,26 @@ for col in range(COLS):
         ]
         lines += acquire_a(row, "p0", "          ")
         lines += acquire_w(col, "p0", "          ")
+        first_projection = (
+            f"          func.call @r29_w8_projection_group(%ap0v, %wp0v, %acc{col}_{row}, %h0) : (memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>, i32) -> ()"
+            if ATTENTION
+            else f"          func.call @r29_w8_projection_init(%ap0v, %wp0v, %acc{col}_{row}) : (memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>) -> ()"
+        )
         lines += [
-            f"          func.call @r29_w8_projection_init(%ap0v, %wp0v, %acc{col}_{row}) : (memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>) -> ()",
+            first_projection,
             f"          aie.objectfifo.release @abc{row}(Consume, 1)",
             f"          aie.objectfifo.release @wbc{col}(Consume, 1)",
             "          scf.for %group = %one to %groups step %one {",
         ]
         lines += acquire_a(row, "pa", "            ")
         lines += acquire_w(col, "pa", "            ")
+        accumulated_projection = (
+            f"            func.call @r29_w8_projection_group(%apav, %wpav, %acc{col}_{row}, %h1) : (memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>, i32) -> ()"
+            if ATTENTION
+            else f"            func.call @r29_w8_projection_accum(%apav, %wpav, %acc{col}_{row}) : (memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>) -> ()"
+        )
         lines += [
-            f"            func.call @r29_w8_projection_accum(%apav, %wpav, %acc{col}_{row}) : (memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>) -> ()",
+            accumulated_projection,
             f"            aie.objectfifo.release @abc{row}(Consume, 1)",
             f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
             "          }",
@@ -193,6 +228,49 @@ for col in range(COLS):
                     lines.append(f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)")
                 lines.append(f"          aie.objectfifo.release @abc{row}(Consume, 1)")
             lines.append("        }")
+        if ATTENTION and col % 2 == 1:
+            lines += [
+                "        scf.for %agroup = %z to %qgroups step %one {",
+            ]
+            lines += acquire_a(row, "attq", "          ")
+            lines += [
+                f"          func.call @r30_attention_load_q(%aattqv, %attq{col}_{row}, %corecol) : (memref<{A_BLOCK}xi8>, memref<{2 * OUT_TILE}xi8>, i32) -> ()",
+                f"          aie.objectfifo.release @abc{row}(Consume, 1)",
+                f"          func.call @r30_attention_init(%attacc0{col}_{row}, %attstats0{col}_{row}) : (memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>) -> ()",
+                f"          func.call @r30_attention_init(%attacc1{col}_{row}, %attstats1{col}_{row}) : (memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>) -> ()",
+                "          scf.for %attblock = %z to %attblocks step %one {",
+            ]
+            lines += acquire_a(row, "attkv", "            ")
+            lines += [
+                f"            func.call @r30_attention_block(%attq{col}_{row}, %aattkvv, %attacc0{col}_{row}, %attstats0{col}_{row}, %h0) : (memref<{2 * OUT_TILE}xi8>, memref<{A_BLOCK}xi8>, memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, i32) -> ()",
+                f"            func.call @r30_attention_block(%attq{col}_{row}, %aattkvv, %attacc1{col}_{row}, %attstats1{col}_{row}, %h1) : (memref<{2 * OUT_TILE}xi8>, memref<{A_BLOCK}xi8>, memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, i32) -> ()",
+                f"            aie.objectfifo.release @abc{row}(Consume, 1)",
+                "          }",
+            ]
+            lines += acquire_out(col, row, "atto0", "          ")
+            lines += [
+                f"          func.call @r30_attention_finish(%attacc0{col}_{row}, %attstats0{col}_{row}, %atto0v) : (memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{OUT_TILE}xi8>) -> ()",
+                f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+            ]
+            lines += acquire_out(col, row, "atto1", "          ")
+            lines += [
+                f"          func.call @r30_attention_finish(%attacc1{col}_{row}, %attstats1{col}_{row}, %atto1v) : (memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{OUT_TILE}xi8>) -> ()",
+                f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                "        }",
+            ]
+        elif ATTENTION:
+            lines += ["        scf.for %agroup = %z to %qgroups step %one {"]
+            lines += acquire_a(row, "attqdrop", "          ")
+            lines += [
+                f"          aie.objectfifo.release @abc{row}(Consume, 1)",
+                "          scf.for %attblock = %z to %attblocks step %one {",
+            ]
+            lines += acquire_a(row, "attkvdrop", "            ")
+            lines += [
+                f"            aie.objectfifo.release @abc{row}(Consume, 1)",
+                "          }",
+                "        }",
+            ]
         lines += [
             "      }",
             "      aie.end",
@@ -200,9 +278,8 @@ for col in range(COLS):
         ]
         out += lines
 
-out.append(
-    f"    aie.runtime_sequence(%A: memref<{A_BYTES}xi8>, %W: memref<{W_BYTES}xi8>, %R: memref<{R_BYTES}xi8>, %Q: memref<{Q_BYTES}xi8>, %KV: memref<{KV_BYTES}xi8>) {{"
-)
+runtime_args = f"%A: memref<{A_BYTES}xi8>, %W: memref<{W_BYTES}xi8>, %R: memref<{R_BYTES}xi8>, %Q: memref<{Q_BYTES}xi8>, %KV: memref<{KV_BYTES}xi8>"
+out.append(f"    aie.runtime_sequence({runtime_args}) {{")
 
 for row in range(ROWS):
     out += [
@@ -318,6 +395,48 @@ for phase, role in (("k", 3), ("v", 4)):
         for col in range(0, COLS, 2):
             for half in range(2):
                 name = f"t{phase}o{wave}_{col}_{half}"
+                out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
+
+if ATTENTION:
+    for group in range(QUERY_GROUPS):
+        for pair in range(COLS // 2):
+            source_col = pair * 2 + 1
+            for lane in range(2):
+                target_col = pair * 2 + lane
+                name = f"tao{group}_{source_col}_{lane}"
+                offset = R_STAGE_BYTES + (target_col * QUERY_GROUPS + group) * OUT_JOIN
+                out += [
+                    f"      %{name} = aiex.dma_configure_task_for @osh{source_col} {{",
+                    f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {OUT_JOIN}, {dims(1, OUT_JOIN)}) {{burst_length = 0 : i32}}",
+                    "        aie.end",
+                    "      } {issue_token = true}",
+                    f"      aiex.dma_start_task(%{name})",
+                ]
+        for row in range(ROWS):
+            qname = f"taqi{group}_{row}"
+            qoffset = (row * QUERY_GROUPS + group) * Q_JOIN
+            out += [
+                f"      %{qname} = aiex.dma_configure_task_for @ash{row} {{",
+                f"        aie.dma_bd(%Q : memref<{Q_BYTES}xi8>, {qoffset}, {Q_JOIN}, {dims(1, Q_JOIN)}) {{burst_length = 0 : i32}}",
+                "        aie.end",
+                "      } {issue_token = true}",
+                f"      aiex.dma_start_task(%{qname})",
+            ]
+            kvname = f"takvi{group}_{row}"
+            out += [
+                f"      %{kvname} = aiex.dma_configure_task_for @ash{row} {{",
+                f"        aie.dma_bd(%KV : memref<{KV_BYTES}xi8>, 0, {KV_BYTES}, {dims(16, KV_TILE)}) {{burst_length = 0 : i32}}",
+                "        aie.end",
+                "      } {issue_token = true}",
+                f"      aiex.dma_start_task(%{kvname})",
+            ]
+        for row in range(ROWS):
+            for name in (f"taqi{group}_{row}", f"takvi{group}_{row}"):
+                out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
+        for pair in range(COLS // 2):
+            source_col = pair * 2 + 1
+            for lane in range(2):
+                name = f"tao{group}_{source_col}_{lane}"
                 out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
 
 out += ["    }", "  }", "}"]
