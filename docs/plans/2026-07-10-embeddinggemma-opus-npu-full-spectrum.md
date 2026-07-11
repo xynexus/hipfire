@@ -882,3 +882,37 @@ not yet a combined QKV projection or resident attention layer: Q/K/V projection
 accumulation still has to write R28's raw prefixes in the same command, and the
 o projection, residuals, FFN, tail stages, full-model 10k/15k admission, and
 package tokens/J remain open.
+
+### R29 resident W8 QKV-to-pack checkpoint
+
+R29 splices the three-group W8 QKV projection into the verified R28
+headnorm/RoPE transform and R27 physical pack in one AIE2P command. The
+projection's BF16 result never becomes a host-visible output: its output DMA
+scatters directly into persistent eight-token records whose immutable tails
+hold precomputed position values and Q/K norm parameters, then the same cores
+consume those records and emit packed Q plus one single-replay K/V sequence.
+
+The first 48-column projection schedule required a second core-output FIFO and
+exceeded the memory tile's input-DMA channel count. A 32-column W8 stripe
+(`LN=2`) makes each core's 24x32 result fit the existing 2 KiB attention-output
+FIFO. Each core pads to 32 token rows, so the projection DMA writes four
+eight-token records and R28 skips the fourth record after every 24 real rows.
+This preserves five exact 256-column roles (`Q0`, `Q1`, `Q2`, `K`, `V`) without
+format-specific column names or 288-column role padding. Fully unrolling all 15
+projection blocks then overflowed program memory; equivalent `scf.for` loops
+reduced the graph and linked successfully.
+
+The combined CPU integer/scaling and transform oracle reports projection cosine
+`0.99999182` with `0.0000610` maximum absolute error, Q cosine `0.99999193`
+with `0.015625` maximum error, K cosine `0.99999198` with `0.015625` maximum
+error, and zero V BF16 mismatches. As in R28, direct vector-argument K rotation
+helpers corrupted results in the larger linked program; pointer-based
+`noinline` lower/upper helpers restore exact handoff behavior. Three independent
+100-command processes measure `1.2041`, `1.2118`, and `1.5602 ms` (median
+`1.2118 ms`).
+
+This is the first verified complete W8 QKV projection-to-attention-pack command,
+not a resident attention layer or full-model result. R27 attention still needs
+to be appended to the command, followed by the o projection, residual/norm
+operations, FFN, tail stages, generic W4 and dense-mixed upload/dispatch,
+end-to-end quality, 10k/15k admission, and package tokens/J.
