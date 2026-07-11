@@ -145,6 +145,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None)
     };
 
+    let profile_hybrid = std::env::var("HIPFIRE_EMBED_PROFILE").is_ok_and(|value| value != "0");
+    if profile_hybrid {
+        hipfire_rdna::profile::start();
+    }
     let npu_started = Instant::now();
     let mut npu_embeddings = Vec::new();
     let mut npu_power = Vec::new();
@@ -162,6 +166,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let npu_ms = npu_started.elapsed().as_secs_f64() * 1e3 / encodes as f64;
+    if profile_hybrid {
+        let mut by_kernel = std::collections::BTreeMap::<&str, (usize, f64)>::new();
+        for entry in hipfire_rdna::profile::stop().unwrap_or_default() {
+            let aggregate = by_kernel.entry(entry.kernel).or_default();
+            aggregate.0 += 1;
+            aggregate.1 += entry.time_us / 1e3;
+        }
+        for (kernel, (calls, total_ms)) in by_kernel {
+            eprintln!(
+                "hybrid_profile kernel={kernel} calls={calls} total_ms={total_ms:.3} mean_ms={:.4}",
+                total_ms / calls as f64
+            );
+        }
+    }
 
     let (mean_cosine, min_cosine, max_abs) = embedding_metrics(&gpu_embeddings, &npu_embeddings);
     if let (Some(fallback), Some(fallback_ms)) = (&fallback_embeddings, fallback_ms) {

@@ -777,3 +777,32 @@ norms, residuals, pooling, and Dense heads still execute elsewhere. Even the
 isolated `2.6309 ms` FFN command would consume about `63.1 ms` over 24 layers,
 so both kernel acceleration and removal of the remaining stage boundaries are
 required for the `25.6 ms`/10k target.
+
+### M256 layer-phase attribution and R27 boundary
+
+A synchronized M256 trace now separates the current hybrid layer into qkv,
+attention-core, output-projection, FFN-core, and FFN-output phases. For OQ8+
+across 24 layers it measured:
+
+| phase | total | per layer |
+|---|---:|---:|
+| input norm + qkv shared projection | 71.906 ms | 2.996 ms |
+| Q/K norm + RoPE + GPU bidirectional attention | 14.264 ms | 0.594 ms |
+| o shared projection + post-attention norm/residual | 66.214 ms | 2.759 ms |
+| pre-FFN norm + resident R26 command | 138.011 ms | 5.750 ms |
+| post-FFN norm/residual | 1.641 ms | 0.068 ms |
+
+The GPU-only reference in the same process spent `2.806 ms`, `3.933 ms`,
+`1.686 ms`, `5.028 ms`, and `0.679 ms` on those phases respectively. Internal
+GPU event profiling also measured all 145 RMSNorm launches at only `4.573 ms`.
+This rules out standalone norm offload as the next optimization: projection
+commands and engine-boundary cache reconciliation dominate, while the actual
+bidirectional attention core is comparatively small.
+
+R27 should therefore be one resident layer command spanning input norm and
+qkv, per-head norm/RoPE, bidirectional attention, o projection, both residual
+norms, and the complete FFN. Existing AIE2P headnorm/RoPE and BF16 softmax
+kernels under `tools/npu/` are reusable arithmetic references; R27 still needs
+resident QK/PV tiling and a layer-level stream schedule. A collection of
+standalone elementwise NPU dispatches would preserve the measured boundary
+cost and is not an admissible substitute.

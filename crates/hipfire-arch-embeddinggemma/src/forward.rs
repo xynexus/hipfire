@@ -223,6 +223,12 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     tokens: &[u32],
     projector: &mut P,
 ) -> HipResult<Vec<f32>> {
+    let trace_phases = std::env::var("HIPFIRE_EMBED_TRACE_PHASES").is_ok_and(|value| value != "0");
+    let mut qkv_ms = 0.0f64;
+    let mut attention_core_ms = 0.0f64;
+    let mut attention_output_ms = 0.0f64;
+    let mut ffn_core_ms = 0.0f64;
+    let mut ffn_output_ms = 0.0f64;
     let dim = cfg.hidden_size;
     let n_heads = cfg.num_attention_heads;
     let n_kv_heads = cfg.num_key_value_heads;
@@ -285,14 +291,20 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
 
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &backbone.layers[layer_idx];
+        let stage_started = std::time::Instant::now();
 
         // ── Attention block (bidirectional) ──
         gpu.rmsnorm_batched(&x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
         projector.project_qkv(
             gpu, layer_idx, &layer.wq, &layer.wk, &layer.wv, &tmp, &q, &k, &v, m,
         )?;
+        if trace_phases {
+            gpu.device_synchronize()?;
+            qkv_ms += stage_started.elapsed().as_secs_f64() * 1e3;
+        }
 
         // Per-head QK-norm (q_norm carries the baked Q pre-scale, 1.0 here).
+        let stage_started = std::time::Instant::now();
         gpu.rmsnorm_batched(&q, &layer.q_norm, &q, m * n_heads, head_dim, eps)?;
         gpu.rmsnorm_batched(&k, &layer.k_norm, &k, m * n_kv_heads, head_dim, eps)?;
 
@@ -309,7 +321,12 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
 
         // Bidirectional self-attention: B = L = m, no causal mask.
         gpu.attention_dflash_f32(&q, &k, &v, &attn_out, m, m, n_heads, n_kv_heads, head_dim)?;
+        if trace_phases {
+            gpu.device_synchronize()?;
+            attention_core_ms += stage_started.elapsed().as_secs_f64() * 1e3;
+        }
 
+        let stage_started = std::time::Instant::now();
         projector.project(
             gpu,
             layer_idx,
@@ -321,8 +338,13 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
         )?;
         gpu.rmsnorm_batched(&o, &layer.post_attn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(&x_batch, &tmp, &x_batch)?;
+        if trace_phases {
+            gpu.device_synchronize()?;
+            attention_output_ms += stage_started.elapsed().as_secs_f64() * 1e3;
+        }
 
         // ── FFN block (GeGLU) ──
+        let stage_started = std::time::Instant::now();
         gpu.rmsnorm_batched(&x_batch, &layer.pre_ffn_norm, &tmp, m, dim, eps)?;
         projector.project_ffn(
             gpu,
@@ -337,13 +359,28 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
             &o,
             m,
         )?;
+        if trace_phases {
+            gpu.device_synchronize()?;
+            ffn_core_ms += stage_started.elapsed().as_secs_f64() * 1e3;
+        }
+        let stage_started = std::time::Instant::now();
         gpu.rmsnorm_batched(&o, &layer.post_ffn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(&x_batch, &tmp, &x_batch)?;
+        if trace_phases {
+            gpu.device_synchronize()?;
+            ffn_output_ms += stage_started.elapsed().as_secs_f64() * 1e3;
+        }
     }
 
     // Final norm (model.norm) → the ST Transformer's last_hidden_state.
     gpu.rmsnorm_batched(&x_batch, &backbone.output_norm, &tmp, m, dim, eps)?;
     let hidden_flat = gpu.download_f32(&tmp)?;
+    if trace_phases {
+        eprintln!(
+            "embeddinggemma_phase_trace rows={m} layers={} qkv_ms={qkv_ms:.3} attention_core_ms={attention_core_ms:.3} attention_output_ms={attention_output_ms:.3} ffn_core_ms={ffn_core_ms:.3} ffn_output_ms={ffn_output_ms:.3}",
+            cfg.num_hidden_layers,
+        );
+    }
     gpu.reclaim_pending();
 
     Ok(pool(&hidden_flat, m, dim, cfg.pooling_mode))
