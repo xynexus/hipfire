@@ -227,6 +227,11 @@ pub use resident_ffn_w8::{
 };
 
 #[cfg(target_os = "linux")]
+pub mod post_ffn_tail;
+#[cfg(target_os = "linux")]
+pub use post_ffn_tail::{NpuEmbeddingPostFfnTail, NpuEmbeddingPostFfnTailParams};
+
+#[cfg(target_os = "linux")]
 pub mod resident_attention_w8;
 #[cfg(target_os = "linux")]
 pub use resident_attention_w8::{NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights};

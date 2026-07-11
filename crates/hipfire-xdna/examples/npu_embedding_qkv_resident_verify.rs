@@ -11,8 +11,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const EPSILON: f32 = 1.0e-6;
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if !(1..=3).contains(&args.len()) {
-        return Err("usage: npu_embedding_qkv_resident_verify CACHE [ITERS] [FFN_CACHE]".into());
+    if !(1..=4).contains(&args.len()) {
+        return Err(
+            "usage: npu_embedding_qkv_resident_verify CACHE [ITERS] [FFN_CACHE] [TAIL_CACHE]"
+                .into(),
+        );
     }
     let iterations = args
         .get(1)
@@ -22,6 +25,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ffn_cache = args.get(2).cloned().unwrap_or_else(|| {
         format!(
             "{}/.hipfire/npu/embgemma_aie2p_resident_ffn_dense_w8_canonical_bf16_m256_k768_i1152_o768",
+            std::env::var("HOME").expect("HOME")
+        )
+    });
+    let tail_cache = args.get(3).cloned().unwrap_or_else(|| {
+        format!(
+            "{}/.hipfire/npu/embgemma_aie2p_post_ffn_tail_m256_k768",
             std::env::var("HOME").expect("HOME")
         )
     });
@@ -94,7 +103,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if residual_norm
         && ![
             "state=pre-ffn-inverse-f32",
-            "state-layout=active-column,core-row,wave,row",
+            "state-layout=core-row,wave-active-column,row",
+            "state-record-bytes=12288",
         ]
         .iter()
         .all(|field| manifest.lines().any(|line| line == *field))
@@ -347,6 +357,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_reference =
         output_projection_reference(&attention_reference_values, &output_weights);
     let mut norm_bf16 = None;
+    let mut attention_residual_reference = None;
     let norm_metrics = if residual_norm {
         let output_bytes = Layout::TOKENS * 768 * 2;
         let output = &r_buffer.as_slice()[..output_bytes];
@@ -373,7 +384,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         let inverse =
-            read_pre_inverse_metadata(r_buffer.as_slice(), r_stage_bytes + Layout::OUTPUT_BYTES);
+            read_pre_inverse_metadata(r_buffer.as_slice(), Layout::TOKENS * 768 * size_of::<u16>());
         let inverse_measured = metrics(&inverse, &inverse_reference);
         if !inverse_measured.0.is_finite()
             || inverse_measured.0 < 0.9999
@@ -408,6 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
+        attention_residual_reference = Some(residual_reference);
         norm_bf16 = Some(got_bits);
         Some((measured, inverse_measured, reconstructed_measured))
     } else {
@@ -419,7 +431,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("R34 shared canonical output backing");
         Some(verify_canonical_ffn_handoff(
             &ffn_cache,
+            &tail_cache,
             input,
+            attention_residual_reference
+                .as_deref()
+                .expect("R38 attention residual reference"),
             shared.dmabuf_fd(),
             shared.len(),
             || {
@@ -553,7 +569,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (norm, inverse, reconstructed) = norm_metrics.expect("residual norm metrics");
         let ffn = ffn_chain_metrics.expect("R34 to R35 FFN metrics");
         println!(
-            "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: staging_prefix_reused_for_norm=true q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_cosine={:.8} v_max={:.7} norm_full_cosine={:.8} norm_full_max={:.7} pre_inverse_cosine={:.8} pre_inverse_max={:.7} residual_reconstruct_cosine={:.8} residual_reconstruct_max={:.7} ffn_zero_copy_cosine={:.8} ffn_zero_copy_max={:.7} ffn_zero_copy_ms={:.4} zero_copy_chain_ms={:.4} zero_copy_chain_rows_s={:.1} dispatch_ms={dispatch_ms:.4}",
+            "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: staging_prefix_reused_for_norm=true q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_cosine={:.8} v_max={:.7} norm_full_cosine={:.8} norm_full_max={:.7} pre_inverse_cosine={:.8} pre_inverse_max={:.7} residual_reconstruct_cosine={:.8} residual_reconstruct_max={:.7} ffn_zero_copy_cosine={:.8} ffn_zero_copy_max={:.7} ffn_zero_copy_ms={:.4} completed_layer_cosine={:.8} completed_layer_max={:.7} tail_ms={:.4} full_layer_chain_ms={:.4} full_layer_chain_rows_s={:.1} dispatch_ms={dispatch_ms:.4}",
             q.0,
             q.1,
             k.0,
@@ -570,7 +586,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ffn.1,
             ffn.2,
             ffn.3,
-            256_000.0 / ffn.3,
+            ffn.4,
+            ffn.5,
+            ffn.6,
+            256_000.0 / ffn.6,
         );
     } else if direct_output {
         let output = output_metrics.expect("direct output projection metrics");
@@ -848,8 +867,7 @@ fn pack_residual_norm_params(epsilon: f32) -> Vec<u8> {
 
 #[cfg(target_os = "linux")]
 fn read_pre_inverse_metadata(bytes: &[u8], base: usize) -> Vec<f32> {
-    const OUT_JOIN: usize = 8192;
-    const OUT_TILE: usize = 2048;
+    const TAIL_TILE: usize = 12_288;
     let mut output = vec![0.0f32; 256];
     for mwave in 0..2 {
         for active_col in 0..4 {
@@ -857,9 +875,8 @@ fn read_pre_inverse_metadata(bytes: &[u8], base: usize) -> Vec<f32> {
                 for row in 0..8 {
                     let token = mwave * 128 + core_row * 32 + active_col * 8 + row;
                     let offset = base
-                        + active_col * OUT_JOIN
-                        + core_row * OUT_TILE
-                        + mwave * 8 * size_of::<f32>()
+                        + core_row * 8 * TAIL_TILE
+                        + (mwave * 4 + active_col) * TAIL_TILE
                         + row * size_of::<f32>();
                     output[token] = f32::from_le_bytes(
                         bytes[offset..offset + size_of::<f32>()]
@@ -1298,18 +1315,23 @@ fn write_u16(destination: &mut [u8], offset: usize, value: u16) {
 #[cfg(target_os = "linux")]
 fn verify_canonical_ffn_handoff<F>(
     cache: &str,
+    tail_cache: &str,
     input_bf16: &[u16],
+    attention_residual: &[f32],
     input_fd: i32,
     input_bytes: usize,
     mut produce_input: F,
-) -> Result<(f64, f32, f64, f64), Box<dyn std::error::Error>>
+) -> Result<(f64, f32, f64, f64, f32, f64, f64), Box<dyn std::error::Error>>
 where
     F: FnMut() -> Result<(), hipfire_xdna::XdnaError>,
 {
     use std::time::Instant;
 
     use hipfire_primitives::conv::{bf16_bits_to_f32, f32_to_bf16_bits};
-    use hipfire_xdna::{NpuResidentFfnDenseW8, NpuResidentFfnDenseW8IoMode, OpusPackedMatrix};
+    use hipfire_xdna::{
+        NpuEmbeddingPostFfnTail, NpuResidentFfnDenseW8, NpuResidentFfnDenseW8IoMode,
+        OpusPackedMatrix,
+    };
 
     const M: usize = 256;
     const K: usize = 768;
@@ -1364,6 +1386,10 @@ where
         return Err("R35 cache did not select the canonical-BF16 ABI".into());
     }
     executor.attach_shared_input(input_fd, input_bytes)?;
+    let gpu = hipfire_rdna::Gpu::init()?;
+    let mut ffn_shared = gpu.alloc_shared_gtt(NpuResidentFfnDenseW8::canonical_output_bytes())?;
+    ffn_shared.as_mut_slice().fill(0);
+    executor.attach_shared_output(ffn_shared.dmabuf_fd(), ffn_shared.len())?;
     let weights = executor.upload_weights(&gate, &up, &down)?;
     executor.run_shared(&weights)?;
     let output = executor.read_canonical_output_f32()?;
@@ -1380,19 +1406,94 @@ where
         .into());
     }
 
+    let pre_norm = (0..K)
+        .map(|hidden| f32_to_bf16_bits(0.91 + (hidden % 29) as f32 * 0.0015))
+        .collect::<Vec<_>>();
+    let post_norm = (0..K)
+        .map(|hidden| f32_to_bf16_bits(0.87 + (hidden % 31) as f32 * 0.0018))
+        .collect::<Vec<_>>();
+    let completed_reference =
+        post_ffn_tail_reference(&reference, attention_residual, &post_norm, 1.0e-6);
+    let mut tail = NpuEmbeddingPostFfnTail::load_cached(tail_cache)?;
+    tail.attach_shared_state(
+        input_fd,
+        input_bytes,
+        ffn_shared.dmabuf_fd(),
+        ffn_shared.len(),
+    )?;
+    let tail_params = tail.upload_params(&pre_norm, &post_norm, 1.0e-6)?;
+    tail.run_shared(&tail_params)?;
+    let completed = tail.read_output_f32()?;
+    let completed_measured = metrics(&completed, &completed_reference);
+    if !completed_measured.0.is_finite()
+        || completed_measured.0 < 0.999
+        || completed_measured.1 > 0.10
+    {
+        return Err(format!(
+            "R39 completed-layer parity failed: cosine={:.8} max_abs={:.7} got={:?} ref={:?}",
+            completed_measured.0,
+            completed_measured.1,
+            &completed[..8],
+            &completed_reference[..8]
+        )
+        .into());
+    }
+
     const TIMED_RUNS: usize = 3;
     let started = Instant::now();
     for _ in 0..TIMED_RUNS {
         executor.run_shared(&weights)?;
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / TIMED_RUNS as f64;
+    let mut tail_seconds = 0.0f64;
+    for _ in 0..TIMED_RUNS {
+        executor.run_shared(&weights)?;
+        let started = Instant::now();
+        tail.run_shared(&tail_params)?;
+        tail_seconds += started.elapsed().as_secs_f64();
+    }
+    let tail_ms = tail_seconds * 1e3 / TIMED_RUNS as f64;
     let started = Instant::now();
     for _ in 0..TIMED_RUNS {
         produce_input()?;
         executor.run_shared(&weights)?;
+        tail.run_shared(&tail_params)?;
     }
     let chain_ms = started.elapsed().as_secs_f64() * 1e3 / TIMED_RUNS as f64;
-    Ok((measured.0, measured.1, dispatch_ms, chain_ms))
+    Ok((
+        measured.0,
+        measured.1,
+        dispatch_ms,
+        completed_measured.0,
+        completed_measured.1,
+        tail_ms,
+        chain_ms,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn post_ffn_tail_reference(
+    ffn: &[f32],
+    residual: &[f32],
+    post_norm: &[u16],
+    epsilon: f32,
+) -> Vec<f32> {
+    use hipfire_primitives::conv::{bf16_bits_to_f32, f32_to_bf16_bits};
+
+    const M: usize = 256;
+    const HIDDEN: usize = 768;
+    let mut output = vec![0.0f32; M * HIDDEN];
+    for token in 0..M {
+        let row = &ffn[token * HIDDEN..(token + 1) * HIDDEN];
+        let sum = row.iter().map(|value| value * value).sum::<f32>();
+        let inverse = (sum / HIDDEN as f32 + epsilon).sqrt().recip();
+        for hidden in 0..HIDDEN {
+            let index = token * HIDDEN + hidden;
+            let normalized = row[hidden] * bf16_bits_to_f32(post_norm[hidden]) * inverse;
+            output[index] = bf16_bits_to_f32(f32_to_bf16_bits(residual[index] + normalized));
+        }
+    }
+    output
 }
 
 #[cfg(target_os = "linux")]

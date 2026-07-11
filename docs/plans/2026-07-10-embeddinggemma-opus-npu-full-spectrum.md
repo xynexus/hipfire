@@ -1433,3 +1433,50 @@ post-FFN tail that consumes the R35 down-projection, reconstructs the attention
 residual, applies post-FFN RMSNorm, and leaves the completed layer state in a
 shared buffer. Full-model execution, generic OQ4/mixed/OQ8 `+/++` admission,
 package tokens/joule, and the 10k/15k end-to-end gates remain open.
+
+### R39 resident post-FFN layer-tail checkpoint
+
+R39 completes the EmbeddingGemma layer equation on AIE2P. It consumes R34's
+canonical pre-FFN-normalized activation and inverse-RMS state plus R35's
+canonical BF16 down-projection, reconstructs the attention residual, applies
+post-FFN RMSNorm, adds the residual, BF16-rounds the result, and overwrites the
+shared R35 output pages with the completed layer state.
+
+Each of the 32 cores owns eight complete 768-wide tokens. This avoids a
+cross-core reduction: every core computes all eight post-FFN RMS reductions
+locally. To stay within compute-tile DMA channels, metadata, duplicated static
+norm parameters, H, and Y travel sequentially through one input ObjectFIFO.
+Each core copies the small inverse and parameter state locally, copies H into
+its output object, then consumes Y and finishes in place. Each token row is
+split across two memory tiles with four consumers apiece, matching the proven
+fan-out geometry instead of over-allocating one memory tile's output channels.
+
+R38's inverse table now begins immediately after the logical M256-by-768 BF16 H
+tensor at byte 393,216. It uses 32 records of 12,288 bytes, ordered by core row
+and combined wave/active-column. R34's odd relay places its two eight-float
+vectors at offsets 0 and 1,024 of the 2 KiB row object; one shim DMA scatters
+the eight 1 KiB chunks into the R39 records. The table occupies only R35's
+padded input rows and dead R34 staging, so no logical activation is displaced.
+
+R35 now accepts a caller-owned shared output dma-buf. R39 imports that buffer
+once and supplies the same BO in both Y-input and output DPU slots. The generic
+XDNA submission path keeps both command-packet addresses but deduplicates GEM
+residency handles, because amdxdna rejects a repeated handle with `EALREADY`.
+This is a general in-place dispatch capability rather than an R39-only special
+case.
+
+The R39 core image is 3,360 bytes. Its isolated hardware oracle reaches cosine
+`0.99999170` and maximum absolute error `0.0078125`. The full locked
+R34-to-R35-to-R39 oracle retains Q/K/V, normalized-H, inverse, residual, and FFN
+gates, then measures the completed layer at cosine `0.99987080` and maximum
+absolute error `0.09375`. The final three-run sample measures R39 at `3.8005 ms`;
+the three-context completed-layer chain averages `24.7080 ms`, or 10,361.0 M256
+layer rows/s.
+
+This clears 10k rows/s for one complete encoder layer, not the requested full
+encoder. Repeating three hardware contexts per layer cannot meet the full-model
+target. The next slice must eliminate per-layer context alternation by batching
+layer phases across long-lived contexts or fusing compatible schedules, then
+wire every encoder layer, final norm, pooling, and output normalization through
+the resident path. Generic OQ4/mixed/OQ8 `+/++` end-to-end admission, package
+tokens/joule, and the 10k/15k full-model gates remain open.

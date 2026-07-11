@@ -191,6 +191,25 @@ impl NpuResidentFfnDenseW8 {
         Ok(())
     }
 
+    /// Replace the canonical output with caller-owned shared pages. The
+    /// post-FFN tail can consume and overwrite those pages without a host copy.
+    pub fn attach_shared_output(
+        &mut self,
+        output_fd: i32,
+        output_bytes: usize,
+    ) -> Result<(), XdnaError> {
+        if output_bytes != self.loaded_output_bytes() {
+            return Err(invalid(
+                "resident dense-W8 FFN shared output dma-buf size mismatch",
+            ));
+        }
+        self.output = self.kernel.import_dmabuf(output_fd, output_bytes, true)?;
+        self.kernel.sync_to_device(&self.output)?;
+        self.primed = false;
+        self.context_commands = 0;
+        Ok(())
+    }
+
     pub fn upload_weights(
         &self,
         gate: &OpusPackedMatrix,

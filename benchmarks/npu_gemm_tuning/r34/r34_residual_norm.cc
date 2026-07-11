@@ -130,8 +130,11 @@ r34_emit_norm_half(const int8_t *restrict block, int8_t *restrict output,
 __attribute__((noinline, minsize)) void
 r38_relay_pre_inverse(const int8_t *restrict input,
                       int8_t *restrict output) {
-  aie::store_v(reinterpret_cast<float *>(output),
-               aie::load_v<16>(reinterpret_cast<const float *>(input)));
+  const auto values =
+      aie::load_v<16>(reinterpret_cast<const float *>(input));
+  aie::store_v(reinterpret_cast<float *>(output), values.extract<8>(0));
+  aie::store_v(reinterpret_cast<float *>(output + 1024),
+               values.extract<8>(1));
 }
 
 }

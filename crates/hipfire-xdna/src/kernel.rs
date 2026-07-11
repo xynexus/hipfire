@@ -215,8 +215,19 @@ impl NpuKernel {
             let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs);
             let mut cmd_bo = self.dev.alloc_buffer(4096, AMDXDNA_BO_CMD)?;
             cmd_bo.as_mut_slice()[..packet.len()].copy_from_slice(&packet);
-            let mut exec_handles = arg_handles.clone();
-            exec_handles.push(self.instr_bo); // instruction BO is an EXEC arg (residency)
+            // One physical BO may intentionally back multiple DPU arguments
+            // (for example an in-place input/output tail). The command packet
+            // keeps every address slot, but the residency handle list must not
+            // repeat a GEM handle: amdxdna rejects duplicates with EALREADY.
+            let mut exec_handles = Vec::with_capacity(arg_handles.len() + 1);
+            for &handle in &arg_handles {
+                if !exec_handles.contains(&handle) {
+                    exec_handles.push(handle);
+                }
+            }
+            if !exec_handles.contains(&self.instr_bo) {
+                exec_handles.push(self.instr_bo); // instruction BO residency
+            }
             cache.push(CachedCmd {
                 arg_handles: arg_handles.clone(),
                 exec_handles,

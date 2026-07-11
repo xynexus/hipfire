@@ -832,11 +832,11 @@ def start_norm_output_tasks(mwave):
     for active_col, col in enumerate(range(0, COLS, 2)):
         if mwave == O_M_WAVES - 1:
             name = f"trnm{col}"
-            offset = R_STAGE_BYTES + ATT_BYTES + active_col * OUT_JOIN
+            offset = 256 * 768 * 2 + active_col * 12288
             out.extend(
                 [
                     f"      %{name} = aiex.dma_configure_task_for @osh{col + 1} {{",
-                    f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {OUT_JOIN}, {dims(1, OUT_JOIN)}) {{burst_length = 0 : i32}}",
+                    f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {OUT_JOIN}, [<size = {ROWS}, stride = {8 * 12288}>, <size = {O_M_WAVES}, stride = {4 * 12288}>, <size = 1024, stride = 1>]) {{burst_length = 0 : i32}}",
                     "        aie.end",
                     "      } {issue_token = true}",
                     f"      aiex.dma_start_task(%{name})",
