@@ -212,12 +212,37 @@ lever is per-model retraining (co-train the model into the rank-32 subspace) or 
 position-equivariant (e.g. RoPE-compatible) basis; both are separate successor
 plans with their own sealed splits and gates.
 
-## If the metadata-selector experiment still fails at scale
+### Result: the position-equivariant basis is rejected by a ceiling diagnostic (2026-07-11)
 
-If the static basis fails honestly on 4B and 9B, the remaining relaxation is
-**per-model adaptation**, not more experts or a looser threshold (both disproven
-/ prohibited by the parent plan). Co-train the model (LoRA or QAT) to live in the
-rank-32 subspace instead of approximating a frozen model post-hoc. This attacks
+Before implementing a RoPE-compatible constrained calibration, ran a per-cache
+ceiling diagnostic on the existing 4B/9B held-out captures (reusing the harness
+causal attention + KLD; the oracle attention-KLD reproduces `reference.json`
+exactly, validating the metric). Per-cache best-case rank-32 attention-KLD:
+
+| Arm | 4B | 9B |
+| --- | --- | --- |
+| oracle (arbitrary SVD) | 0.107 | 0.102 |
+| coord32 (best 32 individual coordinates) | 1.009 | 0.930 |
+| pair16 (equivariant RoPE frequency pairs) | 1.088 | 0.983 |
+
+`coord32` selects the best 32 individual coordinates with no pairing constraint,
+so it is a strict **upper bound** on any RoPE-equivariant basis (which may keep
+only whole frequency planes). It already sits ~9x the oracle attention-KLD and
+worse than the rejected shared-static basis, so the more-constrained equivariant
+family cannot clear the gate either. The KV score matrix's dominant rank-32
+structure lives in arbitrary directions that mix RoPE coordinates; forcing the
+basis to commute with RoPE discards most of the approximation quality. The
+position-equivariant lever is closed without building the constrained
+calibration.
+
+## Only per-model retraining remains
+
+With the shared static basis, the calibration-fit metadata mixture, and the
+position-equivariant family all rejected on 4B and 9B, no static or equivariant
+rank-32 basis on the frozen model can meet the gate. The remaining relaxation is
+**per-model adaptation**, not more experts, a looser threshold, or a different
+fixed basis (all disproven / prohibited). Co-train the model (LoRA or QAT) to
+live in the rank-32 subspace instead of approximating a frozen model post-hoc. This attacks
 the generalization gap at its root and preserves the shared-basis scheduler
 contract, because training is offline and one-time per model package. It changes
 the admission oracle from "within 5% of the frozen model's per-cache SVD" to
