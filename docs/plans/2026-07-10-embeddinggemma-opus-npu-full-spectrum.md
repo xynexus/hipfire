@@ -1322,3 +1322,37 @@ measure the two-context layer boundary before deciding whether context fusion or
 an explicit zero-copy shared buffer is necessary. Full model execution, generic
 OQ4/mixed/OQ8 +/++ admission, the 10k/15k end-to-end target, and package
 tokens/joule remain open.
+
+### R36 full R34-to-R35 canonical handoff checkpoint
+
+R36 replaces R34's 128-dimension diagnostic probe with a complete
+M256-by-768 token-major BF16 drain. Each of the three local 8-by-256 norm
+blocks is emitted as two four-row chunks through the existing 2 KiB output
+FIFO. The shim DMA scatters each chunk directly into its canonical row stride,
+so the transfer preserves complete local row blocks instead of fragmenting the
+hidden dimension. This is the small-group, row-local schedule suggested by
+FlatAttention's warning against over-flattening fixed moderate-size work.
+
+The six additional output objects initially overflowed the even AIE program
+store. Replacing eight statically duplicated norm-parameter FIFO acquisitions
+with one row-aware loop reduced the even image to 16,352 bytes, 32 bytes below
+the 16 KiB limit, while preserving the same eight-object stream protocol. The
+odd image and all projection, attention, and norm arithmetic remain unchanged.
+
+The hardware oracle now covers all 196,608 normalized values. It reports cosine
+`0.99990598`, maximum absolute error `0.0625`, no non-finite values, and no
+zeros. The full-output maximum is one BF16 step above the old probe envelope
+because it observes all dimensions after two AIE reciprocal-square-root
+approximations; the gate uses a `0.065` ceiling while retaining the `0.9998`
+cosine floor. Twenty sustained R34 commands average `5.9177 ms`, close to the
+`5.9733 ms` diagnostic-probe checkpoint despite draining six times as many
+values.
+
+The verifier feeds those exact BF16 bits into R35's canonical ABI and compares
+the FFN result against the format-independent CPU matrix oracle. The composed
+handoff reaches cosine `0.99990868`, maximum absolute error `0.0117188`, and a
+three-run R35 average of `10.0665 ms`. This proves the full two-context data
+contract, but it still performs a host-visible copy between separately allocated
+buffers. A shared dma-buf or fused-context path, the remaining post-FFN layer
+tail, full model execution, generic OQ4/mixed/OQ8 +/++ admission, end-to-end
+10k/15k throughput, and tokens/joule remain open.

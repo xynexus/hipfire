@@ -11,14 +11,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const EPSILON: f32 = 1.0e-6;
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if !(1..=2).contains(&args.len()) {
-        return Err("usage: npu_embedding_qkv_resident_verify CACHE [ITERS]".into());
+    if !(1..=3).contains(&args.len()) {
+        return Err("usage: npu_embedding_qkv_resident_verify CACHE [ITERS] [FFN_CACHE]".into());
     }
     let iterations = args
         .get(1)
         .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(20);
+    let ffn_cache = args.get(2).cloned().unwrap_or_else(|| {
+        format!(
+            "{}/.hipfire/npu/embgemma_aie2p_resident_ffn_dense_w8_canonical_bf16_m256_k768_i1152_o768",
+            std::env::var("HOME").expect("HOME")
+        )
+    });
     if iterations == 0 {
         return Err("R29 verifier needs at least one iteration".into());
     }
@@ -292,34 +298,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let output_reference =
         output_projection_reference(&attention_reference_values, &output_weights);
+    let mut norm_bf16 = None;
     let norm_metrics = if residual_norm {
-        let output = &r_buffer.as_slice()[r_stage_bytes + Layout::OUTPUT_BYTES..];
-        let mut got = Vec::with_capacity(Layout::TOKENS * 128);
-        for token in 0..Layout::TOKENS {
-            for hidden in 0..128 {
-                let offset = (token * 768 + hidden) * 2;
-                got.push(hipfire_primitives::conv::bf16_bits_to_f32(
-                    u16::from_le_bytes([output[offset], output[offset + 1]]),
-                ));
-            }
-        }
+        let output_bytes = Layout::TOKENS * 768 * 2;
+        let output = &r_buffer.as_slice()[r_stage_bytes + Layout::OUTPUT_BYTES
+            ..r_stage_bytes + Layout::OUTPUT_BYTES + output_bytes];
+        let got_bits = output
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        let got = got_bits
+            .iter()
+            .copied()
+            .map(hipfire_primitives::conv::bf16_bits_to_f32)
+            .collect::<Vec<_>>();
         let reference = residual_norm_reference(&output_reference, EPSILON);
-        let mut probe_reference = Vec::with_capacity(Layout::TOKENS * 128);
-        for token in 0..Layout::TOKENS {
-            probe_reference.extend_from_slice(&reference[token * 768..token * 768 + 128]);
-        }
-        let measured = metrics(&got, &probe_reference);
-        if !measured.0.is_finite() || measured.0 < 0.9998 || measured.1 > 0.06 {
+        let measured = metrics(&got, &reference);
+        if !measured.0.is_finite() || measured.0 < 0.9998 || measured.1 > 0.065 {
             return Err(format!(
-                "R34 residual/norm probe parity failed: {measured:?}; nonfinite={} nonzero={} got={:?} ref={:?}",
+                "R34 full residual/norm parity failed: {measured:?}; nonfinite={} nonzero={} got={:?} ref={:?}",
                 got.iter().filter(|value| !value.is_finite()).count(),
                 got.iter().filter(|&&value| value != 0.0).count(),
                 &got[..16],
-                &probe_reference[..16],
+                &reference[..16],
             )
             .into());
         }
+        norm_bf16 = Some(got_bits);
         Some(measured)
+    } else {
+        None
+    };
+    let ffn_chain_metrics = if let Some(input) = norm_bf16.as_deref() {
+        Some(verify_canonical_ffn_handoff(&ffn_cache, input)?)
     } else {
         None
     };
@@ -443,9 +454,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
     if residual_norm {
         let norm = norm_metrics.expect("residual norm metrics");
+        let ffn = ffn_chain_metrics.expect("R34 to R35 FFN metrics");
         println!(
-            "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} norm_probe_cosine={:.8} norm_probe_max={:.7} dispatch_ms={dispatch_ms:.4}",
-            projection.0, projection.1, q.0, q.1, k.0, k.1, norm.0, norm.1,
+            "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} norm_full_cosine={:.8} norm_full_max={:.7} ffn_chain_cosine={:.8} ffn_chain_max={:.7} ffn_chain_ms={:.4} dispatch_ms={dispatch_ms:.4}",
+            projection.0,
+            projection.1,
+            q.0,
+            q.1,
+            k.0,
+            k.1,
+            norm.0,
+            norm.1,
+            ffn.0,
+            ffn.1,
+            ffn.2,
         );
     } else if direct_output {
         let output = output_metrics.expect("direct output projection metrics");
@@ -1137,6 +1159,118 @@ fn read_kv(bytes: &[u8], key: bool) -> Vec<f32> {
 #[cfg(target_os = "linux")]
 fn write_u16(destination: &mut [u8], offset: usize, value: u16) {
     destination[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(target_os = "linux")]
+fn verify_canonical_ffn_handoff(
+    cache: &str,
+    input_bf16: &[u16],
+) -> Result<(f64, f32, f64), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+
+    use hipfire_primitives::conv::{bf16_bits_to_f32, f32_to_bf16_bits};
+    use hipfire_xdna::{NpuResidentFfnDenseW8, NpuResidentFfnDenseW8IoMode, OpusPackedMatrix};
+
+    const M: usize = 256;
+    const K: usize = 768;
+    const INTERMEDIATE: usize = 1152;
+    const OUTPUT: usize = 768;
+
+    let gate = OpusPackedMatrix::from_payload(
+        35,
+        K,
+        INTERMEDIATE,
+        &ffn_w8_payload(K, INTERMEDIATE, 3, 0.0060),
+        None,
+    )?;
+    let up = OpusPackedMatrix::from_payload(
+        35,
+        K,
+        INTERMEDIATE,
+        &ffn_w8_payload(K, INTERMEDIATE, 11, 0.0055),
+        None,
+    )?;
+    let down = OpusPackedMatrix::from_payload(
+        35,
+        INTERMEDIATE,
+        OUTPUT,
+        &ffn_w8_payload(INTERMEDIATE, OUTPUT, 23, 0.0040),
+        None,
+    )?;
+    let input = input_bf16
+        .iter()
+        .copied()
+        .map(bf16_bits_to_f32)
+        .collect::<Vec<_>>();
+    let gate_reference = gate.reference_f32(M, &input)?;
+    let up_reference = up.reference_f32(M, &input)?;
+    let intermediate = gate_reference
+        .iter()
+        .zip(&up_reference)
+        .map(|(&gate, &up)| {
+            let gelu =
+                0.5 * gate * (1.0 + (0.797_884_6 * (gate + 0.044_715 * gate.powi(3))).tanh());
+            bf16_bits_to_f32(f32_to_bf16_bits(gelu * up))
+        })
+        .collect::<Vec<_>>();
+    let reference = down
+        .reference_f32(M, &intermediate)?
+        .into_iter()
+        .map(|value| bf16_bits_to_f32(f32_to_bf16_bits(value)))
+        .collect::<Vec<_>>();
+
+    let mut executor = NpuResidentFfnDenseW8::load_cached(cache)?;
+    if executor.io_mode() != NpuResidentFfnDenseW8IoMode::CanonicalBf16 {
+        return Err("R35 cache did not select the canonical-BF16 ABI".into());
+    }
+    let weights = executor.upload_weights(&gate, &up, &down)?;
+    let output = executor.run_canonical_bf16(&weights, input_bf16)?;
+    let measured = metrics(&output, &reference);
+    let max_reference = reference
+        .iter()
+        .fold(0.0f32, |maximum, value| maximum.max(value.abs()));
+    let max_allowed = 0.02 + 0.03 * max_reference;
+    if !measured.0.is_finite() || measured.0 < 0.999 || measured.1 > max_allowed {
+        return Err(format!(
+            "R34 to R35 canonical handoff failed: cosine={:.8} max_abs={:.7} allowed={max_allowed:.7}",
+            measured.0, measured.1
+        )
+        .into());
+    }
+
+    const TIMED_RUNS: usize = 3;
+    let started = Instant::now();
+    for _ in 0..TIMED_RUNS {
+        executor.run_canonical_bf16(&weights, input_bf16)?;
+    }
+    let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / TIMED_RUNS as f64;
+    Ok((measured.0, measured.1, dispatch_ms))
+}
+
+#[cfg(target_os = "linux")]
+fn ffn_w8_payload(k: usize, n: usize, seed: usize, base_scale: f32) -> Vec<u8> {
+    use hipfire_primitives::conv::f32_to_f16;
+
+    const GROUP: usize = 256;
+    const BLOCK: usize = 258;
+    let groups = k.div_ceil(GROUP);
+    let mut payload = vec![0u8; n * groups * BLOCK];
+    for col in 0..n {
+        for group in 0..groups {
+            let block =
+                &mut payload[(col * groups + group) * BLOCK..(col * groups + group + 1) * BLOCK];
+            let scale = base_scale * (1.0 + ((col + 3 * group + seed) % 7) as f32 * 0.025);
+            block[..2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+            for inner in 0..GROUP {
+                let mixed = (inner as u64).wrapping_mul(0x9e37_79b1)
+                    ^ (col as u64).wrapping_mul(0x85eb_ca77)
+                    ^ (group as u64).wrapping_mul(0xc2b2_ae3d)
+                    ^ (seed as u64).wrapping_mul(0x27d4_eb2f);
+                block[2 + inner] = ((mixed % 15) as i8 - 7) as u8;
+            }
+        }
+    }
+    payload
 }
 
 #[cfg(target_os = "linux")]

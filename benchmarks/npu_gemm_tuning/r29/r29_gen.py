@@ -265,7 +265,7 @@ if OUTPUT_EXECUTION:
         out += [
             f'    func.func private @{output_finish}(memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>, memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, i32) attributes {{link_with = "r34norm.o"}}',
             '    func.func private @r34_post_residual_pre_ffn(memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>) attributes {link_with = "r34norm.o"}',
-            f'    func.func private @r34_emit_norm_probe(memref<4096xi8>, memref<{OUT_TILE}xi8>) attributes {{link_with = "r34norm.o"}}',
+            f'    func.func private @r34_emit_norm_half(memref<4096xi8>, memref<{OUT_TILE}xi8>, index) attributes {{link_with = "r34norm.o"}}',
         ]
     elif DIRECT_OUTPUT:
         out += [
@@ -321,6 +321,14 @@ for col in range(COLS):
             f"      %oslices = arith.constant {O_SLICES} : index",
             f"      %ogroups = arith.constant {O_GROUPS} : index",
             f"      %omwaves = arith.constant {O_M_WAVES} : index",
+            *(
+                [
+                    f"      %rnrows = arith.constant {ROWS} : index",
+                    f"      %rnrow = arith.constant {row} : index",
+                ]
+                if RESIDUAL_NORM
+                else []
+            ),
             f"      %odrops = arith.constant {O_M_WAVES * O_SLICES * O_GROUPS} : index",
             f"      %lane = arith.constant {col % 2} : i32",
             f"      %corecol = arith.constant {col // 2} : i32",
@@ -516,18 +524,25 @@ for col in range(COLS):
                         "          }",
                         f"          aie.objectfifo.release @ad{col // 2}_{row}(Consume, 3)",
                     ]
-                    for target_row in range(ROWS):
-                        lines += acquire_w(col, f"rn{target_row}", "          ")
-                        if row == target_row:
-                            lines += [
-                                f"          func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrn{target_row}v) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>) -> ()",
-                            ]
-                        lines += [f"          aie.objectfifo.release @wbc{col}(Consume, 1)"]
-                    lines += acquire_out(col, row, "rno", "          ")
+                    lines += ["          scf.for %rnparam = %z to %rnrows step %one {"]
+                    lines += acquire_w(col, "rn", "            ")
                     lines += [
-                        f"          func.call @r34_emit_norm_probe(%rns{col}_{row}_0, %rnov) : (memref<4096xi8>, memref<{OUT_TILE}xi8>) -> ()",
-                        f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                        "            %rnactive = arith.cmpi eq, %rnparam, %rnrow : index",
+                        "            scf.if %rnactive {",
+                        f"              func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrnv) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>) -> ()",
+                        "            }",
+                        f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
+                        "          }",
                     ]
+                    for block in range(3):
+                        name = f"rne{block}"
+                        lines += ["          scf.for %rnhalf = %z to %waves step %one {"]
+                        lines += acquire_out(col, row, name, "            ")
+                        lines += [
+                            f"            func.call @r34_emit_norm_half(%rns{col}_{row}_{block}, %{name}v, %rnhalf) : (memref<4096xi8>, memref<{OUT_TILE}xi8>, index) -> ()",
+                            f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                            "          }",
+                        ]
                     lines += ["        }"]
                 else:
                     lines += acquire_out(col, row, "opo", "            ")
@@ -785,28 +800,37 @@ def await_direct_output_tasks(mwave, first_pair, pair_count):
 
 def start_norm_output_tasks(mwave):
     for active_col, col in enumerate(range(0, COLS, 2)):
-        name = f"trno{mwave}_{col}"
-        offset = mwave * 128 * 768 * 2 + active_col * 8 * 768 * 2
-        out.extend(
-            [
-                f"      %{name} = aiex.dma_configure_task_for @osh{col} {{",
-                f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {R_STAGE_BYTES + ATT_BYTES + offset}, {OUT_JOIN}, [<size = {ROWS}, stride = {32 * 768 * 2}>, <size = 8, stride = {768 * 2}>, <size = 256, stride = 1>]) {{burst_length = 0 : i32}}",
-                "        aie.end",
-                "      } {issue_token = true}",
-                f"      aiex.dma_start_task(%{name})",
-            ]
-        )
+        for block in range(3):
+            for half in range(2):
+                name = f"trno{mwave}_{col}_{block}_{half}"
+                offset = (
+                    mwave * 128 * 768 * 2
+                    + active_col * 8 * 768 * 2
+                    + block * 256 * 2
+                    + half * 4 * 768 * 2
+                )
+                out.extend(
+                    [
+                        f"      %{name} = aiex.dma_configure_task_for @osh{col} {{",
+                        f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {R_STAGE_BYTES + ATT_BYTES + offset}, {OUT_JOIN}, [<size = {ROWS}, stride = {32 * 768 * 2}>, <size = 4, stride = {768 * 2}>, <size = 512, stride = 1>]) {{burst_length = 0 : i32}}",
+                        "        aie.end",
+                        "      } {issue_token = true}",
+                        f"      aiex.dma_start_task(%{name})",
+                    ]
+                )
 
 
 def await_norm_output_tasks(mwave):
     for col in range(0, COLS, 2):
-        name = f"trno{mwave}_{col}"
-        out.extend(
-            [
-                f"      aiex.dma_await_task(%{name})",
-                f"      aiex.dma_free_task(%{name})",
-            ]
-        )
+        for block in range(3):
+            for half in range(2):
+                name = f"trno{mwave}_{col}_{block}_{half}"
+                out.extend(
+                    [
+                        f"      aiex.dma_await_task(%{name})",
+                        f"      aiex.dma_free_task(%{name})",
+                    ]
+                )
 
 
 if OUTPUT_EXECUTION and DIRECT_OUTPUT:

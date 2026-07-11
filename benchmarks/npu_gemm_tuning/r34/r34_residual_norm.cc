@@ -109,11 +109,14 @@ void r34_post_residual_pre_ffn(int8_t *restrict block0,
   }
 }
 
-void r34_emit_norm_probe(const int8_t *restrict block0,
-                         int8_t *restrict output) {
-  for (int row = 0; row < ROWS; ++row)
-    for (int offset = 0; offset < 256; offset += 32)
-      aie::store_v(output + row * 256 + offset,
-                   aie::load_v<32>(block0 + row * 512 + offset));
+__attribute__((noinline, minsize)) void
+r34_emit_norm_half(const int8_t *restrict block, int8_t *restrict output,
+                   int32_t half) {
+  const int source_half = half * 2048;
+  for (int offset = 0; offset < 2048; offset += 64) {
+    aie::store_v(output + offset,
+                 aie::load_v<64>(block + source_half + offset));
+  }
 }
+
 }
