@@ -1139,3 +1139,44 @@ stop increasing reuse when reduced per-core efficiency outweighs transfer
 savings. R32's fused M=256 shape and neighbor-memory attention dependency differ
 from the paper's independent large-GEMM mapping, so any scheduling change still
 requires the existing full-coverage oracle and sustained multi-command test.
+
+The first rolling-window experiment kept the working six-task capacity but,
+after each output-pair completion, immediately freed its task and configured the
+corresponding task in the next half-wave. It preserved full coverage and all
+oracle metrics, but averaged `4.7357 ms` over 100 commands versus the bulk
+six-pair schedule's `4.5999 ms`, a `2.95%` regression. At this small fused shape,
+per-pair command-processor reconfiguration costs more than the drain/refill
+bubble it removes. Keep the bulk schedule for R32. A subsequent scheduling
+experiment should reduce the number of output BDs by aggregating more contiguous
+columns or rows per transfer; do not retry finer-grained rolling reuse without
+trace evidence that reconfiguration can be amortized.
+
+A second experiment placed two 8 KiB output transfers in one chained shim task,
+reducing twelve task submissions to six while retaining twelve BDs. The graph
+compiled and loaded, but the second BD did not receive the per-object lock
+behavior supplied by separate ObjectFIFO tasks: priming produced only `238892`
+nonzero output bytes and the measured output remained zero. Multi-BD aggregation
+therefore requires explicit lock/BD construction below the current ObjectFIFO
+task abstraction. Do not admit this compiled-but-incorrect chain. The resident
+layer work returns to the proven bulk schedule; local residual/norm fusion can
+remove the final-output transfer entirely, which is a higher-value boundary than
+optimizing this temporary oracle readback path.
+
+The first R33 residual/norm topology then tested three 4 KiB neighbor buffers
+with explicit lifetime reuse: even cores used them for QKV accumulation, odd
+cores used them for attention accumulators and Q scratch, and even cores
+reacquired them for the full M8-by-768 output. This solved the 12 KiB storage
+problem without DRAM and passed the AIE data-memory allocator. The residual,
+post-attention norm, and pre-FFN norm parameter block also fit one 16 KiB weight
+FIFO object per core row.
+
+R33 still failed admission at program load. The even-core image grew from
+R32's `0x3bb0` bytes (15,280) to `0x5260` bytes (21,088), exceeding the 16 KiB
+program store; the odd image remained near the limit at `0x3fc0` bytes. Reducing
+the two K-group output accumulators to BF16 made data memory and linking fit but
+could not solve program capacity. Therefore do not add norm code to the current
+all-cores QKV image. The next topology must specialize roles: odd cores retain
+QKV packing and attention, while even cores retain output projection,
+residual/norm, and eventually FFN. Paired QKV weights and a 4 KiB two-lane pack
+should be streamed to each odd core so the even image can drop the Q/K/V pack and
+projection routines before adding layer-tail code.
