@@ -1180,3 +1180,61 @@ QKV packing and attention, while even cores retain output projection,
 residual/norm, and eventually FFN. Paired QKV weights and a 4 KiB two-lane pack
 should be streamed to each odd core so the even image can drop the Q/K/V pack and
 projection routines before adding layer-tail code.
+
+### R33 paired-QKV role-specialization checkpoint
+
+R33 implements that odd/even split. Each odd core now projects two adjacent
+32-column QKV stripes, emits the two raw and Q lanes sequentially through one
+2 KiB output object, and retains the R32 attention role. Each even core drops
+the QKV projection accumulator and Q-pack path while retaining K/V packing and
+the direct output projection. This follows the paper's single-output-buffer
+result: output movement is infrequent relative to the reduction, so reclaiming
+L1 for larger resident state is more valuable than double-buffering C.
+
+The first paired layout used a 16,896-byte weight object containing two
+8,192-byte int8 payloads and two 128-byte scale records. It still failed
+bank-aware and sequential L1 allocation after the output object was reduced to
+one buffer. The admitted layout keeps the weight FIFO exactly 16 KiB and moves
+all four pairs' 1,024 bytes of column scales into the unused tail of each
+16 KiB activation object. This is also consistent with the paper's broader
+principle of using in-flight layout transformation and contiguous payloads
+instead of expanding the core's local-buffer footprint.
+
+The resulting graph compiles without allocation warnings. Even-core text falls
+to `0x3470` bytes (13,424), leaving 2,960 bytes for residual/norm work. Odd-core
+text is `0x3fa0` bytes (16,288), only 96 bytes below the 16 KiB program limit,
+so further functions must remain on the even image. The full hardware oracle
+retains projection cosine `0.99999182`, Q cosine `0.99999193`, K cosine
+`0.99999198`, bit-exact V, and output cosine `0.99997223` with maximum absolute
+error `0.0000901`.
+
+The role split is a capacity checkpoint, not a speed admission. One hundred
+sustained commands average `5.1845 ms`, `12.7%` slower than R32's `4.5999 ms`,
+because each odd core performs two projections serially. Keep R32 as the faster
+standalone boundary. R33 is justified only if the 2,960-byte even-core budget
+admits enough residual/norm/FFN work to remove a larger external boundary; that
+is the next experiment.
+
+#### FlatAttention implications for the resident M256 graph
+
+Zhang et al., [*FlatAttention: Dataflow and Fabric Collectives Co-Optimization
+for Large Attention-Based Model Inference on Tile-Based Accelerators*](https://arxiv.org/html/2604.02110v1),
+reinforces the value of treating several tiles' aggregate scratchpad as one
+attention working set, but also identifies "over-flattening": for short or
+moderate sequences, expanding the cooperating tile group shrinks per-tile work
+until fixed synchronization and movement costs dominate. R33's 12.7% regression
+is consistent with that warning; do not spread the fixed M256 projection over
+more serial cooperation merely to reduce local code or storage.
+
+The directly applicable asynchronous variant is smaller in scope. The paper
+notes that two output-row blocks can be scheduled concurrently while sharing
+Q/KV blocks, overlapping one block's matrix work with the other's vector
+softmax and data movement. Each R33 odd core already owns two four-query lanes,
+two attention accumulators, one query pair, and one shared K/V stream. A
+replacement paired-attention kernel should therefore load each K/V tile once,
+interleave the two score/softmax/PV updates, and replace the two current
+single-lane calls. This must replace, not supplement, the existing attention
+routine because the odd image has only 96 bytes of program space. Admit it only
+if the full oracle passes and it recovers enough of the paired-projection loss;
+avoid larger software reductions or multicast groups unless hardware ObjectFIFO
+broadcast/reduction semantics eliminate their synchronization cost.

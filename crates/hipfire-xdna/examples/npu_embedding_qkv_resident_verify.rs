@@ -8,7 +8,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const K: usize = 768;
     const N: usize = 1280;
     const GROUPS: usize = 3;
-    const QKV_W_BYTES: usize = 8 * 45 * 16384;
     const EPSILON: f32 = 1.0e-6;
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -24,9 +23,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("R29 verifier needs at least one iteration".into());
     }
     let manifest = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
-    let direct_output = manifest
+    let paired_qkv = manifest
         .lines()
-        .any(|line| line == "op=resident-qkv-attention-output-direct");
+        .any(|line| line == "op=resident-qkv-paired-attention-output-direct");
+    let direct_output = paired_qkv
+        || manifest
+            .lines()
+            .any(|line| line == "op=resident-qkv-attention-output-direct");
     let output_projection = direct_output
         || manifest
             .lines()
@@ -39,7 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || manifest
             .lines()
             .any(|line| line == "op=resident-qkv-attention");
-    let operation = if direct_output {
+    let operation = if paired_qkv {
+        "op=resident-qkv-paired-attention-output-direct"
+    } else if direct_output {
         "op=resident-qkv-attention-output-direct"
     } else if output_projection {
         "op=resident-qkv-attention-o"
@@ -79,7 +84,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             0
         };
-    let w_bytes = QKV_W_BYTES
+    let qkv_w_bytes = (if paired_qkv { 4 } else { 8 }) * 45 * 16384;
+    let w_bytes = qkv_w_bytes
         + if direct_output {
             4 * 72 * 16384
         } else if output_projection {
@@ -114,9 +120,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let projected = cpu_projection(&activations, &activation_scales, &weights, &weight_scales);
 
-    let packed_a = pack_activations(&activations, &activation_scales, pair_bytes);
+    let mut packed_a = pack_activations(&activations, &activation_scales, pair_bytes);
     let output_weights = output_projection_weights();
-    let mut packed_w = pack_weights(&weights, &weight_scales);
+    let unpacked_w = pack_weights(&weights, &weight_scales);
+    let mut packed_w = if paired_qkv {
+        inject_paired_weight_scales(&mut packed_a, &unpacked_w, pair_bytes);
+        pack_weights_paired(&unpacked_w)
+    } else {
+        unpacked_w
+    };
     if direct_output {
         packed_w.extend_from_slice(&pack_output_projection_direct(&output_weights));
     } else if output_projection {
@@ -761,6 +773,51 @@ fn pack_weights(weights: &[Vec<i8>], scales: &[Vec<f32>]) -> Vec<u8> {
         }
     }
     packed
+}
+
+#[cfg(target_os = "linux")]
+fn pack_weights_paired(unpaired: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 16384;
+    const DATA: usize = 8192;
+    const BLOCKS_PER_STRIPE: usize = 45;
+    let mut paired = vec![0u8; 4 * BLOCKS_PER_STRIPE * BLOCK];
+    for pair in 0..4 {
+        for block in 0..BLOCKS_PER_STRIPE {
+            let target = (pair * BLOCKS_PER_STRIPE + block) * BLOCK;
+            for lane in 0..2 {
+                let source = ((pair * 2 + lane) * BLOCKS_PER_STRIPE + block) * BLOCK;
+                paired[target + lane * DATA..target + (lane + 1) * DATA]
+                    .copy_from_slice(&unpaired[source..source + DATA]);
+            }
+        }
+    }
+    paired
+}
+
+#[cfg(target_os = "linux")]
+fn inject_paired_weight_scales(activations: &mut [u8], unpaired: &[u8], block_bytes: usize) {
+    const BLOCK: usize = 16384;
+    const SCALE_OFFSET: usize = 8192;
+    const SCALE_BYTES: usize = 128;
+    const PAIRED_SCALE_BASE: usize = 6272;
+    const BLOCKS_PER_STRIPE: usize = 45;
+    for row_stripe in 0..4 {
+        for block in 0..BLOCKS_PER_STRIPE {
+            let activation = (row_stripe * BLOCKS_PER_STRIPE + block) * block_bytes;
+            for pair in 0..4 {
+                for lane in 0..2 {
+                    let source =
+                        ((pair * 2 + lane) * BLOCKS_PER_STRIPE + block) * BLOCK + SCALE_OFFSET;
+                    let target = activation
+                        + PAIRED_SCALE_BASE
+                        + pair * 2 * SCALE_BYTES
+                        + lane * SCALE_BYTES;
+                    activations[target..target + SCALE_BYTES]
+                        .copy_from_slice(&unpaired[source..source + SCALE_BYTES]);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
