@@ -56,11 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let qnorm = bf16_values(Layout::HEAD_DIM, |index| 0.83 + (index % 29) as f32 * 0.004);
     let knorm = bf16_values(Layout::HEAD_DIM, |index| 0.91 + (index % 23) as f32 * 0.003);
-    let cs = if std::env::var_os("HIPFIRE_R28_IDENTITY_ROPE").is_some() {
-        identity_rope_cs()
-    } else {
-        rope_cs(ROPE_BASE)
-    };
+    let cs = rope_cs(ROPE_BASE);
 
     let q_reference = headnorm_rope(&q, &qnorm, &cs, Layout::QUERY_HEADS, EPSILON);
     let k_reference = headnorm_rope(&k, &knorm, &cs, Layout::KV_HEADS, EPSILON);
@@ -190,19 +186,6 @@ fn rope_cs(base: f32) -> Vec<u16> {
             let angle = token as f32 * frequency;
             cs[token * Layout::HEAD_DIM + dim] = f32_to_bf16_bits(angle.cos());
             cs[token * Layout::HEAD_DIM + half + dim] = f32_to_bf16_bits(angle.sin());
-        }
-    }
-    cs
-}
-
-#[cfg(target_os = "linux")]
-fn identity_rope_cs() -> Vec<u16> {
-    use hipfire_primitives::conv::f32_to_bf16_bits;
-    use hipfire_xdna::EmbeddingGemmaAttentionLayout as Layout;
-    let mut cs = vec![0u16; Layout::TOKENS * Layout::HEAD_DIM];
-    for token in 0..Layout::TOKENS {
-        for dim in 0..Layout::HEAD_DIM / 2 {
-            cs[token * Layout::HEAD_DIM + dim] = f32_to_bf16_bits(1.0);
         }
     }
     cs

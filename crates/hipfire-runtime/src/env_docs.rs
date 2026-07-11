@@ -3521,13 +3521,6 @@ pub const ENV_HIPFIRE_R26_WARMUPS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:806",
 };
 
-/// `HIPFIRE_R28_IDENTITY_ROPE` — Runtime variable controlling r28 identity rope in hipfire
-pub const ENV_HIPFIRE_R28_IDENTITY_ROPE: EnvVarDoc = EnvVarDoc {
-    name: "HIPFIRE_R28_IDENTITY_ROPE",
-    description: "Runtime variable controlling r28 identity rope in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_embedding_qkv_pack_verify.rs:59",
-};
-
 /// `HIPFIRE_RDNA2_VARIANT` — Runtime variable controlling rdna2 variant in hipfire
 pub const ENV_HIPFIRE_RDNA2_VARIANT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RDNA2_VARIANT",
@@ -4802,7 +4795,6 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_R25_TIMING_TRACE,
     ENV_HIPFIRE_R26_RECYCLE_EVERY,
     ENV_HIPFIRE_R26_WARMUPS,
-    ENV_HIPFIRE_R28_IDENTITY_ROPE,
     ENV_HIPFIRE_RDNA2_VARIANT,
     ENV_HIPFIRE_RECOVER_MODE,
     ENV_HIPFIRE_RECOVER_NOISE,
