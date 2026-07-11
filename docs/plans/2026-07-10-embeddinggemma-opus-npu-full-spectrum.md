@@ -1238,3 +1238,38 @@ routine because the odd image has only 96 bytes of program space. Admit it only
 if the full oracle passes and it recovers enough of the paired-projection loss;
 avoid larger software reductions or multicast groups unless hardware ObjectFIFO
 broadcast/reduction semantics eliminate their synchronization cost.
+
+### R34 resident residual and normalization checkpoint
+
+R34 uses the capacity created by R33 to retain each even core's M8-by-768
+output as three 4 KiB BF16 blocks. The output projection writes paired
+64-column slices into that local store, then one 16 KiB parameter object carries
+the eight-token residual, post-attention norm, pre-FFN norm, and epsilon. The
+core applies post-attention RMSNorm, adds the residual, applies pre-FFN RMSNorm,
+and leaves the resulting BF16 activation resident for the FFN boundary.
+
+The first allocation exceeded 64 KiB by only 48 bytes. R34 removes the unused
+paired-graph K inverse scratch and reuses the later output accumulator for that
+earlier K-pack phase. The remaining 16-byte allocator bookkeeping required
+reducing the declared stack from 4 KiB to 2 KiB; linked stack-size metadata
+reports only 64 bytes. With scalar division replaced by multiplication by the
+constant reciprocal of 768, the even image avoids the 1,168-byte software
+division helper and fits at `0x3f00` bytes (16,128). The odd paired-QKV and
+attention image remains `0x3fa0` bytes (16,288).
+
+A compact diagnostic drains the first 128 normalized dimensions for every
+token while the full 768 dimensions remain in tile memory. Across 32,768 probed
+values, the hardware result reaches cosine `0.99990586` and maximum absolute
+error `0.0546875` against a BF16-aware CPU oracle. The larger maximum reflects
+two chained AIE reciprocal-square-root approximations; a one-step Newton
+refinement did not change the BF16 result and consumed too much program space,
+so it is rejected. Projection/Q/K parity remains unchanged and V remains bit
+exact. One hundred sustained fused commands average `5.9733 ms`, including the
+diagnostic drain, versus `5.1845 ms` for R33 and `4.5999 ms` for R32.
+
+R34 is the first admitted one-command QKV/headnorm/RoPE/attention/output/
+post-attention-norm/residual/pre-FFN-norm boundary. It is not yet a full layer:
+the next step must consume the resident three-block BF16 activation directly in
+the FFN. Both core images are now nearly full, so FFN compute must replace
+diagnostic and phase-specific routines or use a separate role image/context;
+simply appending FFN code cannot fit.

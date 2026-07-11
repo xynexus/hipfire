@@ -23,9 +23,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("R29 verifier needs at least one iteration".into());
     }
     let manifest = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
-    let paired_qkv = manifest
+    let residual_norm = manifest
         .lines()
-        .any(|line| line == "op=resident-qkv-paired-attention-output-direct");
+        .any(|line| line == "op=resident-qkv-paired-attention-output-norm");
+    let paired_qkv = residual_norm
+        || manifest
+            .lines()
+            .any(|line| line == "op=resident-qkv-paired-attention-output-direct");
     let direct_output = paired_qkv
         || manifest
             .lines()
@@ -42,7 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || manifest
             .lines()
             .any(|line| line == "op=resident-qkv-attention");
-    let operation = if paired_qkv {
+    let operation = if residual_norm {
+        "op=resident-qkv-paired-attention-output-norm"
+    } else if paired_qkv {
         "op=resident-qkv-paired-attention-output-direct"
     } else if direct_output {
         "op=resident-qkv-attention-output-direct"
@@ -92,7 +98,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             4 * 18 * 16384
         } else {
             0
-        };
+        }
+        + if residual_norm { 4 * 8 * 16384 } else { 0 };
 
     let activations = (0..Layout::TOKENS * K)
         .map(|index| (((index * 17 + index / 29) % 15) as i8) - 7)
@@ -133,6 +140,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         packed_w.extend_from_slice(&pack_output_projection_direct(&output_weights));
     } else if output_projection {
         packed_w.extend_from_slice(&pack_output_projection(&output_weights));
+    }
+    if residual_norm {
+        packed_w.extend_from_slice(&pack_residual_norm_params(EPSILON));
     }
     let raw_staging = stage_positions_and_params(&cs, &qnorm, &knorm, EPSILON, pair_bytes);
     let raw_base = if packed_attention {
@@ -282,7 +292,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let output_reference =
         output_projection_reference(&attention_reference_values, &output_weights);
-    let output_metrics = if output_projection {
+    let norm_metrics = if residual_norm {
+        let output = &r_buffer.as_slice()[r_stage_bytes + Layout::OUTPUT_BYTES..];
+        let mut got = Vec::with_capacity(Layout::TOKENS * 128);
+        for token in 0..Layout::TOKENS {
+            for hidden in 0..128 {
+                let offset = (token * 768 + hidden) * 2;
+                got.push(hipfire_primitives::conv::bf16_bits_to_f32(
+                    u16::from_le_bytes([output[offset], output[offset + 1]]),
+                ));
+            }
+        }
+        let reference = residual_norm_reference(&output_reference, EPSILON);
+        let mut probe_reference = Vec::with_capacity(Layout::TOKENS * 128);
+        for token in 0..Layout::TOKENS {
+            probe_reference.extend_from_slice(&reference[token * 768..token * 768 + 128]);
+        }
+        let measured = metrics(&got, &probe_reference);
+        if !measured.0.is_finite() || measured.0 < 0.9998 || measured.1 > 0.06 {
+            return Err(format!(
+                "R34 residual/norm probe parity failed: {measured:?}; nonfinite={} nonzero={} got={:?} ref={:?}",
+                got.iter().filter(|value| !value.is_finite()).count(),
+                got.iter().filter(|&&value| value != 0.0).count(),
+                &got[..16],
+                &probe_reference[..16],
+            )
+            .into());
+        }
+        Some(measured)
+    } else {
+        None
+    };
+    let output_metrics = if output_projection && !residual_norm {
         let output = &r_buffer.as_slice()[r_stage_bytes + Layout::OUTPUT_BYTES..];
         let got = if direct_output {
             output
@@ -400,7 +441,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
-    if direct_output {
+    if residual_norm {
+        let norm = norm_metrics.expect("residual norm metrics");
+        println!(
+            "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} norm_probe_cosine={:.8} norm_probe_max={:.7} dispatch_ms={dispatch_ms:.4}",
+            projection.0, projection.1, q.0, q.1, k.0, k.1, norm.0, norm.1,
+        );
+    } else if direct_output {
         let output = output_metrics.expect("direct output projection metrics");
         println!(
             "resident-w8-qkv-attention-output-direct M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} output_cosine={:.8} output_max={:.7} dispatch_ms={dispatch_ms:.4}",
@@ -623,6 +670,89 @@ fn pack_output_projection_direct(weights: &[u16]) -> Vec<u8> {
         }
     }
     packed
+}
+
+#[cfg(target_os = "linux")]
+fn pack_residual_norm_params(epsilon: f32) -> Vec<u8> {
+    use hipfire_primitives::conv::f32_to_bf16_bits;
+
+    const BLOCK: usize = 16384;
+    const HIDDEN: usize = 768;
+    const ROWS_PER_CORE: usize = 8;
+    const POST_NORM: usize = ROWS_PER_CORE * HIDDEN * 2;
+    const PRE_NORM: usize = POST_NORM + HIDDEN * 2;
+    const EPSILON: usize = PRE_NORM + HIDDEN * 2;
+    let mut packed = vec![0u8; 4 * 2 * 4 * BLOCK];
+    for active_col in 0..4 {
+        for mwave in 0..2 {
+            for core_row in 0..4 {
+                let block = ((active_col * 2 + mwave) * 4 + core_row) * BLOCK;
+                let token_base = mwave * 128 + core_row * 32 + active_col * 8;
+                for row in 0..ROWS_PER_CORE {
+                    for hidden in 0..HIDDEN {
+                        let token = token_base + row;
+                        let value = ((token * 17 + hidden * 7) % 97) as f32 * 0.0005 - 0.024;
+                        write_u16(
+                            &mut packed,
+                            block + (row * HIDDEN + hidden) * 2,
+                            f32_to_bf16_bits(value),
+                        );
+                    }
+                }
+                for hidden in 0..HIDDEN {
+                    let post = 0.86 + (hidden % 31) as f32 * 0.002;
+                    let pre = 0.91 + (hidden % 29) as f32 * 0.0015;
+                    write_u16(
+                        &mut packed,
+                        block + POST_NORM + hidden * 2,
+                        f32_to_bf16_bits(post),
+                    );
+                    write_u16(
+                        &mut packed,
+                        block + PRE_NORM + hidden * 2,
+                        f32_to_bf16_bits(pre),
+                    );
+                }
+                packed[block + EPSILON..block + EPSILON + 4]
+                    .copy_from_slice(&epsilon.to_le_bytes());
+            }
+        }
+    }
+    packed
+}
+
+#[cfg(target_os = "linux")]
+fn residual_norm_reference(output: &[f32], epsilon: f32) -> Vec<f32> {
+    use hipfire_primitives::conv::{bf16_bits_to_f32, f32_to_bf16_bits};
+
+    const HIDDEN: usize = 768;
+    let bf16 = |value: f32| bf16_bits_to_f32(f32_to_bf16_bits(value));
+    let mut normalized = vec![0.0f32; output.len()];
+    let mut residual = vec![0.0f32; HIDDEN];
+    for token in 0..256 {
+        let source = &output[token * HIDDEN..(token + 1) * HIDDEN];
+        let output_sum = source
+            .iter()
+            .map(|&value| {
+                let value = bf16(value);
+                value * value
+            })
+            .sum::<f32>();
+        let post_inverse = (output_sum / HIDDEN as f32 + epsilon).sqrt().recip();
+        for hidden in 0..HIDDEN {
+            let output = bf16(source[hidden]);
+            let post = bf16(0.86 + (hidden % 31) as f32 * 0.002);
+            let input = bf16(((token * 17 + hidden * 7) % 97) as f32 * 0.0005 - 0.024);
+            residual[hidden] = bf16(output * post * post_inverse + input);
+        }
+        let residual_sum = residual.iter().map(|value| value * value).sum::<f32>();
+        let pre_inverse = (residual_sum / HIDDEN as f32 + epsilon).sqrt().recip();
+        for hidden in 0..HIDDEN {
+            let pre = bf16(0.91 + (hidden % 29) as f32 * 0.0015);
+            normalized[token * HIDDEN + hidden] = bf16(residual[hidden] * pre * pre_inverse);
+        }
+    }
+    normalized
 }
 
 #[cfg(target_os = "linux")]
