@@ -2608,6 +2608,13 @@ pub const ENV_HIPFIRE_OQ4_TRACE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/src/weights.rs:655",
 };
 
+/// `HIPFIRE_PACK_IDENTITY` — Runtime variable controlling pack identity in hipfire
+pub const ENV_HIPFIRE_PACK_IDENTITY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_PACK_IDENTITY",
+    description: "Runtime variable controlling pack identity in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_pack_down_verify.rs:28",
+};
+
 /// `HIPFIRE_PAGED_MOE_DEBUG` — Enabled when set to 1
 pub const ENV_HIPFIRE_PAGED_MOE_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PAGED_MOE_DEBUG",
@@ -3323,6 +3330,139 @@ pub const ENV_HIPFIRE_R17_PROBE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R17_PROBE",
     description: "Runtime variable controlling r17 probe in hipfire",
     source: "crates/hipfire-xdna/examples/npu_geglu_verify.rs:25",
+};
+
+/// `HIPFIRE_R25_FRESH_COMMAND` — Runtime variable controlling r25 fresh command in hipfire
+pub const ENV_HIPFIRE_R25_FRESH_COMMAND: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_FRESH_COMMAND",
+    description: "Runtime variable controlling r25 fresh command in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:580",
+};
+
+/// `HIPFIRE_R25_GATE_ONLY_STREAM` — Runtime variable controlling r25 gate only stream in hipfire
+pub const ENV_HIPFIRE_R25_GATE_ONLY_STREAM: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_GATE_ONLY_STREAM",
+    description: "Runtime variable controlling r25 gate only stream in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:182",
+};
+
+/// `HIPFIRE_R25_GATE_PROBE` — Runtime variable controlling r25 gate probe in hipfire
+pub const ENV_HIPFIRE_R25_GATE_PROBE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_GATE_PROBE",
+    description: "Runtime variable controlling r25 gate probe in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:421",
+};
+
+/// `HIPFIRE_R25_GROUP` — Parses "HIPFIRE_R25_GROUP" with fallback defaults
+pub const ENV_HIPFIRE_R25_GROUP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_GROUP",
+    description: "Parses \"HIPFIRE_R25_GROUP\" with fallback defaults",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:34",
+};
+
+/// `HIPFIRE_R25_IDENTITY` — Runtime variable controlling r25 identity in hipfire
+pub const ENV_HIPFIRE_R25_IDENTITY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_IDENTITY",
+    description: "Runtime variable controlling r25 identity in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:38",
+};
+
+/// `HIPFIRE_R25_INPUT_PROBE` — Runtime variable controlling r25 input probe in hipfire
+pub const ENV_HIPFIRE_R25_INPUT_PROBE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_INPUT_PROBE",
+    description: "Runtime variable controlling r25 input probe in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:360",
+};
+
+/// `HIPFIRE_R25_PROBE` — Runtime variable controlling r25 probe in hipfire
+pub const ENV_HIPFIRE_R25_PROBE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_PROBE",
+    description: "Runtime variable controlling r25 probe in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:456",
+};
+
+/// `HIPFIRE_R25_PROBE_CORE_ROW` — Parses "HIPFIRE_R25_PROBE_CORE_ROW" with fallback defaults
+pub const ENV_HIPFIRE_R25_PROBE_CORE_ROW: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_PROBE_CORE_ROW",
+    description: "Parses \"HIPFIRE_R25_PROBE_CORE_ROW\" with fallback defaults",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:367",
+};
+
+/// `HIPFIRE_R25_PROBE_GLOBAL_ROW` — Parses "HIPFIRE_R25_PROBE_GLOBAL_ROW" with fallback defaults
+pub const ENV_HIPFIRE_R25_PROBE_GLOBAL_ROW: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_PROBE_GLOBAL_ROW",
+    description: "Parses \"HIPFIRE_R25_PROBE_GLOBAL_ROW\" with fallback defaults",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:427",
+};
+
+/// `HIPFIRE_R25_PROBE_GROUP` — Runtime variable controlling r25 probe group in hipfire
+pub const ENV_HIPFIRE_R25_PROBE_GROUP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_PROBE_GROUP",
+    description: "Runtime variable controlling r25 probe group in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:458",
+};
+
+/// `HIPFIRE_R25_PROBE_MBLOCK` — Runtime variable controlling r25 probe mblock in hipfire
+pub const ENV_HIPFIRE_R25_PROBE_MBLOCK: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_PROBE_MBLOCK",
+    description: "Runtime variable controlling r25 probe mblock in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:362",
+};
+
+/// `HIPFIRE_R25_PROBE_NBLOCK` — Parses "HIPFIRE_R25_PROBE_NBLOCK" with fallback defaults
+pub const ENV_HIPFIRE_R25_PROBE_NBLOCK: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_PROBE_NBLOCK",
+    description: "Parses \"HIPFIRE_R25_PROBE_NBLOCK\" with fallback defaults",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:372",
+};
+
+/// `HIPFIRE_R25_PROBE_ROW` — Parses "HIPFIRE_R25_PROBE_ROW" with fallback defaults
+pub const ENV_HIPFIRE_R25_PROBE_ROW: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_PROBE_ROW",
+    description: "Parses \"HIPFIRE_R25_PROBE_ROW\" with fallback defaults",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:463",
+};
+
+/// `HIPFIRE_R25_RAW_GATE_PROBE` — Runtime variable controlling r25 raw gate probe in hipfire
+pub const ENV_HIPFIRE_R25_RAW_GATE_PROBE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_RAW_GATE_PROBE",
+    description: "Runtime variable controlling r25 raw gate probe in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:195",
+};
+
+/// `HIPFIRE_R25_RAW_GROUP` — Runtime variable controlling r25 raw group in hipfire
+pub const ENV_HIPFIRE_R25_RAW_GROUP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_RAW_GROUP",
+    description: "Runtime variable controlling r25 raw group in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:196",
+};
+
+/// `HIPFIRE_R25_RAW_NBLOCK` — Parses "HIPFIRE_R25_RAW_NBLOCK" with fallback defaults
+pub const ENV_HIPFIRE_R25_RAW_NBLOCK: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_RAW_NBLOCK",
+    description: "Parses \"HIPFIRE_R25_RAW_NBLOCK\" with fallback defaults",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:201",
+};
+
+/// `HIPFIRE_R25_RAW_SOURCE_JN` — Parses "HIPFIRE_R25_RAW_SOURCE_JN" with fallback defaults
+pub const ENV_HIPFIRE_R25_RAW_SOURCE_JN: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_RAW_SOURCE_JN",
+    description: "Parses \"HIPFIRE_R25_RAW_SOURCE_JN\" with fallback defaults",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:211",
+};
+
+/// `HIPFIRE_R25_TIMING_ONLY` — Parses "HIPFIRE_R25_TIMING_ONLY" with fallback defaults
+pub const ENV_HIPFIRE_R25_TIMING_ONLY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_TIMING_ONLY",
+    description: "Parses \"HIPFIRE_R25_TIMING_ONLY\" with fallback defaults",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:33",
+};
+
+/// `HIPFIRE_R25_TIMING_TRACE` — Runtime variable controlling r25 timing trace in hipfire
+pub const ENV_HIPFIRE_R25_TIMING_TRACE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_TIMING_TRACE",
+    description: "Runtime variable controlling r25 timing trace in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:579",
 };
 
 /// `HIPFIRE_RDNA2_VARIANT` — Runtime variable controlling rdna2 variant in hipfire
@@ -4470,6 +4610,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_OQ4_BATCHED_PREFILL,
     ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS,
     ENV_HIPFIRE_OQ4_TRACE,
+    ENV_HIPFIRE_PACK_IDENTITY,
     ENV_HIPFIRE_PAGED_MOE_DEBUG,
     ENV_HIPFIRE_PARO_BATCHED,
     ENV_HIPFIRE_PARO_FA3_FUSED,
@@ -4571,6 +4712,25 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_QWEN35_XDNA1_XCLBIN,
     ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD,
     ENV_HIPFIRE_R17_PROBE,
+    ENV_HIPFIRE_R25_FRESH_COMMAND,
+    ENV_HIPFIRE_R25_GATE_ONLY_STREAM,
+    ENV_HIPFIRE_R25_GATE_PROBE,
+    ENV_HIPFIRE_R25_GROUP,
+    ENV_HIPFIRE_R25_IDENTITY,
+    ENV_HIPFIRE_R25_INPUT_PROBE,
+    ENV_HIPFIRE_R25_PROBE,
+    ENV_HIPFIRE_R25_PROBE_CORE_ROW,
+    ENV_HIPFIRE_R25_PROBE_GLOBAL_ROW,
+    ENV_HIPFIRE_R25_PROBE_GROUP,
+    ENV_HIPFIRE_R25_PROBE_MBLOCK,
+    ENV_HIPFIRE_R25_PROBE_NBLOCK,
+    ENV_HIPFIRE_R25_PROBE_ROW,
+    ENV_HIPFIRE_R25_RAW_GATE_PROBE,
+    ENV_HIPFIRE_R25_RAW_GROUP,
+    ENV_HIPFIRE_R25_RAW_NBLOCK,
+    ENV_HIPFIRE_R25_RAW_SOURCE_JN,
+    ENV_HIPFIRE_R25_TIMING_ONLY,
+    ENV_HIPFIRE_R25_TIMING_TRACE,
     ENV_HIPFIRE_RDNA2_VARIANT,
     ENV_HIPFIRE_RECOVER_MODE,
     ENV_HIPFIRE_RECOVER_NOISE,

@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shape = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
     let w8 = shape.lines().any(|line| line == "mode=w8");
     let mixed = shape.lines().any(|line| line == "mode=mixed");
+    let identity = std::env::var_os("HIPFIRE_PACK_IDENTITY").is_some();
     let overlays = shape
         .lines()
         .find_map(|line| line.strip_prefix("overlays="))
@@ -60,7 +61,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights: Vec<Vec<i8>> = (0..GROUPS)
         .map(|group| {
             (0..GROUP * N)
-                .map(|index| ((index * 11 + index / N * 5 + group * 7) % 15) as i8 - 7)
+                .map(|index| {
+                    if identity {
+                        i8::from(index / N == index % N % GROUP)
+                    } else {
+                        ((index * 11 + index / N * 5 + group * 7) % 15) as i8 - 7
+                    }
+                })
                 .collect()
         })
         .collect();
@@ -79,7 +86,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weight_scales: Vec<Vec<f32>> = (0..GROUPS)
         .map(|group| {
             (0..N)
-                .map(|col| 0.007 + ((col + group * 3) % 31) as f32 * 0.00009)
+                .map(|col| {
+                    if identity {
+                        1.0
+                    } else {
+                        0.007 + ((col + group * 3) % 31) as f32 * 0.00009
+                    }
+                })
                 .collect()
         })
         .collect();

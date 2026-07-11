@@ -590,3 +590,33 @@ format range at the combined down seam, but the scalar sparse gathers are a
 large performance regression relative to R22's 0.9967 ms W4 median and remain
 unadmitted for throughput. R18-to-R24 in-array GeGLU handoff, attention,
 full-model 10k/15k admission, and package tokens/J remain open.
+
+### First complete resident W4 FFN checkpoint
+
+R25 keeps the R18 W4 gate/up accumulator on the array, applies GeGLU, performs
+the canonical AWQ/FWHT/int8 down-activation transform, and accumulates all five
+W4 down groups in one full-M/full-K AIE2P dispatch. The 32 cores exchange gate
+tiles and three-row quantized fragments over the acyclic direct-stream schedule;
+no gate/up or down intermediate crosses to the host.
+
+The gate accumulator and down accumulator share the only core-local 9 KiB
+output tile. R25 therefore spills the partial down result between the three
+gate nblocks as BF16 across otherwise idle scratch buffers, then restores it
+before the next down groups. A random CPU integer/scaling oracle reports
+`0.99999649` cosine, `0.0032624` maximum absolute error, and `0.00033742` mean
+absolute error. Identity isolation passes all five down groups with cosine
+`0.99999846` through `1.0`. Fresh-context dispatches measured 3.79-4.35 ms.
+
+Sustained submission is not yet admitted. On the installed amdxdna
+driver/firmware, a 39- or 42-weight-object stream deterministically reaches the
+four-second TDR on the tenth command submitted to one hardware context. A
+36-object stream remains stable. Increasing the core stack, using fresh command
+BOs, and splitting the host weight DMA into smaller awaited tasks did not remove
+the failure; the split-task schedule also broke numerical ordering and was
+discarded. Eight fresh contexts completed 32 full parity-checked dispatches
+without a TDR, so bounded context recycling is the current evidence-backed
+workaround, but it still must be implemented and timed in the reusable runtime.
+
+R25 is complete-FFN W4 kernel evidence, not arbitrary-mixed/OQ8 FFN support or
+full-model NPU evidence. Attention, norms/residuals, pooling, Dense heads,
+end-to-end 10k/15k admission, and package tokens/J remain open.
