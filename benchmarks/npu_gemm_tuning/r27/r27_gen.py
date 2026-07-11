@@ -12,7 +12,7 @@ OUT_JOIN = ROWS * OUT_TILE
 ACC = 4 * 256
 STATS = 8
 Q_BYTES = ROWS * QUERY_GROUPS * Q_JOIN
-KV_BYTES = QUERY_GROUPS * KEY_BLOCKS * KV_TILE
+KV_BYTES = KEY_BLOCKS * KV_TILE
 O_BYTES = COLS * QUERY_GROUPS * OUT_JOIN
 INF = 9223372036854775807
 
@@ -115,9 +115,9 @@ for row in range(ROWS):
         "      } {issue_token = true}",
         f"      aiex.dma_start_task(%tq{row})",
         f"      %tkv{row} = aiex.dma_configure_task_for @kvsh{row} {{",
-        f"        aie.dma_bd(%KV : memref<{KV_BYTES}xi8>, 0, {KV_BYTES}, {blocks(QUERY_GROUPS * KEY_BLOCKS, KV_TILE)}) {{burst_length = 0 : i32}}",
+        f"        aie.dma_bd(%KV : memref<{KV_BYTES}xi8>, 0, {KV_BYTES}, {blocks(KEY_BLOCKS, KV_TILE)}) {{burst_length = 0 : i32}}",
         "        aie.end",
-        "      } {issue_token = true}",
+        f"      }} {{issue_token = true, repeat_count = {QUERY_GROUPS - 1} : i32}}",
         f"      aiex.dma_start_task(%tkv{row})",
     ]
 for col in range(COLS):

@@ -833,3 +833,21 @@ no room in the `25.6 ms`/10k full-model budget for projections, norms, FFN,
 pooling, or dispatch. R27 therefore still requires one resident layer command,
 direct qkv-to-attention layout production, projection/FFN overlap or further
 kernel acceleration, tail stages, end-to-end quality, and package tokens/J.
+
+The direct projection handoff must preserve those MMUL layouts. An experimental
+row-major BF16 K/V input used 8x8 gathers plus an in-register K transpose in the
+attention core. It retained exact oracle parity but regressed a 20-command run
+to `3.9442 ms`, more than four times the packed median, and is rejected. QKV
+projection must therefore emit K as dimension-by-key 8x8 tiles and V as
+key-by-dimension 8x8 tiles rather than leaving either role row-major for the
+attention core to gather.
+
+R27 no longer stores that packed K/V sequence once per six Q groups. Its DMA
+task replays one 16-block M256 K/V sequence six times inside the command. The
+resident argument falls from `1,572,864` to `262,144` bytes while parity remains
+`0.99999410` cosine and `0.0002527` maximum absolute error. Three independent
+100-command processes measure `0.8893`, `0.9506`, and `0.9792 ms` (median
+`0.9506 ms`), overlapping the earlier packed range. This is the admitted
+projection-facing contract: one packed Q tensor, one packed K/V sequence, and
+internal K/V replay; it remains attention-kernel rather than full-layer or
+full-model evidence.

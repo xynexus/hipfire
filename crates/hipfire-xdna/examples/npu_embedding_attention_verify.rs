@@ -3,29 +3,11 @@
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use hipfire_primitives::conv::{bf16_bits_to_f32, f32_to_bf16_bits};
-    use hipfire_xdna::NpuKernel;
+    use hipfire_xdna::{EmbeddingGemmaAttentionLayout as Layout, NpuKernel};
 
-    const M: usize = 256;
-    const HEADS: usize = 3;
-    const D: usize = 256;
-    const CORES: usize = 32;
-    const ROWS: usize = 4;
-    const COLS: usize = 8;
-    const QUERIES: usize = 4;
-    const GROUPS: usize = HEADS * M / (CORES * QUERIES);
-    const BLOCK_KEYS: usize = 16;
-    const BLOCKS: usize = M / BLOCK_KEYS;
-    const MMUL_K: usize = 8;
-    const MMUL_N: usize = 8;
-    const DIM_TILES: usize = D / MMUL_K;
-    const KEY_TILES: usize = BLOCK_KEYS / MMUL_N;
-    const Q_TILE: usize = QUERIES * D * 2;
-    const Q_JOIN: usize = COLS * Q_TILE;
-    const KV_TILE: usize = 2 * BLOCK_KEYS * D * 2;
-    const O_JOIN: usize = ROWS * Q_TILE;
-    const Q_BYTES: usize = ROWS * GROUPS * Q_JOIN;
-    const KV_BYTES: usize = GROUPS * BLOCKS * KV_TILE;
-    const O_BYTES: usize = COLS * GROUPS * O_JOIN;
+    const M: usize = Layout::TOKENS;
+    const HEADS: usize = Layout::QUERY_HEADS;
+    const D: usize = Layout::HEAD_DIM;
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if !(1..=2).contains(&args.len()) {
@@ -48,6 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "heads=3",
         "kv_heads=1",
         "head_dim=256",
+        "q_layout=mmul-packed",
+        "kv_layout=mmul-packed-single-replay",
     ] {
         if !manifest.lines().any(|line| line == field) {
             return Err(format!("attention cache missing {field}").into());
@@ -75,73 +59,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
     let reference = attention_reference(&q, &k, &v, HEADS, M, D);
 
-    let mut packed_q = vec![0u8; Q_BYTES];
-    for linear in 0..HEADS * M {
-        let group = linear / (CORES * QUERIES);
-        let remainder = linear % (CORES * QUERIES);
-        let core = remainder / QUERIES;
-        let lane = remainder % QUERIES;
-        let row = core / COLS;
-        let col = core % COLS;
-        let tile = (row * GROUPS + group) * Q_JOIN + col * Q_TILE;
-        for dim_tile in 0..DIM_TILES {
-            for dim_lane in 0..MMUL_K {
-                let destination =
-                    tile + (dim_tile * QUERIES * MMUL_K + lane * MMUL_K + dim_lane) * 2;
-                write_bf16_value(
-                    &mut packed_q,
-                    destination,
-                    q[linear * D + dim_tile * MMUL_K + dim_lane],
-                );
-            }
-        }
-    }
-    let mut packed_kv = vec![0u8; KV_BYTES];
-    for group in 0..GROUPS {
-        for block in 0..BLOCKS {
-            let destination = (group * BLOCKS + block) * KV_TILE;
-            for key_tile in 0..KEY_TILES {
-                for dim_tile in 0..DIM_TILES {
-                    for dim_lane in 0..MMUL_K {
-                        for key_lane in 0..MMUL_N {
-                            let key = block * BLOCK_KEYS + key_tile * MMUL_N + key_lane;
-                            let dim = dim_tile * MMUL_K + dim_lane;
-                            let packed = ((key_tile * DIM_TILES + dim_tile) * MMUL_K * MMUL_N)
-                                + dim_lane * MMUL_N
-                                + key_lane;
-                            write_bf16_value(
-                                &mut packed_kv,
-                                destination + packed * 2,
-                                k[key * D + dim],
-                            );
-                        }
-                    }
-                }
-            }
-            let values = destination + BLOCK_KEYS * D * 2;
-            for dim_tile in 0..DIM_TILES {
-                for key_tile in 0..KEY_TILES {
-                    for key_lane in 0..MMUL_K {
-                        for dim_lane in 0..MMUL_N {
-                            let key = block * BLOCK_KEYS + key_tile * MMUL_K + key_lane;
-                            let dim = dim_tile * MMUL_N + dim_lane;
-                            let packed = ((dim_tile * KEY_TILES + key_tile) * MMUL_K * MMUL_N)
-                                + key_lane * MMUL_N
-                                + dim_lane;
-                            write_bf16_value(&mut packed_kv, values + packed * 2, v[key * D + dim]);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let q_bits = q.iter().copied().map(f32_to_bf16_bits).collect::<Vec<_>>();
+    let k_bits = k.iter().copied().map(f32_to_bf16_bits).collect::<Vec<_>>();
+    let v_bits = v.iter().copied().map(f32_to_bf16_bits).collect::<Vec<_>>();
+    let packed_q = Layout::pack_q_bf16(&q_bits).ok_or("invalid Q layout input")?;
+    let packed_kv = Layout::pack_kv_bf16(&k_bits, &v_bits).ok_or("invalid K/V layout input")?;
 
     let xclbin = std::fs::read(format!("{}/final.xclbin", args[0]))?;
     let insts = std::fs::read(format!("{}/insts.bin", args[0]))?;
     let kernel = NpuKernel::load(&xclbin, &insts)?;
-    let mut q_buffer = kernel.alloc_arg(Q_BYTES)?;
-    let mut kv_buffer = kernel.alloc_arg(KV_BYTES)?;
-    let mut output_buffer = kernel.alloc_arg(O_BYTES)?;
+    let mut q_buffer = kernel.alloc_arg(Layout::Q_BYTES)?;
+    let mut kv_buffer = kernel.alloc_arg(Layout::KV_BYTES)?;
+    let mut output_buffer = kernel.alloc_arg(Layout::OUTPUT_BYTES)?;
     q_buffer.as_mut_slice().copy_from_slice(&packed_q);
     kv_buffer.as_mut_slice().copy_from_slice(&packed_kv);
     output_buffer.as_mut_slice().fill(0);
@@ -158,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &[false, false, false],
     )?;
     kernel.sync_output(&output_buffer)?;
-    let output = unpack_output(output_buffer.as_slice(), HEADS, M, D);
+    let output = unpack_output(output_buffer.as_slice())?;
     let (cosine, max_abs, mean_abs) = metrics(&output, &reference);
     if !cosine.is_finite() || cosine < 0.998 || max_abs > 0.04 {
         return Err(format!(
@@ -175,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     kernel.sync_output(&output_buffer)?;
-    let final_output = unpack_output(output_buffer.as_slice(), HEADS, M, D);
+    let final_output = unpack_output(output_buffer.as_slice())?;
     let (final_cosine, final_max_abs, _) = metrics(&final_output, &reference);
     if final_cosine < 0.998 || final_max_abs > 0.04 {
         return Err(format!(
@@ -191,35 +120,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_bf16_value(destination: &mut [u8], byte_offset: usize, value: f32) {
-    destination[byte_offset..byte_offset + 2]
-        .copy_from_slice(&hipfire_primitives::conv::f32_to_bf16_bits(value).to_le_bytes());
-}
-
-#[cfg(target_os = "linux")]
-fn unpack_output(bytes: &[u8], heads: usize, rows: usize, dim: usize) -> Vec<f32> {
-    const CORE_ROWS: usize = 4;
-    const COLS: usize = 8;
-    const QUERIES: usize = 4;
-    const GROUPS: usize = 6;
-    let tile_bytes = QUERIES * dim * 2;
-    let join_bytes = CORE_ROWS * tile_bytes;
-    let mut output = vec![0.0f32; heads * rows * dim];
-    for linear in 0..heads * rows {
-        let group = linear / (CORE_ROWS * COLS * QUERIES);
-        let remainder = linear % (CORE_ROWS * COLS * QUERIES);
-        let core = remainder / QUERIES;
-        let lane = remainder % QUERIES;
-        let core_row = core / COLS;
-        let col = core % COLS;
-        let source = (col * GROUPS + group) * join_bytes + core_row * tile_bytes + lane * dim * 2;
-        for index in 0..dim {
-            let offset = source + index * 2;
-            let bits = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
-            output[linear * dim + index] = hipfire_primitives::conv::bf16_bits_to_f32(bits);
-        }
-    }
-    output
+fn unpack_output(bytes: &[u8]) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let bits = hipfire_xdna::EmbeddingGemmaAttentionLayout::unpack_output_bf16(bytes)
+        .ok_or("invalid physical attention output")?;
+    Ok(bits
+        .into_iter()
+        .map(hipfire_primitives::conv::bf16_bits_to_f32)
+        .collect())
 }
 
 #[cfg(target_os = "linux")]

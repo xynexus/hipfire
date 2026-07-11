@@ -17,5 +17,5 @@ python "$HERE/r27_gen.py" > "$OUT/aie.mlir"
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge --peano="$PEANO" \
   --aie-generate-npu-insts --npu-insts-name="$OUT/insts.bin" \
   --aie-generate-xclbin --xclbin-name="$OUT/final.xclbin" --tmpdir="$OUT" >/dev/null
-printf 'op=attention\nmode=bf16\nm=256\nheads=3\nkv_heads=1\nhead_dim=256\n' > "$OUT/shape.txt"
+printf 'op=attention\nmode=bf16\nm=256\nheads=3\nkv_heads=1\nhead_dim=256\nq_layout=mmul-packed\nkv_layout=mmul-packed-single-replay\n' > "$OUT/shape.txt"
 echo "$OUT"

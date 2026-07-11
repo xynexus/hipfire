@@ -161,6 +161,9 @@ pub mod kernel;
 #[cfg(target_os = "linux")]
 pub use kernel::{NpuInFlight, NpuKernel};
 
+pub mod embedding_attention;
+pub use embedding_attention::EmbeddingGemmaAttentionLayout;
+
 #[cfg(target_os = "linux")]
 pub mod geglu;
 #[cfg(target_os = "linux")]
