@@ -1480,3 +1480,46 @@ layer phases across long-lived contexts or fusing compatible schedules, then
 wire every encoder layer, final norm, pooling, and output normalization through
 the resident path. Generic OQ4/mixed/OQ8 `+/++` end-to-end admission, package
 tokens/joule, and the 10k/15k full-model gates remain open.
+
+### R40 real-model resident-layer pull-up and direct-residual correction
+
+R40 wires the R34, canonical-BF16 R35, and a new direct-residual post-FFN tail
+through the production `LinearProjector` layer boundary. The loader owns actual
+layer-specific QKV, output-projection, FFN, Q/K norm, RoPE, and layer-norm
+payloads for all 24 layers. One shared input feeds R34, its H backing feeds R35,
+and R35's output is consumed and overwritten by the tail. An opt-in
+`HIPFIRE_EMBED_RESIDENT_LAYER=1` keeps this unadmitted path from replacing the
+established encoder until its quality gate passes. A layer-limit and
+same-process boundary comparison are available for bisection.
+
+The real OQ8 artifact invalidates R39's reconstructible-residual assumption.
+Layers 8, 10, and 12 contain an exact zero at pre-FFN norm dimension 39; layers
+20, 21, and 23 contain one at dimension 731. Dividing H by the pre-FFN norm
+cannot recover those residual components. Packing a BF16 inverse and exception
+into the existing metadata word was rejected: the R34 even image grew to
+16,576 bytes, 192 bytes beyond program memory. R40 instead retains canonical
+BF16 X and computes the exact architectural tail `X + post_ffn_norm(Y)` without
+using pre-FFN inverses. Its isolated hardware oracle reaches cosine
+`0.99999166` and maximum absolute error `0.0078125`.
+
+The first real 24-layer OQ8 execution proves that every production layer can
+select the new resident boundary, but it is not admitted. Against the BF16
+reference it measures cosine `0.32072166`, `665.782 ms`, 384.5 input tokens/s,
+22.00 W package power, and 17.5 package tokens/J. A layer-0 same-input bisection
+localizes the quality failure:
+
+| boundary | cosine | minimum row cosine | max abs |
+|---|---:|---:|---:|
+| R34 pre-FFN H vs established H | 0.99996548 | 0.99994784 | 0.8271027 |
+| canonical R35 Y vs established Y | 0.99995595 | 0.99986730 | 0.0151756 |
+| R40 tail vs a CPU oracle using the same resident X/Y | 0.99999334 | — | 4.0000000 |
+| completed layer vs established layer | 0.94956975 | 0.79338516 | 62.4840775 |
+
+The direct tail and both upstream boundaries are individually coherent, but
+post-FFN normalization plus residual cancellation amplifies the canonical R35
+BF16 output error on the real model. The next correction must preserve more
+than one BF16 component across R35-to-tail—prefer an F32 or compensated BF16x2
+down-projection handoff and consume it before rounding the completed layer.
+Do not admit R40's full-model result or treat its package efficiency as meeting
+the goal. OQ4/mixed/OQ8 `+/++`, 10k/15k throughput, and admitted package
+tokens/J remain open.

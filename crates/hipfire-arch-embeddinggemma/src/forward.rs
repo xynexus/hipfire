@@ -63,6 +63,29 @@ pub trait LinearProjector {
         rows: usize,
     ) -> HipResult<()>;
 
+    /// Execute one complete encoder layer when the backend owns the resident
+    /// attention, FFN, residual, and normalization boundary. The normalized
+    /// input and residual are separate because the admitted R34 ABI consumes
+    /// both. Returning `false` selects the canonical operation sequence below.
+    fn project_layer(
+        &mut self,
+        _gpu: &mut Gpu,
+        _layer_idx: usize,
+        _normalized_input: &GpuTensor,
+        _residual_and_output: &GpuTensor,
+        _rows: usize,
+    ) -> HipResult<bool> {
+        Ok(false)
+    }
+
+    fn take_layer_debug_hidden(&mut self) -> Option<Vec<f32>> {
+        None
+    }
+
+    fn take_layer_debug_ffn(&mut self) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Execute the complete QKV projection, Q/K normalization, RoPE, and
     /// bidirectional attention boundary when a resident backend owns it.
     /// Returning `false` selects the canonical per-operation fallback below.
@@ -246,6 +269,8 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     projector: &mut P,
 ) -> HipResult<Vec<f32>> {
     let trace_phases = std::env::var("HIPFIRE_EMBED_TRACE_PHASES").is_ok_and(|value| value != "0");
+    let compare_resident_layer =
+        std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER").is_ok_and(|value| value != "0");
     let mut qkv_ms = 0.0f64;
     let mut attention_core_ms = 0.0f64;
     let mut attention_output_ms = 0.0f64;
@@ -310,6 +335,12 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     let gate = gpu.alloc_owned(&[m * inter], DType::F32)?;
     let up = gpu.alloc_owned(&[m * inter], DType::F32)?;
     let ffn = gpu.alloc_owned(&[m * inter], DType::F32)?;
+    let compare_input = compare_resident_layer
+        .then(|| gpu.alloc_owned(&[m * dim], DType::F32))
+        .transpose()?;
+    let compare_output = compare_resident_layer
+        .then(|| gpu.alloc_owned(&[m * dim], DType::F32))
+        .transpose()?;
 
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &backbone.layers[layer_idx];
@@ -317,6 +348,40 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
 
         // ── Attention block (bidirectional) ──
         gpu.rmsnorm_batched(&x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
+        let compare_this_layer = compare_resident_layer && layer_idx == 0;
+        if compare_this_layer {
+            gpu.memcpy_dtod_at_auto(
+                &compare_input.as_ref().expect("comparison input").buf,
+                0,
+                &x_batch.buf,
+                0,
+                m * dim * size_of::<f32>(),
+            )?;
+        }
+        let completed_layer = projector.project_layer(gpu, layer_idx, &tmp, &x_batch, m)?;
+        if completed_layer && !compare_this_layer {
+            if trace_phases {
+                gpu.device_synchronize()?;
+                attention_core_ms += stage_started.elapsed().as_secs_f64() * 1e3;
+            }
+            continue;
+        }
+        if completed_layer {
+            gpu.memcpy_dtod_at_auto(
+                &compare_output.as_ref().expect("comparison output").buf,
+                0,
+                &x_batch.buf,
+                0,
+                m * dim * size_of::<f32>(),
+            )?;
+            gpu.memcpy_dtod_at_auto(
+                &x_batch.buf,
+                0,
+                &compare_input.as_ref().expect("comparison input").buf,
+                0,
+                m * dim * size_of::<f32>(),
+            )?;
+        }
         let attention_boundary =
             projector.project_attention(gpu, layer_idx, &tmp, &attn_out, &o, m)?;
         if attention_boundary != AttentionBoundary::Fallback {
@@ -379,6 +444,17 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
         // ── FFN block (GeGLU) ──
         let stage_started = std::time::Instant::now();
         gpu.rmsnorm_batched(&x_batch, &layer.pre_ffn_norm, &tmp, m, dim, eps)?;
+        if completed_layer && compare_this_layer {
+            if let Some(resident_hidden) = projector.take_layer_debug_hidden() {
+                gpu.device_synchronize()?;
+                let fallback_hidden = gpu.download_f32(&tmp)?;
+                let (cosine, max_abs) = tensor_metrics(&resident_hidden, &fallback_hidden);
+                let min_row = min_row_cosine(&resident_hidden, &fallback_hidden, dim);
+                eprintln!(
+                    "embeddinggemma_resident_hidden_compare layer={layer_idx} cosine={cosine:.8} min_row_cosine={min_row:.8} max_abs={max_abs:.7}"
+                );
+            }
+        }
         projector.project_ffn(
             gpu,
             layer_idx,
@@ -392,6 +468,17 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
             &o,
             m,
         )?;
+        if completed_layer && compare_this_layer {
+            if let Some(resident_ffn) = projector.take_layer_debug_ffn() {
+                gpu.device_synchronize()?;
+                let fallback_ffn = gpu.download_f32(&o)?;
+                let (cosine, max_abs) = tensor_metrics(&resident_ffn, &fallback_ffn);
+                let min_row = min_row_cosine(&resident_ffn, &fallback_ffn, dim);
+                eprintln!(
+                    "embeddinggemma_resident_ffn_compare layer={layer_idx} cosine={cosine:.8} min_row_cosine={min_row:.8} max_abs={max_abs:.7}"
+                );
+            }
+        }
         if trace_phases {
             gpu.device_synchronize()?;
             ffn_core_ms += stage_started.elapsed().as_secs_f64() * 1e3;
@@ -399,6 +486,16 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
         let stage_started = std::time::Instant::now();
         gpu.rmsnorm_batched(&o, &layer.post_ffn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(&x_batch, &tmp, &x_batch)?;
+        if completed_layer && compare_this_layer {
+            gpu.device_synchronize()?;
+            let resident = gpu.download_f32(compare_output.as_ref().expect("comparison output"))?;
+            let fallback = gpu.download_f32(&x_batch)?;
+            let (cosine, max_abs) = tensor_metrics(&resident, &fallback);
+            let min_row = min_row_cosine(&resident, &fallback, dim);
+            eprintln!(
+                "embeddinggemma_resident_layer_compare layer={layer_idx} cosine={cosine:.8} min_row_cosine={min_row:.8} max_abs={max_abs:.7}"
+            );
+        }
         if trace_phases {
             gpu.device_synchronize()?;
             ffn_output_ms += stage_started.elapsed().as_secs_f64() * 1e3;
@@ -417,6 +514,27 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     gpu.reclaim_pending();
 
     Ok(pool(&hidden_flat, m, dim, cfg.pooling_mode))
+}
+
+fn tensor_metrics(left: &[f32], right: &[f32]) -> (f64, f32) {
+    let mut dot = 0.0f64;
+    let mut left_norm = 0.0f64;
+    let mut right_norm = 0.0f64;
+    let mut max_abs = 0.0f32;
+    for (&left, &right) in left.iter().zip(right) {
+        dot += left as f64 * right as f64;
+        left_norm += (left as f64).powi(2);
+        right_norm += (right as f64).powi(2);
+        max_abs = max_abs.max((left - right).abs());
+    }
+    (dot / (left_norm.sqrt() * right_norm.sqrt()), max_abs)
+}
+
+fn min_row_cosine(left: &[f32], right: &[f32], width: usize) -> f64 {
+    left.chunks_exact(width)
+        .zip(right.chunks_exact(width))
+        .map(|(left, right)| tensor_metrics(left, right).0)
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Reduce the `[m, dim]` final hidden states to one `[dim]` vector. embeddinggemma

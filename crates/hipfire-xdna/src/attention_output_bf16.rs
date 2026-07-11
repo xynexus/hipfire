@@ -201,7 +201,7 @@ fn validate_matrix(matrix: &OpusPackedMatrix) -> Result<(), XdnaError> {
     Ok(())
 }
 
-fn dense_effective_bf16(matrix: &OpusPackedMatrix) -> Vec<u16> {
+pub(crate) fn dense_effective_bf16(matrix: &OpusPackedMatrix) -> Vec<u16> {
     let mut dense = vec![0u16; K * N];
     let signs1 = gen_fwht_signs(42, GROUP);
     let signs2 = gen_fwht_signs(1042, GROUP);

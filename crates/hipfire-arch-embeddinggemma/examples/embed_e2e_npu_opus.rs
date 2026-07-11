@@ -103,11 +103,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         embeddinggemma::NpuOpusProjector::load_cached(&hfq, &config, Path::new(&cache_root))?;
     let power_path = package_power_path();
     eprintln!(
-        "loaded {} layers across {} resident NPU executor widths; resident_attention={} complete_resident_ffn={}",
+        "loaded {} layers across {} resident NPU executor widths; resident_attention={} complete_resident_ffn={} completed_resident_layer={}",
         projector.layer_count(),
         projector.executor_count(),
         projector.resident_attention_enabled(),
         projector.resident_ffn_enabled(),
+        projector.resident_layer_enabled(),
     );
 
     let gpu_started = Instant::now();

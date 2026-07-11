@@ -390,7 +390,7 @@ fn dense_groups(matrix: &OpusPackedMatrix) -> Vec<Cow<'_, [i8]>> {
         .collect()
 }
 
-fn pack_dense_weights(groups: &[&[i8]], scales: &[&[f32]]) -> Vec<u8> {
+pub(crate) fn pack_dense_weights(groups: &[&[i8]], scales: &[&[f32]]) -> Vec<u8> {
     let mut packed = vec![0u8; COLS * INBLOCKS * W_BLOCK];
     for stripe in 0..COLS {
         for m_macro in 0..M_MACROS {
@@ -425,7 +425,7 @@ fn pack_dense_weights(groups: &[&[i8]], scales: &[&[f32]]) -> Vec<u8> {
     packed
 }
 
-fn stage_positions_and_params(
+pub(crate) fn stage_positions_and_params(
     qnorm: &[f32],
     knorm: &[f32],
     epsilon: f32,

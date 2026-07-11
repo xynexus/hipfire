@@ -232,6 +232,20 @@ pub mod post_ffn_tail;
 pub use post_ffn_tail::{NpuEmbeddingPostFfnTail, NpuEmbeddingPostFfnTailParams};
 
 #[cfg(target_os = "linux")]
+pub mod post_ffn_direct_tail;
+#[cfg(target_os = "linux")]
+pub use post_ffn_direct_tail::{
+    NpuEmbeddingPostFfnDirectTail, NpuEmbeddingPostFfnDirectTailParams,
+};
+
+#[cfg(target_os = "linux")]
+pub mod resident_embedding_layer;
+#[cfg(target_os = "linux")]
+pub use resident_embedding_layer::{
+    NpuEmbeddingLayerAttentionDenseW8, NpuEmbeddingLayerAttentionDenseW8Weights,
+};
+
+#[cfg(target_os = "linux")]
 pub mod resident_attention_w8;
 #[cfg(target_os = "linux")]
 pub use resident_attention_w8::{NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights};

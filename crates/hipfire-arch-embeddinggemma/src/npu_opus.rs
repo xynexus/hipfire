@@ -9,10 +9,12 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
-    NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuOpusExecutor,
-    NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights, NpuResidentFfnDenseW8,
-    NpuResidentFfnDenseW8Weights, NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode,
-    NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
+    NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuEmbeddingLayerAttentionDenseW8,
+    NpuEmbeddingLayerAttentionDenseW8Weights, NpuEmbeddingPostFfnDirectTail,
+    NpuEmbeddingPostFfnDirectTailParams, NpuOpusExecutor, NpuResidentAttentionDenseW8,
+    NpuResidentAttentionDenseW8Weights, NpuResidentFfnDenseW8, NpuResidentFfnDenseW8Weights,
+    NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode, NpuWholeScaledIoLayout,
+    OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
 };
 
 use crate::config::EmbeddingGemmaConfig;
@@ -43,6 +45,9 @@ pub struct NpuOpusProjector {
     resident_attention_selected: bool,
     resident_ffn: Option<ResidentFfnState>,
     resident_ffn_selected: bool,
+    resident_layer: Option<ResidentLayerState>,
+    debug_resident_hidden: Option<Vec<f32>>,
+    debug_resident_ffn: Option<Vec<f32>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -100,6 +105,26 @@ struct ResidentAttentionOutputState {
 struct SharedAttentionOutput {
     output_gpu: ImportedTensor,
     _output_buffer: SharedGttBuffer,
+}
+
+struct ResidentLayerState {
+    attention: NpuEmbeddingLayerAttentionDenseW8,
+    attention_weights: Vec<NpuEmbeddingLayerAttentionDenseW8Weights>,
+    ffn: NpuResidentFfnDenseW8,
+    ffn_weights: Vec<NpuResidentFfnDenseW8Weights>,
+    tail: NpuEmbeddingPostFfnDirectTail,
+    tail_params: Vec<NpuEmbeddingPostFfnDirectTailParams>,
+    tail_post_norms: Vec<Vec<u16>>,
+    io: Option<ResidentLayerIo>,
+}
+
+struct ResidentLayerIo {
+    input_gpu: ImportedTensor,
+    residual_gpu: ImportedTensor,
+    _input: SharedGttBuffer,
+    residual: SharedGttBuffer,
+    _hidden: SharedGttBuffer,
+    _ffn: SharedGttBuffer,
 }
 
 enum ResidentFfnState {
@@ -526,6 +551,8 @@ impl NpuOpusProjector {
             cache_root.join("embgemma_aie2p_resident_ffn_w4_m256_k768_i1152_o768");
         let resident_ffn_dense_w8_path =
             cache_root.join("embgemma_aie2p_resident_ffn_dense_w8_m256_k768_i1152_o768");
+        let resident_ffn_dense_w8_canonical_path = cache_root
+            .join("embgemma_aie2p_resident_ffn_dense_w8_canonical_bf16_m256_k768_i1152_o768");
         let resident_mode = resident_ffn_mode(&layers);
         if let Err(reason) = &resident_mode {
             eprintln!("embeddinggemma NPU: resident FFN unavailable: {reason}");
@@ -601,6 +628,141 @@ impl NpuOpusProjector {
             Err(_) => None,
         };
         let resident_ffn_selected = resident_ffn.is_some();
+        let resident_layer_attention_path = cache_root
+            .join("embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_m256_k768_n1280");
+        let resident_layer_tail_path =
+            cache_root.join("embgemma_aie2p_post_ffn_direct_tail_m256_k768");
+        let resident_layer_requested =
+            std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0");
+        let resident_layer = if resident_layer_requested
+            && cfg.hidden_size == 768
+            && resident_ffn_mode(&layers).is_ok_and(|mode| mode == OpusResidentMode::DenseW8)
+            && resident_ffn_dense_w8_canonical_path
+                .join("final.xclbin")
+                .is_file()
+            && resident_ffn_dense_w8_canonical_path
+                .join("insts.bin")
+                .is_file()
+            && resident_layer_attention_path.join("final.xclbin").is_file()
+            && resident_layer_attention_path.join("insts.bin").is_file()
+            && resident_layer_tail_path.join("final.xclbin").is_file()
+            && resident_layer_tail_path.join("insts.bin").is_file()
+        {
+            let attention_cache = resident_layer_attention_path
+                .to_str()
+                .expect("UTF-8 resident layer attention cache path");
+            let attention = NpuEmbeddingLayerAttentionDenseW8::load_cached(attention_cache)
+                .map_err(|error| {
+                    format!("embeddinggemma NPU: load completed-layer attention: {error}")
+                })?;
+            let tail_cache = resident_layer_tail_path
+                .to_str()
+                .expect("UTF-8 resident layer tail cache path");
+            let tail = NpuEmbeddingPostFfnDirectTail::load_cached(tail_cache).map_err(|error| {
+                format!("embeddinggemma NPU: load completed-layer tail: {error}")
+            })?;
+            let ffn_cache = resident_ffn_dense_w8_canonical_path
+                .to_str()
+                .expect("UTF-8 completed-layer FFN cache path");
+            let ffn = NpuResidentFfnDenseW8::load_cached(ffn_cache).map_err(|error| {
+                format!("embeddinggemma NPU: load completed-layer FFN: {error}")
+            })?;
+            let ffn_weights = layers
+                .iter()
+                .map(|layer| {
+                    ffn.upload_weights(
+                        &layer.gate,
+                        &layer.up,
+                        layer.down.as_ref().expect("completed-layer down matrix"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    format!("embeddinggemma NPU: upload completed-layer FFN: {error}")
+                })?;
+            let mut attention_weights = Vec::with_capacity(layers.len());
+            let mut tail_params = Vec::with_capacity(layers.len());
+            let mut tail_post_norms = Vec::with_capacity(layers.len());
+            let zero_residual = vec![0u16; 256 * cfg.hidden_size];
+            for (layer_idx, layer) in layers.iter().enumerate() {
+                let prefix = format!("model.layers.{layer_idx}");
+                let (dense_groups, dense_scales, awq_scale) =
+                    resident_attention_dense_groups(layer)?;
+                let group_refs = dense_groups.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let scale_refs = dense_scales.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let mut qnorm = load_vector_f32(
+                    hfq,
+                    &format!("{prefix}.self_attn.q_norm.weight"),
+                    cfg.head_dim,
+                )?;
+                let prescale = cfg.q_prescale();
+                if (prescale - 1.0).abs() > 1.0e-6 {
+                    qnorm.iter_mut().for_each(|value| *value *= prescale);
+                }
+                let knorm = load_vector_f32(
+                    hfq,
+                    &format!("{prefix}.self_attn.k_norm.weight"),
+                    cfg.head_dim,
+                )?;
+                let post_attention_norm = load_vector_bf16(
+                    hfq,
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                    cfg.hidden_size,
+                )?;
+                let pre_ffn_norm = load_vector_bf16(
+                    hfq,
+                    &format!("{prefix}.pre_feedforward_layernorm.weight"),
+                    cfg.hidden_size,
+                )?;
+                let post_ffn_norm = load_vector_bf16(
+                    hfq,
+                    &format!("{prefix}.post_feedforward_layernorm.weight"),
+                    cfg.hidden_size,
+                )?;
+                attention_weights.push(
+                    attention
+                        .upload_dense_groups(
+                            &group_refs,
+                            &scale_refs,
+                            awq_scale.as_deref(),
+                            &layer.attention_output,
+                            &zero_residual,
+                            &qnorm,
+                            &knorm,
+                            &post_attention_norm,
+                            &pre_ffn_norm,
+                            cfg.rms_norm_eps,
+                            cfg.rope_base_for_layer(layer_idx),
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "embeddinggemma NPU: upload completed-layer attention {layer_idx}: {error}"
+                            )
+                        })?,
+                );
+                tail_params.push(
+                    tail.upload_params(&post_ffn_norm, cfg.rms_norm_eps)
+                        .map_err(|error| {
+                            format!(
+                                "embeddinggemma NPU: upload completed-layer tail {layer_idx}: {error}"
+                            )
+                        })?,
+                );
+                tail_post_norms.push(post_ffn_norm);
+            }
+            Some(ResidentLayerState {
+                attention,
+                attention_weights,
+                ffn,
+                ffn_weights,
+                tail,
+                tail_params,
+                tail_post_norms,
+                io: None,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             executors,
             layers,
@@ -610,6 +772,9 @@ impl NpuOpusProjector {
             resident_attention_selected,
             resident_ffn,
             resident_ffn_selected,
+            resident_layer,
+            debug_resident_hidden: None,
+            debug_resident_ffn: None,
         })
     }
 
@@ -627,6 +792,10 @@ impl NpuOpusProjector {
 
     pub fn resident_attention_enabled(&self) -> bool {
         self.resident_attention.is_some() && self.resident_attention_selected
+    }
+
+    pub fn resident_layer_enabled(&self) -> bool {
+        self.resident_layer.is_some() && self.resident_ffn_selected
     }
 
     pub fn select_resident_attention(&mut self, selected: bool) -> Result<(), String> {
@@ -924,6 +1093,234 @@ fn try_shared_projection(
 }
 
 impl LinearProjector for NpuOpusProjector {
+    fn project_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        normalized_input: &GpuTensor,
+        residual_and_output: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<bool> {
+        let resident_layer_limit = std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        if rows != NpuEmbeddingLayerAttentionDenseW8::rows()
+            || self.resident_layer.is_none()
+            || !self.resident_ffn_selected
+            || layer_idx >= resident_layer_limit
+        {
+            return Ok(false);
+        }
+        if layer_idx >= self.layers.len() {
+            return Err(hip_error(format!(
+                "missing completed resident layer {layer_idx}"
+            )));
+        }
+
+        let needs_io = self
+            .resident_layer
+            .as_ref()
+            .is_some_and(|state| state.io.is_none());
+        if needs_io {
+            let mut input =
+                gpu.alloc_shared_gtt(NpuEmbeddingLayerAttentionDenseW8::input_bytes())?;
+            let mut hidden =
+                gpu.alloc_shared_gtt(NpuEmbeddingLayerAttentionDenseW8::hidden_backing_bytes())?;
+            let mut residual =
+                gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTail::shared_state_bytes())?;
+            let mut ffn = gpu.alloc_shared_gtt(NpuResidentFfnDenseW8::canonical_output_bytes())?;
+            input.as_mut_slice().fill(0);
+            hidden.as_mut_slice().fill(0);
+            residual.as_mut_slice().fill(0);
+            ffn.as_mut_slice().fill(0);
+            let input_gpu =
+                gpu.import_dmabuf(input.dmabuf_fd(), input.len(), &[input.len()], DType::Raw)?;
+            let residual_gpu = gpu.import_dmabuf(
+                residual.dmabuf_fd(),
+                residual.len(),
+                &[rows * 768],
+                DType::BF16,
+            )?;
+            let state = self
+                .resident_layer
+                .as_mut()
+                .expect("checked resident layer");
+            state
+                .attention
+                .attach_shared_input(input.dmabuf_fd(), input.len())
+                .map_err(|error| hip_error(format!("attach completed-layer input: {error}")))?;
+            state
+                .attention
+                .attach_shared_hidden(hidden.dmabuf_fd(), hidden.len())
+                .map_err(|error| hip_error(format!("attach completed-layer hidden: {error}")))?;
+            state
+                .ffn
+                .attach_shared_input(hidden.dmabuf_fd(), hidden.len())
+                .map_err(|error| hip_error(format!("attach completed-layer FFN: {error}")))?;
+            state
+                .ffn
+                .attach_shared_output(ffn.dmabuf_fd(), ffn.len())
+                .map_err(|error| {
+                    hip_error(format!("attach completed-layer FFN output: {error}"))
+                })?;
+            state
+                .tail
+                .attach_shared_state(
+                    residual.dmabuf_fd(),
+                    residual.len(),
+                    ffn.dmabuf_fd(),
+                    ffn.len(),
+                )
+                .map_err(|error| hip_error(format!("attach completed-layer tail: {error}")))?;
+            state.io = Some(ResidentLayerIo {
+                input_gpu,
+                residual_gpu,
+                _input: input,
+                residual,
+                _hidden: hidden,
+                _ffn: ffn,
+            });
+        }
+
+        let matrix_key = MatrixGpuKey {
+            layer: layer_idx,
+            role: MatrixRole::Qkv,
+        };
+        if !self.awq_gpu.contains_key(&matrix_key) {
+            let scale = self
+                .resident_layer
+                .as_ref()
+                .and_then(|state| state.attention_weights.get(layer_idx))
+                .and_then(NpuEmbeddingLayerAttentionDenseW8Weights::awq_scale)
+                .map(<[f32]>::to_vec);
+            if let Some(scale) = scale {
+                self.awq_gpu
+                    .insert(matrix_key, gpu.upload_owned_f32(&scale, &[scale.len()])?);
+            }
+        }
+
+        let residual_view = self
+            .resident_layer
+            .as_ref()
+            .and_then(|state| state.io.as_ref())
+            .expect("completed resident layer I/O")
+            .residual_gpu
+            .view();
+        gpu.cast_f32_to_bf16(residual_and_output, &residual_view)?;
+        gpu.device_synchronize()?;
+        let residual = self
+            .resident_layer
+            .as_ref()
+            .and_then(|state| state.io.as_ref())
+            .expect("completed resident layer I/O")
+            .residual
+            .as_slice()[..rows * 768 * size_of::<u16>()]
+            .chunks_exact(size_of::<u16>())
+            .map(|word| u16::from_le_bytes([word[0], word[1]]))
+            .collect::<Vec<_>>();
+        if compare_this_layer_enabled() {
+            let original = gpu.download_f32(residual_and_output)?;
+            let rounded = residual
+                .iter()
+                .map(|&bits| f32::from_bits((bits as u32) << 16))
+                .collect::<Vec<_>>();
+            let (cosine, max_abs) = host_metrics(&rounded, &original);
+            eprintln!(
+                "embeddinggemma_resident_residual_compare layer={layer_idx} cosine={cosine:.8} max_abs={max_abs:.7}"
+            );
+        }
+        let state = self
+            .resident_layer
+            .as_mut()
+            .expect("checked resident layer");
+        if layer_idx >= state.attention_weights.len() || layer_idx >= state.tail_params.len() {
+            return Err(hip_error(format!(
+                "missing completed resident layer payload {layer_idx}"
+            )));
+        }
+        state
+            .attention
+            .set_residual_bf16(&mut state.attention_weights[layer_idx], &residual)
+            .map_err(|error| hip_error(format!("stage layer {layer_idx} residual: {error}")))?;
+        state
+            .attention
+            .prepare_layer(&state.attention_weights[layer_idx])
+            .map_err(|error| hip_error(format!("prepare layer {layer_idx}: {error}")))?;
+        let input_view = state
+            .io
+            .as_ref()
+            .expect("completed resident layer I/O")
+            .input_gpu
+            .view();
+        gpu.pack_opus_npu_activations(
+            normalized_input,
+            self.awq_gpu.get(&matrix_key).map(OwnedTensor::view),
+            &input_view,
+            rows,
+            768,
+            resident_attention_layout(),
+        )?;
+        gpu.device_synchronize()?;
+        state
+            .attention
+            .run_shared(&state.attention_weights[layer_idx])
+            .map_err(|error| {
+                hip_error(format!("completed-layer attention {layer_idx}: {error}"))
+            })?;
+        if compare_this_layer_enabled() {
+            self.debug_resident_hidden =
+                Some(state.attention.read_hidden_f32().map_err(|error| {
+                    hip_error(format!("read resident hidden {layer_idx}: {error}"))
+                })?);
+        }
+        state
+            .ffn
+            .run_shared(&state.ffn_weights[layer_idx])
+            .map_err(|error| hip_error(format!("completed-layer FFN {layer_idx}: {error}")))?;
+        if compare_this_layer_enabled() {
+            self.debug_resident_ffn =
+                Some(state.ffn.read_canonical_output_f32().map_err(|error| {
+                    hip_error(format!("read resident FFN {layer_idx}: {error}"))
+                })?);
+        }
+        state.tail.sync_shared_inputs().map_err(|error| {
+            hip_error(format!("sync completed-layer tail {layer_idx}: {error}"))
+        })?;
+        state
+            .tail
+            .run_shared(&state.tail_params[layer_idx])
+            .map_err(|error| hip_error(format!("completed-layer tail {layer_idx}: {error}")))?;
+        let completed = state
+            .tail
+            .read_output_f32()
+            .map_err(|error| hip_error(format!("read completed layer {layer_idx}: {error}")))?;
+        if compare_this_layer_enabled() {
+            let expected = direct_tail_reference(
+                &residual,
+                self.debug_resident_ffn
+                    .as_ref()
+                    .expect("resident FFN debug output"),
+                &state.tail_post_norms[layer_idx],
+                1.0e-6,
+            );
+            let (cosine, max_abs) = host_metrics(&completed, &expected);
+            eprintln!(
+                "embeddinggemma_resident_tail_compare layer={layer_idx} cosine={cosine:.8} max_abs={max_abs:.7}"
+            );
+        }
+        copy_host_output(gpu, residual_and_output, &completed)?;
+        Ok(true)
+    }
+
+    fn take_layer_debug_hidden(&mut self) -> Option<Vec<f32>> {
+        self.debug_resident_hidden.take()
+    }
+
+    fn take_layer_debug_ffn(&mut self) -> Option<Vec<f32>> {
+        self.debug_resident_ffn.take()
+    }
+
     fn project_attention(
         &mut self,
         gpu: &mut Gpu,
@@ -1705,6 +2102,62 @@ fn load_vector_f32(hfq: &HfqFile, name: &str, length: usize) -> Result<Vec<f32>,
         ));
     }
     Ok(values)
+}
+
+fn load_vector_bf16(hfq: &HfqFile, name: &str, length: usize) -> Result<Vec<u16>, String> {
+    Ok(load_vector_f32(hfq, name, length)?
+        .into_iter()
+        .map(f32_to_bf16_bits)
+        .collect())
+}
+
+fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
+}
+
+fn compare_this_layer_enabled() -> bool {
+    std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER").is_ok_and(|value| value != "0")
+}
+
+fn host_metrics(left: &[f32], right: &[f32]) -> (f64, f32) {
+    let mut dot = 0.0f64;
+    let mut left_norm = 0.0f64;
+    let mut right_norm = 0.0f64;
+    let mut max_abs = 0.0f32;
+    for (&left, &right) in left.iter().zip(right) {
+        dot += left as f64 * right as f64;
+        left_norm += (left as f64).powi(2);
+        right_norm += (right as f64).powi(2);
+        max_abs = max_abs.max((left - right).abs());
+    }
+    (dot / (left_norm.sqrt() * right_norm.sqrt()), max_abs)
+}
+
+fn direct_tail_reference(
+    residual: &[u16],
+    ffn: &[f32],
+    post_norm: &[u16],
+    epsilon: f32,
+) -> Vec<f32> {
+    const HIDDEN: usize = 768;
+    let mut output = vec![0.0f32; ffn.len()];
+    for token in 0..ffn.len() / HIDDEN {
+        let base = token * HIDDEN;
+        let sum = ffn[base..base + HIDDEN]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>();
+        let inverse = (sum / HIDDEN as f32 + epsilon).sqrt().recip();
+        for hidden in 0..HIDDEN {
+            let index = base + hidden;
+            let value = f32::from_bits((residual[index] as u32) << 16)
+                + ffn[index] * f32::from_bits((post_norm[hidden] as u32) << 16) * inverse;
+            output[index] = f32::from_bits((f32_to_bf16_bits(value) as u32) << 16);
+        }
+    }
+    output
 }
 
 fn hip_error(message: impl AsRef<str>) -> HipError {
