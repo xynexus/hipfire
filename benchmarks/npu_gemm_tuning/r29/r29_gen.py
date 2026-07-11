@@ -209,6 +209,13 @@ for col in range(COLS):
         f"    aie.objectfifo.link [{attention_producers}] -> [@osh{col}] ([{attention_offsets}] [])",
     ]
 
+if RESIDUAL_NORM:
+    for col in range(0, COLS, 2):
+        for row in range(ROWS):
+            out.append(
+                f"    aie.objectfifo @rmc{col}_{row}(%c{col}_{row}, {{%c{col + 1}_{row}}}, 1 : i32) : !aie.objectfifo<memref<64xi8>>"
+            )
+
 out += [
     f'    func.func private @r29_w8_projection_init(memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>) attributes {{link_with = "{OBJECT}"}}',
     f'    func.func private @r29_w8_projection_accum(memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>) attributes {{link_with = "{OBJECT}"}}',
@@ -264,8 +271,9 @@ if OUTPUT_EXECUTION:
     if RESIDUAL_NORM:
         out += [
             f'    func.func private @{output_finish}(memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>, memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, i32) attributes {{link_with = "r34norm.o"}}',
-            '    func.func private @r34_post_residual_pre_ffn(memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>) attributes {link_with = "r34norm.o"}',
+            f'    func.func private @r34_post_residual_pre_ffn(memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<64xi8>, i32) attributes {{link_with = "r34norm.o"}}',
             f'    func.func private @r34_emit_norm_half(memref<4096xi8>, memref<{OUT_TILE}xi8>, index) attributes {{link_with = "r34norm.o"}}',
+            f'    func.func private @r38_relay_pre_inverse(memref<64xi8>, memref<{OUT_TILE}xi8>) attributes {{link_with = "r34norm.o"}}',
         ]
     elif DIRECT_OUTPUT:
         out += [
@@ -490,6 +498,11 @@ for col in range(COLS):
                 ]
         elif ATTENTION:
             if DIRECT_OUTPUT:
+                if RESIDUAL_NORM:
+                    lines += [
+                        f"        %rnmeta = aie.objectfifo.acquire @rmc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<64xi8>>",
+                        f"        %rnmetav = aie.objectfifo.subview.access %rnmeta[0] : !aie.objectfifosubview<memref<64xi8>> -> memref<64xi8>",
+                    ]
                 lines += [
                     "        scf.for %omwave = %z to %omwaves step %one {",
                     "          scf.for %ogroup = %z to %ogroups step %one {",
@@ -524,12 +537,15 @@ for col in range(COLS):
                         "          }",
                         f"          aie.objectfifo.release @ad{col // 2}_{row}(Consume, 3)",
                     ]
-                    lines += ["          scf.for %rnparam = %z to %rnrows step %one {"]
+                    lines += [
+                        "          %omwavei = arith.index_cast %omwave : index to i32",
+                        "          scf.for %rnparam = %z to %rnrows step %one {",
+                    ]
                     lines += acquire_w(col, "rn", "            ")
                     lines += [
                         "            %rnactive = arith.cmpi eq, %rnparam, %rnrow : index",
                         "            scf.if %rnactive {",
-                        f"              func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrnv) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>) -> ()",
+                        f"              func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrnv, %rnmetav, %omwavei) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<64xi8>, i32) -> ()",
                         "            }",
                         f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
                         "          }",
@@ -543,7 +559,10 @@ for col in range(COLS):
                             f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
                             "          }",
                         ]
-                    lines += ["        }"]
+                    lines += [
+                        "        }",
+                        f"        aie.objectfifo.release @rmc{col}_{row}(Produce, 1)",
+                    ]
                 else:
                     lines += acquire_out(col, row, "opo", "            ")
                     lines += [
@@ -566,6 +585,17 @@ for col in range(COLS):
                     "          }",
                     "        }",
                 ]
+        if RESIDUAL_NORM and col % 2 == 1:
+            lines += [
+                f"        %rnmetai = aie.objectfifo.acquire @rmc{col - 1}_{row}(Consume, 1) : !aie.objectfifosubview<memref<64xi8>>",
+                f"        %rnmetaiv = aie.objectfifo.subview.access %rnmetai[0] : !aie.objectfifosubview<memref<64xi8>> -> memref<64xi8>",
+            ]
+            lines += acquire_out(col, row, "rnmetao", "        ")
+            lines += [
+                f"        func.call @r38_relay_pre_inverse(%rnmetaiv, %rnmetaov) : (memref<64xi8>, memref<{OUT_TILE}xi8>) -> ()",
+                f"        aie.objectfifo.release @rmc{col - 1}_{row}(Consume, 1)",
+                f"        aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+            ]
         if OUTPUT_EXECUTION and not DIRECT_OUTPUT:
             if col % 2 == 0:
                 lines += [
@@ -800,6 +830,18 @@ def await_direct_output_tasks(mwave, first_pair, pair_count):
 
 def start_norm_output_tasks(mwave):
     for active_col, col in enumerate(range(0, COLS, 2)):
+        if mwave == O_M_WAVES - 1:
+            name = f"trnm{col}"
+            offset = R_STAGE_BYTES + ATT_BYTES + active_col * OUT_JOIN
+            out.extend(
+                [
+                    f"      %{name} = aiex.dma_configure_task_for @osh{col + 1} {{",
+                    f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {OUT_JOIN}, {dims(1, OUT_JOIN)}) {{burst_length = 0 : i32}}",
+                    "        aie.end",
+                    "      } {issue_token = true}",
+                    f"      aiex.dma_start_task(%{name})",
+                ]
+            )
         for block in range(3):
             for half in range(2):
                 name = f"trno{mwave}_{col}_{block}_{half}"
@@ -822,6 +864,14 @@ def start_norm_output_tasks(mwave):
 
 def await_norm_output_tasks(mwave):
     for col in range(0, COLS, 2):
+        if mwave == O_M_WAVES - 1:
+            name = f"trnm{col}"
+            out.extend(
+                [
+                    f"      aiex.dma_await_task(%{name})",
+                    f"      aiex.dma_free_task(%{name})",
+                ]
+            )
         for block in range(3):
             for half in range(2):
                 name = f"trno{mwave}_{col}_{block}_{half}"

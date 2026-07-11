@@ -48,19 +48,26 @@ void r34_output_projection_finish_pair_bf16(
 void r34_post_residual_pre_ffn(int8_t *restrict block0,
                                int8_t *restrict block1,
                                int8_t *restrict block2,
-                               const int8_t *restrict params_bytes) {
+                               const int8_t *restrict params_bytes,
+                               int8_t *restrict metadata_bytes,
+                               int32_t wave) {
   const auto *params = reinterpret_cast<const bfloat16 *>(params_bytes);
   const auto *residual = params + PARAM_RESIDUAL;
   const auto *post_norm = params + PARAM_POST_NORM;
   const auto *pre_norm = params + PARAM_PRE_NORM;
+  auto *metadata = reinterpret_cast<float *>(metadata_bytes) + wave * ROWS;
   const float epsilon =
       *reinterpret_cast<const float *>(params_bytes + PARAM_EPSILON_BYTES);
+  bfloat16 *blocks[] = {
+      reinterpret_cast<bfloat16 *>(block0),
+      reinterpret_cast<bfloat16 *>(block1),
+      reinterpret_cast<bfloat16 *>(block2),
+  };
 
   for (int row = 0; row < ROWS; ++row) {
     float output_sum = 0.0f;
     for (int block = 0; block < 3; ++block) {
-      const bfloat16 *values = select_block(block0, block1, block2, block)
-                               + row * BLOCK_COLS;
+      const bfloat16 *values = blocks[block] + row * BLOCK_COLS;
       for (int dim = 0; dim < BLOCK_COLS; dim += 16) {
         const auto value = aie::load_v<16>(values + dim);
         output_sum += aie::reduce_add(aie::mul(value, value).to_vector<float>());
@@ -71,8 +78,7 @@ void r34_post_residual_pre_ffn(int8_t *restrict block0,
 
     float residual_sum = 0.0f;
     for (int block = 0; block < 3; ++block) {
-      bfloat16 *values = select_block(block0, block1, block2, block)
-                         + row * BLOCK_COLS;
+      bfloat16 *values = blocks[block] + row * BLOCK_COLS;
       const int hidden_base = block * BLOCK_COLS;
       for (int dim = 0; dim < BLOCK_COLS; dim += 16) {
         const int hidden = hidden_base + dim;
@@ -93,9 +99,9 @@ void r34_post_residual_pre_ffn(int8_t *restrict block0,
     }
     const float pre_inverse =
         aie::invsqrt(residual_sum * INV_HIDDEN + epsilon);
+    metadata[row] = pre_inverse;
     for (int block = 0; block < 3; ++block) {
-      bfloat16 *values = select_block(block0, block1, block2, block)
-                         + row * BLOCK_COLS;
+      bfloat16 *values = blocks[block] + row * BLOCK_COLS;
       const int hidden_base = block * BLOCK_COLS;
       for (int dim = 0; dim < BLOCK_COLS; dim += 16) {
         const auto normalized =
@@ -109,14 +115,23 @@ void r34_post_residual_pre_ffn(int8_t *restrict block0,
   }
 }
 
-__attribute__((noinline, minsize)) void
+__attribute__((noinline, minsize, cold)) void
 r34_emit_norm_half(const int8_t *restrict block, int8_t *restrict output,
                    int32_t half) {
   const int source_half = half * 2048;
-  for (int offset = 0; offset < 2048; offset += 64) {
-    aie::store_v(output + offset,
-                 aie::load_v<64>(block + source_half + offset));
+  block += source_half;
+  for (int chunk = 0; chunk < 32; ++chunk) {
+    aie::store_v(output, aie::load_v<64>(block));
+    block += 64;
+    output += 64;
   }
+}
+
+__attribute__((noinline, minsize)) void
+r38_relay_pre_inverse(const int8_t *restrict input,
+                      int8_t *restrict output) {
+  aie::store_v(reinterpret_cast<float *>(output),
+               aie::load_v<16>(reinterpret_cast<const float *>(input)));
 }
 
 }

@@ -19,10 +19,10 @@ COMMON=(
 "$PEANO/bin/clang++" "$HERE/../r32/r32_attention_finish_pair_packed.cc" -c -o "$OUT/r32att.o" "${COMMON[@]}"
 "$PEANO/bin/clang++" "$HERE/../r32/r32_output_projection_m8.cc" -c -o "$OUT/r32out.o" "${COMMON[@]}"
 "$PEANO/bin/clang++" "$HERE/../r33/r33_paired_qkv.cc" -c -o "$OUT/r33pair.o" "${COMMON[@]}"
-"$PEANO/bin/clang++" "$HERE/r34_residual_norm.cc" -c -o "$OUT/r34norm.o" "${COMMON[@]}"
+"$PEANO/bin/clang++" "$HERE/r34_residual_norm.cc" -c -o "$OUT/r34norm.o" "${COMMON[@]}" -O1
 python "$HERE/../r29/r29_gen.py" --residual-norm > "$OUT/aie.mlir"
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge --peano="$PEANO" \
   --aie-generate-npu-insts --npu-insts-name="$OUT/insts.bin" \
   --aie-generate-xclbin --xclbin-name="$OUT/final.xclbin" --tmpdir="$OUT" >/dev/null
-printf 'op=resident-qkv-paired-attention-output-norm\nmode=w8-scaled\nm=256\nk=768\nn=1280\nroles=q0,q1,q2,k,v,o\ntails=post-attn-norm,residual,pre-ffn-norm\noutput=canonical-token-major-bf16\nhandoff=staging-prefix-dmabuf\n' > "$OUT/shape.txt"
+printf 'op=resident-qkv-paired-attention-output-norm\nmode=w8-scaled\nm=256\nk=768\nn=1280\nroles=q0,q1,q2,k,v,o\ntails=post-attn-norm,residual,pre-ffn-norm\noutput=canonical-token-major-bf16\nhandoff=staging-prefix-dmabuf\nstate=pre-ffn-inverse-f32\nstate-layout=active-column,core-row,wave,row\n' > "$OUT/shape.txt"
 echo "$OUT"

@@ -25,8 +25,9 @@ __attribute__((noinline)) bfloat16 exp_bf16(float value) {
 
 extern "C" {
 
-void r30_attention_load_q(const int8_t *restrict q_join,
-                          int8_t *restrict q_pair, int32_t pair_col) {
+__attribute__((minsize)) void
+r30_attention_load_q(const int8_t *restrict q_join,
+                     int8_t *restrict q_pair, int32_t pair_col) {
   const bfloat16 *source =
       reinterpret_cast<const bfloat16 *>(q_join) + pair_col * 2 * ATTN_QUERY_ELEMS;
   bfloat16 *target = reinterpret_cast<bfloat16 *>(q_pair);
@@ -34,7 +35,8 @@ void r30_attention_load_q(const int8_t *restrict q_join,
     aie::store_v(target + index, aie::load_v<16>(source + index));
 }
 
-void r30_attention_init(float *restrict accum, float *restrict stats) {
+__attribute__((minsize)) void r30_attention_init(float *restrict accum,
+                                                 float *restrict stats) {
   for (int query = 0; query < ATTN_QUERIES; ++query) {
     stats[query] = -3.0e30f;
     stats[ATTN_QUERIES + query] = 0.0f;

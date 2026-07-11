@@ -1392,3 +1392,44 @@ one image or batching layer phases within longer-lived contexts while retaining
 all inter-layer state on shared buffers. The post-FFN residual/tail, full model,
 generic OQ4/mixed/OQ8 +/++ hardware matrix, package-energy sweep, and 10k/15k
 end-to-end gates remain open.
+
+### R38 reconstructible attention-residual state checkpoint
+
+R38 extends the R34-to-R35 boundary with the missing scalar state needed to
+recover the attention residual after pre-FFN normalization. For each token,
+R34 now retains the pre-FFN inverse RMS value alongside the canonical BF16
+activation. A downstream tail can reconstruct the residual as
+`h / (pre_ffn_norm_weight * pre_ffn_inverse)` without draining a second
+M256-by-768 tensor from the attention context.
+
+The inverse state follows a deliberately narrow on-fabric path. Each even core
+aggregates its two M-wave vectors into one 64-byte ObjectFIFO object and sends
+it to its odd neighbor. The odd core relays that object into the first 64 bytes
+of its existing 2 KiB output object; the four core-row objects retain the
+existing 8 KiB memory-tile join. This avoids both a sixth DPU argument and a
+new memory-tile DMA input channel. A separate even-core output stream broke
+steady-state cadence, while a direct even-core-to-odd-memory-tile FIFO was
+rejected because the memory tile had no remaining input DMA channel. Relaying
+one object per M-wave also overflowed the odd program image; aggregating both
+waves removes that loop and halves the output-task count.
+
+Two `minsize` annotations on the attention load/init helpers recover the 96
+bytes needed for the relay without changing arithmetic. Final program text is
+16,368 bytes on even cores and 16,352 bytes on odd cores. The default R29
+generator remains byte-identical because every new graph object and task is
+gated by `--residual-norm`.
+
+The locked AIE2P oracle restores the established Q/K/V and normalized-output
+parity and measures pre-inverse cosine `0.99999994` with maximum absolute error
+`0.0028937`. Reconstructing the full attention residual from the emitted BF16
+activation reaches cosine `0.99990720` and maximum absolute error `0.0551744`.
+Twenty sustained R34 commands average `5.7747 ms`. The alternating R34/R35
+chain averages `22.8842 ms`, or 11,186.7 layer-boundary rows/s, with R35 alone
+at `10.2926 ms`. This remains above the one-layer 10k row/s threshold but is
+slower than R37's 11,797 rows/s; it is not an end-to-end encoder result.
+
+R38 proves the compact state contract only. The next slice is a resident
+post-FFN tail that consumes the R35 down-projection, reconstructs the attention
+residual, applies post-FFN RMSNorm, and leaves the completed layer state in a
+shared buffer. Full-model execution, generic OQ4/mixed/OQ8 `+/++` admission,
+package tokens/joule, and the 10k/15k end-to-end gates remain open.

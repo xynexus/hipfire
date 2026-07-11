@@ -91,6 +91,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("R34 cache missing shared staging-prefix handoff contract".into());
     }
+    if residual_norm
+        && ![
+            "state=pre-ffn-inverse-f32",
+            "state-layout=active-column,core-row,wave,row",
+        ]
+        .iter()
+        .all(|field| manifest.lines().any(|line| line == *field))
+    {
+        return Err("R38 cache missing pre-FFN inverse state contract".into());
+    }
     let pair_bytes = if attention { 16384 } else { 10240 };
     let a_bytes = 4 * 45 * pair_bytes;
     let r_stage_bytes = 5 * 48 * pair_bytes;
@@ -349,7 +359,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .copied()
             .map(hipfire_primitives::conv::bf16_bits_to_f32)
             .collect::<Vec<_>>();
-        let reference = residual_norm_reference(&output_reference, EPSILON);
+        let (reference, inverse_reference, residual_reference) =
+            residual_norm_reference(&output_reference, EPSILON);
         let measured = metrics(&got, &reference);
         if !measured.0.is_finite() || measured.0 < 0.9998 || measured.1 > 0.065 {
             return Err(format!(
@@ -361,8 +372,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
+        let inverse =
+            read_pre_inverse_metadata(r_buffer.as_slice(), r_stage_bytes + Layout::OUTPUT_BYTES);
+        let inverse_measured = metrics(&inverse, &inverse_reference);
+        if !inverse_measured.0.is_finite()
+            || inverse_measured.0 < 0.9999
+            || inverse_measured.1 > 0.02
+        {
+            return Err(format!(
+                "R38 pre-FFN inverse metadata parity failed: {inverse_measured:?}"
+            )
+            .into());
+        }
+        let reconstructed = got
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let token = index / 768;
+                let hidden = index % 768;
+                let pre_norm = hipfire_primitives::conv::bf16_bits_to_f32(
+                    hipfire_primitives::conv::f32_to_bf16_bits(
+                        0.91 + (hidden % 29) as f32 * 0.0015,
+                    ),
+                );
+                value / (pre_norm * inverse[token])
+            })
+            .collect::<Vec<_>>();
+        let reconstructed_measured = metrics(&reconstructed, &residual_reference);
+        if !reconstructed_measured.0.is_finite()
+            || reconstructed_measured.0 < 0.9998
+            || reconstructed_measured.1 > 0.08
+        {
+            return Err(format!(
+                "R38 attention residual reconstruction failed: {reconstructed_measured:?}"
+            )
+            .into());
+        }
         norm_bf16 = Some(got_bits);
-        Some(measured)
+        Some((measured, inverse_measured, reconstructed_measured))
     } else {
         None
     };
@@ -503,10 +550,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
     if residual_norm {
-        let norm = norm_metrics.expect("residual norm metrics");
+        let (norm, inverse, reconstructed) = norm_metrics.expect("residual norm metrics");
         let ffn = ffn_chain_metrics.expect("R34 to R35 FFN metrics");
         println!(
-            "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: staging_prefix_reused_for_norm=true q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_cosine={:.8} v_max={:.7} norm_full_cosine={:.8} norm_full_max={:.7} ffn_zero_copy_cosine={:.8} ffn_zero_copy_max={:.7} ffn_zero_copy_ms={:.4} zero_copy_chain_ms={:.4} zero_copy_chain_rows_s={:.1} dispatch_ms={dispatch_ms:.4}",
+            "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: staging_prefix_reused_for_norm=true q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_cosine={:.8} v_max={:.7} norm_full_cosine={:.8} norm_full_max={:.7} pre_inverse_cosine={:.8} pre_inverse_max={:.7} residual_reconstruct_cosine={:.8} residual_reconstruct_max={:.7} ffn_zero_copy_cosine={:.8} ffn_zero_copy_max={:.7} ffn_zero_copy_ms={:.4} zero_copy_chain_ms={:.4} zero_copy_chain_rows_s={:.1} dispatch_ms={dispatch_ms:.4}",
             q.0,
             q.1,
             k.0,
@@ -515,6 +562,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             v.1,
             norm.0,
             norm.1,
+            inverse.0,
+            inverse.1,
+            reconstructed.0,
+            reconstructed.1,
             ffn.0,
             ffn.1,
             ffn.2,
@@ -796,12 +847,41 @@ fn pack_residual_norm_params(epsilon: f32) -> Vec<u8> {
 }
 
 #[cfg(target_os = "linux")]
-fn residual_norm_reference(output: &[f32], epsilon: f32) -> Vec<f32> {
+fn read_pre_inverse_metadata(bytes: &[u8], base: usize) -> Vec<f32> {
+    const OUT_JOIN: usize = 8192;
+    const OUT_TILE: usize = 2048;
+    let mut output = vec![0.0f32; 256];
+    for mwave in 0..2 {
+        for active_col in 0..4 {
+            for core_row in 0..4 {
+                for row in 0..8 {
+                    let token = mwave * 128 + core_row * 32 + active_col * 8 + row;
+                    let offset = base
+                        + active_col * OUT_JOIN
+                        + core_row * OUT_TILE
+                        + mwave * 8 * size_of::<f32>()
+                        + row * size_of::<f32>();
+                    output[token] = f32::from_le_bytes(
+                        bytes[offset..offset + size_of::<f32>()]
+                            .try_into()
+                            .expect("pre-inverse metadata word"),
+                    );
+                }
+            }
+        }
+    }
+    output
+}
+
+#[cfg(target_os = "linux")]
+fn residual_norm_reference(output: &[f32], epsilon: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     use hipfire_primitives::conv::{bf16_bits_to_f32, f32_to_bf16_bits};
 
     const HIDDEN: usize = 768;
     let bf16 = |value: f32| bf16_bits_to_f32(f32_to_bf16_bits(value));
     let mut normalized = vec![0.0f32; output.len()];
+    let mut inverse = vec![0.0f32; 256];
+    let mut residual_output = vec![0.0f32; output.len()];
     let mut residual = vec![0.0f32; HIDDEN];
     for token in 0..256 {
         let source = &output[token * HIDDEN..(token + 1) * HIDDEN];
@@ -821,12 +901,14 @@ fn residual_norm_reference(output: &[f32], epsilon: f32) -> Vec<f32> {
         }
         let residual_sum = residual.iter().map(|value| value * value).sum::<f32>();
         let pre_inverse = (residual_sum / HIDDEN as f32 + epsilon).sqrt().recip();
+        inverse[token] = pre_inverse;
+        residual_output[token * HIDDEN..(token + 1) * HIDDEN].copy_from_slice(&residual);
         for hidden in 0..HIDDEN {
             let pre = bf16(0.91 + (hidden % 29) as f32 * 0.0015);
             normalized[token * HIDDEN + hidden] = bf16(residual[hidden] * pre * pre_inverse);
         }
     }
-    normalized
+    (normalized, inverse, residual_output)
 }
 
 #[cfg(target_os = "linux")]
