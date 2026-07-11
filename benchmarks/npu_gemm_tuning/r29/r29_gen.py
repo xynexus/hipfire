@@ -7,10 +7,17 @@ ATTENTION = "--attention" in sys.argv[1:]
 OUTPUT_PROJECTION = "--output-projection" in sys.argv[1:]
 OUTPUT_EXECUTION = OUTPUT_PROJECTION and "--no-output-execution" not in sys.argv[1:]
 OUTPUT_FIRST = "--attention-output-first" in sys.argv[1:]
+DIRECT_OUTPUT = "--direct-output-projection" in sys.argv[1:]
+if DIRECT_OUTPUT:
+    ATTENTION = True
+    OUTPUT_PROJECTION = True
+    OUTPUT_EXECUTION = True
 if OUTPUT_PROJECTION and not ATTENTION:
     raise SystemExit("--output-projection requires --attention")
 if OUTPUT_FIRST and (not ATTENTION or OUTPUT_PROJECTION):
     raise SystemExit("--attention-output-first requires standalone --attention")
+if DIRECT_OUTPUT and OUTPUT_FIRST:
+    raise SystemExit("--direct-output-projection cannot use --attention-output-first")
 OBJECT = "r30.o" if ATTENTION else "r29.o"
 OUTPUT_OBJECT = "r31.o"
 
@@ -19,7 +26,7 @@ GROUPS, M_MACROS, N_MACROS = 3, 3, 5
 OUTBLOCKS = M_MACROS * N_MACROS
 A_BLOCK, W_BLOCK = (16384 if ATTENTION else 10240), 16384
 ACC_ELEMS = 768
-O_ACC_ELEMS = 1024
+O_ACC_ELEMS = 256 if DIRECT_OUTPUT else 1024
 INBLOCKS = GROUPS * OUTBLOCKS
 A_BYTES = ROWS * INBLOCKS * A_BLOCK
 W_BYTES = COLS * INBLOCKS * W_BLOCK
@@ -28,14 +35,15 @@ QUERY_GROUPS = 6
 PAIR, PAIRS_PER_ROLE, ROLES = A_BLOCK, 48, 5
 R_STAGE_BYTES = ROLES * PAIRS_PER_ROLE * PAIR
 OUT_TILE, OUT_JOIN = 2048, 8192
+DIRECT_ATT_TILE = 4096
 Q_BYTES, KV_BYTES = 393216, 262144
 Q_JOIN, KV_TILE, K_HALF = 16384, 16384, 8192
 ATT_ACC, ATT_STATS, ATT_BYTES = 1024, 8, 393216
-O_GROUPS, O_SLICES, O_M_WAVES = 3, 6, 2
+O_GROUPS, O_SLICES, O_M_WAVES = 3, (24 if DIRECT_OUTPUT else 6), 2
 O_WEIGHTS_PER_COL = O_GROUPS * O_SLICES
 O_ACTIVE_COLS = COLS // 2
 O_W_BYTES = O_ACTIVE_COLS * O_WEIGHTS_PER_COL * W_BLOCK
-O_BYTES = 256 * 768 * 2
+O_BYTES = 256 * 768 * (4 if DIRECT_OUTPUT else 2)
 R_BYTES = R_STAGE_BYTES + (ATT_BYTES if ATTENTION else 0) + (
     O_BYTES if OUTPUT_PROJECTION else 0
 )
@@ -92,6 +100,13 @@ def output_projection_dims():
     )
 
 
+def direct_output_projection_dims():
+    return (
+        f"[<size = {ROWS}, stride = {32 * 768 * 4}>, "
+        f"<size = 8, stride = {768 * 4}>, <size = 256, stride = 1>]"
+    )
+
+
 def packed_attention_output_dims():
     return (
         f"[<size = {ROWS}, stride = {A_BLOCK}>, "
@@ -118,9 +133,12 @@ for col in range(COLS):
                 f'    %attq{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "attq{col}_{row}"}} : memref<{2 * OUT_TILE}xi8>',
             ]
         if OUTPUT_EXECUTION and col % 2 == 0:
-            out += [
-                f'    %oacc{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "oacc{col}_{row}"}} : memref<{O_ACC_ELEMS}xf32>',
-            ]
+            slices = range(2) if DIRECT_OUTPUT else range(1)
+            for output_slice in slices:
+                suffix = f"_{output_slice}" if DIRECT_OUTPUT else ""
+                out += [
+                    f'    %oacc{col}_{row}{suffix} = aie.buffer(%c{col}_{row}) {{sym_name = "oacc{col}_{row}{suffix}"}} : memref<{O_ACC_ELEMS}xf32>',
+                ]
 
 for col in range(COLS):
     cores = ", ".join(f"%c{col}_{row}" for row in range(ROWS))
@@ -129,6 +147,16 @@ for col in range(COLS):
         f"    aie.objectfifo @wbc{col}(%mt{col}, {{{cores}}}, 1 : i32) : !aie.objectfifo<memref<{W_BLOCK}xi8>>",
         f"    aie.objectfifo.link [@wsh{col}] -> [@wbc{col}] ([] [0])",
     ]
+
+if DIRECT_OUTPUT:
+    for row in range(ROWS):
+        for pair in range(COLS // 2):
+            source_col = pair * 2 + 1
+            target_col = pair * 2
+            name = f"ad{pair}_{row}"
+            out.append(
+                f"    aie.objectfifo @{name}(%c{source_col}_{row}, {{%c{target_col}_{row}}}, 3 : i32) : !aie.objectfifo<memref<{DIRECT_ATT_TILE}xi8>>"
+            )
 
 for row in range(ROWS):
     cores = ", ".join(f"%c{col}_{row}" for col in range(COLS))
@@ -159,20 +187,51 @@ out += [
     f'    func.func private @r29_pack_v(memref<{PAIR}xi8>, memref<{OUT_TILE}xi8>, i32) attributes {{link_with = "{OBJECT}"}}',
 ]
 if ATTENTION:
-    attention_finish = "r31_attention_finish_packed" if OUTPUT_FIRST else "r30_attention_finish"
-    attention_object = OUTPUT_OBJECT if OUTPUT_FIRST else OBJECT
+    attention_finish = (
+        "r32_attention_finish_pair_packed"
+        if DIRECT_OUTPUT
+        else "r31_attention_finish_packed"
+        if OUTPUT_FIRST
+        else "r30_attention_finish"
+    )
+    attention_object = "r32att.o" if DIRECT_OUTPUT else OUTPUT_OBJECT if OUTPUT_FIRST else OBJECT
     out += [
         f'    func.func private @r29_w8_projection_group(memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>, i32) attributes {{link_with = "{OBJECT}"}}',
         f'    func.func private @r30_attention_init(memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>) attributes {{link_with = "{OBJECT}"}}',
         f'    func.func private @r30_attention_load_q(memref<{A_BLOCK}xi8>, memref<{2 * OUT_TILE}xi8>, i32) attributes {{link_with = "{OBJECT}"}}',
         f'    func.func private @r30_attention_block(memref<{2 * OUT_TILE}xi8>, memref<{A_BLOCK}xi8>, memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, i32) attributes {{link_with = "{OBJECT}"}}',
-        f'    func.func private @{attention_finish}(memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{OUT_TILE}xi8>) attributes {{link_with = "{attention_object}"}}',
     ]
+    if DIRECT_OUTPUT:
+        out += [
+            f'    func.func private @{attention_finish}(memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{DIRECT_ATT_TILE}xi8>) attributes {{link_with = "{attention_object}"}}',
+        ]
+    else:
+        out += [
+            f'    func.func private @{attention_finish}(memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{OUT_TILE}xi8>) attributes {{link_with = "{attention_object}"}}',
+        ]
 if OUTPUT_EXECUTION:
+    output_group = (
+        "r32_output_projection_group_m8"
+        if DIRECT_OUTPUT
+        else "r31_output_projection_group"
+    )
+    output_finish = (
+        "r32_output_projection_finish_pair_m8"
+        if DIRECT_OUTPUT
+        else "r31_output_projection_finish"
+    )
+    output_object = "r32out.o" if DIRECT_OUTPUT else OUTPUT_OBJECT
     out += [
-        f'    func.func private @r31_output_projection_group(memref<{A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{O_ACC_ELEMS}xf32>, i32) attributes {{link_with = "{OUTPUT_OBJECT}"}}',
-        f'    func.func private @r31_output_projection_finish(memref<{O_ACC_ELEMS}xf32>, memref<{OUT_TILE}xi8>) attributes {{link_with = "{OUTPUT_OBJECT}"}}',
+        f'    func.func private @{output_group}(memref<{DIRECT_ATT_TILE if DIRECT_OUTPUT else A_BLOCK}xi8>, memref<{W_BLOCK}xi8>, memref<{O_ACC_ELEMS}xf32>, i32) attributes {{link_with = "{output_object}"}}',
     ]
+    if DIRECT_OUTPUT:
+        out += [
+            f'    func.func private @{output_finish}(memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>, memref<{OUT_TILE}xi8>) attributes {{link_with = "{output_object}"}}',
+        ]
+    else:
+        out += [
+            f'    func.func private @{output_finish}(memref<{O_ACC_ELEMS}xf32>, memref<{OUT_TILE}xi8>) attributes {{link_with = "{output_object}"}}',
+        ]
 
 
 def acquire_a(row, name, indent="        "):
@@ -193,6 +252,13 @@ def acquire_out(col, row, name, indent="        "):
     return [
         f"{indent}%{name} = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{OUT_TILE}xi8>>",
         f"{indent}%{name}v = aie.objectfifo.subview.access %{name}[0] : !aie.objectfifosubview<memref<{OUT_TILE}xi8>> -> memref<{OUT_TILE}xi8>",
+    ]
+
+
+def acquire_direct_attention(pair, row, name, indent="        "):
+    return [
+        f"{indent}%{name} = aie.objectfifo.acquire @ad{pair}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{DIRECT_ATT_TILE}xi8>>",
+        f"{indent}%{name}v = aie.objectfifo.subview.access %{name}[0] : !aie.objectfifosubview<memref<{DIRECT_ATT_TILE}xi8>> -> memref<{DIRECT_ATT_TILE}xi8>",
     ]
 
 
@@ -309,31 +375,76 @@ for col in range(COLS):
                 f"            aie.objectfifo.release @abc{row}(Consume, 1)",
                 "          }",
             ]
-            lines += acquire_out(col, row, "atto0", "          ")
-            lines += [
-                f"          func.call @{attention_finish}(%attacc0{col}_{row}, %attstats0{col}_{row}, %atto0v) : (memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{OUT_TILE}xi8>) -> ()",
-                f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
-            ]
-            lines += acquire_out(col, row, "atto1", "          ")
-            lines += [
-                f"          func.call @{attention_finish}(%attacc1{col}_{row}, %attstats1{col}_{row}, %atto1v) : (memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{OUT_TILE}xi8>) -> ()",
-                f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
-                "        }",
-            ]
+            if DIRECT_OUTPUT:
+                lines += acquire_direct_attention(col // 2, row, "attpair", "          ")
+                lines += [
+                    f"          func.call @{attention_finish}(%attacc0{col}_{row}, %attstats0{col}_{row}, %attacc1{col}_{row}, %attstats1{col}_{row}, %attpairv) : (memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{DIRECT_ATT_TILE}xi8>) -> ()",
+                    f"          aie.objectfifo.release @ad{col // 2}_{row}(Produce, 1)",
+                    "        }",
+                ]
+            else:
+                lines += acquire_out(col, row, "atto0", "          ")
+                lines += [
+                    f"          func.call @{attention_finish}(%attacc0{col}_{row}, %attstats0{col}_{row}, %atto0v) : (memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{OUT_TILE}xi8>) -> ()",
+                    f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                ]
+                lines += acquire_out(col, row, "atto1", "          ")
+                lines += [
+                    f"          func.call @{attention_finish}(%attacc1{col}_{row}, %attstats1{col}_{row}, %atto1v) : (memref<{ATT_ACC}xf32>, memref<{ATT_STATS}xf32>, memref<{OUT_TILE}xi8>) -> ()",
+                    f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                    "        }",
+                ]
         elif ATTENTION:
-            lines += ["        scf.for %agroup = %z to %qgroups step %one {"]
-            lines += acquire_a(row, "attqdrop", "          ")
-            lines += [
-                f"          aie.objectfifo.release @abc{row}(Consume, 1)",
-                "          scf.for %attblock = %z to %attblocks step %one {",
-            ]
-            lines += acquire_a(row, "attkvdrop", "            ")
-            lines += [
-                f"            aie.objectfifo.release @abc{row}(Consume, 1)",
-                "          }",
-                "        }",
-            ]
-        if OUTPUT_EXECUTION:
+            if DIRECT_OUTPUT:
+                lines += [
+                    "        scf.for %omwave = %z to %omwaves step %one {",
+                    "          scf.for %ogroup = %z to %ogroups step %one {",
+                ]
+                lines += acquire_a(row, "attqdrop", "            ")
+                lines += [
+                    f"            aie.objectfifo.release @abc{row}(Consume, 1)",
+                    "            scf.for %attblock = %z to %attblocks step %one {",
+                ]
+                lines += acquire_a(row, "attkvdrop", "              ")
+                lines += [
+                    f"              aie.objectfifo.release @abc{row}(Consume, 1)",
+                    "            }",
+                    "          }",
+                    f"          %oppair = aie.objectfifo.acquire @ad{col // 2}_{row}(Consume, 3) : !aie.objectfifosubview<memref<{DIRECT_ATT_TILE}xi8>>",
+                    f"          %opairs = arith.constant {O_SLICES // 2} : index",
+                    "          scf.for %opair = %z to %opairs step %one {",
+                ]
+                for local_slice in range(2):
+                    for group in range(O_GROUPS):
+                        lines += [
+                            f"            %opa{local_slice}_{group} = aie.objectfifo.subview.access %oppair[{group}] : !aie.objectfifosubview<memref<{DIRECT_ATT_TILE}xi8>> -> memref<{DIRECT_ATT_TILE}xi8>",
+                            f"            %wop{local_slice}_{group} = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{W_BLOCK}xi8>>",
+                            f"            %wop{local_slice}_{group}v = aie.objectfifo.subview.access %wop{local_slice}_{group}[0] : !aie.objectfifosubview<memref<{W_BLOCK}xi8>> -> memref<{W_BLOCK}xi8>",
+                            f"            func.call @{output_group}(%opa{local_slice}_{group}, %wop{local_slice}_{group}v, %oacc{col}_{row}_{local_slice}, {'%h0' if group == 0 else '%h1'}) : (memref<{DIRECT_ATT_TILE}xi8>, memref<{W_BLOCK}xi8>, memref<{O_ACC_ELEMS}xf32>, i32) -> ()",
+                            f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
+                        ]
+                lines += acquire_out(col, row, "opo", "            ")
+                lines += [
+                    f"            func.call @{output_finish}(%oacc{col}_{row}_0, %oacc{col}_{row}_1, %opov) : (memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>, memref<{OUT_TILE}xi8>) -> ()",
+                    f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                    "          }",
+                    f"          aie.objectfifo.release @ad{col // 2}_{row}(Consume, 3)",
+                    "        }",
+                ]
+            else:
+                lines += ["        scf.for %agroup = %z to %qgroups step %one {"]
+                lines += acquire_a(row, "attqdrop", "          ")
+                lines += [
+                    f"          aie.objectfifo.release @abc{row}(Consume, 1)",
+                    "          scf.for %attblock = %z to %attblocks step %one {",
+                ]
+                lines += acquire_a(row, "attkvdrop", "            ")
+                lines += [
+                    f"            aie.objectfifo.release @abc{row}(Consume, 1)",
+                    "          }",
+                    "        }",
+                ]
+        if OUTPUT_EXECUTION and not DIRECT_OUTPUT:
             if col % 2 == 0:
                 lines += [
                     "        scf.for %omwave = %z to %omwaves step %one {",
@@ -489,34 +600,83 @@ for phase, role in (("k", 3), ("v", 4)):
                 name = f"t{phase}o{wave}_{col}_{half}"
                 out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
 
-if ATTENTION:
-    for group in range(QUERY_GROUPS):
-        for pair in range(COLS // 2):
-            source_col = pair * 2 + 1
-            for lane in range(2):
-                target_col = pair * 2 + lane
-                name = f"tao{group}_{source_col}_{lane}"
-                if OUTPUT_FIRST:
-                    offset = group * ROWS * A_BLOCK + target_col * OUT_TILE
-                    output_length = OUT_TILE
-                    output_dimensions = packed_attention_output_dims()
-                    output_task_attributes = (
-                        f"issue_token = true, repeat_count = {ROWS - 1} : i32"
-                    )
-                else:
-                    offset = ATTENTION_BASE + (target_col * QUERY_GROUPS + group) * OUT_JOIN
-                    output_length = OUT_JOIN
-                    output_dimensions = dims(1, OUT_JOIN)
-                    output_task_attributes = "issue_token = true"
-                out += [
-                    f"      %{name} = aiex.dma_configure_task_for @osh{source_col} {{",
-                    f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {output_length}, {output_dimensions}) {{burst_length = 0 : i32}}",
+
+def start_direct_output_tasks(mwave, first_pair, pair_count):
+    for output_pair in range(first_pair, first_pair + pair_count):
+        for active_col, col in enumerate(range(0, COLS, 2)):
+            name = f"tdo{mwave}_{output_pair}_{col}"
+            offset = (
+                mwave * 128 * 768 * 4
+                + active_col * 8 * 768 * 4
+                + output_pair * 64 * 4
+            )
+            out.extend(
+                [
+                    f"      %{name} = aiex.dma_configure_task_for @osh{col} {{",
+                    f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {R_STAGE_BYTES + ATT_BYTES + offset}, {OUT_JOIN}, {direct_output_projection_dims()}) {{burst_length = 0 : i32}}",
                     "        aie.end",
-                    f"      }} {{{output_task_attributes}}}",
+                    "      } {issue_token = true}",
                     f"      aiex.dma_start_task(%{name})",
                 ]
+            )
+
+
+def await_direct_output_tasks(mwave, first_pair, pair_count):
+    for output_pair in range(first_pair, first_pair + pair_count):
+        for col in range(0, COLS, 2):
+            name = f"tdo{mwave}_{output_pair}_{col}"
+            out.extend(
+                [
+                    f"      aiex.dma_await_task(%{name})",
+                    f"      aiex.dma_free_task(%{name})",
+                ]
+            )
+
+
+if OUTPUT_EXECUTION and DIRECT_OUTPUT:
+    for active_col, col in enumerate(range(0, COLS, 2)):
+        name = f"tow{col}"
+        offset = W_BYTES + active_col * O_WEIGHTS_PER_COL * W_BLOCK
+        out += [
+            f"      %{name} = aiex.dma_configure_task_for @wsh{col} {{",
+            f"        aie.dma_bd(%W : memref<{TOTAL_W_BYTES}xi8>, {offset}, {O_WEIGHTS_PER_COL * W_BLOCK}, {dims(O_WEIGHTS_PER_COL, W_BLOCK)}) {{burst_length = 0 : i32}}",
+            "        aie.end",
+            f"      }} {{issue_token = true, repeat_count = {O_M_WAVES - 1} : i32}}",
+            f"      aiex.dma_start_task(%{name})",
+        ]
+    start_direct_output_tasks(0, 0, O_SLICES // 4)
+
+
+if ATTENTION:
+    attention_order = [0, 2, 4, 1, 3, 5] if DIRECT_OUTPUT else range(QUERY_GROUPS)
+    for execution_group, group in enumerate(attention_order):
+        if not DIRECT_OUTPUT:
+            for pair in range(COLS // 2):
+                source_col = pair * 2 + 1
+                for lane in range(2):
+                    target_col = pair * 2 + lane
+                    name = f"tao{execution_group}_{source_col}_{lane}"
+                    if OUTPUT_FIRST:
+                        offset = group * ROWS * A_BLOCK + target_col * OUT_TILE
+                        output_length = OUT_TILE
+                        output_dimensions = packed_attention_output_dims()
+                        output_task_attributes = (
+                            f"issue_token = true, repeat_count = {ROWS - 1} : i32"
+                        )
+                    else:
+                        offset = ATTENTION_BASE + (target_col * QUERY_GROUPS + group) * OUT_JOIN
+                        output_length = OUT_JOIN
+                        output_dimensions = dims(1, OUT_JOIN)
+                        output_task_attributes = "issue_token = true"
+                    out += [
+                        f"      %{name} = aiex.dma_configure_task_for @osh{source_col} {{",
+                        f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {output_length}, {output_dimensions}) {{burst_length = 0 : i32}}",
+                        "        aie.end",
+                        f"      }} {{{output_task_attributes}}}",
+                        f"      aiex.dma_start_task(%{name})",
+                    ]
         for row in range(ROWS):
-            qname = f"taqi{group}_{row}"
+            qname = f"taqi{execution_group}_{row}"
             qoffset = (row * QUERY_GROUPS + group) * Q_JOIN
             out += [
                 f"      %{qname} = aiex.dma_configure_task_for @ash{row} {{",
@@ -525,7 +685,7 @@ if ATTENTION:
                 "      } {issue_token = true}",
                 f"      aiex.dma_start_task(%{qname})",
             ]
-            kvname = f"takvi{group}_{row}"
+            kvname = f"takvi{execution_group}_{row}"
             out += [
                 f"      %{kvname} = aiex.dma_configure_task_for @ash{row} {{",
                 f"        aie.dma_bd(%KV : memref<{KV_BYTES}xi8>, 0, {KV_BYTES}, {dims(16, KV_TILE)}) {{burst_length = 0 : i32}}",
@@ -534,15 +694,37 @@ if ATTENTION:
                 f"      aiex.dma_start_task(%{kvname})",
             ]
         for row in range(ROWS):
-            for name in (f"taqi{group}_{row}", f"takvi{group}_{row}"):
+            for name in (
+                f"taqi{execution_group}_{row}",
+                f"takvi{execution_group}_{row}",
+            ):
                 out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
-        for pair in range(COLS // 2):
-            source_col = pair * 2 + 1
-            for lane in range(2):
-                name = f"tao{group}_{source_col}_{lane}"
-                out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
+        if not DIRECT_OUTPUT:
+            for pair in range(COLS // 2):
+                source_col = pair * 2 + 1
+                for lane in range(2):
+                    name = f"tao{execution_group}_{source_col}_{lane}"
+                    out += [
+                        f"      aiex.dma_await_task(%{name})",
+                        f"      aiex.dma_free_task(%{name})",
+                    ]
+        elif execution_group == O_GROUPS - 1:
+            await_direct_output_tasks(0, 0, O_SLICES // 4)
+            start_direct_output_tasks(0, O_SLICES // 4, O_SLICES // 4)
+            await_direct_output_tasks(0, O_SLICES // 4, O_SLICES // 4)
+            start_direct_output_tasks(1, 0, O_SLICES // 4)
+        elif execution_group == QUERY_GROUPS - 1:
+            await_direct_output_tasks(1, 0, O_SLICES // 4)
+            start_direct_output_tasks(1, O_SLICES // 4, O_SLICES // 4)
+            await_direct_output_tasks(1, O_SLICES // 4, O_SLICES // 4)
+            for col in range(0, COLS, 2):
+                name = f"tow{col}"
+                out += [
+                    f"      aiex.dma_await_task(%{name})",
+                    f"      aiex.dma_free_task(%{name})",
+                ]
 
-if OUTPUT_EXECUTION:
+if OUTPUT_EXECUTION and not DIRECT_OUTPUT:
     for active_col, col in enumerate(range(0, COLS, 2)):
         name = f"tow{col}"
         offset = W_BYTES + active_col * O_WEIGHTS_PER_COL * W_BLOCK

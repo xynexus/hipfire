@@ -24,9 +24,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("R29 verifier needs at least one iteration".into());
     }
     let manifest = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
-    let output_projection = manifest
+    let direct_output = manifest
         .lines()
-        .any(|line| line == "op=resident-qkv-attention-o");
+        .any(|line| line == "op=resident-qkv-attention-output-direct");
+    let output_projection = direct_output
+        || manifest
+            .lines()
+            .any(|line| line == "op=resident-qkv-attention-o");
     let packed_attention = manifest
         .lines()
         .any(|line| line == "op=resident-qkv-attention-packed");
@@ -35,7 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || manifest
             .lines()
             .any(|line| line == "op=resident-qkv-attention");
-    let operation = if output_projection {
+    let operation = if direct_output {
+        "op=resident-qkv-attention-output-direct"
+    } else if output_projection {
         "op=resident-qkv-attention-o"
     } else if packed_attention {
         "op=resident-qkv-attention-packed"
@@ -44,7 +50,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         "op=resident-qkv-headnorm-rope-pack"
     };
-    let mode = if output_projection {
+    let mode = if direct_output {
+        "mode=w8-scaled"
+    } else if output_projection {
         "mode=w8-qkv-bf16-o"
     } else {
         "mode=w8-scaled"
@@ -64,12 +72,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let r_stage_bytes = 5 * 48 * pair_bytes;
     let r_bytes = r_stage_bytes
         + if attention { Layout::OUTPUT_BYTES } else { 0 }
-        + if output_projection {
+        + if direct_output {
+            2 * Layout::OUTPUT_BYTES
+        } else if output_projection {
             Layout::OUTPUT_BYTES
         } else {
             0
         };
-    let w_bytes = QKV_W_BYTES + if output_projection { 4 * 18 * 16384 } else { 0 };
+    let w_bytes = QKV_W_BYTES
+        + if direct_output {
+            4 * 72 * 16384
+        } else if output_projection {
+            4 * 18 * 16384
+        } else {
+            0
+        };
 
     let activations = (0..Layout::TOKENS * K)
         .map(|index| (((index * 17 + index / 29) % 15) as i8) - 7)
@@ -100,7 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let packed_a = pack_activations(&activations, &activation_scales, pair_bytes);
     let output_weights = output_projection_weights();
     let mut packed_w = pack_weights(&weights, &weight_scales);
-    if output_projection {
+    if direct_output {
+        packed_w.extend_from_slice(&pack_output_projection_direct(&output_weights));
+    } else if output_projection {
         packed_w.extend_from_slice(&pack_output_projection(&output_weights));
     }
     let raw_staging = stage_positions_and_params(&cs, &qnorm, &knorm, EPSILON, pair_bytes);
@@ -141,7 +160,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             &r_buffer.as_slice()[r_stage_bytes..r_stage_bytes + Layout::OUTPUT_BYTES]
         };
-        let prime_output_nonzero = if output_projection {
+        let prime_output_nonzero = if direct_output {
+            r_buffer.as_slice()[r_stage_bytes + Layout::OUTPUT_BYTES..]
+                .iter()
+                .filter(|&&byte| byte != 0)
+                .count()
+        } else if output_projection {
             r_buffer.as_slice()
                 [r_stage_bytes + Layout::OUTPUT_BYTES..r_stage_bytes + 2 * Layout::OUTPUT_BYTES]
                 .iter()
@@ -150,11 +174,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             0
         };
-        eprintln!(
-            "R31 prime tails: attention_nonzero={} output_nonzero={}",
-            attention_region.iter().filter(|&&byte| byte != 0).count(),
-            prime_output_nonzero,
-        );
+        if direct_output {
+            eprintln!("R32 prime: output_nonzero={prime_output_nonzero}");
+        } else {
+            eprintln!(
+                "R31 prime tails: attention_nonzero={} output_nonzero={}",
+                attention_region.iter().filter(|&&byte| byte != 0).count(),
+                prime_output_nonzero,
+            );
+        }
     }
     r_buffer.as_mut_slice().copy_from_slice(&staged_r);
     q_buffer.as_mut_slice().fill(0);
@@ -168,7 +196,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     kernel.sync_output(&r_buffer)?;
     kernel.sync_output(&q_buffer)?;
     kernel.sync_output(&kv_buffer)?;
-
     let projected_got = read_projected(&r_buffer.as_slice()[raw_base..], pair_bytes);
     let q_got = read_q(q_buffer.as_slice());
     let k_got = read_kv(kv_buffer.as_slice(), true);
@@ -207,7 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let attention_reference_values = attention_reference(&q_got, &k_got, &v_got);
-    let attention_metrics = if attention {
+    let attention_metrics = if attention && !direct_output {
         let got = if packed_attention {
             unpack_projection_attention(&r_buffer.as_slice()[..Layout::OUTPUT_BYTES])
         } else {
@@ -244,16 +271,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_reference =
         output_projection_reference(&attention_reference_values, &output_weights);
     let output_metrics = if output_projection {
-        let got = r_buffer.as_slice()
-            [r_stage_bytes + Layout::OUTPUT_BYTES..r_stage_bytes + 2 * Layout::OUTPUT_BYTES]
-            .chunks_exact(2)
-            .map(|pair| {
-                hipfire_primitives::conv::bf16_bits_to_f32(u16::from_le_bytes([pair[0], pair[1]]))
-            })
-            .collect::<Vec<_>>();
+        let output = &r_buffer.as_slice()[r_stage_bytes + Layout::OUTPUT_BYTES..];
+        let got = if direct_output {
+            output
+                .chunks_exact(4)
+                .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                .collect::<Vec<_>>()
+        } else {
+            output[..Layout::OUTPUT_BYTES]
+                .chunks_exact(2)
+                .map(|pair| {
+                    hipfire_primitives::conv::bf16_bits_to_f32(u16::from_le_bytes([
+                        pair[0], pair[1],
+                    ]))
+                })
+                .collect::<Vec<_>>()
+        };
         let measured = metrics(&got, &output_reference);
         if !measured.0.is_finite() || measured.0 < 0.998 || measured.1 > 0.04 {
-            return Err(format!("R31 output projection parity failed: {measured:?}").into());
+            return Err(format!(
+                "R31/R32 output projection parity failed: {measured:?}; nonfinite={} nonzero={} got={:?} ref={:?}",
+                got.iter().filter(|value| !value.is_finite()).count(),
+                got.iter().filter(|&&value| value != 0.0).count(),
+                &got[..16],
+                &output_reference[..16],
+            )
+            .into());
         }
         Some(measured)
     } else {
@@ -345,7 +388,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
-    if let (Some(attention), Some(output), Some(runtime)) =
+    if direct_output {
+        let output = output_metrics.expect("direct output projection metrics");
+        println!(
+            "resident-w8-qkv-attention-output-direct M=256 K=768 N=1280: projection_cosine={:.8} projection_max={:.7} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_bit_mismatches={v_mismatches} output_cosine={:.8} output_max={:.7} dispatch_ms={dispatch_ms:.4}",
+            projection.0,
+            projection.1,
+            q.0,
+            q.1,
+            k.0,
+            k.1,
+            output.0,
+            output.1,
+        );
+    } else if let (Some(attention), Some(output), Some(runtime)) =
         (attention_metrics, output_metrics, runtime_metrics)
     {
         println!(
@@ -510,6 +566,34 @@ fn pack_output_projection(weights: &[u16]) -> Vec<u8> {
             let column_base = active_col * 192 + slice * 32;
             for group in 0..3 {
                 let block = (active_col * 18 + slice * 3 + group) * BLOCK;
+                for nt in 0..4 {
+                    for kt in 0..32 {
+                        for kk in 0..8 {
+                            for nn in 0..8 {
+                                let k = group * 256 + kt * 8 + kk;
+                                let n = column_base + nt * 8 + nn;
+                                let target = block + ((nt * 32 + kt) * 64 + kk * 8 + nn) * 2;
+                                packed[target..target + 2]
+                                    .copy_from_slice(&weights[k * 768 + n].to_le_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    packed
+}
+
+#[cfg(target_os = "linux")]
+fn pack_output_projection_direct(weights: &[u16]) -> Vec<u8> {
+    const BLOCK: usize = 16384;
+    let mut packed = vec![0u8; 4 * 72 * BLOCK];
+    for active_col in 0..4 {
+        for slice in 0..24 {
+            let column_base = slice * 32;
+            for group in 0..3 {
+                let block = (active_col * 72 + slice * 3 + group) * BLOCK;
                 for nt in 0..4 {
                     for kt in 0..32 {
                         for kk in 0..8 {

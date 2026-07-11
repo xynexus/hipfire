@@ -1066,3 +1066,76 @@ the 24 serial R30+R31 boundaries and `131.5 ms` in the still-separate resident
 FFN boundary. This remains far below the final throughput gate. Residual/norm,
 cross-context scheduling/overlap, FFN fusion, tail stages, 10k/15k admission,
 and competitive package tokens/J remain open.
+
+### R32 direct attention-to-output stream checkpoint
+
+R32 removes the R30-to-R31 external staging round trip and hardware-context
+switch. The first direct-stream graph joined four odd-column attention
+producers in a memory tile and broadcast a 16 KiB M32 activation block to the
+even output-projection cores. It was rejected by the allocator because an even
+core would need three FIFO inputs (`abc`, `wbc`, and the new attention join),
+while this AIE2P routing contract exposes only two. Moving the joins between
+memory tiles did not change that compute-tile limit.
+
+The admitted topology uses the programming manual's neighboring-AIE shared
+memory path instead: each odd attention core writes one 4 KiB pair containing
+eight token rows, and its adjacent even core acquires three such buffers with
+locks, one per K=256/head group. No DMA or third input stream is needed between
+those cores. Each even core owns eight tokens, streams all 24 N=32 output
+slices, and retains only two 256-float accumulators. Two adjacent slices are
+emitted together through the existing 2 KiB `oc` FIFO, so the earlier output
+DMA channel is reused rather than allocating another one.
+
+Two implementation failures narrowed the command contract. Fully unrolling
+the M8 schedule produced about 32.8 KiB of even-core text and overflowed
+program memory; retaining the output-pair loop reduced the linked image enough
+to load. Starting all twelve shim output BDs at once transferred only the first
+six pairs and left subsequent commands with stale locks. Running the BDs in two
+six-pair waves restores full coverage and sustained command reuse.
+
+The hardware oracle covers every token, K group, and output column. R32 retains
+projection cosine `0.99999182`, Q cosine `0.99999193`, K cosine `0.99999198`,
+and bit-exact V. Its final F32 output-projection result reaches cosine
+`0.99997223`, maximum absolute error `0.0000901`, and full 196,608-value
+coverage. Sustained 20- and 100-command processes average `4.6948 ms` and
+`4.5999 ms` per fused QKV/headnorm/RoPE/attention/output command.
+
+R32 is slower than the sum of the isolated raw R30 and R31 command times, but
+it eliminates the much larger runtime hardware-context reconciliation seen in
+the hybrid trace and establishes a compilable one-command stream boundary.
+The M8 ownership is also the required shape for local full-width RMS reductions:
+each even core owns all 768 columns for its eight tokens. The next extension is
+to retain the output in BF16 tile memory, apply post-attention norm/residual and
+pre-FFN norm locally, then stream directly into the resident FFN. R32 is not a
+complete layer or 10k/15k performance admission; residual/norm, FFN, tails,
+end-to-end generic-format quality, and package tokens/J remain open.
+
+#### Paper-guided R32 scheduling follow-up
+
+Taka et al., [*Striking the Balance: GEMM Performance Optimization Across
+Generations of Ryzen AI NPUs*](https://arxiv.org/html/2512.13282v1), provides a
+useful independent explanation for two R32 constraints. Compute tiles expose
+two S2MM and two MM2S channels, so the rejected three-input output core was not
+an allocator accident. The paper also treats shim BD capacity and
+reconfiguration as a first-order system cost: it keeps 15 of 16 BDs occupied,
+waits only for the corresponding output-completion token, then retires and
+reconfigures the associated input, weight, and output BDs while other transfers
+continue.
+
+That completion-driven schedule is the next R32 data-movement experiment. The
+current two-wave workaround drains six output-pair tasks before it configures
+the next six, introducing an avoidable command-processor bubble. The follow-up
+should test a rolling task window that retires an output task and immediately
+reuses its completed BD slot. It should also sweep the amount of contiguous
+output covered per task, selecting the smallest span at bandwidth saturation
+rather than maximizing L2 occupancy. Multi-dimensional shim and memory-tile
+addressing should retain the runtime's standard token-major layout and perform
+the tiling in flight.
+
+The paper's balanced-point method is more relevant than importing its best
+single-core tile literally. For each candidate schedule, measure core compute,
+effective DRAM bandwidth, command latency, and wall-clock fused-layer time;
+stop increasing reuse when reduced per-core efficiency outweighs transfer
+savings. R32's fused M=256 shape and neighbor-memory attention dependency differ
+from the paper's independent large-GEMM mapping, so any scheduling change still
+requires the existing full-coverage oracle and sustained multi-command test.
