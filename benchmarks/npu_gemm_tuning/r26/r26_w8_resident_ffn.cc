@@ -169,9 +169,24 @@ r26_geglu_padded(const int32 *__restrict accumulator_bits,
 }
 
 #ifdef R35_CANONICAL_BF16
+static inline aie::vector<bfloat16, 16>
+r41_bf16_component(aie::vector<float, 16> values, int component) {
+  const auto high = aie::mul(values, 1.0f).template to_vector<bfloat16>();
+  if (component == 0) return high;
+  const auto high_float =
+      aie::mul(high, aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+          .template to_vector<float>();
+  return aie::mul(aie::sub(values, high_float), 1.0f)
+      .template to_vector<bfloat16>();
+}
+
 extern "C" __attribute__((noinline, minsize)) void
 r35_finish_down48_bf16(const int32 *__restrict accumulator_bits,
-                       int8 *__restrict output_bytes, int lane) {
+                       int8 *__restrict output_bytes, int lane
+#ifdef R41_CANONICAL_BF16X2_OUTPUT
+                       , int component
+#endif
+                       ) {
   const float *accumulator = reinterpret_cast<const float *>(accumulator_bits);
   bfloat16 *output = reinterpret_cast<bfloat16 *>(output_bytes);
   for (int im = 0; im < 3; ++im)
@@ -181,23 +196,37 @@ r35_finish_down48_bf16(const int32 *__restrict accumulator_bits,
       const int j1 = (im * 3 + 1) * R26_SC + row * 16;
       const int j2 = (im * 3 + 2) * R26_SC + row * 16;
       if (lane == 0) {
+#ifdef R41_CANONICAL_BF16X2_OUTPUT
+        const auto head = r41_bf16_component(
+            aie::load_v<16>(accumulator + j0), component);
+        const auto j1_values = r41_bf16_component(
+            aie::load_v<16>(accumulator + j1), component);
+#else
         const auto head =
             aie::mul(aie::load_v<16>(accumulator + j0), 1.0f)
                 .template to_vector<bfloat16>();
         const auto j1_values =
             aie::mul(aie::load_v<16>(accumulator + j1), 1.0f)
                 .template to_vector<bfloat16>();
+#endif
         const auto bridge = aie::concat(head.template extract<8>(1),
                                         j1_values.template extract<8>(0));
         aie::store_v(destination, head);
         aie::store_v(destination + 16, bridge);
       } else {
+#ifdef R41_CANONICAL_BF16X2_OUTPUT
+        const auto j1_values = r41_bf16_component(
+            aie::load_v<16>(accumulator + j1), component);
+        const auto j2_values = r41_bf16_component(
+            aie::load_v<16>(accumulator + j2), component);
+#else
         const auto j1_values =
             aie::mul(aie::load_v<16>(accumulator + j1), 1.0f)
                 .template to_vector<bfloat16>();
         const auto j2_values =
             aie::mul(aie::load_v<16>(accumulator + j2), 1.0f)
                 .template to_vector<bfloat16>();
+#endif
         const auto head = aie::concat(j1_values.template extract<8>(1),
                                       j2_values.template extract<8>(0));
         aie::store_v(destination, head);

@@ -42,6 +42,8 @@ const ROWS_PER_CORE: usize = 8;
 const POST_NORM_OFFSET: usize = ROWS_PER_CORE * K * size_of::<u16>();
 const PRE_NORM_OFFSET: usize = POST_NORM_OFFSET + K * size_of::<u16>();
 const EPSILON_OFFSET: usize = PRE_NORM_OFFSET + K * size_of::<u16>();
+const PRE_INVERSE_BASE: usize = M * K * size_of::<u16>();
+const PRE_INVERSE_RECORD_BYTES: usize = ROWS_PER_CORE * K * size_of::<u16>();
 const MAX_CONTEXT_COMMANDS: usize = 1_000;
 
 /// Per-layer immutable R34 payload plus the input-scale template that must be
@@ -300,6 +302,35 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             .collect())
     }
 
+    /// Read the per-token inverse RMS exported by R38/R34 immediately after
+    /// the canonical H prefix. Physical records follow core-row then column;
+    /// map them back to canonical token order for host-side boundary probes.
+    pub fn read_pre_inverse_f32(&self) -> Result<Vec<f32>, XdnaError> {
+        self.kernel.sync_output(&self.hidden)?;
+        let bytes = self.hidden.as_slice();
+        let required = PRE_INVERSE_BASE + COLS * CORE_ROWS * PRE_INVERSE_RECORD_BYTES;
+        if bytes.len() < required {
+            return Err(invalid("resident layer pre-inverse backing is too small"));
+        }
+        let mut inverse = vec![0.0f32; M];
+        for core_row in 0..CORE_ROWS {
+            for column in 0..COLS {
+                let record = core_row * COLS + column;
+                let token_base = (column / 4) * 128 + core_row * 32 + (column % 4) * 8;
+                let start = PRE_INVERSE_BASE + record * PRE_INVERSE_RECORD_BYTES;
+                for row in 0..ROWS_PER_CORE {
+                    let offset = start + row * size_of::<f32>();
+                    inverse[token_base + row] = f32::from_le_bytes(
+                        bytes[offset..offset + size_of::<f32>()]
+                            .try_into()
+                            .expect("four-byte inverse"),
+                    );
+                }
+            }
+        }
+        Ok(inverse)
+    }
+
     fn dispatch(
         &self,
         weights: &NpuEmbeddingLayerAttentionDenseW8Weights,
@@ -539,5 +570,19 @@ mod tests {
         assert_eq!(staged.len(), R_STAGE_BYTES + ATTENTION_BYTES);
         assert!(HIDDEN_BACKING_BYTES >= staged.len());
         assert_eq!(ATTENTION_BYTES, M * K * 2);
+    }
+
+    #[test]
+    fn inverse_records_cover_each_token_once() {
+        let mut seen = vec![false; M];
+        for core_row in 0..CORE_ROWS {
+            for column in 0..COLS {
+                let token_base = (column / 4) * 128 + core_row * 32 + (column % 4) * 8;
+                for row in 0..ROWS_PER_CORE {
+                    assert!(!std::mem::replace(&mut seen[token_base + row], true));
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|value| value));
     }
 }

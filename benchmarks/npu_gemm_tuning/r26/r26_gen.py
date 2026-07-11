@@ -4,6 +4,9 @@
 import sys
 
 CANONICAL_BF16 = "--canonical-bf16-input" in sys.argv[1:]
+CANONICAL_BF16X2_OUTPUT = "--canonical-bf16x2-output" in sys.argv[1:]
+if CANONICAL_BF16X2_OUTPUT and not CANONICAL_BF16:
+    raise SystemExit("--canonical-bf16x2-output requires --canonical-bf16-input")
 
 COLS, CORE_ROWS = 8, 4
 M_MACROS, GATE_N_MACROS = 3, 6
@@ -26,7 +29,8 @@ PAD_M = 288
 O_ELEMS = PAD_M * OUTPUT
 CANONICAL_INPUT_BYTES = PAD_M * 768 * 2
 CANONICAL_T_BYTES = PAD_M * PAD_INTERMEDIATE * 2
-CANONICAL_OUTPUT_BYTES = PAD_M * OUTPUT * 2
+CANONICAL_OUTPUT_COMPONENTS = 3 if CANONICAL_BF16X2_OUTPUT else 1
+CANONICAL_OUTPUT_BYTES = PAD_M * OUTPUT * 2 * CANONICAL_OUTPUT_COMPONENTS
 INF = 9223372036854775807
 
 
@@ -75,7 +79,7 @@ def canonical_gate_output_dims():
 
 def canonical_down_output_dims():
     return (
-        f"[<size = {CORE_ROWS * 24}, stride = {OUTPUT * 2}>, "
+        f"[<size = {CORE_ROWS * 24}, stride = {OUTPUT * 2 * CANONICAL_OUTPUT_COMPONENTS}>, "
         "<size = 2, stride = 16>, <size = 32, stride = 1>]"
     )
 
@@ -174,7 +178,7 @@ decls = [
 ]
 if CANONICAL_BF16:
     decls.append(
-        ("r35_finish_down48_bf16", f"memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32")
+        ("r35_finish_down48_bf16", f"memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32" + (", i32" if CANONICAL_BF16X2_OUTPUT else ""))
     )
 for name, args in decls:
     out.append(
@@ -282,14 +286,26 @@ for col in range(COLS):
                 f"              aie.objectfifo.release @wbc{col}(Consume, 1)",
                 "            }",
             ]
-            for lane in range(2):
-                lines += [
-                    f"            %do{lane} = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>>",
-                    f"            %do{lane}v = aie.objectfifo.subview.access %do{lane}[0] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
-                    f"            %lane{lane} = arith.constant {lane} : i32",
-                    f"            func.call @r35_finish_down48_bf16(%gacc{col}_{row}, %do{lane}v, %lane{lane}) : (memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32) -> ()",
-                    f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
-                ]
+            for component in range(2 if CANONICAL_BF16X2_OUTPUT else 1):
+                for lane in range(2):
+                    suffix = f"{component}_{lane}"
+                    call_args = f"%gacc{col}_{row}, %do{suffix}v, %lane{suffix}"
+                    call_types = f"memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32"
+                    lines += [
+                        f"            %do{suffix} = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>>",
+                        f"            %do{suffix}v = aie.objectfifo.subview.access %do{suffix}[0] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
+                        f"            %lane{suffix} = arith.constant {lane} : i32",
+                    ]
+                    if CANONICAL_BF16X2_OUTPUT:
+                        lines += [
+                            f"            %component{suffix} = arith.constant {component} : i32",
+                            f"            func.call @r35_finish_down48_bf16({call_args}, %component{suffix}) : ({call_types}, i32) -> ()",
+                        ]
+                    else:
+                        lines.append(
+                            f"            func.call @r35_finish_down48_bf16({call_args}) : ({call_types}) -> ()"
+                        )
+                    lines.append(f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)")
             lines += ["          }", "        }"]
         else:
             input_fifo = f"xpair{col // 2}_{row}"
@@ -406,11 +422,13 @@ if not CANONICAL_BF16:
 if CANONICAL_BF16:
     for mblock in range(DOWN_MBLOCKS):
         for nmacro in range(2):
-            for lane in range(2):
+            for component in range(2 if CANONICAL_BF16X2_OUTPUT else 1):
+              for lane in range(2):
                 for col in range(COLS):
-                    name = f"do{col}_{mblock}_{nmacro}_{lane}"
+                    name = f"do{col}_{mblock}_{nmacro}_{component}_{lane}"
                     offset = (
-                        (mblock * 96) * OUTPUT
+                        (mblock * 96) * OUTPUT * CANONICAL_OUTPUT_COMPONENTS
+                        + component * OUTPUT
                         + nmacro * 384
                         + col * 48
                         + lane * 24
@@ -439,13 +457,14 @@ if CANONICAL_BF16:
                         f"      aiex.dma_await_task(%{name})",
                         f"      aiex.dma_free_task(%{name})",
                     ]
-            for lane in range(2):
-                for col in range(COLS):
-                    name = f"do{col}_{mblock}_{nmacro}_{lane}"
-                    out += [
-                        f"      aiex.dma_await_task(%{name})",
-                        f"      aiex.dma_free_task(%{name})",
-                    ]
+            for component in range(2 if CANONICAL_BF16X2_OUTPUT else 1):
+                for lane in range(2):
+                    for col in range(COLS):
+                        name = f"do{col}_{mblock}_{nmacro}_{component}_{lane}"
+                        out += [
+                            f"      aiex.dma_await_task(%{name})",
+                            f"      aiex.dma_free_task(%{name})",
+                        ]
 else:
     for mblock in range(DOWN_MBLOCKS):
         for col in range(COLS):

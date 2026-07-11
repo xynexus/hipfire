@@ -1523,3 +1523,51 @@ down-projection handoff and consume it before rounding the completed layer.
 Do not admit R40's full-model result or treat its package efficiency as meeting
 the goal. OQ4/mixed/OQ8 `+/++`, 10k/15k throughput, and admitted package
 tokens/J remain open.
+
+### R41 compensated FFN handoff and architectural-X correction
+
+R41 first tested the R40 hypothesis that canonical BF16 rounding at the R35
+down-projection boundary caused the real-model layer collapse. A new generic
+resident FFN ABI accepts the same canonical token-major BF16 H input but emits
+each F32 accumulator as compensated BF16x2 (`high + low`). High and low travel
+as two sequential records over the existing core-to-shim ObjectFIFO, so the
+image does not consume another memory-tile DMA channel. The tail consumes
+BF16x2 in two-token/four-phase tiles; an earlier four-token/two-phase image
+compiled with overlapping FIFO allocations and corrupted later token bands,
+so it was rejected. The admitted two-token image has no allocator warnings,
+uses a 3,440-byte core program, and reaches cosine `0.99999166` with maximum
+absolute error `0.0078125` in the locked tail oracle. The R41 FFN reconstructs
+against its F32 reference at cosine `0.99985433`, maximum error `0.0044407`, and
+`21.3356 ms` per measured synthetic command.
+
+The BF16x2 experiment exposed a more fundamental R40 bug. `project_layer` is
+called before attention, so R40's separate residual buffer contains the layer
+input, not the architectural post-attention state X required by
+`X + post_ffn_norm(Y)`. R34 already exports canonical H and the per-token
+pre-FFN inverse RMS. Reconstructing X from that state changes the real layer-0
+comparison from cosine `0.94952030` to `0.99997782` (minimum row cosine
+`0.99987070`, maximum error `4.5864868`). This proves that the wrong residual,
+not FFN BF16 rounding alone, caused the catastrophic R40 result.
+
+Six real-model layers remain non-invertible because their learned pre-FFN norm
+contains one exact zero: layers 8, 10, and 12 at dimension 39 and layers 20,
+21, and 23 at dimension 731. The layer-limit bisect shows the largest discrete
+drop when layer 8 is admitted (`0.99839473` through eight resident layers to
+`0.99488682` through nine). R41 therefore refuses the completed-layer shortcut
+for those six layers and uses the established path rather than inventing X.
+The resulting 18-layer hybrid reaches final embedding cosine `0.99606335`,
+maximum error `0.01134668`, `397.6` input tokens/s at M=256, average package
+power `23.03 W`, and `17.3` tokens/J. This is a large correction over R40's
+all-layer cosine `0.32072166`, but it is still below quality and throughput
+admission and is not a fully resident result.
+
+Two follow-up experiments were rejected. Compensating reconstructed X as
+BF16x2 did not recover information already lost in canonical BF16 H and reduced
+final cosine slightly to `0.99597490`. Replacing zero pre-norm weights with a
+temporary nonzero sentinel, reconstructing X, then restoring zero H columns
+before R35 admitted all 24 layers but reached only `0.99083066`; the sentinel
+perturbed the rounded H/inverse trajectory. The next correctness slice must
+export the one missing X exception value per token from R34 without changing
+the model arithmetic. Only after all 24 layers pass the real-model gate should
+the host reconstruction/copy be moved fully onto fabric and the context and
+throughput work resume.

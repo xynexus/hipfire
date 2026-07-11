@@ -10,8 +10,8 @@ use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
     NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuEmbeddingLayerAttentionDenseW8,
-    NpuEmbeddingLayerAttentionDenseW8Weights, NpuEmbeddingPostFfnDirectTail,
-    NpuEmbeddingPostFfnDirectTailParams, NpuOpusExecutor, NpuResidentAttentionDenseW8,
+    NpuEmbeddingLayerAttentionDenseW8Weights, NpuEmbeddingPostFfnDirectTailBf16x2,
+    NpuEmbeddingPostFfnDirectTailBf16x2Params, NpuOpusExecutor, NpuResidentAttentionDenseW8,
     NpuResidentAttentionDenseW8Weights, NpuResidentFfnDenseW8, NpuResidentFfnDenseW8Weights,
     NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode, NpuWholeScaledIoLayout,
     OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
@@ -112,8 +112,9 @@ struct ResidentLayerState {
     attention_weights: Vec<NpuEmbeddingLayerAttentionDenseW8Weights>,
     ffn: NpuResidentFfnDenseW8,
     ffn_weights: Vec<NpuResidentFfnDenseW8Weights>,
-    tail: NpuEmbeddingPostFfnDirectTail,
-    tail_params: Vec<NpuEmbeddingPostFfnDirectTailParams>,
+    tail: NpuEmbeddingPostFfnDirectTailBf16x2,
+    tail_params: Vec<NpuEmbeddingPostFfnDirectTailBf16x2Params>,
+    tail_pre_norms: Vec<Vec<u16>>,
     tail_post_norms: Vec<Vec<u16>>,
     io: Option<ResidentLayerIo>,
 }
@@ -124,7 +125,7 @@ struct ResidentLayerIo {
     _input: SharedGttBuffer,
     residual: SharedGttBuffer,
     _hidden: SharedGttBuffer,
-    _ffn: SharedGttBuffer,
+    ffn: SharedGttBuffer,
 }
 
 enum ResidentFfnState {
@@ -551,8 +552,8 @@ impl NpuOpusProjector {
             cache_root.join("embgemma_aie2p_resident_ffn_w4_m256_k768_i1152_o768");
         let resident_ffn_dense_w8_path =
             cache_root.join("embgemma_aie2p_resident_ffn_dense_w8_m256_k768_i1152_o768");
-        let resident_ffn_dense_w8_canonical_path = cache_root
-            .join("embgemma_aie2p_resident_ffn_dense_w8_canonical_bf16_m256_k768_i1152_o768");
+        let resident_layer_ffn_path = cache_root
+            .join("embgemma_aie2p_resident_ffn_dense_w8_canonical_bf16x2_m256_k768_i1152_o768");
         let resident_mode = resident_ffn_mode(&layers);
         if let Err(reason) = &resident_mode {
             eprintln!("embeddinggemma NPU: resident FFN unavailable: {reason}");
@@ -631,18 +632,14 @@ impl NpuOpusProjector {
         let resident_layer_attention_path = cache_root
             .join("embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_m256_k768_n1280");
         let resident_layer_tail_path =
-            cache_root.join("embgemma_aie2p_post_ffn_direct_tail_m256_k768");
+            cache_root.join("embgemma_aie2p_post_ffn_direct_tail_bf16x2_m256_k768");
         let resident_layer_requested =
             std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0");
         let resident_layer = if resident_layer_requested
             && cfg.hidden_size == 768
             && resident_ffn_mode(&layers).is_ok_and(|mode| mode == OpusResidentMode::DenseW8)
-            && resident_ffn_dense_w8_canonical_path
-                .join("final.xclbin")
-                .is_file()
-            && resident_ffn_dense_w8_canonical_path
-                .join("insts.bin")
-                .is_file()
+            && resident_layer_ffn_path.join("final.xclbin").is_file()
+            && resident_layer_ffn_path.join("insts.bin").is_file()
             && resident_layer_attention_path.join("final.xclbin").is_file()
             && resident_layer_attention_path.join("insts.bin").is_file()
             && resident_layer_tail_path.join("final.xclbin").is_file()
@@ -658,10 +655,11 @@ impl NpuOpusProjector {
             let tail_cache = resident_layer_tail_path
                 .to_str()
                 .expect("UTF-8 resident layer tail cache path");
-            let tail = NpuEmbeddingPostFfnDirectTail::load_cached(tail_cache).map_err(|error| {
-                format!("embeddinggemma NPU: load completed-layer tail: {error}")
-            })?;
-            let ffn_cache = resident_ffn_dense_w8_canonical_path
+            let tail =
+                NpuEmbeddingPostFfnDirectTailBf16x2::load_cached(tail_cache).map_err(|error| {
+                    format!("embeddinggemma NPU: load completed-layer tail: {error}")
+                })?;
+            let ffn_cache = resident_layer_ffn_path
                 .to_str()
                 .expect("UTF-8 completed-layer FFN cache path");
             let ffn = NpuResidentFfnDenseW8::load_cached(ffn_cache).map_err(|error| {
@@ -682,6 +680,7 @@ impl NpuOpusProjector {
                 })?;
             let mut attention_weights = Vec::with_capacity(layers.len());
             let mut tail_params = Vec::with_capacity(layers.len());
+            let mut tail_pre_norms = Vec::with_capacity(layers.len());
             let mut tail_post_norms = Vec::with_capacity(layers.len());
             let zero_residual = vec![0u16; 256 * cfg.hidden_size];
             for (layer_idx, layer) in layers.iter().enumerate() {
@@ -748,6 +747,7 @@ impl NpuOpusProjector {
                             )
                         })?,
                 );
+                tail_pre_norms.push(pre_ffn_norm);
                 tail_post_norms.push(post_ffn_norm);
             }
             Some(ResidentLayerState {
@@ -757,6 +757,7 @@ impl NpuOpusProjector {
                 ffn_weights,
                 tail,
                 tail_params,
+                tail_pre_norms,
                 tail_post_norms,
                 io: None,
             })
@@ -1117,6 +1118,17 @@ impl LinearProjector for NpuOpusProjector {
                 "missing completed resident layer {layer_idx}"
             )));
         }
+        if self
+            .resident_layer
+            .as_ref()
+            .and_then(|state| state.tail_pre_norms.get(layer_idx))
+            .is_some_and(|norm| norm.iter().any(|&bits| bits & 0x7fff == 0))
+        {
+            // H = pre_ffn_norm(X) loses X where the learned norm is exactly
+            // zero. Keep those six layers on the established path until R34
+            // exports the single exception value per token.
+            return Ok(false);
+        }
 
         let needs_io = self
             .resident_layer
@@ -1128,8 +1140,9 @@ impl LinearProjector for NpuOpusProjector {
             let mut hidden =
                 gpu.alloc_shared_gtt(NpuEmbeddingLayerAttentionDenseW8::hidden_backing_bytes())?;
             let mut residual =
-                gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTail::shared_state_bytes())?;
-            let mut ffn = gpu.alloc_shared_gtt(NpuResidentFfnDenseW8::canonical_output_bytes())?;
+                gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::residual_bytes())?;
+            let mut ffn =
+                gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::combined_bytes())?;
             input.as_mut_slice().fill(0);
             hidden.as_mut_slice().fill(0);
             residual.as_mut_slice().fill(0);
@@ -1167,10 +1180,10 @@ impl LinearProjector for NpuOpusProjector {
             state
                 .tail
                 .attach_shared_state(
-                    residual.dmabuf_fd(),
-                    residual.len(),
                     ffn.dmabuf_fd(),
                     ffn.len(),
+                    residual.dmabuf_fd(),
+                    residual.len(),
                 )
                 .map_err(|error| hip_error(format!("attach completed-layer tail: {error}")))?;
             state.io = Some(ResidentLayerIo {
@@ -1179,7 +1192,7 @@ impl LinearProjector for NpuOpusProjector {
                 _input: input,
                 residual,
                 _hidden: hidden,
-                _ffn: ffn,
+                ffn,
             });
         }
 
@@ -1268,16 +1281,39 @@ impl LinearProjector for NpuOpusProjector {
             .map_err(|error| {
                 hip_error(format!("completed-layer attention {layer_idx}: {error}"))
             })?;
+        let resident_hidden = state
+            .attention
+            .read_hidden_f32()
+            .map_err(|error| hip_error(format!("read resident hidden {layer_idx}: {error}")))?;
+        let pre_inverse = state.attention.read_pre_inverse_f32().map_err(|error| {
+            hip_error(format!("read resident pre-inverse {layer_idx}: {error}"))
+        })?;
+        let reconstructed_x = reconstruct_attention_residual_bf16(
+            &resident_hidden,
+            &pre_inverse,
+            &state.tail_pre_norms[layer_idx],
+            &residual,
+            rows,
+            768,
+        )?;
         if compare_this_layer_enabled() {
-            self.debug_resident_hidden =
-                Some(state.attention.read_hidden_f32().map_err(|error| {
-                    hip_error(format!("read resident hidden {layer_idx}: {error}"))
-                })?);
+            self.debug_resident_hidden = Some(resident_hidden);
         }
         state
             .ffn
             .run_shared(&state.ffn_weights[layer_idx])
             .map_err(|error| hip_error(format!("completed-layer FFN {layer_idx}: {error}")))?;
+        write_residual_component(
+            state
+                .io
+                .as_mut()
+                .expect("completed resident layer I/O")
+                .ffn
+                .as_mut_slice(),
+            &reconstructed_x,
+            rows,
+            768,
+        )?;
         if compare_this_layer_enabled() {
             self.debug_resident_ffn =
                 Some(state.ffn.read_canonical_output_f32().map_err(|error| {
@@ -1297,7 +1333,7 @@ impl LinearProjector for NpuOpusProjector {
             .map_err(|error| hip_error(format!("read completed layer {layer_idx}: {error}")))?;
         if compare_this_layer_enabled() {
             let expected = direct_tail_reference(
-                &residual,
+                &reconstructed_x,
                 self.debug_resident_ffn
                     .as_ref()
                     .expect("resident FFN debug output"),
@@ -2158,6 +2194,64 @@ fn direct_tail_reference(
         }
     }
     output
+}
+
+fn write_residual_component(
+    destination: &mut [u8],
+    residual: &[u16],
+    rows: usize,
+    hidden: usize,
+) -> HipResult<()> {
+    if residual.len() != rows * hidden || destination.len() < rows * hidden * 3 * 2 {
+        return Err(hip_error(
+            "completed-layer BF16x2 residual component geometry mismatch",
+        ));
+    }
+    for row in 0..rows {
+        let source = &residual[row * hidden..(row + 1) * hidden];
+        let start = (row * 3 * hidden + 2 * hidden) * size_of::<u16>();
+        for (encoded, &value) in destination[start..start + hidden * 2]
+            .chunks_exact_mut(2)
+            .zip(source)
+        {
+            encoded.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn reconstruct_attention_residual_bf16(
+    hidden: &[f32],
+    pre_inverse: &[f32],
+    pre_norm: &[u16],
+    fallback: &[u16],
+    rows: usize,
+    width: usize,
+) -> HipResult<Vec<u16>> {
+    if hidden.len() != rows * width
+        || pre_inverse.len() != rows
+        || pre_norm.len() != width
+        || fallback.len() != rows * width
+    {
+        return Err(hip_error(
+            "completed-layer reconstructible residual geometry mismatch",
+        ));
+    }
+    let mut output = Vec::with_capacity(hidden.len());
+    for row in 0..rows {
+        let inverse = pre_inverse[row];
+        for column in 0..width {
+            let index = row * width + column;
+            let weight = f32::from_bits((pre_norm[column] as u32) << 16);
+            let scale = weight * inverse;
+            if scale.is_finite() && scale != 0.0 {
+                output.push(f32_to_bf16_bits(hidden[index] / scale));
+            } else {
+                output.push(fallback[index]);
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn hip_error(message: impl AsRef<str>) -> HipError {

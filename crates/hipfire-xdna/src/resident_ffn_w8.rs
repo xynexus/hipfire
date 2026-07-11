@@ -49,6 +49,10 @@ pub struct NpuResidentFfnDenseW8Weights {
 pub enum NpuResidentFfnDenseW8IoMode {
     PackedF32,
     CanonicalBf16,
+    /// Token-major BF16 input with compensated token-major BF16x2 output.
+    /// This preserves the accumulator precision required by a following
+    /// post-FFN RMSNorm while retaining the compact canonical input ABI.
+    CanonicalBf16Bf16x2Output,
 }
 
 pub struct NpuResidentFfnDenseW8 {
@@ -286,7 +290,11 @@ impl NpuResidentFfnDenseW8 {
         weights: &NpuResidentFfnDenseW8Weights,
         input: &[u16],
     ) -> Result<Vec<f32>, XdnaError> {
-        if self.io_mode != NpuResidentFfnDenseW8IoMode::CanonicalBf16 {
+        if !matches!(
+            self.io_mode,
+            NpuResidentFfnDenseW8IoMode::CanonicalBf16
+                | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
+        ) {
             return Err(invalid(
                 "resident dense-W8 FFN cache does not accept canonical BF16 input",
             ));
@@ -311,16 +319,25 @@ impl NpuResidentFfnDenseW8 {
     }
 
     pub fn read_canonical_output_f32(&self) -> Result<Vec<f32>, XdnaError> {
-        if self.io_mode != NpuResidentFfnDenseW8IoMode::CanonicalBf16 {
-            return Err(invalid(
-                "resident dense-W8 FFN cache does not produce canonical BF16 output",
-            ));
+        match self.io_mode {
+            NpuResidentFfnDenseW8IoMode::CanonicalBf16 => {
+                decode_canonical_bf16_rows(self.output.as_slice(), M, OUTPUT)
+            }
+            NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output => {
+                decode_canonical_bf16x2_rows(self.output.as_slice(), M, OUTPUT)
+            }
+            NpuResidentFfnDenseW8IoMode::PackedF32 => Err(invalid(
+                "resident dense-W8 FFN cache does not use canonical row-major output",
+            )),
         }
-        decode_canonical_bf16_rows(self.output.as_slice(), M, OUTPUT)
     }
 
     pub fn read_canonical_intermediate_f32(&self) -> Result<Vec<f32>, XdnaError> {
-        if self.io_mode != NpuResidentFfnDenseW8IoMode::CanonicalBf16 {
+        if !matches!(
+            self.io_mode,
+            NpuResidentFfnDenseW8IoMode::CanonicalBf16
+                | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
+        ) {
             return Err(invalid(
                 "resident dense-W8 FFN cache has no canonical BF16 intermediate",
             ));
@@ -388,6 +405,32 @@ fn decode_canonical_bf16_rows(
         .collect())
 }
 
+fn decode_canonical_bf16x2_rows(
+    bytes: &[u8],
+    rows: usize,
+    columns: usize,
+) -> Result<Vec<f32>, XdnaError> {
+    let required = rows * columns * 3 * size_of::<u16>();
+    if bytes.len() < required {
+        return Err(invalid(format!(
+            "canonical BF16x2 buffer wants at least {required} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut output = Vec::with_capacity(rows * columns);
+    let row_bytes = columns * 3 * size_of::<u16>();
+    for row in bytes[..required].chunks_exact(row_bytes) {
+        let (high, low) = row.split_at(columns * size_of::<u16>());
+        for (high, low) in high.chunks_exact(2).zip(low.chunks_exact(2)) {
+            output.push(
+                bf16_bits_to_f32(u16::from_le_bytes([high[0], high[1]]))
+                    + bf16_bits_to_f32(u16::from_le_bytes([low[0], low[1]])),
+            );
+        }
+    }
+    Ok(output)
+}
+
 fn decode_canonical_bf16_rows_strided(
     bytes: &[u8],
     rows: usize,
@@ -415,14 +458,16 @@ fn decode_canonical_bf16_rows_strided(
 const fn input_bytes_for(mode: NpuResidentFfnDenseW8IoMode) -> usize {
     match mode {
         NpuResidentFfnDenseW8IoMode::PackedF32 => ROW_STRIPES * GATE_BLOCKS * DATA_JOIN,
-        NpuResidentFfnDenseW8IoMode::CanonicalBf16 => CANONICAL_INPUT_BYTES,
+        NpuResidentFfnDenseW8IoMode::CanonicalBf16
+        | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output => CANONICAL_INPUT_BYTES,
     }
 }
 
 const fn scratch_bytes_for(mode: NpuResidentFfnDenseW8IoMode) -> usize {
     match mode {
         NpuResidentFfnDenseW8IoMode::PackedF32 => T_ROWS * T_STRIDE * size_of::<f32>(),
-        NpuResidentFfnDenseW8IoMode::CanonicalBf16 => CANONICAL_SCRATCH_BYTES,
+        NpuResidentFfnDenseW8IoMode::CanonicalBf16
+        | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output => CANONICAL_SCRATCH_BYTES,
     }
 }
 
@@ -430,6 +475,9 @@ const fn output_bytes_for(mode: NpuResidentFfnDenseW8IoMode) -> usize {
     match mode {
         NpuResidentFfnDenseW8IoMode::PackedF32 => PAD_M * OUTPUT * size_of::<f32>(),
         NpuResidentFfnDenseW8IoMode::CanonicalBf16 => CANONICAL_OUTPUT_BYTES,
+        NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output => {
+            PAD_M * OUTPUT * 3 * size_of::<u16>()
+        }
     }
 }
 
@@ -446,6 +494,18 @@ fn parse_io_mode(manifest: &str) -> Result<NpuResidentFfnDenseW8IoMode, XdnaErro
     {
         return Ok(NpuResidentFfnDenseW8IoMode::CanonicalBf16);
     }
+    if manifest
+        .lines()
+        .any(|line| line == "mode=dense-w8-canonical-bf16-bf16x2-output")
+        && manifest
+            .lines()
+            .any(|line| line == "input=token-major-bf16")
+        && manifest
+            .lines()
+            .any(|line| line == "output=token-major-bf16x2")
+    {
+        return Ok(NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output);
+    }
     Err(invalid(
         "resident dense-W8 FFN cache has no supported mode/input contract",
     ))
@@ -460,7 +520,8 @@ const fn down_block_index(
     GATE_BLOCKS
         + match mode {
             NpuResidentFfnDenseW8IoMode::PackedF32 => (mblock * DOWN_GROUPS + group) * 2 + nmacro,
-            NpuResidentFfnDenseW8IoMode::CanonicalBf16 => {
+            NpuResidentFfnDenseW8IoMode::CanonicalBf16
+            | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output => {
                 (mblock * 2 + nmacro) * DOWN_GROUPS + group
             }
         }
@@ -636,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_selects_legacy_or_canonical_bf16_contract() {
+    fn manifest_selects_packed_bf16_or_precision_preserving_contract() {
         assert_eq!(
             parse_io_mode("op=resident_ffn\nmode=dense-w8\n").unwrap(),
             NpuResidentFfnDenseW8IoMode::PackedF32
@@ -648,7 +709,18 @@ mod tests {
             .unwrap(),
             NpuResidentFfnDenseW8IoMode::CanonicalBf16
         );
+        assert_eq!(
+            parse_io_mode(
+                "op=resident_ffn\nmode=dense-w8-canonical-bf16-bf16x2-output\ninput=token-major-bf16\noutput=token-major-bf16x2\n"
+            )
+            .unwrap(),
+            NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
+        );
         assert!(parse_io_mode("mode=dense-w8-canonical-bf16\n").is_err());
+        assert!(parse_io_mode(
+            "mode=dense-w8-canonical-bf16-bf16x2-output\ninput=token-major-bf16\n"
+        )
+        .is_err());
     }
 
     #[test]
@@ -663,6 +735,15 @@ mod tests {
         );
         assert_eq!(
             down_block_index(NpuResidentFfnDenseW8IoMode::CanonicalBf16, 1, 3, 1),
+            GATE_BLOCKS + 18
+        );
+        assert_eq!(
+            down_block_index(
+                NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output,
+                1,
+                3,
+                1
+            ),
             GATE_BLOCKS + 18
         );
     }

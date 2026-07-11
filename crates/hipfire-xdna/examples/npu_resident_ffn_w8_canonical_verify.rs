@@ -56,7 +56,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let mut executor = NpuResidentFfnDenseW8::load_cached(&cache)?;
-    if executor.io_mode() != NpuResidentFfnDenseW8IoMode::CanonicalBf16 {
+    if !matches!(
+        executor.io_mode(),
+        NpuResidentFfnDenseW8IoMode::CanonicalBf16
+            | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
+    ) {
         return Err("cache did not select the canonical-BF16 ABI".into());
     }
     let weights = executor.upload_weights(&gate, &up, &down)?;
@@ -86,11 +90,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bf16_bits_to_f32(f32_to_bf16_bits(gelu * up))
         })
         .collect::<Vec<_>>();
-    let reference = down
-        .reference_f32(M, &intermediate)?
-        .into_iter()
-        .map(|value| bf16_bits_to_f32(f32_to_bf16_bits(value)))
-        .collect::<Vec<_>>();
+    let mut reference = down.reference_f32(M, &intermediate)?;
+    if executor.io_mode() == NpuResidentFfnDenseW8IoMode::CanonicalBf16 {
+        reference.iter_mut().for_each(|value| {
+            *value = bf16_bits_to_f32(f32_to_bf16_bits(*value));
+        });
+    }
     let reference_ms = reference_started.elapsed().as_secs_f64() * 1e3;
 
     let output = executor.run_canonical_bf16(&weights, &input_bf16)?;

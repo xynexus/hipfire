@@ -237,6 +237,10 @@ pub mod post_ffn_direct_tail;
 pub use post_ffn_direct_tail::{
     NpuEmbeddingPostFfnDirectTail, NpuEmbeddingPostFfnDirectTailParams,
 };
+pub mod post_ffn_direct_tail_bf16x2;
+pub use post_ffn_direct_tail_bf16x2::{
+    NpuEmbeddingPostFfnDirectTailBf16x2, NpuEmbeddingPostFfnDirectTailBf16x2Params,
+};
 
 #[cfg(target_os = "linux")]
 pub mod resident_embedding_layer;
