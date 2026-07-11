@@ -523,3 +523,28 @@ only W4 is integrated, arbitrary mixed overlays are absent, and attention,
 full-model throughput, 10k/15k admission, and package tokens/J remain open.
 The next schedule must stripe the 24 rows across columns and gather one packed
 activation block before the down MMUL.
+
+### Parallel pack-to-down checkpoint
+
+R22 stripes each 24-row activation block across all eight compute columns, so
+every core vector-packs three rows rather than one core packing all 24. Each
+core keeps a 784-byte fragment and all-gathers the other seven fragments over
+direct core streams, leaving both DMA inputs available for activations and
+weights. Adjacent columns share six-row memory-tile outputs to remain within
+the memory tile's output-DMA limit.
+
+A closed stream ring did not make forward progress: the circuit-switched path
+has no cycle-breaking buffer, and Peano also initially bundled blocking send
+and receive operations into one VLIW instruction. The admitted schedule uses
+eight acyclic token broadcasts over the physical ring. Each owner sends through
+seven hops; its predecessor receives without forwarding, so no broadcast
+closes the cycle. An acyclic `col0 -> col1` probe first proved direct-stream
+payload correctness before enabling the complete all-gather.
+
+Three independent 100-iteration M256 W4 runs agree with the CPU oracle for all
+196,608 outputs, with maximum absolute error `1.4e-6`. Dispatches are 0.9967,
+0.9974, and 0.9743 ms (median 0.9967 ms), 2.59 times faster than R21's 2.5797
+ms median. This is still a combined pack/down projection rather than a complete
+FFN: R22 consumes a host-arranged group stream instead of R18's in-array GeGLU
+output, and W8, arbitrary mixed overlays, attention, full-model 10k/15k
+admission, and package tokens/J remain open.

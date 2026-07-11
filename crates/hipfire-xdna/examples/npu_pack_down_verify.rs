@@ -149,6 +149,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("first mismatch row={row} col={col} got={got} expected={expected}");
     }
     if mismatches != 0 {
+        let nonzero = output.iter().filter(|&&value| value != 0.0).count();
+        eprintln!("nonzero physical outputs: {nonzero}/{}", output.len());
+        eprintln!("first physical outputs: {:?}", &output[..16]);
         return Err(
             format!("R21 parity failed: mismatches={mismatches} max_abs={max_abs:.7}").into(),
         );
