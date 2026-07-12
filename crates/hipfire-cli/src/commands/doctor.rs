@@ -79,6 +79,7 @@ pub async fn run(args: DoctorArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     check_npu_driver_firmware(&mut report);
     check_sysinfo(&mut report);
     check_hip_runtime(&mut report, &mut ctx);
+    check_gfx1103_cwsr(&mut report, ctx.arch.as_deref());
     check_rocm_tools(&mut report);
     check_kernel_cache(&mut report, &loaded, ctx.arch.as_deref());
     report.daemon_started = check_lock(&mut report);
@@ -758,6 +759,98 @@ fn check_hip_runtime(report: &mut DoctorReport, ctx: &mut DoctorContext) {
     }
 }
 
+const CWSR_ENABLE_PATH: &str = "/sys/module/amdgpu/parameters/cwsr_enable";
+
+fn check_gfx1103_cwsr(report: &mut DoctorReport, arch: Option<&str>) {
+    let Some(arch) = arch else {
+        return;
+    };
+    let value = fs::read_to_string(CWSR_ENABLE_PATH)
+        .map(|value| value.trim().to_string())
+        .map_err(|err| err.to_string());
+    if let Some(check) = build_gfx1103_cwsr_check(arch, value) {
+        report.checks.push(check);
+    }
+}
+
+fn build_gfx1103_cwsr_check(arch: &str, value: Result<String, String>) -> Option<DoctorCheck> {
+    if arch.split(':').next() != Some("gfx1103") {
+        return None;
+    }
+
+    let remedy =
+        "set the kernel command line to amdgpu.cwsr_enable=0, reboot, and rerun hipfire doctor";
+    Some(match value {
+        Ok(value) => match parse_module_bool(&value) {
+            Some(false) => DoctorCheck {
+                id: "driver.gpu_cwsr",
+                status: CheckStatus::Pass,
+                message: "gfx1103 CWSR is off; the LDS/preemption workaround is active"
+                    .to_string(),
+                details: json!({
+                    "arch": arch,
+                    "path": CWSR_ENABLE_PATH,
+                    "value": value,
+                    "enabled": false,
+                    "workaround_active": true,
+                }),
+                fix: None,
+            },
+            Some(true) => DoctorCheck {
+                id: "driver.gpu_cwsr",
+                status: CheckStatus::Warn,
+                message: "gfx1103 CWSR is on; multi-wave barrier/LDS workloads can hang during preemption"
+                    .to_string(),
+                details: json!({
+                    "arch": arch,
+                    "path": CWSR_ENABLE_PATH,
+                    "value": value,
+                    "enabled": true,
+                    "workaround_active": false,
+                }),
+                fix: Some(remedy.to_string()),
+            },
+            None => DoctorCheck {
+                id: "driver.gpu_cwsr",
+                status: CheckStatus::Warn,
+                message: format!(
+                    "gfx1103 CWSR state is unrecognized ({value:?}); the LDS/preemption workaround cannot be verified"
+                ),
+                details: json!({
+                    "arch": arch,
+                    "path": CWSR_ENABLE_PATH,
+                    "value": value,
+                    "enabled": null,
+                    "workaround_active": false,
+                }),
+                fix: Some(remedy.to_string()),
+            },
+        },
+        Err(err) => DoctorCheck {
+            id: "driver.gpu_cwsr",
+            status: CheckStatus::Warn,
+            message: "gfx1103 CWSR state could not be read; the LDS/preemption workaround cannot be verified"
+                .to_string(),
+            details: json!({
+                "arch": arch,
+                "path": CWSR_ENABLE_PATH,
+                "error": err,
+                "enabled": null,
+                "workaround_active": false,
+            }),
+            fix: Some(remedy.to_string()),
+        },
+    })
+}
+
+fn parse_module_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "y" | "yes" | "true" => Some(true),
+        "0" | "n" | "no" | "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn check_rocm_tools(report: &mut DoctorReport) {
     for tool in ["hipcc", "rocminfo", "rocm-smi"] {
         let path = find_in_path(tool);
@@ -1368,4 +1461,60 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gfx1103_cwsr_off_reports_active_workaround() {
+        let check = build_gfx1103_cwsr_check("gfx1103", Ok("0".to_string())).unwrap();
+
+        assert_eq!(check.id, "driver.gpu_cwsr");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.details["enabled"], json!(false));
+        assert_eq!(check.details["workaround_active"], json!(true));
+        assert!(check.fix.is_none());
+    }
+
+    #[test]
+    fn gfx1103_cwsr_on_warns_with_reboot_remedy() {
+        let check = build_gfx1103_cwsr_check("gfx1103", Ok("Y".to_string())).unwrap();
+
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.details["enabled"], json!(true));
+        assert_eq!(check.details["workaround_active"], json!(false));
+        assert!(check
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("amdgpu.cwsr_enable=0")));
+    }
+
+    #[test]
+    fn gfx1103_unreadable_cwsr_warns() {
+        let check =
+            build_gfx1103_cwsr_check("gfx1103", Err("permission denied".to_string())).unwrap();
+
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.details["error"], json!("permission denied"));
+        assert_eq!(check.details["enabled"], Value::Null);
+    }
+
+    #[test]
+    fn cwsr_check_is_gfx1103_only() {
+        assert!(build_gfx1103_cwsr_check("gfx1151", Ok("1".to_string())).is_none());
+        assert!(build_gfx1103_cwsr_check("gfx1100:sramecc+", Ok("0".to_string())).is_none());
+    }
+
+    #[test]
+    fn cwsr_parser_accepts_kernel_boolean_spellings() {
+        for value in ["0", "N", "no", "FALSE"] {
+            assert_eq!(parse_module_bool(value), Some(false));
+        }
+        for value in ["1", "Y", "yes", "TRUE"] {
+            assert_eq!(parse_module_bool(value), Some(true));
+        }
+        assert_eq!(parse_module_bool("unexpected"), None);
+    }
 }
