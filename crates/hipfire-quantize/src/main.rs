@@ -5277,6 +5277,9 @@ fn main() {
                         "qtip{qtip_bits}-sim: LDLQ ENABLED — Hessian sidecar {p} ({} tensors)",
                         s.n_tensors()
                     );
+                    // Stamp the QTIP calib signature into the output metadata, same
+                    // as the --hessian Opus path.
+                    stamp_calib_provenance(std::path::Path::new(&p));
                     Some(s)
                 }
                 Err(e) => {
