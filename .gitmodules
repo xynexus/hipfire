@@ -43,3 +43,9 @@
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "third_party/flux2"]
+	path = third_party/flux2
+	url = https://github.com/black-forest-labs/flux2.git
+[submodule "third_party/SeFi-Image"]
+	path = third_party/SeFi-Image
+	url = https://github.com/jmliu206/SeFi-Image.git
