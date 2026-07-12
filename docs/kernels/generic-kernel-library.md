@@ -21,8 +21,9 @@ varied quirks, a tested generic kernel library massively speeds bring-up.
   `bf16→f32`, `f16→f16`, `f16→f32`.
 - **Arch targets we can test now:** RDNA3 dGPU (`gfx1100`, k9lin) and
   RDNA3.5 UMA (`gfx1151`, hipx). Local dev box is `gfx1103` (Phoenix UMA),
-  same RDNA3 WMMA ISA — usable for numeric validation with the **no-LDS
-  bodies only** (see hazard below).
+  same RDNA3 WMMA ISA. Register-tiled/no-LDS bodies remain the default there;
+  guarded LDS validation is permitted on treated hosts after confirming the
+  live `amdgpu.cwsr_enable=0` setting (see status below).
 
 All six dtype combos map to a native WMMA instruction on RDNA3/RDNA4
 (verified via `third_party/amd_matrix_instruction_calculator`):
@@ -77,10 +78,13 @@ gfx1103 hazard note drive a **register-tiled (no-LDS) body on UMA** vs an
   amortizes reuse across warps for large M (cf. `gemm_bf16_x_bf16_wmma_gfx1151_m128`).
 - **Scalar INT8 MAC beat the packed-dot intrinsic by ~32% on gfx1151**
   (much smaller on gfx1100). The packed/DP4A default is wrong on UMA.
-- **HAZARD:** on `gfx1103` (Phoenix), LDS-heavy kernels can wedge the GPU
-  (page-fault → MES hang → full reset, sticky 719) — firmware bug. Prefer
-  register tiling; only use LDS where proven and never test the LDS variant
-  blind on a gfx1103 box.
+- **TREATED HOST HAZARD:** on `gfx1103` (Phoenix), multi-wave barrier/LDS-heavy
+  kernels could wedge the GPU during CWSR preemption (HMM invalidation → MES
+  hang/reset → sticky HIP 719). Both maintained Phoenix hosts now boot with
+  `amdgpu.cwsr_enable=0`, which passes the former fail-side workload under
+  proven eviction. This is not an upstream fix: prefer register tiling, verify
+  the live CWSR setting before LDS testing, and report any LDS hang, HIP 719,
+  MES event, nondeterminism, or parity drift immediately.
 
 Selection helper to add (taxonomy gap): `arch_caps` groups `gfx1103` under
 `is_rdna3` but in **neither** `is_rdna3_dgpu` (1100/1/2) **nor**
@@ -126,9 +130,11 @@ follow the same shape.
   designing the API to accommodate: fp8/bf8 matmul
   (`v_wmma_f32_16x16x16_{fp8,bf8}_*`), wide int4 (`…16x16x32_iu4`), and
   SWMMAC 2:4 sparse (`v_swmmac_*`).
-- **gfx1103 LDS-staged bodies:** compile but must not be perf/coherence-tested
-  on a gfx1103 box until the firmware hang is mitigated; validate LDS bodies
-  on gfx1100/gfx1151 only.
+- **gfx1103 LDS-staged bodies:** may now be perf/coherence-tested on a treated
+  gfx1103 host after confirming `amdgpu.cwsr_enable=0` and acquiring the shared
+  GPU lock. Keep register/no-LDS paths as production defaults and preserve a
+  CPU/reference comparison. Any strange LDS behavior must be reported with the
+  launch shape, LDS byte count, live CWSR value, and first-failure dmesg.
 - **fp8 on RDNA3:** no native fp8 WMMA — not a gap on gfx1100/1103/1151.
 
 ## Build order

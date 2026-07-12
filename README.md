@@ -63,6 +63,24 @@ curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/install.sh
 For source builds and verifying the install:
 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
+### gfx1103 / Phoenix LDS status
+
+The known gfx1103 multi-wave barrier/LDS-adjacent HIP-719 failure has been
+treated on hipfire's maintained Phoenix validation hosts by booting with
+`amdgpu.cwsr_enable=0`. This is a host-level workaround for the gfx11 CWSR
+preemption defect, not an upstream driver or firmware fix. Register-tiled,
+no-LDS kernels remain the preferred production default, but guarded LDS
+development and validation may resume on hosts where the live module parameter
+confirms CWSR is off. `hipfire doctor` reports this live state as
+`driver.gpu_cwsr` on gfx1103.
+
+Please report any strange LDS behavior on gfx1103, including hangs, HIP 719,
+MES timeouts/resets, nondeterministic output, or unexpected CPU/GPU parity
+drift—even if the workload appears to recover. Include the reporting evidence
+listed in [CONTRIBUTING.md](.github/CONTRIBUTING.md#gfx1103-lds-reports). The
+full diagnosis and workaround evidence is in
+[the gfx1103 LDS investigation](docs/plans/gfx1103-lds-hip719-investigation.md).
+
 ## Inspiration: Lucebox
 
 hipfire's DFlash work was substantially shaped by Davide Ciffa's
