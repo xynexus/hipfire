@@ -538,12 +538,20 @@ pub enum PlainOpusPolicy {
 }
 
 impl PlainOpusPolicy {
+    /// Parse plain-Opus policy tokens. Decimal tokens express a requested
+    /// parameter-weighted average between four and eight bits; `mixed` keeps the
+    /// separate legacy structural heuristic.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "oq4p" | "oq4-plain" => Some(Self::AllW4),
             "oq8p" | "oq8-plain" => Some(Self::AllW8),
-            "oq4.25" | "oq4-mixed" | "mixed" => Some(Self::Mixed { oq8_fraction: None }),
-            _ => None,
+            "oq4-mixed" | "mixed" => Some(Self::Mixed { oq8_fraction: None }),
+            _ => {
+                let bits = s.strip_prefix("oq")?.parse::<f32>().ok()?;
+                (bits > 4.0 && bits < 8.0).then(|| Self::Mixed {
+                    oq8_fraction: Some((bits - 4.0) / 4.0),
+                })
+            }
         }
     }
     /// Override the int8 fraction (from `--mix-fraction`); forces Mixed.
@@ -613,6 +621,9 @@ struct QuantCandidate {
     params: u128,
     fan_in: u32,
     boundary: bool,
+    /// Distance to the nearest boundary block. Used only as an
+    /// architecture-neutral tiebreak after the arch-owned importance score.
+    boundary_distance: usize,
     is_down: bool,
     /// Arch structural-saliency prior in `[0,255]` (higher = protect harder),
     /// used to rank the int8 promotion when `--arch-importance` is set.
@@ -666,10 +677,13 @@ fn select_int8(
             let target = (total as f64 * f as f64) as u128;
             let mut order: Vec<&QuantCandidate> = cands.iter().collect();
             if by_importance {
-                // Rank by arch importance desc, fan-in as the tiebreak.
+                // The architecture owns the primary score. For exact ties, keep
+                // the allocation symmetric from the transformer boundaries,
+                // then prefer the wider projection.
                 order.sort_by(|a, b| {
                     b.importance
                         .cmp(&a.importance)
+                        .then(a.boundary_distance.cmp(&b.boundary_distance))
                         .then(b.fan_in.cmp(&a.fan_in))
                         .then(a.idx.cmp(&b.idx))
                 });
@@ -688,8 +702,12 @@ fn select_int8(
                 if acc >= target {
                     break;
                 }
+                let next = acc + c.params;
+                if acc.abs_diff(target) < next.abs_diff(target) {
+                    break;
+                }
                 set.insert(c.idx);
-                acc += c.params;
+                acc = next;
             }
             set
         }
@@ -707,6 +725,7 @@ mod select_int8_tests {
             params,
             fan_in,
             boundary: false,
+            boundary_distance: usize::MAX,
             is_down: false,
             importance,
         }
@@ -726,6 +745,48 @@ mod select_int8_tests {
         // Arch-importance ranking promotes the salient tensor instead — same
         // budget, different selection.
         assert_eq!(select_int8(&cands, policy, true), HashSet::from([1]));
+    }
+
+    #[test]
+    fn decimal_opus_token_maps_to_requested_average_bit_budget() {
+        let Some(PlainOpusPolicy::Mixed {
+            oq8_fraction: Some(fraction),
+        }) = PlainOpusPolicy::parse("oq4.25")
+        else {
+            panic!("oq4.25 should be a numeric mixed-Opus policy");
+        };
+        assert!((fraction - 0.0625).abs() < f32::EPSILON);
+        assert!(matches!(
+            PlainOpusPolicy::parse("mixed"),
+            Some(PlainOpusPolicy::Mixed { oq8_fraction: None })
+        ));
+    }
+
+    #[test]
+    fn importance_ties_promote_boundary_tensors_symmetrically() {
+        let mut cands = vec![
+            cand(0, 100, 1024, 253),
+            cand(1, 100, 1024, 253),
+            cand(26, 100, 1024, 253),
+            cand(27, 100, 1024, 253),
+        ];
+        cands[0].boundary = true;
+        cands[3].boundary = true;
+        cands[0].boundary_distance = 0;
+        cands[3].boundary_distance = 0;
+        let policy = PlainOpusPolicy::Mixed {
+            oq8_fraction: Some(0.5),
+        };
+        assert_eq!(select_int8(&cands, policy, true), HashSet::from([0, 27]));
+    }
+
+    #[test]
+    fn fractional_budget_chooses_closest_prefix_without_forced_overshoot() {
+        let cands = vec![cand(0, 100, 1024, 255), cand(1, 100, 1024, 254)];
+        let policy = PlainOpusPolicy::Mixed {
+            oq8_fraction: Some(0.2),
+        };
+        assert_eq!(select_int8(&cands, policy, true), HashSet::new());
     }
 }
 
@@ -778,6 +839,7 @@ pub fn quantize_diffusion_hfq_plain(
                 params: (t.shape[0] as u128) * (t.shape[1] as u128),
                 fan_in: t.shape[1],
                 boundary: blk == 0 || blk == last_block,
+                boundary_distance: blk.min(last_block.saturating_sub(blk)),
                 is_down: t.name.ends_with(".ff.down.weight") || t.name.ends_with(".net.2.weight"),
                 importance: tensor_importance(hfq.arch_id, &t.name),
             }

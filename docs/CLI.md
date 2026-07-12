@@ -674,6 +674,7 @@ With `--enable-hr`, the command first generates the requested base batch, decode
   - `krea2-turbo-8plus1`:
     Krea-2 Turbo, 8 low-res + 1 refine, sigma 0.11, no CFG
 
+* `--mrflow-total-steps <MRFLOW_TOTAL_STEPS>` — Override the total MrFlow denoise budget across the low-resolution and refine passes. The preset's refine count is reserved first; for example, 8 total steps with a 1-step refine runs 7+1
 * `--mrflow-refine-sigma <MRFLOW_REFINE_SIGMA>` — Override the MrFlow refine start sigma (preset default). Larger values (0.16-0.20) can improve text-heavy generations
 * `--mrflow-upscale <MRFLOW_UPSCALE>` — Override the MrFlow pixel-space upscale factor (preset default 2.0)
 * `--mrflow-shifted` — Use the flow-match shifted interior refine schedule (only affects refine passes with more than one step)
@@ -786,7 +787,7 @@ Reads an existing diffusion .hfq (weights stored as f32/f16/bf16 source), re-enc
 ###### **Options:**
 
 * `-o`, `--output <OUTPUT>` — Output quantized .hfq artifact path
-* `--format <FORMAT>` — Quant format: q8, q4, q4k, q4+, oq4/oq4++/oq8 (rotated), or oq4p/oq8p/oq4.25 (plain, loaded directly by the tiled Opus kernels)
+* `--format <FORMAT>` — Quant format: q8, q4, q4k, q4+, oq4/oq4++/oq8 (rotated), oq4p/oq8p (plain), a decimal plain-Opus target such as oq4.25, or oq4-mixed for the legacy data-free heuristic. Plain Opus uses int8 activations
 
   Default value: `q8`
 * `--calib <CALIB>` — Optional .calib.hfq sidecar (from `diffusion calibrate`); enables oq4++ LDLQ

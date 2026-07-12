@@ -150,8 +150,9 @@ pub struct DiffusionQuantizeArgs {
     /// Output quantized .hfq artifact path
     #[arg(long, short)]
     pub output: PathBuf,
-    /// Quant format: q8, q4, q4k, q4+, oq4/oq4++/oq8 (rotated), or oq4p/oq8p/oq4.25
-    /// (plain, loaded directly by the tiled Opus kernels)
+    /// Quant format: q8, q4, q4k, q4+, oq4/oq4++/oq8 (rotated), oq4p/oq8p
+    /// (plain), a decimal plain-Opus target such as oq4.25, or oq4-mixed for
+    /// the legacy data-free heuristic. Plain Opus uses int8 activations.
     #[arg(long, default_value = "q8")]
     pub format: String,
     /// Optional .calib.hfq sidecar (from `diffusion calibrate`); enables oq4++ LDLQ
@@ -327,6 +328,11 @@ pub struct DiffusionTxt2ImgArgs {
     /// Z-Image / Krea-2). Overrides --enable-hr.
     #[arg(long, value_enum)]
     pub mrflow: Option<MrFlowPreset>,
+    /// Override the total MrFlow denoise budget across the low-resolution and
+    /// refine passes. The preset's refine count is reserved first; for example,
+    /// 8 total steps with a 1-step refine runs 7+1.
+    #[arg(long)]
+    pub mrflow_total_steps: Option<u32>,
     /// Override the MrFlow refine start sigma (preset default). Larger values
     /// (0.16-0.20) can improve text-heavy generations.
     #[arg(long)]
@@ -421,6 +427,23 @@ impl MrFlowPreset {
 fn mrflow_round16(value: f64) -> u32 {
     let snapped = (value / 16.0).round() * 16.0;
     (snapped as u32).max(16)
+}
+
+fn mrflow_stage1_steps(
+    preset_stage1_steps: u32,
+    refine_steps: u32,
+    total_steps: Option<u32>,
+) -> anyhow::Result<u32> {
+    let Some(total_steps) = total_steps else {
+        return Ok(preset_stage1_steps);
+    };
+    let stage1_steps = total_steps.checked_sub(refine_steps).unwrap_or(0);
+    if stage1_steps == 0 {
+        anyhow::bail!(
+            "--mrflow-total-steps {total_steps} must exceed the {refine_steps}-step refine pass"
+        );
+    }
+    Ok(stage1_steps)
 }
 
 #[derive(Debug, Args)]
@@ -674,7 +697,7 @@ fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
     }
     let format = DiffusionQuantFormat::parse(&args.format).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown quant format {:?}; expected one of: q8, q4, q4k, q4+, oq4, oq4++, oq8, oq4p, oq8p, oq4.25",
+            "unknown quant format {:?}; expected one of: q8, q4, q4k, q4+, oq4, oq4++, oq8, oq4p, oq8p, oq4.N, oq4-mixed",
             args.format
         )
     })?;
@@ -920,11 +943,16 @@ fn generate_mrflow_txt2img(
     let low_width = mrflow_round16(target_width as f64 / upscale);
     let low_height = mrflow_round16(target_height as f64 / upscale);
     let batch_images = first_pass_request.prompts.len();
+    let stage1_steps = mrflow_stage1_steps(
+        params.stage1_steps,
+        params.refine_steps.max(1),
+        args.mrflow_total_steps,
+    )?;
 
     // Stage 1: fast low-resolution generate with the preset step count and CFG.
     first_pass_request.width = low_width;
     first_pass_request.height = low_height;
-    first_pass_request.steps = params.stage1_steps;
+    first_pass_request.steps = stage1_steps;
     first_pass_request.cfg_scale = params.cfg_scale;
     first_pass_request.send_images = true;
     let mut stage1_progress = step_timing_progress("mrflow-stage1", batch_images);
@@ -993,14 +1021,15 @@ fn generate_mrflow_txt2img(
         );
         map.insert("stage1_width".to_string(), serde_json::json!(low_width));
         map.insert("stage1_height".to_string(), serde_json::json!(low_height));
-        map.insert(
-            "stage1_steps".to_string(),
-            serde_json::json!(params.stage1_steps),
-        );
+        map.insert("stage1_steps".to_string(), serde_json::json!(stage1_steps));
         map.insert("refine_sigma".to_string(), serde_json::json!(refine_sigma));
         map.insert(
             "refine_steps".to_string(),
             serde_json::json!(params.refine_steps.max(1)),
+        );
+        map.insert(
+            "total_steps".to_string(),
+            serde_json::json!(stage1_steps + params.refine_steps.max(1)),
         );
         map.insert("upscale_factor".to_string(), serde_json::json!(upscale));
         map.insert("target_width".to_string(), serde_json::json!(target_width));
@@ -1763,6 +1792,7 @@ mod tests {
             rocm_device_id: None,
             preview_dir: None,
             mrflow: None,
+            mrflow_total_steps: None,
             mrflow_refine_sigma: None,
             mrflow_upscale: None,
             mrflow_shifted: false,
@@ -1796,6 +1826,13 @@ mod tests {
 
         assert_eq!(MrFlowPreset::Zit9Plus1.params().stage1_steps, 9);
         assert_eq!(MrFlowPreset::Krea2Base20Plus1.params().stage1_steps, 20);
+    }
+
+    #[test]
+    fn mrflow_total_steps_override_reserves_the_refine_pass() {
+        assert_eq!(mrflow_stage1_steps(8, 1, Some(8)).unwrap(), 7);
+        assert_eq!(mrflow_stage1_steps(8, 1, None).unwrap(), 8);
+        assert!(mrflow_stage1_steps(8, 1, Some(1)).is_err());
     }
 
     fn smoke_args() -> DiffusionSmokeArgs {

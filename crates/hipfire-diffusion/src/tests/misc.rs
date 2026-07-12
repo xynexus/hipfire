@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+use super::*;
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
     parse_pytorch_state_dict, pytorch_tensor_is_contiguous, reorder_pytorch_storage_to_contiguous,
@@ -10,7 +11,39 @@ use hipfire_diffusion_coexist::{
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
-use super::*;
+
+#[test]
+fn diffusion_opus_step_schedule_never_selects_int4_activations() {
+    assert_eq!(
+        linear_precision_for_thresholds(0, 10, 0.5, 0.0),
+        LinearPrecision::W4A8
+    );
+    assert_eq!(
+        linear_precision_for_thresholds(6, 10, 0.5, 0.8),
+        LinearPrecision::W4A8
+    );
+    assert_eq!(
+        linear_precision_for_thresholds(9, 10, 0.5, 0.8),
+        LinearPrecision::F16
+    );
+}
+
+#[test]
+fn diffusion_opus_layer_policy_promotes_legacy_rungs_to_w4a8() {
+    assert_eq!(
+        linear_precision_for_layer_rung(Some("w4a4")),
+        LinearPrecision::W4A8
+    );
+    assert_eq!(
+        linear_precision_for_layer_rung(Some("w4a16")),
+        LinearPrecision::W4A8
+    );
+    assert_eq!(
+        linear_precision_for_layer_rung(Some("w4a8")),
+        LinearPrecision::W4A8
+    );
+    assert_eq!(linear_precision_for_layer_rung(None), LinearPrecision::W4A8);
+}
 
 #[test]
 fn scaled_dot_product_attention_respects_key_mask() {

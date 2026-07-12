@@ -1437,6 +1437,33 @@ pub(crate) struct WanDownsample {
     resample_bias: CpuTensor,
 }
 
+fn pad_nchw_right_bottom_zeros(
+    input: &CpuTensor,
+    right: usize,
+    bottom: usize,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, channels, height, width] = shape4(input)?;
+    let output_height = height.checked_add(bottom).ok_or_else(|| {
+        DiffusionError::InvalidMetadata("right/bottom padding height overflow".to_string())
+    })?;
+    let output_width = width.checked_add(right).ok_or_else(|| {
+        DiffusionError::InvalidMetadata("right/bottom padding width overflow".to_string())
+    })?;
+    let mut output = CpuTensor::zeros(&[batch, channels, output_height, output_width]);
+    for batch_idx in 0..batch {
+        for channel in 0..channels {
+            for y in 0..height {
+                let source_row = ((batch_idx * channels + channel) * height + y) * width;
+                let target_row =
+                    ((batch_idx * channels + channel) * output_height + y) * output_width;
+                output.data[target_row..target_row + width]
+                    .copy_from_slice(&input.data[source_row..source_row + width]);
+            }
+        }
+    }
+    Ok(output)
+}
+
 #[allow(dead_code)]
 impl WanDownsample {
     pub(crate) fn from_hfq(hfq: &HfqFile, prefix: &str) -> DiffusionResult<Option<Self>> {
@@ -1456,12 +1483,18 @@ impl WanDownsample {
     }
 
     pub(crate) fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
-        // 3x3 stride-2 conv, symmetric padding 1. NB: the exact WanVAE downsample
-        // padding convention (this vs the asymmetric ZeroPad2d((0,1,0,1))) is not
-        // yet pinned against the diffusers reference; symmetric gives the better
-        // encode->decode round-trip so far but full fidelity is unverified.
-        conv2d_nchw_with_stride(input, &self.resample_weight, Some(&self.resample_bias), 1, 2)
-            .map_err(Into::into)
+        // QwenImageResample uses ZeroPad2d((0, 1, 0, 1)) before its unpadded
+        // 3x3 stride-2 convolution. Symmetric padding shifts every encoded
+        // feature one input pixel toward the bottom/right at each scale.
+        let padded = pad_nchw_right_bottom_zeros(input, 1, 1)?;
+        conv2d_nchw_with_stride(
+            &padded,
+            &self.resample_weight,
+            Some(&self.resample_bias),
+            0,
+            2,
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -1571,6 +1604,35 @@ impl WanImageEncoder {
 #[cfg(test)]
 mod wan_vae_tests {
     use super::*;
+
+    #[test]
+    fn wan_downsample_matches_qwen_image_right_bottom_padding() {
+        let mut weight = vec![0.0f32; 9];
+        weight[4] = 1.0;
+        let downsample = WanDownsample {
+            resample_weight: CpuTensor {
+                shape: vec![1, 1, 3, 3],
+                data: weight,
+            },
+            resample_bias: CpuTensor {
+                shape: vec![1],
+                data: vec![0.0],
+            },
+        };
+        let input = CpuTensor {
+            shape: vec![1, 1, 4, 4],
+            data: (1..=16).map(|value| value as f32).collect(),
+        };
+
+        let out = downsample.forward(&input).unwrap();
+
+        assert_eq!(out.shape, vec![1, 1, 2, 2]);
+        // ZeroPad2d((0, 1, 0, 1)) leaves the top/left origin untouched, so a
+        // center-only 3x3 kernel samples input coordinates (1,1), (1,3),
+        // (3,1), and (3,3). Symmetric padding would incorrectly yield
+        // [1, 3, 9, 11], shifting the encoded image toward the bottom/right.
+        assert_eq!(out.data, vec![6.0, 8.0, 14.0, 16.0]);
+    }
 
     #[test]
     fn wan_upsample_doubles_spatial_dims() {

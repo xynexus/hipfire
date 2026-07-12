@@ -3700,10 +3700,9 @@ pub(crate) fn linear_optional_bias_resident(
         return Ok(output);
     }
 
-    // Progressive precision schedule: when an oq4 rung is active and the input
-    // dim is 256-aligned (the oq4 GEMM constraint), run the linear at reduced
-    // precision (oq4 weight + FWHT-rotated activation). Other linears (e.g.
-    // in=320/640) and the F16 setting fall through to the f16 WMMA path. The
+    // Progressive precision schedule: when the W4A8 Opus rung is active and the
+    // input dim is 256-aligned, run oq4 weights with int8 activations. Other
+    // linears (e.g. in=320/640) and F16 fall through to the f16 WMMA path. The
     // per-layer index is advanced for every resident linear so the per-layer
     // policy (every Nth layer, skip first/last) indexes consistently.
     let layer_idx = cache.linear_index;
@@ -3723,15 +3722,6 @@ pub(crate) fn linear_optional_bias_resident(
         gpu.rotate_x_mq_batched(input, &x_rot, in_features, rows)
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
         let launched = match precision {
-            LinearPrecision::W4A16 => gpu.gemm_oq4_grouped_f16_wmma(
-                &w_view,
-                &x_rot,
-                &output,
-                out_features,
-                in_features,
-                rows,
-                256,
-            ),
             LinearPrecision::W4A8 => gpu.gemm_oq4_residual_mmq(
                 &w_view,
                 &x_rot,
@@ -3740,14 +3730,6 @@ pub(crate) fn linear_optional_bias_resident(
                 in_features,
                 rows,
                 false,
-            ),
-            LinearPrecision::W4A4 => gpu.gemm_oq4_grouped_act_batched(
-                &w_view,
-                &x_rot,
-                &output,
-                out_features,
-                in_features,
-                rows,
             ),
             LinearPrecision::F16 => unreachable!("F16 handled by the fall-through path"),
         };

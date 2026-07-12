@@ -201,22 +201,17 @@ fn cpu_reference_env_enabled(value: Option<&str>) -> bool {
 /// the pipeline runtime and are not moved mid-generation). The cache lives for one
 /// generation (the runtime context is created per `generate_*` call), so resident
 /// buffers are released when the GPU/context tears down.
-/// Per-step activation precision for the resident linear path. The progressive
-/// schedule (set per denoise step) walks from cheap/lossy (W4A4) on the early,
-/// high-noise steps to full precision (F16) on the final steps. All oq4 rungs
-/// consume the same resident oq4-packed weight + FWHT-rotated activation; they
-/// only apply to linears with `in % 256 == 0` (others fall back to F16).
+/// Per-step activation precision for the resident linear path. Opus is restricted
+/// to W4A8 because int4 activations cause unacceptable image-quality loss. The
+/// full-precision fallback does not use Opus. W4A8 only applies to linears with
+/// `in % 256 == 0`; others fall back to F16.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LinearPrecision {
     /// f16 weight × f16 activation (the Phase-3 WMMA path).
     #[default]
     F16,
-    /// oq4 weight dequant→f16 × f16 activation (memory-bandwidth win).
-    W4A16,
     /// oq4 weight × int8 (q8_1) activation.
     W4A8,
-    /// oq4 weight × int4 activation (2× matrix rate on gfx1103).
-    W4A4,
 }
 
 #[derive(Default)]

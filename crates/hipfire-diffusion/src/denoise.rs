@@ -253,13 +253,34 @@ pub(crate) fn batched_cfg_prediction_slices<'a>(
     Ok((half_shape, positive, negative))
 }
 
+/// Resolve the resident-linear activation precision for explicit schedule
+/// thresholds. The legacy W4A4 threshold is folded into W4A8 so no Opus image
+/// generation path can select int4 activations.
+pub(crate) fn linear_precision_for_thresholds(
+    step: usize,
+    total: usize,
+    legacy_w4a4_until: f32,
+    w4a8_until: f32,
+) -> LinearPrecision {
+    let w4a8_until = w4a8_until.max(legacy_w4a4_until).clamp(0.0, 1.0);
+    let frac = if total <= 1 {
+        0.0
+    } else {
+        step as f32 / total as f32
+    };
+    if frac < w4a8_until {
+        LinearPrecision::W4A8
+    } else {
+        LinearPrecision::F16
+    }
+}
+
 /// Resolve the resident-linear activation precision for denoise `step` of
 /// `total`, from the progressive schedule. Env-driven (opt-in; default is all
 /// F16, so behavior is unchanged unless set):
-///   `HIPFIRE_DIFFUSION_W4A4_UNTIL` — fraction of steps (0..1) to run at W4A4
-///   `HIPFIRE_DIFFUSION_W4A8_UNTIL` — fraction (0..1) to run at W4A8 (after W4A4)
-/// e.g. `W4A4_UNTIL=0.5 W4A8_UNTIL=0.8` → first 50% W4A4, next 30% W4A8, last
-/// 20% F16. Only affects linears with `in % 256 == 0`; others stay F16.
+///   `HIPFIRE_DIFFUSION_W4A8_UNTIL` — fraction of steps (0..1) to run at W4A8
+///   `HIPFIRE_DIFFUSION_W4A4_UNTIL` — legacy alias, promoted to W4A8
+/// Only affects linears with `in % 256 == 0`; others stay F16.
 pub(crate) fn linear_precision_for_step(step: usize, total: usize) -> LinearPrecision {
     let frac_env = |name: &str| -> f32 {
         std::env::var(name)
@@ -268,31 +289,30 @@ pub(crate) fn linear_precision_for_step(step: usize, total: usize) -> LinearPrec
             .unwrap_or(0.0)
             .clamp(0.0, 1.0)
     };
-    let w4a4_until = frac_env("HIPFIRE_DIFFUSION_W4A4_UNTIL");
-    let w4a8_until = frac_env("HIPFIRE_DIFFUSION_W4A8_UNTIL").max(w4a4_until);
-    let frac = if total <= 1 {
-        0.0
-    } else {
-        step as f32 / total as f32
-    };
-    if frac < w4a4_until {
-        LinearPrecision::W4A4
-    } else if frac < w4a8_until {
-        LinearPrecision::W4A8
-    } else {
-        LinearPrecision::F16
-    }
+    linear_precision_for_thresholds(
+        step,
+        total,
+        frac_env("HIPFIRE_DIFFUSION_W4A4_UNTIL"),
+        frac_env("HIPFIRE_DIFFUSION_W4A8_UNTIL"),
+    )
+}
+
+/// Resolve a configured Opus layer rung. Historical W4A4/W4A16 values are
+/// accepted for compatibility but promoted to the only supported Opus compute
+/// policy for image generation: W4A8.
+pub(crate) fn linear_precision_for_layer_rung(_value: Option<&str>) -> LinearPrecision {
+    LinearPrecision::W4A8
 }
 
 /// Configure the per-layer precision policy on the weight cache from env (opt-in;
 /// `HIPFIRE_DIFFUSION_LAYER_STRIDE=0` = off, the default). When active, every
-/// `STRIDE`-th resident linear runs `RUNG` (default W4A4), except the first
+/// `STRIDE`-th resident linear runs W4A8, except the first
 /// `SKIP_FIRST` and last `SKIP_LAST` linears (kept F16). This is orthogonal to the
 /// per-step schedule and overrides it when `STRIDE > 0`.
 ///   `HIPFIRE_DIFFUSION_LAYER_STRIDE`     — N (every Nth linear; 0=off)
 ///   `HIPFIRE_DIFFUSION_LAYER_SKIP_FIRST` — keep the first X linears F16
 ///   `HIPFIRE_DIFFUSION_LAYER_SKIP_LAST`  — keep the last Y linears F16 (from step 1)
-///   `HIPFIRE_DIFFUSION_LAYER_RUNG`       — w4a4 | w4a8 | w4a16 (default w4a4)
+///   `HIPFIRE_DIFFUSION_LAYER_RUNG`       — legacy setting; all values use W4A8
 pub(crate) fn configure_layer_policy(cache: &mut RocmWeightCache) {
     let usize_env = |name: &str| -> usize {
         std::env::var(name)
@@ -303,15 +323,11 @@ pub(crate) fn configure_layer_policy(cache: &mut RocmWeightCache) {
     cache.layer_stride = usize_env("HIPFIRE_DIFFUSION_LAYER_STRIDE");
     cache.layer_skip_first = usize_env("HIPFIRE_DIFFUSION_LAYER_SKIP_FIRST");
     cache.layer_skip_last = usize_env("HIPFIRE_DIFFUSION_LAYER_SKIP_LAST");
-    cache.layer_rung = match std::env::var("HIPFIRE_DIFFUSION_LAYER_RUNG")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "w4a8" => LinearPrecision::W4A8,
-        "w4a16" => LinearPrecision::W4A16,
-        _ => LinearPrecision::W4A4,
-    };
+    cache.layer_rung = linear_precision_for_layer_rung(
+        std::env::var("HIPFIRE_DIFFUSION_LAYER_RUNG")
+            .ok()
+            .as_deref(),
+    );
     cache.linear_total = 0;
 }
 
