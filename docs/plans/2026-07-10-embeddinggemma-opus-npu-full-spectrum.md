@@ -1571,3 +1571,45 @@ export the one missing X exception value per token from R34 without changing
 the model arithmetic. Only after all 24 layers pass the real-model gate should
 the host reconstruction/copy be moved fully onto fabric and the context and
 throughput work resume.
+
+### R42 zero-norm X-exception export checkpoint
+
+R42 removes the six-layer non-invertibility identified by R41 without changing
+the learned pre-FFN norm. Fixed-column AIE2P images retain the exact F32
+pre-FFN inverse and export one BF16 architectural X value per token for either
+dimension 39 or 731 in otherwise unused metadata-record space. Layers without
+an exact-zero norm continue to select the standard R34 image; the six affected
+layers select the matching fixed-column image through the same resident-layer
+API.
+
+Two compiler details were necessary. A scalar load placed after the block
+stores was scheduled against stale projection data. Reloading the containing
+16-lane X vector creates the required store/load dependence, while
+`chess_copy` keeps the selected block pointer distinct from the restricted
+three-block array; without it Peano silently substituted block2 for block0.
+The extra vector reload initially exceeded AIE program memory by one 16-byte
+instruction packet. `-mllvm -aie-bottomup-cycles=0` recovers that packet and
+keeps the post-residual/norm function at the prior 2,000-byte size.
+
+Locked M256 same-input comparisons validate both exception families:
+
+| boundary | layer / column | cosine | minimum row cosine | max abs |
+|---|---:|---:|---:|---:|
+| exported X vs established X | 8 / 39 | 0.99999805 | — | 9.1132812 |
+| reconstructed X vs established X | 8 / 39 | 0.99998621 | 0.99997409 | 9.1132812 |
+| completed layer vs established layer | 8 / 39 | 0.99996358 | 0.99987305 | 19.6830444 |
+| exported X vs established X | 20 / 731 | 0.99999812 | — | 96.6386719 |
+| reconstructed X vs established X | 20 / 731 | 0.99999375 | 0.99998402 | 96.6386719 |
+| completed layer vs established layer | 20 / 731 | 0.99998723 | 0.99995838 | 144.5478516 |
+
+All 24 layers now execute the completed resident-layer shortcut, so the R41
+six-layer functional blocker is resolved. The resulting OQ8-versus-BF16
+embedding cosine is only `0.99114025`, however, with `0.01623118` maximum
+error. That is better than the rejected zero-sentinel experiment but still
+below the real-model quality gate and far below the established OQ8 path.
+The measured `355.6` input tokens/s at `21.07 W` (`16.9` package tokens/J) is
+also a host-reconstructed hybrid measurement: metadata is read on the host and
+final normalization/pooling remain outside the NPU. It is neither fully
+resident nor a performance admission. The next correctness slice must reduce
+ordinary per-layer BF16 boundary error across R34/R35/R41 before moving the
+reconstruction onto fabric and resuming the 10k/15k throughput work.

@@ -247,6 +247,7 @@ pub mod resident_embedding_layer;
 #[cfg(target_os = "linux")]
 pub use resident_embedding_layer::{
     NpuEmbeddingLayerAttentionDenseW8, NpuEmbeddingLayerAttentionDenseW8Weights,
+    NpuEmbeddingPreFfnException, NpuEmbeddingPreFfnState,
 };
 
 #[cfg(target_os = "linux")]

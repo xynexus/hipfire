@@ -11,10 +11,10 @@ use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
     NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuEmbeddingLayerAttentionDenseW8,
     NpuEmbeddingLayerAttentionDenseW8Weights, NpuEmbeddingPostFfnDirectTailBf16x2,
-    NpuEmbeddingPostFfnDirectTailBf16x2Params, NpuOpusExecutor, NpuResidentAttentionDenseW8,
-    NpuResidentAttentionDenseW8Weights, NpuResidentFfnDenseW8, NpuResidentFfnDenseW8Weights,
-    NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode, NpuWholeScaledIoLayout,
-    OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
+    NpuEmbeddingPostFfnDirectTailBf16x2Params, NpuEmbeddingPreFfnException, NpuOpusExecutor,
+    NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights, NpuResidentFfnDenseW8,
+    NpuResidentFfnDenseW8Weights, NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode,
+    NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
 };
 
 use crate::config::EmbeddingGemmaConfig;
@@ -47,6 +47,8 @@ pub struct NpuOpusProjector {
     resident_ffn_selected: bool,
     resident_layer: Option<ResidentLayerState>,
     debug_resident_hidden: Option<Vec<f32>>,
+    debug_resident_residual: Option<Vec<f32>>,
+    debug_resident_exception: Option<(usize, Vec<f32>)>,
     debug_resident_ffn: Option<Vec<f32>>,
 }
 
@@ -108,8 +110,8 @@ struct SharedAttentionOutput {
 }
 
 struct ResidentLayerState {
-    attention: NpuEmbeddingLayerAttentionDenseW8,
-    attention_weights: Vec<NpuEmbeddingLayerAttentionDenseW8Weights>,
+    attention: ResidentLayerAttentionExecutors,
+    attention_weights: Vec<ResidentLayerAttentionWeights>,
     ffn: NpuResidentFfnDenseW8,
     ffn_weights: Vec<NpuResidentFfnDenseW8Weights>,
     tail: NpuEmbeddingPostFfnDirectTailBf16x2,
@@ -117,6 +119,171 @@ struct ResidentLayerState {
     tail_pre_norms: Vec<Vec<u16>>,
     tail_post_norms: Vec<Vec<u16>>,
     io: Option<ResidentLayerIo>,
+}
+
+struct ResidentLayerAttentionExecutors {
+    standard: NpuEmbeddingLayerAttentionDenseW8,
+    exception_39: Option<NpuEmbeddingLayerAttentionDenseW8>,
+    exception_731: Option<NpuEmbeddingLayerAttentionDenseW8>,
+}
+
+enum ResidentLayerAttentionWeights {
+    Standard(NpuEmbeddingLayerAttentionDenseW8Weights),
+    Exception39(NpuEmbeddingLayerAttentionDenseW8Weights),
+    Exception731(NpuEmbeddingLayerAttentionDenseW8Weights),
+    Unavailable,
+}
+
+impl ResidentLayerAttentionWeights {
+    fn awq_scale(&self) -> Option<&[f32]> {
+        match self {
+            Self::Standard(weights) | Self::Exception39(weights) | Self::Exception731(weights) => {
+                weights.awq_scale()
+            }
+            Self::Unavailable => None,
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+}
+
+impl ResidentLayerAttentionExecutors {
+    fn attach_shared_input(
+        &mut self,
+        fd: i32,
+        bytes: usize,
+    ) -> Result<(), hipfire_xdna::XdnaError> {
+        self.standard.attach_shared_input(fd, bytes)?;
+        if let Some(executor) = &mut self.exception_39 {
+            executor.attach_shared_input(fd, bytes)?;
+        }
+        if let Some(executor) = &mut self.exception_731 {
+            executor.attach_shared_input(fd, bytes)?;
+        }
+        Ok(())
+    }
+
+    fn attach_shared_hidden(
+        &mut self,
+        fd: i32,
+        bytes: usize,
+    ) -> Result<(), hipfire_xdna::XdnaError> {
+        self.standard.attach_shared_hidden(fd, bytes)?;
+        if let Some(executor) = &mut self.exception_39 {
+            executor.attach_shared_hidden(fd, bytes)?;
+        }
+        if let Some(executor) = &mut self.exception_731 {
+            executor.attach_shared_hidden(fd, bytes)?;
+        }
+        Ok(())
+    }
+
+    fn set_residual_bf16(
+        &self,
+        weights: &mut ResidentLayerAttentionWeights,
+        residual: &[u16],
+    ) -> Result<(), hipfire_xdna::XdnaError> {
+        match weights {
+            ResidentLayerAttentionWeights::Standard(weights) => {
+                self.standard.set_residual_bf16(weights, residual)
+            }
+            ResidentLayerAttentionWeights::Exception39(weights) => self
+                .exception_39
+                .as_ref()
+                .expect("exception-39 weights require executor")
+                .set_residual_bf16(weights, residual),
+            ResidentLayerAttentionWeights::Exception731(weights) => self
+                .exception_731
+                .as_ref()
+                .expect("exception-731 weights require executor")
+                .set_residual_bf16(weights, residual),
+            ResidentLayerAttentionWeights::Unavailable => {
+                unreachable!("unavailable resident layer rejected before dispatch")
+            }
+        }
+    }
+
+    fn prepare_layer(
+        &mut self,
+        weights: &ResidentLayerAttentionWeights,
+    ) -> Result<(), hipfire_xdna::XdnaError> {
+        match weights {
+            ResidentLayerAttentionWeights::Standard(weights) => {
+                self.standard.prepare_layer(weights)
+            }
+            ResidentLayerAttentionWeights::Exception39(weights) => self
+                .exception_39
+                .as_mut()
+                .expect("exception-39 weights require executor")
+                .prepare_layer(weights),
+            ResidentLayerAttentionWeights::Exception731(weights) => self
+                .exception_731
+                .as_mut()
+                .expect("exception-731 weights require executor")
+                .prepare_layer(weights),
+            ResidentLayerAttentionWeights::Unavailable => {
+                unreachable!("unavailable resident layer rejected before dispatch")
+            }
+        }
+    }
+
+    fn run_shared(
+        &mut self,
+        weights: &ResidentLayerAttentionWeights,
+    ) -> Result<(), hipfire_xdna::XdnaError> {
+        match weights {
+            ResidentLayerAttentionWeights::Standard(weights) => self.standard.run_shared(weights),
+            ResidentLayerAttentionWeights::Exception39(weights) => self
+                .exception_39
+                .as_mut()
+                .expect("exception-39 weights require executor")
+                .run_shared(weights),
+            ResidentLayerAttentionWeights::Exception731(weights) => self
+                .exception_731
+                .as_mut()
+                .expect("exception-731 weights require executor")
+                .run_shared(weights),
+            ResidentLayerAttentionWeights::Unavailable => {
+                unreachable!("unavailable resident layer rejected before dispatch")
+            }
+        }
+    }
+
+    fn read_hidden_f32(
+        &self,
+        weights: &ResidentLayerAttentionWeights,
+    ) -> Result<Vec<f32>, hipfire_xdna::XdnaError> {
+        self.executor(weights).read_hidden_f32()
+    }
+
+    fn read_pre_ffn_state(
+        &self,
+        weights: &ResidentLayerAttentionWeights,
+    ) -> Result<hipfire_xdna::NpuEmbeddingPreFfnState, hipfire_xdna::XdnaError> {
+        self.executor(weights).read_pre_ffn_state()
+    }
+
+    fn executor(
+        &self,
+        weights: &ResidentLayerAttentionWeights,
+    ) -> &NpuEmbeddingLayerAttentionDenseW8 {
+        match weights {
+            ResidentLayerAttentionWeights::Standard(_) => &self.standard,
+            ResidentLayerAttentionWeights::Exception39(_) => self
+                .exception_39
+                .as_ref()
+                .expect("exception-39 weights require executor"),
+            ResidentLayerAttentionWeights::Exception731(_) => self
+                .exception_731
+                .as_ref()
+                .expect("exception-731 weights require executor"),
+            ResidentLayerAttentionWeights::Unavailable => {
+                unreachable!("unavailable resident layer rejected before dispatch")
+            }
+        }
+    }
 }
 
 struct ResidentLayerIo {
@@ -631,6 +798,12 @@ impl NpuOpusProjector {
         let resident_ffn_selected = resident_ffn.is_some();
         let resident_layer_attention_path = cache_root
             .join("embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_m256_k768_n1280");
+        let resident_layer_exception_39_path = cache_root.join(
+            "embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_x_exception_c39_m256_k768_n1280",
+        );
+        let resident_layer_exception_731_path = cache_root.join(
+            "embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_x_exception_c731_m256_k768_n1280",
+        );
         let resident_layer_tail_path =
             cache_root.join("embgemma_aie2p_post_ffn_direct_tail_bf16x2_m256_k768");
         let resident_layer_requested =
@@ -652,6 +825,20 @@ impl NpuOpusProjector {
                 .map_err(|error| {
                     format!("embeddinggemma NPU: load completed-layer attention: {error}")
                 })?;
+            let load_exception = |path: &Path, column: usize| {
+                if !path.join("final.xclbin").is_file() || !path.join("insts.bin").is_file() {
+                    return Ok(None);
+                }
+                NpuEmbeddingLayerAttentionDenseW8::load_cached(
+                    path.to_str().expect("UTF-8 exception cache path"),
+                )
+                .map(Some)
+                .map_err(|error| {
+                    format!("embeddinggemma NPU: load completed-layer exception-{column}: {error}")
+                })
+            };
+            let exception_39 = load_exception(&resident_layer_exception_39_path, 39)?;
+            let exception_731 = load_exception(&resident_layer_exception_731_path, 731)?;
             let tail_cache = resident_layer_tail_path
                 .to_str()
                 .expect("UTF-8 resident layer tail cache path");
@@ -718,8 +905,19 @@ impl NpuOpusProjector {
                     &format!("{prefix}.post_feedforward_layernorm.weight"),
                     cfg.hidden_size,
                 )?;
-                attention_weights.push(
-                    attention
+                let zero_columns = pre_ffn_norm
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(column, &bits)| (bits & 0x7fff == 0).then_some(column))
+                    .collect::<Vec<_>>();
+                let selected = match zero_columns.as_slice() {
+                    [] => Some((0usize, &attention)),
+                    [39] => exception_39.as_ref().map(|executor| (39, executor)),
+                    [731] => exception_731.as_ref().map(|executor| (731, executor)),
+                    _ => None,
+                };
+                let attention_weight = if let Some((variant, executor)) = selected {
+                    let weights = executor
                         .upload_dense_groups(
                             &group_refs,
                             &scale_refs,
@@ -737,8 +935,17 @@ impl NpuOpusProjector {
                             format!(
                                 "embeddinggemma NPU: upload completed-layer attention {layer_idx}: {error}"
                             )
-                        })?,
-                );
+                        })?;
+                    match variant {
+                        0 => ResidentLayerAttentionWeights::Standard(weights),
+                        39 => ResidentLayerAttentionWeights::Exception39(weights),
+                        731 => ResidentLayerAttentionWeights::Exception731(weights),
+                        _ => unreachable!("selected resident exception variant"),
+                    }
+                } else {
+                    ResidentLayerAttentionWeights::Unavailable
+                };
+                attention_weights.push(attention_weight);
                 tail_params.push(
                     tail.upload_params(&post_ffn_norm, cfg.rms_norm_eps)
                         .map_err(|error| {
@@ -751,7 +958,11 @@ impl NpuOpusProjector {
                 tail_post_norms.push(post_ffn_norm);
             }
             Some(ResidentLayerState {
-                attention,
+                attention: ResidentLayerAttentionExecutors {
+                    standard: attention,
+                    exception_39,
+                    exception_731,
+                },
                 attention_weights,
                 ffn,
                 ffn_weights,
@@ -775,6 +986,8 @@ impl NpuOpusProjector {
             resident_ffn_selected,
             resident_layer,
             debug_resident_hidden: None,
+            debug_resident_residual: None,
+            debug_resident_exception: None,
             debug_resident_ffn: None,
         })
     }
@@ -1121,15 +1334,11 @@ impl LinearProjector for NpuOpusProjector {
         if self
             .resident_layer
             .as_ref()
-            .and_then(|state| state.tail_pre_norms.get(layer_idx))
-            .is_some_and(|norm| norm.iter().any(|&bits| bits & 0x7fff == 0))
+            .and_then(|state| state.attention_weights.get(layer_idx))
+            .is_none_or(|weights| !weights.is_available())
         {
-            // H = pre_ffn_norm(X) loses X where the learned norm is exactly
-            // zero. Keep those six layers on the established path until R34
-            // exports the single exception value per token.
             return Ok(false);
         }
-
         let needs_io = self
             .resident_layer
             .as_ref()
@@ -1205,7 +1414,7 @@ impl LinearProjector for NpuOpusProjector {
                 .resident_layer
                 .as_ref()
                 .and_then(|state| state.attention_weights.get(layer_idx))
-                .and_then(NpuEmbeddingLayerAttentionDenseW8Weights::awq_scale)
+                .and_then(ResidentLayerAttentionWeights::awq_scale)
                 .map(<[f32]>::to_vec);
             if let Some(scale) = scale {
                 self.awq_gpu
@@ -1232,7 +1441,7 @@ impl LinearProjector for NpuOpusProjector {
             .chunks_exact(size_of::<u16>())
             .map(|word| u16::from_le_bytes([word[0], word[1]]))
             .collect::<Vec<_>>();
-        if compare_this_layer_enabled() {
+        if compare_this_layer_enabled(layer_idx) {
             let original = gpu.download_f32(residual_and_output)?;
             let rounded = residual
                 .iter()
@@ -1283,21 +1492,74 @@ impl LinearProjector for NpuOpusProjector {
             })?;
         let resident_hidden = state
             .attention
-            .read_hidden_f32()
+            .read_hidden_f32(&state.attention_weights[layer_idx])
             .map_err(|error| hip_error(format!("read resident hidden {layer_idx}: {error}")))?;
-        let pre_inverse = state.attention.read_pre_inverse_f32().map_err(|error| {
-            hip_error(format!("read resident pre-inverse {layer_idx}: {error}"))
-        })?;
+        let pre_ffn_state = state
+            .attention
+            .read_pre_ffn_state(&state.attention_weights[layer_idx])
+            .map_err(|error| {
+                hip_error(format!("read resident pre-FFN state {layer_idx}: {error}"))
+            })?;
+        if compare_this_layer_enabled(layer_idx) {
+            let finite_inverse = pre_ffn_state
+                .inverse
+                .iter()
+                .filter(|value| value.is_finite())
+                .count();
+            let inverse_min = pre_ffn_state
+                .inverse
+                .iter()
+                .copied()
+                .filter(|value| value.is_finite())
+                .fold(f32::INFINITY, f32::min);
+            let inverse_max = pre_ffn_state
+                .inverse
+                .iter()
+                .copied()
+                .filter(|value| value.is_finite())
+                .fold(f32::NEG_INFINITY, f32::max);
+            let exception = pre_ffn_state.exception.as_ref().map(|exception| {
+                let values = exception
+                    .x
+                    .iter()
+                    .map(|&bits| f32::from_bits((bits as u32) << 16))
+                    .collect::<Vec<_>>();
+                let finite = values.iter().filter(|value| value.is_finite()).count();
+                let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+                let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                (exception.column, finite, min, max)
+            });
+            eprintln!(
+                "embeddinggemma_resident_pre_ffn_state layer={layer_idx} finite_inverse={finite_inverse}/{rows} inverse_min={inverse_min:.7} inverse_max={inverse_max:.7} exception={exception:?}"
+            );
+        }
         let reconstructed_x = reconstruct_attention_residual_bf16(
             &resident_hidden,
-            &pre_inverse,
+            &pre_ffn_state.inverse,
+            pre_ffn_state.exception.as_ref(),
             &state.tail_pre_norms[layer_idx],
             &residual,
             rows,
             768,
         )?;
-        if compare_this_layer_enabled() {
+        if compare_this_layer_enabled(layer_idx) {
             self.debug_resident_hidden = Some(resident_hidden);
+            self.debug_resident_residual = Some(
+                reconstructed_x
+                    .iter()
+                    .map(|&bits| f32::from_bits((bits as u32) << 16))
+                    .collect(),
+            );
+            self.debug_resident_exception = pre_ffn_state.exception.as_ref().map(|exception| {
+                (
+                    exception.column,
+                    exception
+                        .x
+                        .iter()
+                        .map(|&bits| f32::from_bits((bits as u32) << 16))
+                        .collect(),
+                )
+            });
         }
         state
             .ffn
@@ -1314,7 +1576,7 @@ impl LinearProjector for NpuOpusProjector {
             rows,
             768,
         )?;
-        if compare_this_layer_enabled() {
+        if compare_this_layer_enabled(layer_idx) {
             self.debug_resident_ffn =
                 Some(state.ffn.read_canonical_output_f32().map_err(|error| {
                     hip_error(format!("read resident FFN {layer_idx}: {error}"))
@@ -1331,7 +1593,7 @@ impl LinearProjector for NpuOpusProjector {
             .tail
             .read_output_f32()
             .map_err(|error| hip_error(format!("read completed layer {layer_idx}: {error}")))?;
-        if compare_this_layer_enabled() {
+        if compare_this_layer_enabled(layer_idx) {
             let expected = direct_tail_reference(
                 &reconstructed_x,
                 self.debug_resident_ffn
@@ -1351,6 +1613,14 @@ impl LinearProjector for NpuOpusProjector {
 
     fn take_layer_debug_hidden(&mut self) -> Option<Vec<f32>> {
         self.debug_resident_hidden.take()
+    }
+
+    fn take_layer_debug_residual(&mut self) -> Option<Vec<f32>> {
+        self.debug_resident_residual.take()
+    }
+
+    fn take_layer_debug_exception(&mut self) -> Option<(usize, Vec<f32>)> {
+        self.debug_resident_exception.take()
     }
 
     fn take_layer_debug_ffn(&mut self) -> Option<Vec<f32>> {
@@ -2153,8 +2423,13 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
     (rounded >> 16) as u16
 }
 
-fn compare_this_layer_enabled() -> bool {
+fn compare_this_layer_enabled(layer_idx: usize) -> bool {
     std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER").is_ok_and(|value| value != "0")
+        && std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0)
+            == layer_idx
 }
 
 fn host_metrics(left: &[f32], right: &[f32]) -> (f64, f32) {
@@ -2223,6 +2498,7 @@ fn write_residual_component(
 fn reconstruct_attention_residual_bf16(
     hidden: &[f32],
     pre_inverse: &[f32],
+    exception: Option<&NpuEmbeddingPreFfnException>,
     pre_norm: &[u16],
     fallback: &[u16],
     rows: usize,
@@ -2232,6 +2508,7 @@ fn reconstruct_attention_residual_bf16(
         || pre_inverse.len() != rows
         || pre_norm.len() != width
         || fallback.len() != rows * width
+        || exception.is_some_and(|exception| exception.column >= width || exception.x.len() != rows)
     {
         return Err(hip_error(
             "completed-layer reconstructible residual geometry mismatch",
@@ -2242,6 +2519,12 @@ fn reconstruct_attention_residual_bf16(
         let inverse = pre_inverse[row];
         for column in 0..width {
             let index = row * width + column;
+            if let Some(exception) = exception {
+                if column == exception.column {
+                    output.push(exception.x[row]);
+                    continue;
+                }
+            }
             let weight = f32::from_bits((pre_norm[column] as u32) << 16);
             let scale = weight * inverse;
             if scale.is_finite() && scale != 0.0 {
@@ -2256,4 +2539,29 @@ fn reconstruct_attention_residual_bf16(
 
 fn hip_error(message: impl AsRef<str>) -> HipError {
     HipError::new(0, message.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_exception_reconstructs_direct_x() {
+        let x = f32_to_bf16_bits(-0.625);
+        let exception = NpuEmbeddingPreFfnException {
+            column: 0,
+            x: vec![x],
+        };
+        let reconstructed = reconstruct_attention_residual_bf16(
+            &[0.0],
+            &[1.375],
+            Some(&exception),
+            &[f32_to_bf16_bits(2.0)],
+            &[f32_to_bf16_bits(4.0)],
+            1,
+            1,
+        )
+        .expect("packed exception reconstruction");
+        assert_eq!(reconstructed, vec![x]);
+    }
 }

@@ -82,6 +82,14 @@ pub trait LinearProjector {
         None
     }
 
+    fn take_layer_debug_residual(&mut self) -> Option<Vec<f32>> {
+        None
+    }
+
+    fn take_layer_debug_exception(&mut self) -> Option<(usize, Vec<f32>)> {
+        None
+    }
+
     fn take_layer_debug_ffn(&mut self) -> Option<Vec<f32>> {
         None
     }
@@ -271,6 +279,10 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     let trace_phases = std::env::var("HIPFIRE_EMBED_TRACE_PHASES").is_ok_and(|value| value != "0");
     let compare_resident_layer =
         std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER").is_ok_and(|value| value != "0");
+    let compare_resident_layer_index = std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
     let mut qkv_ms = 0.0f64;
     let mut attention_core_ms = 0.0f64;
     let mut attention_output_ms = 0.0f64;
@@ -348,7 +360,8 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
 
         // ── Attention block (bidirectional) ──
         gpu.rmsnorm_batched(&x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
-        let compare_this_layer = compare_resident_layer && layer_idx == 0;
+        let compare_this_layer =
+            compare_resident_layer && layer_idx == compare_resident_layer_index;
         if compare_this_layer {
             gpu.memcpy_dtod_at_auto(
                 &compare_input.as_ref().expect("comparison input").buf,
@@ -436,6 +449,54 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
         }
         gpu.rmsnorm_batched(&o, &layer.post_attn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(&x_batch, &tmp, &x_batch)?;
+        if completed_layer && compare_this_layer {
+            if let Some((column, exported)) = projector.take_layer_debug_exception() {
+                gpu.device_synchronize()?;
+                let fallback_x = gpu.download_f32(&x_batch)?;
+                let fallback_x_column = fallback_x
+                    .chunks_exact(dim)
+                    .map(|row| row[column])
+                    .collect::<Vec<_>>();
+                let (side_x_cosine, side_x_max_abs) = tensor_metrics(&exported, &fallback_x_column);
+                let max_token = exported
+                    .iter()
+                    .zip(&fallback_x_column)
+                    .enumerate()
+                    .max_by(|(_, (left_a, right_a)), (_, (left_b, right_b))| {
+                        (*left_a - *right_a)
+                            .abs()
+                            .total_cmp(&(*left_b - *right_b).abs())
+                    })
+                    .map(|(token, _)| token)
+                    .expect("non-empty exception comparison");
+                eprintln!(
+                    "embeddinggemma_resident_exception_x_compare layer={layer_idx} column={column} cosine={side_x_cosine:.8} max_abs={side_x_max_abs:.7} max_token={max_token} resident={:.7} fallback={:.7}",
+                    exported[max_token],
+                    fallback_x_column[max_token],
+                );
+            }
+            if let Some(resident_residual) = projector.take_layer_debug_residual() {
+                gpu.device_synchronize()?;
+                let fallback_residual = gpu.download_f32(&x_batch)?;
+                let (cosine, max_abs) = tensor_metrics(&resident_residual, &fallback_residual);
+                let min_row = min_row_cosine(&resident_residual, &fallback_residual, dim);
+                let (max_index, (&resident_at_max, &fallback_at_max)) = resident_residual
+                    .iter()
+                    .zip(&fallback_residual)
+                    .enumerate()
+                    .max_by(|(_, (left_a, right_a)), (_, (left_b, right_b))| {
+                        (*left_a - *right_a)
+                            .abs()
+                            .total_cmp(&(*left_b - *right_b).abs())
+                    })
+                    .expect("non-empty resident residual comparison");
+                let max_column = max_index % dim;
+                eprintln!(
+                    "embeddinggemma_resident_reconstructed_x_compare layer={layer_idx} cosine={cosine:.8} min_row_cosine={min_row:.8} max_abs={max_abs:.7} max_token={} max_column={max_column} resident_at_max={resident_at_max:.7} fallback_at_max={fallback_at_max:.7}",
+                    max_index / dim,
+                );
+            }
+        }
         if trace_phases {
             gpu.device_synchronize()?;
             attention_output_ms += stage_started.elapsed().as_secs_f64() * 1e3;

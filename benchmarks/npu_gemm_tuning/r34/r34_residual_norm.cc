@@ -12,6 +12,17 @@ constexpr int PARAM_RESIDUAL = 0;
 constexpr int PARAM_POST_NORM = ROWS * HIDDEN;
 constexpr int PARAM_PRE_NORM = PARAM_POST_NORM + HIDDEN;
 constexpr int PARAM_EPSILON_BYTES = (PARAM_PRE_NORM + HIDDEN) * 2;
+#ifdef R42_EXCEPTION_COLUMN
+constexpr int EXCEPTION_PHYSICAL_COLUMN = R42_EXCEPTION_COLUMN;
+constexpr int EXCEPTION_DIM = EXCEPTION_PHYSICAL_COLUMN % BLOCK_COLS;
+#if R42_EXCEPTION_COLUMN < 256
+#define R42_EXCEPTION_BLOCK block0
+#elif R42_EXCEPTION_COLUMN < 512
+#define R42_EXCEPTION_BLOCK block1
+#else
+#define R42_EXCEPTION_BLOCK block2
+#endif
+#endif
 constexpr float INV_HIDDEN = 1.0f / (float)HIDDEN;
 
 static inline bfloat16 *select_block(int8_t *block0, int8_t *block1,
@@ -24,6 +35,7 @@ static inline bfloat16 *select_block(int8_t *block0, int8_t *block1,
 } // namespace
 
 extern "C" {
+#if !defined(R42_SPLIT_OBJECTS) || defined(R42_BUILD_OUTPUT)
 void r34_output_projection_finish_pair_bf16(
     const float *restrict accum0, const float *restrict accum1,
     int8_t *restrict block0, int8_t *restrict block1, int8_t *restrict block2,
@@ -44,7 +56,9 @@ void r34_output_projection_finish_pair_bf16(
         }
   }
 }
+#endif
 
+#if !defined(R42_SPLIT_OBJECTS) || defined(R42_BUILD_POST)
 void r34_post_residual_pre_ffn(int8_t *restrict block0,
                                int8_t *restrict block1,
                                int8_t *restrict block2,
@@ -99,7 +113,20 @@ void r34_post_residual_pre_ffn(int8_t *restrict block0,
     }
     const float pre_inverse =
         aie::invsqrt(residual_sum * INV_HIDDEN + epsilon);
+#ifdef R42_EXCEPTION_COLUMN
     metadata[row] = pre_inverse;
+    // Keep the selected exception block distinct from the three-pointer array
+    // used above. Without chess_copy Peano aliases block0's late reload with
+    // block2 while optimizing the restricted pointers.
+    const auto *exception_block = reinterpret_cast<const bfloat16 *>(
+        chess_copy(R42_EXCEPTION_BLOCK));
+    const auto exception_vector = aie::load_v<16>(
+        exception_block + row * BLOCK_COLS + (EXCEPTION_DIM & -16));
+    reinterpret_cast<bfloat16 *>(metadata_bytes + 64 + wave * ROWS * 4)
+        [row * 2] = exception_vector[EXCEPTION_DIM & 15];
+#else
+    metadata[row] = pre_inverse;
+#endif
     for (int block = 0; block < 3; ++block) {
       bfloat16 *values = blocks[block] + row * BLOCK_COLS;
       const int hidden_base = block * BLOCK_COLS;
@@ -114,7 +141,13 @@ void r34_post_residual_pre_ffn(int8_t *restrict block0,
     }
   }
 }
+#endif
 
+#ifdef R42_EXCEPTION_COLUMN
+#undef R42_EXCEPTION_BLOCK
+#endif
+
+#if !defined(R42_SPLIT_OBJECTS) || defined(R42_BUILD_EMIT)
 __attribute__((noinline, minsize, cold)) void
 r34_emit_norm_half(const int8_t *restrict block, int8_t *restrict output,
                    int32_t half) {
@@ -126,7 +159,9 @@ r34_emit_norm_half(const int8_t *restrict block, int8_t *restrict output,
     output += 64;
   }
 }
+#endif
 
+#if !defined(R42_SPLIT_OBJECTS) || defined(R42_BUILD_RELAY)
 __attribute__((noinline, minsize)) void
 r38_relay_pre_inverse(const int8_t *restrict input,
                       int8_t *restrict output) {
@@ -135,6 +170,15 @@ r38_relay_pre_inverse(const int8_t *restrict input,
   aie::store_v(reinterpret_cast<float *>(output), values.extract<8>(0));
   aie::store_v(reinterpret_cast<float *>(output + 1024),
                values.extract<8>(1));
+#ifdef R42_EXCEPTION_COLUMN
+  const auto exception_state =
+      aie::load_v<16>(reinterpret_cast<const uint32_t *>(input + 64));
+  aie::store_v(reinterpret_cast<uint32_t *>(output + 32),
+               exception_state.extract<8>(0));
+  aie::store_v(reinterpret_cast<uint32_t *>(output + 1056),
+               exception_state.extract<8>(1));
+#endif
 }
+#endif
 
 }

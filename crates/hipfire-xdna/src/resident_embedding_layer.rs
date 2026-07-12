@@ -44,6 +44,7 @@ const PRE_NORM_OFFSET: usize = POST_NORM_OFFSET + K * size_of::<u16>();
 const EPSILON_OFFSET: usize = PRE_NORM_OFFSET + K * size_of::<u16>();
 const PRE_INVERSE_BASE: usize = M * K * size_of::<u16>();
 const PRE_INVERSE_RECORD_BYTES: usize = ROWS_PER_CORE * K * size_of::<u16>();
+const PRE_EXCEPTION_OFFSET: usize = ROWS_PER_CORE * size_of::<f32>();
 const MAX_CONTEXT_COMMANDS: usize = 1_000;
 
 /// Per-layer immutable R34 payload plus the input-scale template that must be
@@ -53,6 +54,19 @@ pub struct NpuEmbeddingLayerAttentionDenseW8Weights {
     input_template: Vec<u8>,
     hidden_template: Vec<u8>,
     awq_scale: Option<Vec<f32>>,
+}
+
+/// Per-token state exported after the resident attention tail. Exception
+/// images retain the exact F32 inverse and append the one BF16 X component
+/// hidden by a zero weight in otherwise unused record space.
+pub struct NpuEmbeddingPreFfnState {
+    pub inverse: Vec<f32>,
+    pub exception: Option<NpuEmbeddingPreFfnException>,
+}
+
+pub struct NpuEmbeddingPreFfnException {
+    pub column: usize,
+    pub x: Vec<u16>,
 }
 
 impl NpuEmbeddingLayerAttentionDenseW8Weights {
@@ -70,6 +84,7 @@ pub struct NpuEmbeddingLayerAttentionDenseW8 {
     hidden: DeviceBuffer,
     queries: DeviceBuffer,
     key_values: DeviceBuffer,
+    exception_column: Option<usize>,
     primed: bool,
     context_commands: usize,
 }
@@ -88,7 +103,6 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             "tails=post-attn-norm,residual,pre-ffn-norm",
             "output=canonical-token-major-bf16",
             "handoff=staging-prefix-dmabuf",
-            "state=pre-ffn-inverse-f32",
         ] {
             if !manifest.lines().any(|line| line == field) {
                 return Err(invalid(format!(
@@ -96,6 +110,25 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
                 )));
             }
         }
+        let exception_column = if manifest
+            .lines()
+            .any(|line| line == "state=pre-ffn-inverse-f32")
+        {
+            None
+        } else if manifest
+            .lines()
+            .any(|line| line == "state=pre-ffn-inverse-f32-x-bf16")
+        {
+            let column = manifest
+                .lines()
+                .find_map(|line| line.strip_prefix("exception-column="))
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&column| column < K)
+                .ok_or_else(|| invalid("resident layer exception cache has invalid column"))?;
+            Some(column)
+        } else {
+            return Err(invalid("resident layer attention cache has unknown state"));
+        };
         let kernel = NpuKernel::load(
             &std::fs::read(format!("{cache}/final.xclbin")).map_err(XdnaError::Open)?,
             &std::fs::read(format!("{cache}/insts.bin")).map_err(XdnaError::Open)?,
@@ -106,6 +139,7 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             queries: kernel.alloc_arg(Q_BYTES)?,
             key_values: kernel.alloc_arg(KV_BYTES)?,
             kernel,
+            exception_column,
             primed: false,
             context_commands: 0,
         })
@@ -306,6 +340,12 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
     /// the canonical H prefix. Physical records follow core-row then column;
     /// map them back to canonical token order for host-side boundary probes.
     pub fn read_pre_inverse_f32(&self) -> Result<Vec<f32>, XdnaError> {
+        Ok(self.read_pre_ffn_state()?.inverse)
+    }
+
+    /// Read the inverse RMS and, for a fixed-column R42 image, the direct BF16 X
+    /// exception packed into the same metadata word.
+    pub fn read_pre_ffn_state(&self) -> Result<NpuEmbeddingPreFfnState, XdnaError> {
         self.kernel.sync_output(&self.hidden)?;
         let bytes = self.hidden.as_slice();
         let required = PRE_INVERSE_BASE + COLS * CORE_ROWS * PRE_INVERSE_RECORD_BYTES;
@@ -313,22 +353,34 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             return Err(invalid("resident layer pre-inverse backing is too small"));
         }
         let mut inverse = vec![0.0f32; M];
+        let mut exception_x = self.exception_column.map(|_| vec![0u16; M]);
         for core_row in 0..CORE_ROWS {
             for column in 0..COLS {
                 let record = core_row * COLS + column;
                 let token_base = (column / 4) * 128 + core_row * 32 + (column % 4) * 8;
                 let start = PRE_INVERSE_BASE + record * PRE_INVERSE_RECORD_BYTES;
                 for row in 0..ROWS_PER_CORE {
-                    let offset = start + row * size_of::<f32>();
-                    inverse[token_base + row] = f32::from_le_bytes(
-                        bytes[offset..offset + size_of::<f32>()]
-                            .try_into()
-                            .expect("four-byte inverse"),
+                    let (decoded_inverse, decoded_exception) = decode_pre_ffn_record(
+                        &bytes[start..start + PRE_INVERSE_RECORD_BYTES],
+                        row,
+                        self.exception_column.is_some(),
                     );
+                    inverse[token_base + row] = decoded_inverse;
+                    if let (Some(x), Some(value)) = (&mut exception_x, decoded_exception) {
+                        x[token_base + row] = value;
+                    }
                 }
             }
         }
-        Ok(inverse)
+        Ok(NpuEmbeddingPreFfnState {
+            inverse,
+            exception: self
+                .exception_column
+                .map(|column| NpuEmbeddingPreFfnException {
+                    column,
+                    x: exception_x.expect("exception X allocated with column"),
+                }),
+        })
     }
 
     fn dispatch(
@@ -362,6 +414,25 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         self.primed = false;
         self.context_commands = 0;
     }
+}
+
+fn decode_pre_ffn_record(record: &[u8], row: usize, has_exception: bool) -> (f32, Option<u16>) {
+    let inverse_offset = row * size_of::<f32>();
+    let inverse = f32::from_le_bytes(
+        record[inverse_offset..inverse_offset + size_of::<f32>()]
+            .try_into()
+            .expect("four-byte pre-FFN inverse"),
+    );
+    let exception = has_exception.then(|| {
+        let offset = PRE_EXCEPTION_OFFSET + row * size_of::<u32>();
+        let word = u32::from_le_bytes(
+            record[offset..offset + size_of::<u32>()]
+                .try_into()
+                .expect("four-byte pre-FFN exception state"),
+        );
+        word as u16
+    });
+    (inverse, exception)
 }
 
 fn pack_paired_weights(unpaired: &[u8]) -> Vec<u8> {
@@ -584,5 +655,23 @@ mod tests {
             }
         }
         assert!(seen.into_iter().all(|value| value));
+    }
+
+    #[test]
+    fn expanded_exception_record_preserves_inverse_and_x() {
+        let inverse = 1.375f32;
+        let x = f32_to_bf16_bits(-0.625);
+        let mut record = vec![0u8; PRE_EXCEPTION_OFFSET + ROWS_PER_CORE * size_of::<u32>()];
+        record[3 * size_of::<f32>()..4 * size_of::<f32>()].copy_from_slice(&inverse.to_le_bytes());
+        let exception_offset = PRE_EXCEPTION_OFFSET + 3 * size_of::<u32>();
+        let exception_word = x as u32;
+        record[exception_offset..exception_offset + size_of::<u32>()]
+            .copy_from_slice(&exception_word.to_le_bytes());
+        let (decoded_inverse, decoded_exception) = decode_pre_ffn_record(&record, 3, true);
+        assert_eq!(decoded_inverse, inverse);
+        assert_eq!(decoded_exception, Some(x));
+        let (plain, no_exception) = decode_pre_ffn_record(&record, 3, false);
+        assert_eq!(plain, inverse);
+        assert_eq!(no_exception, None);
     }
 }
