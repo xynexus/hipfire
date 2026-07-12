@@ -201,7 +201,10 @@ example OQ4.125 and OQ6.5, to prove the runtime is not hardcoded to OQ4.25.
 - CPU integer/scaling oracle parity for W4, mixed, and W8 matrices.
 - Hardware parity for multiple K/N/M shapes and variable overlay counts.
 - GPU-versus-NPU full embedding cosine and max-absolute-error checks.
-- Existing selection-stability metrics against BF16.
+- STS-Benchmark Spearman-vs-gold admission gate (see the 2026-07-12 checkpoint):
+  the `embedding_quality` hipfire-eval battery, gating candidate-vs-reference
+  Spearman delta within a ~1.0-point band. Cross-model cosine and rank
+  agreement are recorded as evidence but are NOT the admission criterion.
 - `./tests/coherence-gate-dflash.sh` after quant/kernel/dispatch changes.
 
 ### Performance
@@ -2108,3 +2111,70 @@ preparation, and the gate-to-down host-visible intermediate remain separate
 bottlenecks. The next FFN step is to retain or transpose one M block of the
 GeGLU tensor across aggregate tile memory so the down projection does not drain
 and reread the full 288-by-1280 BF16 scratch plane through the shims.
+
+### Quality-admission gate derivation — STS-Benchmark Spearman (2026-07-12)
+
+Every prior checkpoint that called a candidate "below the real-model quality
+gate" or a "quality-quality failure" was measuring against a gate that did not
+exist. Code inspection confirmed it: the "selection-stability metric against
+BF16" was the `quality_compare.rs` example, which computes rich statistics
+(top-1 agreement, top-k overlap, regret, Spearman/Pearson) but only prints JSON
+with no threshold; nothing consumed it. The hipfire-eval admission engine had no
+embedding metric in its vocabulary and could not gate an embedding candidate at
+all. The low OQ4 cosines quoted throughout this document (for example the padded
+`npu.oq4++` "0.97711") were captured stdout of a CROSS-MODEL raw-vector cosine
+field, eyeballed by a human. That is the wrong admission metric for an embedding
+model: embeddings live on a hypersphere where a rotated-but-equally-good space
+deflates cross-model cosine without any retrieval-quality loss.
+
+The correct, self-consistent metric is Spearman of the model's OWN pair-cosine
+scores against human gold labels — how well the model tracks similarity
+judgments when it both indexes and queries. Measured on STS-Benchmark dev (1500
+pairs, 500 selection queries) with `quality_compare` on the GPU path:
+
+| model | Spearman vs gold | Δ vs BF16 (95% CI) | mean cos vs BF16 |
+|---|---:|---|---:|
+| BF16 (ref) | 0.86147 | — | 1.0 |
+| OQ8 | 0.86150 | +0.00003 (−.0002,+.0003) ns | 0.99979 |
+| OQ8++ | 0.86139 | −0.00008 (−.0003,+.0001) ns | 0.99984 |
+| OQ4 | 0.86190 | +0.00043 (−.0022,+.0029) ns | 0.95074 |
+| OQ4+ | 0.86073 | −0.00075 (−.0034,+.0016) ns | 0.96436 |
+| OQ4++ | 0.85764 | −0.00383 (−.0065,−.0013) sig | 0.96475 |
+
+(`ns` = bootstrap CI crosses zero, i.e. statistically indistinguishable from
+BF16.) Every OQ4 variant retains >=99.5% of BF16's downstream STS quality despite
+cross-model cosine of only ~0.95-0.96, so the earlier "0.977 fails quality"
+verdict was measuring the wrong thing by an order of magnitude. Two secondary
+findings: OQ8/OQ8++ are indistinguishable from BF16; and among the OQ4 family,
+plain OQ4 and OQ4+ tie BF16 while OQ4++ is the ONLY variant with a
+statistically significant (but tiny, ~0.44% relative) drop — LDLQ error
+feedback minimizes weight reconstruction, not downstream task error, and here it
+slightly hurt. For this embedding workload, plain OQ4 or OQ4+ is the better
+W4A8 operating point than OQ4++.
+
+Combined with OQ4's ~half-the-bytes memory/bandwidth advantage on this NPU
+path, OQ4 sits strictly ahead of OQ8 on the quality-per-resource frontier: there
+is no quality-based reason to prefer OQ8 for this model. The GPU-path quant
+formats (`oq4`, `oq4+`, `oq4++`, `oq8`, `oq8+`, `oq8++`) all clear a
+task-relative gate; this is a property of the encodings, separate from the
+still-open NPU throughput work.
+
+This was made enforceable rather than eyeballed. A new `embedding_quality`
+hipfire-eval battery (commit `b103908da`) shells out to `quality_compare`, emits
+a candidate row and a reference row sharing one comparison key that both carry a
+raw `spearman` metric, and lets the existing admission pipeline gate the delta.
+The gate is a per-metric admission dead-band: `spearman` gets a 0.01 band (~1.0
+STS point) and is registered higher-is-better, quality-trigger, and hard-reject;
+`delta >= -0.01` admits, `delta < -0.01` rejects. Cross-model cosine and rank
+agreement are recorded as evidence but deliberately NOT gated. Run with
+`hipfire-eval --battery embedding_quality --model <cand>.hfq --reference
+<bf16>.hfq`; the battery is opt-in (absent from every default tier) and skips
+rather than fails when the binary, models, or STS corpus are missing.
+
+This is a quality-admission result, not an NPU throughput result. It does not
+change any 10k/15k performance conclusion. Open: retrieval-quality metrics on a
+labeled corpus (nDCG/recall@k; no MTEB-style set is in the repo, so STS Spearman
+is the only task signal today), and the padded `.npu.` artifacts still differ
+from their unpadded GPU comparison artifacts and cannot load through the GPU
+`quality_compare` path (K=1152 down projection), so their STS quality was not
+measured here.
