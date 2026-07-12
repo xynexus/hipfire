@@ -794,8 +794,8 @@ fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipRes
 // layout version: a future layout change takes a NEW code, so a stale artifact
 // refuses via the loader's catch-all rather than reading as garbage.
 pub use hipfire_runtime::hfq::{
-    oq4_arch_combined_len, oq4_arch_load, oq4_pack_arch_combined, OQ4_ARCH_PACKED_QT,
-    OQ4_CANONICAL_QT,
+    oq4_arch_combined_len, oq4_arch_load, oq4_pack_arch_combined, oq4_to_oq8_combined,
+    oq8_combined, oqplus_compact_to_oq8_combined, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
 };
 
 /// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
@@ -1101,56 +1101,7 @@ fn load_weight_tensor_raw(
             // in-group indices → the Oq8 kernel buffer [int8 M*K | f32 scales M*ng].
             // Tagged Oq8G256 → the single iu8 W8A8 forward, unchanged. AWQ sidecar
             // (when present) is applied to x by the wrapper (Oq8G256 is allow-listed).
-            const GROUP: usize = 256;
-            assert_eq!(k % GROUP, 0, "OQ+C requires K % 256 == 0 (got K={k})");
-            let ng = k / GROUP;
-            let n_groups = m * ng;
-            assert!(n_groups > 0 && !data.is_empty(), "OQ+C empty tensor");
-            assert_eq!(
-                data.len() % n_groups,
-                0,
-                "OQ+C byte length {} not divisible by n_groups {n_groups}",
-                data.len()
-            );
-            let block_bytes = data.len() / n_groups;
-            assert!(
-                block_bytes >= 132 && (block_bytes - 130).is_multiple_of(2),
-                "OQ+C block_bytes {block_bytes} invalid (expected 130 + 2·N_out)"
-            );
-            let n_out = (block_bytes - 130) / 2;
-            let sext4 = |nib: u8| -> i8 {
-                let v = (nib & 0xf) as i8;
-                if v > 7 {
-                    v - 16
-                } else {
-                    v
-                }
-            };
-            let weight_bytes = m * k; // one int8 per weight after expand
-            let scales_bytes = m * ng * 4;
-            let mut combined = vec![0u8; weight_bytes + scales_bytes];
-            for r in 0..m {
-                for g in 0..ng {
-                    let src = (r * ng + g) * block_bytes;
-                    let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-                    let dst = r * k + g * GROUP;
-                    // Expand the 128 int4 nibble bytes → 256 int8 (bulk).
-                    for i in 0..128 {
-                        let byte = data[src + 2 + i];
-                        combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
-                        combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
-                    }
-                    // Overlay the sparse int8 outliers: (u8 idx, i8 val) × N_out.
-                    let tbl = src + 130;
-                    for s in 0..n_out {
-                        let idx = data[tbl + 2 * s] as usize;
-                        let val = data[tbl + 2 * s + 1];
-                        combined[dst + idx] = val;
-                    }
-                    let so = weight_bytes + (r * ng + g) * 4;
-                    combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-                }
-            }
+            let combined = oqplus_compact_to_oq8_combined(data, m, k);
             let buf = gpu.upload_raw(&combined, &[combined.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -1173,46 +1124,7 @@ fn load_weight_tensor_raw(
             // becomes the Oq8 kernel buffer [int8 M*K | f32 scales M*ng] — the exact
             // upcast the `quantize_oq4g256` doc names. AWQ smooth, when present, is
             // applied to x by the wrapper via the awq_scale sidecar (unchanged).
-            const GROUP: usize = 256;
-            // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 on-disk
-            // block = 2 (f16 scale) + 128 nibbles = 130.
-            const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
-                .block_bytes()
-                .unwrap();
-            assert_eq!(k % GROUP, 0, "OQPLUS requires K % 256 == 0 (got K={k})");
-            let ng = k / GROUP;
-            let weight_bytes = m * k; // one int8 per weight after expand
-            let scales_bytes = m * ng * 4;
-            let expect = m * ng * BLOCK;
-            assert_eq!(
-                data.len(),
-                expect,
-                "OQPLUS weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
-                data.len()
-            );
-            let sext4 = |nib: u8| -> i8 {
-                let v = (nib & 0xf) as i8;
-                if v > 7 {
-                    v - 16
-                } else {
-                    v
-                }
-            };
-            let mut combined = vec![0u8; weight_bytes + scales_bytes];
-            for r in 0..m {
-                for g in 0..ng {
-                    let src = (r * ng + g) * BLOCK;
-                    let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-                    let dst = r * k + g * GROUP;
-                    for i in 0..128 {
-                        let byte = data[src + 2 + i];
-                        combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
-                        combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
-                    }
-                    let so = weight_bytes + (r * ng + g) * 4;
-                    combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-                }
-            }
+            let combined = oq4_to_oq8_combined(data, m, k);
             let buf = gpu.upload_raw(&combined, &[combined.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -1259,34 +1171,7 @@ fn load_weight_tensor_raw(
             // `gemm_oq8_grouped_wmma`. Activations are int8-quantized at runtime
             // (`quantize_act_oq8`); weights are FWHT-rotated offline so the forward
             // FWHT-rotates x to match.
-            const GROUP: usize = 256;
-            // Single-sourced from hipfire-quant-format (WP-3.3): Oq8G256 on-disk
-            // block = 2 (f16 scale) + 256 int8 = 258.
-            const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq8G256
-                .block_bytes()
-                .unwrap();
-            assert_eq!(k % GROUP, 0, "OQ8G256 requires K % 256 == 0 (got K={k})");
-            let ng = k / GROUP;
-            let weight_bytes = m * k;
-            let scales_bytes = m * ng * 4;
-            let expect = m * ng * BLOCK;
-            assert_eq!(
-                data.len(),
-                expect,
-                "OQ8G256 weight byte length {} != M*ng*258 = {expect} (M={m} K={k})",
-                data.len()
-            );
-            let mut combined = vec![0u8; weight_bytes + scales_bytes];
-            for r in 0..m {
-                for g in 0..ng {
-                    let src = (r * ng + g) * BLOCK;
-                    let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-                    let dst = r * k + g * GROUP;
-                    combined[dst..dst + 256].copy_from_slice(&data[src + 2..src + BLOCK]);
-                    let so = weight_bytes + (r * ng + g) * 4;
-                    combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-                }
-            }
+            let combined = oq8_combined(data, m, k);
             let buf = gpu.upload_raw(&combined, &[combined.len()])?;
             Ok(WeightTensor {
                 buf,

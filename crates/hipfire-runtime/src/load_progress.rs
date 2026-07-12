@@ -46,6 +46,10 @@ pub fn report(current: u32, total: u32, phase: &str) {
     if let Ok(guard) = SINK.lock() {
         if let Some(sink) = guard.as_ref() {
             sink(current, total, phase);
+            return;
         }
+        // No sink (CLI-direct load, eval, tests): emit the human progress line
+        // loaders used to `eprintln!` themselves, so text callers still see it.
+        eprintln!("  loading {phase} {current}/{total}");
     }
 }

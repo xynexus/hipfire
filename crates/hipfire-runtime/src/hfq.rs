@@ -24,6 +24,7 @@ pub use crate::oq4_arch::{
     oq4_arch_combined_len, oq4_arch_load, oq4_pack_arch_combined, OQ4_ARCH_PACKED_QT,
     OQ4_CANONICAL_QT,
 };
+pub use crate::oq8_arch::{oq4_to_oq8_combined, oq8_combined, oqplus_compact_to_oq8_combined};
 
 pub const HFQM_MAGIC: &[u8; 4] = b"HFQM";
 pub const HFQM_VERSION: u32 = 1;
@@ -1905,7 +1906,6 @@ pub fn load_weights_hfq(
 
     let mut layers = Vec::with_capacity(config.n_layers);
     for i in 0..config.n_layers {
-        eprintln!("  loading layer {i}/{} ...", config.n_layers);
         crate::load_progress::report(i as u32 + 1, config.n_layers as u32, "weights");
         let p = format!("model.layers.{i}");
         let kv_dim = config.n_kv_heads * config.head_dim;

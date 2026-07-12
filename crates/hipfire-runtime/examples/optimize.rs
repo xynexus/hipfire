@@ -40,7 +40,7 @@
 //!     `FADV_DONTNEED`), so the pre-packed bytes stream straight into the single
 //!     device allocation — no page-cache shadow copy in the shared pool.
 //!
-//! The transform itself is `hipfire_arch_qwen35::qwen35::oq4_pack_arch_combined`,
+//! The transform itself is `hipfire_runtime::oq4_arch::oq4_pack_arch_combined`,
 //! the SAME function the loader's qt=34 (OQ4) path calls, so the tool and the
 //! loader can never drift.
 //!
@@ -51,8 +51,10 @@
 
 use std::path::PathBuf;
 
-use hipfire_arch_qwen35::qwen35::{oq4_pack_arch_combined, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT};
-use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+use hipfire_runtime::hfq::{
+    oq4_pack_arch_combined, write_hfqm_package_mem, HfqFile, HfqMemTensor, OQ4_ARCH_PACKED_QT,
+    OQ4_CANONICAL_QT,
+};
 
 /// Best-effort live GPU arch probe (e.g. "gfx1103"). Read-only
 /// `hipGetDeviceProperties` on device 0 — no GPU lock, no compute context, so it

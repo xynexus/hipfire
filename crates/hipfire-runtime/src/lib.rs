@@ -45,6 +45,7 @@ pub mod model_source;
 pub mod mtp_mirror;
 pub mod multi_gpu;
 pub mod oq4_arch;
+pub mod oq8_arch;
 pub mod quant;
 pub mod safetensors_source;
 pub mod sampler;

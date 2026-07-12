@@ -20,7 +20,8 @@
 use hip_bridge::HipResult;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::hfq::{
-    load_awq_scale, oq4_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
+    load_awq_scale, oq4_arch_load, oq4_to_oq8_combined, oq8_combined,
+    oqplus_compact_to_oq8_combined, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
 };
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{EmbeddingFormat, WeightTensor};
@@ -128,11 +129,6 @@ pub fn load_weights_prefixed(
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
-        eprintln!(
-            "gemma3: loading layer {}/{}...",
-            i + 1,
-            cfg.num_hidden_layers
-        );
         hipfire_runtime::load_progress::report(
             i as u32 + 1,
             cfg.num_hidden_layers as u32,
@@ -176,11 +172,6 @@ pub fn load_encoder_weights_prefixed(
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
-        eprintln!(
-            "gemma3: loading layer {}/{}...",
-            i + 1,
-            cfg.num_hidden_layers
-        );
         hipfire_runtime::load_progress::report(
             i as u32 + 1,
             cfg.num_hidden_layers as u32,
@@ -675,125 +666,4 @@ fn load_weight_tensor(
         wt.awq_scale = load_awq_scale(hfq, gpu, name, k);
     }
     Ok(wt)
-}
-
-fn sext4(nib: u8) -> i8 {
-    let v = (nib & 0xf) as i8;
-    if v > 7 {
-        v - 16
-    } else {
-        v
-    }
-}
-
-fn oq4_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    const GROUP: usize = 256;
-    // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 = 130.
-    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
-        .block_bytes()
-        .unwrap();
-    assert_eq!(k % GROUP, 0, "OP4-8 requires K % 256 == 0 (got K={k})");
-    let ng = k / GROUP;
-    let expect = m * ng * BLOCK;
-    assert_eq!(
-        data.len(),
-        expect,
-        "OP4-8 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
-        data.len()
-    );
-    let mut combined = vec![0u8; m * k + m * ng * 4];
-    for r in 0..m {
-        for g in 0..ng {
-            let src = (r * ng + g) * BLOCK;
-            let dst = r * k + g * GROUP;
-            for i in 0..128 {
-                let byte = data[src + 2 + i];
-                combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
-                combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
-            }
-            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-            let so = m * k + (r * ng + g) * 4;
-            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-        }
-    }
-    combined
-}
-
-/// Expand an on-disk `OqPlusCompact` (qt=36) tensor into the Oq8G256 combined
-/// layout (`[m*k int8 weights | m*ng f32 scales]`, same as [`oq4_to_oq8_combined`]
-/// / [`oq8_combined`]). Each group is `[f16 scale | 128 int4 nibbles |
-/// N_out × (u8 idx, i8 val)]` = 130 + 2·N_out bytes; the int4 bulk is
-/// sign-extended into int8 and the sparse int8 outliers overlaid. `N_out` is
-/// uniform per tensor (fixed w8_frac), derived from the block stride — mirrors
-/// minimax's `oqplus_compact_to_moe_oq8_blocks`.
-fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    const GROUP: usize = 256;
-    assert_eq!(k % GROUP, 0, "OQ+C requires K % 256 == 0 (got K={k})");
-    let ng = k / GROUP;
-    let n_groups = m * ng;
-    assert!(
-        n_groups > 0 && !data.is_empty() && data.len() % n_groups == 0,
-        "OQ+C weight byte length {} not divisible by n_groups {n_groups} (M={m} K={k})",
-        data.len()
-    );
-    let block_bytes = data.len() / n_groups;
-    assert!(
-        block_bytes >= 132 && (block_bytes - 130) % 2 == 0,
-        "OQ+C block_bytes {block_bytes} invalid (expected 130 + 2·N_out)"
-    );
-    let n_out = (block_bytes - 130) / 2;
-    let mut combined = vec![0u8; m * k + m * ng * 4];
-    for r in 0..m {
-        for g in 0..ng {
-            let blk = r * ng + g;
-            let src = blk * block_bytes;
-            let dst = r * k + g * GROUP;
-            // int4 bulk → int8 (buffer read as signed char downstream).
-            for i in 0..128 {
-                let byte = data[src + 2 + i];
-                combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
-                combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
-            }
-            // Overlay the sparse int8 outliers.
-            let tbl = src + 130;
-            for s in 0..n_out {
-                let idx = data[tbl + 2 * s] as usize;
-                let val = data[tbl + 2 * s + 1];
-                combined[dst + idx] = val;
-            }
-            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-            let so = m * k + (r * ng + g) * 4;
-            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-        }
-    }
-    combined
-}
-
-fn oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    const GROUP: usize = 256;
-    // Single-sourced from hipfire-quant-format (WP-3.3): Oq8G256 = 258.
-    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq8G256
-        .block_bytes()
-        .unwrap();
-    assert_eq!(k % GROUP, 0, "OP8 requires K % 256 == 0 (got K={k})");
-    let ng = k / GROUP;
-    let expect = m * ng * BLOCK;
-    assert_eq!(
-        data.len(),
-        expect,
-        "OP8 weight byte length {} != M*ng*258 = {expect} (M={m} K={k})",
-        data.len()
-    );
-    let mut combined = vec![0u8; m * k + m * ng * 4];
-    for r in 0..m {
-        for g in 0..ng {
-            let src = (r * ng + g) * BLOCK;
-            let dst = r * k + g * GROUP;
-            combined[dst..dst + GROUP].copy_from_slice(&data[src + 2..src + BLOCK]);
-            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-            let so = m * k + (r * ng + g) * 4;
-            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-        }
-    }
-    combined
 }
