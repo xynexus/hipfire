@@ -1939,3 +1939,47 @@ evidence against the format-neutral kernel contract. Canonical all-projection
 OQ4+ and OQ4++ artifacts still need to be produced and gated. The low W4/mixed
 cosines are quantization-quality failures, not resident-dispatch failures, and
 must not be promoted despite their now-complete NPU execution path.
+
+The canonical suffix artifacts were subsequently generated from BF16 with the
+unified `EmbeddingGemma-300M.calib.hfq` package. Both keep the Dense heads F16
+while quantizing all 168 backbone projections:
+
+- `EmbeddingGemma-300M.npu.oq4+.hfq` uses AWQ/clip-search calibration and
+  reaches the completed resident layer at `0.97610980` BF16 cosine;
+- `EmbeddingGemma-300M.npu.oq4++.hfq` reports 168/168 successful LDLQ packs,
+  reaches the completed resident layer, and measures `0.97711462` BF16 cosine.
+
+These close the `+`/`++` execution matrix but still fail the quality target.
+
+### R51 resident Dense-head and L2 checkpoint
+
+R51 completes the post-encoder AIE2P graph. R49's 768-element pooled F32 output
+is written into the prefix of a shared input/weight dma-buf. A single-core
+consumer streams BF16 rows for the two identity Dense heads
+`768 -> 3072 -> 768`, retains the 3072-element intermediate in local tile
+memory, and applies final L2 normalization before returning the 768-element
+embedding. AWQ Dense sidecars, when present, are folded into the uploaded
+effective weights, preserving the host equation without an activation-side
+buffer. The forward contract now distinguishes a backend-produced final
+embedding from a pooled hidden vector, preventing the CPU heads from being
+applied a second time.
+
+The standalone hardware oracle reports `1.00000000` cosine and about `1e-8`
+maximum absolute error with an `18.1184 ms` five-command average. Full M256
+checks report:
+
+| artifact | BF16 cosine | max abs | hybrid ms | input tok/s |
+|---|---:|---:|---:|---:|
+| OQ8++ | 0.99818963 | 0.00833587 | 959.318 | 266.9 |
+| OQ4++ | 0.97710949 | 0.02409978 | 1000.163 | 256.0 |
+
+This is the first checkpoint where encoder layers, final RMSNorm, mean pooling,
+both Dense heads, and final L2 normalization all execute on AIE2P. It is still
+not a serving or performance admission. The single-core Dense graph is a
+correctness schedule, and the full model remains dominated by serialized
+hardware contexts. More importantly, opening an all-projection Opus artifact
+without `HIPFIRE_EMBED_REFERENCE_MODEL` still invokes the legacy GPU Gemma3
+weight loader first; OQ8 fails its `K % 256 == 0` assertion on the K=1152 down
+projection before the resident projector can take ownership. A lean NPU-native
+weight-loading seam is therefore required before this path is independently
+servable.

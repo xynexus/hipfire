@@ -73,6 +73,15 @@ impl NpuEmbeddingFinalNormMean {
         Ok(())
     }
 
+    pub fn attach_shared_output(&mut self, fd: i32, bytes: usize) -> Result<(), XdnaError> {
+        if bytes != OUTPUT_BYTES {
+            return Err(invalid("final norm/mean shared output size mismatch"));
+        }
+        self.output = self.kernel.import_dmabuf(fd, bytes, true)?;
+        self.primed = false;
+        Ok(())
+    }
+
     pub fn upload_params(
         &self,
         output_norm: &[f32],

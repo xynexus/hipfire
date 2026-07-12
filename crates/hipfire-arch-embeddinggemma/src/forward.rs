@@ -51,6 +51,11 @@ pub enum AttentionBoundary {
     OutputProjected,
 }
 
+pub enum FinalizedEncoder {
+    Pooled(Vec<f32>),
+    Embedding(Vec<f32>),
+}
+
 pub trait LinearProjector {
     fn project(
         &mut self,
@@ -103,12 +108,13 @@ pub trait LinearProjector {
     /// Consume the backend-owned completed encoder state and return the pooled
     /// hidden vector. Resident backends use this to avoid materializing the
     /// final token matrix through the GPU/host fallback boundary.
-    fn finalize_pooled_hidden(
+    fn finalize_encoder(
         &mut self,
         _rows: usize,
         _hidden: usize,
         _mode: PoolingMode,
-    ) -> HipResult<Option<Vec<f32>>> {
+        _dense_heads: &[crate::weights::DenseHeadHost],
+    ) -> HipResult<Option<FinalizedEncoder>> {
         Ok(None)
     }
 
@@ -253,7 +259,12 @@ pub fn embed_forward_with_projector<P: LinearProjector>(
     }
     let hidden = encode_pooled_hidden_with_projector(gpu, weights, cfg, tokens, projector)
         .map_err(|e| format!("embeddinggemma: encode failed: {e:?}"))?;
-    project_dense_with_capture(&weights.dense_heads, hidden, |_, _| Ok(()))
+    match hidden {
+        FinalizedEncoder::Pooled(hidden) => {
+            project_dense_with_capture(&weights.dense_heads, hidden, |_, _| Ok(()))
+        }
+        FinalizedEncoder::Embedding(embedding) => Ok(embedding),
+    }
 }
 
 /// Apply the ordered sentence-transformers Dense heads, exposing each head's
@@ -284,7 +295,13 @@ pub(crate) fn encode_pooled_hidden(
     tokens: &[u32],
 ) -> HipResult<Vec<f32>> {
     let mut projector = GpuLinearProjector;
-    encode_pooled_hidden_with_projector(gpu, weights, cfg, tokens, &mut projector)
+    match encode_pooled_hidden_with_projector(gpu, weights, cfg, tokens, &mut projector)? {
+        FinalizedEncoder::Pooled(hidden) => Ok(hidden),
+        FinalizedEncoder::Embedding(_) => Err(hip_bridge::HipError::new(
+            0,
+            "GPU pooled-hidden path unexpectedly returned a final embedding",
+        )),
+    }
 }
 
 fn encode_pooled_hidden_with_projector<P: LinearProjector>(
@@ -293,7 +310,7 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     cfg: &EmbeddingGemmaConfig,
     tokens: &[u32],
     projector: &mut P,
-) -> HipResult<Vec<f32>> {
+) -> HipResult<FinalizedEncoder> {
     let trace_phases = std::env::var("HIPFIRE_EMBED_TRACE_PHASES").is_ok_and(|value| value != "0");
     let compare_resident_layer =
         std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER").is_ok_and(|value| value != "0");
@@ -617,7 +634,9 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
         }
     }
 
-    if let Some(pooled) = projector.finalize_pooled_hidden(m, dim, cfg.pooling_mode)? {
+    if let Some(finalized) =
+        projector.finalize_encoder(m, dim, cfg.pooling_mode, &weights.dense_heads)?
+    {
         if trace_phases {
             eprintln!(
                 "embeddinggemma_phase_trace rows={m} layers={} qkv_ms={qkv_ms:.3} attention_core_ms={attention_core_ms:.3} attention_output_ms={attention_output_ms:.3} ffn_core_ms={ffn_core_ms:.3} ffn_output_ms={ffn_output_ms:.3}",
@@ -625,7 +644,7 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
             );
         }
         gpu.reclaim_pending();
-        return Ok(pooled);
+        return Ok(finalized);
     }
 
     // Final norm (model.norm) → the ST Transformer's last_hidden_state.
@@ -639,7 +658,12 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     }
     gpu.reclaim_pending();
 
-    Ok(pool(&hidden_flat, m, dim, cfg.pooling_mode))
+    Ok(FinalizedEncoder::Pooled(pool(
+        &hidden_flat,
+        m,
+        dim,
+        cfg.pooling_mode,
+    )))
 }
 
 fn tensor_metrics(left: &[f32], right: &[f32]) -> (f64, f32) {

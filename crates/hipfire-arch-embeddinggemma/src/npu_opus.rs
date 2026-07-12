@@ -9,8 +9,8 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
-    NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuEmbeddingFinalNormMean,
-    NpuEmbeddingFinalNormMeanParams, NpuEmbeddingLayerAttentionDenseW8,
+    NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuEmbeddingDenseL2,
+    NpuEmbeddingFinalNormMean, NpuEmbeddingFinalNormMeanParams, NpuEmbeddingLayerAttentionDenseW8,
     NpuEmbeddingLayerAttentionDenseW8Weights, NpuEmbeddingNextLayerPrepW8,
     NpuEmbeddingNextLayerPrepW8Params, NpuEmbeddingPostFfnDirectTailBf16x2,
     NpuEmbeddingPostFfnDirectTailBf16x2Params, NpuEmbeddingPreFfnException,
@@ -21,7 +21,7 @@ use hipfire_xdna::{
 };
 
 use crate::config::{EmbeddingGemmaConfig, PoolingMode};
-use crate::forward::{AttentionBoundary, LinearProjector, Projection};
+use crate::forward::{AttentionBoundary, FinalizedEncoder, LinearProjector, Projection};
 
 struct LayerMatrices {
     qkv: Option<OpusPackedMatrix>,
@@ -123,6 +123,8 @@ struct ResidentLayerState {
     residual_prep: Option<NpuEmbeddingResidualPrep>,
     final_norm_mean: Option<NpuEmbeddingFinalNormMean>,
     final_norm_mean_params: Option<NpuEmbeddingFinalNormMeanParams>,
+    dense_l2: Option<NpuEmbeddingDenseL2>,
+    dense_weights_uploaded: bool,
     next_prep_params: Vec<NpuEmbeddingNextLayerPrepW8Params>,
     prepared_input_layer: Option<usize>,
     tail_pre_norms: Vec<Vec<u16>>,
@@ -314,6 +316,7 @@ struct ResidentLayerIo {
     residual: SharedGttBuffer,
     hidden: SharedGttBuffer,
     ffn: SharedGttBuffer,
+    _pooled_and_w0: Option<SharedGttBuffer>,
 }
 
 enum ResidentFfnState {
@@ -893,6 +896,7 @@ impl NpuOpusProjector {
             cache_root.join("embgemma_aie2p_residual_prep_bf16x2_to_r34_records_m256_k768");
         let resident_final_norm_mean_path =
             cache_root.join("embgemma_aie2p_final_norm_mean_bf16x2_m256_k768");
+        let resident_dense_l2_path = cache_root.join("embgemma_aie2p_dense_768_3072_768_l2_bf16");
         let resident_layer_requested =
             std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0");
         let resident_layer = if resident_layer_requested
@@ -996,6 +1000,30 @@ impl NpuOpusProjector {
                 (Some(kernel), Some(params))
             } else {
                 (None, None)
+            };
+            let dense_shape_supported = cfg.dense_heads.len() == 2
+                && cfg.dense_heads[0].in_features == 768
+                && cfg.dense_heads[0].out_features == 3072
+                && cfg.dense_heads[0].activation == "identity"
+                && !cfg.dense_heads[0].has_bias
+                && cfg.dense_heads[1].in_features == 3072
+                && cfg.dense_heads[1].out_features == 768
+                && cfg.dense_heads[1].activation == "identity"
+                && !cfg.dense_heads[1].has_bias;
+            let dense_l2 = if final_norm_mean.is_some()
+                && dense_shape_supported
+                && resident_dense_l2_path.join("final.xclbin").is_file()
+                && resident_dense_l2_path.join("insts.bin").is_file()
+            {
+                let kernel = NpuEmbeddingDenseL2::load_cached(
+                    resident_dense_l2_path
+                        .to_str()
+                        .expect("UTF-8 Dense/L2 cache path"),
+                )
+                .map_err(|error| format!("embeddinggemma NPU: load Dense/L2: {error}"))?;
+                Some(kernel)
+            } else {
+                None
             };
             let ffn_cache = resident_layer_ffn_path
                 .to_str()
@@ -1156,6 +1184,8 @@ impl NpuOpusProjector {
                 residual_prep,
                 final_norm_mean,
                 final_norm_mean_params,
+                dense_l2,
+                dense_weights_uploaded: false,
                 next_prep_params,
                 prepared_input_layer: None,
                 tail_pre_norms,
@@ -1552,11 +1582,20 @@ impl LinearProjector for NpuOpusProjector {
             let mut residual = gpu.alloc_shared_gtt(tail_output_bytes)?;
             let mut ffn =
                 gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::combined_bytes())?;
+            let mut pooled_and_w0 = self
+                .resident_layer
+                .as_ref()
+                .is_some_and(|state| state.dense_l2.is_some())
+                .then(|| gpu.alloc_shared_gtt(NpuEmbeddingDenseL2::input_and_w0_bytes()))
+                .transpose()?;
             let activation_bytes = NpuEmbeddingLayerAttentionDenseW8::activation_bytes();
             input.as_mut_slice()[..activation_bytes].fill(0);
             hidden.as_mut_slice().fill(0);
             residual.as_mut_slice().fill(0);
             ffn.as_mut_slice().fill(0);
+            if let Some(buffer) = pooled_and_w0.as_mut() {
+                buffer.as_mut_slice().fill(0);
+            }
             let input_gpu = gpu.import_dmabuf(
                 input.dmabuf_fd(),
                 activation_bytes,
@@ -1642,6 +1681,23 @@ impl LinearProjector for NpuOpusProjector {
                     .attach_shared_completed(residual.dmabuf_fd(), residual.len())
                     .map_err(|error| hip_error(format!("attach final norm/mean input: {error}")))?;
             }
+            if let Some(buffer) = pooled_and_w0.as_ref() {
+                let dense_l2 = state
+                    .dense_l2
+                    .as_mut()
+                    .ok_or_else(|| hip_error("missing resident Dense/L2 kernel"))?;
+                dense_l2
+                    .attach_shared_input_and_w0(buffer.dmabuf_fd(), buffer.len())
+                    .map_err(|error| hip_error(format!("attach Dense/L2 input: {error}")))?;
+                state
+                    .final_norm_mean
+                    .as_mut()
+                    .expect("Dense/L2 requires resident final norm")
+                    .attach_shared_output(buffer.dmabuf_fd(), NpuEmbeddingDenseL2::input_bytes())
+                    .map_err(|error| {
+                        hip_error(format!("attach final norm to Dense/L2 output: {error}"))
+                    })?;
+            }
             state.io = Some(ResidentLayerIo {
                 input_gpu,
                 residual_gpu,
@@ -1649,6 +1705,7 @@ impl LinearProjector for NpuOpusProjector {
                 residual,
                 hidden,
                 ffn,
+                _pooled_and_w0: pooled_and_w0,
             });
         }
 
@@ -2013,12 +2070,13 @@ impl LinearProjector for NpuOpusProjector {
         Ok(true)
     }
 
-    fn finalize_pooled_hidden(
+    fn finalize_encoder(
         &mut self,
         rows: usize,
         hidden: usize,
         mode: PoolingMode,
-    ) -> HipResult<Option<Vec<f32>>> {
+        dense_heads: &[crate::weights::DenseHeadHost],
+    ) -> HipResult<Option<FinalizedEncoder>> {
         if rows != NpuEmbeddingFinalNormMean::rows() || hidden != 768 || mode != PoolingMode::Mean {
             return Ok(None);
         }
@@ -2034,7 +2092,34 @@ impl LinearProjector for NpuOpusProjector {
         kernel
             .run_shared(params)
             .map_err(|error| hip_error(format!("final norm/mean: {error}")))?;
-        Ok(Some(kernel.read_pooled_f32()))
+        if let Some(dense_l2) = state.dense_l2.as_mut() {
+            if !state.dense_weights_uploaded {
+                if dense_heads.len() != 2
+                    || dense_heads[0].in_features != 768
+                    || dense_heads[0].out_features != 3072
+                    || dense_heads[1].in_features != 3072
+                    || dense_heads[1].out_features != 768
+                {
+                    return Err(hip_error("resident Dense/L2 head geometry mismatch"));
+                }
+                let head0 = effective_dense_weights(&dense_heads[0]);
+                let head1 = effective_dense_weights(&dense_heads[1]);
+                dense_l2
+                    .upload_weights(&head0, &head1)
+                    .map_err(|error| hip_error(format!("upload Dense/L2 weights: {error}")))?;
+                state.dense_weights_uploaded = true;
+            }
+            dense_l2
+                .sync_shared_input()
+                .map_err(|error| hip_error(format!("sync Dense/L2 input: {error}")))?;
+            dense_l2
+                .run_shared()
+                .map_err(|error| hip_error(format!("Dense/L2: {error}")))?;
+            return Ok(Some(FinalizedEncoder::Embedding(
+                dense_l2.read_embedding_f32(),
+            )));
+        }
+        Ok(Some(FinalizedEncoder::Pooled(kernel.read_pooled_f32())))
     }
 
     fn has_prepared_layer_input(&self, layer_idx: usize, rows: usize) -> bool {
@@ -2917,6 +3002,16 @@ fn compare_this_layer_enabled(layer_idx: usize) -> bool {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0)
             == layer_idx
+}
+
+fn effective_dense_weights(head: &crate::weights::DenseHeadHost) -> Vec<f32> {
+    let Some(scale) = head.awq_scale.as_deref() else {
+        return head.w.clone();
+    };
+    head.w
+        .chunks_exact(head.in_features)
+        .flat_map(|row| row.iter().zip(scale).map(|(weight, scale)| weight / scale))
+        .collect()
 }
 
 fn should_materialize_completed_output(

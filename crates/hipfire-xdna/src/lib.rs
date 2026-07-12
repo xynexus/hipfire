@@ -260,6 +260,11 @@ pub mod embedding_final_norm_mean;
 pub use embedding_final_norm_mean::{NpuEmbeddingFinalNormMean, NpuEmbeddingFinalNormMeanParams};
 
 #[cfg(target_os = "linux")]
+pub mod embedding_dense_l2;
+#[cfg(target_os = "linux")]
+pub use embedding_dense_l2::NpuEmbeddingDenseL2;
+
+#[cfg(target_os = "linux")]
 pub mod resident_embedding_layer;
 #[cfg(target_os = "linux")]
 pub use resident_embedding_layer::{

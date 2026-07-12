@@ -1376,14 +1376,14 @@ pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_FFN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER",
     description: "Runtime variable controlling embed compare resident layer in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2914",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2999",
 };
 
 /// `HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX` — Parses "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX" with fallback defaults
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX",
     description: "Parses \"HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX\" with fallback defaults",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2915",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3000",
 };
 
 /// `HIPFIRE_EMBED_E2E_TOKENS` — Runtime variable controlling embed e2e tokens in hipfire
@@ -1411,21 +1411,21 @@ pub const ENV_HIPFIRE_EMBED_REFERENCE_MODEL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER",
     description: "Runtime variable controlling embed resident layer in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:897",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:901",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT` — Parses "HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT" with fallback defaults
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT",
     description: "Parses \"HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT\" with fallback defaults",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2041",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2126",
 };
 
 /// `HIPFIRE_EMBED_TRACE_PHASES` — Runtime variable controlling embed trace phases in hipfire
 pub const ENV_HIPFIRE_EMBED_TRACE_PHASES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_TRACE_PHASES",
     description: "Runtime variable controlling embed trace phases in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/forward.rs:297",
+    source: "crates/hipfire-arch-embeddinggemma/src/forward.rs:314",
 };
 
 /// `HIPFIRE_EMIT_TOKEN_IDS` — or "\" in it would corrupt the line, breaking the client's JSONL
