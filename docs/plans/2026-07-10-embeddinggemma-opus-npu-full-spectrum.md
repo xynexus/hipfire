@@ -1613,3 +1613,46 @@ final normalization/pooling remain outside the NPU. It is neither fully
 resident nor a performance admission. The next correctness slice must reduce
 ordinary per-layer BF16 boundary error across R34/R35/R41 before moving the
 reconstruction onto fabric and resuming the 10k/15k throughput work.
+
+### R43 compensated completed-layer output checkpoint
+
+R43 isolates the ordinary rounding loss at the R41 tail output. The existing
+tail ABI remains backward compatible with canonical BF16 caches, while a new
+generic cache emits each completed architectural state as token-major
+compensated BF16x2 (`high + low`). The runtime selects the compensated cache
+when present, sizes the shared output dma-buf from its manifest-selected output
+encoding, and reconstructs F32 without changing the logical residual tensor
+view used by the GPU. The first BF16 plane therefore remains usable for input
+staging while the larger backing allocation carries both output components.
+
+The AIE2P kernel stores two rows per token in one output ObjectFIFO record. Its
+per-core output tile grows from 3,072 to 6,144 bytes; together with the 9,216
+byte input tile, parameters, and 2 KiB stack, it remains inside the 32 KiB tile
+memory budget. The artifact is generated under `~/.hipfire/npu/` as
+`embgemma_aie2p_post_ffn_direct_tail_bf16x2_completed_bf16x2_m256_k768` and
+declares `output=shared-completed-bf16x2`.
+
+Locked same-input comparisons show that the compensated output is active and
+improves all three inspected layer families:
+
+| boundary | layer | R42 cosine | R43 cosine | R43 max abs |
+|---|---:|---:|---:|---:|
+| completed layer | 0 | 0.99997782 | 0.99998185 | 2.6809692 |
+| completed layer | 8 | 0.99996358 | 0.99997813 | 16.2114258 |
+| completed layer | 20 | 0.99998723 | 0.99999170 | 107.0312500 |
+
+Across all 24 completed resident layers, OQ8-versus-BF16 embedding cosine rises
+from `0.99114025` to `0.99557614`, while maximum absolute error falls from
+`0.01623118` to `0.01181315`. The one-run M256 sample measures `345.1` input
+tokens/s at `21.05 W`, or `16.4` package tokens/J. This remains a
+host-reconstructed hybrid measurement and is not a throughput or fully
+resident admission.
+
+Opt-in component attribution compares the fallback oracle, resident X plus
+resident Y, fallback X plus resident Y, and resident X plus fallback Y. Under
+R43 the actual tail closely tracks the resident-X-plus-resident-Y oracle, so
+the dominant remaining correctness loss is upstream: architectural X export
+and resident FFN projection error are comparable, rather than completed-tail
+rounding. The next correctness slice should preserve architectural X directly
+across R34, preferably as compensated fabric-resident state, before removing
+the host reconstruction boundary.

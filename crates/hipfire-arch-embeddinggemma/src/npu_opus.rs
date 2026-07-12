@@ -804,8 +804,19 @@ impl NpuOpusProjector {
         let resident_layer_exception_731_path = cache_root.join(
             "embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_x_exception_c731_m256_k768_n1280",
         );
-        let resident_layer_tail_path =
+        let resident_layer_tail_bf16x2_path = cache_root
+            .join("embgemma_aie2p_post_ffn_direct_tail_bf16x2_completed_bf16x2_m256_k768");
+        let resident_layer_tail_bf16_path =
             cache_root.join("embgemma_aie2p_post_ffn_direct_tail_bf16x2_m256_k768");
+        let resident_layer_tail_path = if resident_layer_tail_bf16x2_path
+            .join("final.xclbin")
+            .is_file()
+            && resident_layer_tail_bf16x2_path.join("insts.bin").is_file()
+        {
+            resident_layer_tail_bf16x2_path
+        } else {
+            resident_layer_tail_bf16_path
+        };
         let resident_layer_requested =
             std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0");
         let resident_layer = if resident_layer_requested
@@ -1348,8 +1359,13 @@ impl LinearProjector for NpuOpusProjector {
                 gpu.alloc_shared_gtt(NpuEmbeddingLayerAttentionDenseW8::input_bytes())?;
             let mut hidden =
                 gpu.alloc_shared_gtt(NpuEmbeddingLayerAttentionDenseW8::hidden_backing_bytes())?;
-            let mut residual =
-                gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::residual_bytes())?;
+            let tail_output_bytes = self
+                .resident_layer
+                .as_ref()
+                .expect("checked resident layer")
+                .tail
+                .output_bytes();
+            let mut residual = gpu.alloc_shared_gtt(tail_output_bytes)?;
             let mut ffn =
                 gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::combined_bytes())?;
             input.as_mut_slice().fill(0);

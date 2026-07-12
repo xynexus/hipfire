@@ -357,6 +357,10 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &backbone.layers[layer_idx];
         let stage_started = std::time::Instant::now();
+        let mut compared_resident_x = None;
+        let mut compared_fallback_x = None;
+        let mut compared_resident_ffn = None;
+        let mut compared_fallback_ffn = None;
 
         // ── Attention block (bidirectional) ──
         gpu.rmsnorm_batched(&x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
@@ -495,6 +499,8 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
                     "embeddinggemma_resident_reconstructed_x_compare layer={layer_idx} cosine={cosine:.8} min_row_cosine={min_row:.8} max_abs={max_abs:.7} max_token={} max_column={max_column} resident_at_max={resident_at_max:.7} fallback_at_max={fallback_at_max:.7}",
                     max_index / dim,
                 );
+                compared_resident_x = Some(resident_residual);
+                compared_fallback_x = Some(fallback_residual);
             }
         }
         if trace_phases {
@@ -538,6 +544,8 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
                 eprintln!(
                     "embeddinggemma_resident_ffn_compare layer={layer_idx} cosine={cosine:.8} min_row_cosine={min_row:.8} max_abs={max_abs:.7}"
                 );
+                compared_resident_ffn = Some(resident_ffn);
+                compared_fallback_ffn = Some(fallback_ffn);
             }
         }
         if trace_phases {
@@ -556,6 +564,32 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
             eprintln!(
                 "embeddinggemma_resident_layer_compare layer={layer_idx} cosine={cosine:.8} min_row_cosine={min_row:.8} max_abs={max_abs:.7}"
             );
+            if let (Some(resident_x), Some(fallback_x), Some(resident_ffn), Some(fallback_ffn)) = (
+                compared_resident_x.as_deref(),
+                compared_fallback_x.as_deref(),
+                compared_resident_ffn.as_deref(),
+                compared_fallback_ffn.as_deref(),
+            ) {
+                let post_ffn_norm = gpu.download_f32(&layer.post_ffn_norm)?;
+                let fallback_oracle =
+                    layer_tail_reference_f32(fallback_x, fallback_ffn, &post_ffn_norm, m, dim, eps);
+                let resident_xy =
+                    layer_tail_reference_f32(resident_x, resident_ffn, &post_ffn_norm, m, dim, eps);
+                let fallback_x_resident_y =
+                    layer_tail_reference_f32(fallback_x, resident_ffn, &post_ffn_norm, m, dim, eps);
+                let resident_x_fallback_y =
+                    layer_tail_reference_f32(resident_x, fallback_ffn, &post_ffn_norm, m, dim, eps);
+                let (oracle_cosine, oracle_max_abs) = tensor_metrics(&fallback_oracle, &fallback);
+                let (resident_xy_cosine, resident_xy_max_abs) =
+                    tensor_metrics(&resident_xy, &fallback);
+                let (fallback_x_cosine, fallback_x_max_abs) =
+                    tensor_metrics(&fallback_x_resident_y, &fallback);
+                let (fallback_y_cosine, fallback_y_max_abs) =
+                    tensor_metrics(&resident_x_fallback_y, &fallback);
+                eprintln!(
+                    "embeddinggemma_resident_component_attribution layer={layer_idx} fallback_oracle_cosine={oracle_cosine:.8} fallback_oracle_max_abs={oracle_max_abs:.7} resident_xy_cosine={resident_xy_cosine:.8} resident_xy_max_abs={resident_xy_max_abs:.7} fallback_x_cosine={fallback_x_cosine:.8} fallback_x_max_abs={fallback_x_max_abs:.7} fallback_y_cosine={fallback_y_cosine:.8} fallback_y_max_abs={fallback_y_max_abs:.7}"
+                );
+            }
         }
         if trace_phases {
             gpu.device_synchronize()?;
@@ -596,6 +630,33 @@ fn min_row_cosine(left: &[f32], right: &[f32], width: usize) -> f64 {
         .zip(right.chunks_exact(width))
         .map(|(left, right)| tensor_metrics(left, right).0)
         .fold(f64::INFINITY, f64::min)
+}
+
+fn layer_tail_reference_f32(
+    residual: &[f32],
+    ffn: &[f32],
+    post_norm: &[f32],
+    rows: usize,
+    width: usize,
+    epsilon: f32,
+) -> Vec<f32> {
+    let mut output = vec![0.0f32; rows * width];
+    for row in 0..rows {
+        let base = row * width;
+        let inverse = (ffn[base..base + width]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            / width as f32
+            + epsilon)
+            .sqrt()
+            .recip();
+        for column in 0..width {
+            let index = base + column;
+            output[index] = residual[index] + ffn[index] * post_norm[column] * inverse;
+        }
+    }
+    output
 }
 
 /// Reduce the `[m, dim]` final hidden states to one `[dim]` vector. embeddinggemma
