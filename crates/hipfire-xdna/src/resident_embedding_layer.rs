@@ -28,6 +28,7 @@ const O_BLOCKS_PER_ACTIVE_COL: usize = 72;
 const R_STAGE_BYTES: usize = 5 * 48 * BLOCK;
 const ATTENTION_BYTES: usize = M * K * size_of::<u16>();
 const INPUT_BYTES: usize = ACTIVE_COLS * QKV_BLOCKS_PER_STRIPE * BLOCK;
+const EXTERNAL_RESIDUAL_BYTES: usize = COLS * CORE_ROWS * BLOCK;
 const QKV_WEIGHT_BYTES: usize = INPUT_BYTES;
 const OUTPUT_WEIGHT_BYTES: usize = ACTIVE_COLS * O_BLOCKS_PER_ACTIVE_COL * BLOCK;
 const NORM_PARAM_BYTES: usize = ACTIVE_COLS * 2 * CORE_ROWS * BLOCK;
@@ -86,6 +87,8 @@ pub struct NpuEmbeddingLayerAttentionDenseW8 {
     key_values: DeviceBuffer,
     exception_column: Option<usize>,
     outputs_direct_x: bool,
+    external_residual: bool,
+    input_bytes: usize,
     primed: bool,
     context_commands: usize,
 }
@@ -109,9 +112,21 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
                 )));
             }
         }
+        let external_residual = manifest
+            .lines()
+            .any(|line| line == "residual-input=shared-activation-tail-r34-bf16-records");
         let outputs_direct_x = if manifest
             .lines()
             .any(|line| line == "tails=post-attn-norm,residual")
+            && manifest
+                .lines()
+                .any(|line| line == "output=canonical-token-major-x-bf16")
+        {
+            true
+        } else if external_residual
+            && manifest
+                .lines()
+                .any(|line| line == "tails=post-attn-norm,external-residual")
             && manifest
                 .lines()
                 .any(|line| line == "output=canonical-token-major-x-bf16")
@@ -153,14 +168,22 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             &std::fs::read(format!("{cache}/final.xclbin")).map_err(XdnaError::Open)?,
             &std::fs::read(format!("{cache}/insts.bin")).map_err(XdnaError::Open)?,
         )?;
+        let input_bytes = INPUT_BYTES
+            + if external_residual {
+                EXTERNAL_RESIDUAL_BYTES
+            } else {
+                0
+            };
         Ok(Self {
-            input: kernel.alloc_arg(INPUT_BYTES)?,
+            input: kernel.alloc_arg(input_bytes)?,
             hidden: kernel.alloc_arg(HIDDEN_BACKING_BYTES)?,
             queries: kernel.alloc_arg(Q_BYTES)?,
             key_values: kernel.alloc_arg(KV_BYTES)?,
             kernel,
             exception_column,
             outputs_direct_x,
+            external_residual,
+            input_bytes,
             primed: false,
             context_commands: 0,
         })
@@ -170,8 +193,20 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         M
     }
 
-    pub const fn input_bytes() -> usize {
+    pub fn input_bytes(&self) -> usize {
+        self.input_bytes
+    }
+
+    pub const fn activation_bytes() -> usize {
         INPUT_BYTES
+    }
+
+    pub const fn external_input_bytes() -> usize {
+        INPUT_BYTES + EXTERNAL_RESIDUAL_BYTES
+    }
+
+    pub const fn uses_external_residual(&self) -> bool {
+        self.external_residual
     }
 
     pub const fn weight_bytes() -> usize {
@@ -187,7 +222,7 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
     }
 
     pub fn attach_shared_input(&mut self, fd: i32, bytes: usize) -> Result<(), XdnaError> {
-        if bytes != INPUT_BYTES {
+        if bytes != self.input_bytes {
             return Err(invalid(
                 "resident layer attention shared input size mismatch",
             ));
@@ -291,7 +326,12 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         }
         copy_paired_weight_scales(self.input.as_mut_slice(), &weights.input_template);
         self.restore_hidden(weights)?;
-        self.kernel.sync_to_device(&self.input)?;
+        if self.external_residual {
+            self.kernel
+                .sync_to_device_prefix(&self.input, INPUT_BYTES)?;
+        } else {
+            self.kernel.sync_to_device(&self.input)?;
+        }
         Ok(())
     }
 
@@ -303,9 +343,13 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         if packed.len() != INPUT_BYTES {
             return Err(invalid("resident layer prepacked input size mismatch"));
         }
-        self.input.as_mut_slice().copy_from_slice(packed);
+        self.input.as_mut_slice()[..INPUT_BYTES].copy_from_slice(packed);
         copy_paired_weight_scales(self.input.as_mut_slice(), &weights.input_template);
-        self.kernel.sync_to_device(&self.input)
+        if self.external_residual {
+            self.kernel.sync_to_device_prefix(&self.input, INPUT_BYTES)
+        } else {
+            self.kernel.sync_to_device(&self.input)
+        }
     }
 
     /// Refresh only the dynamic residual rows in the layer-owned R34 argument.
@@ -596,7 +640,14 @@ mod tests {
 
     #[test]
     fn r34_argument_geometry_matches_the_admitted_graph() {
-        assert_eq!(INPUT_BYTES, 2_949_120);
+        assert_eq!(
+            NpuEmbeddingLayerAttentionDenseW8::activation_bytes(),
+            2_949_120
+        );
+        assert_eq!(
+            NpuEmbeddingLayerAttentionDenseW8::external_input_bytes(),
+            3_473_408
+        );
         assert_eq!(WEIGHT_BYTES, 8_192_000);
         assert_eq!(HIDDEN_BACKING_BYTES, 5_111_808);
         assert_eq!(NORM_PARAM_BYTES, 524_288);

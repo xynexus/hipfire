@@ -1820,3 +1820,58 @@ and pooling remain outside AIE2P. The next cross-layer slice must make R34 read
 that residual directly from the shared completed state, then fold this prep
 work into a producer or consumer schedule rather than repeating a standalone
 context.
+
+### R48 external architectural-residual checkpoint
+
+R48 removes the host-updated residual records from R34. The paired-QKV,
+attention, output-projection, and residual/norm graph now reads 32 padded
+16 KiB residual records appended to its existing activation argument. It reuses
+the even-column weight multicast after output weights and stages the immutable
+post-attention norm in dead output-accumulator storage, avoiding a sixth DPU
+argument and a third shim stream. The generated artifact is
+`~/.hipfire/npu/embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_external_x_bf16x2_m256_k768_n1280`.
+
+A companion 32-core graph converts R46's token-major compensated BF16x2 output
+into R48's `[wave, active-column, core-row]` record order. It reconstructs
+`high + low` in float and uses AIE `conv_even` rounding for the final BF16 value,
+matching the former host reconstruction plus GPU BF16 cast. Copying only the
+high plane passed a structural record test but accumulated end-to-end quality
+loss: plain OQ8 fell to `0.99560386` cosine versus BF16. The compensated oracle
+caught 4,387 rounding-boundary differences in the old artifact; the rebuilt
+graph passes both private-SHMEM and AMDGPU-dma-buf gates with zero mismatches
+and zero nonzero padding. Five standalone dispatches average `0.2906 ms`.
+
+The admitted runtime contract has two initialization details:
+
+- layer 0 writes its host-created compensated state to a prep-owned SHMEM
+  bootstrap input; layers 1 through 23 consume the NPU-produced shared dma-buf;
+- the imported combined activation/residual output BO is zeroed and synchronized
+  once after attachment. Omitting that first publication produced roughly
+  179k incorrect BF16 payload values even though later mappings appeared valid.
+
+Several alternatives were rejected with hardware evidence. A fused R47
+residual route exceeded the memory tile's inbound DMA channels. A separate
+third shim stream was unavailable. PRIME-exporting an amdxdna-owned SHMEM BO
+returned `EINVAL` on the installed driver. Importing the combined GTT BO at one
+full size across HIP/R47/R48 did not repair the uninitialized first-output
+failure. A standalone AMDGPU-owned dma-buf gate proves producer, owner, and a
+second amdxdna import all see the same 32 records before and after explicit
+cache synchronization.
+
+Locked same-input comparisons report:
+
+| boundary | layer 0 | layer 1 |
+|---|---:|---:|
+| architectural X cosine | 0.99998837 | 0.99999209 |
+| normalized H cosine | 0.99998086 | 0.99997304 |
+| resident FFN cosine | 0.99996137 | 0.99996234 |
+| completed layer cosine | 0.99998506 | 0.99998700 |
+
+The canonical OQ8++ full 24-layer run matches the R47 checkpoint exactly at
+`0.99818254` embedding cosine and `0.00840785` maximum absolute error versus
+BF16. Its one-run M256 sample is `267.2` input tokens/s at `20.04 W`, or `13.3`
+package tokens/J. This is a correctness checkpoint, not performance admission:
+R47 remains a separate roughly 5 ms cross-layer preprocessing context, the
+outer runtime still materializes completed state, and final normalization,
+pooling, and Dense heads are not yet resident. The 10k/15k targets therefore
+remain open.

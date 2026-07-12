@@ -250,6 +250,11 @@ pub use embedding_next_layer_prep::{
 };
 
 #[cfg(target_os = "linux")]
+pub mod embedding_residual_prep;
+#[cfg(target_os = "linux")]
+pub use embedding_residual_prep::NpuEmbeddingResidualPrep;
+
+#[cfg(target_os = "linux")]
 pub mod resident_embedding_layer;
 #[cfg(target_os = "linux")]
 pub use resident_embedding_layer::{

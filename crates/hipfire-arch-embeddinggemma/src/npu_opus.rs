@@ -12,10 +12,11 @@ use hipfire_xdna::{
     NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuEmbeddingLayerAttentionDenseW8,
     NpuEmbeddingLayerAttentionDenseW8Weights, NpuEmbeddingNextLayerPrepW8,
     NpuEmbeddingNextLayerPrepW8Params, NpuEmbeddingPostFfnDirectTailBf16x2,
-    NpuEmbeddingPostFfnDirectTailBf16x2Params, NpuEmbeddingPreFfnException, NpuOpusExecutor,
-    NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights, NpuResidentFfnDenseW8,
-    NpuResidentFfnDenseW8Weights, NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode,
-    NpuWholeScaledIoLayout, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
+    NpuEmbeddingPostFfnDirectTailBf16x2Params, NpuEmbeddingPreFfnException,
+    NpuEmbeddingResidualPrep, NpuOpusExecutor, NpuResidentAttentionDenseW8,
+    NpuResidentAttentionDenseW8Weights, NpuResidentFfnDenseW8, NpuResidentFfnDenseW8Weights,
+    NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode, NpuWholeScaledIoLayout,
+    OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
 };
 
 use crate::config::EmbeddingGemmaConfig;
@@ -118,6 +119,7 @@ struct ResidentLayerState {
     tail: NpuEmbeddingPostFfnDirectTailBf16x2,
     tail_params: Vec<NpuEmbeddingPostFfnDirectTailBf16x2Params>,
     next_prep: Option<NpuEmbeddingNextLayerPrepW8>,
+    residual_prep: Option<NpuEmbeddingResidualPrep>,
     next_prep_params: Vec<NpuEmbeddingNextLayerPrepW8Params>,
     prepared_input_layer: Option<usize>,
     tail_pre_norms: Vec<Vec<u16>>,
@@ -154,6 +156,14 @@ impl ResidentLayerAttentionWeights {
 }
 
 impl ResidentLayerAttentionExecutors {
+    fn input_bytes(&self) -> usize {
+        self.standard.input_bytes()
+    }
+
+    fn uses_external_residual(&self) -> bool {
+        self.standard.uses_external_residual()
+    }
+
     fn attach_shared_input(
         &mut self,
         fd: i32,
@@ -821,11 +831,22 @@ impl NpuOpusProjector {
             Err(_) => None,
         };
         let resident_ffn_selected = resident_ffn.is_some();
+        let resident_layer_attention_external_path = cache_root.join(
+            "embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_external_x_bf16x2_m256_k768_n1280",
+        );
         let resident_layer_attention_direct_x_path = cache_root
             .join("embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_x_bf16_m256_k768_n1280");
         let resident_layer_attention_h_path = cache_root
             .join("embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_m256_k768_n1280");
-        let resident_layer_attention_path = if resident_layer_attention_direct_x_path
+        let resident_layer_external_selected = resident_layer_attention_external_path
+            .join("final.xclbin")
+            .is_file()
+            && resident_layer_attention_external_path
+                .join("insts.bin")
+                .is_file();
+        let resident_layer_attention_path = if resident_layer_external_selected {
+            resident_layer_attention_external_path
+        } else if resident_layer_attention_direct_x_path
             .join("final.xclbin")
             .is_file()
             && resident_layer_attention_direct_x_path
@@ -865,6 +886,8 @@ impl NpuOpusProjector {
         };
         let resident_next_prep_path =
             cache_root.join("embgemma_aie2p_next_layer_prep_w8_bf16x2_m256_k768");
+        let resident_residual_prep_path =
+            cache_root.join("embgemma_aie2p_residual_prep_bf16x2_to_r34_records_m256_k768");
         let resident_layer_requested =
             std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0");
         let resident_layer = if resident_layer_requested
@@ -876,6 +899,11 @@ impl NpuOpusProjector {
             && resident_layer_attention_path.join("insts.bin").is_file()
             && resident_layer_tail_path.join("final.xclbin").is_file()
             && resident_layer_tail_path.join("insts.bin").is_file()
+            && (!resident_layer_external_selected
+                || (resident_next_prep_path.join("final.xclbin").is_file()
+                    && resident_next_prep_path.join("insts.bin").is_file()
+                    && resident_residual_prep_path.join("final.xclbin").is_file()
+                    && resident_residual_prep_path.join("insts.bin").is_file()))
         {
             let attention_cache = resident_layer_attention_path
                 .to_str()
@@ -927,6 +955,18 @@ impl NpuOpusProjector {
                     .map_err(|error| {
                         format!("embeddinggemma NPU: load next-layer prep: {error}")
                     })?,
+                )
+            } else {
+                None
+            };
+            let residual_prep = if attention.uses_external_residual() {
+                Some(
+                    NpuEmbeddingResidualPrep::load_cached(
+                        resident_residual_prep_path
+                            .to_str()
+                            .expect("UTF-8 residual prep cache path"),
+                    )
+                    .map_err(|error| format!("embeddinggemma NPU: load residual prep: {error}"))?,
                 )
             } else {
                 None
@@ -1087,6 +1127,7 @@ impl NpuOpusProjector {
                 tail,
                 tail_params,
                 next_prep,
+                residual_prep,
                 next_prep_params,
                 prepared_input_layer: None,
                 tail_pre_norms,
@@ -1465,8 +1506,13 @@ impl LinearProjector for NpuOpusProjector {
             .as_ref()
             .is_some_and(|state| state.io.is_none());
         if needs_io {
-            let mut input =
-                gpu.alloc_shared_gtt(NpuEmbeddingLayerAttentionDenseW8::input_bytes())?;
+            let input_bytes = self
+                .resident_layer
+                .as_ref()
+                .expect("checked resident layer")
+                .attention
+                .input_bytes();
+            let mut input = gpu.alloc_shared_gtt(input_bytes)?;
             let mut hidden =
                 gpu.alloc_shared_gtt(NpuEmbeddingLayerAttentionDenseW8::hidden_backing_bytes())?;
             let tail_output_bytes = self
@@ -1478,12 +1524,17 @@ impl LinearProjector for NpuOpusProjector {
             let mut residual = gpu.alloc_shared_gtt(tail_output_bytes)?;
             let mut ffn =
                 gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::combined_bytes())?;
-            input.as_mut_slice().fill(0);
+            let activation_bytes = NpuEmbeddingLayerAttentionDenseW8::activation_bytes();
+            input.as_mut_slice()[..activation_bytes].fill(0);
             hidden.as_mut_slice().fill(0);
             residual.as_mut_slice().fill(0);
             ffn.as_mut_slice().fill(0);
-            let input_gpu =
-                gpu.import_dmabuf(input.dmabuf_fd(), input.len(), &[input.len()], DType::Raw)?;
+            let input_gpu = gpu.import_dmabuf(
+                input.dmabuf_fd(),
+                activation_bytes,
+                &[activation_bytes],
+                DType::Raw,
+            )?;
             let residual_gpu = gpu.import_dmabuf(
                 residual.dmabuf_fd(),
                 residual.len(),
@@ -1542,9 +1593,21 @@ impl LinearProjector for NpuOpusProjector {
                     residual.dmabuf_fd(),
                     residual.len(),
                     input.dmabuf_fd(),
-                    input.len(),
+                    NpuEmbeddingNextLayerPrepW8::output_bytes(),
                 )
                 .map_err(|error| hip_error(format!("attach next-layer prep: {error}")))?;
+            }
+            if let Some(prep) = state.residual_prep.as_mut() {
+                prep.attach_shared(
+                    residual.dmabuf_fd(),
+                    residual.len(),
+                    input.dmabuf_fd(),
+                    input.len(),
+                )
+                .map_err(|error| hip_error(format!("attach residual prep: {error}")))?;
+                prep.fill_output(0).map_err(|error| {
+                    hip_error(format!("initialize residual prep output: {error}"))
+                })?;
             }
             state.io = Some(ResidentLayerIo {
                 input_gpu,
@@ -1573,25 +1636,40 @@ impl LinearProjector for NpuOpusProjector {
             }
         }
 
-        let residual_view = self
-            .resident_layer
-            .as_ref()
-            .and_then(|state| state.io.as_ref())
-            .expect("completed resident layer I/O")
-            .residual_gpu
-            .view();
-        gpu.cast_f32_to_bf16(residual_and_output, &residual_view)?;
-        gpu.device_synchronize()?;
-        let residual = self
-            .resident_layer
-            .as_ref()
-            .and_then(|state| state.io.as_ref())
-            .expect("completed resident layer I/O")
-            .residual
-            .as_slice()[..rows * 768 * size_of::<u16>()]
-            .chunks_exact(size_of::<u16>())
-            .map(|word| u16::from_le_bytes([word[0], word[1]]))
-            .collect::<Vec<_>>();
+        let compare_layer = compare_this_layer_enabled(layer_idx);
+        let (external_residual, input_prepared) = {
+            let state = self
+                .resident_layer
+                .as_mut()
+                .expect("checked resident layer");
+            (
+                state.attention.uses_external_residual(),
+                state.prepared_input_layer.take() == Some(layer_idx),
+            )
+        };
+        let skip_host_residual = external_residual && input_prepared && !compare_layer;
+        let residual = if skip_host_residual {
+            Vec::new()
+        } else {
+            let residual_view = self
+                .resident_layer
+                .as_ref()
+                .and_then(|state| state.io.as_ref())
+                .expect("completed resident layer I/O")
+                .residual_gpu
+                .view();
+            gpu.cast_f32_to_bf16(residual_and_output, &residual_view)?;
+            gpu.device_synchronize()?;
+            self.resident_layer
+                .as_ref()
+                .and_then(|state| state.io.as_ref())
+                .expect("completed resident layer I/O")
+                .residual
+                .as_slice()[..rows * 768 * size_of::<u16>()]
+                .chunks_exact(size_of::<u16>())
+                .map(|word| u16::from_le_bytes([word[0], word[1]]))
+                .collect::<Vec<_>>()
+        };
         if compare_this_layer_enabled(layer_idx) {
             let original = gpu.download_f32(residual_and_output)?;
             let rounded = residual
@@ -1612,15 +1690,38 @@ impl LinearProjector for NpuOpusProjector {
                 "missing completed resident layer payload {layer_idx}"
             )));
         }
-        state
-            .attention
-            .set_residual_bf16(&mut state.attention_weights[layer_idx], &residual)
-            .map_err(|error| hip_error(format!("stage layer {layer_idx} residual: {error}")))?;
+        if external_residual {
+            if !input_prepared {
+                let completed = completed_high_bf16x2(&residual, rows, 768)?;
+                let prep = state
+                    .residual_prep
+                    .as_mut()
+                    .ok_or_else(|| hip_error("missing resident residual prep"))?;
+                prep.write_bootstrap_bf16x2(&completed).map_err(|error| {
+                    hip_error(format!("stage initial layer residual {layer_idx}: {error}"))
+                })?;
+                prep.run_bootstrap().map_err(|error| {
+                    hip_error(format!(
+                        "prepare initial layer residual {layer_idx}: {error}"
+                    ))
+                })?;
+                if compare_layer {
+                    let mismatches = external_residual_record_mismatches(prep.output(), &residual)?;
+                    eprintln!(
+                        "embeddinggemma_external_residual_producer_compare layer={layer_idx} mismatches={mismatches}"
+                    );
+                }
+            }
+        } else {
+            state
+                .attention
+                .set_residual_bf16(&mut state.attention_weights[layer_idx], &residual)
+                .map_err(|error| hip_error(format!("stage layer {layer_idx} residual: {error}")))?;
+        }
         state
             .attention
             .prepare_layer(&state.attention_weights[layer_idx])
             .map_err(|error| hip_error(format!("prepare layer {layer_idx}: {error}")))?;
-        let input_prepared = state.prepared_input_layer.take() == Some(layer_idx);
         if !input_prepared {
             let input_view = state
                 .io
@@ -1644,7 +1745,6 @@ impl LinearProjector for NpuOpusProjector {
             .map_err(|error| {
                 hip_error(format!("completed-layer attention {layer_idx}: {error}"))
             })?;
-        let compare_layer = compare_this_layer_enabled(layer_idx);
         let split_x_tail = state.tail.consumes_split_x();
         let resident_output_state = if split_x_tail && !compare_layer {
             Vec::new()
@@ -1819,6 +1919,7 @@ impl LinearProjector for NpuOpusProjector {
             .map_err(|error| hip_error(format!("completed-layer tail {layer_idx}: {error}")))?;
         let next_layer = layer_idx + 1;
         if next_layer < state.attention_weights.len() && next_layer < resident_layer_limit {
+            let mut prepared_input = false;
             if let (Some(prep), Some(params)) = (
                 state.next_prep.as_mut(),
                 state.next_prep_params.get(next_layer),
@@ -1828,6 +1929,16 @@ impl LinearProjector for NpuOpusProjector {
                         "prepare completed-layer input {layer_idx}->{next_layer}: {error}"
                     ))
                 })?;
+                prepared_input = true;
+            }
+            if let Some(prep) = state.residual_prep.as_mut() {
+                prep.run_shared().map_err(|error| {
+                    hip_error(format!(
+                        "prepare completed-layer residual {layer_idx}->{next_layer}: {error}"
+                    ))
+                })?;
+            }
+            if prepared_input {
                 state.prepared_input_layer = Some(next_layer);
             }
         }
@@ -2675,6 +2786,55 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
     (rounded >> 16) as u16
+}
+
+fn completed_high_bf16x2(residual: &[u16], rows: usize, hidden: usize) -> HipResult<Vec<u8>> {
+    const PAD_ROWS: usize = 288;
+    if rows != 256 || hidden != 768 || residual.len() != rows * hidden {
+        return Err(hip_error(
+            "initial completed-state BF16x2 geometry mismatch",
+        ));
+    }
+    let mut output = vec![0u8; PAD_ROWS * 2 * hidden * size_of::<u16>()];
+    for row in 0..rows {
+        let target = row * 2 * hidden * size_of::<u16>();
+        for (word, &bits) in output[target..target + hidden * 2]
+            .chunks_exact_mut(2)
+            .zip(&residual[row * hidden..(row + 1) * hidden])
+        {
+            word.copy_from_slice(&bits.to_le_bytes());
+        }
+    }
+    Ok(output)
+}
+
+fn external_residual_record_mismatches(input: &[u8], residual: &[u16]) -> HipResult<usize> {
+    const ROWS: usize = 256;
+    const HIDDEN: usize = 768;
+    const ACTIVATION_BYTES: usize = 4 * 45 * 16_384;
+    const RECORD_BYTES: usize = 16_384;
+    if residual.len() != ROWS * HIDDEN || input.len() < ACTIVATION_BYTES + 32 * RECORD_BYTES {
+        return Err(hip_error("external residual record geometry mismatch"));
+    }
+    let records = &input[ACTIVATION_BYTES..];
+    let mut mismatches = 0usize;
+    for wave in 0..2 {
+        for active_col in 0..4 {
+            for core_row in 0..4 {
+                let record = ((wave * 4 + active_col) * 4 + core_row) * RECORD_BYTES;
+                let token_base = wave * 128 + core_row * 32 + active_col * 8;
+                for row in 0..8 {
+                    for hidden in 0..HIDDEN {
+                        let offset = record + (row * HIDDEN + hidden) * 2;
+                        let got = u16::from_le_bytes([records[offset], records[offset + 1]]);
+                        mismatches +=
+                            usize::from(got != residual[(token_base + row) * HIDDEN + hidden]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(mismatches)
 }
 
 fn compare_this_layer_enabled(layer_idx: usize) -> bool {

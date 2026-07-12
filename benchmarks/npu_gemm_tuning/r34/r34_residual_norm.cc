@@ -59,19 +59,52 @@ void r34_output_projection_finish_pair_bf16(
 #endif
 
 #if !defined(R42_SPLIT_OBJECTS) || defined(R42_BUILD_POST)
+#ifdef R48_EXTERNAL_RESIDUAL
+__attribute__((noinline, minsize)) void
+r48_stage_post_norm(const int8_t *restrict params_bytes,
+                    float *restrict storage0, float *restrict storage1) {
+  const int8_t *source = params_bytes + PARAM_POST_NORM * 2;
+  int8_t *first = reinterpret_cast<int8_t *>(storage0);
+  int8_t *second = reinterpret_cast<int8_t *>(storage1);
+  for (int offset = 0; offset < 1024; offset += 64)
+    aie::store_v(first + offset, aie::load_v<64>(source + offset));
+  for (int offset = 0; offset < 512; offset += 64)
+    aie::store_v(second + offset, aie::load_v<64>(source + 1024 + offset));
+  *reinterpret_cast<float *>(second + 512) =
+      *reinterpret_cast<const float *>(params_bytes + PARAM_EPSILON_BYTES);
+}
+#endif
+
 void r34_post_residual_pre_ffn(int8_t *restrict block0,
                                int8_t *restrict block1,
                                int8_t *restrict block2,
+#ifdef R48_EXTERNAL_RESIDUAL
+                               const int8_t *restrict residual_bytes,
+                               const float *restrict post_storage0,
+                               const float *restrict post_storage1,
+#else
                                const int8_t *restrict params_bytes,
+#endif
                                int8_t *restrict metadata_bytes,
                                int32_t wave) {
+#ifdef R48_EXTERNAL_RESIDUAL
+  const auto *residual = reinterpret_cast<const bfloat16 *>(residual_bytes);
+  const auto *post_norm0 = reinterpret_cast<const bfloat16 *>(post_storage0);
+  const auto *post_norm1 = reinterpret_cast<const bfloat16 *>(post_storage1);
+#else
   const auto *params = reinterpret_cast<const bfloat16 *>(params_bytes);
   const auto *residual = params + PARAM_RESIDUAL;
   const auto *post_norm = params + PARAM_POST_NORM;
   const auto *pre_norm = params + PARAM_PRE_NORM;
+#endif
   auto *metadata = reinterpret_cast<float *>(metadata_bytes) + wave * ROWS;
+#ifdef R48_EXTERNAL_RESIDUAL
+  const float epsilon = *reinterpret_cast<const float *>(
+      reinterpret_cast<const int8_t *>(post_storage1) + 512);
+#else
   const float epsilon =
       *reinterpret_cast<const float *>(params_bytes + PARAM_EPSILON_BYTES);
+#endif
   bfloat16 *blocks[] = {
       reinterpret_cast<bfloat16 *>(block0),
       reinterpret_cast<bfloat16 *>(block1),
@@ -98,7 +131,12 @@ void r34_post_residual_pre_ffn(int8_t *restrict block0,
         const int hidden = hidden_base + dim;
         auto normalized =
             aie::mul(aie::load_v<16>(values + dim),
+#ifdef R48_EXTERNAL_RESIDUAL
+                     aie::load_v<16>(block < 2 ? post_norm0 + hidden
+                                               : post_norm1 + dim))
+#else
                      aie::load_v<16>(post_norm + hidden))
+#endif
                 .to_vector<float>();
         normalized = aie::mul(normalized, post_inverse).to_vector<float>();
         const auto residual_value =

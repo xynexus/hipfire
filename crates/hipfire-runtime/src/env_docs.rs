@@ -1376,14 +1376,14 @@ pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_FFN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER",
     description: "Runtime variable controlling embed compare resident layer in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2681",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2841",
 };
 
 /// `HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX` — Parses "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX" with fallback defaults
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX",
     description: "Parses \"HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX\" with fallback defaults",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2682",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2842",
 };
 
 /// `HIPFIRE_EMBED_E2E_TOKENS` — Runtime variable controlling embed e2e tokens in hipfire
@@ -1411,14 +1411,14 @@ pub const ENV_HIPFIRE_EMBED_REFERENCE_MODEL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER",
     description: "Runtime variable controlling embed resident layer in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:869",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:892",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT` — Parses "HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT" with fallback defaults
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT",
     description: "Parses \"HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT\" with fallback defaults",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1857",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1968",
 };
 
 /// `HIPFIRE_EMBED_TRACE_PHASES` — Runtime variable controlling embed trace phases in hipfire
@@ -3560,14 +3560,14 @@ pub const ENV_HIPFIRE_R26_WARMUPS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_R31_O_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R31_O_CACHE",
     description: "Runtime variable controlling r31 o cache in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_embedding_qkv_resident_verify.rs:484",
+    source: "crates/hipfire-xdna/examples/npu_embedding_qkv_resident_verify.rs:525",
 };
 
 /// `HIPFIRE_R31_O_ITERS` — Runtime variable controlling r31 o iters in hipfire
 pub const ENV_HIPFIRE_R31_O_ITERS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R31_O_ITERS",
     description: "Runtime variable controlling r31 o iters in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_embedding_qkv_resident_verify.rs:507",
+    source: "crates/hipfire-xdna/examples/npu_embedding_qkv_resident_verify.rs:548",
 };
 
 /// `HIPFIRE_RDNA2_VARIANT` — Runtime variable controlling rdna2 variant in hipfire

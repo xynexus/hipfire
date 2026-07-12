@@ -112,6 +112,24 @@ impl NpuKernel {
             .sync_bo(buffer.handle(), submit::SYNC_DIRECT_TO_DEVICE, buffer.len())
     }
 
+    /// Make only the prefix of a shared argument visible to the NPU. This is
+    /// required when another hardware context owns an appended region of the
+    /// same dma-buf and this context's host mapping may still cache stale tail
+    /// lines.
+    pub fn sync_to_device_prefix(
+        &self,
+        buffer: &DeviceBuffer,
+        bytes: usize,
+    ) -> Result<(), XdnaError> {
+        if bytes > buffer.len() {
+            return Err(XdnaError::InvalidOpus(
+                "sync prefix exceeds argument buffer".to_string(),
+            ));
+        }
+        self.dev
+            .sync_bo(buffer.handle(), submit::SYNC_DIRECT_TO_DEVICE, bytes)
+    }
+
     /// Recreate the hardware context while retaining the DRM device, PDI,
     /// instruction, argument, and imported dma-buf BOs. This resets array-local
     /// core/FIFO state without changing any command-packet argument addresses.

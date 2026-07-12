@@ -9,6 +9,9 @@ OUTPUT_EXECUTION = OUTPUT_PROJECTION and "--no-output-execution" not in sys.argv
 OUTPUT_FIRST = "--attention-output-first" in sys.argv[1:]
 DIRECT_OUTPUT = "--direct-output-projection" in sys.argv[1:]
 RESIDUAL_NORM = "--residual-norm" in sys.argv[1:]
+EXTERNAL_RESIDUAL = "--external-residual" in sys.argv[1:]
+if EXTERNAL_RESIDUAL and not RESIDUAL_NORM:
+    raise SystemExit("--external-residual requires --residual-norm")
 PAIRED_QKV = "--paired-qkv" in sys.argv[1:] or RESIDUAL_NORM
 if PAIRED_QKV:
     DIRECT_OUTPUT = True
@@ -33,7 +36,8 @@ PAIR_W_RECORD, PAIR_W_BLOCK = 8192, 16384
 ACC_ELEMS = 768
 O_ACC_ELEMS = 256 if DIRECT_OUTPUT else 1024
 INBLOCKS = GROUPS * OUTBLOCKS
-A_BYTES = ROWS * INBLOCKS * A_BLOCK
+A_BASE_BYTES = ROWS * INBLOCKS * A_BLOCK
+A_BYTES = A_BASE_BYTES + (2 * (COLS // 2) * ROWS * A_BLOCK if EXTERNAL_RESIDUAL else 0)
 W_BYTES = (
     (COLS // 2) * INBLOCKS * PAIR_W_BLOCK
     if PAIRED_QKV
@@ -271,7 +275,16 @@ if OUTPUT_EXECUTION:
     if RESIDUAL_NORM:
         out += [
             f'    func.func private @{output_finish}(memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>, memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, i32) attributes {{link_with = "r34norm.o"}}',
-            f'    func.func private @r34_post_residual_pre_ffn(memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<64xi8>, i32) attributes {{link_with = "r34norm.o"}}',
+            *(
+                [
+                    f'    func.func private @r48_stage_post_norm(memref<16384xi8>, memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>) attributes {{link_with = "r34norm.o"}}',
+                    f'    func.func private @r34_post_residual_pre_ffn(memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>, memref<64xi8>, i32) attributes {{link_with = "r34norm.o"}}',
+                ]
+                if EXTERNAL_RESIDUAL
+                else [
+                    '    func.func private @r34_post_residual_pre_ffn(memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<64xi8>, i32) attributes {link_with = "r34norm.o"}'
+                ]
+            ),
             f'    func.func private @r34_emit_norm_half(memref<4096xi8>, memref<{OUT_TILE}xi8>, index) attributes {{link_with = "r34norm.o"}}',
             f'    func.func private @r38_relay_pre_inverse(memref<64xi8>, memref<{OUT_TILE}xi8>) attributes {{link_with = "r34norm.o"}}',
         ]
@@ -539,17 +552,35 @@ for col in range(COLS):
                     ]
                     lines += [
                         "          %omwavei = arith.index_cast %omwave : index to i32",
-                        "          scf.for %rnparam = %z to %rnrows step %one {",
                     ]
-                    lines += acquire_w(col, "rn", "            ")
-                    lines += [
-                        "            %rnactive = arith.cmpi eq, %rnparam, %rnrow : index",
-                        "            scf.if %rnactive {",
-                        f"              func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrnv, %rnmetav, %omwavei) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<64xi8>, i32) -> ()",
-                        "            }",
-                        f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
-                        "          }",
-                    ]
+                    if EXTERNAL_RESIDUAL:
+                        lines += [
+                            f"          %wrnp = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<16384xi8>>",
+                            "          %wrnpv = aie.objectfifo.subview.access %wrnp[0] : !aie.objectfifosubview<memref<16384xi8>> -> memref<16384xi8>",
+                            f"          func.call @r48_stage_post_norm(%wrnpv, %oacc{col}_{row}_0, %oacc{col}_{row}_1) : (memref<16384xi8>, memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>) -> ()",
+                            f"          aie.objectfifo.release @wbc{col}(Consume, 1)",
+                            "          scf.for %rnparam = %z to %rnrows step %one {",
+                        ]
+                        lines += acquire_w(col, "rn", "            ")
+                        lines += [
+                            "            %rnactive = arith.cmpi eq, %rnparam, %rnrow : index",
+                            "            scf.if %rnactive {",
+                            f"              func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrnv, %oacc{col}_{row}_0, %oacc{col}_{row}_1, %rnmetav, %omwavei) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>, memref<64xi8>, i32) -> ()",
+                            "            }",
+                            f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
+                            "          }",
+                        ]
+                    else:
+                        lines += ["          scf.for %rnparam = %z to %rnrows step %one {"]
+                        lines += acquire_w(col, "rn", "            ")
+                        lines += [
+                            "            %rnactive = arith.cmpi eq, %rnparam, %rnrow : index",
+                            "            scf.if %rnactive {",
+                            f"              func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrnv, %rnmetav, %omwavei) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<64xi8>, i32) -> ()",
+                            "            }",
+                            f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
+                            "          }",
+                        ]
                     for block in range(3):
                         name = f"rne{block}"
                         lines += ["          scf.for %rnhalf = %z to %waves step %one {"]
@@ -883,13 +914,72 @@ def await_norm_output_tasks(mwave):
                 )
 
 
+def start_external_norm_inputs(mwave, include_weights):
+    for active_col, col in enumerate(range(0, COLS, 2)):
+        output_offset = W_BYTES + active_col * O_WEIGHTS_PER_COL * W_BLOCK
+        if include_weights:
+            weight_name = f"tow{mwave}_{col}"
+            out.extend(
+                [
+                    f"      %{weight_name} = aiex.dma_configure_task_for @wsh{col} {{",
+                    f"        aie.dma_bd(%W : memref<{TOTAL_W_BYTES}xi8>, {output_offset}, {O_WEIGHTS_PER_COL * W_BLOCK}, {dims(O_WEIGHTS_PER_COL, W_BLOCK)}) {{burst_length = 0 : i32}}",
+                    "        aie.end",
+                    "      } {issue_token = true}",
+                    f"      aiex.dma_start_task(%{weight_name})",
+                ]
+            )
+        params_name = f"trnp{mwave}_{col}"
+        params_offset = (
+            W_BYTES
+            + O_W_BYTES
+            + active_col * RN_BLOCKS_PER_COL * W_BLOCK
+            + mwave * ROWS * W_BLOCK
+        )
+        out.extend(
+            [
+                f"      %{params_name} = aiex.dma_configure_task_for @wsh{col} {{",
+                f"        aie.dma_bd(%W : memref<{TOTAL_W_BYTES}xi8>, {params_offset}, {W_BLOCK}, {dims(1, W_BLOCK)}) {{burst_length = 0 : i32}}",
+                "        aie.end",
+                "      } {issue_token = true}",
+                f"      aiex.dma_start_task(%{params_name})",
+            ]
+        )
+        for core_row in range(ROWS):
+            residual_name = f"trnx{mwave}_{col}_{core_row}"
+            residual_record = (mwave * O_ACTIVE_COLS + active_col) * ROWS + core_row
+            residual_offset = A_BASE_BYTES + residual_record * A_BLOCK
+            out.extend(
+                [
+                    f"      %{residual_name} = aiex.dma_configure_task_for @wsh{col} {{",
+                    f"        aie.dma_bd(%A : memref<{A_BYTES}xi8>, {residual_offset}, {A_BLOCK}, {dims(1, A_BLOCK)}) {{burst_length = 0 : i32}}",
+                    "        aie.end",
+                    "      } {issue_token = true}",
+                    f"      aiex.dma_start_task(%{residual_name})",
+                ]
+            )
+
+
+def await_external_norm_inputs(mwave):
+    for col in range(0, COLS, 2):
+        names = [f"tow{mwave}_{col}", f"trnp{mwave}_{col}"]
+        names += [f"trnx{mwave}_{col}_{row}" for row in range(ROWS)]
+        for name in names:
+            out.extend(
+                [
+                    f"      aiex.dma_await_task(%{name})",
+                    f"      aiex.dma_free_task(%{name})",
+                ]
+            )
+
+
 if OUTPUT_EXECUTION and DIRECT_OUTPUT:
     for active_col, col in enumerate(range(0, COLS, 2)):
         offset = W_BYTES + active_col * O_WEIGHTS_PER_COL * W_BLOCK
         if RESIDUAL_NORM:
-            for mwave in range(O_M_WAVES):
+            initial_waves = range(1) if EXTERNAL_RESIDUAL else range(O_M_WAVES)
+            for mwave in initial_waves:
                 weight_name = f"tow{mwave}_{col}"
-                params_name = f"trn{mwave}_{col}"
+                params_name = f"trnp{mwave}_{col}"
                 params_offset = (
                     W_BYTES
                     + O_W_BYTES
@@ -902,12 +992,15 @@ if OUTPUT_EXECUTION and DIRECT_OUTPUT:
                     "        aie.end",
                     "      } {issue_token = true}",
                     f"      aiex.dma_start_task(%{weight_name})",
-                    f"      %{params_name} = aiex.dma_configure_task_for @wsh{col} {{",
-                    f"        aie.dma_bd(%W : memref<{TOTAL_W_BYTES}xi8>, {params_offset}, {ROWS * W_BLOCK}, {dims(ROWS, W_BLOCK)}) {{burst_length = 0 : i32}}",
-                    "        aie.end",
-                    "      } {issue_token = true}",
-                    f"      aiex.dma_start_task(%{params_name})",
                 ]
+                if not EXTERNAL_RESIDUAL:
+                    out += [
+                            f"      %{params_name} = aiex.dma_configure_task_for @wsh{col} {{",
+                            f"        aie.dma_bd(%W : memref<{TOTAL_W_BYTES}xi8>, {params_offset}, {ROWS * W_BLOCK}, {dims(ROWS, W_BLOCK)}) {{burst_length = 0 : i32}}",
+                            "        aie.end",
+                            "      } {issue_token = true}",
+                            f"      aiex.dma_start_task(%{params_name})",
+                    ]
         else:
             name = f"tow{col}"
             out += [
@@ -1000,17 +1093,25 @@ if ATTENTION:
                     f"      aiex.dma_free_task(%{name})",
                 ]
         elif RESIDUAL_NORM and execution_group == O_GROUPS - 1:
+            if EXTERNAL_RESIDUAL:
+                start_external_norm_inputs(0, False)
             await_norm_output_tasks(0)
+            if EXTERNAL_RESIDUAL:
+                await_external_norm_inputs(0)
+                start_external_norm_inputs(1, True)
             start_norm_output_tasks(1)
         elif RESIDUAL_NORM and execution_group == QUERY_GROUPS - 1:
             await_norm_output_tasks(1)
-            for col in range(0, COLS, 2):
-                for mwave in range(O_M_WAVES):
-                    for name in (f"tow{mwave}_{col}", f"trn{mwave}_{col}"):
-                        out += [
-                            f"      aiex.dma_await_task(%{name})",
-                            f"      aiex.dma_free_task(%{name})",
-                        ]
+            if EXTERNAL_RESIDUAL:
+                await_external_norm_inputs(1)
+            else:
+                for col in range(0, COLS, 2):
+                    for mwave in range(O_M_WAVES):
+                        for name in (f"tow{mwave}_{col}", f"trnp{mwave}_{col}"):
+                            out += [
+                                f"      aiex.dma_await_task(%{name})",
+                                f"      aiex.dma_free_task(%{name})",
+                            ]
 
 if OUTPUT_EXECUTION and not DIRECT_OUTPUT:
     for active_col, col in enumerate(range(0, COLS, 2)):

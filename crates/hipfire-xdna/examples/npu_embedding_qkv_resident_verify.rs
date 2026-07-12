@@ -41,6 +41,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let residual_norm = manifest
         .lines()
         .any(|line| line == "op=resident-qkv-paired-attention-output-norm");
+    let external_residual = manifest
+        .lines()
+        .any(|line| line == "residual-input=shared-activation-tail-r34-bf16-records");
+    let direct_x = manifest
+        .lines()
+        .any(|line| line == "output=canonical-token-major-x-bf16");
     let paired_qkv = residual_norm
         || manifest
             .lines()
@@ -112,7 +118,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("R38 cache missing pre-FFN inverse state contract".into());
     }
     let pair_bytes = if attention { 16384 } else { 10240 };
-    let a_bytes = 4 * 45 * pair_bytes;
+    let a_base_bytes = 4 * 45 * pair_bytes;
+    let a_bytes = a_base_bytes
+        + if external_residual {
+            2 * 4 * 4 * pair_bytes
+        } else {
+            0
+        };
     let r_stage_bytes = 5 * 48 * pair_bytes;
     let r_bytes = r_stage_bytes
         + if attention { Layout::OUTPUT_BYTES } else { 0 }
@@ -161,6 +173,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let projected = cpu_projection(&activations, &activation_scales, &weights, &weight_scales);
 
     let mut packed_a = pack_activations(&activations, &activation_scales, pair_bytes);
+    if external_residual {
+        packed_a.resize(a_bytes, 0);
+        pack_r34_residual_records(&mut packed_a[a_base_bytes..]);
+    }
     let output_weights = output_projection_weights();
     let unpacked_w = pack_weights(&weights, &weight_scales);
     let mut packed_w = if paired_qkv {
@@ -216,12 +232,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     r_buffer.as_mut_slice().copy_from_slice(&staged_r);
     q_buffer.as_mut_slice().fill(0);
     kv_buffer.as_mut_slice().fill(0);
-
     dispatch_resident(
         &kernel, &a_buffer, &w_buffer, &r_buffer, &q_buffer, &kv_buffer, true,
     )?;
     if output_projection || packed_attention {
         kernel.sync_output(&r_buffer)?;
+        kernel.sync_output(&q_buffer)?;
+        kernel.sync_output(&kv_buffer)?;
         let attention_region = if packed_attention {
             &r_buffer.as_slice()[..Layout::OUTPUT_BYTES]
         } else {
@@ -247,7 +264,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0
         };
         if direct_output {
-            eprintln!("R32 prime: output_nonzero={prime_output_nonzero}");
+            eprintln!(
+                "R32 prime: output_nonzero={prime_output_nonzero} q_nonzero={} kv_nonzero={}",
+                q_buffer
+                    .as_slice()
+                    .iter()
+                    .filter(|&&byte| byte != 0)
+                    .count(),
+                kv_buffer
+                    .as_slice()
+                    .iter()
+                    .filter(|&&byte| byte != 0)
+                    .count(),
+            );
         } else {
             eprintln!(
                 "R31 prime tails: attention_nonzero={} output_nonzero={}",
@@ -370,8 +399,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .copied()
             .map(hipfire_primitives::conv::bf16_bits_to_f32)
             .collect::<Vec<_>>();
-        let (reference, inverse_reference, residual_reference) =
+        let (normalized_reference, inverse_reference, residual_reference) =
             residual_norm_reference(&output_reference, EPSILON);
+        let reference = if direct_x {
+            &residual_reference
+        } else {
+            &normalized_reference
+        };
         let measured = metrics(&got, &reference);
         if !measured.0.is_finite() || measured.0 < 0.9998 || measured.1 > 0.065 {
             return Err(format!(
@@ -395,20 +429,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        let reconstructed = got
-            .iter()
-            .enumerate()
-            .map(|(index, &value)| {
-                let token = index / 768;
-                let hidden = index % 768;
-                let pre_norm = hipfire_primitives::conv::bf16_bits_to_f32(
-                    hipfire_primitives::conv::f32_to_bf16_bits(
-                        0.91 + (hidden % 29) as f32 * 0.0015,
-                    ),
-                );
-                value / (pre_norm * inverse[token])
-            })
-            .collect::<Vec<_>>();
+        let reconstructed = if direct_x {
+            got.clone()
+        } else {
+            got.iter()
+                .enumerate()
+                .map(|(index, &value)| {
+                    let token = index / 768;
+                    let hidden = index % 768;
+                    let pre_norm = hipfire_primitives::conv::bf16_bits_to_f32(
+                        hipfire_primitives::conv::f32_to_bf16_bits(
+                            0.91 + (hidden % 29) as f32 * 0.0015,
+                        ),
+                    );
+                    value / (pre_norm * inverse[token])
+                })
+                .collect::<Vec<_>>()
+        };
         let reconstructed_measured = metrics(&reconstructed, &residual_reference);
         if !reconstructed_measured.0.is_finite()
             || reconstructed_measured.0 < 0.9998
@@ -425,11 +462,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let ffn_chain_metrics = if let Some(input) = norm_bf16.as_deref() {
+    let ffn_chain_metrics = if !direct_x {
+        norm_bf16.as_deref()
+    } else {
+        None
+    }
+    .map(|input| {
         let shared = shared_handoff
             .as_ref()
             .expect("R34 shared canonical output backing");
-        Some(verify_canonical_ffn_handoff(
+        verify_canonical_ffn_handoff(
             &ffn_cache,
             &tail_cache,
             input,
@@ -443,10 +485,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &kernel, &a_buffer, &w_buffer, &r_buffer, &q_buffer, &kv_buffer, false,
                 )
             },
-        )?)
-    } else {
-        None
-    };
+        )
+    })
+    .transpose()?;
     let output_metrics = if output_projection && !residual_norm {
         let output = &r_buffer.as_slice()[r_stage_bytes + Layout::OUTPUT_BYTES..];
         let got = if direct_output {
@@ -567,30 +608,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
     if residual_norm {
         let (norm, inverse, reconstructed) = norm_metrics.expect("residual norm metrics");
-        let ffn = ffn_chain_metrics.expect("R34 to R35 FFN metrics");
-        println!(
-            "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: staging_prefix_reused_for_norm=true q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_cosine={:.8} v_max={:.7} norm_full_cosine={:.8} norm_full_max={:.7} pre_inverse_cosine={:.8} pre_inverse_max={:.7} residual_reconstruct_cosine={:.8} residual_reconstruct_max={:.7} ffn_zero_copy_cosine={:.8} ffn_zero_copy_max={:.7} ffn_zero_copy_ms={:.4} completed_layer_cosine={:.8} completed_layer_max={:.7} tail_ms={:.4} full_layer_chain_ms={:.4} full_layer_chain_rows_s={:.1} dispatch_ms={dispatch_ms:.4}",
-            q.0,
-            q.1,
-            k.0,
-            k.1,
-            v.0,
-            v.1,
-            norm.0,
-            norm.1,
-            inverse.0,
-            inverse.1,
-            reconstructed.0,
-            reconstructed.1,
-            ffn.0,
-            ffn.1,
-            ffn.2,
-            ffn.3,
-            ffn.4,
-            ffn.5,
-            ffn.6,
-            256_000.0 / ffn.6,
-        );
+        if let Some(ffn) = ffn_chain_metrics {
+            println!(
+                "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: staging_prefix_reused_for_norm=true external_residual_records={external_residual} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_cosine={:.8} v_max={:.7} norm_full_cosine={:.8} norm_full_max={:.7} pre_inverse_cosine={:.8} pre_inverse_max={:.7} residual_reconstruct_cosine={:.8} residual_reconstruct_max={:.7} ffn_zero_copy_cosine={:.8} ffn_zero_copy_max={:.7} ffn_zero_copy_ms={:.4} completed_layer_cosine={:.8} completed_layer_max={:.7} tail_ms={:.4} full_layer_chain_ms={:.4} full_layer_chain_rows_s={:.1} dispatch_ms={dispatch_ms:.4}",
+                q.0, q.1, k.0, k.1, v.0, v.1, norm.0, norm.1, inverse.0, inverse.1,
+                reconstructed.0, reconstructed.1, ffn.0, ffn.1, ffn.2, ffn.3, ffn.4,
+                ffn.5, ffn.6, 256_000.0 / ffn.6,
+            );
+        } else {
+            println!(
+                "resident-w8-qkv-attention-output-norm M=256 K=768 N=1280: direct_x=true external_residual_records={external_residual} q_cosine={:.8} q_max={:.7} k_cosine={:.8} k_max={:.7} v_cosine={:.8} v_max={:.7} x_cosine={:.8} x_max={:.7} pre_inverse_cosine={:.8} pre_inverse_max={:.7} residual_reconstruct_cosine={:.8} residual_reconstruct_max={:.7} dispatch_ms={dispatch_ms:.4}",
+                q.0, q.1, k.0, k.1, v.0, v.1, norm.0, norm.1, inverse.0, inverse.1,
+                reconstructed.0, reconstructed.1,
+            );
+        }
     } else if direct_output {
         let output = output_metrics.expect("direct output projection metrics");
         println!(
@@ -676,6 +707,35 @@ fn dispatch_resident(
     let args = [activations, weights, staging, queries, key_values];
     let sync_flags = vec![sync; args.len()];
     kernel.dispatch_synced(&args, &sync_flags)
+}
+
+#[cfg(target_os = "linux")]
+fn pack_r34_residual_records(output: &mut [u8]) {
+    use hipfire_primitives::conv::f32_to_bf16_bits;
+
+    const BLOCK: usize = 16_384;
+    const HIDDEN: usize = 768;
+    assert_eq!(output.len(), 2 * 4 * 4 * BLOCK);
+    output.fill(0);
+    for wave in 0..2 {
+        for active_col in 0..4 {
+            for core_row in 0..4 {
+                let block = ((wave * 4 + active_col) * 4 + core_row) * BLOCK;
+                let token_base = wave * 128 + core_row * 32 + active_col * 8;
+                for row in 0..8 {
+                    for hidden in 0..HIDDEN {
+                        let token = token_base + row;
+                        let value = ((token * 17 + hidden * 7) % 97) as f32 * 0.0005 - 0.024;
+                        write_u16(
+                            output,
+                            block + (row * HIDDEN + hidden) * 2,
+                            f32_to_bf16_bits(value),
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
