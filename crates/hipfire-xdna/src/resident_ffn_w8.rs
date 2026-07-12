@@ -21,8 +21,10 @@ const COLS: usize = 8;
 const ROW_STRIPES: usize = 4;
 const GATE_N_BLOCKS: usize = 6;
 const GATE_BLOCKS: usize = 3 * GATE_N_BLOCKS * GATE_GROUPS;
+const GATE_REUSE_PARAM_BLOCKS: usize = 3 * GATE_GROUPS;
 const DOWN_BLOCKS: usize = 3 * DOWN_GROUPS * 2;
 const WEIGHT_BLOCKS: usize = GATE_BLOCKS + DOWN_BLOCKS;
+const REUSE_WEIGHT_BLOCKS: usize = GATE_REUSE_PARAM_BLOCKS + GATE_BLOCKS + DOWN_BLOCKS;
 const DATA_PAIR: usize = 9216;
 const DATA_REPEATS: usize = 4;
 const DATA_JOIN: usize = DATA_REPEATS * DATA_PAIR;
@@ -63,6 +65,7 @@ pub enum NpuResidentFfnDenseW8IoMode {
 pub struct NpuResidentFfnDenseW8 {
     kernel: NpuKernel,
     io_mode: NpuResidentFfnDenseW8IoMode,
+    reuse_gate_activation: bool,
     input: DeviceBuffer,
     scratch: DeviceBuffer,
     output: DeviceBuffer,
@@ -75,6 +78,15 @@ impl NpuResidentFfnDenseW8 {
         let manifest =
             std::fs::read_to_string(format!("{cache}/shape.txt")).map_err(XdnaError::Open)?;
         let io_mode = parse_io_mode(&manifest)?;
+        let reuse_gate_activation = manifest
+            .lines()
+            .any(|line| line == "gate-activation=reuse-quantized-local-fragments");
+        if reuse_gate_activation && io_mode != NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output
+        {
+            return Err(invalid(
+                "resident dense-W8 gate reuse requires the direct-X BF16x2 ABI",
+            ));
+        }
         for required in [
             "op=resident_ffn",
             "m=256",
@@ -97,6 +109,7 @@ impl NpuResidentFfnDenseW8 {
         Ok(Self {
             kernel,
             io_mode,
+            reuse_gate_activation,
             input,
             scratch,
             output,
@@ -147,6 +160,10 @@ impl NpuResidentFfnDenseW8 {
 
     pub const fn io_mode(&self) -> NpuResidentFfnDenseW8IoMode {
         self.io_mode
+    }
+
+    pub const fn reuses_gate_activation(&self) -> bool {
+        self.reuse_gate_activation
     }
 
     pub const fn consumes_direct_x(&self) -> bool {
@@ -290,13 +307,39 @@ impl NpuResidentFfnDenseW8 {
         let down_awq = padded_awq(down.awq_scale(), DOWN_GROUPS * GROUP);
         let signs1 = gen_fwht_signs(42, GROUP);
         let signs2 = gen_fwht_signs(1042, GROUP);
-        let mut packed = vec![0u8; COLS * WEIGHT_BLOCKS * W_BLOCK];
+        let weight_blocks = if self.reuse_gate_activation {
+            REUSE_WEIGHT_BLOCKS
+        } else {
+            WEIGHT_BLOCKS
+        };
+        let mut packed = vec![0u8; COLS * weight_blocks * W_BLOCK];
         for stripe in 0..COLS {
             for mblock in 0..3 {
+                if self.reuse_gate_activation {
+                    for group in 0..GATE_GROUPS {
+                        let block = gate_param_block_index(mblock, group);
+                        let start = (stripe * weight_blocks + block) * W_BLOCK;
+                        pack_gate_block(
+                            &mut packed[start..start + W_BLOCK],
+                            stripe,
+                            0,
+                            &gate_groups[group],
+                            gate.group_scales(group),
+                            &up_groups[group],
+                            up.group_scales(group),
+                            group,
+                            &gate_awq,
+                            &signs1,
+                            &signs2,
+                            pre_ffn_norm,
+                        );
+                    }
+                }
                 for nblock in 0..GATE_N_BLOCKS {
                     for group in 0..GATE_GROUPS {
-                        let block = (mblock * GATE_N_BLOCKS + nblock) * GATE_GROUPS + group;
-                        let start = (stripe * WEIGHT_BLOCKS + block) * W_BLOCK;
+                        let block =
+                            gate_block_index(self.reuse_gate_activation, mblock, nblock, group);
+                        let start = (stripe * weight_blocks + block) * W_BLOCK;
                         pack_gate_block(
                             &mut packed[start..start + W_BLOCK],
                             stripe,
@@ -317,8 +360,14 @@ impl NpuResidentFfnDenseW8 {
             for mblock in 0..3 {
                 for group in 0..DOWN_GROUPS {
                     for nmacro in 0..2 {
-                        let block = down_block_index(self.io_mode, mblock, group, nmacro);
-                        let start = (stripe * WEIGHT_BLOCKS + block) * W_BLOCK;
+                        let block = down_block_index(
+                            self.io_mode,
+                            self.reuse_gate_activation,
+                            mblock,
+                            group,
+                            nmacro,
+                        );
+                        let start = (stripe * weight_blocks + block) * W_BLOCK;
                         pack_down_block(
                             &mut packed[start..start + W_BLOCK],
                             stripe,
@@ -409,7 +458,12 @@ impl NpuResidentFfnDenseW8 {
     }
 
     pub fn run_shared(&mut self, weights: &NpuResidentFfnDenseW8Weights) -> Result<(), XdnaError> {
-        if weights.buffer.len() != COLS * WEIGHT_BLOCKS * W_BLOCK {
+        let weight_blocks = if self.reuse_gate_activation {
+            REUSE_WEIGHT_BLOCKS
+        } else {
+            WEIGHT_BLOCKS
+        };
+        if weights.buffer.len() != COLS * weight_blocks * W_BLOCK {
             return Err(invalid("resident dense-W8 FFN packed weight size mismatch"));
         }
         if self.context_commands >= MAX_CONTEXT_COMMANDS {
@@ -588,11 +642,17 @@ fn parse_io_mode(manifest: &str) -> Result<NpuResidentFfnDenseW8IoMode, XdnaErro
 
 const fn down_block_index(
     mode: NpuResidentFfnDenseW8IoMode,
+    reuse_gate_activation: bool,
     mblock: usize,
     group: usize,
     nmacro: usize,
 ) -> usize {
-    GATE_BLOCKS
+    let gate_blocks = if reuse_gate_activation {
+        GATE_REUSE_PARAM_BLOCKS + GATE_BLOCKS
+    } else {
+        GATE_BLOCKS
+    };
+    gate_blocks
         + match mode {
             NpuResidentFfnDenseW8IoMode::PackedF32 => (mblock * DOWN_GROUPS + group) * 2 + nmacro,
             NpuResidentFfnDenseW8IoMode::CanonicalBf16
@@ -601,6 +661,26 @@ const fn down_block_index(
                 (mblock * 2 + nmacro) * DOWN_GROUPS + group
             }
         }
+}
+
+const fn gate_param_block_index(mblock: usize, group: usize) -> usize {
+    mblock * (GATE_GROUPS + GATE_N_BLOCKS * GATE_GROUPS) + group
+}
+
+const fn gate_block_index(
+    reuse_gate_activation: bool,
+    mblock: usize,
+    nblock: usize,
+    group: usize,
+) -> usize {
+    if reuse_gate_activation {
+        mblock * (GATE_GROUPS + GATE_N_BLOCKS * GATE_GROUPS)
+            + GATE_GROUPS
+            + nblock * GATE_GROUPS
+            + group
+    } else {
+        (mblock * GATE_N_BLOCKS + nblock) * GATE_GROUPS + group
+    }
 }
 
 fn validate_matrix(
@@ -826,26 +906,41 @@ mod tests {
     #[test]
     fn canonical_down_weights_follow_nmacro_before_group() {
         assert_eq!(
-            down_block_index(NpuResidentFfnDenseW8IoMode::PackedF32, 1, 3, 0),
+            down_block_index(NpuResidentFfnDenseW8IoMode::PackedF32, false, 1, 3, 0),
             GATE_BLOCKS + 16
         );
         assert_eq!(
-            down_block_index(NpuResidentFfnDenseW8IoMode::CanonicalBf16, 1, 3, 0),
+            down_block_index(NpuResidentFfnDenseW8IoMode::CanonicalBf16, false, 1, 3, 0),
             GATE_BLOCKS + 13
         );
         assert_eq!(
-            down_block_index(NpuResidentFfnDenseW8IoMode::CanonicalBf16, 1, 3, 1),
+            down_block_index(NpuResidentFfnDenseW8IoMode::CanonicalBf16, false, 1, 3, 1),
             GATE_BLOCKS + 18
         );
         assert_eq!(
             down_block_index(
                 NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output,
+                false,
                 1,
                 3,
                 1
             ),
             GATE_BLOCKS + 18
         );
+        assert_eq!(gate_param_block_index(1, 2), 23);
+        assert_eq!(gate_block_index(true, 1, 0, 0), 24);
+        assert_eq!(gate_block_index(true, 2, 5, 2), 62);
+        assert_eq!(
+            down_block_index(
+                NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output,
+                true,
+                0,
+                0,
+                0
+            ),
+            63
+        );
+        assert_eq!(COLS * REUSE_WEIGHT_BLOCKS * W_BLOCK, 12_189_696);
     }
 
     #[test]

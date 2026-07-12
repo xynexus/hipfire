@@ -351,7 +351,13 @@ r26_pack3(const int8 *__restrict input_bytes,
           int8 *__restrict fragment, int owner, int group) {
   (void)activation_payload;
 #ifdef R35_CANONICAL_BF16
-  const int mblock = group < 0 ? (-group - 1) / 6 : -1;
+  const int mblock = group < 0 ?
+#ifdef R55_REUSE_GATE_ACTIVATION
+      -group - 1
+#else
+      (-group - 1) / 6
+#endif
+      : -1;
   const int8 *owned = input_bytes + owner * R26_FRAGMENT_ROWS * R26_GROUP * 2;
   constexpr int ROW_BYTES = R26_GROUP * 2;
 #else
@@ -399,8 +405,17 @@ r45_select_inverses(const int8 *__restrict physical_records,
 #endif
 
 extern "C" __attribute__((minsize)) void
-r26_insert_fragment(const int8 *__restrict fragment,
-                    int8 *__restrict activation_payload, int owner) {
+r26_insert_fragment(const int8 *__restrict fragment_base,
+                    int8 *__restrict activation_payload, int owner
+#ifdef R55_REUSE_GATE_ACTIVATION
+                    , int group
+#endif
+                    ) {
+#ifdef R55_REUSE_GATE_ACTIVATION
+  const int8 *fragment = fragment_base + group * R26_FRAGMENT_BYTES;
+#else
+  const int8 *fragment = fragment_base;
+#endif
   float *scales = reinterpret_cast<float *>(activation_payload + R26_A_DATA);
   for (int row = 0; row < 3; row++) {
     const int local_row = owner * 3 + row;
@@ -420,7 +435,16 @@ r26_insert_fragment(const int8 *__restrict fragment,
 }
 
 extern "C" __attribute__((noinline, minsize)) void
-r26_send_fragment(const int8 *__restrict fragment) {
+r26_send_fragment(const int8 *__restrict fragment_base
+#ifdef R55_REUSE_GATE_ACTIVATION
+                  , int group
+#endif
+                  ) {
+#ifdef R55_REUSE_GATE_ACTIVATION
+  const int8 *fragment = fragment_base + group * R26_FRAGMENT_BYTES;
+#else
+  const int8 *fragment = fragment_base;
+#endif
   const int *words = reinterpret_cast<const int *>(fragment);
   for (int word = 0; word < R26_FRAGMENT_WORDS; word++) put_ms(words[word]);
 }
@@ -430,3 +454,16 @@ r26_receive_fragment(int8 *__restrict fragment) {
   int *words = reinterpret_cast<int *>(fragment);
   for (int word = 0; word < R26_FRAGMENT_WORDS; word++) words[word] = get_ss_int();
 }
+
+#ifdef R55_REUSE_GATE_ACTIVATION
+extern "C" __attribute__((noinline, minsize)) void
+r55_pack3_cached(const int8 *__restrict input_bytes,
+                 const float *__restrict inverse_table,
+                 const int8 *__restrict weight_payload,
+                 int8 *__restrict activation_payload, float *__restrict scratch,
+                 int8 *__restrict cached, int owner, int mblock_token,
+                 int group) {
+  r26_pack3(input_bytes, inverse_table, weight_payload, activation_payload,
+            scratch, cached + group * R26_FRAGMENT_BYTES, owner, mblock_token);
+}
+#endif

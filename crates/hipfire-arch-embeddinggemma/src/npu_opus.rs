@@ -745,9 +745,24 @@ impl NpuOpusProjector {
             cache_root.join("embgemma_aie2p_resident_ffn_dense_w8_m256_k768_i1152_o768");
         let resident_layer_ffn_direct_x_path = cache_root
             .join("embgemma_aie2p_resident_ffn_dense_w8_direct_x_bf16x2_m256_k768_i1152_o768");
+        let resident_layer_ffn_gate_reuse_path = cache_root.join(
+            "embgemma_aie2p_resident_ffn_dense_w8_direct_x_gate_reuse_bf16x2_m256_k768_i1152_o768",
+        );
         let resident_layer_ffn_canonical_path = cache_root
             .join("embgemma_aie2p_resident_ffn_dense_w8_canonical_bf16x2_m256_k768_i1152_o768");
-        let resident_layer_ffn_path = if resident_layer_ffn_direct_x_path
+        let resident_layer_ffn_override =
+            std::env::var_os("HIPFIRE_EMBED_RESIDENT_FFN_CACHE").map(PathBuf::from);
+        let resident_layer_ffn_path = if let Some(path) = resident_layer_ffn_override {
+            path
+        } else if resident_layer_ffn_gate_reuse_path
+            .join("final.xclbin")
+            .is_file()
+            && resident_layer_ffn_gate_reuse_path
+                .join("insts.bin")
+                .is_file()
+        {
+            resident_layer_ffn_gate_reuse_path
+        } else if resident_layer_ffn_direct_x_path
             .join("final.xclbin")
             .is_file()
             && resident_layer_ffn_direct_x_path.join("insts.bin").is_file()

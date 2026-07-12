@@ -2062,3 +2062,49 @@ FlatAttention's actual requirement: explicitly partition persistent state across
 the aggregate tile-group memory and schedule DMA, vector transforms, and fabric
 collectives asynchronously. It must not rely on oversized per-core duplication
 or prolonged FIFO acquisition.
+
+### R55 retained gate-activation checkpoint
+
+R55 applies the first successful FlatAttention-style distributed-local reuse to
+the resident FFN. R45 previously broadcasts each 24-by-256 BF16 token group and
+repeats pre-FFN RMSNorm, AWQ scaling, signed FWHT, and row quantization for every
+one of six gate/up output blocks. Gate and up are already required to share one
+AWQ activation scale, so R55 retains each core's three 784-byte quantized row
+fragments for the three K groups and reuses them across all six output blocks.
+For each 96-token M block this reduces gate input broadcasts from 18 to 3 and
+the corresponding vector preprocessing work by the same factor. A separate
+manifest field, `gate-activation=reuse-quantized-local-fragments`, selects the
+63-block weight-stream ABI; the admitted R45 generator remains byte-identical.
+
+The implementation exposed both AIE2P storage limits explicitly. An initial
+three-path unrolled ring image used 16,748 bytes of program text and was
+rejected. A looped selector reduced that to 16,428 bytes, still rejected. The
+admitted graph uses one contiguous 2,352-byte fragment bank, dynamic group
+offsets in the existing insert/send helpers, and looped preprocessing. Its
+largest image is 16,412 bytes and `aiecc` produces a valid xclbin. The generated
+artifact lives under `~/.hipfire/npu` and is rebuilt by `r55_cache.sh`.
+
+Locked M256 end-to-end checks preserve the established quality envelope:
+
+| candidate | BF16 cosine | maximum absolute error |
+|---|---:|---:|
+| OQ8++ | 0.99818963 | 0.00833587 |
+| OQ4++ | 0.97710949 | 0.02409978 |
+
+One phase-attributed OQ8++ A/B measured the steady layers (excluding the first
+context-prime layer) at `13.793 ms/layer` for R45 and `11.329 ms/layer` for
+R55, a 17.9% latency reduction or 1.218x speedup in the resident FFN command.
+Three independent self-contained OQ8++ processes measured:
+
+| graph | latency range (ms) | median ms | throughput range (tok/s) | median tok/s | median package tok/J |
+|---|---:|---:|---:|---:|---:|
+| R45 | 1007.642-1020.227 | 1019.821 | 250.9-254.1 | 251.0 | 13.3 |
+| R55 | 946.261-961.962 | 947.893 | 266.1-270.5 | 270.1 | 14.1 |
+
+Thus tile-local activation reuse improves complete resident execution by about
+7.1% in latency, 7.6% in throughput, and 6.0% in package tokens/J. It does not
+approach the 10k admission threshold: attention, post-FFN tail, next-layer
+preparation, and the gate-to-down host-visible intermediate remain separate
+bottlenecks. The next FFN step is to retain or transpose one M block of the
+GeGLU tensor across aggregate tile memory so the down projection does not drain
+and reread the full 288-by-1280 BF16 scratch plane through the shims.

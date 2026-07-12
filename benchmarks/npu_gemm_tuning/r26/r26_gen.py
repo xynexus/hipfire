@@ -6,6 +6,7 @@ import sys
 CANONICAL_BF16 = "--canonical-bf16-input" in sys.argv[1:]
 CANONICAL_BF16X2_OUTPUT = "--canonical-bf16x2-output" in sys.argv[1:]
 DIRECT_X_PRE_NORM = "--direct-x-pre-norm" in sys.argv[1:]
+REUSE_GATE_ACTIVATION = "--reuse-gate-activation" in sys.argv[1:]
 if CANONICAL_BF16X2_OUTPUT and not CANONICAL_BF16:
     raise SystemExit("--canonical-bf16x2-output requires --canonical-bf16-input")
 if DIRECT_X_PRE_NORM and not (CANONICAL_BF16 and CANONICAL_BF16X2_OUTPUT):
@@ -13,6 +14,8 @@ if DIRECT_X_PRE_NORM and not (CANONICAL_BF16 and CANONICAL_BF16X2_OUTPUT):
         "--direct-x-pre-norm requires --canonical-bf16-input and "
         "--canonical-bf16x2-output"
     )
+if REUSE_GATE_ACTIVATION and not DIRECT_X_PRE_NORM:
+    raise SystemExit("--reuse-gate-activation requires --direct-x-pre-norm")
 
 COLS, CORE_ROWS = 8, 4
 M_MACROS, GATE_N_MACROS = 3, 6
@@ -26,10 +29,12 @@ WB = 16384
 GATE_OUTPUT_BYTES = 1536
 OUTPUT_CO = 2304
 FRAGMENT = 784
+OWN_FRAGMENT = GATE_GROUPS * FRAGMENT if REUSE_GATE_ACTIVATION else FRAGMENT
 SCRATCH = 256
 GATE_ACC = 1152
 GATE_DATA_BLOCKS = GATE_OUTBLOCKS * GATE_GROUPS
-WEIGHT_BLOCKS = GATE_DATA_BLOCKS + DOWN_MBLOCKS * DOWN_GROUPS * 2
+GATE_PARAM_BLOCKS = M_MACROS * GATE_GROUPS if REUSE_GATE_ACTIVATION else 0
+WEIGHT_BLOCKS = GATE_PARAM_BLOCKS + GATE_DATA_BLOCKS + DOWN_MBLOCKS * DOWN_GROUPS * 2
 T_ROWS, T_STRIDE, INTERMEDIATE, PAD_INTERMEDIATE, OUTPUT = 296, 5376, 1152, 1280, 768
 PAD_M = 288
 O_ELEMS = PAD_M * OUTPUT
@@ -111,8 +116,8 @@ for col in range(COLS):
             f"    %gacc{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"gacc{col}_{row}\"}} : memref<{GATE_ACC}xi32>",
             f"    %apack{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"apack{col}_{row}\"}} : memref<{APACK}xi8>",
             f"    %scratch{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"scratch{col}_{row}\"}} : memref<{SCRATCH}xf32>",
-            f"    %own{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"own{col}_{row}\"}} : memref<{FRAGMENT}xi8>",
-            f"    %transit{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"transit{col}_{row}\"}} : memref<{FRAGMENT}xi8>",
+            f"    %own{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"own{col}_{row}\"}} : memref<{OWN_FRAGMENT}xi8>",
+            f"    %transit{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"transit{col}_{row}\"}} : memref<{OWN_FRAGMENT}xi8>",
             *(
                 [
                     f"    %inv{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"inv{col}_{row}\"}} : memref<9xf32>"
@@ -191,11 +196,19 @@ decls = [
         "r26_pack3",
         f"memref<{DATA_PAIR}xi8>, "
         + ("memref<9xf32>, " if DIRECT_X_PRE_NORM else "")
-        + f"memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{FRAGMENT}xi8>, i32, i32",
+        + f"memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{OWN_FRAGMENT}xi8>, i32, i32",
     ),
-    ("r26_insert_fragment", f"memref<{FRAGMENT}xi8>, memref<{APACK}xi8>, i32"),
-    ("r26_send_fragment", f"memref<{FRAGMENT}xi8>"),
-    ("r26_receive_fragment", f"memref<{FRAGMENT}xi8>"),
+    (
+        "r26_insert_fragment",
+        f"memref<{FRAGMENT if not REUSE_GATE_ACTIVATION else GATE_GROUPS * FRAGMENT}xi8>, memref<{APACK}xi8>, i32"
+        + (", i32" if REUSE_GATE_ACTIVATION else ""),
+    ),
+    (
+        "r26_send_fragment",
+        f"memref<{FRAGMENT if not REUSE_GATE_ACTIVATION else GATE_GROUPS * FRAGMENT}xi8>"
+        + (", i32" if REUSE_GATE_ACTIVATION else ""),
+    ),
+    ("r26_receive_fragment", f"memref<{OWN_FRAGMENT}xi8>"),
     ("r26_down0_scaled", f"memref<{APACK}xi8>, memref<{WB}xi8>, memref<{OUTPUT_CO}xi32>, i32"),
     ("r26_down1_scaled", f"memref<{APACK}xi8>, memref<{WB}xi8>, memref<{OUTPUT_CO}xi32>, i32"),
 ]
@@ -203,6 +216,13 @@ if DIRECT_X_PRE_NORM:
     decls.append(
         ("r45_select_inverses", f"memref<{WB}xi8>, memref<9xf32>, i32, i32")
     )
+if REUSE_GATE_ACTIVATION:
+    decls += [
+        (
+            "r55_pack3_cached",
+            f"memref<{DATA_PAIR}xi8>, memref<9xf32>, memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{GATE_GROUPS * FRAGMENT}xi8>, i32, i32, i32",
+        ),
+    ]
 if CANONICAL_BF16:
     decls.append(
         ("r35_finish_down48_bf16", f"memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32" + (", i32" if CANONICAL_BF16X2_OUTPUT else ""))
@@ -213,25 +233,59 @@ for name, args in decls:
     )
 
 
-def append_ring(lines, col, row, indent, insert_own=True):
+def append_ring(
+    lines,
+    col,
+    row,
+    indent,
+    insert_own=True,
+    own=None,
+    suffix="",
+    cached=None,
+    group=None,
+):
+    own = own or f"own{col}_{row}"
+    fragment_memref = GATE_GROUPS * FRAGMENT if REUSE_GATE_ACTIVATION else FRAGMENT
     if insert_own:
-        lines.append(
-            f"{indent}func.call @r26_insert_fragment(%own{col}_{row}, %apack{col}_{row}, %owner) : (memref<{FRAGMENT}xi8>, memref<{APACK}xi8>, i32) -> ()"
-        )
-    for broadcast_owner in range(COLS):
-        if col == broadcast_owner:
+        if cached:
             lines.append(
-                f"{indent}func.call @r26_send_fragment(%own{col}_{row}) : (memref<{FRAGMENT}xi8>) -> ()"
+                f"{indent}func.call @r26_insert_fragment(%{cached}, %apack{col}_{row}, %owner, %{group}) : (memref<{fragment_memref}xi8>, memref<{APACK}xi8>, i32, i32) -> ()"
             )
         else:
+            group_arg = ", %uncached_group" if REUSE_GATE_ACTIVATION else ""
+            group_type = ", i32" if REUSE_GATE_ACTIVATION else ""
+            lines.append(
+                f"{indent}func.call @r26_insert_fragment(%{own}, %apack{col}_{row}, %owner{group_arg}) : (memref<{fragment_memref}xi8>, memref<{APACK}xi8>, i32{group_type}) -> ()"
+            )
+    for broadcast_owner in range(COLS):
+        if col == broadcast_owner:
+            if cached:
+                lines.append(
+                    f"{indent}func.call @r26_send_fragment(%{cached}, %{group}) : (memref<{fragment_memref}xi8>, i32) -> ()"
+                )
+            else:
+                group_arg = ", %uncached_group" if REUSE_GATE_ACTIVATION else ""
+                group_type = ", i32" if REUSE_GATE_ACTIVATION else ""
+                lines.append(
+                    f"{indent}func.call @r26_send_fragment(%{own}{group_arg}) : (memref<{fragment_memref}xi8>{group_type}) -> ()"
+                )
+        else:
             lines += [
-                f"{indent}func.call @r26_receive_fragment(%transit{col}_{row}) : (memref<{FRAGMENT}xi8>) -> ()",
-                f"{indent}%broadcast_owner{broadcast_owner} = arith.constant {broadcast_owner} : i32",
-                f"{indent}func.call @r26_insert_fragment(%transit{col}_{row}, %apack{col}_{row}, %broadcast_owner{broadcast_owner}) : (memref<{FRAGMENT}xi8>, memref<{APACK}xi8>, i32) -> ()",
+                f"{indent}func.call @r26_receive_fragment(%transit{col}_{row}) : (memref<{OWN_FRAGMENT}xi8>) -> ()",
+                f"{indent}%broadcast_owner{broadcast_owner}{suffix} = arith.constant {broadcast_owner} : i32",
+                f"{indent}func.call @r26_insert_fragment(%transit{col}_{row}, %apack{col}_{row}, %broadcast_owner{broadcast_owner}{suffix}"
+                + (", %uncached_group" if REUSE_GATE_ACTIVATION else "")
+                + f") : (memref<{OWN_FRAGMENT}xi8>, memref<{APACK}xi8>, i32"
+                + (", i32" if REUSE_GATE_ACTIVATION else "")
+                + ") -> ()",
             ]
             if col != (broadcast_owner - 1) % COLS:
                 lines.append(
-                    f"{indent}func.call @r26_send_fragment(%transit{col}_{row}) : (memref<{FRAGMENT}xi8>) -> ()"
+                    f"{indent}func.call @r26_send_fragment(%transit{col}_{row}"
+                    + (", %uncached_group" if REUSE_GATE_ACTIVATION else "")
+                    + f") : (memref<{OWN_FRAGMENT}xi8>"
+                    + (", i32" if REUSE_GATE_ACTIVATION else "")
+                    + ") -> ()"
                 )
 
 for col in range(COLS):
@@ -248,6 +302,13 @@ for col in range(COLS):
             *(["      %down_nmacros = arith.constant 2 : index"] if CANONICAL_BF16 else []),
             f"      %owner = arith.constant {col} : i32",
             *(
+                [
+                    "      %uncached_group = arith.constant 0 : i32",
+                ]
+                if REUSE_GATE_ACTIVATION
+                else []
+            ),
+            *(
                 [f"      %core_row = arith.constant {row} : i32"]
                 if DIRECT_X_PRE_NORM
                 else []
@@ -263,42 +324,91 @@ for col in range(COLS):
                 if DIRECT_X_PRE_NORM
                 else []
             ),
-            "        scf.for %outblock = %z to %gate_outblocks step %one {",
+            *(
+                ["        scf.for %mblock = %z to %down_mblocks step %one {"]
+                if REUSE_GATE_ACTIVATION
+                else ["        scf.for %outblock = %z to %gate_outblocks step %one {"]
+            ),
         ]
         if CANONICAL_BF16:
-            if DIRECT_X_PRE_NORM:
+            if REUSE_GATE_ACTIVATION:
+                lines += [
+                    "          %mblock_i32 = arith.index_cast %mblock : index to i32",
+                    "          %negative_one = arith.constant -1 : i32",
+                    "          %negative_token = arith.subi %negative_one, %mblock_i32 : i32",
+                ]
+                lines += [
+                    "          scf.for %pre_group = %z to %gate_groups step %one {",
+                    f"            %px = aie.objectfifo.acquire @xbc{row}(Consume, 1) : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>>",
+                    f"            %pxv = aie.objectfifo.subview.access %px[0] : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>> -> memref<{DATA_PAIR}xi8>",
+                    f"            %pw = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
+                    f"            %pwv = aie.objectfifo.subview.access %pw[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
+                    "            %pre_group_i32 = arith.index_cast %pre_group : index to i32",
+                    f"            func.call @r55_pack3_cached(%pxv, %inv{col}_{row}, %pwv, %apack{col}_{row}, %scratch{col}_{row}, %own{col}_{row}, %owner, %negative_token, %pre_group_i32) : (memref<{DATA_PAIR}xi8>, memref<9xf32>, memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{GATE_GROUPS * FRAGMENT}xi8>, i32, i32, i32) -> ()",
+                    f"            aie.objectfifo.release @xbc{row}(Consume, 1)",
+                    f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
+                    "          }",
+                ]
+                lines += ["          scf.for %nblock = %z to %gate_outblocks step %down_mblocks {"]
+                lines += [
+                    f"            %go = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>>",
+                    f"            %gov = aie.objectfifo.subview.access %go[0] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
+                    "            scf.for %group = %z to %gate_groups step %one {",
+                    f"              %w = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
+                    f"              %wv = aie.objectfifo.subview.access %w[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
+                    "              %accumulate = arith.index_cast %group : index to i32",
+                ]
+                append_ring(
+                    lines,
+                    col,
+                    row,
+                    "              ",
+                    cached=f"own{col}_{row}",
+                    group="accumulate",
+                )
+                lines += [
+                    f"              func.call @r26_gate_scaled(%apack{col}_{row}, %wv, %gacc{col}_{row}, %accumulate) : (memref<{APACK}xi8>, memref<{WB}xi8>, memref<{GATE_ACC}xi32>, i32) -> ()",
+                    f"              aie.objectfifo.release @wbc{col}(Consume, 1)",
+                    "            }",
+                    f"            func.call @r26_geglu_padded(%gacc{col}_{row}, %gov) : (memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>) -> ()",
+                    f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                    "          }",
+                    "        }",
+                ]
+            elif DIRECT_X_PRE_NORM:
                 lines += [
                     "          %outblock_i32 = arith.index_cast %outblock : index to i32",
                     "          %negative_one = arith.constant -1 : i32",
                     "          %negative_token = arith.subi %negative_one, %outblock_i32 : i32",
                 ]
-            lines += [
-                f"          %go = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>>",
-                f"          %gov = aie.objectfifo.subview.access %go[0] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
-                "          scf.for %group = %z to %gate_groups step %one {",
-                f"            %x = aie.objectfifo.acquire @xbc{row}(Consume, 1) : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>>",
-                f"            %xv = aie.objectfifo.subview.access %x[0] : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>> -> memref<{DATA_PAIR}xi8>",
-                f"            %w = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
-                f"            %wv = aie.objectfifo.subview.access %w[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
-                "            %accumulate = arith.index_cast %group : index to i32",
-                f"            func.call @r26_pack3(%xv, "
-                + (f"%inv{col}_{row}, " if DIRECT_X_PRE_NORM else "")
-                + f"%wv, %apack{col}_{row}, %scratch{col}_{row}, %own{col}_{row}, %owner, "
-                + ("%negative_token" if DIRECT_X_PRE_NORM else "%accumulate")
-                + f") : (memref<{DATA_PAIR}xi8>, "
-                + ("memref<9xf32>, " if DIRECT_X_PRE_NORM else "")
-                + f"memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{FRAGMENT}xi8>, i32, i32) -> ()",
-            ]
-            append_ring(lines, col, row, "            ")
-            lines += [
-                f"            func.call @r26_gate_scaled(%apack{col}_{row}, %wv, %gacc{col}_{row}, %accumulate) : (memref<{APACK}xi8>, memref<{WB}xi8>, memref<{GATE_ACC}xi32>, i32) -> ()",
-                f"            aie.objectfifo.release @xbc{row}(Consume, 1)",
-                f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
-                "          }",
-                f"          func.call @r26_geglu_padded(%gacc{col}_{row}, %gov) : (memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>) -> ()",
-                f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
-                "        }",
-            ]
+            if not REUSE_GATE_ACTIVATION:
+                lines += [
+                    f"          %go = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>>",
+                    f"          %gov = aie.objectfifo.subview.access %go[0] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
+                    "          scf.for %group = %z to %gate_groups step %one {",
+                    f"            %x = aie.objectfifo.acquire @xbc{row}(Consume, 1) : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>>",
+                    f"            %xv = aie.objectfifo.subview.access %x[0] : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>> -> memref<{DATA_PAIR}xi8>",
+                    f"            %w = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
+                    f"            %wv = aie.objectfifo.subview.access %w[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
+                    "            %accumulate = arith.index_cast %group : index to i32",
+                    f"            func.call @r26_pack3(%xv, "
+                    + (f"%inv{col}_{row}, " if DIRECT_X_PRE_NORM else "")
+                    + f"%wv, %apack{col}_{row}, %scratch{col}_{row}, %own{col}_{row}, %owner, "
+                    + ("%negative_token" if DIRECT_X_PRE_NORM else "%accumulate")
+                    + f") : (memref<{DATA_PAIR}xi8>, "
+                    + ("memref<9xf32>, " if DIRECT_X_PRE_NORM else "")
+                    + f"memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{OWN_FRAGMENT}xi8>, i32, i32) -> ()",
+                ]
+                append_ring(lines, col, row, "            ")
+                lines += [
+                    f"            func.call @r26_gate_scaled(%apack{col}_{row}, %wv, %gacc{col}_{row}, %accumulate) : (memref<{APACK}xi8>, memref<{WB}xi8>, memref<{GATE_ACC}xi32>, i32) -> ()",
+                    f"            aie.objectfifo.release @xbc{row}(Consume, 1)",
+                    f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
+                    "          }",
+                    f"          func.call @r26_geglu_padded(%gacc{col}_{row}, %gov) : (memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>) -> ()",
+                    f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                    "        }",
+                ]
         else:
             lines += [
                 f"          %go = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{OUTPUT_CO}xi32>>",
@@ -334,7 +444,7 @@ for col in range(COLS):
                 + (f"%inv{col}_{row}, " if DIRECT_X_PRE_NORM else "")
                 + f"%w0v, %apack{col}_{row}, %scratch{col}_{row}, %own{col}_{row}, %owner, %group_i32) : (memref<{DATA_PAIR}xi8>, "
                 + ("memref<9xf32>, " if DIRECT_X_PRE_NORM else "")
-                + f"memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{FRAGMENT}xi8>, i32, i32) -> ()",
+                + f"memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{OWN_FRAGMENT}xi8>, i32, i32) -> ()",
                 f"              aie.objectfifo.release @xbc{row}(Consume, 1)",
             ]
             append_ring(lines, col, row, "              ")
@@ -374,7 +484,7 @@ for col in range(COLS):
                 f"            %x = aie.objectfifo.acquire @{input_fifo}(Consume, 1) : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>>",
                 f"            %xv = aie.objectfifo.subview.access %x[0] : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>> -> memref<{DATA_PAIR}xi8>",
                 "            %group_i32 = arith.index_cast %group : index to i32",
-                f"            func.call @r26_pack3(%xv, %w0v, %apack{col}_{row}, %scratch{col}_{row}, %own{col}_{row}, %owner, %group_i32) : (memref<{DATA_PAIR}xi8>, memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{FRAGMENT}xi8>, i32, i32) -> ()",
+                f"            func.call @r26_pack3(%xv, %w0v, %apack{col}_{row}, %scratch{col}_{row}, %own{col}_{row}, %owner, %group_i32) : (memref<{DATA_PAIR}xi8>, memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{OWN_FRAGMENT}xi8>, i32, i32) -> ()",
                 f"            func.call @r26_insert_fragment(%own{col}_{row}, %apack{col}_{row}, %owner) : (memref<{FRAGMENT}xi8>, memref<{APACK}xi8>, i32) -> ()",
                 f"            aie.objectfifo.release @{input_fifo}(Consume, 1)",
             ]
@@ -467,7 +577,7 @@ for outblock in range(GATE_OUTBLOCKS):
                 "      } {issue_token = true, repeat_count = 31 : i32}",
                 f"      aiex.dma_start_task(%{name})",
             ]
-    if CANONICAL_BF16:
+    if CANONICAL_BF16 and (not REUSE_GATE_ACTIVATION or nblock == 0):
         for group in range(GATE_GROUPS):
             for row in range(CORE_ROWS):
                 name = f"gx{row}_{outblock}_{group}"
