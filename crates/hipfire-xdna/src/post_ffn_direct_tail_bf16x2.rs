@@ -15,11 +15,13 @@ const PAD_M: usize = 288;
 const HIDDEN: usize = 768;
 const CORES: usize = 32;
 const PARAM_RECORD_BYTES: usize = 2 * 3 * HIDDEN * size_of::<u16>();
+const SPLIT_PARAM_RECORD_BYTES: usize = 2 * 2 * HIDDEN * size_of::<u16>();
 const POST_NORM_BYTES: usize = HIDDEN * size_of::<u16>();
 const EPSILON_OFFSET: usize = POST_NORM_BYTES;
 const RESIDUAL_BYTES: usize = PAD_M * HIDDEN * size_of::<u16>();
 const COMBINED_BYTES: usize = PAD_M * HIDDEN * 3 * size_of::<u16>();
 const PARAM_BYTES: usize = CORES * PARAM_RECORD_BYTES;
+const SPLIT_PARAM_BYTES: usize = CORES * SPLIT_PARAM_RECORD_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompletedOutputEncoding {
@@ -43,8 +45,12 @@ pub struct NpuEmbeddingPostFfnDirectTailBf16x2Params {
 pub struct NpuEmbeddingPostFfnDirectTailBf16x2 {
     kernel: NpuKernel,
     combined: DeviceBuffer,
+    residual: Option<DeviceBuffer>,
     output: DeviceBuffer,
     output_encoding: CompletedOutputEncoding,
+    split_residual: bool,
+    param_record_bytes: usize,
+    param_bytes: usize,
 }
 
 impl NpuEmbeddingPostFfnDirectTailBf16x2 {
@@ -56,7 +62,6 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
             "mode=bf16x2-resident",
             "m=256",
             "k=768",
-            "input=shared-y-bf16x2-and-residual-bf16",
         ] {
             if !manifest.lines().any(|line| line == field) {
                 return Err(invalid(format!(
@@ -64,6 +69,21 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
                 )));
             }
         }
+        let split_residual = if manifest
+            .lines()
+            .any(|line| line == "input=shared-y-bf16x2-and-split-x-bf16")
+        {
+            true
+        } else if manifest
+            .lines()
+            .any(|line| line == "input=shared-y-bf16x2-and-residual-bf16")
+        {
+            false
+        } else {
+            return Err(invalid(
+                "compensated post-FFN tail cache missing supported input encoding",
+            ));
+        };
         let output_encoding = if manifest
             .lines()
             .any(|line| line == "output=shared-completed-bf16x2")
@@ -85,9 +105,23 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
         )?;
         Ok(Self {
             combined: kernel.alloc_arg(COMBINED_BYTES)?,
+            residual: split_residual
+                .then(|| kernel.alloc_arg(RESIDUAL_BYTES))
+                .transpose()?,
             output: kernel.alloc_arg(output_encoding.bytes())?,
             kernel,
             output_encoding,
+            split_residual,
+            param_record_bytes: if split_residual {
+                SPLIT_PARAM_RECORD_BYTES
+            } else {
+                PARAM_RECORD_BYTES
+            },
+            param_bytes: if split_residual {
+                SPLIT_PARAM_BYTES
+            } else {
+                PARAM_BYTES
+            },
         })
     }
 
@@ -111,6 +145,10 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
         PARAM_BYTES
     }
 
+    pub const fn consumes_split_x(&self) -> bool {
+        self.split_residual
+    }
+
     pub fn attach_shared_state(
         &mut self,
         combined_fd: i32,
@@ -118,6 +156,11 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
         output_fd: i32,
         output_bytes: usize,
     ) -> Result<(), XdnaError> {
+        if self.split_residual {
+            return Err(invalid(
+                "split-X post-FFN tail requires a separate residual dma-buf",
+            ));
+        }
         if combined_bytes != COMBINED_BYTES || output_bytes != self.output_bytes() {
             return Err(invalid(
                 "compensated post-FFN tail shared dma-buf size mismatch",
@@ -128,6 +171,35 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
             .import_dmabuf(combined_fd, combined_bytes, true)?;
         self.output = self.kernel.import_dmabuf(output_fd, output_bytes, true)?;
         self.kernel.sync_to_device(&self.combined)?;
+        self.kernel.sync_to_device(&self.output)
+    }
+
+    pub fn attach_shared_split_state(
+        &mut self,
+        combined_fd: i32,
+        combined_bytes: usize,
+        residual_fd: i32,
+        residual_bytes: usize,
+        output_fd: i32,
+        output_bytes: usize,
+    ) -> Result<(), XdnaError> {
+        if !self.split_residual
+            || combined_bytes != COMBINED_BYTES
+            || residual_bytes < RESIDUAL_BYTES
+            || output_bytes != self.output_bytes()
+        {
+            return Err(invalid(
+                "split-X post-FFN tail shared dma-buf size/mode mismatch",
+            ));
+        }
+        self.combined = self
+            .kernel
+            .import_dmabuf(combined_fd, combined_bytes, true)?;
+        self.residual = Some(
+            self.kernel
+                .import_dmabuf(residual_fd, residual_bytes, true)?,
+        );
+        self.output = self.kernel.import_dmabuf(output_fd, output_bytes, true)?;
         self.kernel.sync_to_device(&self.output)
     }
 
@@ -154,9 +226,10 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
         {
             return Err(invalid("compensated post-FFN norm weights must be finite"));
         }
-        let mut packed = vec![0u8; PARAM_BYTES];
+        let mut packed = vec![0u8; self.param_bytes];
         for core in 0..CORES {
-            let record = &mut packed[core * PARAM_RECORD_BYTES..(core + 1) * PARAM_RECORD_BYTES];
+            let record =
+                &mut packed[core * self.param_record_bytes..(core + 1) * self.param_record_bytes];
             for (hidden, &bits) in post_ffn_norm.iter().enumerate() {
                 let offset = hidden * size_of::<u16>();
                 record[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
@@ -164,7 +237,7 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
             record[EPSILON_OFFSET..EPSILON_OFFSET + size_of::<f32>()]
                 .copy_from_slice(&epsilon.to_le_bytes());
         }
-        let mut buffer = self.kernel.alloc_arg(PARAM_BYTES)?;
+        let mut buffer = self.kernel.alloc_arg(self.param_bytes)?;
         buffer.as_mut_slice().copy_from_slice(&packed);
         self.kernel.sync_to_device(&buffer)?;
         Ok(NpuEmbeddingPostFfnDirectTailBf16x2Params { buffer })
@@ -174,13 +247,27 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
         &self,
         params: &NpuEmbeddingPostFfnDirectTailBf16x2Params,
     ) -> Result<(), XdnaError> {
-        if params.buffer.len() != PARAM_BYTES {
+        if params.buffer.len() != self.param_bytes {
             return Err(invalid("compensated post-FFN tail parameter size mismatch"));
         }
-        self.kernel.dispatch_synced(
-            &[&self.combined, &params.buffer, &self.output],
-            &[false, false, false],
-        )?;
+        if self.split_residual {
+            self.kernel.dispatch_synced(
+                &[
+                    &self.combined,
+                    self.residual
+                        .as_ref()
+                        .expect("split residual allocated with split mode"),
+                    &params.buffer,
+                    &self.output,
+                ],
+                &[false, false, false, false],
+            )?;
+        } else {
+            self.kernel.dispatch_synced(
+                &[&self.combined, &params.buffer, &self.output],
+                &[false, false, false],
+            )?;
+        }
         self.kernel.sync_output(&self.output)
     }
 

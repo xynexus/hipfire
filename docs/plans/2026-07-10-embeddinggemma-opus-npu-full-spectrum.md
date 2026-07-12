@@ -1745,3 +1745,35 @@ model: the current tail still receives architectural X through a host copy,
 and final normalization and pooling remain outside AIE2P. Pure OQ4 and the
 generic mixed-format hardware matrix also remain open for the completed-layer
 schedule.
+
+### R46 direct architectural-X tail checkpoint
+
+R46 removes the remaining host read, copy, and cache publication of
+architectural X between the resident FFN and the post-FFN tail. The tail now
+imports the R44 hidden dma-buf as a separate X argument while retaining the R45
+BF16x2 Y buffer and the compensated completed-layer output. In non-debug runs,
+the runtime neither decodes X nor reads the pre-FFN inverse plane on the host
+before dispatching the FFN and tail contexts.
+
+A first two-input ObjectFIFO graph compiled through Peano but failed AIE
+resource allocation because each memory tile already spends its two output DMA
+channels on the Y input and completed output streams. The accepted graph leaves
+that pair unchanged. Each shim uses its spare outbound channel to send eight
+canonical X rows directly to the first core in a four-core group. That source
+core keeps its two-row 3 KiB slice and forwards the remaining three chunks over
+a core-stream chain; each following core retains one chunk and relays the rest.
+The source core's Y input, completed output, direct X FIFO, local X slice,
+parameters, and stack remain just below the 32 KiB data-memory budget.
+
+The artifact is generated under `~/.hipfire/npu/` as
+`embgemma_aie2p_post_ffn_direct_tail_bf16x2_split_x_completed_bf16x2_m256_k768`.
+Locked layer-0 attribution is identical to R45, including `0.99998346`
+completed-layer cosine. Across all 24 layers, OQ8++ versus BF16 remains exactly
+`0.99808222` cosine with `0.00816466` maximum absolute error. The no-readback
+M256 sample measures `362.6` input tokens/s at `21.08 W`, or `17.2` package
+tokens/J.
+
+R46 makes attention X, pre-FFN normalization, FFN, and the completed residual
+tail an NPU-to-NPU shared-buffer path. It is still not the requested fully
+resident encoder: the next layer's normalized projection input is produced on
+the GPU, and final normalization and pooling remain outside AIE2P.
