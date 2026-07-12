@@ -14,6 +14,8 @@ constexpr int R26_W_DATA = R26_LN * R26_KT * R26_SB;
 constexpr int R26_GROUP = 256;
 constexpr int R26_W_COLS = 48;
 constexpr int R26_PARAM_OFFSET = R26_W_DATA + R26_W_COLS * sizeof(float);
+constexpr int R45_PRE_NORM_OFFSET =
+    R26_PARAM_OFFSET + 3 * R26_GROUP * sizeof(float);
 constexpr int R26_FRAGMENT_ROWS = 3;
 constexpr int R26_FRAGMENT_BYTES = R26_FRAGMENT_ROWS * R26_GROUP + 16;
 constexpr int R26_FRAGMENT_WORDS = R26_FRAGMENT_BYTES / sizeof(int);
@@ -251,6 +253,9 @@ __attribute__((noinline)) static void r26_fwht16(float *__restrict scratch) {
 static void r26_pack_row(
 #ifdef R35_CANONICAL_BF16
                          const int8 *__restrict input_bytes,
+#ifdef R45_DIRECT_X_PRE_NORM
+                         float inverse,
+#endif
 #else
                          const float *__restrict input,
 #endif
@@ -269,6 +274,23 @@ static void r26_pack_row(
                      reinterpret_cast<const bfloat16 *>(input_bytes) + i),
                  aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
             .template to_vector<float>();
+#ifdef R45_DIRECT_X_PRE_NORM
+    if (inverse >= 0.0f) {
+      const auto *pre_norm = reinterpret_cast<const bfloat16 *>(
+          weight_payload + R45_PRE_NORM_OFFSET);
+      const auto norm =
+          aie::mul(aie::load_v<16>(pre_norm + i),
+                   aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .template to_vector<float>();
+      const auto weighted = aie::mul(input, norm).template to_vector<float>();
+      const auto normalized_bf16 =
+          aie::mul(weighted, aie::broadcast<float, 16>(inverse))
+              .template to_vector<bfloat16>();
+      input = aie::mul(normalized_bf16,
+                       aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+                  .template to_vector<float>();
+    }
+#endif
     auto divided = aie::div(input, aie::load_v<16>(awq + i))
                        .template to_vector<float>();
 #else
@@ -321,12 +343,15 @@ static void r26_pack_row(
 
 extern "C" __attribute__((minsize)) void
 r26_pack3(const int8 *__restrict input_bytes,
+#ifdef R45_DIRECT_X_PRE_NORM
+          const float *__restrict inverse_table,
+#endif
           const int8 *__restrict weight_payload,
           int8 *__restrict activation_payload, float *__restrict scratch,
           int8 *__restrict fragment, int owner, int group) {
   (void)activation_payload;
 #ifdef R35_CANONICAL_BF16
-  (void)group;
+  const int mblock = group < 0 ? (-group - 1) / 6 : -1;
   const int8 *owned = input_bytes + owner * R26_FRAGMENT_ROWS * R26_GROUP * 2;
   constexpr int ROW_BYTES = R26_GROUP * 2;
 #else
@@ -340,6 +365,10 @@ r26_pack3(const int8 *__restrict input_bytes,
     r26_pack_row(
 #ifdef R35_CANONICAL_BF16
                  owned + row * ROW_BYTES,
+#ifdef R45_DIRECT_X_PRE_NORM
+                 mblock < 0 ? -1.0f
+                            : inverse_table[mblock * R26_FRAGMENT_ROWS + row],
+#endif
 #else
                  owned + row * ROW_WINDOW + skip,
 #endif
@@ -347,6 +376,27 @@ r26_pack3(const int8 *__restrict input_bytes,
                  fragment + row * R26_GROUP, scratch, scales[row]);
   reinterpret_cast<int *>(fragment)[R26_FRAGMENT_WORDS - 1] = 0;
 }
+
+#ifdef R45_DIRECT_X_PRE_NORM
+extern "C" __attribute__((minsize)) void
+r45_select_inverses(const int8 *__restrict physical_records,
+                    float *__restrict selected, int core_row, int owner) {
+  for (int mblock = 0; mblock < 3; ++mblock)
+    for (int row = 0; row < R26_FRAGMENT_ROWS; ++row) {
+      const int token = mblock * 96 + core_row * 24
+                        + owner * R26_FRAGMENT_ROWS + row;
+      const int wave = token >> 7;
+      const int within_wave = token & 127;
+      const int source_core_row = within_wave >> 5;
+      const int within_core = within_wave & 31;
+      const int column = wave * 4 + (within_core >> 3);
+      const int lane = within_core & 7;
+      const int record = source_core_row * 8 + column;
+      selected[mblock * R26_FRAGMENT_ROWS + row] =
+          reinterpret_cast<const float *>(physical_records + record * 512)[lane];
+    }
+}
+#endif
 
 extern "C" __attribute__((minsize)) void
 r26_insert_fragment(const int8 *__restrict fragment,

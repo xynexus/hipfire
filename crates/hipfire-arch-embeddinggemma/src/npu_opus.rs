@@ -723,8 +723,25 @@ impl NpuOpusProjector {
             cache_root.join("embgemma_aie2p_resident_ffn_w4_m256_k768_i1152_o768");
         let resident_ffn_dense_w8_path =
             cache_root.join("embgemma_aie2p_resident_ffn_dense_w8_m256_k768_i1152_o768");
-        let resident_layer_ffn_path = cache_root
+        let resident_layer_ffn_direct_x_path = cache_root
+            .join("embgemma_aie2p_resident_ffn_dense_w8_direct_x_bf16x2_m256_k768_i1152_o768");
+        let resident_layer_ffn_canonical_path = cache_root
             .join("embgemma_aie2p_resident_ffn_dense_w8_canonical_bf16x2_m256_k768_i1152_o768");
+        let resident_layer_ffn_path = if resident_layer_ffn_direct_x_path
+            .join("final.xclbin")
+            .is_file()
+            && resident_layer_ffn_direct_x_path.join("insts.bin").is_file()
+            && cache_root
+                .join("embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_x_bf16_m256_k768_n1280/final.xclbin")
+                .is_file()
+            && cache_root
+                .join("embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_x_bf16_m256_k768_n1280/insts.bin")
+                .is_file()
+        {
+            resident_layer_ffn_direct_x_path
+        } else {
+            resident_layer_ffn_canonical_path
+        };
         let resident_mode = resident_ffn_mode(&layers);
         if let Err(reason) = &resident_mode {
             eprintln!("embeddinggemma NPU: resident FFN unavailable: {reason}");
@@ -889,19 +906,13 @@ impl NpuOpusProjector {
             let ffn = NpuResidentFfnDenseW8::load_cached(ffn_cache).map_err(|error| {
                 format!("embeddinggemma NPU: load completed-layer FFN: {error}")
             })?;
-            let ffn_weights = layers
-                .iter()
-                .map(|layer| {
-                    ffn.upload_weights(
-                        &layer.gate,
-                        &layer.up,
-                        layer.down.as_ref().expect("completed-layer down matrix"),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    format!("embeddinggemma NPU: upload completed-layer FFN: {error}")
-                })?;
+            if ffn.consumes_direct_x() && !direct_x_attention {
+                return Err(format!(
+                    "embeddinggemma NPU: completed-layer attention/FFN handoff mismatch: attention direct-X={direct_x_attention}, FFN direct-X={}",
+                    ffn.consumes_direct_x()
+                ));
+            }
+            let mut ffn_weights = Vec::with_capacity(layers.len());
             let mut attention_weights = Vec::with_capacity(layers.len());
             let mut tail_params = Vec::with_capacity(layers.len());
             let mut tail_pre_norms = Vec::with_capacity(layers.len());
@@ -937,6 +948,19 @@ impl NpuOpusProjector {
                     &format!("{prefix}.pre_feedforward_layernorm.weight"),
                     cfg.hidden_size,
                 )?;
+                ffn_weights.push(
+                    ffn.upload_weights_with_pre_ffn_norm(
+                        &layer.gate,
+                        &layer.up,
+                        layer.down.as_ref().expect("completed-layer down matrix"),
+                        &pre_ffn_norm,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "embeddinggemma NPU: upload completed-layer FFN {layer_idx}: {error}"
+                        )
+                    })?,
+                );
                 let post_ffn_norm = load_vector_bf16(
                     hfq,
                     &format!("{prefix}.post_feedforward_layernorm.weight"),
@@ -1540,13 +1564,24 @@ impl LinearProjector for NpuOpusProjector {
             .attention
             .read_hidden_f32(&state.attention_weights[layer_idx])
             .map_err(|error| hip_error(format!("read resident state {layer_idx}: {error}")))?;
-        let pre_ffn_state = state
-            .attention
-            .read_pre_ffn_state(&state.attention_weights[layer_idx])
-            .map_err(|error| {
-                hip_error(format!("read resident pre-FFN state {layer_idx}: {error}"))
-            })?;
-        if compare_this_layer_enabled(layer_idx) {
+        let compare_layer = compare_this_layer_enabled(layer_idx);
+        let direct_x_consumer = state.ffn.consumes_direct_x();
+        let pre_ffn_state = if direct_x_consumer && !compare_layer {
+            None
+        } else {
+            Some(
+                state
+                    .attention
+                    .read_pre_ffn_state(&state.attention_weights[layer_idx])
+                    .map_err(|error| {
+                        hip_error(format!("read resident pre-FFN state {layer_idx}: {error}"))
+                    })?,
+            )
+        };
+        if compare_layer {
+            let pre_ffn_state = pre_ffn_state
+                .as_ref()
+                .expect("comparison reads resident pre-FFN state");
             let finite_inverse = pre_ffn_state
                 .inverse
                 .iter()
@@ -1587,31 +1622,43 @@ impl LinearProjector for NpuOpusProjector {
                 .iter()
                 .map(|value| (value.to_bits() >> 16) as u16)
                 .collect::<Vec<_>>();
-            let normalized_h = normalize_direct_x_bf16(
-                &direct_x,
-                &pre_ffn_state.inverse,
-                &state.tail_pre_norms[layer_idx],
-                rows,
-                768,
-            )?;
-            write_bf16_prefix(
-                state
-                    .io
-                    .as_mut()
-                    .expect("completed resident layer I/O")
-                    .hidden
-                    .as_mut_slice(),
-                &normalized_h,
-            )?;
-            state.ffn.sync_shared_input().map_err(|error| {
-                hip_error(format!("sync direct-X normalized H {layer_idx}: {error}"))
-            })?;
-            let normalized_h_f32 = normalized_h
-                .iter()
-                .map(|&bits| f32::from_bits((bits as u32) << 16))
-                .collect();
+            let normalized_h_f32 = if direct_x_consumer && !compare_layer {
+                Vec::new()
+            } else {
+                let normalized_h = normalize_direct_x_bf16(
+                    &direct_x,
+                    &pre_ffn_state
+                        .as_ref()
+                        .expect("host normalization reads pre-FFN state")
+                        .inverse,
+                    &state.tail_pre_norms[layer_idx],
+                    rows,
+                    768,
+                )?;
+                if !direct_x_consumer {
+                    write_bf16_prefix(
+                        state
+                            .io
+                            .as_mut()
+                            .expect("completed resident layer I/O")
+                            .hidden
+                            .as_mut_slice(),
+                        &normalized_h,
+                    )?;
+                    state.ffn.sync_shared_input().map_err(|error| {
+                        hip_error(format!("sync direct-X normalized H {layer_idx}: {error}"))
+                    })?;
+                }
+                normalized_h
+                    .iter()
+                    .map(|&bits| f32::from_bits((bits as u32) << 16))
+                    .collect()
+            };
             (normalized_h_f32, direct_x)
         } else {
+            let pre_ffn_state = pre_ffn_state
+                .as_ref()
+                .expect("reconstructible H reads pre-FFN state");
             let reconstructed_x = reconstruct_attention_residual_bf16(
                 &resident_output_state,
                 &pre_ffn_state.inverse,
@@ -1623,7 +1670,7 @@ impl LinearProjector for NpuOpusProjector {
             )?;
             (resident_output_state, reconstructed_x)
         };
-        if compare_this_layer_enabled(layer_idx) {
+        if compare_layer {
             self.debug_resident_hidden = Some(resident_hidden);
             self.debug_resident_residual = Some(
                 reconstructed_x
@@ -1631,16 +1678,19 @@ impl LinearProjector for NpuOpusProjector {
                     .map(|&bits| f32::from_bits((bits as u32) << 16))
                     .collect(),
             );
-            self.debug_resident_exception = pre_ffn_state.exception.as_ref().map(|exception| {
-                (
-                    exception.column,
-                    exception
-                        .x
-                        .iter()
-                        .map(|&bits| f32::from_bits((bits as u32) << 16))
-                        .collect(),
-                )
-            });
+            self.debug_resident_exception = pre_ffn_state
+                .as_ref()
+                .and_then(|state| state.exception.as_ref())
+                .map(|exception| {
+                    (
+                        exception.column,
+                        exception
+                            .x
+                            .iter()
+                            .map(|&bits| f32::from_bits((bits as u32) << 16))
+                            .collect(),
+                    )
+                });
         }
         state
             .ffn

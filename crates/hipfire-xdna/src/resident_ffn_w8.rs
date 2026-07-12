@@ -30,9 +30,11 @@ const W_BLOCK: usize = 16384;
 const W_DATA: usize = 12288;
 const W_COLS: usize = 48;
 const PARAM_OFFSET: usize = W_DATA + W_COLS * size_of::<f32>();
+const PRE_NORM_OFFSET: usize = PARAM_OFFSET + 3 * GROUP * size_of::<f32>();
 const T_ROWS: usize = 296;
 const T_STRIDE: usize = 5376;
 const CANONICAL_INPUT_BYTES: usize = PAD_M * K * size_of::<u16>();
+const DIRECT_X_INPUT_BYTES: usize = 2 * M * K * size_of::<u16>();
 const CANONICAL_SCRATCH_BYTES: usize = PAD_M * PAD_INTERMEDIATE * size_of::<u16>();
 const CANONICAL_OUTPUT_BYTES: usize = PAD_M * OUTPUT * size_of::<u16>();
 
@@ -53,6 +55,9 @@ pub enum NpuResidentFfnDenseW8IoMode {
     /// This preserves the accumulator precision required by a following
     /// post-FFN RMSNorm while retaining the compact canonical input ABI.
     CanonicalBf16Bf16x2Output,
+    /// Direct architectural X plus the producer's physical inverse-RMS record
+    /// plane. The AIE consumer applies pre-FFN RMSNorm before activation pack.
+    DirectXBf16Bf16x2Output,
 }
 
 pub struct NpuResidentFfnDenseW8 {
@@ -144,6 +149,13 @@ impl NpuResidentFfnDenseW8 {
         self.io_mode
     }
 
+    pub const fn consumes_direct_x(&self) -> bool {
+        matches!(
+            self.io_mode,
+            NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output
+        )
+    }
+
     pub const fn loaded_input_bytes(&self) -> usize {
         input_bytes_for(self.io_mode)
     }
@@ -227,6 +239,26 @@ impl NpuResidentFfnDenseW8 {
         up: &OpusPackedMatrix,
         down: &OpusPackedMatrix,
     ) -> Result<NpuResidentFfnDenseW8Weights, XdnaError> {
+        self.upload_weights_inner(gate, up, down, None)
+    }
+
+    pub fn upload_weights_with_pre_ffn_norm(
+        &self,
+        gate: &OpusPackedMatrix,
+        up: &OpusPackedMatrix,
+        down: &OpusPackedMatrix,
+        pre_ffn_norm: &[u16],
+    ) -> Result<NpuResidentFfnDenseW8Weights, XdnaError> {
+        self.upload_weights_inner(gate, up, down, Some(pre_ffn_norm))
+    }
+
+    fn upload_weights_inner(
+        &self,
+        gate: &OpusPackedMatrix,
+        up: &OpusPackedMatrix,
+        down: &OpusPackedMatrix,
+        pre_ffn_norm: Option<&[u16]>,
+    ) -> Result<NpuResidentFfnDenseW8Weights, XdnaError> {
         validate_matrix(gate, K, INTERMEDIATE, GATE_GROUPS, "gate")?;
         validate_matrix(up, K, INTERMEDIATE, GATE_GROUPS, "up")?;
         validate_matrix(down, INTERMEDIATE, OUTPUT, DOWN_GROUPS, "down")?;
@@ -235,6 +267,21 @@ impl NpuResidentFfnDenseW8 {
                 "resident dense-W8 FFN gate/up matrices must share one AWQ activation scale",
             ));
         }
+        let pre_ffn_norm = match self.io_mode {
+            NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output => {
+                let norm = pre_ffn_norm.ok_or_else(|| {
+                    invalid("direct-X resident dense-W8 FFN requires pre-FFN norm weights")
+                })?;
+                if norm.len() != K {
+                    return Err(invalid(format!(
+                        "direct-X resident dense-W8 FFN wants {K} pre-norm values, got {}",
+                        norm.len()
+                    )));
+                }
+                Some(norm)
+            }
+            _ => None,
+        };
 
         let gate_groups = dense_groups(gate);
         let up_groups = dense_groups(up);
@@ -262,6 +309,7 @@ impl NpuResidentFfnDenseW8 {
                             &gate_awq,
                             &signs1,
                             &signs2,
+                            pre_ffn_norm,
                         );
                     }
                 }
@@ -330,7 +378,8 @@ impl NpuResidentFfnDenseW8 {
             NpuResidentFfnDenseW8IoMode::CanonicalBf16 => {
                 decode_canonical_bf16_rows(self.output.as_slice(), M, OUTPUT)
             }
-            NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output => {
+            NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
+            | NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output => {
                 decode_canonical_bf16x2_rows(self.output.as_slice(), M, OUTPUT)
             }
             NpuResidentFfnDenseW8IoMode::PackedF32 => Err(invalid(
@@ -344,6 +393,7 @@ impl NpuResidentFfnDenseW8 {
             self.io_mode,
             NpuResidentFfnDenseW8IoMode::CanonicalBf16
                 | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
+                | NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output
         ) {
             return Err(invalid(
                 "resident dense-W8 FFN cache has no canonical BF16 intermediate",
@@ -467,6 +517,7 @@ const fn input_bytes_for(mode: NpuResidentFfnDenseW8IoMode) -> usize {
         NpuResidentFfnDenseW8IoMode::PackedF32 => ROW_STRIPES * GATE_BLOCKS * DATA_JOIN,
         NpuResidentFfnDenseW8IoMode::CanonicalBf16
         | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output => CANONICAL_INPUT_BYTES,
+        NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output => DIRECT_X_INPUT_BYTES,
     }
 }
 
@@ -474,7 +525,8 @@ const fn scratch_bytes_for(mode: NpuResidentFfnDenseW8IoMode) -> usize {
     match mode {
         NpuResidentFfnDenseW8IoMode::PackedF32 => T_ROWS * T_STRIDE * size_of::<f32>(),
         NpuResidentFfnDenseW8IoMode::CanonicalBf16
-        | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output => CANONICAL_SCRATCH_BYTES,
+        | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
+        | NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output => CANONICAL_SCRATCH_BYTES,
     }
 }
 
@@ -482,7 +534,8 @@ const fn output_bytes_for(mode: NpuResidentFfnDenseW8IoMode) -> usize {
     match mode {
         NpuResidentFfnDenseW8IoMode::PackedF32 => PAD_M * OUTPUT * size_of::<f32>(),
         NpuResidentFfnDenseW8IoMode::CanonicalBf16 => CANONICAL_OUTPUT_BYTES,
-        NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output => {
+        NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
+        | NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output => {
             PAD_M * OUTPUT * 3 * size_of::<u16>()
         }
     }
@@ -513,6 +566,21 @@ fn parse_io_mode(manifest: &str) -> Result<NpuResidentFfnDenseW8IoMode, XdnaErro
     {
         return Ok(NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output);
     }
+    if manifest
+        .lines()
+        .any(|line| line == "mode=dense-w8-direct-x-pre-norm-bf16x2-output")
+        && manifest
+            .lines()
+            .any(|line| line == "input=token-major-x-bf16")
+        && manifest
+            .lines()
+            .any(|line| line == "input-state=pre-ffn-inverse-f32-physical-records")
+        && manifest
+            .lines()
+            .any(|line| line == "output=token-major-bf16x2")
+    {
+        return Ok(NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output);
+    }
     Err(invalid(
         "resident dense-W8 FFN cache has no supported mode/input contract",
     ))
@@ -528,7 +596,8 @@ const fn down_block_index(
         + match mode {
             NpuResidentFfnDenseW8IoMode::PackedF32 => (mblock * DOWN_GROUPS + group) * 2 + nmacro,
             NpuResidentFfnDenseW8IoMode::CanonicalBf16
-            | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output => {
+            | NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
+            | NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output => {
                 (mblock * 2 + nmacro) * DOWN_GROUPS + group
             }
         }
@@ -584,6 +653,7 @@ fn pack_gate_block(
     awq: &[f32],
     signs1: &[f32],
     signs2: &[f32],
+    pre_ffn_norm: Option<&[u16]>,
 ) {
     for ln in 0..3 {
         for kt in 0..32 {
@@ -612,6 +682,16 @@ fn pack_gate_block(
     params.extend_from_slice(signs2);
     block[PARAM_OFFSET..PARAM_OFFSET + params.len() * size_of::<f32>()]
         .copy_from_slice(unsafe { as_bytes(&params) });
+    if let Some(pre_ffn_norm) = pre_ffn_norm {
+        let start = group * GROUP;
+        for (destination, &value) in block
+            [PRE_NORM_OFFSET..PRE_NORM_OFFSET + GROUP * size_of::<u16>()]
+            .chunks_exact_mut(size_of::<u16>())
+            .zip(&pre_ffn_norm[start..start + GROUP])
+        {
+            destination.copy_from_slice(&value.to_le_bytes());
+        }
+    }
 }
 
 fn gate_up_local(local: usize) -> (bool, usize) {
@@ -701,6 +781,7 @@ mod tests {
         assert_eq!(NpuResidentFfnDenseW8::canonical_input_bytes(), 442_368);
         assert_eq!(NpuResidentFfnDenseW8::canonical_scratch_bytes(), 737_280);
         assert_eq!(NpuResidentFfnDenseW8::canonical_output_bytes(), 442_368);
+        assert_eq!(DIRECT_X_INPUT_BYTES, 786_432);
     }
 
     #[test]
@@ -722,6 +803,13 @@ mod tests {
             )
             .unwrap(),
             NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
+        );
+        assert_eq!(
+            parse_io_mode(
+                "op=resident_ffn\nmode=dense-w8-direct-x-pre-norm-bf16x2-output\ninput=token-major-x-bf16\ninput-state=pre-ffn-inverse-f32-physical-records\noutput=token-major-bf16x2\n"
+            )
+            .unwrap(),
+            NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output
         );
         assert!(parse_io_mode("mode=dense-w8-canonical-bf16\n").is_err());
         assert!(parse_io_mode(
@@ -766,7 +854,7 @@ mod tests {
         let signs1 = gen_fwht_signs(42, GROUP);
         let signs2 = gen_fwht_signs(1042, GROUP);
         pack_gate_block(
-            &mut block, 0, 0, &weights, &scales, &weights, &scales, 2, &awq, &signs1, &signs2,
+            &mut block, 0, 0, &weights, &scales, &weights, &scales, 2, &awq, &signs1, &signs2, None,
         );
         let params = block[PARAM_OFFSET..PARAM_OFFSET + 3 * GROUP * size_of::<f32>()]
             .chunks_exact(size_of::<f32>())
@@ -775,5 +863,35 @@ mod tests {
         assert_eq!(&params[..GROUP], &awq[2 * GROUP..3 * GROUP]);
         assert_eq!(&params[GROUP..2 * GROUP], signs1.as_slice());
         assert_eq!(&params[2 * GROUP..3 * GROUP], signs2.as_slice());
+    }
+
+    #[test]
+    fn direct_x_gate_block_carries_grouped_pre_ffn_norm() {
+        let mut block = vec![0u8; W_BLOCK];
+        let weights = vec![0i8; GROUP * INTERMEDIATE];
+        let scales = vec![1.0f32; INTERMEDIATE];
+        let awq = vec![1.0f32; GATE_GROUPS * GROUP];
+        let signs1 = gen_fwht_signs(42, GROUP);
+        let signs2 = gen_fwht_signs(1042, GROUP);
+        let pre_norm = (0..K).map(|index| index as u16).collect::<Vec<_>>();
+        pack_gate_block(
+            &mut block,
+            0,
+            0,
+            &weights,
+            &scales,
+            &weights,
+            &scales,
+            1,
+            &awq,
+            &signs1,
+            &signs2,
+            Some(&pre_norm),
+        );
+        let encoded = block[PRE_NORM_OFFSET..PRE_NORM_OFFSET + GROUP * size_of::<u16>()]
+            .chunks_exact(size_of::<u16>())
+            .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(encoded, pre_norm[GROUP..2 * GROUP]);
     }
 }

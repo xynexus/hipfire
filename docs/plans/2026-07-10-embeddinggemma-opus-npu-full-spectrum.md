@@ -1700,3 +1700,48 @@ from `0.99557614` to `0.99807179`, and maximum absolute error falls from
 tokens/s at `21.07 W`, or `17.1` package tokens/J. It remains a hybrid
 correctness result, not a fully resident or throughput admission, because the
 host still creates H and final normalization/pooling remain outside the NPU.
+
+### R45 consumer-resident pre-FFN normalization checkpoint
+
+R45 removes the temporary R44 host rewrite of architectural X into normalized
+H. The R44 producer already leaves direct canonical BF16 X and all 256 exact
+F32 inverse-RMS values in one shared 5.1 MiB backing allocation. The R45 R35
+consumer declares the portion through the physical inverse records as its input
+argument and gathers the first 512 bytes of each of the 32 records into one
+16 KiB preload. That preload travels through the existing per-column weight
+ObjectFIFO, so it does not shrink the 24-row by 256-column activation tile or
+consume a third shim output DMA channel.
+
+Each core selects only the nine inverse values needed by its three owned rows
+across the three M macros into 36 bytes of local state, releases the preload,
+and then consumes the unchanged resident weight schedule. The learned BF16
+pre-FFN norm group occupies 512 bytes of the existing weight record's unused
+832-byte tail. The pack kernel applies `BF16(X * norm * inverse)` before the
+established AWQ/FWHT/int8 activation transform, preserving the R44 host
+bridge's BF16 boundary including exact zero learned norm columns. The generated
+artifact lives under `~/.hipfire/npu/` as
+`embgemma_aie2p_resident_ffn_dense_w8_direct_x_bf16x2_m256_k768_i1152_o768`.
+
+An initially attempted independent inverse ObjectFIFO was rejected by the
+compiler because every shim already uses both output DMA channels for
+activation and weight streams. Reusing the weight multicast follows the
+FlatAttention principle of preserving per-tile arithmetic intensity before
+adding another collective and compiles without changing the gate/down GEMM
+geometry.
+
+Locked OQ8++ comparisons against the established fallback report:
+
+| boundary | layer 0 | layer 8 | layer 20 |
+|---|---:|---:|---:|
+| normalized H cosine | 0.99998035 | 0.99998560 | 0.99998813 |
+| resident FFN cosine | 0.99996978 | 0.99994007 | 0.99997241 |
+| completed layer cosine | 0.99998346 | 0.99998120 | 0.99999386 |
+
+Across all 24 completed layers, OQ8++ versus BF16 embedding cosine is
+`0.99808222` with `0.00816466` maximum absolute error. The one-run M256 sample
+measures `362.6` input tokens/s at `22.02 W`, or `16.5` package tokens/J. This
+admits the consumer-resident normalization boundary, but not a fully resident
+model: the current tail still receives architectural X through a host copy,
+and final normalization and pooling remain outside AIE2P. Pure OQ4 and the
+generic mixed-format hardware matrix also remain open for the completed-layer
+schedule.
