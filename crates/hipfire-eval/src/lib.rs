@@ -186,6 +186,7 @@ pub enum BatteryId {
     Calibrate,
     Perplexity,
     TinyQuant,
+    EmbeddingQuality,
 }
 
 impl BatteryId {
@@ -210,6 +211,9 @@ impl BatteryId {
             "calibrate" | "calibration" => Ok(Self::Calibrate),
             "perplexity" | "ppl" => Ok(Self::Perplexity),
             "tinyquant" | "tiny_quant" | "tiny-quant" => Ok(Self::TinyQuant),
+            "embedding_quality" | "embed_quality" | "embedding-quality" | "sts" => {
+                Ok(Self::EmbeddingQuality)
+            }
             other => Err(format!("unknown battery: {other}")),
         }
     }
@@ -235,6 +239,7 @@ impl BatteryId {
             Self::Calibrate => "calibrate",
             Self::Perplexity => "perplexity",
             Self::TinyQuant => "tiny_quant",
+            Self::EmbeddingQuality => "embedding_quality",
         }
     }
 }
@@ -1240,6 +1245,21 @@ fn resolve_perplexity_bin() -> Option<PathBuf> {
     newest_existing_path([
         repo.join(format!("target/release/examples/perplexity{exe}")),
         repo.join(format!("target/debug/examples/perplexity{exe}")),
+    ])
+}
+
+fn resolve_quality_compare_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("HIPFIRE_QUALITY_COMPARE_BIN") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::consts::EXE_SUFFIX;
+    let repo = repo_root()?;
+    newest_existing_path([
+        repo.join(format!("target/release/examples/quality_compare{exe}")),
+        repo.join(format!("target/debug/examples/quality_compare{exe}")),
     ])
 }
 
@@ -2641,6 +2661,15 @@ mod tests {
             BatteryId::Runtime
         );
         assert_eq!(BatteryId::Runtime.as_str(), "runtime");
+        assert_eq!(
+            BatteryId::parse("embedding_quality").unwrap(),
+            BatteryId::EmbeddingQuality
+        );
+        assert_eq!(
+            BatteryId::parse("sts").unwrap(),
+            BatteryId::EmbeddingQuality
+        );
+        assert_eq!(BatteryId::EmbeddingQuality.as_str(), "embedding_quality");
     }
 
     #[test]
@@ -7944,6 +7973,112 @@ more noise
         assert_eq!(admission.verdict, "reject");
         assert_eq!(admission.findings[0].severity, "reject");
         assert_eq!(admission.findings[0].metric, "mean_kld");
+    }
+
+    /// A candidate + reference `spearman` pair sharing one comparison key: a
+    /// beyond-tolerance drop rejects; a sub-tolerance drop is admitted. This is
+    /// the wiring the embedding_quality battery emits.
+    fn embedding_quality_rows_pair(
+        cfg: &EvalConfig,
+        ctx: &EvalContext,
+        candidate_spearman: f64,
+        reference_spearman: f64,
+    ) -> Vec<EvalResult> {
+        vec![
+            row_for_model(
+                BatteryId::EmbeddingQuality,
+                None,
+                "sts_benchmark",
+                Some("candidate".to_string()),
+                EvalStatus::Pass,
+                None,
+                BTreeMap::from([("spearman".to_string(), json!(candidate_spearman))]),
+                cfg,
+                ctx,
+                None,
+                0,
+                "candidate.hfq".to_string(),
+            ),
+            row_for_model(
+                BatteryId::EmbeddingQuality,
+                None,
+                "sts_benchmark",
+                Some("candidate".to_string()),
+                EvalStatus::Pass,
+                None,
+                BTreeMap::from([("spearman".to_string(), json!(reference_spearman))]),
+                cfg,
+                ctx,
+                None,
+                0,
+                "bf16.hfq".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn admission_rejects_embedding_quality_spearman_regression() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "candidate.hfq",
+            "--reference",
+            "bf16.hfq",
+            "--battery",
+            "embedding_quality",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+        // delta = 0.80 - 0.82 = -0.02, beyond the 0.01 dead-band ⇒ reject.
+        let rows = embedding_quality_rows_pair(&cfg, &ctx, 0.80, 0.82);
+        let comparison = build_comparison_artifact(&cfg, &rows, &ctx);
+        let admission = build_admission_artifact(&cfg, &rows, &comparison, &ctx);
+        assert_eq!(admission.status, EvalStatus::Fail);
+        assert_eq!(admission.verdict, "reject");
+        assert!(admission
+            .findings
+            .iter()
+            .any(|f| f.metric == "spearman" && f.severity == "reject"));
+    }
+
+    #[test]
+    fn admission_admits_embedding_quality_within_tolerance() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "candidate.hfq",
+            "--reference",
+            "bf16.hfq",
+            "--battery",
+            "embedding_quality",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+        // delta = 0.8576 - 0.8615 = -0.0039, within the 0.01 dead-band ⇒ admit.
+        // (These are the measured OQ4++ vs BF16 STS-Benchmark Spearman values.)
+        let rows = embedding_quality_rows_pair(&cfg, &ctx, 0.8576, 0.8615);
+        let comparison = build_comparison_artifact(&cfg, &rows, &ctx);
+        let admission = build_admission_artifact(&cfg, &rows, &comparison, &ctx);
+        assert_ne!(admission.status, EvalStatus::Fail);
+        assert!(admission.findings.iter().all(|f| f.severity != "reject"));
     }
 
     #[test]

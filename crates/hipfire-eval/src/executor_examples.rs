@@ -997,6 +997,259 @@ pub(crate) fn run_examples_perplexity_model(
     )
 }
 
+/// STS-Benchmark embedding-quality battery. Spawns the embeddinggemma
+/// `quality_compare` example once (it encodes the reference and the candidate),
+/// then emits two rows sharing a comparison key: a candidate row carrying the
+/// gated `spearman` (Spearman correlation vs human gold labels) and a reference
+/// row carrying the reference's `spearman`. The admission engine computes
+/// `delta = candidate - reference` and rejects only when it drops beyond the
+/// per-metric tolerance band (see `admission_metric_tolerance`). Cross-model
+/// cosine and rank-agreement are recorded on the candidate row for evidence but
+/// are deliberately NOT gated — a rotated-but-equally-good embedding space
+/// deflates those without any real retrieval-quality loss.
+pub(crate) fn run_examples_embedding_quality_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+) -> Vec<EvalResult> {
+    run_examples_embedding_quality_model(config, ctx, config.model.clone())
+}
+
+pub(crate) fn run_examples_embedding_quality_model(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: String,
+) -> Vec<EvalResult> {
+    let battery = BatteryId::EmbeddingQuality;
+    let case_id = "sts_benchmark";
+    // Distinct dataset_item_id per candidate keeps comparison keys from
+    // colliding when several candidates are swept; the paired reference row
+    // reuses the candidate's stem so the two rows share one comparison key.
+    let item = model_artifact_stem(&model);
+    let dataset = match std::env::var("HIPFIRE_EVAL_STS_DATASET") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => home_dir()
+            .map(|h| h.join(".hipfire/corpora/sts-b/STS-B/dev.tsv"))
+            .unwrap_or_else(|| PathBuf::from("dev.tsv")),
+    };
+    let base_metrics = BTreeMap::from([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("examples")),
+        ("suite".to_string(), json!("embedding_quality")),
+        ("dataset".to_string(), json!(dataset.display().to_string())),
+    ]);
+
+    let skip = |reason: &str| -> Vec<EvalResult> {
+        vec![row_for_model(
+            battery,
+            None,
+            case_id,
+            Some(item.clone()),
+            EvalStatus::Skip,
+            Some(reason.to_string()),
+            base_metrics.clone(),
+            config,
+            ctx,
+            None,
+            0,
+            model.clone(),
+        )]
+    };
+
+    let Some(reference) = config.reference.clone() else {
+        return skip(
+            "embedding_quality requires --reference <BF16.hfq> to gate the spearman delta",
+        );
+    };
+    if !Path::new(&model).exists() {
+        return skip("embedding_quality requires the candidate model to resolve to a local path");
+    }
+    if !Path::new(&reference).exists() {
+        return skip("embedding_quality requires the reference model to resolve to a local path");
+    }
+    let Some(bin) = resolve_quality_compare_bin() else {
+        return skip(
+            "quality_compare example not found; build with `cargo build --release -p hipfire-arch-embeddinggemma --example quality_compare`",
+        );
+    };
+    if !dataset.exists() {
+        return skip(&format!(
+            "STS dataset not found: {} — set HIPFIRE_EVAL_STS_DATASET",
+            dataset.display()
+        ));
+    }
+
+    let max_pairs = std::env::var("HIPFIRE_EVAL_STS_MAX_PAIRS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1500);
+    let selection_queries = std::env::var("HIPFIRE_EVAL_STS_SELECTION_QUERIES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(500);
+    let args = vec![
+        "--reference".to_string(),
+        reference.clone(),
+        "--candidate".to_string(),
+        model.clone(),
+        "--dataset".to_string(),
+        dataset.display().to_string(),
+        "--max-pairs".to_string(),
+        max_pairs.to_string(),
+        "--selection-queries".to_string(),
+        selection_queries.to_string(),
+    ];
+    let command_display = format!("{} {}", bin.display(), args.join(" "));
+    let started = SystemTime::now();
+    let output = match Command::new(&bin).args(&args).output() {
+        Ok(o) => o,
+        Err(err) => {
+            let mut m = base_metrics.clone();
+            m.insert("command".to_string(), json!(command_display));
+            return vec![row_for_model(
+                battery,
+                None,
+                case_id,
+                Some(item.clone()),
+                EvalStatus::Fail,
+                Some(format!("spawn quality_compare: {err}")),
+                m,
+                config,
+                ctx,
+                None,
+                elapsed_since_ms(started),
+                model,
+            )];
+        }
+    };
+    let elapsed_ms = elapsed_since_ms(started);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // One JSON object per candidate; we pass a single candidate. Take the last
+    // parseable object carrying candidate_spearman.
+    let report = stdout.lines().rev().find_map(|line| {
+        serde_json::from_str::<Value>(line.trim())
+            .ok()
+            .filter(|v| v.get("candidate_spearman").is_some())
+    });
+
+    let Some(report) = report else {
+        let mut m = base_metrics.clone();
+        m.insert("command".to_string(), json!(command_display));
+        m.insert(
+            "stdout_hash".to_string(),
+            json!(stable_hash_bytes(stdout.as_bytes())),
+        );
+        let reason = if output.status.success() {
+            "quality_compare produced no parseable JSON report".to_string()
+        } else {
+            format!("quality_compare exited with {}", output.status)
+        };
+        return vec![row_for_model(
+            battery,
+            None,
+            case_id,
+            Some(item.clone()),
+            EvalStatus::Fail,
+            Some(reason),
+            m,
+            config,
+            ctx,
+            None,
+            elapsed_ms,
+            model,
+        )];
+    };
+
+    let candidate_spearman = report.get("candidate_spearman").and_then(Value::as_f64);
+    let reference_spearman = report.get("reference_spearman").and_then(Value::as_f64);
+
+    // Candidate row: gated `spearman` plus recorded (ungated) evidence metrics.
+    let mut cand_metrics = base_metrics.clone();
+    cand_metrics.insert("command".to_string(), json!(command_display));
+    cand_metrics.insert(
+        "stdout_hash".to_string(),
+        json!(stable_hash_bytes(stdout.as_bytes())),
+    );
+    for key in [
+        "candidate_spearman",
+        "candidate_pearson",
+        "reference_spearman",
+        "spearman_delta_vs_reference",
+        "spearman_delta_ci95_low",
+        "spearman_delta_ci95_high",
+        "selection_top1_agreement",
+        "selection_top5_overlap",
+        "selection_top10_overlap",
+        "embedding_cosine_mean_vs_reference",
+        "embedding_cosine_min_vs_reference",
+        "pair_cosine_mae_vs_reference",
+        "pairs",
+    ] {
+        if let Some(v) = report.get(key) {
+            cand_metrics.insert(key.to_string(), v.clone());
+        }
+    }
+    if let Some(v) = candidate_spearman {
+        // Gated metric name; only this overlaps the reference row numerically.
+        cand_metrics.insert("spearman".to_string(), json!(v));
+    }
+
+    let cand_ok = candidate_spearman.is_some_and(f64::is_finite);
+    let cand_status = if output.status.success() && cand_ok {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let cand_reason = if cand_status == EvalStatus::Pass {
+        None
+    } else if !output.status.success() {
+        Some(format!("quality_compare exited with {}", output.status))
+    } else {
+        Some("quality_compare produced no finite candidate spearman".to_string())
+    };
+    let candidate_row = row_for_model(
+        battery,
+        None,
+        case_id,
+        Some(item.clone()),
+        cand_status,
+        cand_reason,
+        cand_metrics,
+        config,
+        ctx,
+        None,
+        elapsed_ms,
+        model.clone(),
+    );
+
+    // Reference row: carries only the gated `spearman`, so the admission engine
+    // compares exactly one metric (candidate_spearman − reference_spearman).
+    let mut ref_metrics = base_metrics.clone();
+    if let Some(v) = reference_spearman {
+        ref_metrics.insert("spearman".to_string(), json!(v));
+    }
+    let ref_status = if reference_spearman.is_some_and(f64::is_finite) {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Skip
+    };
+    let reference_row = row_for_model(
+        battery,
+        None,
+        case_id,
+        Some(item),
+        ref_status,
+        None,
+        ref_metrics,
+        config,
+        ctx,
+        None,
+        elapsed_ms,
+        reference,
+    );
+
+    vec![candidate_row, reference_row]
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Qwen35SpeedCase {
     pub(crate) label: &'static str,

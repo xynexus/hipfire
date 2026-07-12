@@ -633,6 +633,9 @@ pub(crate) fn result_cache_prompt_paths(battery: BatteryId) -> Vec<&'static str>
         // TinyQuant has no committed prompt — its inputs are the seeded presets +
         // the baselines file, not a corpus.
         BatteryId::TinyQuant => Vec::new(),
+        // EmbeddingQuality inputs are HFQ paths + the STS-Benchmark dataset,
+        // not a committed prompt corpus.
+        BatteryId::EmbeddingQuality => Vec::new(),
         BatteryId::Barrage | BatteryId::Cask => Vec::new(),
     }
 }
@@ -694,6 +697,14 @@ pub(crate) fn run_battery(
         // `--executor` mode. Not a daemon/prompt battery, so it bypasses the
         // executor cascade entirely.
         return tiny_quant_rows(config, ctx);
+    }
+    if battery == BatteryId::EmbeddingQuality {
+        // Self-contained STS-Benchmark similarity comparison, driven by the
+        // embeddinggemma `quality_compare` example. Emits a candidate row and a
+        // reference row that share a comparison key, both carrying a raw
+        // `spearman` (correlation vs human gold) metric; the admission engine
+        // computes the delta and gates it. Not a daemon/prompt battery.
+        return run_examples_embedding_quality_rows(config, ctx);
     }
     if battery == BatteryId::Quality {
         if let Some(rows) = quality_json_rows(config, ctx) {
@@ -951,5 +962,7 @@ pub(crate) fn run_battery(
         }
         // TinyQuant early-returns at the top of `run_battery`; never reaches here.
         BatteryId::TinyQuant => tiny_quant_rows(config, ctx),
+        // EmbeddingQuality early-returns at the top of `run_battery`; never here.
+        BatteryId::EmbeddingQuality => run_examples_embedding_quality_rows(config, ctx),
     }
 }
