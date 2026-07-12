@@ -142,6 +142,47 @@ fn thinking_controls_from_config(
     )
 }
 
+/// Drive a model-load future to completion while rendering an indicatif bar
+/// fed by the daemon adapter's `model_load_progress()` global. Starts as a
+/// spinner (pre-first-frame), then switches to a `pos/len` bar once the daemon
+/// reports a phase total; the bar restarts per phase (see `model_load_progress`).
+async fn load_with_progress<T>(
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+    model_path: &Path,
+) -> anyhow::Result<T> {
+    use indicatif::{ProgressBar, ProgressStyle};
+
+    let bar = ProgressBar::new_spinner();
+    bar.set_message(format!("Loading {}…", model_path.display()));
+    tokio::pin!(fut);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            r = &mut fut => {
+                bar.finish_and_clear();
+                return r;
+            }
+            _ = tick.tick() => {
+                let (cur, total, phase) = hipfire_daemon_adapter::model_load_progress();
+                if total > 0 {
+                    if bar.length() != Some(total as u64) {
+                        bar.set_length(total as u64);
+                        bar.set_style(
+                            ProgressStyle::with_template("{msg} [{bar:30}] {pos}/{len}")
+                                .unwrap()
+                                .progress_chars("=>-"),
+                        );
+                    }
+                    bar.set_position(cur as u64);
+                    bar.set_message(format!("Loading {phase}"));
+                } else {
+                    bar.tick();
+                }
+            }
+        }
+    }
+}
+
 pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     // Resolve the model first (using the global config for `default_model`),
     // then re-resolve the config with that model's tag so per-model overrides
@@ -168,15 +209,11 @@ pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
 
     let bin = find_daemon_bin_or_error()?;
 
-    eprintln!("Loading {}…", model_path.display());
     let mut engine = DaemonEngine::spawn(&bin).await?;
 
-    engine
-        .load(
-            &model_path.to_string_lossy(),
-            load_params_from_config(&config),
-        )
-        .await?;
+    let model_path_str = model_path.to_string_lossy().into_owned();
+    let load = engine.load(&model_path_str, load_params_from_config(&config));
+    load_with_progress(load, &model_path).await?;
 
     let (thinking_mode, assistant_prefix, max_think_tokens) =
         thinking_controls_from_config(&config);
