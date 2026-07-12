@@ -2010,3 +2010,55 @@ M256 path. It does not widen support to other sequence lengths: resident-only
 weights intentionally reject those until the NPU layer graphs become
 shape-generic. It also does not change the performance conclusion; serialized
 context submission remains roughly two orders of magnitude from the 10k target.
+
+### R53 resident phase decomposition
+
+`HIPFIRE_EMBED_TRACE_RESIDENT=1` now records setup, attention, FFN, post-FFN
+tail, cross-layer preparation/materialization, and total wall time for every
+completed resident layer. A locked self-contained OQ8++ M256 run measured
+`932.187 ms`, `274.6` input tokens/s, and `13.1` package tokens/J. Averaged over
+all 24 layers:
+
+| phase | mean ms/layer |
+|---|---:|
+| setup | 0.522 |
+| attention + output/residual/pre-FFN norm | 9.050 |
+| resident FFN | 13.603 |
+| post-FFN norm/residual tail | 3.563 |
+| next activation + residual preparation/output | 9.847 |
+| total | 36.592 |
+
+This rejects a dispatch-overhead-only explanation. The tail and next-layer
+preparation consume `13.410 ms/layer`, repeatedly materializing and rereading
+the same compensated token rows, while attention plus FFN consume another
+`22.653 ms/layer`. The first FlatAttention-inspired fusion boundary is therefore
+FFN down accumulation -> post-FFN norm/residual -> next-layer AWQ/FWHT/quant
+packing and residual-record emission on each row's owning core. It should remove
+two commands and the BF16x2 round trips per layer. Even eliminating that entire
+13.4 ms would leave roughly 22.7 ms/layer, so attention/FFN tile utilization and
+eventual whole-layer fusion remain necessary for the 25.6 ms model target.
+
+### R54 rejected local-reuse schedules
+
+Two attempts tested whether R47's four completed-state DMA passes could be
+collapsed into one before undertaking a larger fused graph:
+
+1. Retaining all eight compensated BF16x2 rows in each core required `24,576`
+   bytes per tile. Together with parameters, scratch, routing chunks, FIFOs, and
+   the assembly block, this exceeded AIE tile-local allocation. `aiecc` emitted
+   `Failed to allocate buffer` warnings even though the cache wrapper returned
+   success, so that artifact was rejected without execution.
+2. Keeping each object-FIFO row acquired while packing all three groups reduced
+   explicit storage to three `2,080`-byte chunks and compiled without allocation
+   warnings. Hardware parity nevertheless produced almost entirely zero output
+   (`974,234` mismatches, maximum quantized delta `127`). Holding the FIFO element
+   across the three compute calls violates the graph's working producer/consumer
+   schedule; it is not a safe substitute for distributed scratchpad ownership.
+
+The admitted four-pass R47 graph was rebuilt after both experiments and passed
+the hardware gate with five one-step quantization ties, maximum scale error
+`7e-9`, and `5.0422 ms` mean dispatch. The next fusion should therefore follow
+FlatAttention's actual requirement: explicitly partition persistent state across
+the aggregate tile-group memory and schedule DMA, vector transforms, and fabric
+collectives asynchronously. It must not rely on oversized per-core duplication
+or prolonged FIFO acquisition.

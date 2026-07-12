@@ -1535,6 +1535,9 @@ impl LinearProjector for NpuOpusProjector {
         residual_and_output: &GpuTensor,
         rows: usize,
     ) -> HipResult<bool> {
+        let trace_resident =
+            std::env::var("HIPFIRE_EMBED_TRACE_RESIDENT").is_ok_and(|value| value != "0");
+        let resident_started = std::time::Instant::now();
         let resident_layer_limit = std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -1808,6 +1811,7 @@ impl LinearProjector for NpuOpusProjector {
                 .set_residual_bf16(&mut state.attention_weights[layer_idx], &residual)
                 .map_err(|error| hip_error(format!("stage layer {layer_idx} residual: {error}")))?;
         }
+        let attention_started = std::time::Instant::now();
         state
             .attention
             .prepare_layer(&state.attention_weights[layer_idx])
@@ -1835,6 +1839,7 @@ impl LinearProjector for NpuOpusProjector {
             .map_err(|error| {
                 hip_error(format!("completed-layer attention {layer_idx}: {error}"))
             })?;
+        let attention_elapsed = attention_started.elapsed();
         let split_x_tail = state.tail.consumes_split_x();
         let resident_output_state = if split_x_tail && !compare_layer {
             Vec::new()
@@ -1975,10 +1980,12 @@ impl LinearProjector for NpuOpusProjector {
                     )
                 });
         }
+        let ffn_started = std::time::Instant::now();
         state
             .ffn
             .run_shared(&state.ffn_weights[layer_idx])
             .map_err(|error| hip_error(format!("completed-layer FFN {layer_idx}: {error}")))?;
+        let ffn_elapsed = ffn_started.elapsed();
         if !state.tail.consumes_split_x() {
             write_residual_component(
                 state
@@ -2003,10 +2010,13 @@ impl LinearProjector for NpuOpusProjector {
                 hip_error(format!("sync completed-layer tail {layer_idx}: {error}"))
             })?;
         }
+        let tail_started = std::time::Instant::now();
         state
             .tail
             .run_shared(&state.tail_params[layer_idx])
             .map_err(|error| hip_error(format!("completed-layer tail {layer_idx}: {error}")))?;
+        let tail_elapsed = tail_started.elapsed();
+        let prep_started = std::time::Instant::now();
         let next_layer = layer_idx + 1;
         let has_resident_next = next_layer < state.attention_weights.len()
             && next_layer < resident_layer_limit
@@ -2066,6 +2076,17 @@ impl LinearProjector for NpuOpusProjector {
             );
             }
             copy_host_output(gpu, residual_and_output, &completed)?;
+        }
+        if trace_resident {
+            eprintln!(
+                "embeddinggemma_resident_phase layer={layer_idx} setup_ms={:.3} attention_ms={:.3} ffn_ms={:.3} tail_ms={:.3} prep_and_output_ms={:.3} total_ms={:.3}",
+                attention_started.duration_since(resident_started).as_secs_f64() * 1e3,
+                attention_elapsed.as_secs_f64() * 1e3,
+                ffn_elapsed.as_secs_f64() * 1e3,
+                tail_elapsed.as_secs_f64() * 1e3,
+                prep_started.elapsed().as_secs_f64() * 1e3,
+                resident_started.elapsed().as_secs_f64() * 1e3,
+            );
         }
         Ok(true)
     }
