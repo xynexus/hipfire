@@ -255,6 +255,11 @@ pub mod embedding_residual_prep;
 pub use embedding_residual_prep::NpuEmbeddingResidualPrep;
 
 #[cfg(target_os = "linux")]
+pub mod embedding_final_norm_mean;
+#[cfg(target_os = "linux")]
+pub use embedding_final_norm_mean::{NpuEmbeddingFinalNormMean, NpuEmbeddingFinalNormMeanParams};
+
+#[cfg(target_os = "linux")]
 pub mod resident_embedding_layer;
 #[cfg(target_os = "linux")]
 pub use resident_embedding_layer::{

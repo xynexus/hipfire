@@ -1875,3 +1875,40 @@ R47 remains a separate roughly 5 ms cross-layer preprocessing context, the
 outer runtime still materializes completed state, and final normalization,
 pooling, and Dense heads are not yet resident. The 10k/15k targets therefore
 remain open.
+
+### R49 resident final-norm/mean-pool checkpoint
+
+R49 removes two more host/GPU boundaries. Intermediate resident layers no
+longer decode the 256x768 compensated output on the CPU and upload it to the
+GPU when R47 and R48 have already prepared both the activation and residual for
+the next admitted layer. Terminal, debug-comparison, unavailable-next-layer,
+and partial-preparation paths still materialize the canonical output, so the
+optimization does not silently hand stale GPU state to a fallback.
+
+The final admitted layer now feeds
+`embgemma_aie2p_final_norm_mean_bf16x2_m256_k768` through the same shared
+completed-state dma-buf. A single AIE2P core streams all 256 compensated rows,
+applies the baked F32 `model.norm` vector and RMS epsilon, and retains the
+768-wide mean accumulator locally. Only the final 3 KiB pooled F32 vector is
+read by the host. Five fresh-process hardware checks are exact against the CPU
+oracle (`1.00000000` cosine, about `3e-8` maximum absolute error); three timed
+commands per process measured `2.04-2.19 ms`. The context requires one priming
+command because an unprimed fresh hardware context intermittently returned an
+all-zero first output.
+
+The full OQ8++ M256 path preserves BF16 quality at `0.99818283` cosine and
+`0.00840781` maximum absolute error. A five-iteration run measured `914.595 ms`,
+`279.9` input tokens/s, `17.05 W`, and `16.4` package tokens/J. This is a real
+resident final-norm/pooling boundary but still not performance admission: the
+roughly 120 serialized attention, FFN, tail, and preparation context commands
+dominate the two-millisecond final stage. The FlatAttention-style next lever is
+therefore command fusion or asynchronous overlap, not further optimization of
+the final mean reduction.
+
+Format admission also remains incomplete. Native OQ8 reaches the completed
+resident layer and reports `0.99805230` cosine versus BF16. The current native
+OQ4 artifact still selects projection-only execution
+(`completed_resident_layer=false`) and reports `0.92913818`; the resident FFN
+mode gate must be made format-generic before OQ4, mixed OQ, and their `+`/`++`
+variants can claim this same full-layer path. Dense heads and final L2
+normalization also remain host-resident.

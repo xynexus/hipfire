@@ -100,6 +100,18 @@ pub trait LinearProjector {
         None
     }
 
+    /// Consume the backend-owned completed encoder state and return the pooled
+    /// hidden vector. Resident backends use this to avoid materializing the
+    /// final token matrix through the GPU/host fallback boundary.
+    fn finalize_pooled_hidden(
+        &mut self,
+        _rows: usize,
+        _hidden: usize,
+        _mode: PoolingMode,
+    ) -> HipResult<Option<Vec<f32>>> {
+        Ok(None)
+    }
+
     /// Execute the complete QKV projection, Q/K normalization, RoPE, and
     /// bidirectional attention boundary when a resident backend owns it.
     /// Returning `false` selects the canonical per-operation fallback below.
@@ -603,6 +615,17 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
             gpu.device_synchronize()?;
             ffn_output_ms += stage_started.elapsed().as_secs_f64() * 1e3;
         }
+    }
+
+    if let Some(pooled) = projector.finalize_pooled_hidden(m, dim, cfg.pooling_mode)? {
+        if trace_phases {
+            eprintln!(
+                "embeddinggemma_phase_trace rows={m} layers={} qkv_ms={qkv_ms:.3} attention_core_ms={attention_core_ms:.3} attention_output_ms={attention_output_ms:.3} ffn_core_ms={ffn_core_ms:.3} ffn_output_ms={ffn_output_ms:.3}",
+                cfg.num_hidden_layers,
+            );
+        }
+        gpu.reclaim_pending();
+        return Ok(pooled);
     }
 
     // Final norm (model.norm) → the ST Transformer's last_hidden_state.

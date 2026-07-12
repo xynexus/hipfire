@@ -9,7 +9,8 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
-    NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuEmbeddingLayerAttentionDenseW8,
+    NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuEmbeddingFinalNormMean,
+    NpuEmbeddingFinalNormMeanParams, NpuEmbeddingLayerAttentionDenseW8,
     NpuEmbeddingLayerAttentionDenseW8Weights, NpuEmbeddingNextLayerPrepW8,
     NpuEmbeddingNextLayerPrepW8Params, NpuEmbeddingPostFfnDirectTailBf16x2,
     NpuEmbeddingPostFfnDirectTailBf16x2Params, NpuEmbeddingPreFfnException,
@@ -19,7 +20,7 @@ use hipfire_xdna::{
     OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
 };
 
-use crate::config::EmbeddingGemmaConfig;
+use crate::config::{EmbeddingGemmaConfig, PoolingMode};
 use crate::forward::{AttentionBoundary, LinearProjector, Projection};
 
 struct LayerMatrices {
@@ -120,6 +121,8 @@ struct ResidentLayerState {
     tail_params: Vec<NpuEmbeddingPostFfnDirectTailBf16x2Params>,
     next_prep: Option<NpuEmbeddingNextLayerPrepW8>,
     residual_prep: Option<NpuEmbeddingResidualPrep>,
+    final_norm_mean: Option<NpuEmbeddingFinalNormMean>,
+    final_norm_mean_params: Option<NpuEmbeddingFinalNormMeanParams>,
     next_prep_params: Vec<NpuEmbeddingNextLayerPrepW8Params>,
     prepared_input_layer: Option<usize>,
     tail_pre_norms: Vec<Vec<u16>>,
@@ -888,6 +891,8 @@ impl NpuOpusProjector {
             cache_root.join("embgemma_aie2p_next_layer_prep_w8_bf16x2_m256_k768");
         let resident_residual_prep_path =
             cache_root.join("embgemma_aie2p_residual_prep_bf16x2_to_r34_records_m256_k768");
+        let resident_final_norm_mean_path =
+            cache_root.join("embgemma_aie2p_final_norm_mean_bf16x2_m256_k768");
         let resident_layer_requested =
             std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0");
         let resident_layer = if resident_layer_requested
@@ -970,6 +975,27 @@ impl NpuOpusProjector {
                 )
             } else {
                 None
+            };
+            let (final_norm_mean, final_norm_mean_params) = if tail.output_bytes()
+                == NpuEmbeddingFinalNormMean::completed_bytes()
+                && resident_final_norm_mean_path.join("final.xclbin").is_file()
+                && resident_final_norm_mean_path.join("insts.bin").is_file()
+            {
+                let kernel = NpuEmbeddingFinalNormMean::load_cached(
+                    resident_final_norm_mean_path
+                        .to_str()
+                        .expect("UTF-8 final norm/mean cache path"),
+                )
+                .map_err(|error| format!("embeddinggemma NPU: load final norm/mean: {error}"))?;
+                let output_norm = load_vector_f32(hfq, "model.norm.weight", cfg.hidden_size)?;
+                let params = kernel
+                    .upload_params(&output_norm, cfg.rms_norm_eps)
+                    .map_err(|error| {
+                        format!("embeddinggemma NPU: upload final norm/mean: {error}")
+                    })?;
+                (Some(kernel), Some(params))
+            } else {
+                (None, None)
             };
             let ffn_cache = resident_layer_ffn_path
                 .to_str()
@@ -1128,6 +1154,8 @@ impl NpuOpusProjector {
                 tail_params,
                 next_prep,
                 residual_prep,
+                final_norm_mean,
+                final_norm_mean_params,
                 next_prep_params,
                 prepared_input_layer: None,
                 tail_pre_norms,
@@ -1609,6 +1637,11 @@ impl LinearProjector for NpuOpusProjector {
                     hip_error(format!("initialize residual prep output: {error}"))
                 })?;
             }
+            if let Some(final_norm_mean) = state.final_norm_mean.as_mut() {
+                final_norm_mean
+                    .attach_shared_completed(residual.dmabuf_fd(), residual.len())
+                    .map_err(|error| hip_error(format!("attach final norm/mean input: {error}")))?;
+            }
             state.io = Some(ResidentLayerIo {
                 input_gpu,
                 residual_gpu,
@@ -1918,8 +1951,12 @@ impl LinearProjector for NpuOpusProjector {
             .run_shared(&state.tail_params[layer_idx])
             .map_err(|error| hip_error(format!("completed-layer tail {layer_idx}: {error}")))?;
         let next_layer = layer_idx + 1;
-        if next_layer < state.attention_weights.len() && next_layer < resident_layer_limit {
-            let mut prepared_input = false;
+        let has_resident_next = next_layer < state.attention_weights.len()
+            && next_layer < resident_layer_limit
+            && state.attention_weights[next_layer].is_available();
+        let mut prepared_activation = false;
+        let mut prepared_residual = false;
+        if has_resident_next {
             if let (Some(prep), Some(params)) = (
                 state.next_prep.as_mut(),
                 state.next_prep_params.get(next_layer),
@@ -1929,7 +1966,7 @@ impl LinearProjector for NpuOpusProjector {
                         "prepare completed-layer input {layer_idx}->{next_layer}: {error}"
                     ))
                 })?;
-                prepared_input = true;
+                prepared_activation = true;
             }
             if let Some(prep) = state.residual_prep.as_mut() {
                 prep.run_shared().map_err(|error| {
@@ -1937,31 +1974,67 @@ impl LinearProjector for NpuOpusProjector {
                         "prepare completed-layer residual {layer_idx}->{next_layer}: {error}"
                     ))
                 })?;
+                prepared_residual = true;
             }
-            if prepared_input {
+            if prepared_activation {
                 state.prepared_input_layer = Some(next_layer);
             }
         }
-        let completed = state
-            .tail
-            .read_output_f32()
-            .map_err(|error| hip_error(format!("read completed layer {layer_idx}: {error}")))?;
-        if compare_this_layer_enabled(layer_idx) {
-            let expected = direct_tail_reference(
-                &reconstructed_x,
-                self.debug_resident_ffn
-                    .as_ref()
-                    .expect("resident FFN debug output"),
-                &state.tail_post_norms[layer_idx],
-                1.0e-6,
-            );
-            let (cosine, max_abs) = host_metrics(&completed, &expected);
-            eprintln!(
+        let compare_layer = compare_this_layer_enabled(layer_idx);
+        let final_norm_mean_ready = next_layer == state.attention_weights.len()
+            && state.final_norm_mean.is_some()
+            && state.final_norm_mean_params.is_some();
+        if should_materialize_completed_output(
+            !has_resident_next && !final_norm_mean_ready,
+            prepared_activation,
+            prepared_residual,
+            compare_layer,
+        ) {
+            let completed = state
+                .tail
+                .read_output_f32()
+                .map_err(|error| hip_error(format!("read completed layer {layer_idx}: {error}")))?;
+            if compare_layer {
+                let expected = direct_tail_reference(
+                    &reconstructed_x,
+                    self.debug_resident_ffn
+                        .as_ref()
+                        .expect("resident FFN debug output"),
+                    &state.tail_post_norms[layer_idx],
+                    1.0e-6,
+                );
+                let (cosine, max_abs) = host_metrics(&completed, &expected);
+                eprintln!(
                 "embeddinggemma_resident_tail_compare layer={layer_idx} cosine={cosine:.8} max_abs={max_abs:.7}"
             );
+            }
+            copy_host_output(gpu, residual_and_output, &completed)?;
         }
-        copy_host_output(gpu, residual_and_output, &completed)?;
         Ok(true)
+    }
+
+    fn finalize_pooled_hidden(
+        &mut self,
+        rows: usize,
+        hidden: usize,
+        mode: PoolingMode,
+    ) -> HipResult<Option<Vec<f32>>> {
+        if rows != NpuEmbeddingFinalNormMean::rows() || hidden != 768 || mode != PoolingMode::Mean {
+            return Ok(None);
+        }
+        let Some(state) = self.resident_layer.as_mut() else {
+            return Ok(None);
+        };
+        let (Some(kernel), Some(params)) = (
+            state.final_norm_mean.as_mut(),
+            state.final_norm_mean_params.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        kernel
+            .run_shared(params)
+            .map_err(|error| hip_error(format!("final norm/mean: {error}")))?;
+        Ok(Some(kernel.read_pooled_f32()))
     }
 
     fn has_prepared_layer_input(&self, layer_idx: usize, rows: usize) -> bool {
@@ -2846,6 +2919,15 @@ fn compare_this_layer_enabled(layer_idx: usize) -> bool {
             == layer_idx
 }
 
+fn should_materialize_completed_output(
+    terminal_or_fallback: bool,
+    prepared_activation: bool,
+    prepared_residual: bool,
+    compare_layer: bool,
+) -> bool {
+    terminal_or_fallback || !prepared_activation || !prepared_residual || compare_layer
+}
+
 fn host_metrics(left: &[f32], right: &[f32]) -> (f64, f32) {
     let mut dot = 0.0f64;
     let mut left_norm = 0.0f64;
@@ -2992,6 +3074,21 @@ fn hip_error(message: impl AsRef<str>) -> HipError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_chain_skips_only_fully_prepared_intermediate_outputs() {
+        assert!(!should_materialize_completed_output(
+            false, true, true, false
+        ));
+        assert!(should_materialize_completed_output(
+            false, true, false, false
+        ));
+        assert!(should_materialize_completed_output(
+            false, false, true, false
+        ));
+        assert!(should_materialize_completed_output(true, true, true, false));
+        assert!(should_materialize_completed_output(false, true, true, true));
+    }
 
     #[test]
     fn packed_exception_reconstructs_direct_x() {
