@@ -10,7 +10,8 @@ use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
     NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuEmbeddingLayerAttentionDenseW8,
-    NpuEmbeddingLayerAttentionDenseW8Weights, NpuEmbeddingPostFfnDirectTailBf16x2,
+    NpuEmbeddingLayerAttentionDenseW8Weights, NpuEmbeddingNextLayerPrepW8,
+    NpuEmbeddingNextLayerPrepW8Params, NpuEmbeddingPostFfnDirectTailBf16x2,
     NpuEmbeddingPostFfnDirectTailBf16x2Params, NpuEmbeddingPreFfnException, NpuOpusExecutor,
     NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights, NpuResidentFfnDenseW8,
     NpuResidentFfnDenseW8Weights, NpuResidentFfnW4, NpuResidentFfnW4Weights, NpuWholeMode,
@@ -116,6 +117,9 @@ struct ResidentLayerState {
     ffn_weights: Vec<NpuResidentFfnDenseW8Weights>,
     tail: NpuEmbeddingPostFfnDirectTailBf16x2,
     tail_params: Vec<NpuEmbeddingPostFfnDirectTailBf16x2Params>,
+    next_prep: Option<NpuEmbeddingNextLayerPrepW8>,
+    next_prep_params: Vec<NpuEmbeddingNextLayerPrepW8Params>,
+    prepared_input_layer: Option<usize>,
     tail_pre_norms: Vec<Vec<u16>>,
     tail_post_norms: Vec<Vec<u16>>,
     io: Option<ResidentLayerIo>,
@@ -859,6 +863,8 @@ impl NpuOpusProjector {
         } else {
             resident_layer_tail_bf16_path
         };
+        let resident_next_prep_path =
+            cache_root.join("embgemma_aie2p_next_layer_prep_w8_bf16x2_m256_k768");
         let resident_layer_requested =
             std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0");
         let resident_layer = if resident_layer_requested
@@ -908,6 +914,23 @@ impl NpuOpusProjector {
                 NpuEmbeddingPostFfnDirectTailBf16x2::load_cached(tail_cache).map_err(|error| {
                     format!("embeddinggemma NPU: load completed-layer tail: {error}")
                 })?;
+            let next_prep = if resident_next_prep_path.join("final.xclbin").is_file()
+                && resident_next_prep_path.join("insts.bin").is_file()
+                && tail.output_bytes() == NpuEmbeddingNextLayerPrepW8::completed_bytes()
+            {
+                Some(
+                    NpuEmbeddingNextLayerPrepW8::load_cached(
+                        resident_next_prep_path
+                            .to_str()
+                            .expect("UTF-8 next-layer prep cache path"),
+                    )
+                    .map_err(|error| {
+                        format!("embeddinggemma NPU: load next-layer prep: {error}")
+                    })?,
+                )
+            } else {
+                None
+            };
             let ffn_cache = resident_layer_ffn_path
                 .to_str()
                 .expect("UTF-8 completed-layer FFN cache path");
@@ -929,6 +952,7 @@ impl NpuOpusProjector {
             let mut ffn_weights = Vec::with_capacity(layers.len());
             let mut attention_weights = Vec::with_capacity(layers.len());
             let mut tail_params = Vec::with_capacity(layers.len());
+            let mut next_prep_params = Vec::with_capacity(layers.len());
             let mut tail_pre_norms = Vec::with_capacity(layers.len());
             let mut tail_post_norms = Vec::with_capacity(layers.len());
             let zero_residual = vec![0u16; 256 * cfg.hidden_size];
@@ -936,6 +960,21 @@ impl NpuOpusProjector {
                 let prefix = format!("model.layers.{layer_idx}");
                 let (dense_groups, dense_scales, awq_scale) =
                     resident_attention_dense_groups(layer)?;
+                if let Some(prep) = next_prep.as_ref() {
+                    let input_norm = load_vector_f32(
+                        hfq,
+                        &format!("{prefix}.input_layernorm.weight"),
+                        cfg.hidden_size,
+                    )?;
+                    next_prep_params.push(
+                        prep.upload_params(&input_norm, awq_scale.as_deref())
+                            .map_err(|error| {
+                                format!(
+                                    "embeddinggemma NPU: upload next-layer prep {layer_idx}: {error}"
+                                )
+                            })?,
+                    );
+                }
                 let group_refs = dense_groups.iter().map(Vec::as_slice).collect::<Vec<_>>();
                 let scale_refs = dense_scales.iter().map(Vec::as_slice).collect::<Vec<_>>();
                 let mut qnorm = load_vector_f32(
@@ -1047,6 +1086,9 @@ impl NpuOpusProjector {
                 ffn_weights,
                 tail,
                 tail_params,
+                next_prep,
+                next_prep_params,
+                prepared_input_layer: None,
                 tail_pre_norms,
                 tail_post_norms,
                 io: None,
@@ -1495,6 +1537,15 @@ impl LinearProjector for NpuOpusProjector {
                     )
                     .map_err(|error| hip_error(format!("attach completed-layer tail: {error}")))?;
             }
+            if let Some(prep) = state.next_prep.as_mut() {
+                prep.attach_shared(
+                    residual.dmabuf_fd(),
+                    residual.len(),
+                    input.dmabuf_fd(),
+                    input.len(),
+                )
+                .map_err(|error| hip_error(format!("attach next-layer prep: {error}")))?;
+            }
             state.io = Some(ResidentLayerIo {
                 input_gpu,
                 residual_gpu,
@@ -1569,21 +1620,24 @@ impl LinearProjector for NpuOpusProjector {
             .attention
             .prepare_layer(&state.attention_weights[layer_idx])
             .map_err(|error| hip_error(format!("prepare layer {layer_idx}: {error}")))?;
-        let input_view = state
-            .io
-            .as_ref()
-            .expect("completed resident layer I/O")
-            .input_gpu
-            .view();
-        gpu.pack_opus_npu_activations(
-            normalized_input,
-            self.awq_gpu.get(&matrix_key).map(OwnedTensor::view),
-            &input_view,
-            rows,
-            768,
-            resident_attention_layout(),
-        )?;
-        gpu.device_synchronize()?;
+        let input_prepared = state.prepared_input_layer.take() == Some(layer_idx);
+        if !input_prepared {
+            let input_view = state
+                .io
+                .as_ref()
+                .expect("completed resident layer I/O")
+                .input_gpu
+                .view();
+            gpu.pack_opus_npu_activations(
+                normalized_input,
+                self.awq_gpu.get(&matrix_key).map(OwnedTensor::view),
+                &input_view,
+                rows,
+                768,
+                resident_attention_layout(),
+            )?;
+            gpu.device_synchronize()?;
+        }
         state
             .attention
             .run_shared(&state.attention_weights[layer_idx])
@@ -1763,6 +1817,20 @@ impl LinearProjector for NpuOpusProjector {
             .tail
             .run_shared(&state.tail_params[layer_idx])
             .map_err(|error| hip_error(format!("completed-layer tail {layer_idx}: {error}")))?;
+        let next_layer = layer_idx + 1;
+        if next_layer < state.attention_weights.len() && next_layer < resident_layer_limit {
+            if let (Some(prep), Some(params)) = (
+                state.next_prep.as_mut(),
+                state.next_prep_params.get(next_layer),
+            ) {
+                prep.run_shared(params).map_err(|error| {
+                    hip_error(format!(
+                        "prepare completed-layer input {layer_idx}->{next_layer}: {error}"
+                    ))
+                })?;
+                state.prepared_input_layer = Some(next_layer);
+            }
+        }
         let completed = state
             .tail
             .read_output_f32()
@@ -1783,6 +1851,18 @@ impl LinearProjector for NpuOpusProjector {
         }
         copy_host_output(gpu, residual_and_output, &completed)?;
         Ok(true)
+    }
+
+    fn has_prepared_layer_input(&self, layer_idx: usize, rows: usize) -> bool {
+        let resident_layer_limit = std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        rows == NpuEmbeddingNextLayerPrepW8::rows()
+            && layer_idx < resident_layer_limit
+            && self.resident_layer.as_ref().is_some_and(|state| {
+                state.next_prep.is_some() && state.prepared_input_layer == Some(layer_idx)
+            })
     }
 
     fn take_layer_debug_hidden(&mut self) -> Option<Vec<f32>> {

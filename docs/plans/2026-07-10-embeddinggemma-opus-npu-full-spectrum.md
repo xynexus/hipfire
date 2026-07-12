@@ -1777,3 +1777,46 @@ R46 makes attention X, pre-FFN normalization, FFN, and the completed residual
 tail an NPU-to-NPU shared-buffer path. It is still not the requested fully
 resident encoder: the next layer's normalized projection input is produced on
 the GPU, and final normalization and pooling remain outside AIE2P.
+
+### R47 resident next-layer activation checkpoint
+
+R47 consumes R46's compensated completed-layer BF16x2 output directly on
+AIE2P and writes the dynamic 6,240-byte prefix of every next-layer R34 QKV
+activation block. The layer-resident paired QKV weight scales at byte 6,272
+and above remain untouched. Layer 0 retains the canonical GPU producer; layers
+1 through 23 skip both GPU input RMSNorm and `pack_opus_npu_activations` when
+the preceding resident tail has prepared their shared input buffer.
+
+Each compute tile owns eight rows. It first reduces the full K=768 compensated
+row, then replays the source for the three 256-value groups, applying the next
+layer's learned input norm, optional AWQ scale, seed-42/1042 signed FWHT, and
+per-row int8 quantization. Three logical row chunks aggregate over core streams
+into R34's exact 24-row physical prefix, which each packer emits five times for
+the N-macro consumers. The final partial block retains zero padding.
+
+The first graph used separate X and parameter broadcasts. AIE resource
+allocation rejected it because those two memory-tile outbound DMA channels
+left no route for packer output. The accepted schedule preloads the three
+immutable parameter records over the X ObjectFIFO, then serializes completed
+state replays on that same channel. This leaves one memory-tile route in each
+direction and compiled across all eleven aggregation chains.
+
+The generated artifact is
+`~/.hipfire/npu/embgemma_aie2p_next_layer_prep_w8_bf16x2_m256_k768`. Its locked
+standalone gate checks 983,040 physical int8 values across all five replicas:
+five values differ from the CPU square-root oracle by one LSB because AIE
+`invsqrt` lands on the opposite quantization boundary; maximum scale error is
+`7e-9`. Ten measured dispatches average `5.0835 ms`.
+
+A locked layer-1 same-input comparison after an R47 handoff reaches
+`0.99998975` completed-layer cosine. Across all 24 completed resident layers,
+OQ8++ versus BF16 reaches `0.99818254` cosine with `0.00840785` maximum absolute
+error. The one-run M256 sample measures `289.5` input tokens/s at `20.04 W`, or
+`14.5` package tokens/J. This is a correctness checkpoint, not a performance
+admission: the standalone preprocessing context is intentionally unfused and
+adds about 117 ms over 23 boundaries. R34 still receives its architectural
+residual through the host-updated parameter records, and final normalization
+and pooling remain outside AIE2P. The next cross-layer slice must make R34 read
+that residual directly from the shared completed state, then fold this prep
+work into a producer or consumer schedule rather than repeating a standalone
+context.

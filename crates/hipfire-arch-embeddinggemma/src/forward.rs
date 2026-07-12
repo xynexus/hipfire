@@ -78,6 +78,12 @@ pub trait LinearProjector {
         Ok(false)
     }
 
+    /// Whether `project_layer` already owns the normalized/packed input for
+    /// this layer. The canonical GPU RMSNorm can be skipped when true.
+    fn has_prepared_layer_input(&self, _layer_idx: usize, _rows: usize) -> bool {
+        false
+    }
+
     fn take_layer_debug_hidden(&mut self) -> Option<Vec<f32>> {
         None
     }
@@ -362,10 +368,12 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
         let mut compared_resident_ffn = None;
         let mut compared_fallback_ffn = None;
 
-        // ── Attention block (bidirectional) ──
-        gpu.rmsnorm_batched(&x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
         let compare_this_layer =
             compare_resident_layer && layer_idx == compare_resident_layer_index;
+        // ── Attention block (bidirectional) ──
+        if !projector.has_prepared_layer_input(layer_idx, m) || compare_this_layer {
+            gpu.rmsnorm_batched(&x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
+        }
         if compare_this_layer {
             gpu.memcpy_dtod_at_auto(
                 &compare_input.as_ref().expect("comparison input").buf,

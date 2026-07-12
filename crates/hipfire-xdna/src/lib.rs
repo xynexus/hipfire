@@ -243,6 +243,13 @@ pub use post_ffn_direct_tail_bf16x2::{
 };
 
 #[cfg(target_os = "linux")]
+pub mod embedding_next_layer_prep;
+#[cfg(target_os = "linux")]
+pub use embedding_next_layer_prep::{
+    NpuEmbeddingNextLayerPrepW8, NpuEmbeddingNextLayerPrepW8Params,
+};
+
+#[cfg(target_os = "linux")]
 pub mod resident_embedding_layer;
 #[cfg(target_os = "linux")]
 pub use resident_embedding_layer::{
