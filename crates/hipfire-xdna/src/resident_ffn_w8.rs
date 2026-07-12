@@ -6,7 +6,7 @@
 
 use hipfire_primitives::{conv::bf16_bits_to_f32, fwht::gen_fwht_signs};
 
-use crate::{DeviceBuffer, NpuKernel, OpusPackedMatrix, OpusResidentMode, XdnaError};
+use crate::{DeviceBuffer, NpuKernel, OpusPackedMatrix, XdnaError};
 
 const M: usize = 256;
 const PAD_M: usize = 288;
@@ -610,13 +610,9 @@ fn validate_matrix(
     groups: usize,
     role: &str,
 ) -> Result<(), XdnaError> {
-    if matrix.resident_mode() != OpusResidentMode::DenseW8
-        || matrix.k() != k
-        || matrix.n() != n
-        || matrix.group_count() != groups
-    {
+    if matrix.k() != k || matrix.n() != n || matrix.group_count() != groups {
         return Err(invalid(format!(
-            "resident dense-W8 FFN {role} wants dense-W8 K={k} N={n} groups={groups}, got {:?} K={} N={} groups={}",
+            "resident dense execution FFN {role} wants K={k} N={n} groups={groups}, got {:?} K={} N={} groups={}",
             matrix.resident_mode(),
             matrix.k(),
             matrix.n(),
@@ -751,6 +747,15 @@ unsafe fn as_bytes(values: &[f32]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_execution_contract_accepts_native_w4_source_groups() {
+        let payload = vec![0u8; INTERMEDIATE * GATE_GROUPS * 130];
+        let matrix = OpusPackedMatrix::from_payload(33, K, INTERMEDIATE, &payload, None)
+            .expect("native W4 matrix");
+        validate_matrix(&matrix, K, INTERMEDIATE, GATE_GROUPS, "gate")
+            .expect("dense execution expands native W4 groups");
+    }
 
     #[test]
     fn gate_up_physical_columns_cover_both_roles_without_aliases() {

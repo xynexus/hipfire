@@ -1912,3 +1912,30 @@ OQ4 artifact still selects projection-only execution
 mode gate must be made format-generic before OQ4, mixed OQ, and their `+`/`++`
 variants can claim this same full-layer path. Dense heads and final L2
 normalization also remain host-resident.
+
+### R50 format-neutral completed-layer admission
+
+R50 removes the stale source-format restriction identified by R49. The
+completed FFN already calls `group_dense_i8()` for every gate, up, and down
+group, so native W4, compact mixed Opus, and W8 all produce the same dense
+signed-byte plus scale execution payload. Its validator nevertheless required
+the source label to be `DenseW8`, and the completed-layer selector repeated
+that check. A unit test now admits a real native-W4 payload to the dense
+execution contract; geometry and group-count validation remain unchanged.
+
+Locked M256 hardware checks now report `completed_resident_layer=true` for:
+
+| artifact | source family | BF16 cosine | hybrid input tok/s |
+|---|---|---:|---:|
+| `EmbeddingGemma-300M.npu.oq4.hfq` | native OQ4 | 0.92998326 | 265.0 |
+| `EmbeddingGemma-300M.npu.oq4.125.hfq` | compact mixed | 0.92795205 | 288.6 |
+| `EmbeddingGemma-300M.npu.oq6.5.hfq` | compact mixed | 0.95893502 | 270.0 |
+| `EmbeddingGemma-300M.npu.oq8+.hfq` | calibrated OQ8+ | 0.99834824 | 268.4 |
+
+The established OQ8++ result remains the `++` proof at `0.99818283`. Existing
+non-`npu` OQ4+/OQ4++/OQ4.25++ artifacts keep their down projections in a
+non-Opus storage type and correctly remain projection-only; they are not valid
+evidence against the format-neutral kernel contract. Canonical all-projection
+OQ4+ and OQ4++ artifacts still need to be produced and gated. The low W4/mixed
+cosines are quantization-quality failures, not resident-dispatch failures, and
+must not be promoted despite their now-complete NPU execution path.

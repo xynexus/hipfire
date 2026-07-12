@@ -897,7 +897,7 @@ impl NpuOpusProjector {
             std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0");
         let resident_layer = if resident_layer_requested
             && cfg.hidden_size == 768
-            && resident_ffn_mode(&layers).is_ok_and(|mode| mode == OpusResidentMode::DenseW8)
+            && resident_ffn_mode(&layers).is_ok()
             && resident_layer_ffn_path.join("final.xclbin").is_file()
             && resident_layer_ffn_path.join("insts.bin").is_file()
             && resident_layer_attention_path.join("final.xclbin").is_file()
