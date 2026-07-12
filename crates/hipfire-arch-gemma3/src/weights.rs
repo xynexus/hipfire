@@ -199,6 +199,94 @@ pub fn load_encoder_weights_prefixed(
     })
 }
 
+/// Load only normalization tensors for a backend that owns every projection.
+/// Projection fields retain their logical shapes but contain one-element dummy
+/// buffers and must never reach the GPU fallback path.
+pub fn load_resident_encoder_scaffold(
+    hfq: &HfqFile,
+    cfg: &Gemma3Config,
+    gpu: &mut Gpu,
+) -> HipResult<Gemma3Weights> {
+    let dummy_weight = |gpu: &mut Gpu, m: usize, k: usize| -> HipResult<WeightTensor> {
+        Ok(weight_tensor(
+            gpu.zeros(&[1], DType::F32)?,
+            DType::F32,
+            m,
+            k,
+        ))
+    };
+    let output_norm = load_norm_weight_raw(hfq, gpu, "model.norm.weight", cfg.hidden_size)?;
+    let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+    for i in 0..cfg.num_hidden_layers {
+        let p = format!("model.layers.{i}");
+        let input_norm = load_norm_weight_raw(
+            hfq,
+            gpu,
+            &format!("{p}.input_layernorm.weight"),
+            cfg.hidden_size,
+        )?;
+        let q_norm = load_norm_weight_raw(
+            hfq,
+            gpu,
+            &format!("{p}.self_attn.q_norm.weight"),
+            cfg.head_dim,
+        )?;
+        let prescale = cfg.q_prescale();
+        if (prescale - 1.0).abs() > 1e-6 {
+            gpu.scale_f32(&q_norm, prescale)?;
+        }
+        let k_norm = load_norm_weight_raw(
+            hfq,
+            gpu,
+            &format!("{p}.self_attn.k_norm.weight"),
+            cfg.head_dim,
+        )?;
+        let post_attn_norm = load_norm_weight_raw(
+            hfq,
+            gpu,
+            &format!("{p}.post_attention_layernorm.weight"),
+            cfg.hidden_size,
+        )?;
+        let pre_ffn_norm = load_norm_weight_raw(
+            hfq,
+            gpu,
+            &format!("{p}.pre_feedforward_layernorm.weight"),
+            cfg.hidden_size,
+        )?;
+        let post_ffn_norm = load_norm_weight_raw(
+            hfq,
+            gpu,
+            &format!("{p}.post_feedforward_layernorm.weight"),
+            cfg.hidden_size,
+        )?;
+        let q_dim = cfg.num_attention_heads * cfg.head_dim;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        layers.push(Gemma3LayerWeights {
+            input_norm,
+            q_norm,
+            k_norm,
+            wq: dummy_weight(gpu, q_dim, cfg.hidden_size)?,
+            wk: dummy_weight(gpu, kv_dim, cfg.hidden_size)?,
+            wv: dummy_weight(gpu, kv_dim, cfg.hidden_size)?,
+            wo: dummy_weight(gpu, cfg.hidden_size, q_dim)?,
+            post_attn_norm,
+            pre_ffn_norm,
+            post_ffn_norm,
+            w_gate: dummy_weight(gpu, cfg.intermediate_size, cfg.hidden_size)?,
+            w_up: dummy_weight(gpu, cfg.intermediate_size, cfg.hidden_size)?,
+            w_down: dummy_weight(gpu, cfg.hidden_size, cfg.intermediate_size)?,
+        });
+    }
+    Ok(Gemma3Weights {
+        token_embd: gpu.zeros(&[1], DType::F32)?,
+        embd_format: EmbeddingFormat::F32,
+        output_norm,
+        output: dummy_weight(gpu, 1, 1)?,
+        layers,
+        tied_lm_head: false,
+    })
+}
+
 // ─── Per-tensor loaders (replicated from qwen2; see module doc) ──────────────
 
 fn load_embed_tokens(

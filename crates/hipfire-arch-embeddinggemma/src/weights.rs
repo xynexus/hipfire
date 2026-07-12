@@ -62,18 +62,36 @@ pub struct EmbeddingGemmaWeights {
     pub backbone: Gemma3Weights,
     pub dense_heads: Vec<DenseHeadHost>,
     pub(crate) host_embedding: Option<HostEmbedding>,
+    pub(crate) resident_only: bool,
 }
 
 pub(crate) enum HostEmbedding {
     F16(Vec<u8>),
     Bf16(Vec<u8>),
+    Q8F16(Vec<u8>),
 }
 
 impl HostEmbedding {
     pub(crate) fn row(&self, token: u32, dim: usize) -> Result<Vec<f32>, String> {
+        if let Self::Q8F16(data) = self {
+            let blocks = dim.div_ceil(32);
+            let row_bytes = blocks * 34;
+            let start = token as usize * row_bytes;
+            let end = start + row_bytes;
+            if end > data.len() {
+                return Err(format!(
+                    "embeddinggemma: token {token} exceeds host Q8F16 embedding table"
+                ));
+            }
+            return Ok(hipfire_runtime::quant::dequant_q8f16(
+                &data[start..end],
+                dim,
+            ));
+        }
         let start = token as usize * dim * 2;
         let data = match self {
             Self::F16(data) | Self::Bf16(data) => data,
+            Self::Q8F16(_) => unreachable!("handled Q8F16 above"),
         };
         let end = start + dim * 2;
         if end > data.len() {
@@ -88,6 +106,7 @@ impl HostEmbedding {
                 match self {
                     Self::F16(_) => f16_to_f32(bits),
                     Self::Bf16(_) => f32::from_bits((bits as u32) << 16),
+                    Self::Q8F16(_) => unreachable!("handled Q8F16 above"),
                 }
             })
             .collect())
@@ -95,6 +114,10 @@ impl HostEmbedding {
 }
 
 impl EmbeddingGemmaWeights {
+    pub fn resident_only(&self) -> bool {
+        self.resident_only
+    }
+
     pub fn load(
         hfq: &mut HfqFile,
         cfg: &EmbeddingGemmaConfig,
@@ -128,6 +151,57 @@ impl EmbeddingGemmaWeights {
             backbone,
             dense_heads,
             host_embedding: None,
+            resident_only: false,
+        })
+    }
+
+    /// Load the host-visible embedding/Dense tensors plus normalization-only
+    /// GPU scaffolding for the M256 fully resident NPU path.
+    pub fn load_resident_npu(
+        hfq: &mut HfqFile,
+        cfg: &EmbeddingGemmaConfig,
+        gpu: &mut Gpu,
+    ) -> Result<Self, String> {
+        let (embedding_info, embedding_data) = hfq
+            .tensor_data_vec("model.embed_tokens.weight")
+            .ok_or_else(|| "embeddinggemma: model.embed_tokens.weight not found".to_string())?;
+        let host_embedding = match embedding_info.quant_type {
+            1 => HostEmbedding::F16(embedding_data),
+            3 => HostEmbedding::Q8F16(embedding_data),
+            16 => HostEmbedding::Bf16(embedding_data),
+            quant_type => {
+                return Err(format!(
+                    "embeddinggemma resident NPU: host embedding requires f16/q8f16/bf16, got qt={quant_type}"
+                ));
+            }
+        };
+        let backbone = hipfire_arch_gemma3::weights::load_resident_encoder_scaffold(
+            hfq,
+            &gemma3_config(cfg),
+            gpu,
+        )
+        .map_err(|error| format!("embeddinggemma resident NPU scaffold: {error:?}"))?;
+        let mut dense_heads = Vec::with_capacity(cfg.dense_heads.len());
+        for (i, head) in cfg.dense_heads.iter().enumerate() {
+            let name = format!("dense.{i}.weight");
+            if head.activation != "identity" {
+                return Err(format!(
+                    "embeddinggemma: Dense head {i} activation {:?} unsupported",
+                    head.activation
+                ));
+            }
+            dense_heads.push(DenseHeadHost {
+                in_features: head.in_features,
+                out_features: head.out_features,
+                w: load_dense_head_f32(hfq, &name, head.out_features, head.in_features)?,
+                awq_scale: load_dense_awq_scale(hfq, &name, head.in_features)?,
+            });
+        }
+        Ok(Self {
+            backbone,
+            dense_heads,
+            host_embedding: Some(host_embedding),
+            resident_only: true,
         })
     }
 
@@ -175,6 +249,7 @@ impl EmbeddingGemmaWeights {
             backbone,
             dense_heads,
             host_embedding: Some(host_embedding),
+            resident_only: false,
         })
     }
 
@@ -280,6 +355,20 @@ fn load_dense_awq_scale(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q8f16_host_embedding_decodes_one_row_without_full_table_expansion() {
+        let mut block = vec![0u8; 34];
+        block[..2].copy_from_slice(&hipfire_runtime::quant::f32_to_f16(0.5).to_le_bytes());
+        for (index, value) in block[2..].iter_mut().enumerate() {
+            *value = (index as i8 - 16) as u8;
+        }
+        let row = HostEmbedding::Q8F16(block)
+            .row(0, 32)
+            .expect("Q8F16 embedding row");
+        assert_eq!(row[0], -8.0);
+        assert_eq!(row[31], 7.5);
+    }
 
     #[test]
     fn dense_head_applies_identity_matmul() {

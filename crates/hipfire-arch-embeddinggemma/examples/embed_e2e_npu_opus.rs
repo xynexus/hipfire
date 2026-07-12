@@ -96,6 +96,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("embeddinggemma reference model shape does not match candidate".into());
         }
         embeddinggemma::EmbeddingGemmaWeights::load(&mut reference_hfq, &config, &mut gpu)?
+    } else if std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0") {
+        embeddinggemma::EmbeddingGemmaWeights::load_resident_npu(&mut hfq, &config, &mut gpu)?
     } else {
         embeddinggemma::EmbeddingGemmaWeights::load(&mut hfq, &config, &mut gpu)?
     };
@@ -114,17 +116,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gpu_started = Instant::now();
     let mut gpu_embeddings = Vec::new();
     let mut gpu_power = Vec::new();
-    for _ in 0..iterations {
-        gpu_embeddings.clear();
-        for tokens in &token_batches {
-            gpu_embeddings.push(embeddinggemma::embed_forward(
-                &mut gpu, &weights, &config, tokens,
-            )?);
-            gpu_power.extend(package_watts(power_path.as_deref()));
+    if !weights.resident_only() {
+        for _ in 0..iterations {
+            gpu_embeddings.clear();
+            for tokens in &token_batches {
+                gpu_embeddings.push(embeddinggemma::embed_forward(
+                    &mut gpu, &weights, &config, tokens,
+                )?);
+                gpu_power.extend(package_watts(power_path.as_deref()));
+            }
         }
     }
     let encodes = iterations * token_batches.len();
-    let gpu_ms = gpu_started.elapsed().as_secs_f64() * 1e3 / encodes as f64;
+    let gpu_ms = if weights.resident_only() {
+        f64::NAN
+    } else {
+        gpu_started.elapsed().as_secs_f64() * 1e3 / encodes as f64
+    };
 
     let (fallback_embeddings, fallback_ms) = if compare_resident_ffn {
         projector.select_resident_ffn(false)?;
@@ -207,7 +215,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let (mean_cosine, min_cosine, max_abs) = embedding_metrics(&gpu_embeddings, &npu_embeddings);
+    let (mean_cosine, min_cosine, max_abs) = if gpu_embeddings.is_empty() {
+        (f32::NAN, f32::NAN, f32::NAN)
+    } else {
+        embedding_metrics(&gpu_embeddings, &npu_embeddings)
+    };
     if let (Some(fallback), Some(fallback_ms)) = (&fallback_embeddings, fallback_ms) {
         let (mean, min, max_abs) = embedding_metrics(fallback, &npu_embeddings);
         println!(
@@ -223,7 +235,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let token_count = iterations * token_batches.iter().map(Vec::len).sum::<usize>();
-    let gpu_tok_s = token_count as f64 / (gpu_ms * encodes as f64 / 1e3);
+    let gpu_tok_s = if gpu_ms.is_finite() {
+        token_count as f64 / (gpu_ms * encodes as f64 / 1e3)
+    } else {
+        f64::NAN
+    };
     let hybrid_tok_s = token_count as f64 / (npu_ms * encodes as f64 / 1e3);
     let mean_power = |samples: &[f64]| {
         (!samples.is_empty()).then(|| samples.iter().sum::<f64>() / samples.len() as f64)
@@ -236,7 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reference_model.as_deref().unwrap_or(&args[0]),
         token_batches.len(),
         token_batches.iter().map(Vec::len).collect::<Vec<_>>(),
-        gpu_embeddings[0].len(),
+        npu_embeddings[0].len(),
         npu_ms / gpu_ms,
         gpu_w.map_or_else(|| "n/a".into(), |watts| format!("{watts:.2}")),
         hybrid_w.map_or_else(|| "n/a".into(), |watts| format!("{watts:.2}")),
@@ -246,7 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             |watts| format!("{:.1}", hybrid_tok_s / watts)
         ),
     );
-    if reference_model.is_none() && min_cosine < 0.999 {
+    if reference_model.is_none() && !weights.resident_only() && min_cosine < 0.999 {
         return Err(format!("hybrid parity minimum cosine {min_cosine:.8} is below 0.999").into());
     }
     weights.free_gpu(&mut gpu);

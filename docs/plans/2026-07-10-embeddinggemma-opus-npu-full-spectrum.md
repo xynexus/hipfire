@@ -1983,3 +1983,30 @@ weight loader first; OQ8 fails its `K % 256 == 0` assertion on the K=1152 down
 projection before the resident projector can take ownership. A lean NPU-native
 weight-loading seam is therefore required before this path is independently
 servable.
+
+### R52 resident-only weight-loading checkpoint
+
+R52 removes that legacy loader dependency for the explicit resident path. A
+Gemma3 normalization scaffold loads the six norm vectors per layer and retains
+logical projection shapes, but allocates only one-element dummy projection
+buffers. `EmbeddingGemmaWeights::load_resident_npu` keeps token embeddings and
+Dense tensors host-visible, decodes Q8F16 embedding rows directly from their
+34-byte blocks without expanding the 262k-row table, and marks the result
+resident-only. The forward loop fails closed before any GPU fallback can touch
+a dummy projection, including non-M256 inputs or an unavailable resident layer.
+
+The end-to-end probe selects this loader whenever the completed resident path
+is explicitly requested without a reference model. It omits GPU parity metrics
+in that mode rather than comparing against itself. Locked self-contained M256
+smokes now open and run directly from:
+
+| artifact | hybrid ms | input tok/s | package tok/J |
+|---|---:|---:|---:|
+| OQ8++ | 1008.062 | 254.0 | 12.7 |
+| OQ4++ | 997.849 | 256.6 | 13.5 |
+
+This closes the independent-loading correctness blocker for the experimental
+M256 path. It does not widen support to other sequence lengths: resident-only
+weights intentionally reject those until the NPU layer graphs become
+shape-generic. It also does not change the performance conclusion; serialized
+context submission remains roughly two orders of magnitude from the 10k target.

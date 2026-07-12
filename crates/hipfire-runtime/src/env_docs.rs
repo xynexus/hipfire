@@ -1397,7 +1397,7 @@ pub const ENV_HIPFIRE_EMBED_E2E_TOKENS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_PROFILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_PROFILE",
     description: "Runtime variable controlling embed profile in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:174",
+    source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:182",
 };
 
 /// `HIPFIRE_EMBED_REFERENCE_MODEL` — Runtime variable controlling embed reference model in hipfire

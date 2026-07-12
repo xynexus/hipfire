@@ -413,6 +413,14 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
             )?;
         }
         let completed_layer = projector.project_layer(gpu, layer_idx, &tmp, &x_batch, m)?;
+        if weights.resident_only && !completed_layer {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "resident-only EmbeddingGemma weights require the complete M256 NPU layer path (layer {layer_idx}, rows {m})"
+                ),
+            ));
+        }
         if completed_layer && !compare_this_layer {
             if trace_phases {
                 gpu.device_synchronize()?;
