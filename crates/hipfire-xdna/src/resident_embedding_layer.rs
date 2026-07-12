@@ -85,6 +85,7 @@ pub struct NpuEmbeddingLayerAttentionDenseW8 {
     queries: DeviceBuffer,
     key_values: DeviceBuffer,
     exception_column: Option<usize>,
+    outputs_direct_x: bool,
     primed: bool,
     context_commands: usize,
 }
@@ -100,8 +101,6 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             "k=768",
             "n=1280",
             "roles=q0,q1,q2,k,v,o",
-            "tails=post-attn-norm,residual,pre-ffn-norm",
-            "output=canonical-token-major-bf16",
             "handoff=staging-prefix-dmabuf",
         ] {
             if !manifest.lines().any(|line| line == field) {
@@ -110,6 +109,27 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
                 )));
             }
         }
+        let outputs_direct_x = if manifest
+            .lines()
+            .any(|line| line == "tails=post-attn-norm,residual")
+            && manifest
+                .lines()
+                .any(|line| line == "output=canonical-token-major-x-bf16")
+        {
+            true
+        } else if manifest
+            .lines()
+            .any(|line| line == "tails=post-attn-norm,residual,pre-ffn-norm")
+            && manifest
+                .lines()
+                .any(|line| line == "output=canonical-token-major-bf16")
+        {
+            false
+        } else {
+            return Err(invalid(
+                "resident layer attention cache has unsupported output state",
+            ));
+        };
         let exception_column = if manifest
             .lines()
             .any(|line| line == "state=pre-ffn-inverse-f32")
@@ -140,6 +160,7 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             key_values: kernel.alloc_arg(KV_BYTES)?,
             kernel,
             exception_column,
+            outputs_direct_x,
             primed: false,
             context_commands: 0,
         })
@@ -159,6 +180,10 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
 
     pub const fn hidden_backing_bytes() -> usize {
         HIDDEN_BACKING_BYTES
+    }
+
+    pub const fn outputs_direct_x(&self) -> bool {
+        self.outputs_direct_x
     }
 
     pub fn attach_shared_input(&mut self, fd: i32, bytes: usize) -> Result<(), XdnaError> {
@@ -312,7 +337,7 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         if !self.primed {
             self.dispatch(weights, true)?;
             self.context_commands += 1;
-            // R34 writes its canonical H output over the staging prefix and
+            // R34/R44 writes its canonical H or X output over the staging prefix and
             // uses Q/KV scratch. The warm-up command therefore needs the same
             // reset performed by the admitted hardware oracle before the real
             // command can consume valid RoPE/norm parameters.

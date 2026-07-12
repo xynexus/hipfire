@@ -265,6 +265,10 @@ impl ResidentLayerAttentionExecutors {
         self.executor(weights).read_pre_ffn_state()
     }
 
+    fn outputs_direct_x(&self, weights: &ResidentLayerAttentionWeights) -> bool {
+        self.executor(weights).outputs_direct_x()
+    }
+
     fn executor(
         &self,
         weights: &ResidentLayerAttentionWeights,
@@ -291,7 +295,7 @@ struct ResidentLayerIo {
     residual_gpu: ImportedTensor,
     _input: SharedGttBuffer,
     residual: SharedGttBuffer,
-    _hidden: SharedGttBuffer,
+    hidden: SharedGttBuffer,
     ffn: SharedGttBuffer,
 }
 
@@ -796,8 +800,21 @@ impl NpuOpusProjector {
             Err(_) => None,
         };
         let resident_ffn_selected = resident_ffn.is_some();
-        let resident_layer_attention_path = cache_root
+        let resident_layer_attention_direct_x_path = cache_root
+            .join("embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_x_bf16_m256_k768_n1280");
+        let resident_layer_attention_h_path = cache_root
             .join("embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_m256_k768_n1280");
+        let resident_layer_attention_path = if resident_layer_attention_direct_x_path
+            .join("final.xclbin")
+            .is_file()
+            && resident_layer_attention_direct_x_path
+                .join("insts.bin")
+                .is_file()
+        {
+            resident_layer_attention_direct_x_path
+        } else {
+            resident_layer_attention_h_path
+        };
         let resident_layer_exception_39_path = cache_root.join(
             "embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_x_exception_c39_m256_k768_n1280",
         );
@@ -848,8 +865,17 @@ impl NpuOpusProjector {
                     format!("embeddinggemma NPU: load completed-layer exception-{column}: {error}")
                 })
             };
-            let exception_39 = load_exception(&resident_layer_exception_39_path, 39)?;
-            let exception_731 = load_exception(&resident_layer_exception_731_path, 731)?;
+            let direct_x_attention = attention.outputs_direct_x();
+            let exception_39 = if direct_x_attention {
+                None
+            } else {
+                load_exception(&resident_layer_exception_39_path, 39)?
+            };
+            let exception_731 = if direct_x_attention {
+                None
+            } else {
+                load_exception(&resident_layer_exception_731_path, 731)?
+            };
             let tail_cache = resident_layer_tail_path
                 .to_str()
                 .expect("UTF-8 resident layer tail cache path");
@@ -921,11 +947,15 @@ impl NpuOpusProjector {
                     .enumerate()
                     .filter_map(|(column, &bits)| (bits & 0x7fff == 0).then_some(column))
                     .collect::<Vec<_>>();
-                let selected = match zero_columns.as_slice() {
-                    [] => Some((0usize, &attention)),
-                    [39] => exception_39.as_ref().map(|executor| (39, executor)),
-                    [731] => exception_731.as_ref().map(|executor| (731, executor)),
-                    _ => None,
+                let selected = if direct_x_attention {
+                    Some((0usize, &attention))
+                } else {
+                    match zero_columns.as_slice() {
+                        [] => Some((0usize, &attention)),
+                        [39] => exception_39.as_ref().map(|executor| (39, executor)),
+                        [731] => exception_731.as_ref().map(|executor| (731, executor)),
+                        _ => None,
+                    }
                 };
                 let attention_weight = if let Some((variant, executor)) = selected {
                     let weights = executor
@@ -1416,7 +1446,7 @@ impl LinearProjector for NpuOpusProjector {
                 residual_gpu,
                 _input: input,
                 residual,
-                _hidden: hidden,
+                hidden,
                 ffn,
             });
         }
@@ -1506,10 +1536,10 @@ impl LinearProjector for NpuOpusProjector {
             .map_err(|error| {
                 hip_error(format!("completed-layer attention {layer_idx}: {error}"))
             })?;
-        let resident_hidden = state
+        let resident_output_state = state
             .attention
             .read_hidden_f32(&state.attention_weights[layer_idx])
-            .map_err(|error| hip_error(format!("read resident hidden {layer_idx}: {error}")))?;
+            .map_err(|error| hip_error(format!("read resident state {layer_idx}: {error}")))?;
         let pre_ffn_state = state
             .attention
             .read_pre_ffn_state(&state.attention_weights[layer_idx])
@@ -1549,15 +1579,50 @@ impl LinearProjector for NpuOpusProjector {
                 "embeddinggemma_resident_pre_ffn_state layer={layer_idx} finite_inverse={finite_inverse}/{rows} inverse_min={inverse_min:.7} inverse_max={inverse_max:.7} exception={exception:?}"
             );
         }
-        let reconstructed_x = reconstruct_attention_residual_bf16(
-            &resident_hidden,
-            &pre_ffn_state.inverse,
-            pre_ffn_state.exception.as_ref(),
-            &state.tail_pre_norms[layer_idx],
-            &residual,
-            rows,
-            768,
-        )?;
+        let (resident_hidden, reconstructed_x) = if state
+            .attention
+            .outputs_direct_x(&state.attention_weights[layer_idx])
+        {
+            let direct_x = resident_output_state
+                .iter()
+                .map(|value| (value.to_bits() >> 16) as u16)
+                .collect::<Vec<_>>();
+            let normalized_h = normalize_direct_x_bf16(
+                &direct_x,
+                &pre_ffn_state.inverse,
+                &state.tail_pre_norms[layer_idx],
+                rows,
+                768,
+            )?;
+            write_bf16_prefix(
+                state
+                    .io
+                    .as_mut()
+                    .expect("completed resident layer I/O")
+                    .hidden
+                    .as_mut_slice(),
+                &normalized_h,
+            )?;
+            state.ffn.sync_shared_input().map_err(|error| {
+                hip_error(format!("sync direct-X normalized H {layer_idx}: {error}"))
+            })?;
+            let normalized_h_f32 = normalized_h
+                .iter()
+                .map(|&bits| f32::from_bits((bits as u32) << 16))
+                .collect();
+            (normalized_h_f32, direct_x)
+        } else {
+            let reconstructed_x = reconstruct_attention_residual_bf16(
+                &resident_output_state,
+                &pre_ffn_state.inverse,
+                pre_ffn_state.exception.as_ref(),
+                &state.tail_pre_norms[layer_idx],
+                &residual,
+                rows,
+                768,
+            )?;
+            (resident_output_state, reconstructed_x)
+        };
         if compare_this_layer_enabled(layer_idx) {
             self.debug_resident_hidden = Some(resident_hidden);
             self.debug_resident_residual = Some(
@@ -2511,6 +2576,40 @@ fn write_residual_component(
     Ok(())
 }
 
+fn write_bf16_prefix(destination: &mut [u8], values: &[u16]) -> HipResult<()> {
+    if destination.len() < values.len() * size_of::<u16>() {
+        return Err(hip_error("direct-X normalized H backing is too small"));
+    }
+    for (encoded, &value) in destination[..values.len() * size_of::<u16>()]
+        .chunks_exact_mut(size_of::<u16>())
+        .zip(values)
+    {
+        encoded.copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn normalize_direct_x_bf16(
+    direct_x: &[u16],
+    pre_inverse: &[f32],
+    pre_norm: &[u16],
+    rows: usize,
+    width: usize,
+) -> HipResult<Vec<u16>> {
+    if direct_x.len() != rows * width || pre_inverse.len() != rows || pre_norm.len() != width {
+        return Err(hip_error("direct-X pre-FFN norm geometry mismatch"));
+    }
+    let mut output = Vec::with_capacity(direct_x.len());
+    for row in 0..rows {
+        for column in 0..width {
+            let x = f32::from_bits((direct_x[row * width + column] as u32) << 16);
+            let weight = f32::from_bits((pre_norm[column] as u32) << 16);
+            output.push(f32_to_bf16_bits(x * weight * pre_inverse[row]));
+        }
+    }
+    Ok(output)
+}
+
 fn reconstruct_attention_residual_bf16(
     hidden: &[f32],
     pre_inverse: &[f32],
@@ -2579,5 +2678,21 @@ mod tests {
         )
         .expect("packed exception reconstruction");
         assert_eq!(reconstructed, vec![x]);
+    }
+
+    #[test]
+    fn direct_x_normalization_matches_resident_equation() {
+        let normalized = normalize_direct_x_bf16(
+            &[f32_to_bf16_bits(2.0), f32_to_bf16_bits(-4.0)],
+            &[0.5],
+            &[f32_to_bf16_bits(3.0), f32_to_bf16_bits(0.25)],
+            1,
+            2,
+        )
+        .expect("direct X normalization");
+        assert_eq!(
+            normalized,
+            vec![f32_to_bf16_bits(3.0), f32_to_bf16_bits(-0.5)]
+        );
     }
 }

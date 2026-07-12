@@ -195,6 +195,13 @@ impl NpuResidentFfnDenseW8 {
         Ok(())
     }
 
+    /// Publish caller writes to the shared input before a dispatch. NPU-to-NPU
+    /// handoffs do not need this, but a host correctness bridge that rewrites
+    /// direct architectural X into normalized H does.
+    pub fn sync_shared_input(&self) -> Result<(), XdnaError> {
+        self.kernel.sync_to_device(&self.input)
+    }
+
     /// Replace the canonical output with caller-owned shared pages. The
     /// post-FFN tail can consume and overwrite those pages without a host copy.
     pub fn attach_shared_output(

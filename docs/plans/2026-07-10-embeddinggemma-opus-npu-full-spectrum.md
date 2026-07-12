@@ -1656,3 +1656,47 @@ and resident FFN projection error are comparable, rather than completed-tail
 rounding. The next correctness slice should preserve architectural X directly
 across R34, preferably as compensated fabric-resident state, before removing
 the host reconstruction boundary.
+
+### R44 direct architectural-X handoff checkpoint
+
+R44 replaces the lossy H-plus-inverse reconstruction boundary with a direct
+canonical BF16 architectural-X handoff. The first attempted design streamed
+both X and H from R34. It was rejected after exposing four independent AIE2P
+constraints: twelve simultaneous output epochs exhausted shim buffer
+descriptors; interleaved H/X records could not be scattered to distant planes
+with the available three-dimensional DMA layout; a separate 1.5 KiB pre-norm
+copy overflowed tile SRAM by 48 bytes; and the smallest dual-state core image
+still exceeded program memory by about 1.3 KiB. These failures rule out paying
+twice for state at the producer.
+
+The accepted design exports only X in the exact canonical prefix previously
+used for H. R34 keeps its original ObjectFIFO graph, DMA schedule, output byte
+count, and program-memory footprint; a compile-time tail mode simply omits the
+final pre-FFN normalization loop after X and the exact F32 inverse have been
+computed. The cache is generated under `~/.hipfire/npu/` as
+`embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_x_bf16_m256_k768_n1280`
+and declares `output=canonical-token-major-x-bf16`.
+
+The current correctness bridge reconstructs canonical H from direct X, the
+exported inverse, and the layer pre-FFN norm on the host, writes H into the same
+shared R35 input pages, and explicitly publishes the host write to the NPU.
+The tail consumes direct X, so zero learned pre-norm columns no longer require
+fixed-column exception images. This bridge is deliberately temporary: the
+next slice must fuse X-to-H normalization into the R35 consumer and remove the
+host state rewrite.
+
+Locked same-input comparisons improve every inspected layer:
+
+| boundary | layer | R43 cosine | R44 cosine | R44 max abs |
+|---|---:|---:|---:|---:|
+| architectural X | 0 | 0.99997447 | 0.99998837 | 0.6121483 |
+| completed layer | 0 | 0.99998185 | 0.99998702 | 2.7560730 |
+| completed layer | 8 | 0.99997813 | 0.99998436 | 15.4559326 |
+| completed layer | 20 | 0.99999170 | 0.99999417 | 118.5166016 |
+
+Across all 24 completed resident layers, OQ8-versus-BF16 embedding cosine rises
+from `0.99557614` to `0.99807179`, and maximum absolute error falls from
+`0.01181315` to `0.00729077`. The one-run M256 sample measures `359.6` input
+tokens/s at `21.07 W`, or `17.1` package tokens/J. It remains a hybrid
+correctness result, not a fully resident or throughput admission, because the
+host still creates H and final normalization/pooling remain outside the NPU.

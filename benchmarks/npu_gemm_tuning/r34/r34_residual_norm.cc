@@ -127,6 +127,7 @@ void r34_post_residual_pre_ffn(int8_t *restrict block0,
 #else
     metadata[row] = pre_inverse;
 #endif
+#ifndef R44_DIRECT_X_OUTPUT
     for (int block = 0; block < 3; ++block) {
       bfloat16 *values = blocks[block] + row * BLOCK_COLS;
       const int hidden_base = block * BLOCK_COLS;
@@ -139,6 +140,7 @@ void r34_post_residual_pre_ffn(int8_t *restrict block0,
                      aie::mul(normalized, pre_inverse).to_vector<bfloat16>());
       }
     }
+#endif
   }
 }
 #endif
