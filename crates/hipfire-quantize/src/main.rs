@@ -128,6 +128,33 @@ impl Oq4LdlqHessian {
 }
 
 static OQ4_LDLQ_HESSIAN: OnceLock<Oq4LdlqHessian> = OnceLock::new();
+
+/// Provenance of the `--hessian` calibration consumed by this run, stamped into
+/// the output model metadata (`"calibration"`) so a quantized artifact can
+/// self-report WHICH calibration produced it (source name + content hash). Set
+/// once when `--hessian` is first resolved; absent for RTN/data-free formats.
+static CALIB_PROVENANCE: OnceLock<serde_json::Value> = OnceLock::new();
+
+/// Compute and record `{source, xxh64, bytes}` for the calib file at `path`.
+/// The xxh64 is over the full file bytes, so any change to the calibration
+/// (corpus, prompt, token budget, Hessian payload) changes the recorded hash.
+fn stamp_calib_provenance(path: &Path) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let mut h = hipfire_quantize::hfq_out::Xxh64::new(0);
+    h.update(&bytes);
+    let source = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("calib")
+        .to_string();
+    let _ = CALIB_PROVENANCE.set(serde_json::json!({
+        "source": source,
+        "xxh64": format!("{:016x}", h.digest()),
+        "bytes": bytes.len(),
+    }));
+}
 static LDLQ_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_SUCCESS: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_MISSING: AtomicUsize = AtomicUsize::new(0);
@@ -3032,6 +3059,28 @@ fn quantize_hfq_source_tensor(
     let k = shape[1] as usize;
     let signs1 = gen_fwht_signs(42, 256);
     let signs2 = gen_fwht_signs(1042, 256);
+    // Opt-in GPU-servable fallback: keep ragged-K tensors (K not a multiple of
+    // 256, e.g. EmbeddingGemma down_proj K=1152) at Q8 across the whole Opus
+    // family instead of zero-padding to a 256 group. The GPU serving loaders
+    // assert K % 256 == 0, so padded Opus ragged tensors only load on the
+    // NPU-native path; this env keeps such artifacts loadable on GPU. Default
+    // stays padded-Opus (NPU loader), unchanged.
+    if k % 256 != 0
+        && std::env::var_os("HIPFIRE_OQ_RAGGED_Q8").is_some()
+        && matches!(
+            format,
+            HfqInputFormat::Oq3
+                | HfqInputFormat::Oq4
+                | HfqInputFormat::OqPlus
+                | HfqInputFormat::Oq6
+                | HfqInputFormat::Oq8
+                | HfqInputFormat::Oq8Plus
+                | HfqInputFormat::OqPlusTiered
+                | HfqInputFormat::OqPlusCompact
+        )
+    {
+        return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+    }
     let out = match format {
         HfqInputFormat::Q8F16 => (quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"),
         HfqInputFormat::Hfq4 => {
@@ -3192,15 +3241,6 @@ fn quantize_hfq_source_tensor(
             (q, QuantType::Oq3G256, 256, "OQ3G256")
         }
         HfqInputFormat::Oq4 | HfqInputFormat::OqPlus => {
-            // Opt-in GPU-servable fallback: keep ragged-K tensors (K not a
-            // multiple of 256, e.g. EmbeddingGemma down_proj K=1152) at Q8 instead
-            // of zero-padding to a 256 group. The GPU serving loader asserts
-            // K % 256 == 0, so padded-OQ4 ragged tensors only load on the
-            // NPU-native path; this env keeps such artifacts loadable on GPU. The
-            // default stays padded-OQ4 (NPU loader), unchanged.
-            if k % 256 != 0 && std::env::var_os("HIPFIRE_OQ_RAGGED_Q8").is_some() {
-                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
-            }
             // Opus Quant W4A4 (Oq4) / OQ+ Opus Plus W4A8 (OqPlus). IDENTICAL weight
             // quantization — symmetric signed-int4, FWHT-256, clip-search, plus the
             // shared LDLQ/AWQ calibration below — producing the same packed bytes.
@@ -4040,6 +4080,13 @@ fn run_hfq_source_pipeline(
         0,
     );
     insert_quant_format_metadata(&mut metadata, format_label);
+    // Stamp the consumed calibration's signature (source + content hash) so the
+    // artifact self-reports which calib produced it.
+    if let Some(prov) = CALIB_PROVENANCE.get() {
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("calibration".to_string(), prov.clone());
+        }
+    }
     let metadata_json =
         metadata_with_quantization_hash(metadata, &hfq_tensors, None).map_err(|e| e.to_string())?;
     write_hfq(output, hfq.arch_id, &metadata_json, &hfq_tensors, None)
@@ -5599,6 +5646,19 @@ fn main() {
     // also contribute their diagonal because H[j,j] = Σ_token x[j]² is AWQ's
     // in_sum2[j]. Keyed by the weight tensor name (AWQ looks up
     // `<...>.weight`). Ignored if --imatrix already populated IMATRIX.
+    // Stamp calib provenance (source name + content hash) for the output model
+    // metadata, regardless of whether --hessian is consumed as the AWQ imatrix,
+    // full-Hessian LDLQ, or both. Runs once; a no-op when --hessian is absent.
+    if let Some(hpath) = args
+        .iter()
+        .position(|a| a == "--hessian")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
+    {
+        if hpath.exists() {
+            stamp_calib_provenance(&hpath);
+        }
+    }
     if IMATRIX.get().is_none() {
         if let Some(hpath) = args
             .iter()
@@ -10226,6 +10286,15 @@ fn main() {
         quantized_params,
         skipped_params,
     );
+
+    // Stamp the consumed calibration's signature so the artifact self-reports
+    // which calib produced it (closes the provenance gap where only the
+    // transient quantize log recorded the calib source).
+    if let Some(prov) = CALIB_PROVENANCE.get() {
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("calibration".to_string(), prov.clone());
+        }
+    }
 
     // Write .hfq file
     eprintln!("\nWriting: {}", output_path.display());

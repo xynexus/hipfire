@@ -2225,8 +2225,31 @@ Supporting changes:
   zero-padding to a 256 group, keeping the artifact loadable on the GPU serving
   path. The default stays padded-OQ4 for the NPU-native loader.
 
-Provenance gap: the quantized model `.hfq` does NOT record the calib source or a
-calib hash — only the transient quantize log does, so an artifact cannot
-self-report which calibration produced it. Worth closing (stamp the consumed
-`.calib.hfq` digest into the output metadata). The old-calib-generated `+`/`++`
+Provenance gap: the quantized model `.hfq` did NOT record the calib source or a
+calib hash — only the transient quantize log did, so an artifact could not
+self-report which calibration produced it. The old-calib-generated `+`/`++`
 EmbeddingGemma artifacts were removed to avoid silently serving them.
+
+Follow-up (2026-07-12): gap closed and family regenerated. `hipfire-quantize`
+now stamps the consumed calib's signature into the output model metadata
+(`"calibration": {source, xxh64, bytes}`, hashed over the full calib file), so
+any artifact self-reports its calibration. The `HIPFIRE_OQ_RAGGED_Q8`
+GPU-servable fallback was generalized from OQ4 to the whole Opus family
+(OQ4/OQ8/OQ6/OQ3/tiered/compact), keeping ragged-K tensors at Q8 so calibrated
+artifacts load on the GPU serving path. The STS+prompt calib was promoted to the
+canonical `EmbeddingGemma-300M.calib.hfq` (the wikitext calibs were deleted), and
+the whole GPU-servable `+`/`++` family was requantized off it and gated through
+`embedding_quality` (STS-B dev, 1500 pairs). All admit within the 1.0-point band:
+
+| artifact | Spearman | Δ vs BF16 |
+|---|---:|---|
+| OQ8++ | 0.86156 | +0.00009 |
+| OQ8+ | 0.86153 | +0.00006 |
+| OQ4.25+ | 0.86148 | +0.00000 |
+| OQ4++ | 0.86111 | −0.00037 |
+| OQ4.25++ | 0.85999 | −0.00148 |
+| OQ4+ | 0.85891 | −0.00257 |
+| OQ4 (RTN) | 0.86190 | +0.00043 |
+
+BF16 = 0.86147. Every regenerated artifact is embedding-focused-calibrated,
+GPU-servable (Q8 ragged down_proj), and carries its calib hash in metadata.
