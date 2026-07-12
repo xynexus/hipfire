@@ -101,10 +101,35 @@ fn main() {
         )
     };
 
+    // Embedding calibration prepends the SAME document_prompt that `embed_forward`
+    // applies at inference (config document_prompt, e.g. "title: none | text: "),
+    // so the tapped activations match the served distribution instead of bare
+    // text. Opt out with `--no-calib-prompt` for a legacy unprompted calibration.
+    let calib_apply_prompt =
+        source_arch_id == 19 && !std::env::args().any(|a| a == "--no-calib-prompt");
+    let calib_doc_prompt: String = if calib_apply_prompt {
+        embeddinggemma::config_from_metadata_json(&hfq.metadata_json)
+            .expect("embeddinggemma config for calibration prompt")
+            .document_prompt
+    } else {
+        String::new()
+    };
     let embedding_samples: Vec<Vec<u32>> = if source_arch_id == 19 {
         let text = std::fs::read_to_string(&corpus).expect("read embedding corpus as UTF-8");
+        if calib_apply_prompt {
+            eprintln!("embedding calibration: prepending document_prompt {calib_doc_prompt:?}");
+        } else {
+            eprintln!("embedding calibration: --no-calib-prompt (unprompted samples)");
+        }
         let samples = tokenize_embedding_samples(&text, max_tokens, |sample| {
-            tokenizer.as_ref().unwrap().encode(sample)
+            let prompted;
+            let s: &str = if calib_apply_prompt {
+                prompted = format!("{calib_doc_prompt}{sample}");
+                &prompted
+            } else {
+                sample
+            };
+            tokenizer.as_ref().unwrap().encode(s)
         });
         if samples.is_empty() {
             panic!(
@@ -171,6 +196,7 @@ fn main() {
         ("corpus", serde_json::json!(corpus)),
         ("n_calib_tokens", serde_json::json!(n_tok)),
         ("source_arch_id", serde_json::json!(source_arch_id)),
+        ("calib_document_prompt", serde_json::json!(calib_doc_prompt)),
     ];
     let t0 = std::time::Instant::now();
     let (n_hessian, n_imatrix, max_consistency, mode) = match source_arch_id {

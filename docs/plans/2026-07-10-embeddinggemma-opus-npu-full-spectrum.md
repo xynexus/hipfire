@@ -2178,3 +2178,55 @@ is the only task signal today), and the padded `.npu.` artifacts still differ
 from their unpadded GPU comparison artifacts and cannot load through the GPU
 `quality_compare` path (K=1152 down projection), so their STS quality was not
 measured here.
+
+### OQ4++ anomaly root-caused to calibration domain (2026-07-12)
+
+The only OQ4 variant that significantly dropped (OQ4++, the LDLQ recipe) was
+traced to the calibration artifact's INPUT distribution, not to LDLQ itself.
+The EmbeddingGemma calib forward was already embedding-correct (bidirectional,
+mean-pooled, all q/k/v/o+gate/up/down taps, Dense-head capture), but the
+samples it tapped were wrong twice over: the `document_prompt` prefix that
+`embed_forward` prepends at inference was never applied, and the corpus was a
+383-token slice of wikitext, not retrieval sentences. LDLQ error feedback needs
+the full activation Hessian (confirmed full, not diagonal), so it is the recipe
+most sensitive to a mismatched input covariance — exactly the observed ordering
+(RTN and AWQ, which use no/coarse activation stats, tied BF16; only LDLQ dipped).
+
+A controlled A/B confirmed it. A new embedding-focused calib was collected
+(STS-Benchmark train sentences, the `title: none | text: ` document prompt
+applied, 4087 tokens), and OQ4++ was requantized off it; a control requantized
+off the old wikitext calib with the same current binary. Only the calib differs.
+On STS-Benchmark dev (1500 pairs, Spearman vs gold):
+
+| OQ4++ calibration | Spearman | Δ vs BF16 (95% CI) |
+|---|---:|---|
+| STS + document prompt (new) | 0.86111 | −0.00037 (−.0027,+.0020) *ns* |
+| wikitext, no prompt (old) | 0.85764 | −0.00383 (−.0065,−.0013) **sig** |
+| plain OQ4 (RTN, reference) | 0.86190 | +0.00043 *ns* |
+
+BF16 reference Spearman = 0.86147. The significant −0.00383 drop shrank ~10x to
+a non-significant −0.00037: embedding-focused calibration recovers OQ4++ to
+BF16 parity. The control reproduced the original artifact's 0.85764 exactly,
+isolating the calibration data as the sole cause. OQ4++ is therefore the
+byte-cheapest `++` W4A8 operating point at BF16-parity quality, and the repo's
+whole OQ4 family (all calibrated on the 383-token wikitext package) should be
+recalibrated embedding-focused.
+
+Caveat: the fix bundled three sub-levers (retrieval domain, document prompt,
+10x tokens); the A/B proves the bundle recovers OQ4++ but does not isolate which
+sub-lever dominates.
+
+Supporting changes:
+- `collect_artifacts` now prepends the config `document_prompt` to each arch-19
+  calibration sample (opt out with `--no-calib-prompt`) and records it in the
+  calib provenance (`calib_document_prompt`).
+- `hipfire-quantize` gained an opt-in `HIPFIRE_OQ_RAGGED_Q8`: ragged-K Opus
+  tensors (e.g. EmbeddingGemma down_proj K=1152) fall back to Q8 instead of
+  zero-padding to a 256 group, keeping the artifact loadable on the GPU serving
+  path. The default stays padded-OQ4 for the NPU-native loader.
+
+Provenance gap: the quantized model `.hfq` does NOT record the calib source or a
+calib hash — only the transient quantize log does, so an artifact cannot
+self-report which calibration produced it. Worth closing (stamp the consumed
+`.calib.hfq` digest into the output metadata). The old-calib-generated `+`/`++`
+EmbeddingGemma artifacts were removed to avoid silently serving them.

@@ -3192,6 +3192,15 @@ fn quantize_hfq_source_tensor(
             (q, QuantType::Oq3G256, 256, "OQ3G256")
         }
         HfqInputFormat::Oq4 | HfqInputFormat::OqPlus => {
+            // Opt-in GPU-servable fallback: keep ragged-K tensors (K not a
+            // multiple of 256, e.g. EmbeddingGemma down_proj K=1152) at Q8 instead
+            // of zero-padding to a 256 group. The GPU serving loader asserts
+            // K % 256 == 0, so padded-OQ4 ragged tensors only load on the
+            // NPU-native path; this env keeps such artifacts loadable on GPU. The
+            // default stays padded-OQ4 (NPU loader), unchanged.
+            if k % 256 != 0 && std::env::var_os("HIPFIRE_OQ_RAGGED_Q8").is_some() {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
             // Opus Quant W4A4 (Oq4) / OQ+ Opus Plus W4A8 (OqPlus). IDENTICAL weight
             // quantization — symmetric signed-int4, FWHT-256, clip-search, plus the
             // shared LDLQ/AWQ calibration below — producing the same packed bytes.
