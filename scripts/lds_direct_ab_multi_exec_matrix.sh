@@ -30,6 +30,9 @@ OBJDUMP="${OBJDUMP:-/opt/rocm/llvm/bin/llvm-objdump}"
 CLEAR_COREDUMP="${CLEAR_COREDUMP:-0}"
 WAIT_DEVCD_MS="${WAIT_DEVCD_MS:-8000}"
 
+clang_bin="$(readlink -m "$(dirname "$HIPCC")/../llvm/bin/clang++")"
+amdgpu_module="$(modinfo -F filename amdgpu 2>/dev/null || true)"
+
 tag_chunks="${CHUNKS//,/_}"
 tag_extra=""
 if [ "$PRE_SYNC_EACH_LAUNCH" != "0" ]; then
@@ -85,10 +88,21 @@ start_since="$(date -u '+%Y-%m-%d %H:%M:%S')"
     echo "arch=$ARCH"
     echo "build_only=$BUILD_ONLY"
     echo "hipcc=$HIPCC"
+    echo "hipcc_version=$($HIPCC --version 2>/dev/null | sed -n '1p')"
+    echo "clang=$clang_bin"
+    if [[ -x "$clang_bin" ]]; then
+        echo "clang_version=$($clang_bin --version 2>/dev/null | sed -n '1p')"
+        echo "clang_sha256=$(sha256sum "$clang_bin" | awk '{ print $1 }')"
+    fi
+    echo "amdgpu_module=$amdgpu_module"
+    if [[ -r "$amdgpu_module" ]]; then
+        echo "amdgpu_module_sha256=$(sha256sum "$amdgpu_module" | awk '{ print $1 }')"
+    fi
+    echo "amdgpu_module_version=$(modinfo -F version amdgpu 2>/dev/null || true)"
+    echo "amdgpu_module_srcversion=$(modinfo -F srcversion amdgpu 2>/dev/null || true)"
     echo "clear_coredump=$CLEAR_COREDUMP"
     echo "wait_devcd_ms=$WAIT_DEVCD_MS"
     echo "date=$start_iso"
-    "$HIPCC" --version 2>/dev/null | sed 's/^/hipcc_version=/' | head -1 || true
     "$ROCMINFO" | sed -n '/Agent 2/,/Agent 3/p' | grep -E 'Name:|Marketing Name|Vendor Name' || true
     "$ROCMSMI" --showproductname --showdriverversion || true
 } >"$dest/meta.txt"

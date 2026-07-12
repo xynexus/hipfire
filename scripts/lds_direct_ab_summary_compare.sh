@@ -68,7 +68,9 @@ function resource_sig(side, k) {
         side[k, "sgpr"] "/" side[k, "vgpr"] "/" side[k, "wavefront"];
 }
 function dmesg_sig(side, k) {
-    return side[k, "dmesg_remove_queue"] "/" side[k, "dmesg_mode2"] "/" side[k, "dmesg_gds"];
+    return side[k, "dmesg_remove_queue"] "/" side[k, "dmesg_mes_suspend"] "/" \
+        side[k, "dmesg_mes_remove_queue"] "/" side[k, "dmesg_remove_all_kfd_queues"] "/" \
+        side[k, "dmesg_mode2"] "/" side[k, "dmesg_gds"];
 }
 function devcore_sig(side, k) {
     if (side[k, "devcoredump"] != "1") {
@@ -76,7 +78,7 @@ function devcore_sig(side, k) {
     }
     return side[k, "devcore_gfxhub_page_fault"] "/" side[k, "devcore_fault_addr"] "/" \
         side[k, "devcore_prot_status"] "/" side[k, "devcore_gds_protection_fault"] "/" \
-        side[k, "devcore_gds_vm_protection_fault"];
+        side[k, "devcore_gds_vm_protection_fault"] "/" hardware_sig(side, k);
 }
 function gcvm_sig(side, k) {
     if (side[k, "devcoredump"] != "1" || side[k, "devcore_gcvm_flags"] == "") {
@@ -94,6 +96,24 @@ function gds_sig(side, k) {
         side[k, "devcore_gds_vm_flags"] "/" side[k, "devcore_gds_vm_vmid"] "/" \
         side[k, "devcore_gds_vm_addr"];
 }
+function hardware_sig(side, k) {
+    if (side[k, "devcoredump"] != "1") {
+        return "";
+    }
+    return side[k, "devcore_grbm_status"] "/" side[k, "devcore_grbm_status2"] "/" \
+        side[k, "devcore_grbm_status3"] "/" side[k, "devcore_grbm_status_se0"] "/" \
+        side[k, "devcore_hqd_nonzero_vmid_count"] "/" \
+        side[k, "devcore_hqd_dispatch_active_count"] "/" \
+        side[k, "devcore_hqd_error_count"];
+}
+function compiler_sig(side, k) {
+    return side[k, "hipcc_version"] "/" side[k, "clang_version"] "/" \
+        side[k, "clang_sha256"];
+}
+function module_sig(side, k) {
+    return side[k, "amdgpu_module"] "/" side[k, "amdgpu_module_version"] "/" \
+        side[k, "amdgpu_module_srcversion"] "/" side[k, "amdgpu_module_sha256"];
+}
 function code_same(k) {
     if (left[k, "amdgpu_isa_norm_sha256"] != "" && right[k, "amdgpu_isa_norm_sha256"] != "") {
         return same(left[k, "amdgpu_isa_norm_sha256"], right[k, "amdgpu_isa_norm_sha256"]);
@@ -108,7 +128,9 @@ function classify(k,    source_same, code_same_result, resource_same, exit_same,
     sync_same = same(left[k, "sync_failure"], right[k, "sync_failure"]);
     env_same = (same_known(left[k, "driver"], right[k, "driver"]) == "same" && \
         same_known(left[k, "gpu"], right[k, "gpu"]) == "same" && \
-        same_known(left[k, "hipcc"], right[k, "hipcc"]) == "same") ? "same" : "diff";
+        same_known(left[k, "hipcc"], right[k, "hipcc"]) == "same" && \
+        same_known(compiler_sig(left, k), compiler_sig(right, k)) == "same" && \
+        same_known(module_sig(left, k), module_sig(right, k)) == "same") ? "same" : "diff";
     build_same = same_known(left[k, "build_only"], right[k, "build_only"]);
 
     if (source_same == "diff") {
@@ -189,8 +211,10 @@ function print_both(k,    verdict) {
         same(left[k, "amdgpu_obj_sha256"], right[k, "amdgpu_obj_sha256"]), \
         same(left[k, "amdgpu_isa_norm_sha256"], right[k, "amdgpu_isa_norm_sha256"]), \
         same(resource_sig(left, k), resource_sig(right, k)), \
-        same_known(left[k, "driver"], right[k, "driver"]), \
-        same_known(left[k, "hipcc"], right[k, "hipcc"]), \
+        same_known(left[k, "driver"] "/" module_sig(left, k), \
+            right[k, "driver"] "/" module_sig(right, k)), \
+        same_known(left[k, "hipcc"] "/" compiler_sig(left, k), \
+            right[k, "hipcc"] "/" compiler_sig(right, k)), \
         same(dmesg_sig(left, k), dmesg_sig(right, k)), \
         same(devcore_sig(left, k), devcore_sig(right, k)), \
         same(gcvm_sig(left, k), gcvm_sig(right, k)), \

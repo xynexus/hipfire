@@ -169,6 +169,30 @@ __global__ void gemm_barrier_synth_probe(int M, int N, int K, int k_limit) {
     asm volatile("" ::"v"(sum));
 }
 
+// Keep the kernel body and grid identical while varying only the runtime
+// workgroup size across the gfx11 wave32 boundary. This isolates whether a
+// forced queue quiesce needs a cross-wave workgroup barrier to reproduce the
+// HIP 719 fault.
+__global__ void gemm_barrier_wavecount_probe(int M, int N, int K,
+                                             int k_limit) {
+    const int tid = static_cast<int>(threadIdx.x);
+    const int group = static_cast<int>(blockIdx.y * gridDim.x + blockIdx.x);
+    const int K_run = k_limit > 0 && k_limit < K ? k_limit : K;
+
+    float sum = static_cast<float>((group & 7) + tid);
+    for (int kt = 0; kt < K_run; kt += 6) {
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 6; ++kk) {
+            sum += static_cast<float>((tid & 7) + kk + kt) *
+                   static_cast<float>((group & 7) - kk + kt);
+        }
+        __syncthreads();
+    }
+
+    asm volatile("" ::"v"(sum));
+}
+
 template <int TILE>
 __global__ void gemm_barrier3_synth_probe(int M, int N, int K, int k_limit) {
     const int tx = threadIdx.x;
@@ -2538,6 +2562,18 @@ static int run_variant(const char* variant, const char* mode_name, int launches,
             dim3 block(6, 6, 1);
             dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
             hipLaunchKernelGGL((gemm_barrier_synth_probe<6>), grid, block, 0,
+                               0, m, n, k, k_limit);
+        } else if (std::strcmp(variant, "barrier31_synth") == 0 ||
+                   std::strcmp(variant, "barrier32_synth") == 0 ||
+                   std::strcmp(variant, "barrier33_synth") == 0 ||
+                   std::strcmp(variant, "barrier64_synth") == 0) {
+            const unsigned int threads =
+                std::strcmp(variant, "barrier31_synth") == 0 ? 31u :
+                std::strcmp(variant, "barrier32_synth") == 0 ? 32u :
+                std::strcmp(variant, "barrier33_synth") == 0 ? 33u : 64u;
+            dim3 block(threads, 1, 1);
+            dim3 grid((n + 5) / 6, (m + 5) / 6, 1);
+            hipLaunchKernelGGL(gemm_barrier_wavecount_probe, grid, block, 0,
                                0, m, n, k, k_limit);
         } else if (std::strcmp(variant, "tile6_barrier3_synth") == 0) {
             dim3 block(6, 6, 1);

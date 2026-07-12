@@ -130,6 +130,35 @@ devcore_reg_value() {
     fi
 }
 
+devcore_reg_nonzero_count() {
+    local reg="$1"
+    local path="$2"
+    if [[ -r "$path" ]]; then
+        rg -a "^${reg}[[:space:]]+" "$path" \
+            | awk '$NF != "0x00000000" { count++ } END { print count + 0 }'
+    else
+        echo 0
+    fi
+}
+
+devcore_reg_mask_count() {
+    local reg="$1"
+    local mask="$2"
+    local path="$3"
+    local count=0
+    local value raw
+    if [[ -r "$path" ]]; then
+        while read -r value; do
+            raw="$(hex_to_dec "$value")"
+            [[ -n "$raw" ]] || continue
+            if ((raw & mask)); then
+                count=$((count + 1))
+            fi
+        done < <(rg -a "^${reg}[[:space:]]+" "$path" | awk '{ print $NF }')
+    fi
+    printf '%u\n' "$count"
+}
+
 hex_to_dec() {
     local value="$1"
     if [[ "$value" =~ ^0[xX][0-9a-fA-F]+$ ]]; then
@@ -229,7 +258,7 @@ first_devcoredump() {
     find "$dir/coredumps" -maxdepth 1 -type f -name '*.data' 2>/dev/null | sort | head -1 || true
 }
 
-printf 'artifact\tactive\tblock\treads\titers\tchunks\tmode\tgrid\tarch\tbuild_only\texit\tsync_failure\thip_error\tdriver\tgpu\thipcc\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tamdgpu_isa_norm_sha256\tgroup_segment\tprivate_segment\tsgpr\tvgpr\twavefront\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tdevcore_file\tdevcore_gfxhub_page_fault\tdevcore_fault_addr\tdevcore_prot_status\tdevcore_gcvm_flags\tdevcore_gcvm_cid\tdevcore_gcvm_rw\tdevcore_gcvm_vmid\tdevcore_gds_protection_fault\tdevcore_gds_flags\tdevcore_gds_addr\tdevcore_gds_vm_protection_fault\tdevcore_gds_vm_flags\tdevcore_gds_vm_vmid\tdevcore_gds_vm_addr\tisa_s_barrier\tisa_ds\tisa_s_waitcnt\tisa_s_cbranch\tisa_ds_store_offset1\tlayout\tactive_start\tforce_wrap_cndmask\n' >"$TSV"
+printf 'artifact\tactive\tblock\treads\titers\tchunks\tmode\tgrid\tarch\tbuild_only\texit\tsync_failure\thip_error\tdriver\tgpu\thipcc\tsource_sha256\tamdgpu_obj_sha256\tamdgpu_isa_sha256\tamdgpu_isa_norm_sha256\tgroup_segment\tprivate_segment\tsgpr\tvgpr\twavefront\tdmesg_remove_queue\tdmesg_mode2\tdmesg_gds\tdevcoredump\tdevcore_file\tdevcore_gfxhub_page_fault\tdevcore_fault_addr\tdevcore_prot_status\tdevcore_gcvm_flags\tdevcore_gcvm_cid\tdevcore_gcvm_rw\tdevcore_gcvm_vmid\tdevcore_gds_protection_fault\tdevcore_gds_flags\tdevcore_gds_addr\tdevcore_gds_vm_protection_fault\tdevcore_gds_vm_flags\tdevcore_gds_vm_vmid\tdevcore_gds_vm_addr\tisa_s_barrier\tisa_ds\tisa_s_waitcnt\tisa_s_cbranch\tisa_ds_store_offset1\tlayout\tactive_start\tforce_wrap_cndmask\tdmesg_mes_suspend\tdmesg_mes_remove_queue\tdmesg_remove_all_kfd_queues\thipcc_version\tclang\tclang_version\tclang_sha256\tamdgpu_module\tamdgpu_module_version\tamdgpu_module_srcversion\tamdgpu_module_sha256\tdevcore_grbm_status\tdevcore_grbm_status_se0\tdevcore_cp_mec1_instr_pntr\tdevcore_hqd_nonzero_vmid_count\tdevcore_hqd_dispatch_active_count\tdevcore_hqd_error_count\tdevcore_grbm_status2\tdevcore_grbm_status3\n' >"$TSV"
 
 while IFS= read -r meta; do
     dir="$(dirname "$meta")"
@@ -257,6 +286,14 @@ while IFS= read -r meta; do
     arch="$(meta_value arch "$meta" | sanitize)"
     build_only="$(meta_value build_only "$meta" | sanitize)"
     hipcc="$(meta_value hipcc "$meta" | sanitize)"
+    hipcc_version="$(meta_value hipcc_version "$meta" | sanitize)"
+    clang="$(meta_value clang "$meta" | sanitize)"
+    clang_version="$(meta_value clang_version "$meta" | sanitize)"
+    clang_sha256="$(meta_value clang_sha256 "$meta" | sanitize)"
+    amdgpu_module="$(meta_value amdgpu_module "$meta" | sanitize)"
+    amdgpu_module_version="$(meta_value amdgpu_module_version "$meta" | sanitize)"
+    amdgpu_module_srcversion="$(meta_value amdgpu_module_srcversion "$meta" | sanitize)"
+    amdgpu_module_sha256="$(meta_value amdgpu_module_sha256 "$meta" | sanitize)"
     driver="$(meta_contains_value 'Driver version:' "$meta" | sed 's/.*Driver version:[[:space:]]*//' | sanitize)"
     gpu="$(meta_contains_value 'Marketing Name:' "$meta" | sed 's/.*Marketing Name:[[:space:]]*//' | sanitize)"
     exit_code="$([[ -r "$exit_file" ]] && tr -d '\n\r\t ' <"$exit_file" || true)"
@@ -271,9 +308,15 @@ while IFS= read -r meta; do
     dmesg_remove_queue="$(dmesg_delta_count 'REMOVE_QUEUE|remove queue' "$dmesg_before" "$dmesg_after")"
     dmesg_mode2="$(dmesg_delta_count 'MODE2|mode2' "$dmesg_before" "$dmesg_after")"
     dmesg_gds="$(dmesg_delta_count 'GDS|regGDS' "$dmesg_before" "$dmesg_after")"
+    dmesg_mes_suspend="$(dmesg_delta_count 'MES failed to respond to msg=SUSPEND' "$dmesg_before" "$dmesg_after")"
+    dmesg_mes_remove_queue="$(dmesg_delta_count 'MES failed to respond to msg=REMOVE_QUEUE' "$dmesg_before" "$dmesg_after")"
+    dmesg_remove_all_kfd_queues="$(dmesg_delta_count 'remove_all_kfd_queues_mes:' "$dmesg_before" "$dmesg_after")"
     dmesg_remove_queue="${dmesg_remove_queue:-0}"
     dmesg_mode2="${dmesg_mode2:-0}"
     dmesg_gds="${dmesg_gds:-0}"
+    dmesg_mes_suspend="${dmesg_mes_suspend:-0}"
+    dmesg_mes_remove_queue="${dmesg_mes_remove_queue:-0}"
+    dmesg_remove_all_kfd_queues="${dmesg_remove_all_kfd_queues:-0}"
 
     source_sha="$(short_sha256 "$dir/lds_direct_ab_phase_probe.hip")"
     amdgpu_obj="$(first_artifact_file "$dir" '*hip-amdgcn-amd-amdhsa-*.o')"
@@ -312,8 +355,16 @@ while IFS= read -r meta; do
     devcore_gds_vm_flags="$(gds_vm_fault_flags "$devcore_gds_vm_pf")"
     devcore_gds_vm_vmid="$(gds_vm_fault_vmid "$devcore_gds_vm_pf")"
     devcore_gds_vm_addr="$(gds_vm_fault_addr "$devcore_gds_vm_pf")"
+    devcore_grbm_status="$(devcore_reg_value 'regGRBM_STATUS' "$devcore")"
+    devcore_grbm_status_se0="$(devcore_reg_value 'regGRBM_STATUS_SE0' "$devcore")"
+    devcore_grbm_status2="$(devcore_reg_value 'regGRBM_STATUS2' "$devcore")"
+    devcore_grbm_status3="$(devcore_reg_value 'regGRBM_STATUS3' "$devcore")"
+    devcore_cp_mec1_instr_pntr="$(devcore_reg_value 'regCP_MEC1_INSTR_PNTR' "$devcore")"
+    devcore_hqd_nonzero_vmid_count="$(devcore_reg_nonzero_count 'regCP_HQD_VMID' "$devcore")"
+    devcore_hqd_dispatch_active_count="$(devcore_reg_mask_count 'regCP_HQD_PERSISTENT_STATE' 0x80000000 "$devcore")"
+    devcore_hqd_error_count="$(devcore_reg_nonzero_count 'regCP_HQD_ERROR' "$devcore")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$rel" "$active" "$block" "$reads" "$iters" "$chunks" "$mode" "$grid" \
         "$arch" "$build_only" "$exit_code" "$sync_failure" "$hip_error" \
         "$driver" "$gpu" "$hipcc" "$source_sha" "$amdgpu_obj_sha" \
@@ -326,7 +377,16 @@ while IFS= read -r meta; do
         "$devcore_gds_addr" "$devcore_gds_vm_pf" "$devcore_gds_vm_flags" \
         "$devcore_gds_vm_vmid" "$devcore_gds_vm_addr" "$isa_s_barrier" \
         "$isa_ds" "$isa_s_waitcnt" "$isa_s_cbranch" "$isa_ds_offset1" \
-        "$layout" "$active_start" "$force_wrap_cndmask" >>"$TSV"
+        "$layout" "$active_start" "$force_wrap_cndmask" \
+        "$dmesg_mes_suspend" "$dmesg_mes_remove_queue" \
+        "$dmesg_remove_all_kfd_queues" "$hipcc_version" "$clang" \
+        "$clang_version" "$clang_sha256" "$amdgpu_module" \
+        "$amdgpu_module_version" "$amdgpu_module_srcversion" \
+        "$amdgpu_module_sha256" "$devcore_grbm_status" \
+        "$devcore_grbm_status_se0" "$devcore_cp_mec1_instr_pntr" \
+        "$devcore_hqd_nonzero_vmid_count" \
+        "$devcore_hqd_dispatch_active_count" "$devcore_hqd_error_count" \
+        "$devcore_grbm_status2" "$devcore_grbm_status3" >>"$TSV"
 done < <(find "$ROOT" -type f -name meta.txt | sort)
 
 {
@@ -340,7 +400,7 @@ done < <(find "$ROOT" -type f -name meta.txt | sort)
     echo "|---|---:|---|---|---|---:|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---|---:|---|---|---|"
     awk -F '\t' 'NR > 1 {
         sync_failure = ($12 == "") ? " " : $12;
-        dmesg = "rq=" $26 ",mode2=" $27 ",gds=" $28;
+        dmesg = "rq=" $26 ",suspend=" $53 ",mes-rm=" $54 ",rm-all=" $55 ",mode2=" $27 ",gds=" $28;
         gds = $38 "/" $41;
         layout = ($50 == "") ? $2 : $50;
         active_start = ($51 == "") ? "0 x 0" : $51;

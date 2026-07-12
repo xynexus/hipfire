@@ -3,6 +3,25 @@
 Living notes for narrowing the intermittent, sticky HIP-719 launch failure seen
 with LDS-backed `gemm_f32_train` variants on gfx1103.
 
+## Current Status — Treated Locally, Reports Still Wanted
+
+The operational impact is treated on both maintained gfx1103/Phoenix hosts,
+nix1 and nix2. Each now boots persistently with `amdgpu.cwsr_enable=0`, and the
+former fail-side 33-thread barrier workload passes 3,000 launches; nix1's
+rollout validation included a proven HMM invalidation/KFD quiesce with no MES
+timeout or reset. The matched MES `0x8b` firmware update did not fix the
+failure, so this remains a host workaround rather than a driver, firmware, or
+hardware resolution.
+
+Guarded LDS testing may resume on a gfx1103 host only after confirming the live
+module parameter is `0`. Continue to prefer register-tiled/no-LDS production
+kernels where practical. Report any strange LDS behavior—including hangs, HIP
+719, MES timeouts/resets, nondeterministic output, or CPU/GPU parity drift—even
+if it is intermittent or self-recovers. Capture the exact kernel and launch
+shape plus `/proc/cmdline`, the live `cwsr_enable` value, kernel/ROCm versions,
+and the first failure's amdgpu dmesg. The contributor checklist is in
+[`CONTRIBUTING.md`](../../.github/CONTRIBUTING.md#gfx1103-lds-reports).
+
 ## Scope
 
 - Kernel under investigation: `kernels/src/gemm_f32_train.hip`.
@@ -3602,6 +3621,511 @@ Compare pass/fail boundary for:
 - occupancy/workgroup metadata,
 - any kernel log evidence of GPUVM fault, queue fault, ring timeout, or trap.
 
+## 2026-07-11 Queue-Fault Logging And Driver Refresh
+
+A fresh run on the same first 780M host used the promoted direct-AB probe with
+`9x4` active/block/layout, `READS=2`, `ITERS=448`, and a `512x86` grid. The
+code object remained a pure LDS/control kernel: normalized ISA hash
+`4cb8caf4588a0e72`, 288 bytes of group memory, no private segment, 2 SGPRs,
+24 VGPRs, wave32, 8 barriers, 20 DS instructions, and no global, flat,
+scratch, GDS, or trap instruction.
+
+ROCr/ROCclr/libhsakmt diagnostics were enabled with:
+
+```text
+HSA_ENABLE_VM_FAULT_MESSAGE=1
+HSA_ENABLE_QUEUE_FAULT_MESSAGE=1
+AMD_LOG_LEVEL=3
+AMD_LOG_MASK=0x10
+HSAKMT_DEBUG_LEVEL=7
+```
+
+The intended split-child pass control (`CHUNKS=130,10`) instead failed in its
+first child at zero-based `sync 60`; a following one-child `CHUNKS=140` run
+failed at `sync 130`. Exact 60- and 61-launch A/B checks then passed both with
+and without the logging environment. This does not establish that logging
+causes the fault. It does reinforce that the edge is a moving state-sensitive
+band, and that a historical pass-side chunk must be revalidated immediately
+before it is used as a live control.
+
+The user-space logs add only `HW Exception Error` immediately before HIP 719;
+they do not identify a wave or instruction. Both failures captured the same
+current coredump shape:
+
+```text
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x0000000000000000
+Protection fault status register: 0x0
+regGDS_PROTECTION_FAULT       0x3f000007
+regGDS_VM_PROTECTION_FAULT    0x0fc00113
+```
+
+The driver recovery path differed from several older artifacts: the MES
+opcode that timed out was `SUSPEND`, not `REMOVE_QUEUE`. The in-tree driver's
+ordinary process-eviction path called `suspend_all_queues_mes()`, MES did not
+answer the suspend-all request, and the driver proceeded through
+`remove_all_kfd_queues_mes`, MODE2 reset, and successful device recovery. The
+older summary's broad `REMOVE_QUEUE|remove
+queue` counter conflated `remove_all_kfd_queues_mes` with a
+`msg=REMOVE_QUEUE` timeout. The direct-AB summarizer now records exact
+`dmesg_mes_suspend`, `dmesg_mes_remove_queue`, and
+`dmesg_remove_all_kfd_queues` counters separately.
+
+The GDS registers need more cautious interpretation than earlier notes used.
+For gfx11, `0x3f000007` decodes to `WRITE_DIS`, `FAULT_DETECTED`, and `GRBM`,
+with all shader identity fields (SE/SA/WGP/SIMD/WAVE) zero and address `0xfc0`.
+`0x0fc00113` likewise includes the GDS-VM `GRBM` bit. Combined with a code
+object that has no GDS instruction, this proves the registers do not identify
+the direct-AB shader as the GDS accessor. They may describe a MES/driver GRBM
+access during the hang or recovery. Keep them as a stable fault-family
+signature, but do not treat them alone as proof that the kernel executed an
+out-of-range GDS operation.
+
+Upstream Linux at `dd3210c47e8d` contains several recovery changes absent from
+the nix1 in-tree amdgpu source:
+
+- `3fd20580b96a` avoids suspending all MES gangs for ordinary per-process
+  eviction because doing so also stops kernel queues and can cause timeouts in
+  mixed workloads.
+- `56ae73c92e20` makes the bad-queue path continue to remove the bad queue and
+  resume good queues even when suspend-all fails.
+- `eed95012c71a` adds MES hung-queue detection/reset fallback, but its support
+  gate is GC 12.1 with MES firmware revision at least `0x73`; it does not
+  provide that fallback on Phoenix/gfx1103.
+- `96f222efc9e7` adds a doorbell offset to MES11 single-user-queue
+  suspend/resume packets. It does not change the suspend-all packet used by
+  this observed path.
+
+These changes may improve containment/recovery on a newer driver, but none is
+currently evidence that the initiating gfx1103 hang is fixed. The cross-driver
+experiment below confirms that distinction: the recovery opcode changes, but
+HIP 719 and the coredump hardware signature do not.
+
+Artifacts from this pass:
+
+```text
+/tmp/hipfire-719-20260711-buildonly/
+/tmp/hipfire-719-20260711-runtime-logs/
+/tmp/hipfire-719-20260711-log-perturbation/
+/tmp/linux-719-upstream/
+```
+
+### Cross-host ROCm, interrupt, and eviction trace
+
+The promoted `9x4`, `READS=2`, `ITERS=448`, `512x86` direct-AB repro was then
+run on both Phoenix/780M hosts. The environments were similar enough to expose
+the same fault family, but not identical:
+
+- nix1 used ROCm/HIP `7.14.60850-d34cbb6409` and normalized ISA
+  `4cb8caf4588a0e72`.
+- nix2 used ROCm/HIP `7.13.26176-79e85e1468` and normalized ISA
+  `277a9cab2146459e`.
+- Resource metadata was identical: 288 bytes group memory, no private segment,
+  2 SGPRs, 24 VGPRs, wave32, 8 barriers, and 20 DS instructions. The 7.13 ISA
+  had an additional dependency `s_delay_alu` plus register-allocation and
+  backedge-placement differences.
+
+Despite that codegen drift, both hosts passed 130 launches and failed the
+140-launch arm. The first matched pair failed at zero-based sync 132 on nix1
+and 134 on nix2. Later trace-enabled runs failed at 133 and 134. This makes a
+ROCm 7.14-only compiler regression unlikely: two distinct code objects reach
+the same state-sensitive fault band and the same post-hang hardware state.
+
+The apparent driver-version match was also misleading. Both machines booted
+Ubuntu `6.17.0-35-generic`, but `modinfo` showed different loaded modules:
+
+```text
+nix1: /lib/modules/6.17.0-35-generic/kernel/drivers/gpu/drm/amd/amdgpu/amdgpu.ko.zst
+      srcversion 386085FB1FA1D414D431AE0
+nix2: /lib/modules/6.17.0-35-generic/updates/dkms/amdgpu.ko.zst
+      version 6.19.0, srcversion 881C3001B014A64D91CDFBB
+```
+
+This explains the recovery-opcode difference. The exact Ubuntu source tag
+`Ubuntu-hwe-6.17-6.17.0-35.35_24.04.1` still calls
+`suspend_all_queues_mes()` around ordinary MES process eviction. The ROCm
+6.19 DKMS source contains upstream commit `3fd20580b96a`'s behavior: ordinary
+process eviction removes the process's active MES queue directly and no
+longer suspends and resumes all gangs. Therefore the same initiating hang
+surfaces as `msg=SUSPEND` on nix1 and `msg=REMOVE_QUEUE` on nix2. This is a
+recovery-policy difference, not evidence of different initiating faults.
+
+Dynamic debug was enabled only for `event_interrupt_isr_v11` during one
+fail-side run on each host. Both produced the same two KFD-visible interrupt
+classes before recovery:
+
+```text
+client id 0x14, source id 181, vmid 8, pasid 0x8002
+context_id0/data[4] = 0x5
+```
+
+Source 181 is CP end-of-pipe, not CP bad opcode (183). No bad-opcode, SQ
+interrupt, or VM-fault interrupt was logged. The raw interrupt capture does
+not identify the fault; it shows only normal end-of-pipe events before the
+queue stops making progress. ROCclr's `HW Exception Error` is likewise
+downstream: ROCr emits `HSA_AMD_GPU_HW_EXCEPTION_EVENT` when KFD signals the
+subsequent GPU reset.
+
+`debug_evictions=Y` provided the first kernel call stacks leading into
+recovery. The first two ordinary HMM/SVM invalidations for the faulting process
+came from host page-policy activity:
+
+```text
+kcompactd -> compact_zone -> migrate_pages -> try_to_migrate
+  -> mmu_notifier -> amdgpu_hmm_invalidate_hsa
+  -> amdgpu_amdkfd_evict_userptr -> kgd2kfd_quiesce_mm
+
+task_numa_work -> change_prot_numa -> mmu_notifier
+  -> svm_range_cpu_invalidate_pagetables -> svm_range_evict
+  -> kgd2kfd_quiesce_mm
+```
+
+The second path then reached `MES failed to respond to msg=SUSPEND` and reset.
+Temporarily disabling `kernel.numa_balancing` did not prevent the fault: the
+500-launch arm still failed at sync 24, while the paired default arm failed at
+sync 133. Automatic NUMA balancing alone is therefore not the cause; page
+compaction reaches the same HMM quiesce path with NUMA balancing disabled.
+
+The two driver coredumps agree more deeply than the earlier GDS signature:
+
+```text
+regGRBM_STATUS             0xa840302c
+regGRBM_STATUS2            0x3000000c
+regGRBM_STATUS3            0x00000000
+regGRBM_STATUS_SE0         0x08000006
+nonzero CP_HQD_VMID rows   2
+DISP_ACTIVE HQD rows       1
+nonzero CP_HQD_ERROR rows  0
+```
+
+`GRBM_STATUS=0xa840302c` has GUI active, CP busy, any-active, and SPI-busy set;
+it does not have GDS-busy set. `GRBM_STATUS2=0x3000000c` has CPF and CPC busy.
+`GRBM_STATUS_SE0=0x08000006` has SE0 `SPI_BUSY` set while the clean bits remain
+set. Of the two VMID-8 HQDs, one has `DISP_ACTIVE=1`; both have zero
+`CP_HQD_ERROR` and zero dequeue status. The full hardware signature, the zero
+address/protection-status pseudo-page-fault record, and the GDS registers are
+identical across the two hosts. This is the strongest current evidence that a
+shader dispatch remains active without a reported CP/SQ/VM exception after
+quiesce fails. Because the coredump is captured after that request, it cannot
+by itself distinguish a pre-existing shader hang from a quiesce-induced hang;
+the forced-compaction controls below resolve that ambiguity.
+
+The direct-AB artifact tooling now records the full HIP/clang identity, clang
+hash, loaded amdgpu module path/version/srcversion/hash, GRBM status, MEC
+instruction pointer, and active/error HQD counts. This prevents a common
+`/opt/rocm/bin/hipcc` path from being mistaken for identical codegen and a
+common kernel release from being mistaken for an identical loaded driver.
+
+Artifacts from this trace:
+
+```text
+/tmp/hipfire-719-nix1-20260711-runtime-valid/
+/tmp/hipfire-719-nix2-20260711-runtime-valid/       # on nix2
+/tmp/hipfire-719-nix1-20260711-ih-debug/
+/tmp/hipfire-719-nix2-20260711-ih-debug/            # on nix2
+/tmp/hipfire-719-nix1-20260711-eviction-trace/
+/tmp/hipfire-719-nix1-20260711-numa-off/
+/tmp/hipfire-719-nix1-20260711-numa-on-control/
+/tmp/hipfire-719-summary-check/
+```
+
+### Deterministic HMM-compaction trigger and CWSR lead
+
+The eviction stacks enabled a causal A/B that the launch-count sweeps had
+missed. With both automatic host page-migration sources temporarily disabled:
+
+```text
+kernel.numa_balancing=0
+vm.compaction_proactiveness=0
+```
+
+the exact ROCm 7.14 `READS=2` code object completed 500 launches. Both sysctls
+were restored, and the same binary immediately failed under defaults at sync
+67. The earlier NUMA-only arm failed because proactive compaction was still
+enabled.
+
+With both automatic sources disabled, one explicit write of `1` to
+`/proc/sys/vm/compact_memory` made the failure deterministic. The fail-side
+direct-AB kernel failed at sync 56, and `debug_evictions` showed the initiating
+stack was exactly:
+
+```text
+sysctl_compaction_handler -> compact_node -> compact_zone -> migrate_pages
+  -> try_to_migrate -> mmu_notifier -> amdgpu_hmm_invalidate_hsa
+  -> amdgpu_amdkfd_evict_userptr -> kgd2kfd_quiesce_mm
+  -> MES SUSPEND timeout -> MODE2 reset
+```
+
+Controls distinguish the interaction from a generic live-queue failure:
+
+- The historically pass-side `9x4 READS=1` direct-AB kernel also failed under
+  forced compaction, at sync 100.
+- A zero-iteration/no-LDS direct-AB code object passed 5,000 launches under the
+  same forced-compaction protocol.
+- The full-shape `tile6_nolds_synth` arithmetic kernel passed 100 launches
+  under forced compaction.
+- The full-shape `tile6_barrier_synth`, which has no LDS but executes two
+  workgroup barriers per K tile, failed at sync 52 under forced compaction even
+  though it passes the ordinary 100-launch protocol.
+
+#### Exact wave32 boundary
+
+A follow-up probe removes the remaining geometry ambiguity. One kernel symbol,
+`gemm_barrier_wavecount_probe`, is launched with 31, 32, 33, or 64 threads per
+workgroup. Every arm uses the same grid, loop body, and code object; only the
+runtime block size changes. The kernel has two `s_barrier` instructions per
+loop, no LDS or private allocation, 8 VGPRs, 7 SGPRs, wave32, and WGP mode.
+ROCm 7.13 and 7.14 produce different instruction bytes but the same resource
+tuple and use the same kernel within each host's A/B.
+
+All ordinary 100-launch controls passed. With automatic NUMA balancing and
+proactive compaction disabled, explicit compaction produced this boundary:
+
+| Host | Threads | Waves/workgroup | Proven HMM/KFD eviction | Result |
+|---|---:|---:|---|---|
+| nix1, ROCm 7.14 | 31 | 1 | 9 evictions, 4 HMM invalidations | 1,500/1,500 pass |
+| nix1, ROCm 7.14 | 32 | 1 | 17 evictions, 7 HMM invalidations | 500/500 pass |
+| nix1, ROCm 7.14 | 33 | 2 | 7 evictions, 2 HMM invalidations | sync 0 HIP 719; `SUSPEND` timeout |
+| nix1, ROCm 7.14 | 64 | 2 | 9 evictions, 5 HMM invalidations | sync 0 HIP 719; `SUSPEND` timeout |
+| nix2, ROCm 7.13 | 32 | 1 | 7 evictions, 4 HMM invalidations | 3,000/3,000 pass |
+| nix2, ROCm 7.13 | 33 | 2 | 2 evictions, 1 HMM invalidation | sync 7 HIP 719; `REMOVE_QUEUE` timeout |
+
+The first nix1 31-thread attempt did not migrate any registered page and was
+discarded; the reported repeat used five compaction requests and has explicit
+eviction stacks. The same rule was applied to nix2's first 32-thread pass, which
+was repeated until its log proved HMM invalidation and KFD quiesce. A tile5
+control passed after every 33/64-thread reset.
+
+This is the sharpest causal result in the investigation: crossing from one wave
+to two waves is sufficient to turn a successful HMM/KFD quiesce into a MES
+timeout, with identical shader code and no LDS. Partial second-wave occupancy
+is not required because both 33 and 64 threads fail. The defect is therefore in
+cross-wave workgroup-barrier handling during queue preemption/quiesce, not in
+the GEMM's shared-memory addressing.
+
+Artifacts:
+
+```text
+/tmp/hipfire-719-wave-boundary-build/
+/tmp/hipfire-719-wave-boundary-normal/
+/tmp/hipfire-719-wave-boundary-forced/
+/tmp/hipfire-719-wave-boundary-build/                 # on nix2
+/tmp/hipfire-719-wave-boundary-forced-nix2-rerun/     # on nix2
+```
+
+The `/tmp` trees are live-session paths only. Before any reboot, the full
+investigation artifacts were archived to persistent storage:
+
+```text
+/home/sadara/hipfire-artifacts/gfx1103-hip719-20260711/
+  nix1-artifacts.tar.zst
+  nix1-artifacts.tar.zst.sha256
+  nix1-archive-manifest.txt
+  nix2-artifacts.tar.zst
+  nix2-artifacts.tar.zst.sha256
+  nix2-archive-manifest.txt
+```
+
+The nix1 archive contains 739 entries and has SHA-256
+`e053650585dcff2013a5d62962e2e7d676b6f554a6ff5c7c02fe04f29e79557e`.
+The nix2 archive contains 43 entries and has SHA-256
+`22f61b643ca646d99ca4922f4e875f9b2ece881e3234cb4823533ad34d8b54a6`.
+nix2 retains its own persistent copy, and the second verified copy above is on
+nix1.
+
+This supersedes the simpler "LDS kernel eventually wedges and HMM merely
+detects it" interpretation. Host page migration asks KFD/MES to quiesce or
+preempt a live compute queue; a barrier-heavy multi-wave dispatch makes that
+operation hang on gfx1103. LDS-heavy kernels are frequent victims because they
+also use recurrent workgroup barriers, but LDS access is not required by the
+new deterministic control. Arithmetic-only and empty dispatches survive the
+same forced migration.
+
+The loaded driver has `amdgpu.cwsr_enable=1`. KFD initializes the gfx11 CWSR
+trap handler, and the module describes CWSR as middle-of-wave compute
+preemption. This mechanism is consistent with a wave save/resume deadlock when
+a multi-wave workgroup is stopped around a barrier. Public ROCm issue
+[#5590](https://github.com/ROCm/ROCm/issues/5590) reports the same HIP
+`unspecified launch failure` plus MES `REMOVE_QUEUE`/`SUSPEND` family on gfx11
+and identifies `amdgpu.cwsr_enable=0` as the effective workaround; gfx1103
+users report the same workaround in ROCm discussion
+[#2631](https://github.com/ROCm/ROCm/discussions/2631). That external evidence
+matches this local mechanism, which the boot A/B below confirms locally.
+
+#### CWSR, firmware, and MES-workaround provenance
+
+The two kernel lines do not differ in their gfx11 CWSR program. Extracting the
+`cwsr_trap_gfx11_hex` symbol from each loaded module produced the same 3,528-byte
+payload and SHA-256:
+
+```text
+11e00216b4515117387d50c58f32a688f547b940ba5ddb7b4516770833e2451b
+```
+
+That payload is also byte-identical to mainline Linux v6.17, v6.19, and the
+current mainline file. The later kernel/hsakmt VGPR-allocation correction
+associated with the public gfx1151 CWSR report is explicitly gfx1151-only:
+gfx1151 receives `0x60000` bytes of VGPR save area per CU, while gfx1103 remains
+on the ordinary `0x40000` allocation. It therefore does not explain this
+gfx1103 result, and neither host is missing a newer generic gfx11 trap-handler
+payload.
+
+Disassembling that exact payload with ROCm `llvm-mc` for gfx1103 yields 684
+instructions and three `s_barrier` operations: an early conditional barrier,
+one on the LDS-save path, and one in the restore path. This makes the
+barrier/CWSR connection concrete rather than purely circumstantial: the
+preemption program itself synchronizes waves while saving or restoring state.
+The corresponding public source is `amd/amdkfd/cwsr_trap_handler_gfx10.asm`,
+compiled for gfx11 with `ASIC_FAMILY=CHIP_PLUM_BONITO`. Its early conditional
+barrier tests `ttmp1[30]` and says the `s_barrier` is issued "to unblock
+dependent waves" before the handler sends `MSG_RTN_SAVE_WAVE` readiness to
+SPI. Upstream commit `6640f8e5adb6` added that sequence with a corresponding
+firmware change, describing the fixed failure as CWSR on a workgroup with
+waves in `s_barrier` failing to back off and hanging. The local 32/33-thread
+boundary is therefore an instance of that gfx11 barrier-backoff failure family,
+although source alone cannot distinguish firmware flag/sequencing failure from
+an SQ/SPI hardware erratum. The `cwsr_enable=0` A/B below identifies the CWSR
+path as necessary for the reproduced fault.
+
+Both hosts also boot byte-identical MES firmware from the
+`amdgpu-dkms-firmware` override in `/lib/firmware/updates/amdgpu`, ahead of the
+older Ubuntu `linux-firmware` copy:
+
+```text
+gc_11_0_1_mes_2.bin  d19c9a1e1e121643...  internal/live scheduler rev 0x87
+gc_11_0_1_mes1.bin   8f2c02490e295197...  live MES_KIQ rev 0x109
+```
+
+The initramfs contains both copies, and debugfs confirms the same live MES
+`0x87`, MES_KIQ `0x109`, and MEC `0x44` revisions on nix1 and nix2. Firmware
+drift therefore cannot explain their matching fault. The
+[current upstream linux-firmware tree](https://gitlab.com/kernel-firmware/linux-firmware)
+does contain newer Phoenix files (scheduler internal rev `0x8b`, KIQ internal
+rev `0x6e`), so a firmware-refresh boot A/B remains useful, but no public
+per-revision notes establish that those opaque updates fix this barrier/CWSR
+case.
+
+#### MES scheduler `0x87` -> `0x8b` firmware boot A/B
+
+nix2 was booted with the complete matched gfx11.0.1 firmware set from
+`linux-firmware` commit `d531e213`, rather than replacing the MES scheduler in
+isolation. Debugfs proved that the live revisions changed from MES `0x87`,
+MES_KIQ `0x109`, and MEC `0x44` to MES `0x8b`, MES_KIQ `0x110`, and MEC
+`0x46`; `cwsr_enable` remained `1`. Both 32- and 33-thread ordinary 100-launch
+controls passed.
+
+Immediately after reboot the machine had 45 GiB free and explicit compaction
+did not migrate registered GPU pages, so those initial 3,000-launch passes were
+discarded as non-admission evidence. A bounded user-space allocator then held
+15 GiB resident across a deliberately fragmented 30 GiB virtual range. Under
+that same fragmentation and explicit-compaction protocol:
+
+| Threads | Proven eviction evidence | Result with MES `0x8b` |
+|---:|---|---|
+| 32 | 13 `amdgpu_hmm_invalidate_hsa` stacks, 46 `kgd2kfd_quiesce_mm` frames | 3,000/3,000 pass; no MES timeout or reset |
+| 33 | 3 `amdgpu_hmm_invalidate_hsa` stacks, 12 `kgd2kfd_quiesce_mm` frames | sync 74 HIP 719; two `REMOVE_QUEUE` timeouts and one MES reset |
+
+A post-reset tile5 control passed. Therefore scheduler `0x8b` does **not** fix
+the gfx1103 multi-wave barrier/CWSR failure, and it preserves the exact one-wave
+versus two-wave boundary. nix2 was restored byte-for-byte to its original six
+firmware override files and pre-test initramfs, rebooted, and verified live at
+MES `0x87`, MES_KIQ `0x109`, and MEC `0x44`, with NUMA balancing `1`,
+compaction proactiveness `20`, eviction debugging off, and a passing tile5
+control. Persistent evidence is archived at:
+
+```text
+/home/sadara/hipfire-artifacts/gfx1103-hip719-20260711/
+  nix2-firmware-0x8b-ab.tar.zst
+  nix2-firmware-0x8b-ab.tar.zst.sha256
+```
+
+The archive SHA-256 is
+`a1ff2368ebdedf209176f1caaad20aa63460e66a8c282b392f951e5b5fcb3f9a`.
+
+The two drivers do differ in the gfx1151-oriented MES long-running-compute
+workaround. The nix2 DKMS module enables `enable_lr_compute_wa` for scheduler
+firmware `>=0x7f`; nix1's loaded Ubuntu module does not contain that code. The
+workaround was later removed upstream because of reported instability on other
+products with newer GC microcode
+([commit 9973e64b](https://github.com/torvalds/linux/commit/9973e64bd6ee7642860a6f3b6958cbf14e89cabd)).
+Because nix1 reproduces the same initiating fault without the bit, the
+workaround is not the common trigger here. It may still affect nix2 behavior,
+but it cannot account for the cross-host result.
+
+#### Decisive `cwsr_enable=0` boot A/B
+
+nix2 was booted with `amdgpu.cwsr_enable=0` while retaining the same kernel,
+ROCm 7.13 userspace, DKMS 6.19 driver, gfx1103 hardware, and MES firmware. Both
+`/proc/cmdline` and the live read-only module parameter confirmed CWSR was off.
+The exact fail-side tests then became clean passes under proven HMM/KFD
+evictions:
+
+| CWSR-off arm | Compaction evidence | Result |
+|---|---|---|
+| 32-thread barrier-only | 1 eviction, 1 HMM invalidation | 3,000/3,000 pass |
+| 33-thread barrier-only | 5 evictions, 3 HMM invalidations | 3,000/3,000 pass |
+| original `tile6_barrier_synth` | 3 evictions, 1 HMM invalidation | 2,000/2,000 pass |
+| promoted `9x4 READS=2 ITERS=448` direct-AB | 6 evictions, 4 HMM invalidations | 500/500 pass |
+
+All arms used 20 explicit compaction requests. Their logs contain zero MES
+`SUSPEND`/`REMOVE_QUEUE` timeout and zero GPU reset. The same nix2 33-thread
+binary had failed with HIP 719 at sync 7 under CWSR-on, while CWSR-off completed
+all 3,000 launches. This proves that middle-of-wave CWSR is necessary for the
+reproduced failure; generic HMM invalidation, queue eviction, barriers, LDS, or
+MES queue removal alone are insufficient.
+
+The temporary GRUB drop-in was then removed, the original `/etc/default/grub`
+checksum was verified byte-for-byte, GRUB was regenerated without the
+parameter, and nix2 was rebooted again. The restored host has
+`cwsr_enable=1`, its original command line, NUMA balancing `1`, compaction
+proactiveness `20`, eviction tracing off, a free GPU lock, and a visible
+gfx1103 ROCm agent.
+
+The completed boot A/B is archived persistently on both hosts:
+
+```text
+/home/sadara/hipfire-artifacts/gfx1103-hip719-20260711/
+  nix2-cwsr-off-results.tar.zst
+  nix2-cwsr-off-results.tar.zst.sha256
+  nix2-cwsr-off-results-manifest.txt
+```
+
+The final 88-entry archive has SHA-256
+`ad71160c8f1e3bc8b96ba762e2141a796bf0ee03effaeb1704c64fc569ae3dc8`.
+Disabling CWSR is therefore a validated diagnostic workaround, but not yet a
+production kernel fix: it changes compute-preemption behavior and its
+scheduling/coexistence cost still needs measurement.
+
+For the dedicated text-console research role of nix1/nix2, the scheduling
+tradeoff was subsequently accepted. Both hosts now carry the isolated
+persistent GRUB drop-in
+`/etc/default/grub.d/99-hipfire-gfx1103-cwsr-off.cfg`; each base
+`/etc/default/grub` remains unchanged. After reboot, `/proc/cmdline` and the
+live module parameter on both hosts reported `amdgpu.cwsr_enable=0`. Each host
+passed a tile5 smoke test and 3,000-launch 33-thread barrier validation under
+the bounded fragmented-memory/explicit-compaction protocol. nix2's fresh
+rollout runs did not happen to migrate the probe's registered pages and remain
+smoke evidence only, with its proven-eviction admission evidence supplied by
+the boot A/B table above. nix1's rollout run did exercise the target path: one
+`amdgpu_hmm_invalidate_hsa` event and eight `kgd2kfd_quiesce_mm` frames, with
+zero MES timeout and zero reset. NUMA balancing `1`, compaction proactiveness
+`20`, and `debug_evictions=N` were restored after validation on both hosts.
+Persistent configuration, rollback, and validation evidence is mirrored on
+both hosts:
+
+```text
+nix1-persistent-cwsr-off.tar.zst  344c56bd5dfa263bc1b4fddb42987bb8d86b35cb4d6e2bfe65a10a2474b9d782
+nix2-persistent-cwsr-off.tar.zst  3c2fa8d5174eee6235025a7ab0167c50f3420fbfe710ba77abb9a1c00c5ad10c
+```
+
+Additional build/control artifacts:
+
+```text
+/tmp/hipfire-719-explicit-compaction-control-build/
+/tmp/hipfire-719-explicit-compaction-nolds-build/
+/tmp/hipfire-719-explicit-compaction-nolds-synth/
+```
+
 ## CU Mode (`-mcumode`) — Tested, Does Not Help
 
 A/B on the promoted standalone GEMM probe (`scripts/lds_gemm_standalone_probe.hip`),
@@ -3615,19 +4139,35 @@ same source built two ways on the gfx1103/780M, run `tile6 full 100 512 3072 307
 Both failed at the same point within the documented launch-count state-sensitivity
 (17 vs 19), with the same recoverable MES-reset behavior (a follow-up `tile5` control
 passed after each arm). Confining workgroups to a single CU does **not** avoid the
-fault path. Consistent with the protection-fault hypothesis: CU mode changes LDS
-layout/timing but not the OOB/over-capacity access itself, and it *halves* per-block
-LDS (128→64 KB), so it can only hurt the LDS-heavy kernels at issue. The flag was
-confirmed to flip the mode bit (`workgroup_processor_mode 1→0`) via a standalone
-compile. Conclusion unchanged: keep the no-LDS register-tiled / wave-shuffle path.
+fault path. The later forced-compaction barrier-only result supersedes the earlier
+OOB/protection-fault interpretation: CU mode does not remove workgroup barriers or
+the CWSR/MES quiesce interaction. The flag was confirmed to flip the mode bit
+(`workgroup_processor_mode 1→0`) via a standalone compile. Conclusion unchanged:
+keep the no-LDS register-tiled / wave-shuffle path.
 
 ## Working Conclusion
 
 `5546fe12`'s no-LDS register-tiled production choice is currently justified.
 The 288 GFLOP/s LDS path from `b41368bb` is not safe on gfx1103. The strongest
-current lead is not just "LDS is flaky"; LDS-only direct-HIP stress passes, but
-a multi-wave GEMM-shaped synthetic LDS loop with no global memory traffic can
-still fail, producing a MES reset path plus GDS/GDS-VM protection-fault state in
-the amdgpu coredump. A production mitigation should not be attempted until the
-standalone synthetic repro is reduced enough to identify which grid/work/ISA
-feature crosses from valid LDS use into the gfx1103 fault path.
+current lead is a gfx11 compute preemption defect, not an LDS bounds error.
+Forced host compaction deterministically drives HMM invalidation into KFD/MES
+quiesce. The exact same barrier kernel passes with one wave per workgroup and
+fails with two, on both hosts, while arithmetic-only and empty kernels pass.
+The recovered state has one VMID-8 HQD dispatch active, SE0 SPI busy, and no CP,
+SQ, or VM fault interrupt. ROCm 7.13 and 7.14 produce different ISA but
+reproduce the same wave32 boundary; different KFD recovery policies only change
+`SUSPEND` versus `REMOVE_QUEUE`. CWSR was enabled in the failing reproductions,
+and the local evidence matches the known gfx11 CWSR/MES hang family. Both
+loaded modules use the same gfx11
+CWSR payload and both hosts use the same MES firmware, while the MES LR-compute
+workaround is present only on nix2; those provenance checks remove all three as
+explanations for the cross-host difference. The completed CWSR-off boot A/B
+makes CWSR necessary for the reproduced fault: every previously failing
+multi-wave barrier/direct-AB arm passed under proven eviction with no MES
+timeout. The GDS registers remain a recovery-family signature, not proof that
+the shader accessed GDS. Production kernels should continue to avoid the
+affected barrier path. Disabling CWSR is a validated system-wide workaround,
+not a kernel-level fix; it is now persistent on both dedicated text-console
+research hosts. The matched MES `0x8b` firmware A/B did not repair the
+interaction and preserved the exact 32/33-thread boundary, so a newer firmware
+revision alone is no longer the leading remediation path.
