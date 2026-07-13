@@ -3,7 +3,8 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use hipfire_primitives::fwht::gen_fwht_signs;
+    use hipfire_primitives::conv::f32_to_bf16_bits;
+    use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
     use hipfire_xdna::{NpuGemmWholeScaled, NpuKernel};
 
     const M: usize = 256;
@@ -20,6 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const AB: usize = 6656;
     const PACKER_AB: usize = 8192;
     const WB: usize = 15872;
+    const PARAM_OFFSET: usize = 12_672;
     const PACKER_WB: usize = 16384;
     const W_BLOCKS: usize = 42;
 
@@ -32,6 +34,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let resident_shape = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
     let dense_w8 = resident_shape.lines().any(|line| line == "mode=dense-w8");
+    let direct_x_inline_norm = resident_shape
+        .lines()
+        .any(|line| line == "normalization=inline-rms-pre-ffn-norm");
+    let canonical_gate = direct_x_inline_norm
+        || resident_shape
+            .lines()
+            .any(|line| line == "input=canonical-bf16-pre-ffn-norm");
+    let interleaved_bf16x2_output = resident_shape
+        .lines()
+        .any(|line| line == "output=token-major-interleaved-bf16x2");
+    let output_row_words = resident_shape
+        .lines()
+        .find_map(|line| line.strip_prefix("output-row-words="))
+        .map(str::parse::<usize>)
+        .transpose()?
+        .unwrap_or(N);
+    let canonical_reference =
+        canonical_gate || std::env::var_os("HIPFIRE_R25_CANONICAL_REFERENCE").is_some();
+    let resident_nmacros = resident_shape
+        .lines()
+        .find_map(|line| line.strip_prefix("nmacros="))
+        .map(str::parse::<usize>)
+        .transpose()?
+        .unwrap_or(3);
+    let resident_nmacro_base = resident_shape
+        .lines()
+        .find_map(|line| line.strip_prefix("nmacro_base="))
+        .map(str::parse::<usize>)
+        .transpose()?
+        .unwrap_or(0);
     let iterations = args.get(3).map(|v| v.parse()).transpose()?.unwrap_or(20);
     let timing_only = std::env::var_os("HIPFIRE_R25_TIMING_ONLY").is_some();
     let isolated_group = std::env::var("HIPFIRE_R25_GROUP")
@@ -40,12 +72,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     let identity_down = std::env::var_os("HIPFIRE_R25_IDENTITY").is_some();
 
-    let gate_activations: Vec<i8> = (0..M * K)
-        .map(|index| signed_sample(index as u64 ^ 0xa17e_5eed, 63))
-        .collect();
-    let gate_activation_scales: Vec<f32> = (0..GATE_GROUPS)
-        .flat_map(|group| (0..M).map(move |row| 0.015 + ((row + group * 7) % 19) as f32 * 0.0003))
-        .collect();
+    let gate_awq = (0..K)
+        .map(|col| 0.7 + (col % 23) as f32 * 0.017)
+        .collect::<Vec<_>>();
+    let gate_signs1 = gen_fwht_signs(42, GROUP);
+    let gate_signs2 = gen_fwht_signs(1042, GROUP);
+    let mut canonical_bf16 = vec![0u16; PAD_M * K];
+    let (gate_activations, gate_activation_scales) = if canonical_reference {
+        let mut rounded = vec![0.0f32; M * K];
+        for row in 0..M {
+            for col in 0..K {
+                let value = ((row * 31 + col * 17) as f32 * 0.0031).sin() * 2.5
+                    + ((row + col * 3) % 11) as f32 * 0.019;
+                let bits = f32_to_bf16_bits(value);
+                canonical_bf16[row * K + col] = bits;
+                rounded[row * K + col] = f32::from_bits((bits as u32) << 16);
+            }
+        }
+        if direct_x_inline_norm {
+            for row in 0..M {
+                let row_values = &mut rounded[row * K..(row + 1) * K];
+                let square_sum = row_values.iter().map(|value| value * value).sum::<f32>();
+                let inverse = (square_sum / K as f32 + 1.0e-6).sqrt().recip();
+                row_values.iter_mut().for_each(|value| *value *= inverse);
+            }
+        }
+        let mut quantized = vec![0i8; M * K];
+        let mut scales = vec![0.0f32; GATE_GROUPS * M];
+        for row in 0..M {
+            for group in 0..GATE_GROUPS {
+                let mut rotated = [0.0f32; GROUP];
+                for inner in 0..GROUP {
+                    let col = group * GROUP + inner;
+                    rotated[inner] = rounded[row * K + col] / gate_awq[col];
+                }
+                cpu_fwht_256(&mut rotated, &gate_signs1, &gate_signs2);
+                let max_abs = rotated
+                    .iter()
+                    .fold(0.0f32, |max, value| max.max(value.abs()));
+                let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 0.0 };
+                scales[group * M + row] = scale;
+                if scale > 0.0 {
+                    for inner in 0..GROUP {
+                        quantized[row * K + group * GROUP + inner] =
+                            (rotated[inner] / scale).round().clamp(-127.0, 127.0) as i8;
+                    }
+                }
+            }
+        }
+        (quantized, scales)
+    } else {
+        (
+            (0..M * K)
+                .map(|index| signed_sample(index as u64 ^ 0xa17e_5eed, 63))
+                .collect(),
+            (0..GATE_GROUPS)
+                .flat_map(|group| {
+                    (0..M).map(move |row| 0.015 + ((row + group * 7) % 19) as f32 * 0.0003)
+                })
+                .collect(),
+        )
+    };
     let mut gate_weights = vec![vec![0i8; GROUP * PHYSICAL_GATE_N]; GATE_GROUPS];
     let mut gate_scales = vec![vec![0.0f32; PHYSICAL_GATE_N]; GATE_GROUPS];
     for group in 0..GATE_GROUPS {
@@ -65,10 +152,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let gate_packer = NpuGemmWholeScaled::load_cached(&args[1])?;
     let packed_a = gate_packer.prepack_activations(&gate_activations, &gate_activation_scales)?;
-    let mut resident_a = vec![0u8; packed_a.len() / PACKER_AB * AB];
-    for block in 0..packed_a.len() / PACKER_AB {
-        resident_a[block * AB..(block + 1) * AB]
-            .copy_from_slice(&packed_a[block * PACKER_AB..block * PACKER_AB + AB]);
+    let mut resident_a = vec![0u8; 4 * 27 * AB];
+    for row_stripe in 0..4 {
+        for m_macro in 0..3 {
+            for n_macro in 0..3 {
+                for group in 0..GATE_GROUPS {
+                    let source_outblock = m_macro * 6;
+                    let source_block = row_stripe * 54 + source_outblock * GATE_GROUPS + group;
+                    let destination_block =
+                        row_stripe * 27 + (m_macro * 3 + n_macro) * GATE_GROUPS + group;
+                    resident_a[destination_block * AB..(destination_block + 1) * AB]
+                        .copy_from_slice(
+                            &packed_a[source_block * PACKER_AB..source_block * PACKER_AB + AB],
+                        );
+                }
+            }
+        }
     }
     let gate_weight_refs = gate_weights.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let gate_scale_refs = gate_scales.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -136,13 +235,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut destination_block = 0;
         for m_macro in 0..3 {
             for n_macro in 0..3 {
-                let gate_outblock = m_macro * 3 + n_macro;
                 for group in 0..GATE_GROUPS {
+                    let source_col = stripe % 4;
+                    let source_nmacro = n_macro * 2 + stripe / 4;
+                    let source_outblock = m_macro * 6 + source_nmacro;
                     let source_block =
-                        (stripe * 27 + gate_outblock * GATE_GROUPS + group) * PACKER_WB;
+                        (source_col * 54 + source_outblock * GATE_GROUPS + group) * PACKER_WB;
                     let destination = (stripe * W_BLOCKS + destination_block) * WB;
                     packed_w[destination..destination + WB]
                         .copy_from_slice(&packed_gate_w[source_block..source_block + WB]);
+                    if canonical_gate || std::env::var_os("HIPFIRE_R25_PRECALL_PACK").is_some() {
+                        let mut params = Vec::with_capacity(3 * GROUP);
+                        params.extend_from_slice(&gate_awq[group * GROUP..(group + 1) * GROUP]);
+                        params.extend_from_slice(&gate_signs1);
+                        params.extend_from_slice(&gate_signs2);
+                        packed_w[destination + PARAM_OFFSET
+                            ..destination + PARAM_OFFSET + params.len() * size_of::<f32>()]
+                            .copy_from_slice(unsafe { as_bytes(&params) });
+                    }
                     destination_block += 1;
                 }
                 let ready: &[usize] = match n_macro {
@@ -175,19 +285,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &gate_weights,
         &gate_scales,
     );
-    let geglu = {
-        let xclbin = std::fs::read(format!("{}/final.xclbin", args[2]))?;
-        let insts = std::fs::read(format!("{}/insts.bin", args[2]))?;
-        let kernel = NpuKernel::load(&xclbin, &insts)?;
-        let mut a = kernel.alloc_arg(packed_a.len())?;
-        let mut w = kernel.alloc_arg(packed_gate_w.len())?;
-        let o = kernel.alloc_arg(PAD_M * INTER * size_of::<f32>())?;
-        a.as_mut_slice().copy_from_slice(&packed_a);
-        w.as_mut_slice().copy_from_slice(&packed_gate_w);
-        kernel.dispatch_synced(&[&a, &w, &o], &[true, true, true])?;
-        kernel.sync_output(&o)?;
-        unsafe { as_f32(o.as_slice())[..M * INTER].to_vec() }
-    };
+    let geglu = cpu_geglu.clone();
     let (gate_cosine, gate_max_abs, _, _) = metrics(&geglu, &cpu_geglu);
     let (down_activations, down_activation_scales) = prepare_down(&geglu, &awq, &signs1, &signs2);
     let reference = down_reference(
@@ -200,20 +298,160 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let xclbin = std::fs::read(format!("{}/final.xclbin", args[0]))?;
     let insts = std::fs::read(format!("{}/insts.bin", args[0]))?;
     let mut kernel = NpuKernel::load(&xclbin, &insts)?;
-    let mut a = kernel.alloc_arg(resident_a.len())?;
+    let canonical_input_bytes = canonical_bf16
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    let external_resident_a = std::env::var_os("HIPFIRE_R25_A_PAYLOAD_FILE")
+        .map(std::fs::read)
+        .transpose()?;
+    if external_resident_a
+        .as_ref()
+        .is_some_and(|payload| payload.len() != 4 * 27 * AB)
+    {
+        return Err("external resident-A payload has the wrong byte size".into());
+    }
+    let resident_a_source = external_resident_a.as_deref().unwrap_or(&resident_a);
+    if let Some(payload) = external_resident_a.as_deref() {
+        let differences = payload
+            .iter()
+            .zip(&resident_a)
+            .enumerate()
+            .filter_map(|(offset, (&got, &expected))| {
+                (got != expected).then_some((offset, got, expected))
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "external resident-A byte_differences={} first={:?}",
+            differences.len(),
+            &differences[..differences.len().min(24)]
+        );
+    }
     let gate_only_stream = std::env::var_os("HIPFIRE_R25_GATE_ONLY_STREAM").is_some();
-    let w_payload = if gate_only_stream {
-        packed_gate_w.as_slice()
+    let gate_only_activations = if gate_only_stream && !canonical_gate {
+        let blocks_per_stripe = 3 * resident_nmacros * GATE_GROUPS;
+        let mut reduced = vec![0u8; 4 * blocks_per_stripe * AB];
+        for core_row in 0..4 {
+            for mblock in 0..3 {
+                for nblock in 0..resident_nmacros {
+                    for group in 0..GATE_GROUPS {
+                        let source_nblock = resident_nmacro_base + nblock;
+                        let source_block =
+                            core_row * 27 + mblock * 9 + source_nblock * GATE_GROUPS + group;
+                        let destination_block = core_row * blocks_per_stripe
+                            + (mblock * resident_nmacros + nblock) * GATE_GROUPS
+                            + group;
+                        reduced[destination_block * AB..(destination_block + 1) * AB]
+                            .copy_from_slice(
+                                &resident_a_source[source_block * AB..(source_block + 1) * AB],
+                            );
+                    }
+                }
+            }
+        }
+        Some(reduced)
+    } else {
+        None
+    };
+    let a_payload = if canonical_gate {
+        canonical_input_bytes.as_slice()
+    } else if let Some(reduced) = gate_only_activations.as_deref() {
+        reduced
+    } else {
+        resident_a_source
+    };
+    let mut a = kernel.alloc_arg(a_payload.len())?;
+    let gate_only_weights = if gate_only_stream {
+        let blocks_per_col = 3 * resident_nmacros * GATE_GROUPS;
+        let mut reduced = vec![0u8; COLS * blocks_per_col * WB];
+        let nblock_offsets = [0usize, 4, 9];
+        for stripe in 0..COLS {
+            for mblock in 0..3 {
+                for nblock in 0..resident_nmacros {
+                    for group in 0..GATE_GROUPS {
+                        let source_nblock = resident_nmacro_base + nblock;
+                        let source_block =
+                            stripe * W_BLOCKS + mblock * 14 + nblock_offsets[source_nblock] + group;
+                        let destination_block = stripe * blocks_per_col
+                            + (mblock * resident_nmacros + nblock) * GATE_GROUPS
+                            + group;
+                        reduced[destination_block * WB..(destination_block + 1) * WB]
+                            .copy_from_slice(&packed_w[source_block * WB..(source_block + 1) * WB]);
+                    }
+                }
+            }
+        }
+        Some(reduced)
+    } else {
+        None
+    };
+    let w_payload = if let Some(reduced) = gate_only_weights.as_deref() {
+        reduced
     } else {
         packed_w.as_slice()
     };
     let mut w = kernel.alloc_arg(w_payload.len())?;
-    let c = kernel.alloc_arg(PAD_M * N * size_of::<f32>())?;
-    a.as_mut_slice().copy_from_slice(&resident_a);
+    let c = kernel.alloc_arg(PAD_M * output_row_words * size_of::<f32>())?;
+    a.as_mut_slice().copy_from_slice(a_payload);
     w.as_mut_slice().copy_from_slice(w_payload);
     kernel.dispatch_synced(&[&a, &w, &c], &[true, true, true])?;
     kernel.sync_output(&c)?;
-    let output = unsafe { as_f32(c.as_slice()) };
+    let decoded_output;
+    let output = if interleaved_bf16x2_output {
+        let output_bytes = c.as_slice();
+        decoded_output = (0..PAD_M)
+            .flat_map(|row| {
+                (0..N).map(move |column| {
+                    let offset = (row * output_row_words + column) * size_of::<u32>();
+                    &output_bytes[offset..offset + size_of::<u32>()]
+                })
+            })
+            .map(|word| {
+                let high = u16::from_le_bytes([word[0], word[1]]);
+                let low = u16::from_le_bytes([word[2], word[3]]);
+                f32::from_bits((high as u32) << 16) + f32::from_bits((low as u32) << 16)
+            })
+            .collect::<Vec<_>>();
+        decoded_output.as_slice()
+    } else {
+        unsafe { as_f32(c.as_slice()) }
+    };
+    if std::env::var_os("HIPFIRE_R25_GATE_RAW_ONLY").is_some() {
+        let probe_row = std::env::var("HIPFIRE_R25_PROBE_GLOBAL_ROW")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(0);
+        let expected = raw_gate_reference(
+            &gate_activations,
+            &gate_activation_scales,
+            &gate_weights,
+            &gate_scales,
+            2,
+            resident_nmacro_base,
+        );
+        let got_row = &output[probe_row * N..(probe_row + 1) * N];
+        let expected_row = &expected[probe_row * N..(probe_row + 1) * N];
+        let (cosine, max_abs, mean_abs, max_reference) = metrics(got_row, expected_row);
+        let allowed = 2.0e-5 + max_reference * 2.0e-5;
+        let mismatches = got_row
+            .iter()
+            .zip(expected_row)
+            .enumerate()
+            .filter_map(|(col, (&got, &want))| {
+                ((got - want).abs() > allowed).then_some((col, got, want))
+            })
+            .take(24)
+            .collect::<Vec<_>>();
+        eprintln!(
+            "gate-raw-only row={probe_row} nblock={resident_nmacro_base} cosine={cosine:.8} max_abs={max_abs:.7} mean_abs={mean_abs:.8} mismatches={mismatches:?}"
+        );
+        return if cosine >= 0.999_999 && max_abs <= allowed {
+            Ok(())
+        } else {
+            Err("resident FFN gate raw-only probe failed".into())
+        };
+    }
     if std::env::var_os("HIPFIRE_R25_RAW_GATE_PROBE").is_some() {
         let raw_group = std::env::var("HIPFIRE_R25_RAW_GROUP")
             .ok()
@@ -411,8 +649,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut results = Vec::with_capacity(COLS * GATE_GROUPS);
         for stripe in 0..COLS {
             for group in 0..GATE_GROUPS {
-                let got_a = physical[row * N + stripe * 96 + 2 * group] as u32;
-                let got_w = physical[row * N + stripe * 96 + 2 * group + 1] as u32;
+                let got_a = physical[row * N + stripe * 96 + 32 + 2 * group] as u32;
+                let got_w = physical[row * N + stripe * 96 + 32 + 2 * group + 1] as u32;
                 let a_base =
                     (probe_core_row * 27 + probe_mblock * 9 + probe_nblock * 3 + group) * AB;
                 let nblock_offset = [0, 4, 9][probe_nblock];
@@ -430,6 +668,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_map(|(block, bytes)| (fnv(&bytes[..6240]) == first_a).then_some(block))
             .collect::<Vec<_>>();
         eprintln!("gate-input A candidates for first hash={a_candidates:?}");
+        if canonical_gate {
+            let canonical_bytes = canonical_bf16
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            let mut source_results = Vec::new();
+            for stripe in 0..COLS {
+                for group in 0..GATE_GROUPS {
+                    let got = physical[row * N + stripe * 96 + 38 + group] as u32;
+                    let source_row = probe_mblock * 96 + probe_core_row * 24 + stripe * 3;
+                    let mut source = Vec::with_capacity(3 * GROUP * 2);
+                    for local_row in 0..3 {
+                        let offset = (source_row + local_row) * K * 2 + group * GROUP * 2;
+                        source.extend_from_slice(&canonical_bytes[offset..offset + GROUP * 2]);
+                    }
+                    source_results.push((stripe, group, got, fnv(&source)));
+                }
+            }
+            eprintln!("canonical source hashes={source_results:#x?}");
+            let probe_group = std::env::var("HIPFIRE_R25_PROBE_GROUP")
+                .ok()
+                .map(|value| value.parse::<usize>())
+                .transpose()?
+                .unwrap_or(1);
+            let mut got_q = Vec::with_capacity(GROUP);
+            for stripe in 0..COLS {
+                got_q.extend(
+                    physical[row * N + stripe * 96..row * N + stripe * 96 + 32]
+                        .iter()
+                        .map(|value| *value as i8),
+                );
+            }
+            let expected_q = &gate_activations
+                [row * K + probe_group * GROUP..row * K + (probe_group + 1) * GROUP];
+            let q_mismatches = got_q
+                .iter()
+                .zip(expected_q)
+                .enumerate()
+                .filter_map(|(inner, (&got, &expected))| {
+                    (got != expected).then_some((inner, got, expected))
+                })
+                .take(24)
+                .collect::<Vec<_>>();
+            eprintln!("canonical packed row={row} group={probe_group} mismatches={q_mismatches:?}");
+            let expected_scale = gate_activation_scales[probe_group * M + row];
+            let got_scales = (0..COLS)
+                .map(|stripe| f32::from_bits(physical[row * N + stripe * 96 + 48] as u32))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "canonical packed row={row} group={probe_group} scales={got_scales:?} expected_scale={expected_scale:?}"
+            );
+            let gate_activations_ref = &gate_activations;
+            let all_q_mismatches = (0..M)
+                .flat_map(|test_row| {
+                    (0..GROUP).filter_map(move |inner| {
+                        let stripe = inner / 32;
+                        let lane = inner % 32;
+                        let got = physical[test_row * N + stripe * 96 + lane] as i8;
+                        let expected =
+                            gate_activations_ref[test_row * K + probe_group * GROUP + inner];
+                        (got != expected).then_some((test_row, inner, got, expected))
+                    })
+                })
+                .take(24)
+                .collect::<Vec<_>>();
+            let all_scale_mismatches = (0..M)
+                .filter_map(|test_row| {
+                    let got = f32::from_bits(physical[test_row * N + 48] as u32);
+                    let expected = gate_activation_scales[probe_group * M + test_row];
+                    (got.to_bits() != expected.to_bits()).then_some((test_row, got, expected))
+                })
+                .take(24)
+                .collect::<Vec<_>>();
+            eprintln!(
+                "canonical packed group={probe_group} all_q_mismatches={all_q_mismatches:?} all_scale_mismatches={all_scale_mismatches:?}"
+            );
+        }
         return if results
             .iter()
             .all(|(_, _, got_a, expected_a, got_w, expected_w)| {
@@ -458,7 +773,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let stripe = col / 48;
                     let local_col = col % 48;
                     let got = output[row * N + stripe * 96 + local_col];
-                    let expected = expected_gate[row * INTER + col];
+                    let expected = expected_gate[row * INTER + resident_nmacro_base * 384 + col];
                     (got.to_bits() != expected.to_bits()).then_some((row, col, got, expected))
                 })
             })
@@ -467,6 +782,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "gate-row probe local_row={probe_row} global_row={global_row:?} mismatches={mismatches:?}"
         );
+        if std::env::var_os("HIPFIRE_R25_GATE_ACTIVATION_HASH").is_some() {
+            let hash_row = global_row.unwrap_or(probe_row);
+            let hashes = (0..COLS)
+                .map(|stripe| {
+                    (0..2 * GATE_GROUPS)
+                        .map(|group| output[hash_row * N + stripe * 96 + 48 + group].to_bits())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            eprintln!("gate-row probe activation_hashes={hashes:#x?}");
+        }
+        if let Some(target_row) = global_row.filter(|_| !mismatches.is_empty()) {
+            let got = (0..384)
+                .map(|col| {
+                    let stripe = col / 48;
+                    let local_col = col % 48;
+                    output[target_row * N + stripe * 96 + local_col]
+                })
+                .collect::<Vec<_>>();
+            let mut row_candidates = (0..M)
+                .map(|candidate| {
+                    let start = candidate * INTER + resident_nmacro_base * 384;
+                    let (cosine, max_abs, _, _) = metrics(&got, &expected_gate[start..start + 384]);
+                    (candidate, cosine, max_abs)
+                })
+                .collect::<Vec<_>>();
+            row_candidates.sort_by(|left, right| right.1.total_cmp(&left.1));
+            row_candidates.truncate(12);
+            eprintln!("gate-row probe closest_expected_rows={row_candidates:?}");
+            let group_candidates = (1u8..8)
+                .map(|mask| {
+                    let candidate = gate_reference_mask(
+                        &gate_activations,
+                        &gate_activation_scales,
+                        &gate_weights,
+                        &gate_scales,
+                        target_row,
+                        resident_nmacro_base,
+                        mask,
+                    );
+                    let (cosine, max_abs, _, _) = metrics(&got, &candidate);
+                    (mask, cosine, max_abs)
+                })
+                .collect::<Vec<_>>();
+            eprintln!("gate-row probe group_candidates={group_candidates:?}");
+        }
         if !timing_only {
             return if mismatches.is_empty() {
                 Ok(())
@@ -968,6 +1329,49 @@ fn gate_reference(
             );
             output[row * INTER + col] = 0.5 * gate * (1.0 + tanh) * up;
         }
+    }
+    output
+}
+
+#[cfg(target_os = "linux")]
+fn gate_reference_mask(
+    activations: &[i8],
+    activation_scales: &[f32],
+    weights: &[Vec<i8>],
+    scales: &[Vec<f32>],
+    row: usize,
+    nblock: usize,
+    group_mask: u8,
+) -> Vec<f32> {
+    const M: usize = 256;
+    const GROUP: usize = 256;
+    const PN: usize = 2304;
+    let mut output = vec![0.0; 384];
+    for (local_col, result) in output.iter_mut().enumerate() {
+        let logical_col = nblock * 384 + local_col;
+        let mut projected = [0.0f32; 2];
+        for (role, value) in projected.iter_mut().enumerate() {
+            let stripe = logical_col / 48;
+            let pcol = stripe * 96 + role * 48 + logical_col % 48;
+            for group in 0..3 {
+                if group_mask & (1 << group) == 0 {
+                    continue;
+                }
+                let dot: i32 = (0..GROUP)
+                    .map(|kk| {
+                        activations[row * 768 + group * GROUP + kk] as i32
+                            * weights[group][kk * PN + pcol] as i32
+                    })
+                    .sum();
+                *value += dot as f32 * activation_scales[group * M + row] * scales[group][pcol];
+            }
+        }
+        let gate = projected[0];
+        let up = projected[1];
+        let tanh = hipfire_primitives::conv::round_f32_to_bf16(
+            (0.797_884_6 * (gate + 0.044_715 * gate.powi(3))).tanh(),
+        );
+        *result = 0.5 * gate * (1.0 + tanh) * up;
     }
     output
 }

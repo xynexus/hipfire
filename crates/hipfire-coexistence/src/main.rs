@@ -32,6 +32,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Some("lora"), Some("merge")) => lora_merge(&args[2..]),
         (Some("lora"), Some("convert")) => lora_convert(&args[2..]),
         (Some("import"), Some("gguf")) => import_gguf(&args[2..]),
+        #[cfg(target_os = "linux")]
+        (Some("npu"), Some("pair-hfp")) => npu_pair_hfp(&args[2..]),
         _ => {
             usage();
             std::process::exit(2);
@@ -48,8 +50,24 @@ fn usage() {
          lora merge   --hfq <base.hfq> --adapter <adapter.lora> --out <merged.hfq>\n\
          lora convert --in <adapter.lora.{{hfq,json}}> --out <adapter.lora.{{hfq,json}}>\n\
          import gguf  --in <model.gguf> --out <model.hfq> --format <FMT> \
-         [--no-kmap] [--kmap-dense] [--kmap-mode full|alt|typed] [--arch-id N]"
+         [--no-kmap] [--kmap-dense] [--kmap-mode full|alt|typed] [--arch-id N]\n\
+         npu pair-hfp --in <whole-scaled.rdna2.hfp> --out <paired.rdna2.hfp>"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn npu_pair_hfp(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let flags = Flags::parse(args)?;
+    let input = PathBuf::from(flags.req("in")?);
+    let output = PathBuf::from(flags.req("out")?);
+    let payload =
+        hipfire_xdna::NpuOpusExecutor::prepack_paired_whole_scaled_cached(&output, &input)?;
+    eprintln!(
+        "wrote paired whole-scaled NPU HFP: {} payload bytes -> {}",
+        payload.len(),
+        output.display()
+    );
+    Ok(())
 }
 
 /// Import a GGUF checkpoint, re-quantizing its weights to a native `.hfq`

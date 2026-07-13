@@ -61,12 +61,34 @@ pub const GEM_CLOSE_REQUEST: u64 = ioc(
     core::mem::size_of::<GemClose>() as u64,
 );
 
+/// `DRM_IOCTL_PRIME_HANDLE_TO_FD` — export a GEM handle as a dma-buf fd.
+/// This is a core DRM ioctl, not an amdxdna command ioctl.
+pub const PRIME_HANDLE_TO_FD_REQUEST: u64 = ioc(
+    IOC_READ_WRITE,
+    DRM_TYPE,
+    0x2D,
+    core::mem::size_of::<PrimeHandle>() as u64,
+);
+
+/// Core DRM PRIME export flags from `drm.h`.
+pub const DRM_CLOEXEC: u32 = 0x1;
+pub const DRM_RDWR: u32 = 0x2;
+
 /// struct drm_gem_close (core DRM).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GemClose {
     pub handle: u32,
     pub pad: u32,
+}
+
+/// `struct drm_prime_handle` (core DRM).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PrimeHandle {
+    pub handle: u32,
+    pub flags: u32,
+    pub fd: i32,
 }
 
 pub const CREATE_HWCTX_REQUEST: u64 = iowr!(DRM_AMDXDNA_CREATE_HWCTX, CreateHwctx);
@@ -295,6 +317,13 @@ mod tests {
     fn dpu_packet_rejects_too_many_args() {
         dpu_cmd_packet(0, 0, &[0; 6]);
     }
+
+    #[test]
+    fn prime_export_abi_matches_core_drm() {
+        assert_eq!(core::mem::size_of::<PrimeHandle>(), 12);
+        assert_eq!(PRIME_HANDLE_TO_FD_REQUEST, 0xC00C_642D);
+        assert_eq!(DRM_CLOEXEC | DRM_RDWR, 3);
+    }
 }
 const _: () = assert!(core::mem::size_of::<QosInfo>() == 24);
 const _: () = assert!(core::mem::size_of::<CreateHwctx>() == 56);
@@ -305,3 +334,4 @@ const _: () = assert!(core::mem::size_of::<CreateBo>() == 32);
 const _: () = assert!(core::mem::size_of::<GetBoInfo>() == 48);
 const _: () = assert!(core::mem::size_of::<SyncBo>() == 24);
 const _: () = assert!(core::mem::size_of::<ExecCmd>() == 56);
+const _: () = assert!(core::mem::size_of::<PrimeHandle>() == 12);

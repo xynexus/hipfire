@@ -28,8 +28,10 @@ pub struct NpuEmbeddingNextLayerPrepW8Params {
 
 pub struct NpuEmbeddingNextLayerPrepW8 {
     kernel: NpuKernel,
-    completed: DeviceBuffer,
+    completed: Option<DeviceBuffer>,
     output: DeviceBuffer,
+    output_prefix_offset: usize,
+    in_place: bool,
 }
 
 impl NpuEmbeddingNextLayerPrepW8 {
@@ -53,9 +55,25 @@ impl NpuEmbeddingNextLayerPrepW8 {
             &std::fs::read(format!("{cache}/final.xclbin")).map_err(XdnaError::Open)?,
             &std::fs::read(format!("{cache}/insts.bin")).map_err(XdnaError::Open)?,
         )?;
+        let output_prefix_offset = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("output-prefix-offset="))
+            .map(str::parse::<usize>)
+            .transpose()
+            .map_err(|_| invalid("invalid next-layer output prefix offset"))?
+            .unwrap_or(0);
+        let in_place = manifest
+            .lines()
+            .any(|line| line == "buffer-mode=in-place-disjoint-prefix-suffix");
+        let output_bytes = output_prefix_offset + R34_INPUT_BYTES;
+        let output = kernel.alloc_arg(output_bytes)?;
         Ok(Self {
-            completed: kernel.alloc_arg(COMPLETED_BYTES)?,
-            output: kernel.alloc_arg(R34_INPUT_BYTES)?,
+            completed: (!in_place)
+                .then(|| kernel.alloc_arg(COMPLETED_BYTES))
+                .transpose()?,
+            output,
+            output_prefix_offset,
+            in_place,
             kernel,
         })
     }
@@ -68,7 +86,11 @@ impl NpuEmbeddingNextLayerPrepW8 {
         COMPLETED_BYTES
     }
 
-    pub const fn output_bytes() -> usize {
+    pub fn output_bytes(&self) -> usize {
+        self.output_prefix_offset + R34_INPUT_BYTES
+    }
+
+    pub const fn canonical_output_bytes() -> usize {
         R34_INPUT_BYTES
     }
 
@@ -79,13 +101,24 @@ impl NpuEmbeddingNextLayerPrepW8 {
         output_fd: i32,
         output_bytes: usize,
     ) -> Result<(), XdnaError> {
-        if completed_bytes != COMPLETED_BYTES || output_bytes != R34_INPUT_BYTES {
+        if completed_bytes != COMPLETED_BYTES || output_bytes != self.output_bytes() {
             return Err(invalid("next-layer prep shared dma-buf size mismatch"));
         }
-        self.completed = self
-            .kernel
-            .import_dmabuf(completed_fd, completed_bytes, true)?;
-        self.output = self.kernel.import_dmabuf(output_fd, output_bytes, true)?;
+        if self.in_place {
+            if completed_fd != output_fd {
+                return Err(invalid(
+                    "in-place next-layer prep requires one shared dma-buf",
+                ));
+            }
+            self.output = self.kernel.import_dmabuf(output_fd, output_bytes, true)?;
+        } else {
+            self.completed = Some(self.kernel.import_dmabuf(
+                completed_fd,
+                completed_bytes,
+                true,
+            )?);
+            self.output = self.kernel.import_dmabuf(output_fd, output_bytes, true)?;
+        }
         Ok(())
     }
 
@@ -155,10 +188,21 @@ impl NpuEmbeddingNextLayerPrepW8 {
         if params.buffer.len() != PARAM_TOTAL_BYTES {
             return Err(invalid("next-layer prep parameter size mismatch"));
         }
-        self.kernel.dispatch_synced(
-            &[&self.completed, &params.buffer, &self.output],
-            &[false, false, false],
-        )?;
+        if self.in_place {
+            self.kernel
+                .dispatch_synced(&[&self.output, &params.buffer], &[false, false])?;
+        } else {
+            self.kernel.dispatch_synced(
+                &[
+                    self.completed
+                        .as_ref()
+                        .expect("non-in-place prep has completed input"),
+                    &params.buffer,
+                    &self.output,
+                ],
+                &[false, false, false],
+            )?;
+        }
         self.kernel.sync_output(&self.output)
     }
 
@@ -166,12 +210,22 @@ impl NpuEmbeddingNextLayerPrepW8 {
         if bytes.len() != COMPLETED_BYTES {
             return Err(invalid("next-layer completed-state size mismatch"));
         }
-        self.completed.as_mut_slice().copy_from_slice(bytes);
-        self.kernel.sync_to_device(&self.completed)
+        if self.in_place {
+            self.output.as_mut_slice()[..COMPLETED_BYTES].copy_from_slice(bytes);
+            self.kernel.sync_to_device(&self.output)
+        } else {
+            let completed = self
+                .completed
+                .as_mut()
+                .expect("non-in-place prep has completed input");
+            completed.as_mut_slice().copy_from_slice(bytes);
+            self.kernel.sync_to_device(completed)
+        }
     }
 
     pub fn output_prefixes(&self) -> &[u8] {
-        self.output.as_slice()
+        &self.output.as_slice()
+            [self.output_prefix_offset..self.output_prefix_offset + R34_INPUT_BYTES]
     }
 }
 
@@ -187,7 +241,10 @@ mod tests {
     fn geometry_matches_r34_and_r46() {
         assert_eq!(NpuEmbeddingNextLayerPrepW8::rows(), 256);
         assert_eq!(NpuEmbeddingNextLayerPrepW8::completed_bytes(), 884_736);
-        assert_eq!(NpuEmbeddingNextLayerPrepW8::output_bytes(), 2_949_120);
+        assert_eq!(
+            NpuEmbeddingNextLayerPrepW8::canonical_output_bytes(),
+            2_949_120
+        );
         assert_eq!(PARAM_BYTES, 3_072);
         assert_eq!(PARAM_TOTAL_BYTES, 36_864);
     }

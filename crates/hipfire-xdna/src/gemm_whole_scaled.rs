@@ -2,7 +2,9 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
+use std::path::Path;
 
+use crate::opus_hfp::{self, OpusHfpDescriptor, OpusHfpEncoding, OpusHfpLayout};
 use crate::{DeviceBuffer, NpuKernel, NpuWholeMode, XdnaError};
 
 const ROW_STRIPES: usize = 4;
@@ -285,6 +287,53 @@ impl NpuGemmWholeScaled {
 
     pub fn packed_weight_bytes(&self) -> usize {
         self.cols * self.inblocks() * W_BLOCK
+    }
+
+    fn hfp_descriptor(&self, quant_type: u8) -> OpusHfpDescriptor {
+        OpusHfpDescriptor {
+            encoding: match self.layout.mode {
+                NpuWholeMode::W4 => OpusHfpEncoding::W4,
+                NpuWholeMode::W8 => OpusHfpEncoding::W8,
+            },
+            layout: OpusHfpLayout::WholeScaledV1,
+            quant_type: quant_type.into(),
+            flags: 0,
+            m: self.rows as u32,
+            k: self.k() as u32,
+            n: self.n as u32,
+            columns: self.cols as u32,
+            groups: self.groups as u32,
+            m_macros: self.m_macros as u32,
+            n_macros: self.n_macros as u32,
+            outblocks: self.outblocks as u32,
+            tile_bytes: W_BLOCK as u32,
+            data_bytes: W_DATA as u32,
+            scale_offset: W_DATA as u32,
+            scale_values: self.layout.cols_stripe as u32,
+            payload_bytes: self.packed_weight_bytes() as u64,
+            segment_bytes: [0; 4],
+        }
+    }
+
+    /// Load an already converted `.rdna2.hfp` weight stream, or create it once
+    /// from the source Opus tensor. Only global block/tile ordering happens
+    /// here; W4 nibbles remain packed for the AIE kernel to decode and swizzle.
+    pub(crate) fn prepack_weights_cached(
+        &self,
+        path: &Path,
+        quant_type: u8,
+        source_payload: &[u8],
+        weights: &[&[i8]],
+        scales: &[&[f32]],
+    ) -> Result<Vec<u8>, XdnaError> {
+        let descriptor = self.hfp_descriptor(quant_type);
+        let source_sha = opus_hfp::source_sha256(&[source_payload]);
+        if let Some(packed) = opus_hfp::read(path, descriptor, source_sha).map_err(invalid)? {
+            return Ok(packed);
+        }
+        let packed = self.prepack_weights(weights, scales)?;
+        opus_hfp::write(path, descriptor, source_sha, &packed).map_err(invalid)?;
+        Ok(packed)
     }
 
     /// Pack W4 `[256,N]` groups and their per-column scales into persistent,

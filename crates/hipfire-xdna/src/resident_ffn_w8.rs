@@ -75,6 +75,23 @@ pub struct NpuResidentFfnDenseW8 {
 
 impl NpuResidentFfnDenseW8 {
     pub fn load_cached(cache: &str) -> Result<Self, XdnaError> {
+        let xclbin = std::fs::read(format!("{cache}/final.xclbin")).map_err(XdnaError::Open)?;
+        let insts = std::fs::read(format!("{cache}/insts.bin")).map_err(XdnaError::Open)?;
+        let kernel = NpuKernel::load(&xclbin, &insts)?;
+        Self::load_cached_on_kernel(cache, kernel)
+    }
+
+    /// Load the FFN on a peer hardware context sharing the producer's DRM file
+    /// and device heap. This keeps a zero-copy producer/consumer chain in one
+    /// GEM-handle namespace while retaining separate near-capacity AIE images.
+    pub fn load_cached_peer(cache: &str, peer: &NpuKernel) -> Result<Self, XdnaError> {
+        let xclbin = std::fs::read(format!("{cache}/final.xclbin")).map_err(XdnaError::Open)?;
+        let insts = std::fs::read(format!("{cache}/insts.bin")).map_err(XdnaError::Open)?;
+        let kernel = NpuKernel::load_peer(peer, &xclbin, &insts)?;
+        Self::load_cached_on_kernel(cache, kernel)
+    }
+
+    fn load_cached_on_kernel(cache: &str, kernel: NpuKernel) -> Result<Self, XdnaError> {
         let manifest =
             std::fs::read_to_string(format!("{cache}/shape.txt")).map_err(XdnaError::Open)?;
         let io_mode = parse_io_mode(&manifest)?;
@@ -100,9 +117,6 @@ impl NpuResidentFfnDenseW8 {
                 )));
             }
         }
-        let xclbin = std::fs::read(format!("{cache}/final.xclbin")).map_err(XdnaError::Open)?;
-        let insts = std::fs::read(format!("{cache}/insts.bin")).map_err(XdnaError::Open)?;
-        let kernel = NpuKernel::load(&xclbin, &insts)?;
         let input = kernel.alloc_arg(input_bytes_for(io_mode))?;
         let scratch = kernel.alloc_arg(scratch_bytes_for(io_mode))?;
         let output = kernel.alloc_arg(output_bytes_for(io_mode))?;

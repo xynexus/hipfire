@@ -14,6 +14,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::var("HOME").expect("HOME")
         )
     });
+    let iterations = std::env::args()
+        .nth(2)
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(0);
+    let manifest = std::fs::read_to_string(format!("{cache}/shape.txt"))?;
+    let split_residual = manifest.lines().any(|line| line.contains("split-x-bf16"));
+    let interleaved_ffn = manifest
+        .lines()
+        .any(|line| line.contains("interleaved-bf16x2"));
     let post_norm = (0..HIDDEN)
         .map(|hidden| f32_to_bf16_bits(0.87 + (hidden % 31) as f32 * 0.0018))
         .collect::<Vec<_>>();
@@ -54,27 +64,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let gpu = hipfire_rdna::Gpu::init()?;
-    let mut output_shared =
-        gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::residual_bytes())?;
+    let mut tail = NpuEmbeddingPostFfnDirectTailBf16x2::load_cached(&cache)?;
+    let mut output_shared = gpu.alloc_shared_gtt(tail.output_bytes())?;
     let mut combined_shared =
         gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::combined_bytes())?;
     output_shared.as_mut_slice().fill(0);
     combined_shared.as_mut_slice().fill(0);
-    write_combined_rows(
-        combined_shared.as_mut_slice(),
-        &high,
-        &low,
-        &residual,
-        M,
-        HIDDEN,
-    );
-    let mut tail = NpuEmbeddingPostFfnDirectTailBf16x2::load_cached(&cache)?;
-    tail.attach_shared_state(
-        combined_shared.dmabuf_fd(),
-        combined_shared.len(),
-        output_shared.dmabuf_fd(),
-        output_shared.len(),
-    )?;
+    if interleaved_ffn {
+        if split_residual {
+            write_interleaved_rows(combined_shared.as_mut_slice(), &high, &low, M, HIDDEN);
+        } else {
+            write_interleaved_combined_rows(
+                combined_shared.as_mut_slice(),
+                &high,
+                &low,
+                &residual,
+                M,
+                HIDDEN,
+            );
+        }
+    } else {
+        write_combined_rows(
+            combined_shared.as_mut_slice(),
+            &high,
+            &low,
+            &residual,
+            M,
+            HIDDEN,
+        );
+    }
+    let residual_shared = if split_residual {
+        let mut buffer =
+            gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::residual_bytes())?;
+        write_bf16(buffer.as_mut_slice(), &residual);
+        tail.attach_shared_split_state(
+            combined_shared.dmabuf_fd(),
+            combined_shared.len(),
+            buffer.dmabuf_fd(),
+            buffer.len(),
+            output_shared.dmabuf_fd(),
+            output_shared.len(),
+        )?;
+        Some(buffer)
+    } else {
+        tail.attach_shared_state(
+            combined_shared.dmabuf_fd(),
+            combined_shared.len(),
+            output_shared.dmabuf_fd(),
+            output_shared.len(),
+        )?;
+        None
+    };
+    let _residual_shared = residual_shared;
+    tail.sync_shared_inputs()?;
     let params = tail.upload_params(&post_norm, EPSILON)?;
     tail.run_shared(&params)?;
     let got = tail.read_output_f32()?;
@@ -101,6 +143,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "embeddinggemma-post-ffn-direct-tail-bf16x2 M=256 K=768: cosine={cosine:.8} max_abs={max_abs:.7}"
     );
+    if iterations > 0 {
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            tail.run_shared(&params)?;
+        }
+        let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
+        println!("iterations={iterations} dispatch_ms={dispatch_ms:.6}");
+    }
     Ok(())
 }
 
@@ -108,6 +158,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn write_bf16(destination: &mut [u8], values: &[u16]) {
     for (bytes, value) in destination.chunks_exact_mut(2).zip(values.iter().copied()) {
         bytes.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_interleaved_combined_rows(
+    destination: &mut [u8],
+    high: &[u16],
+    low: &[u16],
+    residual: &[u16],
+    rows: usize,
+    hidden: usize,
+) {
+    let row_bytes = 3 * hidden * size_of::<u16>();
+    for row in 0..rows {
+        let destination = &mut destination[row * row_bytes..(row + 1) * row_bytes];
+        let source = row * hidden;
+        for column in 0..hidden {
+            let offset = 2 * column * size_of::<u16>();
+            destination[offset..offset + 2].copy_from_slice(&high[source + column].to_le_bytes());
+            destination[offset + 2..offset + 4]
+                .copy_from_slice(&low[source + column].to_le_bytes());
+        }
+        write_bf16(
+            &mut destination[2 * hidden * 2..],
+            &residual[source..source + hidden],
+        );
     }
 }
 
@@ -135,6 +211,24 @@ fn write_combined_rows(
             &mut destination[target + columns * 4..target + columns * 6],
             &residual[source..source + columns],
         );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_interleaved_rows(
+    destination: &mut [u8],
+    high: &[u16],
+    low: &[u16],
+    rows: usize,
+    columns: usize,
+) {
+    for row in 0..rows {
+        for column in 0..columns {
+            let source = row * columns + column;
+            let target = row * columns * 6 + column * 4;
+            destination[target..target + 2].copy_from_slice(&high[source].to_le_bytes());
+            destination[target + 2..target + 4].copy_from_slice(&low[source].to_le_bytes());
+        }
     }
 }
 

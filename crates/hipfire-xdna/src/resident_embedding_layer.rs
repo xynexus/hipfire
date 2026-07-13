@@ -6,12 +6,17 @@
 //! compact mixed OQ, and OQ8 all enter through dense signed-byte groups expanded
 //! once at upload; `+` and `++` retain their shared AWQ activation sidecar.
 
+use std::path::Path;
+
 use hipfire_primitives::conv::bf16_bits_to_f32;
 #[cfg(test)]
 use hipfire_primitives::conv::f32_to_bf16_bits;
 
 use crate::attention_output_bf16::dense_effective_bf16;
-use crate::resident_attention_w8::{pack_dense_weights, stage_positions_and_params};
+use crate::r34_prepacked;
+use crate::resident_attention_w8::{
+    pack_dense_weights, stage_positions_and_params, NpuResidentAttentionDenseW8,
+};
 use crate::{DeviceBuffer, NpuKernel, OpusPackedMatrix, XdnaError};
 
 const M: usize = 256;
@@ -29,6 +34,7 @@ const R_STAGE_BYTES: usize = 5 * 48 * BLOCK;
 const ATTENTION_BYTES: usize = M * K * size_of::<u16>();
 const INPUT_BYTES: usize = ACTIVE_COLS * QKV_BLOCKS_PER_STRIPE * BLOCK;
 const EXTERNAL_RESIDUAL_BYTES: usize = COLS * CORE_ROWS * BLOCK;
+const COMPLETED_BF16X2_BYTES: usize = 288 * 2 * K * size_of::<u16>();
 const QKV_WEIGHT_BYTES: usize = INPUT_BYTES;
 const OUTPUT_WEIGHT_BYTES: usize = ACTIVE_COLS * O_BLOCKS_PER_ACTIVE_COL * BLOCK;
 const NORM_PARAM_BYTES: usize = ACTIVE_COLS * 2 * CORE_ROWS * BLOCK;
@@ -37,6 +43,7 @@ const HIDDEN_BACKING_BYTES: usize = R_STAGE_BYTES + 3 * ATTENTION_BYTES;
 const Q_BYTES: usize = 3 * ATTENTION_BYTES;
 const KV_BYTES: usize = 2 * ATTENTION_BYTES;
 const PAIRED_SCALE_BASE: usize = 6_272;
+#[cfg(test)]
 const SCALE_OFFSET: usize = 8_192;
 const SCALE_BYTES: usize = 128;
 const ROWS_PER_CORE: usize = 8;
@@ -46,6 +53,8 @@ const EPSILON_OFFSET: usize = PRE_NORM_OFFSET + K * size_of::<u16>();
 const PRE_INVERSE_BASE: usize = M * K * size_of::<u16>();
 const PRE_INVERSE_RECORD_BYTES: usize = ROWS_PER_CORE * K * size_of::<u16>();
 const PRE_EXCEPTION_OFFSET: usize = ROWS_PER_CORE * size_of::<f32>();
+const ROW_STATE_BYTES: usize = 1_664;
+const ROW_STATE_OFFSET: usize = K * size_of::<u16>();
 const MAX_CONTEXT_COMMANDS: usize = 1_000;
 
 /// Per-layer immutable R34 payload plus the input-scale template that must be
@@ -87,13 +96,31 @@ pub struct NpuEmbeddingLayerAttentionDenseW8 {
     key_values: DeviceBuffer,
     exception_column: Option<usize>,
     outputs_direct_x: bool,
+    output_row_bytes: usize,
+    row_state_output: bool,
     external_residual: bool,
+    direct_completed_residual: bool,
+    activation_offset: usize,
     input_bytes: usize,
     primed: bool,
     context_commands: usize,
 }
 
 impl NpuEmbeddingLayerAttentionDenseW8 {
+    /// Pack canonical int8/FWHT activations and per-group row scales into the
+    /// shared R34 input layout. The dynamic 8-KiB activation record is byte
+    /// identical to R30 and occupies the prefix of each 16-KiB R34 block; the
+    /// remaining tail is reserved for immutable per-layer metadata.
+    pub fn prepack_activations(activations: &[i8], scales: &[f32]) -> Result<Vec<u8>, XdnaError> {
+        let packed = NpuResidentAttentionDenseW8::prepack_activations(activations, scales)?;
+        if packed.len() != INPUT_BYTES {
+            return Err(invalid(
+                "resident layer compact activation geometry mismatch",
+            ));
+        }
+        Ok(packed)
+    }
+
     pub fn load_cached(cache: &str) -> Result<Self, XdnaError> {
         let manifest =
             std::fs::read_to_string(format!("{cache}/shape.txt")).map_err(XdnaError::Open)?;
@@ -112,10 +139,21 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
                 )));
             }
         }
-        let external_residual = manifest
+        let direct_completed_residual = manifest_uses_direct_completed_residual(&manifest);
+        let external_residual = direct_completed_residual
+            || manifest
+                .lines()
+                .any(|line| line == "residual-input=shared-activation-tail-r34-bf16-records");
+        let row_state_output = manifest
             .lines()
-            .any(|line| line == "residual-input=shared-activation-tail-r34-bf16-records");
-        let outputs_direct_x = if manifest
+            .any(|line| line == "output=canonical-token-major-x-bf16-row-state")
+            && manifest.lines().any(|line| line == "output-row-bytes=1664")
+            && manifest
+                .lines()
+                .any(|line| line == "state=pre-ffn-inverse-f32-row-tail");
+        let outputs_direct_x = if row_state_output {
+            true
+        } else if manifest
             .lines()
             .any(|line| line == "tails=post-attn-norm,residual")
             && manifest
@@ -145,7 +183,9 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
                 "resident layer attention cache has unsupported output state",
             ));
         };
-        let exception_column = if manifest
+        let exception_column = if row_state_output {
+            None
+        } else if manifest
             .lines()
             .any(|line| line == "state=pre-ffn-inverse-f32")
         {
@@ -168,8 +208,14 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             &std::fs::read(format!("{cache}/final.xclbin")).map_err(XdnaError::Open)?,
             &std::fs::read(format!("{cache}/insts.bin")).map_err(XdnaError::Open)?,
         )?;
-        let input_bytes = INPUT_BYTES
-            + if external_residual {
+        let activation_offset = if direct_completed_residual {
+            COMPLETED_BF16X2_BYTES
+        } else {
+            0
+        };
+        let input_bytes = activation_offset
+            + INPUT_BYTES
+            + if external_residual && !direct_completed_residual {
                 EXTERNAL_RESIDUAL_BYTES
             } else {
                 0
@@ -182,7 +228,15 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             kernel,
             exception_column,
             outputs_direct_x,
+            output_row_bytes: if row_state_output {
+                ROW_STATE_BYTES
+            } else {
+                K * size_of::<u16>()
+            },
+            row_state_output,
             external_residual,
+            direct_completed_residual,
+            activation_offset,
             input_bytes,
             primed: false,
             context_commands: 0,
@@ -209,6 +263,10 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         self.external_residual
     }
 
+    pub fn uses_direct_completed_residual(&self) -> bool {
+        self.direct_completed_residual
+    }
+
     pub const fn weight_bytes() -> usize {
         WEIGHT_BYTES
     }
@@ -219,6 +277,14 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
 
     pub const fn outputs_direct_x(&self) -> bool {
         self.outputs_direct_x
+    }
+
+    pub const fn outputs_row_state(&self) -> bool {
+        self.row_state_output
+    }
+
+    pub fn sync_shared_hidden(&self) -> Result<(), XdnaError> {
+        self.kernel.sync_output(&self.hidden)
     }
 
     pub fn attach_shared_input(&mut self, fd: i32, bytes: usize) -> Result<(), XdnaError> {
@@ -243,9 +309,83 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         Ok(())
     }
 
+    pub fn sync_shared_completed_residual(&self) -> Result<(), XdnaError> {
+        if !self.direct_completed_residual {
+            return Err(invalid("resident layer has no direct completed residual"));
+        }
+        self.kernel.sync_to_device(&self.input)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn upload_dense_groups(
         &self,
+        groups: &[&[i8]],
+        scales: &[&[f32]],
+        awq_scale: Option<&[f32]>,
+        output: &OpusPackedMatrix,
+        residual: &[u16],
+        qnorm: &[f32],
+        knorm: &[f32],
+        post_attention_norm: &[u16],
+        pre_ffn_norm: &[u16],
+        epsilon: f32,
+        rope_base: f32,
+    ) -> Result<NpuEmbeddingLayerAttentionDenseW8Weights, XdnaError> {
+        self.upload_dense_groups_impl(
+            None,
+            groups,
+            scales,
+            awq_scale,
+            output,
+            residual,
+            qnorm,
+            knorm,
+            post_attention_norm,
+            pre_ffn_norm,
+            epsilon,
+            rope_base,
+        )
+    }
+
+    /// Upload one R34 layer from an architecture-packed derivative. On the
+    /// first load the loader writes `<name>.rdna2.hfp`; subsequent loads verify
+    /// the source and payload SHA-256 values and skip tensor-block reordering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_dense_groups_prepacked(
+        &self,
+        prepacked_path: &Path,
+        groups: &[&[i8]],
+        scales: &[&[f32]],
+        awq_scale: Option<&[f32]>,
+        output: &OpusPackedMatrix,
+        residual: &[u16],
+        qnorm: &[f32],
+        knorm: &[f32],
+        post_attention_norm: &[u16],
+        pre_ffn_norm: &[u16],
+        epsilon: f32,
+        rope_base: f32,
+    ) -> Result<NpuEmbeddingLayerAttentionDenseW8Weights, XdnaError> {
+        self.upload_dense_groups_impl(
+            Some(prepacked_path),
+            groups,
+            scales,
+            awq_scale,
+            output,
+            residual,
+            qnorm,
+            knorm,
+            post_attention_norm,
+            pre_ffn_norm,
+            epsilon,
+            rope_base,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_dense_groups_impl(
+        &self,
+        prepacked_path: Option<&Path>,
         groups: &[&[i8]],
         scales: &[&[f32]],
         awq_scale: Option<&[f32]>,
@@ -282,20 +422,40 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
                 "resident layer output projection must be K=N=768 with 3 groups",
             ));
         }
-        let unpacked_qkv = pack_dense_weights(groups, scales);
-        let mut input_template = vec![0u8; INPUT_BYTES];
-        inject_paired_weight_scales(&mut input_template, &unpacked_qkv);
-
-        let mut packed = pack_paired_weights(&unpacked_qkv);
-        packed.extend_from_slice(&pack_output_projection_direct(&dense_effective_bf16(
-            output,
-        )));
-        packed.extend_from_slice(&pack_residual_norm_params(
+        let input_template = paired_weight_scale_template(scales);
+        let output_dense = dense_effective_bf16(output);
+        let source_sha256 = prepacked_source_sha256(
+            groups,
+            &output_dense,
             residual,
             post_attention_norm,
             pre_ffn_norm,
             epsilon,
-        ));
+        );
+        let pack = || {
+            let unpacked_qkv = pack_dense_weights(groups, scales);
+            let mut packed = pack_paired_weights(&unpacked_qkv);
+            packed.extend_from_slice(&pack_output_projection_direct(&output_dense));
+            packed.extend_from_slice(&pack_residual_norm_params(
+                residual,
+                post_attention_norm,
+                pre_ffn_norm,
+                epsilon,
+            ));
+            packed
+        };
+        let packed = if let Some(path) = prepacked_path {
+            match r34_prepacked::read(path, source_sha256).map_err(invalid)? {
+                Some(packed) => packed,
+                None => {
+                    let packed = pack();
+                    r34_prepacked::write(path, source_sha256, &packed).map_err(invalid)?;
+                    packed
+                }
+            }
+        } else {
+            pack()
+        };
         debug_assert_eq!(packed.len(), WEIGHT_BYTES);
         let mut weights = self.kernel.alloc_arg(WEIGHT_BYTES)?;
         weights.as_mut_slice().copy_from_slice(&packed);
@@ -324,11 +484,15 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         {
             return Err(invalid("resident layer template size mismatch"));
         }
-        copy_paired_weight_scales(self.input.as_mut_slice(), &weights.input_template);
+        copy_paired_weight_scales(
+            &mut self.input.as_mut_slice()
+                [self.activation_offset..self.activation_offset + INPUT_BYTES],
+            &weights.input_template,
+        );
         self.restore_hidden(weights)?;
         if self.external_residual {
             self.kernel
-                .sync_to_device_prefix(&self.input, INPUT_BYTES)?;
+                .sync_to_device_prefix(&self.input, self.activation_offset + INPUT_BYTES)?;
         } else {
             self.kernel.sync_to_device(&self.input)?;
         }
@@ -343,10 +507,16 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         if packed.len() != INPUT_BYTES {
             return Err(invalid("resident layer prepacked input size mismatch"));
         }
-        self.input.as_mut_slice()[..INPUT_BYTES].copy_from_slice(packed);
-        copy_paired_weight_scales(self.input.as_mut_slice(), &weights.input_template);
+        self.input.as_mut_slice()[self.activation_offset..self.activation_offset + INPUT_BYTES]
+            .copy_from_slice(packed);
+        copy_paired_weight_scales(
+            &mut self.input.as_mut_slice()
+                [self.activation_offset..self.activation_offset + INPUT_BYTES],
+            &weights.input_template,
+        );
         if self.external_residual {
-            self.kernel.sync_to_device_prefix(&self.input, INPUT_BYTES)
+            self.kernel
+                .sync_to_device_prefix(&self.input, self.activation_offset + INPUT_BYTES)
         } else {
             self.kernel.sync_to_device(&self.input)
         }
@@ -399,10 +569,17 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
 
     pub fn read_hidden_f32(&self) -> Result<Vec<f32>, XdnaError> {
         self.kernel.sync_output(&self.hidden)?;
-        Ok(self.hidden.as_slice()[..M * K * size_of::<u16>()]
-            .chunks_exact(size_of::<u16>())
-            .map(|word| bf16_bits_to_f32(u16::from_le_bytes([word[0], word[1]])))
-            .collect())
+        let bytes = self.hidden.as_slice();
+        let mut output = Vec::with_capacity(M * K);
+        for row in 0..M {
+            let start = row * self.output_row_bytes;
+            output.extend(
+                bytes[start..start + K * size_of::<u16>()]
+                    .chunks_exact(size_of::<u16>())
+                    .map(|word| bf16_bits_to_f32(u16::from_le_bytes([word[0], word[1]]))),
+            );
+        }
+        Ok(output)
     }
 
     /// Read the per-token inverse RMS exported by R38/R34 immediately after
@@ -417,6 +594,21 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
     pub fn read_pre_ffn_state(&self) -> Result<NpuEmbeddingPreFfnState, XdnaError> {
         self.kernel.sync_output(&self.hidden)?;
         let bytes = self.hidden.as_slice();
+        if self.row_state_output {
+            let mut inverse = Vec::with_capacity(M);
+            for row in 0..M {
+                let offset = row * ROW_STATE_BYTES + ROW_STATE_OFFSET;
+                inverse.push(f32::from_le_bytes(
+                    bytes[offset..offset + size_of::<f32>()]
+                        .try_into()
+                        .expect("four-byte row-state inverse"),
+                ));
+            }
+            return Ok(NpuEmbeddingPreFfnState {
+                inverse,
+                exception: None,
+            });
+        }
         let required = PRE_INVERSE_BASE + COLS * CORE_ROWS * PRE_INVERSE_RECORD_BYTES;
         if bytes.len() < required {
             return Err(invalid("resident layer pre-inverse backing is too small"));
@@ -504,6 +696,12 @@ fn decode_pre_ffn_record(record: &[u8], row: usize, has_exception: bool) -> (f32
     (inverse, exception)
 }
 
+fn manifest_uses_direct_completed_residual(manifest: &str) -> bool {
+    manifest
+        .lines()
+        .any(|line| line == "residual-input=shared-completed-bf16x2-high")
+}
+
 fn pack_paired_weights(unpaired: &[u8]) -> Vec<u8> {
     debug_assert_eq!(unpaired.len(), COLS * QKV_BLOCKS_PER_STRIPE * BLOCK);
     let mut paired = vec![0u8; QKV_WEIGHT_BYTES];
@@ -520,6 +718,7 @@ fn pack_paired_weights(unpaired: &[u8]) -> Vec<u8> {
     paired
 }
 
+#[cfg(test)]
 fn inject_paired_weight_scales(input: &mut [u8], unpaired: &[u8]) {
     for row_stripe in 0..CORE_ROWS {
         for block in 0..QKV_BLOCKS_PER_STRIPE {
@@ -535,6 +734,53 @@ fn inject_paired_weight_scales(input: &mut [u8], unpaired: &[u8]) {
             }
         }
     }
+}
+
+fn paired_weight_scale_template(scales: &[&[f32]]) -> Vec<u8> {
+    let mut template = vec![0u8; INPUT_BYTES];
+    for row_stripe in 0..CORE_ROWS {
+        for block in 0..QKV_BLOCKS_PER_STRIPE {
+            let group = block % GROUPS;
+            let n_macro = (block / GROUPS) % 5;
+            let target_block = (row_stripe * QKV_BLOCKS_PER_STRIPE + block) * BLOCK;
+            for source_col in 0..COLS {
+                for local_col in 0..32 {
+                    let canonical_col = n_macro * 256 + source_col * 32 + local_col;
+                    let target = target_block
+                        + PAIRED_SCALE_BASE
+                        + source_col * SCALE_BYTES
+                        + local_col * size_of::<f32>();
+                    template[target..target + size_of::<f32>()]
+                        .copy_from_slice(&scales[group][canonical_col].to_ne_bytes());
+                }
+            }
+        }
+    }
+    template
+}
+
+fn prepacked_source_sha256(
+    groups: &[&[i8]],
+    output: &[u16],
+    residual: &[u16],
+    post_attention_norm: &[u16],
+    pre_ffn_norm: &[u16],
+    epsilon: f32,
+) -> [u8; 32] {
+    let capacity = groups.iter().map(|group| group.len()).sum::<usize>()
+        + (output.len() + residual.len() + post_attention_norm.len() + pre_ffn_norm.len()) * 2
+        + size_of::<f32>();
+    let mut source = Vec::with_capacity(capacity);
+    for group in groups {
+        source.extend(group.iter().map(|&value| value as u8));
+    }
+    for values in [output, residual, post_attention_norm, pre_ffn_norm] {
+        for &value in values {
+            source.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    source.extend_from_slice(&epsilon.to_le_bytes());
+    r34_prepacked::sha256_parts(&[&source])
 }
 
 fn copy_paired_weight_scales(destination: &mut [u8], template: &[u8]) {
@@ -651,6 +897,37 @@ mod tests {
         assert_eq!(WEIGHT_BYTES, 8_192_000);
         assert_eq!(HIDDEN_BACKING_BYTES, 5_111_808);
         assert_eq!(NORM_PARAM_BYTES, 524_288);
+        assert_eq!(COMPLETED_BF16X2_BYTES, 884_736);
+    }
+
+    #[test]
+    fn r108_manifest_selects_direct_completed_residual() {
+        let manifest = "tails=post-attn-norm,external-residual\n\
+                        residual-input=shared-completed-bf16x2-high\n\
+                        residual-row-stride-bytes=3072\n";
+        assert!(manifest_uses_direct_completed_residual(manifest));
+    }
+
+    #[test]
+    fn shared_activation_packer_preserves_the_r30_block_prefix() {
+        let activations = (0..M * K)
+            .map(|index| (index as u8).wrapping_mul(29) as i8)
+            .collect::<Vec<_>>();
+        let scales = (0..GROUPS * M)
+            .map(|index| index as f32 * 0.000_125 + 0.25)
+            .collect::<Vec<_>>();
+        let compact =
+            NpuResidentAttentionDenseW8::prepack_activations(&activations, &scales).unwrap();
+        let packed =
+            NpuEmbeddingLayerAttentionDenseW8::prepack_activations(&activations, &scales).unwrap();
+        assert_eq!(packed.len(), INPUT_BYTES);
+        assert_eq!(packed, compact);
+        for block in 0..CORE_ROWS * QKV_BLOCKS_PER_STRIPE {
+            let base = block * BLOCK;
+            assert!(packed[base + BLOCK / 2..base + BLOCK]
+                .iter()
+                .all(|&value| value == 0));
+        }
     }
 
     #[test]
@@ -678,6 +955,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn direct_scale_template_matches_the_prior_unpaired_layout_oracle() {
+        let groups = (0..GROUPS)
+            .map(|_| vec![0i8; 256 * QKV_N])
+            .collect::<Vec<_>>();
+        let scales = (0..GROUPS)
+            .map(|group| {
+                (0..QKV_N)
+                    .map(|column| group as f32 * 10_000.0 + column as f32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let group_refs = groups.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let scale_refs = scales.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let unpaired = pack_dense_weights(&group_refs, &scale_refs);
+        let mut prior = vec![0u8; INPUT_BYTES];
+        inject_paired_weight_scales(&mut prior, &unpaired);
+        assert_eq!(paired_weight_scale_template(&scale_refs), prior);
     }
 
     #[test]

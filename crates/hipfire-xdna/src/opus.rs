@@ -15,12 +15,14 @@ use hipfire_primitives::{
 use rayon::prelude::*;
 
 use crate::{
-    NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK, NpuGemmMp, NpuGemmResidentWeights,
-    NpuGemmWholeArray, NpuGemmWholeScaled, NpuSparse3Mp, NpuSparse3ResidentWeights, NpuWholeMode,
+    opus_hfp, NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK, NpuGemmMp,
+    NpuGemmResidentWeights, NpuGemmStagedFullK, NpuGemmWholeArray, NpuGemmWholeScaled,
+    NpuSparse3Mp, NpuSparse3ResidentWeights, NpuStagedFullKResidentWeights, NpuWholeMode,
     NpuWholeResidentWeights, NpuWholeScaledIoLayout, NpuWholeScaledResidentWeights, XdnaError,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
 
 const GROUP: usize = 256;
 
@@ -114,6 +116,7 @@ pub struct OpusPackedMatrix {
     awq_scale: Option<Vec<f32>>,
     k: usize,
     n: usize,
+    staged_fullk_weights: Option<NpuStagedFullKResidentWeights>,
     fullk_weights: Option<NpuFullKResidentWeights>,
     whole_weights: Option<NpuWholeResidentWeights>,
     whole_scaled_weights: Option<NpuWholeScaledResidentWeights>,
@@ -150,6 +153,7 @@ impl OpusPackedMatrix {
             awq_scale,
             k,
             n,
+            staged_fullk_weights: None,
             fullk_weights: None,
             whole_weights: None,
             whole_scaled_weights: None,
@@ -263,12 +267,35 @@ pub struct NpuOpusExecutor {
     residual_sparse3: Option<NpuSparse3Mp>,
     n: usize,
     rows_per_dispatch: usize,
+    staged_fullk: HashMap<usize, NpuGemmStagedFullK>,
     fullk: HashMap<(NpuFullKMode, usize), NpuGemmFullK>,
     whole: HashMap<(NpuWholeMode, usize), NpuGemmWholeArray>,
     whole_scaled: HashMap<(NpuWholeMode, usize), NpuGemmWholeScaled>,
 }
 
 impl NpuOpusExecutor {
+    /// Build or reuse one destination-context bundle from already converted
+    /// HFP matrices. Role-local block order is preserved; only immutable role
+    /// segments and the parameter tile are assembled offline.
+    pub fn prepack_resident_context_bundle_cached(
+        path: &Path,
+        source_paths: &[&Path],
+        parameters: &[u8],
+    ) -> Result<Vec<u8>, XdnaError> {
+        opus_hfp::resident_context_bundle_cached(path, source_paths, parameters).map_err(invalid)
+    }
+
+    /// Build or reuse a pair-major whole-scaled derivative for a role-split
+    /// resident graph. Complete schedule blocks are reordered once by the
+    /// loader; their packed encoding and local nibble/lane contract are
+    /// unchanged.
+    pub fn prepack_paired_whole_scaled_cached(
+        path: &Path,
+        source_path: &Path,
+    ) -> Result<Vec<u8>, XdnaError> {
+        opus_hfp::paired_whole_scaled_cached(path, source_path).map_err(invalid)
+    }
+
     /// Load W4, W8, and sparse-overlay caches for matrices with output width `N`.
     pub fn load_cached(
         w4_cache: &str,
@@ -315,6 +342,7 @@ impl NpuOpusExecutor {
             residual_sparse3: Some(residual_sparse3),
             n,
             rows_per_dispatch,
+            staged_fullk: HashMap::new(),
             fullk: HashMap::new(),
             whole: HashMap::new(),
             whole_scaled: HashMap::new(),
@@ -333,6 +361,7 @@ impl NpuOpusExecutor {
             residual_sparse3: None,
             n,
             rows_per_dispatch: 0,
+            staged_fullk: HashMap::new(),
             fullk: HashMap::new(),
             whole: HashMap::new(),
             whole_scaled: HashMap::new(),
@@ -355,6 +384,7 @@ impl NpuOpusExecutor {
             residual_sparse3: None,
             n,
             rows_per_dispatch: 0,
+            staged_fullk: HashMap::new(),
             fullk: HashMap::new(),
             whole: HashMap::new(),
             whole_scaled: HashMap::new(),
@@ -379,6 +409,7 @@ impl NpuOpusExecutor {
             residual_sparse3: None,
             n,
             rows_per_dispatch: 0,
+            staged_fullk: HashMap::new(),
             fullk: HashMap::new(),
             whole: HashMap::new(),
             whole_scaled: HashMap::new(),
@@ -387,6 +418,74 @@ impl NpuOpusExecutor {
             executor.enable_whole_scaled_cache(cache)?;
         }
         Ok(executor)
+    }
+
+    /// Load only activation-once full-K caches. The current admitted schedule
+    /// consumes native OQ8 records; OQ4/mixed remain on their native paths.
+    pub fn load_staged_fullk_cached(caches: &[&str], n: usize) -> Result<Self, XdnaError> {
+        if n == 0 || caches.is_empty() {
+            return Err(invalid(
+                "staged full-K executor wants non-zero N and caches",
+            ));
+        }
+        let mut executor = Self {
+            w4: None,
+            w8: None,
+            residual_sparse3: None,
+            n,
+            rows_per_dispatch: 0,
+            staged_fullk: HashMap::new(),
+            fullk: HashMap::new(),
+            whole: HashMap::new(),
+            whole_scaled: HashMap::new(),
+        };
+        for &cache in caches {
+            executor.enable_staged_fullk_cache(cache)?;
+        }
+        Ok(executor)
+    }
+
+    pub fn enable_staged_fullk_cache(&mut self, cache: &str) -> Result<(), XdnaError> {
+        let staged = NpuGemmStagedFullK::load_cached(cache)?;
+        if staged.n() != self.n {
+            return Err(invalid(format!(
+                "staged full-K cache N={} does not match executor N={}",
+                staged.n(),
+                self.n
+            )));
+        }
+        self.staged_fullk.insert(staged.k(), staged);
+        Ok(())
+    }
+
+    /// Filename tag for the selected offline tensor layout. Existing paths
+    /// retain their historical tag; only R121 uses the staged-fullk tag.
+    pub fn prepacked_layout_tag(
+        &self,
+        encoding: OpusMatrixEncoding,
+        padded_k: usize,
+    ) -> &'static str {
+        if encoding == OpusMatrixEncoding::W8 && self.staged_fullk.contains_key(&padded_k) {
+            "staged-fullk"
+        } else {
+            "whole-scaled"
+        }
+    }
+
+    /// Recreate the selected staged projection context after loader-side model
+    /// prepacking. This is a context-lifetime diagnostic, not the platform
+    /// kernel-parameter workaround.
+    pub fn recreate_staged_fullk_context(
+        &mut self,
+        matrix: &OpusPackedMatrix,
+    ) -> Result<(), XdnaError> {
+        if matrix.staged_fullk_weights.is_none() {
+            return Err(invalid("matrix has no staged full-K weights"));
+        }
+        self.staged_fullk
+            .get_mut(&(matrix.groups.len() * GROUP))
+            .ok_or_else(|| invalid("missing staged full-K cache"))?
+            .recreate_hwctx()
     }
 
     pub fn enable_whole_scaled_cache(&mut self, cache: &str) -> Result<(), XdnaError> {
@@ -439,6 +538,32 @@ impl NpuOpusExecutor {
         payload: &[u8],
         awq_scale: Option<Vec<f32>>,
     ) -> Result<OpusPackedMatrix, XdnaError> {
+        self.pack_matrix_impl(quant_type, k, n, payload, awq_scale, None)
+    }
+
+    /// Decode and upload an Opus matrix while persisting the production NPU
+    /// block layout in a `.rdna2.hfp` artifact. W4 remains nibble-packed.
+    pub fn pack_matrix_prepacked(
+        &self,
+        quant_type: u8,
+        k: usize,
+        n: usize,
+        payload: &[u8],
+        awq_scale: Option<Vec<f32>>,
+        prepacked_path: &Path,
+    ) -> Result<OpusPackedMatrix, XdnaError> {
+        self.pack_matrix_impl(quant_type, k, n, payload, awq_scale, Some(prepacked_path))
+    }
+
+    fn pack_matrix_impl(
+        &self,
+        quant_type: u8,
+        k: usize,
+        n: usize,
+        payload: &[u8],
+        awq_scale: Option<Vec<f32>>,
+        prepacked_path: Option<&Path>,
+    ) -> Result<OpusPackedMatrix, XdnaError> {
         if k == 0 || n == 0 || n != self.n {
             return Err(invalid(format!(
                 "want non-zero K and executor N={}, got K={k} N={n}",
@@ -453,15 +578,46 @@ impl NpuOpusExecutor {
         let mode = fullk_mode(encoding);
         let whole_mode = whole_mode(encoding);
         let padded_k = decoded.len() * GROUP;
-        let whole_scaled_weights = if let Some(mode) = whole_mode {
-            if let Some(whole) = self.whole_scaled.get(&(mode, padded_k)) {
-                let base: Vec<&[i8]> = decoded.iter().map(|group| group.base.as_slice()).collect();
-                let scales: Vec<&[f32]> = decoded
-                    .iter()
-                    .map(|group| group.scales.as_slice())
-                    .collect();
-                let packed = whole.prepack_weights(&base, &scales)?;
-                Some(whole.upload_resident_weights(&packed)?)
+        let staged_fullk_weights = if encoding == OpusMatrixEncoding::W8 {
+            self.staged_fullk.get(&padded_k)
+        } else {
+            None
+        }
+        .map(|staged| {
+            let base = decoded
+                .iter()
+                .map(|group| group.base.as_slice())
+                .collect::<Vec<_>>();
+            let scales = decoded
+                .iter()
+                .map(|group| group.scales.as_slice())
+                .collect::<Vec<_>>();
+            let packed = if let Some(path) = prepacked_path {
+                staged.prepack_weights_cached(path, quant_type, payload, &base, &scales)?
+            } else {
+                staged.prepack_weights(&base, &scales)?
+            };
+            staged.upload_resident_weights(&packed)
+        })
+        .transpose()?;
+        let whole_scaled_weights = if staged_fullk_weights.is_none() {
+            if let Some(mode) = whole_mode {
+                if let Some(whole) = self.whole_scaled.get(&(mode, padded_k)) {
+                    let base: Vec<&[i8]> =
+                        decoded.iter().map(|group| group.base.as_slice()).collect();
+                    let scales: Vec<&[f32]> = decoded
+                        .iter()
+                        .map(|group| group.scales.as_slice())
+                        .collect();
+                    let packed = if let Some(path) = prepacked_path {
+                        whole.prepack_weights_cached(path, quant_type, payload, &base, &scales)?
+                    } else {
+                        whole.prepack_weights(&base, &scales)?
+                    };
+                    Some(whole.upload_resident_weights(&packed)?)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -479,7 +635,15 @@ impl NpuOpusExecutor {
         } else {
             None
         };
-        let fullk_weights = if let Some(fullk) = self.fullk.get(&(mode, padded_k)) {
+        let fullk_weights = if staged_fullk_weights.is_none()
+            && whole_scaled_weights.is_none()
+            && whole_weights.is_none()
+        {
+            self.fullk.get(&(mode, padded_k))
+        } else {
+            None
+        }
+        .map(|fullk| {
             let base: Vec<&[i8]> = decoded.iter().map(|group| group.base.as_slice()).collect();
             let residual: Vec<&[i8]> = if mode == NpuFullKMode::Mixed {
                 decoded
@@ -493,19 +657,31 @@ impl NpuOpusExecutor {
                 .iter()
                 .map(|group| group.scales.as_slice())
                 .collect();
-            let packed = if fullk.scaled_output() {
-                fullk.prepack_weights_with_scales(&base, &residual, &scales)?
+            let scale_payload = if fullk.scaled_output() {
+                scales.as_slice()
             } else {
-                fullk.prepack_weights(&base, &residual)?
+                &[]
             };
-            Some(fullk.upload_resident_weights(&packed)?)
-        } else {
-            None
-        };
+            let packed = if let Some(path) = prepacked_path {
+                fullk.prepack_weights_cached(
+                    path,
+                    quant_type,
+                    payload,
+                    &base,
+                    &residual,
+                    scale_payload,
+                )?
+            } else {
+                fullk.prepack_weights_with_scales(&base, &residual, scale_payload)?
+            };
+            fullk.upload_resident_weights(&packed)
+        })
+        .transpose()?;
         let resident_only =
             self.w4.is_none() && self.w8.is_none() && self.residual_sparse3.is_none();
         if resident_only
             && fullk_weights.is_none()
+            && staged_fullk_weights.is_none()
             && whole_weights.is_none()
             && whole_scaled_weights.is_none()
         {
@@ -516,7 +692,8 @@ impl NpuOpusExecutor {
         }
         let mut groups = Vec::with_capacity(decoded.len());
         for decoded in decoded {
-            let resident_base = if fullk_weights.is_some()
+            let resident_base = if staged_fullk_weights.is_some()
+                || fullk_weights.is_some()
                 || whole_weights.is_some()
                 || whole_scaled_weights.is_some()
             {
@@ -541,7 +718,8 @@ impl NpuOpusExecutor {
                     }
                 })
             };
-            let mut resident_sparse = if fullk_weights.is_some()
+            let mut resident_sparse = if staged_fullk_weights.is_some()
+                || fullk_weights.is_some()
                 || whole_weights.is_some()
                 || whole_scaled_weights.is_some()
             {
@@ -551,6 +729,7 @@ impl NpuOpusExecutor {
             };
             if !decoded.sparse_residual_chunks.is_empty()
                 && fullk_weights.is_none()
+                && staged_fullk_weights.is_none()
                 && whole_weights.is_none()
                 && whole_scaled_weights.is_none()
             {
@@ -576,6 +755,7 @@ impl NpuOpusExecutor {
             awq_scale,
             k,
             n,
+            staged_fullk_weights,
             fullk_weights,
             whole_weights,
             whole_scaled_weights,
@@ -679,6 +859,11 @@ impl NpuOpusExecutor {
     }
 
     fn rows_per_dispatch_for_matrix(&self, matrix: &OpusPackedMatrix) -> usize {
+        if matrix.staged_fullk_weights.is_some() {
+            if let Some(staged) = self.staged_fullk.get(&(matrix.groups.len() * GROUP)) {
+                return staged.rows();
+            }
+        }
         if matrix.whole_scaled_weights.is_some() {
             if let Some(mode) = whole_mode(matrix.encoding) {
                 if let Some(whole) = self.whole_scaled.get(&(mode, matrix.groups.len() * GROUP)) {
@@ -772,6 +957,39 @@ impl NpuOpusExecutor {
             matrix.awq_scale.as_deref(),
             self.rows_per_dispatch_for_matrix(matrix),
         );
+        if let (Some(staged), Some(weights)) = (
+            self.staged_fullk.get_mut(&padded_k),
+            &matrix.staged_fullk_weights,
+        ) {
+            let chunk_rows = staged.rows();
+            if prepared.padded_rows % chunk_rows == 0 {
+                let mut scaled_output = vec![0.0f32; chunk_rows * matrix.n];
+                for row0 in (0..prepared.padded_rows).step_by(chunk_rows) {
+                    let activation_groups = prepared
+                        .groups
+                        .iter()
+                        .map(|group| &group[row0 * GROUP..(row0 + chunk_rows) * GROUP])
+                        .collect::<Vec<_>>();
+                    let activation_scales = prepared
+                        .scales
+                        .iter()
+                        .map(|scale| &scale[row0..row0 + chunk_rows])
+                        .collect::<Vec<_>>();
+                    staged.run_resident_scaled(
+                        weights,
+                        &activation_groups,
+                        &activation_scales,
+                        &mut scaled_output,
+                    )?;
+                    let valid_rows = (m - row0.min(m)).min(chunk_rows);
+                    for row in 0..valid_rows {
+                        c[(row0 + row) * matrix.n..(row0 + row + 1) * matrix.n]
+                            .copy_from_slice(&scaled_output[row * matrix.n..(row + 1) * matrix.n]);
+                    }
+                }
+                return Ok(());
+            }
+        }
         if let (Some(mode), Some(weights)) = (whole_mode(matrix.encoding), &matrix.whole_weights) {
             if let Some(whole) = self.whole.get_mut(&(mode, padded_k)) {
                 let chunk_rows = whole.rows();

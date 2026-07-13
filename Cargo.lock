@@ -1641,6 +1641,7 @@ dependencies = [
  "hipfire-quantize",
  "hipfire-steer",
  "hipfire-steer-harness",
+ "hipfire-xdna",
 ]
 
 [[package]]
@@ -2322,6 +2323,7 @@ dependencies = [
  "hipfire-rdna",
  "libc",
  "rayon",
+ "sha2",
 ]
 
 [[package]]

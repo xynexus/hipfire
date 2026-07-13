@@ -65,6 +65,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let output = prep.output_prefixes();
     let mut mismatches = 0usize;
+    let mut mismatches_by_group = [0usize; GROUPS];
+    let mut mismatches_by_owner = [0usize; 32];
+    let mut negated_mismatches = 0usize;
     let mut first = None;
     let mut max_q_delta = 0i16;
     let mut max_scale_abs = 0.0f32;
@@ -114,6 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     if got != expected {
                         mismatches += 1;
+                        mismatches_by_group[group] += 1;
+                        mismatches_by_owner[row / 8] += 1;
+                        negated_mismatches += usize::from(got == expected.saturating_neg());
                         max_q_delta = max_q_delta.max((got as i16 - expected as i16).abs());
                         first.get_or_insert((row, group, n_macro, inner, got, expected));
                     }
@@ -128,6 +134,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output.len(),
             &output[..32],
             &output[6144..6240],
+        );
+        eprintln!(
+            "R47 debug mismatches_by_group={mismatches_by_group:?} mismatches_by_owner={mismatches_by_owner:?} negated_mismatches={negated_mismatches}"
         );
         return Err(format!(
             "R47 parity failed: mismatches={mismatches} max_q_delta={max_q_delta} max_scale_abs={max_scale_abs:.9} first={first:?}"

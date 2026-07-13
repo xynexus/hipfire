@@ -193,6 +193,13 @@ pub mod gemm_fullk;
 #[cfg(target_os = "linux")]
 pub use gemm_fullk::{NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK};
 
+// Activation-once full-K projection schedule. Complete immutable records are
+// prepared offline; each AIE core reuses one compact activation stage across N.
+#[cfg(target_os = "linux")]
+pub mod gemm_staged_fullk;
+#[cfg(target_os = "linux")]
+pub use gemm_staged_fullk::{NpuGemmStagedFullK, NpuStagedFullKResidentWeights};
+
 // AIE2P 4x4 whole-array W4A8 GEMM. Each dispatch reuses four activation and
 // four weight stripes across all 16 compute tiles and returns K-group partials.
 #[cfg(target_os = "linux")]
@@ -210,6 +217,8 @@ pub use gemm_whole_scaled::{
 #[cfg(target_os = "linux")]
 pub mod opus;
 #[cfg(target_os = "linux")]
+pub mod opus_hfp;
+#[cfg(target_os = "linux")]
 pub use opus::{
     NpuOpusExecutor, NpuOpusGemmMp, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
 };
@@ -217,7 +226,7 @@ pub use opus::{
 #[cfg(target_os = "linux")]
 pub mod resident_ffn;
 #[cfg(target_os = "linux")]
-pub use resident_ffn::{NpuResidentFfnW4, NpuResidentFfnW4Weights};
+pub use resident_ffn::{NpuResidentFfnW4, NpuResidentFfnW4IoMode, NpuResidentFfnW4Weights};
 
 #[cfg(target_os = "linux")]
 pub mod resident_ffn_w8;
@@ -250,9 +259,29 @@ pub use embedding_next_layer_prep::{
 };
 
 #[cfg(target_os = "linux")]
+pub mod embedding_ffn_activation_prep;
+#[cfg(target_os = "linux")]
+pub use embedding_ffn_activation_prep::{
+    NpuEmbeddingFfnActivationPrepW4, NpuEmbeddingFfnActivationPrepW4Params,
+};
+
+#[cfg(target_os = "linux")]
+pub mod embedding_pre_ffn_unit_rms;
+#[cfg(target_os = "linux")]
+pub use embedding_pre_ffn_unit_rms::NpuEmbeddingPreFfnUnitRms;
+
+#[cfg(target_os = "linux")]
 pub mod embedding_residual_prep;
 #[cfg(target_os = "linux")]
 pub use embedding_residual_prep::NpuEmbeddingResidualPrep;
+
+#[cfg(target_os = "linux")]
+pub mod embedding_qkv_attention_opus;
+#[cfg(target_os = "linux")]
+pub use embedding_qkv_attention_opus::{
+    NpuEmbeddingQkvAttentionOpus, NpuEmbeddingQkvAttentionOpusOutput,
+    NpuEmbeddingQkvAttentionOpusWeights,
+};
 
 #[cfg(target_os = "linux")]
 pub mod embedding_final_norm_mean;
@@ -264,6 +293,8 @@ pub mod embedding_dense_l2;
 #[cfg(target_os = "linux")]
 pub use embedding_dense_l2::NpuEmbeddingDenseL2;
 
+#[cfg(target_os = "linux")]
+mod r34_prepacked;
 #[cfg(target_os = "linux")]
 pub mod resident_embedding_layer;
 #[cfg(target_os = "linux")]
@@ -285,7 +316,7 @@ pub use sparse3_mp::{NpuSparse3Mp, NpuSparse3ResidentWeights};
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*; // brings the crate-root `submit` module into scope
-    use std::os::fd::{IntoRawFd, RawFd};
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
     #[repr(C)]
     struct GetInfo {
@@ -789,6 +820,35 @@ mod imp {
                 len: size,
                 xdna_addr: info.xdna_addr,
             })
+        }
+
+        /// PRIME-export an XDNA-owned SHMEM BO as a dma-buf. A second XDNA
+        /// context can import the returned fd and address the same physical
+        /// pages without routing the handoff through amdgpu or host copies.
+        pub fn export_dmabuf(&self, buffer: &DeviceBuffer) -> Result<OwnedFd, XdnaError> {
+            if buffer.fd != self.fd {
+                return Err(XdnaError::Ioctl(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cannot export a buffer owned by another XDNA device fd",
+                )));
+            }
+            let mut prime = submit::PrimeHandle {
+                handle: buffer.handle,
+                flags: submit::DRM_CLOEXEC | submit::DRM_RDWR,
+                fd: -1,
+            };
+            self.submit_ioctl(
+                submit::PRIME_HANDLE_TO_FD_REQUEST,
+                &mut prime as *mut _ as *mut libc::c_void,
+            )?;
+            if prime.fd < 0 {
+                return Err(XdnaError::Ioctl(std::io::Error::other(
+                    "PRIME export succeeded without returning a dma-buf fd",
+                )));
+            }
+            // SAFETY: a successful PRIME_HANDLE_TO_FD ioctl returns a new fd
+            // owned by the caller. OwnedFd closes that reference exactly once.
+            Ok(unsafe { OwnedFd::from_raw_fd(prime.fd) })
         }
 
         /// Allocate + map the device heap the way XRT does: CREATE_BO(DEV_HEAP),

@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use crate::opus_hfp::{self, OpusHfpDescriptor, OpusHfpEncoding, OpusHfpLayout};
 use crate::{DeviceBuffer, NpuKernel, XdnaError};
 
 const GROUP_K: usize = 256;
@@ -173,6 +174,63 @@ impl NpuGemmFullK {
     pub fn packed_weight_bytes(&self) -> usize {
         self.device_weight_bytes()
             + usize::from(self.scaled_output) * self.groups * self.n * std::mem::size_of::<f32>()
+    }
+
+    fn hfp_descriptor(&self, quant_type: u8) -> OpusHfpDescriptor {
+        let encoding = match self.mode {
+            NpuFullKMode::W4 => OpusHfpEncoding::W4,
+            NpuFullKMode::Mixed => OpusHfpEncoding::MixedW4WithOverlays,
+            NpuFullKMode::W8 => OpusHfpEncoding::W8,
+        };
+        let flags = u32::from(self.direct_output)
+            | (u32::from(self.scaled_output) << 1)
+            | (u32::from(self.combined_input) << 2);
+        OpusHfpDescriptor {
+            encoding,
+            layout: OpusHfpLayout::FullKV1,
+            quant_type: quant_type.into(),
+            flags,
+            m: self.rows as u32,
+            k: self.k() as u32,
+            n: self.n as u32,
+            columns: self.cols as u32,
+            groups: self.groups as u32,
+            m_macros: (self.rows / self.cols) as u32,
+            n_macros: (self.n / SLAB_N) as u32,
+            outblocks: (self.groups * (self.n / SLAB_N)) as u32,
+            tile_bytes: self.packed_weight_entry_bytes() as u32,
+            data_bytes: self.device_weight_bytes() as u32,
+            scale_offset: self.device_weight_bytes() as u32,
+            scale_values: if self.scaled_output {
+                (self.groups * self.n) as u32
+            } else {
+                0
+            },
+            payload_bytes: self.packed_weight_bytes() as u64,
+            segment_bytes: [0; 4],
+        }
+    }
+
+    /// Load the schedule-ready full-K weight stream from `.rdna2.hfp`, or
+    /// perform the global slab ordering once and persist it. W4 base entries
+    /// remain nibble-packed; only the AIE kernel decodes/swizzles their nibbles.
+    pub(crate) fn prepack_weights_cached(
+        &self,
+        path: &Path,
+        quant_type: u8,
+        source_payload: &[u8],
+        base: &[&[i8]],
+        residual: &[&[i8]],
+        scales: &[&[f32]],
+    ) -> Result<Vec<u8>, XdnaError> {
+        let descriptor = self.hfp_descriptor(quant_type);
+        let source_sha = opus_hfp::source_sha256(&[source_payload]);
+        if let Some(packed) = opus_hfp::read(path, descriptor, source_sha).map_err(invalid)? {
+            return Ok(packed);
+        }
+        let packed = self.prepack_weights_with_scales(base, residual, scales)?;
+        opus_hfp::write(path, descriptor, source_sha, &packed).map_err(invalid)?;
+        Ok(packed)
     }
 
     pub fn upload_resident_weights(

@@ -13,6 +13,9 @@
 use crate::submit::{self, QosInfo, AMDXDNA_BO_CMD, AMDXDNA_BO_SHMEM};
 use crate::xclbin::Axlf;
 use crate::{DeviceBuffer, XdnaDevice, XdnaError};
+use std::cell::RefCell;
+use std::os::fd::OwnedFd;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const DEV_HEAP_BASE_VA: usize = 0x7000_0000_0000;
@@ -32,9 +35,8 @@ struct CachedCmd {
 /// A single compiled NPU kernel with its hwctx and loaded program. Bind argument
 /// buffers with [`Self::alloc_arg`], fill inputs, then [`Self::dispatch`].
 pub struct NpuKernel {
-    dev: XdnaDevice,
     // Backing heap for the PDI + instruction DEV BOs; must outlive the hwctx.
-    _heap: DeviceBuffer,
+    _heap: Rc<RefCell<DeviceBuffer>>,
     hwctx: u32,
     syncobj: u32,
     pdi_bo: u32,
@@ -44,7 +46,10 @@ pub struct NpuKernel {
     instr_size: usize,
     // Reused across dispatches; one entry per distinct argument set (e.g. the two
     // C-buffers of a pipelined loop), so alternating arg sets don't thrash the cache.
-    cmd_cache: std::cell::RefCell<Vec<CachedCmd>>,
+    cmd_cache: RefCell<Vec<CachedCmd>>,
+    // Declared last so internal BOs release their GEM handles before the last
+    // shared device reference closes. Peer kernels share this DRM file.
+    dev: Rc<XdnaDevice>,
 }
 
 impl NpuKernel {
@@ -55,7 +60,7 @@ impl NpuKernel {
     /// Load a compiled kernel: `xclbin` bytes (for the PDI) and its `insts`
     /// instruction stream. Sets up the hwctx and loads the program on hardware.
     pub fn load(xclbin: &[u8], insts: &[u8]) -> Result<Self, XdnaError> {
-        let dev = XdnaDevice::open_default()?;
+        let dev = Rc::new(XdnaDevice::open_default()?);
         let heap_slot = NEXT_HEAP_SLOT.fetch_add(1, Ordering::Relaxed);
         let heap_va = DEV_HEAP_BASE_VA
             .checked_add(heap_slot * DEV_HEAP_STRIDE)
@@ -65,19 +70,37 @@ impl NpuKernel {
                     "NPU device heap VA slots exhausted",
                 ))
             })?;
-        let mut heap = dev.alloc_dev_heap_at(Self::HEAP_BYTES, heap_va)?;
+        let heap = Rc::new(RefCell::new(
+            dev.alloc_dev_heap_at(Self::HEAP_BYTES, heap_va)?,
+        ));
+        Self::load_on_device(dev, heap, xclbin, insts)
+    }
 
+    /// Load a second kernel on a new hardware context backed by the same DRM
+    /// file description as `peer`. Both kernels then share one GEM-handle
+    /// namespace, allowing direct SHMEM producer/consumer boundaries without
+    /// PRIME export/import.
+    pub fn load_peer(peer: &Self, xclbin: &[u8], insts: &[u8]) -> Result<Self, XdnaError> {
+        Self::load_on_device(Rc::clone(&peer.dev), Rc::clone(&peer._heap), xclbin, insts)
+    }
+
+    fn load_on_device(
+        dev: Rc<XdnaDevice>,
+        heap: Rc<RefCell<DeviceBuffer>>,
+        xclbin: &[u8],
+        insts: &[u8],
+    ) -> Result<Self, XdnaError> {
         let axlf = Axlf::parse(xclbin)?;
         let part = axlf.aie_partition().ok_or(XdnaError::NoAiePartition)?;
         let num_tiles = part.column_width as u32 * 4; // aie2p: 4 core rows/column
 
         let (hwctx, syncobj) = dev.create_hwctx(num_tiles, 0, 0x800, &QosInfo::default())?;
-        let (pdi_bo, _) = dev.alloc_dev_bo(&mut heap, part.pdi)?;
+        let (pdi_bo, _) = dev.alloc_dev_bo(&mut heap.borrow_mut(), part.pdi)?;
         if let Err(e) = dev.config_hwctx_cu(hwctx, pdi_bo) {
             let _ = dev.destroy_hwctx(hwctx);
             return Err(e);
         }
-        let (instr_bo, instr_addr) = match dev.alloc_dev_bo(&mut heap, insts) {
+        let (instr_bo, instr_addr) = match dev.alloc_dev_bo(&mut heap.borrow_mut(), insts) {
             Ok(v) => v,
             Err(e) => {
                 let _ = dev.destroy_hwctx(hwctx);
@@ -86,7 +109,6 @@ impl NpuKernel {
         };
 
         Ok(Self {
-            dev,
             _heap: heap,
             hwctx,
             syncobj,
@@ -95,7 +117,8 @@ impl NpuKernel {
             instr_bo,
             instr_addr,
             instr_size: insts.len(),
-            cmd_cache: std::cell::RefCell::new(Vec::new()),
+            cmd_cache: RefCell::new(Vec::new()),
+            dev,
         })
     }
 
@@ -157,6 +180,13 @@ impl NpuKernel {
         map: bool,
     ) -> Result<DeviceBuffer, XdnaError> {
         self.dev.import_dmabuf(fd, size, map)
+    }
+
+    /// Export an argument BO allocated by this kernel's XDNA device as a
+    /// dma-buf. Other NPU contexts can import it for a physical zero-copy
+    /// producer/consumer boundary.
+    pub fn export_dmabuf(&self, buffer: &DeviceBuffer) -> Result<OwnedFd, XdnaError> {
+        self.dev.export_dmabuf(buffer)
     }
 
     /// Run the kernel over `args` in kernel-signature order (e.g. A, W, C). Flushes

@@ -19,6 +19,7 @@ const SPLIT_PARAM_RECORD_BYTES: usize = 2 * 2 * HIDDEN * size_of::<u16>();
 const POST_NORM_BYTES: usize = HIDDEN * size_of::<u16>();
 const EPSILON_OFFSET: usize = POST_NORM_BYTES;
 const RESIDUAL_BYTES: usize = PAD_M * HIDDEN * size_of::<u16>();
+const ROW_STATE_RESIDUAL_BYTES: usize = PAD_M * 1_664;
 const COMBINED_BYTES: usize = PAD_M * HIDDEN * 3 * size_of::<u16>();
 const PARAM_BYTES: usize = CORES * PARAM_RECORD_BYTES;
 const SPLIT_PARAM_BYTES: usize = CORES * SPLIT_PARAM_RECORD_BYTES;
@@ -49,6 +50,7 @@ pub struct NpuEmbeddingPostFfnDirectTailBf16x2 {
     output: DeviceBuffer,
     output_encoding: CompletedOutputEncoding,
     split_residual: bool,
+    residual_bytes: usize,
     param_record_bytes: usize,
     param_bytes: usize,
 }
@@ -69,7 +71,23 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
                 )));
             }
         }
-        let split_residual = if manifest
+        let row_state_residual = manifest
+            .lines()
+            .any(|line| line == "input=shared-y-interleaved-bf16x2-and-split-x-bf16-row-state")
+            && manifest.lines().any(|line| line == "x-row-bytes=1664");
+        let split_residual = if row_state_residual {
+            true
+        } else if manifest
+            .lines()
+            .any(|line| line == "input=shared-y-interleaved-bf16x2-and-residual-bf16")
+        {
+            false
+        } else if manifest
+            .lines()
+            .any(|line| line == "input=shared-y-interleaved-bf16x2-and-split-x-bf16")
+        {
+            true
+        } else if manifest
             .lines()
             .any(|line| line == "input=shared-y-bf16x2-and-split-x-bf16")
         {
@@ -106,12 +124,23 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
         Ok(Self {
             combined: kernel.alloc_arg(COMBINED_BYTES)?,
             residual: split_residual
-                .then(|| kernel.alloc_arg(RESIDUAL_BYTES))
+                .then(|| {
+                    kernel.alloc_arg(if row_state_residual {
+                        ROW_STATE_RESIDUAL_BYTES
+                    } else {
+                        RESIDUAL_BYTES
+                    })
+                })
                 .transpose()?,
             output: kernel.alloc_arg(output_encoding.bytes())?,
             kernel,
             output_encoding,
             split_residual,
+            residual_bytes: if row_state_residual {
+                ROW_STATE_RESIDUAL_BYTES
+            } else {
+                RESIDUAL_BYTES
+            },
             param_record_bytes: if split_residual {
                 SPLIT_PARAM_RECORD_BYTES
             } else {
@@ -147,6 +176,10 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
 
     pub const fn consumes_split_x(&self) -> bool {
         self.split_residual
+    }
+
+    pub const fn split_x_input_bytes(&self) -> usize {
+        self.residual_bytes
     }
 
     pub fn attach_shared_state(
@@ -185,7 +218,7 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
     ) -> Result<(), XdnaError> {
         if !self.split_residual
             || combined_bytes != COMBINED_BYTES
-            || residual_bytes < RESIDUAL_BYTES
+            || residual_bytes < self.residual_bytes
             || output_bytes != self.output_bytes()
         {
             return Err(invalid(
@@ -204,7 +237,18 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
     }
 
     pub fn sync_shared_inputs(&self) -> Result<(), XdnaError> {
-        self.kernel.sync_to_device(&self.combined)
+        self.kernel.sync_to_device(&self.combined)?;
+        if let Some(residual) = &self.residual {
+            self.kernel.sync_to_device(residual)?;
+        }
+        Ok(())
+    }
+
+    pub fn sync_shared_residual(&self) -> Result<(), XdnaError> {
+        let residual = self.residual.as_ref().ok_or_else(|| {
+            invalid("only a split-X post-FFN tail has a separate residual dma-buf")
+        })?;
+        self.kernel.sync_to_device(residual)
     }
 
     pub fn upload_params(

@@ -29,9 +29,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let manifest = std::fs::read_to_string(format!("{}/shape.txt", args[0]))?;
+    let inline_records = manifest
+        .lines()
+        .any(|line| line == "op=r65-stage-headnorm-rope-pack");
+    let joined_records = manifest.lines().any(|line| {
+        line == "op=r67-joined-stage-headnorm-rope-pack"
+            || line == "op=r68-overlap-joined-stage-headnorm-rope-pack"
+    });
+    let overlap_records = manifest
+        .lines()
+        .any(|line| line == "op=r68-overlap-joined-stage-headnorm-rope-pack");
+    let embedded_stage = inline_records || joined_records;
+    let operation = if overlap_records {
+        "op=r68-overlap-joined-stage-headnorm-rope-pack"
+    } else if joined_records {
+        "op=r67-joined-stage-headnorm-rope-pack"
+    } else if inline_records {
+        "op=r65-stage-headnorm-rope-pack"
+    } else {
+        "op=qkv-headnorm-rope-pack"
+    };
+    let mode = if overlap_records {
+        "mode=bf16-overlap-joined"
+    } else if joined_records {
+        "mode=bf16-padded-joined"
+    } else if inline_records {
+        "mode=bf16-inline-records"
+    } else {
+        "mode=bf16"
+    };
     for field in [
-        "op=qkv-headnorm-rope-pack",
-        "mode=bf16",
+        operation,
+        mode,
         "m=256",
         "heads=3",
         "kv_heads=1",
@@ -64,35 +93,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let k_reference_bits = to_bf16_bits(&k_reference);
     let v_bits = to_bf16_bits(&v);
 
-    let raw = pack_raw_inputs(&q, &k, &v, &cs);
-    let params = pack_params(&qnorm, &knorm, EPSILON);
-    assert_eq!(raw.len(), RAW_BYTES);
-    assert_eq!(params.len(), PARAMS);
+    let raw = if joined_records {
+        pack_joined_records(
+            &q,
+            &k,
+            &v,
+            &cs,
+            &qnorm,
+            &knorm,
+            EPSILON,
+            if overlap_records { 37 } else { 36 },
+        )
+    } else if inline_records {
+        pack_inline_records(&q, &k, &v, &cs, &qnorm, &knorm, EPSILON)
+    } else {
+        pack_raw_inputs(&q, &k, &v, &cs)
+    };
+    let params = (!embedded_stage).then(|| pack_params(&qnorm, &knorm, EPSILON));
+    assert_eq!(
+        raw.len(),
+        if joined_records {
+            5 * (if overlap_records { 37 } else { 36 }) * 8192 + PARAMS
+        } else if inline_records {
+            5 * 48 * 10240
+        } else {
+            RAW_BYTES
+        }
+    );
+    assert_eq!(
+        params.as_ref().map(Vec::len),
+        (!embedded_stage).then_some(PARAMS)
+    );
 
     let xclbin = std::fs::read(format!("{}/final.xclbin", args[0]))?;
     let insts = std::fs::read(format!("{}/insts.bin", args[0]))?;
     let kernel = NpuKernel::load(&xclbin, &insts)?;
-    let mut raw_buffer = kernel.alloc_arg(RAW_BYTES)?;
-    let mut params_buffer = kernel.alloc_arg(PARAMS)?;
+    let mut raw_buffer = kernel.alloc_arg(raw.len())?;
+    let mut params_buffer = params
+        .as_ref()
+        .map(|value| kernel.alloc_arg(value.len()))
+        .transpose()?;
     let mut q_buffer = kernel.alloc_arg(Layout::Q_BYTES)?;
     let mut kv_buffer = kernel.alloc_arg(Layout::KV_BYTES)?;
     raw_buffer.as_mut_slice().copy_from_slice(&raw);
-    params_buffer.as_mut_slice().copy_from_slice(&params);
+    if let (Some(buffer), Some(value)) = (params_buffer.as_mut(), params.as_ref()) {
+        buffer.as_mut_slice().copy_from_slice(value);
+    }
     q_buffer.as_mut_slice().fill(0);
     kv_buffer.as_mut_slice().fill(0);
 
-    kernel.dispatch_synced(
-        &[&raw_buffer, &params_buffer, &q_buffer, &kv_buffer],
-        &[true, true, true, true],
-    )?;
+    if let Some(params_buffer) = params_buffer.as_ref() {
+        kernel.dispatch_synced(
+            &[&raw_buffer, params_buffer, &q_buffer, &kv_buffer],
+            &[true, true, true, true],
+        )?;
+    } else {
+        kernel.dispatch_synced(&[&raw_buffer, &q_buffer, &kv_buffer], &[true, true, true])?;
+    }
     q_buffer.as_mut_slice().fill(0);
     kv_buffer.as_mut_slice().fill(0);
     kernel.sync_to_device(&q_buffer)?;
     kernel.sync_to_device(&kv_buffer)?;
-    kernel.dispatch_synced(
-        &[&raw_buffer, &params_buffer, &q_buffer, &kv_buffer],
-        &[false, false, false, false],
-    )?;
+    if let Some(params_buffer) = params_buffer.as_ref() {
+        kernel.dispatch_synced(
+            &[&raw_buffer, params_buffer, &q_buffer, &kv_buffer],
+            &[false, false, false, false],
+        )?;
+    } else {
+        kernel.dispatch_synced(
+            &[&raw_buffer, &q_buffer, &kv_buffer],
+            &[false, false, false],
+        )?;
+    }
     kernel.sync_output(&q_buffer)?;
     kernel.sync_output(&kv_buffer)?;
 
@@ -139,10 +211,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let started = std::time::Instant::now();
     for _ in 0..iterations {
-        kernel.dispatch_synced(
-            &[&raw_buffer, &params_buffer, &q_buffer, &kv_buffer],
-            &[false, false, false, false],
-        )?;
+        if let Some(params_buffer) = params_buffer.as_ref() {
+            kernel.dispatch_synced(
+                &[&raw_buffer, params_buffer, &q_buffer, &kv_buffer],
+                &[false, false, false, false],
+            )?;
+        } else {
+            kernel.dispatch_synced(
+                &[&raw_buffer, &q_buffer, &kv_buffer],
+                &[false, false, false],
+            )?;
+        }
     }
     let dispatch_ms = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
     println!(
@@ -311,6 +390,124 @@ fn pack_params(qnorm: &[f32], knorm: &[f32], epsilon: f32) -> Vec<u8> {
     }
     params[1024..1028].copy_from_slice(&epsilon.to_le_bytes());
     params
+}
+
+#[cfg(target_os = "linux")]
+fn pack_inline_records(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    cs: &[u16],
+    qnorm: &[f32],
+    knorm: &[f32],
+    epsilon: f32,
+) -> Vec<u8> {
+    use hipfire_primitives::conv::f32_to_bf16_bits;
+    use hipfire_xdna::EmbeddingGemmaAttentionLayout as Layout;
+    const PAIR: usize = 10240;
+    const PAIRS_PER_ROLE: usize = 48;
+    let mut staged = vec![0u8; 5 * PAIRS_PER_ROLE * PAIR];
+    for role in 0..5 {
+        for physical_pair in 0..PAIRS_PER_ROLE {
+            let base = (role * PAIRS_PER_ROLE + physical_pair) * PAIR;
+            let m_macro = physical_pair / 16;
+            let within = physical_pair % 16;
+            let core_row = within / 4;
+            let subpair = within % 4;
+            if subpair < 3 {
+                let token0 = m_macro * 96 + core_row * 24 + subpair * 8;
+                for row in 0..8 {
+                    let token = token0 + row;
+                    if token >= Layout::TOKENS {
+                        continue;
+                    }
+                    for dim in 0..Layout::HEAD_DIM {
+                        let value = match role {
+                            0..=2 => q[(role * Layout::TOKENS + token) * Layout::HEAD_DIM + dim],
+                            3 => k[token * Layout::HEAD_DIM + dim],
+                            _ => v[token * Layout::HEAD_DIM + dim],
+                        };
+                        write_u16(
+                            &mut staged,
+                            base + (row * Layout::HEAD_DIM + dim) * 2,
+                            f32_to_bf16_bits(value),
+                        );
+                        write_u16(
+                            &mut staged,
+                            base + 4096 + (row * Layout::HEAD_DIM + dim) * 2,
+                            cs[token * Layout::HEAD_DIM + dim],
+                        );
+                    }
+                }
+            }
+            for (index, &value) in qnorm.iter().enumerate() {
+                write_u16(
+                    &mut staged,
+                    base + 8192 + index * 2,
+                    f32_to_bf16_bits(value),
+                );
+            }
+            for (index, &value) in knorm.iter().enumerate() {
+                write_u16(
+                    &mut staged,
+                    base + 8192 + 512 + index * 2,
+                    f32_to_bf16_bits(value),
+                );
+            }
+            staged[base + 8192 + 1024..base + 8192 + 1028].copy_from_slice(&epsilon.to_le_bytes());
+        }
+    }
+    staged
+}
+
+#[cfg(target_os = "linux")]
+fn pack_joined_records(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    cs: &[u16],
+    qnorm: &[f32],
+    knorm: &[f32],
+    epsilon: f32,
+    pairs_per_role: usize,
+) -> Vec<u8> {
+    use hipfire_primitives::conv::f32_to_bf16_bits;
+    use hipfire_xdna::EmbeddingGemmaAttentionLayout as Layout;
+    const PAIR: usize = 8192;
+    let value_bytes = 5 * pairs_per_role * PAIR;
+    let mut staged = vec![0u8; value_bytes + 2048];
+    for role in 0..5 {
+        for pair in 0..pairs_per_role {
+            let token0 = pair * 8;
+            let base = (role * pairs_per_role + pair) * PAIR;
+            for row in 0..8 {
+                let token = token0 + row;
+                if token >= Layout::TOKENS {
+                    continue;
+                }
+                for dim in 0..Layout::HEAD_DIM {
+                    let value = match role {
+                        0..=2 => q[(role * Layout::TOKENS + token) * Layout::HEAD_DIM + dim],
+                        3 => k[token * Layout::HEAD_DIM + dim],
+                        _ => v[token * Layout::HEAD_DIM + dim],
+                    };
+                    write_u16(
+                        &mut staged,
+                        base + (row * Layout::HEAD_DIM + dim) * 2,
+                        f32_to_bf16_bits(value),
+                    );
+                    write_u16(
+                        &mut staged,
+                        base + 4096 + (row * Layout::HEAD_DIM + dim) * 2,
+                        cs[token * Layout::HEAD_DIM + dim],
+                    );
+                }
+            }
+        }
+    }
+    let params = pack_params(qnorm, knorm, epsilon);
+    staged[value_bytes..].copy_from_slice(&params);
+    staged
 }
 
 #[cfg(target_os = "linux")]
