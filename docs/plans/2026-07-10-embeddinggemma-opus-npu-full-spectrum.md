@@ -617,8 +617,11 @@ four-second TDR on the tenth command submitted to one hardware context. A
 BOs, and splitting the host weight DMA into smaller awaited tasks did not remove
 the failure; the split-task schedule also broke numerical ordering and was
 discarded. Eight fresh contexts completed 32 full parity-checked dispatches
-without a TDR, so bounded context recycling is the current evidence-backed
-workaround, but it still must be implemented and timed in the reusable runtime.
+without a TDR, so bounded context recycling was the first evidence-backed
+mitigation. It is not the current workaround: the later kernel parameter
+prevents the issue without requiring LDS avoidance. Preserve that parameter
+when deriving kernels, and choose LDS use or avoidance independently from
+measured bandwidth, tile-memory pressure, and compute performance.
 
 R25 is complete-FFN W4 kernel evidence, not arbitrary-mixed/OQ8 FFN support or
 full-model NPU evidence. Attention, norms/residuals, pooling, Dense heads,
@@ -1126,7 +1129,7 @@ reconfigures the associated input, weight, and output BDs while other transfers
 continue.
 
 That completion-driven schedule is the next R32 data-movement experiment. The
-current two-wave workaround drains six output-pair tasks before it configures
+current two-wave scheduling workaround drains six output-pair tasks before it configures
 the next six, introducing an avoidable command-processor bubble. The follow-up
 should test a rolling task window that retires an output task and immediately
 reuses its completed BD slot. It should also sweep the amount of contiguous
@@ -2253,3 +2256,1055 @@ the whole GPU-servable `+`/`++` family was requantized off it and gated through
 
 BF16 = 0.86147. Every regenerated artifact is embedding-focused-calibrated,
 GPU-servable (Q8 ragged down_proj), and carries its calib hash in metadata.
+
+### R57 bandwidth-first kernel-development plan (2026-07-12)
+
+Further NPU kernel work follows the dedicated
+[`2026-07-12-npu-bandwidth-first-kernel-development.md`](2026-07-12-npu-bandwidth-first-kernel-development.md)
+plan. R1/R56 is the stage-zero oracle: one active receive stream reaches 14.4
+GB/s and eight columns reach about 56.5 GB/s, while the current resident
+attention and FFN paths expose only about 0.9 GB/s of useful packed-weight
+payload. New kernels must therefore grow from the measured DMA path one
+observable stage at a time rather than landing as complete GEMMs.
+
+The required sequence is external feed, production transfer geometry,
+memory-tile ping-pong, memory-tile broadcast, preconverted-layout admission,
+representation-local nibble decode, compute stage 1, compute stage 2/reduction,
+scale/epilogue, output drain, and finally a persistent multi-stage boundary.
+Every accumulated mode remains runnable and emits the same wire-byte,
+useful-byte, trace-cycle, compute, and correctness schema.
+
+Immutable tensor-block reordering is explicitly outside the kernels. It is
+performed once by the offline producer or loader, and the derived layout is
+identified by the literal `.rdna2.hfp` filename suffix/tag plus a version and
+source-content hash. The preconverted-layout step only validates and consumes
+blocks in that stream order; it must not transpose or reorder macro tiles on a
+compute tile, in a memory-tile program, or in the dispatch loop.
+
+Representation-local decode remains in-kernel. In particular, packed Opus
+W4/OQ4 weights still require low/high-nibble separation, signed extension, and
+lane swizzling before MMUL. That operation gets its own measured stage and may
+not change global tensor-block order. Multidimensional DMA remains valid for
+placing mutable activations, but it is no longer the immutable tensor-block
+reordering mechanism described by the R31 experiment above.
+
+### R58 packed-W4 admission and nibble-decode result (2026-07-12)
+
+The dense R57 checkpoint has been superseded for projection weights by the
+version-2 `hipfire_xdna::opus_hfp` ABI. A real combined layer-0 QKV derivative,
+`EmbeddingGemma-300M.npu.oq4.layer-0.qkv.oq4.whole-scaled.rdna2.hfp`, retains
+packed W4 through its 2,359,296-byte physical payload. The loader validates
+source and payload SHA-256 plus the complete production geometry and reuses the
+file without rewriting it. Dense R34 completed-attention caches now use the
+unambiguous `.attention-dense.rdna2.hfp` role tag so the two encodings cannot
+collide.
+
+On locked `halo` AIE2P trials, the exact same eight-column/four-row QKV stream
+measured 56.173 GB/s median in feed-only mode and 56.061 GB/s with every nibble
+sign-extended and lane-decoded in each consumer. Retention is 99.80%; hardware
+lane-sum and byte-exact vector oracles pass. `COMPUTE_STAGE1` then adds one real
+native int8-by-int4 MMUL per 128 packed bytes and passes an exact int32 oracle at
+55.933 GB/s median and 2.685 TOPS. `COMPUTE_STAGE2` expands to six activation
+row blocks and full K=256 continuation per core. It passes exact int32 parity,
+reaches 11.497 TOPS, and reduces wire delivery to 39.919 GB/s with 57.45%
+receive stalls. That is the desired, counter-supported transition from
+feed-bound to compute-backpressured operation rather than unexplained bandwidth
+loss. It does not yet prove a complete scaled projection, end-to-end tok/s, or
+the 10k target; scale accumulation, distinct output placement, and resident
+model integration remain open.
+
+Follow-up: complete scaled-projection correctness now passes through the
+production vector-store kernel. `npu_opus_hfp_verify` loaded the real layer-0
+Q/K/V roles through the real QKV HFP and matched all 327,680 outputs at
+`max_abs=2e-7`. Three wrapper runs averaged 0.8635 ms (0.5829 logical TOPS), but
+that includes CPU activation preparation, dispatch/synchronization, and output
+deblocking and must not be presented as a kernel ceiling or end-to-end tok/s.
+A checksum-only epilogue experiment was rejected because horizontal float
+reductions corrupted later virtual-int4 MMUL results; integer sentinels caught
+it before admission. The remaining work is to preserve the proven full-output
+contract inside the resident layer graph without host pack/unpack boundaries.
+
+### Generic HFP format checkpoint (2026-07-13)
+
+The offline-layout ABI is no longer pure-W4/W8-only. `OpusHfpLayout::FullKV1`
+now persists the existing one-dispatch full-K slab order for W4, W8, and compact
+mixed `qt=36`. Mixed HFP payloads keep the W4 base nibble-packed and place the
+dense W8 overlay in the exact AIE schedule entry; no runtime model load repeats
+global slab ordering. Descriptor flags distinguish direct/scaled and combined
+input layouts, while source and payload SHA-256 fail closed on stale/corrupt
+files.
+
+Twenty-six locked real-model AIE2P cases passed with zero mismatches. Coverage
+includes OQ4/OQ8 plain, `+`, and `++`; OQ4.125, OQ4.25 plain/`+`/`++`, OQ4.5,
+and OQ6.5; overlay counts 1/3/7/39; and N=256/768/1152/1280/2304 including
+combined QKV and gate/up. Maximum absolute error was 2e-7 for whole-scaled
+W4/W8 and zero for the direct mixed full-K path. Reopening OQ6.5 preserved the
+HFP mtime, byte size, and SHA. Raw rows are in
+`benchmarks/npu_gemm_tuning/results/r58-opus-hfp-format-matrix-20260713.csv`.
+
+This closes generic projection-format/HFP correctness, not resident-model
+integration or performance. The completed R34/R35 layer kernels still consume
+separate dense derivatives and achieve only about 270 input tok/s end to end.
+Their next ABI must load QKV/O and gate-up/down HFP payloads into BOs owned by
+the destination hardware context, move norm/FWHT/AWQ metadata into small
+parameter BOs, and retain the existing shared activation/hidden/FFN chain. A
+standalone projection wrapper or debug-build timing is not evidence for the
+10k/15k targets.
+
+### R59 resident HFP argument checkpoint (2026-07-13)
+
+R59 establishes the destination-context ABI before porting R34/R35 compute.
+The DPU command regmap accepts at most five data arguments. A combined test with
+four weight BOs, one parameter BO, and one output BO exceeded that limit and
+made XRT reference a nonexistent BO. Counting the completed graph's shared I/O
+shows that separate role BOs would also exceed the limit in production.
+
+The selected ABI is one offline `ResidentContextBundleV1` HFP per destination
+context: QKV+O+attention parameters for R34, and gate/up+down+FFN parameters for
+R35. The loader places immutable role segments column-major without changing
+block order within a role and pads one parameter tile. Source/payload SHA-256,
+segment sizes, geometry, and parameter length are validated. The generic Rust
+entry point is `NpuOpusExecutor::prepack_resident_context_bundle_cached`.
+
+Three locked trials per mode produced:
+
+| R59 ABI | median wire GB/s | range | packed-data GB/s |
+|---|---:|---:|---:|
+| R34 separate-BO control | 56.121 | 56.012-56.227 | 42.042 |
+| R35 separate-BO control | 56.053 | 55.941-56.114 | 42.009 |
+| R34 bundled weight/parameter BO | 55.884 | 55.789-55.898 | 40.416 |
+| R35 bundled weight/parameter BO | 56.018 | 55.922-56.062 | 41.037 |
+
+All role and parameter guards pass, with zero traced receive stalls. Both bundles
+retain at least 99.48% of R58's 56.173-GB/s feed median, so the required production
+argument reduction does not reintroduce the resident path's old ~0.9-GB/s
+bottleneck. This remains a feed/ABI result, not resident projection or tok/s.
+R60 must port R58 decode/MMUL/output into R34 first while preserving its current
+shared input/hidden/query/key-value boundary.
+
+### R60 first resident scaled-output tile (2026-07-13)
+
+R60 now proves that boundary directly. `NpuEmbeddingLayerAttentionDenseW8`
+exposes a CPU activation-packing oracle that delegates to the existing R30
+layout and verifies the full 2,949,120-byte R34 input byte-for-byte. The AIE2P
+graph accepts that shared input plus the R59 QKV/O/parameter bundle, keeping the
+command below the five-data-argument ceiling and performing no global block
+reorder in-core.
+
+Three locked trials per stage:
+
+| R60 stage | median bundle GB/s | range | R59 retention | result |
+|---|---:|---:|---:|---|
+| first MMUL | 53.838 | 53.829-54.112 | 96.34% | exact int32 |
+| K=256 group reduction | 54.252 | 53.870-54.635 | 97.08% | exact int32 |
+| three groups + scale tails | 50.912 | 50.605-51.092 | 91.10% | scaled f32 pass |
+
+The last stage performs the first real 4x16 QKV output tile: 48 W4A8 MMULs,
+three group reductions, activation scales from the existing shared blocks, and
+weight scales from the HFP tails. It clears the 85% bandwidth gate while
+showing about 9.9% receive stalls. The next ratchet is complete row/N-tile
+coverage and production output placement, followed by attention; this result
+is not yet a complete projection, layer, encoder, tok/s, or tokens/J claim.
+
+### R61 complete QKV result: correct but not admitted (2026-07-13)
+
+R61 expands that tile to the entire M256/K768/N1280 projection and drains
+directly to padded row-major output. All 327,680 real values plus padding pass
+with `max_abs=3.8147e-6`. The raw R16-style graph respects the three-argument
+input/bundle/output ABI and never reorders immutable weight blocks in-core.
+
+The final three-trial median is 4.114 ms (3.900-4.476), or 0.122 useful TOPS.
+This is roughly 4.9x slower than the already-proven 0.8635-ms whole-scaled
+wrapper control. Vectorizing R34's local 8+8 activation join improved the
+scalar 6.870-ms median to 4.238 ms, while caching the complete transformed
+6-KiB activation view in tile SRAM did not improve it further. R61 is therefore
+correctness/output-placement evidence only and is rejected for model
+integration.
+
+R62/R63 complete the required controls. Producer-native W4 activation only
+changes the cold raw-runtime median to 3.850 ms; physical output and canonical
+dynamic group looping measure 3.856 ms. R63 then uses byte-identical R15 MLIR
+and the compact 2,359,296-byte QKV `.rdna2.hfp`, yet its cold Python result is
+3.964 ms. These results falsify the claim that the R34 activation join was the
+dominant cost.
+
+The discrepancy is measurement-system overhead. Through the production
+Rust/C++ executor, current R63 measures 1.0292 ms median across three fresh
+processes, versus 1.0288 ms for the pre-`3db7a1497` spill kernel and 1.0596 ms
+for the historical cache. Every run passes the real 327,680-output oracle at
+`max_abs=2e-7`. The no-spill kernel is not a material regression.
+
+The next required stage is resident integration: attach the current compact
+QKV HFP/BO and whole-scaled executor to the shared activation/output chain.
+The offline `.rdna2.hfp` writer owns immutable tensor-block ordering; the
+kernel retains only local nibble/lane swizzles. Admission must use warmed
+production-wrapper and end-to-end resident timings, never cold Python
+`XRTHostRuntime.npu_time` as a substitute.
+
+R64 now separates the exact production graph's device window from that wrapper
+measurement. Twelve locked shim-DMA traces across columns 0-3 pass every real
+output and measure a 241.248-us median input-to-output span, 19.559 GB/s of
+effective aggregate traffic, 198.240 us of output-DMA starvation, 2.817 padded
+TOPS, and 2.086 useful TOPS. Core-tile trace packet routing is a compiler
+scalability dead end on the fully occupied graph, while shim-local tracing
+builds quickly. Columns 4-7 lack a terminal S2MM trace event and are excluded
+from the timing result rather than estimated.
+
+Only about 23.4% of the 1.0292-ms warm wrapper is inside the traced device
+window. The next ratchet is therefore the mutable output boundary: emit the
+verified BF16 attention handoff and keep it in shared BOs instead of returning
+physical f32 QKV for host deblocking. Immutable role/block ordering remains a
+one-time loader or on-disk `.rdna2.hfp` operation; the kernel may still perform
+the local nibble and lane swizzles required by OQ4.
+
+R65 closes the first half of that boundary. It retains the compact W4 HFP and
+unchanged R15 compute, converts completed f32 accumulator tiles to BF16 locally,
+and scatters them directly into the five-role R29 raw attention staging ABI.
+Three locked fresh-process runs pass all 327,680 BF16 values bit-for-bit,
+preserve every preseeded cos/sin/norm byte, and keep padding records zero.
+Median warmed raw-runtime time is 0.487964 ms (0.485649-0.490328), with a
+0.551481-ms median host call and 1.0315 useful TOPS. Largest core text is 9,280
+bytes.
+
+This is not yet the complete attention projection: R66 must consume the shared
+staging BO with R29's headnorm/RoPE packers and prove exact Q/KV layouts before
+attention execution is attached. The result establishes that returning and
+host-deblocking physical f32 QKV is unnecessary. Immutable role/block
+conversion remains offline in `.rdna2.hfp`; only mutable output placement and
+local OQ4 nibble/lane work occur on the NPU.
+
+R66 validates the second half functionally but rejects the first inline-record
+schedule for speed. The exact R65 records produce canonical Q/K/V with the
+established R28 metrics (Q cosine 0.99999121/max 0.0078125, K cosine
+0.99999156/max 0.0078125, and bit-exact V). Three fresh 100-command processes
+measure 0.9511-0.9984 ms, median 0.9915 ms. Sequential R65+R66 would therefore
+cost about 1.48 ms before attention.
+
+The regression is structural: broadcasting one physical record at a time
+serializes four core-pair packers, while R28's joined compact input activates
+them concurrently. R67 should change only the mutable staging/consumer order
+to recover that concurrency. Neither the offline HFP order nor the pack math is
+implicated, and the separate kernel-parameter workaround remains independent
+of LDS use or avoidance.
+
+This distinction is a design constraint for later rungs: do not carry forward
+"no LDS" as a correctness requirement. The added kernel parameter is the
+platform-issue workaround and must remain enabled. Local tile-memory use is a
+separate capacity/performance variable that must be measured like DMA depth,
+FIFO schedule, and swizzle cost; using LDS does not replace or weaken that
+parameter workaround.
+
+R67 restores the lost pack concurrency with a mutable joined layout. Each role
+has 36 8-KiB records (32 M256 records plus four padding records), and R28's
+split FIFO feeds all four core pairs from one joined DMA input. Projection
+passes 327,680 BF16 values bit-for-bit and preserves all cos/sin/parameter
+tails. Its median is 0.751200 ms across three fresh warmed processes, including
+one 1.152343-ms outlier. The pack stage returns to a 0.3670-ms median while
+preserving the established Q/K/V oracle. Sequential medians total about 1.1182
+ms before attention.
+
+This is an admitted layout/concurrency direction but not yet the resident
+handoff: the projection issues roughly 360 small output tasks. R68 should
+collapse three token-group writes into one padded 24-token write with safe
+record overlap, then compare the complete projection-plus-pack boundary before
+attention is attached.
+
+R68 reduces the producer task count about threefold using overlapping padded
+writes. A 37th 8-KiB record per role absorbs the terminal pad while the first
+32 records remain the exact joined M256 consumer order. Projection stays
+bit-exact and measures a 0.494605-ms median; pack stays at 0.3579 ms with the
+established Q/K/V oracle. Sequential medians are about 0.8525 ms before
+attention, 24% faster than R67 and 42% faster than R65+R66.
+
+This is still a sum of isolated contexts. R69 must import one shared stage BO
+into both contexts and measure the actual no-copy chain before the handoff is
+attached to resident attention. No immutable conversion or tensor-block reorder
+is permitted at that boundary.
+
+R69 rejects that cross-context architecture. Independent imports of an amdgpu
+GTT dma-buf are incoherent despite producer/consumer BO sync and dma-buf
+barriers, while the installed amdxdna driver rejects PRIME export of native
+XDNA SHMEM with `EINVAL`. Sharing one DRM file description and the original GEM
+handle does produce exact output after a 0.028-0.029-ms BO sync in two fresh
+processes, but a third fails by 384 Q bytes. More importantly, the two passing
+100-command runs take 5.4478 and 5.6600 ms: projection and pack each inflate to
+roughly 2.7-2.9 ms because two full-array hardware contexts are scheduled around
+the boundary. R70 must therefore fuse projection and headnorm/RoPE packing into
+one compiled graph/hardware context. The handoff must remain graph-local; it
+must not add an online tensor-block conversion.
+
+R70 completes that single-context seam. A literal R68+R67 merge first exceeded
+the tile's two input DMA channels; an inline merge then exceeded the 16-KiB
+program limit. The admitted build reuses the activation channel, specializes K
+and V ownership across columns, and replaces duplicate W4 init/accumulate code
+with one generic group function. Three fresh primed 100-command processes match
+the isolated R65 projection stage and R66 Q/KV outputs byte-for-byte at a
+1.3076-ms median (1.3006-1.3108 ms); maximum core text is 13,504 bytes.
+Activation padding is loader-side and weights remain in offline `.rdna2.hfp`
+order. R71 must now attach the existing packed-Q/KV attention phase inside this
+same context. Do not route R70 output through a second full-array context and
+do not interpret 256/1.3076 ms as end-to-end model tokens/s.
+
+R71 attaches attention in that context and closes the correctness seam, but it
+is not yet the resident integration candidate. The five-argument graph appends
+the attention result to the stage BO, moves Q/V pack ownership to columns 0-3,
+and uses columns 4-7 for full-width attention. Maximum core text is 15,888
+bytes. The projection stage, Q, KV, and all 393,216 attention bytes match the
+isolated R70-to-R27 reference exactly in three fresh primed runs.
+
+Those runs measure 3.5951, 3.2617, and 3.3118 ms (median 3.3118 ms). The exact
+redistributed pack-only control is 1.5446 ms median and isolated R27 attention
+is 0.9141 ms, leaving about 1.77 ms in the fused attention/feed phase. A
+two-column fallback is rejected at 5.8228 ms median, and adding a separate
+attention output path is rejected because it exceeds memory-tile input DMA
+channels. R72 must eliminate or locally stream the packed-Q/KV external round
+trip while preserving R71's byte oracle. The kernel parameter remains the
+correctness workaround; LDS use or avoidance remains an independent measured
+optimization choice.
+
+R72's first graph-local sub-rung proves the direct-Q dependency but rejects its
+scalar-stream implementation. Columns 0-3 stream packed query pairs to columns
+4-7, which reuse a 24-KiB projection accumulator as a six-group query cache.
+The external Q BO is unused, and projection stage, external KV, and final
+attention match the R70/R27 references byte-for-byte. The graph fits at 15,248
+bytes maximum core text.
+
+Three fresh primed 100-command runs measure 3.9288, 3.7749, and 3.9272 ms
+(median 3.9272 ms), an 18.6% regression from R71. The scalar synchronization
+and cache pressure outweigh removal of the 393,216-byte Q round trip. Do not
+extend this implementation to K/V. Continue R72 with a burst/vector DMA or
+existing-FIFO handoff that preserves the exact final-attention oracle. The
+existing kernel parameter remains the correctness workaround; neither this
+rejection nor the next design should infer an LDS/tile-memory avoidance rule.
+
+R73 tests that distinction directly by using shared tile memory for a
+graph-local Q handoff. One depth-one 24-KiB ObjectFIFO joins each adjacent
+projection/attention core pair; the external Q BO is unused and all projection,
+KV, and attention bytes remain exact. A producer-local cache exceeded the
+16-KiB program limit, and the adjacent graph required a 2-KiB rather than
+4-KiB producer stack to fit tile memory. Those are capacity constraints, not
+correctness workarounds.
+
+Three fresh primed 100-command runs measure 3.6449, 3.7165, and 3.7205 ms
+(median 3.7165 ms). R73 recovers 5.4% from scalar R72 but remains 12.2% slower
+than R71, so the depth-one six-group schedule is rejected. The next graph-local
+handoff must overlap production and attention or reuse an existing DMA path;
+it must not extend this serialization to K/V. The added kernel parameter remains
+the workaround that stops the platform issue. LDS/tile-memory use remains a
+separate measured optimization choice.
+
+R74 tests the other external attention operand without adding a local handoff.
+It keeps two query groups and four accumulator/stat sets live per attention
+core, so one 262-KiB KV replay updates both groups and complete KV replays fall
+from six to three. The first 4-KiB-stack graph exceeded the 64-KiB active-tile
+allocation by 1,184 bytes; the already-hardware-tested 2-KiB stack makes it fit
+at 64,672 bytes, leaving 864 bytes. Maximum linked core text is 15,248 bytes.
+
+All projection stage, Q, KV, and attention bytes remain exact. Three fresh
+primed 100-command runs measure 3.4496, 3.4242, and 3.2867 ms (median 3.4242
+ms), 3.4% slower than R71. Reject paired-group residence as the next integration
+topology: halving KV replays/tasks does not recover the stable median. R72-R74
+together show that simply moving more attention state into tile memory is not
+the missing win. The next rung must change phase scheduling or redistribute
+core work while retaining R71's exact observable oracle. The added kernel
+parameter remains the platform-issue workaround; no local-memory avoidance
+rule follows from this result.
+
+R75 changes no kernel math or local-memory allocation. It batches R71's
+runtime tasks into two-group windows, reducing six per-group await/free barriers
+to three. A six-group window exhausts static BD IDs at group 4; a four-group
+window links but corrupts the observable Q boundary (392,405 of 393,216 bytes
+wrong), so queue depth cannot be inferred from successful lowering alone.
+
+The two-group window is byte-exact across projection stage, Q, KV, and final
+attention. Three fresh primed 100-command runs measure 3.2580, 3.2775, and
+3.3314 ms (median 3.2775 ms), 1.0% faster than R71. Admit R75 as the new
+projection/pack/attention scheduling baseline. The result identifies a real,
+if modest, command-stream bubble without adding resident state. Continue the
+window sweep only under the same exact oracle, then carry the admitted schedule
+into the resident-weight layer graph.
+
+R76 tests the only remaining queue point, three groups per window. It remains
+byte-exact across projection stage, Q, KV, and attention. Three fresh primed
+100-command runs measure 3.4199, 3.2222, and 3.2604 ms (median 3.2604 ms), 0.52%
+faster than R75 and 1.55% faster than R71. Three groups is therefore the maximum
+correct and best measured task window for this graph: four corrupts Q and six
+cannot allocate BDs. Admit R76 and stop widening this queue. The next work is
+to preserve its two-window attention schedule while replacing the benchmark
+weight argument with destination-context-owned `.rdna2.hfp` resident bundles.
+
+R77 closes the first resident-weight seam in production Rust. The
+`NpuEmbeddingQkvAttentionOpus` executor reads the real layer QKV
+`.rdna2.hfp`, validates its v2 descriptor and payload SHA-256, allocates the
+2,359,296-byte compact BO from the destination R76 hardware context, uploads
+once, and reuses it across commands. The fused path no longer depends on the
+benchmark's extracted `weights.bin`; immutable block order remains offline and
+only local nibble/lane work remains in the kernel.
+
+The layer-0 hardware oracle passes every projection stage, Q, KV, and attention
+byte. Three fresh primed 100-command runs measure 3.2753, 3.3165, and 3.2137 ms
+(median 3.2753 ms), 0.46% above raw R76 and 1.1% below R71. Admit this resident
+QKV/attention weight seam. Do not call it a resident layer or model result:
+output projection, residual/norm tail, FFN, next-layer handoff, end-to-end
+tokens/s, and package tokens/J remain open. Next, join this executor's output
+to the existing resident O/tail path without adding an online block reorder or
+a sixth DPU argument.
+
+R78 isolates the role map required for that join before adding O-projection
+code. Even columns own the unchanged external Q/K/V packers; adjacent odd
+columns run R76 attention and its three-group task window. Projection stage, Q,
+KV, and attention remain byte-exact, and odd cores fit at 15,888 bytes. Three
+fresh primed 100-command runs measure 3.8331, 3.7729, and 3.7959 ms (median
+3.7959 ms), 16.4% slower than R76. Reject the remap as a standalone schedule.
+
+The capacity result is also decisive: even cores still link compact-W4
+projection plus pack routines, leaving insufficient program store for the R32
+output projection and R34 norm tail. The next graph cannot append those
+functions to R78. It must adopt R33's specialization principle: odd cores
+project a pair of adjacent compact-W4 stripes and retain attention; even cores
+drop QKV projection before receiving the direct attention pair and running O
+projection/tails. The pair-major immutable block schedule must be generated
+once by the loader and stored as `.rdna2.hfp`; only nibble/lane swizzle remains
+local to the kernel.
+
+R79 implements that offline prerequisite as a generic HFP layout rather than a
+kernel conversion. `PairedWholeScaledV1` changes complete-block order from
+`(column, block)` to `(adjacent-column-pair, block, lane)` while preserving
+every encoded block byte-for-byte. Its cache identity includes the complete
+source artifact, and the descriptor retains source encoding/geometry plus the
+source payload size. A deterministic unit oracle verifies full block coverage,
+unchanged bytes, exact pair order, descriptor fields, and cache reuse.
+
+R79 is not hardware evidence. The next rung must feed this pair-major HFP to a
+paired compact projection graph, remove QKV projection functions from even
+cores, and match R65/R70 stage bytes before Q/K/V packing, attention, or O
+projection are attached.
+
+R80 consumes R79's pair-major HFP in the isolated projection graph. Each odd
+core holds two accumulators, reuses one activation block across two intact
+adjacent-column weight blocks, and scatters both stripes into the exact R65
+inline stage. Even cores execute no QKV projection code. A six-task-per-shim
+output schedule timed out; restoring R65's one-slice-per-channel cadence passes
+all 327,680 BF16 outputs bit-for-bit with zero tail or padding corruption.
+
+Three warm process medians are 0.818433, 0.833471, and 0.789289 ms (median
+0.818433 ms), 67.7% slower than R65's eight-column projection. Admit R80 only
+as the required capacity topology. Odd-core text is at most 11,872 bytes,
+leaving 4,512 bytes, and even cores remain completely free. Next, attach the
+existing external Q/K/V pack boundary to this exact stage while retaining
+paired weights and measure program fit before attention or O projection.
+
+R81 attaches even-core Q/K/V packing and preserves every stage, Q, and KV byte.
+Three 100-command runs have a 1.8370-ms median; odd/even text is at most
+14,032/10,912 bytes. It is a capacity checkpoint, not a speed win.
+
+R82 appends R76 attention to the odd cores and is rejected before hardware
+execution. Columns 1/3 reach 22,416 bytes, exactly 6,032 bytes beyond the 16 KiB
+program store. Attention contributes 2,992 bytes of fully unrolled driver,
+4,256 bytes of functions, and 1,136 bytes of helpers. This is program capacity,
+not LDS/tile-memory capacity, and it does not change the separate
+kernel-parameter correctness workaround.
+
+R83 removes that overflow without changing math or offline layout. It reuses
+R70's single projection-group ABI and uses non-LTO trip-count helpers so Peano
+retains the 16-block attention and three-slice finish loops. Maximum odd/even
+text is 15,888/10,912 bytes; stage, Q, KV, and attention are byte-exact. Three
+100-command runs have a 4.0535-ms median, 6.8% slower than R78 and 24.3% slower
+than R76. Admit R83 only as the first fitting paired
+projection/pack/attention image.
+
+R84 attaches direct O projection to the even cores without growing the odd
+projection/attention program. The existing kernel parameter remains the
+correctness workaround; allocator placement and tile-memory use remain
+independent capacity/performance choices. A first hardware oracle exposed an
+R32-to-R83 token-axis transpose, corrected solely in the output DMA scatter as
+`active_column * 32 + core_row * 8`. There is no kernel-side tensor-block
+reorder, and the paired QKV plus direct-O order remains loader-preconverted.
+
+The corrected graph passes exact stage and KV checks and the fused
+attention-to-O numerical oracle. Three 100-command runs measure 5.9362, 5.8716,
+and 5.9856 ms (median 5.9362 ms), 46.4% slower than R83. Admit R84 as a
+correctness/capacity rung and reject it as a speed baseline. Before adding
+residual/norm, split the 1.8827-ms increment into O-weight feed,
+attention-to-O FIFO, O compute, and output-DMA probes; retain R76/R77 as the
+current speed baseline.
+
+R84 attribution subsequently separates its 1.8827-ms R83 increment into
+0.0416 ms paired attention handoff, 0.6209 ms complete O-weight
+delivery/consumption, 1.0601 ms O MMUL plus F32 finish, and 0.1601 ms canonical
+output DMA. The corresponding control medians are 4.0951, 4.7160, and 5.7761
+ms, each synchronized with a 64 KiB completion signal. This rules out the
+adjacent FIFO as the dominant cost and identifies O compute/finish first, then
+the 16 KiB weight cadence, as the next levers.
+
+R85 reuses each activation load across four O N tiles and passes the full
+oracle at a 5.7945-ms median, 2.4% faster than R84. R86's two-accumulator
+variant passes but regresses to 5.9203 ms. Admit R85 as the direct-O baseline,
+reject R86, and preserve the loader-only layout conversion and independent
+kernel-parameter workaround in the next tail-fusion rung.
+
+R87 deepens only the shim-to-memory-tile O-weight FIFO to two objects and
+measures 5.7450 ms median. R88 depth three reaches 5.7343 ms, only 0.0107 ms
+better, so retain the simpler R87 depth-two feed. Both pass the full oracle;
+neither changes compute-tile storage or the correctness parameter.
+
+R89 establishes the post-attention tail's local-storage seam without an
+external round trip. Each even core reuses 8 KiB of its final dead 10 KiB
+activation FIFO object after packing and adds one 4 KiB buffer, staging one
+8x768 O wave as three block-aligned 8x256 BF16 tiles. The DMA scatter alone applies R83's token mapping
+`active_column * 32 + core_row * 8`; the kernel performs no tensor-block
+reorder. Stage and KV are bit-exact, and O has 0.99999225 cosine with 0.0625
+maximum error, one BF16 quantum at the worst magnitude. Three fresh
+100-command runs have a 5.7202-ms median. Maximum even/odd text is
+14,544/16,048 bytes. Admit this capacity seam, but do not call it residual/norm
+execution or a full-layer/model throughput result.
+
+R90 closes that local tail boundary. A first literal image expanded the
+18-record projection-drain loop and reached 16,784 bytes. Replacing the Q-pack
+sequence with a loop linked at 14,976 bytes but changed attention numerics, so
+that rewrite is rejected. R90 instead makes only the existing projection-drain
+bound noinline/runtime-stable. This retains all 12 Q-pack calls per even core in
+their byte-verified order and fits at 15,952/16,048 bytes maximum even/odd text.
+The build now treats missing artifacts and any core above 16 KiB as hard
+failures, even when `aiecc` returns success after a CDO overflow.
+
+The full hardware oracle keeps stage and KV bit-exact. All 196,608 normalized
+BF16 values are finite and nonzero, with 0.99995399 global cosine, 0.99994058
+minimum token-row cosine, and 0.09375 maximum error. The two AIE `invsqrt`
+operations produce a bounded row-scale difference rather than a tensor-layout
+or parameter-record error; admission requires both cosine measures at least
+0.9998 and maximum error at most 0.1. Three fresh 100-command runs measure
+6.6044, 6.2915, and 6.3890 ms (median 6.3890 ms), adding 0.6688 ms to R89.
+Admit the complete post-attention norm/residual/pre-FFN-norm boundary for
+correctness and proceed to direct FFN consumption; it is not a speed or
+full-layer admission. The kernel parameter remains the platform workaround,
+independent of tile-memory use.
+
+R91 makes that FFN consumption physically zero-copy. A first offset-zero DMA
+passed one command but corrupted sustained execution: the paired projection
+regenerates only 327,680 stage bytes, while the following 65,536 bytes are
+immutable headnorm/RoPE pack state. The normalized 393,216-byte tensor had
+overwritten those tails. The accepted layout shifts the complete 2,457,600-byte
+stage ABI forward by 393,216 bytes and reserves offset zero for canonical BF16
+H. This is a loader/DMA offset change, not a kernel tensor-block reorder.
+
+Sustained SHMEM and PRIME/GTT controls pass the R90 tail gate and exact KV
+oracle. The same physical GTT pages then feed the existing canonical-BF16 R35
+resident FFN without a host write. The synthetic dense-OQ8 FFN reaches
+0.99989925 cosine and 0.0118408 maximum error. Three fresh 100-command runs have
+6.3727 ms producer, 9.7654 ms isolated FFN, and 22.1772 ms alternating-chain
+medians. The 6.0391-ms residual is context alternation, 27.2% of the chain. One
+layer boundary reaches 11,543 M256 rows/s, but this is not end-to-end encoder
+input-token throughput. R91 admits the zero-copy contract and rejects per-layer
+two-context alternation as the final schedule. Test same-DRM peer contexts next;
+if the tax remains, the graph must change phase partitioning rather than memory
+layout.
+
+R92 tests that same-DRM alternative. `NpuKernel::load_peer` places R91 and R35
+on separate hardware contexts backed by one amdxdna DRM file and device heap;
+the physical handoff remains the proven GTT dma-buf because PRIME-exporting an
+XDNA-owned SHMEM BO returns `EINVAL` on this driver. All tail/KV/FFN oracles
+pass. Three fresh 100-command runs have 6.4109 ms producer, 9.7080 ms isolated
+FFN, and 22.1542 ms alternating-chain medians. The residual 6.0353 ms (27.2%)
+is indistinguishable from R91's 6.0391 ms. Reject peer ownership as a sustained
+win: the tax belongs to hardware-context alternation, not separate DRM files or
+the GTT handoff. A one-iteration 19.8480-ms sample is not admission evidence.
+Continue with the bandwidth-first native compact FFN phase and a different
+phase partition; do not spend another rung changing shared-buffer ownership.
+
+### R93 bandwidth-first canonical-BF16 to resident-W4 checkpoint
+
+R93 implements the next boundary one operation at a time. It consumes R90/R91's
+canonical M256xK768 BF16 pre-FFN-normalized state, applies only gate/up AWQ
+scaling, the canonical seed-42/1042 signed FWHT-256, and row quantization, then
+writes R25's exact 718,848-byte activation ABI. The DMA scatter produces four
+row stripes, 27 blocks per stripe, and 6,656 bytes per block. Each 6,240-byte
+dynamic prefix is placed directly in the three N-macro consumer positions;
+the 416-byte tail remains zero. This is mutable activation preparation, not
+immutable tensor-block conversion. Weight order remains an offline/loader
+`.rdna2.hfp` contract and OQ4 nibble/lane swizzle remains local to compute.
+
+The physical input BO pads the canonical 256 rows to 288. Each AIE DMA object
+reads a two-row 3,072-byte window and consumes only the first row, allowing the
+same FIFO to preload the proven 3,072-byte BF16-vector parameter record without
+changing canonical row order. Across all three replicas, all 589,824 int8
+values match the CPU oracle, maximum scale error is `7e-9`, every block tail
+and padded-row guard remains zero, and core text is 7,856-9,040 bytes.
+
+A scalar/int8-sign implementation is rejected. A route-only image writes all
+chains and a load-only image reads valid source/parameter data, but the full
+scalar image corrupts the scale/quantization loop. Reusing R47's noinline
+BF16-vector sign/post-scale path restores exactness. This is compiler/codegen
+evidence, not a tile-memory correctness constraint. The added kernel parameter
+continues to be the platform workaround; LDS use is independent.
+
+Three fresh 100-command processes measure 4.0618, 4.1218, and 4.1117 ms
+(median 4.1117 ms). At only 0.263 GiB/s of physical source-plus-output traffic,
+the standalone producer is transform/control limited rather than external
+bandwidth limited. Admit the byte contract and reject the separate phase. R94
+must fold preparation into the first native gate/up stage, overlap it with
+resident weight DMA, and avoid external materialization of the three identical
+N-macro activation copies. This remains a rung-level result, not complete-layer
+or end-to-end token/s evidence.
+
+### R94-R97 native-W4 preparation and fusion checkpoint
+
+R94's BF16-vector preparation reduces the R93 median from 4.1117 to 2.1320 ms
+while retaining the physical ABI (three one-code q differences, `7e-9` maximum
+scale error, zero padding corruption). Its 0.507 GiB/s rate still rejects a
+separate preparation context.
+
+R95 unifies W4 init/accumulate and R96 compacts the repeated fragment-ring
+driver. The complete R25 FFN oracle is unchanged while maximum core text falls
+from 16,320 to 13,968 and then 12,944 bytes. These rungs buy fusion capacity;
+they do not establish a sustained throughput win.
+
+R97 spends that capacity to consume canonical BF16 inside the first gate/up
+phase. Hardware probes prove all 216 source DMA objects, all weight objects,
+and the full 256-row quantized activation boundary. Groups 1-2 are q-exact;
+group 0 differs by one code in one value, and scale differences are bounded to
+normal floating-point rounding. The initial full graph emitted NaNs because
+inline gate preparation reused `own` and `transit` while those buffers still
+held R25's spilled partial down accumulator. Two dedicated 784-byte gate
+fragment buffers remove that state-lifetime alias. The full hardware oracle
+then passes with gate cosine `1.00000000`, final cosine `0.99998228`, maximum
+absolute error `0.2597733`, and mean absolute error `0.03750710`; maximum core
+text is 15,456 bytes. A fresh dispatch measures 6.4095 ms, or 39,941 M256
+rows/s. This admits correctness and fusion capacity, not sustained throughput:
+R97 already inherits R15's `rounding=floor` and `saturation=none` numerical
+controls, but a 20-command run still encounters the independent four-second
+command timeout cadence. The added kernel parameter that stops the platform
+issue remains active. Bounded context
+recycling closes the immediate execution gate: three independent 100-command
+runs recycling every seven commands preserve the full oracle at 6.4974, 6.4844,
+and 6.3388 ms (median 6.4844 ms, 39,479 M256 rows/s). Admit sustained standalone
+R97 with this timeout mitigation. The next step is to replace the reusable W4
+runtime's externally packed activation ABI with this canonical-BF16 input and
+then join it to the resident layer graph; this row rate is not yet full-layer or
+end-to-end encoder throughput.
+
+Terminology is binding here: the added kernel parameter is the platform-issue
+workaround. It is not LDS avoidance and it is not the R15 rounding/saturation
+configuration. LDS/tile-memory use or avoidance,
+the command timeout, context recycling, and program-capacity refactors are
+independent issues or performance/capacity decisions; none replaces those
+workarounds. R97's dedicated fragment buffers fix its own kernel state
+alias and are likewise not that workaround.
+
+R98-R100 complete the next bandwidth-first output ladder. R98 converts the
+final F32 values in place to compensated BF16 high/low pairs, retaining the
+884,736-byte transfer and fitting at 16,032 bytes. Its 6.5832-ms sustained
+median is 38,886 M256 rows/s. R99 changes only the output DMA destination stride
+to place those bytes in the first 3,072 bytes of the existing 4,608-byte
+post-FFN combined row; it sustains 6.6000 ms or 38,788 rows/s. R100 changes only
+the split-X tail reader and passes at `0.99999861` cosine and `0.0039062`
+maximum error. These are mutable scalar encoding and DMA placement changes, not
+immutable tensor-block conversion. The next integration step is to select the
+R99/R100 pair for native W4 layers in the reusable resident executor while
+leaving arbitrary mixed and OQ8 layers on the generic dense-W8 executor.
+
+That reusable native-W4 selection is now implemented and compile-checked. The
+first layer oracle isolated an integration alias: the temporary host
+pre-FFN-normalization bridge overwrote direct architectural X with normalized H
+in the attention hidden BO, while R100's split-X tail still consumed that BO.
+A separate 442,368-byte shared X buffer fixes the seam. Layer 0 now reaches
+`0.99997024` FFN cosine, `0.99999873` tail cosine, and `0.99998514`
+completed-layer cosine. All 24 resident-only OQ4 layers complete for M256.
+
+The full run is only 291.6 input tok/s (878.003 ms), so it is not a throughput
+admission. The temporary host readback/normalization bridge and per-layer
+preparation/output account for roughly 10-12 ms per layer and must be removed.
+The next bandwidth-first rung should make attention emit canonical
+pre-FFN-normalized H while preserving X directly into the R100 split input,
+then remeasure each phase before extending native compact execution beyond W4.
+Mixed OQ and OQ8 remain on the generic dense-W8 executor meanwhile.
+
+Do not conflate this integration fix with the platform workaround. The latter
+is the separately added kernel parameter that stops the issue, not LDS
+avoidance and not R15's `rounding=floor`/`saturation=none` numerical controls.
+X preservation, R97's dedicated fragment buffers, context recycling, and
+tile-memory placement are separate concerns.
+
+R101-R103 and the first R104 form test the initial direct-X bridge-removal
+designs and reject them before runtime selection. The literal per-row inverse
+relay overflows at 16,444 bytes.
+A shim-DMA scatter fits at 16,380 bytes but misaddresses inverse state and
+reduces layer-0 cosine to 0.50248530. Reusing the even normalized-X output FIFO
+fits at 16,268 bytes but triggers the independent four-second timeout. The R102
+consumer is allocation-clean at 16,064 bytes with weight FIFO depth one, but
+has no correct producer; the first R104 in-FFN RMS prepass overflows at 18,352
+bytes (`-Oz`: 20,032 bytes). A separate metadata FIFO also exceeds DMA-channel
+count.
+
+The next rung is therefore smaller: keep R44's known-good direct-X producer and
+R99/R100's admitted W4/tail seam, preserve X, and move only X-times-inverse
+activation preparation off host. Fold immutable pre-FFN norm into loader-side
+W4 scaling. First admit that boundary alone against exact per-row inverse and
+FFN oracles, then integrate it only if it avoids the four-second timeout and
+materially reduces the current two 5.1-MiB host synchronizations. Keep both the
+R15 numerical controls and the distinct platform-workaround kernel parameter.
+
+R105/R106 completes this smaller boundary as a correctness experiment but
+rejects it as the resident topology. R105 alone passes at cosine `0.99999122`
+and a 0.1295-ms median; loader-side folding lets R106 preserve the intended
+learned pre-FFN norm without another immutable input. Integrated layer 0 reaches
+unit-RMS cosine `0.99999269`, FFN cosine `0.99990930`, tail cosine
+`0.99999862`, and completed-layer cosine `0.99996179`. The full 24-layer run is
+slower than the R99/R100 host bridge: 901.432 ms / 284.0 input tok/s versus
+878.003 ms / 291.6 tok/s. Cross-context cache maintenance inflates the nominal
+R105 phase to 2.35-4.14 ms per layer and preparation/output remains roughly
+9-12 ms. Keep the pair behind `HIPFIRE_EMBED_UNIT_RMS_BRIDGE=1` for diagnostics
+and compact RMS into the resident W4 program next. This rejection is unrelated
+to LDS; the existing kernel parameter remains the separate platform-issue
+workaround.
+
+### R104 single-context RMS is admitted
+
+R104 now fits the resident W4 context under the normal build. Vectorizing the
+mean multiply removes the scalar runtime helper; inverse completion is fused
+into the scan; four cloned FWHT specializations share one runtime-stride body;
+and each core retains one complete `3 x 768` BF16 X object. All 32 core text
+sections are exactly 16,384 bytes. The input DMA contract is one padded
+442,368-byte canonical-X pass, not a prepass followed by nine tensor replays.
+
+Standalone hardware reaches gate cosine `1.00000000`, final cosine
+`0.99996707`, maximum absolute error `0.0737100`, and mean absolute error
+`0.01499078`; a 100-command recycle-every-seven run takes 6.5401 ms. Default
+layer-0 execution reaches FFN cosine `0.99991494`, tail cosine `0.99999844`, and
+completed-layer cosine `0.99996658`. Alternating full-model trials measure R99
+at 892.708/909.986 ms and R104 at 859.599/869.015 ms, a 4.1% paired-mean latency
+reduction. A separate current default run is 894.222 ms, 286.3 input tok/s,
+18.07 W, and 15.8 tok/J.
+
+Select R104 by default for native W4 when its artifact exists; keep R105/R106
+behind `HIPFIRE_EMBED_UNIT_RMS_BRIDGE=1`. Reject the smaller post-link Peano
+variants because they time out with all-zero hardware output. The next
+bandwidth-first rung is no longer pre-FFN normalization: it is the separate
+next-layer and residual preparation contexts, which still consume about 9-12
+ms per layer. Preserve the existing kernel-parameter workaround independently
+of LDS/tile-memory placement.
+
+### R108/R109 remove the residual-copy context
+
+R107's literal R47+R48 graph exceeds memory-tile DMA channels. A separate R108
+argument then exceeds amdxdna's five-argument DPU register map, and importing
+the same dma-buf twice into R109 returns `EALREADY`. The admitted form uses one
+in-place attention argument: its first 884,736 bytes hold completed BF16x2 and
+its suffix holds R34 activation records. R109 reads the prefix and prepares the
+suffix; R108 strided-DMAs the already-rounded high BF16 residual through the
+existing residual FIFO. No tensor block is reordered and the immutable
+`.rdna2.hfp` layout is unchanged.
+
+Layer 0 reaches FFN cosine `0.99991644`, tail cosine `0.99999886`, and completed
+layer cosine `0.99996836`. Preparation drops from roughly 9-12 ms to 7-9 ms.
+Paired full-model means improve from 815.294 ms (R48) to 804.722 ms (R108/R109),
+or 1.30%. Tokens/J samples are too variable for an energy claim. Admit R108/R109
+as the default direct-residual path when both artifacts exist. The next rung
+must attack R47/R109's remaining four full completed-state passes or fold
+next-layer preparation into the tail/attention context; the kernel-parameter
+workaround and LDS decisions remain separate.
+
+### R110 refreshes generic Opus suffix and mixed-width execution
+
+The current R108/R109 completed-layer chain is not native-W4-specific. Locked
+M256 layer-0 oracles pass for native OQ8, calibrated OQ8+, freshly generated
+OQ8++, and compact mixed OQ6.5, with completed-layer cosine between
+`0.99996270` and `0.99997103`. OQ8++ was produced offline from BF16 and the
+unified calibration/Hessian package; all 168 backbone projection LDLQ packs
+succeeded. No tensor-block conversion was added to a kernel.
+
+Full 24-layer results are 296.0 tok/s for OQ8, 299.1 for OQ8+, 305.1 for OQ8++,
+and 294.9 for OQ6.5. OQ8-family BF16 embedding cosine is
+`0.99547863-0.99584466`; OQ6.5 reaches `0.95821863`, so it is arbitrary
+mixed-width execution evidence rather than an OQ8-quality promotion. This
+closes the refreshed generic API matrix but does not alter the performance
+blocker: the best row remains about 33x below 10k. Continue by reducing the
+remaining full completed-state passes and serialized context boundaries.
+The added kernel parameter remains the platform-issue workaround; LDS use or
+avoidance and R15 numerical controls remain independent.
+
+### R111 admits one-pass completed-state preparation
+
+R111 preserves R109's in-place completed-prefix/R34-suffix ABI and all
+immutable `.rdna2.hfp` ordering. Each core copies one active 3,072-byte
+completed row into tile memory, immediately releases the input FIFO, and then
+computes RMS plus all three K256 activation chunks from that explicit local
+copy. The allocation remains 884,736 bytes because it includes 32 padded rows,
+but one physical sweep reads 786,432 active bytes. R111 reduces four sweeps
+(3,145,728 bytes) to one and cuts completed-input shim tasks from 32 to 8.
+
+The first schedule held the FIFO across RMS and three packs and reproduced
+R54's failure; it remains rejected. Copy-and-release initially left all scales
+exact but corrupted the packer-owned group-1/group-2 Q partitions. Those chunks
+were 32-byte aligned while assembly used a 64-byte load. Using the allocator's
+guaranteed 32-byte alignment restores the gate: five one-code Q differences,
+maximum Q delta 1, and `7e-9` maximum scale error. Core text ranges from 9,072
+to 10,592 bytes.
+
+Standalone paired means improve from 5.1424 ms for R109 to 5.0949 ms for R111,
+only 0.9%, so the default decision uses four counterbalanced full-model pairs
+with three encodes per process. R109 averages 760.323 ms, 336.7 input tok/s,
+18.88 W, and 17.83 tok/J. R111 averages 749.409 ms, 341.6 tok/s, 18.87 W, and
+18.10 tok/J. It wins every latency pair and preserves BF16 embedding cosine
+`0.92839295`. Select R111 when its artifact is present and retain R109 as the
+fallback.
+
+This is a clean bandwidth-first admission, but its size is diagnostically
+important: removing 2,359,296 active bytes per layer improves end-to-end
+latency by only 1.44%. The remaining path is not simply capped by external
+memory bandwidth. The next rung should consolidate a context and its routes,
+with R100 tail fusion the plausible target. Do not append it to R108, whose
+largest core has only 16 bytes of program headroom. The added kernel parameter
+continues to be the platform workaround; it is separate from LDS placement,
+R15 rounding/saturation, and R111's alignment fix.
+
+### R112 admits the fusion-ready tail topology
+
+R112 changes R100's mutable ownership schedule so each core receives eight
+contiguous tokens, while DMA gathers from and scatters to canonical token-major
+rows. The first design tried to send split architectural X through a second
+memory-tile broadcast; compilation rejects it because the tile's output DMA
+channels are already consumed. The admitted form uses the third plane reserved
+in R99's 4,608-byte mutable row for canonical BF16 X. This eliminates the
+separate X DMA/relay route without reordering immutable tensor blocks or adding
+kernel-side layout conversion.
+
+Total active input DMA remains 1,179,648 bytes in both variants. R100 divides
+that into 786,432 FFN bytes and 393,216 split-X bytes; R112 carries the same
+bytes in one joined row-state route. Maximum core text drops from 4,208 to
+3,696 bytes and 24 horizontal core flows become zero. The locked oracle is
+unchanged at cosine `0.99999861` and maximum error `0.0039062`. Four
+counterbalanced 100-command pairs all favor R112: mean dispatch drops from
+`0.324965 ms` to `0.218271 ms`, a 32.84% reduction.
+
+Admit R112 as the topology for the next tail-local RMS/three-group pack rung.
+Do not treat this standalone tail win as an end-to-end throughput claim. The
+added kernel parameter remains the platform-issue workaround and stays enabled;
+it is not LDS avoidance. Tile-memory placement, R15 numerical controls, R97
+fragment buffers, and context recycling remain separate decisions or fixes.
+
+### R113 admits phase-local tail-to-next-pack fusion
+
+R113 now executes R111's exact next-layer RMS/AWQ/FWHT/int8 preparation in the
+R112 tail context. It preloads one 9,216-byte three-group parameter record per
+core and packs each still-local two-row completed output. It does not retain a
+separate completed-state tensor and therefore removes the 786,432-byte active
+input pass that R111 still requires. Canonical mutable row order and immutable
+`.rdna2.hfp` tensor-block order remain unchanged.
+
+The failed literal implementation kept all eight completed rows in a
+24,576-byte local buffer and exceeded bank capacity. The phase-local form fits
+at 9,984 text bytes on every core. Its first diagnostic schedule kept seven
+shim output tasks live; group 2 remained all zero. Retiring one old completed
+task per stripe before queuing three diagnostics fixes the queue limit, but
+those retirements must occur after every stripe is launched. Doing them inside
+the construction loop serialized the array and measured 13.3578 ms.
+
+The final oracle is tail cosine `1.00000000`, maximum error `0.0000310`, three
+one-code Q differences, Q delta 1, and `7e-9` maximum scale error. Four live
+50-command samples average 5.056325 ms. Current R112 and R111 controls total
+5.260901 ms, so fusion saves 0.204576 ms (3.8886%) and one full completed-state
+pass. One fresh process returned all-zero output during the first series, but
+four immediate fresh contexts and the complete repeated series passed; retain
+that as context-transition evidence.
+
+Admit R113 as the next bandwidth-first rung, not yet as the full-layer default.
+Do not restore the eliminated completed-state pass. The separately added kernel
+parameter remains the platform workaround and is independent of LDS placement,
+the shim queue schedule, R111 alignment, and context lifetime.
+
+### R114 rejects assembled compact R34 output; consume R113 chunks directly
+
+R114 tested in-context assembly before adding R34 compute. Logical-owner stream
+chains and physical column-major stream chains both exhaust legal routing.
+Adjacent neighbor-memory ObjectFIFOs avoid extra core flows, but adding a new
+shim output route also exhausts routing. A zero-destination-stride scheme cannot
+reuse one output task because the DMA compiler requires positive strides.
+
+The remaining split-plane graph reuses the completed-output route, builds in
+about nine seconds, and fits at 11,200 bytes maximum core text. It emits only
+589,824 bytes: no 16 KiB record padding and no fivefold N-macro materialization.
+Hardware parity rejects it with 107,811 pack mismatches, maximum Q delta 254,
+and maximum scale error 0.034057196 even when the completed tail passes. Errors
+span all three K256 groups and all local-memory owner positions. This proves the
+compact assembly/mapping is wrong, but does not isolate one neighbor link. R114
+is not admitted.
+
+Change the next slice from producer-side assembly/replication to consumer-side
+reuse. R113 already emits correct per-core chunks in a 589,824-byte padded ABI,
+of which 199,680 bytes are unique chunk data. Add the first resident R34 GEMM
+consumer directly against that ABI and reuse every chunk across its five
+N-macros. Do not materialize the canonical 2,949,120-byte activation replicas,
+and do not reorder immutable tensor blocks in the kernel; `.rdna2.hfp` order is
+an offline or loader responsibility. Once that consumer passes, optimize the
+RMS/FWHT pack body that now dominates this seam.
+
+One fresh context returned an all-zero completed tail between otherwise useful
+runs; the immediate repeat returned the distributed pack mismatch. Record it as
+context-transition evidence, not as an LDS diagnosis. The added kernel
+parameter is the workaround that stops the platform issue. It is not LDS
+avoidance; local-memory use, output mapping, R111 alignment, and context
+lifetime are separate design variables.
+
+### R115 admits direct compact consumption for K256 x N16
+
+R115 implements the consumer-side plan without trying to fix R114 assembly.
+Each core owns eight tokens, reads its R113 group-0 chunk directly, and computes
+one scaled int8 K256-by-N16 stage. The same offline-packed weight record reaches
+all token owners and 32 core outputs scatter to canonical `[256,16]` f32. No
+24-token block is assembled, no N-macro activation replica is materialized, and
+no immutable tensor block is reordered in the kernel.
+
+The first mapping gate deliberately keeps R113's slot padding. It reads 196,608
+physical activation bytes containing 66,560 unique chunk bytes. The image fits
+at 1,692 bytes maximum core text. Locked parity is zero mismatches and `2e-9`
+maximum absolute error. Six fresh 1,000-dispatch processes pass at a mean of
+0.092506 ms. One preceding fresh context returned mostly zero output and the
+immediate six-process series passed; keep that as context-transition evidence.
+
+Admit the direct consumer mapping and group-0 matrix stage only. Next add groups
+1 and 2 with local f32 accumulation, preserving this ABI and its zero N-macro
+replicas. Then extend N one slice at a time. Only after full-K parity should a
+DMA gather remove diagnostic padding. Immutable weights remain an offline or
+loader `.rdna2.hfp` responsibility. The added kernel parameter remains the
+platform workaround that stops the platform issue; it is not LDS avoidance.
+
+### R116 proves full-K direct consumption at N16
+
+R116 adds groups 1 and 2 without changing the R113 ABI. Every token-owning core
+consumes three K256 chunks and accumulates a single N16 output tile locally in
+f32. Physical activation input is 589,824 bytes with 199,680 unique bytes,
+versus 2,949,120 bytes for the old five-N-macro materialization. N-macro
+activation replicas remain zero and immutable tensor ordering stays offline.
+
+The first group-1 build corrupts only columns 0-7. Padding weight records to
+128-byte starts does not alter the error. Separate group DMA tasks and an
+unrolled core schedule return zeros and are also rejected. The correct design
+copies the previous 8x16 f32 tile into a 512-byte local staging array before the
+next MMUL. This makes the inter-group output reload dependency explicit. K512
+with unit scales is bit-exact; full K768 has zero mismatches and `4e-9` maximum
+error at 2,220 bytes maximum core text.
+
+Eight passing fresh 1,000-dispatch processes average 0.096384 ms. Two other
+fresh processes return all-zero output, after which fresh processes pass again.
+Admit the full-K math/ABI rung, not context-stable production selection. The
+next slice adds one more N16 output at a time while reusing the same three input
+chunks; do not reintroduce N-macro activation replicas. Keep a byte oracle for
+each N extension before considering padding removal.
+
+The added kernel parameter remains the workaround that stops the platform
+issue. The R116 prior-output staging is a separate local data-dependency fix,
+and local-memory use remains an independent design variable rather than the
+workaround.
+
+### R117 admits N32 reuse at unchanged activation traffic
+
+R117 doubles the useful output width by feeding four 8-column MMUL halves from
+each K-tile activation load. It retains R116's three-group local accumulation
+fix, reads the same 589,824 physical/199,680 unique activation bytes, and still
+materializes zero N-macro replicas. Immutable N32 records are loader/offline
+`.rdna2.hfp` data; no kernel-side tensor reorder is introduced.
+
+Both N16 halves pass with zero mismatches and `3e-9` maximum error. Maximum core
+text is 3,192 bytes. Eight passing fresh 1,000-dispatch processes average
+0.086916 ms, 9.82% faster than R116's N16 mean of 0.096384 ms despite twice the
+useful N work. Fixed dispatch and activation traffic dominate this small stage,
+so wider compute per load is productive.
+
+Two fresh contexts returned all-zero output before the eight passes. Admit N32
+math and activation-load reuse, not context-stable production selection. For
+the next slice, stage the three 2,080-byte compact chunks once per core and
+stream at least two N32 weight/output records from that local state. Activation
+DMA must remain 589,824 bytes as N grows. This topology, rather than a monolithic
+ever-wider accumulator, is the scalable path to N1280.
+
+The added kernel parameter remains the workaround that stops the platform
+issue. Wider MMUL use, per-core activation staging, and LDS placement are
+independent design decisions.
+
+### R118 admits activation-once N64
+
+R118 stages each core's three compact activation chunks once, releases the
+activation FIFO, and streams two full-K N32 weight/output blocks. Activation
+DMA remains one 589,824-byte physical pass containing 199,680 unique bytes as N
+grows from 32 to 64. N-macro activation replicas remain zero.
+
+The first 6,240-byte stage is rejected because group 1 starts at byte 2,080,
+only 32-byte aligned for a 64-byte MMUL activation load. A 2,112-byte stride
+creates a 6,336-byte stage with every group 64-byte aligned. This fixes block 0.
+The first repeated output BD then leaves block 1 zero; two explicit output tasks
+at queue depth two restore both blocks. Final parity is zero mismatches with
+`5e-9` maximum error, and core text is 3,736 bytes.
+
+Nine passing fresh 1,000-dispatch processes average 0.106058 ms, only 22.0%
+above R117 N32 while doing twice the useful work. One other fresh process
+returns all zeros. Admit activation-once N64 math/topology, not context-stable
+production selection.
+
+Before increasing the block count, test an output task with both the outer DMA
+tiling dimension and `repeat_count`. If admitted, increase N32 block count while
+keeping activation DMA fixed. If not, use bounded two-task waves with await/free
+between waves; do not queue all N1280 outputs simultaneously.
+
+The added kernel parameter remains the workaround that stops the platform
+issue. R118's group alignment and local activation stage are separate design
+constraints and do not imply LDS avoidance.
+
+### R119 admits the scalable repeated S2MM task
+
+R119 keeps R118 compute and local state unchanged. It combines the outer output
+tiling dimension of two with task `repeat_count=1`. This consumes and scatters
+both N32 output objects using one task per stream; the outer dimension alone
+only transferred block 0.
+
+Parity is zero mismatches with `5e-9` maximum error. Eight passing fresh
+1,000-dispatch processes average 0.102308 ms, 3.54% below the explicit two-task
+R118 mean. Two other fresh processes return all zeros. Admit the repeated-task
+schedule for N scaling, with the existing context-stability caveat.
+
+Parameterize the staged consumer by N32 block count. Gate four blocks (N128)
+before the full 40-block N1280 projection, keeping activation DMA fixed at one
+589,824-byte pass. The task repeat must be `block_count - 1`, and the outer
+tiling dimension must equal `block_count`.
+
+The added kernel parameter remains the platform workaround. Output task repeat,
+activation staging, and LDS placement are independent.
+
+### R120 admits four repeated N32 blocks
+
+R120 parameterizes the R119 graph to N128. The output row strides scale with N,
+the outer tiling dimension is four, and task `repeat_count` is three. The
+compute kernel, 6,336-byte aligned local activation stage, and one 589,824-byte
+activation pass do not change. All four output blocks pass with zero mismatches
+and `7e-9` maximum error.
+
+Four passing fresh 1,000-dispatch contexts average 0.115102 ms. Six other fresh
+contexts return the known whole-output zero symptom, so admit the N128 topology
+without claiming context-stable production selection. Maximum core text is
+4,312 bytes. The added kernel parameter remains the platform workaround; this
+result neither requires nor implies LDS avoidance.
+
+### R121 admits the complete N1280 projection schedule
+
+R121 grows the same graph to all 40 N32 blocks of the 768x1280 projection. The
+task outer dimension is 40 and `repeat_count=39`. Each core still stages the
+three R113 activation chunks exactly once. Physical activation traffic remains
+589,824 bytes with 199,680 unique bytes and zero N-macro replicas while the W8
+diagnostic weight payload grows to 7,987,200 bytes and f32 output to 1,310,720
+bytes. Immutable record layout remains an offline/loader `.rdna2.hfp`
+responsibility.
+
+The full M256 K768 N1280 byte oracle passes with zero mismatches and `6e-9`
+maximum error. All ten fresh 1,000-dispatch contexts pass at
+0.319049-0.325542 ms, mean 0.320640 ms. That is about 798,402 M256 projection
+rows/s and 30.84 GB/s over the W8 input, compact activation, and f32 output
+bytes. Maximum core text is 3,848 bytes.
+
+This is a full-width projection-schedule result, not full-layer resident NPU or
+encoder tok/s evidence. The next concrete slice is to feed this schedule from
+the generic runtime Opus packed-record API, preserve the oracle for OQ4,
+arbitrary mixed OQ bitwidths, OQ8, and +/++ variants, then replace W8 diagnostic
+records with native packed/decode records one measured stage at a time. The
+added kernel parameter remains the platform workaround. LDS placement, local
+activation staging, DMA repetition, and encoding/decode are separate design
+variables.
