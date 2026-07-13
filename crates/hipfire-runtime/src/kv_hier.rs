@@ -127,6 +127,11 @@ pub struct HierKvState {
     /// Group merged (non-core) cold tokens by adjacent position (similar RoPE
     /// phase → less merge blur) rather than importance rank. Default on.
     pub position_local: bool,
+    /// CASK content-similarity merge grouping (`HIPFIRE_KV_MERGE=similarity`): fold
+    /// near-DUPLICATE keys (K-cosine) instead of position-adjacent ones, so averaging
+    /// is ~lossless (fixes the content-merge loss). Takes precedence over
+    /// position_local. Default off (byte-identical).
+    pub similarity_merge: bool,
     /// Max quant code for cold K tiles (15=4-bit default, 3=2-bit probe).
     pub cold_qmax: f32,
     /// Bits per cold K code (4 or 2) — drives real sub-nibble packing + dequant.
@@ -143,6 +148,12 @@ pub struct HierKvState {
     /// folds them all into one wider tile (bounds the per-segment two-tier read
     /// cost + amortizes per-channel scale overhead). Off by default (byte-identical).
     pub defrag_segments: usize,
+    /// PyramidKV per-layer budget schedule (`HIPFIRE_KV_PYRAMID=1`): upper layers fold
+    /// MORE aggressively (concentrated attention → cheaper) + keep less core; lower
+    /// layers fold LESS (diffuse attention → need more tokens). Varies fold_m/core_frac
+    /// around the base by ±`pyramid_amp` linearly in layer index. Default off.
+    pub pyramid: bool,
+    pub pyramid_amp: f32,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub hot_k: Vec<GpuTensor>, // [n_layers] slot-major [nkv × hot_budget × HD] f32
@@ -234,6 +245,8 @@ impl HierKvState {
             None
         };
         let position_local = std::env::var("HIPFIRE_KV_POS_LOCAL").ok().as_deref() != Some("0");
+        let similarity_merge =
+            std::env::var("HIPFIRE_KV_MERGE").ok().as_deref() == Some("similarity");
         // Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,
         // 2-bit=3). Same nibble storage; this measures lower-precision quant QUALITY.
         let cold_bits: u32 = std::env::var("HIPFIRE_KV_COLD_BITS")
@@ -258,6 +271,11 @@ impl HierKvState {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0usize);
+        let pyramid = std::env::var("HIPFIRE_KV_PYRAMID").ok().as_deref() == Some("1");
+        let pyramid_amp = std::env::var("HIPFIRE_KV_PYRAMID_AMP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.5f32);
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
         let mut attn_mass = Vec::with_capacity(n_layers);
@@ -282,12 +300,15 @@ impl HierKvState {
             fold_m,
             importance_mode,
             position_local,
+            similarity_merge,
             cold_qmax,
             cold_bits: cold_bits as usize,
             cold_v_qmax,
             cold_v_bits: cold_v_bits as usize,
             cold_v_perslot,
             defrag_segments,
+            pyramid,
+            pyramid_amp,
             n_heads,
             n_kv_heads,
             hot_k,
@@ -304,6 +325,22 @@ impl HierKvState {
 
     fn kv_dim(&self) -> usize {
         self.n_kv_heads * HD
+    }
+
+    /// Per-layer (fold_m, core_frac) under the PyramidKV schedule. Budget scale s(l) is
+    /// `1+amp` at the bottom (l=0), `1−amp` at the top: lower layers get less fold + more
+    /// core, upper layers more fold + less core. Identity when pyramid is off. (The
+    /// paper's exact arithmetic is for a flat top-B budget; this maps the depth principle
+    /// onto the hier cold-merge knobs.)
+    fn layer_fold_core(&self, layer: usize, n_layers: usize) -> (usize, f32) {
+        if !self.pyramid || n_layers <= 1 {
+            return (self.fold_m, self.core_frac);
+        }
+        let t = layer as f32 / (n_layers - 1) as f32; // 0..1 bottom→top
+        let s = 1.0 + self.pyramid_amp * (1.0 - 2.0 * t);
+        let fold = ((self.fold_m as f32 / s).round() as usize).max(1);
+        let core = (self.core_frac * s).clamp(0.0, 1.0);
+        (fold, core)
     }
 
     /// Reset all per-layer tier state for a new sequence (pos==0). Hot ring buffers
@@ -493,6 +530,7 @@ impl HierKvState {
                 }
             })
             .collect();
+        let (layer_fold, layer_core) = self.layer_fold_core(layer, self.cold.len());
         let cold = compact_cold_kv(
             &ck,
             &cv,
@@ -500,10 +538,11 @@ impl HierKvState {
             nkv,
             HD,
             &importance,
-            self.core_frac,
-            self.fold_m,
+            layer_core,
+            layer_fold,
             false,
             self.position_local,
+            self.similarity_merge,
             self.cold_qmax,
             self.cold_v_qmax,
             self.cold_v_perslot,
@@ -713,6 +752,7 @@ impl HierKvState {
                 &importance,
                 1.0,
                 1,
+                false,
                 false,
                 false,
                 self.cold_qmax,

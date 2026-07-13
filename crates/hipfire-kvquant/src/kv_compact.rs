@@ -42,16 +42,67 @@ pub struct ColdTier {
     pub v_perslot: bool,
 }
 
+/// Greedy K-similarity grouping (CASK-style consolidation). Clusters the non-core
+/// scratch tokens into groups of up to `fold_m` NEAR-DUPLICATE keys (highest cosine
+/// on the full K vector), so the mass-weighted average folds tokens that barely
+/// differ — nearly lossless, unlike position-adjacency which averages distinct
+/// content (the measured merge-loss root cause). O(n²) over scratch; runs off the
+/// latency path (idle/migration). ponytail: O(n²) greedy is fine at migrate/idle
+/// scratch sizes; if long-session drains get huge, cap with a candidate window / LSH.
+fn similarity_groups(k: &[f32], scratch: &[usize], kv_dim: usize, fold_m: usize) -> Vec<Vec<u32>> {
+    let n = scratch.len();
+    let norm: Vec<f32> = scratch
+        .iter()
+        .map(|&t| {
+            let b = t * kv_dim;
+            (0..kv_dim)
+                .map(|d| k[b + d] * k[b + d])
+                .sum::<f32>()
+                .sqrt()
+                .max(1e-12)
+        })
+        .collect();
+    let cos = |i: usize, j: usize| -> f32 {
+        let (bi, bj) = (scratch[i] * kv_dim, scratch[j] * kv_dim);
+        let dot: f32 = (0..kv_dim).map(|d| k[bi + d] * k[bj + d]).sum();
+        dot / (norm[i] * norm[j])
+    };
+    let mut used = vec![false; n];
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    for seed in 0..n {
+        if used[seed] {
+            continue;
+        }
+        used[seed] = true;
+        let mut group = vec![scratch[seed] as u32];
+        if fold_m > 1 {
+            let mut cands: Vec<(f32, usize)> = (0..n)
+                .filter(|&j| !used[j])
+                .map(|j| (cos(seed, j), j))
+                .collect();
+            cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            for &(_, j) in cands.iter().take(fold_m - 1) {
+                used[j] = true;
+                group.push(scratch[j] as u32);
+            }
+        }
+        groups.push(group);
+    }
+    groups
+}
+
 /// Deferred cold-tier compaction. `k`,`v` are `[n_tok, n_kv_heads*head_dim]` f32,
 /// post-RoPE (the cold tokens, contiguous). `importance[t]` is a shared (head-
 /// aggregated) score; higher = keep exact. `core_frac` of tokens stay singleton
 /// (exact), the rest fold `fold_m:1` by importance-weighted average. `rotate` =
 /// FWHT-256 incoherence per head before quantize. head_dim must be 256 (KVarN v1).
 ///
-/// `position_local`: when true, the to-be-merged (non-core) tokens are grouped by
-/// adjacent POSITION rather than by importance rank, so each merged slot averages
-/// K vectors with similar RoPE phase (less phase-blur — the dominant cold-merge
-/// quality cost). Core selection stays importance-based either way.
+/// Grouping of the non-core tokens (which fold together):
+/// - `similarity_merge` (CASK): cluster near-DUPLICATE keys by K-cosine → averaging
+///   is ~lossless (fixes the content-merge loss). Takes precedence when set.
+/// - else `position_local`: group by adjacent POSITION (similar RoPE phase); the
+///   original default.
+/// Core selection stays importance-based either way.
 #[allow(clippy::too_many_arguments)]
 pub fn compact_cold_kv(
     k: &[f32],
@@ -64,6 +115,7 @@ pub fn compact_cold_kv(
     fold_m: usize,
     rotate: bool,
     position_local: bool,
+    similarity_merge: bool,
     // Max quant code for the cold K / V tiles, independently: 15 = 4-bit, 3 =
     // 2-bit, etc. Asymmetric (e.g. K2V4: k_qmax=3, v_qmax=15) is supported — V is
     // the "easy" operand (weighted-average, no outlier channels), so it can carry
@@ -89,30 +141,34 @@ pub fn compact_cold_kv(
     });
     let ncore = ((core_frac * n_tok as f32) as usize).min(n_tok);
     let core = &order[..ncore];
-    // The non-core tokens to merge. Position-local grouping sorts them back into
-    // ascending position so each fold_m group is position-contiguous (similar
-    // RoPE phase); otherwise they stay in importance-rank order.
+    // The non-core tokens to merge. similarity_merge (CASK) clusters near-duplicates;
+    // else position_local sorts into ascending position (RoPE-phase-contiguous groups);
+    // else importance-rank order.
     let mut scratch_owned: Vec<usize> = order[ncore..].to_vec();
-    if position_local {
+    if position_local && !similarity_merge {
         scratch_owned.sort_unstable();
     }
     let scratch = &scratch_owned[..];
-    let nb = scratch.len().checked_div(fold_m).unwrap_or(0);
 
-    let mut slot_members: Vec<Vec<u32>> = Vec::with_capacity(ncore + nb + fold_m);
+    let mut slot_members: Vec<Vec<u32>> = Vec::with_capacity(ncore + scratch.len());
     for &t in core {
         slot_members.push(vec![t as u32]);
     }
-    for g in 0..nb {
-        slot_members.push(
-            scratch[g * fold_m..(g + 1) * fold_m]
-                .iter()
-                .map(|&x| x as u32)
-                .collect(),
-        );
-    }
-    for &t in &scratch[nb * fold_m..] {
-        slot_members.push(vec![t as u32]); // leftover scratch kept singleton
+    if similarity_merge && fold_m > 1 {
+        slot_members.extend(similarity_groups(k, scratch, kv_dim, fold_m));
+    } else {
+        let nb = scratch.len().checked_div(fold_m).unwrap_or(0);
+        for g in 0..nb {
+            slot_members.push(
+                scratch[g * fold_m..(g + 1) * fold_m]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .collect(),
+            );
+        }
+        for &t in &scratch[nb * fold_m..] {
+            slot_members.push(vec![t as u32]); // leftover scratch kept singleton
+        }
     }
     let n_valid = slot_members.len();
     let n_slots = if n_valid.is_multiple_of(2) {
@@ -404,6 +460,7 @@ mod tests {
                 m,
                 true,
                 false,
+                false,
                 15.0,
                 15.0,
                 false,
@@ -446,7 +503,7 @@ mod tests {
         }
         let imp: Vec<f32> = (0..nt).map(|t| 1.0 + (t % 5) as f32).collect(); // varied weights
         let cold = compact_cold_kv(
-            &k, &v, nt, 1, d, &imp, 0.0, 8, true, false, 15.0, 15.0, false,
+            &k, &v, nt, 1, d, &imp, 0.0, 8, true, false, false, 15.0, 15.0, false,
         ); // all merged
         let (kr, _) = cold.dequant_head(0);
         // recompute the true weighted-average of slot 0's members and compare.
@@ -503,6 +560,7 @@ mod tests {
             8,
             true,
             false,
+            false,
             15.0,
             15.0,
             false,
@@ -544,7 +602,7 @@ mod tests {
             .map(|t| (0..d).map(|i| q[i] * k[t * d + i]).sum::<f32>())
             .collect();
         let cold = compact_cold_kv(
-            &k, &v, nt, h, d, &imp, 0.25, 4, false, false, 15.0, 15.0, false,
+            &k, &v, nt, h, d, &imp, 0.25, 4, false, false, false, 15.0, 15.0, false,
         );
         let (kr, _vr) = cold.dequant_head(0);
         assert_eq!(kr.len(), cold.n_valid * d);
@@ -576,7 +634,7 @@ mod tests {
         let refo = attn(&q, &k, &v, nt, d); // full-precision reference
         let build = |vps: bool| {
             compact_cold_kv(
-                &k, &v, nt, h, d, &imp, 0.0, 1, true, false, 255.0, 15.0, vps,
+                &k, &v, nt, h, d, &imp, 0.0, 1, true, false, false, 255.0, 15.0, vps,
             )
         };
         let rel = |o: &[f32]| -> f64 {

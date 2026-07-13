@@ -72,6 +72,27 @@ was already near-optimal), and hierarchical stays a memory-only play.
 **Sequencing: FIRST.** Everything else composes on top; this decides whether the
 hierarchical-quality direction lives.
 
+**RESULT — WASH on wikitext (2026-07-13, DONE).** Implemented `similarity_groups`
+(greedy K-cosine) in `compact_cold_kv`, gated `HIPFIRE_KV_MERGE=similarity` (default
+`position`); 5 kvquant unit tests + `parity_kv_hier` PASS on both modes. Gate
+(0.8B mq4+, fold=4 2-bit, vs bf16):
+| ctx | position PPL/KLD | similarity PPL/KLD |
+| --- | --- | --- |
+| 2048 (hot=512) | 27.54 / 0.153 | 27.60 / **0.150** |
+| 16384 (hot=2048) | 18.42 / 0.146 | 18.66 / **0.144** |
+Similarity gives a tiny *consistent* KLD improvement (~2%) but a tiny PPL regression,
+and **does not close the gap to single-tier KVarN** (0.144 vs 0.085). **Wash.**
+**Why (important):** wikitext is dense, low-redundancy general text — the regime where
+CASK's near-duplicate merge has the *least* to exploit. CASK's wins are on *reasoning
+traces* (AIME) full of restatements/self-checks; our KLD-vs-bf16-on-wikitext rig may be
+structurally unable to show it. **Verdict:** on general-text serving, hierarchical merge
+quality is a wash regardless of grouping → hierarchical stays a **memory-compression
+play**; similarity-merge is kept flag-gated (available + tiny KLD win for redundant
+workloads) but is not a default win. Properly testing CASK's premise needs a
+redundant/reasoning corpus + teacher-forced replay (the paper's own methodology) —
+a separate eval-infra effort, out of scope here. **The remaining levers (memory
+efficiency) are the right direction; proceed.**
+
 ---
 
 ## Lever 2 — PyramidKV per-layer budgets
@@ -95,6 +116,31 @@ shape to hot_budget and inversely to fold_m. Gate `HIPFIRE_KV_PYRAMID=1`.
 green. Low bar; low risk.
 
 **Difficulty.** Low. **Sequencing: parallel to Lever 1** (independent; composes).
+
+**RESULT — NEGATIVE on wikitext (2026-07-13, DONE).** Implemented per-layer
+fold_m/core_frac schedule (`HIPFIRE_KV_PYRAMID=1`, amp 0.5); parity PASS. Experiment
+(0.8B mq4+, base fold=4 core=0.125 2-bit, vs bf16):
+| ctx | uniform PPL/KLD | pyramid PPL/KLD |
+| --- | --- | --- |
+| 2048 | 27.54 / 0.153 | 27.61 / 0.161 |
+| 16384 | 18.36 / 0.138 | 18.72 / 0.153 |
+Pyramid **hurts** (+0.4 PPL, +6–10% KLD) at the tested amp/direction. Could be a wrong
+amp/direction for qwen3.5, but combined with Lever 1's wash it points to a **methodology
+blocker**: PyramidKV/CASK are validated on **long-context RETRIEVAL/reasoning**
+(LongBench, AIME, NIAH), not next-token PPL on dense wikitext. Our KLD-vs-bf16-on-
+wikitext rig cannot reward "keep the needle across long context" — the regime these
+levers target. **Two levers, two non-wins on the wrong eval.** Kept flag-gated.
+
+### ⚠ Methodology blocker (2026-07-13) — the eval regime is wrong for these levers
+
+Levers 1–5 all target the **long-context / retrieval / redundancy** regime; the
+wikitext PPL/KLD rig measures dense next-token prediction, which is structurally unable
+to show their benefit (and can penalise them). Continuing Levers 3–5 on this rig will
+keep producing washes/negatives regardless of the levers' merit. **Before implementing
+more, validation must move to the papers' regime** — e.g. `pflash_niah_bench`
+(needle-in-a-haystack, already in-tree) and/or a redundant/reasoning corpus with
+teacher-forced replay. Decision needed: build the long-context eval first, or accept
+that on general-text serving hierarchical is a memory-play and these levers don't help.
 
 ---
 
