@@ -1,0 +1,4 @@
+variant,trial,contexts,projection_columns,pack_columns,stage_mismatches,q_mismatches,kv_mismatches,iterations,ms,status,notes
+paired-projection-pack,1,1,odd,even,0,0,0,100,1.8370,capacity-admitted,exact R65 and R66 boundaries
+paired-projection-pack,2,1,odd,even,0,0,0,100,1.8179,capacity-admitted,exact R65 and R66 boundaries
+paired-projection-pack,3,1,odd,even,0,0,0,100,1.8397,capacity-admitted,exact R65 and R66 boundaries

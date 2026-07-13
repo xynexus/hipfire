@@ -1,0 +1,13 @@
+sample,parity,mismatches,max_abs,dispatch_ms,n,n32_blocks,activation_physical_bytes,weight_bytes,output_bytes,output_task_repeat_count,max_core_text_bytes,status
+correctness_1,pass,0,0.000000007,0.125765,128,4,589824,798720,131072,3,4312,correctness-probe
+fresh_1,pass,0,0.000000007,0.114647,128,4,589824,798720,131072,3,4312,admitted-math
+fresh_2,fail,32700,0.025049984,,128,4,589824,798720,131072,3,4312,context-transition-zero
+fresh_3,fail,32700,0.025049984,,128,4,589824,798720,131072,3,4312,context-transition-zero
+fresh_4,fail,32700,0.025049984,,128,4,589824,798720,131072,3,4312,context-transition-zero
+fresh_5,pass,0,0.000000007,0.115430,128,4,589824,798720,131072,3,4312,admitted-math
+fresh_6,fail,32700,0.025049984,,128,4,589824,798720,131072,3,4312,context-transition-zero
+fresh_7,fail,32700,0.025049984,,128,4,589824,798720,131072,3,4312,context-transition-zero
+fresh_8,pass,0,0.000000007,0.116050,128,4,589824,798720,131072,3,4312,admitted-math
+fresh_9,fail,32700,0.025049984,,128,4,589824,798720,131072,3,4312,context-transition-zero
+fresh_10,pass,0,0.000000007,0.114280,128,4,589824,798720,131072,3,4312,admitted-math
+passing_mean,pass,0,0.000000007,0.115102,128,4,589824,798720,131072,3,4312,admitted-topology-context-caveat

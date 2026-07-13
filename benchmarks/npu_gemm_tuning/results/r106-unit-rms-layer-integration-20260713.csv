@@ -1,0 +1,3 @@
+variant,m,layers,layer0_unit_rms_cosine,layer0_ffn_cosine,layer0_tail_cosine,layer0_complete_cosine,total_ms,input_tok_s,package_w,tok_per_j,status
+r99_r100_host_bridge,256,24,,0.99997024,0.99999873,0.99998514,878.003,291.6,,,admitted_correctness_baseline
+r105_r106_cross_context,256,24,0.99999269,0.99990930,0.99999862,0.99996179,901.432,284.0,21.0,13.5,rejected_default_cross_context_coherence_regression

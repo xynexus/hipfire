@@ -1,0 +1,2 @@
+variant,physical_output_bytes,destination_bo_bytes,gate_cosine,final_cosine,max_abs,mean_abs,recycle_every,sustained_iterations_per_trial,sustained_trials,sustained_range_ms,sustained_median_ms,sustained_m256_rows_per_s,decision
+r99-combined-row-scatter,884736,1327104,1.00000000,0.99998228,0.2596474,0.03750556,7,100,3,6.4729-6.6113,6.6000,38787.9,admit-tail-compatible-dma-scatter

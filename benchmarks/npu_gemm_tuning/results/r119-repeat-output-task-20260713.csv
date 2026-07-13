@@ -1,0 +1,16 @@
+sample,parity,mismatches,max_abs,dispatch_ms,activation_physical_bytes,activation_dma_passes,output_tasks_per_stream,output_task_repeat_count,max_core_text_bytes,status
+correctness_1,pass,0,0.000000005,0.267154,589824,1,1,1,3736,correctness-probe
+correctness_2,pass,0,0.000000005,0.253209,589824,1,1,1,3736,correctness-probe
+correctness_3,pass,0,0.000000005,0.258900,589824,1,1,1,3736,correctness-probe
+correctness_4,pass,0,0.000000005,0.495367,589824,1,1,1,3736,correctness-probe
+fresh_1,pass,0,0.000000005,0.102314,589824,1,1,1,3736,admitted-math
+fresh_2,pass,0,0.000000005,0.103706,589824,1,1,1,3736,admitted-math
+fresh_3,fail,16333,0.020542033,,589824,1,1,1,3736,context-transition-zero
+fresh_4,pass,0,0.000000005,0.100600,589824,1,1,1,3736,admitted-math
+fresh_5,pass,0,0.000000005,0.101129,589824,1,1,1,3736,admitted-math
+fresh_6,pass,0,0.000000005,0.103954,589824,1,1,1,3736,admitted-math
+fresh_7,pass,0,0.000000005,0.102298,589824,1,1,1,3736,admitted-math
+fresh_8,fail,16333,0.020542033,,589824,1,1,1,3736,context-transition-zero
+fresh_9,pass,0,0.000000005,0.102226,589824,1,1,1,3736,admitted-math
+fresh_10,pass,0,0.000000005,0.102238,589824,1,1,1,3736,admitted-math
+passing_mean,pass,0,0.000000005,0.102308,589824,1,1,1,3736,admitted-schedule-context-caveat

@@ -1,0 +1,4 @@
+variant,trial,contexts,q_handoff,kv_handoff,stage_mismatches,q_external,kv_mismatches,attention_mismatches,iterations,ms,status,notes
+adjacent-objectfifo,1,1,graph-local-shared-tile,external,0,unused,0,0,100,3.6449,rejected,exact output but slower than R71
+adjacent-objectfifo,2,1,graph-local-shared-tile,external,0,unused,0,0,100,3.7165,rejected,exact output but slower than R71
+adjacent-objectfifo,3,1,graph-local-shared-tile,external,0,unused,0,0,100,3.7205,rejected,exact output but slower than R71

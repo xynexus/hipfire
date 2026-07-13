@@ -242,6 +242,13 @@ void r29_pack_q(const int8_t *restrict pair, int8_t *restrict packed_bytes,
   }
 }
 
+__attribute__((noinline, minsize)) void
+r72_pack_q_cache(const int8_t *restrict pair, int32_t *restrict cache,
+                 int32_t group, int32_t lane) {
+  auto *bytes = reinterpret_cast<int8_t *>(cache);
+  r29_pack_q(pair, bytes + (group * 2 + lane) * 2048, lane);
+}
+
 void r29_pack_k(const int8_t *restrict pair, int8_t *restrict packed_bytes,
                 float *restrict inverse_rows, int32_t upper_half) {
   const bfloat16 *raw = raw_values(pair);

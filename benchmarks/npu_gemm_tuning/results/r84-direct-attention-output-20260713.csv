@@ -1,0 +1,4 @@
+mode,run,contexts,weight_layout,stage_mismatches,q_status,kv_mismatches,output_projection,iterations,fused_ms,decision,notes
+r84-direct-attention-output,1,1,paired-qkv-plus-loader-packed-direct-o,0,external-unused,0,pass,100,5.9362,speed-rejected,correctness-capacity rung
+r84-direct-attention-output,2,1,paired-qkv-plus-loader-packed-direct-o,0,external-unused,0,pass,100,5.8716,speed-rejected,correctness-capacity rung
+r84-direct-attention-output,3,1,paired-qkv-plus-loader-packed-direct-o,0,external-unused,0,pass,100,5.9856,speed-rejected,correctness-capacity rung

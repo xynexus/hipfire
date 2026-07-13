@@ -1,0 +1,4 @@
+mode,run,contexts,stage_prefix,kv_mismatches,tail_projection,ffn_zero_copy,ffn_cosine,ffn_max_abs,iterations,producer_ms,ffn_ms,chain_ms,decision
+r91-zero-copy-ffn-handoff,1,2,reused-shifted,0,pass,pass,0.99989925,0.0118408,100,6.3961,9.7394,22.1772,admitted-correctness-boundary
+r91-zero-copy-ffn-handoff,2,2,reused-shifted,0,pass,pass,0.99989925,0.0118408,100,6.3727,9.7654,22.2041,admitted-correctness-boundary
+r91-zero-copy-ffn-handoff,3,2,reused-shifted,0,pass,pass,0.99989925,0.0118408,100,6.2203,10.1406,22.1470,admitted-correctness-boundary

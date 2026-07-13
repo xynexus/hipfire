@@ -1,0 +1,4 @@
+variant,trial,contexts,projection_columns,stripes_per_core,checked_outputs,mismatches,tail_mismatches,padding_mismatches,npu_ms,status,notes
+paired-w4,1,1,odd,2,327680,0,0,0,0.818433,capacity-admitted,exact R65 stage
+paired-w4,2,1,odd,2,327680,0,0,0,0.833471,capacity-admitted,exact R65 stage
+paired-w4,3,1,odd,2,327680,0,0,0,0.789289,capacity-admitted,exact R65 stage

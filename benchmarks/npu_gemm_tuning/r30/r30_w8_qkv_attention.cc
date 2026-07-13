@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // R29 resident W8 QKV pack followed by R27 BF16 bidirectional attention.
 
+#ifdef R30_ATTENTION_ONLY
+#include <aie_api/aie.hpp>
+#include "aie_kernels/aie_kernel_utils.h"
+#include <stdint.h>
+#else
 #include "../r29/r29_w8_qkv_attention_pack.cc"
+#endif
 
 namespace {
 constexpr int ATTN_QUERIES = 4;
@@ -45,12 +51,21 @@ __attribute__((minsize)) void r30_attention_init(float *restrict accum,
     aie::store_v(accum + index, aie::zeros<float, 16>());
 }
 
+#ifdef R72_Q_CACHE
+void r72_attention_block_cached(const int8_t *restrict query_bytes,
+                                const int8_t *restrict key_value_bytes,
+                                float *restrict accum, float *restrict stats,
+                                int32_t cache_group, int32_t cache_lane) {
+  const bfloat16 *queries = reinterpret_cast<const bfloat16 *>(query_bytes) +
+                            (cache_group * 2 + cache_lane) * ATTN_QUERY_ELEMS;
+#else
 void r30_attention_block(const int8_t *restrict query_bytes,
                          const int8_t *restrict key_value_bytes,
                          float *restrict accum, float *restrict stats,
                          int32_t pair_lane) {
   const bfloat16 *queries = reinterpret_cast<const bfloat16 *>(query_bytes) +
                             pair_lane * ATTN_QUERY_ELEMS;
+#endif
   const bfloat16 *keys =
       reinterpret_cast<const bfloat16 *>(key_value_bytes);
   const bfloat16 *values = keys + ATTN_KEYS * ATTN_DIM;

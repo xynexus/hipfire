@@ -1,0 +1,4 @@
+variant,trial,contexts,q_group_batch,kv_replays,stage_mismatches,q_mismatches,kv_mismatches,attention_mismatches,iterations,ms,status,notes
+qgroup2,1,1,2,3,0,0,0,0,100,3.4496,rejected,exact output but median slower than R71
+qgroup2,2,1,2,3,0,0,0,0,100,3.4242,rejected,exact output but median slower than R71
+qgroup2,3,1,2,3,0,0,0,0,100,3.2867,rejected,exact output but median slower than R71

@@ -1,0 +1,4 @@
+mode,run,contexts,stage_mismatches,q_status,kv_mismatches,output_projection,iterations,fused_ms,decision
+r88-output-weight-shim-depth3,1,1,0,external-unused,0,pass,100,5.7539,rejected
+r88-output-weight-shim-depth3,2,1,0,external-unused,0,pass,100,5.6671,rejected
+r88-output-weight-shim-depth3,3,1,0,external-unused,0,pass,100,5.7343,rejected

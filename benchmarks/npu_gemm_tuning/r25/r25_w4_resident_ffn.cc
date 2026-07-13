@@ -21,12 +21,213 @@ constexpr int R25_WEIGHT_BYTES = 15872;
 #ifndef R25_RAW_SOURCE_JN
 #define R25_RAW_SOURCE_JN -1
 #endif
+
+extern "C" __attribute__((noinline, minsize)) void
+r98_finish_interleaved_bf16x2(int32 *__restrict accumulator_bits) {
+  float *input = reinterpret_cast<float *>(accumulator_bits);
+  bfloat16 *output = reinterpret_cast<bfloat16 *>(accumulator_bits);
+  for (int offset = 0; offset < 2 * R25_TILE_FLOATS; offset += 16) {
+    const auto values = aie::load_v<16>(input + offset);
+    const auto high =
+        aie::mul(values, 1.0f).template to_vector<bfloat16>();
+    const auto high_float =
+        aie::mul(high, aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+            .template to_vector<float>();
+    const auto low = aie::mul(aie::sub(values, high_float), 1.0f)
+                         .template to_vector<bfloat16>();
+    aie::store_v(output + 2 * offset,
+                 aie::concat(aie::interleave_zip(high, low, 1)));
+  }
+}
+
 extern "C" __attribute__((noinline, minsize)) void
 r25_wait_weight(const int8 *__restrict weights, float *__restrict scratch) {
   uint32_t hash = 2166136261u;
   for (int i = 0; i < R25_WEIGHT_BYTES; i++)
     hash = (hash ^ static_cast<uint8_t>(weights[i])) * 16777619u;
   reinterpret_cast<volatile uint32_t *>(scratch)[0] = hash;
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r97_bf16_to_f32_3(const int8 *__restrict input_bytes,
+                  float *__restrict output) {
+  const auto *input = reinterpret_cast<const bfloat16 *>(input_bytes);
+  for (int row = 0; row < 3; ++row)
+    for (int inner = 0; inner < R25_GROUP; inner += 16) {
+      const auto values =
+          aie::mul(aie::load_v<16>(input + row * R25_GROUP + inner),
+                   aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .to_vector<float>();
+      aie::store_v(output + row * R25_GROUP + inner, values);
+    }
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r101_bf16_x_inverse_to_f32_3(const int8 *__restrict input_bytes,
+                             float *__restrict output, int32_t group) {
+  for (int row = 0; row < 3; ++row) {
+    const int8 *row_bytes = input_bytes + row * 1664;
+    const auto *input = reinterpret_cast<const bfloat16 *>(row_bytes);
+    const float inverse =
+        *reinterpret_cast<const float *>(row_bytes + 1536);
+    const auto scale = aie::broadcast<float, 16>(inverse);
+    for (int inner = 0; inner < R25_GROUP; inner += 16) {
+      const auto values =
+          aie::mul(aie::load_v<16>(input + group * R25_GROUP + inner),
+                   aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .to_vector<float>();
+      aie::store_v(output + row * R25_GROUP + inner,
+                   aie::mul(values, scale).to_vector<float>());
+    }
+  }
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r104_rms_accumulate3(const int8 *__restrict input_bytes,
+#ifdef R104_FULL_X_OBJECT
+                     float *__restrict inverse) {
+#else
+                     float *__restrict inverse, int32_t group) {
+#endif
+  const auto *input = reinterpret_cast<const bfloat16 *>(input_bytes);
+  for (int row = 0; row < 3; ++row) {
+#ifdef R104_FULL_X_OBJECT
+    float sum = 0.0f;
+    for (int inner = 0; inner < 3 * R25_GROUP; inner += 16) {
+      const auto values =
+          aie::mul(aie::load_v<16>(input + row * 3 * R25_GROUP + inner),
+                   aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .to_vector<float>();
+      sum += aie::reduce_add(aie::mul(values, values).to_vector<float>());
+    }
+#else
+    float sum = group == 0 ? 0.0f : inverse[row];
+    for (int inner = 0; inner < R25_GROUP; inner += 16) {
+      const auto values =
+          aie::mul(aie::load_v<16>(input + row * R25_GROUP + inner),
+                   aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .to_vector<float>();
+      sum += aie::reduce_add(aie::mul(values, values).to_vector<float>());
+    }
+#endif
+#ifdef R104_FULL_X_OBJECT
+    {
+#else
+    if (group == 2) {
+#endif
+      const auto mean =
+          aie::mul(aie::broadcast<float, 16>(sum),
+                   aie::broadcast<float, 16>(1.0f / 768.0f))
+              .template to_vector<float>();
+      inverse[row] = aie::invsqrt(mean[0] + 1.0e-6f);
+#ifndef R104_FULL_X_OBJECT
+    } else {
+      inverse[row] = sum;
+#endif
+    }
+  }
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r104_bf16_x_inverse_to_f32_3(const int8 *__restrict input_bytes,
+                             const float *__restrict inverse,
+                             float *__restrict output
+#ifdef R104_FULL_X_OBJECT
+                             ,
+                             int32_t group
+#endif
+                             ) {
+  const auto *input = reinterpret_cast<const bfloat16 *>(input_bytes);
+  for (int row = 0; row < 3; ++row) {
+    const auto scale = aie::broadcast<float, 16>(inverse[row]);
+    for (int inner = 0; inner < R25_GROUP; inner += 16) {
+      const auto values =
+          aie::mul(aie::load_v<16>(input
+#ifdef R104_FULL_X_OBJECT
+                                   + row * 3 * R25_GROUP + group * R25_GROUP
+#else
+                                   + row * R25_GROUP
+#endif
+                                   + inner),
+                   aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .to_vector<float>();
+      aie::store_v(output + row * R25_GROUP + inner,
+                   aie::mul(values, scale).to_vector<float>());
+    }
+  }
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r97_activation_fence(const int8 *__restrict activations) {
+  const volatile int8 *visible = activations;
+  int sink = visible[0] + visible[R25_A_DATA - 1] +
+             visible[R25_A_BYTES - (int)sizeof(float)];
+  (void)sink;
+  chess_separator_scheduler(1);
+  chess_separator();
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r97_scan_activation(const int8 *__restrict activations,
+                    float *__restrict scratch) {
+  const volatile int8 *visible = activations;
+  uint32_t hash = 2166136261u;
+  for (int offset = 0; offset < R25_A_BYTES; ++offset)
+    hash = (hash ^ static_cast<uint8_t>(visible[offset])) * 16777619u;
+  reinterpret_cast<volatile uint32_t *>(scratch)[0] = hash;
+  chess_separator_scheduler(1);
+  chess_separator();
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r97_snapshot_activation_hash(const int8 *__restrict activations,
+                             float *__restrict snapshot, int slot) {
+  uint32_t hash = 2166136261u;
+  for (int offset = 0; offset < R25_A_BYTES; ++offset)
+    hash = (hash ^ static_cast<uint8_t>(activations[offset])) * 16777619u;
+  reinterpret_cast<uint32_t *>(snapshot)[slot] = hash;
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r97_snapshot_weight_hash(const int8 *__restrict weights,
+                         float *__restrict snapshot, int slot) {
+  uint32_t hash = 2166136261u;
+  for (int offset = 0; offset < R25_WEIGHT_BYTES; ++offset)
+    hash = (hash ^ static_cast<uint8_t>(weights[offset])) * 16777619u;
+  reinterpret_cast<uint32_t *>(snapshot)[slot] = hash;
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r97_emit_activation_hashes(const float *__restrict snapshot,
+                           int32 *__restrict output) {
+  constexpr int row = R25_PROBE_ROW;
+  constexpr int im = row / 4;
+  constexpr int rr = row % 4;
+  for (int slot = 0; slot < 6; ++slot) {
+    const int col = 48 + slot;
+    const int destination = (im * 6 + col / 16) * 64 + rr * 16 + col % 16;
+    output[destination] = reinterpret_cast<const int32 *>(snapshot)[slot];
+  }
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r97_copy_activation(const int8 *__restrict input, int8 *__restrict output) {
+  for (int offset = 0; offset < R25_A_BYTES; offset += 16)
+    aie::store_v(output + offset, aie::load_v<16>(input + offset));
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r97_probe_source(const int8 *__restrict input, int32 *__restrict output,
+                 int slot) {
+  uint32_t hash = 2166136261u;
+  for (int offset = 0; offset < 3 * R25_GROUP * (int)sizeof(bfloat16); ++offset)
+    hash = (hash ^ static_cast<uint8_t>(input[offset])) * 16777619u;
+  constexpr int row = R25_PROBE_ROW;
+  constexpr int im = row / 4;
+  constexpr int rr = row % 4;
+  const int col = 38 + slot;
+  const int destination = (im * 6 + col / 16) * 64 + rr * 16 + col % 16;
+  output[destination] = static_cast<int32_t>(hash);
 }
 
 extern "C" void r25_zero(int32 *__restrict output_bits) {
@@ -37,9 +238,13 @@ extern "C" void r25_zero(int32 *__restrict output_bits) {
 
 extern "C" __attribute__((minsize)) void
 r25_down(const int8 *a, const int8 *w, int32 *c, int accumulate) {
+#ifdef R15_DYNAMIC_ONLY
+  r15_w4_scaled_dynamic(a, w, c, accumulate);
+#else
   using down_fn = void (*)(const int8 *, const int8 *, int32 *);
   const down_fn fn = accumulate ? r15_w4_scaled_accum : r15_w4_scaled_init;
   fn(a, w, c);
+#endif
 }
 
 extern "C" void r25_touch_weight(const int8 *__restrict weights,
@@ -128,15 +333,15 @@ r25_geglu_inplace(int32 *__restrict accumulator_bits,
   chess_separator();
 }
 
-template <unsigned STRIDE>
-__attribute__((noinline)) static void r25_fwht16(float *__restrict scratch) {
+__attribute__((noinline)) static void
+r25_fwht16(float *__restrict scratch, unsigned stride) {
   for (int block = 0; block < R25_GROUP; block += 16) {
     auto values = aie::load_v<16>(scratch + block);
-    auto a = aie::filter_even(values, STRIDE);
-    auto b = aie::filter_odd(values, STRIDE);
+    auto a = aie::filter_even(values, stride);
+    auto b = aie::filter_odd(values, stride);
     aie::store_v(scratch + block,
                  aie::concat(aie::interleave_zip(aie::add(a, b),
-                                                 aie::sub(a, b), STRIDE)));
+                                                 aie::sub(a, b), stride)));
   }
 }
 
@@ -169,10 +374,8 @@ static void r25_pack_row(const float *__restrict input,
                  aie::mul(divided, aie::load_v<16>(signs1 + i))
                      .template to_vector<float>());
   }
-  r25_fwht16<1>(scratch);
-  r25_fwht16<2>(scratch);
-  r25_fwht16<4>(scratch);
-  r25_fwht16<8>(scratch);
+  for (unsigned stride = 1; stride <= 8; stride <<= 1)
+    r25_fwht16(scratch, stride);
   for (int stride = 16; stride < R25_GROUP; stride <<= 1)
     for (int block = 0; block < R25_GROUP; block += 2 * stride)
       for (int i = 0; i < stride; i += 16) {
@@ -350,17 +553,40 @@ r25_receive_fragment(int8 *__restrict fragment) {
   for (int word = 0; word < R25_FRAGMENT_WORDS; word++) words[word] = get_ss_int();
 }
 
+extern "C" __attribute__((noinline, minsize)) void
+r25_exchange_fragments(int8 *__restrict activations,
+                       const int8 *__restrict own,
+                       int8 *__restrict transit, int owner) {
+  r25_insert_fragment(own, activations, owner);
+  for (int source = 0; source < 8; ++source) {
+    if (owner == source) {
+      r25_send_fragment(own);
+    } else {
+      r25_receive_fragment(transit);
+      r25_insert_fragment(transit, activations, source);
+      if (owner != (source + 7) % 8)
+        r25_send_fragment(transit);
+    }
+  }
+}
+
 extern "C" void r25_probe_activation_rows(const int8 *__restrict activations,
                                            int32 *__restrict output_bits,
                                            int owner) {
-  constexpr int row = R25_PROBE_ROW;
-  constexpr int im = row / 4;
-  constexpr int rr = row % 4;
-  for (int lane = 0; lane < 32; lane++) {
-    const int inner = owner * 32 + lane;
-    const int source = (im * 16 + inner / 16) * 64 + rr * 16 + inner % 16;
-    const int destination = (im * 6 + lane / 16) * 64 + rr * 16 + lane % 16;
-    output_bits[destination] = activations[source];
+  for (int row = 0; row < R25_TILE_ROWS; ++row) {
+    const int im = row / 4;
+    const int rr = row % 4;
+    for (int lane = 0; lane < 32; lane++) {
+      const int inner = owner * 32 + lane;
+      const int source = (im * 16 + inner / 16) * 64 + rr * 16 + inner % 16;
+      const int destination = (im * 6 + lane / 16) * 64 + rr * 16 + lane % 16;
+      output_bits[destination] = activations[source];
+    }
+    constexpr int scale_col = 48;
+    const int scale_destination =
+        (im * 6 + scale_col / 16) * 64 + rr * 16 + scale_col % 16;
+    output_bits[scale_destination] = reinterpret_cast<const int32 *>(
+        activations + R25_A_DATA)[row];
   }
 }
 
@@ -388,7 +614,12 @@ extern "C" void r25_probe_gate_inputs(const int8 *__restrict activations,
     activation_hash = (activation_hash ^ static_cast<uint8_t>(activations[i])) * 16777619u;
   for (int i = 0; i < R25_WEIGHT_BYTES; i++)
     weight_hash = (weight_hash ^ static_cast<uint8_t>(weights[i])) * 16777619u;
-  const int base = im * 6 * 64 + rr * 16;
-  output_bits[base + 2 * slot] = activation_hash;
-  output_bits[base + 2 * slot + 1] = weight_hash;
+  const int activation_col = 32 + 2 * slot;
+  const int weight_col = activation_col + 1;
+  const int activation_destination =
+      (im * 6 + activation_col / 16) * 64 + rr * 16 + activation_col % 16;
+  const int weight_destination =
+      (im * 6 + weight_col / 16) * 64 + rr * 16 + weight_col % 16;
+  output_bits[activation_destination] = activation_hash;
+  output_bits[weight_destination] = weight_hash;
 }

@@ -1,0 +1,4 @@
+mode,run,contexts,q_mismatches,max_q_delta,max_scale_abs,padding_nonzero,iterations,dispatch_ms,physical_gib_s,decision
+r94-vector-activation-prep,1,1,3,1,0.000000007,0,100,2.1320,0.507,admit-vector-body-reject-standalone-phase
+r94-vector-activation-prep,2,1,3,1,0.000000007,0,100,2.4486,0.442,admit-vector-body-reject-standalone-phase
+r94-vector-activation-prep,3,1,3,1,0.000000007,0,100,2.1293,0.508,admit-vector-body-reject-standalone-phase

@@ -1,0 +1,10 @@
+variant,m,layers,layer0_ffn_cosine,layer0_tail_cosine,layer0_complete_cosine,total_ms,input_tok_s,package_w,tok_per_j,status
+r107_four_output_fifos,256,24,,,,,,,,rejected_memtile_dma_channel_limit
+r108_six_arg,256,24,,,,,,,,rejected_dpu_regmap_max_five_args
+r109_duplicate_import,256,24,,,,,,,,rejected_same_dmabuf_import_ealready
+r108_r109_layer0,256,1,0.99991644,0.99999886,0.99996836,,,,,pass
+r48_control_a,256,24,,,,813.690,314.6,18.05,17.4,control
+r108_r109_a,256,24,,,,801.536,319.4,21.00,15.2,pass
+r48_control_b,256,24,,,,816.898,313.4,20.01,15.7,control
+r108_r109_b,256,24,,,,807.908,316.9,21.06,15.0,pass
+r108_r109_trace,256,24,,,,832.686,307.4,18.10,17.0,trace

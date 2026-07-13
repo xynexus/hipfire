@@ -352,3 +352,17 @@ Results:
 - `benchmarks/npu_gemm_tuning/results/embeddinggemma-opus-gpu-energy-20260710-raw.csv`
 - `benchmarks/npu_gemm_tuning/results/embeddinggemma-opus-gpu-energy-20260710-summary.csv`
 - `benchmarks/npu_gemm_tuning/results/embeddinggemma-opus-gpu-energy-20260710.svg`
+
+## Resident-path bandwidth roofline (2026-07-12)
+
+The completed 256-token resident trace averages 9.050 ms for attention and
+13.603 ms for FFN across 24 layers. Their actual padded/duplicated packed weight
+payloads are 8.192 MB and 12.190 MB per layer, giving only 0.905 and 0.896 GB/s
+of payload throughput. R56 measures about 56.5 GB/s of aggregate external NPU
+feed on the same host.
+
+Even the conservative one-read-per-packed-byte calculation uses only about
+1.6% of that roof. The resident model path is therefore not globally
+memory-bandwidth limited: serialized dataflow, dispatch boundaries, local
+stream/bank utilization, and preparation remain material. See
+[`../../../docs/npu/npu-memory-bandwidth-cache-characterization.md`](../../../docs/npu/npu-memory-bandwidth-cache-characterization.md).

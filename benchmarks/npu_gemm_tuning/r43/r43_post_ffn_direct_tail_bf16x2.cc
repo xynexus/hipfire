@@ -10,6 +10,7 @@ constexpr int HIDDEN = 768;
 constexpr int POST_NORM_BYTES = HIDDEN * sizeof(bfloat16);
 constexpr int EPSILON_OFFSET = POST_NORM_BYTES;
 constexpr float INV_HIDDEN = 1.0f / HIDDEN;
+
 } // namespace
 
 extern "C" {
@@ -66,14 +67,31 @@ void r43_post_ffn_direct_tail_bf16x2(int8_t *restrict output_bytes,
 #else
     const bfloat16 *ffn_row = combined + row * 3 * HIDDEN;
 #endif
+#ifndef R100_INTERLEAVED_FFN
     const bfloat16 *ffn_low = ffn_row + HIDDEN;
+#endif
 #ifdef R46_SPLIT_RESIDUAL
     const bfloat16 *residual_row = residual + row * HIDDEN;
 #else
+#ifdef R100_INTERLEAVED_FFN
+    const bfloat16 *residual_row = ffn_row + 2 * HIDDEN;
+#else
     const bfloat16 *residual_row = ffn_low + HIDDEN;
+#endif
 #endif
     float sum = 0.0f;
     for (int hidden = 0; hidden < HIDDEN; hidden += 16) {
+#ifdef R100_INTERLEAVED_FFN
+      const auto pairs = aie::load_v<32>(ffn_row + 2 * hidden);
+      const auto high_bf16 = aie::filter_even(pairs);
+      const auto low_bf16 = aie::filter_odd(pairs);
+      const auto high =
+          aie::mul(high_bf16, aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .to_vector<float>();
+      const auto low =
+          aie::mul(low_bf16, aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .to_vector<float>();
+#else
       const auto high =
           aie::mul(aie::load_v<16>(ffn_row + hidden),
                    aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
@@ -82,6 +100,7 @@ void r43_post_ffn_direct_tail_bf16x2(int8_t *restrict output_bytes,
           aie::mul(aie::load_v<16>(ffn_low + hidden),
                    aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
               .to_vector<float>();
+#endif
       const auto value = aie::add(high, low);
       sum += aie::reduce_add(aie::mul(value, value).to_vector<float>());
     }
@@ -97,6 +116,19 @@ void r43_post_ffn_direct_tail_bf16x2(int8_t *restrict output_bytes,
           aie::mul(aie::load_v<16>(post_norm + hidden),
                    aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
               .to_vector<float>();
+#ifdef R100_INTERLEAVED_FFN
+      const auto ffn_pairs = aie::load_v<32>(ffn_row + 2 * hidden);
+      const auto ffn_high_bf16 = aie::filter_even(ffn_pairs);
+      const auto ffn_low_bf16 = aie::filter_odd(ffn_pairs);
+      const auto ffn_high =
+          aie::mul(ffn_high_bf16,
+                   aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .to_vector<float>();
+      const auto ffn_low_value =
+          aie::mul(ffn_low_bf16,
+                   aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .to_vector<float>();
+#else
       const auto ffn_high =
           aie::mul(aie::load_v<16>(ffn_row + hidden),
                    aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
@@ -105,6 +137,7 @@ void r43_post_ffn_direct_tail_bf16x2(int8_t *restrict output_bytes,
           aie::mul(aie::load_v<16>(ffn_low + hidden),
                    aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
               .to_vector<float>();
+#endif
       const auto normalized =
           aie::mul(aie::add(ffn_high, ffn_low_value), norm).to_vector<float>();
       const auto result =

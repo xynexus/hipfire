@@ -74,9 +74,19 @@ static inline void copy_chunk_to_block(const int8_t *restrict chunk,
                                        int8_t *restrict block, int lm) {
   const int q_base = lm * Q_BYTES;
   const int scale_base = 3 * Q_BYTES + lm * SCALE_BYTES;
+  // R111 keeps three chunks live. The allocator guarantees 32-byte alignment
+  // for each buffer, but the second and third chunks need not be 64-byte
+  // aligned. AIE load_v requires vector-size alignment, so use the guaranteed
+  // width for that schedule rather than issuing an invalid 64-byte load.
+#ifdef R111_ALIGN_SAFE_CHUNK_COPY
+  for (int offset = 0; offset < Q_BYTES; offset += 32)
+    aie::store_v(block + q_base + offset,
+                 aie::load_v<32>(chunk + offset));
+#else
   for (int offset = 0; offset < Q_BYTES; offset += 64)
     aie::store_v(block + q_base + offset,
                  aie::load_v<64>(chunk + offset));
+#endif
   for (int offset = 0; offset < SCALE_BYTES; offset += 32)
     aie::store_v(block + scale_base + offset,
                  aie::load_v<32>(chunk + Q_BYTES + offset));
@@ -85,6 +95,12 @@ static inline void copy_chunk_to_block(const int8_t *restrict chunk,
 } // namespace
 
 extern "C" {
+
+__attribute__((noinline, minsize)) void
+r111_copy_row(const int8_t *restrict input, int8_t *restrict output) {
+  for (int offset = 0; offset < INPUT_BYTES; offset += 32)
+    aie::store_v(output + offset, aie::load_v<32>(input + offset));
+}
 
 void r47_accumulate_row(const int8_t *restrict input_bytes,
                         float *restrict sums, int32_t row) {

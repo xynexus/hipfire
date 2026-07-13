@@ -1,0 +1,4 @@
+variant,trial,contexts,weight_source,weight_upload,stage_mismatches,q_mismatches,kv_mismatches,attention_mismatches,iterations,ms,status,notes
+r76-resident-hfp,1,1,layer-0-qkv-rdna2-hfp,once-destination-context,0,0,0,0,100,3.2753,admitted,exact resident weight path
+r76-resident-hfp,2,1,layer-0-qkv-rdna2-hfp,once-destination-context,0,0,0,0,100,3.3165,admitted,exact resident weight path
+r76-resident-hfp,3,1,layer-0-qkv-rdna2-hfp,once-destination-context,0,0,0,0,100,3.2137,admitted,exact resident weight path

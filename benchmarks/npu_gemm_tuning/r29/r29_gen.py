@@ -10,8 +10,13 @@ OUTPUT_FIRST = "--attention-output-first" in sys.argv[1:]
 DIRECT_OUTPUT = "--direct-output-projection" in sys.argv[1:]
 RESIDUAL_NORM = "--residual-norm" in sys.argv[1:]
 EXTERNAL_RESIDUAL = "--external-residual" in sys.argv[1:]
+DIRECT_EXTERNAL_RESIDUAL = "--external-residual-direct" in sys.argv[1:]
+EXTERNAL_RESIDUAL = EXTERNAL_RESIDUAL or DIRECT_EXTERNAL_RESIDUAL
+ROW_STATE_OUTPUT = "--row-state-output" in sys.argv[1:]
 if EXTERNAL_RESIDUAL and not RESIDUAL_NORM:
     raise SystemExit("--external-residual requires --residual-norm")
+if ROW_STATE_OUTPUT and not RESIDUAL_NORM:
+    raise SystemExit("--row-state-output requires --residual-norm")
 PAIRED_QKV = "--paired-qkv" in sys.argv[1:] or RESIDUAL_NORM
 if PAIRED_QKV:
     DIRECT_OUTPUT = True
@@ -37,7 +42,14 @@ ACC_ELEMS = 768
 O_ACC_ELEMS = 256 if DIRECT_OUTPUT else 1024
 INBLOCKS = GROUPS * OUTBLOCKS
 A_BASE_BYTES = ROWS * INBLOCKS * A_BLOCK
-A_BYTES = A_BASE_BYTES + (2 * (COLS // 2) * ROWS * A_BLOCK if EXTERNAL_RESIDUAL else 0)
+COMPLETED_ROW_BYTES = 2 * 768 * 2
+COMPLETED_BYTES = 288 * COMPLETED_ROW_BYTES
+A_ACTIVATION_BASE = COMPLETED_BYTES if DIRECT_EXTERNAL_RESIDUAL else 0
+A_BYTES = A_ACTIVATION_BASE + A_BASE_BYTES + (
+    2 * (COLS // 2) * ROWS * A_BLOCK
+    if EXTERNAL_RESIDUAL and not DIRECT_EXTERNAL_RESIDUAL
+    else 0
+)
 W_BYTES = (
     (COLS // 2) * INBLOCKS * PAIR_W_BLOCK
     if PAIRED_QKV
@@ -59,6 +71,7 @@ O_W_BYTES = O_ACTIVE_COLS * O_WEIGHTS_PER_COL * W_BLOCK
 RN_BLOCKS_PER_COL = O_M_WAVES * ROWS
 RN_W_BYTES = O_ACTIVE_COLS * RN_BLOCKS_PER_COL * W_BLOCK
 O_BYTES = 256 * 768 * (4 if DIRECT_OUTPUT else 2)
+NORM_ROW_BYTES = 1664 if ROW_STATE_OUTPUT else 768 * 2
 R_BYTES = R_STAGE_BYTES + (ATT_BYTES if ATTENTION else 0) + (
     O_BYTES if OUTPUT_PROJECTION else 0
 )
@@ -670,7 +683,7 @@ out.append(f"    aie.runtime_sequence({runtime_args}) {{")
 for row in range(ROWS):
     out += [
         f"      %ta{row} = aiex.dma_configure_task_for @ash{row} {{",
-        f"        aie.dma_bd(%A : memref<{A_BYTES}xi8>, {row * INBLOCKS * A_BLOCK}, {INBLOCKS * A_BLOCK}, {dims(INBLOCKS, A_BLOCK)}) {{burst_length = 0 : i32}}",
+        f"        aie.dma_bd(%A : memref<{A_BYTES}xi8>, {A_ACTIVATION_BASE + row * INBLOCKS * A_BLOCK}, {INBLOCKS * A_BLOCK}, {dims(INBLOCKS, A_BLOCK)}) {{burst_length = 0 : i32}}",
         "        aie.end",
         "      }",
         f"      aiex.dma_start_task(%ta{row})",
@@ -863,11 +876,23 @@ def start_norm_output_tasks(mwave):
     for active_col, col in enumerate(range(0, COLS, 2)):
         if mwave == O_M_WAVES - 1:
             name = f"trnm{col}"
-            offset = 256 * 768 * 2 + active_col * 12288
+            offset = (
+                active_col * 8 * NORM_ROW_BYTES + 768 * 2
+                if ROW_STATE_OUTPUT
+                else 256 * 768 * 2 + active_col * 12288
+            )
+            metadata_dims = (
+                f"[<size = {ROWS}, stride = {32 * NORM_ROW_BYTES}>, "
+                f"<size = {O_M_WAVES}, stride = {128 * NORM_ROW_BYTES}>, "
+                f"<size = 8, stride = {NORM_ROW_BYTES}>, "
+                "<size = 128, stride = 1>]"
+                if ROW_STATE_OUTPUT
+                else f"[<size = {ROWS}, stride = {8 * 12288}>, <size = {O_M_WAVES}, stride = {4 * 12288}>, <size = 1024, stride = 1>]"
+            )
             out.extend(
                 [
                     f"      %{name} = aiex.dma_configure_task_for @osh{col + 1} {{",
-                    f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {OUT_JOIN}, [<size = {ROWS}, stride = {8 * 12288}>, <size = {O_M_WAVES}, stride = {4 * 12288}>, <size = 1024, stride = 1>]) {{burst_length = 0 : i32}}",
+                    f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {2048 if ROW_STATE_OUTPUT else OUT_JOIN}, {metadata_dims}) {{burst_length = 0 : i32}}",
                     "        aie.end",
                     "      } {issue_token = true}",
                     f"      aiex.dma_start_task(%{name})",
@@ -877,15 +902,20 @@ def start_norm_output_tasks(mwave):
             for half in range(2):
                 name = f"trno{mwave}_{col}_{block}_{half}"
                 offset = (
-                    mwave * 128 * 768 * 2
-                    + active_col * 8 * 768 * 2
+                    mwave * 128 * NORM_ROW_BYTES
+                    + active_col * 8 * NORM_ROW_BYTES
                     + block * 256 * 2
-                    + half * 4 * 768 * 2
+                    + half * 4 * NORM_ROW_BYTES
+                )
+                output_dims = (
+                    f"[<size = {ROWS}, stride = {32 * NORM_ROW_BYTES}>, <size = 4, stride = {NORM_ROW_BYTES}>, <size = 512, stride = 1>]"
+                    if ROW_STATE_OUTPUT
+                    else f"[<size = {ROWS}, stride = {32 * 768 * 2}>, <size = 4, stride = {768 * 2}>, <size = 512, stride = 1>]"
                 )
                 out.extend(
                     [
                         f"      %{name} = aiex.dma_configure_task_for @osh{col} {{",
-                        f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {OUT_JOIN}, [<size = {ROWS}, stride = {32 * 768 * 2}>, <size = 4, stride = {768 * 2}>, <size = 512, stride = 1>]) {{burst_length = 0 : i32}}",
+                        f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {OUT_JOIN}, {output_dims}) {{burst_length = 0 : i32}}",
                         "        aie.end",
                         "      } {issue_token = true}",
                         f"      aiex.dma_start_task(%{name})",
@@ -947,11 +977,24 @@ def start_external_norm_inputs(mwave, include_weights):
         for core_row in range(ROWS):
             residual_name = f"trnx{mwave}_{col}_{core_row}"
             residual_record = (mwave * O_ACTIVE_COLS + active_col) * ROWS + core_row
-            residual_offset = A_BASE_BYTES + residual_record * A_BLOCK
+            if DIRECT_EXTERNAL_RESIDUAL:
+                token_base = mwave * 128 + core_row * 32 + active_col * 8
+                residual_source = "A"
+                residual_source_bytes = A_BYTES
+                residual_offset = token_base * COMPLETED_ROW_BYTES
+                residual_dims = (
+                    f"[<size = 8, stride = {COMPLETED_ROW_BYTES}>, "
+                    "<size = 4, stride = 512>, <size = 512, stride = 1>]"
+                )
+            else:
+                residual_source = "A"
+                residual_source_bytes = A_BYTES
+                residual_offset = A_BASE_BYTES + residual_record * A_BLOCK
+                residual_dims = dims(1, A_BLOCK)
             out.extend(
                 [
                     f"      %{residual_name} = aiex.dma_configure_task_for @wsh{col} {{",
-                    f"        aie.dma_bd(%A : memref<{A_BYTES}xi8>, {residual_offset}, {A_BLOCK}, {dims(1, A_BLOCK)}) {{burst_length = 0 : i32}}",
+                    f"        aie.dma_bd(%{residual_source} : memref<{residual_source_bytes}xi8>, {residual_offset}, {A_BLOCK}, {residual_dims}) {{burst_length = 0 : i32}}",
                     "        aie.end",
                     "      } {issue_token = true}",
                     f"      aiex.dma_start_task(%{residual_name})",

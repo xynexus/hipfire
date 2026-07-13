@@ -128,7 +128,7 @@ with open(TRACE_TXT) as f:
     n_pkts = sum(1 for ln in f if ln.strip() and ln.strip() != "00000000")
 p = subprocess.run([sys.executable, "-m", "aie.utils.trace.parse",
                     "--input", TRACE_TXT, "--mlir", mlir, "--output", TRACE_JSON],
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, check=False)
 if p.returncode != 0 or not os.path.exists(TRACE_JSON):
     sys.exit(f"ERROR: trace parse failed rc={p.returncode}\n{p.stderr[-800:]}")
 

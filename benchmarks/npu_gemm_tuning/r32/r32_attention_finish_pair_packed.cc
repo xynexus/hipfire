@@ -4,6 +4,9 @@
 #include <stdint.h>
 
 namespace {
+#ifdef R101_MIN_SIZE
+__attribute__((noinline, minsize))
+#endif
 void finish_one(const float *restrict accum, const float *restrict stats,
                 bfloat16 *restrict output) {
   constexpr int queries = 4;

@@ -1,0 +1,2 @@
+variant,split_x,host_sync_combined,host_sync_residual,cosine,max_abs,decision
+r100-interleaved-tail,true,true,true,0.99999861,0.0039062,admit-interleaved-tail-reader

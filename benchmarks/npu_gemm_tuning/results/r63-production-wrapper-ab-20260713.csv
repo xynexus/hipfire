@@ -1,0 +1,10 @@
+variant,trial,iterations,mismatches,max_abs,wrapper_ms,logical_tops,cache,hfp
+current-no-spill,1,3,0,2e-07,1.0292,0.489,/home/sadara/.hipfire/npu/embgemma_r63_w4_native_compact_qkv_m256_k768_n1280,/home/sadara/.hipfire/npu/prepacked/EmbeddingGemma-300M.npu.oq4.layer-0.qkv.oq4.whole-scaled.rdna2.hfp
+current-no-spill,2,3,0,2e-07,1.1301,0.4454,/home/sadara/.hipfire/npu/embgemma_r63_w4_native_compact_qkv_m256_k768_n1280,/home/sadara/.hipfire/npu/prepacked/EmbeddingGemma-300M.npu.oq4.layer-0.qkv.oq4.whole-scaled.rdna2.hfp
+current-no-spill,3,3,0,2e-07,1.0011,0.5028,/home/sadara/.hipfire/npu/embgemma_r63_w4_native_compact_qkv_m256_k768_n1280,/home/sadara/.hipfire/npu/prepacked/EmbeddingGemma-300M.npu.oq4.layer-0.qkv.oq4.whole-scaled.rdna2.hfp
+pre-3db7a1497-spill,1,3,0,2e-07,1.0288,0.4892,/home/sadara/.hipfire/npu/embgemma_r63_oldspill_compact_qkv_m256_k768_n1280,/home/sadara/.hipfire/npu/prepacked/EmbeddingGemma-300M.npu.oq4.layer-0.qkv.oq4.whole-scaled.rdna2.hfp
+pre-3db7a1497-spill,2,3,0,2e-07,1.0059,0.5004,/home/sadara/.hipfire/npu/embgemma_r63_oldspill_compact_qkv_m256_k768_n1280,/home/sadara/.hipfire/npu/prepacked/EmbeddingGemma-300M.npu.oq4.layer-0.qkv.oq4.whole-scaled.rdna2.hfp
+pre-3db7a1497-spill,3,3,0,2e-07,1.0996,0.4577,/home/sadara/.hipfire/npu/embgemma_r63_oldspill_compact_qkv_m256_k768_n1280,/home/sadara/.hipfire/npu/prepacked/EmbeddingGemma-300M.npu.oq4.layer-0.qkv.oq4.whole-scaled.rdna2.hfp
+historical-cache,1,3,0,2e-07,0.8912,0.5648,/home/sadara/.hipfire/npu/embgemma_aie2p_whole8_w4-scaled_m256_kg3_n1280,/home/sadara/.hipfire/npu/prepacked/EmbeddingGemma-300M.npu.oq4.layer-0.qkv.oq4.whole-scaled.rdna2.hfp
+historical-cache,2,3,0,2e-07,1.0993,0.4579,/home/sadara/.hipfire/npu/embgemma_aie2p_whole8_w4-scaled_m256_kg3_n1280,/home/sadara/.hipfire/npu/prepacked/EmbeddingGemma-300M.npu.oq4.layer-0.qkv.oq4.whole-scaled.rdna2.hfp
+historical-cache,3,3,0,2e-07,1.0596,0.475,/home/sadara/.hipfire/npu/embgemma_aie2p_whole8_w4-scaled_m256_kg3_n1280,/home/sadara/.hipfire/npu/prepacked/EmbeddingGemma-300M.npu.oq4.layer-0.qkv.oq4.whole-scaled.rdna2.hfp

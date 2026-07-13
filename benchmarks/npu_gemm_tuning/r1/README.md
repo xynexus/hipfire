@@ -183,6 +183,22 @@ invariances above, not a direct counter or datasheet figure.
 2. (Optional) trace the shim MM2S directly (`shimtile_events`) for the DDR-read
    view; the core-receive seal already bounds the end-to-end feed.
 
+### R56 follow-up: no usable MALL/cache knee on the SHMEM feed
+
+The 2026-07-12 follow-up swept one shared region from 64 KiB through 64 MiB
+across eight columns. Aggregate throughput settles at 56.5 GB/s by 1 MiB and is
+flat across 2 MiB and 32 MiB. Shared and distinct 1 MiB regions measure 56.35
+and 55.65 GB/s respectively.
+
+Contention controls separate a MALL-sized GPU hot set from true external-memory
+traffic: GPU copy loops totaling 16 or 32 MiB leave NPU bandwidth unchanged,
+whereas a 512 MiB GPU stream cuts it to 18.21 GB/s and CPU streaming cuts it to
+43.04 GB/s. The current amdxdna SHMEM path therefore shows no usable MALL
+caching, but clearly shares an upstream external-memory resource with CPU and
+GPU traffic. Full results and caveats are in
+[`../r56/README.md`](../r56/README.md) and
+[`../../../docs/npu/npu-memory-bandwidth-cache-characterization.md`](../../../docs/npu/npu-memory-bandwidth-cache-characterization.md).
+
 ### Three-way status (what worked, what the toolchain blocked)
 
 - **M1 host single-shot** (r1b_run.py): dominated by the 16 ms fixed cost —

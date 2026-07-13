@@ -1,0 +1,4 @@
+mode,run,contexts,stage_mismatches,q_status,kv_mismatches,output_projection,iterations,fused_ms,decision
+r86-output-reuse-a2,1,1,0,external-unused,0,pass,100,5.9589,rejected
+r86-output-reuse-a2,2,1,0,external-unused,0,pass,100,5.9203,rejected
+r86-output-reuse-a2,3,1,0,external-unused,0,pass,100,5.7962,rejected

@@ -1,0 +1,4 @@
+mode,run,contexts,drm_files,stage_prefix,kv_mismatches,ffn_zero_copy,ffn_cosine,ffn_max_abs,iterations,producer_ms,ffn_ms,chain_ms,decision
+r92-peer-context-control,1,2,1,reused-shifted,0,pass,0.99989925,0.0118408,100,6.3782,9.6659,22.2196,rejected-no-sustained-win
+r92-peer-context-control,2,2,1,reused-shifted,0,pass,0.99989925,0.0118408,100,6.4433,9.7931,22.1542,rejected-no-sustained-win
+r92-peer-context-control,3,2,1,reused-shifted,0,pass,0.99989925,0.0118408,100,6.4109,9.7080,21.7891,rejected-no-sustained-win

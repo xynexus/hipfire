@@ -1,0 +1,4 @@
+variant,trial,contexts,enqueue_window,windows,stage_mismatches,q_mismatches,kv_mismatches,attention_mismatches,iterations,ms,status,notes
+window2,1,1,2,3,0,0,0,0,100,3.2580,admitted,exact and faster median than R71
+window2,2,1,2,3,0,0,0,0,100,3.2775,admitted,exact and faster median than R71
+window2,3,1,2,3,0,0,0,0,100,3.3314,admitted,exact and faster median than R71

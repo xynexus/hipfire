@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <aie_api/aie.hpp>
+#include "aie_kernels/aie_kernel_utils.h"
 #include <stdint.h>
 
 namespace {
@@ -140,7 +141,13 @@ void r34_post_residual_pre_ffn(int8_t *restrict block0,
                 .to_vector<float>();
         normalized = aie::mul(normalized, post_inverse).to_vector<float>();
         const auto residual_value =
-            aie::mul(aie::load_v<16>(residual + row * HIDDEN + hidden),
+            aie::mul(aie::load_v<16>(residual + row *
+#ifdef R108_DIRECT_COMPLETED_RESIDUAL
+                                     1024
+#else
+                                     HIDDEN
+#endif
+                                     + hidden),
                      aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
                 .to_vector<float>();
         const auto x = aie::add(normalized, residual_value);
@@ -202,11 +209,18 @@ r34_emit_norm_half(const int8_t *restrict block, int8_t *restrict output,
 #endif
 
 #if !defined(R42_SPLIT_OBJECTS) || defined(R42_BUILD_RELAY)
-__attribute__((noinline, minsize)) void
+__attribute__((noinline, minsize, cold)) void
 r38_relay_pre_inverse(const int8_t *restrict input,
                       int8_t *restrict output) {
   const auto values =
       aie::load_v<16>(reinterpret_cast<const float *>(input));
+#ifdef R101_ROW_STATE_OUTPUT
+  auto *records = reinterpret_cast<float *>(output);
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(16)
+  for (int row = 0; row < 16; ++row, records += 32)
+    *records = values[row];
+#else
   aie::store_v(reinterpret_cast<float *>(output), values.extract<8>(0));
   aie::store_v(reinterpret_cast<float *>(output + 1024),
                values.extract<8>(1));
@@ -217,6 +231,7 @@ r38_relay_pre_inverse(const int8_t *restrict input,
                exception_state.extract<8>(0));
   aie::store_v(reinterpret_cast<uint32_t *>(output + 1056),
                exception_state.extract<8>(1));
+#endif
 #endif
 }
 #endif
