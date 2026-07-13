@@ -424,7 +424,11 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         Some("auto"),
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
-        "KV-cache precision and memory policy."
+        "KV-cache precision and memory policy. NOTE: asym2/asym3/asym4 are DEPRECATED — \
+         single-tier KVarN strictly dominates them (better PPL+KLD at iso-memory, both \
+         short and long ctx; see docs/plans/2026-07-12-hot-cold-hierarchical-kv-implementation.md \
+         and NEXT-STEPS Phase D). Prefer kvarn. asym is retained only for back-compat and \
+         because TriAttention/CASK eviction scoring reads the asym format."
     ),
     field!(
         "kv_adaptive",

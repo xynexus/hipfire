@@ -353,6 +353,206 @@ recoverability matter (explore measured rank-64 SVD KV at cos 0.991 @256B). Stor
 group mean + rank-r correction, SVD computed in the idle/between-turns budget.
 Gate on KLD beating flat-mean at equal bytes. Keep parked unless triggered.
 
+### Phase 5 — CASK-driven hierarchical merge (design intent, 2026-07-13)
+
+Motivated by the head-to-head (see NEXT-STEPS Phase D): hierarchical-with-**vnorm**
+loses quality-per-token (KLD 0.149 vs asym 0.096) because it merges — but the merge
+loss may be *vnorm picking the wrong keys*, not merging being inherently costly. The
+intended architecture (`FEATURES.md:323`, "hierarchical KV + CASK eviction") is that
+**CASK's calibrated attention-importance drives the merge**, so only genuinely
+low-attention keys fold. Today CASK (`cask.rs`, TriAttention-score + sidecar) and the
+hier cache (`kv_hier.rs`, vnorm) are **disconnected parallel subsystems**; the hier
+`attn` mode is a naive *while-hot* accumulation (can't see future retrieval) — which
+is what tested worse than vnorm, **not** the real CASK controller. So the design is
+not disproven. Open pieces:
+
+1. **Wire CASK importance into the hier merge** (replaces vnorm). Requires per-hot-token
+   CASK scores reachable at `migrate_n`. (Plumbing distance = investigation B.)
+2. **Multi-level folding** — fold depth should scale with importance: very-low keys
+   fold at high m, medium keys at low m, core stays exact. Replaces the single
+   `fold_m`. (CASK's calibrated score makes graded m meaningful.)
+3. **Unfold / extract on importance change — the hard problem.** Importance is not
+   static: a merged low-importance key may later be retrieved. `ColdTier.slot_members`
+   already records which original token indices went into each slot, but the *exact
+   original K/V are gone after merge* (only the averaged+quantized slot survives) — so
+   naive unfold recovers the merged value, not the original. Options to evaluate:
+   (a) accept lossy unfold (slot value stands in); (b) retain exact originals in a
+   spill tier for high-uncertainty keys (ties to the cold-storage/orchestrator idea);
+   (c) never unfold — only re-rank future merges. Decide before building multi-level.
+4. **Further value (V) compression** — CASK v1 is Q8-only; hier cold V is `cold_v_bits`
+   (2–4) / `v_perslot`. Values are the "easy" operand (weighted-average, no outlier
+   channels); headroom to push below the current floor. Probe as its own sweep.
+
+Next experiment once (1) is wired: **hier+CASK vs hier+vnorm vs asym vs single-tier
+KVarN**, same rig. If CASK-driven merge closes the KLD gap, the "hierarchical is only
+a memory play" caveat is retired.
+
+#### Phase 5 scoping (from investigation B, 2026-07-13)
+
+**Ground truth (B):** CASK (`cask.rs`) and `HierKvState` (`kv_hier.rs`) are two full,
+parallel core-preserving m-fold merge engines that are **disconnected state objects** —
+`LoadedModel.eviction` (wraps `CaskCtx`/`EvictionCtx`) vs `KvCache.hier`, no field
+path between them. CASK's importance is a **TriAttention z-score aggregate**:
+`gpu.triattn_score_{q8,asym*}` scores keys against calibrated band-center means
+(`TriAttnCenters`, loaded from a **TRIA sidecar**), z-normalized per head, max across
+heads. It is **ephemeral** (recomputed each eviction, never stored). At the hier merge
+point (`migrate_n`) those scores **do not reach** — hier computes vnorm locally, or
+reads the naive while-hot `attn_mass` (the `ImportanceMode::Attn` that lost to vnorm).
+**Prereq present:** `qwen3.5-0.8b.mq4.triattn.bin` is staged (`/srv/hipfire/triattn/`).
+
+**Integration decision — Approach 1 (recommended): hier computes TriAttn importance
+itself**, rather than threading CASK's ephemeral scores across the cadence/indexing
+mismatch. Cleaner and reuses the scorer + sidecar.
+
+Sequenced tasks:
+
+- **T1 — TriAttn importance in the hier merge (the gating enabler).** Add
+  `ImportanceMode::TriAttn`; make `TriAttnCenters` reachable at `migrate_n` (plumb a
+  centers ref down from the qwen35 dispatch that already owns the model state, or load
+  the sidecar into `HierKvState`); score the hot tokens against the centers
+  (`triattn_score` on GPU pre-download, or the CPU center-logit path post-download) →
+  per-hot-token importance for `compact_cold_kv`, replacing vnorm. Read is unchanged,
+  so `parity_kv_hier` still gates it. Gate: `HIPFIRE_KV_IMPORTANCE=triattn`. Generate a
+  **matching** sidecar for the test model via the existing TriAttn calib-tap machinery
+  (`tap_enabled`/`take_tap_gpu` → `finalize` → `TRIA` write, triattn.rs) — a clean
+  model↔sidecar pair, no approximation (`qwen3.5-0.8b.mq4.triattn.bin` staged as fallback).
+  **Then run the gating experiment** (hier+triattn vs hier+vnorm vs asym vs KVarN,
+  2k+16k). *Optional cheaper pre-check:* offline, on captured hot K + centers, test
+  whether TriAttn importance ranks "will-be-retrieved" keys better than vnorm before
+  building the plumbing (mirrors the ceiling-first that killed the dephasing kernel).
+- **T1 RESULT — TriAttn importance is WORSE than vnorm (2026-07-13, negative).**
+  Implemented `ImportanceMode::TriAttn` (calibrated `Σ_band ‖E[q_f]‖·‖k_band‖`,
+  GQA-aggregated; sidecar loaded, parity PASS). Experiment (0.8B mq4+, fold=4 2-bit,
+  vs bf16):
+  | ctx | vnorm PPL/KLD | TriAttn PPL/KLD |
+  | --- | --- | --- |
+  | 2048 (hot=512) | 27.54 / 0.153 | 29.67 / 0.206 |
+  | 16384 (hot=2048) | 18.38 / 0.145 | 20.21 / 0.193 |
+  TriAttn is **+2 PPL / +33–35% KLD worse** at both contexts.
+  **9B confirmation (2026-07-13, matched mq4 model+sidecar, ctx=2048 hot=512, PPL):**
+  vnorm 12.22 vs TriAttn 12.83 — **still worse (+5%)**, so the 0.8B result is NOT a
+  small-model artifact. One nuance: the deficit *narrows* with scale (0.8B +7.7% →
+  9B +5% PPL) but does **not** flip sign; a mild trend, not compelling evidence it
+  crosses zero at 27B/122B. **Caveat:** this is a
+  *simplified* calibrated score (magnitude-alignment only — no phase/distance
+  `cos(ω·Δ+φ)` term, no per-head z-norm), so it does not fully refute the full CASK
+  score. But it's a strong negative: (a) it's a calibrated *knorm*, and knorm already
+  lost to vnorm (why vnorm is default); (b) merge cost is **value-dominated** — vnorm
+  directly measures the value contribution a merged token loses, which a K-side score
+  can't. The full phase-aware CASK score is the only untested variant, but its
+  distance term is **future-uncertain at merge time** (importance = future attention,
+  unknown when we merge) and replicating it is the fragile path. **Recommendation:
+  the CASK→hier importance direction is a likely NO-GO; do not build T2/T3 on it.**
+  Reinforces the standing picture: hierarchical is a memory-compression play (merge
+  is lossy content-loss), single-tier KVarN is the quality winner, and no importance
+  signal tried (vnorm / while-hot attn / calibrated TriAttn) beats plain vnorm.
+- **T2 — multi-level folding (only if T1 wins — NOT triggered; T1 was negative).** Replace the scalar `fold_m` with an
+  importance-graded fold depth (core exact → medium low-m → low high-m). Needs
+  `compact_cold_kv` to take a per-token fold assignment instead of one global `fold_m`;
+  CASK's calibrated score is what makes graded m meaningful (vnorm is too noisy for it).
+- **T3 — unfold decision (design, before T2 ships).** `slot_members`/`slot_repr_pos`
+  provenance survives a merge but **the exact original K/V do not** (only the
+  averaged+quantized slot). So unfold-to-original is impossible as built. Decide:
+  (a) accept lossy unfold (slot value stands in); (b) spill exact originals for
+  high-uncertainty keys to a cold-storage tier (ties to the orchestrator-eviction idea
+  + the memory-accounting blind spot — `kv_cache_bytes` excludes `kv.hier`); (c) never
+  unfold, only re-rank future merges. Gate the choice on measured data: *how often does
+  a merged low-importance key later receive high attention?* If rarely, (c)/(a) suffice
+  and multi-level is safe; if often, (b) is needed.
+- **T4 — further V compression (independent sweep).** CASK V is Q8-only; hier cold V is
+  `cold_v_bits`(2–4)/`v_perslot` (per-slot ≈ −15–20% output error). Probe sub-2-bit V
+  and better per-slot axis on the T1-validated path; V is the easy operand (weighted
+  average, no outlier channels), so it has headroom below the K floor.
+
+**Plumbing cost of A:** the disconnected-state gap is real but Approach-1-bounded — T1
+only needs `TriAttnCenters` at the merge point, not a full CASK↔hier state merge. The
+bigger architectural question (do CASK and hier eventually *unify* into one
+importance-driven tiered compressor?) is deferred until T1 proves the importance
+signal is the lever.
+
+#### Phase 5 REFRAME after reading the CASK paper (2026-07-13) — T1 tested the WRONG lever
+
+Read `third_party/KV-Compression/2604.10900v1-CASK`. The T1 negative is **not** a
+refutation of CASK — it **reproduces CASK's own "Phase 1" finding**, and my whole
+framing of "CASK = a calibrated importance scorer" was wrong.
+
+- **CASK's central thesis is that scorer refinement is a dead end.** Their Phase 1
+  tried better scorers (TriAttention + adaptive-horizon/RMS2/variational-horizon) and
+  found "keep-set churn was limited; the protected set did not reorganize even when the
+  scorer changed." **My T1 (a TriAttn-style scorer) losing to vnorm is the same result.**
+  "TriAttention" in the paper is a *baseline scorer that CASK beats* — not by a better
+  score but by a different **policy**. So vnorm≈TriAttn tells us nothing against CASK.
+- **What CASK actually is — three levers, none a scorer:**
+  1. **Core/scratch role separation.** Split the trace into a *protected core*
+     (answer-anchoring / state-anchoring / recent pivots — never merged) and *mergeable
+     scratch* (high-redundancy: restatements, self-checks, near-duplicates). Decide what
+     to PRESERVE first, consolidate only the redundant remainder. `C ⊆ R`.
+  2. **Similarity-based merge grouping (the real innovation).** Merge tokens that are
+     **near-duplicates of each other**, grouped by a future-relevance-weighted distance
+     `d_κ(k_i,k_j)=Σ_f |κ(ω_f)|·‖k_{i,f}-k_{j,f}‖`. Averaging near-duplicates is ~lossless
+     — that's why the merge is cheap. m-folding is a mass-weighted average (= our
+     `compact_cold_kv`).
+  3. **Two-stage** (prefix eviction + decode consolidation) — serving-policy detail.
+- **Why this is the key for hipfire:** our merge groups by **position-locality**
+  (`position_local` = adjacent positions) or importance-rank. My ceiling analysis proved
+  the merge loss is **content, not phase** — because adjacent tokens differ in content.
+  **CASK avoids exactly this by merging content-SIMILAR tokens (near-duplicates), where
+  averaging loses nothing.** hipfire is doing the merge grouping *wrong* relative to CASK.
+- **Correction to the earlier verdicts:** the T1 "CASK→hier NO-GO" was NO-GO for the
+  *scorer* (correct, and CASK agrees). It says nothing about the real CASK lever, which
+  is **untested** and directly attacks the content-loss finding.
+
+**The real experiment (supersedes T1/T2/T3 as framed):** change the cold-merge grouping
+in `compact_cold_kv` from position-local to **content-similarity clustering** — group
+near-duplicate keys (κ-weighted or cosine), merge those, and protect a role-based core.
+This is the CASK lever and the one thing that could make hierarchical merge quality-
+competitive (not a memory-only play). Re-run hier(similarity-merge) vs single-tier KVarN
+vs asym. The `attn` (while-hot) and `triattn` importance modes stay as documented
+negatives; importance ranking is a spent lever per CASK's own thesis.
+
+## KV-compression literature map (2026-07-13, `third_party/KV-Compression`)
+
+Seven papers, three axes. Reconciled with our findings (KVarN wins quant; the merge
+loss is *content*; asym deprecated; the importance *scorer* is spent for ranking).
+
+**Axis A — eviction/consolidation POLICY:**
+- **TriAttention** — calibrated eviction scorer (predicts *future* attention via Q/K
+  band-centers: `S_trig` distance series at many offsets + `S_norm`). Already in
+  hipfire (`triattn.rs`). NB: my T1 dropped `S_trig` (the main term) → even more
+  degraded than a real TriAttn scorer; explains the miss.
+- **CASK** — core/scratch role separation + **similarity-based** m-fold merge (group
+  near-duplicates by a future-relevance κ-distance → lossless average). In hipfire
+  (`cask.rs`) but **standalone, not wired to the hierarchical cache**. THE lever.
+- **PyramidKV** — training-free **per-layer budget** allocation (lower layers larger,
+  upper smaller; arithmetic). hipfire uses uniform budgets → direct fit.
+
+**Axis B — LOW-RANK (SVD subspace); caveat: head_dim=256 is large, low-rank is harder
+(papers' best are hd 64–128), and KVarN quant already won — so low-rank is a *supplement*
+at the 128–256 B/tok band, not the main path:**
+- **KQ-SVD** — factorize the *interaction* `K·Qᵀ` (not K alone) + `V·Wᵒ` for values;
+  the "correct objective." Q-aware K, output-aware V. Training-free. K advantage shrinks
+  if you quant K first (we do) → use its **V·Wᵒ** idea for V, skip for K.
+- **ReCalKV** — offline closed-form **value recalibration (OVC)** + head-grouping (HSR
+  for K, since RoPE needs full K reconstruction). Training-free; strict win over vanilla
+  SVD. Fisher: V is *more* low-rank-sensitive than K.
+- **OjaKV** — **online incremental PCA** (Oja's rule) replaces per-cache SVD; adapts the
+  basis to distribution shift, cheaper. Training-free. Edge is shift-heavy tasks.
+- **QSVD** — joint-QKV down-proj + cross-layer Fisher rank alloc + learnable β for
+  quant-factor balance. Mostly *weight* compression (VLM); β only matters at W4A4;
+  KVarN's Sinkhorn already does the incoherence job → lowest priority.
+
+**Prioritized adoption (training-free throughout):**
+1. **CASK similarity-merge grouping** in `compact_cold_kv` (replace `position_local`) +
+   role-based core. Reuses `cask.rs` merge + `triattn` centers for the κ-distance;
+   unifies the two disconnected subsystems; directly fixes the content-loss ceiling.
+   **This is the real experiment.**
+2. **PyramidKV per-layer budgets** (hot_budget / fold_m / core_frac by layer). Cheap,
+   low-risk complement.
+3. **V compression (T4):** KQ-SVD `V·Wᵒ` objective + ReCalKV OVC — the training-free way
+   to push V below its floor.
+4. Low-rank KV track (OjaKV online basis / KQ-SVD) — only if the 128–256 B/tok
+   long-ctx band becomes the target; gated on head_dim=256 viability.
+
 ## Deferred / closed — do not re-tread
 
 - **Rotation + ConQuR on cold tiles** (follow-up #6): Sinkhorn variance-norm

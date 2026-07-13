@@ -47,6 +47,7 @@
 //! flash_tier_merge,flash_partials_ml,two_tier_e2e,cold_4bit_read} and
 //! hipfire-runtime/examples/parity_kv_hier.
 
+use crate::triattn::TriAttnCenters;
 use hipfire_kvquant::kv_compact::{compact_cold_kv, ColdTier};
 use hipfire_kvquant::kvarn::{
     dequantize_tile, kvarn_record_bytes_bits, pack_kvarn_tile_bits, unpack_kvarn_tile_bits,
@@ -66,6 +67,11 @@ pub enum ImportanceMode {
     /// Real accumulated attention mass (CASK): Σ over q-heads & decode steps of the
     /// normalized attention weight each token received while in the hot window.
     Attn,
+    /// Calibrated TriAttention importance: score(key) = Σ_band ‖E[q_f]‖·‖k_band‖ from
+    /// a calibrated TRIA sidecar (query-energy-weighted key magnitude), GQA-aggregated.
+    /// The "real CASK" importance signal (vs the while-hot `Attn` proxy). Needs
+    /// `HIPFIRE_KV_TRIATTN_SIDECAR`; falls back to vnorm if centers are missing.
+    TriAttn,
 }
 
 impl ImportanceMode {
@@ -75,6 +81,7 @@ impl ImportanceMode {
             "knorm" => ImportanceMode::KNorm,
             "kvnorm" => ImportanceMode::KvNorm,
             "attn" => ImportanceMode::Attn,
+            "triattn" => ImportanceMode::TriAttn,
             _ => ImportanceMode::VNorm, // default
         }
     }
@@ -152,6 +159,10 @@ pub struct HierKvState {
     /// it is placed into the f16 hot ring (avoids a per-token alloc). `None` when
     /// disabled.
     hot_cast: Option<GpuTensor>,
+    /// Calibrated TriAttention centers for `ImportanceMode::TriAttn` (loaded from
+    /// `HIPFIRE_KV_TRIATTN_SIDECAR`). `None` unless that mode is active with a sidecar.
+    /// Read at `migrate_n` to rank the cold merge by calibrated query-energy alignment.
+    centers: Option<TriAttnCenters>,
 }
 
 impl HierKvState {
@@ -195,6 +206,33 @@ impl HierKvState {
         let importance_mode = ImportanceMode::from_str(
             &std::env::var("HIPFIRE_KV_IMPORTANCE").unwrap_or_else(|_| "vnorm".to_string()),
         );
+        // TriAttn importance needs calibrated centers from a TRIA sidecar. Load once
+        // here; if missing, migrate_n falls back to vnorm ranking (never fails hard).
+        let centers = if importance_mode == ImportanceMode::TriAttn {
+            match std::env::var("HIPFIRE_KV_TRIATTN_SIDECAR") {
+                Ok(p) => match TriAttnCenters::load(std::path::Path::new(&p)) {
+                    Ok(c) => {
+                        eprintln!(
+                            "[kv_hier] TriAttn importance: centers {}L x {}H (hd={}) from {p}",
+                            c.n_layers, c.n_heads, c.head_dim
+                        );
+                        Some(c)
+                    }
+                    Err(e) => {
+                        eprintln!("[kv_hier] TRIA sidecar load failed ({e}); using vnorm");
+                        None
+                    }
+                },
+                Err(_) => {
+                    eprintln!(
+                        "[kv_hier] ImportanceMode::TriAttn but HIPFIRE_KV_TRIATTN_SIDECAR unset; using vnorm"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let position_local = std::env::var("HIPFIRE_KV_POS_LOCAL").ok().as_deref() != Some("0");
         // Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,
         // 2-bit=3). Same nibble storage; this measures lower-precision quant QUALITY.
@@ -260,6 +298,7 @@ impl HierKvState {
             cold: (0..n_layers).map(|_| Vec::new()).collect(),
             scr: None,
             hot_cast,
+            centers,
         })
     }
 
@@ -390,6 +429,30 @@ impl HierKvState {
         } else {
             Vec::new()
         };
+        // TriAttn: per (kv-head, band) calibrated query-energy weight
+        // W[kv*n_bands + b] = Σ_{query heads h in the GQA group of kv} ‖E[q_f]‖ from
+        // the centers at this layer. Then score(token) = Σ_kv Σ_b W · ‖k_band‖ (the
+        // key's RoPE-pair magnitude, rotation-invariant). None → vnorm fallback.
+        let n_bands = HD / 2;
+        let triattn_w: Option<Vec<f32>> = if self.importance_mode == ImportanceMode::TriAttn {
+            self.centers
+                .as_ref()
+                .filter(|c| layer < c.n_layers && c.head_dim == HD)
+                .map(|c| {
+                    let group = (self.n_heads / nkv).max(1);
+                    let mut w = vec![0.0f32; nkv * n_bands];
+                    for kv in 0..nkv {
+                        for h in (kv * group)..((kv + 1) * group).min(c.n_heads) {
+                            for b in 0..n_bands {
+                                w[kv * n_bands + b] += c.get(layer, h, b).magnitude();
+                            }
+                        }
+                    }
+                    w
+                })
+        } else {
+            None
+        };
         let importance: Vec<f32> = (0..mb)
             .map(|t| {
                 let base = t * kv_dim;
@@ -412,6 +475,21 @@ impl HierKvState {
                     ImportanceMode::KvNorm => kn() * vn(),
                     // Small floor so an unattended token still sorts/weights sanely.
                     ImportanceMode::Attn => mass[t] + 1e-6,
+                    ImportanceMode::TriAttn => match &triattn_w {
+                        Some(w) => {
+                            let mut s = 0.0f32;
+                            for kv in 0..nkv {
+                                let kb = base + kv * HD;
+                                for b in 0..n_bands {
+                                    let kr = ck[kb + 2 * b];
+                                    let ki = ck[kb + 2 * b + 1];
+                                    s += w[kv * n_bands + b] * (kr * kr + ki * ki).sqrt();
+                                }
+                            }
+                            s + 1e-6
+                        }
+                        None => vn(), // centers missing / layer out of range → vnorm
+                    },
                 }
             })
             .collect();
