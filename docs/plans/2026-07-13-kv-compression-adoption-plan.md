@@ -46,8 +46,21 @@ the retrieval-regime levers.** Consolidated:
 | --- | --- | --- |
 | 1 CASK similarity-merge | DONE, committed | **wash** on wikitext (KLD −2%, PPL flat; no move toward KVarN floor) |
 | 2 PyramidKV budgets | DONE, committed | **negative** (+0.4 PPL, +6–10% KLD) |
-| 3–4 V·Wᵒ / OVC low-rank V | probed, not built | V has **no naive headroom** (V=1 catastrophic +2.5 PPL); only a *structured* V·Wᵒ build could beat the 2-bit floor — large offline tooling, high bar, uncertain |
-| 5 OjaKV online low-rank | not built | retrieval-regime + gated on a hd=256 static-low-rank probe; large runtime build |
+| 3–4 V·Wᵒ / OVC low-rank V | probed → **gated out** | V has no naive bit-headroom (V=1 +2.5 PPL) AND V is only modestly low-rank at hd=256 (rank-128 for 94% energy = 2×) → structured low-rank V not worth the large build over KVarN |
+| 5 OjaKV online low-rank | **gate FAILED** | static rank-r low-rank does NOT hold at hd=256 (K rank-64 rel-err **0.56**, V **0.35**; post-RoPE K high-rank as RoPE predicts). Per the plan, build only if the static probe clears — it doesn't. Correctly gated out. |
+
+**Low-rank track (Levers 3-4-5) is closed by its own feasibility gate** (`lowrank_feasibility.py`
+on 24k captured cold K/V): aggressive low-rank isn't available at head_dim=256, so the
+shared SVD basis those levers need doesn't exist. This is the concrete head_dim=256 penalty
+the plan flagged. (Frobenius metric is stricter than attention-output cosine, but the energy
+fractions alone rule out aggressive low-rank; KQ-SVD's interaction-aware factorization might
+squeeze a bit more but is a large build for a small, uncertain gain over KVarN.)
+
+**PLAN STATUS: fully addressed.** Levers 1-2 built + tested (non-wins on wikitext; kept
+flag-gated). Levers 3-5 (the low-rank track) gated out by the Lever-5 feasibility probe. No
+further lever-building is warranted on the current evidence + eval. The real KV wins are
+banked (KVarN>asym deprecated, f16-hot+512, defrag, dephasing killed, K4V2 operating point).
+Reopen only with a retrieval eval (`pflash_niah_bench`) to test the merge levers in-regime.
 
 **Two findings dominate:** (1) **the wikitext PPL/KLD rig cannot measure the levers'
 target regime** (long-context retrieval / redundancy) — Levers 1/2/5 all live there;

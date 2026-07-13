@@ -457,6 +457,26 @@ impl HierKvState {
                 let _ = f.write_all(&buf);
             }
         }
+        // Parallel V capture (`HIPFIRE_KV_CAPTURE_V`, same record format) for the
+        // low-rank feasibility probe (Lever 5 gate): does static rank-r hold at HD=256?
+        if let Ok(path) = std::env::var("HIPFIRE_KV_CAPTURE_V") {
+            use std::io::Write;
+            let mut buf = Vec::with_capacity(16 + cv.len() * 4);
+            buf.extend_from_slice(&(self.migrated[layer] as u32).to_le_bytes());
+            buf.extend_from_slice(&(mb as u32).to_le_bytes());
+            buf.extend_from_slice(&(nkv as u32).to_le_bytes());
+            buf.extend_from_slice(&(HD as u32).to_le_bytes());
+            for &x in &cv {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(&buf);
+            }
+        }
         // Per-token importance for core selection + merge weighting. Norm proxies
         // pull the merged K toward the dominant token's RoPE phase (less blur) and
         // keep high-norm tokens exact; Attn = real accumulated attention mass

@@ -2053,6 +2053,13 @@ pub const ENV_HIPFIRE_KV_CAPTURE_K: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/src/kv_hier.rs:366",
 };
 
+/// `HIPFIRE_KV_CAPTURE_V` — Parallel V capture ("HIPFIRE_KV_CAPTURE_V", same record format) for the
+pub const ENV_HIPFIRE_KV_CAPTURE_V: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_CAPTURE_V",
+    description: "Parallel V capture (\"HIPFIRE_KV_CAPTURE_V\", same record format) for the",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:462",
+};
+
 /// `HIPFIRE_KV_COLD_BITS` — Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,
 pub const ENV_HIPFIRE_KV_COLD_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_COLD_BITS",
@@ -4804,6 +4811,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_KVNOISE_HOT,
     ENV_HIPFIRE_KVNOISE_LR,
     ENV_HIPFIRE_KV_CAPTURE_K,
+    ENV_HIPFIRE_KV_CAPTURE_V,
     ENV_HIPFIRE_KV_COLD_BITS,
     ENV_HIPFIRE_KV_COLD_V_BITS,
     ENV_HIPFIRE_KV_COLD_V_PERSLOT,
