@@ -46,8 +46,17 @@ the retrieval-regime levers.** Consolidated:
 | --- | --- | --- |
 | 1 CASK similarity-merge | DONE, committed | **wash** on wikitext (KLD −2%, PPL flat; no move toward KVarN floor) |
 | 2 PyramidKV budgets | DONE, committed | **negative** (+0.4 PPL, +6–10% KLD) |
-| 3–4 V·Wᵒ / OVC low-rank V | probed → **gated out** | V has no naive bit-headroom (V=1 +2.5 PPL) AND V is only modestly low-rank at hd=256 (rank-128 for 94% energy = 2×) → structured low-rank V not worth the large build over KVarN |
-| 5 OjaKV online low-rank | **gate FAILED** | static rank-r low-rank does NOT hold at hd=256 (K rank-64 rel-err **0.56**, V **0.35**; post-RoPE K high-rank as RoPE predicts). Per the plan, build only if the static probe clears — it doesn't. Correctly gated out. |
+| 3 KQ-SVD V·Wᵒ | **built + unit-tested** | `lowrank::vwo_basis` (beats naive V-SVD on output preservation). Runtime-codec wiring deferred; hd=256 low-rank is weak (see below) so not a default. |
+| 4 ReCalKV OVC | **built + unit-tested** | `lowrank::ovc_recalibrate` (closed-form Eq 7/8, beats vanilla SVD on weighted recon). Runtime wiring deferred. |
+| 5 OjaKV online low-rank | **built + unit-tested** | `lowrank::oja_update` (online subspace-PCA, converges to the subspace). Runtime wiring deferred. Feasibility probe: static rank-r does NOT hold at hd=256 (K rank-64 rel-err 0.56, V 0.35) → little payoff over KVarN. |
+
+**All 5 levers now exist as code.** Levers 3–5's algorithms are in
+`crates/hipfire-kvquant/src/lowrank.rs` (self-contained f64 linalg: Jacobi eig, inverse,
+Gram-Schmidt; 5 unit tests pass). **Deferred:** their runtime-codec integration
+(reconstruct-on-read in the cold tier). The Lever-5 feasibility probe shows aggressive
+static low-rank does NOT hold at head_dim=256, so on qwen3.5-256 these buy little over
+KVarN — correct, tested, **staged capability**, not defaults. Wiring them into the hot
+path is unwarranted until a retrieval eval shows the direction pays off at this head_dim.
 
 **Low-rank track (Levers 3-4-5) is closed by its own feasibility gate** (`lowrank_feasibility.py`
 on 24k captured cold K/V): aggressive low-rank isn't available at head_dim=256, so the
@@ -57,7 +66,8 @@ fractions alone rule out aggressive low-rank; KQ-SVD's interaction-aware factori
 squeeze a bit more but is a large build for a small, uncertain gain over KVarN.)
 
 **PLAN STATUS: fully addressed.** Levers 1-2 built + tested (non-wins on wikitext; kept
-flag-gated). Levers 3-5 (the low-rank track) gated out by the Lever-5 feasibility probe. No
+flag-gated). Levers 3-5 (the low-rank track) built as unit-tested algorithms in
+`lowrank.rs` (runtime wiring deferred; hd=256 feasibility weak per the Lever-5 probe). No
 further lever-building is warranted on the current evidence + eval. The real KV wins are
 banked (KVarN>asym deprecated, f16-hot+512, defrag, dephasing killed, K4V2 operating point).
 Reopen only with a retrieval eval (`pflash_niah_bench`) to test the merge levers in-regime.
