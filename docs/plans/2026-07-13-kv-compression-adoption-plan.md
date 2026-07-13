@@ -36,6 +36,41 @@ live), coordinate with `hipfire lock`. Baselines to beat, from the head-to-head
 
 ---
 
+## ADOPTION-PLAN OUTCOME (2026-07-13) — read this first
+
+Levers 1–2 implemented + tested; the V-track (3–4) precursor probed; 5 gated. The
+evidence says **the remaining big builds are not warranted, and the eval can't validate
+the retrieval-regime levers.** Consolidated:
+
+| Lever | Status | Result |
+| --- | --- | --- |
+| 1 CASK similarity-merge | DONE, committed | **wash** on wikitext (KLD −2%, PPL flat; no move toward KVarN floor) |
+| 2 PyramidKV budgets | DONE, committed | **negative** (+0.4 PPL, +6–10% KLD) |
+| 3–4 V·Wᵒ / OVC low-rank V | probed, not built | V has **no naive headroom** (V=1 catastrophic +2.5 PPL); only a *structured* V·Wᵒ build could beat the 2-bit floor — large offline tooling, high bar, uncertain |
+| 5 OjaKV online low-rank | not built | retrieval-regime + gated on a hd=256 static-low-rank probe; large runtime build |
+
+**Two findings dominate:** (1) **the wikitext PPL/KLD rig cannot measure the levers'
+target regime** (long-context retrieval / redundancy) — Levers 1/2/5 all live there;
+(2) the one wikitext-measurable lever (V compression) shows **no cheap headroom** — V·Wᵒ
+is the only path and it's a big build with a high bar. **The cheap, real KV wins are
+already banked** (KVarN dominates asym → deprecated; f16 hot ring + hot=512; segment
+defrag; dephasing kernel correctly killed; K4V2 > K2V2 as a better operating point).
+
+**Recommendation (firm): stop building levers on this eval.** Two next moves, either is
+sound; neither is "implement 3 more levers blind":
+- **Validate the direction in its real regime first** — stand up `pflash_niah_bench`
+  (needle-in-haystack) for the hier path and re-test Levers 1–2 (+ a K4V2 sweep). Only
+  if the merge/budget levers help retrieval does the offline V·Wᵒ / OjaKV effort earn its
+  cost. This needs eval-infra work (NIAH fixtures + kvarn-mode support in the bench).
+- **Or accept the memory-play conclusion** and close the adoption plan: hierarchical is a
+  memory-compression tier; the merge micro-levers don't move general-text quality; ship
+  what's banked. Levers 1–2 remain as flag-gated options.
+
+Levers 3–5 should be built **only after** a retrieval eval shows the direction pays off —
+building them now optimizes against a measurement that can't see their benefit.
+
+---
+
 ## Lever 1 — CASK similarity-based merge grouping (the gating experiment)
 
 **Goal.** Replace the cold-merge's position-local grouping with **content-similarity
