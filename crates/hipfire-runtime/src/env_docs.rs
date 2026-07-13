@@ -2025,39 +2025,53 @@ pub const ENV_HIPFIRE_KVNOISE_LR: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:61",
 };
 
+/// `HIPFIRE_KV_CAPTURE_K` — change when unset: append the post-RoPE K about to be merged, token-major
+pub const ENV_HIPFIRE_KV_CAPTURE_K: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_CAPTURE_K",
+    description: "change when unset: append the post-RoPE K about to be merged, token-major",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:366",
+};
+
 /// `HIPFIRE_KV_COLD_BITS` — Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,
 pub const ENV_HIPFIRE_KV_COLD_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_COLD_BITS",
     description: "Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:184",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:201",
 };
 
 /// `HIPFIRE_KV_COLD_V_BITS` — match it. Defaults to "cold_bits" (symmetric) when unset
 pub const ENV_HIPFIRE_KV_COLD_V_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_COLD_V_BITS",
     description: "match it. Defaults to \"cold_bits\" (symmetric) when unset",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:194",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:211",
 };
 
 /// `HIPFIRE_KV_COLD_V_PERSLOT` — Enabled when set to 1
 pub const ENV_HIPFIRE_KV_COLD_V_PERSLOT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_COLD_V_PERSLOT",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:201",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:218",
 };
 
 /// `HIPFIRE_KV_CORE_FRAC` — Runtime variable controlling KV core frac in hipfire
 pub const ENV_HIPFIRE_KV_CORE_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_CORE_FRAC",
     description: "Runtime variable controlling KV core frac in hipfire",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:174",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:191",
+};
+
+/// `HIPFIRE_KV_DEFRAG_SEGMENTS` — Runtime variable controlling KV defrag segments in hipfire
+pub const ENV_HIPFIRE_KV_DEFRAG_SEGMENTS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_DEFRAG_SEGMENTS",
+    description: "Runtime variable controlling KV defrag segments in hipfire",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:219",
 };
 
 /// `HIPFIRE_KV_FOLD_M` — Cold-tier compaction knobs. fold_m=1 disables the m:1 merge (cold = pure
 pub const ENV_HIPFIRE_KV_FOLD_M: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_FOLD_M",
     description: "Cold-tier compaction knobs. fold_m=1 disables the m:1 merge (cold = pure",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:169",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:186",
 };
 
 /// `HIPFIRE_KV_HIERARCHICAL` — (→ qwen35_prefill_active_session → per-token forward_scratch), which honours
@@ -2074,6 +2088,13 @@ pub const ENV_HIPFIRE_KV_HIER_KEEP: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/examples/parity_kv_hier.rs:78",
 };
 
+/// `HIPFIRE_KV_HIER_TEST_DEFRAG` — Enabled when set to 1
+pub const ENV_HIPFIRE_KV_HIER_TEST_DEFRAG: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KV_HIER_TEST_DEFRAG",
+    description: "Enabled when set to 1",
+    source: "crates/hipfire-runtime/examples/parity_kv_hier.rs:98",
+};
+
 /// `HIPFIRE_KV_HIER_TEST_IDLE` — Optional: exercise the deferred between-turns drain. idle_compact moves hot
 pub const ENV_HIPFIRE_KV_HIER_TEST_IDLE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_HIER_TEST_IDLE",
@@ -2085,7 +2106,7 @@ pub const ENV_HIPFIRE_KV_HIER_TEST_IDLE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KV_HOT_BUDGET: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_HOT_BUDGET",
     description: "Runtime variable controlling KV hot budget in hipfire",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:156",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:173",
 };
 
 /// `HIPFIRE_KV_IDLE_KEEP` — Runtime variable controlling KV idle keep in hipfire
@@ -2099,14 +2120,14 @@ pub const ENV_HIPFIRE_KV_IDLE_KEEP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KV_IMPORTANCE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_IMPORTANCE",
     description: "Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:179",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:196",
 };
 
 /// `HIPFIRE_KV_MIGRATE_BATCH` — Cold-tier compaction knobs. fold_m=1 disables the m:1 merge (cold = pure
 pub const ENV_HIPFIRE_KV_MIGRATE_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_MIGRATE_BATCH",
     description: "Cold-tier compaction knobs. fold_m=1 disables the m:1 merge (cold = pure",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:160",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:177",
 };
 
 /// `HIPFIRE_KV_MODE` — Runtime variable controlling KV mode in hipfire
@@ -2127,7 +2148,7 @@ pub const ENV_HIPFIRE_KV_PHYSICAL_CAP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KV_POS_LOCAL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_POS_LOCAL",
     description: "Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:181",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:198",
 };
 
 /// `HIPFIRE_LATENTKV_EVAL` — Runtime variable controlling latentKV eval in hipfire
@@ -4702,13 +4723,16 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_KVNOISE_FOLD,
     ENV_HIPFIRE_KVNOISE_HOT,
     ENV_HIPFIRE_KVNOISE_LR,
+    ENV_HIPFIRE_KV_CAPTURE_K,
     ENV_HIPFIRE_KV_COLD_BITS,
     ENV_HIPFIRE_KV_COLD_V_BITS,
     ENV_HIPFIRE_KV_COLD_V_PERSLOT,
     ENV_HIPFIRE_KV_CORE_FRAC,
+    ENV_HIPFIRE_KV_DEFRAG_SEGMENTS,
     ENV_HIPFIRE_KV_FOLD_M,
     ENV_HIPFIRE_KV_HIERARCHICAL,
     ENV_HIPFIRE_KV_HIER_KEEP,
+    ENV_HIPFIRE_KV_HIER_TEST_DEFRAG,
     ENV_HIPFIRE_KV_HIER_TEST_IDLE,
     ENV_HIPFIRE_KV_HOT_BUDGET,
     ENV_HIPFIRE_KV_IDLE_KEEP,

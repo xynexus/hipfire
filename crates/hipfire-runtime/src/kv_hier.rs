@@ -3,18 +3,19 @@
 //!
 //! When `HIPFIRE_KV_HIERARCHICAL=1`, the KVarN decode path is replaced by a
 //! two-tier cache:
-//!   * HOT tier — the most recent `hot_budget` tokens, kept as a raw-f32 ring
-//!     `[n_kv_heads × hot_budget × head_dim]` (slot-major). For a single decode
-//!     query at the last position every hot token is causally visible, so it is
-//!     read by `attention_cold_slots` (slot-major f32), which already emits the
-//!     flash partials (m,l) — no `kvarn_attend`/`flash_partials_ml` plumbing.
+//!   * HOT tier — the most recent `hot_budget` tokens, kept as an f16 ring
+//!     `[n_kv_heads × hot_budget × head_dim]` (slot-major; f16 halves the exact-tier
+//!     VRAM and is near-lossless — measured PPL-identical to f32, far above the cold
+//!     2-bit floor). For a single decode query at the last position every hot token
+//!     is causally visible, so it is read by `attention_cold_slots` slot-major-f16
+//!     (layout 2), which already emits the flash partials (m,l).
 //!   * COLD tier — older tokens, compacted by `compact_cold_kv` (KVarN 4-bit,
 //!     importance-weighted m:1 merge) into segments that stay 4-bit-resident on
 //!     GPU and are dequantized on-the-fly each step (`kvarn_dequant_tile` → f16)
 //!     and read by the channel-major mode of `attention_cold_slots`.
 //!
 //! The two tiers are folded by `flash_tier_merge` (online softmax). The hot tier
-//! being raw-f32 (not 4-bit) costs `hot_budget × kv_dim × 4` B/layer — small; the
+//! being f16 (not 4-bit) costs `hot_budget × kv_dim × 2` B/layer — small; the
 //! storage win lives in the compacted cold tier that holds the bulk of a long
 //! context. head_dim is fixed at 256 (the kernels' CHD).
 //!
@@ -36,7 +37,7 @@
 //!     PPL — quant is cheap even at 2-bit (Sinkhorn variance-norm does the
 //!     incoherence job a rotation would, so `rotate=false` and no ConQuR needed).
 //!
-//! Window/drain knobs: `HIPFIRE_KV_HOT_BUDGET`(256), `HIPFIRE_KV_MIGRATE_BATCH`(128),
+//! Window/drain knobs: `HIPFIRE_KV_HOT_BUDGET`(512), `HIPFIRE_KV_MIGRATE_BATCH`(128),
 //! `HIPFIRE_KV_IDLE_KEEP`(0 = full between-turns drain).
 //!
 //! Constraint: this is an inherently per-token-attention feature (it lives in
@@ -46,8 +47,11 @@
 //! flash_tier_merge,flash_partials_ml,two_tier_e2e,cold_4bit_read} and
 //! hipfire-runtime/examples/parity_kv_hier.
 
-use hipfire_kvquant::kv_compact::compact_cold_kv;
-use hipfire_kvquant::kvarn::{kvarn_record_bytes_bits, pack_kvarn_tile_bits};
+use hipfire_kvquant::kv_compact::{compact_cold_kv, ColdTier};
+use hipfire_kvquant::kvarn::{
+    dequantize_tile, kvarn_record_bytes_bits, pack_kvarn_tile_bits, unpack_kvarn_tile_bits,
+};
+use hipfire_primitives::conv::f16_to_f32;
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 const HD: usize = 256; // head_dim (kernel CHD)
@@ -127,6 +131,11 @@ pub struct HierKvState {
     /// Store cold V per-slot (token axis) instead of per-channel — V's natural
     /// quant axis (`HIPFIRE_KV_COLD_V_PERSLOT=1`, default off).
     pub cold_v_perslot: bool,
+    /// Idle-time cold-segment defrag threshold (`HIPFIRE_KV_DEFRAG_SEGMENTS`, 0 =
+    /// off). When a layer holds more than this many cold segments, `idle_compact`
+    /// folds them all into one wider tile (bounds the per-segment two-tier read
+    /// cost + amortizes per-channel scale overhead). Off by default (byte-identical).
+    pub defrag_segments: usize,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub hot_k: Vec<GpuTensor>, // [n_layers] slot-major [nkv × hot_budget × HD] f32
@@ -139,6 +148,10 @@ pub struct HierKvState {
     pub migrated: Vec<usize>,           // tokens already moved to cold per layer
     pub cold: Vec<Vec<ColdSegmentGpu>>, // [n_layers][segments]
     scr: Option<HierScratch>,
+    /// Reused f16 [n_kv_heads × HD] scratch for casting an incoming f32 token before
+    /// it is placed into the f16 hot ring (avoids a per-token alloc). `None` when
+    /// disabled.
+    hot_cast: Option<GpuTensor>,
 }
 
 impl HierKvState {
@@ -153,10 +166,14 @@ impl HierKvState {
     ) -> HipResult<Self> {
         let enabled =
             std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() == Some("1") && head_dim == HD;
+        // Default 512: the knee sweep showed hot=512 clearly beats 256 (PPL 27.5 vs
+        // 29.0 at fold=4/2-bit), and the f16 ring makes 512 cost the same VRAM the old
+        // f32-256 default did. Hot budget is the primary quality dial now that the
+        // dephasing merge lever is closed (content loss, not phase).
         let hot_budget = std::env::var("HIPFIRE_KV_HOT_BUDGET")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(256usize);
+            .unwrap_or(512usize);
         let migrate_batch = std::env::var("HIPFIRE_KV_MIGRATE_BATCH")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -199,15 +216,25 @@ impl HierKvState {
         let cold_v_qmax = ((1u32 << cold_v_bits) - 1) as f32;
         let cold_v_perslot =
             std::env::var("HIPFIRE_KV_COLD_V_PERSLOT").ok().as_deref() == Some("1");
+        let defrag_segments = std::env::var("HIPFIRE_KV_DEFRAG_SEGMENTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0usize);
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
         let mut attn_mass = Vec::with_capacity(n_layers);
+        let mut hot_cast = None;
         if enabled {
+            // Hot ring is f16 (halves hot VRAM → a larger exact window fits the same
+            // budget; f16 is far above the cold 2-bit floor, so it is near-lossless
+            // for the exact tier). Read via attention_cold_slots slot-major-f16
+            // (layout 2); migrate downloads raw f16 and widens to f32 for compaction.
             for _ in 0..n_layers {
-                hot_k.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F32)?);
-                hot_v.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F32)?);
+                hot_k.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
+                hot_v.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
                 attn_mass.push(gpu.zeros(&[hot_budget], DType::F32)?);
             }
+            hot_cast = Some(gpu.zeros(&[n_kv_heads * HD], DType::F16)?);
         }
         Ok(Self {
             enabled,
@@ -222,6 +249,7 @@ impl HierKvState {
             cold_v_qmax,
             cold_v_bits: cold_v_bits as usize,
             cold_v_perslot,
+            defrag_segments,
             n_heads,
             n_kv_heads,
             hot_k,
@@ -231,6 +259,7 @@ impl HierKvState {
             migrated: vec![0; n_layers],
             cold: (0..n_layers).map(|_| Vec::new()).collect(),
             scr: None,
+            hot_cast,
         })
     }
 
@@ -278,12 +307,19 @@ impl HierKvState {
         }
         let slot = self.hot_count[layer];
         let hb = self.hot_budget;
-        // fa_k is [nkv × HD] (kv*HD + d); place head kv at hot slot (kv*hb+slot)*HD.
-        for kv in 0..self.n_kv_heads {
-            let dst = ((kv * hb + slot) * HD) * 4;
-            let src = (kv * HD) * 4;
-            gpu.memcpy_dtod_at_auto(&self.hot_k[layer].buf, dst, &fa_k.buf, src, HD * 4)?;
-            gpu.memcpy_dtod_at_auto(&self.hot_v[layer].buf, dst, &fa_v.buf, src, HD * 4)?;
+        // f16 ring: cast the incoming f32 token [nkv×HD] into the reused f16 scratch,
+        // then place each head at hot slot (kv*hb+slot)*HD (2 bytes/elem).
+        let cast = self
+            .hot_cast
+            .as_ref()
+            .expect("hot_cast present when enabled");
+        for (fa, ring) in [(fa_k, &self.hot_k[layer]), (fa_v, &self.hot_v[layer])] {
+            gpu.cast_f32_to_f16(fa, cast)?;
+            for kv in 0..self.n_kv_heads {
+                let dst = ((kv * hb + slot) * HD) * 2;
+                let src = (kv * HD) * 2;
+                gpu.memcpy_dtod_at_auto(&ring.buf, dst, &cast.buf, src, HD * 2)?;
+            }
         }
         self.hot_count[layer] += 1;
         Ok(())
@@ -300,10 +336,16 @@ impl HierKvState {
         let hb = self.hot_budget;
         let nkv = self.n_kv_heads;
         let kv_dim = self.kv_dim();
-        // Download hot rings, assemble the oldest `mb` tokens as token-major
-        // [mb × kv_dim] for compact_cold_kv.
-        let hk = gpu.download_f32(&self.hot_k[layer])?;
-        let hv = gpu.download_f32(&self.hot_v[layer])?;
+        // Download the f16 hot rings and widen to f32, then assemble the oldest `mb`
+        // tokens as token-major [mb × kv_dim] for compact_cold_kv.
+        let ring_elems = nkv * hb * HD;
+        let widen = |bytes: &[u8]| -> Vec<f32> {
+            (0..ring_elems)
+                .map(|i| f16_to_f32(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])))
+                .collect()
+        };
+        let hk = widen(&gpu.download_raw(&self.hot_k[layer], ring_elems * 2)?);
+        let hv = widen(&gpu.download_raw(&self.hot_v[layer], ring_elems * 2)?);
         let mut ck = vec![0.0f32; mb * kv_dim];
         let mut cv = vec![0.0f32; mb * kv_dim];
         for t in 0..mb {
@@ -312,6 +354,31 @@ impl HierKvState {
                 let dst = t * kv_dim + kv * HD;
                 ck[dst..dst + HD].copy_from_slice(&hk[src..src + HD]);
                 cv[dst..dst + HD].copy_from_slice(&hv[src..src + HD]);
+            }
+        }
+        // Phase-2 (RoPE-dephased merge) ceiling capture. Debug-gated, no behavior
+        // change when unset: append the post-RoPE K about to be merged, token-major
+        // `[mb × kv_dim]`, with its absolute base position, so an offline analysis can
+        // measure whether de-rotating a merge group collapses its intra-group variance
+        // (blur is phase → lever has headroom) or not (blur is content → lever dead).
+        // Record = [u32 base_pos][u32 mb][u32 nkv][u32 HD][f32 ck…]. See
+        // docs/plans/2026-07-12-hot-cold-hierarchical-kv-implementation.md Phase 2.
+        if let Ok(path) = std::env::var("HIPFIRE_KV_CAPTURE_K") {
+            use std::io::Write;
+            let mut buf = Vec::with_capacity(16 + ck.len() * 4);
+            buf.extend_from_slice(&(self.migrated[layer] as u32).to_le_bytes());
+            buf.extend_from_slice(&(mb as u32).to_le_bytes());
+            buf.extend_from_slice(&(nkv as u32).to_le_bytes());
+            buf.extend_from_slice(&(HD as u32).to_le_bytes());
+            for &x in &ck {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(&buf);
             }
         }
         // Per-token importance for core selection + merge weighting. Norm proxies
@@ -363,62 +430,29 @@ impl HierKvState {
             self.cold_v_qmax,
             self.cold_v_perslot,
         );
-        let n_slots = cold.n_slots;
-        let bits = self.cold_bits;
-        let v_bits = self.cold_v_bits;
-        let v_perslot = self.cold_v_perslot;
-        // K and V may pack at different bit widths → separate record strides.
-        // Each rec_bytes is padded up to a multiple of 4 for the f32-view upload.
-        // Per-slot V transposes the tile to [n_slots × HD], so its record geometry
-        // (per-row scale metadata) differs from the K [HD × n_slots] layout.
-        let k_padded = kvarn_record_bytes_bits(HD, n_slots, bits).div_ceil(4) * 4;
-        let v_padded = if v_perslot {
-            kvarn_record_bytes_bits(n_slots, HD, v_bits).div_ceil(4) * 4
-        } else {
-            kvarn_record_bytes_bits(HD, n_slots, v_bits).div_ceil(4) * 4
-        };
-        let mut krecs = vec![0u8; nkv * k_padded];
-        let mut vrecs = vec![0u8; nkv * v_padded];
-        for h in 0..nkv {
-            let kp = pack_kvarn_tile_bits(&cold.k_tiles[h], bits);
-            let vp = pack_kvarn_tile_bits(&cold.v_tiles[h], v_bits);
-            krecs[h * k_padded..h * k_padded + kp.len()].copy_from_slice(&kp);
-            vrecs[h * v_padded..h * v_padded + vp.len()].copy_from_slice(&vp);
-        }
-        let k_recs = gpu.upload_raw(&krecs, &[nkv * k_padded / 4])?;
-        let v_recs = gpu.upload_raw(&vrecs, &[nkv * v_padded / 4])?;
-        self.cold[layer].push(ColdSegmentGpu {
-            k_recs,
-            v_recs,
-            n_valid: cold.n_valid,
-            n_slots,
-            rec_bytes: k_padded,
-            bits,
-            v_rec_bytes: v_padded,
-            v_bits,
-            v_perslot,
-        });
+        self.push_cold_segment(gpu, layer, &cold)?;
         self.migrated[layer] += mb;
 
         // Shift the remaining (hot_count - mb) tokens down to slots [0, ...).
         let rem = self.hot_count[layer] - mb;
         if rem > 0 {
             for kv in 0..nkv {
-                let dst = ((kv * hb) * HD) * 4;
-                let src = ((kv * hb + mb) * HD) * 4;
+                // f16 ring: 2 bytes/elem.
+                let dst = ((kv * hb) * HD) * 2;
+                let src = ((kv * hb + mb) * HD) * 2;
                 gpu.memcpy_dtod_at_auto(
                     &self.hot_k[layer].buf,
                     dst,
                     &self.hot_k[layer].buf,
                     src,
-                    rem * HD * 4,
+                    rem * HD * 2,
                 )?;
                 gpu.memcpy_dtod_at_auto(
                     &self.hot_v[layer].buf,
                     dst,
                     &self.hot_v[layer].buf,
                     src,
-                    rem * HD * 4,
+                    rem * HD * 2,
                 )?;
             }
         }
@@ -446,6 +480,172 @@ impl HierKvState {
         Ok(())
     }
 
+    /// Pack a freshly-produced `ColdTier` into GPU records and push it as one new
+    /// cold segment for `layer`. Shared by `migrate_n` (hot→cold fold) and `defrag`
+    /// (segment repack). K and V may pack at different bit widths → separate record
+    /// strides; each is padded to a multiple of 4 for the f32-view upload. Per-slot
+    /// V transposes the tile to `[n_slots × HD]`, so its record geometry differs
+    /// from the K `[HD × n_slots]` layout.
+    fn push_cold_segment(&mut self, gpu: &mut Gpu, layer: usize, cold: &ColdTier) -> HipResult<()> {
+        let nkv = self.n_kv_heads;
+        let n_slots = cold.n_slots;
+        let bits = self.cold_bits;
+        let v_bits = self.cold_v_bits;
+        let v_perslot = self.cold_v_perslot;
+        let k_padded = kvarn_record_bytes_bits(HD, n_slots, bits).div_ceil(4) * 4;
+        let v_padded = if v_perslot {
+            kvarn_record_bytes_bits(n_slots, HD, v_bits).div_ceil(4) * 4
+        } else {
+            kvarn_record_bytes_bits(HD, n_slots, v_bits).div_ceil(4) * 4
+        };
+        let mut krecs = vec![0u8; nkv * k_padded];
+        let mut vrecs = vec![0u8; nkv * v_padded];
+        for h in 0..nkv {
+            let kp = pack_kvarn_tile_bits(&cold.k_tiles[h], bits);
+            let vp = pack_kvarn_tile_bits(&cold.v_tiles[h], v_bits);
+            krecs[h * k_padded..h * k_padded + kp.len()].copy_from_slice(&kp);
+            vrecs[h * v_padded..h * v_padded + vp.len()].copy_from_slice(&vp);
+        }
+        let k_recs = gpu.upload_raw(&krecs, &[nkv * k_padded / 4])?;
+        let v_recs = gpu.upload_raw(&vrecs, &[nkv * v_padded / 4])?;
+        self.cold[layer].push(ColdSegmentGpu {
+            k_recs,
+            v_recs,
+            n_valid: cold.n_valid,
+            n_slots,
+            rec_bytes: k_padded,
+            bits,
+            v_rec_bytes: v_padded,
+            v_bits,
+            v_perslot,
+        });
+        Ok(())
+    }
+
+    /// Dequantize a resident cold segment back to token-major f32 `(K, V)`, each
+    /// `[n_valid × kv_dim]`, in the original basis — the inverse of the migrate_n
+    /// pack (mirrors `ColdTier::dequant_head`). Runtime cold segments are never
+    /// FWHT-rotated (migrate_n / defrag pass `rotate=false`), so no inverse rotation
+    /// is applied. Slots `[0, n_valid)` are the real ones; `[n_valid, n_slots)` are
+    /// zero padding and are dropped here.
+    fn dequant_segment_tokmajor(
+        &self,
+        gpu: &mut Gpu,
+        seg: &ColdSegmentGpu,
+    ) -> HipResult<(Vec<f32>, Vec<f32>)> {
+        let nkv = self.n_kv_heads;
+        let kv_dim = self.kv_dim();
+        let (nv, ns) = (seg.n_valid, seg.n_slots);
+        // Records were uploaded as an f32-view (bytes/4); download and reinterpret
+        // to the little-endian byte stream the unpack expects.
+        let kf = gpu.download_f32(&seg.k_recs)?;
+        let vf = gpu.download_f32(&seg.v_recs)?;
+        let kbytes: Vec<u8> = kf.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let vbytes: Vec<u8> = vf.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let krb = kvarn_record_bytes_bits(HD, ns, seg.bits);
+        let (vr, vc, vrb) = if seg.v_perslot {
+            (ns, HD, kvarn_record_bytes_bits(ns, HD, seg.v_bits))
+        } else {
+            (HD, ns, kvarn_record_bytes_bits(HD, ns, seg.v_bits))
+        };
+        let mut k = vec![0.0f32; nv * kv_dim];
+        let mut v = vec![0.0f32; nv * kv_dim];
+        for h in 0..nkv {
+            let kt = dequantize_tile(&unpack_kvarn_tile_bits(
+                &kbytes[h * seg.rec_bytes..h * seg.rec_bytes + krb],
+                HD,
+                ns,
+                seg.bits,
+            )); // [HD × ns]
+            let vt = dequantize_tile(&unpack_kvarn_tile_bits(
+                &vbytes[h * seg.v_rec_bytes..h * seg.v_rec_bytes + vrb],
+                vr,
+                vc,
+                seg.v_bits,
+            )); // [vr × vc]
+            for s in 0..nv {
+                let dst = s * kv_dim + h * HD;
+                for d in 0..HD {
+                    k[dst + d] = kt[d * ns + s]; // channel-major → token-major
+                    v[dst + d] = if seg.v_perslot {
+                        vt[s * HD + d]
+                    } else {
+                        vt[d * ns + s]
+                    };
+                }
+            }
+        }
+        Ok((k, v))
+    }
+
+    /// Idle-time cold-segment defragmentation (follow-up #2). `idle_compact` folds
+    /// each turn's drain into ONE segment, so a layer accumulates ~1 segment/turn and
+    /// the two-tier read pays one `attention_cold_slots`+`flash_tier_merge` per
+    /// segment → read cost grows linearly with turn count. When a layer holds more
+    /// than `max_segments` segments, dequant them all, concatenate their real slots,
+    /// and re-pack into ONE wider tile via `compact_cold_kv(core_frac=1, fold_m=1)` —
+    /// a pure repack (no further merge, so attention is unchanged up to one extra
+    /// quant round on the oldest, least-important tokens). Win: bounded read cost +
+    /// amortized per-channel scale overhead (fixed `r_dim*4 B/tile` now spans more
+    /// slots). Attention over cold keys is permutation-invariant, so folding all
+    /// segments and ignoring order is safe. Idle-path only (allocates); no-op unless
+    /// enabled and a layer exceeds the threshold.
+    pub fn defrag(&mut self, gpu: &mut Gpu, max_segments: usize) -> HipResult<()> {
+        if !self.enabled || max_segments == 0 {
+            return Ok(());
+        }
+        let nkv = self.n_kv_heads;
+        let kv_dim = self.kv_dim();
+        let n_layers = self.cold.len();
+        for layer in 0..n_layers {
+            if self.cold[layer].len() <= max_segments {
+                continue;
+            }
+            // ponytail: folds ALL segments (incl. a prior defrag result) into one, so
+            // repeated idle_compact defrags re-quantize the whole cold history each
+            // time → the oldest tokens accumulate requant coarsening (~1.6% output
+            // error per fold-6→1, measured; parity_kv_hier defrag mode). Fine as an
+            // opt-in (default off) that bounds read cost; if enabled by default, upgrade
+            // to generational/LSM compaction (fold only same-generation small segments,
+            // exempt the wide archive) to stop the compounding.
+            let segs = std::mem::take(&mut self.cold[layer]);
+            let total_valid: usize = segs.iter().map(|s| s.n_valid).sum();
+            if total_valid == 0 {
+                continue;
+            }
+            let mut k = vec![0.0f32; total_valid * kv_dim];
+            let mut v = vec![0.0f32; total_valid * kv_dim];
+            let mut off = 0usize;
+            for seg in &segs {
+                let (sk, sv) = self.dequant_segment_tokmajor(gpu, seg)?;
+                let nv = seg.n_valid;
+                k[off * kv_dim..(off + nv) * kv_dim].copy_from_slice(&sk);
+                v[off * kv_dim..(off + nv) * kv_dim].copy_from_slice(&sv);
+                off += nv;
+            }
+            // Repack the already-compacted slots into one wide tile: all-core
+            // (core_frac=1) + fold_m=1 = every slot kept singleton, no re-merge.
+            let importance = vec![1.0f32; total_valid];
+            let cold = compact_cold_kv(
+                &k,
+                &v,
+                total_valid,
+                nkv,
+                HD,
+                &importance,
+                1.0,
+                1,
+                false,
+                false,
+                self.cold_qmax,
+                self.cold_v_qmax,
+                self.cold_v_perslot,
+            );
+            self.push_cold_segment(gpu, layer, &cold)?;
+        }
+        Ok(())
+    }
+
     /// Deferred between-turns compaction (the "deferred-hierarchical" thesis). Run
     /// in the idle gap after a turn ends, off the latency-critical path: drain each
     /// layer's hot ring down to `keep_recent` tokens, folding everything older into
@@ -465,6 +665,8 @@ impl HierKvState {
                 self.migrate_n(gpu, layer, hc - keep_recent)?;
             }
         }
+        // Bound the accumulated per-turn segments (off the latency path).
+        self.defrag(gpu, self.defrag_segments)?;
         Ok(())
     }
 
@@ -533,8 +735,8 @@ impl HierKvState {
             nkv,
             self.hot_count[layer],
             scale,
-            0, // k_layout: hot ring is slot-major f32
-            0, // v_layout: hot ring is slot-major f32
+            2, // k_layout: hot ring is slot-major f16
+            2, // v_layout: hot ring is slot-major f16
             self.hot_budget,
             mass,
         )?;

@@ -89,17 +89,73 @@ fn main() {
 
     let q = lcg(7, NH * HD);
     let qd = gpu.upload_f32(&q, &[NH, HD]).unwrap();
+
+    // Optional: exercise cold-segment defrag. Read BEFORE folding, then fold every
+    // accumulated segment into one wider tile, then let the main read + oracle below
+    // run on the defragged state. defrag is a pure repack, so the read must be
+    // preserved up to one extra quant round on the repacked slots (looser tol).
+    let out_before: Option<Vec<f32>> =
+        if std::env::var("HIPFIRE_KV_HIER_TEST_DEFRAG").ok().as_deref() == Some("1") {
+            let ob = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
+            hier.two_tier_read(&mut gpu, 0, &qd, &ob).unwrap();
+            gpu.device_synchronize().unwrap();
+            let before = hier.cold[0].len();
+            hier.defrag(&mut gpu, 1).unwrap(); // threshold 1 → fold all (>1) into one
+            eprintln!(
+                "after defrag(max_segments=1): cold_segs {before} -> {}",
+                hier.cold[0].len()
+            );
+            assert!(
+                hier.cold[0].len() <= 1,
+                "defrag should leave at most one segment"
+            );
+            Some(gpu.download_f32(&ob).unwrap())
+        } else {
+            None
+        };
+
     let out = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
     hier.two_tier_read(&mut gpu, 0, &qd, &out).unwrap();
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&out).unwrap();
 
+    // Defrag preservation: the read after folding must match the read before, up to
+    // one extra quant round on the repacked slots.
+    if let Some(before) = &out_before {
+        let mut dmax = 0.0f32;
+        for i in 0..NH * HD {
+            dmax = dmax.max((got[i] - before[i]).abs());
+        }
+        // Informational only: the before/after delta is requant coarsening (one wide
+        // per-channel scale vs many narrow ones), NOT corruption — the post-defrag
+        // oracle below is the correctness gate. ~1.6% of output magnitude for a
+        // fold-6→1 is expected; a much larger delta would flag a geometry bug.
+        let dinfo = 3.0e-2f32;
+        println!(
+            "defrag preservation (requant coarsening): max_abs(before,after)={dmax:.6} expect<{dinfo:.3} -> {}",
+            if dmax <= dinfo { "OK" } else { "SUSPECT-BUG" }
+        );
+        if dmax > dinfo {
+            std::process::exit(1); // only a gross delta (geometry bug) fails
+        }
+    }
+
     // ── CPU oracle over the SAME stored data.
     // Hot: first hot_count slots of the slot-major ring [nkv × hot_budget × HD].
     let hot_count = hier.hot_count[0];
     let hb = hier.hot_budget;
-    let hk = gpu.download_f32(&hier.hot_k[0]).unwrap();
-    let hv = gpu.download_f32(&hier.hot_v[0]).unwrap();
+    // Hot ring is f16 (2 bytes/elem); download raw and widen to f32.
+    let ring_elems = NKV * hb * HD;
+    let widen16 = |t: &hipfire_rdna::GpuTensor| -> Vec<f32> {
+        let b = gpu.download_raw(t, ring_elems * 2).unwrap();
+        (0..ring_elems)
+            .map(|i| {
+                hipfire_primitives::conv::f16_to_f32(u16::from_le_bytes([b[2 * i], b[2 * i + 1]]))
+            })
+            .collect()
+    };
+    let hk = widen16(&hier.hot_k[0]);
+    let hv = widen16(&hier.hot_v[0]);
     // Per kv-head list of (k,v) slots in attention order (hot then each cold seg).
     let mut k_slots: Vec<Vec<[f32; HD]>> = vec![Vec::new(); NKV];
     let mut v_slots: Vec<Vec<[f32; HD]>> = vec![Vec::new(); NKV];
