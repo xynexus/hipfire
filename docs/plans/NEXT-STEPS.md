@@ -190,10 +190,26 @@ row scale, GROUP=128 tile records, dequant-to-fp16-scratch then stock decode.
       ratified north-star (root `README.md`) **KVarN + the hierarchical cache are now
       the primary KV systems**, with asym retained as the baseline to beat. Long-ctx
       hierarchical results (0.8B, ctx=16384): a larger f16 hot window nearly
-      eliminates the merge penalty (KLD 0.247→0.146 at hot=512→2048). **Pending
-      validation:** a direct hierarchical-vs-asym4 long-ctx head-to-head (the "should
-      outperform asym in every way" claim is not yet proven). Evidence:
-      `docs/plans/2026-07-12-hot-cold-hierarchical-kv-implementation.md`.
+      eliminates the merge penalty (KLD 0.247→0.146 at hot=512→2048).
+    - ✅ **HEAD-TO-HEAD SETTLED (2026-07-13)** (0.8B mq4+, PPL/KLD vs bf16;
+      `benchmarks/results/hier-kv-rebaseline-20260712/asym_headtohead.md`):
+      | ctx | asym4 | asym3 | single-tier KVarN | hierarchical |
+      | --- | --- | --- | --- | --- |
+      | 2048 | 27.04 / 0.095 | 27.82 / 0.115 | **26.38 / 0.083** | 27.54 / 0.153 |
+      | 16384 | 18.15 / 0.096 | 19.22 / 0.125 | **17.71 / 0.085** | 18.41 / 0.149 |
+      - **Single-tier KVarN strictly dominates asym4** (better PPL *and* KLD at both
+        ctx) at **iso-memory** (both 4-bit K + Q8 V; Sinkhorn var-norm beats Givens
+        rotation). This overturns the 2026-06-16 "ship asym4" verdict on the real
+        runtime — **asym is now dominated by KVarN and can be deprecated.**
+      - **Hierarchical is a memory play, not a pure-quality one.** Its quality-per-token
+        is *worse* than asym4/KVarN (it merges tokens), but it reaches near-asym4 PPL
+        (18.41 vs 18.15) at **~4× less memory** (hot f16 + 4:1-merged 2-bit cold ≈ 85 MB
+        vs asym4 ~350 MB at 16k) — it wins quality-per-byte, not absolute quality.
+      - Net: "KVarN + hierarchical are the primary KV systems" holds — KVarN for best
+        4-bit quality (beats asym), hierarchical for long-context memory compression.
+        The blanket "outperforms asym in every way" is accurate for KVarN, and for
+        hierarchical only on the memory axis. Full detail:
+        `docs/plans/2026-07-12-hot-cold-hierarchical-kv-implementation.md`.
     - ✅ **VERDICT — SKIP the GPU Sinkhorn subsystem (2026-06-16).** Long-ctx
       test (calib-5m, fair within-run): f32 ctx1024=11.51 ctx4096=24.27; asym4
       11.60 / 24.80; KVarN-K 11.56 / **28.66**. KVarN-K helps +0.5% at ctx1024
