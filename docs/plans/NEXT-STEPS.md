@@ -183,6 +183,17 @@ row scale, GROUP=128 tile records, dequant-to-fp16-scratch then stock decode.
       loss on REAL K (mechanism confirmed, not just synthetic). But the margin
       is modest at short ctx (asym4's per-channel scales already capture most
       skew).
+    - ⚠️ **SUPERSEDED (2026-07-13):** the verdict below was for *single-tier
+      per-token* KVarN (per-token Sinkhorn s_col on the whole cache). The **hot/cold
+      hierarchical cache** (2026-07) is a different system — KVarN is only the
+      *cold-tier* codec while recent tokens stay exact (f16 hot ring) — and per the
+      ratified north-star (root `README.md`) **KVarN + the hierarchical cache are now
+      the primary KV systems**, with asym retained as the baseline to beat. Long-ctx
+      hierarchical results (0.8B, ctx=16384): a larger f16 hot window nearly
+      eliminates the merge penalty (KLD 0.247→0.146 at hot=512→2048). **Pending
+      validation:** a direct hierarchical-vs-asym4 long-ctx head-to-head (the "should
+      outperform asym in every way" claim is not yet proven). Evidence:
+      `docs/plans/2026-07-12-hot-cold-hierarchical-kv-implementation.md`.
     - ✅ **VERDICT — SKIP the GPU Sinkhorn subsystem (2026-06-16).** Long-ctx
       test (calib-5m, fair within-run): f32 ctx1024=11.51 ctx4096=24.27; asym4
       11.60 / 24.80; KVarN-K 11.56 / **28.66**. KVarN-K helps +0.5% at ctx1024

@@ -1,7 +1,22 @@
 # hipfire
 
-LLM inference for AMD RDNA GPUs. Rust + HIP. Single binary. No Python
-in the hot path. Ollama-style UX.
+A Rust-native inference engine for AMD GPUs, NPUs, and APUs. Single binary,
+HIP/ROCm-direct, no Python in the hot path.
+
+hipfire runs a **daemon** that serves concurrent, prioritized batching of
+multi-modal inference, embedding + rerank, and image generation — with
+opportunistic background training and offline steering. The OpenAI **Responses**
+API is the primary first-class interface (embedding, rerank, and image-gen are
+first-class alongside it); **chat-completions** and **AUTOMATIC1111-style SD**
+endpoints are provided for backwards compatibility. Web-based admin + monitoring
+is included.
+
+**Hardware:** supported GPUs align with ROCm; supported NPUs align with the XDNA
+NPUs in AMD APUs. The RX 5700 XT (RDNA1) bring-up was the origin (see "Historical
+RDNA1 bootstrap" below); the engine now spans RDNA1–4, Vega/CDNA, and XDNA.
+
+**KV:** KVarN and the hierarchical hot/cold cache are the primary KV systems;
+asym is retained only as a baseline to beat.
 
 ```bash
 hipfire chat -m qwen3.5:9b "What is the capital of France?"
@@ -24,8 +39,9 @@ Discord: <https://discord.gg/F3BaywB8Rs>
 
 `llama.cpp + ROCm` works on RDNA but is painful: upstream ROCm
 officially supports only a handful of datacenter cards; consumer RDNA
-is a second-class citizen. hipfire targets the entire RDNA family
-(RDNA1 → RDNA4, consumer + pro + APU) with a single Rust binary that
+is a second-class citizen. hipfire targets AMD accelerators broadly —
+GPUs across the ROCm-supported range (RDNA1 → RDNA4, Vega/CDNA, consumer +
+pro) plus the XDNA NPUs in AMD APUs — with a single Rust binary that
 ships pre-compiled kernel blobs when possible and JIT-compiles the
 rest through HIP. No Python, no PyTorch, no ROCm userspace stack at
 runtime.
