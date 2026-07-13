@@ -59,8 +59,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use hipfire_arch_dots_ocr::{dots_ocr, image as preprocess, rope};
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_rdna::Gpu;
+use hipfire_runtime::hfq::HfqFile;
 
 // ─── Argument parsing ─────────────────────────────────────────────────
 

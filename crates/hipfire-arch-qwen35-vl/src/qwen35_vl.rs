@@ -6,9 +6,9 @@
 //! GPU path: gemm_f16 (9 VGPRs), layernorm (13), gelu (8), vit_attention, transpose.
 
 use hip_bridge::HipResult;
+use hipfire_rdna::{DType, Gpu, GpuTensor, OwnedTensor};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::{f16_to_f32, f32_to_f16};
-use hipfire_rdna::{DType, Gpu, GpuTensor, OwnedTensor};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 

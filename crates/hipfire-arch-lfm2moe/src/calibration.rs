@@ -5,10 +5,10 @@ use crate::config::Lfm2MoeConfig;
 use crate::forward::decode_step;
 use crate::lfm2moe::{Ffn, Lfm2MoeState, Lfm2MoeWeights, Mixer};
 use hip_bridge::{HipError, HipResult};
+use hipfire_rdna::Gpu;
 use hipfire_runtime::calibration::{collect, logsumexp, topk_logits, CalibForward};
 use hipfire_runtime::hfq::HfqMemTensor;
 use hipfire_runtime::weights::WeightTensor;
-use hipfire_rdna::Gpu;
 use std::collections::HashMap;
 use std::path::Path;
 

@@ -55,10 +55,10 @@ use hipfire_arch_deepseek4::{
     spec_decode::{logits_argmax, speculative_decode_step_with_pbs},
     DeepseekV4, DeepseekV4State,
 };
+use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::Gpu;
 use std::io::{self, BufRead, Write};
 
 /// Read one prompt "turn" from stdin: accumulate lines into a buffer

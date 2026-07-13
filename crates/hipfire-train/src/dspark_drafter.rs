@@ -532,7 +532,16 @@ pub fn dspark_block_forward(
     let k_pos_tiled = tile_kpos(k_pos_host, ctx_len, block, n_win);
     let k_pos = gpu.upload_f32(&k_pos_tiled, &[rkv])?;
     let k_rope = gpu.zeros(&[rkv * kvd], DType::F32)?;
-    rope_forward(gpu, &kn, &k_rope, &k_pos, rkv * nkv, nkv, hd, dims.rope_base)?;
+    rope_forward(
+        gpu,
+        &kn,
+        &k_rope,
+        &k_pos,
+        rkv * nkv,
+        nkv,
+        hd,
+        dims.rope_base,
+    )?;
 
     // 8. all_v = [v_proj(all-ctx) ++ v_proj(all-block)]  (phase-major, no norm/rope)
     let all_v = gpu.zeros(&[rkv * kvd], DType::F32)?;

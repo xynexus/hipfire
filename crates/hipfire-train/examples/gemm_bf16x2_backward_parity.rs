@@ -178,12 +178,34 @@ fn main() -> HipResult<()> {
         let dy_view: GpuTensor = dy_parent.sub_offset(pad, m * n);
         let dx_view_wmma = gpu.zeros(&[m * k], DType::F32)?;
         gpu.gemm_bf16x2_train_nt(&dy_view, &wt, &dx_view_wmma, m, n, k)?;
-        let (cv, rv) = metrics(&gpu.download_f32(&dx_ref)?, &gpu.download_f32(&dx_view_wmma)?);
+        let (cv, rv) = metrics(
+            &gpu.download_f32(&dx_ref)?,
+            &gpu.download_f32(&dx_view_wmma)?,
+        );
         report("dX from sub_offset dY", cv, rv);
 
         for t in [
-            x, w, dy, dx_ref, dw_ref, wt, dx_wmma, dyt, xt, dw_wmma, dx_bf16, dw_bf16, dx_f16,
-            dw_f16, dx_f16s, dw_f16s, dx_acc_ref, dx_acc_wmma, scratch, dy_parent, dx_view_wmma,
+            x,
+            w,
+            dy,
+            dx_ref,
+            dw_ref,
+            wt,
+            dx_wmma,
+            dyt,
+            xt,
+            dw_wmma,
+            dx_bf16,
+            dw_bf16,
+            dx_f16,
+            dw_f16,
+            dx_f16s,
+            dw_f16s,
+            dx_acc_ref,
+            dx_acc_wmma,
+            scratch,
+            dy_parent,
+            dx_view_wmma,
         ] {
             gpu.free_tensor(t)?;
         }

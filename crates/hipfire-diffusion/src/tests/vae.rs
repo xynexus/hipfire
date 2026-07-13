@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+use super::*;
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
     parse_pytorch_state_dict, pytorch_tensor_is_contiguous, reorder_pytorch_storage_to_contiguous,
@@ -10,7 +11,6 @@ use hipfire_diffusion_coexist::{
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
-use super::*;
 
 #[test]
 fn vae_moments_to_latents_selects_mean_channels_and_scales() {
@@ -163,17 +163,28 @@ fn wan_qwen_image_vae_encode_decode_round_trips() {
             data.push((((x + y) * 255) / (w + h)) as u8);
         }
     }
-    let img = RgbImageBatch { batch: 1, width: w, height: h, data };
+    let img = RgbImageBatch {
+        batch: 1,
+        width: w,
+        height: h,
+        data,
+    };
 
     let latent = encoder.encode_to_latents(&img).unwrap();
     assert_eq!(latent.channels, 16, "Qwen-Image z_dim=16 latent");
     assert_eq!((latent.height, latent.width), (h / 8, w / 8));
-    assert!(latent.data.iter().all(|v| v.is_finite()), "latent has non-finite values");
+    assert!(
+        latent.data.iter().all(|v| v.is_finite()),
+        "latent has non-finite values"
+    );
 
     // decode -> [-1,1] pixel tensor; compare to the input in the same range.
     let recon = decoder.decode_latents(&latent).unwrap();
     let input_tensor = rgb_batch_to_vae_tensor(&img).unwrap();
-    assert_eq!(recon.shape, input_tensor.shape, "reconstruction shape matches input");
+    assert_eq!(
+        recon.shape, input_tensor.shape,
+        "reconstruction shape matches input"
+    );
     let mse: f64 = recon
         .data
         .iter()
@@ -213,7 +224,10 @@ fn wan_qwen_image_decoder_smooth_latent_is_smooth() {
     // Debug: HIPFIRE_TEST_LATENT=<path> loads a real [4xu32 hdr + f32] latent dump
     // instead, to exercise the decoder on structured input (stage dumps then flow
     // through HIPFIRE_DEBUG_VAE_DUMP).
-    let latent = match std::env::var("HIPFIRE_TEST_LATENT").ok().filter(|v| !v.is_empty()) {
+    let latent = match std::env::var("HIPFIRE_TEST_LATENT")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
         Some(path) => {
             let bytes = std::fs::read(&path).unwrap();
             let dim = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
@@ -222,7 +236,13 @@ fn wan_qwen_image_decoder_smooth_latent_is_smooth() {
                 .chunks_exact(4)
                 .map(|ch| f32::from_le_bytes(ch.try_into().unwrap()))
                 .collect();
-            LatentBatch { batch: b, channels: c, height: h, width: w, data }
+            LatentBatch {
+                batch: b,
+                channels: c,
+                height: h,
+                width: w,
+                data,
+            }
         }
         None => LatentBatch {
             batch: 1,
@@ -253,7 +273,11 @@ fn wan_qwen_image_decoder_smooth_latent_is_smooth() {
     let smoothness = acc / n.max(1) as f64;
     let var = {
         let m = out.data.iter().map(|&v| v as f64).sum::<f64>() / out.data.len() as f64;
-        out.data.iter().map(|&v| (v as f64 - m).powi(2)).sum::<f64>() / out.data.len() as f64
+        out.data
+            .iter()
+            .map(|&v| (v as f64 - m).powi(2))
+            .sum::<f64>()
+            / out.data.len() as f64
     };
     eprintln!(
         "decode(constant latent): {ph}x{pw} std={:.3} mean|Δright|={smoothness:.4}",

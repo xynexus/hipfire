@@ -44,10 +44,10 @@ use hipfire_arch_lfm2moe::dflash::{
     validate_dflash_contract,
 };
 use hipfire_arch_lfm2moe::{Lfm2MoeConfig, Lfm2MoeWeights};
+use hipfire_rdna::DType;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor, HfqPackage};
 use hipfire_runtime::weights::weight_gemm;
-use hipfire_rdna::DType;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Instant;

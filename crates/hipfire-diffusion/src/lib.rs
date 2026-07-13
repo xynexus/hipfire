@@ -240,11 +240,13 @@ struct RocmWeightCache {
     /// decoding the bf16 source and per-group symmetric int8 quantizing it (no
     /// FWHT rotation — plain oq8, matching gemm_opus_tiled_wmma). Halves the
     /// resident weight footprint vs the bf16 cache.
-    named_oq8: std::collections::HashMap<String, (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
+    named_oq8:
+        std::collections::HashMap<String, (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
     /// W4A8 load-time quant: per HFQ tensor **name**, the (packed signed-int4
     /// weight [M*K/2], per-group f32 scales [M*K/256]) pair for the tiled oq4a8
     /// GEMM. Quarter the bf16 footprint; the int8 activation keeps precision.
-    named_w4a8: std::collections::HashMap<String, (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
+    named_w4a8:
+        std::collections::HashMap<String, (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
     /// Active activation precision for the resident linear path this step (the
     /// per-STEP schedule). Used directly unless the per-LAYER policy overrides.
     linear_precision: LinearPrecision,
@@ -294,7 +296,13 @@ pub(crate) fn bf16_byte_to_f32(lo: u8, hi: u8) -> f32 {
 /// reading values via `val(row_byte_base, elem)`. Returns (int8-as-u8 `[m*k]`,
 /// f32 scales `[m*ng]`). Rows are independent, so this fans out over rows with
 /// rayon — the load-time hot path for W8A8.
-pub(crate) fn quantize_oq8_rows<F>(m: usize, k: usize, ng: usize, elem_stride: usize, val: F) -> (Vec<u8>, Vec<f32>)
+pub(crate) fn quantize_oq8_rows<F>(
+    m: usize,
+    k: usize,
+    ng: usize,
+    elem_stride: usize,
+    val: F,
+) -> (Vec<u8>, Vec<f32>)
 where
     F: Fn(usize, usize) -> f32 + Sync,
 {
@@ -328,7 +336,13 @@ where
 /// Parallel per-group (256) symmetric int4 quant, packed two nibbles/byte
 /// (byte = even_k | odd_k<<4). Returns (packed `[m*k/2]`, f32 scales `[m*ng]`).
 /// The load-time hot path for W4A8.
-pub(crate) fn quantize_w4a8_rows<F>(m: usize, k: usize, ng: usize, elem_stride: usize, val: F) -> (Vec<u8>, Vec<f32>)
+pub(crate) fn quantize_w4a8_rows<F>(
+    m: usize,
+    k: usize,
+    ng: usize,
+    elem_stride: usize,
+    val: F,
+) -> (Vec<u8>, Vec<f32>)
 where
     F: Fn(usize, usize) -> f32 + Sync,
 {
@@ -640,7 +654,8 @@ impl RocmWeightCache {
                 let w_scales = gpu
                     .upload_f32(&scales, &[m * ng])
                     .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
-                self.named_w4a8.insert(weight.name.clone(), (w_i4, w_scales));
+                self.named_w4a8
+                    .insert(weight.name.clone(), (w_i4, w_scales));
                 let (w_i4, w_scales) = self.named_w4a8.get(&weight.name).unwrap();
                 return Ok((w_i4.buf.as_ptr(), w_scales.buf.as_ptr(), ng));
             }
@@ -693,7 +708,8 @@ impl RocmWeightCache {
             let w_scales = gpu
                 .upload_f32(&scales, &[m * ng])
                 .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-            self.named_w4a8.insert(weight.name.clone(), (w_i4, w_scales));
+            self.named_w4a8
+                .insert(weight.name.clone(), (w_i4, w_scales));
         }
         let (w_i4, w_scales) = self
             .named_w4a8
@@ -1212,9 +1228,9 @@ use quant_decode::*;
 
 mod quant_encode;
 pub use quant_encode::{
-    open_calib_sidecar, oq4_arch_combined_len, pack_oq4_arch_combined, quantize_diffusion_hfq,
-    opus_quant_token, quantize_diffusion_hfq_plain, DiffusionQuantFormat, DiffusionQuantizeSummary,
-    HessianSidecar, PlainOpusPolicy, PlainQuantizeSummary,
+    open_calib_sidecar, opus_quant_token, oq4_arch_combined_len, pack_oq4_arch_combined,
+    quantize_diffusion_hfq, quantize_diffusion_hfq_plain, DiffusionQuantFormat,
+    DiffusionQuantizeSummary, HessianSidecar, PlainOpusPolicy, PlainQuantizeSummary,
 };
 
 mod quant_calib;

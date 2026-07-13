@@ -31,10 +31,10 @@
 //!   cargo run -p hipfire-train --release --example quantize_damage_supra50m
 //!   hipfire gpu-lock release
 
+use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
 use hipfire_train::model::{model_forward, LlamaModel};
 use hipfire_train::qtip_quant::qtip_quantize_dequant;
-use hipfire_rdna::{Gpu, GpuTensor};
 use std::path::Path;
 
 const MODEL_DIR: &str =

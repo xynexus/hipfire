@@ -23,6 +23,7 @@ use faer::prelude::Solve;
 use faer::{Mat, Side};
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 use hipfire_train::block::BlockAdjoints;
 use hipfire_train::learn_rotation::learn_rotation_kurtosis;
 use hipfire_train::loader::load_llama_fp32;
@@ -30,7 +31,6 @@ use hipfire_train::model::{model_forward, model_guided_adjoints, LlamaModel};
 use hipfire_train::qtip_quant::{build_codebook, qtip_group_requant};
 use hipfire_train::rotation::{rotate_rows, Rotation};
 use rayon::prelude::*;
-use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 use std::path::Path;
 
 const DEFAULT_DIR: &str =

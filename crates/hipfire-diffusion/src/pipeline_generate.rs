@@ -17,8 +17,12 @@ fn dump_conditioning_stats(label: &str, t: &CpuTensor) {
     let n = t.data.len().max(1);
     let finite = t.data.iter().filter(|v| v.is_finite()).count();
     let mean = t.data.iter().copied().map(|v| v as f64).sum::<f64>() / n as f64;
-    let var =
-        t.data.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n as f64;
+    let var = t
+        .data
+        .iter()
+        .map(|&v| (v as f64 - mean).powi(2))
+        .sum::<f64>()
+        / n as f64;
     let min = t.data.iter().copied().fold(f32::INFINITY, f32::min);
     let max = t.data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     // Per-token L2 norm over the last (hidden) dim.
@@ -136,7 +140,9 @@ impl DiffusionPipeline {
                     .map(|(a, b)| (a - b).abs() as f64)
                     .sum::<f64>()
                     / n as f64;
-                eprintln!("[cond] pos-vs-neg mean|Δ|={mad:.6} (near 0 => CFG has nothing to steer)");
+                eprintln!(
+                    "[cond] pos-vs-neg mean|Δ|={mad:.6} (near 0 => CFG has nothing to steer)"
+                );
             }
         }
         let _primary_positive_embeddings = plan
@@ -299,7 +305,9 @@ impl DiffusionPipeline {
                     .map(|(a, b)| (a - b).abs() as f64)
                     .sum::<f64>()
                     / n as f64;
-                eprintln!("[cond] pos-vs-neg mean|Δ|={mad:.6} (near 0 => CFG has nothing to steer)");
+                eprintln!(
+                    "[cond] pos-vs-neg mean|Δ|={mad:.6} (near 0 => CFG has nothing to steer)"
+                );
             }
         }
         let _primary_positive_embeddings = plan
@@ -393,14 +401,15 @@ impl DiffusionPipeline {
         // replaces the strength-derived slice of the base schedule. `start_step`
         // is 0 because the refine schedule already starts at `first_sigma`.
         let (schedule, start_step) = if let Some(refine) = request.refine_sigma.as_ref() {
-            let refine_schedule =
-                plan.schedule
-                    .refine_direct_sigma(refine.first_sigma, refine.steps, refine.shifted)?;
+            let refine_schedule = plan.schedule.refine_direct_sigma(
+                refine.first_sigma,
+                refine.steps,
+                refine.shifted,
+            )?;
             (refine_schedule, 0usize)
         } else {
             let strength = request.denoising_strength.clamp(0.0, 1.0);
-            let denoise_steps =
-                ((plan.schedule.timesteps.len() as f32) * strength).ceil() as usize;
+            let denoise_steps = ((plan.schedule.timesteps.len() as f32) * strength).ceil() as usize;
             let start_step = plan.schedule.timesteps.len().saturating_sub(denoise_steps);
             (plan.schedule.slice_from_step(start_step)?, start_step)
         };

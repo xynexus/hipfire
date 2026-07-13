@@ -38,8 +38,8 @@ use hipfire_arch_nemotron::loader::load_nemotron_weights;
 use hipfire_arch_nemotron::model::NemotronModel;
 use hipfire_arch_nemotron::NemotronHConfig;
 use hipfire_model::ModelSource;
-use hipfire_runtime::safetensors_source::SafetensorsSource;
 use hipfire_rdna::Gpu;
+use hipfire_runtime::safetensors_source::SafetensorsSource;
 use std::path::PathBuf;
 
 const DEFAULT_DIR: &str = "/srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16/snapshots/dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f";

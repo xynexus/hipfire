@@ -44,13 +44,13 @@
 //! Env: HIPFIRE_CAP_DIR (default /tmp/residcap), HIPFIRE_MODEL (bf16 .hfq),
 //!      HIPFIRE_RECOVER_LR (3e-4), HIPFIRE_RECOVER_STEPS (200).
 
+use hipfire_rdna::{DType, Gpu};
 use hipfire_train::hfq_patch::{bf16_bits_to_f32, parse_hfq, HfqEntry};
 use hipfire_train::ops::linear::{linear_backward_x, linear_forward};
 use hipfire_train::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use hipfire_train::ops::swiglu::{swiglu_backward, swiglu_forward};
 use hipfire_train::optim::AdamW;
 use hipfire_train::oqplus_quant::oqplus_simquant;
-use hipfire_rdna::{DType, Gpu};
 use std::collections::HashMap;
 
 const QT_BF16: u8 = 16;

@@ -13,10 +13,10 @@
 //!   cargo run -p hipfire-train --release --example rotation_invariance_probe
 //!   hipfire lock release
 
+use hipfire_rdna::{Gpu, HipResult};
 use hipfire_train::block::BlockDims;
 use hipfire_train::model::{model_forward, LayerLora, LayerWeights, LlamaModel};
 use hipfire_train::rotation::{apply_r1, apply_r2, Rotation};
-use hipfire_rdna::{Gpu, HipResult};
 
 const NL: usize = 2;
 const SEQ: usize = 4;

@@ -30,8 +30,8 @@
 //!   cargo run -p hipfire-train --release --example gradcheck_cross_entropy
 //!   hipfire gpu-lock release
 
-use hipfire_train::ops::cross_entropy::cross_entropy;
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_train::ops::cross_entropy::cross_entropy;
 
 const ROWS: usize = 4;
 const V: usize = 9;

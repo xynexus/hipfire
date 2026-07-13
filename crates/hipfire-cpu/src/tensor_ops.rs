@@ -351,9 +351,7 @@ pub fn conv2d_nchw_with_stride(
     stride: usize,
 ) -> CpuResult<CpuTensor> {
     if stride == 0 {
-        return Err(CpuError(
-            "conv2d stride must be positive".to_string(),
-        ));
+        return Err(CpuError("conv2d stride must be positive".to_string()));
     }
     let [batch, in_channels, in_h, in_w] = shape4(input)?;
     let [out_channels, weight_in_channels, kernel_h, kernel_w] = shape4(weight)?;
@@ -487,9 +485,7 @@ pub fn group_norm_nchw(
 
 pub fn upsample_nearest2d_nchw(input: &CpuTensor, scale: usize) -> CpuResult<CpuTensor> {
     if scale == 0 {
-        return Err(CpuError(
-            "upsample scale must be positive".to_string(),
-        ));
+        return Err(CpuError("upsample scale must be positive".to_string()));
     }
     let [batch, channels, height, width] = shape4(input)?;
     let out_h = height * scale;
@@ -517,7 +513,9 @@ pub fn upsample_nearest2d_nchw(input: &CpuTensor, scale: usize) -> CpuResult<Cpu
 /// stage.
 pub fn pixel_unshuffle_nchw(input: &CpuTensor, scale: usize) -> CpuResult<CpuTensor> {
     if scale == 0 {
-        return Err(CpuError("pixel_unshuffle scale must be positive".to_string()));
+        return Err(CpuError(
+            "pixel_unshuffle scale must be positive".to_string(),
+        ));
     }
     let [batch, channels, height, width] = shape4(input)?;
     if height % scale != 0 || width % scale != 0 {

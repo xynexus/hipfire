@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+use super::*;
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
     parse_pytorch_state_dict, pytorch_tensor_is_contiguous, reorder_pytorch_storage_to_contiguous,
@@ -10,7 +11,6 @@ use hipfire_diffusion_coexist::{
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
-use super::*;
 
 #[test]
 fn inspect_hfq_reports_metadata_runtime_support_without_loading_runtime() {
@@ -283,13 +283,19 @@ fn tiny_sd_native_vae_encoder_loads_when_import_exists() {
     let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
     let encoder = NativeVaeEncoder::from_hfq(&hfq, &config.vae).unwrap();
 
-    assert_eq!(encoder.conv_in.as_ref().unwrap().weight.shape, vec![128, 3, 3, 3]);
+    assert_eq!(
+        encoder.conv_in.as_ref().unwrap().weight.shape,
+        vec![128, 3, 3, 3]
+    );
     assert_eq!(encoder.down_blocks.len(), 4);
     assert!(encoder.down_blocks[0].downsampler.is_some());
     assert!(encoder.down_blocks[1].downsampler.is_some());
     assert!(encoder.down_blocks[2].downsampler.is_some());
     assert!(encoder.down_blocks[3].downsampler.is_none());
-    assert_eq!(encoder.conv_out.as_ref().unwrap().weight.shape, vec![8, 512, 3, 3]);
+    assert_eq!(
+        encoder.conv_out.as_ref().unwrap().weight.shape,
+        vec![8, 512, 3, 3]
+    );
     assert!(encoder.quant_conv.is_some());
 }
 

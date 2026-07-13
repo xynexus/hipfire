@@ -108,6 +108,8 @@ mod tests {
             ing.importance("model.layers.0.self_attn.q_proj.weight")
                 > ing.importance("model.layers.0.mlp.up_proj.weight")
         );
-        assert!(ing.importance("dense.0.weight") > ing.importance("model.layers.0.mlp.up_proj.weight"));
+        assert!(
+            ing.importance("dense.0.weight") > ing.importance("model.layers.0.mlp.up_proj.weight")
+        );
     }
 }

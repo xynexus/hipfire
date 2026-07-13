@@ -29,8 +29,8 @@ use crate::dspark_drafter::{
     dspark_drafter_backward, dspark_drafter_forward_train, dspark_heads_backward,
     dspark_heads_forward, free_dspark_drafter_acts, free_dspark_drafter_grads,
     free_dspark_heads_acts, free_dspark_heads_grads, DsparkDrafterActs, DsparkDrafterConfig,
-    DsparkDrafterWeights, DsparkFullGrads, DsparkFullWeights, DsparkHeadsActs,
-    DsparkHeadsConfig, DsparkHeadsWeights, DsparkLayerWeights,
+    DsparkDrafterWeights, DsparkFullGrads, DsparkFullWeights, DsparkHeadsActs, DsparkHeadsConfig,
+    DsparkHeadsWeights, DsparkLayerWeights,
 };
 use crate::dspark_loss::{dspark_loss_forward_backward, DsparkLossCfg, DsparkLossOut};
 use crate::loader::LlamaWeightsF32;
@@ -660,7 +660,13 @@ fn forward_loss_batch(
         let block_embeds = gpu.zeros(&[rows * h], DType::F32)?;
         for (wi, win) in windows.iter().enumerate() {
             let be = embed_block_tokens(gpu, embed, &win.block_tokens, h)?;
-            gpu.memcpy_dtod_at_auto(&block_embeds.buf, wi * block * h * 4, &be.buf, 0, block * h * 4)?;
+            gpu.memcpy_dtod_at_auto(
+                &block_embeds.buf,
+                wi * block * h * 4,
+                &be.buf,
+                0,
+                block * h * 4,
+            )?;
             gpu.free_tensor(be)?;
         }
         let body = dspark_drafter_forward_train(

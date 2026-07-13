@@ -26,8 +26,8 @@
 //!   hipfire gpu-lock acquire "gated-scan-gradcheck"
 //!   cargo run -p hipfire-train --release --example gradcheck_gated_scan
 
-use hipfire_train::ops::gated_scan::{gated_scan_backward, gated_scan_forward};
 use hipfire_rdna::Gpu;
+use hipfire_train::ops::gated_scan::{gated_scan_backward, gated_scan_forward};
 
 const SEQ: usize = 12;
 const D: usize = 8;

@@ -27,11 +27,11 @@
 //!   hipfire gpu-lock acquire "ssm-dgc"
 //!   cargo run -p hipfire-train --release --example gradcheck_ssm_drafter
 
+use hipfire_rdna::{DType, Gpu};
 use hipfire_train::ops::pflash_score::pflash_score_forward;
 use hipfire_train::ssm_drafter::{
     ssm_drafter_backward, ssm_drafter_forward_train, SsmDrafter, SsmDrafterConfig,
 };
-use hipfire_rdna::{DType, Gpu};
 
 const VOCAB: usize = 32;
 const H_T: usize = 8;

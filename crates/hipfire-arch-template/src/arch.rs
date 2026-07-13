@@ -14,11 +14,11 @@
 //! `crates/hipfire-arch-qwen35/src/arch.rs`.
 
 use crate::template_model::{TemplateConfig, TemplateState, TemplateWeights};
+use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::{
     Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
 };
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_rdna::Gpu;
 
 /// Type marker for the template arch. Zero-sized — no per-instance state.
 /// A real arch's marker is exactly this shape (e.g. `Qwen35`, `Llama`); rename

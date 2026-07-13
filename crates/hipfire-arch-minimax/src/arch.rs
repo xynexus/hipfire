@@ -10,9 +10,9 @@
 //! directly by the daemon's `arch_id == 10` generate branch.
 
 use crate::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
+use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_rdna::Gpu;
 
 /// Zero-sized type marker for MiniMax-M2. Trait dispatch uses the type.
 pub struct MiniMaxM2;

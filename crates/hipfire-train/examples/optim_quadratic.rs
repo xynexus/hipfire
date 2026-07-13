@@ -28,8 +28,8 @@
 //!   cargo run -p hipfire-train --release --example optim_quadratic
 //!   hipfire gpu-lock release
 
-use hipfire_train::optim::AdamW;
 use hipfire_rdna::Gpu;
+use hipfire_train::optim::AdamW;
 
 const N: usize = 16;
 const STEPS: usize = 400;

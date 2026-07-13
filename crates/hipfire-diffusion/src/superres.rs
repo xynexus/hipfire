@@ -381,11 +381,16 @@ impl SuperResRrdbNet {
         let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).map_err(|err| {
             DiffusionError::InvalidMetadata(format!("super-res metadata parse failed: {err}"))
         })?;
-        let scale = meta.get("scale").and_then(serde_json::Value::as_u64).ok_or_else(|| {
-            DiffusionError::InvalidMetadata("super-res metadata missing scale".to_string())
-        })? as usize;
-        let num_block =
-            meta.get("num_block").and_then(serde_json::Value::as_u64).ok_or_else(|| {
+        let scale = meta
+            .get("scale")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata("super-res metadata missing scale".to_string())
+            })? as usize;
+        let num_block = meta
+            .get("num_block")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
                 DiffusionError::InvalidMetadata("super-res metadata missing num_block".to_string())
             })? as usize;
         Self::from_hfq(&hfq, num_block, scale)
@@ -442,11 +447,9 @@ impl SuperResRrdbNet {
         } else {
             None
         };
-        let feat = self.conv_first.forward_resident(
-            unshuffled.as_ref().unwrap_or(input),
-            gpu,
-            cache,
-        )?;
+        let feat =
+            self.conv_first
+                .forward_resident(unshuffled.as_ref().unwrap_or(input), gpu, cache)?;
         if let Some(unshuffled) = unshuffled {
             free_resident(gpu, unshuffled)?;
         }

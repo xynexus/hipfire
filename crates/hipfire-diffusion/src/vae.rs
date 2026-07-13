@@ -1294,8 +1294,7 @@ impl WanImageDecoder {
         }
         // post_quant_conv is a VAE-level tensor (sibling of `decoder`), not under
         // the decoder prefix.
-        let post_quant_conv_weight =
-            optional_tensor(hfq, "vae/tensors/post_quant_conv.weight")?;
+        let post_quant_conv_weight = optional_tensor(hfq, "vae/tensors/post_quant_conv.weight")?;
         let post_quant_conv_bias = optional_tensor(hfq, "vae/tensors/post_quant_conv.bias")?;
         Ok(Some(Self {
             post_quant_conv_weight,
@@ -1317,7 +1316,9 @@ impl WanImageDecoder {
 
     pub(crate) fn decode(&self, latent: &CpuTensor) -> DiffusionResult<CpuTensor> {
         let dbg = std::env::var("HIPFIRE_DEBUG_VAE_STAGES").is_ok_and(|v| !v.is_empty());
-        let dump_dir = std::env::var("HIPFIRE_DEBUG_VAE_DUMP").ok().filter(|v| !v.is_empty());
+        let dump_dir = std::env::var("HIPFIRE_DEBUG_VAE_DUMP")
+            .ok()
+            .filter(|v| !v.is_empty());
         let report = |name: &str, t: &CpuTensor| {
             if let Some(dir) = &dump_dir {
                 let mut bytes = Vec::new();
@@ -1380,7 +1381,11 @@ impl WanImageDecoder {
         // post_quant_conv (1x1x1 channel-mix) on the denormalized latent, before
         // conv_in -- matches AutoencoderKLQwenImage._decode's `post_quant_conv(z)`.
         let post_quant = match &self.post_quant_conv_weight {
-            Some(w) => Some(wan_causal_conv2d(latent, w, self.post_quant_conv_bias.as_ref())?),
+            Some(w) => Some(wan_causal_conv2d(
+                latent,
+                w,
+                self.post_quant_conv_bias.as_ref(),
+            )?),
             None => None,
         };
         let latent = post_quant.as_ref().unwrap_or(latent);
@@ -1593,11 +1598,19 @@ impl WanImageEncoder {
         hidden = self.mid_resnet0.forward(&hidden)?;
         hidden = self.mid_attention.forward(&hidden)?;
         hidden = self.mid_resnet1.forward(&hidden)?;
-        hidden = wan_silu(&wan_rms_norm_nchw(&hidden, &self.norm_out_gamma, Self::EPS)?);
+        hidden = wan_silu(&wan_rms_norm_nchw(
+            &hidden,
+            &self.norm_out_gamma,
+            Self::EPS,
+        )?);
         hidden = wan_causal_conv2d(&hidden, &self.conv_out_weight, Some(&self.conv_out_bias))?;
         // quant_conv is a 1x1x1 Conv3d (per-channel affine); wan_causal_conv2d
         // handles it directly.
-        wan_causal_conv2d(&hidden, &self.quant_conv_weight, Some(&self.quant_conv_bias))
+        wan_causal_conv2d(
+            &hidden,
+            &self.quant_conv_weight,
+            Some(&self.quant_conv_bias),
+        )
     }
 }
 

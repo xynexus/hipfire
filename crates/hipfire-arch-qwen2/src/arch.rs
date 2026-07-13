@@ -14,13 +14,13 @@
 //! [`crate::qwen2::forward_step_greedy`] directly.
 
 use crate::qwen2::{forward_step, Qwen2Config, Qwen2State, Qwen2Weights};
+use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_runtime::arch::{
     run_simple_ar, ArchCaps, Architecture, EosFilterOverrides, GenerateCtx, LoopGuardOverrides,
     PromptFrameOverrides, SamplerOverrides, ServeOutcome, ServingBackend, SimpleAr,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::{Gpu, GpuTensor};
 
 /// Zero-sized type marker for the Qwen2 arch.
 pub struct Qwen2;

@@ -1154,8 +1154,14 @@ impl TransformerAttentionStreamProjection {
             k_bias: None,
             v_weight: ResidentWeight::from_bf16_parts("attn.v", vec![inner_kv, hidden], v),
             v_bias: None,
-            norm_q_weight: Some(CpuTensor { shape: vec![head_dim], data: norm_q.to_vec() }),
-            norm_k_weight: Some(CpuTensor { shape: vec![head_dim], data: norm_k.to_vec() }),
+            norm_q_weight: Some(CpuTensor {
+                shape: vec![head_dim],
+                data: norm_q.to_vec(),
+            }),
+            norm_k_weight: Some(CpuTensor {
+                shape: vec![head_dim],
+                data: norm_k.to_vec(),
+            }),
             out_weight: ResidentWeight::from_bf16_parts("attn.out", vec![hidden, inner_q], out),
             out_bias: None,
         }
@@ -1177,17 +1183,52 @@ impl TransformerAttentionStreamProjection {
         hipfire_rdna::GpuTensor,
         hipfire_rdna::GpuTensor,
     )> {
-        let q =
-            linear_resident_weight_resident(gpu, cache, hidden, &self.q_weight, self.q_bias.as_ref())?;
-        let k =
-            linear_resident_weight_resident(gpu, cache, hidden, &self.k_weight, self.k_bias.as_ref())?;
-        let v =
-            linear_resident_weight_resident(gpu, cache, hidden, &self.v_weight, self.v_bias.as_ref())?;
+        let q = linear_resident_weight_resident(
+            gpu,
+            cache,
+            hidden,
+            &self.q_weight,
+            self.q_bias.as_ref(),
+        )?;
+        let k = linear_resident_weight_resident(
+            gpu,
+            cache,
+            hidden,
+            &self.k_weight,
+            self.k_bias.as_ref(),
+        )?;
+        let v = linear_resident_weight_resident(
+            gpu,
+            cache,
+            hidden,
+            &self.v_weight,
+            self.v_bias.as_ref(),
+        )?;
         let kv_width = *k.shape.last().expect("k has a last dim");
-        let kv_heads = if head_dim == 0 { heads } else { kv_width / head_dim };
+        let kv_heads = if head_dim == 0 {
+            heads
+        } else {
+            kv_width / head_dim
+        };
 
-        let q = qk_norm_heads_resident(gpu, cache, q, self.norm_q_weight.as_ref(), heads, head_dim, 1e-6)?;
-        let k = qk_norm_heads_resident(gpu, cache, k, self.norm_k_weight.as_ref(), kv_heads, head_dim, 1e-6)?;
+        let q = qk_norm_heads_resident(
+            gpu,
+            cache,
+            q,
+            self.norm_q_weight.as_ref(),
+            heads,
+            head_dim,
+            1e-6,
+        )?;
+        let k = qk_norm_heads_resident(
+            gpu,
+            cache,
+            k,
+            self.norm_k_weight.as_ref(),
+            kv_heads,
+            head_dim,
+            1e-6,
+        )?;
 
         let k_exp = repeat_kv_heads_resident(gpu, &k, heads, kv_heads, head_dim)?;
         free_resident(gpu, k)?;
@@ -1204,7 +1245,13 @@ impl TransformerAttentionStreamProjection {
         gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
     ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
-        linear_resident_weight_resident(gpu, cache, attention, &self.out_weight, self.out_bias.as_ref())
+        linear_resident_weight_resident(
+            gpu,
+            cache,
+            attention,
+            &self.out_weight,
+            self.out_bias.as_ref(),
+        )
     }
 }
 
@@ -1237,8 +1284,14 @@ impl RotaryFrequencies {
     #[cfg(test)]
     pub(crate) fn for_test(seq: usize, freq_width: usize, cos: &[f32], sin: &[f32]) -> Self {
         Self {
-            cos: CpuTensor { shape: vec![seq, freq_width], data: cos.to_vec() },
-            sin: CpuTensor { shape: vec![seq, freq_width], data: sin.to_vec() },
+            cos: CpuTensor {
+                shape: vec![seq, freq_width],
+                data: cos.to_vec(),
+            },
+            sin: CpuTensor {
+                shape: vec![seq, freq_width],
+                data: sin.to_vec(),
+            },
         }
     }
 
@@ -1523,10 +1576,26 @@ impl NativeTransformerAttentionProjection {
             self.image
                 .project_qkv_resident(hidden, self.heads, self.head_dim, gpu, cache)?;
         if let Some(freqs) = rotary {
-            let q_rot = rope_qwen_resident(gpu, cache, &q, &freqs.cos, &freqs.sin, self.heads, self.head_dim)?;
+            let q_rot = rope_qwen_resident(
+                gpu,
+                cache,
+                &q,
+                &freqs.cos,
+                &freqs.sin,
+                self.heads,
+                self.head_dim,
+            )?;
             free_resident(gpu, q)?;
             q = q_rot;
-            let k_rot = rope_qwen_resident(gpu, cache, &k, &freqs.cos, &freqs.sin, self.heads, self.head_dim)?;
+            let k_rot = rope_qwen_resident(
+                gpu,
+                cache,
+                &k,
+                &freqs.cos,
+                &freqs.sin,
+                self.heads,
+                self.head_dim,
+            )?;
             free_resident(gpu, k)?;
             k = k_rot;
         }
@@ -1549,7 +1618,13 @@ impl NativeTransformerAttentionProjection {
 
         let gated = match self.gate_weight.as_ref() {
             Some(weight) => {
-                let gate = linear_resident_weight_resident(gpu, cache, hidden, weight, self.gate_bias.as_ref())?;
+                let gate = linear_resident_weight_resident(
+                    gpu,
+                    cache,
+                    hidden,
+                    weight,
+                    self.gate_bias.as_ref(),
+                )?;
                 // Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate
                 // collapses toward 0 the attention output is suppressed and tokens
                 // stop mixing (a candidate for the residual token-grid).
@@ -1991,7 +2066,9 @@ impl TransformerFeedForwardStream {
         let activated = match self.activation {
             TransformerFeedForwardActivation::GeGlu => {
                 let proj_weight = self.proj_weight.as_ref().ok_or_else(|| {
-                    DiffusionError::InvalidMetadata("GEGLU feed-forward projection weight missing".into())
+                    DiffusionError::InvalidMetadata(
+                        "GEGLU feed-forward projection weight missing".into(),
+                    )
                 })?;
                 let projected = linear_resident_weight_resident(
                     gpu,
@@ -2009,7 +2086,9 @@ impl TransformerFeedForwardStream {
                     DiffusionError::InvalidMetadata("SwiGLU feed-forward up weight missing".into())
                 })?;
                 let gate_weight = self.gate_weight.as_ref().ok_or_else(|| {
-                    DiffusionError::InvalidMetadata("SwiGLU feed-forward gate weight missing".into())
+                    DiffusionError::InvalidMetadata(
+                        "SwiGLU feed-forward gate weight missing".into(),
+                    )
                 })?;
                 let up = linear_resident_weight_resident(
                     gpu,
@@ -2338,9 +2417,9 @@ impl NativeTransformerBlock {
         let normed1 = rms_norm_resident(gpu, cache, hidden, norm1_weight, 1e-5)?;
         let attn_input = modulate_3d_resident(gpu, &normed1, &preshift, &prescale)?;
         free_resident(gpu, normed1)?;
-        let attention = self
-            .attention
-            .attend_krea_self_gated_resident(&attn_input, rotary, gpu, cache)?;
+        let attention =
+            self.attention
+                .attend_krea_self_gated_resident(&attn_input, rotary, gpu, cache)?;
         free_resident(gpu, attn_input)?;
         let hidden2 = gated_residual_3d_resident(gpu, hidden, &attention, &pregate)?;
         free_resident(gpu, attention)?;
@@ -2349,7 +2428,9 @@ impl NativeTransformerBlock {
         let normed2 = rms_norm_resident(gpu, cache, &hidden2, norm2_weight, 1e-5)?;
         let ff_input = modulate_3d_resident(gpu, &normed2, &postshift, &postscale)?;
         free_resident(gpu, normed2)?;
-        let feed_forward = self.feed_forward.forward_image_resident(&ff_input, gpu, cache)?;
+        let feed_forward = self
+            .feed_forward
+            .forward_image_resident(&ff_input, gpu, cache)?;
         free_resident(gpu, ff_input)?;
         let out = gated_residual_3d_resident(gpu, &hidden2, &feed_forward, &postgate)?;
         free_resident(gpu, hidden2)?;
@@ -3897,24 +3978,12 @@ impl Qwen3EncoderLayer {
             Self::EPS,
             runtime_context,
         )?;
-        let mut q = linear_3d_resident_with_runtime_context(
-            &normed,
-            &self.q_proj,
-            None,
-            runtime_context,
-        )?;
-        let mut k = linear_3d_resident_with_runtime_context(
-            &normed,
-            &self.k_proj,
-            None,
-            runtime_context,
-        )?;
-        let v = linear_3d_resident_with_runtime_context(
-            &normed,
-            &self.v_proj,
-            None,
-            runtime_context,
-        )?;
+        let mut q =
+            linear_3d_resident_with_runtime_context(&normed, &self.q_proj, None, runtime_context)?;
+        let mut k =
+            linear_3d_resident_with_runtime_context(&normed, &self.k_proj, None, runtime_context)?;
+        let v =
+            linear_3d_resident_with_runtime_context(&normed, &self.v_proj, None, runtime_context)?;
         q = rms_norm_attention_heads_3d(
             &q,
             &CpuTensor {

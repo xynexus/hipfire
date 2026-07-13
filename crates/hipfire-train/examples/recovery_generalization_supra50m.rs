@@ -38,6 +38,7 @@
 //!   hipfire gpu-lock release
 
 use hipfire_model::tokenizer::Tokenizer;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_train::block::BlockLoraGrad;
 use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
 use hipfire_train::model::{
@@ -47,7 +48,6 @@ use hipfire_train::model::{
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
 use hipfire_train::oqplus_quant::oqplus_simquant;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
 const MODEL_DIR: &str =

@@ -32,7 +32,9 @@ pub(crate) mod profile {
     pub static CACHE_HIT: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
-        std::env::var("HIPFIRE_PROFILE").map(|v| !v.is_empty()).unwrap_or(false)
+        std::env::var("HIPFIRE_PROFILE")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
     }
 
     pub fn add(counter: &AtomicU64, v: u64) {
@@ -1859,8 +1861,14 @@ pub(crate) fn pixel_unshuffle_nchw_hip_on_gpu(
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input_gpu.buf.as_ptr());
     kernargs.push_ptr(output_gpu.as_ptr());
-    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output elements", output_elements)?);
-    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output channels", out_channels)?);
+    kernargs.push_i32(i32_kernel_dim(
+        "pixel_unshuffle output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim(
+        "pixel_unshuffle output channels",
+        out_channels,
+    )?);
     kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output height", out_h)?);
     kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output width", out_w)?);
     kernargs.push_i32(i32_kernel_dim("pixel_unshuffle scale", scale)?);
@@ -2087,7 +2095,9 @@ pub(crate) fn linear_resident_weight_hip_on_gpu(
     let weight_bytes = out_features
         .checked_mul(in_features)
         .and_then(|v| v.checked_mul(std::mem::size_of::<u16>()))
-        .ok_or_else(|| DiffusionError::InvalidMetadata("linear weight size overflows".to_string()))?;
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("linear weight size overflows".to_string())
+        })?;
     let weight_view = hipfire_rdna::GpuTensor {
         buf: unsafe { hip_bridge::DeviceBuffer::from_raw(weight_ptr, weight_bytes) },
         shape: vec![out_features, in_features],
@@ -2178,9 +2188,9 @@ pub(crate) fn linear_resident_weight_resident(
     let rows = total / in_features;
     let mut output_shape = input.shape.clone();
     *output_shape.last_mut().expect("input has a last dim") = out_features;
-    let output_elements = rows
-        .checked_mul(out_features)
-        .ok_or_else(|| DiffusionError::InvalidMetadata("resident linear size overflows".to_string()))?;
+    let output_elements = rows.checked_mul(out_features).ok_or_else(|| {
+        DiffusionError::InvalidMetadata("resident linear size overflows".to_string())
+    })?;
     gpu.bind_thread()
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     let output = alloc_resident_f32(gpu, &output_shape)?;
@@ -2208,7 +2218,11 @@ pub(crate) fn linear_resident_weight_resident(
             || (quant_ok && std::env::var("HIPFIRE_DIFFUSION_OQ8").ok().as_deref() == Some("1")));
     if use_w4a8 {
         const GROUP: usize = 256;
-        let prep_start = if prof { Some(std::time::Instant::now()) } else { None };
+        let prep_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let (w_i4_ptr, w_scales_ptr, ng) = cache.resident_w4a8(gpu, weight)?;
         let w_i4_bytes = out_features
             .checked_mul(in_features)
@@ -2225,9 +2239,7 @@ pub(crate) fn linear_resident_weight_resident(
             dtype: hipfire_rdna::DType::Raw,
         };
         let w_scales_view = hipfire_rdna::GpuTensor {
-            buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(w_scales_ptr, out_features * ng * 4)
-            },
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(w_scales_ptr, out_features * ng * 4) },
             shape: vec![out_features * ng],
             dtype: hipfire_rdna::DType::F32,
         };
@@ -2239,10 +2251,24 @@ pub(crate) fn linear_resident_weight_resident(
             .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
         gpu.quantize_act_oq8(input, &xq, &xs, rows, in_features, GROUP)
             .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
-        let gemm_start = if prof { Some(std::time::Instant::now()) } else { None };
+        let gemm_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         gpu.gemm_opus_tiled_wmma(
-            4, &w_i4_view, &w_scales_view, &xq, &xs, &output, out_features, in_features, rows,
-            GROUP, 2, 4,
+            4,
+            &w_i4_view,
+            &w_scales_view,
+            &xq,
+            &xs,
+            &output,
+            out_features,
+            in_features,
+            rows,
+            GROUP,
+            2,
+            4,
         )
         .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
         if let Some(start) = gemm_start {
@@ -2258,7 +2284,11 @@ pub(crate) fn linear_resident_weight_resident(
         free_resident(gpu, xs)?;
     } else if use_oq8 {
         const GROUP: usize = 256;
-        let prep_start = if prof { Some(std::time::Instant::now()) } else { None };
+        let prep_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let (w_i8_ptr, w_scales_ptr, ng) = cache.resident_oq8(gpu, weight)?;
         let w_i8_bytes = out_features
             .checked_mul(in_features)
@@ -2274,9 +2304,7 @@ pub(crate) fn linear_resident_weight_resident(
             dtype: hipfire_rdna::DType::Raw,
         };
         let w_scales_view = hipfire_rdna::GpuTensor {
-            buf: unsafe {
-                hip_bridge::DeviceBuffer::from_raw(w_scales_ptr, out_features * ng * 4)
-            },
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(w_scales_ptr, out_features * ng * 4) },
             shape: vec![out_features * ng],
             dtype: hipfire_rdna::DType::F32,
         };
@@ -2288,10 +2316,24 @@ pub(crate) fn linear_resident_weight_resident(
             .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
         gpu.quantize_act_oq8(input, &xq, &xs, rows, in_features, GROUP)
             .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
-        let gemm_start = if prof { Some(std::time::Instant::now()) } else { None };
+        let gemm_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         gpu.gemm_opus_tiled_wmma(
-            8, &w_i8_view, &w_scales_view, &xq, &xs, &output, out_features, in_features, rows,
-            GROUP, 2, 4,
+            8,
+            &w_i8_view,
+            &w_scales_view,
+            &xq,
+            &xs,
+            &output,
+            out_features,
+            in_features,
+            rows,
+            GROUP,
+            2,
+            4,
         )
         .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
         if let Some(start) = gemm_start {
@@ -2306,55 +2348,76 @@ pub(crate) fn linear_resident_weight_resident(
         free_resident(gpu, xq)?;
         free_resident(gpu, xs)?;
     } else {
-    let prep_start = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let weight_ptr = cache.resident_bf16_named(gpu, weight)?;
-    let weight_bytes = out_features
-        .checked_mul(in_features)
-        .and_then(|v| v.checked_mul(std::mem::size_of::<u16>()))
-        .ok_or_else(|| DiffusionError::InvalidMetadata("linear weight size overflows".to_string()))?;
-    if let Some(start) = prep_start {
-        // Sync so a cache-miss upload is fully attributed to weight-prep.
-        let _ = gpu.hip.device_synchronize();
-        profile::add(&profile::PREP_NS, start.elapsed().as_nanos() as u64);
-        profile::add(&profile::PREP_BYTES, weight_bytes as u64);
-    }
-    let weight_view = hipfire_rdna::GpuTensor {
-        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(weight_ptr, weight_bytes) },
-        shape: vec![out_features, in_features],
-        dtype: hipfire_rdna::DType::BF16,
-    };
-    let gemm_start = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    // Register-tiled 4x4 WMMA is ~2.4x the naive one-tile-per-wave kernel on the
-    // dense DiT shapes (gfx1103). gfx1151 keeps its own m128 LDS path inside
-    // gemm_bf16_x_bf16_wmma, so only route the tiled kernel off gfx1151. Opt out
-    // with HIPFIRE_DIFFUSION_TILED_GEMM=0.
-    let use_tiled = gpu.arch != "gfx1151"
-        && std::env::var("HIPFIRE_DIFFUSION_TILED_GEMM").ok().as_deref() != Some("0");
-    if use_tiled {
-        gpu.gemm_bf16_tiled_wmma(&weight_view, input, &output, out_features, in_features, rows, 4, 4)
+        let prep_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let weight_ptr = cache.resident_bf16_named(gpu, weight)?;
+        let weight_bytes = out_features
+            .checked_mul(in_features)
+            .and_then(|v| v.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata("linear weight size overflows".to_string())
+            })?;
+        if let Some(start) = prep_start {
+            // Sync so a cache-miss upload is fully attributed to weight-prep.
+            let _ = gpu.hip.device_synchronize();
+            profile::add(&profile::PREP_NS, start.elapsed().as_nanos() as u64);
+            profile::add(&profile::PREP_BYTES, weight_bytes as u64);
+        }
+        let weight_view = hipfire_rdna::GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(weight_ptr, weight_bytes) },
+            shape: vec![out_features, in_features],
+            dtype: hipfire_rdna::DType::BF16,
+        };
+        let gemm_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        // Register-tiled 4x4 WMMA is ~2.4x the naive one-tile-per-wave kernel on the
+        // dense DiT shapes (gfx1103). gfx1151 keeps its own m128 LDS path inside
+        // gemm_bf16_x_bf16_wmma, so only route the tiled kernel off gfx1151. Opt out
+        // with HIPFIRE_DIFFUSION_TILED_GEMM=0.
+        let use_tiled = gpu.arch != "gfx1151"
+            && std::env::var("HIPFIRE_DIFFUSION_TILED_GEMM")
+                .ok()
+                .as_deref()
+                != Some("0");
+        if use_tiled {
+            gpu.gemm_bf16_tiled_wmma(
+                &weight_view,
+                input,
+                &output,
+                out_features,
+                in_features,
+                rows,
+                4,
+                4,
+            )
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    } else {
-        gpu.gemm_bf16_x_bf16_wmma(&weight_view, input, &output, out_features, in_features, rows)
+        } else {
+            gpu.gemm_bf16_x_bf16_wmma(
+                &weight_view,
+                input,
+                &output,
+                out_features,
+                in_features,
+                rows,
+            )
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
-    }
-    if let Some(start) = gemm_start {
-        let _ = gpu.hip.device_synchronize();
-        profile::add(&profile::GEMM_NS, start.elapsed().as_nanos() as u64);
-        // 2 FLOPs per MAC.
-        let flops = (out_features as u64)
-            .saturating_mul(in_features as u64)
-            .saturating_mul(rows as u64)
-            .saturating_mul(2);
-        profile::add(&profile::GEMM_FLOPS, flops);
-    }
+        }
+        if let Some(start) = gemm_start {
+            let _ = gpu.hip.device_synchronize();
+            profile::add(&profile::GEMM_NS, start.elapsed().as_nanos() as u64);
+            // 2 FLOPs per MAC.
+            let flops = (out_features as u64)
+                .saturating_mul(in_features as u64)
+                .saturating_mul(rows as u64)
+                .saturating_mul(2);
+            profile::add(&profile::GEMM_FLOPS, flops);
+        }
     }
     if let Some(bias) = bias {
         let bias_ptr = cache.resident_ptr(gpu, bias)?;
@@ -3569,8 +3632,14 @@ pub(crate) fn pixel_unshuffle_nchw_resident(
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(input.buf.as_ptr());
     kernargs.push_ptr(output.buf.as_ptr());
-    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output elements", output_elements)?);
-    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output channels", out_channels)?);
+    kernargs.push_i32(i32_kernel_dim(
+        "pixel_unshuffle output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim(
+        "pixel_unshuffle output channels",
+        out_channels,
+    )?);
     kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output height", out_h)?);
     kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output width", out_w)?);
     kernargs.push_i32(i32_kernel_dim("pixel_unshuffle scale", scale)?);
@@ -3954,7 +4023,10 @@ pub(crate) fn scaled_dot_product_attention_resident(
         // The qtile kernel hard-codes FLASH_NP=4 (head_dim 128) so its per-query
         // register arrays are statically indexed and stay in VGPRs.
         let use_qtile = head_dim == 128
-            && std::env::var("HIPFIRE_DIFFUSION_ATTN_QTILE").ok().as_deref() != Some("0");
+            && std::env::var("HIPFIRE_DIFFUSION_ATTN_QTILE")
+                .ok()
+                .as_deref()
+                != Some("0");
         let queries_per_wave = if use_qtile { Q_TILE } else { 1 };
         let waves = batch
             .checked_mul(heads)
@@ -4187,13 +4259,7 @@ pub(crate) fn swiglu_gate_3d_resident(
     up: &hipfire_rdna::GpuTensor,
     gate: &hipfire_rdna::GpuTensor,
 ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
-    two_input_gate_resident(
-        gpu,
-        up,
-        gate,
-        "diffusion_swiglu_gate_f32",
-        "SwiGLU",
-    )
+    two_input_gate_resident(gpu, up, gate, "diffusion_swiglu_gate_f32", "SwiGLU")
 }
 
 /// Device-resident sigmoid gate from two resident tensors: `value * sigmoid(gate)`

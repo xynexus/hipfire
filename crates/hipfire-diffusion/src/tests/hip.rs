@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+use super::*;
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, import_realesrgan_to_hfq, ldm_unet_native_tensor_name,
     ldm_vae_native_tensor_name, parse_pytorch_state_dict, pytorch_tensor_is_contiguous,
@@ -10,7 +11,6 @@ use hipfire_diffusion_coexist::{
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
-use super::*;
 
 #[test]
 fn hip_memory_plan_accounts_for_diffusion_buffers() {
@@ -729,8 +729,7 @@ fn hip_denoise_vector_runtime_context_reuses_single_gpu() {
         DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::rocm_hybrid(0));
 
     let (_scaled, scale_kind) =
-        scale_model_input_with_runtime_context(&schedule, sample, 0, &mut runtime_context)
-            .unwrap();
+        scale_model_input_with_runtime_context(&schedule, sample, 0, &mut runtime_context).unwrap();
     let (guided, guidance_kind) = cfg_guidance_with_runtime_context(
         &negative_pred,
         &positive_pred,
@@ -943,7 +942,10 @@ fn hip_leaky_relu_matches_cpu_reference_when_gpu_is_available() {
     // RealESRGAN / RRDBNet negative slope.
     let alpha = 0.2_f32;
 
-    let cpu = tensor_map(&input, |value| if value >= 0.0 { value } else { alpha * value });
+    let cpu = tensor_map(
+        &input,
+        |value| if value >= 0.0 { value } else { alpha * value },
+    );
     let hip = leaky_relu_hip_on_gpu(&mut gpu, &input, alpha).unwrap();
 
     assert_eq!(hip.shape, cpu.shape);
@@ -1221,7 +1223,11 @@ fn superres_rrdbnet_x2_resident_matches_cpu_reference() {
     };
 
     let cpu = net.forward(&input).unwrap();
-    assert_eq!(cpu.shape, vec![1, 3, 8, 8], "x2 output should double spatial");
+    assert_eq!(
+        cpu.shape,
+        vec![1, 3, 8, 8],
+        "x2 output should double spatial"
+    );
 
     let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
     let mut cache = RocmWeightCache::default();
@@ -1344,9 +1350,7 @@ fn diffusion_superres_model_upscales_rgb_batch_x2() {
         batch,
         width: w,
         height: h,
-        data: (0..(batch * w * h * 3))
-            .map(|v| (v % 256) as u8)
-            .collect(),
+        data: (0..(batch * w * h * 3)).map(|v| (v % 256) as u8).collect(),
     };
     let upscaled = model.upscale_rgb_batch(&input, Some(0)).unwrap();
 
@@ -1526,7 +1530,9 @@ fn resident_weight_bf16_linear_matches_cpu_and_caches_by_name() {
         &weight_f32,
     );
     // Reference uses the weight AS the GPU sees it: bf16-rounded back to f32.
-    let bf16_round = |v: f32| f32::from_bits((((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) >> 16) as u32) << 16);
+    let bf16_round = |v: f32| {
+        f32::from_bits((((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) >> 16) as u32) << 16)
+    };
     let wq: Vec<f32> = weight_f32.iter().map(|&v| bf16_round(v)).collect();
     let mut cpu = vec![0.0f32; rows * out_features];
     for r in 0..rows {
@@ -1540,7 +1546,8 @@ fn resident_weight_bf16_linear_matches_cpu_and_caches_by_name() {
     }
 
     let mut cache = RocmWeightCache::default();
-    let hip = linear_resident_weight_hip_on_gpu(&mut gpu, &mut cache, &input, &weight, None).unwrap();
+    let hip =
+        linear_resident_weight_hip_on_gpu(&mut gpu, &mut cache, &input, &weight, None).unwrap();
     // second call: same result, served from the name cache.
     let hip2 =
         linear_resident_weight_hip_on_gpu(&mut gpu, &mut cache, &input, &weight, None).unwrap();
@@ -1651,8 +1658,9 @@ fn linear_resident_weight_resident_matches_cpu_reference() {
         vec![out_features, in_features],
         &weight_f32,
     );
-    let bf16_round =
-        |v: f32| f32::from_bits((((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) >> 16) as u32) << 16);
+    let bf16_round = |v: f32| {
+        f32::from_bits((((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) >> 16) as u32) << 16)
+    };
     let wq: Vec<f32> = weight_f32.iter().map(|&v| bf16_round(v)).collect();
     let mut cpu = vec![0.0f32; rows * out_features];
     for r in 0..rows {
@@ -1713,7 +1721,12 @@ fn resident_swiglu_and_sigmoid_gates_match_cpu_reference() {
     };
     let silu = |x: f32| x / (1.0 + (-x).exp());
     let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
-    let swiglu_cpu: Vec<f32> = a.data.iter().zip(&g.data).map(|(u, x)| u * silu(*x)).collect();
+    let swiglu_cpu: Vec<f32> = a
+        .data
+        .iter()
+        .zip(&g.data)
+        .map(|(u, x)| u * silu(*x))
+        .collect();
     let sigmoid_cpu: Vec<f32> = a
         .data
         .iter()
@@ -1737,7 +1750,10 @@ fn resident_swiglu_and_sigmoid_gates_match_cpu_reference() {
         assert!((h - c).abs() <= 1e-5, "swiglu mismatch at {i}: {h} vs {c}");
     }
     for (i, (h, c)) in sg_h.data.iter().zip(&sigmoid_cpu).enumerate() {
-        assert!((h - c).abs() <= 1e-5, "sigmoid gate mismatch at {i}: {h} vs {c}");
+        assert!(
+            (h - c).abs() <= 1e-5,
+            "sigmoid gate mismatch at {i}: {h} vs {c}"
+        );
     }
 }
 
@@ -1772,8 +1788,14 @@ fn rope_qwen_resident_matches_cpu_reference() {
             sin_d[t * freq_width + p] = theta.sin();
         }
     }
-    let cos = CpuTensor { shape: vec![seq, freq_width], data: cos_d };
-    let sin = CpuTensor { shape: vec![seq, freq_width], data: sin_d };
+    let cos = CpuTensor {
+        shape: vec![seq, freq_width],
+        data: cos_d,
+    };
+    let sin = CpuTensor {
+        shape: vec![seq, freq_width],
+        data: sin_d,
+    };
 
     // CPU reference (interleaved pairs).
     let mut cpu = vec![0.0f32; batch * seq * width];
@@ -1794,8 +1816,10 @@ fn rope_qwen_resident_matches_cpu_reference() {
 
     let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
     let mut cache = RocmWeightCache::default();
-    let out_gpu =
-        rope_qwen_resident(&mut gpu, &mut cache, &input_gpu, &cos, &sin, heads, head_dim).unwrap();
+    let out_gpu = rope_qwen_resident(
+        &mut gpu, &mut cache, &input_gpu, &cos, &sin, heads, head_dim,
+    )
+    .unwrap();
     let hip = download_resident(&mut gpu, &out_gpu).unwrap();
     free_resident(&mut gpu, out_gpu).unwrap();
     free_resident(&mut gpu, input_gpu).unwrap();
@@ -1825,11 +1849,26 @@ fn resident_adaln_modulate_and_gated_residual_match_cpu() {
             .map(|k| (((k as f32 + seed) % 11.0) - 5.0) / 5.0 * scale)
             .collect()
     };
-    let x = CpuTensor { shape: vec![batch, seq, width], data: fill(batch * seq * width, 1.0, 1.0) };
-    let upd = CpuTensor { shape: vec![batch, seq, width], data: fill(batch * seq * width, 9.0, 1.0) };
-    let shift = CpuTensor { shape: vec![batch, width], data: fill(batch * width, 3.0, 0.5) };
-    let scale = CpuTensor { shape: vec![batch, width], data: fill(batch * width, 5.0, 0.5) };
-    let gate = CpuTensor { shape: vec![batch, width], data: fill(batch * width, 7.0, 0.5) };
+    let x = CpuTensor {
+        shape: vec![batch, seq, width],
+        data: fill(batch * seq * width, 1.0, 1.0),
+    };
+    let upd = CpuTensor {
+        shape: vec![batch, seq, width],
+        data: fill(batch * seq * width, 9.0, 1.0),
+    };
+    let shift = CpuTensor {
+        shape: vec![batch, width],
+        data: fill(batch * width, 3.0, 0.5),
+    };
+    let scale = CpuTensor {
+        shape: vec![batch, width],
+        data: fill(batch * width, 5.0, 0.5),
+    };
+    let gate = CpuTensor {
+        shape: vec![batch, width],
+        data: fill(batch * width, 7.0, 0.5),
+    };
 
     let mut mod_cpu = vec![0.0f32; batch * seq * width];
     let mut gr_cpu = vec![0.0f32; batch * seq * width];
@@ -1902,7 +1941,9 @@ fn feed_forward_stream_forward_resident_matches_cpu_reference() {
         TransformerFeedForwardStream::swiglu_for_test(hidden, inner, &up_f32, &gate_f32, &down_f32);
 
     // CPU reference with bf16-rounded weights.
-    let bf16 = |v: f32| f32::from_bits((((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) >> 16) as u32) << 16);
+    let bf16 = |v: f32| {
+        f32::from_bits((((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) >> 16) as u32) << 16)
+    };
     let (uq, gq, dq): (Vec<f32>, Vec<f32>, Vec<f32>) = (
         up_f32.iter().map(|&v| bf16(v)).collect(),
         gate_f32.iter().map(|&v| bf16(v)).collect(),
@@ -1931,7 +1972,9 @@ fn feed_forward_stream_forward_resident_matches_cpu_reference() {
 
     let hidden_gpu = gpu.upload_f32(&hidden_in.data, &hidden_in.shape).unwrap();
     let mut cache = RocmWeightCache::default();
-    let out_gpu = stream.forward_resident(&hidden_gpu, &mut gpu, &mut cache).unwrap();
+    let out_gpu = stream
+        .forward_resident(&hidden_gpu, &mut gpu, &mut cache)
+        .unwrap();
     let hip = download_resident(&mut gpu, &out_gpu).unwrap();
     free_resident(&mut gpu, out_gpu).unwrap();
     free_resident(&mut gpu, hidden_gpu).unwrap();
@@ -1977,9 +2020,8 @@ fn attend_krea_resident_matches_runtime_context_path() {
         data: fill(batch * seq * width, 2.0, 1.0),
     };
 
-    let mut ctx = DiffusionGenerationRuntimeContext::new(
-        DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
-    );
+    let mut ctx =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::rocm_hybrid(0));
     let cpu_out = attn
         .attend_krea_self_gated_with_runtime_context(&hidden_in, None, &mut ctx)
         .unwrap();
@@ -2035,7 +2077,8 @@ fn krea_block_forward_resident_matches_runtime_context_path() {
         &fill(width * width, 3.0, 0.3),
         &fill(width * width, 4.0, 0.3),
     );
-    let attention = NativeTransformerAttentionProjection::krea_mha_for_test(heads, head_dim, attn_stream);
+    let attention =
+        NativeTransformerAttentionProjection::krea_mha_for_test(heads, head_dim, attn_stream);
     let ffn = NativeTransformerFeedForward::krea_swiglu_for_test(
         width,
         inner_ff,
@@ -2043,13 +2086,20 @@ fn krea_block_forward_resident_matches_runtime_context_path() {
         &fill(inner_ff * width, 6.0, 0.3),
         &fill(width * inner_ff, 7.0, 0.3),
     );
-    let modulation = NativeTransformerBlockModulation::krea_for_test(width, &fill(6 * width, 8.0, 0.2));
+    let modulation =
+        NativeTransformerBlockModulation::krea_for_test(width, &fill(6 * width, 8.0, 0.2));
     let block = NativeTransformerBlock::krea_for_test(
         modulation,
         attention,
         ffn,
-        CpuTensor { shape: vec![width], data: fill(width, 9.0, 0.3) },
-        CpuTensor { shape: vec![width], data: fill(width, 11.0, 0.3) },
+        CpuTensor {
+            shape: vec![width],
+            data: fill(width, 9.0, 0.3),
+        },
+        CpuTensor {
+            shape: vec![width],
+            data: fill(width, 11.0, 0.3),
+        },
     );
     let hidden_in = CpuTensor {
         shape: vec![batch, seq, width],
@@ -2060,9 +2110,8 @@ fn krea_block_forward_resident_matches_runtime_context_path() {
         data: fill(batch * 6 * width, 13.0, 0.5),
     };
 
-    let mut ctx = DiffusionGenerationRuntimeContext::new(
-        DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
-    );
+    let mut ctx =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::rocm_hybrid(0));
     let cpu_out = block
         .forward_krea_with_runtime_context(&hidden_in, &time_modulation, None, &mut ctx)
         .unwrap();
@@ -2071,7 +2120,8 @@ fn krea_block_forward_resident_matches_runtime_context_path() {
             let hidden_gpu = gpu
                 .upload_f32(&hidden_in.data, &hidden_in.shape)
                 .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
-            let out_gpu = block.forward_krea_resident(&hidden_gpu, &time_modulation, None, gpu, cache)?;
+            let out_gpu =
+                block.forward_krea_resident(&hidden_gpu, &time_modulation, None, gpu, cache)?;
             let out = download_resident(gpu, &out_gpu)?;
             free_resident(gpu, out_gpu)?;
             free_resident(gpu, hidden_gpu)?;
@@ -2119,12 +2169,12 @@ fn krea_block_forward_resident_matches_runtime_context_real_op_set() {
         width,
         inner_kv,
         width,
-        &fill(width * width, 1.0, 0.3),      // q  [32,32]
-        &fill(inner_kv * width, 2.0, 0.3),   // k  [16,32]
-        &fill(inner_kv * width, 3.0, 0.3),   // v  [16,32]
-        &fill(width * width, 4.0, 0.3),      // out[32,32]
-        &fill(head_dim, 5.0, 0.5),           // norm_q [8]
-        &fill(head_dim, 6.0, 0.5),           // norm_k [8]
+        &fill(width * width, 1.0, 0.3),    // q  [32,32]
+        &fill(inner_kv * width, 2.0, 0.3), // k  [16,32]
+        &fill(inner_kv * width, 3.0, 0.3), // v  [16,32]
+        &fill(width * width, 4.0, 0.3),    // out[32,32]
+        &fill(head_dim, 5.0, 0.5),         // norm_q [8]
+        &fill(head_dim, 6.0, 0.5),         // norm_k [8]
         head_dim,
     );
     let attention = NativeTransformerAttentionProjection::krea_gqa_gated_for_test(
@@ -2140,13 +2190,20 @@ fn krea_block_forward_resident_matches_runtime_context_real_op_set() {
         &fill(inner_ff * width, 9.0, 0.3),
         &fill(width * inner_ff, 10.0, 0.3),
     );
-    let modulation = NativeTransformerBlockModulation::krea_for_test(width, &fill(6 * width, 11.0, 0.2));
+    let modulation =
+        NativeTransformerBlockModulation::krea_for_test(width, &fill(6 * width, 11.0, 0.2));
     let block = NativeTransformerBlock::krea_for_test(
         modulation,
         attention,
         ffn,
-        CpuTensor { shape: vec![width], data: fill(width, 12.0, 0.3) },
-        CpuTensor { shape: vec![width], data: fill(width, 13.0, 0.3) },
+        CpuTensor {
+            shape: vec![width],
+            data: fill(width, 12.0, 0.3),
+        },
+        CpuTensor {
+            shape: vec![width],
+            data: fill(width, 13.0, 0.3),
+        },
     );
     let hidden_in = CpuTensor {
         shape: vec![batch, seq, width],
@@ -2166,9 +2223,8 @@ fn krea_block_forward_resident_matches_runtime_context_real_op_set() {
         .collect();
     let rotary = RotaryFrequencies::for_test(seq, freq_width, &cos, &sin);
 
-    let mut ctx = DiffusionGenerationRuntimeContext::new(
-        DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
-    );
+    let mut ctx =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::rocm_hybrid(0));
     let cpu_out = block
         .forward_krea_with_runtime_context(&hidden_in, &time_modulation, Some(&rotary), &mut ctx)
         .unwrap();

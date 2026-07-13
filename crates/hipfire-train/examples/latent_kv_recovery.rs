@@ -40,10 +40,16 @@ use std::path::Path;
 const DEFAULT_DIR: &str =
     "/srv/huggingface/models--SupraLabs--Supra-50M-Instruct/snapshots/77a1c2a33f386f9f4bf7151ec5f2156b62caac39";
 fn env_f32(key: &str, default: f32) -> f32 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Read whitespace-separated token-ID windows (one per line) into a batch.
@@ -52,7 +58,11 @@ fn load_ids(path: &str) -> Result<Vec<Vec<u32>>, Box<dyn std::error::Error>> {
     let batch: Vec<Vec<u32>> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| l.split_whitespace().map(|t| t.parse::<u32>().unwrap()).collect())
+        .map(|l| {
+            l.split_whitespace()
+                .map(|t| t.parse::<u32>().unwrap())
+                .collect()
+        })
         .collect();
     if batch.is_empty() {
         return Err(format!("no token windows in {path}").into());
@@ -130,7 +140,9 @@ fn calibrate(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_DIR.to_string());
+    let dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_DIR.to_string());
     let dir = Path::new(&dir);
     if !dir.exists() {
         return Err(format!("model dir not found: {}", dir.display()).into());
@@ -164,8 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cfg, w_teacher) = load_llama_fp32(&mut gpu, dir)?;
     let (_, w_student) = load_llama_fp32(&mut gpu, dir)?;
     let vocab = cfg.vocab_size;
-    let (n_layers, n_kv, head_dim) =
-        (cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim);
+    let (n_layers, n_kv, head_dim) = (cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim);
     println!(
         "real-text batches: {n_train} train / {n_eval} held-out windows x seq {seq}  (disjoint docs)"
     );
@@ -200,7 +211,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Calibrate the fixed rank-r K/V subspaces (projection OFF, LoRA=0 ⇒ clean),
     // on the TRAIN batch, then install them. Eval stays held-out.
     let projectors = calibrate(
-        &mut gpu, &student, &train_batch, &pos, seq, n_layers, n_kv, head_dim, latent_rank,
+        &mut gpu,
+        &student,
+        &train_batch,
+        &pos,
+        seq,
+        n_layers,
+        n_kv,
+        head_dim,
+        latent_rank,
     )?;
     latent_kv::set_projectors(projectors);
     println!("calibrated + installed rank-{latent_rank} latent-KV projectors\n");

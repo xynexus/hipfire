@@ -35,9 +35,9 @@
 //! Env knobs: HIPFIRE_PFLASH_{EPOCHS,TAU,LR,WD,NEVAL,SHUFFLE_SEED},
 //!            HIPFIRE_SSM_LAYERS, HIPFIRE_SSM_H.
 
+use hipfire_rdna::Gpu;
 use hipfire_train::ssm_drafter::{SsmDrafter, SsmDrafterConfig};
 use hipfire_train::train_loop::{eval_ssm_drafter, spearman, train_ssm_drafter_loop, TrainCfg};
-use hipfire_rdna::Gpu;
 
 const SEQ: usize = 512;
 const BLOCK: usize = 64;

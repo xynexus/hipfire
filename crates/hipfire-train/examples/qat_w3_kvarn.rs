@@ -17,6 +17,7 @@
 //!   cargo run -p hipfire-train --release --example qat_w3_kvarn [model_dir]
 //!   hipfire lock release
 
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_train::loader::{load_llama_fp32, LlamaWeightsF32};
 use hipfire_train::model::{
     flatten_recovery_grads, model_distill_backward, model_forward, LlamaModel,
@@ -24,7 +25,6 @@ use hipfire_train::model::{
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
 use hipfire_train::oqplus_quant::oq3_simquant;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
 const DEFAULT_DIR: &str =

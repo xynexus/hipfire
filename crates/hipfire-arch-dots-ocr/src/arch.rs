@@ -24,11 +24,11 @@
 
 use crate::dots_ocr::{DotsOcrConfig, DotsOcrWeights};
 use hipfire_arch_qwen2::qwen2::Qwen2State;
+use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::{
     Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
 };
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_rdna::Gpu;
 
 /// Zero-sized type marker for the dots.ocr arch.
 pub struct DotsOcr;

@@ -133,10 +133,11 @@ mod tests {
         // 8 dots-ocr, 9 deepseek4, 10 minimax, 11 lfm2, 12 gemma3, 13 gemma3-vl,
         // 14 nemotron-h, 15 mamba2, 16 zaya, 17 krea2 (diffusion),
         // 18 qwen-image (diffusion), 19 embeddinggemma, 0xFF template.
-        let expected: BTreeSet<u16> =
-            [0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 0xFF]
-            .into_iter()
-            .collect();
+        let expected: BTreeSet<u16> = [
+            0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 0xFF,
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             unique, expected,
             "arch migration ledger drift — update the expected set as families \

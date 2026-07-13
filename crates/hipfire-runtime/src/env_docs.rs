@@ -486,14 +486,14 @@ pub const ENV_HIPFIRE_DEBUG_PREFIX_BOUNDARIES: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEBUG_VAE_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEBUG_VAE_DUMP",
     description: "Runtime variable controlling debug vae dump in hipfire",
-    source: "crates/hipfire-diffusion/src/vae.rs:1388",
+    source: "crates/hipfire-diffusion/src/vae.rs:1393",
 };
 
 /// `HIPFIRE_DEBUG_VAE_STAGES` — Runtime variable controlling debug vae stages in hipfire
 pub const ENV_HIPFIRE_DEBUG_VAE_STAGES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEBUG_VAE_STAGES",
     description: "Runtime variable controlling debug vae stages in hipfire",
-    source: "crates/hipfire-diffusion/src/vae.rs:1319",
+    source: "crates/hipfire-diffusion/src/vae.rs:1318",
 };
 
 /// `HIPFIRE_DEEPSEEK4_ATTN` — main model's final_norm_and_head head-HC reduction. Without
@@ -1095,7 +1095,7 @@ pub const ENV_HIPFIRE_DIAG: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIFFUSION_ATTN_QTILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_ATTN_QTILE",
     description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:3957",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:4026",
 };
 
 /// `HIPFIRE_DIFFUSION_CPU_REFERENCE` — Runtime variable controlling diffusion cpu reference in hipfire
@@ -1109,7 +1109,7 @@ pub const ENV_HIPFIRE_DIFFUSION_CPU_REFERENCE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIFFUSION_DUMP_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_DUMP_DIR",
     description: "Runtime variable controlling diffusion dump dir in hipfire",
-    source: "crates/hipfire-diffusion/src/lib.rs:1011",
+    source: "crates/hipfire-diffusion/src/lib.rs:1027",
 };
 
 /// `HIPFIRE_DIFFUSION_LAYER_RUNG` — Selects behavior from recognized values
@@ -1123,21 +1123,21 @@ pub const ENV_HIPFIRE_DIFFUSION_LAYER_RUNG: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIFFUSION_OQ8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_OQ8",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2208",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2218",
 };
 
 /// `HIPFIRE_DIFFUSION_TILED_GEMM` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_DIFFUSION_TILED_GEMM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_TILED_GEMM",
     description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2340",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2384",
 };
 
 /// `HIPFIRE_DIFFUSION_W4A8` — W8A8 (oq8) path: int8 weight (½ bf16 footprint) × dynamic-int8 activation,
 pub const ENV_HIPFIRE_DIFFUSION_W4A8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_W4A8",
     description: "W8A8 (oq8) path: int8 weight (½ bf16 footprint) × dynamic-int8 activation,",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2203",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2213",
 };
 
 /// `HIPFIRE_DIR` — Runtime variable controlling dir in hipfire
@@ -1243,7 +1243,7 @@ pub const ENV_HIPFIRE_DSPARK_HFQ4_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DSPARK_PROFILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DSPARK_PROFILE",
     description: "Runtime variable controlling dspark profile in hipfire",
-    source: "crates/hipfire-train/src/dspark_train.rs:785",
+    source: "crates/hipfire-train/src/dspark_train.rs:791",
 };
 
 /// `HIPFIRE_DSPARK_Q8_4W` — Environment toggle value controls runtime behavior
@@ -1285,14 +1285,14 @@ pub const ENV_HIPFIRE_DUMMY_PREFILL_DELAY_MS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DUMP_COND: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_COND",
     description: "Debug hook: HIPFIRE_DUMP_COND prints stats for the text conditioning",
-    source: "crates/hipfire-diffusion/src/pipeline_generate.rs:290",
+    source: "crates/hipfire-diffusion/src/pipeline_generate.rs:296",
 };
 
 /// `HIPFIRE_DUMP_GATE` — Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate
 pub const ENV_HIPFIRE_DUMP_GATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_GATE",
     description: "Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate",
-    source: "crates/hipfire-diffusion/src/transformer.rs:1556",
+    source: "crates/hipfire-diffusion/src/transformer.rs:1631",
 };
 
 /// `HIPFIRE_DUMP_HIDDEN` — DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
@@ -1334,7 +1334,7 @@ pub const ENV_HIPFIRE_DUMP_HIDDEN_POS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DUMP_LATENT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_LATENT",
     description: "Debug hook: when HIPFIRE_DUMP_LATENT names a path, write the final latent",
-    source: "crates/hipfire-diffusion/src/lib.rs:1496",
+    source: "crates/hipfire-diffusion/src/lib.rs:1512",
 };
 
 /// `HIPFIRE_DUMP_REQUEST` — a strace. Off by default — gigantic for typical agent prompts
@@ -1376,14 +1376,14 @@ pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_FFN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER",
     description: "Runtime variable controlling embed compare resident layer in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3035",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3610",
 };
 
 /// `HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX` — Parses "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX" with fallback defaults
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX",
     description: "Parses \"HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX\" with fallback defaults",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3036",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3611",
 };
 
 /// `HIPFIRE_EMBED_E2E_TOKENS` — Runtime variable controlling embed e2e tokens in hipfire
@@ -1407,25 +1407,39 @@ pub const ENV_HIPFIRE_EMBED_REFERENCE_MODEL: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:58",
 };
 
+/// `HIPFIRE_EMBED_RESIDENT_ATTENTION_CACHE` — Runtime variable controlling embed resident attention cache in hipfire
+pub const ENV_HIPFIRE_EMBED_RESIDENT_ATTENTION_CACHE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_EMBED_RESIDENT_ATTENTION_CACHE",
+    description: "Runtime variable controlling embed resident attention cache in hipfire",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1100",
+};
+
 /// `HIPFIRE_EMBED_RESIDENT_FFN_CACHE` — Runtime variable controlling embed resident ffn cache in hipfire
 pub const ENV_HIPFIRE_EMBED_RESIDENT_FFN_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_FFN_CACHE",
     description: "Runtime variable controlling embed resident ffn cache in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:754",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:940",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_LAYER` — Runtime variable controlling embed resident layer in hipfire
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER",
     description: "Runtime variable controlling embed resident layer in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:916",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:798",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT` — Parses "HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT" with fallback defaults
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT",
     description: "Parses \"HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT\" with fallback defaults",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2162",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2665",
+};
+
+/// `HIPFIRE_EMBED_RESIDENT_NEXT_PREP_CACHE` — Runtime variable controlling embed resident next prep cache in hipfire
+pub const ENV_HIPFIRE_EMBED_RESIDENT_NEXT_PREP_CACHE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_EMBED_RESIDENT_NEXT_PREP_CACHE",
+    description: "Runtime variable controlling embed resident next prep cache in hipfire",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1169",
 };
 
 /// `HIPFIRE_EMBED_TRACE_PHASES` — Runtime variable controlling embed trace phases in hipfire
@@ -1439,7 +1453,14 @@ pub const ENV_HIPFIRE_EMBED_TRACE_PHASES: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_TRACE_RESIDENT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_TRACE_RESIDENT",
     description: "Runtime variable controlling embed trace resident in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1554",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1875",
+};
+
+/// `HIPFIRE_EMBED_UNIT_RMS_BRIDGE` — Runtime variable controlling embed unit rms bridge in hipfire
+pub const ENV_HIPFIRE_EMBED_UNIT_RMS_BRIDGE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_EMBED_UNIT_RMS_BRIDGE",
+    description: "Runtime variable controlling embed unit rms bridge in hipfire",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:937",
 };
 
 /// `HIPFIRE_EMIT_TOKEN_IDS` — or "\" in it would corrupt the line, breaking the client's JSONL
@@ -1789,7 +1810,7 @@ pub const ENV_HIPFIRE_GQA_CHUNK: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GQA_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GQA_FUSED",
     description: "Fused variant (opt-in via HIPFIRE_GQA_FUSED=1): single launch",
-    source: "crates/hipfire-arch-qwen2/src/qwen2.rs:1700",
+    source: "crates/hipfire-arch-qwen2/src/qwen2.rs:1704",
 };
 
 /// `HIPFIRE_GRAPH` — Used to configure runtime execution by explicitly setting "HIPFIRE_GRAPH"
@@ -2155,21 +2176,21 @@ pub const ENV_HIPFIRE_KV_POS_LOCAL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_LATENTKV_EVAL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LATENTKV_EVAL",
     description: "Runtime variable controlling latentKV eval in hipfire",
-    source: "crates/hipfire-train/examples/latent_kv_recovery.rs:150",
+    source: "crates/hipfire-train/examples/latent_kv_recovery.rs:162",
 };
 
 /// `HIPFIRE_LATENTKV_RANK` — Keep alpha/rank constant (baseline 32/16 = 2.0) so a rank sweep isolates
 pub const ENV_HIPFIRE_LATENTKV_RANK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LATENTKV_RANK",
     description: "Keep alpha/rank constant (baseline 32/16 = 2.0) so a rank sweep isolates",
-    source: "crates/hipfire-train/examples/latent_kv_recovery.rs:138",
+    source: "crates/hipfire-train/examples/latent_kv_recovery.rs:150",
 };
 
 /// `HIPFIRE_LATENTKV_TRAIN` — Runtime variable controlling latentKV train in hipfire
 pub const ENV_HIPFIRE_LATENTKV_TRAIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LATENTKV_TRAIN",
     description: "Runtime variable controlling latentKV train in hipfire",
-    source: "crates/hipfire-train/examples/latent_kv_recovery.rs:148",
+    source: "crates/hipfire-train/examples/latent_kv_recovery.rs:160",
 };
 
 /// `HIPFIRE_LFM2_CAPTURE_POSTMIXER` — Runtime variable controlling lfm2 capture postmixer in hipfire
@@ -3486,6 +3507,13 @@ pub const ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-serving-core/src/load.rs:3492",
 };
 
+/// `HIPFIRE_R116_UNIT_SCALES` — Runtime variable controlling r116 unit scales in hipfire
+pub const ENV_HIPFIRE_R116_UNIT_SCALES: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R116_UNIT_SCALES",
+    description: "Runtime variable controlling r116 unit scales in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_embedding_r113_compact_fullk_n16_verify.rs:30",
+};
+
 /// `HIPFIRE_R17_PROBE` — Runtime variable controlling r17 probe in hipfire
 pub const ENV_HIPFIRE_R17_PROBE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R17_PROBE",
@@ -3493,158 +3521,193 @@ pub const ENV_HIPFIRE_R17_PROBE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-xdna/examples/npu_geglu_verify.rs:25",
 };
 
+/// `HIPFIRE_R25_A_PAYLOAD_FILE` — Runtime variable controlling r25 a payload file in hipfire
+pub const ENV_HIPFIRE_R25_A_PAYLOAD_FILE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_A_PAYLOAD_FILE",
+    description: "Runtime variable controlling r25 a payload file in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:305",
+};
+
+/// `HIPFIRE_R25_CANONICAL_REFERENCE` — Parses "HIPFIRE_R25_CANONICAL_REFERENCE" with fallback defaults
+pub const ENV_HIPFIRE_R25_CANONICAL_REFERENCE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_CANONICAL_REFERENCE",
+    description: "Parses \"HIPFIRE_R25_CANONICAL_REFERENCE\" with fallback defaults",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:54",
+};
+
 /// `HIPFIRE_R25_FRESH_COMMAND` — Runtime variable controlling r25 fresh command in hipfire
 pub const ENV_HIPFIRE_R25_FRESH_COMMAND: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_FRESH_COMMAND",
     description: "Runtime variable controlling r25 fresh command in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:602",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:963",
+};
+
+/// `HIPFIRE_R25_GATE_ACTIVATION_HASH` — Runtime variable controlling r25 gate activation hash in hipfire
+pub const ENV_HIPFIRE_R25_GATE_ACTIVATION_HASH: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_GATE_ACTIVATION_HASH",
+    description: "Runtime variable controlling r25 gate activation hash in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:785",
 };
 
 /// `HIPFIRE_R25_GATE_ONLY_STREAM` — Runtime variable controlling r25 gate only stream in hipfire
 pub const ENV_HIPFIRE_R25_GATE_ONLY_STREAM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_GATE_ONLY_STREAM",
     description: "Runtime variable controlling r25 gate only stream in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:204",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:330",
 };
 
 /// `HIPFIRE_R25_GATE_PROBE` — Runtime variable controlling r25 gate probe in hipfire
 pub const ENV_HIPFIRE_R25_GATE_PROBE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_GATE_PROBE",
     description: "Runtime variable controlling r25 gate probe in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:443",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:758",
+};
+
+/// `HIPFIRE_R25_GATE_RAW_ONLY` — Runtime variable controlling r25 gate raw only in hipfire
+pub const ENV_HIPFIRE_R25_GATE_RAW_ONLY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_GATE_RAW_ONLY",
+    description: "Runtime variable controlling r25 gate raw only in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:419",
 };
 
 /// `HIPFIRE_R25_GROUP` — Parses "HIPFIRE_R25_GROUP" with fallback defaults
 pub const ENV_HIPFIRE_R25_GROUP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_GROUP",
     description: "Parses \"HIPFIRE_R25_GROUP\" with fallback defaults",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:37",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:69",
 };
 
 /// `HIPFIRE_R25_IDENTITY` — Runtime variable controlling r25 identity in hipfire
 pub const ENV_HIPFIRE_R25_IDENTITY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_IDENTITY",
     description: "Runtime variable controlling r25 identity in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:41",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:73",
 };
 
 /// `HIPFIRE_R25_INPUT_PROBE` — Runtime variable controlling r25 input probe in hipfire
 pub const ENV_HIPFIRE_R25_INPUT_PROBE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_INPUT_PROBE",
     description: "Runtime variable controlling r25 input probe in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:382",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:620",
+};
+
+/// `HIPFIRE_R25_PRECALL_PACK` — Runtime variable controlling r25 precall pack in hipfire
+pub const ENV_HIPFIRE_R25_PRECALL_PACK: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R25_PRECALL_PACK",
+    description: "Runtime variable controlling r25 precall pack in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:247",
 };
 
 /// `HIPFIRE_R25_PROBE` — Runtime variable controlling r25 probe in hipfire
 pub const ENV_HIPFIRE_R25_PROBE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_PROBE",
     description: "Runtime variable controlling r25 probe in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:478",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:839",
 };
 
 /// `HIPFIRE_R25_PROBE_CORE_ROW` — Parses "HIPFIRE_R25_PROBE_CORE_ROW" with fallback defaults
 pub const ENV_HIPFIRE_R25_PROBE_CORE_ROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_PROBE_CORE_ROW",
     description: "Parses \"HIPFIRE_R25_PROBE_CORE_ROW\" with fallback defaults",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:389",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:627",
 };
 
 /// `HIPFIRE_R25_PROBE_GLOBAL_ROW` — Parses "HIPFIRE_R25_PROBE_GLOBAL_ROW" with fallback defaults
 pub const ENV_HIPFIRE_R25_PROBE_GLOBAL_ROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_PROBE_GLOBAL_ROW",
     description: "Parses \"HIPFIRE_R25_PROBE_GLOBAL_ROW\" with fallback defaults",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:449",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:764",
 };
 
 /// `HIPFIRE_R25_PROBE_GROUP` — Runtime variable controlling r25 probe group in hipfire
 pub const ENV_HIPFIRE_R25_PROBE_GROUP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_PROBE_GROUP",
     description: "Runtime variable controlling r25 probe group in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:480",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:841",
 };
 
 /// `HIPFIRE_R25_PROBE_MBLOCK` — Runtime variable controlling r25 probe mblock in hipfire
 pub const ENV_HIPFIRE_R25_PROBE_MBLOCK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_PROBE_MBLOCK",
     description: "Runtime variable controlling r25 probe mblock in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:384",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:622",
 };
 
 /// `HIPFIRE_R25_PROBE_NBLOCK` — Parses "HIPFIRE_R25_PROBE_NBLOCK" with fallback defaults
 pub const ENV_HIPFIRE_R25_PROBE_NBLOCK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_PROBE_NBLOCK",
     description: "Parses \"HIPFIRE_R25_PROBE_NBLOCK\" with fallback defaults",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:394",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:632",
 };
 
 /// `HIPFIRE_R25_PROBE_ROW` — Parses "HIPFIRE_R25_PROBE_ROW" with fallback defaults
 pub const ENV_HIPFIRE_R25_PROBE_ROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_PROBE_ROW",
     description: "Parses \"HIPFIRE_R25_PROBE_ROW\" with fallback defaults",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:485",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:846",
 };
 
 /// `HIPFIRE_R25_RAW_GATE_PROBE` — Runtime variable controlling r25 raw gate probe in hipfire
 pub const ENV_HIPFIRE_R25_RAW_GATE_PROBE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_RAW_GATE_PROBE",
     description: "Runtime variable controlling r25 raw gate probe in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:217",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:455",
 };
 
 /// `HIPFIRE_R25_RAW_GROUP` — Runtime variable controlling r25 raw group in hipfire
 pub const ENV_HIPFIRE_R25_RAW_GROUP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_RAW_GROUP",
     description: "Runtime variable controlling r25 raw group in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:218",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:456",
 };
 
 /// `HIPFIRE_R25_RAW_NBLOCK` — Parses "HIPFIRE_R25_RAW_NBLOCK" with fallback defaults
 pub const ENV_HIPFIRE_R25_RAW_NBLOCK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_RAW_NBLOCK",
     description: "Parses \"HIPFIRE_R25_RAW_NBLOCK\" with fallback defaults",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:223",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:461",
 };
 
 /// `HIPFIRE_R25_RAW_SOURCE_JN` — Parses "HIPFIRE_R25_RAW_SOURCE_JN" with fallback defaults
 pub const ENV_HIPFIRE_R25_RAW_SOURCE_JN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_RAW_SOURCE_JN",
     description: "Parses \"HIPFIRE_R25_RAW_SOURCE_JN\" with fallback defaults",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:233",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:471",
 };
 
 /// `HIPFIRE_R25_RECYCLE_EVERY` — Runtime variable controlling r25 recycle every in hipfire
 pub const ENV_HIPFIRE_R25_RECYCLE_EVERY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_RECYCLE_EVERY",
     description: "Runtime variable controlling r25 recycle every in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:603",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:964",
 };
 
 /// `HIPFIRE_R25_TIMING_ONLY` — Parses "HIPFIRE_R25_TIMING_ONLY" with fallback defaults
 pub const ENV_HIPFIRE_R25_TIMING_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_TIMING_ONLY",
     description: "Parses \"HIPFIRE_R25_TIMING_ONLY\" with fallback defaults",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:36",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:68",
 };
 
 /// `HIPFIRE_R25_TIMING_TRACE` — Runtime variable controlling r25 timing trace in hipfire
 pub const ENV_HIPFIRE_R25_TIMING_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R25_TIMING_TRACE",
     description: "Runtime variable controlling r25 timing trace in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:601",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:962",
 };
 
 /// `HIPFIRE_R26_RECYCLE_EVERY` — Parses "HIPFIRE_R26_RECYCLE_EVERY" with fallback defaults
 pub const ENV_HIPFIRE_R26_RECYCLE_EVERY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R26_RECYCLE_EVERY",
     description: "Parses \"HIPFIRE_R26_RECYCLE_EVERY\" with fallback defaults",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:811",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:1172",
 };
 
 /// `HIPFIRE_R26_WARMUPS` — Runtime variable controlling r26 warmups in hipfire
 pub const ENV_HIPFIRE_R26_WARMUPS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R26_WARMUPS",
     description: "Runtime variable controlling r26 warmups in hipfire",
-    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:806",
+    source: "crates/hipfire-xdna/examples/npu_resident_ffn_verify.rs:1167",
 };
 
 /// `HIPFIRE_R31_O_CACHE` — Runtime variable controlling r31 o cache in hipfire
@@ -3659,6 +3722,20 @@ pub const ENV_HIPFIRE_R31_O_ITERS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_R31_O_ITERS",
     description: "Runtime variable controlling r31 o iters in hipfire",
     source: "crates/hipfire-xdna/examples/npu_embedding_qkv_resident_verify.rs:548",
+};
+
+/// `HIPFIRE_R93_DUMP_OUTPUT` — Runtime variable controlling r93 dump output in hipfire
+pub const ENV_HIPFIRE_R93_DUMP_OUTPUT: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R93_DUMP_OUTPUT",
+    description: "Runtime variable controlling r93 dump output in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_embedding_ffn_activation_prep_verify.rs:54",
+};
+
+/// `HIPFIRE_R93_HASHES` — Runtime variable controlling r93 hashes in hipfire
+pub const ENV_HIPFIRE_R93_HASHES: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_R93_HASHES",
+    description: "Runtime variable controlling r93 hashes in hipfire",
+    source: "crates/hipfire-xdna/examples/npu_embedding_ffn_activation_prep_verify.rs:57",
 };
 
 /// `HIPFIRE_RDNA2_VARIANT` — Runtime variable controlling rdna2 variant in hipfire
@@ -4059,7 +4136,7 @@ pub const ENV_HIPFIRE_TARGET_ARCH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TEST_LATENT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TEST_LATENT",
     description: "Debug: HIPFIRE_TEST_LATENT=<path> loads a real [4xu32 hdr + f32] latent dump",
-    source: "crates/hipfire-diffusion/src/tests/vae.rs:216",
+    source: "crates/hipfire-diffusion/src/tests/vae.rs:227",
 };
 
 /// `HIPFIRE_TIER_RATIO` — Runtime variable controlling tier ratio in hipfire
@@ -4635,11 +4712,14 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_EMBED_E2E_TOKENS,
     ENV_HIPFIRE_EMBED_PROFILE,
     ENV_HIPFIRE_EMBED_REFERENCE_MODEL,
+    ENV_HIPFIRE_EMBED_RESIDENT_ATTENTION_CACHE,
     ENV_HIPFIRE_EMBED_RESIDENT_FFN_CACHE,
     ENV_HIPFIRE_EMBED_RESIDENT_LAYER,
     ENV_HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT,
+    ENV_HIPFIRE_EMBED_RESIDENT_NEXT_PREP_CACHE,
     ENV_HIPFIRE_EMBED_TRACE_PHASES,
     ENV_HIPFIRE_EMBED_TRACE_RESIDENT,
+    ENV_HIPFIRE_EMBED_UNIT_RMS_BRIDGE,
     ENV_HIPFIRE_EMIT_TOKEN_IDS,
     ENV_HIPFIRE_EP_DECODE_TIMING,
     ENV_HIPFIRE_EP_DUMP_IDX,
@@ -4930,13 +5010,19 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_QWEN35_XDNA1_INSTR,
     ENV_HIPFIRE_QWEN35_XDNA1_XCLBIN,
     ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD,
+    ENV_HIPFIRE_R116_UNIT_SCALES,
     ENV_HIPFIRE_R17_PROBE,
+    ENV_HIPFIRE_R25_A_PAYLOAD_FILE,
+    ENV_HIPFIRE_R25_CANONICAL_REFERENCE,
     ENV_HIPFIRE_R25_FRESH_COMMAND,
+    ENV_HIPFIRE_R25_GATE_ACTIVATION_HASH,
     ENV_HIPFIRE_R25_GATE_ONLY_STREAM,
     ENV_HIPFIRE_R25_GATE_PROBE,
+    ENV_HIPFIRE_R25_GATE_RAW_ONLY,
     ENV_HIPFIRE_R25_GROUP,
     ENV_HIPFIRE_R25_IDENTITY,
     ENV_HIPFIRE_R25_INPUT_PROBE,
+    ENV_HIPFIRE_R25_PRECALL_PACK,
     ENV_HIPFIRE_R25_PROBE,
     ENV_HIPFIRE_R25_PROBE_CORE_ROW,
     ENV_HIPFIRE_R25_PROBE_GLOBAL_ROW,
@@ -4955,6 +5041,8 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_R26_WARMUPS,
     ENV_HIPFIRE_R31_O_CACHE,
     ENV_HIPFIRE_R31_O_ITERS,
+    ENV_HIPFIRE_R93_DUMP_OUTPUT,
+    ENV_HIPFIRE_R93_HASHES,
     ENV_HIPFIRE_RDNA2_VARIANT,
     ENV_HIPFIRE_RECOVER_MODE,
     ENV_HIPFIRE_RECOVER_NOISE,

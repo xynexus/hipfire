@@ -37,8 +37,8 @@
 
 use hipfire_arch_nemotron::model::NemotronModel;
 use hipfire_arch_nemotron::NemotronHConfig;
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_rdna::Gpu;
+use hipfire_runtime::hfq::HfqFile;
 use std::io::Write;
 use std::path::Path;
 

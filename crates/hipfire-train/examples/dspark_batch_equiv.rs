@@ -269,13 +269,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 worst_abs = ma;
                 worst_p = p;
             }
-            let ok = ma <= atol + rtol * {
-                // magnitude reference: max|ref| element
-                ref_grad_sum[p]
-                    .iter()
-                    .fold(0.0f32, |m, v| m.max(v.abs()))
-                    .max(1e-6)
-            };
+            let ok = ma
+                <= atol
+                    + rtol * {
+                        // magnitude reference: max|ref| element
+                        ref_grad_sum[p]
+                            .iter()
+                            .fold(0.0f32, |m, v| m.max(v.abs()))
+                            .max(1e-6)
+                    };
             grads_ok &= ok;
         }
         all_ok &= grads_ok;

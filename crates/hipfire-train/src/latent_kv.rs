@@ -209,10 +209,20 @@ impl CovAccum {
     pub fn new(n_layers: usize, n_kv: usize, head_dim: usize) -> Self {
         let mk = || {
             (0..n_layers)
-                .map(|_| (0..n_kv).map(|_| vec![0.0f64; head_dim * head_dim]).collect())
+                .map(|_| {
+                    (0..n_kv)
+                        .map(|_| vec![0.0f64; head_dim * head_dim])
+                        .collect()
+                })
                 .collect::<Vec<Vec<Vec<f64>>>>()
         };
-        Self { n_layers, n_kv, head_dim, kcov: mk(), vcov: mk() }
+        Self {
+            n_layers,
+            n_kv,
+            head_dim,
+            kcov: mk(),
+            vcov: mk(),
+        }
     }
 
     /// Add one calibration sequence's post-RoPE K/V (downloaded host buffers).

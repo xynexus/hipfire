@@ -35,12 +35,12 @@
 //!   hipfire gpu-lock release
 
 use hipfire_model::tokenizer::Tokenizer;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_train::hfq_patch::{is_norm, parse_hfq, patch_norms_inplace};
 use hipfire_train::loader::{load_llama_fp32, load_llama_from_hfq};
 use hipfire_train::model::{flatten_norm_grads, model_distill_backward, model_forward, LlamaModel};
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::path::Path;
 

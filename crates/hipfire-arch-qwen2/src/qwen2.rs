@@ -34,11 +34,11 @@ use hipfire_dispatch::pipeline::superop::{
 };
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::dispatch::gemv_family;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{weight_gemm, EmbeddingFormat, WeightTensor};
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
 ///
@@ -285,7 +285,11 @@ pub fn load_weights(
             i + 1,
             cfg.num_hidden_layers
         );
-        hipfire_runtime::load_progress::report(i as u32 + 1, cfg.num_hidden_layers as u32, "weights");
+        hipfire_runtime::load_progress::report(
+            i as u32 + 1,
+            cfg.num_hidden_layers as u32,
+            "weights",
+        );
         layers.push(load_layer(hfq, gpu, cfg, i)?);
     }
 

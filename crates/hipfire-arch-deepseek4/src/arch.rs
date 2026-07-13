@@ -18,9 +18,9 @@
 use crate::deepseek4::{
     DeepseekV4Config, DeepseekV4LayerWeights, DeepseekV4State, DeepseekV4Weights,
 };
+use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_rdna::Gpu;
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
 /// after `8 = Qwen2-VL (dots.ocr)` reserved in `docs/architecture-ids.md`.

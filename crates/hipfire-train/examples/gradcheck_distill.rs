@@ -31,8 +31,8 @@
 //!   cargo run -p hipfire-train --release --example gradcheck_distill
 //!   hipfire gpu-lock release
 
-use hipfire_train::ops::distill::distill_kl;
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_train::ops::distill::distill_kl;
 
 const ROWS: usize = 3;
 const V: usize = 9;

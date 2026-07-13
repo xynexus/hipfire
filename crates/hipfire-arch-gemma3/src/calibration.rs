@@ -2,11 +2,11 @@
 // hipfire — Gemma3 text-decoder calibration collection. See LICENSE / NOTICE.
 
 use hip_bridge::{HipError, HipResult};
+use hipfire_rdna::Gpu;
 use hipfire_runtime::calibration::{collect_grouped, logsumexp, topk_logits, CalibForward};
 use hipfire_runtime::hfq::HfqMemTensor;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weights::WeightTensor;
-use hipfire_rdna::Gpu;
 
 pub use hipfire_runtime::calibration::CalibSummary;
 

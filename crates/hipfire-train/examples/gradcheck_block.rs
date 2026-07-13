@@ -29,8 +29,8 @@
 //!   cargo run -p hipfire-train --release --example gradcheck_block
 //!   hipfire gpu-lock release
 
-use hipfire_train::block::{block_backward, block_forward, BlockDims, BlockLora, BlockWeights};
 use hipfire_rdna::{Gpu, GpuTensor, HipResult};
+use hipfire_train::block::{block_backward, block_forward, BlockDims, BlockLora, BlockWeights};
 
 const SEQ: usize = 3;
 const H: usize = 8;

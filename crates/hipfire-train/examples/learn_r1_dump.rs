@@ -18,10 +18,10 @@
 //!   cargo run -p hipfire-train --release --example learn_r1_dump -- <model_dir> <out.r1>
 //!   hipfire lock release
 
+use hipfire_rdna::Gpu;
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, LlamaModel};
 use hipfire_train::rotation::{apply_r1, bake_for_oq4_recipe, Rotation};
-use hipfire_rdna::Gpu;
 use std::io::Write;
 use std::path::Path;
 

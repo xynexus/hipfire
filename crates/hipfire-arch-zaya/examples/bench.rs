@@ -30,9 +30,9 @@
 
 use hipfire_arch_zaya::arch::ZayaModel;
 use hipfire_arch_zaya::ZayaConfig;
+use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::SimpleAr;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_rdna::Gpu;
 use std::path::Path;
 use std::time::Instant;
 
