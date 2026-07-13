@@ -2257,6 +2257,39 @@ the whole GPU-servable `+`/`++` family was requantized off it and gated through
 BF16 = 0.86147. Every regenerated artifact is embedding-focused-calibrated,
 GPU-servable (Q8 ragged down_proj), and carries its calib hash in metadata.
 
+NPU padded family + resident-path validation (2026-07-13): the NPU-native padded
+`+`/`++` family was regenerated off the same canonical embedding-focused calib.
+Recipe: `--format <fmt> --hessian <canonical calib> --tensor-format
+"dense.*=f16"` WITHOUT `HIPFIRE_OQ_RAGGED_Q8`, so the down projection pads to
+OQ4G256/OQ8G256 for the NPU-native loader while Dense heads stay F16. All four
+(`npu.oq4+`, `npu.oq4++`, `npu.oq8+`, `npu.oq8++`) carry the canonical calib hash
+`744be90eeb9ac33a`.
+
+`npu.oq4++` and `npu.oq8++` were validated end-to-end on the resident AIE2P path
+at M256 via `embed_e2e_npu_opus`, in two modes (resident attn+FFN vs BF16, and
+the fully-fused completed-resident-layer self-contained R52 loader):
+
+| artifact | resident attn+FFN vs BF16 cosine | completed_resident_layer | resident tok/s (attn+FFN / fused) | pkg tok/J |
+|---|---:|---|---:|---:|
+| npu.oq4++ (W4A8) | 0.97526 | true (runs) | 626 / 308 | 25.0 / 16.2 |
+| npu.oq8++ (W8A8) | 0.99958 | true (runs) | 645 / 297 | 26.8 / 14.8 |
+
+Both load and execute resident bidirectional attention + resident W4/W8 FFN
+across all 24 layers with no non-finite values, and the fully-fused
+completed-resident-layer schedule engages cleanly. W8A8 is near-lossless at
+0.99958; W4A8 sits at 0.975 (its padded down is OQ4 vs OQ8).
+
+Caveats: (1) the example cannot compare the completed-layer path to BF16 in one
+run — resident-only weights carry dummy projection buffers, so that mode
+self-references and reports NaN cosine; the completed-layer quality is inferred
+from the resident attn+FFN path (same kernels) matching BF16. (2) Raw embedding
+cosine is the pessimistic metric; the authoritative quality verdict remains the
+GPU `embedding_quality` Spearman gate, which the padded NPU artifacts cannot run
+through (the GPU loader asserts K % 256 == 0). (3) Throughput (~300-650 tok/s)
+stays far below the 10k target, consistent with the R53 per-layer
+context-serialization finding; this was a correctness/coherence validation of the
+regenerated artifacts, not a throughput result.
+
 ### R57 bandwidth-first kernel-development plan (2026-07-12)
 
 Further NPU kernel work follows the dedicated
