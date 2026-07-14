@@ -130,3 +130,13 @@ patching — which removes the app's most fragile piece.
   Weight fed as `(1+w)`; kernel eps 1e-5 negligible (post-embed-scale mean(x²)≈700).
   Next: steps 2–5 (QKV gemms, QK-norm+RoPE+mha, o_proj+residual, GeGLU FFN) same
   pattern; step 6 fuse; Rung B stack 24 + check final embedding cosine vs f32.
+- **Rung A steps 2–3 (2026-07-14).** Step 2 ✅: the three QKV GEMMs on NPU vs HF
+  (q 8.2e-3 / k 9.0e-3 / v 6.8e-3, bf16 accum tol) — `b_col_maj=True` feeds HF
+  `[out,in]` directly; `tile_n=64 * 4 cols` → min_N=256 divides 768 & 256. Import
+  order aie/iron-before-torch avoids the duelling-LLVM segfault.
+  Step 3 **redirected**: the IRON `MHA` operator is **head_dim=64 only** (Embedding-
+  Gemma head_dim=256), so attention is composed from verified primitives instead —
+  per q-head: scores = GEMM(Q, K, b_col_maj=True)·(1/√256) → `softmax` op → context
+  = GEMM(P, V). GQA rep 3 (3 q-heads share the 1 kv-head), bidirectional (no mask),
+  then o_proj GEMM + residual (step 4). This matches how the Llama fused decode does
+  attention (GEMV+softmax+GEMV), so it composes cleanly into the fused ELF.
