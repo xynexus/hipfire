@@ -134,6 +134,7 @@ fn main() {
         4,
         true,
         false,
+        false, // similarity_merge
         15.0,
         15.0,
         false,
