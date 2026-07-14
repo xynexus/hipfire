@@ -122,3 +122,11 @@ patching — which removes the app's most fragile piece.
   Order of work: (1) rms_norm@[256,768] vs oracle input_layernorm; (2) the 3 QKV
   gemms; (3) qk-norm + rope + mha attention block; (4) o_proj + residual;
   (5) GeGLU FFN + residual; (6) fuse the 6 into one layer ELF; (7) Rung B: stack 24.
+- **Rung A step 1 — DONE on hardware.** `step1_rmsnorm.py` (via `run_step1.sh`):
+  IRON weighted `RMSNorm(size=256*768, tile_size=768, weighted=True)` compiled and
+  dispatched on the aie2p NPU, verified vs the HF oracle `input_layernorm` at
+  **rel 1.1e-2** (bf16 tolerance — per-element ~4e-3 over the 768 reduction). Proves
+  the operator-reuse → compile → NPU dispatch → verify loop at EmbeddingGemma dims.
+  Weight fed as `(1+w)`; kernel eps 1e-5 negligible (post-embed-scale mean(x²)≈700).
+  Next: steps 2–5 (QKV gemms, QK-norm+RoPE+mha, o_proj+residual, GeGLU FFN) same
+  pattern; step 6 fuse; Rung B stack 24 + check final embedding cosine vs f32.
