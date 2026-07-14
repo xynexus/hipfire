@@ -1,5 +1,6 @@
 *.npz
 _build/
+build/
 *.xclbin
 *.insts.bin
 __pycache__/

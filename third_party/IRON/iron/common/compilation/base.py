@@ -500,9 +500,18 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
         worklist = graph.get_worklist(FullElfArtifact)
         commands = []
 
+        # LLAMA_FULLELF_AIECC: use a specific aiecc for ONLY the
+        # --generate-full-elf step. The pinned mlir_aie mis-lowers the fused
+        # main-device DMA (aie.dma_bd on a memref.view of the arena block arg is
+        # rejected because the buffer tracer doesn't follow memref.view). A
+        # source-built aiecc that teaches the tracer memref.view fixes it, and
+        # still lowers the pinned-mlir_aie-generated MLIR. Per-op xclbins keep
+        # using self.aiecc_path. Default unset preserves original behavior.
+        _fe_aiecc = os.getenv("LLAMA_FULLELF_AIECC")
+
         for artifact in worklist:
             compile_cmd = [
-                str(self.aiecc_path),
+                _fe_aiecc if _fe_aiecc else str(self.aiecc_path),
                 "-v",
                 "-j1",
                 "--no-compile-host",
