@@ -28,6 +28,9 @@ where
     let mut suites: Vec<SuiteId> = Vec::new();
     let mut out_dir: Option<PathBuf> = None;
     let mut kv_mode: Option<String> = None;
+    let mut ctx: Option<usize> = None;
+    let mut corpus: Option<PathBuf> = None;
+    let mut kv_hierarchical = false;
     let mut max_tokens = 64usize;
     let mut dflash = DflashMode::Off;
     let mut profile = ProfileMode::Off;
@@ -121,7 +124,21 @@ where
                 i += 2;
             }
             "--kv-mode" => {
-                kv_mode = Some(take_value(&argv, i, "--kv-mode")?);
+                let mode = take_value(&argv, i, "--kv-mode")?;
+                validate_kv_mode(&mode)?;
+                kv_mode = Some(mode);
+                i += 2;
+            }
+            "--kv-hierarchical" => {
+                kv_hierarchical = true;
+                i += 1;
+            }
+            "--ctx" => {
+                ctx = Some(parse_usize(&take_value(&argv, i, "--ctx")?, "--ctx")?);
+                i += 2;
+            }
+            "--corpus" => {
+                corpus = Some(PathBuf::from(take_value(&argv, i, "--corpus")?));
                 i += 2;
             }
             "--max-tokens" => {
@@ -313,6 +330,9 @@ where
         suites,
         out_dir,
         kv_mode,
+        ctx,
+        corpus,
+        kv_hierarchical,
         max_tokens,
         dflash,
         profile,
@@ -365,7 +385,10 @@ pub fn usage() -> String {
        --out <dir>              output directory\n\
        --draft <path>           DFlash draft artifact\n\
        --dflash <off|auto|on>   DFlash mode (default: off)\n\
-       --kv-mode <mode>         KV mode metadata to record\n\
+       --kv-mode <mode>         KV cache mode: f32,q8,asym2,asym3,asym4,kvarn,fwht2,fwht3,fwht4 (passed to the model binary)\n\
+       --kv-hierarchical        enable the two-tier hot/cold KV cache in spawned binaries (sets HIPFIRE_KV_HIERARCHICAL=1; other HIPFIRE_KV_* knobs pass through the environment)\n\
+       --ctx <N>                context length for perplexity/long-context batteries (default: 512; overrides HIPFIRE_EVAL_PERPLEXITY_CTX)\n\
+       --corpus <path>          perplexity corpus path (overrides HIPFIRE_EVAL_PERPLEXITY_CORPUS)\n\
        --max-tokens <N>         short decode cap for execution batteries (default: 64)\n\
        --profile <off|passive>  profiling mode (default: off)\n\
        --quality-max-chunks <N> quality canary chunk cap\n\
@@ -453,6 +476,32 @@ fn parse_csv<T>(raw: &str, parse: fn(&str) -> Result<T, String>) -> Result<Vec<T
         .filter(|s| !s.trim().is_empty())
         .map(|s| parse(s.trim()))
         .collect()
+}
+
+/// Canonical KV-cache modes surfaced in help (human-facing set).
+pub(crate) const KV_MODE_CANONICAL: &[&str] = &[
+    "f32", "q8", "asym2", "asym3", "asym4", "kvarn", "fwht2", "fwht3", "fwht4",
+];
+
+/// Validate `--kv-mode` against the union of tokens the spawned binaries accept
+/// (`perplexity` and the `run` example). This only catches typos: the two
+/// binaries accept overlapping-but-not-identical sets (e.g. `kvarn` is
+/// perplexity-only; `turbo*` are `run` aliases), so we accept the union and let
+/// each binary reject a mode it does not implement. `--kv-hierarchical` gates
+/// the two-tier cache separately (it is not a `--kv-mode` value).
+fn validate_kv_mode(mode: &str) -> Result<(), String> {
+    const ACCEPTED: &[&str] = &[
+        "f32", "fp16", "fp32", "q8", "asym2", "asym3", "asym4", "turbo", "turbo2", "turbo3",
+        "turbo4", "kvarn", "fwht2", "fwht3", "fwht4",
+    ];
+    if ACCEPTED.contains(&mode) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown --kv-mode: {mode}\nvalid modes: {}",
+            KV_MODE_CANONICAL.join(", ")
+        ))
+    }
 }
 
 fn parse_usize(raw: &str, flag: &str) -> Result<usize, String> {

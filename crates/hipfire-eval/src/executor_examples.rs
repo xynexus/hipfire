@@ -839,15 +839,29 @@ pub(crate) fn parse_labeled_f64(s: &str, label: &str) -> Option<f64> {
         .ok()
 }
 
+/// Apply KV-cache environment to a spawned model subprocess. The two-tier
+/// hot/cold cache is env-gated (`HIPFIRE_KV_HIERARCHICAL`), not a `--kv-mode`
+/// value; other `HIPFIRE_KV_*` knobs are inherited from the caller's env
+/// (the parent process passes them through by default).
+pub(crate) fn apply_kv_env(cmd: &mut Command, config: &EvalConfig) {
+    if config.kv_hierarchical {
+        cmd.env("HIPFIRE_KV_HIERARCHICAL", "1");
+    }
+}
+
 pub(crate) fn run_examples_perplexity_model(
     config: &EvalConfig,
     ctx: &EvalContext,
     model: String,
 ) -> EvalResult {
     let label = "corpus_perplexity";
-    let corpus_rel = std::env::var("HIPFIRE_EVAL_PERPLEXITY_CORPUS").unwrap_or_else(|_| {
-        "benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt".into()
-    });
+    // Corpus: --corpus flag wins, then the env fallback, then the frozen slice.
+    let corpus_rel = config
+        .corpus
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| std::env::var("HIPFIRE_EVAL_PERPLEXITY_CORPUS").ok())
+        .unwrap_or_else(|| "benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt".into());
     let prompt_ref = prompt(&corpus_rel);
     // KLD needs a reference; absent ⇒ PPL-only (not a failure). See resolve_kldref.
     let kldref = resolve_kldref(&model, config);
@@ -892,9 +906,14 @@ pub(crate) fn run_examples_perplexity_model(
         ));
     }
 
-    let ctx_len = std::env::var("HIPFIRE_EVAL_PERPLEXITY_CTX")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+    // Context length: --ctx flag wins, then the env fallback, then 512.
+    let ctx_len = config
+        .ctx
+        .or_else(|| {
+            std::env::var("HIPFIRE_EVAL_PERPLEXITY_CTX")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+        })
         .unwrap_or(512);
     let kv_mode = config.kv_mode.as_deref().unwrap_or("q8").to_string();
     let mut args = vec![
@@ -915,7 +934,10 @@ pub(crate) fn run_examples_perplexity_model(
     }
     let command_display = format!("{} {}", bin.display(), args.join(" "));
     let started = SystemTime::now();
-    let output = match Command::new(&bin).args(&args).output() {
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args);
+    apply_kv_env(&mut cmd, config);
+    let output = match cmd.output() {
         Ok(o) => o,
         Err(err) => {
             let mut m = base_metrics.clone();

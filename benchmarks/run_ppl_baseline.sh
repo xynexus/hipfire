@@ -12,13 +12,14 @@ WARMUP="${WARMUP:-8}"
 OFFSET="${OFFSET:-0}"
 RESULTS="benchmarks/results/ppl_baseline_$(date -u +%Y%m%dT%H%M%SZ).md"
 
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 MODELS=(
-    "/home/kaden/.hipfire/models/qwen3.5-0.8b-mq4.hfq"
-    "/home/kaden/.hipfire/models/qwen3.5-0.8b-mq3.hfq"
-    "/home/kaden/.hipfire/models/qwen3.5-4b-mq4.hfq"
-    "/home/kaden/.hipfire/models/qwen3.5-4b-mq3.hfq"
-    "/home/kaden/.hipfire/models/qwen3.5-9b-mq4.hfq"
-    "/home/kaden/.hipfire/models/qwen3.5-9b-mq3.hfq"
+    "$MODELS_DIR/qwen3.5-0.8b-mq4.hfq"
+    "$MODELS_DIR/qwen3.5-0.8b-mq3.hfq"
+    "$MODELS_DIR/qwen3.5-4b-mq4.hfq"
+    "$MODELS_DIR/qwen3.5-4b-mq3.hfq"
+    "$MODELS_DIR/qwen3.5-9b-mq4.hfq"
+    "$MODELS_DIR/qwen3.5-9b-mq3.hfq"
 )
 CORPUS="dev/bench/data/wikitext2-test.txt"
 

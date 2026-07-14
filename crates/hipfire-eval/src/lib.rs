@@ -443,6 +443,19 @@ pub struct EvalConfig {
     pub suites: Vec<SuiteId>,
     pub out_dir: PathBuf,
     pub kv_mode: Option<String>,
+    /// `--ctx N`: context length for perplexity / long-context batteries.
+    /// Supersedes the `HIPFIRE_EVAL_PERPLEXITY_CTX` env fallback.
+    #[serde(default)]
+    pub ctx: Option<usize>,
+    /// `--corpus PATH`: perplexity corpus. Supersedes the
+    /// `HIPFIRE_EVAL_PERPLEXITY_CORPUS` env fallback.
+    #[serde(default)]
+    pub corpus: Option<PathBuf>,
+    /// `--kv-hierarchical`: enable the two-tier hot/cold KV cache in spawned
+    /// model binaries (sets `HIPFIRE_KV_HIERARCHICAL=1`). The two-tier cache is
+    /// env-gated, not a `--kv-mode` value.
+    #[serde(default)]
+    pub kv_hierarchical: bool,
     pub max_tokens: usize,
     pub dflash: DflashMode,
     pub profile: ProfileMode,
@@ -3254,6 +3267,9 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             suites: vec![],
             out_dir: PathBuf::from("out"),
             kv_mode: Some("q8".to_string()),
+            ctx: None,
+            corpus: None,
+            kv_hierarchical: false,
             max_tokens: 8,
             dflash: DflashMode::Off,
             profile: ProfileMode::Off,
@@ -7379,6 +7395,9 @@ more noise
             suites: vec![],
             out_dir: PathBuf::from("out"),
             kv_mode: None,
+            ctx: None,
+            corpus: None,
+            kv_hierarchical: false,
             max_tokens: 8,
             dflash: DflashMode::Off,
             profile: ProfileMode::Off,

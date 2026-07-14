@@ -26,8 +26,12 @@ Common options:
   --compare <model>         Model to compare against the candidate
   --baseline <model>        Deprecated alias for --compare
   --reference <model>       Higher precision reference model or fixture
-  --battery <a,b>           Batteries such as smoke,quality,speed,barrage
-  --suite <a,b>             Dataset/eval suites such as gpqa,lm_eval_micro
+  --battery <a,b>           Batteries such as smoke,quality,speed,barrage,perplexity,longctx
+  --suite <a,b>             Dataset/eval suites such as gpqa,ruler,niah,nolima
+  --kv-mode <mode>          KV cache mode: f32,q8,asym2,asym3,asym4,kvarn,fwht2,fwht3,fwht4
+  --kv-hierarchical         Enable the two-tier hot/cold KV cache (HIPFIRE_KV_HIERARCHICAL=1)
+  --ctx <N>                 Context length for perplexity/long-context batteries (default: 512)
+  --corpus <path>           Perplexity corpus path
   --benchmark               Run repeated samples and emit aggregate rows
   --runs <N>                Repeat each scored battery N times
   --force                   Ignore cache hits for this run
