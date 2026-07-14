@@ -79,8 +79,16 @@ patching — which removes the app's most fragile piece.
 
 ## Risks
 
-- M256 whole-encoder ELF may exceed program store where M1 decode fit (the core
-  risk; Rung A de-risks it cheaply).
+- ~~M256 whole-encoder ELF may exceed program store~~ — **largely retired.** The
+  fused ELF uses **temporal streaming, not spatial packing**: the 24-layer Llama
+  decode fuses into ONE ELF with only ~13 distinct operator sub-devices (RMSNorm,
+  GEMV, Transpose, …), each core's program **2.5–6.3 KB — well under the 16 KiB
+  limit**. Layers are DMA-schedule iterations over a fixed operator set; the
+  program does not grow with depth. hipfire hit 16 KiB because it *spatially packs*
+  attention+FFN+tail into each core; IRON runs one small op/core and streams. The
+  real M256 gate is therefore the **DMA / static BD-ID schedule** (R119/R120
+  regime), mitigable with `repeat_count`/outer-tiling DMA, BD reuse across layers,
+  and finer core tiling; per-layer fused ELFs are the graceful fallback.
 - Numerical fidelity of the IRON operators at Gemma3 specifics (query pre-attn
   scalar, QK-norm, GeGLU, dual RMSNorm) must match the GPU reference before any
   perf number counts.
