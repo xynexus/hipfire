@@ -80,9 +80,13 @@ the character name (substring scored via the shared runner). Non-commercial
 license carried in the manifest. Real-component assembly validated behind an
 `#[ignore]` test.
 
-### Phase 2c — RULER — PENDING
-Vendor generated slices via an in-repo RULER generator (start with the NIAH
-subtasks, then variable-tracking/aggregation). May be its own PR.
+### Phase 2c — RULER — DONE
+Vendored generated slices (`benchmarks/longctx/ruler/generate_ruler.py`) for two
+canonical RULER task families: S-NIAH (magic-number retrieval) and
+variable-tracking (chained assignments → recover all vars equal to a value), at
+4k/8k, in the NIAH multi-needle schema. Wired as a local suite (like Niah) via
+`ruler_materialized_items`. Recall-scored by the shared runner. Follow-up: the
+remaining RULER tasks (multi-key/value NIAH, CWE/FWE aggregation, QA).
 
 ### Phase 3 — graded long-context KLD bridge — DONE
 The perplexity battery now accepts a NIAH-family `.jsonl` fixture as `--corpus`:

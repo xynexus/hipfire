@@ -25,9 +25,12 @@ pub(crate) fn resolve_datasets(config: &EvalConfig) -> Result<Vec<DatasetManifes
             entries.push(builtin_dataset_entry(*suite));
             continue;
         }
-        // Niah / SequentialNiah ship as vendored in-repo fixtures — always
-        // available, no fetch (resolved by `resolve_repo_path` at run time).
-        if matches!(*suite, SuiteId::Niah | SuiteId::SequentialNiah) {
+        // Niah / SequentialNiah / Ruler ship as vendored in-repo fixtures —
+        // always available, no fetch (resolved by `resolve_repo_path` at run time).
+        if matches!(
+            *suite,
+            SuiteId::Niah | SuiteId::SequentialNiah | SuiteId::Ruler
+        ) {
             entries.push(local_longctx_dataset_entry(*suite));
             continue;
         }
@@ -145,6 +148,7 @@ pub(crate) fn builtin_dataset_entry(suite: SuiteId) -> DatasetManifestEntry {
 pub(crate) fn local_longctx_dataset_entry(suite: SuiteId) -> DatasetManifestEntry {
     let subdir = match suite {
         SuiteId::SequentialNiah => "benchmarks/longctx/seqniah",
+        SuiteId::Ruler => "benchmarks/longctx/ruler",
         _ => "benchmarks/longctx/niah",
     };
     let ids = selected_item_ids(suite);
@@ -308,7 +312,13 @@ pub(crate) fn selected_item_ids(suite: SuiteId) -> Vec<String> {
         SuiteId::HumanEval => vec!["HumanEval/0".to_string(), "HumanEval/53".to_string()],
         SuiteId::DeepSwe => vec!["deep_swe_verified:0".to_string()],
         SuiteId::SweBench => vec!["swe_bench_lite:0".to_string()],
-        SuiteId::Ruler => vec!["ruler_niah_4k:0".to_string()],
+        // Ruler: vendored generated slices (S-NIAH + variable-tracking).
+        SuiteId::Ruler => vec![
+            "ruler_niah_4k:0".to_string(),
+            "ruler_niah_8k:0".to_string(),
+            "ruler_vt_4k:0".to_string(),
+            "ruler_vt_8k:0".to_string(),
+        ],
         // NoLiMa: <needle_id>:<test_key>:<ctx>k:<book> over the HF components.
         SuiteId::NoLiMa => vec![
             "0401:T17_C02:4k:1".to_string(),
@@ -591,6 +601,12 @@ pub(crate) fn sequential_niah_materialized_items(
     item_ids: &[String],
 ) -> Result<Vec<LongCtxItem>, String> {
     niah_family_items(SuiteId::SequentialNiah, "longctx/seqniah", item_ids)
+}
+
+/// Ruler: vendored generated slices (S-NIAH + variable-tracking) from
+/// `benchmarks/longctx/ruler/`, in the NIAH multi-needle schema.
+pub(crate) fn ruler_materialized_items(item_ids: &[String]) -> Result<Vec<LongCtxItem>, String> {
+    niah_family_items(SuiteId::Ruler, "longctx/ruler", item_ids)
 }
 
 /// Locate the parquet shard for a k-chain (e.g. `k5` → `data/k5-00000-of-00001.parquet`)
@@ -1491,6 +1507,20 @@ mod longctx_tests {
         for secret in &it.expected {
             assert!(it.prompt.contains(secret));
         }
+    }
+
+    #[test]
+    fn ruler_materializes_niah_and_vt() {
+        let niah = ruler_materialized_items(&["ruler_niah_4k:0".to_string()])
+            .expect("ruler_niah_4k should materialize");
+        assert_eq!(niah[0].suite, SuiteId::Ruler);
+        assert_eq!(niah[0].expected.len(), 1);
+        assert!(niah[0].prompt.contains(&niah[0].expected[0]));
+        let vt = ruler_materialized_items(&["ruler_vt_4k:0".to_string()])
+            .expect("ruler_vt_4k should materialize");
+        // Variable tracking: multiple variables, full-chain recall required.
+        assert!(vt[0].expected.len() >= 3);
+        assert_eq!(vt[0].min_recovered, vt[0].expected.len());
     }
 
     #[test]

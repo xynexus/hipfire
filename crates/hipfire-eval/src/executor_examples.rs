@@ -3441,11 +3441,12 @@ pub(crate) fn examples_barrage_rows(
                     }
                 }
             }
-            (SuiteId::Niah | SuiteId::SequentialNiah, EvalStatus::Pass) => {
+            (SuiteId::Niah | SuiteId::SequentialNiah | SuiteId::Ruler, EvalStatus::Pass) => {
                 let materialized = match d.suite {
                     SuiteId::SequentialNiah => {
                         sequential_niah_materialized_items(&d.selected_item_ids)
                     }
+                    SuiteId::Ruler => ruler_materialized_items(&d.selected_item_ids),
                     _ => niah_materialized_items(&d.selected_item_ids),
                 };
                 match materialized {

@@ -1627,7 +1627,8 @@ fn barrage_rows(
                 SuiteId::Niah
                 | SuiteId::SequentialNiah
                 | SuiteId::NeedleChain
-                | SuiteId::NoLiMa => {
+                | SuiteId::NoLiMa
+                | SuiteId::Ruler => {
                     "long-context retrieval runs under the examples executor (use --executor examples)"
                         .to_string()
                 }

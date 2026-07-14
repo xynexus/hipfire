@@ -1538,7 +1538,7 @@ pub const ENV_HIPFIRE_EP_SKIP_ALLREDUCE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EVAL_DATASET_MIRROR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_DATASET_MIRROR",
     description: "Runtime variable controlling eval dataset mirror in hipfire",
-    source: "crates/hipfire-eval/src/datasets.rs:239",
+    source: "crates/hipfire-eval/src/datasets.rs:243",
 };
 
 /// `HIPFIRE_EVAL_EVIDENCE_DIR` — Runtime variable controlling eval evidence dir in hipfire
@@ -4174,14 +4174,14 @@ pub const ENV_HIPFIRE_TEST_LATENT: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TEST_NEEDLECHAIN_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TEST_NEEDLECHAIN_CACHE",
     description: "Runtime variable controlling test needlechain cache in hipfire",
-    source: "crates/hipfire-eval/src/datasets.rs:1520",
+    source: "crates/hipfire-eval/src/datasets.rs:1550",
 };
 
 /// `HIPFIRE_TEST_NOLIMA_CACHE` — Runtime variable controlling test nolima cache in hipfire
 pub const ENV_HIPFIRE_TEST_NOLIMA_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TEST_NOLIMA_CACHE",
     description: "Runtime variable controlling test nolima cache in hipfire",
-    source: "crates/hipfire-eval/src/datasets.rs:1541",
+    source: "crates/hipfire-eval/src/datasets.rs:1571",
 };
 
 /// `HIPFIRE_TIER_RATIO` — Runtime variable controlling tier ratio in hipfire
