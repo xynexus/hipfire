@@ -101,3 +101,16 @@ patching — which removes the app's most fragile piece.
 - **Next — Rung A (IRON graph).** Author the layer as an IRON graph at M256, one
   operator at a time verified against `numpy_reference` intermediates, compile with
   the fixed `build/bin/aiecc`, dispatch, then fuse to one ELF. Then Rung B stacks 24.
+- **Rung A de-risked — it's composition, not authoring.** The vendored IRON
+  operator library (`third_party/IRON/iron/operators/`) already provides every
+  building block the layer needs: `rms_norm` (weighted), `gemm`, `gemv`, `rope`,
+  `mha`/`softmax`, `gelu`, `elementwise_add`/`elementwise_mul`, `swiglu`. So Rung A
+  is: instantiate each at EmbeddingGemma dims → verify each vs `numpy_reference`
+  intermediates on the NPU (single-op xclbin, no full-ELF needed) → compose into a
+  fused layer via `FusedMLIROperator` (the same runlist path the Llama decode uses)
+  → compile with the fixed `build/bin/aiecc`. Gemma specifics map onto library ops:
+  RMSNorm weight passed as `(1+w)`; QK-norm = rms_norm at tile 256; GeGLU = gelu +
+  elementwise_mul; separate q/k/v = three gemm instances.
+  Order of work: (1) rms_norm@[256,768] vs oracle input_layernorm; (2) the 3 QKV
+  gemms; (3) qk-norm + rope + mha attention block; (4) o_proj + residual;
+  (5) GeGLU FFN + residual; (6) fuse the 6 into one layer ELF; (7) Rung B: stack 24.
