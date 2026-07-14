@@ -1,0 +1,106 @@
+From 03475e79670926606bb316df6133c157269f69f9 Mon Sep 17 00:00:00 2001
+From: Sadara Kael <sadara@gmail.com>
+Date: Tue, 14 Jul 2026 18:02:12 +0800
+Subject: [PATCH] [AIEX] Trace memref.view in dma_bd buffer lowering
+
+AIEDMATasksToNPU (aie-dma-tasks-to-npu) resolves a dma_bd's buffer to a
+runtime-sequence block argument via traceSubviewToBlockArgument, which
+follows memref.cast / reinterpret_cast / subview. It did not follow
+memref.view, so a BD whose buffer is a memref.view slice of a runtime
+input failed with:
+
+  'aie.dma_bd' op Buffer argument must be a constant aie.buffer, a runtime
+   sequence input argument, or a (chain of) subview(s) or cast(s) ...
+
+This is the pattern the fused whole-model --generate-full-elf lowering
+emits: every DMA buffer is a typed memref.view slice of one flat byte
+arena passed as a runtime-sequence input. A memref.view result has an
+identity layout, so tracing only needs to accumulate the constant byte
+offset and follow the source. Adds a good_view.mlir regression test.
+---
+ lib/Dialect/AIEX/Utils/AIEUtils.cpp           | 19 ++++++++++
+ .../dma-tasks-to-npu/good_view.mlir           | 35 +++++++++++++++++++
+ 2 files changed, 54 insertions(+)
+ create mode 100644 test/bd-chains-and-dma-tasks/dma-tasks-to-npu/good_view.mlir
+
+diff --git a/lib/Dialect/AIEX/Utils/AIEUtils.cpp b/lib/Dialect/AIEX/Utils/AIEUtils.cpp
+index 3b6643f54ae..7b267a8d6af 100644
+--- a/lib/Dialect/AIEX/Utils/AIEUtils.cpp
++++ b/lib/Dialect/AIEX/Utils/AIEUtils.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "aie/Dialect/AIEX/AIEUtils.h"
+ #include "aie/Dialect/AIEX/IR/AIEXDialect.h"
++#include "mlir/Dialect/Utils/StaticValueUtils.h"
+ 
+ using namespace mlir;
+ using namespace xilinx;
+@@ -115,6 +116,24 @@ AIEX::traceSubviewToBlockArgument(Value value) {
+       continue;
+     }
+ 
++    // Handle memref.view. The fused full-ELF path materializes every DMA
++    // buffer as a typed, contiguous view sliced out of a single flat byte
++    // arena (a runtime-sequence block argument) at a constant byte offset:
++    //   %v = memref.view %arena[%byte_off][] : memref<Nxi8> to memref<...>
++    // A memref.view result always has an identity (contiguous) layout, so only
++    // the byte offset needs to be accumulated before following the source.
++    if (auto viewOp = dyn_cast<memref::ViewOp>(defOp)) {
++      if (!viewOp.getSizes().empty())
++        return std::nullopt; // dynamic result sizes unsupported
++      std::optional<int64_t> byteShift =
++          getConstantIntValue(viewOp.getByteShift());
++      if (!byteShift)
++        return std::nullopt; // non-constant byte offset
++      offsetInBytes += *byteShift;
++      current = viewOp.getSource();
++      continue;
++    }
++
+     // Encountered an unsupported operation
+     return std::nullopt;
+   }
+diff --git a/test/bd-chains-and-dma-tasks/dma-tasks-to-npu/good_view.mlir b/test/bd-chains-and-dma-tasks/dma-tasks-to-npu/good_view.mlir
+new file mode 100644
+index 00000000000..30ab48501ca
+--- /dev/null
++++ b/test/bd-chains-and-dma-tasks/dma-tasks-to-npu/good_view.mlir
+@@ -0,0 +1,35 @@
++//
++// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++
++// RUN: aie-opt --aie-dma-tasks-to-npu %s | FileCheck %s
++
++// Test that memref.view is correctly traced through when configuring DMA tasks.
++// This is the pattern the fused whole-model (--generate-full-elf) lowering emits:
++// every DMA buffer is a typed memref.view slice of one flat byte-arena runtime
++// sequence input argument at a constant byte offset. Without tracing view, the
++// buffer fails to resolve to its block argument and the BD cannot be lowered.
++
++module {
++  aie.device(npu1) {
++    %tile_0_0 = aie.tile(0, 0)
++
++    aie.runtime_sequence(%arg0: memref<1024xi8>) {
++      // View at byte offset 128 -> address patch arg_plus = 128.
++      // CHECK: aiex.npu.writebd
++      // CHECK: aiex.npu.address_patch {addr = {{.*}}, arg_idx = 0 : i32, arg_plus = 128 : i32}
++      %c128 = arith.constant 128 : index
++      %view = memref.view %arg0[%c128][] : memref<1024xi8> to memref<128xi16>
++      %t1 = aiex.dma_configure_task(%tile_0_0, MM2S, 0) {
++        aie.dma_bd(%view : memref<128xi16>, 0, 128) {bd_id = 7 : i32}
++        aie.end
++      } {issue_token = true}
++
++      // CHECK: aiex.npu.push_queue(0, 0, MM2S : 0) {bd_id = 7 : i32, issue_token = true, repeat_count = 0 : i32}
++      aiex.dma_start_task(%t1)
++      // CHECK: aiex.npu.sync
++      aiex.dma_await_task(%t1)
++    }
++  }
++}
+-- 
+2.53.0
+

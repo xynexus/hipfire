@@ -1,0 +1,78 @@
+diff --git a/third_party/IRON/iron/applications/llama_3.2_1b/llama_npu.py b/third_party/IRON/iron/applications/llama_3.2_1b/llama_npu.py
+index f5c565d71..309b35e25 100755
+--- a/third_party/IRON/iron/applications/llama_3.2_1b/llama_npu.py
++++ b/third_party/IRON/iron/applications/llama_3.2_1b/llama_npu.py
+@@ -277,6 +277,16 @@ class AIELlamaOperators:
+             .get_callable()
+         )
+ 
++        # LLAMA_SKIP_FUSED_DECODE: skip ALL decode-operator construction and the
++        # fused whole-model decode ELF (aiecc --generate-full-elf currently fails
++        # NPU lowering on a fused aie.dma_bd). Only the per-op prefill path above
++        # is built; decode runs by re-prefill (use_kv_cache=False in main). This
++        # is the whole tail of __init__, so an early return is safe. Default unset
++        # preserves original fused-decode behavior.
++        import os
++        if os.getenv("LLAMA_SKIP_FUSED_DECODE"):
++            return
++
+         # Decode operator (everything temporally fused)
+         # ##################################################################
+ 
+@@ -1284,15 +1294,17 @@ def llama_forward_pass(config, state):
+     if seq_len > 1:
+         ret = llama_forward_pass_prefill(config, state)
+         state.num_preceding_tokens = state.token_ids.shape[1]
+-        # Pass KV cache data onto fused decode operator
+-        for layer_idx in range(config.n_layers):
+-            aie_ops.decode.fused.get_buffer(f"keys_cache_{layer_idx}").torch_view()[
+-                :
+-            ] = (aie_buffers.keys_cache[layer_idx].to_torch().flatten())
+-            aie_ops.decode.fused.get_buffer(f"values_cache_{layer_idx}").torch_view()[
+-                :
+-            ] = (aie_buffers.values_cache[layer_idx].to_torch().flatten())
+-        aie_ops.decode.fused.scratch_buffer.to("cpu")
++        import os
++        if not os.getenv("LLAMA_SKIP_FUSED_DECODE"):
++            # Pass KV cache data onto fused decode operator
++            for layer_idx in range(config.n_layers):
++                aie_ops.decode.fused.get_buffer(f"keys_cache_{layer_idx}").torch_view()[
++                    :
++                ] = (aie_buffers.keys_cache[layer_idx].to_torch().flatten())
++                aie_ops.decode.fused.get_buffer(f"values_cache_{layer_idx}").torch_view()[
++                    :
++                ] = (aie_buffers.values_cache[layer_idx].to_torch().flatten())
++            aie_ops.decode.fused.scratch_buffer.to("cpu")
+         return ret
+     else:
+         ret = llama_forward_pass_decode(config, state)
+@@ -1305,6 +1317,12 @@ def main():
+     logging.basicConfig(level=logging.DEBUG)
+     args = harness.parse_args()
+ 
++    # LLAMA_MAX_SEQ_LEN: size the per-op prefill operators to just cover the
++    # sequence. The non-fused (re-prefill) decode reprocesses the whole padded
++    # sequence each step, so a smaller max_seq_len is dramatically faster.
++    import os
++    max_seq_len = int(os.getenv("LLAMA_MAX_SEQ_LEN", str(max_seq_len)))
++
+     assert (
+         max_seq_len >= args.prompt_len + args.num_tokens
+     ), "max_seq_len must be at least prompt_len + num_tokens"
+@@ -1317,8 +1335,15 @@ def main():
+     aie_buffers = AIELlamaBuffers(config, max_seq_len, aie_ops)
+ 
+     print(prompt, end="", flush=True)
++    import os
++    # When the fused decode ELF is skipped, decode must re-run prefill over the
++    # growing sequence (use_kv_cache=False) so every step goes through the per-op
++    # path (prefill pads to max_seq_len=2048, so a growing seq_len <= 2048 reuses
++    # the same M2048 operators). Default (fused decode present) keeps kv-cache.
+     harness.generate(
+-        config, state, llama_forward_pass, use_kv_cache=True, num_tokens=args.num_tokens
++        config, state, llama_forward_pass,
++        use_kv_cache=not os.getenv("LLAMA_SKIP_FUSED_DECODE"),
++        num_tokens=args.num_tokens,
+     )
+ 
+ 

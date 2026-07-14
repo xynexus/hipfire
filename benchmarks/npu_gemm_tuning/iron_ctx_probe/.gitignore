@@ -1,0 +1,4 @@
+_build/
+phase2_llama/_build/
+*.xclbin
+*.insts.bin
