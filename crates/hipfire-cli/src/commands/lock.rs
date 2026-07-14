@@ -64,8 +64,21 @@ enum LockAction {
         #[arg(long, default_value_t = default_poll())]
         poll_secs: u64,
     },
-    /// Release the GPU lock (SIGTERM the holder recorded in the lockfile).
-    Release,
+    /// Release the GPU lock (SIGTERM the recorded holder + its `run` process
+    /// group). With a `label`, only releases a matching holder (a safety guard so
+    /// `release <name>` never drops another agent's lock); `--all` releases
+    /// regardless of the recorded label; `--force` escalates to SIGKILL for a
+    /// wedged holder (and also ignores the label). No-op if the lock is free.
+    Release {
+        /// Only release if the recorded holder label matches (safety guard).
+        label: Option<String>,
+        /// Release regardless of which label holds the lock.
+        #[arg(long)]
+        all: bool,
+        /// Escalate to SIGKILL for a wedged holder (also ignores the label).
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Print lock status: "gpu is free" or "gpu BUSY: <holder>".
     Status,
     /// Forcibly free the lock by signalling its recorded holder — and, for a
@@ -145,7 +158,7 @@ pub fn run(args: LockArgs) -> anyhow::Result<()> {
             timeout_secs,
             poll_secs,
         } => acquire(&label, watch_pid, timeout_secs, poll_secs.max(1)),
-        LockAction::Release => release(),
+        LockAction::Release { label, all, force } => release_lock(label.as_deref(), all, force),
         LockAction::Status => {
             println!("{}", status_line());
             Ok(())
@@ -250,17 +263,37 @@ fn acquire(
     Ok(())
 }
 
-fn release() -> anyhow::Result<()> {
-    let path = lockfile_path();
-    let Some(holder_pid) = read_holder_pid(&path) else {
+fn release_lock(label: Option<&str>, all: bool, force: bool) -> anyhow::Result<()> {
+    release_lock_at(&lockfile_path(), label, all, force)
+}
+
+/// Release the GPU lock. When `label` is named and neither `--all` nor `--force`
+/// is set, only a holder whose recorded label matches is released (so
+/// `release <name>` cannot drop another agent's lock); otherwise the recorded
+/// holder (and its `run` process group) is signalled — SIGKILL under `--force`,
+/// else SIGTERM. No-op if the lock is free. Parameterized on `path` for tests.
+fn release_lock_at(
+    path: &std::path::Path,
+    label: Option<&str>,
+    all: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    if matches!(hipfire_lock::probe(path), Ok(hipfire_lock::LockState::Free)) {
         eprintln!("[gpu-lock] no lock held");
         return Ok(());
-    };
-    if pid_alive(holder_pid) {
-        unsafe { libc::kill(holder_pid, libc::SIGTERM) };
     }
-    eprintln!("[gpu-lock] released");
-    Ok(())
+    if let (Some(want), false, false) = (label, all, force) {
+        let holder = read_holder(path).unwrap_or_default();
+        // The label is the first whitespace-delimited field of the holder line.
+        let held_label = holder.split_whitespace().next().unwrap_or("");
+        if held_label != want {
+            eprintln!(
+                "[gpu-lock] held by '{held_label}', not '{want}'; use --all to release regardless or --force to SIGKILL"
+            );
+            return Ok(());
+        }
+    }
+    kill_holder_at(path, force)
 }
 
 fn kill_holder(force: bool) -> anyhow::Result<()> {
@@ -656,6 +689,39 @@ mod tests {
         // We still hold the flock, so probe() sees Busy; the recorded pid is dead.
         assert!(kill_holder_at(&path, true).is_ok());
         assert!(guard.is_locked(), "our own lock must be untouched");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn release_on_free_lock_is_noop() {
+        let path = temp_lock("rel-free");
+        assert!(release_lock_at(&path, Some("x"), false, false).is_ok());
+        assert!(release_lock_at(&path, None, true, true).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn release_label_guard_matches_and_overrides() {
+        // Holder pid is a dead sentinel, so kill_holder_at never signals — we
+        // only exercise the label-guard control flow.
+        let path = temp_lock("rel-guard");
+        let mut guard = hipfire_lock::FlockGuard::open(&path).unwrap();
+        assert!(guard.try_lock().unwrap());
+        guard
+            .write_holder("job holder=2147483646 pgid=2147483646 mode=run")
+            .unwrap();
+        // Named a different label, no override → refuse (our lock stays held).
+        assert!(release_lock_at(&path, Some("other"), false, false).is_ok());
+        assert!(guard.is_locked(), "mismatched label must not release");
+        // Matching label proceeds; --all and --force bypass the label guard.
+        assert!(release_lock_at(&path, Some("job"), false, false).is_ok());
+        assert!(release_lock_at(&path, Some("other"), true, false).is_ok());
+        assert!(release_lock_at(&path, Some("other"), false, true).is_ok());
+        assert!(
+            guard.is_locked(),
+            "our own flock stays held (recorded holder pid is dead)"
+        );
         drop(guard);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
