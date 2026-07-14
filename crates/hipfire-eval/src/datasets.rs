@@ -309,7 +309,11 @@ pub(crate) fn selected_item_ids(suite: SuiteId) -> Vec<String> {
         SuiteId::DeepSwe => vec!["deep_swe_verified:0".to_string()],
         SuiteId::SweBench => vec!["swe_bench_lite:0".to_string()],
         SuiteId::Ruler => vec!["ruler_niah_4k:0".to_string()],
-        SuiteId::NoLiMa => vec!["nolima_4k:0".to_string()],
+        // NoLiMa: <needle_id>:<test_key>:<ctx>k:<book> over the HF components.
+        SuiteId::NoLiMa => vec![
+            "0401:T17_C02:4k:1".to_string(),
+            "0401:T15_C02:4k:2".to_string(),
+        ],
         // NeedleChain: <k-chain>:<ordering>:<row> over the HF parquet shards.
         SuiteId::NeedleChain => vec!["k5:forward:0".to_string(), "k10:forward:0".to_string()],
         // Niah / SequentialNiah: <fixture>:<row> over vendored local fixtures.
@@ -755,6 +759,126 @@ pub(crate) fn needlechain_materialized_items(
                     .and_then(OsStr::to_str)
                     .unwrap_or("needlechain.parquet")
             ),
+        });
+    }
+    Ok(out)
+}
+
+/// Parse a `<ctx>k` shard token (e.g. `4k` → 4096) into a token budget.
+fn parse_ctx_k(tok: &str) -> Option<usize> {
+    let n: usize = tok.trim_end_matches('k').parse().ok()?;
+    Some(n * 1024)
+}
+
+/// NoLiMa: assemble a needle-in-book test from the HF components
+/// (`amodaresi/NoLiMa`: needle templates + haystack books). Item id is
+/// `<needle_id>:<test_key>:<ctx>k:<book>`, e.g. `0401:T17_C02:4k:1`. The needle
+/// (`{CHAR} lives next to {1}`) is inserted at mid-depth into a book truncated
+/// to the context budget; the one-hop question asks which character has been to
+/// `{2}` (the place `{1}` is located in). Expected answer = the character name.
+pub(crate) fn nolima_materialized_items(
+    cache_path: &Path,
+    item_ids: &[String],
+) -> Result<Vec<LongCtxItem>, String> {
+    let needle_set_path = cache_path.join("needlesets/needle_set.json");
+    let text = fs::read_to_string(&needle_set_path)
+        .map_err(|e| format!("read {}: {e}", needle_set_path.display()))?;
+    let needle_set: Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse needle_set.json: {e}"))?;
+    let needles = needle_set
+        .as_array()
+        .ok_or("needle_set.json is not a JSON array")?;
+
+    let mut out = Vec::new();
+    for id in item_ids {
+        let parts: Vec<&str> = id.split(':').collect();
+        if parts.len() != 4 {
+            return Err(format!(
+                "bad NoLiMa item id: {id} (want <needle_id>:<test_key>:<ctx>k:<book>)"
+            ));
+        }
+        let (needle_id, test_key, ctx_tok, book_tok) = (parts[0], parts[1], parts[2], parts[3]);
+        let ctx_tokens =
+            parse_ctx_k(ctx_tok).ok_or_else(|| format!("bad NoLiMa ctx {ctx_tok} in {id}"))?;
+
+        let needle = needles
+            .iter()
+            .find(|n| n.get("id").and_then(Value::as_str) == Some(needle_id))
+            .ok_or_else(|| format!("NoLiMa needle {needle_id} not found"))?;
+        let task_template = needle
+            .get("task_template")
+            .and_then(Value::as_str)
+            .ok_or("needle missing task_template")?;
+        let needle_tmpl = needle
+            .get("needle")
+            .and_then(Value::as_str)
+            .ok_or("needle missing needle template")?;
+        let question_tmpl = needle
+            .get("questions")
+            .and_then(|q| q.get("onehop"))
+            .and_then(Value::as_str)
+            .ok_or("needle missing questions.onehop")?;
+        let character_set: Vec<&str> = needle
+            .get("character_set")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if character_set.is_empty() {
+            return Err(format!("NoLiMa needle {needle_id} has empty character_set"));
+        }
+        let args: Vec<&str> = needle
+            .get("tests")
+            .and_then(|t| t.get(test_key))
+            .and_then(|t| t.get("input_args"))
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .ok_or_else(|| format!("NoLiMa test {test_key} not found for needle {needle_id}"))?;
+        if args.len() < 2 {
+            return Err(format!("NoLiMa test {test_key} has too few input_args"));
+        }
+        // Character index encoded in the test key suffix (…_C0N).
+        let char_idx = test_key
+            .rsplit_once('C')
+            .and_then(|(_, n)| n.trim_start_matches('0').parse::<usize>().ok())
+            .unwrap_or(0);
+        let character = character_set[char_idx % character_set.len()];
+
+        let fill = |t: &str| -> String {
+            let mut s = t.replace("{CHAR}", character).replace("{1}", args[0]);
+            s = s.replace("{2}", args[1]);
+            if let Some(a3) = args.get(2) {
+                s = s.replace("{3}", a3);
+            }
+            s
+        };
+        let needle_sentence = fill(needle_tmpl);
+        let question = fill(question_tmpl);
+
+        // Truncate a haystack book to the context budget and insert the needle
+        // at mid-depth (char-based to stay UTF-8 safe).
+        let book_path = cache_path.join(format!("haystack/rand_shuffle/rand_book_{book_tok}.txt"));
+        let book = fs::read_to_string(&book_path)
+            .map_err(|e| format!("read NoLiMa book {}: {e}", book_path.display()))?;
+        let budget_chars = ctx_tokens.saturating_mul(4);
+        let chars: Vec<char> = book.chars().take(budget_chars).collect();
+        let mid = chars.len() / 2;
+        let head: String = chars[..mid].iter().collect();
+        let tail: String = chars[mid..].iter().collect();
+        let haystack = format!("{head}\n\n{needle_sentence}\n\n{tail}");
+        let prompt = task_template
+            .replace("{haystack}", &haystack)
+            .replace("{question}", &question);
+
+        out.push(LongCtxItem {
+            item_id: id.clone(),
+            suite: SuiteId::NoLiMa,
+            case_id: "nolima_native".to_string(),
+            task: format!("nolima:{needle_id}:{test_key}"),
+            prompt,
+            expected: vec![character.to_string()],
+            min_recovered: 1,
+            context_tokens: ctx_tokens,
+            dataset_file: format!("needle_set.json#{needle_id}/{test_key}"),
         });
     }
     Ok(out)
@@ -1405,5 +1529,27 @@ mod longctx_tests {
         assert_eq!(it.min_recovered, 1);
         // The chain text and the compute-the-total question are both present.
         assert!(it.prompt.contains("total"));
+    }
+
+    // Fetch-dependent assembly check. Point HIPFIRE_TEST_NOLIMA_CACHE at a dir
+    // containing needlesets/needle_set.json + haystack/rand_shuffle/rand_book_*.txt
+    // and run:
+    //   cargo test -p hipfire-eval nolima_assembles_from_components -- --ignored
+    #[test]
+    #[ignore]
+    fn nolima_assembles_from_components() {
+        let cache = std::env::var("HIPFIRE_TEST_NOLIMA_CACHE")
+            .expect("set HIPFIRE_TEST_NOLIMA_CACHE to the fetched cache dir");
+        let items =
+            nolima_materialized_items(Path::new(&cache), &["0401:T17_C02:4k:1".to_string()])
+                .expect("materialize NoLiMa item");
+        let it = &items[0];
+        assert_eq!(it.suite, SuiteId::NoLiMa);
+        assert_eq!(it.expected.len(), 1);
+        assert_eq!(it.context_tokens, 4096);
+        // The expected character answer and the assembled question are present.
+        assert!(it.prompt.contains(&it.expected[0]));
+        assert!(it.prompt.contains("Question:"));
+        assert!(it.prompt.len() > 4000);
     }
 }

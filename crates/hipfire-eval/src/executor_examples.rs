@@ -3384,6 +3384,34 @@ pub(crate) fn examples_barrage_rows(
                     }
                 }
             }
+            (SuiteId::NoLiMa, EvalStatus::Pass) => {
+                match nolima_materialized_items(Path::new(&d.cache_path), &d.selected_item_ids) {
+                    Ok(items) => {
+                        rows.extend(items.into_iter().flat_map(|item| {
+                            evaluation_models(config).into_iter().map(move |model| {
+                                run_examples_longctx_item(config, ctx, d, item.clone(), model)
+                            })
+                        }));
+                    }
+                    Err(reason) => {
+                        rows.extend(d.selected_item_ids.iter().cloned().map(|id| {
+                            let mut metrics = BTreeMap::new();
+                            add_dataset_provenance_metrics(&mut metrics, d);
+                            skip_row_with_metrics(
+                                BatteryId::Barrage,
+                                Some(SuiteId::NoLiMa),
+                                "nolima_materialize_failed",
+                                Some(id),
+                                &reason,
+                                config,
+                                ctx,
+                                None,
+                                metrics,
+                            )
+                        }));
+                    }
+                }
+            }
             (SuiteId::NeedleChain, EvalStatus::Pass) => {
                 match needlechain_materialized_items(Path::new(&d.cache_path), &d.selected_item_ids)
                 {

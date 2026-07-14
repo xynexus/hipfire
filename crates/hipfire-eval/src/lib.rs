@@ -1624,7 +1624,10 @@ fn barrage_rows(
             let reason = d.reason.clone().unwrap_or_else(|| match d.suite {
                 // These are implemented under the examples executor; this
                 // fallback only fires when a non-examples executor is selected.
-                SuiteId::Niah | SuiteId::SequentialNiah | SuiteId::NeedleChain => {
+                SuiteId::Niah
+                | SuiteId::SequentialNiah
+                | SuiteId::NeedleChain
+                | SuiteId::NoLiMa => {
                     "long-context retrieval runs under the examples executor (use --executor examples)"
                         .to_string()
                 }

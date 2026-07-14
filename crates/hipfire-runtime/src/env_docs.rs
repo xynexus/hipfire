@@ -4174,7 +4174,14 @@ pub const ENV_HIPFIRE_TEST_LATENT: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TEST_NEEDLECHAIN_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TEST_NEEDLECHAIN_CACHE",
     description: "Runtime variable controlling test needlechain cache in hipfire",
-    source: "crates/hipfire-eval/src/datasets.rs:1396",
+    source: "crates/hipfire-eval/src/datasets.rs:1520",
+};
+
+/// `HIPFIRE_TEST_NOLIMA_CACHE` — Runtime variable controlling test nolima cache in hipfire
+pub const ENV_HIPFIRE_TEST_NOLIMA_CACHE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_TEST_NOLIMA_CACHE",
+    description: "Runtime variable controlling test nolima cache in hipfire",
+    source: "crates/hipfire-eval/src/datasets.rs:1541",
 };
 
 /// `HIPFIRE_TIER_RATIO` — Runtime variable controlling tier ratio in hipfire
@@ -5144,6 +5151,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_TARGET_ARCH,
     ENV_HIPFIRE_TEST_LATENT,
     ENV_HIPFIRE_TEST_NEEDLECHAIN_CACHE,
+    ENV_HIPFIRE_TEST_NOLIMA_CACHE,
     ENV_HIPFIRE_TIER_RATIO,
     ENV_HIPFIRE_TINYQUANT_FAMILIES,
     ENV_HIPFIRE_TINYQUANT_RECORD,

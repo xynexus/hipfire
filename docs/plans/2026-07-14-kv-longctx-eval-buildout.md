@@ -71,9 +71,14 @@ Shared long-context barrage runner, then the three suites. Template:
   numeric-match scoring.
 - Per-suite `_materialized_items`, registration touch points, unit tests.
 
-### Phase 2b — NoLiMa — PENDING
-Assemble needle-in-book at depths/lengths + faithful scoring from
-`amodaresi/NoLiMa` components. Record the non-commercial license in the manifest.
+### Phase 2b — NoLiMa — DONE
+`nolima_materialized_items` assembles a needle-in-book test from the
+`amodaresi/NoLiMa` components: needle template (`{CHAR} lives next to {1}`) +
+one-hop question, character chosen by the test key's `_C0N` suffix, inserted at
+mid-depth into a haystack book truncated to the ctx budget. Expected answer =
+the character name (substring scored via the shared runner). Non-commercial
+license carried in the manifest. Real-component assembly validated behind an
+`#[ignore]` test.
 
 ### Phase 2c — RULER — PENDING
 Vendor generated slices via an in-repo RULER generator (start with the NIAH
