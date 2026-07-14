@@ -91,13 +91,37 @@ this is the *pure* KV-quant effect, not weight quant):
 Reproduce: `perplexity MODEL corpus.txt --ctx 4096 --kv-mode f32 --dump-ref
 ref.pkld`, then `--kv-mode kvarn --kld-ref ref.pkld` at `HIPFIRE_KVARN_BITS`=4/8.
 
-## Remaining work
+## Verdict (2026-07-14): don't swap the hot ring — use single-tier 8-bit kvarn
 
-1. **Swap the f16 hot ring for 8-bit kvarn** (`kv_hier.rs`). The container +
-   kernels exist; the hot read (`attention_cold_slots` layout-2) would move onto
-   the kvarn dequant path. 8-bit gives attn-KLD 3.8e-4 (negligible) at 2× smaller
-   than f16 → ~2× hot-tier win. Re-validate exact recall + end-to-end KLD
-   (confirm 8-bit ≈ f16 at the model level, not just the tile).
+Investigated the swap; it's the wrong move. Two reasons:
+
+1. **Structural mismatch.** The hot ring is a **per-token** f16 ring
+   (`hot_budget × HD`, written per token via `cast_f32_to_f16`, read via
+   `attention_cold_slots` layout-2). kvarn is **128-token-block** quantized — it
+   can't quantize a per-token ring without re-quantizing the whole window each
+   step. f16-per-token is the *right* fit for the exact tier; that's why the
+   design uses it.
+2. **The goal is already met.** For "near-lossless KV, smaller than f16, no f16
+   tier," just use **single-tier 8-bit kvarn** (`--kv-mode kvarn` +
+   `HIPFIRE_KVARN_BITS=8`, no `--kv-hierarchical`): model KLD **1.1e-5** (§Model-
+   level KLD), 2× smaller than f16, with only a one-block fp16 window. No code
+   change. The 512-token f16 hot ring only exists to protect recent tokens when
+   the **cold tier is aggressively lossy (4-bit + merge)** for very long context —
+   there, per-token f16 is correct and the ~16 MB tier isn't worth a read-path
+   rework (halving it saves ~8 MB).
+
+**So:** near-lossless long-context → single-tier 8-bit kvarn (done).
+Aggressive compression → hierarchical (f16 hot + 4-bit merged cold), keep f16 hot.
+If a smaller *hierarchical* hot ring is ever wanted, the fit is a **per-token
+8-bit affine** ring (like the existing Q8 V tier), NOT block-kvarn — and that
+needs a new K read layout for ~8 MB, so it's not worth it now.
+
+## Live guidance
+
+- `--kv-mode kvarn --kvarn-bits 8` (single-tier) = the near-lossless, 2×-smaller
+  KV. Default `--kvarn-bits 4` is already near-harmless (KV KLD 9e-4).
+- Weight quant dominates model KLD (mq4 ≈ 0.08 vs KV's 9e-4) — chase oq4 weights
+  for quality, not KV bits.
 2. **Lloyd-Max / codebook kvarn (per-bit fidelity).** Since it's precision-
    limited, a non-uniform quantizer fit to the balanced-tile distribution
    typically buys ~0.5–1 bit vs uniform min/max at the same storage — the repo
