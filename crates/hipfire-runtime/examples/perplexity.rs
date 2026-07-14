@@ -329,7 +329,7 @@ fn main() {
             config.n_kv_heads,
             config.head_dim,
             kv_max,
-            4,
+            KvCache::kvarn_bits_from_env(),
         )
         .unwrap(),
         "asym3" => KvCache::new_gpu_asym3(

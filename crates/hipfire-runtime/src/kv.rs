@@ -1188,6 +1188,21 @@ impl KvCache {
     /// block) plus an fp16 recent-window ring for the trailing partial block;
     /// V at Q8_0 (identical layout to asym4's V). Back-compat wrapper:
     /// `physical_cap == max_seq_len`. See [`new_gpu_kvarn_capped`].
+    /// KVarN K bits from `HIPFIRE_KVARN_BITS` (default 4). Valid: 2, 4, 8. 4-bit
+    /// is lossy vs f16 (~0.085 KLD, precision-limited); 8-bit is ~165× lower KLD
+    /// at 2× the K storage — see `docs/todo/kvarn-hot-bitwidth.md`.
+    pub fn kvarn_bits_from_env() -> usize {
+        match std::env::var("HIPFIRE_KVARN_BITS").ok().as_deref() {
+            Some("2") => 2,
+            Some("8") => 8,
+            Some("4") | None => 4,
+            Some(other) => {
+                eprintln!("[kvarn] HIPFIRE_KVARN_BITS={other} invalid (want 2|4|8); using 4");
+                4
+            }
+        }
+    }
+
     pub fn new_gpu_kvarn(
         gpu: &mut Gpu,
         n_layers: usize,

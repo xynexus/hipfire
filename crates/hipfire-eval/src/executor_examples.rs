@@ -869,8 +869,13 @@ pub(crate) fn longctx_corpus_from_fixture(
 /// (setting it under a non-kvarn cache would be a no-op at best). Other
 /// `HIPFIRE_KV_*` knobs are inherited from the caller's env.
 pub(crate) fn apply_kv_env(cmd: &mut Command, config: &EvalConfig, kv_mode: &str) {
-    if config.kv_hierarchical && kv_mode == "kvarn" {
-        cmd.env("HIPFIRE_KV_HIERARCHICAL", "1");
+    if kv_mode == "kvarn" {
+        if config.kv_hierarchical {
+            cmd.env("HIPFIRE_KV_HIERARCHICAL", "1");
+        }
+        if let Some(bits) = config.kvarn_bits {
+            cmd.env("HIPFIRE_KVARN_BITS", bits.to_string());
+        }
     }
 }
 

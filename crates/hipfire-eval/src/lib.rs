@@ -456,6 +456,10 @@ pub struct EvalConfig {
     /// env-gated, not a `--kv-mode` value.
     #[serde(default)]
     pub kv_hierarchical: bool,
+    /// `--kvarn-bits <2|4|8>`: kvarn K precision (default 4). Sets
+    /// `HIPFIRE_KVARN_BITS` on spawned binaries when the mode is kvarn.
+    #[serde(default)]
+    pub kvarn_bits: Option<usize>,
     /// `--fixture <a,b>`: substring filter over pflash/longctx NIAH fixtures
     /// (matched against the fixture path + case label). `None` runs all.
     #[serde(default)]
@@ -3283,6 +3287,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             ctx: None,
             corpus: None,
             kv_hierarchical: false,
+            kvarn_bits: None,
             fixture: None,
             max_tokens: 8,
             dflash: DflashMode::Off,
@@ -7412,6 +7417,7 @@ more noise
             ctx: None,
             corpus: None,
             kv_hierarchical: false,
+            kvarn_bits: None,
             fixture: None,
             max_tokens: 8,
             dflash: DflashMode::Off,

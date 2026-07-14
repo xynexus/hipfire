@@ -33,6 +33,7 @@ where
     // Default KV is kvarn + the two-tier hierarchical cache (the quality winner);
     // `--no-kv-hierarchical` opts out. asym/mq are no longer the defaults.
     let mut kv_hierarchical = true;
+    let mut kvarn_bits: Option<usize> = None;
     let mut fixture: Option<String> = None;
     let mut max_tokens = 64usize;
     let mut dflash = DflashMode::Off;
@@ -139,6 +140,14 @@ where
             "--no-kv-hierarchical" => {
                 kv_hierarchical = false;
                 i += 1;
+            }
+            "--kvarn-bits" => {
+                let n = parse_usize(&take_value(&argv, i, "--kvarn-bits")?, "--kvarn-bits")?;
+                if !matches!(n, 2 | 4 | 8) {
+                    return Err(format!("--kvarn-bits must be 2, 4, or 8 (got {n})"));
+                }
+                kvarn_bits = Some(n);
+                i += 2;
             }
             "--ctx" => {
                 ctx = Some(parse_usize(&take_value(&argv, i, "--ctx")?, "--ctx")?);
@@ -344,6 +353,7 @@ where
         ctx,
         corpus,
         kv_hierarchical,
+        kvarn_bits,
         fixture,
         max_tokens,
         dflash,
@@ -400,6 +410,7 @@ pub fn usage() -> String {
        --kv-mode <mode>         KV cache mode: f32,q8,asym2,asym3,asym4,kvarn,fwht2,fwht3,fwht4 (default: kvarn)\n\
        --kv-hierarchical        force the two-tier hot/cold KV cache on (default: on for kvarn; sets HIPFIRE_KV_HIERARCHICAL=1)\n\
        --no-kv-hierarchical     disable the two-tier hot/cold KV cache\n\
+       --kvarn-bits <2|4|8>     kvarn K precision (default 4; 8 is ~lossless-er, 2x K storage; sets HIPFIRE_KVARN_BITS)\n\
        --ctx <N>                context length for perplexity/long-context batteries (default: 512; overrides HIPFIRE_EVAL_PERPLEXITY_CTX)\n\
        --corpus <path>          perplexity corpus path (overrides HIPFIRE_EVAL_PERPLEXITY_CORPUS)\n\
        --fixture <a,b>          pflash/longctx NIAH fixture filter (substring match on name, e.g. niah_16k,longcode); default: all\n\

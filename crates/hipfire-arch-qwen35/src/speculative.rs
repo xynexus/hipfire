@@ -667,7 +667,7 @@ impl ModelSlot {
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
-                4,
+                KvCache::kvarn_bits_from_env(),
             )?,
         };
 

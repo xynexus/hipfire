@@ -283,7 +283,7 @@ pub const ENV_HIPFIRE_BATCHES_STATE_MAX: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_BENCH_QWEN35_SPEED_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BENCH_QWEN35_SPEED_BIN",
     description: "Runtime variable controlling bench qwen35 speed bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1192",
+    source: "crates/hipfire-eval/src/lib.rs:1196",
 };
 
 /// `HIPFIRE_BF16_DENSE_M128` — Enabled by default; set to 0 to disable
@@ -361,7 +361,7 @@ pub const ENV_HIPFIRE_CHAT_TEMPLATE_FILE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_COLLECT_ARTIFACTS_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_COLLECT_ARTIFACTS_BIN",
     description: "Runtime variable controlling collect artifacts bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1239",
+    source: "crates/hipfire-eval/src/lib.rs:1243",
 };
 
 /// `HIPFIRE_COMP_DUMP` — Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each
@@ -1062,7 +1062,7 @@ pub const ENV_HIPFIRE_DFLASH_SERIAL_TAPE_X_IN_COMPARE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DFLASH_SPEC_DEMO_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_SPEC_DEMO_BIN",
     description: "Runtime variable controlling dflash spec demo bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1177",
+    source: "crates/hipfire-eval/src/lib.rs:1181",
 };
 
 /// `HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN` — Runtime variable controlling dflash trace expected token in hipfire
@@ -1566,7 +1566,7 @@ pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CORPUS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CTX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_PERPLEXITY_CTX",
     description: "Parses \"HIPFIRE_EVAL_PERPLEXITY_CTX\" with fallback defaults",
-    source: "crates/hipfire-eval/src/executor_examples.rs:951",
+    source: "crates/hipfire-eval/src/executor_examples.rs:956",
 };
 
 /// `HIPFIRE_EVAL_SERVER_URL` — Runtime variable controlling eval server url in hipfire
@@ -1580,21 +1580,21 @@ pub const ENV_HIPFIRE_EVAL_SERVER_URL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EVAL_STS_DATASET: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_STS_DATASET",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1088",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1093",
 };
 
 /// `HIPFIRE_EVAL_STS_MAX_PAIRS` — Parses "HIPFIRE_EVAL_STS_MAX_PAIRS" with fallback defaults
 pub const ENV_HIPFIRE_EVAL_STS_MAX_PAIRS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_STS_MAX_PAIRS",
     description: "Parses \"HIPFIRE_EVAL_STS_MAX_PAIRS\" with fallback defaults",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1141",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1146",
 };
 
 /// `HIPFIRE_EVAL_STS_SELECTION_QUERIES` — Parses "HIPFIRE_EVAL_STS_SELECTION_QUERIES" with fallback defaults
 pub const ENV_HIPFIRE_EVAL_STS_SELECTION_QUERIES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_STS_SELECTION_QUERIES",
     description: "Parses \"HIPFIRE_EVAL_STS_SELECTION_QUERIES\" with fallback defaults",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1145",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1150",
 };
 
 /// `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` — GATED: off by default. The feature has a real UX hazard — if
@@ -1937,7 +1937,7 @@ pub const ENV_HIPFIRE_HIP_WAIT: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_HOST_PROFILE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HOST_PROFILE_BIN",
     description: "Runtime variable controlling host profile bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1284",
+    source: "crates/hipfire-eval/src/lib.rs:1288",
 };
 
 /// `HIPFIRE_HOST_TIMING` — HIPFIRE_HOST_TIMING=1: dump per-cycle host-side wall-clock breakdown
@@ -1994,6 +1994,13 @@ pub const ENV_HIPFIRE_KLD_TOP_K: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KLD_TOP_K",
     description: "Runtime variable controlling kld top k in hipfire",
     source: "crates/hipfire-kld/src/config.rs:106",
+};
+
+/// `HIPFIRE_KVARN_BITS` — Selects behavior from recognized values
+pub const ENV_HIPFIRE_KVARN_BITS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_KVARN_BITS",
+    description: "Selects behavior from recognized values",
+    source: "crates/hipfire-runtime/src/kv.rs:1195",
 };
 
 /// `HIPFIRE_KVARN_ROTATE` — In-place: mq_rotate_x loads each 256-group into registers (ds_swizzle
@@ -2932,21 +2939,21 @@ pub const ENV_HIPFIRE_PARO_SWIGLU_FUSED: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PERF_BASELINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERF_BASELINE",
     description: "Runtime variable controlling perf baseline in hipfire",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1769",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1774",
 };
 
 /// `HIPFIRE_PERF_BASELINE_DIR` — Runtime variable controlling perf baseline dir in hipfire
 pub const ENV_HIPFIRE_PERF_BASELINE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERF_BASELINE_DIR",
     description: "Runtime variable controlling perf baseline dir in hipfire",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1782",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1787",
 };
 
 /// `HIPFIRE_PERPLEXITY_BIN` — Runtime variable controlling perplexity bin in hipfire
 pub const ENV_HIPFIRE_PERPLEXITY_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERPLEXITY_BIN",
     description: "Runtime variable controlling perplexity bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1254",
+    source: "crates/hipfire-eval/src/lib.rs:1258",
 };
 
 /// `HIPFIRE_PFLASH_DAEMON_LABELS` — ONE loader, shared with the daemon train_drafter op
@@ -2988,7 +2995,7 @@ pub const ENV_HIPFIRE_PFLASH_FRESH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PFLASH_NIAH_BENCH_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_NIAH_BENCH_BIN",
     description: "Runtime variable controlling pflash niah bench bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1209",
+    source: "crates/hipfire-eval/src/lib.rs:1213",
 };
 
 /// `HIPFIRE_PFLASH_REPORT_TRAIN` — Runtime variable controlling pflash report train in hipfire
@@ -3352,7 +3359,7 @@ pub const ENV_HIPFIRE_QTIP_HESSIAN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QUALITY_COMPARE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUALITY_COMPARE_BIN",
     description: "Runtime variable controlling quality compare bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1269",
+    source: "crates/hipfire-eval/src/lib.rs:1273",
 };
 
 /// `HIPFIRE_QUANTIZE_BIN` — Runtime variable controlling quantize bin in hipfire
@@ -4048,7 +4055,7 @@ pub const ENV_HIPFIRE_RQ_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RUN_EXAMPLE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RUN_EXAMPLE_BIN",
     description: "Runtime variable controlling run example bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1224",
+    source: "crates/hipfire-eval/src/lib.rs:1228",
 };
 
 /// `HIPFIRE_SAMPLE_COMPARE` — Enabled when set to 1
@@ -4841,6 +4848,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_KLD_FP32_GQA4_ATTN,
     ENV_HIPFIRE_KLD_SCORING_MODE,
     ENV_HIPFIRE_KLD_TOP_K,
+    ENV_HIPFIRE_KVARN_BITS,
     ENV_HIPFIRE_KVARN_ROTATE,
     ENV_HIPFIRE_KVARN_SIM,
     ENV_HIPFIRE_KVNOISE,

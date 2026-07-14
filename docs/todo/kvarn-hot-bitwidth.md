@@ -44,18 +44,34 @@ Conclusions:
 - **More bits help proportionally**, but nothing reasonable reaches the f16 floor
   (8-bit is still ~900× above it; true losslessness needs ~11–12 bits).
 
-## The real work (root-cause is answered: precision-limited)
+## Update (2026-07-14): 8-bit kvarn is now selectable + validated
 
-Two independent levers — the codec is already optimal for uniform quant, so
-"fix the Sinkhorn" is a dead end.
+The 8-bit path **already existed** end to end — `new_gpu_kvarn_capped_filtered`
+sizes records by `bits` and asserts `{2,4,8}`, and the GPU quantize/dequant
+kernels (`kvarn_quantize_tile`/`kvarn_dequant_tile`, `dispatch/kv.rs`) already
+take `bits ∈ {2,4,8}`. Only the *selection* was missing (hardcoded 4). Wired
+`KvCache::kvarn_bits_from_env()` (`HIPFIRE_KVARN_BITS`, default 4) at all
+construction sites (ModelSlot, run, pflash, perplexity) + a `hipfire eval
+--kvarn-bits <2|4|8>` flag.
 
-1. **8-bit kvarn container for the hot ring.** 8-bit gives attn-KLD 3.8e-4 —
-   negligible, and 2× smaller than f16. Add a byte-per-code container + dequant
-   kernel (current one is a 4-bit nibble; `quantize_tile_qmax` only *measures*
-   higher precision, u8 codes, no 8-bit storage/kernel). Then swap the f16 hot
-   ring in `kv_hier.rs` for 8-bit kvarn (the hot read reuses the cold dequant
-   path). 2× hot-tier win; re-validate exact needle recall + coherence + the end
-   to-end KLD (confirm 8-bit ≈ f16 at the model level, not just the tile).
+Validated on nix2 (qwen3.5-9b-mq4): `HIPFIRE_KVARN_BITS=8` builds `K 8b var-norm
+records`, coherent, +16 MB K storage vs 4-bit.
+
+**Caveat on the needle test:** a magic-number needle came out one digit off
+(`8674309` vs `8675309`) **identically at 4-bit and 8-bit** — and identically in
+the f16 hot ring vs a kvarn-quantized block. So that error is **weight-quant
+(mq4), not KV quant**; KV bits don't move it. The KV-quant quality delta only
+shows up where KV error is the bottleneck (long context, many quantized blocks) —
+measure with long-context KLD vs a bf16 ref (`--kv-mode kvarn --kvarn-bits {4,8}`
++ the KLD bridge), not this needle.
+
+## Remaining work
+
+1. **Swap the f16 hot ring for 8-bit kvarn** (`kv_hier.rs`). The container +
+   kernels exist; the hot read (`attention_cold_slots` layout-2) would move onto
+   the kvarn dequant path. 8-bit gives attn-KLD 3.8e-4 (negligible) at 2× smaller
+   than f16 → ~2× hot-tier win. Re-validate exact recall + end-to-end KLD
+   (confirm 8-bit ≈ f16 at the model level, not just the tile).
 2. **Lloyd-Max / codebook kvarn (per-bit fidelity).** Since it's precision-
    limited, a non-uniform quantizer fit to the balanced-tile distribution
    typically buys ~0.5–1 bit vs uniform min/max at the same storage — the repo

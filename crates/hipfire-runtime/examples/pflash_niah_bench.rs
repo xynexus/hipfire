@@ -810,7 +810,7 @@ fn main() {
             config.n_kv_heads,
             config.head_dim,
             kv_seq,
-            4,
+            KvCache::kvarn_bits_from_env(),
         )
         .expect("kv kvarn"),
         other => {
