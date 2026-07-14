@@ -864,11 +864,12 @@ pub(crate) fn longctx_corpus_from_fixture(
 }
 
 /// Apply KV-cache environment to a spawned model subprocess. The two-tier
-/// hot/cold cache is env-gated (`HIPFIRE_KV_HIERARCHICAL`), not a `--kv-mode`
-/// value; other `HIPFIRE_KV_*` knobs are inherited from the caller's env
-/// (the parent process passes them through by default).
-pub(crate) fn apply_kv_env(cmd: &mut Command, config: &EvalConfig) {
-    if config.kv_hierarchical {
+/// hot/cold cache is env-gated (`HIPFIRE_KV_HIERARCHICAL`) and layers on top of
+/// the KVarN base tier, so it is only set when the effective mode is `kvarn`
+/// (setting it under a non-kvarn cache would be a no-op at best). Other
+/// `HIPFIRE_KV_*` knobs are inherited from the caller's env.
+pub(crate) fn apply_kv_env(cmd: &mut Command, config: &EvalConfig, kv_mode: &str) {
+    if config.kv_hierarchical && kv_mode == "kvarn" {
         cmd.env("HIPFIRE_KV_HIERARCHICAL", "1");
     }
 }
@@ -952,7 +953,7 @@ pub(crate) fn run_examples_perplexity_model(
                 .and_then(|s| s.parse::<usize>().ok())
         })
         .unwrap_or(512);
-    let kv_mode = config.kv_mode.as_deref().unwrap_or("q8").to_string();
+    let kv_mode = config.kv_mode.as_deref().unwrap_or("kvarn").to_string();
     let mut args = vec![
         model.clone(),
         corpus.display().to_string(),
@@ -973,7 +974,7 @@ pub(crate) fn run_examples_perplexity_model(
     let started = SystemTime::now();
     let mut cmd = Command::new(&bin);
     cmd.args(&args);
-    apply_kv_env(&mut cmd, config);
+    apply_kv_env(&mut cmd, config, &kv_mode);
     let output = match cmd.output() {
         Ok(o) => o,
         Err(err) => {
@@ -1361,7 +1362,7 @@ pub(crate) fn run_examples_qwen35_speed_model(
 ) -> Vec<EvalResult> {
     let cases = qwen35_speed_cases();
     let prompt_ref = prompt("benchmarks/prompts/lru_cache_single_blank.txt");
-    let kv_mode = config.kv_mode.as_deref().unwrap_or("asym3").to_string();
+    let kv_mode = config.kv_mode.as_deref().unwrap_or("kvarn").to_string();
     let mut rows = Vec::new();
     let base_metrics = BTreeMap::from([
         ("implemented".to_string(), json!(true)),
@@ -2438,8 +2439,9 @@ pub(crate) fn pflash_niah_cases() -> &'static [PflashNiahCase] {
 /// KV modes the `pflash_niah_bench` binary implements (see its `--kv-mode`
 /// resolution). `kvarn`/`f32`/`fp16` and the two-tier hierarchical cache are not
 /// among them — those are measured through the perplexity battery instead.
-pub(crate) const PFLASH_KV_MODES: &[&str] =
-    &["q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2"];
+pub(crate) const PFLASH_KV_MODES: &[&str] = &[
+    "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "kvarn",
+];
 
 pub(crate) fn pflash_maxgen_for_fixture(fixture: &str) -> usize {
     if fixture.contains("multi") {
@@ -2483,7 +2485,7 @@ pub(crate) fn run_examples_pflash_case(
     let model = config.model.clone();
     let prompt_ref = prompt(case.fixture);
     // pflash battery defaults to asym3 (the bench default) when --kv-mode is unset.
-    let kv_mode = config.kv_mode.as_deref().unwrap_or("asym3").to_string();
+    let kv_mode = config.kv_mode.as_deref().unwrap_or("kvarn").to_string();
     let mut base_metrics = BTreeMap::from([
         ("implemented".to_string(), json!(true)),
         ("executor".to_string(), json!("examples")),
@@ -2632,7 +2634,7 @@ pub(crate) fn run_examples_pflash_case(
     let started = SystemTime::now();
     let mut cmd = Command::new(&bin);
     cmd.args(&args);
-    apply_kv_env(&mut cmd, config);
+    apply_kv_env(&mut cmd, config, &kv_mode);
     let output = match cmd.output() {
         Ok(output) => output,
         Err(err) => {
@@ -3607,7 +3609,10 @@ pub(crate) fn run_examples_lm_eval_micro_item(
         "--max-tokens".to_string(),
         config.max_tokens.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -3827,7 +3832,10 @@ pub(crate) fn run_examples_builtin_barrage_item(
         "--max-tokens".to_string(),
         config.max_tokens.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -4044,7 +4052,10 @@ pub(crate) fn run_examples_humaneval_item(
         "--max-tokens".to_string(),
         config.max_tokens.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -4240,7 +4251,10 @@ pub(crate) fn run_examples_gpqa_item(
         "--max-tokens".to_string(),
         config.max_tokens.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -4365,7 +4379,10 @@ pub(crate) fn run_examples_longctx_item(
         format!("dataset:{}:{item_id}", suite.as_str()),
         item.prompt.as_bytes(),
     );
-    let kv_mode = config.kv_mode.clone().unwrap_or_else(|| "q8".to_string());
+    let kv_mode = config
+        .kv_mode
+        .clone()
+        .unwrap_or_else(|| "kvarn".to_string());
     let mut base_metrics = BTreeMap::from([
         ("prompt_format".to_string(), json!("longctx_retrieval_v1")),
         ("task".to_string(), json!(item.task.clone())),
@@ -4465,7 +4482,7 @@ pub(crate) fn run_examples_longctx_item(
     let started = SystemTime::now();
     let mut cmd = Command::new(&bin);
     cmd.args(&args);
-    apply_kv_env(&mut cmd, config);
+    apply_kv_env(&mut cmd, config, &kv_mode);
     let output = match cmd.output() {
         Ok(o) => o,
         Err(err) => {
@@ -4665,7 +4682,10 @@ pub(crate) fn run_dflash_spec_demo_anchor(
         "--ctx".to_string(),
         "2048".to_string(),
         "--kv-mode".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--no-adaptive-b".to_string(),
         "--no-chatml".to_string(),
     ];
@@ -4954,7 +4974,10 @@ pub(crate) fn run_examples_run_anchor_with_prompt_ref_for_model(
         "--max-tokens".to_string(),
         config.max_tokens.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -5117,7 +5140,10 @@ pub(crate) fn run_direct_session_reset_recall(
         "--prompt-file".to_string(),
         prompt_path.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];

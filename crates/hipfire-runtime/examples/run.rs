@@ -337,8 +337,9 @@ fn main() {
             "fwht4" => KvMode::Fwht4,
             "fwht3" => KvMode::Fwht3,
             "fwht2" => KvMode::Fwht2,
+            "kvarn" => KvMode::Kvarn,
             other => {
-                panic!("unknown --kv {other}; expected fp32|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2")
+                panic!("unknown --kv {other}; expected fp32|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|kvarn")
             }
         }
     }

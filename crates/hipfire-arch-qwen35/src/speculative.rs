@@ -659,6 +659,16 @@ impl ModelSlot {
                 config.head_dim,
                 slot_config.max_seq,
             )?,
+            // KVarN 4-bit K + Q8 V. The two-tier hot/cold hierarchical cache
+            // (HIPFIRE_KV_HIERARCHICAL=1) layers on top of this base tier.
+            KvMode::Kvarn => KvCache::new_gpu_kvarn_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+                4,
+            )?,
         };
 
         let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;

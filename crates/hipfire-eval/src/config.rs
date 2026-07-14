@@ -30,7 +30,9 @@ where
     let mut kv_mode: Option<String> = None;
     let mut ctx: Option<usize> = None;
     let mut corpus: Option<PathBuf> = None;
-    let mut kv_hierarchical = false;
+    // Default KV is kvarn + the two-tier hierarchical cache (the quality winner);
+    // `--no-kv-hierarchical` opts out. asym/mq are no longer the defaults.
+    let mut kv_hierarchical = true;
     let mut fixture: Option<String> = None;
     let mut max_tokens = 64usize;
     let mut dflash = DflashMode::Off;
@@ -132,6 +134,10 @@ where
             }
             "--kv-hierarchical" => {
                 kv_hierarchical = true;
+                i += 1;
+            }
+            "--no-kv-hierarchical" => {
+                kv_hierarchical = false;
                 i += 1;
             }
             "--ctx" => {
@@ -391,8 +397,9 @@ pub fn usage() -> String {
        --out <dir>              output directory\n\
        --draft <path>           DFlash draft artifact\n\
        --dflash <off|auto|on>   DFlash mode (default: off)\n\
-       --kv-mode <mode>         KV cache mode: f32,q8,asym2,asym3,asym4,kvarn,fwht2,fwht3,fwht4 (passed to the model binary)\n\
-       --kv-hierarchical        enable the two-tier hot/cold KV cache in spawned binaries (sets HIPFIRE_KV_HIERARCHICAL=1; other HIPFIRE_KV_* knobs pass through the environment)\n\
+       --kv-mode <mode>         KV cache mode: f32,q8,asym2,asym3,asym4,kvarn,fwht2,fwht3,fwht4 (default: kvarn)\n\
+       --kv-hierarchical        force the two-tier hot/cold KV cache on (default: on for kvarn; sets HIPFIRE_KV_HIERARCHICAL=1)\n\
+       --no-kv-hierarchical     disable the two-tier hot/cold KV cache\n\
        --ctx <N>                context length for perplexity/long-context batteries (default: 512; overrides HIPFIRE_EVAL_PERPLEXITY_CTX)\n\
        --corpus <path>          perplexity corpus path (overrides HIPFIRE_EVAL_PERPLEXITY_CORPUS)\n\
        --fixture <a,b>          pflash/longctx NIAH fixture filter (substring match on name, e.g. niah_16k,longcode); default: all\n\
