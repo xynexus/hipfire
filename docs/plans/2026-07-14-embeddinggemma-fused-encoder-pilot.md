@@ -1,0 +1,103 @@
+# EmbeddingGemma fused-encoder pilot — scoping + plan
+
+Date: 2026-07-14. Follows the top-down NPU investigation
+(`benchmarks/npu_gemm_tuning/iron_ctx_probe/`) that fixed the mlir-aie
+`--generate-full-elf` bug (Xilinx/mlir-aie#3337) and got the reference IRON
+Llama-3.2-1B **fused decode to 8 tok/s** (1 dispatch/token). Goal: decide whether
+the same compiler-managed fused-graph approach beats hipfire's hand-authored
+amdxdna-direct resident EmbeddingGemma encode (currently ~336 tok/s at M256, the
+subject of NPU-RESULTS R57–R121).
+
+## The premise had to be reframed
+
+The obvious pitch — "fuse per-layer to cut dispatches" — is **already done**.
+`NpuOpusProjector::project_layer` runs a *resident context* that fuses attention
+(`NpuEmbeddingLayerAttentionDenseW8`) + FFN + tail into one per-layer NPU unit.
+hipfire's resident path is not dispatch-count-bound within a layer.
+
+The real overhead is **cross-layer**, documented in NPU-RESULTS:
+
+- host readback / normalization / output-deblocking ≈ **10–12 ms/layer** (R100);
+- distinct next-layer / residual preparation contexts ≈ **7–9 ms/layer**
+  (R104/R108/R109, down from 9–12);
+- context-alternation tax ≈ **27%** of wall time (R91).
+
+At M256 the layer compute itself is real (256×768 GEMMs, 256×256 attention) — this
+is **compute-bound, not dispatch-bound** (unlike the M1 Llama decode). So the win
+is bounded by how much of the 749 ms (24 layers) is *overhead* vs *compute*.
+Rough envelope: (10–12 + 7–9) ms/layer × 24 ≈ **400–500 ms of the 749 ms** is
+cross-layer overhead. Removing most of it → ~300–450 ms → **~570–850 tok/s, i.e.
+~1.7–2.5×**. A meaningful but not order-of-magnitude win.
+
+## Why the resident path pays that overhead — and why IRON might not
+
+hipfire's amdxdna-direct path was *forced* into per-layer host-bridged contexts by
+the exact limits R59–R121 fought: the **5-data-argument DPU regmap**, the **16 KiB
+core-text program store**, and cross-context state handoff (PRIME `EINVAL`, etc.).
+That is why it cannot keep 24 layers resident in one context and round-trips
+through the host between layers.
+
+The IRON `--generate-full-elf` mechanism is *different*: it stitches per-op
+sub-ELFs together via a **fused `main` device** whose DMA orchestration addresses
+one flat byte **arena** (the `memref.view` slices that PR #3337 fixes). That arena
+is how cross-op/cross-layer state stays on-device without per-context host bridges
+or the 5-arg limit. The Llama fused decode **proves the mechanism carries 24 layers
+in one dispatch** (at M1). The open question is purely: **does it hold at M256**
+(bigger tiles, same program), giving a whole-encoder ELF that eliminates the
+per-layer host bridges hipfire cannot avoid?
+
+That is the pilot's real hypothesis:
+> The fixed IRON full-ELF can fuse the whole EmbeddingGemma encoder into one
+> on-device dispatch where hipfire's direct path was forced into 24 host-bridged
+> per-layer contexts — removing the ~400–500 ms cross-layer overhead.
+
+## EmbeddingGemma-300M shapes (for the IRON graph)
+
+hidden 768 · 24 layers · 3 Q-heads + 1 KV-head × head_dim 256 (QKV = 1280, matches
+R-log N1280) · FFN 1152 (GeGLU) · attention 5 sliding : 1 global (window pattern 6)
+· **encoder: bidirectional, no KV cache, no causal mask** · M256 · mean-pool tail.
+Note: encode is *simpler* than the Llama decode it's modeled on — no KV-cache ELF
+patching — which removes the app's most fragile piece.
+
+## Build plan
+
+1. **Baseline** — run hipfire's resident encode with `HIPFIRE_EMBED_TRACE_RESIDENT=1`
+   to get the real per-layer overhead vs compute split (confirm the envelope above).
+2. **Rung A — one fused layer at EmbeddingGemma dims.** Author a single bidirectional
+   Gemma3 layer (RMSNorm ×2, QKV 768→1280, QK-norm, no-RoPE-for-global/RoPE-for-
+   sliding, softmax attention, O-proj, GeGLU FFN 768→1152→768) as an IRON graph at
+   M256, compile with the fixed `build/bin/aiecc`, dispatch, verify numerics vs the
+   GPU reference, and measure one-dispatch wall time. Reuse the Llama app's GEMM /
+   RMSNorm / softmax / SiLU operators; add the bidirectional attention + GeGLU.
+3. **Rung B — stack to whole-encoder fused ELF.** Chain 24 layers through the arena
+   (the full-ELF path), add the pooling tail, and measure end-to-end M256 encode
+   tok/s vs the 336 baseline. This is the go/no-go on the hypothesis.
+4. **Decide.** If ≥1.7× and numerically faithful, it's a real alternative to the
+   resident path and worth productionizing a hipfire↔IRON bridge (author graph in
+   IRON, compile offline, dispatch via amdxdna or XRT). If it hits the M256 program
+   wall, that's a clean negative that validates the hand-authored per-layer design.
+
+## Risks
+
+- M256 whole-encoder ELF may exceed program store where M1 decode fit (the core
+  risk; Rung A de-risks it cheaply).
+- Numerical fidelity of the IRON operators at Gemma3 specifics (query pre-attn
+  scalar, QK-norm, GeGLU, dual RMSNorm) must match the GPU reference before any
+  perf number counts.
+- Even at 2×, this is a *second* NPU execution path; productionizing it is a real
+  cost that only pays off if the win is robust across shapes.
+
+## Progress
+
+- **Rung 0 (verification foundation) — DONE.** `benchmarks/npu_gemm_tuning/embeddinggemma_pilot/`:
+  `dump_reference.py` captures HF's exact layer-0 I/O + per-submodule intermediates
+  (full 256-token no-pad input → pure bidirectional attention). `numpy_reference.py`
+  reimplements the layer per the spec and **verifies against HF stage-by-stage**
+  (input_layernorm / q,k,v_proj / self_attn / mlp / final: rel error 1e-6–1e-7).
+  This numpy layer is the executable oracle the IRON graph must match.
+  Confirmed math: RMSNorm `rsqrt(mean(x²)+1e-6)·(1+w)`; QK-norm per-head(256) then
+  RoPE rotate-half base 1e4 (layer 0 local); GQA rep 3; softmax scale 0.0625;
+  o_proj; sandwich residual; GeGLU tanh (0.7978845608, 0.044715); dual norms.
+- **Next — Rung A (IRON graph).** Author the layer as an IRON graph at M256, one
+  operator at a time verified against `numpy_reference` intermediates, compile with
+  the fixed `build/bin/aiecc`, dispatch, then fuse to one ELF. Then Rung B stacks 24.
