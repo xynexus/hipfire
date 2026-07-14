@@ -1566,7 +1566,7 @@ pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CORPUS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CTX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_PERPLEXITY_CTX",
     description: "Parses \"HIPFIRE_EVAL_PERPLEXITY_CTX\" with fallback defaults",
-    source: "crates/hipfire-eval/src/executor_examples.rs:913",
+    source: "crates/hipfire-eval/src/executor_examples.rs:950",
 };
 
 /// `HIPFIRE_EVAL_SERVER_URL` — Runtime variable controlling eval server url in hipfire
@@ -1580,21 +1580,21 @@ pub const ENV_HIPFIRE_EVAL_SERVER_URL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EVAL_STS_DATASET: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_STS_DATASET",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1050",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1087",
 };
 
 /// `HIPFIRE_EVAL_STS_MAX_PAIRS` — Parses "HIPFIRE_EVAL_STS_MAX_PAIRS" with fallback defaults
 pub const ENV_HIPFIRE_EVAL_STS_MAX_PAIRS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_STS_MAX_PAIRS",
     description: "Parses \"HIPFIRE_EVAL_STS_MAX_PAIRS\" with fallback defaults",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1103",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1140",
 };
 
 /// `HIPFIRE_EVAL_STS_SELECTION_QUERIES` — Parses "HIPFIRE_EVAL_STS_SELECTION_QUERIES" with fallback defaults
 pub const ENV_HIPFIRE_EVAL_STS_SELECTION_QUERIES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_STS_SELECTION_QUERIES",
     description: "Parses \"HIPFIRE_EVAL_STS_SELECTION_QUERIES\" with fallback defaults",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1107",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1144",
 };
 
 /// `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` — GATED: off by default. The feature has a real UX hazard — if
@@ -2932,14 +2932,14 @@ pub const ENV_HIPFIRE_PARO_SWIGLU_FUSED: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PERF_BASELINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERF_BASELINE",
     description: "Runtime variable controlling perf baseline in hipfire",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1731",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1768",
 };
 
 /// `HIPFIRE_PERF_BASELINE_DIR` — Runtime variable controlling perf baseline dir in hipfire
 pub const ENV_HIPFIRE_PERF_BASELINE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERF_BASELINE_DIR",
     description: "Runtime variable controlling perf baseline dir in hipfire",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1744",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1781",
 };
 
 /// `HIPFIRE_PERPLEXITY_BIN` — Runtime variable controlling perplexity bin in hipfire

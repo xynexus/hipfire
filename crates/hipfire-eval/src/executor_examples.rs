@@ -839,6 +839,30 @@ pub(crate) fn parse_labeled_f64(s: &str, label: &str) -> Option<f64> {
         .ok()
 }
 
+/// Extract the haystack text of a NIAH-family `.jsonl` fixture into a plain-text
+/// corpus the perplexity harness can score. Returns the written corpus path.
+/// This is the long-context KLD bridge: it lets `--battery perplexity --corpus
+/// <fixture.jsonl> --ctx N` measure PPL/KLD over a long sequence.
+pub(crate) fn longctx_corpus_from_fixture(
+    fixture: &Path,
+    out_dir: &Path,
+) -> Result<PathBuf, String> {
+    let v = crate::datasets::read_first_jsonl_object(fixture)?;
+    let text = v
+        .get("filler_text")
+        .and_then(|x| x.as_str())
+        .ok_or("fixture missing filler_text (not a NIAH-family fixture?)")?;
+    let dir = out_dir.join("artifacts").join("perplexity_corpus");
+    fs::create_dir_all(&dir).map_err(|e| format!("create corpus dir: {e}"))?;
+    let stem = fixture
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fixture");
+    let path = dir.join(format!("{stem}.txt"));
+    fs::write(&path, text).map_err(|e| format!("write corpus: {e}"))?;
+    Ok(path)
+}
+
 /// Apply KV-cache environment to a spawned model subprocess. The two-tier
 /// hot/cold cache is env-gated (`HIPFIRE_KV_HIERARCHICAL`), not a `--kv-mode`
 /// value; other `HIPFIRE_KV_*` knobs are inherited from the caller's env
@@ -905,6 +929,19 @@ pub(crate) fn run_examples_perplexity_model(
             corpus.display()
         ));
     }
+
+    // Long-context KLD bridge: a NIAH-family `.jsonl` fixture is scored by
+    // extracting its haystack text into a plain-text corpus, so the perplexity
+    // harness emits PPL + KLD/tok over the long sequence (the graded
+    // long-context KV-quality metric). Plain-text corpora pass through.
+    let corpus = if corpus.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        match longctx_corpus_from_fixture(&corpus, &config.out_dir) {
+            Ok(p) => p,
+            Err(e) => return skip(&format!("extract long-context corpus from fixture: {e}")),
+        }
+    } else {
+        corpus
+    };
 
     // Context length: --ctx flag wins, then the env fallback, then 512.
     let ctx_len = config
@@ -5187,5 +5224,19 @@ mod pflash_filter_tests {
             .filter(|c| pflash_case_selected(c, Some("niah_16k")))
             .count();
         assert!(niah16 > 0 && niah16 < all);
+    }
+
+    #[test]
+    fn longctx_corpus_extracts_haystack_from_fixture() {
+        let fixture = crate::resolve_repo_path("benchmarks/longctx/niah/niah_8k.jsonl")
+            .expect("niah_8k fixture should resolve");
+        let tmp = std::env::temp_dir().join(format!("hipfire-corpus-test-{}", std::process::id()));
+        let corpus = super::longctx_corpus_from_fixture(&fixture, &tmp)
+            .expect("extract long-context corpus");
+        let text = std::fs::read_to_string(&corpus).expect("read extracted corpus");
+        // The haystack is a large plain-text blob (not the jsonl wrapper).
+        assert!(text.len() > 10_000);
+        assert!(!text.trim_start().starts_with('{'));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

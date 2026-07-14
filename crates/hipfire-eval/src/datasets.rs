@@ -493,7 +493,7 @@ pub(crate) struct LongCtxItem {
 
 /// Read the first non-empty JSON object from a `.jsonl` fixture (our vendored
 /// NIAH fixtures carry one sample per file).
-fn read_first_jsonl_object(path: &Path) -> Result<Value, String> {
+pub(crate) fn read_first_jsonl_object(path: &Path) -> Result<Value, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("read fixture {}: {e}", path.display()))?;
     let line = text

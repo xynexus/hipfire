@@ -50,7 +50,7 @@ flags (env as fallback). Portable model paths in `run_ppl_baseline.sh` /
 modes the bench can't do (kvarn/f32/hierarchical) skip toward the perplexity
 battery (`PFLASH_KV_MODES`). `apply_kv_env` applied. Unit tests for the filter.
 
-### Phase 2a — NIAH-family suites (Niah + SequentialNiah + NeedleChain) — IN PROGRESS
+### Phase 2a — NIAH-family suites (Niah + SequentialNiah + NeedleChain) — DONE (`1039a4265`), pushed
 Shared long-context barrage runner, then the three suites. Template:
 `gpqa_materialized_items`/`read_gpqa_item`/`run_examples_gpqa_item`
 (`executor_examples.rs`) + `fetch_dataset` (`datasets.rs`).
@@ -79,10 +79,25 @@ Assemble needle-in-book at depths/lengths + faithful scoring from
 Vendor generated slices via an in-repo RULER generator (start with the NIAH
 subtasks, then variable-tracking/aggregation). May be its own PR.
 
-### Phase 3 — graded long-context KLD bridge — PENDING
-Feed a long corpus/fixture through `perplexity` at large `--ctx` + `--kld-ref`
-→ `KLD/tok` as the graded long-context KV-quality metric; provide a bf16
-long-context reference. Stretch: position-windowed (post-needle) KLD.
+### Phase 3 — graded long-context KLD bridge — DONE
+The perplexity battery now accepts a NIAH-family `.jsonl` fixture as `--corpus`:
+`longctx_corpus_from_fixture` extracts the haystack text to a plain-text corpus,
+so PPL + `KLD/tok` are measured over the long sequence (the graded long-context
+KV-quality metric). Plain-text corpora pass through unchanged.
+
+bf16 long-context reference recipe (needs a bf16 model + GPU):
+```
+# 1. one eval run writes the extracted corpus to
+#    <out_dir>/artifacts/perplexity_corpus/<fixture>.txt  (or use any long .txt)
+# 2. build the bf16 reference over that corpus:
+perplexity <bf16-model.hfq> <long-corpus.txt> --ctx 16384 --dump-ref ref.pkld
+# 3. score a quantized model against it at long ctx:
+hipfire eval <model.hfq> --battery perplexity \
+  --corpus benchmarks/longctx/niah/niah_16k.jsonl --ctx 16384 \
+  --kldref ref.pkld --kv-mode kvarn
+```
+Stretch (deferred): position-windowed (post-needle) KLD needs a small
+`perplexity` flag.
 
 ## Registration touch points (per suite)
 
