@@ -18,21 +18,53 @@ precisely why `kv_hier.rs` keeps the hot ring at f16.
 So the "4-bit lossless" claim is **unverified/false in our impl**, and the hot
 ring cannot become 4-bit kvarn as-is without quality loss.
 
-## The real work (in order)
+## Findings (2026-07-14) — codec precision sweep
 
-1. **Root-cause the losslessness gap.** Why is our 4-bit kvarn ~0.085 KLD off
-   f16 when the paper says lossless? Audit our codec vs the paper: Sinkhorn
-   variance-normalization iterations/convergence, the FWHT/Hadamard rotation,
-   per-channel scale + zp fp16 precision, the 128-token block layout, V handling
-   (Q8). Isolate which step costs the fidelity (A/B each on a fixed tile).
-2. **If closable at 4-bit** → then 4-bit kvarn ≈ f16 and it *can* replace the
-   f16 hot ring (unmerged 4-bit kvarn hot tier; the hot read reuses the cold
-   dequant path). 4× hot-tier win; re-validate exact needle recall + coherence.
-3. **If not closable at 4-bit** → add a **higher-bit kvarn container** (our codec
-   only stores 2/4-bit today — a 4-bit nibble container; `quantize_tile_qmax`
-   only *measures* lower precision within the nibble, no 6/8-bit storage). Test
-   6-bit (awkward packing) / 8-bit (byte-per-code, new dequant kernel) and find
-   the smallest bit-width that is lossless vs f16; use it for the hot ring.
+`cargo run -p hipfire-kvquant --example kvarn_precision_sweep` (offline, on a
+realistic K-shaped tile: log-normal per-channel σ + outlier channels/tokens)
+sweeps the KVarN codec at 2..8 "bits" vs the f16 round-trip floor:
+
+| bits | rel_rmse | attn_KLD |
+|---|---|---|
+| f16 | 4.0e-4 | 4.2e-7 (floor) |
+| 4 | 1.2e-1 | 6.3e-2 |
+| 5 | 6.1e-2 | 1.7e-2 |
+| 6 | 3.0e-2 | 2.4e-3 |
+| 7 | 1.5e-2 | 9.7e-4 |
+| 8 | 7.5e-3 | 3.8e-4 |
+
+Conclusions:
+- **4-bit is NOT lossless vs f16.** Its attn-KLD (6.3e-2) matches the observed
+  model KLD (~0.085 single-tier), so the synthetic tile is representative — the
+  gap is real, not a measurement artifact.
+- **Precision-limited, not structural.** Error halves ~2× per bit with no
+  plateau — that is *optimal* uniform-quantizer scaling, so Sinkhorn + per-channel
+  min/max is already doing its job. There is **no codec bug to fix**; uniform
+  4-bit fundamentally cannot be f16-lossless (4-bit ≈ 6% step).
+- **More bits help proportionally**, but nothing reasonable reaches the f16 floor
+  (8-bit is still ~900× above it; true losslessness needs ~11–12 bits).
+
+## The real work (root-cause is answered: precision-limited)
+
+Two independent levers — the codec is already optimal for uniform quant, so
+"fix the Sinkhorn" is a dead end.
+
+1. **8-bit kvarn container for the hot ring.** 8-bit gives attn-KLD 3.8e-4 —
+   negligible, and 2× smaller than f16. Add a byte-per-code container + dequant
+   kernel (current one is a 4-bit nibble; `quantize_tile_qmax` only *measures*
+   higher precision, u8 codes, no 8-bit storage/kernel). Then swap the f16 hot
+   ring in `kv_hier.rs` for 8-bit kvarn (the hot read reuses the cold dequant
+   path). 2× hot-tier win; re-validate exact needle recall + coherence + the end
+   to-end KLD (confirm 8-bit ≈ f16 at the model level, not just the tile).
+2. **Lloyd-Max / codebook kvarn (per-bit fidelity).** Since it's precision-
+   limited, a non-uniform quantizer fit to the balanced-tile distribution
+   typically buys ~0.5–1 bit vs uniform min/max at the same storage — the repo
+   already has Lloyd variants (`mq4l`). A Lloyd-Max kvarn could make 4-bit
+   materially better (closer to today's 5-bit) for the cold tier, and let a
+   smaller hot-ring bit-width clear the bar. Measure vs uniform at 4/6/8-bit.
+
+Both are config sweeps once the container/quantizer exist: `new_gpu_kvarn*` takes
+`bits`; plumb `HIPFIRE_KVARN_BITS` / `--kv-mode kvarn:N`.
 
 ## How to measure
 
