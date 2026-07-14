@@ -140,3 +140,17 @@ patching — which removes the app's most fragile piece.
   = GEMM(P, V). GQA rep 3 (3 q-heads share the 1 kv-head), bidirectional (no mask),
   then o_proj GEMM + residual (step 4). This matches how the Llama fused decode does
   attention (GEMV+softmax+GEMV), so it composes cleanly into the fused ELF.
+- **Rung A COMPLETE — full layer on NPU matches HF (2026-07-14).** `full_layer.py`
+  runs the whole Gemma3 encoder layer with heavy ops on the aie2p NPU (RMSNorm ×4,
+  q/k/v/o/gate/up/down GEMMs, GQA softmax attention, GeGLU = gelu[tanh]·mul) and
+  glue (residuals, qk-norm, RoPE, reshape) in numpy; verified vs the HF oracle's
+  final layer-0 output at **rel 1.06e-2, cos 0.99993** (every intermediate cos
+  >0.999). Numeric fidelity of the composed operators is proven on hardware. Bug
+  caught+fixed: down_proj is a weight [out,in] so `b_col_maj=True` (not False).
+  All Gemma3 specifics land correctly (query scale 0.0625 folded into Q; per-head
+  qk-norm; RoPE base 1e4; gelu tanh-approx; sandwich residuals).
+- **Next — step 6 (fuse) + Rung B (stack 24).** Compose the layer's ops into ONE
+  ELF via FusedMLIROperator + the fixed `build/bin/aiecc` (tests the M256 DMA/BD
+  schedule, the remaining feasibility gate), move the numpy glue on-device, stack
+  24 layers + pooling tail, and measure end-to-end M256 tok/s vs the 336 baseline
+  plus final-embedding cosine vs f32.
