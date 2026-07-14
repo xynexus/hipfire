@@ -26,5 +26,10 @@ csv.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json = "1"
+# Read the NeedleChain HF dataset (parquet). default-features=false drops the
+# heavy arrow dep — we use the record reader. See memory
+# `project-parquet-crate-training-port`: hipfire-train's data loading should port
+# onto this crate too.
+parquet = { version = "54", default-features = false, features = ["snap", "zstd", "flate2"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }

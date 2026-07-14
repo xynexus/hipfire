@@ -1538,7 +1538,7 @@ pub const ENV_HIPFIRE_EP_SKIP_ALLREDUCE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EVAL_DATASET_MIRROR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_DATASET_MIRROR",
     description: "Runtime variable controlling eval dataset mirror in hipfire",
-    source: "crates/hipfire-eval/src/datasets.rs:203",
+    source: "crates/hipfire-eval/src/datasets.rs:239",
 };
 
 /// `HIPFIRE_EVAL_EVIDENCE_DIR` — Runtime variable controlling eval evidence dir in hipfire
@@ -4170,6 +4170,13 @@ pub const ENV_HIPFIRE_TEST_LATENT: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-diffusion/src/tests/vae.rs:227",
 };
 
+/// `HIPFIRE_TEST_NEEDLECHAIN_CACHE` — Runtime variable controlling test needlechain cache in hipfire
+pub const ENV_HIPFIRE_TEST_NEEDLECHAIN_CACHE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_TEST_NEEDLECHAIN_CACHE",
+    description: "Runtime variable controlling test needlechain cache in hipfire",
+    source: "crates/hipfire-eval/src/datasets.rs:1396",
+};
+
 /// `HIPFIRE_TIER_RATIO` — Runtime variable controlling tier ratio in hipfire
 pub const ENV_HIPFIRE_TIER_RATIO: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TIER_RATIO",
@@ -5136,6 +5143,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_STEER_DUMP,
     ENV_HIPFIRE_TARGET_ARCH,
     ENV_HIPFIRE_TEST_LATENT,
+    ENV_HIPFIRE_TEST_NEEDLECHAIN_CACHE,
     ENV_HIPFIRE_TIER_RATIO,
     ENV_HIPFIRE_TINYQUANT_FAMILIES,
     ENV_HIPFIRE_TINYQUANT_RECORD,

@@ -3347,6 +3347,70 @@ pub(crate) fn examples_barrage_rows(
                     }
                 }
             }
+            (SuiteId::NeedleChain, EvalStatus::Pass) => {
+                match needlechain_materialized_items(Path::new(&d.cache_path), &d.selected_item_ids)
+                {
+                    Ok(items) => {
+                        rows.extend(items.into_iter().flat_map(|item| {
+                            evaluation_models(config).into_iter().map(move |model| {
+                                run_examples_longctx_item(config, ctx, d, item.clone(), model)
+                            })
+                        }));
+                    }
+                    Err(reason) => {
+                        rows.extend(d.selected_item_ids.iter().cloned().map(|id| {
+                            let mut metrics = BTreeMap::new();
+                            add_dataset_provenance_metrics(&mut metrics, d);
+                            skip_row_with_metrics(
+                                BatteryId::Barrage,
+                                Some(SuiteId::NeedleChain),
+                                "needle_chain_materialize_failed",
+                                Some(id),
+                                &reason,
+                                config,
+                                ctx,
+                                None,
+                                metrics,
+                            )
+                        }));
+                    }
+                }
+            }
+            (SuiteId::Niah | SuiteId::SequentialNiah, EvalStatus::Pass) => {
+                let materialized = match d.suite {
+                    SuiteId::SequentialNiah => {
+                        sequential_niah_materialized_items(&d.selected_item_ids)
+                    }
+                    _ => niah_materialized_items(&d.selected_item_ids),
+                };
+                match materialized {
+                    Ok(items) => {
+                        rows.extend(items.into_iter().flat_map(|item| {
+                            evaluation_models(config).into_iter().map(move |model| {
+                                run_examples_longctx_item(config, ctx, d, item.clone(), model)
+                            })
+                        }));
+                    }
+                    Err(reason) => {
+                        let cid = format!("{}_materialize_failed", d.suite.as_str());
+                        rows.extend(d.selected_item_ids.iter().cloned().map(|id| {
+                            let mut metrics = BTreeMap::new();
+                            add_dataset_provenance_metrics(&mut metrics, d);
+                            skip_row_with_metrics(
+                                BatteryId::Barrage,
+                                Some(d.suite),
+                                &cid,
+                                Some(id),
+                                &reason,
+                                config,
+                                ctx,
+                                None,
+                                metrics,
+                            )
+                        }));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4214,6 +4278,202 @@ pub(crate) fn run_examples_gpqa_item(
             model,
         )
     }
+}
+
+/// Shared executor for the long-context retrieval suites (Niah, SequentialNiah,
+/// NeedleChain). Mirrors `run_examples_gpqa_item` (prompt-file → `run` example
+/// binary → parse stderr metrics) but sizes the KV window to the fixture and
+/// scores by substring recall: PASS-row iff the run executed; `accuracy`
+/// reflects whether ≥ `min_recovered` expected substrings appear in the answer.
+pub(crate) fn run_examples_longctx_item(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    dataset: &DatasetManifestEntry,
+    item: LongCtxItem,
+    model: String,
+) -> EvalResult {
+    let suite = item.suite;
+    let case_id = item.case_id.clone();
+    let item_id = item.item_id.clone();
+    let prompt_ref = PromptRef::from_content(
+        format!("dataset:{}:{item_id}", suite.as_str()),
+        item.prompt.as_bytes(),
+    );
+    let kv_mode = config.kv_mode.clone().unwrap_or_else(|| "q8".to_string());
+    let mut base_metrics = BTreeMap::from([
+        ("prompt_format".to_string(), json!("longctx_retrieval_v1")),
+        ("task".to_string(), json!(item.task.clone())),
+        ("expected_count".to_string(), json!(item.expected.len())),
+        ("min_recovered".to_string(), json!(item.min_recovered)),
+        ("context_tokens".to_string(), json!(item.context_tokens)),
+        ("dataset_file".to_string(), json!(item.dataset_file.clone())),
+        ("executor".to_string(), json!("examples")),
+        ("kv_mode".to_string(), json!(kv_mode.clone())),
+    ]);
+    add_dataset_provenance_metrics(&mut base_metrics, dataset);
+
+    let row = |status: EvalStatus,
+               reason: Option<String>,
+               metrics: BTreeMap<String, Value>,
+               elapsed: u128|
+     -> EvalResult {
+        row_for_model(
+            BatteryId::Barrage,
+            Some(suite),
+            &case_id,
+            Some(item_id.clone()),
+            status,
+            reason,
+            metrics,
+            config,
+            ctx,
+            Some(prompt_ref.clone()),
+            elapsed,
+            model.clone(),
+        )
+    };
+
+    if !Path::new(&model).exists() {
+        return row(
+            EvalStatus::Skip,
+            Some(
+                "examples executor requires each evaluated model to be a local filesystem path"
+                    .to_string(),
+            ),
+            base_metrics,
+            0,
+        );
+    }
+    let Some(bin) = resolve_run_example_bin() else {
+        return row(
+            EvalStatus::Skip,
+            Some("run example binary not found; build with `cargo build --release --features deltanet -p hipfire-runtime --example run`".to_string()),
+            base_metrics,
+            0,
+        );
+    };
+
+    let prompt_dir = config.out_dir.join("artifacts").join("runtime_prompts");
+    if let Err(err) = fs::create_dir_all(&prompt_dir) {
+        return row(
+            EvalStatus::Fail,
+            Some(format!("create runtime prompt dir: {err}")),
+            base_metrics,
+            0,
+        );
+    }
+    let prompt_file = prompt_dir.join(format!(
+        "{}-{}.txt",
+        suite.as_str(),
+        sanitize_path_component(&item_id)
+    ));
+    if let Err(err) = fs::write(&prompt_file, &item.prompt) {
+        return row(
+            EvalStatus::Fail,
+            Some(format!("write runtime prompt: {err}")),
+            base_metrics,
+            0,
+        );
+    }
+
+    let evidence_dir =
+        runtime_evidence_dir(config, &format!("{}-{item_id}", suite.as_str()), &model);
+    // Long prompts: size the KV window to the fixture plus generation headroom
+    // (4096 floor for short chains, matching the default execution window).
+    let max_seq = (item.context_tokens + config.max_tokens + 512).max(4096);
+    let mut args = vec![
+        model.clone(),
+        "--prompt-file".to_string(),
+        prompt_file.display().to_string(),
+        "--max-tokens".to_string(),
+        config.max_tokens.to_string(),
+        "--kv".to_string(),
+        kv_mode.clone(),
+        "--temp".to_string(),
+        "0.0".to_string(),
+        "--max-seq".to_string(),
+        max_seq.to_string(),
+    ];
+    add_runtime_evidence_arg(&mut args, &evidence_dir);
+    let command_display = format!("{} {}", bin.display(), args.join(" "));
+    let started = SystemTime::now();
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args);
+    apply_kv_env(&mut cmd, config);
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(err) => {
+            base_metrics.insert("command".to_string(), json!(command_display));
+            return row(
+                EvalStatus::Fail,
+                Some(format!("spawn run example: {err}")),
+                base_metrics,
+                elapsed_since_ms(started),
+            );
+        }
+    };
+    let elapsed_ms = elapsed_since_ms(started);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut metrics = parse_bench_metrics(&stderr);
+    metrics.extend(base_metrics);
+    metrics.insert("implemented".to_string(), json!(true));
+    metrics.insert("command".to_string(), json!(command_display));
+    metrics.insert(
+        "runtime_prompt_path".to_string(),
+        json!(prompt_file.display().to_string()),
+    );
+    metrics.insert(
+        "runtime_evidence_dir".to_string(),
+        json!(evidence_dir.display().to_string()),
+    );
+    metrics.insert(
+        "stdout_hash".to_string(),
+        json!(stable_hash_bytes(stdout.as_bytes())),
+    );
+    metrics.insert(
+        "stderr_hash".to_string(),
+        json!(stable_hash_bytes(stderr.as_bytes())),
+    );
+    if let Some(v) = metrics.get("decode_tok_s").cloned() {
+        metrics.entry("tok_s".to_string()).or_insert(v);
+    }
+
+    // Substring-recall scoring (case-insensitive). The row PASSes when the eval
+    // executed; correctness lives in `accuracy`/`retrieved` (GPQA semantics).
+    let recovered = count_recovered(&stdout, &item.expected);
+    let recall = recovered as f64 / item.expected.len().max(1) as f64;
+    let retrieved = recovered >= item.min_recovered;
+    metrics.insert("recovered".to_string(), json!(recovered));
+    metrics.insert("recall".to_string(), json!(recall));
+    metrics.insert(
+        "retrieved".to_string(),
+        json!(if retrieved { 1.0 } else { 0.0 }),
+    );
+    metrics.insert(
+        "accuracy".to_string(),
+        json!(if retrieved { 1.0 } else { 0.0 }),
+    );
+
+    if output.status.success() && metrics.contains_key("decode_tok_s") {
+        row(EvalStatus::Pass, None, metrics, elapsed_ms)
+    } else {
+        let reason = if output.status.success() {
+            "run example did not emit BENCH METRICS".to_string()
+        } else {
+            format!("run example exited with {}", output.status)
+        };
+        row(EvalStatus::Fail, Some(reason), metrics, elapsed_ms)
+    }
+}
+
+/// Count how many `expected` substrings appear (case-insensitively) in `stdout`.
+pub(crate) fn count_recovered(stdout: &str, expected: &[String]) -> usize {
+    let hay = stdout.to_lowercase();
+    expected
+        .iter()
+        .filter(|e| hay.contains(&e.to_lowercase()))
+        .count()
 }
 
 pub(crate) fn extract_answer_letter(stdout: &str) -> Option<String> {
