@@ -1,6 +1,7 @@
 # KV & long-context eval buildout
 
-Status: **active**. Branch: `chaingun`. Date: 2026-07-14.
+Status: **implemented** (all phases landed; live GPU accuracy validation pending).
+Branch: `chaingun`. Date: 2026-07-14.
 
 Turns the scattered, half-wired KV/long-context tests into first-class
 `hipfire eval` batteries/suites: human-usable CLI, the NIAH bench driven through
