@@ -15,7 +15,6 @@ use std::{
     panic,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,10 +25,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use hipfire_admin_types::{fmt_bytes, AdminStats, GpuTelemetry, MemPool};
-use libdrm_amdgpu_sys::{
-    LibDrmAmdgpu,
-    AMDGPU::{DeviceHandle, CHIP_CLASS, GPU_INFO, GRBM2_OFFSET, GRBM_OFFSET},
-};
+use hipfire_sysinfo::{AmdgpuRegDevice, AmdgpuRegLib, ChipClass, GRBM2_OFFSET, GRBM_OFFSET};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -2023,7 +2019,6 @@ struct GpuBlockSampler {
     devices: Vec<GpuCounterDevice>,
     meters: BTreeMap<String, Meter>,
     sample_count: u64,
-    _libdrm: LibDrmAmdgpu,
 }
 
 impl std::fmt::Debug for GpuBlockSampler {
@@ -2038,10 +2033,10 @@ impl std::fmt::Debug for GpuBlockSampler {
 
 impl GpuBlockSampler {
     fn open() -> Option<Self> {
-        let libdrm = LibDrmAmdgpu::new().ok()?;
+        let libdrm = AmdgpuRegLib::load()?;
         let devices = discover_amdgpu_render_nodes()
             .into_iter()
-            .filter_map(|path| GpuCounterDevice::open(&libdrm, path))
+            .filter_map(|path| libdrm.open_device(&path).map(GpuCounterDevice::new))
             .collect::<Vec<_>>();
         if devices.is_empty() {
             return None;
@@ -2054,7 +2049,6 @@ impl GpuBlockSampler {
             devices,
             meters,
             sample_count: 0,
-            _libdrm: libdrm,
         })
     }
 
@@ -2113,33 +2107,24 @@ impl GpuBlockSampler {
 }
 
 struct GpuCounterDevice {
-    handle: DeviceHandle,
-    _fd: Arc<OwnedFd>,
+    device: AmdgpuRegDevice,
     grbm: RegisterSampler,
     grbm2: RegisterSampler,
 }
 
 impl GpuCounterDevice {
-    fn open(libdrm: &LibDrmAmdgpu, render_node: PathBuf) -> Option<Self> {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(render_node)
-            .ok()?;
-        let fd = Arc::new(OwnedFd::from(file));
-        let (handle, _, _) = libdrm.init_device_handle_with_fd(fd.clone()).ok()?;
-        let chip_class = handle.device_info().ok()?.get_chip_class();
-        Some(Self {
-            handle,
-            _fd: fd,
+    fn new(device: AmdgpuRegDevice) -> Self {
+        let chip_class = device.chip_class();
+        Self {
+            device,
             grbm: RegisterSampler::new(GRBM_OFFSET, GRBM_INDEX),
             grbm2: RegisterSampler::new(GRBM2_OFFSET, grbm2_index(chip_class)),
-        })
+        }
     }
 
     fn sample(&mut self) -> bool {
-        let grbm = self.grbm.sample(&self.handle);
-        let grbm2 = self.grbm2.sample(&self.handle);
+        let grbm = self.grbm.sample(&self.device);
+        let grbm2 = self.grbm2.sample(&self.device);
         grbm || grbm2
     }
 
@@ -2181,8 +2166,8 @@ impl RegisterSampler {
         }
     }
 
-    fn sample(&mut self, handle: &DeviceHandle) -> bool {
-        let Ok(value) = handle.read_mm_registers(self.offset) else {
+    fn sample(&mut self, device: &AmdgpuRegDevice) -> bool {
+        let Some(value) = device.read_mm_register(self.offset) else {
             return false;
         };
         self.samples = self.samples.saturating_add(1);
@@ -2254,14 +2239,14 @@ fn find_render_node(drm_path: PathBuf) -> Option<PathBuf> {
     render_nodes.into_iter().map(|(_, path)| path).next()
 }
 
-fn grbm2_index(chip_class: CHIP_CLASS) -> &'static [(&'static str, usize)] {
-    if CHIP_CLASS::GFX12 <= chip_class {
+fn grbm2_index(chip_class: ChipClass) -> &'static [(&'static str, usize)] {
+    if ChipClass::Gfx12 <= chip_class {
         GFX12_GRBM2_INDEX
-    } else if CHIP_CLASS::GFX10_3 <= chip_class {
+    } else if ChipClass::Gfx10_3 <= chip_class {
         GFX10_3_GRBM2_INDEX
-    } else if CHIP_CLASS::GFX10 <= chip_class {
+    } else if ChipClass::Gfx10 <= chip_class {
         GFX10_GRBM2_INDEX
-    } else if CHIP_CLASS::GFX9 <= chip_class {
+    } else if ChipClass::Gfx9 <= chip_class {
         GFX9_GRBM2_INDEX
     } else {
         GRBM2_INDEX
@@ -2707,12 +2692,12 @@ mod tests {
 
     #[test]
     fn grbm2_uses_arch_specific_tcp_and_rlc_bits() {
-        assert!(grbm2_index(CHIP_CLASS::GFX10).contains(&("RLC", 24)));
-        assert!(grbm2_index(CHIP_CLASS::GFX10).contains(&("TCP", 25)));
-        assert!(grbm2_index(CHIP_CLASS::GFX10_3).contains(&("RLC", 26)));
-        assert!(grbm2_index(CHIP_CLASS::GFX10_3).contains(&("TCP", 27)));
-        assert!(grbm2_index(CHIP_CLASS::GFX12).contains(&("RLC", 26)));
-        assert!(grbm2_index(CHIP_CLASS::GFX12).contains(&("TCP", 27)));
+        assert!(grbm2_index(ChipClass::Gfx10).contains(&("RLC", 24)));
+        assert!(grbm2_index(ChipClass::Gfx10).contains(&("TCP", 25)));
+        assert!(grbm2_index(ChipClass::Gfx10_3).contains(&("RLC", 26)));
+        assert!(grbm2_index(ChipClass::Gfx10_3).contains(&("TCP", 27)));
+        assert!(grbm2_index(ChipClass::Gfx12).contains(&("RLC", 26)));
+        assert!(grbm2_index(ChipClass::Gfx12).contains(&("TCP", 27)));
     }
 
     #[test]

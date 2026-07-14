@@ -1947,7 +1947,6 @@ dependencies = [
  "hipfire-admin-types",
  "hipfire-sysinfo",
  "libc",
- "libdrm_amdgpu_sys",
  "ratatui",
 ]
 
@@ -2684,14 +2683,6 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
-
-[[package]]
-name = "libdrm_amdgpu_sys"
-version = "0.8.16"
-source = "git+https://github.com/Umio-Yasuno/libdrm-amdgpu-sys-rs?rev=46c5aceeef63dbf7045453f69a3ccaf0d376b0fb#46c5aceeef63dbf7045453f69a3ccaf0d376b0fb"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "libloading"

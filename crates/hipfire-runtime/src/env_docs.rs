@@ -108,7 +108,7 @@ pub const ENV_CARGO_PKG_VERSION: EnvVarDoc = EnvVarDoc {
 pub const ENV_COLORTERM: EnvVarDoc = EnvVarDoc {
     name: "COLORTERM",
     description: "Runtime variable controlling colorterm in hipfire",
-    source: "crates/hipfire-monitor/src/lib.rs:397",
+    source: "crates/hipfire-monitor/src/lib.rs:393",
 };
 
 /// `DDTREE_TIMING` — pre_verify / verify. The draft and top-K are fused into one GPU-
@@ -4463,7 +4463,7 @@ pub const ENV_NEMO_TOKENS: EnvVarDoc = EnvVarDoc {
 pub const ENV_NO_COLOR: EnvVarDoc = EnvVarDoc {
     name: "NO_COLOR",
     description: "Runtime variable controlling no color in hipfire",
-    source: "crates/hipfire-monitor/src/lib.rs:396",
+    source: "crates/hipfire-monitor/src/lib.rs:392",
 };
 
 /// `NO_NGRAM` — Disabled for perf measurement — re-enable after implementing GPU n-gram kernel
@@ -4519,7 +4519,7 @@ pub const ENV_ROCR_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
 pub const ENV_TERM: EnvVarDoc = EnvVarDoc {
     name: "TERM",
     description: "Runtime variable controlling term in hipfire",
-    source: "crates/hipfire-monitor/src/lib.rs:398",
+    source: "crates/hipfire-monitor/src/lib.rs:394",
 };
 
 /// `TRIALS` — Runtime variable controlling trials in hipfire
