@@ -65,6 +65,32 @@ shows up where KV error is the bottleneck (long context, many quantized blocks) 
 measure with long-context KLD vs a bf16 ref (`--kv-mode kvarn --kvarn-bits {4,8}`
 + the KLD bridge), not this needle.
 
+## Model-level KLD (2026-07-14) — isolates KV quant from weight quant
+
+`perplexity` on qwen3.5-9b-mq4, ctx=4096, ~4.6k-token long-context slice, 3031
+scored positions, each vs an **f32-KV reference with the same mq4 weights** (so
+this is the *pure* KV-quant effect, not weight quant):
+
+| KV mode | PPL | KLD/tok vs f32-KV |
+|---|---|---|
+| f32 (ref) | 125.22 | 0 |
+| kvarn 4-bit | 125.22 | 9.1e-4 |
+| kvarn 8-bit | 125.20 | 1.1e-5 |
+
+- **8-bit is ~82× lower KLD than 4-bit** — the precision win is real at the model
+  level (same order as the tile sweep's ~165×).
+- **8-bit kvarn is essentially KV-lossless** (1.1e-5) → strong f16-hot-ring
+  replacement (2× smaller, KLD in the noise).
+- **Correction:** the plan's "single-tier KVarN 0.085 KLD" was measured vs
+  **bf16** (full-precision weights AND KV), so it was dominated by the **mq4
+  weight quant**. The KV-quant contribution alone is only **9.1e-4** at 4-bit —
+  ~90× smaller. The attention softmax + model robustness attenuate the 12% tile
+  reconstruction error (the codec sweep's `attn_KLD` proxy over-estimated model
+  impact). So even 4-bit KV is near-harmless; 8-bit is negligible.
+
+Reproduce: `perplexity MODEL corpus.txt --ctx 4096 --kv-mode f32 --dump-ref
+ref.pkld`, then `--kv-mode kvarn --kld-ref ref.pkld` at `HIPFIRE_KVARN_BITS`=4/8.
+
 ## Remaining work
 
 1. **Swap the f16 hot ring for 8-bit kvarn** (`kv_hier.rs`). The container +
