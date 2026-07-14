@@ -2398,6 +2398,12 @@ pub(crate) fn pflash_niah_cases() -> &'static [PflashNiahCase] {
     ]
 }
 
+/// KV modes the `pflash_niah_bench` binary implements (see its `--kv-mode`
+/// resolution). `kvarn`/`f32`/`fp16` and the two-tier hierarchical cache are not
+/// among them — those are measured through the perplexity battery instead.
+pub(crate) const PFLASH_KV_MODES: &[&str] =
+    &["q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2"];
+
 pub(crate) fn pflash_maxgen_for_fixture(fixture: &str) -> usize {
     if fixture.contains("multi") {
         80
@@ -2408,9 +2414,26 @@ pub(crate) fn pflash_maxgen_for_fixture(fixture: &str) -> usize {
     }
 }
 
+/// A pflash case is selected when the `--fixture` filter is unset, or any
+/// comma-separated token is a (case-insensitive) substring of the case's
+/// fixture path or label. Lets `--fixture niah_16k` or `--fixture longcode,niah`
+/// narrow the default 12-case sweep.
+pub(crate) fn pflash_case_selected(case: &PflashNiahCase, filter: Option<&str>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let hay = format!("{} {}", case.fixture, case.label).to_lowercase();
+    filter
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .any(|t| hay.contains(&t.to_lowercase()))
+}
+
 pub(crate) fn run_examples_pflash_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
     pflash_niah_cases()
         .iter()
+        .filter(|case| pflash_case_selected(case, config.fixture.as_deref()))
         .map(|case| run_examples_pflash_case(config, ctx, *case))
         .collect()
 }
@@ -2422,19 +2445,42 @@ pub(crate) fn run_examples_pflash_case(
 ) -> EvalResult {
     let model = config.model.clone();
     let prompt_ref = prompt(case.fixture);
+    // pflash battery defaults to asym3 (the bench default) when --kv-mode is unset.
+    let kv_mode = config.kv_mode.as_deref().unwrap_or("asym3").to_string();
     let mut base_metrics = BTreeMap::from([
         ("implemented".to_string(), json!(true)),
         ("executor".to_string(), json!("examples")),
         ("suite".to_string(), json!("pflash_niah")),
         ("fixture".to_string(), json!(case.fixture)),
         ("mode".to_string(), json!(case.mode)),
-        ("kv_mode".to_string(), json!("asym3")),
+        ("kv_mode".to_string(), json!(kv_mode)),
         ("pretok".to_string(), json!(true)),
         (
             "maxgen".to_string(),
             json!(pflash_maxgen_for_fixture(case.fixture)),
         ),
     ]);
+
+    if !PFLASH_KV_MODES.contains(&kv_mode.as_str()) {
+        return row_for_model(
+            BatteryId::Pflash,
+            None,
+            case.label,
+            None,
+            EvalStatus::Skip,
+            Some(format!(
+                "pflash_niah_bench does not implement --kv-mode {kv_mode} (supported: {}); \
+                 use the perplexity battery for kvarn/hierarchical",
+                PFLASH_KV_MODES.join(", ")
+            )),
+            base_metrics,
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    }
 
     if !Path::new(&model).exists() {
         return row_for_model(
@@ -2493,7 +2539,8 @@ pub(crate) fn run_examples_pflash_case(
         fixture_path.display().to_string(),
         "--maxgen".to_string(),
         pflash_maxgen_for_fixture(case.fixture).to_string(),
-        "--asym3".to_string(),
+        "--kv-mode".to_string(),
+        kv_mode.clone(),
         "--pretok".to_string(),
     ];
     if case.mode == "pflash" {
@@ -2546,7 +2593,10 @@ pub(crate) fn run_examples_pflash_case(
 
     let command_display = format!("{} {}", bin.display(), args.join(" "));
     let started = SystemTime::now();
-    let output = match Command::new(&bin).args(&args).output() {
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args);
+    apply_kv_env(&mut cmd, config);
+    let output = match cmd.output() {
         Ok(output) => output,
         Err(err) => {
             base_metrics.insert("command".to_string(), json!(command_display));
@@ -4833,4 +4883,49 @@ pub(crate) fn run_direct_session_reset_recall(
         elapsed_ms,
         model,
     )
+}
+
+#[cfg(test)]
+mod pflash_filter_tests {
+    use super::{pflash_case_selected, pflash_niah_cases, PflashNiahCase};
+
+    fn case(fixture: &'static str, label: &'static str) -> PflashNiahCase {
+        PflashNiahCase {
+            label,
+            fixture,
+            mode: "baseline",
+        }
+    }
+
+    #[test]
+    fn no_filter_selects_all() {
+        let c = case(
+            "benchmarks/longctx/niah/niah_16k.jsonl",
+            "niah_16k_baseline",
+        );
+        assert!(pflash_case_selected(&c, None));
+    }
+
+    #[test]
+    fn substring_matches_fixture_or_label() {
+        let c = case(
+            "benchmarks/longctx/niah/niah_16k.jsonl",
+            "niah_16k_baseline",
+        );
+        assert!(pflash_case_selected(&c, Some("niah_16k")));
+        assert!(pflash_case_selected(&c, Some("NIAH_16K"))); // case-insensitive
+        assert!(pflash_case_selected(&c, Some("longcode,niah_16k"))); // any csv token
+        assert!(!pflash_case_selected(&c, Some("niah_32k")));
+        assert!(!pflash_case_selected(&c, Some("longcode")));
+    }
+
+    #[test]
+    fn filter_narrows_the_default_sweep() {
+        let all = pflash_niah_cases().len();
+        let niah16 = pflash_niah_cases()
+            .iter()
+            .filter(|c| pflash_case_selected(c, Some("niah_16k")))
+            .count();
+        assert!(niah16 > 0 && niah16 < all);
+    }
 }

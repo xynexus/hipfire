@@ -456,6 +456,10 @@ pub struct EvalConfig {
     /// env-gated, not a `--kv-mode` value.
     #[serde(default)]
     pub kv_hierarchical: bool,
+    /// `--fixture <a,b>`: substring filter over pflash/longctx NIAH fixtures
+    /// (matched against the fixture path + case label). `None` runs all.
+    #[serde(default)]
+    pub fixture: Option<String>,
     pub max_tokens: usize,
     pub dflash: DflashMode,
     pub profile: ProfileMode,
@@ -3270,6 +3274,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             ctx: None,
             corpus: None,
             kv_hierarchical: false,
+            fixture: None,
             max_tokens: 8,
             dflash: DflashMode::Off,
             profile: ProfileMode::Off,
@@ -7398,6 +7403,7 @@ more noise
             ctx: None,
             corpus: None,
             kv_hierarchical: false,
+            fixture: None,
             max_tokens: 8,
             dflash: DflashMode::Off,
             profile: ProfileMode::Off,

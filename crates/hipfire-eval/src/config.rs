@@ -31,6 +31,7 @@ where
     let mut ctx: Option<usize> = None;
     let mut corpus: Option<PathBuf> = None;
     let mut kv_hierarchical = false;
+    let mut fixture: Option<String> = None;
     let mut max_tokens = 64usize;
     let mut dflash = DflashMode::Off;
     let mut profile = ProfileMode::Off;
@@ -139,6 +140,10 @@ where
             }
             "--corpus" => {
                 corpus = Some(PathBuf::from(take_value(&argv, i, "--corpus")?));
+                i += 2;
+            }
+            "--fixture" => {
+                fixture = Some(take_value(&argv, i, "--fixture")?);
                 i += 2;
             }
             "--max-tokens" => {
@@ -333,6 +338,7 @@ where
         ctx,
         corpus,
         kv_hierarchical,
+        fixture,
         max_tokens,
         dflash,
         profile,
@@ -389,6 +395,7 @@ pub fn usage() -> String {
        --kv-hierarchical        enable the two-tier hot/cold KV cache in spawned binaries (sets HIPFIRE_KV_HIERARCHICAL=1; other HIPFIRE_KV_* knobs pass through the environment)\n\
        --ctx <N>                context length for perplexity/long-context batteries (default: 512; overrides HIPFIRE_EVAL_PERPLEXITY_CTX)\n\
        --corpus <path>          perplexity corpus path (overrides HIPFIRE_EVAL_PERPLEXITY_CORPUS)\n\
+       --fixture <a,b>          pflash/longctx NIAH fixture filter (substring match on name, e.g. niah_16k,longcode); default: all\n\
        --max-tokens <N>         short decode cap for execution batteries (default: 64)\n\
        --profile <off|passive>  profiling mode (default: off)\n\
        --quality-max-chunks <N> quality canary chunk cap\n\

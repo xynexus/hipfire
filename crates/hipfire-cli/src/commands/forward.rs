@@ -32,6 +32,7 @@ Common options:
   --kv-hierarchical         Enable the two-tier hot/cold KV cache (HIPFIRE_KV_HIERARCHICAL=1)
   --ctx <N>                 Context length for perplexity/long-context batteries (default: 512)
   --corpus <path>           Perplexity corpus path
+  --fixture <a,b>           pflash/longctx NIAH fixture filter (e.g. niah_16k,longcode)
   --benchmark               Run repeated samples and emit aggregate rows
   --runs <N>                Repeat each scored battery N times
   --force                   Ignore cache hits for this run
