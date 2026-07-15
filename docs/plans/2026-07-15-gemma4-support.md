@@ -38,11 +38,16 @@ The best retained valid 31B result is
 - hidden-state thresholds fail first at layer 39 and also at layers 52, 56, 57,
   and 58.
 
-Subsequent BF16-boundary, batched-prefill, attention, and exact-rocBLAS
-experiments did not pass the unchanged gate. Their exact results are recorded in
-`benchmarks/gemma4/PHASE5.md`; unadmitted serving integrations were removed.
-rocBLAS remains only in standalone numerical parity diagnostics, where it proves
-bit-exact BF16 projection and ROCm math-SDPA contracts.
+Subsequent BF16-boundary, batched-prefill, attention, exact-rocBLAS, and
+BF16-staged RoPE experiments did not pass the unchanged gate. Their exact
+results are recorded in `benchmarks/gemma4/PHASE5.md`; unadmitted serving
+integrations were removed. The latest staged-RoPE candidate exactly reproduces
+the isolated Transformers layer-0 Q/K RoPE outputs, but worsens final-logit
+maximum error to `0.5677473545074463` and expands the hidden-state failure set to
+layers 39, 40, 41, 43, 52, 53, 56, 57, and 58. It is retained only as a
+standalone diagnostic, alongside the rocBLAS probes that prove bit-exact BF16
+projection and ROCm math-SDPA contracts. The normal serving path remains the
+best retained portable sequential implementation.
 
 A post-freeze Transformers reference-variability control is retained at
 `benchmarks/gemma4/control-noise-31B.json`. It shows that alternate BF16

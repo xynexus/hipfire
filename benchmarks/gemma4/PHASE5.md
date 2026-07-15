@@ -235,6 +235,44 @@ linear and SDPA parity probes remain because they establish exact operator
 contracts, but exact projections and attention alone do not close the
 whole-model admission gap.
 
+## Rejected BF16-staged RoPE candidate
+
+The pinned Transformers implementation materializes each pointwise RoPE
+product in BF16 before the final BF16 add/subtract. This is a different
+precision boundary from the previously tested whole-output rounding. A
+standalone HIP parity probe using the exact layer-0 Q/K inputs and RoPE tables
+confirmed the distinction:
+
+- the ordinary F32 kernel followed by BF16 rounding matched `35022/40960` Q
+  values and `17515/20480` K values;
+- a portable diagnostic kernel that rounds each input, trigonometric value,
+  product, and final sum to BF16 matched `40960/40960` Q values and
+  `20480/20480` K values exactly;
+- the generated cosine and sine tables already matched the captured BF16 tables
+  exactly (`640/640` values each), so the difference is pointwise staging rather
+  than frequency or table generation;
+- the diagnostic kernel compiled for `gfx1030`, `gfx1100`, `gfx1151`, and
+  `gfx1200`.
+
+Despite exact isolated-operator parity, selecting the staged kernel throughout
+the 31B forward worsened the unchanged all-layer comparison:
+
+- final-logit maximum absolute error `0.5677473545074463`, versus the retained
+  path's `0.5618224143981934`;
+- final-logit cosine `0.9997615861188698` and normalized RMSE
+  `0.022828305269326585`;
+- hidden-state threshold failures at layers 39, 40, 41, 43, 52, 53, 56, 57,
+  and 58, versus layers 39, 52, 56, 57, and 58 on the retained path;
+- exact greedy generation, argmax `7001`, top-5 overlap `5/5`, and finite
+  captures remained unchanged.
+
+The serving integration was removed. The standalone kernel and parity example
+remain only as a diagnostic operator contract. Candidate evidence is retained
+at
+`~/.hipfire/evidence/gemma4/base-short-hipfire-all-layers-bf16-staged-rope`;
+the layer-0 oracle inputs and tables are retained at
+`~/.hipfire/evidence/gemma4/base-short-layer0-rope-cos`.
+
 The best result remains
 `~/.hipfire/evidence/gemma4/base-short-hipfire-all-layers-embed-bf16-rope-order`
 at final-logit maximum error `0.5618224143981934`, with exact greedy generation,
