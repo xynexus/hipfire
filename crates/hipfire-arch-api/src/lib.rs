@@ -93,6 +93,9 @@ pub const ARCH_ID_EMBEDDINGGEMMA: u32 = 19;
 // = 21 already exist as local consts in the quantize bins (`dflash_convert.rs`,
 // `mtp_extract.rs`); the DSpark drafter sidecar takes the next free id.
 pub const ARCH_ID_DSPARK_DRAFT: u32 = 22;
+/// FLUX.2 MMDiT image denoisers, including Klein and the SeFi semantic-first
+/// variant. Pipeline metadata distinguishes the vanilla and dual-time drivers.
+pub const ARCH_ID_FLUX2: u32 = 23;
 
 impl core::fmt::Display for ArchId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

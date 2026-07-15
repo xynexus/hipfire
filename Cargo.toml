@@ -43,6 +43,7 @@ members = [
     "crates/hipfire-arch-qwen35-spec",
     "crates/hipfire-arch-krea2-spec",
     "crates/hipfire-arch-qwenimage-spec",
+    "crates/hipfire-arch-flux2-spec",
     "crates/hipfire-arch-dots-ocr-spec",
     "crates/hipfire-arch-deepseek4-spec",
     "crates/hipfire-arch-minimax-spec",

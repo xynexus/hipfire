@@ -67,6 +67,7 @@ mod tests {
         ));
         assert!(is_diffusion_arch(hipfire_arch_api::ARCH_ID_KREA2));
         assert!(is_diffusion_arch(hipfire_arch_api::ARCH_ID_QWEN_IMAGE));
+        assert!(is_diffusion_arch(hipfire_arch_api::ARCH_ID_FLUX2));
         // A text LM arch is not diffusion.
         assert!(!is_diffusion_arch(hipfire_arch_api::ARCH_ID_QWEN35_DENSE));
         assert!(!is_diffusion_arch(999));
@@ -132,9 +133,10 @@ mod tests {
         // untracked addition. Ids: 0 llama, 1 qwen2/3, 5 qwen3.5, 6 qwen3.5-moe,
         // 8 dots-ocr, 9 deepseek4, 10 minimax, 11 lfm2, 12 gemma3, 13 gemma3-vl,
         // 14 nemotron-h, 15 mamba2, 16 zaya, 17 krea2 (diffusion),
-        // 18 qwen-image (diffusion), 19 embeddinggemma, 0xFF template.
+        // 18 qwen-image (diffusion), 19 embeddinggemma, 23 flux2 (diffusion),
+        // 0xFF template.
         let expected: BTreeSet<u16> = [
-            0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 0xFF,
+            0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 0xFF,
         ]
         .into_iter()
         .collect();

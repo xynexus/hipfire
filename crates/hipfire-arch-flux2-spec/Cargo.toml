@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-flux2-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline architecture and ingest policy for FLUX.2 diffusion models."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

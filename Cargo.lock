@@ -1354,6 +1354,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-flux2-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-gemma3"
 version = "0.3.0"
 dependencies = [
@@ -1561,6 +1568,7 @@ dependencies = [
  "hipfire-arch-deepseek4-spec",
  "hipfire-arch-dots-ocr-spec",
  "hipfire-arch-embeddinggemma-spec",
+ "hipfire-arch-flux2-spec",
  "hipfire-arch-gemma3-spec",
  "hipfire-arch-gemma3-vl-spec",
  "hipfire-arch-krea2-spec",
