@@ -28,5 +28,15 @@
       "multiple_global_layers"
     ]
   },
-  "rationale": "The limits allow accumulated BF16 reduction-order noise while requiring near-identical vector direction, bounded absolute logit drift, identical greedy decisions, and no non-finite masking. They are frozen before observing Hipfire Gemma 4 whole-model output and may not be weakened after results are seen."
+  "reference_variability_diagnostic": {
+    "admission_use": "diagnostic only; the post-freeze measurement does not modify these thresholds",
+    "tool": "benchmarks/gemma4/control_noise_bf16.py",
+    "artifact": "benchmarks/gemma4/control-noise-31B.json",
+    "method": "Compare the pinned unpadded SDPA reference with alternate Transformers BF16 attention and padding executions, and also record all pairwise variability. This is a finite observed control band for one prompt, not an irreducible numerical floor.",
+    "checkpoint": "google/gemma-4-31B @ 02e15e4990e8c452f8543fb26beff15b1daf8f3d",
+    "prompt": "The capital of France is",
+    "env": "torch 2.11.0+rocm7.13.0, transformers 5.10.2 (the oracle capture env)",
+    "samples": ["sdpa", "sdpa_pad16", "eager", "eager_pad16"]
+  },
+  "rationale": "The limits allow accumulated BF16 reduction-order noise while requiring near-identical vector direction, bounded absolute logit drift, identical greedy decisions, and no non-finite masking. They are frozen before observing Hipfire Gemma 4 whole-model output and may not be weakened after results are seen. Post-freeze reference-variability measurements are retained as diagnostics only."
 }

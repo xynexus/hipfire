@@ -1,0 +1,377 @@
+{
+  "final_logits_floor": {
+    "maximum_absolute_error": 0.6875,
+    "minimum_cosine": 0.9997665418350917
+  },
+  "hidden_states_floor": {
+    "minimum_cosine_any_layer": 0.9984564246605113,
+    "per_layer": {
+      "0": {
+        "minimum_cosine": 0.9999882709566117,
+        "worst_maximum_absolute_error": 0.125,
+        "worst_normalized_rmse": 0.0049785120624121935
+      },
+      "1": {
+        "minimum_cosine": 0.9999928322635807,
+        "worst_maximum_absolute_error": 0.0625,
+        "worst_normalized_rmse": 0.0038070725492506284
+      },
+      "10": {
+        "minimum_cosine": 0.9999929380240629,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.006305542621160876
+      },
+      "11": {
+        "minimum_cosine": 0.9999826383795389,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.0068013328073404595
+      },
+      "12": {
+        "minimum_cosine": 0.9999855933639158,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.005689753393185675
+      },
+      "13": {
+        "minimum_cosine": 0.9999857938500657,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.005641933691423483
+      },
+      "14": {
+        "minimum_cosine": 0.9999859644152131,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.005585952521839947
+      },
+      "15": {
+        "minimum_cosine": 0.9999936051437303,
+        "worst_maximum_absolute_error": 0.5,
+        "worst_normalized_rmse": 0.0036595558048352827
+      },
+      "16": {
+        "minimum_cosine": 0.999993180032139,
+        "worst_maximum_absolute_error": 0.5,
+        "worst_normalized_rmse": 0.003806045676527026
+      },
+      "17": {
+        "minimum_cosine": 0.9999923263347014,
+        "worst_maximum_absolute_error": 0.5,
+        "worst_normalized_rmse": 0.0040459700476226206
+      },
+      "18": {
+        "minimum_cosine": 0.9999866331455959,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.005488283581248275
+      },
+      "19": {
+        "minimum_cosine": 0.9999895033138219,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.0056106046899380355
+      },
+      "2": {
+        "minimum_cosine": 0.9999919916068876,
+        "worst_maximum_absolute_error": 0.0625,
+        "worst_normalized_rmse": 0.004005627843832978
+      },
+      "20": {
+        "minimum_cosine": 0.9999864138870341,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.005935780587193614
+      },
+      "21": {
+        "minimum_cosine": 0.999984061378674,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.006302867169669403
+      },
+      "22": {
+        "minimum_cosine": 0.999970302686331,
+        "worst_maximum_absolute_error": 2.0,
+        "worst_normalized_rmse": 0.00974971446695974
+      },
+      "23": {
+        "minimum_cosine": 0.9999546973332146,
+        "worst_maximum_absolute_error": 2.0,
+        "worst_normalized_rmse": 0.011816652026501978
+      },
+      "24": {
+        "minimum_cosine": 0.9999528254714496,
+        "worst_maximum_absolute_error": 2.0,
+        "worst_normalized_rmse": 0.011902666131205723
+      },
+      "25": {
+        "minimum_cosine": 0.999937795933773,
+        "worst_maximum_absolute_error": 2.0,
+        "worst_normalized_rmse": 0.013208763060603684
+      },
+      "26": {
+        "minimum_cosine": 0.9999241028764541,
+        "worst_maximum_absolute_error": 2.0,
+        "worst_normalized_rmse": 0.014795243799228544
+      },
+      "27": {
+        "minimum_cosine": 0.9999100667013946,
+        "worst_maximum_absolute_error": 2.0,
+        "worst_normalized_rmse": 0.015542282909247966
+      },
+      "28": {
+        "minimum_cosine": 0.9999374292587945,
+        "worst_maximum_absolute_error": 2.0,
+        "worst_normalized_rmse": 0.013738541433748136
+      },
+      "29": {
+        "minimum_cosine": 0.9998415063015551,
+        "worst_maximum_absolute_error": 2.0,
+        "worst_normalized_rmse": 0.01981964058512818
+      },
+      "3": {
+        "minimum_cosine": 0.9999912023853261,
+        "worst_maximum_absolute_error": 0.125,
+        "worst_normalized_rmse": 0.004197723533701371
+      },
+      "30": {
+        "minimum_cosine": 0.9998452891409032,
+        "worst_maximum_absolute_error": 2.0,
+        "worst_normalized_rmse": 0.019039664758235486
+      },
+      "31": {
+        "minimum_cosine": 0.9998627589598758,
+        "worst_maximum_absolute_error": 2.0,
+        "worst_normalized_rmse": 0.01804000718912326
+      },
+      "32": {
+        "minimum_cosine": 0.9998764412138766,
+        "worst_maximum_absolute_error": 0.328125,
+        "worst_normalized_rmse": 0.01572909090817427
+      },
+      "33": {
+        "minimum_cosine": 0.9998665175851098,
+        "worst_maximum_absolute_error": 0.5,
+        "worst_normalized_rmse": 0.016356909788591646
+      },
+      "34": {
+        "minimum_cosine": 0.9998456463080092,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.017725461099647226
+      },
+      "35": {
+        "minimum_cosine": 0.99966348911477,
+        "worst_maximum_absolute_error": 0.75,
+        "worst_normalized_rmse": 0.025943814989652158
+      },
+      "36": {
+        "minimum_cosine": 0.9995565858590815,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.029858751433442795
+      },
+      "37": {
+        "minimum_cosine": 0.999457388231658,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.033020112581642155
+      },
+      "38": {
+        "minimum_cosine": 0.9992592430413374,
+        "worst_maximum_absolute_error": 1.2109375,
+        "worst_normalized_rmse": 0.0386756986310048
+      },
+      "39": {
+        "minimum_cosine": 0.9986419682919964,
+        "worst_maximum_absolute_error": 1.1171875,
+        "worst_normalized_rmse": 0.0520981776259124
+      },
+      "4": {
+        "minimum_cosine": 0.9999906467267108,
+        "worst_maximum_absolute_error": 0.125,
+        "worst_normalized_rmse": 0.004328058787366272
+      },
+      "40": {
+        "minimum_cosine": 0.998980202351611,
+        "worst_maximum_absolute_error": 1.125,
+        "worst_normalized_rmse": 0.04519411523647554
+      },
+      "41": {
+        "minimum_cosine": 0.9990542502463704,
+        "worst_maximum_absolute_error": 1.125,
+        "worst_normalized_rmse": 0.04366925336514525
+      },
+      "42": {
+        "minimum_cosine": 0.9990633310116366,
+        "worst_maximum_absolute_error": 1.5,
+        "worst_normalized_rmse": 0.04360004676869785
+      },
+      "43": {
+        "minimum_cosine": 0.9989927409416514,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.0449691658650891
+      },
+      "44": {
+        "minimum_cosine": 0.9990995993301357,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.04246498145374525
+      },
+      "45": {
+        "minimum_cosine": 0.9991078859103247,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.042251564901488875
+      },
+      "46": {
+        "minimum_cosine": 0.9990818805261776,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.04285257114905717
+      },
+      "47": {
+        "minimum_cosine": 0.9991165827775181,
+        "worst_maximum_absolute_error": 0.75,
+        "worst_normalized_rmse": 0.04205060082822087
+      },
+      "48": {
+        "minimum_cosine": 0.999291239736756,
+        "worst_maximum_absolute_error": 0.5,
+        "worst_normalized_rmse": 0.03771977399451803
+      },
+      "49": {
+        "minimum_cosine": 0.9993443128591456,
+        "worst_maximum_absolute_error": 0.5,
+        "worst_normalized_rmse": 0.036363894839680826
+      },
+      "5": {
+        "minimum_cosine": 0.9999930560593673,
+        "worst_maximum_absolute_error": 0.15625,
+        "worst_normalized_rmse": 0.003729676845645763
+      },
+      "50": {
+        "minimum_cosine": 0.9992588673419556,
+        "worst_maximum_absolute_error": 0.5,
+        "worst_normalized_rmse": 0.038776672984338914
+      },
+      "51": {
+        "minimum_cosine": 0.9990943227448266,
+        "worst_maximum_absolute_error": 0.5,
+        "worst_normalized_rmse": 0.04289657004341562
+      },
+      "52": {
+        "minimum_cosine": 0.9988849297266854,
+        "worst_maximum_absolute_error": 0.359375,
+        "worst_normalized_rmse": 0.04725773771648945
+      },
+      "53": {
+        "minimum_cosine": 0.9989757621815364,
+        "worst_maximum_absolute_error": 0.25,
+        "worst_normalized_rmse": 0.04578188220095049
+      },
+      "54": {
+        "minimum_cosine": 0.9991173462151627,
+        "worst_maximum_absolute_error": 0.5,
+        "worst_normalized_rmse": 0.0430820473064353
+      },
+      "55": {
+        "minimum_cosine": 0.9991319310659542,
+        "worst_maximum_absolute_error": 0.5,
+        "worst_normalized_rmse": 0.042734809606151156
+      },
+      "56": {
+        "minimum_cosine": 0.9988768451457988,
+        "worst_maximum_absolute_error": 0.25,
+        "worst_normalized_rmse": 0.048148247814121914
+      },
+      "57": {
+        "minimum_cosine": 0.9984564246605113,
+        "worst_maximum_absolute_error": 0.296875,
+        "worst_normalized_rmse": 0.05577409576338641
+      },
+      "58": {
+        "minimum_cosine": 0.9987584842421224,
+        "worst_maximum_absolute_error": 0.21875,
+        "worst_normalized_rmse": 0.05032269237162718
+      },
+      "59": {
+        "minimum_cosine": 0.9997944462387757,
+        "worst_maximum_absolute_error": 0.0625,
+        "worst_normalized_rmse": 0.020663352925566408
+      },
+      "6": {
+        "minimum_cosine": 0.9999952798874661,
+        "worst_maximum_absolute_error": 0.125,
+        "worst_normalized_rmse": 0.0030751632448921965
+      },
+      "7": {
+        "minimum_cosine": 0.9999951609731863,
+        "worst_maximum_absolute_error": 0.09375,
+        "worst_normalized_rmse": 0.003110953368981503
+      },
+      "8": {
+        "minimum_cosine": 0.999987866740776,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.006767635722657094
+      },
+      "9": {
+        "minimum_cosine": 0.9999924056077304,
+        "worst_maximum_absolute_error": 1.0,
+        "worst_normalized_rmse": 0.006615916342798413
+      }
+    },
+    "worst_layer": 57,
+    "worst_normalized_rmse": 0.05577409576338641
+  },
+  "input_token_count": 5,
+  "model": "/srv/huggingface/models--google--gemma-4-31B/snapshots/02e15e4990e8c452f8543fb26beff15b1daf8f3d",
+  "pairs_compared": 6,
+  "prompt": "The capital of France is",
+  "samples": [
+    "sdpa",
+    "sdpa_pad16",
+    "eager",
+    "eager_pad16"
+  ],
+  "scope": "Gemma 4 observed BF16 reference-execution variability",
+  "admission_use": "diagnostic only; does not modify frozen thresholds",
+  "canonical_sample": "sdpa",
+  "canonical_reference_envelope": {
+    "final_logit_maximum_absolute_error": 0.625,
+    "final_logit_minimum_cosine": 0.9997768115323811,
+    "hidden_minimum_cosine_any_layer": 0.9986535067997332,
+    "hidden_worst_normalized_rmse": 0.051879554204107906
+  },
+  "all_pairwise_envelope": {
+    "final_logit_maximum_absolute_error": 0.6875,
+    "final_logit_minimum_cosine": 0.9997665418350917,
+    "hidden_minimum_cosine_any_layer": 0.9984564246605113,
+    "hidden_worst_normalized_rmse": 0.05577409576338641
+  },
+  "sample_summaries": {
+    "sdpa": {
+      "final_argmax": 7001,
+      "final_logits_sha256": "20a2098982101ccad610bdc05ca3f72913b0e468ee25a9e3feb40eebe34fe702",
+      "final_non_finite_values": 0,
+      "final_top5": [496, 506, 528, 711, 7001],
+      "hidden_non_finite_values": 0,
+      "hidden_states_sha256": "7c6d0cb2eebbeebccc03b254cbb9a5e3ca0f0bb372a9d8302abda8c76fde839b"
+    },
+    "sdpa_pad16": {
+      "final_argmax": 7001,
+      "final_logits_sha256": "36726fbbd30c19b650a014a401c8bfe8caa073347086a074322c2c6467f98c96",
+      "final_non_finite_values": 0,
+      "final_top5": [496, 506, 528, 711, 7001],
+      "hidden_non_finite_values": 0,
+      "hidden_states_sha256": "47ebd55119d28be9b19cb94418d406c3c6d8efa9e44ee32a1d6849d560b820a9"
+    },
+    "eager": {
+      "final_argmax": 7001,
+      "final_logits_sha256": "69337c2d2e949aa874d496a15b085530719f73e329b476ef5a56f129fd842f06",
+      "final_non_finite_values": 0,
+      "final_top5": [496, 506, 528, 711, 7001],
+      "hidden_non_finite_values": 0,
+      "hidden_states_sha256": "78e0f1b3685c9cf7f8e4d44f9d86e434f6b5db432a6acd7b219f5758e1037a33"
+    },
+    "eager_pad16": {
+      "final_argmax": 7001,
+      "final_logits_sha256": "1ec69cb0dfad79f95c58635d2e1e8fc58c319c6ac54f7aa9cd6de92a65e893f2",
+      "final_non_finite_values": 0,
+      "final_top5": [496, 506, 528, 711, 7001],
+      "hidden_non_finite_values": 0,
+      "hidden_states_sha256": "503aca76989b1e7428305762b00c04b48e348159f91c846d3e4d9e5da6232973"
+    }
+  },
+  "rocm_version": "7.13.99004",
+  "device": "cuda",
+  "device_name": "Radeon 8060S Graphics",
+  "torch_version": "2.11.0+rocm7.13.0",
+  "transformers_version": "5.10.2"
+}

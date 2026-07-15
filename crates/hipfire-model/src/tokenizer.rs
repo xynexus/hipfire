@@ -185,6 +185,10 @@ pub struct Tokenizer {
     /// metaspace marker at the start of an otherwise unspaced string. Gemma 4
     /// uses Replace+Split without Prepend, unlike older SentencePiece models.
     sentencepiece_add_prefix_space: bool,
+    /// True for a non-ByteLevel Hugging Face `model.type == "BPE"`. These
+    /// tokenizers use SentencePiece-style normalization/byte fallback but still
+    /// require ranked BPE merges; greedy longest-vocabulary matching is wrong.
+    sentencepiece_uses_bpe: bool,
 }
 
 /// Resolve a list of `(left_string, right_string)` merge pairs into a
@@ -457,6 +461,8 @@ impl Tokenizer {
             .unwrap_or_else(|| {
                 tok.get("normalizer").is_none() && tok.get("pre_tokenizer").is_none()
             });
+        let sentencepiece_uses_bpe =
+            !is_gpt2_bpe && model.get("type").and_then(|value| value.as_str()) == Some("BPE");
 
         Ok(Tokenizer {
             vocab,
@@ -470,6 +476,7 @@ impl Tokenizer {
             eot_id,
             is_gpt2_bpe,
             sentencepiece_add_prefix_space,
+            sentencepiece_uses_bpe,
         })
     }
 
@@ -648,6 +655,7 @@ impl Tokenizer {
             eot_id,
             is_gpt2_bpe,
             sentencepiece_add_prefix_space: !is_gpt2_bpe,
+            sentencepiece_uses_bpe: !is_gpt2_bpe && !merges_strings.is_empty(),
         })
     }
 
@@ -774,9 +782,48 @@ impl Tokenizer {
     /// Encode without special token handling.
     fn encode_raw(&self, text: &str) -> Vec<u32> {
         if !self.is_gpt2_bpe {
-            return self.encode_sentencepiece(text);
+            return if self.sentencepiece_uses_bpe {
+                self.encode_sentencepiece_bpe(text)
+            } else {
+                self.encode_sentencepiece(text)
+            };
         }
         self.encode_gpt2_bpe(text)
+    }
+
+    fn normalize_sentencepiece(&self, text: &str) -> String {
+        let mut sp_text = String::with_capacity(text.len() + 3);
+        if self.sentencepiece_add_prefix_space {
+            sp_text.push('\u{2581}');
+        }
+        for ch in text.chars() {
+            sp_text.push(if ch == ' ' { '\u{2581}' } else { ch });
+        }
+        sp_text
+    }
+
+    /// SentencePiece-normalized BPE: seed one Unicode scalar (or byte-fallback
+    /// token) per symbol, then apply the same ranked merge engine as ByteLevel
+    /// BPE. Gemma 4 uses this tokenizer shape.
+    fn encode_sentencepiece_bpe(&self, text: &str) -> Vec<u32> {
+        let sp_text = self.normalize_sentencepiece(text);
+        let mut symbols = Vec::with_capacity(sp_text.chars().count());
+        let unknown = self.token_to_id.get("<unk>").copied().unwrap_or(0);
+        for ch in sp_text.chars() {
+            let mut utf8 = [0u8; 4];
+            let scalar = ch.encode_utf8(&mut utf8);
+            if let Some(&id) = self.token_to_id.get(scalar) {
+                symbols.push(id);
+                continue;
+            }
+            for &byte in scalar.as_bytes() {
+                let fallback = format!("<0x{byte:02X}>");
+                symbols.push(self.token_to_id.get(&fallback).copied().unwrap_or(unknown));
+            }
+        }
+        let mut out = Vec::with_capacity(symbols.len());
+        self.merge_bpe_symbols(symbols, &mut out);
+        out
     }
 
     /// SentencePiece greedy encoding: prepend ▁ for spaces, longest-match lookup.
@@ -808,13 +855,7 @@ impl Tokenizer {
         // (all-space input) needs `text.len() * 3 + 3` bytes; typical
         // inputs fit in the lower-bound hint and the String grows only
         // if needed.
-        let mut sp_text = String::with_capacity(text.len() + 3);
-        if self.sentencepiece_add_prefix_space {
-            sp_text.push('\u{2581}');
-        }
-        for ch in text.chars() {
-            sp_text.push(if ch == ' ' { '\u{2581}' } else { ch });
-        }
+        let sp_text = self.normalize_sentencepiece(text);
 
         // Char-boundary byte offsets. `boundaries[i]` is the byte index of
         // char `i`; the trailing entry is `sp_text.len()` so `boundaries[end]`
@@ -922,10 +963,15 @@ impl Tokenizer {
             .byte_to_id
             .as_ref()
             .expect("encode_gpt2_chunk called on non-GPT2 tokenizer");
-        let mut syms: Vec<u32> = chunk_bytes
+        let syms: Vec<u32> = chunk_bytes
             .iter()
             .map(|&b| byte_to_id[b as usize])
             .collect();
+        self.merge_bpe_symbols(syms, out);
+    }
+
+    /// Apply ranked BPE merges to an already-tokenized symbol sequence.
+    fn merge_bpe_symbols(&self, mut syms: Vec<u32>, out: &mut Vec<u32>) {
         let n = syms.len();
         if n == 0 {
             return;
@@ -1593,6 +1639,7 @@ mod bpe_tests {
             eot_id: None,
             is_gpt2_bpe: true,
             sentencepiece_add_prefix_space: false,
+            sentencepiece_uses_bpe: false,
         }
     }
 
@@ -1922,6 +1969,7 @@ mod sp_tests {
             eot_id: None,
             is_gpt2_bpe: false,
             sentencepiece_add_prefix_space: true,
+            sentencepiece_uses_bpe: false,
         }
     }
 
@@ -1930,8 +1978,11 @@ mod sp_tests {
         let json = serde_json::json!({
             "model": {
                 "type": "BPE",
-                "vocab": {"<s>": 0, "</s>": 1, "The": 2, "\u{2581}The": 3},
-                "merges": [],
+                "vocab": {
+                    "<s>": 0, "</s>": 1, "T": 2, "h": 3, "e": 4,
+                    "Th": 5, "The": 6, "\u{2581}": 7, "\u{2581}The": 8
+                },
+                "merges": [["T", "h"], ["Th", "e"], ["\u{2581}", "The"]],
                 "byte_fallback": true
             },
             "normalizer": {
@@ -1948,8 +1999,41 @@ mod sp_tests {
         })
         .to_string();
         let tok = Tokenizer::from_hf_json(&json).unwrap();
-        assert_eq!(tok.encode("The"), vec![2]);
-        assert_eq!(tok.encode(" The"), vec![3]);
+        assert_eq!(tok.encode("The"), vec![6]);
+        assert_eq!(tok.encode(" The"), vec![8]);
+    }
+
+    #[test]
+    fn gemma4_sentencepiece_bpe_obeys_merge_ranks_not_longest_vocab_match() {
+        let json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "<unk>": 0, "c": 1, "e": 2, "l": 3, "s": 4,
+                    "i": 5, "u": 6, "el": 7, "els": 8, "elsi": 9,
+                    "elsiu": 10, "elsius": 11, "celsius": 12
+                },
+                "merges": [
+                    ["e", "l"], ["el", "s"], ["els", "i"],
+                    ["elsi", "u"], ["elsiu", "s"]
+                ],
+                "byte_fallback": true
+            },
+            "normalizer": {
+                "type": "Replace",
+                "pattern": {"String": " "},
+                "content": "\u{2581}"
+            },
+            "pre_tokenizer": {
+                "type": "Split",
+                "pattern": {"String": " "},
+                "behavior": "MergedWithPrevious"
+            },
+            "decoder": {"type": "ByteFallback"}
+        })
+        .to_string();
+        let tok = Tokenizer::from_hf_json(&json).unwrap();
+        assert_eq!(tok.encode("celsius"), vec![1, 11]);
     }
 
     #[test]

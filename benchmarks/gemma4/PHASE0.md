@@ -23,6 +23,28 @@ Date: 2026-07-15. Status: passed.
 - `bf16-thresholds.json` froze full-model hidden/logit/generation admission
   limits before any Hipfire Gemma 4 whole-model result was observed.
 
+## Post-freeze reference-variability diagnostic (2026-07-15)
+
+`control_noise_bf16.py` measures the real 31B BF16 checkpoint under Transformers
+`sdpa`/`eager` attention and padded/unpadded execution. This is useful evidence
+about observed reduction-order variability, including the same late-stack
+hotspots seen by Hipfire. It was measured after the Hipfire result, however, and
+one prompt plus a finite set of reference implementations cannot establish an
+irreducible family-wide noise floor. It therefore does not re-derive or modify
+the Phase-0 limits. The original `0.5` final-logit maximum error, `0.045` hidden
+NRMSE, and `0.999` hidden cosine remain frozen. The diagnostic artifact is
+`control-noise-31B.json`; interpretation and the admission result are recorded in
+`PHASE5.md`.
+
+An independent rerun on `halo` with torch `2.11.0+rocm7.13.0`, Transformers
+`5.10.2`, ROCm `7.13.99004`, and the Radeon 8060S reproduced the committed
+all-pairwise extrema exactly. Relative to the canonical unpadded SDPA sample,
+the observed envelope was `0.625` final-logit maximum absolute difference,
+`0.0518795542` worst hidden NRMSE, and `0.9986535068` minimum hidden cosine.
+Across all six reference/reference pairs those values were `0.6875`,
+`0.0557740958`, and `0.9984564247`. All samples retained argmax `7001`, the
+same top five, and zero non-finite values.
+
 Reproduction gate:
 
 ```text
