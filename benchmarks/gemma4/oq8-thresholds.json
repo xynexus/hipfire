@@ -1,0 +1,41 @@
+{
+  "frozen_at": "2026-07-15",
+  "scope": "Gemma 4 OQ8 full-model comparisons against the pinned Transformers BF16 oracle",
+  "contract_revision": "The first valid exact-prompt OQ8 base-short measurement was adopted as the Phase 5 baseline by explicit plan revision after it was observed.",
+  "candidate": {
+    "artifact": "Gemma-4-31B.oq8.hfq",
+    "quantization_hash": "705685e2d7993d57",
+    "source_checkpoint": "google/gemma-4-31B",
+    "source_revision": "02e15e4990e8c452f8543fb26beff15b1daf8f3d",
+    "tokenizer_sha256": "12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6",
+    "capture_sha256": "6748e27abc3b7fcf863f86da91f0b72f0c2829261b1eb8cf0cfaad379e5eedc7",
+    "comparison_sha256": "f78ef9a746ed33a144cf5f30e53cea002051bd3a409aed5c92140efcf47c3bac"
+  },
+  "hidden_states": {
+    "minimum_cosine": 0.9953113139978088,
+    "maximum_normalized_rmse": 0.09686980655966955,
+    "non_finite_values_allowed": 0
+  },
+  "final_logits": {
+    "minimum_cosine": 0.9993488808874887,
+    "maximum_absolute_error": 1.1197633743286133,
+    "require_argmax_match": true,
+    "minimum_top5_overlap": 5,
+    "non_finite_values_allowed": 0
+  },
+  "greedy_generation": {
+    "require_exact_token_ids": true
+  },
+  "application": {
+    "hidden_capture_points": "Every selected decoder boundary, including local and global layers and the final pre-norm state",
+    "logit_positions": "Every committed comparison position, not only the final prompt token",
+    "required_prompt_classes": [
+      "short",
+      "sliding_window_minus_one",
+      "sliding_window",
+      "sliding_window_plus_one",
+      "multiple_global_layers"
+    ]
+  },
+  "rationale": "These exact observed OQ8 values are the revised broad functional baseline. They permit Phase 5 to advance beyond base-short while preserving exact greedy decisions, exact final argmax, full top-5 overlap, and finite outputs. They are not claimed to have been frozen before observing the candidate and must not be weakened after this revision. The final OQ8++ stage uses the separate narrower oq8pp-thresholds.json contract."
+}

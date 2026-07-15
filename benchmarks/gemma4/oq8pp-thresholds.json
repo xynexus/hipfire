@@ -1,0 +1,33 @@
+{
+  "frozen_at": "2026-07-15",
+  "scope": "Final Gemma 4 OQ8++ promotion comparisons against the pinned Transformers BF16 oracle",
+  "derived_from": "benchmarks/gemma4/bf16-thresholds.json",
+  "threshold_change": "none",
+  "hidden_states": {
+    "minimum_cosine": 0.999,
+    "maximum_normalized_rmse": 0.045,
+    "non_finite_values_allowed": 0
+  },
+  "final_logits": {
+    "minimum_cosine": 0.999,
+    "maximum_absolute_error": 0.5,
+    "require_argmax_match": true,
+    "minimum_top5_overlap": 4,
+    "non_finite_values_allowed": 0
+  },
+  "greedy_generation": {
+    "require_exact_token_ids": true
+  },
+  "application": {
+    "hidden_capture_points": "Every selected decoder boundary, including local and global layers and the final pre-norm state",
+    "logit_positions": "Every committed comparison position, not only the final prompt token",
+    "required_prompt_classes": [
+      "short",
+      "sliding_window_minus_one",
+      "sliding_window",
+      "sliding_window_plus_one",
+      "multiple_global_layers"
+    ]
+  },
+  "rationale": "OQ8++ is the final narrower promotion stage. It must recover the original strict pre-observation BF16 limits without weakening them, while retaining exact greedy decisions and finite outputs."
+}

@@ -1,7 +1,7 @@
 # Plan: Gemma 4 support with reusable transformer seams
 
-Status: **blocked at the frozen Phase 5 dense-31B BF16 admission gate**. Branch:
-`chaingun`. Plan date: 2026-07-15. Status updated: 2026-07-15.
+Status: **in progress at the revised Phase 5 dense-31B OQ8 admission gate**.
+Branch: `chaingun`. Plan date: 2026-07-15. Status updated: 2026-07-15.
 
 This is the canonical Gemma 4 plan. When older roadmap text disagrees with this
 file, this file wins. In particular, Gemma 4 is not "Gemma 3 plus MoE" and the
@@ -10,44 +10,55 @@ E2B/E4B models are not MoE models.
 ## Current implementation status
 
 The implementation has advanced through the reusable dense-text foundation, but
-no Gemma 4 checkpoint is admitted in the support registry. The frozen stop rule
-in this plan remains binding: Phase 5 failed at the base-short comparison, so the
-SWA-crossing, 31B-it model admission, and later variant phases were not advanced.
+no Gemma 4 checkpoint is admitted in the support registry. By explicit contract
+revision on 2026-07-15, OQ8 replaces BF16 as the Phase 5 product candidate. The
+pinned Transformers BF16 capture remains the independent oracle. The first valid
+exact-prompt OQ8 measurement is frozen as the broad functional baseline in
+`benchmarks/gemma4/oq8-thresholds.json`; this adoption occurred after observing
+the result and is recorded honestly rather than presented as a pre-observation
+gate. The former strict limits remain unchanged as the final OQ8++ narrowing
+stage in `benchmarks/gemma4/oq8pp-thresholds.json`.
 
 | phase | status | current result |
 |---|---|---|
-| 0 — truth freeze | passed | Pinned config, tensor, prompt/token, and BF16 oracle fixtures plus thresholds are committed under `benchmarks/gemma4/`. |
+| 0 — truth freeze | passed, contract revised | Pinned config, tensor, prompt/token, and BF16 oracle fixtures remain authoritative. Separate OQ8 baseline and OQ8++ narrowing thresholds are committed under `benchmarks/gemma4/`. |
 | 1 — identity/ingest/toys | passed | Architecture id 24, registry/spec/ingest policy, and dense, PLE-sharing, and dense-MoE toy fixtures are implemented. |
 | 2 — shared loader | passed | `TransformerLoader` is shared by Gemma 3 and Gemma 4; Gemma 3 regression evidence is retained. |
 | 3 — layered KV | passed | Mixed full/SWA geometry, shared-producer planning, exact storage accounting, reset, and GPU boundary parity are implemented. |
 | 4 — primitives/lowered forward | passed | Proportional RoPE, weightless RMSNorm, vector softcap, reference forward, and lowered dense forward passed operator, tiny-model, portability-compile, and coherence gates. |
-| 5 — dense 31B/serving | blocked | Dense loading, bounded state, lowered execution, and the boxed serving factory exist, but the real 31B BF16 base-short gate failed. |
-| 6 — prompt/tools/sampling | implementation gates passed, model not admitted | Official Jinja bytes and all 1,640 fixture token IDs match; native tools/channels, metadata EOS IDs `[1, 106, 50]`, and generic top-k 64 pass their gates. 31B-it remains unadmitted because Phase 5 is blocked. |
+| 5 — dense 31B/serving | in progress | Dense loading, bounded state, lowered execution, and the boxed serving factory exist. The real 31B OQ8 base-short run establishes and passes the revised baseline; SWA-boundary, multi-global, reload/sequential, and IT gates remain. |
+| 6 — prompt/tools/sampling | implementation gates passed, model not admitted | Official Jinja bytes and all 1,640 fixture token IDs match; native tools/channels, metadata EOS IDs `[1, 106, 50]`, and generic top-k 64 pass their gates. 31B-it remains unadmitted until the remaining Phase 5 OQ8 gates pass. |
 | 7 — PLE/KV sharing | scaffold only | Config lowering and generic shared-KV storage exist; the real Gemma 4 loader/forward intentionally rejects PLE and shared-KV variants. |
 | 8 — dense-plus-MoE | scaffold only | Ingest/config/toy coverage exists; no Gemma 4 routed-expert runtime or real-model admission exists. |
-| 9 — quant/eval | not started | No Gemma 4 quant or eval battery is admitted because BF16 has not passed. |
+| 9 — quant/eval | OQ8 baseline established | The first OQ8 artifact and exact-prompt evidence exist; the reusable Gemma 4 eval battery, broader prompt gates, and per-variant admission remain. |
 | 10 — unified/multimodal/DSpark | not started | Only fixture/config investigation exists; no unified 12B, multimodal, or DSpark spec-decode runtime is claimed. |
+| 11 — final OQ8++ narrowing | not started | Produce OQ8++ from the same pinned source and pass the unchanged former strict limits after broad OQ8 admission. |
 
-The best retained valid 31B result is
-`~/.hipfire/evidence/gemma4/base-short-hipfire-all-layers-embed-bf16-rope-order`:
+The revised Phase 5 baseline is the valid exact-prompt OQ8 result at
+`~/.hipfire/evidence/gemma4/base-short-hipfire-all-layers-oq8-exact-prompt`:
 
-- greedy generation, final argmax, and top-5 agree with the pinned oracle;
-- final-logit cosine is `0.9997767002770637`;
-- final-logit maximum absolute error is `0.5618224143981934`, above the frozen
-  `0.5` limit;
-- hidden-state thresholds fail first at layer 39 and also at layers 52, 56, 57,
-  and 58.
+- the embedded tokenizer is byte-identical to the pinned Gemma 4 tokenizer
+  (`sha256:12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6`),
+  and the five input IDs match the oracle exactly;
+- greedy generation matches exactly for eight tokens, final argmax agrees at
+  token `7001`, and top-5 overlap is `5/5`;
+- final-logit cosine is `0.9993488808874887` and maximum absolute error is
+  `1.1197633743286133`;
+- the all-layer minimum hidden cosine is `0.9953113139978088`, the maximum
+  hidden NRMSE is `0.09686980655966955`, and every value is finite;
+- the broad OQ8 base-short gate passes at the newly frozen observed values.
 
-Subsequent BF16-boundary, batched-prefill, attention, exact-rocBLAS, and
-BF16-staged RoPE experiments did not pass the unchanged gate. Their exact
-results are recorded in `benchmarks/gemma4/PHASE5.md`; unadmitted serving
-integrations were removed. The latest staged-RoPE candidate exactly reproduces
-the isolated Transformers layer-0 Q/K RoPE outputs, but worsens final-logit
-maximum error to `0.5677473545074463` and expands the hidden-state failure set to
-layers 39, 40, 41, 43, 52, 53, 56, 57, and 58. It is retained only as a
-standalone diagnostic, alongside the rocBLAS probes that prove bit-exact BF16
-projection and ROCm math-SDPA contracts. The normal serving path remains the
-best retained portable sequential implementation.
+The OQ8 result advances Phase 5 beyond base-short but does not admit the model.
+The same OQ8 ceiling/floor must now hold for the committed short-prompt suite,
+SWA-1/SWA/SWA+1, multiple global layers, unload/reload, and sequential requests.
+Any worse result stops the phase and is recorded without changing the new gate.
+
+The earlier BF16 result remains useful historical localization evidence, not the
+product admission target. Its best final-logit maximum error was
+`0.5618224143981934`, with exact greedy/argmax/top-5 agreement and hidden-state
+failures at layers 39, 52, 56, 57, and 58. The rejected BF16-boundary,
+batched-prefill, attention, rocBLAS, RoPE, and GeGLU experiments remain recorded
+in `benchmarks/gemma4/PHASE5.md`; none is promoted into serving.
 
 A same-input sweep now also covers all 60 decoder transitions independently.
 Each layer receives the exact frozen oracle boundary and builds its own real
@@ -55,10 +66,10 @@ five-position KV history. The worst final-position transition NRMSE is
 `0.005205519351551357`; sliding and full-attention layers have nearly identical
 mean transition error (`0.0030814201888346663` and `0.003070946966302261`). This
 rules out a discrete layer or attention-geometry defect for the frozen prompt
-and narrows the blocker to small numerical differences accumulated through the
-full stack. The exact per-layer evidence and reproduction tools are recorded in
-`benchmarks/gemma4/PHASE5.md`; this diagnostic does not alter serving or the
-frozen gate.
+and narrows the historical BF16 discrepancy to small numerical differences
+accumulated through the full stack. The exact per-layer evidence and reproduction
+tools are recorded in `benchmarks/gemma4/PHASE5.md`; this diagnostic does not
+alter serving or either OQ8 gate.
 
 Operator traces at exact-input layers 39, 40, and 58 reproduce the frozen
 Transformers layer outputs bit-for-bit and show smooth error growth through
@@ -67,24 +78,25 @@ or discrete jump. A selective BF16-staged GeGLU diagnostic improves layer 40
 slightly but worsens the first failing layer 39 and the worst late layer 58, so
 it is rejected for serving. At this point the retained evidence has ruled out
 the tested loader, geometry, cache, norm, projection, RoPE, attention, GeGLU,
-residual, layer-scalar, final-norm, and head hypotheses. The observed blocker
-remains cumulative BF16 reduction/materialization-order sensitivity; the frozen
-Phase-5 stop rule remains binding.
+residual, layer-scalar, final-norm, and head hypotheses. The historical BF16
+discrepancy remains cumulative reduction/materialization-order sensitivity; it
+does not override the revised OQ8 product contract.
 
 A post-freeze Transformers reference-variability control is retained at
 `benchmarks/gemma4/control-noise-31B.json`. It shows that alternate BF16
 reference executions can diverge at the same late-stack hotspots, which is useful
-diagnostic context. It does not change the frozen Phase-0 limits or convert the
-failed comparison into admission evidence.
+diagnostic context. It does not change the BF16 oracle, the OQ8 baseline, or the
+final OQ8++ narrowing limits.
 
 The Phase-6 implementation gates are complete: official rendered bytes and
 1,640 token IDs match across 36 committed cases, the full metadata stop-ID set
 is carried through serving, and native tools/channels plus top-k 64 pass unit
-coverage. This is not a model admission claim; the Phase-5 stop remains binding.
+coverage. This is not a model admission claim; the remaining Phase 5 OQ8 gates
+remain binding.
 
 The support matrix therefore intentionally continues to advertise Gemma 4 as
-unsupported (`prefill = "none"`, no KV capability) until a future implementation
-passes the frozen Phase 5 gates. Phases 0 through 6 have detailed evidence and
+unsupported (`prefill = "none"`, no KV capability) until the implementation
+passes all revised Phase 5 OQ8 gates. Phases 0 through 6 have detailed evidence and
 reuse/cleanup ledgers in `benchmarks/gemma4/PHASE0.md` through `PHASE6.md`.
 
 ## Goal
@@ -101,15 +113,16 @@ the family necessarily crosses:
 - dense, PLE/KV-sharing, and MoE variants;
 - later, multimodal adapters and DSpark speculative decoding.
 
-The first admitted product target is **Gemma-4-31B-it text generation in BF16**.
+The first admitted product target is **Gemma-4-31B-it text generation in OQ8**.
 The complete text-family target is E2B, E4B, 12B unified, 26B-A4B, and 31B,
 base and instruction-tuned where checkpoints exist. Multimodal input and DSpark
 speculative decoding are later, explicit capability phases; a working 31B text
 decoder must not be advertised as blanket "Gemma 4 multimodal support."
 
-Correctness comes before quantization, fusion, or speed. Python/Transformers is
-allowed as an offline oracle and fixture generator, never in the inference hot
-path.
+Correctness evidence comes before fusion or speed. OQ8 is the initial product
+format, but every candidate is still compared with the independent BF16 oracle;
+Python/Transformers is allowed as an offline oracle and fixture generator, never
+in the inference hot path.
 
 ## Local source material (validation input, not a product dependency)
 
@@ -203,13 +216,15 @@ head-dimension representation.
 6. **KV sharing is a real alias/lifetime rule.** E2B/E4B sharing layers reuse the
    already-transformed K/V produced by the last non-sharing layer of the same
    attention type. They do not own K/V projection weights or cache allocations.
-7. **BF16 first.** No MQ/HFQ quality or performance claim is admitted until the
-   BF16 source model passes the frozen reference gates.
+7. **OQ8 product gate, BF16 oracle.** The pinned Transformers BF16 capture stays
+   independent and immutable, while OQ8 is the first runtime artifact admitted.
+   The broad OQ8 gate uses `oq8-thresholds.json`; final OQ8++ promotion uses the
+   narrower `oq8pp-thresholds.json` without weakening either after this revision.
 8. **Official prompts, no family fallback.** Gemma 4 instruction models require
    their official Jinja template and channel/tool grammar. A render failure is an
    error; falling back to Gemma 3 or ChatML is silent model corruption.
 9. **No legacy names.** New artifacts follow the canonical names, for example
-   `Gemma-4-31B-it.bf16.hfq`, `Gemma-4-E4B-it.mq4.hfq`, and role sidecars such as
+   `Gemma-4-31B-it.oq8.hfq`, `Gemma-4-E4B-it.oq8.hfq`, and role sidecars such as
    `.vl.hfq`, `.audio.hfq`, `.dspark.hfq`, or `.jinja.hfq` when independently loaded.
 
 ## Code-reuse and cleanup contract
@@ -386,7 +401,10 @@ The parser validates that:
 ## Implementation phases and frozen exit gates
 
 Do not skip an exit gate. If a gate fails, record the exact result and stop that
-phase; do not weaken the gate after seeing the result.
+phase; do not weaken the gate after seeing the result. The explicit 2026-07-15
+contract revision from BF16-as-candidate to OQ8-as-candidate is recorded above.
+From this revision onward, both the OQ8 baseline and OQ8++ narrowing gate are
+frozen.
 
 ### Phase 0 — freeze truth and remove stale assumptions
 
@@ -406,15 +424,20 @@ Deliverables:
    `2026-06-19-arch-roster-feature-matrix.md` and point its Gemma 4 section here.
 6. Mark the current Gemma 4 EOS/parser tests as obsolete fixtures to be replaced
    in the prompt phase; do not allow them to become acceptance evidence.
-7. Record full-model BF16 numerical thresholds before running the first Hipfire
-   whole-model comparison. Thresholds may be derived from operator and existing
-   BF16 control noise, but once recorded they are frozen.
+7. Record the pinned Transformers BF16 oracle and original strict numerical
+   thresholds before running the first Hipfire whole-model comparison.
+8. Under the explicit later contract revision, record the first valid exact-prompt
+   OQ8 measurement in `oq8-thresholds.json` as the broad product baseline and copy
+   the unchanged original strict limits into `oq8pp-thresholds.json` as the final
+   OQ8++ narrowing gate. Do not imply that the OQ8 baseline was pre-observation.
 
 Exit gate:
 
 - fixture extraction is reproducible from the pinned snapshots;
 - config/manifest assertions distinguish every variant correctly;
 - official Jinja2 renders match the committed expected bytes;
+- BF16 oracle, OQ8 baseline, and OQ8++ narrowing artifacts have explicit scopes
+  and machine-readable thresholds;
 - no code path has been changed yet;
 - stale roadmap text no longer claims E2B/E4B are MoE or that bring-up is cheap.
 
@@ -430,7 +453,7 @@ Deliverables:
    canonical model types and stacked-expert layout without a family match arm.
 4. Make the Gemma 4 ingest policy retain direct norm weights, layer scalars,
    router scales, PLE tables, and sensitive small tensors at source precision for
-   BF16 bring-up.
+   OQ8 conversion and bring-up.
 5. Create at least three tiny deterministic fixtures:
    - dense local/global with different head dimensions and a K=V global layer;
    - PLE plus local/global KV sharing;
@@ -443,7 +466,7 @@ Exit gate:
 - `cargo test -p hipfire-arch-gemma4-spec` passes;
 - `cargo test -p hipfire-arch-specs` proves id 24 is force-linked with ingest and
   toy capabilities;
-- tiny fixture generation and BF16 HFQ conversion pass;
+- tiny fixture generation and BF16-oracle/OQ8 HFQ conversion pass;
 - `rg` finds no Gemma 4 model-type literal in the central quantizer detection
   ladder;
 - no Gemma 3 norm-offset transform can match id 24.
@@ -539,7 +562,7 @@ Deliverables:
    `LoadedModel` backend slot.
 3. Route load, serve, reset, and unload generically. Gemma 4 must not add a new
    typed field or central generation function.
-4. Support BF16 HFQ first at a bounded bring-up context. Increase context only
+4. Support OQ8 HFQ first at a bounded bring-up context. Increase context only
    after short-context parity; do not allocate 256K F32 KV by default.
 5. Admit the base checkpoint as raw completion and the IT checkpoint through the
    official prompt profile.
@@ -551,7 +574,7 @@ Exit gate:
 - no-gpu load/config/fixture tests pass;
 - `LoadedModel` has no Gemma 4-specific field;
 - daemon/serving code has no `arch_id == 24` or equivalent Gemma 4 branch;
-- BF16 hidden/logit captures pass the Phase-0 frozen thresholds for short prompts,
+- OQ8 hidden/logit captures stay within `oq8-thresholds.json` for short prompts,
   a prompt crossing SWA 1024, and multiple global layers;
 - greedy generation matches the upstream oracle for the committed prompt suite;
 - unload/reload and two sequential requests do not retain stale KV state.
@@ -597,8 +620,8 @@ Deliverables:
 Exit gate:
 
 - tiny PLE/sharing reference and lowered paths pass layer-by-layer parity;
-- E4B BF16 passes frozen hidden/logit and greedy-generation gates;
-- E2B BF16 passes the same gates and specifically crosses the first double-wide
+- E4B OQ8 passes frozen hidden/logit and greedy-generation gates;
+- E2B OQ8 passes the same gates and specifically crosses the first double-wide
   tail layer;
 - projected K/V executes only on producer layers; counters/tests prove sharing
   consumers do not launch absent projections;
@@ -617,21 +640,21 @@ Deliverables:
    scales.
 4. Preserve the dense GeGLU branch as a normal dense path and combine it with the
    routed branch in the Gemma layer implementation.
-5. Bring up base, then IT, in BF16 before expert quantization.
+5. Bring up base, then IT, in OQ8 against the pinned BF16 oracle.
 
 Exit gate:
 
 - existing Qwen MoE goldens and model smoke remain unchanged through its adapter;
 - tiny Gemma MoE router probabilities, selected indices, renormalized/scaled
   weights, dense output, routed output, and combined output match the CPU oracle;
-- real 26B-A4B BF16 selected-layer captures and final logits pass frozen limits;
+- real 26B-A4B OQ8 selected-layer captures and final logits pass frozen limits;
 - greedy generation matches on the committed base/IT prompts;
 - router/per-expert scales stay at the precision declared by ingest;
 - no mandatory Qwen shared-expert weight exists in the generic routed core.
 
 ### Phase 9 — quantization and eval admission
 
-Only begin after the corresponding BF16 variant passes.
+Only begin after the corresponding OQ8 variant passes its broad product gate.
 
 Deliverables:
 
@@ -648,7 +671,8 @@ Deliverables:
 
 Exit gate:
 
-- BF16 remains the frozen oracle artifact;
+- BF16 remains the frozen oracle artifact and OQ8 is the first admitted runtime
+  format;
 - KLD/PPL/task thresholds are declared before candidate results and are not
   weakened afterward;
 - `hipfire-eval` holds the evidence; shell gates only enforce it;
@@ -682,7 +706,7 @@ These are three separate subprojects, not one "finish Gemma 4" checkbox.
      re-anchors the layered cache and overwrites every rejected full/SWA tail
      slot, matching the shared pure-attention target contract;
    - implement a Gemma 4 `DsparkBody`, capture a `DSLB` label cache from the
-     admitted BF16 target, train the drafter through `hipfire-train`'s DSpark
+     admitted OQ8 target, train the drafter through `hipfire-train`'s DSpark
      path, and pack it with `dspark_convert` to `.dspark.hfq`;
    - the same extract-layer target seam is the foundation a later DFlash sidecar
      drives, so the hidden capture must stay drafter-agnostic, not DSpark-only.
@@ -706,6 +730,42 @@ DSpark exit gate:
 - Gemma 4 adds no spec-decode branch outside the shared `SpecTarget`/`DsparkBody`
   seam, and the extract-layer tap is reachable by DFlash without a second capture.
 
+### Phase 11 — final OQ8++ strict narrowing gate
+
+This is the final promotion stage for the dense 31B product after broad OQ8
+functional admission. It does not replace the OQ8 compatibility floor and does
+not weaken the pinned BF16 oracle. In canonical artifact spelling, OQ8++ is
+`.oq8++.hfq`: activation-aware clipping/scaling plus Hessian/LDLQ error feedback
+on the Opus 8-bit weight encoding.
+
+Deliverables:
+
+1. Produce `Gemma-4-31B-it.oq8++.hfq` from the same pinned source revision and
+   tokenizer as the admitted OQ8 artifact.
+2. Record calibration corpus, activation-aware method, Hessian/LDLQ settings,
+   quantization hash, producer commit, and source revision in durable evidence.
+3. Run the complete OQ8 prompt, SWA/global, reset/reload, sequential-request,
+   prompt/tool, and portability matrix without dropping any case.
+4. Compare every required hidden/logit capture against the same pinned
+   Transformers BF16 oracle using `benchmarks/gemma4/oq8pp-thresholds.json`.
+5. Run the corresponding `hipfire-eval` KLD/PPL/task and performance batteries;
+   quality admission precedes Kernel Atlas or performance promotion.
+
+Exit gate:
+
+- hidden-state cosine is at least `0.999`, hidden-state NRMSE is at most `0.045`,
+  and no hidden value is non-finite at every required capture point;
+- final-logit cosine is at least `0.999`, maximum absolute error is at most
+  `0.5`, final argmax matches, top-5 overlap is at least `4`, and no logit is
+  non-finite at every committed comparison position;
+- greedy token IDs match exactly for the committed prompt suite;
+- every broad OQ8 lifecycle, serving, prompt/tool, SWA/global, and portability
+  gate remains green on OQ8++;
+- KLD/PPL/task limits are declared before the OQ8++ result and pass without a
+  post-result threshold change;
+- a miss is recorded as a rejected OQ8++ candidate. OQ8 remains the admitted
+  compatibility artifact, and the narrower gate is not relaxed.
+
 ## Verification matrix
 
 ### CPU/no-GPU on every phase
@@ -724,7 +784,8 @@ DSpark exit gate:
 - reference-vs-lowered layer captures before enabling lowered by default;
 - `./tests/coherence-gate-dflash.sh` after changes to kernels, dispatch, quant,
   fusion, rotation, RMSNorm, KV, or spec-decode-adjacent paths;
-- BF16 model comparisons on locally available checkpoints;
+- OQ8 model comparisons against the pinned BF16 oracle on locally available
+  checkpoints;
 - boundary prompts at SWA-1/SWA/SWA+1 and positions beyond one full layer pattern;
 - reset/reload/multi-turn checks;
 - compile/JIT matrix for gfx1030, gfx1103, gfx1151, and gfx1201; run on available
@@ -775,7 +836,8 @@ subtree.
 Gemma 4 text support is complete only when:
 
 1. Every locally available official text variant has an explicit support status
-   backed by BF16 evidence; unsupported/deferred variants are labeled honestly.
+   backed by OQ8 evidence against the pinned BF16 oracle; unsupported/deferred
+   variants are labeled honestly.
 2. Dense, PLE/KV-sharing, and dense-plus-MoE math have independent operator and
    real-model evidence.
 3. Official prompt, thinking, tools, stop behavior, and sampling are correct for
@@ -799,7 +861,7 @@ Gemma 4 text support is complete only when:
   31B bring-up);
 - DFlash, TriAttention, CASK, or new KV quant formats;
 - pipeline/expert parallelism;
-- performance fusion before BF16 parity;
+- performance fusion before OQ8 admission and the final OQ8++ narrowing gate;
 - direct GGUF execution;
 - broad rewrites of unrelated architecture crates.
 

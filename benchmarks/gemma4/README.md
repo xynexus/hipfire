@@ -37,3 +37,21 @@ python3 benchmarks/gemma4/capture_transformers_reference.py \
 
 The output records input IDs, selected hidden states, final logits, greedy
 generation IDs, software versions, prompt hash, and source revision.
+
+Comparison contracts:
+
+- `oq8-thresholds.json` is the revised broad OQ8 functional baseline, frozen
+  from the first valid exact-prompt OQ8 measurement by explicit plan revision;
+- `oq8pp-thresholds.json` is the final narrower OQ8++ promotion gate and retains
+  the original strict limits unchanged;
+- `bf16-thresholds.json` preserves the original pre-observation BF16 candidate
+  contract as historical evidence.
+
+Select the contract explicitly when comparing a capture:
+
+```bash
+python3 benchmarks/gemma4/compare_bf16_captures.py \
+  --oracle /path/to/pinned-oracle \
+  --hipfire /path/to/hipfire-capture \
+  --thresholds benchmarks/gemma4/oq8-thresholds.json
+```
