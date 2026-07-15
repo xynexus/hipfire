@@ -120,8 +120,11 @@ needs a new K read layout for ~8 MB, so it's not worth it now.
 
 - `--kv-mode kvarn --kvarn-bits 8` (single-tier) = the near-lossless, 2×-smaller
   KV. Default `--kvarn-bits 4` is already near-harmless (KV KLD 9e-4).
-- Weight quant dominates model KLD (mq4 ≈ 0.08 vs KV's 9e-4) — chase oq4 weights
-  for quality, not KV bits.
+- Weight quant dominates model KLD, not KV. Measured on qwen3.5-0.8b vs bf16
+  (`benchmarks/results/oq-weight-quant-kld-20260715.md`): **oq8++ 3.0e-4**
+  (~lossless), **oq4.5++ 4.8e-2**, **mq4+ 8.2e-2** — vs KV's 9e-4 (kvarn-4) /
+  1e-5 (kvarn-8). So chase oq weights (oq8++ ≈ free; oq4.5++ ≈ halves mq4+), not
+  KV bits.
 2. **Lloyd-Max / codebook kvarn (per-bit fidelity).** Since it's precision-
    limited, a non-uniform quantizer fit to the balanced-tile distribution
    typically buys ~0.5–1 bit vs uniform min/max at the same storage — the repo
