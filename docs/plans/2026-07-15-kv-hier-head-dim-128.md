@@ -85,17 +85,22 @@ Low.
 
 ## Risks / open questions (resolve BEFORE coding)
 
-- **RQ (must resolve first): single-tier rotate vs hier append rotate — one or two
-  rotations of `fa_k`?** The base KVarN path rotates `fa_k` in place at
-  `qwen35/mod.rs:3124` (`kvarn_rotate && head_dim==256`), and `HierKvState::append_token`
-  *also* FWHT-rotates K (Phase 0, forced on for q8). If both fire on the same `fa_k`
-  in the real decode path, K is double-rotated. Phase 0/1 parity (`parity_kv_hier`)
-  drives `HierKvState` directly and never hits `:3124`, so it would not catch this;
-  the `infer_qwen35` decode A/B was coherent, which suggests only one fires (likely
-  the base rotate is skipped when hier owns the read, or hier consumes pre-`:3124`
-  `fa_k`) — but this must be traced and pinned down at 256 first, because the 128 port
-  duplicates whichever rotation(s) are live. This is the highest-priority unknown and
-  also a latent correctness check on the *existing* 256 path.
+- **RQ [RESOLVED 2026-07-15 — NO double-rotation]** Traced the live per-token decode
+  path (`qwen35/mod.rs kv_cache_attention_dispatch`). The hier branch calls
+  `append_token(&s.fa_k, ..)` then **`return`s `two_tier_read(..)` at :3105**, so the
+  single-tier KVarN rotate at `:3132` (`rotate_x_mq_batched(&s.fa_k, .., in-place)`)
+  is UNREACHABLE when hier is enabled. The two are mutually exclusive:
+  - hier ON → only `append_token`'s FWHT runs, and it rotates into the `rot_k`/`q_rot`
+    *scratch* (`fa_k`/`fa_q` are never mutated). One rotation.
+  - hier OFF → only `:3132` runs (in-place). One rotation.
+  Confirmed two ways: (1) control flow (early return), (2) exhaustive grep — the ONLY
+  `s.fa_k`/`s.fa_q` rotation site in the qwen35 crate is `:3132–3133`; every other
+  `rotate_x_mq*` call rotates activations (`x_norm`/`hidden`/`gate_up`) for the MQ4
+  weight GEMMs, not the KV key. So the 128 port needs NO double-rotation coordination:
+  just route `append_token`'s internal `rotate_x_mq` → `rotate_x_mq_128` by head_dim.
+  Side fix: the `:3071` call-site comment ("NO KVarN rotation … fa_q consumed
+  un-rotated") was stale post-Phase-0 (default int8 hot forces rotation) and is
+  corrected in the same commit.
 - **Validation model gap.** `parity_kv_hier` hardcodes `NH/NKV/HD=256` — parametrize
   it to also run HD=128 (cheap, synthetic; the strongest proof). But an *end-to-end*
   decode test needs a head_dim=128 **qwen35-arch** model — that is **Qwen3.5-122B-A10B**
@@ -107,8 +112,8 @@ Low.
 
 ## Phasing
 
-0. **Resolve RQ** (trace `fa_k` rotation count at head_dim=256 in the live qwen35
-   decode path). Gate everything on this.
+0. **[DONE]** Resolve RQ — traced: no double-rotation (hier `return`s before the
+   single-tier rotate; the two are mutually exclusive). Clears the gate.
 1. **R1**: `HD` const → field (256-only still; pure refactor, `parity_kv_hier` +
    `infer_qwen35` unchanged). Land first, separately validatable.
 2. **K1 + K2**: `attention_cold_slots_128` + `flash_tier_merge_128` kernels + SRC

@@ -2043,7 +2043,7 @@ pub const ENV_HIPFIRE_KVARN_BITS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KVARN_ROTATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVARN_ROTATE",
     description: "In-place: mq_rotate_x loads each 256-group into registers (ds_swizzle",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/mod.rs:3123",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/mod.rs:3127",
 };
 
 /// `HIPFIRE_KVARN_SIM` — Environment toggle value controls runtime behavior

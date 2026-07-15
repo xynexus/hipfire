@@ -3071,11 +3071,15 @@ fn kv_cache_attention_dispatch(
         // ── Deferred-hierarchical two-tier KV (flag-gated HIPFIRE_KV_HIERARCHICAL=1).
         // Lazily built on first dispatch (needs n_heads from the config). Replaces
         // the single-tier KVarN read with hot-ring ⊕ 4-bit cold-segment two-tier
-        // attention. NO KVarN rotation: the hot ring stores raw fa_k and the cold
-        // segments compact with rotate=false, so fa_q is consumed un-rotated and
-        // both tiers' K are in the same (un-rotated, RoPE-baked) basis as Q.
-        // This is the ONLY KVarN attention entry point (prefill is per-token here
-        // too, n=1), so one hook covers prompt + decode.
+        // attention, and RETURNS below — so the single-tier KVarN rotate + attend
+        // path is MUTUALLY EXCLUSIVE with it (no double-rotation of fa_k).
+        // Rotation frame: with the int8 hot tier (default HIPFIRE_KV_HOT_BITS=8) or
+        // HIPFIRE_KV_HOT_ROTATE=1, HierKvState FWHT-rotates K on write and the query
+        // on read *internally, into its own scratch* — fa_k/fa_q are NOT mutated here
+        // — and the cold tier inherits that frame via migrate; f16 hot (HOT_BITS=16)
+        // keeps the raw un-rotated (RoPE-baked) basis for both tiers. This is the
+        // ONLY KVarN attention entry point (prefill is per-token here too, n=1), so
+        // one hook covers prompt + decode.
         if kv_cache.hier.is_none() {
             // KV-layer mask (full-attention layers only) so hybrid arches allocate
             // hot rings just for KV-bearing layers — mirrors the base cache's
