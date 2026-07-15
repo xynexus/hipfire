@@ -380,6 +380,32 @@ impl HierKvState {
                 rot_k = Some(gpu.zeros(&[n_kv_heads * HD], DType::F32)?);
                 q_rot = Some(gpu.zeros(&[n_heads * HD], DType::F32)?);
             }
+            // Bit accounting (Phase 5): log the per-session hot-tier footprint ONCE
+            // per process (not per session — the daemon batches thousands) so the
+            // int8 win is visible in telemetry, with the multi-session projection.
+            static LOG_ONCE: std::sync::Once = std::sync::Once::new();
+            LOG_ONCE.call_once(|| {
+                let per_ring = if hot_q8 {
+                    n_kv_heads * hot_budget * HD + n_kv_heads * hot_budget * 4
+                } else {
+                    n_kv_heads * hot_budget * HD * 2
+                };
+                let total = n_layers * 2 * per_ring;
+                let mb = total as f64 / 1e6;
+                let gb_1k = total as f64 * 1000.0 / 1e9;
+                if hot_q8 {
+                    let f16_total = n_layers * 2 * (n_kv_heads * hot_budget * HD * 2);
+                    let saved = 100.0 * (1.0 - total as f64 / f16_total as f64);
+                    eprintln!(
+                        "[kv-hier] hot tier: int8, {mb:.1} MB/session ({n_layers} layers, nkv={n_kv_heads}, hot_budget={hot_budget}); f16 baseline {:.1} MB → {saved:.0}% saved; ~{gb_1k:.0} GB at 1000 sessions",
+                        f16_total as f64 / 1e6
+                    );
+                } else {
+                    eprintln!(
+                        "[kv-hier] hot tier: f16, {mb:.1} MB/session ({n_layers} layers, nkv={n_kv_heads}, hot_budget={hot_budget}); ~{gb_1k:.0} GB at 1000 sessions (HIPFIRE_KV_HOT_BITS=8 halves it)"
+                    );
+                }
+            });
         }
         Ok(Self {
             enabled,
@@ -577,6 +603,24 @@ impl HierKvState {
                 widen(&gpu.download_raw(&self.hot_v[layer], ring_elems * 2)?),
             ))
         }
+    }
+
+    /// Per-session resident hot-ring VRAM (bytes), summed over all layers (K+V).
+    /// int8 ring = codes (`nkv·hb·HD`) + per-slot scale (`nkv·hb·4`); f16 ring =
+    /// `2·nkv·hb·HD`. Excludes the shared dequant scratch (a fixed read-overhead of
+    /// one ring's worth, not per-tier storage). Drives the bit-accounting telemetry
+    /// so the multi-session int8 win is visible. 0 when disabled.
+    pub fn hot_tier_bytes(&self) -> usize {
+        if !self.enabled {
+            return 0;
+        }
+        let n_layers = self.hot_count.len();
+        let per_ring = if self.hot_q8 {
+            self.n_kv_heads * self.hot_budget * HD + self.n_kv_heads * self.hot_budget * 4
+        } else {
+            self.n_kv_heads * self.hot_budget * HD * 2
+        };
+        n_layers * 2 * per_ring // K + V rings
     }
 
     /// Migrate the oldest `n_req` hot tokens into ONE new cold segment, then shift

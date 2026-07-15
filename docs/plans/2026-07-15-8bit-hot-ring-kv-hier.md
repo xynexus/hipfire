@@ -170,8 +170,38 @@ The rotation lives at the **hot write**; the cold tier inherits it through migra
    Validated on gfx1103: default parity (no env) = q8 PASS 4.3e-5; `HOT_BITS=16`
    f16 PASS 5.2e-5; invalid value coerces to 8 with a warning. All Rust no-gpu-ci
    tests pass.
-5. **Bit accounting.** Log per-session hot-tier bytes so the multi-session win is
-   visible in `hipfire doctor`/telemetry.
+5. **[DONE 2026-07-15]** Bit accounting. `HierKvState::hot_tier_bytes()` +
+   a once-per-process log (`std::sync::Once` — NOT per session; the daemon batches
+   thousands) at `from_env`: `[kv-hier] hot tier: int8, <MB>/session (<layers>,
+   hot_budget=<n>); f16 baseline <MB> → <pct>% saved; ~<GB> at 1000 sessions`.
+   `doctor` was NOT a fit — it is hardware/env diagnostics with no model loaded, so
+   it can't compute the per-session KV geometry; the runtime construction log is
+   where the number is actually known. Real numbers observed on qwen3.5-0.8b (24
+   layers, nkv=2, hot_budget=512): int8 12.8 MB vs f16 25.2 MB/session (49%),
+   ~13 GB vs ~25 GB at 1000 sessions.
+
+## Validation-harness correction (2026-07-15)
+
+The Phase 0/1 "PPL A/B via `perplexity`" numbers above (17.1xx) DID NOT exercise
+the hierarchical cache. `perplexity` is a **batched-prefill** scorer, and the
+two-tier `HierKvState` is a **per-token DECODE** feature that the batched prefill
+path explicitly bypasses (see `kv_hier.rs` module doc: "inherently per-token…the
+batched session-batch prefill…is guarded against hier"). So those PPL deltas were
+run-to-run noise, not the codec. What actually validated the work:
+- **Parity oracle** (`parity_kv_hier`, HD=256) — rigorous pipeline proof of the
+  rotated frame + q8 round-trip + migrate + defrag (unchanged, still valid).
+- **Real model-level decode A/B** (the correct harness): `HIPFIRE_KV_MODE=kvarn
+  HIPFIRE_KV_HIERARCHICAL=1 [HIPFIRE_KV_HOT_BITS=8|16] infer_qwen35
+  qwen3.5-0.8b-mq4+ "<prompt>"` — head_dim=256 so hier engages; the accounting log
+  fires, and q8 vs f16 generations are both fully coherent and quality-equivalent
+  (identical Rayleigh-scattering explanation, diverging only in top-p sampling
+  wording). q8 hot causes no decode-quality regression.
+
+Follow-up noted: for this hybrid model (`layer_types` = 6 full-attention of 24),
+`from_env` allocates hot rings for all 24 layers, not just the 6 attention layers
+— a pre-existing over-allocation (the f16 ring did it too); the accounting honestly
+reports allocated bytes. Trimming hot rings to attention-only layers is a separate
+optimization.
 
 Invariant throughout: **only K is rotated; V stays per-slot un-rotated**, so the
 attention output needs no inverse rotation.
