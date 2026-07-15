@@ -197,11 +197,15 @@ run-to-run noise, not the codec. What actually validated the work:
   (identical Rayleigh-scattering explanation, diverging only in top-p sampling
   wording). q8 hot causes no decode-quality regression.
 
-Follow-up noted: for this hybrid model (`layer_types` = 6 full-attention of 24),
-`from_env` allocates hot rings for all 24 layers, not just the 6 attention layers
-— a pre-existing over-allocation (the f16 ring did it too); the accounting honestly
-reports allocated bytes. Trimming hot rings to attention-only layers is a separate
-optimization.
+Follow-up [DONE 2026-07-15]: the pre-existing over-allocation (hot rings for ALL
+layers, not just full-attention) is fixed. `from_env` now takes `is_kv_layer:
+&[bool]` (the base cache's `layer_types == FullAttention` mask) and allocates full
+rings only for KV-bearing layers, 1-element `Q8Ring::placeholder`/`[1]` f16 for the
+rest — mirroring the base cache's `alloc_k_v_filtered`; absolute layer indexing is
+preserved (linear-attention layers never hit the hier hook). Measured on
+qwen3.5-0.8b: hot tier 12.8 → **3.2 MB/session** int8 (6/24 KV layers), ~13 → ~3 GB
+at 1000 sessions — a further 4× on top of the q8 2× (≈8× vs naive f16-all-layers).
+Decode stays coherent (Rayleigh + photosynthesis A/B); `parity_kv_hier` PASS.
 
 Invariant throughout: **only K is rotated; V stays per-slot un-rotated**, so the
 attention output needs no inverse rotation.

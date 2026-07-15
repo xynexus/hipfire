@@ -129,6 +129,15 @@ impl Q8Ring {
             scale: gpu.zeros(&[nkv * hb], DType::F32)?,
         })
     }
+    /// 1-element placeholder for a non-KV (e.g. linear-attention) layer — never
+    /// written/read, mirrors the base cache's `alloc_k_v_filtered` placeholders so
+    /// absolute layer indexing is preserved without full-ring VRAM.
+    fn placeholder(gpu: &mut Gpu) -> HipResult<Self> {
+        Ok(Q8Ring {
+            codes: gpu.upload_raw(&[0u8], &[1])?,
+            scale: gpu.zeros(&[1], DType::F32)?,
+        })
+    }
 }
 
 pub struct HierKvState {
@@ -215,6 +224,10 @@ pub struct HierKvState {
     pub hot_q8: bool,
     hot_kq: Vec<Q8Ring>, // [n_layers] rotated-K int8 ring; empty unless hot_q8
     hot_vq: Vec<Q8Ring>, // [n_layers] V int8 ring; empty unless hot_q8
+    /// Count of KV-bearing (full-attention) layers — hybrid arches (Qwen3.5:
+    /// DeltaNet + FullAttention) allocate full hot rings only for these; the rest
+    /// get 1-element placeholders. Drives honest `hot_tier_bytes` accounting.
+    n_kv_layers: usize,
     /// Shared f16 [nkv × hot_budget × HD] dequant scratch (one ring's worth, reused
     /// across layers/reads). Some when hot_q8.
     hot_deq_k: Option<GpuTensor>,
@@ -226,11 +239,17 @@ impl HierKvState {
     /// `HIPFIRE_KV_MIGRATE_BATCH`. Returns a disabled state when the flag is off.
     pub fn from_env(
         gpu: &mut Gpu,
-        n_layers: usize,
+        is_kv_layer: &[bool],
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
     ) -> HipResult<Self> {
+        // Full hot rings only for KV-bearing (full-attention) layers; hybrid arches
+        // (Qwen3.5 DeltaNet + FullAttention) get 1-element placeholders for the rest,
+        // mirroring the base cache's `alloc_k_v_filtered`. Absolute layer indexing is
+        // preserved. `is_kv_layer` = base-cache mask (layer_types == FullAttention).
+        let n_layers = is_kv_layer.len();
+        let n_kv_layers = is_kv_layer.iter().filter(|b| **b).count();
         let enabled =
             std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() == Some("1") && head_dim == HD;
         // Default 512: the knee sweep showed hot=512 clearly beats 256 (PPL 27.5 vs
@@ -356,22 +375,35 @@ impl HierKvState {
             // budget; f16 is far above the cold 2-bit floor, so it is near-lossless
             // for the exact tier). Read via attention_cold_slots slot-major-f16
             // (layout 2); migrate downloads raw f16 and widens to f32 for compaction.
-            for _ in 0..n_layers {
-                attn_mass.push(gpu.zeros(&[hot_budget], DType::F32)?);
+            // Per-layer allocation: full rings for KV layers, [1] placeholders for
+            // non-KV (linear-attention) layers (never appended/read — the hier hook
+            // only fires on full-attention layers). Preserves absolute layer indexing.
+            for &is_kv in is_kv_layer {
+                attn_mass.push(gpu.zeros(&[if is_kv { hot_budget } else { 1 }], DType::F32)?);
             }
             if hot_q8 {
                 // 8-bit hot ring: int8 codes + per-slot scale, plus a shared f16
                 // dequant scratch (one ring's worth, reused across layers/reads).
-                for _ in 0..n_layers {
-                    hot_kq.push(Q8Ring::alloc(gpu, n_kv_heads, hot_budget)?);
-                    hot_vq.push(Q8Ring::alloc(gpu, n_kv_heads, hot_budget)?);
+                for &is_kv in is_kv_layer {
+                    if is_kv {
+                        hot_kq.push(Q8Ring::alloc(gpu, n_kv_heads, hot_budget)?);
+                        hot_vq.push(Q8Ring::alloc(gpu, n_kv_heads, hot_budget)?);
+                    } else {
+                        hot_kq.push(Q8Ring::placeholder(gpu)?);
+                        hot_vq.push(Q8Ring::placeholder(gpu)?);
+                    }
                 }
                 hot_deq_k = Some(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
                 hot_deq_v = Some(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
             } else {
-                for _ in 0..n_layers {
-                    hot_k.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
-                    hot_v.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
+                for &is_kv in is_kv_layer {
+                    let n = if is_kv {
+                        n_kv_heads * hot_budget * HD
+                    } else {
+                        1
+                    };
+                    hot_k.push(gpu.zeros(&[n], DType::F16)?);
+                    hot_v.push(gpu.zeros(&[n], DType::F16)?);
                 }
                 hot_cast = Some(gpu.zeros(&[n_kv_heads * HD], DType::F16)?);
             }
@@ -390,19 +422,20 @@ impl HierKvState {
                 } else {
                     n_kv_heads * hot_budget * HD * 2
                 };
-                let total = n_layers * 2 * per_ring;
+                // Only KV-bearing layers hold real rings (hybrid arches skip the rest).
+                let total = n_kv_layers * 2 * per_ring;
                 let mb = total as f64 / 1e6;
                 let gb_1k = total as f64 * 1000.0 / 1e9;
                 if hot_q8 {
-                    let f16_total = n_layers * 2 * (n_kv_heads * hot_budget * HD * 2);
+                    let f16_total = n_kv_layers * 2 * (n_kv_heads * hot_budget * HD * 2);
                     let saved = 100.0 * (1.0 - total as f64 / f16_total as f64);
                     eprintln!(
-                        "[kv-hier] hot tier: int8, {mb:.1} MB/session ({n_layers} layers, nkv={n_kv_heads}, hot_budget={hot_budget}); f16 baseline {:.1} MB → {saved:.0}% saved; ~{gb_1k:.0} GB at 1000 sessions",
+                        "[kv-hier] hot tier: int8, {mb:.1} MB/session ({n_kv_layers}/{n_layers} KV layers, nkv={n_kv_heads}, hot_budget={hot_budget}); f16 baseline {:.1} MB → {saved:.0}% saved; ~{gb_1k:.0} GB at 1000 sessions",
                         f16_total as f64 / 1e6
                     );
                 } else {
                     eprintln!(
-                        "[kv-hier] hot tier: f16, {mb:.1} MB/session ({n_layers} layers, nkv={n_kv_heads}, hot_budget={hot_budget}); ~{gb_1k:.0} GB at 1000 sessions (HIPFIRE_KV_HOT_BITS=8 halves it)"
+                        "[kv-hier] hot tier: f16, {mb:.1} MB/session ({n_kv_layers}/{n_layers} KV layers, nkv={n_kv_heads}, hot_budget={hot_budget}); ~{gb_1k:.0} GB at 1000 sessions (HIPFIRE_KV_HOT_BITS=8 halves it)"
                     );
                 }
             });
@@ -441,6 +474,7 @@ impl HierKvState {
             hot_q8,
             hot_kq,
             hot_vq,
+            n_kv_layers,
             hot_deq_k,
             hot_deq_v,
         })
@@ -614,13 +648,12 @@ impl HierKvState {
         if !self.enabled {
             return 0;
         }
-        let n_layers = self.hot_count.len();
         let per_ring = if self.hot_q8 {
             self.n_kv_heads * self.hot_budget * HD + self.n_kv_heads * self.hot_budget * 4
         } else {
             self.n_kv_heads * self.hot_budget * HD * 2
         };
-        n_layers * 2 * per_ring // K + V rings
+        self.n_kv_layers * 2 * per_ring // K + V rings, KV-bearing layers only
     }
 
     /// Migrate the oldest `n_req` hot tokens into ONE new cold segment, then shift

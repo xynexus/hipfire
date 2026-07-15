@@ -3077,9 +3077,17 @@ fn kv_cache_attention_dispatch(
         // This is the ONLY KVarN attention entry point (prefill is per-token here
         // too, n=1), so one hook covers prompt + decode.
         if kv_cache.hier.is_none() {
+            // KV-layer mask (full-attention layers only) so hybrid arches allocate
+            // hot rings just for KV-bearing layers — mirrors the base cache's
+            // `alloc_k_v_filtered`. Same source as loading.rs's is_kv_layer.
+            let is_kv: Vec<bool> = config
+                .layer_types
+                .iter()
+                .map(|t| *t == LayerType::FullAttention)
+                .collect();
             kv_cache.hier = Some(hipfire_runtime::kv_hier::HierKvState::from_env(
                 gpu,
-                kv_cache.k_gpu.len(),
+                &is_kv,
                 config.n_heads,
                 config.n_kv_heads,
                 config.head_dim,

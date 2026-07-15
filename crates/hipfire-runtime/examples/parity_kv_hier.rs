@@ -60,7 +60,7 @@ fn main() {
     std::env::set_var("HIPFIRE_KV_MIGRATE_BATCH", "8");
 
     let mut gpu = Gpu::init().unwrap();
-    let mut hier = HierKvState::from_env(&mut gpu, 1, NH, NKV, HD).unwrap();
+    let mut hier = HierKvState::from_env(&mut gpu, &[true], NH, NKV, HD).unwrap();
     assert!(hier.enabled, "hierarchical not enabled");
 
     // Feed N tokens (layer 0). Keep host copies for nothing — we read back GPU state.
