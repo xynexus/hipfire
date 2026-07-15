@@ -1,0 +1,5 @@
+{
+  "schema": "hipfire.gemma4.exact-input.v1",
+  "description": "Exact tokenizer output for: The capital of France is",
+  "input_ids": [818, 5279, 529, 7001, 563]
+}

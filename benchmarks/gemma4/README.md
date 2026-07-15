@@ -38,6 +38,13 @@ python3 benchmarks/gemma4/capture_transformers_reference.py \
 The output records input IDs, selected hidden states, final logits, greedy
 generation IDs, software versions, prompt hash, and source revision.
 
+For long exact-token boundary prompts,
+`capture_transformers_streaming_reference.py` runs the same upstream Gemma 4
+BF16 modules and source tensors one decoder layer at a time. Its streamed path
+must first pass `compare_transformers_oracles.py` against a resident capture;
+the retained base-short calibration is bit-exact at all 60 captured layers and
+final logits.
+
 Comparison contracts:
 
 - `oq8-thresholds.json` is the revised broad OQ8 functional baseline, frozen
@@ -55,3 +62,26 @@ python3 benchmarks/gemma4/compare_bf16_captures.py \
   --hipfire /path/to/hipfire-capture \
   --thresholds benchmarks/gemma4/oq8-thresholds.json
 ```
+
+The complete Phase 5 OQ8 matrix is frozen in
+`phase5-oq8-capture-plan.json`. It uses committed exact-token fixtures for the
+short prompt and the 1023/1024/1025-token SWA boundary cases, so both sides see
+identical IDs independently of prompt-file newline handling. Run it under the
+shared GPU lock:
+
+```bash
+hipfire lock run gemma4-phase5-oq8 -- \
+  python3 benchmarks/gemma4/run_full_model_admission.py \
+    --oracle-model /path/to/pinned/google/gemma-4-31B/snapshot \
+    --candidate-model ~/.hipfire/models/Gemma-4-31B.oq8.hfq \
+    --output ~/.hipfire/evidence/gemma4/phase5-oq8-admission
+```
+
+`--case CASE_ID` runs a selected case without discarding prior case records in
+the output manifest. The base-short case also sets the candidate capture's
+lifecycle mode, which requires an exact second request and exact unload/reload
+rerun. The canonical candidate example is `gemma4_capture`; the historical
+`bf16_capture` name remains available only so old evidence commands reproduce.
+The plan selects the resident oracle for base-short and the validated streamed
+oracle for the one-token SWA boundary cases. Stop at the first frozen-gate
+failure; do not run later cases or revise thresholds after observing it.

@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 hipfire contributors
 
-"""Compare a Hipfire Gemma 4 BF16 capture with the frozen Transformers oracle."""
+"""Compare a Hipfire Gemma 4 candidate with the pinned BF16 oracle."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(__file__).with_name("bf16-thresholds.json"),
     )
+    parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
@@ -42,11 +43,12 @@ def vector_metrics(reference: np.ndarray, candidate: np.ndarray) -> dict[str, fl
     }
 
 
-def main() -> None:
-    args = parse_args()
-    thresholds = json.loads(args.thresholds.read_text())
-    metadata = json.loads(args.hipfire.joinpath("capture.json").read_text())
-    oracle = np.load(args.oracle / "capture.npz")
+def compare_capture(
+    oracle_dir: Path, hipfire_dir: Path, thresholds_path: Path
+) -> dict[str, object]:
+    thresholds = json.loads(thresholds_path.read_text())
+    metadata = json.loads(hipfire_dir.joinpath("capture.json").read_text())
+    oracle = np.load(oracle_dir / "capture.npz")
     failures: list[str] = []
     results: dict[str, object] = {}
 
@@ -58,7 +60,7 @@ def main() -> None:
     hidden_results = {}
     for layer in metadata["captured_layers"]:
         candidate = np.fromfile(
-            args.hipfire / f"hidden_layer_{layer}.f32", dtype="<f4"
+            hipfire_dir / f"hidden_layer_{layer}.f32", dtype="<f4"
         )
         reference = oracle[f"hidden_layer_{layer}"][0, -1]
         metrics = vector_metrics(reference, candidate)
@@ -71,8 +73,10 @@ def main() -> None:
             failures.append(f"layer {layer} contains non-finite values")
     results["hidden_states"] = hidden_results
 
-    logits_reference = oracle["final_logits"][0]
-    logits_candidate = np.fromfile(args.hipfire / "final_logits.f32", dtype="<f4")
+    logits_reference = oracle["final_logits"].reshape(-1)
+    logits_candidate = np.fromfile(
+        hipfire_dir / "final_logits.f32", dtype="<f4"
+    ).reshape(-1)
     logits = vector_metrics(logits_reference, logits_candidate)
     logits["reference_argmax"] = int(np.argmax(logits_reference))
     logits["candidate_argmax"] = int(np.argmax(logits_candidate))
@@ -108,8 +112,18 @@ def main() -> None:
 
     results["status"] = "pass" if not failures else "fail"
     results["failures"] = failures
-    print(json.dumps(results, indent=2, sort_keys=True))
-    if failures:
+    return results
+
+
+def main() -> None:
+    args = parse_args()
+    results = compare_capture(args.oracle, args.hipfire, args.thresholds)
+    rendered = json.dumps(results, indent=2, sort_keys=True) + "\n"
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered)
+    print(rendered, end="")
+    if results["status"] != "pass":
         raise SystemExit(1)
 
 
