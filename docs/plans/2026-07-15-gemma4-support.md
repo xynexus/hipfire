@@ -60,6 +60,17 @@ full stack. The exact per-layer evidence and reproduction tools are recorded in
 `benchmarks/gemma4/PHASE5.md`; this diagnostic does not alter serving or the
 frozen gate.
 
+Operator traces at exact-input layers 39, 40, and 58 reproduce the frozen
+Transformers layer outputs bit-for-bit and show smooth error growth through
+normalization, projections, attention, and FFN rather than a missing operation
+or discrete jump. A selective BF16-staged GeGLU diagnostic improves layer 40
+slightly but worsens the first failing layer 39 and the worst late layer 58, so
+it is rejected for serving. At this point the retained evidence has ruled out
+the tested loader, geometry, cache, norm, projection, RoPE, attention, GeGLU,
+residual, layer-scalar, final-norm, and head hypotheses. The observed blocker
+remains cumulative BF16 reduction/materialization-order sensitivity; the frozen
+Phase-5 stop rule remains binding.
+
 A post-freeze Transformers reference-variability control is retained at
 `benchmarks/gemma4/control-noise-31B.json`. It shows that alternate BF16
 reference executions can diverge at the same late-stack hotspots, which is useful

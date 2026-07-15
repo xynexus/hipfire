@@ -546,6 +546,72 @@ fn capture_operator(
     Ok(())
 }
 
+fn run_reference_layer(
+    gpu: &mut Gpu,
+    weights: &Gemma4DenseWeights,
+    config: &Gemma4Config,
+    state: &Gemma4DenseState,
+    layer_idx: usize,
+    position: usize,
+    bf16_staged_geglu: bool,
+    mut capture: Option<&mut Gemma4ForwardCapture>,
+) -> HipResult<()> {
+    let layer = &weights.layers[layer_idx];
+    if let Some(capture) = capture.as_deref_mut() {
+        capture_operator(gpu, capture, layer_idx, "pre_layer", &state.x)?;
+    }
+    attention_block(
+        gpu,
+        layer_idx,
+        layer,
+        config,
+        state,
+        position,
+        capture.as_deref_mut(),
+    )?;
+    if let Some(capture) = capture.as_deref_mut() {
+        capture_operator(gpu, capture, layer_idx, "post_attention_residual", &state.x)?;
+    }
+    ffn_project(gpu, layer, config, state)?;
+    if bf16_staged_geglu {
+        gpu.bf16_round_trip_f32(&state.gate)?;
+        gpu.bf16_round_trip_f32(&state.up)?;
+    }
+    if let Some(capture) = capture.as_deref_mut() {
+        capture_operator(gpu, capture, layer_idx, "pre_ffn_norm", &state.tmp)?;
+        capture_operator(gpu, capture, layer_idx, "gate", &state.gate)?;
+        capture_operator(gpu, capture, layer_idx, "up", &state.up)?;
+    }
+    if bf16_staged_geglu {
+        let ffn = state.ffn.sub_offset(0, layer.w_down.k);
+        gpu.gelu_tanh_f32(&state.gate, &ffn, layer.w_down.k)?;
+        gpu.bf16_round_trip_f32(&ffn)?;
+        gpu.mul_f32(&ffn, &state.up, &ffn)?;
+        gpu.bf16_round_trip_f32(&ffn)?;
+    } else {
+        ffn_activate(gpu, layer, state)?;
+    }
+    if let Some(capture) = capture.as_deref_mut() {
+        capture_operator(
+            gpu,
+            capture,
+            layer_idx,
+            "geglu",
+            &state.ffn.sub_offset(0, layer.w_down.k),
+        )?;
+    }
+    ffn_finish(gpu, layer, config, state)?;
+    if let Some(capture) = capture.as_deref_mut() {
+        capture_operator(gpu, capture, layer_idx, "post_ffn_norm", &state.tmp)?;
+        capture_operator(gpu, capture, layer_idx, "post_ffn_residual", &state.x)?;
+    }
+    gpu.scale_f32(&state.x, layer.layer_scalar)?;
+    if let Some(capture) = capture {
+        capture_operator(gpu, capture, layer_idx, "layer_output", &state.x)?;
+    }
+    Ok(())
+}
+
 pub fn forward_step_reference(
     gpu: &mut Gpu,
     weights: &Gemma4DenseWeights,
@@ -556,46 +622,18 @@ pub fn forward_step_reference(
 ) -> HipResult<()> {
     let position = state.next_pos();
     embed_token(gpu, weights, config, state, token)?;
-    for (layer_idx, layer) in weights.layers.iter().enumerate() {
-        if let Some(capture) = capture.as_deref_mut() {
-            capture_operator(gpu, capture, layer_idx, "pre_layer", &state.x)?;
-        }
-        attention_block(
+    for layer_idx in 0..weights.layers.len() {
+        run_reference_layer(
             gpu,
-            layer_idx,
-            layer,
+            weights,
             config,
             state,
+            layer_idx,
             position,
+            false,
             capture.as_deref_mut(),
         )?;
         if let Some(capture) = capture.as_deref_mut() {
-            capture_operator(gpu, capture, layer_idx, "post_attention_residual", &state.x)?;
-        }
-        ffn_project(gpu, layer, config, state)?;
-        if let Some(capture) = capture.as_deref_mut() {
-            capture_operator(gpu, capture, layer_idx, "pre_ffn_norm", &state.tmp)?;
-            capture_operator(gpu, capture, layer_idx, "gate", &state.gate)?;
-            capture_operator(gpu, capture, layer_idx, "up", &state.up)?;
-        }
-        ffn_activate(gpu, layer, state)?;
-        if let Some(capture) = capture.as_deref_mut() {
-            capture_operator(
-                gpu,
-                capture,
-                layer_idx,
-                "geglu",
-                &state.ffn.sub_offset(0, layer.w_down.k),
-            )?;
-        }
-        ffn_finish(gpu, layer, config, state)?;
-        if let Some(capture) = capture.as_deref_mut() {
-            capture_operator(gpu, capture, layer_idx, "post_ffn_norm", &state.tmp)?;
-            capture_operator(gpu, capture, layer_idx, "post_ffn_residual", &state.x)?;
-        }
-        gpu.scale_f32(&state.x, layer.layer_scalar)?;
-        if let Some(capture) = capture.as_deref_mut() {
-            capture_operator(gpu, capture, layer_idx, "layer_output", &state.x)?;
             capture_layer(gpu, state, capture);
         }
     }
@@ -627,6 +665,59 @@ pub fn diagnostic_forward_layer_from_hidden(
     position: usize,
     hidden: &[f32],
 ) -> HipResult<Vec<f32>> {
+    diagnostic_forward_layer_from_hidden_capture(
+        gpu, weights, config, state, layer_idx, position, hidden, None,
+    )
+}
+
+/// Capture operator boundaries for [`diagnostic_forward_layer_from_hidden`].
+/// The caller selects the same `layer_idx` in `capture.operator_layer`.
+#[allow(clippy::too_many_arguments)]
+pub fn diagnostic_forward_layer_from_hidden_capture(
+    gpu: &mut Gpu,
+    weights: &Gemma4DenseWeights,
+    config: &Gemma4Config,
+    state: &mut Gemma4DenseState,
+    layer_idx: usize,
+    position: usize,
+    hidden: &[f32],
+    capture: Option<&mut Gemma4ForwardCapture>,
+) -> HipResult<Vec<f32>> {
+    diagnostic_forward_layer_from_hidden_impl(
+        gpu, weights, config, state, layer_idx, position, hidden, false, capture,
+    )
+}
+
+/// Diagnostic variant that reproduces PyTorch's BF16 GeGLU materialization
+/// boundaries while leaving every other layer operator unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn diagnostic_forward_layer_from_hidden_bf16_geglu_capture(
+    gpu: &mut Gpu,
+    weights: &Gemma4DenseWeights,
+    config: &Gemma4Config,
+    state: &mut Gemma4DenseState,
+    layer_idx: usize,
+    position: usize,
+    hidden: &[f32],
+    capture: Option<&mut Gemma4ForwardCapture>,
+) -> HipResult<Vec<f32>> {
+    diagnostic_forward_layer_from_hidden_impl(
+        gpu, weights, config, state, layer_idx, position, hidden, true, capture,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diagnostic_forward_layer_from_hidden_impl(
+    gpu: &mut Gpu,
+    weights: &Gemma4DenseWeights,
+    config: &Gemma4Config,
+    state: &mut Gemma4DenseState,
+    layer_idx: usize,
+    position: usize,
+    hidden: &[f32],
+    bf16_staged_geglu: bool,
+    capture: Option<&mut Gemma4ForwardCapture>,
+) -> HipResult<Vec<f32>> {
     if layer_idx >= weights.layers.len() || layer_idx >= config.layers.len() {
         return Err(HipError::new(
             0,
@@ -657,12 +748,16 @@ pub fn diagnostic_forward_layer_from_hidden(
         std::slice::from_raw_parts(hidden.as_ptr().cast::<u8>(), std::mem::size_of_val(hidden))
     };
     gpu.hip.memcpy_htod(&state.x.buf, bytes)?;
-    let layer = &weights.layers[layer_idx];
-    attention_block(gpu, layer_idx, layer, config, state, position, None)?;
-    ffn_project(gpu, layer, config, state)?;
-    ffn_activate(gpu, layer, state)?;
-    ffn_finish(gpu, layer, config, state)?;
-    gpu.scale_f32(&state.x, layer.layer_scalar)?;
+    run_reference_layer(
+        gpu,
+        weights,
+        config,
+        state,
+        layer_idx,
+        position,
+        bf16_staged_geglu,
+        capture,
+    )?;
     let output = gpu.download_f32(&state.x)?;
     state
         .kv
