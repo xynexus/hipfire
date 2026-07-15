@@ -1193,3 +1193,31 @@ schedule and retain the byte oracle through OQ4, arbitrary mixed bitwidths,
 OQ8, and +/++ metadata. The kernel parameter remains the platform workaround;
 LDS placement and repeated DMA scheduling are independent. Durable rows:
 `benchmarks/npu_gemm_tuning/results/r121-staged-fullk-n1280-20260713.csv`.
+
+## R122 — resident component characterization before batched M (2026-07-15)
+
+The active EmbeddingGemma completed-layer route now exposes decision-level
+timings for attention prepare/pack/run, unit RMS, FFN, tail, next activation
+prep, residual prep, output materialization, final norm/mean, and Dense/L2. A
+new trace summarizer assigns repeated encodes to cold/primed samples and derives
+per-encode XDNA submit/wait deltas from the cumulative dispatch trace.
+
+One fresh oq8 process ran three M256 encodes; the two primed samples averaged
+746.822 ms across the 24 layers plus 20.976 ms finalization. Component totals
+were 269.042 ms FFN, 212.178 ms attention (11.540 prepare and 200.629 NPU run),
+168.409 ms next-layer prep, 86.612 ms tail, 8.322 ms setup, 2.575 ms final
+norm/mean, 18.392 ms Dense/L2, and 1.992 ms final host materialization. The
+active route bypasses separate unit-RMS, residual-prep, and interior GPU-pack
+work; zeroes in those columns describe route selection, not alternate-kernel
+latency.
+
+The same primed samples used 98 XDNA dispatches and averaged 1.894 ms submit vs
+744.854 ms wait. A repeated batched FFN hardware check remained bit-exact and
+measured M256 10.520 ms vs M512 19.929 ms, only 1.06x row throughput. Therefore
+launch batching and naive FFN M growth are rejected. Continue with FFN weight
+reuse and next-prep/tail context consolidation; postpone final Dense/L2 work.
+
+Durable rows:
+`benchmarks/npu_gemm_tuning/results/embeddinggemma-resident-components-m256-20260715.csv`
+and
+`benchmarks/npu_gemm_tuning/results/embeddinggemma-resident-samples-m256-20260715.csv`.

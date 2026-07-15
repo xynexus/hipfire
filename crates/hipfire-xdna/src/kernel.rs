@@ -22,6 +22,32 @@ const DEV_HEAP_BASE_VA: usize = 0x7000_0000_0000;
 const DEV_HEAP_STRIDE: usize = 128 * 1024 * 1024;
 static NEXT_HEAP_SLOT: AtomicUsize = AtomicUsize::new(0);
 
+// Route-A step-1 instrumentation: split every dispatch into submit-side (host
+// cache flush + EXEC_CMD ioctl) vs wait-side (NPU execution + weight/activation
+// DMA + syncobj signal). Env-gated (HIPFIRE_XDNA_TRACE), cumulative across the
+// process; the last printed line holds the totals. Cheap enough for the hot path.
+static XDNA_TRACE_SUBMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static XDNA_TRACE_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static XDNA_TRACE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn xdna_trace_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("HIPFIRE_XDNA_TRACE").is_ok_and(|v| v != "0"))
+}
+
+fn xdna_trace_record(submit: std::time::Duration, wait: std::time::Duration) {
+    let s = XDNA_TRACE_SUBMIT_NS.fetch_add(submit.as_nanos() as u64, Ordering::Relaxed)
+        + submit.as_nanos() as u64;
+    let w = XDNA_TRACE_WAIT_NS.fetch_add(wait.as_nanos() as u64, Ordering::Relaxed)
+        + wait.as_nanos() as u64;
+    let c = XDNA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "xdna_dispatch_cumulative count={c} submit_ms={:.3} wait_ms={:.3}",
+        s as f64 / 1e6,
+        w as f64 / 1e6
+    );
+}
+
 /// A prepared ERT command BO for a fixed set of argument buffers. Building it costs
 /// a CREATE_BO + GET_BO_INFO + mmap (~tens of µs); caching it across dispatches with
 /// the same buffers removes that from the per-dispatch path (measured ~100µs → far
@@ -194,12 +220,28 @@ impl NpuKernel {
     /// completes; on return the output buffers are readable directly (SHMEM is
     /// coherent once the timeline signals).
     pub fn dispatch(&self, args: &[&DeviceBuffer]) -> Result<(), XdnaError> {
+        if xdna_trace_enabled() {
+            let t0 = std::time::Instant::now();
+            let seq = self.submit(args)?;
+            let t1 = std::time::Instant::now();
+            let r = self.wait(seq);
+            xdna_trace_record(t1 - t0, t1.elapsed());
+            return r;
+        }
         let seq = self.submit(args)?;
         self.wait(seq)
     }
 
     /// Blocking dispatch with explicit host-to-device synchronization flags.
     pub fn dispatch_synced(&self, args: &[&DeviceBuffer], sync: &[bool]) -> Result<(), XdnaError> {
+        if xdna_trace_enabled() {
+            let t0 = std::time::Instant::now();
+            let seq = self.submit_synced(args, Some(sync))?;
+            let t1 = std::time::Instant::now();
+            let r = self.wait(seq);
+            xdna_trace_record(t1 - t0, t1.elapsed());
+            return r;
+        }
         let seq = self.submit_synced(args, Some(sync))?;
         self.wait(seq)
     }

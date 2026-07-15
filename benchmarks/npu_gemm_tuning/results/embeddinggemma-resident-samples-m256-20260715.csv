@@ -1,0 +1,4 @@
+sample,state,layers,layer_total_ms,final_norm_mean_ms,dense_l2_ms,finalize_total_ms,dispatches,submit_ms,wait_ms
+0,cold,24,724.091,4.213,39.935,44.154,102,2.939,736.253
+1,primed,24,728.237,2.688,18.344,21.041,98,1.583,727.286
+2,primed,24,765.408,2.461,18.441,20.911,98,2.205,762.423
