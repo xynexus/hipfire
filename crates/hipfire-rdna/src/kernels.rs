@@ -2834,6 +2834,11 @@ pub const KV_FOLD_ASYM2_SRC: &str = include_str!("../../../kernels/src/kv_fold_a
 /// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.
 pub const KV_CACHE_WRITE_Q8_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_q8.hip");
 
+/// 8-bit KV hot-ring codec (hierarchical cache Phase 1): per-token symmetric
+/// absmax int8 quant into a head-major slot-major ring, and its f16 dequant.
+pub const KV_HOT_QUANT_Q8_SRC: &str = include_str!("../../../kernels/src/kv_hot_quant_q8.hip");
+pub const KV_HOT_DEQUANT_Q8_SRC: &str = include_str!("../../../kernels/src/kv_hot_dequant_q8.hip");
+
 /// Attention with Q8 quantized KV cache — symmetric int8, dequant on read.
 pub const ATTENTION_Q8KV_SRC: &str = include_str!("../../../kernels/src/attention_q8kv.hip");
 

@@ -157,18 +157,9 @@ fn main() {
     // Hot: first hot_count slots of the slot-major ring [nkv × hot_budget × HD].
     let hot_count = hier.hot_count[0];
     let hb = hier.hot_budget;
-    // Hot ring is f16 (2 bytes/elem); download raw and widen to f32.
-    let ring_elems = NKV * hb * HD;
-    let widen16 = |t: &hipfire_rdna::GpuTensor| -> Vec<f32> {
-        let b = gpu.download_raw(t, ring_elems * 2).unwrap();
-        (0..ring_elems)
-            .map(|i| {
-                hipfire_primitives::conv::f16_to_f32(u16::from_le_bytes([b[2 * i], b[2 * i + 1]]))
-            })
-            .collect()
-    };
-    let hk = widen16(&hier.hot_k[0]);
-    let hv = widen16(&hier.hot_v[0]);
+    // Read back the hot tier as f32 (f16 ring → widen; 8-bit ring → GPU dequant),
+    // so the oracle scores the SAME stored values the GPU read saw in either codec.
+    let (hk, hv) = hier.hot_tier_f32(&mut gpu, 0).unwrap();
     // Per kv-head list of (k,v) slots in attention order (hot then each cold seg).
     let mut k_slots: Vec<Vec<[f32; HD]>> = vec![Vec::new(); NKV];
     let mut v_slots: Vec<Vec<[f32; HD]>> = vec![Vec::new(); NKV];

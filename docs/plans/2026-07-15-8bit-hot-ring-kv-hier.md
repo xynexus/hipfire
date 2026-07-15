@@ -135,10 +135,26 @@ The rotation lives at the **hot write**; the cold tier inherits it through migra
    Dot-preservation of `rotate_x_mq` confirmed directly on GPU (1e-5). The
    rotated frame is exactly neutral, so Phase 1 (8-bit affine codec on the
    already-rotated K) can build on it.
-1. **Hot codec = per-token 8-bit affine (on the already-rotated K).** Add a GPU
-   per-token/slot 8-bit affine quant + dequant for the ring (V too). Close to the
-   `q8_0` slot path; the rotation is already done in step 0, so the codec is just
-   affine. Store slot-major 8-bit instead of f16.
+1. **[DONE 2026-07-15 — 8-bit ring, parity + PPL neutral]** Hot codec = per-token
+   8-bit on the already-rotated K. Store slot-major 8-bit instead of f16.
+
+   **Implemented:** `HIPFIRE_KV_HOT_BITS=8` (default 16=f16) on `HierKvState`.
+   Codec = per-token **symmetric absmax int8** (reuses the `kv_cache_write_q8`
+   codec, not affine — the probe added a `sym+FWHT` row: rel 5.4e-3 / attn-KLD
+   6.7e-4 ≈ `affine+FWHT` 5.5e-4 ≈ kvarn 3.8e-4, since the FWHT frame is centered
+   so symmetric ≈ affine; saves the zero-point plane). Two small kernels:
+   `kv_hot_quant_q8` (append: per-head absmax → int8, head-major slot-major planes
+   `codes [nkv×hb×HD]` i8 + `scale [nkv×hb]` f32) and `kv_hot_dequant_q8`
+   (q8 ring → f16 slot-major scratch). q8 mode **forces rotation**. The read and
+   migrate both dequant into a shared f16 scratch (`hot_deq_k/v`) and reuse the
+   existing layout-2 read + widen/compact path unchanged; the ring-shift moves
+   int8 codes + scales. f16 rings aren't allocated in q8 mode. **~49% hot-tier
+   VRAM** (260 B vs 512 B per slot·head). **Validated on nix2/gfx1103:**
+   - `parity_kv_hier` (oracle reads back via new `hot_tier_f32`, dequant-aware):
+     PASS 0.0 (hot-only) / 4.3e-5 (n=40, 3 segs) / 5.1e-5 (n=100, 11 segs) /
+     5.1e-5 (+defrag). f16 baseline + Phase-0 rotate unchanged (5.2e-5).
+   - PPL A/B (qwen3.5-0.8b-mq4+, kvarn-8 hier, ctx=2048): f16 17.136 vs f16+rotate
+     17.121 vs **q8 17.105** — all within PPL wiggle (±0.03), no quality loss.
 2. **Hot read.** dequant 8-bit hot → transient shared f16 scratch → the existing
    `attention_cold_slots` layout-2 read with `q_rot`.
 3. **Migrate.** dequant 8-bit hot → f32 (instead of `widen` f16) → the existing

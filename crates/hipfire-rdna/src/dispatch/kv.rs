@@ -1073,6 +1073,112 @@ impl Gpu {
             )
         }
     }
+    /// Quantize one token's KV vector `src` [n_kv_heads × head_dim] (head-major)
+    /// into the 8-bit hot ring at `slot`: per-head symmetric absmax int8 codes
+    /// (head-major slot-major, stride `hb`) + per-slot-per-head f32 scale. Phase 1
+    /// of the 8-bit hot tier — see kernels/src/kv_hot_quant_q8.hip.
+    pub fn kv_hot_quant_q8(
+        &mut self,
+        codes: &GpuTensor,
+        scales: &GpuTensor,
+        src: &GpuTensor,
+        slot: usize,
+        hb: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_hot_quant_q8",
+            kernels::KV_HOT_QUANT_Q8_SRC,
+            "kv_hot_quant_q8",
+        )?;
+        let func = &self.functions["kv_hot_quant_q8"];
+        let mut c = codes.buf.as_ptr();
+        let mut sc = scales.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut sl = slot as i32;
+        let mut h = hb as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut c as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let block = 256u32.min(head_dim as u32);
+        let shared = block * 4;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_kv_heads as u32, 1, 1],
+                [block, 1, 1],
+                shared,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Dequantize the first `n_slots` live slots of an 8-bit hot ring into a
+    /// head-major slot-major f16 tile [n_kv_heads × hb × head_dim] — exactly the
+    /// `attention_cold_slots` k_layout=2 / v_layout=2 input. Shared by the two-tier
+    /// read and by migrate (download the f16 tile → widen → compact). Tail slots
+    /// [n_slots, hb) are left untouched (the read masks by the live count).
+    /// See kernels/src/kv_hot_dequant_q8.hip.
+    pub fn kv_hot_dequant_q8(
+        &mut self,
+        codes: &GpuTensor,
+        scales: &GpuTensor,
+        out: &GpuTensor,
+        n_slots: usize,
+        hb: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        if n_slots == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_hot_dequant_q8",
+            kernels::KV_HOT_DEQUANT_Q8_SRC,
+            "kv_hot_dequant_q8",
+        )?;
+        let func = &self.functions["kv_hot_dequant_q8"];
+        let mut c = codes.buf.as_ptr();
+        let mut sc = scales.buf.as_ptr();
+        let mut o = out.buf.as_ptr();
+        let mut ns = n_slots as i32;
+        let mut h = hb as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut c as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let block = 256u32.min(head_dim as u32);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_kv_heads as u32, n_slots as u32, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Write KV vector to quantized HFQ4 cache.
     pub fn kv_cache_write_q4(
         &mut self,

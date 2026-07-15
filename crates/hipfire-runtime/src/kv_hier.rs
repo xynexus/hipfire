@@ -112,6 +112,25 @@ struct HierScratch {
     max_slots: usize,
 }
 
+/// 8-bit hot-ring store (Phase 1): head-major slot-major symmetric-absmax int8,
+/// replacing one f16 ring. `codes` = int8 [nkv × hot_budget × HD] (raw bytes),
+/// `scale` = f32 [nkv × hot_budget] (one per slot per head). Written by
+/// `kv_hot_quant_q8`, read back via `kv_hot_dequant_q8` → f16 slot-major scratch.
+struct Q8Ring {
+    codes: GpuTensor,
+    scale: GpuTensor,
+}
+
+impl Q8Ring {
+    fn alloc(gpu: &mut Gpu, nkv: usize, hb: usize) -> HipResult<Self> {
+        let n = nkv * hb * HD;
+        Ok(Q8Ring {
+            codes: gpu.upload_raw(&vec![0u8; n], &[n])?,
+            scale: gpu.zeros(&[nkv * hb], DType::F32)?,
+        })
+    }
+}
+
 pub struct HierKvState {
     pub enabled: bool,
     pub hot_budget: usize,
@@ -187,6 +206,19 @@ pub struct HierKvState {
     rot_k: Option<GpuTensor>,
     /// f32 [n_heads × HD] scratch: rotated query for the two-tier read. Some when hot_rotate.
     q_rot: Option<GpuTensor>,
+    /// Phase 1 8-bit hot tier (`HIPFIRE_KV_HOT_BITS=8`, default 16=f16). When on,
+    /// the hot ring is per-token symmetric-absmax int8 (`hot_kq`/`hot_vq`) instead
+    /// of the f16 `hot_k`/`hot_v` rings (which are then left empty), halving hot-tier
+    /// VRAM. Forces `hot_rotate` (symmetric q8 needs the FWHT-centered frame). The
+    /// read/migrate dequant into a shared f16 scratch (`hot_deq_k`/`hot_deq_v`) and
+    /// reuse the existing layout-2 read + widen/compact path.
+    pub hot_q8: bool,
+    hot_kq: Vec<Q8Ring>, // [n_layers] rotated-K int8 ring; empty unless hot_q8
+    hot_vq: Vec<Q8Ring>, // [n_layers] V int8 ring; empty unless hot_q8
+    /// Shared f16 [nkv × hot_budget × HD] dequant scratch (one ring's worth, reused
+    /// across layers/reads). Some when hot_q8.
+    hot_deq_k: Option<GpuTensor>,
+    hot_deq_v: Option<GpuTensor>,
 }
 
 impl HierKvState {
@@ -289,30 +321,55 @@ impl HierKvState {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.5f32);
+        // Phase 1 hot-tier bit-width (`HIPFIRE_KV_HOT_BITS`): 16 = f16 ring (default),
+        // 8 = per-token symmetric-absmax int8 ring (halves hot VRAM).
+        let hot_bits = std::env::var("HIPFIRE_KV_HOT_BITS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16usize);
+        let hot_q8 = enabled && hot_bits == 8;
         // Phase 0 rotated-frame probe: rotate hot K on write + query on read (see
-        // the `hot_rotate` field doc). Opt-in, default off — must be proven neutral
-        // (parity + KLD-vs-bf16 A/B) before it can become the default.
-        let hot_rotate =
-            enabled && std::env::var("HIPFIRE_KV_HOT_ROTATE").ok().as_deref() == Some("1");
+        // the `hot_rotate` field doc). q8 mode REQUIRES rotation (symmetric absmax
+        // wants the FWHT-centered frame — codec probe: sym+FWHT ≈ affine+FWHT ≈
+        // kvarn); otherwise it is the opt-in `HIPFIRE_KV_HOT_ROTATE` f16 A/B.
+        let hot_rotate = enabled
+            && (hot_q8 || std::env::var("HIPFIRE_KV_HOT_ROTATE").ok().as_deref() == Some("1"));
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
         let mut attn_mass = Vec::with_capacity(n_layers);
         let mut hot_cast = None;
         let mut rot_k = None;
         let mut q_rot = None;
+        let mut hot_kq = Vec::new();
+        let mut hot_vq = Vec::new();
+        let mut hot_deq_k = None;
+        let mut hot_deq_v = None;
         if enabled {
             // Hot ring is f16 (halves hot VRAM → a larger exact window fits the same
             // budget; f16 is far above the cold 2-bit floor, so it is near-lossless
             // for the exact tier). Read via attention_cold_slots slot-major-f16
             // (layout 2); migrate downloads raw f16 and widens to f32 for compaction.
             for _ in 0..n_layers {
-                hot_k.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
-                hot_v.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
                 attn_mass.push(gpu.zeros(&[hot_budget], DType::F32)?);
             }
-            hot_cast = Some(gpu.zeros(&[n_kv_heads * HD], DType::F16)?);
+            if hot_q8 {
+                // 8-bit hot ring: int8 codes + per-slot scale, plus a shared f16
+                // dequant scratch (one ring's worth, reused across layers/reads).
+                for _ in 0..n_layers {
+                    hot_kq.push(Q8Ring::alloc(gpu, n_kv_heads, hot_budget)?);
+                    hot_vq.push(Q8Ring::alloc(gpu, n_kv_heads, hot_budget)?);
+                }
+                hot_deq_k = Some(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
+                hot_deq_v = Some(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
+            } else {
+                for _ in 0..n_layers {
+                    hot_k.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
+                    hot_v.push(gpu.zeros(&[n_kv_heads * hot_budget * HD], DType::F16)?);
+                }
+                hot_cast = Some(gpu.zeros(&[n_kv_heads * HD], DType::F16)?);
+            }
             if hot_rotate {
-                // f32 scratch for the FWHT-rotated K (before f16 cast) and query.
+                // f32 scratch for the FWHT-rotated K (before f16 cast/quant) and query.
                 rot_k = Some(gpu.zeros(&[n_kv_heads * HD], DType::F32)?);
                 q_rot = Some(gpu.zeros(&[n_heads * HD], DType::F32)?);
             }
@@ -348,6 +405,11 @@ impl HierKvState {
             hot_rotate,
             rot_k,
             q_rot,
+            hot_q8,
+            hot_kq,
+            hot_vq,
+            hot_deq_k,
+            hot_deq_v,
         })
     }
 
@@ -411,36 +473,103 @@ impl HierKvState {
         }
         let slot = self.hot_count[layer];
         let hb = self.hot_budget;
-        // f16 ring: cast the incoming f32 token [nkv×HD] into the reused f16 scratch,
-        // then place each head at hot slot (kv*hb+slot)*HD (2 bytes/elem).
-        let cast = self
-            .hot_cast
-            .as_ref()
-            .expect("hot_cast present when enabled");
-        for (fa, ring, rotate) in [
-            (fa_k, &self.hot_k[layer], self.hot_rotate),
-            (fa_v, &self.hot_v[layer], false),
-        ] {
-            // Phase 0 (rotated frame): FWHT-rotate K into `rot_k` before the f16
-            // cast so the hot tier is stored rotated; the query is rotated to match
-            // on read, and the cold tier inherits the rotation via migrate
-            // (rotate=false on already-rotated K). V is never rotated.
-            let input = if rotate {
-                let rk = self.rot_k.as_ref().expect("rot_k present when hot_rotate");
-                gpu.rotate_x_mq(fa, rk, self.n_kv_heads * HD)?;
-                rk
-            } else {
-                fa
-            };
-            gpu.cast_f32_to_f16(input, cast)?;
-            for kv in 0..self.n_kv_heads {
-                let dst = ((kv * hb + slot) * HD) * 2;
-                let src = (kv * HD) * 2;
-                gpu.memcpy_dtod_at_auto(&ring.buf, dst, &cast.buf, src, HD * 2)?;
+        let nkv = self.n_kv_heads;
+        if self.hot_q8 {
+            // 8-bit hot ring (Phase 1): rotate K (mandatory — symmetric absmax needs
+            // the centered frame) then per-token symmetric-q8 quant into the ring; V
+            // quantized un-rotated. No f16 cast / memcpy — the quant kernel writes the
+            // slot directly.
+            let rk = self.rot_k.as_ref().expect("rot_k present when hot_q8");
+            gpu.rotate_x_mq(fa_k, rk, nkv * HD)?;
+            let kq = &self.hot_kq[layer];
+            gpu.kv_hot_quant_q8(&kq.codes, &kq.scale, rk, slot, hb, nkv, HD)?;
+            let vq = &self.hot_vq[layer];
+            gpu.kv_hot_quant_q8(&vq.codes, &vq.scale, fa_v, slot, hb, nkv, HD)?;
+        } else {
+            // f16 ring: cast the incoming f32 token [nkv×HD] into the reused f16
+            // scratch, then place each head at hot slot (kv*hb+slot)*HD (2 bytes/elem).
+            let cast = self
+                .hot_cast
+                .as_ref()
+                .expect("hot_cast present when enabled");
+            for (fa, ring, rotate) in [
+                (fa_k, &self.hot_k[layer], self.hot_rotate),
+                (fa_v, &self.hot_v[layer], false),
+            ] {
+                // Phase 0 (rotated frame): FWHT-rotate K into `rot_k` before the f16
+                // cast so the hot tier is stored rotated; the query is rotated to match
+                // on read, and the cold tier inherits the rotation via migrate
+                // (rotate=false on already-rotated K). V is never rotated.
+                let input = if rotate {
+                    let rk = self.rot_k.as_ref().expect("rot_k present when hot_rotate");
+                    gpu.rotate_x_mq(fa, rk, nkv * HD)?;
+                    rk
+                } else {
+                    fa
+                };
+                gpu.cast_f32_to_f16(input, cast)?;
+                for kv in 0..nkv {
+                    let dst = ((kv * hb + slot) * HD) * 2;
+                    let src = (kv * HD) * 2;
+                    gpu.memcpy_dtod_at_auto(&ring.buf, dst, &cast.buf, src, HD * 2)?;
+                }
             }
         }
         self.hot_count[layer] += 1;
         Ok(())
+    }
+
+    /// The hot tier for `layer` as f32, head-major slot-major
+    /// `[nkv × hot_budget × HD]` (only the first `hot_count` slots are meaningful).
+    /// f16 ring → download+widen; 8-bit ring → GPU dequant then widen. Used by the
+    /// parity oracle and diagnostics so both codecs share one read-back path.
+    pub fn hot_tier_f32(&mut self, gpu: &mut Gpu, layer: usize) -> HipResult<(Vec<f32>, Vec<f32>)> {
+        let hb = self.hot_budget;
+        let nkv = self.n_kv_heads;
+        let ring_elems = nkv * hb * HD;
+        let widen = |bytes: &[u8]| -> Vec<f32> {
+            (0..ring_elems)
+                .map(|i| f16_to_f32(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])))
+                .collect()
+        };
+        if self.hot_q8 {
+            let hc = self.hot_count[layer];
+            let dk = self
+                .hot_deq_k
+                .as_ref()
+                .expect("hot_deq_k present when hot_q8");
+            let dv = self
+                .hot_deq_v
+                .as_ref()
+                .expect("hot_deq_v present when hot_q8");
+            gpu.kv_hot_dequant_q8(
+                &self.hot_kq[layer].codes,
+                &self.hot_kq[layer].scale,
+                dk,
+                hc,
+                hb,
+                nkv,
+                HD,
+            )?;
+            gpu.kv_hot_dequant_q8(
+                &self.hot_vq[layer].codes,
+                &self.hot_vq[layer].scale,
+                dv,
+                hc,
+                hb,
+                nkv,
+                HD,
+            )?;
+            Ok((
+                widen(&gpu.download_raw(dk, ring_elems * 2)?),
+                widen(&gpu.download_raw(dv, ring_elems * 2)?),
+            ))
+        } else {
+            Ok((
+                widen(&gpu.download_raw(&self.hot_k[layer], ring_elems * 2)?),
+                widen(&gpu.download_raw(&self.hot_v[layer], ring_elems * 2)?),
+            ))
+        }
     }
 
     /// Migrate the oldest `n_req` hot tokens into ONE new cold segment, then shift
@@ -462,8 +591,46 @@ impl HierKvState {
                 .map(|i| f16_to_f32(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])))
                 .collect()
         };
-        let hk = widen(&gpu.download_raw(&self.hot_k[layer], ring_elems * 2)?);
-        let hv = widen(&gpu.download_raw(&self.hot_v[layer], ring_elems * 2)?);
+        // 8-bit ring: dequant the live slots into the shared f16 scratch first, then
+        // download+widen exactly as the f16 path (cold compaction stays f16→f32).
+        let (hk, hv) = if self.hot_q8 {
+            let dk = self
+                .hot_deq_k
+                .as_ref()
+                .expect("hot_deq_k present when hot_q8");
+            let dv = self
+                .hot_deq_v
+                .as_ref()
+                .expect("hot_deq_v present when hot_q8");
+            let hc = self.hot_count[layer];
+            gpu.kv_hot_dequant_q8(
+                &self.hot_kq[layer].codes,
+                &self.hot_kq[layer].scale,
+                dk,
+                hc,
+                hb,
+                nkv,
+                HD,
+            )?;
+            gpu.kv_hot_dequant_q8(
+                &self.hot_vq[layer].codes,
+                &self.hot_vq[layer].scale,
+                dv,
+                hc,
+                hb,
+                nkv,
+                HD,
+            )?;
+            (
+                widen(&gpu.download_raw(dk, ring_elems * 2)?),
+                widen(&gpu.download_raw(dv, ring_elems * 2)?),
+            )
+        } else {
+            (
+                widen(&gpu.download_raw(&self.hot_k[layer], ring_elems * 2)?),
+                widen(&gpu.download_raw(&self.hot_v[layer], ring_elems * 2)?),
+            )
+        };
         let mut ck = vec![0.0f32; mb * kv_dim];
         let mut cv = vec![0.0f32; mb * kv_dim];
         for t in 0..mb {
@@ -616,23 +783,47 @@ impl HierKvState {
         let rem = self.hot_count[layer] - mb;
         if rem > 0 {
             for kv in 0..nkv {
-                // f16 ring: 2 bytes/elem.
-                let dst = ((kv * hb) * HD) * 2;
-                let src = ((kv * hb + mb) * HD) * 2;
-                gpu.memcpy_dtod_at_auto(
-                    &self.hot_k[layer].buf,
-                    dst,
-                    &self.hot_k[layer].buf,
-                    src,
-                    rem * HD * 2,
-                )?;
-                gpu.memcpy_dtod_at_auto(
-                    &self.hot_v[layer].buf,
-                    dst,
-                    &self.hot_v[layer].buf,
-                    src,
-                    rem * HD * 2,
-                )?;
+                if self.hot_q8 {
+                    // int8 codes (1 B/elem) + f32 per-slot scale (4 B/slot).
+                    let cdst = (kv * hb) * HD;
+                    let csrc = (kv * hb + mb) * HD;
+                    let sdst = (kv * hb) * 4;
+                    let ssrc = (kv * hb + mb) * 4;
+                    for ring in [&self.hot_kq[layer], &self.hot_vq[layer]] {
+                        gpu.memcpy_dtod_at_auto(
+                            &ring.codes.buf,
+                            cdst,
+                            &ring.codes.buf,
+                            csrc,
+                            rem * HD,
+                        )?;
+                        gpu.memcpy_dtod_at_auto(
+                            &ring.scale.buf,
+                            sdst,
+                            &ring.scale.buf,
+                            ssrc,
+                            rem * 4,
+                        )?;
+                    }
+                } else {
+                    // f16 ring: 2 bytes/elem.
+                    let dst = ((kv * hb) * HD) * 2;
+                    let src = ((kv * hb + mb) * HD) * 2;
+                    gpu.memcpy_dtod_at_auto(
+                        &self.hot_k[layer].buf,
+                        dst,
+                        &self.hot_k[layer].buf,
+                        src,
+                        rem * HD * 2,
+                    )?;
+                    gpu.memcpy_dtod_at_auto(
+                        &self.hot_v[layer].buf,
+                        dst,
+                        &self.hot_v[layer].buf,
+                        src,
+                        rem * HD * 2,
+                    )?;
+                }
             }
         }
         // Mirror the shift for the attention-mass ring (slot s holds token s's mass),
@@ -916,10 +1107,44 @@ impl HierKvState {
         } else {
             None
         };
+        // 8-bit ring: dequant the live slots into the shared f16 scratch, then read
+        // it with the existing layout-2 path (identical to the f16 ring downstream).
+        let (hk, hv): (&GpuTensor, &GpuTensor) = if self.hot_q8 {
+            let dk = self
+                .hot_deq_k
+                .as_ref()
+                .expect("hot_deq_k present when hot_q8");
+            let dv = self
+                .hot_deq_v
+                .as_ref()
+                .expect("hot_deq_v present when hot_q8");
+            let hc = self.hot_count[layer];
+            gpu.kv_hot_dequant_q8(
+                &self.hot_kq[layer].codes,
+                &self.hot_kq[layer].scale,
+                dk,
+                hc,
+                self.hot_budget,
+                nkv,
+                HD,
+            )?;
+            gpu.kv_hot_dequant_q8(
+                &self.hot_vq[layer].codes,
+                &self.hot_vq[layer].scale,
+                dv,
+                hc,
+                self.hot_budget,
+                nkv,
+                HD,
+            )?;
+            (dk, dv)
+        } else {
+            (&self.hot_k[layer], &self.hot_v[layer])
+        };
         gpu.attention_cold_slots(
             q_read,
-            &self.hot_k[layer],
-            &self.hot_v[layer],
+            hk,
+            hv,
             out,
             &scr.acc_m,
             &scr.acc_l,
@@ -927,8 +1152,8 @@ impl HierKvState {
             nkv,
             self.hot_count[layer],
             scale,
-            2, // k_layout: hot ring is slot-major f16
-            2, // v_layout: hot ring is slot-major f16
+            2, // k_layout: hot ring is slot-major f16 (dequant scratch when q8)
+            2, // v_layout: hot ring is slot-major f16 (dequant scratch when q8)
             self.hot_budget,
             mass,
         )?;

@@ -137,6 +137,27 @@ fn affine_per_token(tile: &[f32], r: usize, c: usize, qmax: f32) -> Vec<f32> {
     recon
 }
 
+/// Plain per-token (per-column) SYMMETRIC absmax int8 quant → dequant (no zero-
+/// point), mirroring the GPU `kv_cache_write_q8` codec (scale = amax/127). This is
+/// the hot-ring candidate: on FWHT-rotated K the distribution is centered, so
+/// symmetric should ≈ affine. `qmax` here is the signed level count (127 for 8-bit).
+fn sym_per_token(tile: &[f32], r: usize, c: usize, qlev: f32) -> Vec<f32> {
+    let mut recon = vec![0f32; r * c];
+    for t in 0..c {
+        let mut amax = 0f32;
+        for row in 0..r {
+            amax = amax.max(tile[row * c + t].abs());
+        }
+        let scale = (amax / qlev).max(1e-8);
+        for row in 0..r {
+            let v = tile[row * c + t];
+            let q = (v / scale).round().clamp(-qlev, qlev);
+            recon[row * c + t] = q * scale;
+        }
+    }
+    recon
+}
+
 /// Per-token FWHT/Hadamard rotation of a `[head_dim × tokens]` tile (rotate each
 /// token's head_dim column). `signed_fwht` is orthonormal, so rotating both K and
 /// the query preserves q·K — we measure the affine error in this rotated frame
@@ -221,6 +242,12 @@ fn main() {
             ("affine plain", affine_per_token(&tile, r, c, qmax), &tile),
             // affine + FWHT: quantize the rotated tile, score vs the rotated ref.
             ("affine+FWHT", affine_per_token(&rot, r, c, qmax), &rot),
+            // symmetric absmax (kv_cache_write_q8 codec) + FWHT — the hot-ring path.
+            (
+                "sym+FWHT",
+                sym_per_token(&rot, r, c, (qmax - 1.0) / 2.0),
+                &rot,
+            ),
         ] {
             let (rel, _) = recon_metrics(refr, &recon);
             let kld = attn_kld(refr, &recon, r, c, &mut Rng(0xABCD));
