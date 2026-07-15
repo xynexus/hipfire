@@ -2922,6 +2922,12 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str =
 pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
 
+/// Half-split partial RoPE with explicit BF16 product/add staging. Gemma 4's
+/// Transformers reference executes the pointwise expression at model dtype.
+#[cfg(feature = "deltanet")]
+pub const ROPE_PARTIAL_HALFSPLIT_BF16_STAGED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halfsplit_bf16_staged.hip");
+
 /// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
 /// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision
 /// attention. See `kernels/src/rope_2d_halfsplit.hip` for the layout

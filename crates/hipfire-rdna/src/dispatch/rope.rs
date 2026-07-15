@@ -450,6 +450,59 @@ impl Gpu {
         }
         result
     }
+
+    /// Half-split partial RoPE with PyTorch-style BF16 pointwise staging while
+    /// retaining F32 scratch storage. Intended for BF16 reference parity, not
+    /// as a replacement for the ordinary F32 RoPE path.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_partial_halfsplit_bf16_staged_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &hip_bridge::DeviceBuffer,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        n_rot: usize,
+        basis_dim: usize,
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let entry = "rope_partial_halfsplit_bf16_staged_f32";
+        self.ensure_kernel(
+            "rope_partial_halfsplit_bf16_staged",
+            kernels::ROPE_PARTIAL_HALFSPLIT_BF16_STAGED_SRC,
+            entry,
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
+        let nr = n_rot as i32;
+        let bd = basis_dim as i32;
+        let fb = freq_base;
+        let n_pairs = (n_rot / 2) as u32;
+        let block = 32u32.min(n_pairs);
+        let grid = [(n_pairs + block - 1) / block, 1, 1];
+        let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", entry, bytes);
+        let result = self.launch_kernargs(
+            entry,
+            grid,
+            [block, 1, 1],
+            0,
+            &kernargs![
+                ptr qp, ptr kp, ptr pp, i32 nhq, i32 nhk, i32 hd, i32 nr, i32 bd, f32 fb
+            ],
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        result
+    }
     /// Batched partial-interleaved RoPE. Each batch row reads its physical
     /// position from positions[b], adds pos_offset for the RoPE angle only,
     /// and rotates the first n_rot dims of every Q and K head. Q/K are

@@ -8,8 +8,9 @@
 This is a lightweight numerical probe, not a second admission oracle. It loads
 only layer 0 from the pinned safetensors checkpoint, feeds the exact per-token
 ``pre_layer`` rows captured by Hipfire, and writes the Q/K/V tensors entering
-ROCm SDPA plus SDPA's attention output. The raw tensors use Hipfire's
-position-major F32 layout for direct HIP kernel parity checks.
+ROCm SDPA, the BF16 RoPE cosine/sine tables, and SDPA's attention output. The
+raw tensors use Hipfire's position-major F32 layout for direct HIP kernel parity
+checks.
 """
 
 from __future__ import annotations
@@ -172,6 +173,9 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     for name, tensor in captured.items():
         write_f32(args.output / f"operator_{name}.f32", tensor)
+    rope_cos, rope_sin = position_embeddings
+    write_f32(args.output / "operator_rope_cos.f32", rope_cos)
+    write_f32(args.output / "operator_rope_sin.f32", rope_sin)
     write_f32(args.output / "hidden_layer_0.f32", layer_output)
     metadata = {
         "model": str(args.model.resolve()),
