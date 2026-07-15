@@ -213,6 +213,80 @@ impl Gpu {
         }
     }
 
+    /// Mixed-precision Opus GEMM (unsigned weight codes + zero-point fold).
+    /// Consumes W{8,4,2,1}A8: dense unsigned codes, the WMMA weight operand flagged
+    /// unsigned, and the symmetric zero-point folded out per group using `x_sum`
+    /// (`Σ_{k∈g} x[b,k]`). One kernel body per width; see `gemm_opus_tiled_wmma.hip`
+    /// and the `hipfire_quantize::opus_lowbit` CPU reference.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_opus_tiled_wmma_u(
+        &mut self,
+        w_bits: usize,
+        w_packed: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        x_sum: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        mb: usize,
+        nb: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % group, 0, "gemm_opus_tiled_wmma_u: K must be a multiple of group");
+        assert_eq!(group % 16, 0, "gemm_opus_tiled_wmma_u: group must be a multiple of 16");
+        let kname = match (w_bits, mb, nb) {
+            (8, 2, 2) => "gemm_opus_w8a8u_tiled_wmma_2x2",
+            (8, 2, 4) => "gemm_opus_w8a8u_tiled_wmma_2x4",
+            (4, 2, 2) => "gemm_opus_w4a8u_tiled_wmma_2x2",
+            (4, 2, 4) => "gemm_opus_w4a8u_tiled_wmma_2x4",
+            (2, 2, 2) => "gemm_opus_w2a8u_tiled_wmma_2x2",
+            (2, 2, 4) => "gemm_opus_w2a8u_tiled_wmma_2x4",
+            (1, 2, 2) => "gemm_opus_w1a8u_tiled_wmma_2x2",
+            (1, 2, 4) => "gemm_opus_w1a8u_tiled_wmma_2x4",
+            _ => panic!("gemm_opus_tiled_wmma_u: unsupported w{w_bits} tiling {mb}x{nb}"),
+        };
+        self.ensure_kernel(kname, kernels::GEMM_OPUS_TILED_WMMA_SRC, kname)?;
+        let wp = w_packed.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_i8.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let xsump = x_sum.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &xsump as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_m = m.div_ceil(16 * mb) as u32;
+        let grid_b = batch_size.div_ceil(16 * nb) as u32;
+        let func = &self.functions[kname];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Opus Quant W8A8 dynamic int8 activation quantizer (f32 → signed int8 +
     /// per-group f32 scales). `xq_i8` is [B,K] int8; `xs` is [B,K/group] f32.
     pub fn quantize_act_oq8(
@@ -257,6 +331,59 @@ impl Gpu {
         let grid_g = (k / group) as u32;
         let grid_b = batch_size as u32;
         let func = &self.functions["quantize_act_oq8"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_g, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// As [`Self::quantize_act_oq8`], but also emits the per-group signed sum
+    /// `x_sum` [B, K/group] (int32) that the mixed-precision fold GEMM
+    /// ([`Self::gemm_opus_tiled_wmma_u`]) uses to cancel the weight zero-point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_act_oq8_sum(
+        &mut self,
+        x_f32: &GpuTensor,
+        xq_i8: &GpuTensor,
+        xs: &GpuTensor,
+        x_sum: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group % 32, 0, "quantize_act_oq8_sum: group must be a multiple of 32");
+        assert_eq!(k % group, 0, "quantize_act_oq8_sum: K must be a multiple of group");
+        self.ensure_kernel(
+            "quantize_act_oq8_sum",
+            kernels::QUANTIZE_ACT_OQ8_SRC,
+            "quantize_act_oq8_sum",
+        )?;
+        let xp = x_f32.buf.as_ptr();
+        let xqp = xq_i8.buf.as_ptr();
+        let xsp = xs.buf.as_ptr();
+        let xsump = x_sum.buf.as_ptr();
+        let mut bi = batch_size as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &xqp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &xsump as *const _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_g = (k / group) as u32;
+        let grid_b = batch_size as u32;
+        let func = &self.functions["quantize_act_oq8_sum"];
         unsafe {
             self.hip.launch_kernel(
                 func,
