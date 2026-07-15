@@ -11,13 +11,25 @@ The two-tier hierarchical KV cache (`HierKvState`, `HIPFIRE_KV_HIERARCHICAL=1`)
 (`kv_hier.rs:58 const HD = 256`, enable gate at `:254 head_dim == HD`). The FWHT-256
 rotation and the two cold/merge attention kernels are compiled for CHD=256.
 
-head_dim=128 is the rest of the world: Qwen3/Llama/Gemma are almost all 128. Within
-the qwen35 arch itself, **Qwen3.5-122B-A10B is head_dim=128** (verified in its HF
-config) while the 0.8b/9b are 256. So the concrete near-term beneficiary is the
-122B MoE — exactly the model where thousands of batched sessions × a smaller hot
-tier matters most. (Other 128 arches — llama/gemma/qwen3-base — additionally lack
-the hier *hook*; that is a separate, larger integration and out of scope here. This
-doc only removes the head_dim ceiling **within the qwen35 arch**.)
+head_dim=128 is the rest of the world: Qwen3/Llama/Gemma are almost all 128.
+
+**CORRECTION (2026-07-15, after checking the actual artifacts):** an earlier draft
+of this doc claimed **Qwen3.5-122B-A10B is head_dim=128** — that is WRONG. The real
+`Qwen/Qwen3.5-122B-A10B` (`qwen3_5_moe`, 48 layers, 256 experts, 234 GB bf16) is
+**head_dim=256** — it uses the existing 256 path, not this work. The head_dim=128
+"Qwen3.5-122B-A10B-DFlash" artifacts are `qwen3`-arch DRAFT heads (4 layers), which
+have no hier hook. So **every real qwen35-arch model in the fleet (0.8b, 9b, 122B)
+is head_dim=256**, and the head_dim=128 arches (qwen3-base/llama/gemma/DFlash drafts)
+lack the hier hook entirely.
+
+Consequence: this generalization is **forward-looking infrastructure** — it removes
+the head_dim ceiling within the qwen35 arch, but has **no current real-model
+consumer**. It pays off only if (a) a future qwen35-arch checkpoint ships at
+head_dim=128, or (b) the hier hook is later ported to a head_dim=128 arch (a
+separate, larger integration, out of scope here). The **parity oracle is therefore
+the only available validation** — which is fine, since it exercises the full
+two-tier path over real stored 128-dim data (see Phase 2). No end-to-end 128 decode
+is possible with current artifacts.
 
 ## What is ALREADY general (no work)
 
@@ -101,12 +113,13 @@ Low.
   Side fix: the `:3071` call-site comment ("NO KVarN rotation … fa_q consumed
   un-rotated") was stale post-Phase-0 (default int8 hot forces rotation) and is
   corrected in the same commit.
-- **Validation model gap.** `parity_kv_hier` hardcodes `NH/NKV/HD=256` — parametrize
-  it to also run HD=128 (cheap, synthetic; the strongest proof). But an *end-to-end*
-  decode test needs a head_dim=128 **qwen35-arch** model — that is **Qwen3.5-122B-A10B**
-  (huge; halo/medusa only, may need conversion to `.hfq`). Without it, 128 hier ships
-  on parity-oracle evidence alone. Confirm the 122B artifact exists / is convertible
-  before committing to end-to-end validation.
+- **Validation model gap [CONFIRMED unavoidable].** `parity_kv_hier` was parametrized
+  to also run HD=128 (done, Phase 2 — the strongest available proof). An *end-to-end*
+  decode test needs a head_dim=128 **qwen35-arch** model, and after checking the
+  fleet **none exists**: the real Qwen3.5-122B-A10B is head_dim=256, and the 128
+  artifacts are qwen3-arch DFlash drafts without the hier hook. So 128 hier ships on
+  **parity-oracle evidence alone** — this is not a temporary gap to close later; it
+  is inherent until a 128 qwen35 checkpoint or a hier-hook port to a 128 arch exists.
 - **Kernel precompile / cache keys.** New `_128` kernels need `.hsaco`/hash sidecar
   entries and `ensure_kernel` cache keys (mirror the `mq_rotate_x_128` wiring).
 
@@ -133,14 +146,16 @@ Low.
    (`mod.rs:3124 head_dim==256`) + add `rotate_x_mq_128_batched` — ONLY needed for
    the NON-hier single-tier kvarn path at 128 (hier returns before it). Not required
    for hier-at-128, which is now fully functional.
-4. **End-to-end**: HD=128 decode on Qwen3.5-122B-A10B (halo/medusa) if available;
-   else document parity-only coverage. Coherence gate.
+4. **End-to-end [NOT POSSIBLE with current artifacts]**: no head_dim=128 qwen35-arch
+   model exists (the real 122B is head_dim=256; the 128 DFlash artifacts are qwen3
+   drafts without the hier hook). Coverage is parity-only until such a model appears.
 
 ## Effort
 
-~2 new small kernels (K1/K2, ~60 LOC + consts/dispatch), one mechanical const→field
-refactor (R1), and ~3 low-risk relaxations (C1/Q1). Real cost is in the **validation**
-(parity parametrization is easy; a 122B end-to-end run is not) and in **resolving RQ**
-first. Estimate: 2–3 focused days for code; validation depends on 122B availability.
-No new algorithms — the FWHT-128 rotation and the parametric cold/q8 kernels already
-exist; this is dimension-plumbing + two kernel clones.
+Code landed in ~1 session (Phases 0–2 + C1): 2 small kernel clones (K1/K2), the
+const→field refactor (R1), and the low-risk relaxations (C1). No new algorithms —
+the FWHT-128 rotation and the parametric cold/q8 kernels already existed; this was
+dimension-plumbing + two kernel clones + a parametrized parity oracle. Validation is
+**parity-only by necessity** (no 128 qwen35 model exists), and it passes. Remaining:
+Q1 (single-tier 128, only if that non-hier path is wanted). Net: correct,
+parity-proven infrastructure awaiting a real-model consumer.
