@@ -13,6 +13,113 @@ use std::fs;
 use super::*;
 
 #[test]
+fn sefi_turbo_dual_schedule_matches_pinned_diffusers_reference() {
+    let reference_path = Path::new("/tmp/hipfire-sefi-schedule-reference.json");
+    if !reference_path.is_file() {
+        eprintln!("skip: run scripts/sefi_schedule_reference.py for local parity");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let values = |step_count: usize, name: &str| {
+        reference[step_count.to_string()][name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>()
+    };
+    for step_count in [4usize, 8, 10] {
+        let schedule = DiffusionSchedule::sefi_dual_euler(step_count, 0.1, 1.0).unwrap();
+        let timestep_sem = schedule
+            .steps
+            .iter()
+            .map(|step| step.timestep_sem)
+            .collect::<Vec<_>>();
+        let timestep_tex = schedule
+            .steps
+            .iter()
+            .map(|step| step.timestep_tex)
+            .collect::<Vec<_>>();
+        let mut sigma_sem = schedule
+            .steps
+            .iter()
+            .map(|step| step.sigma_sem)
+            .collect::<Vec<_>>();
+        let mut sigma_tex = schedule
+            .steps
+            .iter()
+            .map(|step| step.sigma_tex)
+            .collect::<Vec<_>>();
+        sigma_sem.push(schedule.steps.last().unwrap().sigma_sem_next);
+        sigma_tex.push(schedule.steps.last().unwrap().sigma_tex_next);
+        for (label, actual, expected) in [
+            ("base_sigmas", schedule.base_sigmas, values(step_count, "base_sigmas")),
+            ("timestep_sem", timestep_sem, values(step_count, "timestep_sem")),
+            ("timestep_tex", timestep_tex, values(step_count, "timestep_tex")),
+            ("sigma_sem", sigma_sem, values(step_count, "sigma_sem")),
+            ("sigma_tex", sigma_tex, values(step_count, "sigma_tex")),
+        ] {
+            assert_eq!(actual.len(), expected.len(), "{step_count} {label} length");
+            let max_abs = actual
+                .iter()
+                .zip(expected)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= 1e-6,
+                "SeFi {step_count}-step {label} max_abs={max_abs}"
+            );
+        }
+
+        let mut latents = LatentBatch {
+            batch: 1,
+            channels: 3,
+            height: 1,
+            width: 2,
+            data: values(step_count, "integration_initial"),
+        };
+        let trace = reference[step_count.to_string()]["integration_trace"]
+            .as_array()
+            .unwrap();
+        for (index, (step, expected_step)) in
+            schedule.steps.iter().zip(trace.iter()).enumerate()
+        {
+            let mut velocity = vec![0.0f32; latents.data.len()];
+            for channel in 0..latents.channels {
+                let timestep = if channel == 0 {
+                    step.timestep_sem
+                } else {
+                    step.timestep_tex
+                };
+                for element in 0..2 {
+                    let offset = channel * 2 + element;
+                    velocity[offset] = latents.data[offset] * 0.125
+                        + (index + 1) as f32 * 0.01
+                        + offset as f32 * 0.05
+                        + timestep * 1e-5;
+                }
+            }
+            let expected_velocity = expected_step["velocity"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>();
+            assert_f32_close(&velocity, &expected_velocity, 1e-6);
+            sefi_dual_euler_step(&mut latents, &velocity, 1, step).unwrap();
+            let expected_latent = expected_step["latent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>();
+            assert_f32_close(&latents.data, &expected_latent, 1e-6);
+        }
+    }
+}
+
+#[test]
 fn linear_scheduler_euler_step_moves_toward_next_sigma() {
     let schedule = DiffusionSchedule::linear(2).unwrap();
     let mut latents = LatentBatch {

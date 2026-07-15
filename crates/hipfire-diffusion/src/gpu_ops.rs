@@ -2044,6 +2044,90 @@ pub(crate) fn linear_optional_bias_hip_on_gpu(
     })
 }
 
+/// Force the f32 diffusion linear kernel even when BF16 WMMA is available.
+/// Flux.2 uses this for the shared modulation/final adaLN boundaries whose
+/// small numeric drift is amplified by every block or by the final projection.
+pub(crate) fn linear_optional_bias_f32_hip_on_gpu(
+    gpu: &mut hipfire_rdna::Gpu,
+    cache: &mut RocmWeightCache,
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: Option<&CpuTensor>,
+) -> DiffusionResult<CpuTensor> {
+    let (rows, in_features) = input.rows_cols()?;
+    let (out_features, weight_in) = weight.rows_cols()?;
+    if in_features != weight_in {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "linear input width {in_features} != weight input width {weight_in}"
+        )));
+    }
+    if bias.is_some_and(|value| value.shape.as_slice() != [out_features]) {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "linear bias shape {:?} != [{out_features}]",
+            bias.map(|value| &value.shape)
+        )));
+    }
+    let output_shape = [rows, out_features];
+    let output_elements = checked_shape_elements("f32 linear output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("f32 linear output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let weight_ptr = cache.resident_ptr(gpu, weight)?;
+    let bias_ptr = match bias {
+        Some(value) => cache.resident_ptr(gpu, value)?,
+        None => std::ptr::null_mut(),
+    };
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(weight_ptr);
+    kernargs.push_ptr(bias_ptr);
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("f32 linear output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim("f32 linear input features", in_features)?);
+    kernargs.push_i32(i32_kernel_dim("f32 linear output features", out_features)?);
+    kernargs.push_i32(i32::from(bias.is_some()));
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_linear_f32",
+        DIFFUSION_LINEAR_HIP_SRC,
+        "diffusion_linear_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.hip
+        .free(input_gpu.buf)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
 /// Linear over a source-reference `ResidentWeight`, using the persistent
 /// name-keyed BF16 weight cache (uploaded once, reused every step) and the bf16
 /// WMMA GEMM. Falls back to decoding + the CpuTensor linear when the bf16 WMMA
@@ -2068,6 +2152,14 @@ pub(crate) fn linear_resident_weight_hip_on_gpu(
         return Err(DiffusionError::InvalidMetadata(format!(
             "linear input width {input_in} != weight input width {in_features}"
         )));
+    }
+    if crate::quant_calib::calib_active() {
+        crate::quant_calib::calib_observe_named(
+            weight.name(),
+            &input.data,
+            rows,
+            in_features,
+        );
     }
     // Non-eligible dims / archs: decode once and use the CpuTensor linear.
     if !(gpu.arch_caps.has_wmma_w32() && in_features % 16 == 0) {
@@ -2176,6 +2268,15 @@ pub(crate) fn linear_resident_weight_resident(
     }
     let total = checked_shape_elements("resident linear input", &input.shape)?;
     let rows = total / in_features;
+    if crate::quant_calib::calib_active() {
+        let observed = download_resident(gpu, input)?;
+        crate::quant_calib::calib_observe_named(
+            weight.name(),
+            &observed.data,
+            rows,
+            in_features,
+        );
+    }
     let mut output_shape = input.shape.clone();
     *output_shape.last_mut().expect("input has a last dim") = out_features;
     let output_elements = rows
@@ -2198,6 +2299,25 @@ pub(crate) fn linear_resident_weight_resident(
     // opt bf16-on-disk weights into load-time quant (off gfx1151).
     let ondisk_w4a8 = weight.quant_type == QT_DIFFUSION_TENSOR_OQ4_PLAIN;
     let ondisk_oq8 = weight.quant_type == QT_DIFFUSION_TENSOR_OQ8_PLAIN;
+    // Mixed-precision unsigned fold codes (W{4,2,1}A8u): the tensor carries its
+    // precision in quant_type and routes to the fold GEMM unconditionally.
+    let ondisk_fold_bits = match weight.quant_type {
+        QT_DIFFUSION_TENSOR_OQF_W4 => Some(4u32),
+        QT_DIFFUSION_TENSOR_OQF_W2 => Some(2),
+        QT_DIFFUSION_TENSOR_OQF_W1 => Some(1),
+        _ => None,
+    };
+    // Sensitivity-ablation hook: quantize a selected set of bf16 tensors on the
+    // fly (RTN fold) without a per-tensor artifact, so a driver can measure each
+    // role's step-1 velocity delta. HIPFIRE_DIFFUSION_ABLATE=<name substring>
+    // (space-separated OR of substrings), HIPFIRE_DIFFUSION_ABLATE_BITS=1|2|4.
+    let fold_bits_sel = ondisk_fold_bits.or_else(|| {
+        if weight.quant_type == QT_DIFFUSION_TENSOR_BF16 && in_features % 256 == 0 {
+            diffusion_ablate_bits(&weight.name)
+        } else {
+            None
+        }
+    });
     let quant_ok = gpu.arch != "gfx1151" && in_features % 256 == 0;
     let use_w4a8 = ondisk_w4a8
         || (quant_ok && std::env::var("HIPFIRE_DIFFUSION_W4A8").ok().as_deref() == Some("1"));
@@ -2206,7 +2326,64 @@ pub(crate) fn linear_resident_weight_resident(
     let use_oq8 = !use_w4a8
         && (ondisk_oq8
             || (quant_ok && std::env::var("HIPFIRE_DIFFUSION_OQ8").ok().as_deref() == Some("1")));
-    if use_w4a8 {
+    if let Some(fold_bits) = fold_bits_sel {
+        // Fold path: unsigned codes + dynamic-int8 activation (with per-group sum)
+        // + register-tiled fold GEMM that cancels the weight zero-point.
+        const GROUP: usize = 256;
+        let prep_start = if prof { Some(std::time::Instant::now()) } else { None };
+        let (w_ptr, w_scales_ptr, ng) = cache.resident_wua8(gpu, weight, fold_bits)?;
+        let w_bytes = out_features
+            .checked_mul(in_features)
+            .and_then(|v| v.checked_mul(fold_bits as usize))
+            .map(|v| v / 8)
+            .ok_or_else(|| DiffusionError::InvalidMetadata("fold weight size overflows".into()))?;
+        if let Some(start) = prep_start {
+            let _ = gpu.hip.device_synchronize();
+            profile::add(&profile::PREP_NS, start.elapsed().as_nanos() as u64);
+            profile::add(&profile::PREP_BYTES, w_bytes as u64);
+        }
+        let w_view = hipfire_rdna::GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(w_ptr, w_bytes) },
+            shape: vec![w_bytes],
+            dtype: hipfire_rdna::DType::Raw,
+        };
+        let w_scales_view = hipfire_rdna::GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(w_scales_ptr, out_features * ng * 4) },
+            shape: vec![out_features * ng],
+            dtype: hipfire_rdna::DType::F32,
+        };
+        let xq = gpu
+            .alloc_tensor(&[total], hipfire_rdna::DType::Raw)
+            .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        let xs = gpu
+            .alloc_tensor(&[rows * ng], hipfire_rdna::DType::F32)
+            .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        // int32 per-group activation sums (4 bytes/elem; dtype label is cosmetic —
+        // the kernels take raw pointers).
+        let xsum = gpu
+            .alloc_tensor(&[rows * ng], hipfire_rdna::DType::F32)
+            .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        gpu.quantize_act_oq8_sum(input, &xq, &xs, &xsum, rows, in_features, GROUP)
+            .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        let gemm_start = if prof { Some(std::time::Instant::now()) } else { None };
+        gpu.gemm_opus_tiled_wmma_u(
+            fold_bits as usize, &w_view, &w_scales_view, &xq, &xs, &xsum, &output, out_features,
+            in_features, rows, GROUP, 2, 4,
+        )
+        .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        if let Some(start) = gemm_start {
+            let _ = gpu.hip.device_synchronize();
+            profile::add(&profile::GEMM_NS, start.elapsed().as_nanos() as u64);
+            let flops = (out_features as u64)
+                .saturating_mul(in_features as u64)
+                .saturating_mul(rows as u64)
+                .saturating_mul(2);
+            profile::add(&profile::GEMM_FLOPS, flops);
+        }
+        free_resident(gpu, xq)?;
+        free_resident(gpu, xs)?;
+        free_resident(gpu, xsum)?;
+    } else if use_w4a8 {
         const GROUP: usize = 256;
         let prep_start = if prof { Some(std::time::Instant::now()) } else { None };
         let (w_i4_ptr, w_scales_ptr, ng) = cache.resident_w4a8(gpu, weight)?;
@@ -2377,6 +2554,21 @@ pub(crate) fn linear_resident_weight_resident(
         )?;
     }
     Ok(output)
+}
+
+/// Sensitivity-ablation selector: returns the fold bit width to force on a bf16
+/// tensor whose name matches `HIPFIRE_DIFFUSION_ABLATE` (space-separated OR of
+/// substrings). Used only by the ablation driver; unset in normal serving.
+fn diffusion_ablate_bits(name: &str) -> Option<u32> {
+    let sel = std::env::var("HIPFIRE_DIFFUSION_ABLATE").ok()?;
+    if sel.trim().is_empty() || !sel.split_whitespace().any(|s| name.contains(s)) {
+        return None;
+    }
+    let bits = std::env::var("HIPFIRE_DIFFUSION_ABLATE_BITS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(4);
+    matches!(bits, 1 | 2 | 4).then_some(bits)
 }
 
 pub(crate) fn layer_norm_hip_on_gpu(
@@ -4084,6 +4276,46 @@ pub(crate) fn layer_norm_resident(
     Ok(output)
 }
 
+pub(crate) fn layer_norm_no_affine_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+    eps: f32,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let width = input.shape.last().copied().ok_or_else(|| {
+        DiffusionError::InvalidMetadata(
+            "no-affine layer_norm input must have at least one dim".to_string(),
+        )
+    })?;
+    let output_elements = checked_shape_elements("no-affine layer_norm output", &input.shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &input.shape)?;
+    if output_elements == 0 || width == 0 {
+        return Ok(output);
+    }
+    let rows = output_elements / width;
+    const WAVES_PER_BLOCK: usize = 8;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("no-affine layer_norm rows", rows)?);
+    kernargs.push_i32(i32_kernel_dim("no-affine layer_norm width", width)?);
+    kernargs.push_f32(eps);
+    kernargs.pad_to(16);
+    let blocks = rows.div_ceil(WAVES_PER_BLOCK);
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_layer_norm_no_affine_rows_f32",
+        DIFFUSION_LAYER_NORM_ROWS_HIP_SRC,
+        "diffusion_layer_norm_no_affine_rows_f32",
+        [i32_kernel_dim("no-affine layer_norm grid", blocks)? as u32, 1, 1],
+        [(WAVES_PER_BLOCK * 32) as u32, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
 /// Device-resident weighted RMSNorm over the last dim: consumes and returns a
 /// resident `GpuTensor`, keeping the activation on-device (the DiT norm was a
 /// pure-CPU op that round-tripped every call). `out = x/sqrt(mean(x^2)+eps) * w`.
@@ -4171,6 +4403,52 @@ pub(crate) fn geglu_gate_3d_resident(
         "diffusion_geglu_gate_3d_f32",
         DIFFUSION_GEGLU_GATE_HIP_SRC,
         "diffusion_geglu_gate_3d_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
+/// Device-resident FLUX.2 SiLU-GLU over a packed 3D projection. The first
+/// half is activated and multiplied by the second half:
+/// `silu(projected[..., :inner]) * projected[..., inner:]`.
+pub(crate) fn silu_glu_first_3d_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    projected: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let [batch, seq, width] = resident_dims3(&projected.shape, "SiLU-GLU projection")?;
+    if width == 0 || width % 2 != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "SiLU-GLU projection width {width} is not positive and even"
+        )));
+    }
+    let inner = width / 2;
+    let output_shape = [batch, seq, inner];
+    let output_elements = checked_shape_elements("SiLU-GLU gate output", &output_shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &output_shape)?;
+    if output_elements == 0 {
+        return Ok(output);
+    }
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(projected.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "SiLU-GLU gate output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("SiLU-GLU gate inner width", inner)?);
+    kernargs.push_i32(i32_kernel_dim("SiLU-GLU gate projected width", width)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_silu_glu_first_3d_f32",
+        DIFFUSION_GEGLU_GATE_HIP_SRC,
+        "diffusion_silu_glu_first_3d_f32",
         grid,
         [256, 1, 1],
         0,
@@ -4545,6 +4823,160 @@ pub(crate) fn concat_channels_nchw_resident(
     Ok(output)
 }
 
+pub(crate) fn concat_last_dim_3d_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    left: &hipfire_rdna::GpuTensor,
+    right: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let [batch, seq, left_width] = resident_dims3(&left.shape, "last-dim concat left")?;
+    let [right_batch, right_seq, right_width] =
+        resident_dims3(&right.shape, "last-dim concat right")?;
+    if batch != right_batch || seq != right_seq {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "cannot concatenate resident 3D tensors {:?} and {:?}",
+            left.shape, right.shape
+        )));
+    }
+    let output_shape = [batch, seq, left_width + right_width];
+    let output_elements = checked_shape_elements("resident last-dim concat", &output_shape)?;
+    let output = alloc_resident_f32(gpu, &output_shape)?;
+    launch_diffusion_concat_kernel(
+        gpu,
+        "diffusion_concat_last_dim_f32",
+        left,
+        right,
+        &output.buf,
+        |kernargs| {
+            kernargs.push_i32(i32_kernel_dim("concat left width", left_width)?);
+            kernargs.push_i32(i32_kernel_dim("concat right width", right_width)?);
+            Ok(())
+        },
+        output_elements,
+        false,
+    )?;
+    Ok(output)
+}
+
+pub(crate) fn concat_sequence_3d_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    left: &hipfire_rdna::GpuTensor,
+    right: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let [batch, left_seq, width] = resident_dims3(&left.shape, "sequence concat left")?;
+    let [right_batch, right_seq, right_width] =
+        resident_dims3(&right.shape, "sequence concat right")?;
+    if batch != right_batch || width != right_width {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "cannot concatenate resident sequences {:?} and {:?}",
+            left.shape, right.shape
+        )));
+    }
+    let output_shape = [batch, left_seq + right_seq, width];
+    let output_elements = checked_shape_elements("resident sequence concat", &output_shape)?;
+    let output = alloc_resident_f32(gpu, &output_shape)?;
+    launch_diffusion_concat_kernel(
+        gpu,
+        "diffusion_concat_sequence_3d_f32",
+        left,
+        right,
+        &output.buf,
+        |kernargs| {
+            kernargs.push_i32(i32_kernel_dim("concat left sequence", left_seq)?);
+            kernargs.push_i32(i32_kernel_dim("concat right sequence", right_seq)?);
+            kernargs.push_i32(i32_kernel_dim("concat sequence width", width)?);
+            Ok(())
+        },
+        output_elements,
+        false,
+    )?;
+    Ok(output)
+}
+
+pub(crate) fn slice_sequence_3d_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+    start: usize,
+    len: usize,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let [batch, input_seq, width] = resident_dims3(&input.shape, "sequence slice input")?;
+    if len == 0 || start.checked_add(len).is_none_or(|end| end > input_seq) {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "sequence slice [{start}..{}] exceeds input sequence {input_seq}",
+            start.saturating_add(len)
+        )));
+    }
+    let output_shape = [batch, len, width];
+    launch_resident_slice_kernel(
+        gpu,
+        input,
+        &output_shape,
+        "diffusion_slice_sequence_3d_f32",
+        |kernargs| {
+            kernargs.push_i32(i32_kernel_dim("slice input sequence", input_seq)?);
+            kernargs.push_i32(i32_kernel_dim("slice sequence start", start)?);
+            kernargs.push_i32(i32_kernel_dim("slice output sequence", len)?);
+            kernargs.push_i32(i32_kernel_dim("slice sequence width", width)?);
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn slice_last_dim_3d_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+    start: usize,
+    len: usize,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let [batch, seq, input_width] = resident_dims3(&input.shape, "last-dim slice input")?;
+    if len == 0 || start.checked_add(len).is_none_or(|end| end > input_width) {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "last-dim slice [{start}..{}] exceeds input width {input_width}",
+            start.saturating_add(len)
+        )));
+    }
+    let output_shape = [batch, seq, len];
+    launch_resident_slice_kernel(
+        gpu,
+        input,
+        &output_shape,
+        "diffusion_slice_last_dim_3d_f32",
+        |kernargs| {
+            kernargs.push_i32(i32_kernel_dim("slice input width", input_width)?);
+            kernargs.push_i32(i32_kernel_dim("slice width start", start)?);
+            kernargs.push_i32(i32_kernel_dim("slice output width", len)?);
+            Ok(())
+        },
+    )
+}
+
+fn launch_resident_slice_kernel(
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+    output_shape: &[usize],
+    function_name: &str,
+    tail: impl FnOnce(&mut hip_bridge::KernargBlob) -> DiffusionResult<()>,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let output_elements = checked_shape_elements("resident slice output", output_shape)?;
+    let output = alloc_resident_f32(gpu, output_shape)?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("resident slice elements", output_elements)?);
+    tail(&mut kernargs)?;
+    kernargs.pad_to(16);
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        function_name,
+        DIFFUSION_CONCAT_HIP_SRC,
+        function_name,
+        [((output_elements as u32).saturating_add(255)) / 256, 1, 1],
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
 /// Device-resident QuickGELU (`x * sigmoid(1.702 * x)`).
 pub(crate) fn quick_gelu_resident(
     gpu: &mut hipfire_rdna::Gpu,
@@ -4632,5 +5064,117 @@ pub(crate) fn clip_causal_self_attention_resident(
         0,
         &mut kernargs,
     )?;
+    Ok(output)
+}
+
+/// Device-resident Qwen3 causal self-attention for a right-padded sequence.
+/// `valid_keys` is the non-empty contiguous prefix selected by the attention
+/// mask; all queries are retained so the padded hidden states still match the
+/// Transformers reference.
+pub(crate) fn qwen3_masked_causal_self_attention_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    q: &hipfire_rdna::GpuTensor,
+    k: &hipfire_rdna::GpuTensor,
+    v: &hipfire_rdna::GpuTensor,
+    n_heads: usize,
+    valid_keys: usize,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let (seq, hidden) = match q.shape.as_slice() {
+        [seq, hidden] => (*seq, *hidden),
+        other => {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "Qwen3 masked causal attention expected a 2D tensor, got shape {other:?}"
+            )))
+        }
+    };
+    if k.shape.as_slice() != [seq, hidden] || v.shape.as_slice() != [seq, hidden] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen3 masked causal attention q/k/v shapes {:?}/{:?}/{:?} are incompatible",
+            q.shape, k.shape, v.shape
+        )));
+    }
+    if n_heads == 0 || hidden % n_heads != 0 || valid_keys == 0 || valid_keys > seq {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen3 masked causal attention hidden {hidden}, heads {n_heads}, valid_keys {valid_keys}, seq {seq} are incompatible"
+        )));
+    }
+    let head_dim = hidden / n_heads;
+    let output_shape = [seq, hidden];
+    let output_elements =
+        checked_shape_elements("Qwen3 masked causal attention output", &output_shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &output_shape)?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(q.buf.as_ptr());
+    kernargs.push_ptr(k.buf.as_ptr());
+    kernargs.push_ptr(v.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(
+        "Qwen3 masked causal attention output elements",
+        output_elements,
+    )?);
+    kernargs.push_i32(i32_kernel_dim("Qwen3 masked causal attention sequence", seq)?);
+    kernargs.push_i32(i32_kernel_dim("Qwen3 masked causal attention hidden", hidden)?);
+    kernargs.push_i32(i32_kernel_dim("Qwen3 masked causal attention heads", n_heads)?);
+    kernargs.push_i32(i32_kernel_dim("Qwen3 masked causal attention head dim", head_dim)?);
+    kernargs.push_i32(i32_kernel_dim("Qwen3 masked causal attention valid keys", valid_keys)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_qwen3_masked_causal_attention_f32",
+        DIFFUSION_CLIP_CAUSAL_ATTENTION_HIP_SRC,
+        "diffusion_qwen3_masked_causal_attention_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
+pub(crate) fn qwen3_masked_causal_self_attention_hip_on_gpu(
+    gpu: &mut hipfire_rdna::Gpu,
+    q: &CpuTensor,
+    k: &CpuTensor,
+    v: &CpuTensor,
+    n_heads: usize,
+    key_mask: &[bool],
+) -> DiffusionResult<CpuTensor> {
+    let [seq, _] = shape2(q)?;
+    if key_mask.len() != seq {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen3 attention mask length {} != sequence {seq}",
+            key_mask.len()
+        )));
+    }
+    let valid_keys = key_mask.iter().take_while(|keep| **keep).count();
+    if valid_keys == 0 || key_mask[valid_keys..].iter().any(|keep| *keep) {
+        return Err(DiffusionError::InvalidMetadata(
+            "Qwen3 GPU attention requires a non-empty right-padded mask".to_string(),
+        ));
+    }
+    let q_gpu = gpu
+        .upload_f32(&q.data, &q.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let k_gpu = gpu
+        .upload_f32(&k.data, &k.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let v_gpu = gpu
+        .upload_f32(&v.data, &v.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = qwen3_masked_causal_self_attention_resident(
+        gpu,
+        &q_gpu,
+        &k_gpu,
+        &v_gpu,
+        n_heads,
+        valid_keys,
+    )?;
+    let output = download_resident(gpu, &output_gpu)?;
+    for tensor in [q_gpu, k_gpu, v_gpu, output_gpu] {
+        free_resident(gpu, tensor)?;
+    }
     Ok(output)
 }

@@ -44,7 +44,7 @@ struct TensorAccum {
 
 struct CalibState {
     name_by_ptr: HashMap<usize, String>,
-    accum: HashMap<usize, TensorAccum>,
+    accum: HashMap<String, TensorAccum>,
     hessian_max_k: usize,
 }
 
@@ -92,29 +92,45 @@ pub(crate) fn calib_observe_matrix(weight_ptr: usize, input: &[f32], rows: usize
         let Some(name) = state.name_by_ptr.get(&weight_ptr).cloned() else {
             return; // not a registered weight (e.g. an activation×activation matmul)
         };
-        let want_hessian = k <= state.hessian_max_k && k % 256 == 0;
-        let entry = state
-            .accum
-            .entry(weight_ptr)
-            .or_insert_with(|| TensorAccum {
-                name,
-                k,
-                imatrix: vec![0.0; k],
-                hessian: want_hessian.then(|| vec![0.0; k * k]),
-            });
-        if entry.k != k {
-            return; // shape changed unexpectedly; skip rather than corrupt
-        }
-        for r in 0..rows {
-            let row = &input[r * k..r * k + k];
-            for (acc, &x) in entry.imatrix.iter_mut().zip(row) {
-                *acc += (x as f64) * (x as f64);
-            }
-        }
-        if let Some(h) = entry.hessian.as_mut() {
-            accumulate_hessian(h, input, rows, k);
+        observe_named(state, &name, input, rows, k);
+    });
+}
+
+pub(crate) fn calib_observe_named(name: &str, input: &[f32], rows: usize, k: usize) {
+    if k == 0 || rows == 0 {
+        return;
+    }
+    CALIB.with(|c| {
+        let mut guard = c.borrow_mut();
+        if let Some(state) = guard.as_mut() {
+            observe_named(state, name, input, rows, k);
         }
     });
+}
+
+fn observe_named(state: &mut CalibState, name: &str, input: &[f32], rows: usize, k: usize) {
+    let want_hessian = k <= state.hessian_max_k && k % 256 == 0;
+    let entry = state
+        .accum
+        .entry(name.to_string())
+        .or_insert_with(|| TensorAccum {
+            name: name.to_string(),
+            k,
+            imatrix: vec![0.0; k],
+            hessian: want_hessian.then(|| vec![0.0; k * k]),
+        });
+    if entry.k != k {
+        return;
+    }
+    for r in 0..rows {
+        let row = &input[r * k..r * k + k];
+        for (acc, &x) in entry.imatrix.iter_mut().zip(row) {
+            *acc += (x as f64) * (x as f64);
+        }
+    }
+    if let Some(h) = entry.hessian.as_mut() {
+        accumulate_hessian(h, input, rows, k);
+    }
 }
 
 /// `H += Xᵀ X` for `X = [rows, k]` (row-major), parallel over output rows of `H`.
@@ -196,10 +212,9 @@ pub struct CalibrateSummary {
     pub imatrices: usize,
 }
 
-/// Run a CPU-reference calibration pass over `prompts` and write the resulting
-/// `.calib.hfq` to `output`. Arms calibration BEFORE loading the model so every
-/// weight registers its pointer, runs `steps` denoise steps per prompt at
-/// `width`×`height`, then serializes the accumulated Hessians/imatrices.
+/// Run an instrumented calibration pass over `prompts` and write the resulting
+/// `.calib.hfq` to `output`. Resident GPU linears download their inputs only
+/// while calibration is armed, preserving the production forward otherwise.
 pub fn calibrate_diffusion_hfq(
     model: &std::path::Path,
     output: &std::path::Path,
@@ -209,6 +224,7 @@ pub fn calibrate_diffusion_hfq(
     height: u32,
     cfg_scale: f32,
     hessian_max_k: usize,
+    runtime_options: crate::DiffusionGenerationRuntimeOptions,
 ) -> anyhow::Result<CalibrateSummary> {
     calib_begin(hessian_max_k);
     // From here on, cpu_tensor_from_hfq registers weight pointers.
@@ -243,10 +259,7 @@ pub fn calibrate_diffusion_hfq(
         send_images: false,
         save_images: false,
     };
-    pipeline.generate_batch_with_runtime_options(
-        request,
-        crate::DiffusionGenerationRuntimeOptions::cpu_reference(),
-    )?;
+    pipeline.generate_batch_with_runtime_options(request, runtime_options)?;
     let observed = calib_observed_count();
     let (hessians, imatrices) = calib_finish_and_write(output)?;
     Ok(CalibrateSummary {

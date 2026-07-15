@@ -11,6 +11,42 @@
 
 use super::*;
 
+/// Debug-only tensor trace used by the pinned Flux.2/SeFi reference scripts.
+/// Format: `HFDT`, u32 rank, u32 dimensions, then little-endian f32 data.
+pub(crate) fn dump_denoise_trace_tensor(name: &str, shape: &[usize], data: &[f32]) {
+    let Ok(dir) = std::env::var("HIPFIRE_DUMP_DENOISE_TRACE") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("[dump] failed to create denoise trace directory {dir}: {error}");
+        return;
+    }
+    let mut bytes = Vec::with_capacity(8 + shape.len() * 4 + data.len() * 4);
+    bytes.extend_from_slice(b"HFDT");
+    bytes.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+    for &dim in shape {
+        bytes.extend_from_slice(&(dim as u32).to_le_bytes());
+    }
+    for &value in data {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let path = std::path::Path::new(&dir).join(format!("{name}.bin"));
+    match std::fs::write(&path, bytes) {
+        Ok(()) => eprintln!("[dump] denoise trace {name} -> {}", path.display()),
+        Err(error) => eprintln!(
+            "[dump] failed to write denoise trace {name} to {}: {error}",
+            path.display()
+        ),
+    }
+}
+
+pub(crate) fn denoise_trace_enabled() -> bool {
+    std::env::var("HIPFIRE_DUMP_DENOISE_TRACE").is_ok_and(|dir| !dir.is_empty())
+}
+
 pub(crate) fn seeded_latents_for_request(
     config: &StableDiffusionConfig,
     request: &DiffusionBatchRequest,
@@ -375,6 +411,21 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
     let cfg_is_identity = classifier_free_guidance_is_identity(cfg_scale);
     configure_layer_policy(&mut runtime_context.rocm_weights);
     let total_steps = schedule.timesteps.len();
+    dump_denoise_trace_tensor(
+        "latent_000",
+        &[latents.batch, latents.channels, latents.height, latents.width],
+        &latents.data,
+    );
+    dump_denoise_trace_tensor(
+        "conditioning_positive",
+        &positive_embeddings.shape,
+        &positive_embeddings.data,
+    );
+    dump_denoise_trace_tensor(
+        "conditioning_negative",
+        &negative_embeddings.shape,
+        &negative_embeddings.data,
+    );
     for step in 0..total_steps {
         // Progressive precision schedule: pick the resident-linear activation
         // precision for this step (early/high-noise steps tolerate cheaper rungs).
@@ -490,6 +541,11 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
             runtime_kind = merge_runtime_kind(runtime_kind, guidance_runtime_kind);
             guided
         };
+        dump_denoise_trace_tensor(
+            &format!("velocity_{:03}", step + 1),
+            &[latents.batch, latents.channels, latents.height, latents.width],
+            &guided.data,
+        );
         // Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model
         // velocity (the flow-match prediction, before the scheduler integrates
         // it) as <dir>/vel_<step>.bin (4x u32 LE header [b,c,h,w] + f32 data).
@@ -525,6 +581,11 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
             runtime_context,
         )?;
         runtime_kind = merge_runtime_kind(runtime_kind, step_runtime_kind);
+        dump_denoise_trace_tensor(
+            &format!("latent_{:03}", step + 1),
+            &[latents.batch, latents.channels, latents.height, latents.width],
+            &latents.data,
+        );
         if let Some(masked_reference) = masked_reference {
             let masked_reference_runtime_kind =
                 apply_masked_denoise_reference_with_runtime_context(

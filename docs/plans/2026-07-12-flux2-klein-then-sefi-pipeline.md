@@ -1,6 +1,11 @@
 # FLUX.2 [klein] → SeFi-Image DiT pipeline (plan)
 
-Status: proposed (2026-07-12). Branch: `chaingun`.
+Status: implementation stopped at the frozen P4 rejection (2026-07-13).
+Implementation began from `12892469d1d68c331be59ec71768bfcd280219dc` and was
+fast-forwarded/revalidated at `origin/chaingun`
+`3ff7a351dd9832b65470e09f3c48fa92bd50f5e6` before handoff.
+Implementation starts from a clean worktree at the then-current
+`origin/chaingun`; do not layer this port over an unrelated dirty checkout.
 
 Bring the **FLUX.2 [klein]** family and then **SeFi-Image** text-to-image models
 into `hipfire-diffusion`. Both are flow-matching **Flux.2 MMDiT** image models
@@ -19,8 +24,10 @@ Reference code (vendored):
 - SeFi-Image: `third_party/SeFi-Image/sefi/` (semantic-first wrapper over Flux.2).
 
 Source models (on `/srv/huggingface`):
-- `black-forest-labs/FLUX.2-klein-base-4B` (vanilla milestone; downloading).
-- `SeFi-Image/SeFi-Image-2B-turbo` (target; diffusers layout).
+- `black-forest-labs/FLUX.2-klein-base-4B` (vanilla milestone; complete 23 GiB
+  snapshot at HF revision `a3b4f4849157f664bdbc776fd7453c2783562f4d`).
+- `SeFi-Image/SeFi-Image-2B-turbo` (target; diffusers layout, snapshot revision
+  `fa04be3b555fc5385e822a12f75e271d763f4d59`).
 
 ## 0. Why this is smaller than a from-scratch build
 
@@ -142,7 +149,9 @@ On top of vanilla Flux.2:
 
 Every Flux.2 op has a near-exact analogue already in
 `crates/hipfire-diffusion/src/transformer.rs` (the QwenImage double-stream and
-Krea-2 single-stream forwards). Line refs are as of this writing.
+Krea-2 single-stream forwards). Symbol names are authoritative; line refs are
+orientation only and must be refreshed after the implementation branch is
+rebased.
 
 | Flux.2 (`third_party/flux2/model.py`) | Closest existing hipfire code | Delta to implement |
 |---|---|---|
@@ -174,8 +183,10 @@ shared `time_modulation`), not recompute per block.
 
 ## 3. Arch ids
 
-- `ARCH_ID_FLUX2 = 20` (next free; 17/18 = Krea2/QwenImage, 19 = embeddinggemma)
-  in `crates/hipfire-arch-api/src/lib.rs`, plus `docs/architecture-ids.md`.
+- `ARCH_ID_FLUX2 = 23` in `crates/hipfire-arch-api/src/lib.rs`, plus
+  `docs/architecture-ids.md`. IDs 20 and 21 are already reserved by tooling-only
+  DFlash/MTP sidecars and 22 is `ARCH_ID_DSPARK_DRAFT`; do not reuse them. Recheck
+  the registry immediately before landing P0 in case another family takes 23.
 - Optionally a distinct `ARCH_ID_SEFI` if routing needs to distinguish the
   dual-time / split-denoise runtime; otherwise reuse `ARCH_ID_FLUX2` with a
   metadata flag (`sefi: true`, `semantic_channels`, `delta_t`). **Decision:**
@@ -189,17 +200,27 @@ shared `time_modulation`), not recompute per block.
 Per `AGENTS.md` naming:
 - `FLUX.2-klein-base-4B.bf16.hfq` (+ `.oq8`/`.oq4++` quant variants later).
 - `SeFi-Image-2B-turbo.sefi.bf16.hfq` (feature dot-group `.sefi` for the
-  dual-time / split-denoise role; quant token after, e.g. `.sefi.oq8.hfq`).
+  dual-time / split-denoise role; quant token after, e.g. `.sefi.oq8.hfq` or
+  `.sefi.oq4.25.hfq`).
 
 ## 5. Phasing
 
 **Vanilla FLUX.2 [klein]-base-4B first.**
 
+- **P-1 — Clean synchronized baseline.** Fetch `origin`, create a clean worktree
+  from the current `origin/chaingun`, confirm the model/reference inventories,
+  and refresh the orientation-only line references in this document. Preserve
+  unrelated work in the existing checkout. Record the exact code commit and HF
+  snapshot revisions in the first experiment result.
 - **P0 — Import + metadata + arch-id.** Recognize FLUX.2 (native single-file
   *and* diffusers layouts), normalize block/qkv naming into the canonical HFQ
   layout, stamp `ARCH_ID_FLUX2`, capture Qwen3-4B encoder ref + shared AE. Unit
   tests mirror the Krea-2 import tests. Fidelity check: `in_channels 128`,
   `context_in_dim 7680`, `axes_dim [32,32,32,32]`, `use_guidance_embed false`.
+  Pin the complete Klein snapshot revision above. Normalize the vanilla
+  `text_encoder/model.*` keys and SeFi's `Qwen3-VL-2B-Instruct/model.*` /
+  `model.language_model.*` keys into one diffusion-native Qwen3 text-tower
+  layout; do not route either through the Qwen3.5-VL vision crate.
 - **P1 — Flux.2 DiT forward.** `TransformerDenoiserFamily::Flux2`. Concretely, in
   `transformer.rs`:
   - Generalize `qwen_rope_axes_from_transformer_config` (`:3106`) + the grid
@@ -223,12 +244,23 @@ Per `AGENTS.md` naming:
   CPU tensors (per-block, then full forward).
 - **P2 — Qwen3-4B hidden-state extraction.** Add a "run selected layers, emit
   hidden states `[9,18,27]` concatenated" mode to the Qwen3 runner; chat-template
-  wrap (`add_generation_prompt=False`, `max_length 512`, `enable_thinking=False`).
+  wrap (`add_generation_prompt=True`, `enable_thinking=False`, `max_length 512`).
+  Pin whether indices address the embedding output or
+  post-layer states with a reference tensor test; do not rely on an assumed
+  zero-/one-based convention.
 - **P3 — VAE decode + schedule + CFG → end-to-end.** conv-KL decode at z=32 with
   bn inv_normalize + patch [2,2] unpack; mu-shift flow schedule; `denoise` Euler;
   CFG two-pass (`denoise_cfg`, g=4.0). Produce an image from a prompt.
-- **P4 — Quant (oq).** DiT is all-linear ⇒ the oq weight ladder + progressive
-  per-step precision apply directly (as with Krea-2). `.oq8` then `.oq4++`.
+- **P4 — Quant (oq).** Start from the admitted BF16 artifact, then evaluate
+  `.oq8`, calibrated `.oq4++`, and only then decimal mixed-Opus candidates.
+  Image-generation Opus activations are **W4A8 only**: the legacy W4A4/W4A16
+  rungs are not admission candidates because current Krea evidence shows
+  unacceptable image-quality loss. Add a Flux2-specific `Ingest` importance /
+  `PrecisionClass` policy rather than inheriting the generic MMDiT prior:
+  protect input/output/modulation tensors, both ends of the double-stream and
+  single-stream stacks, attention residual writers and Q/K/V in descending
+  order, and keep FF expansion tensors as the compressible bulk. Mixed-precision
+  allocation must compute boundary distance independently for both stacks.
 
 **Then SeFi-Image-2B-turbo delta.**
 
@@ -236,19 +268,57 @@ Per `AGENTS.md` naming:
   → concat `vec`); 16/128 channel split; dual sigma schedules offset by
   `delta_t`; per-stream Euler; texture-only decode. `semantic_channels`/`delta_t`
   from metadata. Distilled defaults (g=1.0, steps ∈ {4,8,10}, no CFG).
-- **P6 — Qwen3-VL-2B text tower.** Reuse `hipfire-arch-qwen35-vl`; text-tower-only
-  load (drop visual); same `[9,18,27]` extraction as P2.
-- **P7 — SeFi quant + eval.** oq variants; admission evidence.
+- **P6 — Qwen3-VL-2B text tower.** Reuse/extract the diffusion-native
+  `NativeQwen3TextEncoder` / `Qwen3EncoderLayer` seam; do **not** reuse
+  `hipfire-arch-qwen35-vl`, which implements the distinct Qwen3.5-VL + SigLIP-2
+  architecture. Load only `model.language_model.*` and omit visual weights.
+  Match the SeFi reference exactly: processor chat template with
+  `add_generation_prompt=true`, `enable_thinking=false`, max length 1024,
+  truncation and `padding=max_length`, then concatenate hidden states
+  `[9,18,27]` without Krea's `text_fusion` or prefix drop.
+- **P7 — SeFi quant + eval.** Repeat the BF16 → OQ8 → calibrated OQ4++ / decimal
+  mixed-Opus ladder using the SeFi workload. Stamp calibration signatures,
+  compare every candidate to the frozen BF16 baseline, and promote only on a
+  passing `hipfire eval` admission battery.
 
 ## 6. Validation
 
-- Per-block CPU parity vs. `third_party/flux2` (P1) and `third_party/SeFi-Image`
-  (P5) reference forwards on fixed seeds/tensors.
+- Each phase has an explicit exit gate and stops on failure. Record metric names
+  and thresholds before evaluating the first full candidate; do not loosen them
+  after observing results.
+- **P0 gate:** both native and Diffusers imports round-trip to the same canonical
+  tensor roles; configs, tokenizer, complete transformer/text/VAE weights, arch
+  id and source revisions are present. No legacy-name fallback is accepted.
+- **P1 gate:** fixed-input per-op, per-block and tiny full-forward CPU tensors
+  match `third_party/flux2`; compare values and shapes, require finite outputs,
+  and report max-absolute/max-relative error. A successful compile is not parity.
+- **P2/P6 gate:** token ids, attention masks and all three selected hidden-state
+  tensors match the appropriate Transformers reference before concatenation;
+  the concatenated conditioning tensor then matches independently.
+- **P3 gate:** schedule timesteps/sigmas, every denoise-step latent, VAE
+  de-normalized/unpatchified latent and decoded pixels match the pinned Klein
+  reference for a fixed prompt/seed. A coherent image is secondary evidence, not
+  the correctness gate.
+- **P5 gate:** dual semantic/texture timesteps, per-stream sigmas, velocity
+  slices, every Euler-updated latent and texture-only decode match
+  `third_party/SeFi-Image` for 4, 8 and 10 steps. Failure ends the phase before
+  any quant work.
+- **P4/P7 gate:** establish the BF16 eval baseline first, then compare each quant
+  candidate using the same frozen prompts, seeds, dimensions, step counts and
+  thresholds. Finite/coherent output alone is not admission evidence.
+- The native `hipfire eval --battery diffusion` admission battery freezes three
+  committed object/scene/texture prompts at seeds `7/23/101`, `64x64`, four
+  Euler steps, CFG `4.0` for Klein and `1.0` for SeFi. Every candidate image is
+  compared to the matching BF16 RGB output and must satisfy both MAE
+  `<= 1 / 255` and maximum channel error `<= 4 / 255` for every prompt. The
+  device/dimensions/steps can be overridden only for diagnostic runs; promotion
+  uses these defaults and records prompt hashes plus both batch timings.
 - `./tests/coherence-gate-dflash.sh` after kernel/dispatch-touching changes.
-- End-to-end image sanity: a fixed prompt/seed renders a coherent (non-noise)
-  image — the Krea-2 noise-bug regression is the guardrail here.
-- `hipfire eval` battery for admission before promoting quant variants.
+- `./tests/no-gpu-ci.sh` for importer, metadata, CLI and workflow-only changes.
+- `hipfire eval` battery for admission before promoting quant variants; keep
+  shell gates as enforcement wrappers where they still compare a baseline.
 - GPU work coordinated via `hipfire lock {acquire,release,status}`.
+- Run `graphify update .` after code changes.
 
 ## 7. Parity traps (found while diffing `model.py` ↔ `transformer.rs`)
 
@@ -282,3 +352,109 @@ Other constraints:
   (no-LDS) kernels, consistent with the Krea-2 hot path.
 - klein-base-4B fits nix1 (64 GB UMA) / halo easily; BFL claims consumer-GPU /
   gfx1103-class viability for klein-4B.
+
+## 8. Implementation record (2026-07-12)
+
+The synchronized implementation has changed the risk assessment in four useful
+ways:
+
+1. The Flux.2 DiT is no longer an uncertain assembly task. Tiny BFL parity now
+   covers double-stream, single-stream and full-forward paths, and the real
+   5+20-block Klein stack stays resident on gfx1103. The fixed one-step 16x16
+   smoke dropped from 320.3 s on the initial hybrid path to 166.4 s resident.
+2. The tokenizer limit must be a pipeline contract, not inherited blindly from
+   Qwen config. The upstream tokenizer advertises a very large generic model
+   limit; padding Klein to that value exhausted host RAM. Import and runtime now
+   enforce 512 for Klein and 1024 for SeFi.
+3. SeFi is confirmed to be the intended thin delta: the complete local artifact
+   runs its 144-channel denoiser, independent semantic/texture Euler update and
+   texture-only VAE decode. Its dual timestep embedding matches the actual
+   checkpoint reference to `5.72e-6` max absolute error.
+4. Full-image success remains supporting evidence only. The actual-weight
+   P2/P6 selected-state oracles and the P3/P5 step traces now pass; P4/P7 still
+   require BF16-first admission evidence. Those gates remain unchanged despite
+   successful real-model PNG smokes.
+5. The first real BFL denoise trace exposed a layout difference that the tiny
+   native fixture could not: BFL stores final adaLN rows as `[shift, scale]`,
+   while Diffusers and SeFi store `[scale, shift]`. Canonical HFQ now splits the
+   tensor into explicit `norm_out.shift.weight` and `norm_out.scale.weight`
+   roles. Ambiguous pre-split Flux.2 artifacts are rejected rather than treated
+   as a legacy fallback. Keeping the shared timestep/modulation and final
+   adaLN/projection boundaries in f32 then brought the actual one-step velocity
+   to max-absolute `0.00842`, NRMSE `0.00241`, and the updated latent to NRMSE
+   `0.00911` against the frozen `0.5 / 0.02` limits. The full serialized
+   `hipfire-diffusion` suite subsequently passed `293` tests with no failures
+   (`5` explicitly ignored), including all local actual-checkpoint gates.
+6. The original calibration command forced the CPU-reference runtime and was
+   not viable for the 4B workload. Calibration now uses the requested ROCm
+   device, observes name-keyed inputs at both decoded and resident linears, and
+   downloads resident activations only while the calibration collector is
+   armed. This plumbing compiles cleanly; a real Klein calibration artifact and
+   non-zero LDLQ packing count are still required before P4 can complete.
+7. The first corrected-weight OQ8 pack failed the frozen implementation screen:
+   RGB MAE was `1.422 / 255` and maximum channel error was `11 / 255`, above the
+   frozen `1 / 255` and `4 / 255` limits, and cold generation took `607.3 s`.
+   The pack had quantized all 435 matrix/conv tensors, including the Qwen text
+   tower and VAE, instead of applying the Flux2 DiT policy. The gate was not
+   weakened and OQ4++ admission did not proceed. General Opus packing now keeps
+   text/VAE weights at source precision, quantizes only transformer weights,
+   applies the Flux2 precision class, and streams one tensor at a time. The
+   component-scoped replacement improved cold generation to `411.9 s` but also
+   failed (`1.470 / 255` MAE, `7 / 255` maximum): protected roles were still
+   OQ8, which provides no protection inside the OQ8 rung. The next replacement
+   therefore keeps `High`/`Pinned`/`SourcePrecision` roles in BF16 and applies
+   OQ8 only to `Compressed` DiT bulk. In an OQ4 candidate those protected roles
+   become OQ8 while the compressible FF bulk becomes OQ4. That third pack
+   quantized only 10 tensors (819 copied), was 15.42 GB / `1.04x`, and passed
+   the 16x16 screen at RGB MAE `0.453 / 255`, maximum `1 / 255`, in `152.7 s`.
+   This was a fidelity smoke only; the fused single-stream QKV+MLP projection
+   prevents useful tensor-granular compression because its protected and
+   compressible subranges cannot receive different formats.
+8. `hipfire eval` now has a native `diffusion` battery rather than relying on a
+   shell-only PNG check. It loads a BF16 baseline and candidate, generates the
+   three committed prompt/seed cases as matched batches, compares decoded RGB,
+   records prompt hashes/settings/timings, and returns an internal promote or
+   reject admission verdict. Its 106-test library suite and the explicit
+   diffusion admission verdict test pass. Diagnostic overrides are forbidden
+   with `--fail-on-admission`, and step-level progress is reported so a slow
+   first forward is distinguishable from VAE/postprocessing cost.
+9. The OQ8 candidate is rejected at the P4 admission boundary. A full three-case
+   run was stopped after more than 90 minutes when case 2 had not completed its
+   first step; a one-case diagnostic then completed both matched four-step
+   64x64 generations and produced definitive failure on seed 7: RGB MAE
+   `76.006 / 255`, maximum `255 / 255` against the unchanged `1 / 4` limits.
+   Evidence (including candidate/baseline hashes and prompt hash) is retained in
+   `benchmarks/results/flux2-klein-oq8-admission-diagnostic-2026-07-12/`.
+   Because every case must pass, this single failure rejects OQ8. Per the frozen
+   ladder, calibrated OQ4++ and P7 do not proceed. Meaningful future quant work
+   needs sub-tensor precision for the fused single-stream projection plus a
+   materially faster/persistent admission runtime; it is not an adjustment to
+   the existing thresholds.
+10. Final verification on 2026-07-13 passed `293` diffusion tests with zero
+    failures (`5` ignored), `106` hipfire-eval tests, `38` hipfire-evidence
+    tests, `108` Python tests, Rust checks, Ruff, mypy, fixture round-trips,
+    env/config/model-support freshness, artifact naming and arch-spec purity.
+    `coherence-gate-dflash.sh` had zero hard errors: DFlash prose and both
+    DDTree cases were OK; DFlash code retained one non-blocking repetition soft
+    warning. `no-gpu-ci.sh` reaches only the known pre-existing CLI-doc drift
+    (`docs/CLI.md` plus 13 manpages); the task-owned env docs are regenerated
+    and current. The post-fast-forward `graphify update .` completed with
+    22,685 nodes / 55,680 edges.
+
+Current phase state:
+
+| Phase | State | Current evidence |
+|---|---|---|
+| P-1 / P0 | complete | synchronized commit and pinned revisions; native/Diffusers/SeFi canonical imports |
+| P1 | complete | per-op/block/tiny parity; resident 5+20 stack; actual BFL one-step velocity parity |
+| P2 | complete | tokenizer/mask plus actual Qwen3 layers 9/18/27 and concatenation |
+| P3 | complete | BFL schedule, velocity/updated-latent gate and actual VAE parity |
+| P4 | rejected / stop | protected OQ8 passed the 16x16 screen but failed formal 64x64 admission at MAE 76.006/max 255; OQ4++ not run after failure |
+| P5 / P6 | complete | exact 4/8/10 split-loop trace, actual dual embed/text tower, corrected four-step SeFi smoke |
+| P7 | not run | frozen sequencing stops after the P4 rejection; SeFi BF16 correctness remains complete but its quant ladder is not admitted |
+
+Quant screening is frozen before inspecting the first OQ8 image: use the same
+Klein prompt, seed, 16x16 dimensions, one Euler step and CFG=1 as the resident
+BF16 smoke; require RGB pixel MAE <= 1/255 and maximum channel error <= 4/255.
+This is a deterministic implementation screen, not the P4 admission battery.
+Promotion still requires the BF16-first multi-prompt `hipfire eval` gate above.

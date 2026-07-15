@@ -107,16 +107,35 @@ impl DiffusionPipeline {
                 image_seq_len = max_seq;
             }
         }
-        let schedule = DiffusionSchedule::from_config_with_image_seq_len(
-            &scheduler_config,
-            request.steps,
-            Some(image_seq_len),
-        )?;
+        let schedule = if self.metadata.pipeline.class_name == "Flux2KleinPipeline" {
+            DiffusionSchedule::flux2_euler(request.steps as usize, image_seq_len)?
+        } else {
+            DiffusionSchedule::from_config_with_image_seq_len(
+                &scheduler_config,
+                request.steps,
+                Some(image_seq_len),
+            )?
+        };
+        let sefi_dual_schedule = if self.metadata.pipeline.sefi {
+            let delta_t = self.metadata.pipeline.delta_t.ok_or_else(|| {
+                DiffusionError::InvalidMetadata(
+                    "SeFi pipeline metadata is missing delta_t".to_string(),
+                )
+            })?;
+            Some(DiffusionSchedule::sefi_dual_euler(
+                request.steps as usize,
+                delta_t,
+                1.0,
+            )?)
+        } else {
+            None
+        };
         schedule.scale_initial_latents(&mut latents);
         Ok(DiffusionRunPlan {
             latent_shape,
             latents,
             schedule,
+            sefi_dual_schedule,
             conditioning,
         })
     }
@@ -189,6 +208,75 @@ impl DiffusionPipeline {
         })
     }
 
+    fn prepare_flux2_conditioning_batch(
+        &self,
+        request: &DiffusionBatchRequest,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<DiffusionConditioningBatch> {
+        let runtime = self.native_runtime()?;
+        let missing = || {
+            DiffusionError::BackendUnavailable("FLUX.2 text conditioner unavailable".to_string())
+        };
+        let cfg_is_identity = classifier_free_guidance_is_identity(request.cfg_scale);
+        let mut prompt_conds = Vec::with_capacity(request.prompts.len());
+        let mut negative_conds = Vec::with_capacity(request.prompts.len());
+        let mut prompt_tokens = Vec::with_capacity(request.prompts.len());
+        let mut negative_tokens = Vec::with_capacity(request.prompts.len());
+        let mut prompt_masks = Vec::with_capacity(request.prompts.len());
+        let mut negative_masks = Vec::with_capacity(request.prompts.len());
+        for prompt in &request.prompts {
+            let (conditioning, tokens, mask) = runtime
+                .flux2_conditioning_from_prompt(&prompt.prompt, runtime_context)?
+                .ok_or_else(missing)?;
+            if cfg_is_identity {
+                negative_conds.push(conditioning.clone());
+                negative_tokens.push(tokens.clone());
+                negative_masks.push(mask.clone());
+            } else {
+                let (negative, negative_ids, negative_mask) = runtime
+                    .flux2_conditioning_from_prompt(&prompt.negative_prompt, runtime_context)?
+                    .ok_or_else(missing)?;
+                negative_conds.push(negative);
+                negative_tokens.push(negative_ids);
+                negative_masks.push(negative_mask);
+            }
+            prompt_conds.push(conditioning);
+            prompt_tokens.push(tokens);
+            prompt_masks.push(mask);
+        }
+        let stack_masks = |masks: &[Vec<bool>]| -> DiffusionResult<CpuTensor> {
+            let width = masks.first().map(Vec::len).unwrap_or(0);
+            if width == 0 || masks.iter().any(|mask| mask.len() != width) {
+                return Err(DiffusionError::InvalidMetadata(
+                    "FLUX.2 attention masks have inconsistent lengths".to_string(),
+                ));
+            }
+            Ok(CpuTensor {
+                shape: vec![masks.len(), width],
+                data: masks
+                    .iter()
+                    .flat_map(|mask| mask.iter().map(|keep| u8::from(*keep) as f32))
+                    .collect(),
+            })
+        };
+        Ok(DiffusionConditioningBatch {
+            prompt_tokens,
+            negative_tokens,
+            prompt_tokens_2: None,
+            negative_tokens_2: None,
+            prompt_embeddings: Some(stack_krea2_conditioning(&prompt_conds)?),
+            negative_embeddings: Some(stack_krea2_conditioning(&negative_conds)?),
+            prompt_embeddings_2: None,
+            negative_embeddings_2: None,
+            prompt_cross_attention_embeddings: None,
+            negative_cross_attention_embeddings: None,
+            prompt_attention_mask: Some(stack_masks(&prompt_masks)?),
+            negative_attention_mask: Some(stack_masks(&negative_masks)?),
+            prompt_pooled_embeddings: None,
+            negative_pooled_embeddings: None,
+        })
+    }
+
     fn prepare_conditioning_batch_with_runtime_context(
         &self,
         request: &DiffusionBatchRequest,
@@ -200,6 +288,13 @@ impl DiffusionPipeline {
                 conditioning,
                 request.prompts.len(),
             ));
+        }
+        if self
+            .native_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.flux2_text_conditioner.is_some())
+        {
+            return self.prepare_flux2_conditioning_batch(request, runtime_context);
         }
         // Krea2: the Qwen3-VL encoder + text_fusion produce the DiT conditioning
         // in-runtime (no CLIP). NOTE: numerically unvalidated against a diffusers

@@ -203,6 +203,7 @@ pub(crate) fn minimal_metadata() -> DiffusionHfqMetadata {
             latent_width: Some(64),
             supported_widths: vec![512],
             supported_heights: vec![512],
+            ..DiffusionPipelineMetadata::default()
         },
         tokenizer: DiffusionTokenizerMetadata::default(),
         tokenizer_2: None,
@@ -342,6 +343,8 @@ pub(crate) fn tiny_runtime_config() -> StableDiffusionConfig {
             up_block_types: vec!["UpDecoderBlock2D".into()],
             norm_num_groups: Some(1),
             norm_eps: Some(1e-6),
+            patch_size: Vec::new(),
+            batch_norm_eps: None,
         },
         scheduler: SchedulerConfig::default(),
         latent_channels: 1,
@@ -995,7 +998,10 @@ pub(crate) fn tiny_txt2img_test_pipeline(decoder: Box<dyn DiffusionImageDecoder>
             encoder: None,
             decoder,
             text_conditioner: None,
+            flux2_text_conditioner: None,
             krea2_tokenizer: None,
+            flux2_tokenizer: None,
+            flux2_text_max_length: 512,
         }),
         native_runtime_error: None,
     }
@@ -1075,7 +1081,10 @@ pub(crate) fn tiny_inpaint_test_pipeline(
             encoder: Some(encoder),
             decoder,
             text_conditioner: None,
+            flux2_text_conditioner: None,
             krea2_tokenizer: None,
+            flux2_tokenizer: None,
+            flux2_text_max_length: 512,
         }),
         native_runtime_error: None,
     };

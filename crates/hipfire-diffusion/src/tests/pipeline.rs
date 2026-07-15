@@ -383,7 +383,10 @@ fn diffusion_pipeline_generate_batch_returns_sdapi_png_images_with_test_backend(
             encoder: None,
             decoder: Box::new(TestImageDecoder),
             text_conditioner: None,
+            flux2_text_conditioner: None,
             krea2_tokenizer: None,
+            flux2_tokenizer: None,
+            flux2_text_max_length: 512,
         }),
         native_runtime_error: None,
     };
@@ -922,7 +925,10 @@ fn diffusion_pipeline_passes_sdxl_conditioning_to_noise_backend() {
             encoder: None,
             decoder: Box::new(TestImageDecoder),
             text_conditioner: None,
+            flux2_text_conditioner: None,
             krea2_tokenizer: None,
+            flux2_tokenizer: None,
+            flux2_text_max_length: 512,
         }),
         native_runtime_error: None,
     };

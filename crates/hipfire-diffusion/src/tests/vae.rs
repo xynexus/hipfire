@@ -46,6 +46,8 @@ fn vae_per_channel_norm_overrides_scalar_scaling() {
         up_block_types: Vec::new(),
         norm_num_groups: None,
         norm_eps: None,
+        patch_size: Vec::new(),
+        batch_norm_eps: None,
     };
     let norm = VaeLatentNorm::from_config(&config).unwrap();
     assert!(norm.is_per_channel());
@@ -65,6 +67,155 @@ fn vae_per_channel_norm_overrides_scalar_scaling() {
     let mut roundtrip = latents.data.clone();
     norm.apply_decode(&mut roundtrip, 2, 2).unwrap();
     assert_eq!(roundtrip, vec![3.0, 5.0, 2.0, 6.0]);
+}
+
+#[test]
+fn flux2_vae_inverse_batch_norm_unpatchifies_channel_major_tiles() {
+    let dir = std::env::temp_dir().join(format!(
+        "hipfire-flux2-vae-patch-norm-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("flux2-vae-patch.hfq");
+    let means = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0];
+    let variances = [4.0; 8];
+    write_hfqm_package_mem(
+        &path,
+        HFQ_ARCH_DIFFUSION,
+        "{}",
+        &[
+            f32_mem_tensor("vae/tensors/bn.running_mean", &[8], &means),
+            f32_mem_tensor("vae/tensors/bn.running_var", &[8], &variances),
+        ],
+    )
+    .unwrap();
+    let hfq = HfqFile::open_index_only(&path).unwrap();
+    let config = VaeConfig {
+        class_name: "AutoencoderKLFlux2".to_string(),
+        patch_size: vec![2, 2],
+        batch_norm_eps: Some(1e-4),
+        ..VaeConfig::default()
+    };
+    let norm = Flux2VaePatchNorm::from_hfq(&hfq, &config)
+        .unwrap()
+        .unwrap();
+    let input = CpuTensor {
+        shape: vec![1, 8, 1, 1],
+        data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    };
+    let output = norm.inverse_and_unpatchify(&input).unwrap();
+    let scale = (4.0f32 + 1e-4).sqrt();
+    assert_eq!(output.shape, vec![1, 2, 2, 2]);
+    assert_f32_close(
+        &output.data,
+        &[
+            scale,
+            2.0 * scale + 10.0,
+            3.0 * scale + 20.0,
+            4.0 * scale + 30.0,
+            5.0 * scale + 40.0,
+            6.0 * scale + 50.0,
+            7.0 * scale + 60.0,
+            8.0 * scale + 70.0,
+        ],
+        1e-6,
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_flux2_full_vae_loads_and_decodes_patchified_latents() {
+    let artifact = Path::new("/srv/huggingface/FLUX.2-klein-base-4B.diffusers.p0.hfq");
+    if !artifact.is_file() {
+        eprintln!("skip: local full FLUX.2 artifact is absent");
+        return;
+    }
+    let hfq = HfqFile::open_index_only(artifact).unwrap();
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+    assert_eq!(config.vae_scale_factor, 16);
+    let decoder = NativeVaeDecoder::from_hfq(&hfq, &config.vae).unwrap();
+    let decoded = decoder
+        .decode_latents(&LatentBatch {
+            batch: 1,
+            channels: 128,
+            height: 1,
+            width: 1,
+            data: vec![0.0; 128],
+        })
+        .unwrap();
+    assert_eq!(decoded.shape, vec![1, 3, 16, 16]);
+    assert!(decoded.data.iter().all(|value| value.is_finite()));
+}
+
+#[test]
+fn local_flux2_full_vae_matches_vendored_bfl_reference() {
+    let artifact = Path::new("/srv/huggingface/FLUX.2-klein-base-4B.diffusers.p0.hfq");
+    let reference_path = Path::new("/tmp/hipfire-flux2-vae-reference.json");
+    if !artifact.is_file() || !reference_path.is_file() {
+        eprintln!(
+            "skip: generate the local reference with scripts/flux2_vae_reference.py"
+        );
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let values = |name: &str| {
+        reference[name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>()
+    };
+    let hfq = HfqFile::open_index_only(artifact).unwrap();
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+    let decoder = NativeVaeDecoder::from_hfq(&hfq, &config.vae).unwrap();
+    let latents = LatentBatch {
+        batch: 1,
+        channels: 128,
+        height: 1,
+        width: 1,
+        data: values("latent"),
+    };
+    let unpatchified = Flux2VaePatchNorm::from_hfq(&hfq, &config.vae)
+        .unwrap()
+        .unwrap()
+        .inverse_and_unpatchify(&latents.as_nchw_tensor())
+        .unwrap();
+    let decoded = decoder.decode_latents(&latents).unwrap();
+    let expected_shape = reference["decoded_shape"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap() as usize)
+        .collect::<Vec<_>>();
+    assert_eq!(decoded.shape, expected_shape);
+
+    let compare = |label: &str, actual: &[f32], expected: Vec<f32>, tolerance: f32| {
+        assert_eq!(actual.len(), expected.len(), "{label} length");
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (&actual, expected) in actual.iter().zip(expected) {
+            let absolute = (actual - expected).abs();
+            max_abs = max_abs.max(absolute);
+            max_rel = max_rel.max(absolute / expected.abs().max(1e-6));
+        }
+        eprintln!("FLUX.2 VAE {label}: max_abs={max_abs:.8} max_rel={max_rel:.8}");
+        assert!(
+            max_abs <= tolerance,
+            "{label} max_abs={max_abs} max_rel={max_rel} tolerance={tolerance}"
+        );
+    };
+    compare(
+        "inverse_norm_unpatchify",
+        &unpatchified.data,
+        values("unpatchified"),
+        1e-6,
+    );
+    compare("decoded", &decoded.data, values("decoded"), 2e-4);
 }
 
 #[test]

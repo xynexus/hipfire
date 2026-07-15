@@ -15,11 +15,15 @@ use hipfire_diffusion::DiffusionHipRuntimeOptions;
 // now lives in the offline hipfire-diffusion-coexist crate, out of the
 // server-linked hipfire-diffusion.
 use hipfire_diffusion::{
-    calibrate_diffusion_hfq, inspect_hfq_with_runtime_support, quantize_diffusion_hfq,
-    resize_rgb_batch_to_cover_nearest, DiffusionBatchRequest, DiffusionError,
-    DiffusionGenerationRuntimeOptions, DiffusionHfqInspection, DiffusionImg2ImgRequest,
-    DiffusionPipeline, DiffusionProgress, DiffusionPrompt, DiffusionQuantFormat, DiffusionResult,
-    RefineSigmaSchedule, RgbImageBatch,
+    calibrate_diffusion_hfq, diff_quantized_transformer_tensors, eval_fold_calibration,
+    inspect_hfq_with_runtime_support, quantize_diffusion_hfq, resize_rgb_batch_to_cover_nearest,
+    DiffusionBatchRequest,
+    DiffusionError, DiffusionGenerationRuntimeOptions, DiffusionHfqInspection,
+    DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress, DiffusionPrompt,
+    DiffusionQuantFormat, DiffusionResult, RefineSigmaSchedule, RgbImageBatch, TensorQuantDiff,
+    QT_DIFFUSION_TENSOR_BF16, QT_DIFFUSION_TENSOR_F16, QT_DIFFUSION_TENSOR_F32,
+    QT_DIFFUSION_TENSOR_OQ4_G256, QT_DIFFUSION_TENSOR_OQ4_PLAIN, QT_DIFFUSION_TENSOR_OQ8_G256,
+    QT_DIFFUSION_TENSOR_OQ8_PLAIN, QT_DIFFUSION_TENSOR_Q8F16,
 };
 use hipfire_diffusion_coexist::{import_diffusers_to_hfq, DiffusersImportOptions};
 use serde::Serialize;
@@ -112,10 +116,54 @@ pub enum DiffusionCommand {
     Quantize(DiffusionQuantizeArgs),
     /// Run an activation-calibration pass and write a .calib.hfq sidecar
     ///
-    /// Generates a few CPU-reference denoise steps over sample prompts, capturing
+    /// Generates a few instrumented denoise steps over sample prompts, capturing
     /// per-weight activation statistics (imatrix + per-linear Hessian). The
     /// resulting .calib.hfq feeds `quantize --format oq4++ --calib`.
     Calibrate(DiffusionCalibrateArgs),
+    /// Compare per-tensor weight reconstruction error between two diffusion .hfq
+    /// artifacts (e.g. a bf16 reference vs its quantized derivative)
+    ///
+    /// Decodes every quantizable `transformer/tensors/*.weight` from both
+    /// artifacts to f32 and reports per-tensor error, ranked by relative L2. This
+    /// is the sampler-independent quant-quality check: if the worst tensor is
+    /// near-lossless, any rendered-image drift is trajectory divergence, not
+    /// weight corruption. Pairs with `scripts/flux2_trajectory_divergence.py`.
+    QuantDiff(DiffusionQuantDiffArgs),
+    /// Quantify the activation-aware clip calibration ("+") on the fold format:
+    /// for each fold-eligible transformer linear, report RTN vs clip weight-space
+    /// error using a `.calib.hfq` imatrix. Weight-space only (no GPU).
+    CalibEval(DiffusionCalibEvalArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DiffusionCalibEvalArgs {
+    /// Source diffusion .hfq (bf16 weights)
+    pub source: PathBuf,
+    /// Calibration sidecar (.calib.hfq) with per-tensor imatrix
+    pub calib: PathBuf,
+    /// Fold bit width to evaluate (1/2/4)
+    #[arg(long, default_value_t = 4)]
+    pub bits: u32,
+    /// Emit JSON instead of a table
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DiffusionQuantDiffArgs {
+    /// Reference artifact (typically the bf16 / p0 source .hfq)
+    pub reference: PathBuf,
+    /// Candidate artifact (typically the quantized .hfq, e.g. .oq8.hfq)
+    pub candidate: PathBuf,
+    /// Print the N worst tensors by relative L2 error
+    #[arg(long, default_value_t = 20)]
+    pub top: usize,
+    /// Relative-L2 threshold above which a tensor is flagged as real corruption
+    #[arg(long, default_value_t = 0.05)]
+    pub rel_rms_threshold: f64,
+    /// Emit the full per-tensor diff as JSON instead of a table
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -141,6 +189,9 @@ pub struct DiffusionCalibrateArgs {
     /// Max linear input dim K to capture a full [K,K] Hessian for (else imatrix only)
     #[arg(long, default_value_t = 2048)]
     pub hessian_max_k: usize,
+    /// ROCm device used for instrumented resident calibration
+    #[arg(long)]
+    pub rocm_device_id: Option<i32>,
 }
 
 #[derive(Debug, Args)]
@@ -594,7 +645,78 @@ pub fn run(args: DiffusionArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
         DiffusionCommand::Smoke(args) => run_smoke(args, &loaded),
         DiffusionCommand::Quantize(args) => run_quantize(args),
         DiffusionCommand::Calibrate(args) => run_calibrate(args),
+        DiffusionCommand::QuantDiff(args) => run_quant_diff(args),
+        DiffusionCommand::CalibEval(args) => run_calib_eval(args),
     }
+}
+
+fn run_calib_eval(args: DiffusionCalibEvalArgs) -> anyhow::Result<()> {
+    if !matches!(args.bits, 1 | 2 | 4) {
+        anyhow::bail!("--bits must be 1, 2, or 4");
+    }
+    let mut rows = eval_fold_calibration(&args.source, &args.calib, args.bits)?;
+    if rows.is_empty() {
+        println!("no fold-eligible transformer linears in {}", args.source.display());
+        return Ok(());
+    }
+    if args.json {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "name": r.name, "elements": r.elements, "has_imatrix": r.has_imatrix,
+                    "rtn_weighted": r.rtn_weighted, "clip_weighted": r.clip_weighted,
+                    "rtn_unweighted": r.rtn_unweighted, "clip_unweighted": r.clip_unweighted,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": args.source, "calib": args.calib, "bits": args.bits, "tensors": out,
+            }))?
+        );
+        return Ok(());
+    }
+    // Rank by weighted improvement (best-calibrated first).
+    rows.sort_by(|a, b| {
+        let ra = if a.rtn_weighted > 0.0 { a.clip_weighted / a.rtn_weighted } else { 1.0 };
+        let rb = if b.rtn_weighted > 0.0 { b.clip_weighted / b.rtn_weighted } else { 1.0 };
+        ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let with_im = rows.iter().filter(|r| r.has_imatrix).count();
+    println!("source: {}", args.source.display());
+    println!("calib:  {}", args.calib.display());
+    println!("bits:   {}   fold tensors: {} ({} with imatrix)", args.bits, rows.len(), with_im);
+    println!();
+    println!(
+        "{:>12} {:>12} {:>8}  {:>12} {:>12}  {:>3}  {}",
+        "rtn_wErr", "clip_wErr", "wRedux", "rtn_uErr", "clip_uErr", "im", "tensor"
+    );
+    for r in &rows {
+        let redux = if r.rtn_weighted > 0.0 {
+            100.0 * (1.0 - r.clip_weighted / r.rtn_weighted)
+        } else {
+            0.0
+        };
+        println!(
+            "{:>12.6} {:>12.6} {:>7.1}%  {:>12.6} {:>12.6}  {:>3}  {}",
+            r.rtn_weighted,
+            r.clip_weighted,
+            redux,
+            r.rtn_unweighted,
+            r.clip_unweighted,
+            if r.has_imatrix { "y" } else { "-" },
+            r.name
+        );
+    }
+    let n = rows.len() as f64;
+    let mean_rtn = rows.iter().map(|r| r.rtn_weighted).sum::<f64>() / n;
+    let mean_clip = rows.iter().map(|r| r.clip_weighted).sum::<f64>() / n;
+    let redux = if mean_rtn > 0.0 { 100.0 * (1.0 - mean_clip / mean_rtn) } else { 0.0 };
+    println!();
+    println!("mean weighted rel-RMSE: RTN={mean_rtn:.6}  clip={mean_clip:.6}  ({redux:.1}% reduction)");
+    Ok(())
 }
 
 fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
@@ -607,6 +729,7 @@ fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
     } else {
         args.prompts.clone()
     };
+    let runtime_options = resolve_runtime_options(args.rocm_device_id)?;
     let summary = calibrate_diffusion_hfq(
         &args.model,
         &args.output,
@@ -616,6 +739,7 @@ fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
         args.height,
         args.cfg_scale,
         args.hessian_max_k,
+        runtime_options,
     )?;
     println!(
         "{}",
@@ -629,6 +753,129 @@ fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
             "imatrices": summary.imatrices,
         }))?
     );
+    Ok(())
+}
+
+fn quant_type_label(q: u8) -> &'static str {
+    match q {
+        QT_DIFFUSION_TENSOR_F16 => "f16",
+        QT_DIFFUSION_TENSOR_F32 => "f32",
+        QT_DIFFUSION_TENSOR_Q8F16 => "q8f16",
+        QT_DIFFUSION_TENSOR_OQ4_G256 => "oq4g256",
+        QT_DIFFUSION_TENSOR_OQ8_G256 => "oq8g256",
+        QT_DIFFUSION_TENSOR_OQ4_PLAIN => "oq4plain",
+        QT_DIFFUSION_TENSOR_OQ8_PLAIN => "oq8plain",
+        QT_DIFFUSION_TENSOR_BF16 => "bf16",
+        _ => "other",
+    }
+}
+
+fn run_quant_diff(args: DiffusionQuantDiffArgs) -> anyhow::Result<()> {
+    let (mut diffs, warnings) =
+        diff_quantized_transformer_tensors(&args.reference, &args.candidate)?;
+    // Rank worst-first by relative L2.
+    diffs.sort_by(|a, b| {
+        b.rel_rms
+            .partial_cmp(&a.rel_rms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if args.json {
+        let rows: Vec<_> = diffs
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "name": d.name,
+                    "elements": d.elements,
+                    "quant_type_ref": quant_type_label(d.quant_type_ref),
+                    "quant_type_cand": quant_type_label(d.quant_type_cand),
+                    "mae": d.mae,
+                    "max_abs": d.max_abs,
+                    "rms": d.rms,
+                    "rel_rms": d.rel_rms,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "reference": args.reference,
+                "candidate": args.candidate,
+                "tensors": rows,
+                "warnings": warnings,
+            }))?
+        );
+        return Ok(());
+    }
+
+    let compared = diffs.len();
+    // "Changed" = the quantizer actually touched it (verbatim-copied bf16 tensors
+    // reconstruct exactly and report rms 0).
+    let changed: Vec<&TensorQuantDiff> = diffs.iter().filter(|d| d.rms > 0.0).collect();
+    let worst_rel = diffs.first().map(|d| d.rel_rms).unwrap_or(0.0);
+    // Element-weighted global MAE over every compared tensor.
+    let total_elems: u128 = diffs.iter().map(|d| d.elements as u128).sum();
+    let global_mae = if total_elems > 0 {
+        diffs
+            .iter()
+            .map(|d| d.mae * d.elements as f64)
+            .sum::<f64>()
+            / total_elems as f64
+    } else {
+        0.0
+    };
+
+    println!("reference:  {}", args.reference.display());
+    println!("candidate:  {}", args.candidate.display());
+    println!(
+        "tensors:    {compared} compared, {} changed (quantizer touched), {} verbatim",
+        changed.len(),
+        compared - changed.len()
+    );
+    println!("global element-weighted MAE: {global_mae:.6}");
+    println!("worst relative-L2:           {worst_rel:.6}");
+    println!();
+    println!(
+        "{:>10}  {:>10}  {:>10}  {:>12}  {:>16}  {}",
+        "rel_L2", "max_abs", "mae", "elements", "qtype ref->cand", "tensor"
+    );
+    for d in diffs.iter().take(args.top) {
+        println!(
+            "{:>10.6}  {:>10.6}  {:>10.6}  {:>12}  {:>7}->{:<8}  {}",
+            d.rel_rms,
+            d.max_abs,
+            d.mae,
+            d.elements,
+            quant_type_label(d.quant_type_ref),
+            quant_type_label(d.quant_type_cand),
+            d.name,
+        );
+    }
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    println!();
+    if worst_rel <= args.rel_rms_threshold {
+        println!(
+            "VERDICT: quantization is faithful in weight space (worst rel-L2 {worst_rel:.4} <= {:.4}).",
+            args.rel_rms_threshold
+        );
+        println!(
+            "         Any rendered-image drift vs the reference is trajectory divergence"
+        );
+        println!(
+            "         (sampler chaos), NOT weight corruption. Gate on perceptual/early-latent"
+        );
+        println!("         metrics, not exact pixel comparison.");
+    } else {
+        println!(
+            "VERDICT: {} tensor(s) exceed rel-L2 {:.4} (worst {worst_rel:.4}) — real quant",
+            changed.iter().filter(|d| d.rel_rms > args.rel_rms_threshold).count(),
+            args.rel_rms_threshold
+        );
+        println!("         corruption. Investigate the encode path for the top-ranked tensor(s).");
+    }
     Ok(())
 }
 
@@ -949,24 +1196,45 @@ fn generate_mrflow_txt2img(
         args.mrflow_total_steps,
     )?;
 
+    // Draft-mode Stage-2 is latent-space by default (model-agnostic, SeFi-safe).
+    // Pixel-space super-resolution (`--mrflow-sr`) is an opt-in overlay that only
+    // works for fully pixel-derivable latents; SeFi's semantic channels cannot be
+    // recovered from pixels, so guard it with a clear error rather than a hang.
+    let is_sefi = pipeline.metadata().pipeline.sefi;
+    let use_pixel_sr = args.mrflow_sr.is_some();
+    if use_pixel_sr && is_sefi {
+        anyhow::bail!(
+            "--mrflow-sr pixel-space super-resolution is not supported for SeFi models: the \
+             semantic latent channels cannot be recovered from RGB. Run --mrflow without \
+             --mrflow-sr to use the latent-space refine."
+        );
+    }
+
     // Stage 1: fast low-resolution generate with the preset step count and CFG.
+    // Capture the FULL latent (all channels, e.g. SeFi's 144) for the
+    // latent-space Stage-2 refine.
     first_pass_request.width = low_width;
     first_pass_request.height = low_height;
     first_pass_request.steps = stage1_steps;
     first_pass_request.cfg_scale = params.cfg_scale;
     first_pass_request.send_images = true;
     let mut stage1_progress = step_timing_progress("mrflow-stage1", batch_images);
-    let first_pass = pipeline.generate_batch_with_progress_and_runtime_options(
+    let (first_pass, stage1_full_latent) = pipeline.generate_batch_capturing_latent(
         first_pass_request.clone(),
         runtime_options,
-        &mut stage1_progress,
+        Some(&mut stage1_progress),
     )?;
 
-    // Stage 2: decode + pixel-space upscale to the target resolution. With a
-    // RealESRGAN model, run it (by its native factor) then cover-resize to the
-    // exact target; otherwise a plain cover-resize placeholder.
-    let decoded = decode_png_images_to_rgb_batch(&first_pass.images)?;
-    let (upscaled, sr_label) = if let Some(sr_path) = args.mrflow_sr.as_ref() {
+    let refine_steps = params.refine_steps.max(1);
+    let (mut output, sr_label) = if use_pixel_sr {
+        // Stage 2 (SR overlay): decode + pixel-space upscale to the target
+        // resolution with a RealESRGAN model, then re-encode and run the
+        // direct-sigma refine via img2img. Pixel-derivable latents only.
+        let decoded = decode_png_images_to_rgb_batch(&first_pass.images)?;
+        let sr_path = args
+            .mrflow_sr
+            .as_ref()
+            .expect("mrflow_sr checked present above");
         let sr_model = hipfire_diffusion::DiffusionSuperResModel::open_hfq(&resolve_model_path(
             sr_path.clone(),
             loaded,
@@ -978,41 +1246,57 @@ fn generate_mrflow_txt2img(
             sr_model.scale(),
             sr_start.elapsed().as_secs_f64(),
         );
-        let resized = resize_rgb_batch_to_cover_nearest(&sr_upscaled, target_width, target_height)?;
-        (resized, format!("realesrgan-x{}", sr_model.scale()))
-    } else {
-        (
-            resize_rgb_batch_to_cover_nearest(&decoded, target_width, target_height)?,
-            "nearest-cover (placeholder)".to_string(),
-        )
-    };
+        let upscaled =
+            resize_rgb_batch_to_cover_nearest(&sr_upscaled, target_width, target_height)?;
 
-    // Stage 3+4: re-encode the upscaled image and run the direct-sigma refine.
-    let mut refine_batch = first_pass_request;
-    refine_batch.width = target_width;
-    refine_batch.height = target_height;
-    refine_batch.steps = params.refine_steps.max(1);
-    refine_batch.send_images = true;
-    let mut refine_progress = step_timing_progress("mrflow-refine", batch_images);
-    let mut output = pipeline.generate_img2img_batch_with_progress_and_runtime_options(
-        DiffusionImg2ImgRequest {
-            batch: refine_batch,
-            init_image: upscaled,
-            mask: None,
-            inpainting_fill: None,
-            resize_mode: Default::default(),
-            // Ignored when refine_sigma is set; the direct-sigma schedule drives
-            // the refine.
-            denoising_strength: 1.0,
-            refine_sigma: Some(RefineSigmaSchedule {
-                first_sigma: refine_sigma,
-                steps: params.refine_steps.max(1),
-                shifted: args.mrflow_shifted,
-            }),
-        },
-        runtime_options,
-        &mut refine_progress,
-    )?;
+        let mut refine_batch = first_pass_request.clone();
+        refine_batch.width = target_width;
+        refine_batch.height = target_height;
+        refine_batch.steps = refine_steps;
+        refine_batch.send_images = true;
+        let mut refine_progress = step_timing_progress("mrflow-refine", batch_images);
+        let output = pipeline.generate_img2img_batch_with_progress_and_runtime_options(
+            DiffusionImg2ImgRequest {
+                batch: refine_batch,
+                init_image: upscaled,
+                mask: None,
+                inpainting_fill: None,
+                resize_mode: Default::default(),
+                // Ignored when refine_sigma is set; the direct-sigma schedule
+                // drives the refine.
+                denoising_strength: 1.0,
+                refine_sigma: Some(RefineSigmaSchedule {
+                    first_sigma: refine_sigma,
+                    steps: refine_steps,
+                    shifted: args.mrflow_shifted,
+                }),
+            },
+            runtime_options,
+            &mut refine_progress,
+        )?;
+        (output, format!("realesrgan-x{}", sr_model.scale()))
+    } else {
+        // Stage 2 (default): generic latent-space refine. Upscale the Stage-1
+        // latent in latent space, add refine noise, and re-denoise with the
+        // model's own denoiser (SeFi dual-stream or standard). No pixel
+        // re-encode, so model-specific latent channels are carried through.
+        let mut refine_batch = first_pass_request.clone();
+        refine_batch.width = target_width;
+        refine_batch.height = target_height;
+        refine_batch.steps = refine_steps;
+        refine_batch.send_images = true;
+        let mut refine_progress = step_timing_progress("mrflow-refine", batch_images);
+        let output = pipeline.generate_draft_refine(
+            refine_batch,
+            stage1_full_latent,
+            refine_sigma,
+            refine_steps,
+            args.mrflow_shifted,
+            runtime_options,
+            Some(&mut refine_progress),
+        )?;
+        (output, "latent-space (no pixel SR)".to_string())
+    };
     if let Some(map) = output.info.as_object_mut() {
         map.insert("mode".to_string(), serde_json::json!("txt2img-mrflow"));
         map.insert(
@@ -1023,13 +1307,10 @@ fn generate_mrflow_txt2img(
         map.insert("stage1_height".to_string(), serde_json::json!(low_height));
         map.insert("stage1_steps".to_string(), serde_json::json!(stage1_steps));
         map.insert("refine_sigma".to_string(), serde_json::json!(refine_sigma));
-        map.insert(
-            "refine_steps".to_string(),
-            serde_json::json!(params.refine_steps.max(1)),
-        );
+        map.insert("refine_steps".to_string(), serde_json::json!(refine_steps));
         map.insert(
             "total_steps".to_string(),
-            serde_json::json!(stage1_steps + params.refine_steps.max(1)),
+            serde_json::json!(stage1_steps + refine_steps),
         );
         map.insert("upscale_factor".to_string(), serde_json::json!(upscale));
         map.insert("target_width".to_string(), serde_json::json!(target_width));

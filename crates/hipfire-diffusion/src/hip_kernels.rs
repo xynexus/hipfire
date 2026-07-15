@@ -939,6 +939,65 @@ extern "C" __global__ void diffusion_concat_last_dim_f32(
         output[idx] = b[row * right_width + (col - left_width)];
     }
 }
+
+extern "C" __global__ void diffusion_concat_sequence_3d_f32(
+    const float* left,
+    const float* right,
+    float* output,
+    int total_outputs,
+    int left_seq,
+    int right_seq,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int col = idx % width;
+    int token = (idx / width) % (left_seq + right_seq);
+    int batch = idx / (width * (left_seq + right_seq));
+    if (token < left_seq) {
+        output[idx] = left[(batch * left_seq + token) * width + col];
+    } else {
+        output[idx] = right[(batch * right_seq + token - left_seq) * width + col];
+    }
+}
+
+extern "C" __global__ void diffusion_slice_sequence_3d_f32(
+    const float* input,
+    float* output,
+    int total_outputs,
+    int input_seq,
+    int start,
+    int output_seq,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int col = idx % width;
+    int token = (idx / width) % output_seq;
+    int batch = idx / (width * output_seq);
+    output[idx] = input[(batch * input_seq + start + token) * width + col];
+}
+
+extern "C" __global__ void diffusion_slice_last_dim_3d_f32(
+    const float* input,
+    float* output,
+    int total_outputs,
+    int input_width,
+    int start,
+    int output_width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int col = idx % output_width;
+    int row = idx / output_width;
+    output[idx] = input[row * input_width + start + col];
+}
 "#;
 
 pub(crate) const DIFFUSION_LINEAR_HIP_SRC: &str = r#"
@@ -1017,6 +1076,42 @@ extern "C" __global__ void diffusion_layer_norm_rows_f32(
 
     for (int c = lane; c < cols; c += 32) {
         output[base + c] = (input[base + c] - mean) * inv_std * weight[c] + bias[c];
+    }
+}
+
+extern "C" __global__ void diffusion_layer_norm_no_affine_rows_f32(
+    const float* input,
+    float* output,
+    int rows,
+    int cols,
+    float eps
+) {
+    int lane = threadIdx.x & 31;
+    int wave = threadIdx.x >> 5;
+    int row = blockIdx.x * (blockDim.x >> 5) + wave;
+    if (row >= rows) {
+        return;
+    }
+    long base = (long)row * cols;
+    float s = 0.0f;
+    for (int c = lane; c < cols; c += 32) {
+        s += input[base + c];
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        s += __shfl_down(s, off);
+    }
+    float mean = __shfl(s, 0) / (float)cols;
+    float vs = 0.0f;
+    for (int c = lane; c < cols; c += 32) {
+        float d = input[base + c] - mean;
+        vs += d * d;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        vs += __shfl_down(vs, off);
+    }
+    float inv_std = rsqrtf(__shfl(vs, 0) / (float)cols + eps);
+    for (int c = lane; c < cols; c += 32) {
+        output[base + c] = (input[base + c] - mean) * inv_std;
     }
 }
 "#;
@@ -1422,6 +1517,57 @@ extern "C" __global__ void diffusion_clip_causal_attention_f32(
     }
     output[idx] = sum > 0.0f ? acc / sum : 0.0f;
 }
+
+// Qwen3 right-padded causal attention. `valid_keys` is the length of the
+// contiguous true prefix in the tokenizer attention mask. Padded queries are
+// still evaluated, but they can only attend to real prefix keys, exactly as
+// the additive Transformers attention mask specifies.
+extern "C" __global__ void diffusion_qwen3_masked_causal_attention_f32(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* output,
+    int total_outputs,
+    int seq,
+    int hidden,
+    int heads,
+    int head_dim,
+    int valid_keys
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int d = idx % hidden;
+    int qi = idx / hidden;
+    int head = d / head_dim;
+    int head_off = head * head_dim;
+    int local_d = d - head_off;
+    int key_limit = min(qi + 1, valid_keys);
+    float scale = rsqrtf((float)head_dim);
+
+    float max_score = -INFINITY;
+    for (int ki = 0; ki < key_limit; ++ki) {
+        float dot = 0.0f;
+        for (int hd = 0; hd < head_dim; ++hd) {
+            dot += q[qi * hidden + head_off + hd] * k[ki * hidden + head_off + hd];
+        }
+        max_score = fmaxf(max_score, dot * scale);
+    }
+
+    float sum = 0.0f;
+    float acc = 0.0f;
+    for (int ki = 0; ki < key_limit; ++ki) {
+        float dot = 0.0f;
+        for (int hd = 0; hd < head_dim; ++hd) {
+            dot += q[qi * hidden + head_off + hd] * k[ki * hidden + head_off + hd];
+        }
+        float weight = expf(dot * scale - max_score);
+        acc += weight * v[ki * hidden + head_off + local_d];
+        sum += weight;
+    }
+    output[idx] = sum > 0.0f ? acc / sum : 0.0f;
+}
 "#;
 
 pub(crate) const DIFFUSION_GEGLU_GATE_HIP_SRC: &str = r#"
@@ -1446,6 +1592,26 @@ extern "C" __global__ void diffusion_geglu_gate_3d_f32(
     float gelu_arg = 1.1283791670955126f * (gate_value + 0.044715f * gate_value * gate_value * gate_value);
     float gate = 0.5f * gate_value * (1.0f + tanhf(gelu_arg));
     output[idx] = value * gate;
+}
+
+// FLUX.2 fused MLP projection: out = silu(first_half) * second_half.
+extern "C" __global__ void diffusion_silu_glu_first_3d_f32(
+    const float* input,
+    float* output,
+    int total_outputs,
+    int inner,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int col = idx % inner;
+    int row = idx / inner;
+    int src = row * width;
+    float first = input[src + col];
+    float second = input[src + inner + col];
+    output[idx] = (first / (1.0f + expf(-first))) * second;
 }
 "#;
 
