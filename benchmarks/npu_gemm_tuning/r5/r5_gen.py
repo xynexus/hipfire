@@ -5,7 +5,7 @@
 # ROWS * KSLICE * 16 (each core's KSLICE-mmul partial is KSLICE*16, summed over ROWS
 # by the cascade). Columns are independent -> COLS C blocks of 64 i32 each.
 #
-# Usage: r5_gen.py COLS ROWS > r5_array.mlir   (then build with r5_build.sh)
+# Usage: r5_gen.py COLS ROWS NB > r5_array.mlir   (then build with r5_build.sh)
 import os, sys
 
 # R5_ARCH: aie2p = Strix Halo/npu2 (default; 8 cols x 4 rows, int8xint4 <4,16,16>);
@@ -21,6 +21,7 @@ else:
 
 COLS = int(sys.argv[1]) if len(sys.argv) > 1 else min(8, MAXCOL)
 ROWS = int(sys.argv[2]) if len(sys.argv) > 2 else 4  # cascade depth per column (tile rows 2..2+ROWS-1)
+NB = int(sys.argv[3]) if len(sys.argv) > 3 else 1  # output tiles streamed per dispatch
 if COLS > MAXCOL:
     sys.exit(f"COLS={COLS} exceeds {ARCH} column count {MAXCOL}")
 if ROWS > 4:

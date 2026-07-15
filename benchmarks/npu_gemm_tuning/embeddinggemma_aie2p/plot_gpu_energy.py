@@ -20,19 +20,19 @@ def main() -> None:
 
     summary = []
     for label, samples in grouped.items():
-        values = lambda field: [float(sample[field]) for sample in samples]
+        field_values = lambda field: [float(sample[field]) for sample in samples]
         summary.append(
             {
                 "label": label,
                 "bytes": int(samples[0]["bytes"]),
                 "runs": len(samples),
-                "tok_s_median": statistics.median(values("tok_s")),
-                "tok_s_min": min(values("tok_s")),
-                "tok_s_max": max(values("tok_s")),
-                "pkg_w_median": statistics.median(values("pkg_w")),
-                "dyn_w_median": statistics.median(values("dyn_w")),
-                "pkg_tok_j_median": statistics.median(values("pkg_tok_j")),
-                "dyn_tok_j_median": statistics.median(values("dyn_tok_j")),
+                "tok_s_median": statistics.median(field_values("tok_s")),
+                "tok_s_min": min(field_values("tok_s")),
+                "tok_s_max": max(field_values("tok_s")),
+                "pkg_w_median": statistics.median(field_values("pkg_w")),
+                "dyn_w_median": statistics.median(field_values("dyn_w")),
+                "pkg_tok_j_median": statistics.median(field_values("pkg_tok_j")),
+                "dyn_tok_j_median": statistics.median(field_values("dyn_tok_j")),
             }
         )
     summary.sort(key=lambda row: row["tok_s_median"])
@@ -57,19 +57,19 @@ def main() -> None:
         ("pkg_tok_j_median", "Package efficiency (tokens/joule)"),
     ]
     for axis, (field, title) in zip(axes, metrics):
-        values = [row[field] for row in plotted]
-        bars = axis.barh(labels, values, color=colors)
+        plot_values = [float(row[field]) for row in plotted]
+        bars = axis.barh(labels, plot_values, color=colors)
         axis.set_title(title, fontweight="bold")
         axis.grid(axis="x", alpha=0.25)
         axis.set_axisbelow(True)
         decimals = 1 if field == "pkg_tok_j_median" else 0
         axis.bar_label(
             bars,
-            labels=[f"{value:,.{decimals}f}" for value in values],
+            labels=[f"{value:,.{decimals}f}" for value in plot_values],
             padding=3,
             fontsize=8,
         )
-        axis.set_xlim(0, max(values) * 1.16)
+        axis.set_xlim(0, max(plot_values) * 1.16)
     bf16 = references.get("EmbeddingGemma-300M.bf16")
     reference_note = ""
     if bf16:

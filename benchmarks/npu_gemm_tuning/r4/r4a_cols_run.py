@@ -25,10 +25,10 @@ N_BTILES = int(os.environ["N_BTILES"])
 SZ_A, SZ_C, SZ_Bb = 64, 64, 128  # int8 A tile / int32 C tile / packed-int4 W tile (128 B)
 MACS = COLS * N_BTILES * (INNER + 1) * NACC * 1024
 
-a_ty = np.ndarray[(NACC * SZ_A,), np.dtype[np.int8]]
-w_ty = np.ndarray[(SZ_Bb,), np.dtype[np.int8]]
-in_w_ty = np.ndarray[(N_BTILES * SZ_Bb,), np.dtype[np.int8]]
-c_ty = np.ndarray[(NACC * SZ_C,), np.dtype[np.int32]]
+a_ty: object = np.ndarray[(NACC * SZ_A,), np.dtype[np.int8]]
+w_ty: object = np.ndarray[(SZ_Bb,), np.dtype[np.int8]]
+in_w_ty: object = np.ndarray[(N_BTILES * SZ_Bb,), np.dtype[np.int8]]
+c_ty: object = np.ndarray[(NACC * SZ_C,), np.dtype[np.int32]]
 
 flags = ["-std=c++20", "-O2", f"-DNACC={NACC}", f"-DINNER={INNER}"]
 kern = ExternalFunction("r2a_mac", source_file="../r2/r2a_gemm.cc",
