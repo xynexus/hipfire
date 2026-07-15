@@ -235,8 +235,38 @@ linear and SDPA parity probes remain because they establish exact operator
 contracts, but exact projections and attention alone do not close the
 whole-model admission gap.
 
-The frozen Phase-5 verdict is therefore unchanged: the best result remains
+The best result remains
 `~/.hipfire/evidence/gemma4/base-short-hipfire-all-layers-embed-bf16-rope-order`
-at final-logit maximum error `0.5618224143981934`. Phase 5 stops here; the SWA
-crossing, instruction-checkpoint admission, and later model-variant phases are
-not advanced.
+at final-logit maximum error `0.5618224143981934`, with exact greedy generation,
+argmax, and top-5 agreement throughout. It remains above the frozen `0.5` limit.
+
+## Post-freeze BF16 reference-variability control
+
+`benchmarks/gemma4/control_noise_bf16.py` runs the same pinned Transformers
+checkpoint under unpadded/padded and `sdpa`/`eager` BF16 executions. The initial
+four-sample control observed an all-pairs final-logit maximum difference of
+`0.6875`, hidden-state worst NRMSE `0.055774`, and minimum hidden cosine
+`0.998456`; layer 57 was the worst hidden-state hotspot. This is strong evidence
+that the retained Hipfire trajectory overlaps a real region of BF16
+reduction-order sensitivity rather than a single gross operator defect.
+
+It is not admission evidence. The control was run after the Hipfire result, it
+covers one five-token prompt, and the all-pairs maximum may be produced by two
+alternate executions rather than by the pinned unpadded SDPA oracle used by the
+frozen comparator. Calling it an irreducible noise floor would overstate what the
+measurement proves. The tool therefore records both the canonical-oracle
+envelope and all six pairwise comparisons, along with output hashes and exact
+decision agreement. The Phase-0 `0.5`/`0.045`/`0.999` limits remain unchanged.
+
+The independent `halo` rerun reproduced the committed all-pairwise extrema
+exactly. Its canonical unpadded-SDPA envelope was `0.625` final-logit maximum
+absolute difference, `0.0518795542` worst hidden NRMSE, and `0.9986535068`
+minimum hidden cosine. The broader all-pairwise values were `0.6875`,
+`0.0557740958`, and `0.9984564247`. The committed artifact now includes that
+canonical/all-pairs split, ROCm/device provenance, sample hashes, decision
+summaries, and non-finite counts.
+
+The original base-short verdict is therefore unchanged: final-logit maximum
+error is `0.5618224143981934`; hidden thresholds fail at layers 39, 52, 56, 57,
+and 58. Phase 5 stops here, so the SWA-crossing, multi-global, reload/sequential,
+instruction-checkpoint, and later variant gates are not advanced.

@@ -10,10 +10,10 @@ use crate::weights::{load_dense_weights, Gemma4DenseWeights};
 use hipfire_dispatch::pipeline::superop::LoweredForward;
 use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_runtime::arch::{
-    run_simple_ar, ArchCaps, Architecture, EosFilterOverrides, FactoryLoadedBackend, GenerateCtx,
-    ModelShapeProfile, OutputProtocol, PromptFrameOverrides, PromptGenerationProfile,
-    SamplerOverrides, ServeOutcome, ServingBackend, ServingFactory, ServingFactoryOptions,
-    SimpleAr,
+    run_simple_ar_with_terminators, ArchCaps, Architecture, EosFilterOverrides,
+    FactoryLoadedBackend, GenerateCtx, ModelShapeProfile, OutputProtocol, PromptFrameOverrides,
+    PromptGenerationProfile, SamplerOverrides, ServeOutcome, ServingBackend, ServingFactory,
+    ServingFactoryOptions, SimpleAr,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -52,7 +52,7 @@ fn generation_eos_ids(metadata: &serde_json::Value) -> Vec<u32> {
     }
 }
 
-fn generation_eos_ids_from_hfq(hfq: &HfqFile) -> Vec<u32> {
+pub fn generation_eos_ids_from_hfq(hfq: &HfqFile) -> Vec<u32> {
     serde_json::from_str::<serde_json::Value>(&hfq.metadata_json)
         .map(|metadata| generation_eos_ids(&metadata))
         .unwrap_or_else(|_| vec![1])
@@ -127,7 +127,7 @@ pub struct Gemma4Backend {
     weights: Gemma4DenseWeights,
     state: Gemma4DenseState,
     lowered: LoweredForward,
-    eos_token_id: u32,
+    eos_token_ids: Vec<u32>,
 }
 
 impl Gemma4Backend {
@@ -135,15 +135,18 @@ impl Gemma4Backend {
         config: Gemma4Config,
         weights: Gemma4DenseWeights,
         state: Gemma4DenseState,
-        eos_token_id: u32,
+        mut eos_token_ids: Vec<u32>,
     ) -> Self {
+        if eos_token_ids.is_empty() {
+            eos_token_ids.push(1);
+        }
         let lowered = lower_dense_forward(&config, &state);
         Self {
             config,
             weights,
             state,
             lowered,
-            eos_token_id,
+            eos_token_ids,
         }
     }
 }
@@ -202,7 +205,7 @@ impl ServingBackend for Gemma4Backend {
     }
 
     fn eos_token(&self) -> u32 {
-        self.eos_token_id
+        self.eos_token_ids[0]
     }
 
     fn serve(
@@ -211,10 +214,11 @@ impl ServingBackend for Gemma4Backend {
         tok: &Tokenizer,
         ctx: &mut GenerateCtx,
     ) -> Result<ServeOutcome, String> {
-        let eos = tok
-            .special_token_id("<end_of_turn>")
-            .unwrap_or(self.eos_token_id);
-        run_simple_ar(gpu, self, tok, eos, ctx)
+        // Copy the tiny metadata-declared set so `self` can be borrowed mutably
+        // by the shared decode loop. Gemma 4 instruction checkpoints declare
+        // `[1, 106, 50]`; none may leak into visible output.
+        let terminators = self.eos_token_ids.clone();
+        run_simple_ar_with_terminators(gpu, self, tok, &terminators, ctx)
     }
 
     fn reset_session(&mut self, _gpu: &mut Gpu, _session_id: &str) -> Result<(), String> {
@@ -261,7 +265,6 @@ impl ServingFactory for Gemma4ServingFactory {
         let physical_cap =
             bounded_physical_cap(options.max_seq, config.max_position_embeddings, default_cap)?;
         let eos_token_ids = generation_eos_ids_from_hfq(hfq);
-        let eos_token_id = eos_token_ids[0];
         let instruction_tuned = eos_token_ids.len() > 1;
         let weights = load_dense_weights(hfq, gpu, &config)
             .map_err(|error| format!("Gemma 4 weights: {error:?}"))?;
@@ -286,7 +289,7 @@ impl ServingFactory for Gemma4ServingFactory {
         };
         let _ = options.kv_mode;
         Ok(FactoryLoadedBackend {
-            backend: Box::new(Gemma4Backend::new(config, weights, state, eos_token_id)),
+            backend: Box::new(Gemma4Backend::new(config, weights, state, eos_token_ids)),
             family: self.family(),
             shape,
             profile,

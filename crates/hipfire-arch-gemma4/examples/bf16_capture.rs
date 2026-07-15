@@ -9,8 +9,8 @@
 //! already rendered (raw for base models, official Jinja bytes for IT models).
 
 use hipfire_arch_gemma4::{
-    forward_step_lowered, forward_step_reference, load_dense_weights, lower_dense_forward, Gemma4,
-    Gemma4DenseState, Gemma4ForwardCapture,
+    forward_step_lowered, forward_step_reference, generation_eos_ids_from_hfq, load_dense_weights,
+    lower_dense_forward, Gemma4, Gemma4DenseState, Gemma4ForwardCapture,
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
@@ -86,6 +86,7 @@ fn main() -> Result<(), String> {
         return Err("rendered prompt tokenized to zero ids".to_string());
     }
     let config = Gemma4::config_from_hfq(&hfq)?;
+    let eos_token_ids = generation_eos_ids_from_hfq(&hfq);
     let layers = parse_layers(&args[4], config.num_hidden_layers)?;
     if operator_layer.is_some_and(|layer| layer >= config.num_hidden_layers) {
         return Err(format!(
@@ -153,10 +154,9 @@ fn main() -> Result<(), String> {
 
     let mut generated_ids = Vec::with_capacity(max_new);
     let mut next = *argmax_per_position.last().expect("nonempty prompt");
-    let end_of_turn = tokenizer.special_token_id("<end_of_turn>");
     for step in 0..max_new {
         generated_ids.push(next);
-        if tokenizer.is_terminator(next) || end_of_turn == Some(next) {
+        if tokenizer.is_terminator(next) || eos_token_ids.contains(&next) {
             break;
         }
         forward_step_lowered(

@@ -13,7 +13,7 @@ pub mod config;
 pub mod forward;
 pub mod weights;
 
-pub use arch::{Gemma4, Gemma4Backend};
+pub use arch::{generation_eos_ids_from_hfq, Gemma4, Gemma4Backend};
 
 pub use config::{Gemma4Config, Gemma4LayerPlan};
 pub use forward::{

@@ -22,11 +22,11 @@ SWA-crossing, 31B-it model admission, and later variant phases were not advanced
 | 3 — layered KV | passed | Mixed full/SWA geometry, shared-producer planning, exact storage accounting, reset, and GPU boundary parity are implemented. |
 | 4 — primitives/lowered forward | passed | Proportional RoPE, weightless RMSNorm, vector softcap, reference forward, and lowered dense forward passed operator, tiny-model, portability-compile, and coherence gates. |
 | 5 — dense 31B/serving | blocked | Dense loading, bounded state, lowered execution, and the boxed serving factory exist, but the real 31B BF16 base-short gate failed. |
-| 6 — prompt/tools/sampling | partial, not admitted | Official Jinja byte rendering, native tool grammar, channel-aware output, and generic top-k 64 are implemented and unit-tested. Full token-ID, stop-ID, and 31B-it model gates are not complete. |
+| 6 — prompt/tools/sampling | implementation gates passed, model not admitted | Official Jinja bytes and all 1,640 fixture token IDs match; native tools/channels, metadata EOS IDs `[1, 106, 50]`, and generic top-k 64 pass their gates. 31B-it remains unadmitted because Phase 5 is blocked. |
 | 7 — PLE/KV sharing | scaffold only | Config lowering and generic shared-KV storage exist; the real Gemma 4 loader/forward intentionally rejects PLE and shared-KV variants. |
 | 8 — dense-plus-MoE | scaffold only | Ingest/config/toy coverage exists; no Gemma 4 routed-expert runtime or real-model admission exists. |
 | 9 — quant/eval | not started | No Gemma 4 quant or eval battery is admitted because BF16 has not passed. |
-| 10 — unified/multimodal/MTP | not started | Only fixture/config investigation exists; no unified 12B, multimodal, or MTP runtime is claimed. |
+| 10 — unified/multimodal/DSpark | not started | Only fixture/config investigation exists; no unified 12B, multimodal, or DSpark spec-decode runtime is claimed. |
 
 The best retained valid 31B result is
 `~/.hipfire/evidence/gemma4/base-short-hipfire-all-layers-embed-bf16-rope-order`:
@@ -38,16 +38,27 @@ The best retained valid 31B result is
 - hidden-state thresholds fail first at layer 39 and also at layers 52, 56, 57,
   and 58.
 
-Subsequent BF16-boundary, batched-prefill, attention, and exact rocBLAS
+Subsequent BF16-boundary, batched-prefill, attention, and exact-rocBLAS
 experiments did not pass the unchanged gate. Their exact results are recorded in
 `benchmarks/gemma4/PHASE5.md`; unadmitted serving integrations were removed.
 rocBLAS remains only in standalone numerical parity diagnostics, where it proves
 bit-exact BF16 projection and ROCm math-SDPA contracts.
 
+A post-freeze Transformers reference-variability control is retained at
+`benchmarks/gemma4/control-noise-31B.json`. It shows that alternate BF16
+reference executions can diverge at the same late-stack hotspots, which is useful
+diagnostic context. It does not change the frozen Phase-0 limits or convert the
+failed comparison into admission evidence.
+
+The Phase-6 implementation gates are complete: official rendered bytes and
+1,640 token IDs match across 36 committed cases, the full metadata stop-ID set
+is carried through serving, and native tools/channels plus top-k 64 pass unit
+coverage. This is not a model admission claim; the Phase-5 stop remains binding.
+
 The support matrix therefore intentionally continues to advertise Gemma 4 as
 unsupported (`prefill = "none"`, no KV capability) until a future implementation
-passes the frozen Phase 5 gates. Phases 0 through 5 have detailed evidence and
-reuse/cleanup ledgers in `benchmarks/gemma4/PHASE0.md` through `PHASE5.md`.
+passes the frozen Phase 5 gates. Phases 0 through 6 have detailed evidence and
+reuse/cleanup ledgers in `benchmarks/gemma4/PHASE0.md` through `PHASE6.md`.
 
 ## Goal
 
@@ -61,13 +72,13 @@ the family necessarily crosses:
 - boxed serving and generation policy;
 - prompt, thinking, tool-call, and output-channel handling;
 - dense, PLE/KV-sharing, and MoE variants;
-- later, multimodal adapters and MTP.
+- later, multimodal adapters and DSpark speculative decoding.
 
 The first admitted product target is **Gemma-4-31B-it text generation in BF16**.
 The complete text-family target is E2B, E4B, 12B unified, 26B-A4B, and 31B,
-base and instruction-tuned where checkpoints exist. Multimodal input and MTP
-are later, explicit capability phases; a working 31B text decoder must not be
-advertised as blanket "Gemma 4 multimodal support."
+base and instruction-tuned where checkpoints exist. Multimodal input and DSpark
+speculative decoding are later, explicit capability phases; a working 31B text
+decoder must not be advertised as blanket "Gemma 4 multimodal support."
 
 Correctness comes before quantization, fusion, or speed. Python/Transformers is
 allowed as an offline oracle and fixture generator, never in the inference hot
@@ -116,8 +127,10 @@ against:
   <https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4>
 - Google Gemma 4 function calling:
   <https://ai.google.dev/gemma/docs/capabilities/text/function-calling-gemma4>
-- Google Gemma MTP overview:
-  <https://ai.google.dev/gemma/docs/mtp/overview>
+- hipfire spec-decode foundation for the DSpark drafter phase (the `SpecTarget`
+  verifier seam, `DsparkBody` drafter core, and `.dspark.hfq` sidecar format):
+  `crates/hipfire-specdecode-dspark/` and the gemma3 DSpark plan
+  `docs/plans/2026-07-07-gemma3-4b-dspark-dflash-cask.md`.
 
 Do not infer missing fields from Gemma 3. Structural fields must be present and
 validated; defaults are allowed only where upstream defines a stable default and
@@ -148,7 +161,7 @@ head-dimension representation.
 2. **One base architecture id.** Reserve `ARCH_ID_GEMMA4 = 24` for all Gemma 4
    text-core configurations. `gemma4`, `gemma4_text`, `gemma4_unified`, and
    `gemma4_unified_text` map to the same id; a typed wrapper enum preserves the
-   source distinction. Modality and MTP artifacts are roles/capabilities, not new
+   source distinction. Modality and DSpark artifacts are roles/capabilities, not new
    base ids.
 3. **No new Option soup.** Gemma 4 loads into a generic
    `Box<dyn ServingBackend>` slot. Do not add `gemma4_text: Option<...>` to
@@ -170,7 +183,7 @@ head-dimension representation.
    error; falling back to Gemma 3 or ChatML is silent model corruption.
 9. **No legacy names.** New artifacts follow the canonical names, for example
    `Gemma-4-31B-it.bf16.hfq`, `Gemma-4-E4B-it.mq4.hfq`, and role sidecars such as
-   `.vl.hfq`, `.audio.hfq`, `.mtp.hfq`, or `.jinja.hfq` when independently loaded.
+   `.vl.hfq`, `.audio.hfq`, `.dspark.hfq`, or `.jinja.hfq` when independently loaded.
 
 ## Code-reuse and cleanup contract
 
@@ -616,7 +629,7 @@ Exit gate:
 - every packaged artifact identifies source snapshot, calibration data, format,
   arch, and prompt/template provenance.
 
-### Phase 10 — 12B unified text, multimodal roles, and MTP
+### Phase 10 — 12B unified text, multimodal roles, and DSpark speculative decoding
 
 These are three separate subprojects, not one "finish Gemma 4" checkbox.
 
@@ -629,12 +642,42 @@ These are three separate subprojects, not one "finish Gemma 4" checkbox.
    actually match.
 3. **12B unified multimodal:** implement its direct projection/mask behavior as a
    distinct adapter; do not force it through the standard encoder adapter.
-4. **MTP:** add target/assistant activation and shared-embedding/KV contracts only
-   after target batched verification is correct. Package independently as `.mtp`.
+4. **DSpark speculative decoding:** add Gemma 4 to the shared spec-decode target
+   seam and train a block drafter, packaged independently as a `.dspark.hfq`
+   sidecar. Reuse `hipfire-specdecode-dspark`'s `SpecTarget` verifier boundary,
+   `DsparkBody` drafter core, greedy-accept rule, and `DsparkConfig`/`DsparkWeights`
+   sidecar format instead of adding a Gemma-4-only spec path:
+   - implement `SpecTarget for Gemma4Backend` — first a per-token
+     greedy-equivalent baseline, then a batched `verify_block` plus an
+     extract-layer residual-hidden tap that honors the local/global, PLE, and
+     KV-sharing layer layout; Gemma 4 has no recurrent state, so
+     `commit_prefix` may be a no-op only after tests prove that the next verify
+     re-anchors the layered cache and overwrites every rejected full/SWA tail
+     slot, matching the shared pure-attention target contract;
+   - implement a Gemma 4 `DsparkBody`, capture a `DSLB` label cache from the
+     admitted BF16 target, train the drafter through `hipfire-train`'s DSpark
+     path, and pack it with `dspark_convert` to `.dspark.hfq`;
+   - the same extract-layer target seam is the foundation a later DFlash sidecar
+     drives, so the hidden capture must stay drafter-agnostic, not DSpark-only.
 
 Each subproject requires its own config/tensor fixtures, CPU/HF oracle, feature
 entry, eval battery, and admission result. Audio/video preprocessing and tool
 messages containing modalities need separate prompt fixtures.
+
+DSpark exit gate:
+
+- `verify_block` reproduces the admitted AR target's greedy token IDs exactly on
+  the committed prompt suite — spec decode is a speedup, never a new decoder;
+- partial acceptance followed by another verify preserves the accepted prefix
+  and overwrites the rejected tail at SWA-1, SWA, SWA+1, and global-layer cache
+  boundaries before the no-op `commit_prefix` contract is admitted;
+- drafter acceptance length and end-to-end tokens/sec are measured against the AR
+  baseline on locally available checkpoints and recorded as `hipfire-eval`
+  evidence, not asserted;
+- the `.dspark.hfq` sidecar loads independently and records its provenance
+  (source snapshot, label corpus, target revision, arch);
+- Gemma 4 adds no spec-decode branch outside the shared `SpecTarget`/`DsparkBody`
+  seam, and the extract-layer tap is reachable by DFlash without a second capture.
 
 ## Verification matrix
 
@@ -725,7 +768,8 @@ Gemma 4 text support is complete only when:
 
 - Gemma 4 vision, audio, and video input;
 - 12B unified wrapper validation until its official checkpoint is local;
-- MTP/speculative decoding;
+- DSpark speculative decoding (a later Phase 10 subproject, never folded into
+  31B bring-up);
 - DFlash, TriAttention, CASK, or new KV quant formats;
 - pipeline/expert parallelism;
 - performance fusion before BF16 parity;

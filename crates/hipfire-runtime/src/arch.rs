@@ -679,13 +679,12 @@ pub trait SessionServingBackend {
 const _: Option<&dyn SessionServingBackend> = None;
 
 /// Shared dense-AR serving loop: tokenize the (pre-framed) prompt → prefill →
-/// greedy-decode, streaming JSONL `token` events to `ctx.sink` and a final
+/// decode, streaming JSONL `token` events to `ctx.sink` and a final
 /// `done`, stopping on EOS / `max_tokens` / a `stop_sequences` match. Every
 /// `SimpleAr` backend's `ServingBackend::serve` delegates here, so the loop
 /// lives in ONE place instead of per-arch `generate_*` copies.
 ///
-/// Greedy for now (matches the bring-up examples); top-p / repeat-penalty /
-/// loop-guard thread in as the daemon's sampler is migrated behind this driver.
+/// Sampling uses the shared sampler and remains greedy when temperature is zero.
 pub fn run_simple_ar(
     gpu: &mut Gpu,
     backend: &mut dyn SimpleAr,
@@ -693,12 +692,26 @@ pub fn run_simple_ar(
     eos: u32,
     ctx: &mut GenerateCtx,
 ) -> Result<ServeOutcome, String> {
+    run_simple_ar_with_terminators(gpu, backend, tok, &[eos], ctx)
+}
+
+/// Multi-terminator form of [`run_simple_ar`]. This is required by checkpoints
+/// whose generation metadata declares more than one EOS id (for example Gemma 4
+/// instruction models use `[1, 106, 50]`). The explicit set augments the
+/// tokenizer's own `eos_id`/`eot_id` pair instead of replacing it.
+pub fn run_simple_ar_with_terminators(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    terminators: &[u32],
+    ctx: &mut GenerateCtx,
+) -> Result<ServeOutcome, String> {
     let ids = tok.encode(ctx.prompt);
     if ids.is_empty() {
         return Err("run_simple_ar: empty prompt after tokenize".to_string());
     }
     backend.prefill(gpu, &ids)?;
-    decode_loop(gpu, backend, tok, eos, ctx, ids.len(), ids.len())
+    decode_loop_with_terminators(gpu, backend, tok, terminators, ctx, ids.len(), ids.len())
 }
 
 /// Shared post-prefill greedy decode loop: from the just-prefilled
@@ -808,6 +821,21 @@ fn emit_gemma4_output_events(
     emitted_tool_calls
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DecodedNext {
+    Terminator(String),
+    Content(String),
+}
+
+fn decode_next(tok: &crate::tokenizer::Tokenizer, token: u32, terminators: &[u32]) -> DecodedNext {
+    let decoded = tok.decode(&[token]);
+    if terminators.contains(&token) || tok.is_terminator(token) {
+        DecodedNext::Terminator(decoded)
+    } else {
+        DecodedNext::Content(decoded)
+    }
+}
+
 /// Shared post-prefill decode loop: from the just-prefilled `backend.logits()`,
 /// pick the next token → stream a JSONL `token` event → `decode_step`, until EOS
 /// / `max_tokens` / a `stop_sequences` match / a single-token attractor, then a
@@ -824,11 +852,24 @@ pub fn decode_loop(
     start_pos: usize,
     prompt_tokens: usize,
 ) -> Result<ServeOutcome, String> {
-    decode_loop_with_timing(
+    decode_loop_with_terminators(gpu, backend, tok, &[eos], ctx, start_pos, prompt_tokens)
+}
+
+/// Multi-terminator form of [`decode_loop`].
+pub fn decode_loop_with_terminators(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    terminators: &[u32],
+    ctx: &mut GenerateCtx,
+    start_pos: usize,
+    prompt_tokens: usize,
+) -> Result<ServeOutcome, String> {
+    decode_loop_with_timing_terminators(
         gpu,
         backend,
         tok,
-        eos,
+        terminators,
         ctx,
         start_pos,
         prompt_tokens,
@@ -843,6 +884,30 @@ pub fn decode_loop_with_timing(
     backend: &mut dyn SimpleAr,
     tok: &crate::tokenizer::Tokenizer,
     eos: u32,
+    ctx: &mut GenerateCtx,
+    start_pos: usize,
+    prompt_tokens: usize,
+    timing: DecodeLoopTiming,
+) -> Result<ServeOutcome, String> {
+    decode_loop_with_timing_terminators(
+        gpu,
+        backend,
+        tok,
+        &[eos],
+        ctx,
+        start_pos,
+        prompt_tokens,
+        timing,
+    )
+}
+
+/// Multi-terminator form of [`decode_loop_with_timing`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_loop_with_timing_terminators(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    terminators: &[u32],
     ctx: &mut GenerateCtx,
     start_pos: usize,
     prompt_tokens: usize,
@@ -914,24 +979,25 @@ pub fn decode_loop_with_timing(
         // Stop on explicit EOS or any tokenizer-declared terminator. Feed the
         // decoded terminator only to the native state machine so a structural
         // close token can complete a tool call; it is never emitted as text.
-        if next == eos || tok.is_terminator(next) {
-            if matches!(ctx.output_protocol, OutputProtocol::Gemma4Native) {
-                let marker = tok.decode(&[next]);
-                if let Some(state) = native_output.as_mut() {
-                    emitted_tool_calls |=
-                        emit_gemma4_output_events(ctx.sink, ctx.id, state.observe(&marker));
+        let frag = match decode_next(tok, next, terminators) {
+            DecodedNext::Terminator(marker) => {
+                if matches!(ctx.output_protocol, OutputProtocol::Gemma4Native) {
+                    if let Some(state) = native_output.as_mut() {
+                        emitted_tool_calls |=
+                            emit_gemma4_output_events(ctx.sink, ctx.id, state.observe(&marker));
+                    }
                 }
+                stop = StopReason::Eos;
+                break;
             }
-            stop = StopReason::Eos;
-            break;
-        }
+            DecodedNext::Content(frag) => frag,
+        };
         // Safety net for a single-token attractor that slips past the penalty
         // (or when penalty is off): if the same token would extend a run of 12,
         // stop rather than emit a wall of garbage.
         if committed.len() >= 11 && committed[committed.len() - 11..].iter().all(|&t| t == next) {
             break;
         }
-        let frag = tok.decode(&[next]);
         let filter_action = output_filter.observe(frag.as_bytes());
         let stop_after_emit = matches!(
             filter_action,
@@ -1031,4 +1097,40 @@ pub fn decode_loop_with_timing(
         decode_ms: Some(decode_ms),
         ttft_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_next, DecodedNext};
+    use crate::tokenizer::Tokenizer;
+
+    #[test]
+    fn metadata_terminators_are_never_classified_as_visible_content() {
+        let json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"<unk>": 0, "</s>": 1, "x": 2, "<end_of_turn>": 50, "<end_of_message>": 106},
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 1, "content": "</s>", "special": true},
+                {"id": 50, "content": "<end_of_turn>", "special": true},
+                {"id": 106, "content": "<end_of_message>", "special": true}
+            ]
+        })
+        .to_string();
+        let tok = Tokenizer::from_hf_json(&json).unwrap();
+        let terminators = [1, 106, 50];
+
+        for token in terminators {
+            assert!(matches!(
+                decode_next(&tok, token, &terminators),
+                DecodedNext::Terminator(_)
+            ));
+        }
+        assert_eq!(
+            decode_next(&tok, 2, &terminators),
+            DecodedNext::Content("x".to_string())
+        );
+    }
 }
