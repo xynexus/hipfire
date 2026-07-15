@@ -150,3 +150,153 @@ DEFINE_OPUS_TILED_GEMM(gemm_opus_w8a8_tiled_wmma_2x2, 8, 2, 2, 4)
 DEFINE_OPUS_TILED_GEMM(gemm_opus_w8a8_tiled_wmma_2x4, 8, 2, 4, 2)
 DEFINE_OPUS_TILED_GEMM(gemm_opus_w4a8_tiled_wmma_2x2, 4, 2, 2, 4)
 DEFINE_OPUS_TILED_GEMM(gemm_opus_w4a8_tiled_wmma_2x4, 4, 2, 4, 2)
+
+// ---------------------------------------------------------------------------
+// Mixed-precision unsigned path: W{1,2,4,8}A8 with a single body.
+//
+// Weights are stored as UNSIGNED codes u ∈ [0, 2^b-1] (dense, LSB-first: code j
+// in bits [(j*b)%8 .. +b] of byte j*b/8). The unpack is pure branch-free bit-
+// slicing to 16 unsigned int8 (0..2^b-1) — no sign extension. The WMMA weight
+// operand is flagged UNSIGNED, and the symmetric zero-point Z = 2^(b-1) is folded
+// out of the accumulator per group using the precomputed activation group sum
+// Xsum[b,g] = Σ_{k∈g} x[b,k]:
+//
+//   Σ_k (u_k - Z)·x_k  =  <unsigned WMMA>  -  Z · Xsum[b,g]
+//
+// This mirrors hipfire_quantize::opus_lowbit (CPU reference + parity tests).
+// Non-power-of-two widths (3/5/6/7) use the bit-plane layout, not this body.
+// ---------------------------------------------------------------------------
+
+// Unpack 16 unsigned codes packed `WBITS`-per-field, LSB-first, into 16 unsigned
+// int8 lanes of an int32x4. `nbytes` = 16*WBITS/8 source bytes. Branch-free; the
+// per-field mask/shift is the scalar analogue of a v_perm_b32 lane gather.
+template <int WBITS>
+static __device__ __forceinline__ int32x4_t opus_unpack_uNx16(const uint8_t* p) {
+    const unsigned mask = (1u << WBITS) - 1u;
+    const int per_byte = 8 / WBITS;
+    int32x4_t out;
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        unsigned packed = 0;
+        #pragma unroll
+        for (int lane = 0; lane < 4; ++lane) {
+            const int code_idx = w * 4 + lane;         // 0..15
+            const int byte = code_idx / per_byte;
+            const int slot = code_idx % per_byte;
+            const unsigned u = (p[byte] >> (slot * WBITS)) & mask; // 0..2^b-1
+            packed |= (u & 0xffu) << (lane * 8);
+        }
+        out[w] = (int)packed;
+    }
+    return out;
+}
+
+#define DEFINE_OPUS_TILED_GEMM_U(NAME, WBITS, TILE_MB, TILE_NB, MINWAVES)        \
+__launch_bounds__(32, MINWAVES)                                                 \
+extern "C" __global__ void NAME(                                                \
+    const uint8_t* __restrict__ W, const float* __restrict__ Ws,                \
+    const int8_t*  __restrict__ X, const float* __restrict__ Xs,                \
+    const int32_t* __restrict__ Xsum,                                           \
+    float* __restrict__ Y,                                                       \
+    int M, int K, int B, int group                                              \
+) {                                                                             \
+    const int tid  = threadIdx.x;                                              \
+    const int lane = tid & 15;                                                 \
+    const int row_start   = blockIdx.x * (16 * TILE_MB);                       \
+    const int batch_start = blockIdx.y * (16 * TILE_NB);                       \
+    if (row_start >= M || batch_start >= B) return;                           \
+    const int wstride = (K * (WBITS)) / 8;                                     \
+    const int n_groups = K / group;                                           \
+    const int tiles_per_group = group / 16;                                   \
+    const int Z = 1 << ((WBITS) - 1);                                          \
+    const int gbytes = (group * (WBITS)) / 8;                                  \
+    const int tbytes = (16 * (WBITS)) / 8;                                     \
+    const uint8_t* w_row[TILE_MB];                                             \
+    const int8_t*  x_row[TILE_NB];                                             \
+    _Pragma("unroll")                                                          \
+    for (int mi = 0; mi < TILE_MB; ++mi) {                                     \
+        int m = row_start + mi * 16 + lane;                                    \
+        w_row[mi] = W + (long long)((m < M) ? m : (M - 1)) * wstride;          \
+    }                                                                          \
+    _Pragma("unroll")                                                          \
+    for (int ni = 0; ni < TILE_NB; ++ni) {                                     \
+        int b = batch_start + ni * 16 + lane;                                  \
+        x_row[ni] = X + (long long)((b < B) ? b : (B - 1)) * K;                \
+    }                                                                          \
+    float8_t facc[TILE_MB][TILE_NB];                                          \
+    _Pragma("unroll")                                                          \
+    for (int mi = 0; mi < TILE_MB; ++mi)                                       \
+        _Pragma("unroll")                                                      \
+        for (int ni = 0; ni < TILE_NB; ++ni)                                   \
+            facc[mi][ni] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};                  \
+    for (int g = 0; g < n_groups; ++g) {                                       \
+        int32x8_t iacc[TILE_MB][TILE_NB];                                     \
+        _Pragma("unroll")                                                      \
+        for (int mi = 0; mi < TILE_MB; ++mi)                                   \
+            _Pragma("unroll")                                                  \
+            for (int ni = 0; ni < TILE_NB; ++ni)                               \
+                iacc[mi][ni] = {0,0,0,0,0,0,0,0};                              \
+        const int g_elem = g * group;                                         \
+        for (int kt = 0; kt < tiles_per_group; ++kt) {                        \
+            const int woff = g * gbytes + kt * tbytes;                         \
+            int32x4_t a_frag[TILE_MB];                                        \
+            int32x4_t x_frag[TILE_NB];                                        \
+            _Pragma("unroll")                                                  \
+            for (int mi = 0; mi < TILE_MB; ++mi)                               \
+                a_frag[mi] = ((WBITS) == 8) ? opus_load_i8x16(w_row[mi] + woff)\
+                                            : opus_unpack_uNx16<WBITS>(w_row[mi] + woff); \
+            _Pragma("unroll")                                                  \
+            for (int ni = 0; ni < TILE_NB; ++ni)                               \
+                x_frag[ni] = *(const int32x4_t*)(x_row[ni] + g_elem + kt * 16); \
+            _Pragma("unroll")                                                  \
+            for (int mi = 0; mi < TILE_MB; ++mi)                               \
+                _Pragma("unroll")                                              \
+                for (int ni = 0; ni < TILE_NB; ++ni)                           \
+                    /* weight operand UNSIGNED (first flag false) */           \
+                    iacc[mi][ni] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32( \
+                        false, a_frag[mi], true, x_frag[ni], iacc[mi][ni], false); \
+        }                                                                      \
+        _Pragma("unroll")                                                      \
+        for (int ni = 0; ni < TILE_NB; ++ni) {                                 \
+            const int b_col = batch_start + ni * 16 + lane;                    \
+            const float sx = (b_col < B) ? Xs[(long long)b_col * n_groups + g] : 0.f; \
+            const int xs_sum = (b_col < B) ? Xsum[(long long)b_col * n_groups + g] : 0; \
+            _Pragma("unroll")                                                  \
+            for (int mi = 0; mi < TILE_MB; ++mi) {                             \
+                _Pragma("unroll")                                             \
+                for (int j = 0; j < 8; ++j) {                                  \
+                    const int m_row = row_start + mi * 16 + 2 * j + (tid >> 4);\
+                    const float sw = (m_row < M) ? Ws[(long long)m_row * n_groups + g] : 0.f; \
+                    /* fold the symmetric zero-point out of the group dot */    \
+                    const int folded = iacc[mi][ni][j] - Z * xs_sum;          \
+                    facc[mi][ni][j] += (float)folded * sw * sx;               \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    _Pragma("unroll")                                                          \
+    for (int ni = 0; ni < TILE_NB; ++ni) {                                     \
+        const int out_col = batch_start + ni * 16 + lane;                      \
+        if (out_col >= B) continue;                                            \
+        _Pragma("unroll")                                                      \
+        for (int mi = 0; mi < TILE_MB; ++mi) {                                 \
+            _Pragma("unroll")                                                  \
+            for (int j = 0; j < 8; ++j) {                                      \
+                const int out_row = row_start + mi * 16 + 2 * j + (tid >> 4);  \
+                if (out_row < M)                                              \
+                    Y[(long long)out_col * M + out_row] = facc[mi][ni][j];     \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+}
+
+// Mixed-precision unsigned entrypoints (offset-fold). W8 shares the direct int8
+// load; W4/W2/W1 unpack unsigned codes. One body, WBITS folds at compile time.
+DEFINE_OPUS_TILED_GEMM_U(gemm_opus_w8a8u_tiled_wmma_2x2, 8, 2, 2, 4)
+DEFINE_OPUS_TILED_GEMM_U(gemm_opus_w8a8u_tiled_wmma_2x4, 8, 2, 4, 2)
+DEFINE_OPUS_TILED_GEMM_U(gemm_opus_w4a8u_tiled_wmma_2x2, 4, 2, 2, 4)
+DEFINE_OPUS_TILED_GEMM_U(gemm_opus_w4a8u_tiled_wmma_2x4, 4, 2, 4, 2)
+DEFINE_OPUS_TILED_GEMM_U(gemm_opus_w2a8u_tiled_wmma_2x2, 2, 2, 2, 4)
+DEFINE_OPUS_TILED_GEMM_U(gemm_opus_w2a8u_tiled_wmma_2x4, 2, 2, 4, 2)
+DEFINE_OPUS_TILED_GEMM_U(gemm_opus_w1a8u_tiled_wmma_2x2, 1, 2, 2, 4)
+DEFINE_OPUS_TILED_GEMM_U(gemm_opus_w1a8u_tiled_wmma_2x4, 1, 2, 4, 2)

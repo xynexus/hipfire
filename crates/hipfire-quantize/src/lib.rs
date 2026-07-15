@@ -29,6 +29,8 @@ use hipfire_arch_specs as _;
 
 pub mod codecs;
 pub mod gguf_import;
+/// Opus mixed-precision low-bit weight codec (unsigned codes + offset fold).
+pub mod opus_lowbit;
 pub mod gptq;
 pub mod hessian_io;
 #[allow(dead_code)]

@@ -60,3 +60,57 @@ extern "C" __global__ void quantize_act_oq8(
         out[idx] = (int8_t)q;
     }
 }
+
+// As quantize_act_oq8, but also writes the per-group signed sum Σ_{k∈g} Xq[b,k]
+// into Xsum [B, K/group] (int32). This is the term the mixed-precision fold GEMM
+// (gemm_opus_wNa8u_*) subtracts to remove the symmetric weight zero-point:
+//   Σ (u-Z)·x = Σ u·x - Z·Σ x. Reuses the same wave32/zero-LDS structure.
+__launch_bounds__(32)
+extern "C" __global__ void quantize_act_oq8_sum(
+    const float*   __restrict__ X,
+    int8_t*        __restrict__ Xq,
+    float*         __restrict__ Xs,
+    int32_t*       __restrict__ Xsum,
+    int B, int K, int group
+) {
+    const int b = blockIdx.y;
+    const int g = blockIdx.x;
+    if (b >= B) return;
+    const int lane = threadIdx.x;
+    const int per_lane = group / 32;
+    const int n_groups = K / group;
+    const long long g0 = (long long)g * group;
+    const float* row = X + (long long)b * K + g0;
+
+    float amax = 0.0f;
+    for (int i = 0; i < per_lane; ++i) {
+        amax = fmaxf(amax, fabsf(row[lane * per_lane + i]));
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_down(amax, off));
+    }
+    amax = __shfl(amax, 0);
+
+    const float scale = (amax > 0.0f) ? (amax / 127.0f) : 1.0f;
+    const float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    if (lane == 0) {
+        Xs[(long long)b * n_groups + g] = scale;
+    }
+
+    int8_t* out = Xq + (long long)b * K + g0;
+    int lane_sum = 0;
+    for (int i = 0; i < per_lane; ++i) {
+        const int idx = lane * per_lane + i;
+        int q = (int)lroundf(row[idx] * inv);
+        q = max(-127, min(127, q));
+        out[idx] = (int8_t)q;
+        lane_sum += q;
+    }
+    // Wave-cooperative sum reduction of the quantized group.
+    for (int off = 16; off > 0; off >>= 1) {
+        lane_sum += __shfl_down(lane_sum, off);
+    }
+    if (lane == 0) {
+        Xsum[(long long)b * n_groups + g] = lane_sum;
+    }
+}
