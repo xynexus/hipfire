@@ -310,6 +310,57 @@ Durable evidence on `halo`:
 - per-layer and per-position report:
   `~/.hipfire/evidence/gemma4/base-short-layer-transition-parity.json`.
 
+## Same-input operator localization at layers 39, 40, and 58
+
+A lightweight Transformers runner then loaded only layers 39, 40, and 58 and
+fed each one the prepared exact oracle inputs. Its complete layer outputs were
+bit-exact with the corresponding boundaries from the frozen full-model oracle,
+so the lightweight trace preserves the admission reference rather than creating
+a second oracle. Hipfire ran the same rows position by position with its real
+five-position KV history. Q was divided by Hipfire's explicit
+`sqrt(head_dim)` compensation before the RoPE comparison.
+
+The final-row error grows smoothly across operator boundaries. For layer 40,
+NRMSE progresses from input norm `0.001751342`, Q/K/V projections
+`0.001619107`/`0.001682360`/`0.001577249`, normalized Q/K/V
+`0.002305754`/`0.002341887`/`0.002154251`, RoPE Q/K
+`0.003025287`/`0.002972519`, attention `0.002848781`, output projection
+`0.003789778`, and post-attention norm `0.004309132` to GeGLU `0.006183478`,
+post-FFN norm `0.005104472`, and layer output `0.005173886`. Layer 58 follows
+the same pattern: input norm `0.002194212`, attention `0.002132943`, GeGLU
+`0.004671467`, post-FFN norm `0.004342631`, and layer output `0.005205519`.
+There is no single boundary discontinuity or omitted layer operation.
+
+The largest local amplification suggested a selective PyTorch-style BF16
+GeGLU test. The diagnostic rounds gate/up inputs, GELU output, and the final
+product through BF16 while leaving every other operator unchanged. It is not a
+general correction:
+
+- layer 39, the first frozen-gate failure, worsened from final-position NRMSE
+  `0.004865753532395866` to `0.0049196606360259`;
+- layer 40 improved from `0.005173885575744475` to `0.004967589187231396`, but
+  its GeGLU boundary itself worsened from `0.006183478` to `0.006340308`;
+- layer 58 worsened from `0.005205519351551357` to `0.005426525068154615`, with
+  GeGLU worsening from `0.004671467` to `0.005007373`.
+
+The candidate remains diagnostic-only and is rejected for serving. Together
+with the exact projection, SDPA, RoPE, RMSNorm, and GeGLU formula probes, this
+trace leaves cumulative reduction/materialization-order sensitivity as the
+remaining observed blocker, not a discrete architecture-semantic defect.
+
+Durable evidence on `halo`:
+
+- bit-exact lightweight oracle traces:
+  `~/.hipfire/evidence/gemma4/base-short-layer-transition-oracle-operators`;
+- ordinary Hipfire traces and comparison:
+  `~/.hipfire/evidence/gemma4/base-short-layer-transition-hipfire-operators`
+  and
+  `~/.hipfire/evidence/gemma4/base-short-layer-transition-operator-parity.json`;
+- BF16-GeGLU candidate reports:
+  `~/.hipfire/evidence/gemma4/base-short-layer-transition-operator-parity-bf16-geglu.json`
+  and
+  `~/.hipfire/evidence/gemma4/base-short-layer-transition-operator-parity-bf16-geglu-39.json`.
+
 The best result remains
 `~/.hipfire/evidence/gemma4/base-short-hipfire-all-layers-embed-bf16-rope-order`
 at final-logit maximum error `0.5618224143981934`, with exact greedy generation,

@@ -17,7 +17,8 @@ pub use arch::{generation_eos_ids_from_hfq, Gemma4, Gemma4Backend};
 
 pub use config::{Gemma4Config, Gemma4LayerPlan};
 pub use forward::{
-    diagnostic_forward_layer_from_hidden, forward_step, forward_step_lowered,
+    diagnostic_forward_layer_from_hidden, diagnostic_forward_layer_from_hidden_bf16_geglu_capture,
+    diagnostic_forward_layer_from_hidden_capture, forward_step, forward_step_lowered,
     forward_step_reference, logits, lower_dense_forward, Gemma4DenseState, Gemma4ForwardCapture,
 };
 pub use weights::{

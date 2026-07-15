@@ -8,15 +8,19 @@
 //! and the LM head. It still executes each selected layer position by position
 //! so its own full/SWA KV history is real. Coordinate it with `hipfire gpu-lock`.
 //!
-//! Usage: `parity_layer_transitions MODEL.hfq INPUT_DIR OUTPUT.json`
+//! Usage: `parity_layer_transitions MODEL.hfq INPUT_DIR OUTPUT.json \
+//!         [TRACE_LAYERS TRACE_DIR [BF16_GEGLU_LAYERS]]`
 
 use hipfire_arch_gemma4::config::AttentionKind;
 use hipfire_arch_gemma4::{
-    diagnostic_forward_layer_from_hidden, load_dense_weights, Gemma4, Gemma4DenseState,
+    diagnostic_forward_layer_from_hidden, diagnostic_forward_layer_from_hidden_bf16_geglu_capture,
+    diagnostic_forward_layer_from_hidden_capture, load_dense_weights, Gemma4, Gemma4DenseState,
+    Gemma4ForwardCapture,
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +33,31 @@ fn read_f32(path: &Path) -> Result<Vec<f32>, String> {
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
         .collect())
+}
+
+fn write_f32(path: &Path, values: &[f32]) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    fs::write(path, bytes).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn parse_layers(raw: &str, count: usize) -> Result<BTreeSet<usize>, String> {
+    let layers = raw
+        .split(',')
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|error| format!("invalid trace layer `{value}`: {error}"))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if layers.iter().any(|&layer| layer >= count) {
+        return Err(format!(
+            "trace layers {layers:?} exceed layer count {count}"
+        ));
+    }
+    Ok(layers)
 }
 
 fn round_bf16(value: f32) -> f32 {
@@ -82,8 +111,12 @@ fn required_usize(manifest: &Value, name: &str) -> Result<usize, String> {
 
 fn main() -> Result<(), String> {
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() != 4 {
-        return Err("usage: parity_layer_transitions MODEL.hfq INPUT_DIR OUTPUT.json".into());
+    if !matches!(args.len(), 4 | 6 | 7) {
+        return Err(
+            "usage: parity_layer_transitions MODEL.hfq INPUT_DIR OUTPUT.json \
+             [TRACE_LAYERS TRACE_DIR [BF16_GEGLU_LAYERS]]"
+                .into(),
+        );
     }
     let model = PathBuf::from(&args[1]);
     let input_dir = PathBuf::from(&args[2]);
@@ -119,6 +152,20 @@ fn main() -> Result<(), String> {
             config.hidden_size, config.num_hidden_layers
         ));
     }
+    let trace_layers = args
+        .get(4)
+        .map(|raw| parse_layers(raw, layer_count))
+        .transpose()?
+        .unwrap_or_default();
+    let trace_dir = args.get(5).map(PathBuf::from);
+    let bf16_geglu_layers = args
+        .get(6)
+        .map(|raw| parse_layers(raw, layer_count))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(trace_dir) = &trace_dir {
+        fs::create_dir_all(trace_dir).map_err(|error| error.to_string())?;
+    }
 
     let mut gpu =
         hipfire_rdna::Gpu::init_with_device(0).map_err(|error| format!("GPU init: {error:?}"))?;
@@ -142,20 +189,80 @@ fn main() -> Result<(), String> {
 
         state.reset();
         let mut actual = Vec::with_capacity(expected_values);
+        let trace_layer_dir = trace_dir
+            .as_ref()
+            .filter(|_| trace_layers.contains(&layer))
+            .map(|root| root.join(format!("layer_{layer}")));
+        if let Some(dir) = &trace_layer_dir {
+            fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        }
+        let mut traced_boundaries = BTreeSet::new();
         for position in 0..positions {
             let start = position * hidden_size;
-            actual.extend(
-                diagnostic_forward_layer_from_hidden(
-                    &mut gpu,
-                    &weights,
-                    &config,
-                    &mut state,
-                    layer,
-                    position,
-                    &inputs[start..start + hidden_size],
-                )
-                .map_err(|error| format!("Gemma 4 layer {layer} position {position}: {error:?}"))?,
-            );
+            if let Some(dir) = &trace_layer_dir {
+                let mut capture = Gemma4ForwardCapture {
+                    operator_layer: Some(layer),
+                    ..Gemma4ForwardCapture::default()
+                };
+                let output = if bf16_geglu_layers.contains(&layer) {
+                    diagnostic_forward_layer_from_hidden_bf16_geglu_capture(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        &mut state,
+                        layer,
+                        position,
+                        &inputs[start..start + hidden_size],
+                        Some(&mut capture),
+                    )
+                } else {
+                    diagnostic_forward_layer_from_hidden_capture(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        &mut state,
+                        layer,
+                        position,
+                        &inputs[start..start + hidden_size],
+                        Some(&mut capture),
+                    )
+                }
+                .map_err(|error| format!("Gemma 4 layer {layer} position {position}: {error:?}"))?;
+                actual.extend(output);
+                for (name, values) in &capture.operator_boundaries {
+                    write_f32(&dir.join(format!("position_{position}_{name}.f32")), values)?;
+                    traced_boundaries.insert(name.clone());
+                }
+            } else {
+                actual.extend(
+                    diagnostic_forward_layer_from_hidden(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        &mut state,
+                        layer,
+                        position,
+                        &inputs[start..start + hidden_size],
+                    )
+                    .map_err(|error| {
+                        format!("Gemma 4 layer {layer} position {position}: {error:?}")
+                    })?,
+                );
+            }
+        }
+        if let Some(dir) = &trace_layer_dir {
+            fs::write(
+                dir.join("capture.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "schema": "hipfire.gemma4.layer-transition-operators.v1",
+                    "layer": layer,
+                    "positions": positions,
+                    "hidden_size": hidden_size,
+                    "boundaries": traced_boundaries,
+                }))
+                .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
         }
         let result = metrics(&expected, &actual);
         let per_position = (0..positions)
@@ -199,6 +306,8 @@ fn main() -> Result<(), String> {
         "gpu_arch": gpu.arch,
         "positions": positions,
         "hidden_size": hidden_size,
+        "traced_layers": trace_layers,
+        "bf16_staged_geglu_layers": bf16_geglu_layers,
         "layers": layer_results,
     });
     fs::write(
