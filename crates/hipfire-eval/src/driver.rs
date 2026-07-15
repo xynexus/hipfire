@@ -636,6 +636,11 @@ pub(crate) fn result_cache_prompt_paths(battery: BatteryId) -> Vec<&'static str>
         // EmbeddingQuality inputs are HFQ paths + the STS-Benchmark dataset,
         // not a committed prompt corpus.
         BatteryId::EmbeddingQuality => Vec::new(),
+        BatteryId::Diffusion => vec![
+            "benchmarks/prompts/flux2_image_admission_object.txt",
+            "benchmarks/prompts/flux2_image_admission_scene.txt",
+            "benchmarks/prompts/flux2_image_admission_texture.txt",
+        ],
         BatteryId::Barrage | BatteryId::Cask => Vec::new(),
     }
 }
@@ -691,6 +696,9 @@ pub(crate) fn run_battery(
     ctx: &EvalContext,
     datasets: &[DatasetManifestEntry],
 ) -> Vec<EvalResult> {
+    if battery == BatteryId::Diffusion {
+        return diffusion_battery_rows(config, ctx);
+    }
     if battery == BatteryId::TinyQuant {
         // Self-contained pipeline (emit → quantize → collect → KLD), driven by
         // the `hipfire-quantize` + `tiny_quant_probe` binaries regardless of the
@@ -964,5 +972,7 @@ pub(crate) fn run_battery(
         BatteryId::TinyQuant => tiny_quant_rows(config, ctx),
         // EmbeddingQuality early-returns at the top of `run_battery`; never here.
         BatteryId::EmbeddingQuality => run_examples_embedding_quality_rows(config, ctx),
+        // Diffusion early-returns at the top of `run_battery`; never here.
+        BatteryId::Diffusion => diffusion_battery_rows(config, ctx),
     }
 }

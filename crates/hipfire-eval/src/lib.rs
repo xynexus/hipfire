@@ -71,6 +71,8 @@ mod driver;
 use driver::*;
 mod executor_daemon;
 use executor_daemon::*;
+mod executor_diffusion;
+use executor_diffusion::*;
 mod executor_examples;
 use executor_examples::*;
 mod executor_mock;
@@ -187,6 +189,7 @@ pub enum BatteryId {
     Perplexity,
     TinyQuant,
     EmbeddingQuality,
+    Diffusion,
 }
 
 impl BatteryId {
@@ -214,6 +217,7 @@ impl BatteryId {
             "embedding_quality" | "embed_quality" | "embedding-quality" | "sts" => {
                 Ok(Self::EmbeddingQuality)
             }
+            "diffusion" | "image" | "image_quality" | "image-quality" => Ok(Self::Diffusion),
             other => Err(format!("unknown battery: {other}")),
         }
     }
@@ -240,6 +244,7 @@ impl BatteryId {
             Self::Perplexity => "perplexity",
             Self::TinyQuant => "tiny_quant",
             Self::EmbeddingQuality => "embedding_quality",
+            Self::Diffusion => "diffusion",
         }
     }
 }
@@ -7615,6 +7620,67 @@ more noise
         assert_eq!(admission.status, EvalStatus::Pass);
         assert_eq!(admission.verdict, "promote");
         assert!(admission.findings.is_empty());
+    }
+
+    #[test]
+    fn diffusion_admission_uses_internal_frozen_baseline_verdict() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "candidate.hfq",
+            "--baseline",
+            "baseline.hfq",
+            "--battery",
+            "diffusion",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+        let passing = row_for_model(
+            BatteryId::Diffusion,
+            None,
+            "rgb_baseline_0",
+            None,
+            EvalStatus::Pass,
+            None,
+            BTreeMap::from([("rgb_mae_u8".to_string(), json!(0.5))]),
+            &cfg,
+            &ctx,
+            None,
+            0,
+            "candidate.hfq".to_string(),
+        );
+        let comparison = build_comparison_artifact(&cfg, std::slice::from_ref(&passing), &ctx);
+        let admission = build_admission_artifact(&cfg, &[passing], &comparison, &ctx);
+        assert_eq!(admission.status, EvalStatus::Pass);
+        assert_eq!(admission.verdict, "promote");
+
+        let failing = row_for_model(
+            BatteryId::Diffusion,
+            None,
+            "rgb_baseline_0",
+            None,
+            EvalStatus::Fail,
+            Some("frozen RGB threshold exceeded".to_string()),
+            BTreeMap::from([("rgb_mae_u8".to_string(), json!(1.5))]),
+            &cfg,
+            &ctx,
+            None,
+            0,
+            "candidate.hfq".to_string(),
+        );
+        let comparison = build_comparison_artifact(&cfg, std::slice::from_ref(&failing), &ctx);
+        let admission = build_admission_artifact(&cfg, &[failing], &comparison, &ctx);
+        assert_eq!(admission.status, EvalStatus::Fail);
+        assert_eq!(admission.verdict, "reject");
     }
 
     #[test]
