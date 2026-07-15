@@ -3,11 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Kaden Schutt
 
-"""Capture a BF16 Transformers oracle for Gemma 4 text execution.
+"""Capture the pinned BF16 Transformers oracle for Gemma 4 text execution.
 
 This offline evidence tool writes token IDs, selected decoder-layer boundary
 states, the final-position logits, and greedy generated IDs. Runtime code never
-imports it.
+imports it. Inputs can be rendered prompt bytes or a committed exact-token JSON
+fixture, which lets SWA-1/SWA/SWA+1 cases share precisely the same IDs with the
+Hipfire candidate capture.
 """
 
 from __future__ import annotations
@@ -27,7 +29,10 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--prompt", required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--prompt")
+    inputs.add_argument("--prompt-file", type=Path)
+    inputs.add_argument("--input-ids", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--layers", default="0,-1", help="comma-separated decoder layer indices"
@@ -35,6 +40,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--operator-layer", type=int)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument(
+        "--device-map",
+        choices=("single", "auto"),
+        default="single",
+        help="place the full model on --device or let Accelerate split it",
+    )
+    parser.add_argument("--gpu-max-memory")
+    parser.add_argument("--cpu-max-memory")
+    parser.add_argument("--offload-folder", type=Path)
     return parser.parse_args()
 
 
@@ -50,22 +64,76 @@ def tokenizer_for(model: Path) -> PreTrainedTokenizerFast:
     )
 
 
+def capture_input(
+    args: argparse.Namespace, tokenizer: PreTrainedTokenizerFast
+) -> tuple[list[int], str, str | None, str]:
+    if args.input_ids is not None:
+        raw = args.input_ids.read_bytes()
+        value = json.loads(raw)
+        if isinstance(value, dict) and "input_ids_pattern" in value:
+            pattern = value["input_ids_pattern"]
+            length = value.get("length")
+            if not isinstance(pattern, list) or not pattern or not isinstance(length, int) or length <= 0:
+                raise ValueError("input_ids_pattern and length must both be nonzero")
+            values = [pattern[index % len(pattern)] for index in range(length)]
+        else:
+            values = value.get("input_ids") if isinstance(value, dict) else value
+        if not isinstance(values, list) or not values:
+            raise ValueError("--input-ids must contain a nonempty JSON array")
+        if any(not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF for value in values):
+            raise ValueError("every exact input token must be a u32")
+        return values, "exact_token_ids", str(args.input_ids.resolve()), hashlib.sha256(raw).hexdigest()
+
+    if args.prompt_file is not None:
+        raw = args.prompt_file.read_bytes()
+        prompt = raw.decode("utf-8")
+        source = str(args.prompt_file.resolve())
+    else:
+        prompt = args.prompt
+        raw = prompt.encode()
+        source = None
+    return (
+        tokenizer.encode(prompt, add_special_tokens=False),
+        "rendered_prompt",
+        source,
+        hashlib.sha256(raw).hexdigest(),
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("--device cuda requested but PyTorch has no ROCm/CUDA device")
 
     tokenizer = tokenizer_for(args.model)
-    input_ids = tokenizer.encode(args.prompt, add_special_tokens=False)
+    input_ids, input_kind, input_path, input_sha256 = capture_input(args, tokenizer)
+    if not input_ids:
+        raise ValueError("capture input contains zero token IDs")
     device = torch.device(args.device)
     ids = torch.tensor([input_ids], dtype=torch.long, device=device)
 
+    device_map: dict[str, torch.device] | str
+    device_map = "auto" if args.device_map == "auto" else {"": device}
+    max_memory = None
+    if args.device_map == "auto" and (
+        args.gpu_max_memory is not None or args.cpu_max_memory is not None
+    ):
+        max_memory = {}
+        if args.gpu_max_memory is not None:
+            max_memory[0] = args.gpu_max_memory
+        if args.cpu_max_memory is not None:
+            max_memory["cpu"] = args.cpu_max_memory
+    if args.offload_folder is not None:
+        args.offload_folder.mkdir(parents=True, exist_ok=True)
     model = AutoModelForImageTextToText.from_pretrained(
         args.model,
         dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         local_files_only=True,
-        device_map={"": device},
+        device_map=device_map,
+        max_memory=max_memory,
+        offload_folder=args.offload_folder,
+        offload_state_dict=args.offload_folder is not None,
     )
     model.eval()
 
@@ -240,9 +308,22 @@ def main() -> None:
         "revision": revision,
         "dtype": "bfloat16",
         "device": str(device),
+        "device_map": args.device_map,
+        "max_memory": max_memory,
+        "offload_folder": (
+            str(args.offload_folder.resolve())
+            if args.offload_folder is not None
+            else None
+        ),
+        "resolved_device_map": {
+            key: str(value)
+            for key, value in getattr(model, "hf_device_map", {}).items()
+        },
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
-        "prompt_sha256": hashlib.sha256(args.prompt.encode()).hexdigest(),
+        "input_kind": input_kind,
+        "input_path": input_path,
+        "input_sha256": input_sha256,
         "input_token_count": len(input_ids),
         "selected_decoder_layers": sorted(resolved_layers),
         "operator_layer": args.operator_layer,

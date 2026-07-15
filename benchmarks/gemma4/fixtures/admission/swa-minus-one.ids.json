@@ -1,0 +1,6 @@
+{
+  "schema": "hipfire.gemma4.exact-input.v1",
+  "description": "Deterministic 1023-token input ending at SWA-1",
+  "input_ids_pattern": [818, 5279, 529, 7001, 563],
+  "length": 1023
+}

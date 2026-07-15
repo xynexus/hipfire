@@ -32,9 +32,40 @@ original strict `0.999` hidden cosine, `0.045` hidden NRMSE, and `0.5` final-log
 maximum-error limits remain unchanged as the final OQ8++ narrowing stage in
 `benchmarks/gemma4/oq8pp-thresholds.json`.
 
-The base-short OQ8 result permits Phase 5 to continue to the SWA-boundary,
-multi-global, reload/sequential, and instruction-checkpoint gates. It does not
-by itself admit Gemma 4 in the support registry.
+The base-short OQ8 result permits Phase 5 to continue to the SWA-boundary and
+instruction-checkpoint gates. A repeat run using the committed exact-token
+fixture now also passes the multiple-global-layer and lifecycle requirements:
+all 60 boundaries reproduce the frozen baseline, a second sequential request is
+bit-exact to the first, and a full unload/reload request is also bit-exact. The
+capture and comparison are retained under
+`~/.hipfire/evidence/gemma4/phase5-oq8-lifecycle-base-short` with SHA256 values
+`3d3994cc20b4e67117d2358295270230b55254f1b08fa1efdce4e4bcb53daeba`
+and `59e14a621702d117d205d033f8d3fca4d8b20eba8425870d3c8fcb3c81a11b3c`.
+This still does not admit Gemma 4 in the support registry.
+
+## OQ8 SWA-1 rejection
+
+The first boundary case uses the committed exact-token fixture at 1023 input
+tokens (SWA-1) and selected local/global boundaries `[0, 4, 5, 10, 11, 58, 59]`.
+The long-prompt BF16 oracle is layer-streamed from the same pinned source tensors
+to bound residency. Before admission use, that path was calibrated against the
+resident five-token oracle: all 60 last-token hidden states and all final logits
+were bit-exact, with the same argmax, top-5 set, and first generated token.
+
+The SWA-1 OQ8 comparison fails the frozen broad gate:
+
+- layer 58 cosine `0.9708344535967379`, NRMSE `0.24631485040195675`;
+- layer 59 cosine `0.992854853723198`, NRMSE `0.18289128899485854`;
+- final-logit cosine `0.9200965486970811`;
+- final-logit maximum absolute error `4.389132022857666`;
+- final top-5 overlap `4/5`.
+
+Every compared value is finite, final argmax and the first greedy token still
+match at `7001`, and layers 0/4/5/10/11 remain within the broad OQ8 envelope.
+This is nevertheless a gate failure. The 1024, 1025, and IT cases were not run,
+and no threshold was changed. Evidence is retained under
+`~/.hipfire/evidence/gemma4/phase5-oq8-admission/swa-minus-one`; the comparison
+SHA256 is `7886383e21f82b5c3a2d3e83d170dea5137f79ffe9276af15e6ba39e46f7c307`.
 
 ## Historical BF16 base-short result
 

@@ -1,0 +1,6 @@
+{
+  "schema": "hipfire.gemma4.exact-input.v1",
+  "description": "Deterministic 1024-token input ending at the SWA boundary",
+  "input_ids_pattern": [818, 5279, 529, 7001, 563],
+  "length": 1024
+}
