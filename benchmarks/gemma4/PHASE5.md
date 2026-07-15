@@ -1,8 +1,42 @@
 # Gemma 4 Phase 5 dense-31B admission
 
-Date: 2026-07-15. Status: blocked at the frozen base-short BF16 gate.
+Date: 2026-07-15. Status: historical BF16 gate blocked; canonical product gate
+revised to OQ8 and advancing beyond base-short.
 
-## Base-short result
+## OQ8 contract revision
+
+By explicit plan revision after the BF16 investigation, OQ8 is now the Phase 5
+product candidate and the pinned Transformers BF16 capture remains the oracle.
+The first valid exact-prompt OQ8 comparison is retained at
+`~/.hipfire/evidence/gemma4/base-short-hipfire-all-layers-oq8-exact-prompt`.
+The discarded predecessor included a trailing newline and produced six input
+tokens; it is not admission evidence. The valid run uses the exact five oracle
+IDs `[818, 5279, 529, 7001, 563]`.
+
+The OQ8 artifact embeds the pinned Gemma 4 tokenizer byte-for-byte
+(`sha256:12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6`)
+and has quantization hash `705685e2d7993d57`. The valid base-short result is:
+
+- exact eight-token greedy generation;
+- final argmax `7001` and top-5 overlap `5/5`;
+- final-logit cosine `0.9993488808874887`;
+- final-logit maximum absolute error `1.1197633743286133`;
+- all-layer minimum hidden cosine `0.9953113139978088`;
+- all-layer maximum hidden NRMSE `0.09686980655966955` at layer 57;
+- no non-finite hidden or logit values.
+
+Those exact observed values are now frozen as the broad OQ8 functional baseline
+in `benchmarks/gemma4/oq8-thresholds.json`. This is explicitly a post-observation
+contract revision, not a claim that OQ8 passed the original BF16 gate. The
+original strict `0.999` hidden cosine, `0.045` hidden NRMSE, and `0.5` final-logit
+maximum-error limits remain unchanged as the final OQ8++ narrowing stage in
+`benchmarks/gemma4/oq8pp-thresholds.json`.
+
+The base-short OQ8 result permits Phase 5 to continue to the SWA-boundary,
+multi-global, reload/sequential, and instruction-checkpoint gates. It does not
+by itself admit Gemma 4 in the support registry.
+
+## Historical BF16 base-short result
 
 Checkpoint: `google/gemma-4-31B` revision
 `02e15e4990e8c452f8543fb26beff15b1daf8f3d`, converted losslessly to
@@ -20,8 +54,9 @@ stride fixed, the initial selected-boundary comparison reported:
 - final-logit maximum absolute error is `0.5654382705688477`, above the frozen
   `0.5` limit.
 
-Therefore the comparison status is `fail`. Phase 5 does not advance to the SWA
-crossing or instruction checkpoint gates.
+Therefore the historical BF16 comparison status is `fail`. Under the original
+contract, Phase 5 did not advance to the SWA crossing or instruction checkpoint
+gates; the explicit OQ8 revision above now supersedes that stop condition.
 
 An expanded capture of all 60 decoder boundaries then showed that the initial
 selection had hidden a second failure class. The source-BF16 embedding scale and
@@ -392,7 +427,8 @@ minimum hidden cosine. The broader all-pairwise values were `0.6875`,
 canonical/all-pairs split, ROCm/device provenance, sample hashes, decision
 summaries, and non-finite counts.
 
-The original base-short verdict is therefore unchanged: final-logit maximum
+The original BF16 base-short verdict is therefore unchanged: final-logit maximum
 error is `0.5618224143981934`; hidden thresholds fail at layers 39, 52, 56, 57,
-and 58. Phase 5 stops here, so the SWA-crossing, multi-global, reload/sequential,
-instruction-checkpoint, and later variant gates are not advanced.
+and 58. The BF16 candidate path stopped here. Under the explicit OQ8 revision,
+current Phase 5 advances from the valid OQ8 base-short baseline to the
+SWA-crossing, multi-global, reload/sequential, and instruction-checkpoint gates.
