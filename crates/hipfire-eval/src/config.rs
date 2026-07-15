@@ -34,6 +34,7 @@ where
     // `--no-kv-hierarchical` opts out. asym/mq are no longer the defaults.
     let mut kv_hierarchical = true;
     let mut kvarn_bits: Option<usize> = None;
+    let mut hot_bits: Option<usize> = None;
     let mut fixture: Option<String> = None;
     let mut max_tokens = 64usize;
     let mut dflash = DflashMode::Off;
@@ -147,6 +148,14 @@ where
                     return Err(format!("--kvarn-bits must be 2, 4, or 8 (got {n})"));
                 }
                 kvarn_bits = Some(n);
+                i += 2;
+            }
+            "--hot-bits" => {
+                let n = parse_usize(&take_value(&argv, i, "--hot-bits")?, "--hot-bits")?;
+                if !matches!(n, 8 | 16) {
+                    return Err(format!("--hot-bits must be 8 or 16 (got {n})"));
+                }
+                hot_bits = Some(n);
                 i += 2;
             }
             "--ctx" => {
@@ -354,6 +363,7 @@ where
         corpus,
         kv_hierarchical,
         kvarn_bits,
+        hot_bits,
         fixture,
         max_tokens,
         dflash,
@@ -411,6 +421,7 @@ pub fn usage() -> String {
        --kv-hierarchical        force the two-tier hot/cold KV cache on (default: on for kvarn; sets HIPFIRE_KV_HIERARCHICAL=1)\n\
        --no-kv-hierarchical     disable the two-tier hot/cold KV cache\n\
        --kvarn-bits <2|4|8>     kvarn K precision (default 4; 8 is ~lossless-er, 2x K storage; sets HIPFIRE_KVARN_BITS)\n\
+       --hot-bits <8|16>        hierarchical hot-tier precision (default 8 = int8 ring, ~½ hot VRAM; 16 = f16 for A/B; sets HIPFIRE_KV_HOT_BITS)\n\
        --ctx <N>                context length for perplexity/long-context batteries (default: 512; overrides HIPFIRE_EVAL_PERPLEXITY_CTX)\n\
        --corpus <path>          perplexity corpus path (overrides HIPFIRE_EVAL_PERPLEXITY_CORPUS)\n\
        --fixture <a,b>          pflash/longctx NIAH fixture filter (substring match on name, e.g. niah_16k,longcode); default: all\n\

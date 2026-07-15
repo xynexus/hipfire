@@ -206,7 +206,7 @@ pub struct HierKvState {
     rot_k: Option<GpuTensor>,
     /// f32 [n_heads × HD] scratch: rotated query for the two-tier read. Some when hot_rotate.
     q_rot: Option<GpuTensor>,
-    /// Phase 1 8-bit hot tier (`HIPFIRE_KV_HOT_BITS=8`, default 16=f16). When on,
+    /// 8-bit hot tier (`HIPFIRE_KV_HOT_BITS`, DEFAULT 8; 16 = f16 for A/B). When on,
     /// the hot ring is per-token symmetric-absmax int8 (`hot_kq`/`hot_vq`) instead
     /// of the f16 `hot_k`/`hot_v` rings (which are then left empty), halving hot-tier
     /// VRAM. Forces `hot_rotate` (symmetric q8 needs the FWHT-centered frame). The
@@ -321,12 +321,19 @@ impl HierKvState {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.5f32);
-        // Phase 1 hot-tier bit-width (`HIPFIRE_KV_HOT_BITS`): 16 = f16 ring (default),
-        // 8 = per-token symmetric-absmax int8 ring (halves hot VRAM).
-        let hot_bits = std::env::var("HIPFIRE_KV_HOT_BITS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(16usize);
+        // Hot-tier bit-width (`HIPFIRE_KV_HOT_BITS`): 8 = per-token symmetric-absmax
+        // int8 ring (DEFAULT — Phase 4; ~49% smaller hot VRAM, parity + PPL neutral
+        // vs f16), 16 = f16 ring (kept selectable for A/B). Only 8 and 16 are valid:
+        // the hot tier is the EXACT tier, so 4-bit belongs to the cold tier, not here
+        // — any other value coerces to the 8-bit default.
+        let hot_bits = match std::env::var("HIPFIRE_KV_HOT_BITS").ok().as_deref() {
+            Some("16") => 16,
+            Some("8") | None => 8,
+            Some(other) => {
+                eprintln!("[kv-hier] HIPFIRE_KV_HOT_BITS={other} invalid (want 8|16); using 8");
+                8
+            }
+        };
         let hot_q8 = enabled && hot_bits == 8;
         // Phase 0 rotated-frame probe: rotate hot K on write + query on read (see
         // the `hot_rotate` field doc). q8 mode REQUIRES rotation (symmetric absmax

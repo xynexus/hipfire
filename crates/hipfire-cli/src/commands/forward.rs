@@ -31,6 +31,7 @@ Common options:
   --kv-mode <mode>          KV cache mode: f32,q8,asym2,asym3,asym4,kvarn,fwht2,fwht3,fwht4
   --kv-hierarchical         Enable the two-tier hot/cold KV cache (HIPFIRE_KV_HIERARCHICAL=1)
   --kvarn-bits <2|4|8>      kvarn K precision (default 4; 8 ~= lossless-er, 2x K storage)
+  --hot-bits <8|16>         hierarchical hot-tier precision (default 8 = int8 ring, ~1/2 hot VRAM; 16 = f16)
   --ctx <N>                 Context length for perplexity/long-context batteries (default: 512)
   --corpus <path>           Perplexity corpus path
   --fixture <a,b>           pflash/longctx NIAH fixture filter (e.g. niah_16k,longcode)

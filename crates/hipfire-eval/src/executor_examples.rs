@@ -872,6 +872,11 @@ pub(crate) fn apply_kv_env(cmd: &mut Command, config: &EvalConfig, kv_mode: &str
     if kv_mode == "kvarn" {
         if config.kv_hierarchical {
             cmd.env("HIPFIRE_KV_HIERARCHICAL", "1");
+            // Hot-tier precision only applies to the hierarchical cache (default 8;
+            // 16 selects the f16 ring for A/B).
+            if let Some(bits) = config.hot_bits {
+                cmd.env("HIPFIRE_KV_HOT_BITS", bits.to_string());
+            }
         }
         if let Some(bits) = config.kvarn_bits {
             cmd.env("HIPFIRE_KVARN_BITS", bits.to_string());

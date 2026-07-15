@@ -465,6 +465,10 @@ pub struct EvalConfig {
     /// `HIPFIRE_KVARN_BITS` on spawned binaries when the mode is kvarn.
     #[serde(default)]
     pub kvarn_bits: Option<usize>,
+    /// `--hot-bits <8|16>`: hierarchical hot-tier precision (default 8 = int8 ring).
+    /// Sets `HIPFIRE_KV_HOT_BITS` on spawned binaries when kvarn + hierarchical.
+    #[serde(default)]
+    pub hot_bits: Option<usize>,
     /// `--fixture <a,b>`: substring filter over pflash/longctx NIAH fixtures
     /// (matched against the fixture path + case label). `None` runs all.
     #[serde(default)]
@@ -3293,6 +3297,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             corpus: None,
             kv_hierarchical: false,
             kvarn_bits: None,
+            hot_bits: None,
             fixture: None,
             max_tokens: 8,
             dflash: DflashMode::Off,
@@ -7423,6 +7428,7 @@ more noise
             corpus: None,
             kv_hierarchical: false,
             kvarn_bits: None,
+            hot_bits: None,
             fixture: None,
             max_tokens: 8,
             dflash: DflashMode::Off,

@@ -159,8 +159,17 @@ The rotation lives at the **hot write**; the cold tier inherits it through migra
    `attention_cold_slots` layout-2 read with `q_rot`.
 3. **Migrate.** dequant 8-bit hot → f32 (instead of `widen` f16) → the existing
    `compact_cold_kv(rotate=false, bits=8)` (K already rotated).
-4. **Knobs + default.** `HIPFIRE_KV_HOT_BITS` (default 8; 4/8), keep f16 hot
-   selectable for A/B. Wire into the default policy (`project-kv-default-kvarn-hier`).
+4. **[DONE 2026-07-15]** Knobs + default. `HIPFIRE_KV_HOT_BITS` now DEFAULTS to 8
+   (was 16); 16 keeps the f16 ring selectable for A/B. Only 8/16 are valid — the
+   hot tier is the EXACT tier, so 4-bit stays a cold-tier concern; any other value
+   warns and coerces to 8. Wired into the eval default policy: `hipfire eval
+   --hot-bits <8|16>` (mirrors `--kvarn-bits`) sets `HIPFIRE_KV_HOT_BITS` on spawned
+   binaries when kvarn + hierarchical; help updated in `config.rs::usage` and
+   `forward.rs::EVAL_HELP`. Any `HIPFIRE_KV_HIERARCHICAL=1` path (run/pflash/
+   ModelSlot/eval) now gets the 8-bit hot tier by default via `from_env`.
+   Validated on gfx1103: default parity (no env) = q8 PASS 4.3e-5; `HOT_BITS=16`
+   f16 PASS 5.2e-5; invalid value coerces to 8 with a warning. All Rust no-gpu-ci
+   tests pass.
 5. **Bit accounting.** Log per-session hot-tier bytes so the multi-session win is
    visible in `hipfire doctor`/telemetry.
 
