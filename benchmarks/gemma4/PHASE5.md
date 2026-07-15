@@ -273,6 +273,43 @@ at
 the layer-0 oracle inputs and tables are retained at
 `~/.hipfire/evidence/gemma4/base-short-layer0-rope-cos`.
 
+## Same-input decoder-transition sweep
+
+The remaining full-stack drift was separated from individual decoder semantics
+with a benchmark-only transition runner. Layer 0 receives the exact captured
+post-embedding rows. Every later layer receives the preceding frozen
+Transformers decoder boundary. Each layer then runs independently across the
+same five prompt positions while building its own real full/SWA KV history.
+This preserves each layer's attention geometry and causal history without
+propagating error from earlier Hipfire layers.
+
+All 60 transitions were finite, and no individual final-position transition
+approached the frozen full-stack hidden-state limits:
+
+- the worst final-position normalized RMSE was `0.005205519351551357` at layer
+  58; the next highest values were `0.005173885575744475` at layer 40 and
+  `0.005047795244414561` at layer 28;
+- layer 39, the first full-stack failure, had same-input final-position NRMSE
+  `0.004865753532395866` and cosine `0.9999912831135805`;
+- layer 59 had maximum absolute error `0.0066835880279541016`, NRMSE
+  `0.00236000046446405`, and cosine `0.9999976753678922` when given the exact
+  layer-58 oracle boundary;
+- the mean final-position NRMSE was `0.0030814201888346663` for the 50 sliding
+  layers and `0.003070946966302261` for the 10 full-attention layers. There is
+  no geometry-class discontinuity in this test.
+
+This result rules out a single gross decoder-layer or full-versus-SWA semantic
+defect for the frozen prompt. It is consistent with small per-layer numerical
+differences accumulating through the 60-layer stack. The transition runner does
+not change serving behavior or the frozen admission gate.
+
+Durable evidence on `halo`:
+
+- prepared, hashed transition inputs:
+  `~/.hipfire/evidence/gemma4/base-short-layer-transition-inputs`;
+- per-layer and per-position report:
+  `~/.hipfire/evidence/gemma4/base-short-layer-transition-parity.json`.
+
 The best result remains
 `~/.hipfire/evidence/gemma4/base-short-hipfire-all-layers-embed-bf16-rope-order`
 at final-logit maximum error `0.5618224143981934`, with exact greedy generation,

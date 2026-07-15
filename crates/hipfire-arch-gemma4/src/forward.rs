@@ -610,6 +610,67 @@ pub fn forward_step_reference(
         .map_err(|error| HipError::new(0, &error))
 }
 
+/// Run one dense decoder layer from caller-supplied hidden rows while building
+/// that layer's KV history position by position.
+///
+/// This is an offline diagnostic seam for frozen-oracle transition tests. It
+/// deliberately skips embedding, all other layers, final normalization, and
+/// the language-model head; normal inference must use [`forward_step`]. The
+/// caller must provide positions contiguously and call [`Gemma4DenseState::reset`]
+/// before starting a different layer.
+pub fn diagnostic_forward_layer_from_hidden(
+    gpu: &mut Gpu,
+    weights: &Gemma4DenseWeights,
+    config: &Gemma4Config,
+    state: &mut Gemma4DenseState,
+    layer_idx: usize,
+    position: usize,
+    hidden: &[f32],
+) -> HipResult<Vec<f32>> {
+    if layer_idx >= weights.layers.len() || layer_idx >= config.layers.len() {
+        return Err(HipError::new(
+            0,
+            &format!("Gemma 4 diagnostic layer {layer_idx} is out of range"),
+        ));
+    }
+    if hidden.len() != config.hidden_size {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "Gemma 4 diagnostic hidden width {} does not match {}",
+                hidden.len(),
+                config.hidden_size
+            ),
+        ));
+    }
+    if position != state.next_pos() {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "Gemma 4 diagnostic position {position} is not contiguous with {}",
+                state.next_pos()
+            ),
+        ));
+    }
+
+    let bytes = unsafe {
+        std::slice::from_raw_parts(hidden.as_ptr().cast::<u8>(), std::mem::size_of_val(hidden))
+    };
+    gpu.hip.memcpy_htod(&state.x.buf, bytes)?;
+    let layer = &weights.layers[layer_idx];
+    attention_block(gpu, layer_idx, layer, config, state, position, None)?;
+    ffn_project(gpu, layer, config, state)?;
+    ffn_activate(gpu, layer, state)?;
+    ffn_finish(gpu, layer, config, state)?;
+    gpu.scale_f32(&state.x, layer.layer_scalar)?;
+    let output = gpu.download_f32(&state.x)?;
+    state
+        .kv
+        .advance(position)
+        .map_err(|error| HipError::new(0, &error))?;
+    Ok(output)
+}
+
 fn op(kind: SuperOpKind, flavor: OpFlavor, weights: Vec<WeightSlot>) -> SuperOp {
     SuperOp {
         kind,

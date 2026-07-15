@@ -49,6 +49,17 @@ standalone diagnostic, alongside the rocBLAS probes that prove bit-exact BF16
 projection and ROCm math-SDPA contracts. The normal serving path remains the
 best retained portable sequential implementation.
 
+A same-input sweep now also covers all 60 decoder transitions independently.
+Each layer receives the exact frozen oracle boundary and builds its own real
+five-position KV history. The worst final-position transition NRMSE is
+`0.005205519351551357`; sliding and full-attention layers have nearly identical
+mean transition error (`0.0030814201888346663` and `0.003070946966302261`). This
+rules out a discrete layer or attention-geometry defect for the frozen prompt
+and narrows the blocker to small numerical differences accumulated through the
+full stack. The exact per-layer evidence and reproduction tools are recorded in
+`benchmarks/gemma4/PHASE5.md`; this diagnostic does not alter serving or the
+frozen gate.
+
 A post-freeze Transformers reference-variability control is retained at
 `benchmarks/gemma4/control-noise-31B.json`. It shows that alternate BF16
 reference executions can diverge at the same late-stack hotspots, which is useful
