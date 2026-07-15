@@ -1765,8 +1765,11 @@ mod tests {
             messages: None,
             sampling: GenerationSamplingPolicy {
                 temperature: 0.7,
+                temperature_is_default: false,
                 max_tokens: 8,
                 top_p: None,
+                top_p_is_default: false,
+                top_k: None,
                 repeat_penalty: None,
             },
             worker_key_id: Some("worker-a".to_string()),

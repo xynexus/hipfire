@@ -165,6 +165,7 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                     content: "I'll fetch both.".into(),
                     tool_calls: vec![
                         ToolCall {
+                            id: None,
                             name: "list_landmarks".into(),
                             arguments: json!({ "city": "Paris" }),
                         },

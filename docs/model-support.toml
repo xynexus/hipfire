@@ -112,6 +112,17 @@ mtp = "none"
 kv = "none"
 vision = "none"
 
+# Gemma 4 identity/ingest is registered, but no runtime forward is admitted yet.
+# Update capabilities only when the corresponding frozen phase gate passes.
+[[arch]]
+ids = [24]
+label = "gemma4"
+prefill = "none"
+dflash = "none"
+mtp = "none"
+kv = "none"
+vision = "none"
+
 [[arch]]
 ids = [7]
 label = "qwen2"

@@ -1,29 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — Gemma3 weight loading. See LICENSE / NOTICE.
 
-//! GPU-resident Gemma3 weights + the HFQ loader.
-//!
-//! Replicates the qwen2 loader pattern (the helpers there are crate-private)
-//! adapted for the Gemma3 layout: **4 norms per layer** (`input_layernorm`,
+//! GPU-resident Gemma3 weights + family-specific tensor assembly over the
+//! shared runtime transformer loader. Gemma3 contributes its layout: **4 norms
+//! per layer** (`input_layernorm`,
 //! `post_attention_layernorm`, `pre_feedforward_layernorm`,
 //! `post_feedforward_layernorm`), **per-head `q_norm`/`k_norm`** (over
 //! `head_dim`), **GeGLU** (`gate`/`up`/`down`), **tied embeddings**, and **no
 //! QKV bias** (`attention_bias=false`). Norm weights ship `(1+w)`-baked from the
 //! quantizer, so they load as plain F32 and need no runtime offset.
 //!
-//! `load_weight_tensor` covers the bring-up format set (F16 / Q8F16 / HFQ4G256
-//! / HFQ4G128); extend for MQ4/MQ6 when those gemma3 artifacts ship. The
-//! duplication with qwen2/qwen35/dots-ocr is intentional debt — see the
-//! shared-transformer-loader cleanup in
-//! `docs/plans/2026-06-19-arch-roster-feature-matrix.md`.
+//! Prefix rules, required tensors, and the per-layer structure stay here;
+//! lookup, exact-shape validation, upload/quant mapping, embeddings, tied
+//! heads, and direct norms live in `hipfire_runtime::transformer_loader`.
 
 use hip_bridge::HipResult;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
-use hipfire_runtime::hfq::{
-    load_awq_scale, oq4_arch_load, oq4_to_oq8_combined, oq8_combined,
-    oqplus_compact_to_oq8_combined, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
-};
-use hipfire_runtime::quant::f16_to_f32;
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::transformer_loader::TransformerLoader;
 use hipfire_runtime::weights::{EmbeddingFormat, WeightTensor};
 
 use crate::config::Gemma3Config;
@@ -109,23 +103,35 @@ pub fn load_weights_prefixed(
 ) -> HipResult<Gemma3Weights> {
     #[cfg(unix)]
     hfq.drop_mmap();
+    let loader = TransformerLoader::new(hfq, "gemma3");
 
     eprintln!("gemma3: loading token_embd...");
-    let (token_embd, embd_format) = load_embed_tokens(hfq, gpu, cfg, prefix)?;
+    let (token_embd, embd_format) = loader.load_embedding(
+        gpu,
+        &format!("{prefix}model.embed_tokens.weight"),
+        cfg.vocab_size,
+        cfg.hidden_size,
+    )?;
 
     eprintln!("gemma3: loading model.norm...");
-    let output_norm = load_norm_weight_raw(
-        hfq,
+    let output_norm = loader.load_direct_f32(
         gpu,
         &format!("{prefix}model.norm.weight"),
-        cfg.hidden_size,
+        &[cfg.hidden_size],
     )?;
 
     eprintln!(
         "gemma3: loading lm_head (tied={})...",
         cfg.tie_word_embeddings
     );
-    let (output, tied_lm_head) = load_lm_head(hfq, gpu, cfg, embd_format, prefix)?;
+    let (output, tied_lm_head) = loader.load_lm_head(
+        gpu,
+        &format!("{prefix}model.embed_tokens.weight"),
+        &format!("{prefix}lm_head.weight"),
+        cfg.tie_word_embeddings,
+        cfg.vocab_size,
+        cfg.hidden_size,
+    )?;
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
@@ -134,7 +140,7 @@ pub fn load_weights_prefixed(
             cfg.num_hidden_layers as u32,
             "weights",
         );
-        layers.push(load_layer(hfq, gpu, cfg, i, prefix)?);
+        layers.push(load_layer(&loader, gpu, cfg, i, prefix)?);
     }
 
     Ok(Gemma3Weights {
@@ -159,16 +165,16 @@ pub fn load_encoder_weights_prefixed(
 ) -> HipResult<Gemma3Weights> {
     #[cfg(unix)]
     hfq.drop_mmap();
+    let loader = TransformerLoader::new(hfq, "gemma3");
 
     eprintln!("gemma3: loading encoder without token_embd/lm_head...");
     let token_embd = gpu.zeros(&[1], DType::F32)?;
-    let output_norm = load_norm_weight_raw(
-        hfq,
+    let output_norm = loader.load_direct_f32(
         gpu,
         &format!("{prefix}model.norm.weight"),
-        cfg.hidden_size,
+        &[cfg.hidden_size],
     )?;
-    let output = weight_tensor(gpu.zeros(&[1], DType::F32)?, DType::F32, 1, 1);
+    let output = dummy_weight_tensor(gpu.zeros(&[1], DType::F32)?, 1, 1);
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
@@ -177,7 +183,7 @@ pub fn load_encoder_weights_prefixed(
             cfg.num_hidden_layers as u32,
             "weights",
         );
-        layers.push(load_layer(hfq, gpu, cfg, i, prefix)?);
+        layers.push(load_layer(&loader, gpu, cfg, i, prefix)?);
     }
 
     Ok(Gemma3Weights {
@@ -198,57 +204,47 @@ pub fn load_resident_encoder_scaffold(
     cfg: &Gemma3Config,
     gpu: &mut Gpu,
 ) -> HipResult<Gemma3Weights> {
+    let loader = TransformerLoader::new(hfq, "gemma3");
     let dummy_weight = |gpu: &mut Gpu, m: usize, k: usize| -> HipResult<WeightTensor> {
-        Ok(weight_tensor(
-            gpu.zeros(&[1], DType::F32)?,
-            DType::F32,
-            m,
-            k,
-        ))
+        Ok(dummy_weight_tensor(gpu.zeros(&[1], DType::F32)?, m, k))
     };
-    let output_norm = load_norm_weight_raw(hfq, gpu, "model.norm.weight", cfg.hidden_size)?;
+    let output_norm = loader.load_direct_f32(gpu, "model.norm.weight", &[cfg.hidden_size])?;
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
         let p = format!("model.layers.{i}");
-        let input_norm = load_norm_weight_raw(
-            hfq,
+        let input_norm = loader.load_direct_f32(
             gpu,
             &format!("{p}.input_layernorm.weight"),
-            cfg.hidden_size,
+            &[cfg.hidden_size],
         )?;
-        let q_norm = load_norm_weight_raw(
-            hfq,
+        let q_norm = loader.load_direct_f32(
             gpu,
             &format!("{p}.self_attn.q_norm.weight"),
-            cfg.head_dim,
+            &[cfg.head_dim],
         )?;
         let prescale = cfg.q_prescale();
         if (prescale - 1.0).abs() > 1e-6 {
             gpu.scale_f32(&q_norm, prescale)?;
         }
-        let k_norm = load_norm_weight_raw(
-            hfq,
+        let k_norm = loader.load_direct_f32(
             gpu,
             &format!("{p}.self_attn.k_norm.weight"),
-            cfg.head_dim,
+            &[cfg.head_dim],
         )?;
-        let post_attn_norm = load_norm_weight_raw(
-            hfq,
+        let post_attn_norm = loader.load_direct_f32(
             gpu,
             &format!("{p}.post_attention_layernorm.weight"),
-            cfg.hidden_size,
+            &[cfg.hidden_size],
         )?;
-        let pre_ffn_norm = load_norm_weight_raw(
-            hfq,
+        let pre_ffn_norm = loader.load_direct_f32(
             gpu,
             &format!("{p}.pre_feedforward_layernorm.weight"),
-            cfg.hidden_size,
+            &[cfg.hidden_size],
         )?;
-        let post_ffn_norm = load_norm_weight_raw(
-            hfq,
+        let post_ffn_norm = loader.load_direct_f32(
             gpu,
             &format!("{p}.post_feedforward_layernorm.weight"),
-            cfg.hidden_size,
+            &[cfg.hidden_size],
         )?;
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
@@ -278,135 +274,8 @@ pub fn load_resident_encoder_scaffold(
     })
 }
 
-// ─── Per-tensor loaders (replicated from qwen2; see module doc) ──────────────
-
-fn load_embed_tokens(
-    hfq: &HfqFile,
-    gpu: &mut Gpu,
-    cfg: &Gemma3Config,
-    prefix: &str,
-) -> HipResult<(GpuTensor, EmbeddingFormat)> {
-    let name = format!("{prefix}model.embed_tokens.weight");
-    let (info, data) = hfq
-        .tensor_data_vec(&name)
-        .unwrap_or_else(|| panic!("gemma3: tensor not found: {name}"));
-    match info.quant_type {
-        6 => Ok((
-            gpu.upload_raw(&data, &[data.len()])?,
-            EmbeddingFormat::HFQ4G256,
-        )),
-        7 => Ok((
-            gpu.upload_raw(&data, &[data.len()])?,
-            EmbeddingFormat::HFQ4G128,
-        )),
-        3 => Ok((gpu.upload_raw(&data, &[data.len()])?, EmbeddingFormat::Q8_0)),
-        1 => {
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let buf = gpu.upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])?;
-            Ok((buf, EmbeddingFormat::F32))
-        }
-        16 => {
-            // bf16 source → promote to F32 (bf16 = high 16 bits of f32; there is
-            // no bf16 EmbeddingFormat, and a raw upload tagged otherwise corrupts
-            // the lookup). Mirrors the F16 (type 1) arm.
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect();
-            let buf = gpu.upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])?;
-            Ok((buf, EmbeddingFormat::F32))
-        }
-        qt => panic!(
-            "gemma3: unsupported embedding quant_type {qt}; handled 1/3/6/7/16. \
-             Extend load_embed_tokens."
-        ),
-    }
-}
-
-/// Load the lm_head. Gemma3 ties embeddings: re-upload the embedding bytes as a
-/// separate allocation (GpuTensor is not Clone). F16 source is promoted to F32
-/// (EmbeddingFormat has no F16 variant — uploading raw F16 tagged F32 corrupts
-/// the matmul; see qwen2's load_lm_head doc).
-fn load_lm_head(
-    hfq: &HfqFile,
-    gpu: &mut Gpu,
-    cfg: &Gemma3Config,
-    embd_format: EmbeddingFormat,
-    prefix: &str,
-) -> HipResult<(WeightTensor, bool)> {
-    // Gemma3 is tied in every shipped config, but honor the flag.
-    let name = if cfg.tie_word_embeddings {
-        format!("{prefix}model.embed_tokens.weight")
-    } else {
-        format!("{prefix}lm_head.weight")
-    };
-    let (info, data) = hfq
-        .tensor_data_vec(&name)
-        .unwrap_or_else(|| panic!("gemma3: tensor not found for lm_head: {name}"));
-    let m = cfg.vocab_size;
-    let k = cfg.hidden_size;
-    let mut weight = match info.quant_type {
-        6 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::HFQ4G256, m, k),
-        7 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::HFQ4G128, m, k),
-        3 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::Q8_0, m, k),
-        33 => {
-            let combined = oq4_to_oq8_combined(&data, m, k);
-            weight_tensor(
-                gpu.upload_raw(&combined, &[combined.len()])?,
-                DType::Oq8G256,
-                m,
-                k,
-            )
-        }
-        35 => {
-            let combined = oq8_combined(&data, m, k);
-            weight_tensor(
-                gpu.upload_raw(&combined, &[combined.len()])?,
-                DType::Oq8G256,
-                m,
-                k,
-            )
-        }
-        // OQ4 canonical (34) / arch-packed (37) via the shared decision helper.
-        OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
-            let (bytes, gpu_dtype) = oq4_arch_load(info.quant_type, &data, m, k)
-                .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
-            weight_tensor(gpu.upload_raw(&bytes, &[bytes.len()])?, gpu_dtype, m, k)
-        }
-        1 => {
-            // Promote F16 → F32 on host (see doc above), unless the tied embed
-            // is already a packed format (handled by the arms above).
-            let _ = embd_format;
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            weight_tensor(gpu.upload_f32(&f32_data, &[m, k])?, DType::F32, m, k)
-        }
-        16 => {
-            // bf16 → F32 (mirrors the F16 arm; bf16 = high 16 bits of f32).
-            let _ = embd_format;
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect();
-            weight_tensor(gpu.upload_f32(&f32_data, &[m, k])?, DType::F32, m, k)
-        }
-        qt => {
-            panic!("gemma3: unsupported lm_head quant_type {qt}; handled 1/3/6/7/16/33/34/35/37.")
-        }
-    };
-    if weight.gpu_dtype.supports_awq_sidecar() {
-        weight.awq_scale = load_awq_scale(hfq, gpu, &name, k);
-    }
-    Ok((weight, cfg.tie_word_embeddings))
-}
-
 fn load_layer(
-    hfq: &HfqFile,
+    loader: &TransformerLoader<'_>,
     gpu: &mut Gpu,
     cfg: &Gemma3Config,
     i: usize,
@@ -416,97 +285,84 @@ fn load_layer(
     let q_dim = cfg.num_attention_heads * cfg.head_dim;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
-    let input_norm = load_norm_weight_raw(
-        hfq,
+    let input_norm = loader.load_direct_f32(
         gpu,
         &format!("{p}.input_layernorm.weight"),
-        cfg.hidden_size,
+        &[cfg.hidden_size],
     )?;
     // Per-head QK-norm: RMSNorm over head_dim. Bake the Q pre-scale into
     // q_norm so the attention kernel's built-in 1/√head_dim becomes Gemma's
     // 1/√query_pre_attn_scalar (no per-step scale launch). No-op when
     // q_prescale == 1.0 (query_pre_attn_scalar == head_dim, e.g. gemma3-4b).
-    let q_norm = load_norm_weight_raw(
-        hfq,
+    let q_norm = loader.load_direct_f32(
         gpu,
         &format!("{p}.self_attn.q_norm.weight"),
-        cfg.head_dim,
+        &[cfg.head_dim],
     )?;
     let prescale = cfg.q_prescale();
     if (prescale - 1.0).abs() > 1e-6 {
         gpu.scale_f32(&q_norm, prescale)?;
     }
-    let k_norm = load_norm_weight_raw(
-        hfq,
+    let k_norm = loader.load_direct_f32(
         gpu,
         &format!("{p}.self_attn.k_norm.weight"),
-        cfg.head_dim,
+        &[cfg.head_dim],
     )?;
 
-    let wq = load_weight_tensor(
-        hfq,
+    let wq = loader.load_weight(
         gpu,
         &format!("{p}.self_attn.q_proj.weight"),
         q_dim,
         cfg.hidden_size,
     )?;
-    let wk = load_weight_tensor(
-        hfq,
+    let wk = loader.load_weight(
         gpu,
         &format!("{p}.self_attn.k_proj.weight"),
         kv_dim,
         cfg.hidden_size,
     )?;
-    let wv = load_weight_tensor(
-        hfq,
+    let wv = loader.load_weight(
         gpu,
         &format!("{p}.self_attn.v_proj.weight"),
         kv_dim,
         cfg.hidden_size,
     )?;
-    let wo = load_weight_tensor(
-        hfq,
+    let wo = loader.load_weight(
         gpu,
         &format!("{p}.self_attn.o_proj.weight"),
         cfg.hidden_size,
         q_dim,
     )?;
 
-    let post_attn_norm = load_norm_weight_raw(
-        hfq,
+    let post_attn_norm = loader.load_direct_f32(
         gpu,
         &format!("{p}.post_attention_layernorm.weight"),
-        cfg.hidden_size,
+        &[cfg.hidden_size],
     )?;
-    let pre_ffn_norm = load_norm_weight_raw(
-        hfq,
+    let pre_ffn_norm = loader.load_direct_f32(
         gpu,
         &format!("{p}.pre_feedforward_layernorm.weight"),
-        cfg.hidden_size,
+        &[cfg.hidden_size],
     )?;
-    let post_ffn_norm = load_norm_weight_raw(
-        hfq,
+    let post_ffn_norm = loader.load_direct_f32(
         gpu,
         &format!("{p}.post_feedforward_layernorm.weight"),
-        cfg.hidden_size,
+        &[cfg.hidden_size],
     )?;
 
-    let w_gate = load_weight_tensor(
-        hfq,
+    let w_gate = loader.load_weight(
         gpu,
         &format!("{p}.mlp.gate_proj.weight"),
         cfg.intermediate_size,
         cfg.hidden_size,
     )?;
-    let w_up = load_weight_tensor(
-        hfq,
+    let w_up = loader.load_weight(
         gpu,
         &format!("{p}.mlp.up_proj.weight"),
         cfg.intermediate_size,
         cfg.hidden_size,
     )?;
-    let w_down = load_weight_tensor(
-        hfq,
+    let w_down = loader.load_weight(
         gpu,
         &format!("{p}.mlp.down_proj.weight"),
         cfg.hidden_size,
@@ -530,53 +386,6 @@ fn load_layer(
     })
 }
 
-/// Upload an F16/F32/BF16 norm/scalar tensor as F32 on GPU. (Gemma3 norms are
-/// already `(1+w)`-baked at ingest, so this loads them verbatim.)
-fn load_norm_weight_raw(
-    hfq: &HfqFile,
-    gpu: &mut Gpu,
-    name: &str,
-    n: usize,
-) -> HipResult<GpuTensor> {
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .unwrap_or_else(|| panic!("gemma3: tensor not found: {name}"));
-    let f32_data: Vec<f32> = match info.quant_type {
-        1 => data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        2 => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        16 => data
-            .chunks_exact(2)
-            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-            .collect(),
-        qt => panic!("gemma3: expected F16/F32/BF16 for norm {name}, got qt={qt}"),
-    };
-    assert_eq!(
-        f32_data.len(),
-        n,
-        "gemma3: norm {name} has {} elements, expected {n}",
-        f32_data.len()
-    );
-    gpu.upload_f32(&f32_data, &[n])
-}
-
-fn weight_tensor(buf: GpuTensor, gpu_dtype: DType, m: usize, k: usize) -> WeightTensor {
-    WeightTensor {
-        buf,
-        gpu_dtype,
-        m,
-        k,
-        row_stride: 0,
-        paro: None,
-        awq_scale: None,
-    }
-}
-
 fn free_weight_tensor(gpu: &mut Gpu, wt: WeightTensor) {
     let _ = gpu.free_tensor(wt.buf);
     if let Some(awq) = wt.awq_scale {
@@ -584,86 +393,14 @@ fn free_weight_tensor(gpu: &mut Gpu, wt: WeightTensor) {
     }
 }
 
-/// Load a linear weight to a `WeightTensor`. Bring-up format set
-/// (F16 / Q8F16 / HFQ4G256 / HFQ4G128 / OP4 / OP8).
-fn load_weight_tensor(
-    hfq: &HfqFile,
-    gpu: &Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-) -> HipResult<WeightTensor> {
-    let (info, data) = hfq
-        .tensor_data_vec(name)
-        .unwrap_or_else(|| panic!("gemma3: tensor not found: {name}"));
-    let mut wt = match info.quant_type {
-        33 => {
-            let combined = oq4_to_oq8_combined(&data, m, k);
-            weight_tensor(
-                gpu.upload_raw(&combined, &[combined.len()])?,
-                DType::Oq8G256,
-                m,
-                k,
-            )
-        }
-        35 => {
-            let combined = oq8_combined(&data, m, k);
-            weight_tensor(
-                gpu.upload_raw(&combined, &[combined.len()])?,
-                DType::Oq8G256,
-                m,
-                k,
-            )
-        }
-        // OqPlusCompact: OQ+ magnitude-tiered (int4 bulk + sparse int8 outliers),
-        // stored compactly on disk (130 + 2·N_out B/group). Expand to the same
-        // Oq8G256 combined layout as arm 33/35 — int4 bulk sign-extended into int8
-        // with the outliers overlaid — so it reads through the OQ8 gemm/gemv path.
-        // Matches the minimax `oqplus_compact_to_moe_oq8_blocks` decoder (dense
-        // combined layout here vs the indexed-MoE block layout there). The `+`
-        // AWQ smoothing sidecar is attached generically below (Oq8G256 carries it).
-        36 => {
-            let combined = oqplus_compact_to_oq8_combined(&data, m, k);
-            weight_tensor(
-                gpu.upload_raw(&combined, &[combined.len()])?,
-                DType::Oq8G256,
-                m,
-                k,
-            )
-        }
-        // OQ4 canonical (34, repack at load) / arch-packed (37, verbatim) — both
-        // delegate to the shared `oq4_arch_load` (single source of truth).
-        OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
-            let (bytes, gpu_dtype) = oq4_arch_load(info.quant_type, &data, m, k)
-                .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
-            weight_tensor(gpu.upload_raw(&bytes, &[bytes.len()])?, gpu_dtype, m, k)
-        }
-        // bf16 stays bf16 on GPU (the gemm/gemv families dispatch a bf16 path,
-        // same as the gemma3-vl bf16 vision tower) — no F32 promotion needed. The
-        // *buffer's* dtype must be BF16, not just the WeightTensor's gpu_dtype:
-        // `gemm_bf16_x_bf16_wmma` asserts on the GpuTensor's dtype, and
-        // `upload_raw` tags the buffer `Raw`.
-        16 => {
-            let mut buf = gpu.upload_raw(&data, &[data.len()])?;
-            buf.dtype = DType::BF16;
-            weight_tensor(buf, DType::BF16, m, k)
-        }
-        // All pure upload-and-tag formats (F16/Q8/HFQ*/MQ*/Qtip3G256/FP4…)
-        // route through the shared canonical map in hipfire_runtime::quant;
-        // the transform arms above (bf16 retag, OP4/OP8 arch-repack) stay local.
-        qt => {
-            let dtype = hipfire_runtime::quant::dtype_for_quant_type(qt, k).unwrap_or_else(|| {
-                panic!(
-                    "gemma3: unsupported linear quant_type {qt} for {name}; \
-                     transform arms handle 16 (BF16), 33/34/35/36/37 (OP4/OP8/OQ+C); \
-                     all pure formats come from hipfire_runtime::quant::dtype_for_quant_type."
-                )
-            });
-            weight_tensor(gpu.upload_raw(&data, &[data.len()])?, dtype, m, k)
-        }
-    };
-    if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = load_awq_scale(hfq, gpu, name, k);
+fn dummy_weight_tensor(buf: GpuTensor, m: usize, k: usize) -> WeightTensor {
+    WeightTensor {
+        buf,
+        gpu_dtype: DType::F32,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
     }
-    Ok(wt)
 }

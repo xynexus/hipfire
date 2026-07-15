@@ -43,6 +43,7 @@ pub struct ChatRequest {
     pub stream: bool,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<usize>,
     pub repeat_penalty: Option<f64>,
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
@@ -70,6 +71,8 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<Value>>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 pub async fn post_chat_completions(
@@ -424,6 +427,9 @@ fn chat_message_to_prompt_message(message: &ChatMessage) -> Option<PromptMessage
     let mut content = openai_chat_content_to_text(message.content.as_ref());
     if matches!(role, Role::Assistant) {
         content = strip_visible_thinking(content, false, false);
+        if let Some(reasoning) = message.reasoning_content.as_deref() {
+            content = format!("<|channel>thought\n{reasoning}\n<channel|>{content}");
+        }
     }
     Some(PromptMessage {
         role,
@@ -441,7 +447,8 @@ fn chat_message_to_prompt_message(message: &ChatMessage) -> Option<PromptMessage
 
 fn chat_role_to_prompt_role(role: &str) -> Option<Role> {
     match role {
-        "developer" | "system" => Some(Role::System),
+        "developer" => Some(Role::Developer),
+        "system" => Some(Role::System),
         "user" => Some(Role::User),
         "assistant" => Some(Role::Assistant),
         "tool" | "toolResult" | "tool_result" => Some(Role::Tool),
@@ -482,7 +489,14 @@ fn parse_openai_tool_calls(calls: Option<&[Value]>) -> Vec<PromptToolCall> {
                 Some(value) => value.clone(),
                 None => json!({}),
             };
-            Some(PromptToolCall { name, arguments })
+            Some(PromptToolCall {
+                id: call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                name,
+                arguments,
+            })
         })
         .collect()
 }
@@ -1768,6 +1782,7 @@ where
                 resolved.max_tokens,
                 body.temperature,
                 body.top_p,
+                body.top_k,
                 body.repeat_penalty,
                 Some(request_max_tokens),
             ),
@@ -2092,6 +2107,7 @@ async fn stream_chat(
                     resolved.max_tokens,
                     body.temperature,
                     body.top_p,
+                    body.top_k,
                     body.repeat_penalty,
                     Some(request_max_tokens),
                 ),
@@ -2393,8 +2409,11 @@ mod tests {
             &messages,
             GenerationSamplingPolicy {
                 temperature: 0.3,
+                temperature_is_default: false,
                 max_tokens: 16,
                 top_p: Some(0.8),
+                top_p_is_default: false,
+                top_k: None,
                 repeat_penalty: Some(1.0),
             },
             Some("worker-a".to_string()),
@@ -2571,12 +2590,16 @@ mod tests {
         );
 
         let daemon_messages = req.messages.unwrap();
-        assert_eq!(daemon_messages[0].role, Role::System);
+        assert_eq!(daemon_messages[0].role, Role::Developer);
         assert_eq!(daemon_messages[0].content, "follow policy");
         assert_eq!(daemon_messages[2].role, Role::Assistant);
         assert_eq!(daemon_messages[2].content, "");
         assert_eq!(daemon_messages[2].tool_calls.len(), 1);
         assert_eq!(daemon_messages[2].tool_calls[0].name, "lookup");
+        assert_eq!(
+            daemon_messages[2].tool_calls[0].id.as_deref(),
+            Some("call_1")
+        );
         assert_eq!(
             daemon_messages[2].tool_calls[0].arguments,
             json!({"q":"hipfire"})

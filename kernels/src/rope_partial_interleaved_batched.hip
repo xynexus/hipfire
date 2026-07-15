@@ -24,6 +24,7 @@ extern "C" __global__ void rope_partial_interleaved_batched_f32(
     int n_heads_k,
     int head_dim,
     int n_rot,          // number of dims to rotate (64 for Qwen3.5)
+    int basis_dim,      // exponent denominator (n_rot for legacy callers)
     float freq_base,
     int batch_size,
     int pos_offset      // added to positions[b] for RoPE angle only;
@@ -40,7 +41,7 @@ extern "C" __global__ void rope_partial_interleaved_batched_f32(
     int d0 = pair * 2;
     int d1 = pair * 2 + 1;
 
-    float freq = 1.0f / powf(freq_base, (float)(2 * pair) / (float)n_rot);
+    float freq = 1.0f / powf(freq_base, (float)(2 * pair) / (float)basis_dim);
     float angle = (float)pos * freq;
     float cos_a = cosf(angle);
     float sin_a = sinf(angle);

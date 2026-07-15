@@ -11209,6 +11209,7 @@ pub fn spec_step_ddtree_batched(
                 target.config.n_kv_heads,
                 target.config.head_dim,
                 n_rot,
+                n_rot,
                 target.config.rope_theta,
                 n_positions,
                 0,

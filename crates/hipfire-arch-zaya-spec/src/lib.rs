@@ -7,7 +7,7 @@
 
 use hipfire_arch_api::{
     default_importance, default_requires, register_arch, transformer_role, Arch, ArchId, CapReq,
-    Ingest, TensorRole,
+    ExpertLayout, Ingest, TensorRole,
 };
 
 /// ZAYA1 family header id.
@@ -23,6 +23,9 @@ impl Arch for ZayaSpec {
     fn family(&self) -> &'static str {
         "zaya"
     }
+    fn model_types(&self) -> &'static [&'static str] {
+        &["zaya"]
+    }
 }
 
 impl Ingest for ZayaSpec {
@@ -34,6 +37,9 @@ impl Ingest for ZayaSpec {
     }
     fn requires(&self, tensor: &str) -> CapReq {
         default_requires(self.role(tensor))
+    }
+    fn expert_layout(&self) -> ExpertLayout {
+        ExpertLayout::StackedGateUpDown
     }
 }
 

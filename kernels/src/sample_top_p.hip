@@ -6,7 +6,7 @@
 
 // GPU-side sampling. Matches CPU llama::sample_top_p + apply_repeat_penalty:
 //   - Frequency-weighted + recency-decayed repeat penalty (count + cap at 1.5×)
-//   - Top-K (=20) selection directly from raw logits (no threshold race)
+//   - Caller-selected top-K (1..64) directly from raw logits (no threshold race)
 //   - Softmax over top-K only (matches CPU normalization)
 //   - Top-p sampling within the top-K distribution
 //
@@ -29,13 +29,16 @@ extern "C" __global__ void sample_top_p(
     int vocab_size,
     float temperature,
     float top_p,
+    int requested_top_k,
     unsigned int rand_seed,
     int repeat_window,
     float repeat_penalty,
     float presence_penalty,
     float frequency_penalty
 ) {
-    const int TOP_K = 20;
+    const int MAX_TOP_K = 64;
+    const int TOP_K = requested_top_k < 1 ? MAX_TOP_K :
+                      (requested_top_k > MAX_TOP_K ? MAX_TOP_K : requested_top_k);
     extern __shared__ char smem[];
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
@@ -97,8 +100,7 @@ extern "C" __global__ void sample_top_p(
     // Use a fixed-size local buffer with manual min-tracking (same algorithm
     // as CPU `sample_top_p` but sharded across threads). After this pass,
     // every thread owns TOP_K candidates covering its strip.
-    float my_vals[20]; int my_idx[20];
-    #pragma unroll
+    float my_vals[MAX_TOP_K]; int my_idx[MAX_TOP_K];
     for (int k = 0; k < TOP_K; k++) { my_vals[k] = -1e30f; my_idx[k] = 0; }
     int min_pos = 0;
     float min_val = -1e30f;
@@ -109,14 +111,12 @@ extern "C" __global__ void sample_top_p(
             my_idx[min_pos] = i;
             // Recompute min.
             min_val = my_vals[0]; min_pos = 0;
-            #pragma unroll
             for (int k = 1; k < TOP_K; k++) {
                 if (my_vals[k] < min_val) { min_val = my_vals[k]; min_pos = k; }
             }
         }
     }
     // Stash this thread's local top-K into shared memory.
-    #pragma unroll
     for (int k = 0; k < TOP_K; k++) {
         topk_val[tid * TOP_K + k] = my_vals[k];
         topk_idx[tid * TOP_K + k] = my_idx[k];
@@ -134,12 +134,10 @@ extern "C" __global__ void sample_top_p(
             // Merge two sorted-or-unsorted TOP_K lists into top-K of the union.
             // Since neither list is sorted, we do min-replace: for each element
             // in b, try to insert into a.
-            #pragma unroll
             for (int j = 0; j < TOP_K; j++) {
                 float bv = b_val[j]; int bi = b_idx[j];
                 // Find a's min.
                 float amin = a_val[0]; int amin_pos = 0;
-                #pragma unroll
                 for (int k = 1; k < TOP_K; k++) {
                     if (a_val[k] < amin) { amin = a_val[k]; amin_pos = k; }
                 }
@@ -151,8 +149,7 @@ extern "C" __global__ void sample_top_p(
 
     // Phase 3: thread 0 owns the final top-K — softmax, sort descending, top-p sample.
     if (tid == 0) {
-        float vals[20]; int idx[20];
-        #pragma unroll
+        float vals[MAX_TOP_K]; int idx[MAX_TOP_K];
         for (int k = 0; k < TOP_K; k++) {
             vals[k] = topk_val[k];
             idx[k]  = topk_idx[k];
@@ -176,8 +173,7 @@ extern "C" __global__ void sample_top_p(
         // Softmax over top-K only (matches CPU `sample_top_p`).
         float inv_temp = 1.0f / temperature;
         float sum = 0.0f;
-        float probs[20];
-        #pragma unroll
+        float probs[MAX_TOP_K];
         for (int k = 0; k < TOP_K; k++) {
             if (vals[k] <= -1e29f) { probs[k] = 0.0f; continue; }
             float p = expf((vals[k] - max_val) * inv_temp);
@@ -187,8 +183,7 @@ extern "C" __global__ void sample_top_p(
         if (sum <= 0.0f) { result[0] = (unsigned int)idx[0]; result[1] = rand_seed; return; }
 
         // Sort indices by probability descending (insertion sort on 20 elems).
-        int order[20];
-        #pragma unroll
+        int order[MAX_TOP_K];
         for (int k = 0; k < TOP_K; k++) order[k] = k;
         for (int i = 1; i < TOP_K; i++) {
             int cur = order[i];

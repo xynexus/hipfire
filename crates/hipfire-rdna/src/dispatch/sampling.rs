@@ -274,6 +274,7 @@ impl Gpu {
             vocab_size,
             temperature,
             top_p,
+            20,
             rng_state,
             repeat_window,
             repeat_penalty,
@@ -291,6 +292,7 @@ impl Gpu {
         vocab_size: usize,
         temperature: f32,
         top_p: f32,
+        top_k: usize,
         rng_state: u32,
         repeat_window: usize,
         repeat_penalty: f32,
@@ -307,6 +309,11 @@ impl Gpu {
         let mut vs = vocab_size as i32;
         let mut temp = temperature;
         let mut tp = top_p;
+        let mut tk = if top_k == 0 {
+            64_i32
+        } else {
+            top_k.clamp(1, 64) as i32
+        };
         let mut rng = rng_state;
         let mut rw = repeat_window as i32;
         let mut rp = repeat_penalty;
@@ -320,6 +327,7 @@ impl Gpu {
             &mut vs as *mut _ as *mut std::ffi::c_void,
             &mut temp as *mut _ as *mut std::ffi::c_void,
             &mut tp as *mut _ as *mut std::ffi::c_void,
+            &mut tk as *mut _ as *mut std::ffi::c_void,
             &mut rng as *mut _ as *mut std::ffi::c_void,
             &mut rw as *mut _ as *mut std::ffi::c_void,
             &mut rp as *mut _ as *mut std::ffi::c_void,
@@ -327,9 +335,11 @@ impl Gpu {
             &mut fp as *mut _ as *mut std::ffi::c_void,
         ];
 
-        let block_size = 256u32;
-        // topk_val[nthreads*20] + topk_idx[nthreads*20] = 256*20*4 + 256*20*4 = 40960 bytes
-        let shared_mem = 256u32 * 20 * 4 * 2;
+        // Keep the established 256-thread launch for top-k <= 20. Wider
+        // candidate sets use 64 threads so the generic top-64 reduction stays
+        // comfortably below the 64 KiB LDS limit on every supported RDNA.
+        let block_size = if tk <= 20 { 256u32 } else { 64u32 };
+        let shared_mem = block_size * tk as u32 * 4 * 2;
 
         unsafe {
             self.hip.launch_kernel(
@@ -371,6 +381,7 @@ impl Gpu {
         let mut vs = vocab_size as i32;
         let mut temp = temperature;
         let mut tp = top_p;
+        let mut tk = 20_i32;
         let mut rng = rng_state;
         let mut rw = repeat_window as i32;
         let mut rp = repeat_penalty;
@@ -384,6 +395,7 @@ impl Gpu {
             &mut vs as *mut _ as *mut std::ffi::c_void,
             &mut temp as *mut _ as *mut std::ffi::c_void,
             &mut tp as *mut _ as *mut std::ffi::c_void,
+            &mut tk as *mut _ as *mut std::ffi::c_void,
             &mut rng as *mut _ as *mut std::ffi::c_void,
             &mut rw as *mut _ as *mut std::ffi::c_void,
             &mut rp as *mut _ as *mut std::ffi::c_void,

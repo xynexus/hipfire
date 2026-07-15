@@ -274,6 +274,7 @@ fn decode_step_body(
             cfg.num_key_value_heads,
             cfg.head_dim,
             cfg.rotary_dim,
+            cfg.rotary_dim,
             cfg.rope_theta,
         )
         .map_err(|e| format!("minimax L{l}: rope: {e:?}"))?;
@@ -753,6 +754,7 @@ fn minimax_attn_block(
         cfg.num_attention_heads,
         cfg.num_key_value_heads,
         cfg.head_dim,
+        cfg.rotary_dim,
         cfg.rotary_dim,
         cfg.rope_theta,
     )
@@ -1353,6 +1355,7 @@ pub fn forward_batch(
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
             cfg.head_dim,
+            cfg.rotary_dim,
             cfg.rotary_dim,
             cfg.rope_theta,
             b,

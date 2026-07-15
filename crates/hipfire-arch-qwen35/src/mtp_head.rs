@@ -1692,6 +1692,7 @@ fn mtp_head_block_post_embedding(
         cfg.n_head_kv,
         cfg.head_dim,
         cfg.n_rot,
+        cfg.n_rot,
         cfg.rope_theta,
     )?;
 
@@ -2546,6 +2547,7 @@ pub fn mtp_head_forward_block_batched(
         cfg.n_head,
         cfg.n_head_kv,
         cfg.head_dim,
+        cfg.n_rot,
         cfg.n_rot,
         cfg.rope_theta,
         n,

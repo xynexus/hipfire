@@ -23,11 +23,25 @@ use hipfire_state::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct GenerationSamplingPolicy {
     pub temperature: f64,
+    /// True when `temperature` came from a server/default profile rather than
+    /// an explicit request field. A registered checkpoint profile may replace
+    /// it; explicit request values always win.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub temperature_is_default: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
+    /// See [`Self::temperature_is_default`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub top_p_is_default: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repeat_penalty: Option<f64>,
     pub max_tokens: u32,
@@ -37,7 +51,10 @@ impl GenerationSamplingPolicy {
     pub fn greedy(max_tokens: u32) -> Self {
         Self {
             temperature: 0.0,
+            temperature_is_default: false,
             top_p: None,
+            top_p_is_default: false,
+            top_k: None,
             repeat_penalty: None,
             max_tokens,
         }
@@ -51,12 +68,16 @@ impl GenerationSamplingPolicy {
         default_max_tokens: u32,
         temperature: Option<f64>,
         top_p: Option<f64>,
+        top_k: Option<usize>,
         repeat_penalty: Option<f64>,
         max_tokens: Option<u32>,
     ) -> Self {
         Self {
             temperature: temperature.unwrap_or(default_temperature),
+            temperature_is_default: temperature.is_none(),
             top_p: Some(top_p.unwrap_or(default_top_p)),
+            top_p_is_default: top_p.is_none(),
+            top_k,
             repeat_penalty: Some(repeat_penalty.unwrap_or(default_repeat_penalty)),
             max_tokens: max_tokens.unwrap_or(default_max_tokens),
         }
@@ -1650,8 +1671,11 @@ mod tests {
             ],
             GenerationSamplingPolicy {
                 temperature: 0.3,
+                temperature_is_default: false,
                 max_tokens: 16,
                 top_p: Some(0.8),
+                top_p_is_default: false,
+                top_k: None,
                 repeat_penalty: Some(1.0),
             },
         );
@@ -1702,6 +1726,7 @@ mod tests {
             1.05,
             128,
             Some(0.2),
+            None,
             None,
             None,
             Some(8),
@@ -1853,7 +1878,10 @@ mod tests {
             messages: None,
             sampling: GenerationSamplingPolicy {
                 temperature: 0.3,
+                temperature_is_default: false,
                 top_p: Some(0.8),
+                top_p_is_default: false,
+                top_k: None,
                 repeat_penalty: Some(1.05),
                 max_tokens: 128,
             },

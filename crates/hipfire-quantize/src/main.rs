@@ -2536,6 +2536,28 @@ use hipfire_arch_specs as _;
 static ARCH_REGISTRY: std::sync::OnceLock<hipfire_arch_api::ArchRegistry> =
     std::sync::OnceLock::new();
 
+fn arch_id_via_registry(model_type: &str) -> Option<u32> {
+    Some(
+        ARCH_REGISTRY
+            .get_or_init(hipfire_arch_api::ArchRegistry::build)
+            .find_by_model_type(model_type)?
+            .id
+            .0 as u32,
+    )
+}
+
+fn expert_layout_via_ingest(arch_id: u32) -> Option<hipfire_arch_api::ExpertLayout> {
+    use hipfire_arch_api::ArchId;
+    Some(
+        ARCH_REGISTRY
+            .get_or_init(hipfire_arch_api::ArchRegistry::build)
+            .get(ArchId(arch_id as u16))?
+            .caps
+            .ingest?
+            .expert_layout(),
+    )
+}
+
 /// Should this tensor be kept at HIGH PRECISION (vs. compressed), for arches
 /// migrated onto `hipfire-arch-api`? Returns `Some(true)` = keep high precision,
 /// `Some(false)` = compressible, or `None` when this arch has NOT declared an
@@ -6087,6 +6109,8 @@ fn main() {
     // `arch_str` detection tokens are documented in `docs/architecture-ids.md`.
     let auto_arch_id = if is_mamba2_config {
         ARCH_ID_MAMBA2
+    } else if let Some(registered) = arch_id_via_registry(arch_str) {
+        registered
     } else {
         match arch_str {
             "llama" => ARCH_ID_LLAMA_MISTRAL,
@@ -6179,10 +6203,18 @@ fn main() {
     } else {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
-    // arch_id 6 = Qwen3.5-MoE, 16 = ZAYA1: both store routed experts as stacked 3D
-    // `mlp.experts.{gate_up,down}_proj` tensors that the ingest path must split
-    // per-expert (see the 3D split gated on `is_moe`).
-    let is_moe = arch_id == ARCH_ID_QWEN35_MOE || arch_id == ARCH_ID_ZAYA;
+    // Resolve stacked routed-expert ingest from the registered source layout and
+    // config structure. Dense variants sharing a base id remain dense because
+    // they declare no experts, while Qwen3.5-MoE, Zaya, and future registered
+    // families reach the same rank-3 split path without another family arm.
+    let text_config = config.get("text_config").unwrap_or(&config);
+    let has_declared_experts = text_config
+        .get("num_experts")
+        .and_then(|value| value.as_u64())
+        .is_some_and(|experts| experts > 0);
+    let is_moe = has_declared_experts
+        && expert_layout_via_ingest(arch_id)
+            == Some(hipfire_arch_api::ExpertLayout::StackedGateUpDown);
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
@@ -6391,14 +6423,28 @@ fn main() {
             // block-[128,128] scale). Strip the longer suffix FIRST.
             if let Some(stem) = name.strip_suffix(".weight_scale_inv") {
                 let w_name = format!("{stem}.weight");
-                fp8_scale_for.insert(w_name, (fi, name.to_string()));
-                continue;
+                let has_fp8_weight = st_files.iter().any(|candidate| {
+                    candidate
+                        .tensor_data(&w_name)
+                        .is_some_and(|(meta, _)| meta.dtype == "I8" || meta.dtype == "F8_E4M3")
+                });
+                if has_fp8_weight {
+                    fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                    continue;
+                }
             }
             if let Some(stem) = name.strip_suffix(".scale") {
                 // Sibling weight name (drop `.scale`, add `.weight`).
                 let w_name = format!("{stem}.weight");
-                fp8_scale_for.insert(w_name, (fi, name.to_string()));
-                continue;
+                let has_fp8_weight = st_files.iter().any(|candidate| {
+                    candidate
+                        .tensor_data(&w_name)
+                        .is_some_and(|(meta, _)| meta.dtype == "I8" || meta.dtype == "F8_E4M3")
+                });
+                if has_fp8_weight {
+                    fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                    continue;
+                }
             }
             all_tensors.push((name, fi));
         }
@@ -7004,15 +7050,17 @@ fn main() {
         }
 
         // ── MoE 3D-stacked expert tensor split ─────────────────────────────────
-        // Qwen3.5-MoE stores routed experts as 3D tensors:
-        //   model.language_model.layers.{N}.mlp.experts.gate_up_proj
+        // Registered `StackedGateUpDown` families store routed experts as 3D
+        // tensors. Qwen3.5 uses an `.mlp.experts.` parent while Gemma 4 uses
+        // `.experts.` directly:
+        //   model.language_model.layers.{N}[.mlp].experts.gate_up_proj
         //     shape: [num_experts, 2 * moe_intermediate, hidden_size]
-        //   model.language_model.layers.{N}.mlp.experts.down_proj
+        //   model.language_model.layers.{N}[.mlp].experts.down_proj
         //     shape: [num_experts, hidden_size, moe_intermediate]
         // Note: no `.weight` suffix on these, so should_quantize() returns false
         // and the standard path would store them as F16 — defeating the purpose.
         // We split into per-expert 2D MQ4G256 quantized tensors named
-        //   model.language_model.layers.{N}.mlp.experts.{X}.{base}.weight
+        //   model.language_model.layers.{N}[.mlp].experts.{X}.{base}.weight
         // so the engine loader can fish them out by expert index.
         // ── DeepSeek V4 per-expert tensor path ─────────────────────────────────────
         // DeepSeek V4 ships per-expert 2D tensors at `layers.L.ffn.experts.E.{w1,w2,w3}.weight`.
@@ -7458,7 +7506,7 @@ fn main() {
         }
 
         if is_moe
-            && name.contains("mlp.experts.")
+            && name.contains(".experts.")
             && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
             && meta.shape.len() == 3
         {
@@ -7488,9 +7536,9 @@ fn main() {
             let inner_k = inner_shape[1] as usize;
             let supports_g256 = inner_k % 256 == 0;
             // K-map: check the parent tensor name directly. The parent
-            // (e.g. "...mlp.experts.gate_up_proj") contains "mlp.experts."
-            // so kmap_resolve rule 4 matches it. The kmap HashMap was built
-            // from all_tensors which has these parent names as keys.
+            // Qwen's parent (e.g. "...mlp.experts.gate_up_proj") matches the
+            // existing MoE K-map rule. Other registered stacked layouts use
+            // their base format until they declare their own calibration map.
             let kmap_promote = kmap.get(*name) == Some(&QuantLevel::Promote6);
             // Phase 5 tiering decision needs the layer index for this parent.
             // Computed once here and reused by both expert_lloyd_mq2_native
@@ -13071,6 +13119,35 @@ mod tests {
         assert_eq!(
             high_precision_via_ingest(200, "whatever.weight", 4096),
             None
+        );
+    }
+
+    #[test]
+    fn registry_resolves_gemma4_identity_and_stacked_expert_layout() {
+        for model_type in [
+            "gemma4",
+            "gemma4_text",
+            "gemma4_unified",
+            "gemma4_unified_text",
+        ] {
+            assert_eq!(arch_id_via_registry(model_type), Some(24));
+        }
+        assert_eq!(
+            expert_layout_via_ingest(24),
+            Some(hipfire_arch_api::ExpertLayout::StackedGateUpDown)
+        );
+        // Existing consumers prove the source-layout seam is not Gemma-4-only.
+        assert_eq!(
+            expert_layout_via_ingest(6),
+            Some(hipfire_arch_api::ExpertLayout::StackedGateUpDown)
+        );
+        assert_eq!(
+            expert_layout_via_ingest(16),
+            Some(hipfire_arch_api::ExpertLayout::StackedGateUpDown)
+        );
+        assert_eq!(
+            expert_layout_via_ingest(12),
+            Some(hipfire_arch_api::ExpertLayout::None)
         );
     }
 

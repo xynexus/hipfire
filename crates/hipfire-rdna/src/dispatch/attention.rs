@@ -3922,6 +3922,78 @@ impl Gpu {
         }
         result
     }
+
+    /// BF16-compute causal prefill parity primitive. This mirrors the dtype
+    /// boundaries of PyTorch ROCm SDPA while keeping Hipfire's generic F32
+    /// tensor ABI. It is deliberately not selected by architecture dispatch;
+    /// callers must establish real-model numerical evidence first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_dflash_wmma_bf16_causal_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        b: usize,
+        l: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        query_position_base: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "BF16 attention Q must use the F32 ABI");
+        assert_eq!(k.dtype, DType::F32, "BF16 attention K must use the F32 ABI");
+        assert_eq!(v.dtype, DType::F32, "BF16 attention V must use the F32 ABI");
+        assert_eq!(out.dtype, DType::F32, "BF16 attention output must be F32");
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            head_dim % 16 == 0 && head_dim <= 256,
+            "attention_dflash_wmma_bf16_causal_f32: head_dim={head_dim} must be a multiple of 16 and <= 256",
+        );
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_bf16_causal_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        assert!(
+            self.arch_caps.has_wmma_w32(),
+            "attention_dflash_wmma_bf16_causal_f32 requires wave32 BF16 WMMA; arch={}",
+            self.arch,
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_bf16_causal_f32",
+            kernels::ATTENTION_DFLASH_WMMA_BF16_SRC,
+            "attention_dflash_wmma_bf16_causal_f32",
+        )?;
+
+        let shared_f32 = 3 * 16 * head_dim + 16 * 16 + 16 * 3;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let bi = b as i32;
+        let li = l as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let qbase = query_position_base as i32;
+        let kv_layout = 0i32;
+        let kv_window = 0i32;
+        let kv_batch = 0i32;
+        self.launch_kernargs(
+            "attention_dflash_wmma_bf16_causal_f32",
+            [n_heads as u32, b.div_ceil(16) as u32, 1],
+            [32, 1, 1],
+            (shared_f32 * std::mem::size_of::<f32>()) as u32,
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr op,
+                i32 bi, i32 li, i32 nh, i32 nkv, i32 hd, f32 scale,
+                i32 qbase, i32 kv_layout, i32 kv_window, i32 kv_batch
+            ],
+        )
+    }
+
     /// FlashAttention-style WMMA with M=32 query tile (vs M=16 in
     /// `attention_dflash_wmma_f32`). Two waves per block; doubles the
     /// queries served per K-tile load, halving global-memory K

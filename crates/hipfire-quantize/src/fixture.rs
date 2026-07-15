@@ -14,7 +14,7 @@
 // The fixture manifest vocabulary (TensorSpec/Init/Dt) lives in hipfire-arch-api so
 // each family's `-spec` crate can DECLARE its ToyModel fixture with only that dep;
 // this crate keeps the writer (seeded RNG → safetensors + shared tokenizer).
-use hipfire_arch_api::{Dt, Init, TensorSpec};
+use hipfire_arch_api::{Dt, Init, TensorSpec, ARCH_ID_GEMMA4};
 use hipfire_primitives::conv::f32_to_bf16_bits as bf16_bits;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -283,12 +283,25 @@ fn toy_fixture_from_registry(
     arch_id: u16,
     seed: u64,
 ) -> Result<(serde_json::Value, Vec<TensorSpec>), String> {
+    named_toy_fixture_from_registry(arch_id, "default", seed)
+}
+
+fn named_toy_fixture_from_registry(
+    arch_id: u16,
+    fixture_name: &str,
+    seed: u64,
+) -> Result<(serde_json::Value, Vec<TensorSpec>), String> {
     use hipfire_arch_api::{ArchId, ArchRegistry};
-    let f = ArchRegistry::build()
+    let toy = ArchRegistry::build()
         .get(ArchId(arch_id))
         .and_then(|a| a.caps.toy_model)
-        .ok_or_else(|| format!("--emit-fixture: arch_id {arch_id} declares no ToyModel"))?
-        .fixture(seed);
+        .ok_or_else(|| format!("--emit-fixture: arch_id {arch_id} declares no ToyModel"))?;
+    let f = toy.fixture_named(fixture_name, seed).ok_or_else(|| {
+        format!(
+            "--emit-fixture: arch_id {arch_id} has no fixture `{fixture_name}`; available: {}",
+            toy.fixture_names().join(", ")
+        )
+    })?;
     let config = serde_json::from_str(&f.config_json)
         .map_err(|e| format!("parse toy config for arch {arch_id}: {e}"))?;
     Ok((config, f.tensors))
@@ -306,6 +319,15 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
         "qwen3_5_moe" | "qwen35moe" | "qwen3_5_moe_text" => toy_fixture_from_registry(6, seed)?,
         "qwen2" => toy_fixture_from_registry(1, seed)?,
         "gemma3" | "gemma3_text" => toy_fixture_from_registry(12, seed)?,
+        "gemma4" | "gemma4_dense" | "gemma4_text" => {
+            named_toy_fixture_from_registry(ARCH_ID_GEMMA4 as u16, "dense", seed)?
+        }
+        "gemma4_ple" | "gemma4_ple_sharing" => {
+            named_toy_fixture_from_registry(ARCH_ID_GEMMA4 as u16, "ple-sharing", seed)?
+        }
+        "gemma4_moe" | "gemma4_dense_moe" => {
+            named_toy_fixture_from_registry(ARCH_ID_GEMMA4 as u16, "dense-moe", seed)?
+        }
         "minimax" | "minimax_m2" => toy_fixture_from_registry(10, seed)?,
         "mamba2" | "mamba_2" => toy_fixture_from_registry(15, seed)?,
         "llama" | "mistral" => toy_fixture_from_registry(0, seed)?,
@@ -318,7 +340,8 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
                 "--emit-fixture: unsupported arch '{other}'. Supported: qwen3_5 \
                  (arch 5 dense), qwen3_5_moe (arch 6 MoE), qwen2 (arch 7, quantize \
                  with --arch-id 7), gemma3 (arch 12), minimax (arch 10), mamba2 \
-                 (arch 15), llama (arch 0), dflash (draft sidecar). Add a tiny \
+                 (arch 15), gemma4_dense/gemma4_ple/gemma4_moe (arch 24), \
+                 llama (arch 0), dflash (draft sidecar). Add a tiny \
                  preset per arch as support lands."
             ));
         }

@@ -28,6 +28,7 @@
 use hip_bridge::{DeviceBuffer, HipError, HipResult};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::kv::{KvCache, KvQuantMode};
+use hipfire_runtime::layered_kv::LayeredKvArena;
 use hipfire_runtime::llama::HiddenCaptureSink;
 use hipfire_runtime::weights::{weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor};
 
@@ -156,7 +157,14 @@ impl Gemma3State {
         } else if kv_quant_q8 {
             KvCache::new_gpu_q8(gpu, n_layers, n_kv, head_dim, max_seq)?
         } else {
-            KvCache::new_gpu(gpu, n_layers, n_kv, head_dim, max_seq)?
+            LayeredKvArena::homogeneous_fp32_cache(
+                gpu,
+                n_layers,
+                cfg.num_attention_heads,
+                n_kv,
+                head_dim,
+                max_seq,
+            )?
         };
 
         // KVarN needs two reusable scratch buffers (see field docs). Allocate

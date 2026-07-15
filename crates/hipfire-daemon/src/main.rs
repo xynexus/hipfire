@@ -3684,26 +3684,35 @@ fn main() {
                             let _ = stdout.flush();
                             continue;
                         }
-                        let arch = match m.arch_id {
-                            5 => "qwen3_5",
-                            6 => "qwen3_5_moe",
-                            7 => "qwen2",
-                            8 => "dots-ocr",
-                            9 => "deepseek4",
-                            10 => "minimax_m2",
-                            11 => "lfm2moe",
-                            12 => "gemma3",
-                            13 => "gemma3_vl",
-                            14 => "nemotron_h",
-                            15 => "mamba2",
-                            16 => "zaya",
-                            ARCH_ID_EMBEDDINGGEMMA => "embeddinggemma",
-                            _ => "qwen3",
-                        };
+                        let arch = m.registered_backend.as_ref().map_or_else(
+                            || match m.arch_id {
+                                5 => "qwen3_5",
+                                6 => "qwen3_5_moe",
+                                7 => "qwen2",
+                                8 => "dots-ocr",
+                                9 => "deepseek4",
+                                10 => "minimax_m2",
+                                11 => "lfm2moe",
+                                12 => "gemma3",
+                                13 => "gemma3_vl",
+                                14 => "nemotron_h",
+                                15 => "mamba2",
+                                16 => "zaya",
+                                ARCH_ID_EMBEDDINGGEMMA => "embeddinggemma",
+                                _ => "qwen3",
+                            },
+                            |loaded| loaded.family,
+                        );
                         let vl = m.vision_config.is_some()
                             || m.dots_ocr_config.is_some()
                             || m.gemma3_vl.is_some();
-                        let (dim, layers, vocab) = if let Some(ref b) = m.gemma3_vl {
+                        let (dim, layers, vocab) = if let Some(ref loaded) = m.registered_backend {
+                            (
+                                loaded.shape.hidden_size,
+                                loaded.shape.num_layers,
+                                loaded.shape.vocab_size,
+                            )
+                        } else if let Some(ref b) = m.gemma3_vl {
                             (
                                 b.text_cfg.hidden_size,
                                 b.text_cfg.num_hidden_layers,
@@ -4337,7 +4346,7 @@ fn main() {
                 // model. Pick arch-shaped defaults so a vanilla
                 // `/v1/chat/completions` POST (no sampling fields) works on
                 // both. Explicit per-request values still override either.
-                let (default_temp, default_top_p) = if m.arch_id == ARCH_ID_LFM2_MOE {
+                let (mut default_temp, mut default_top_p) = if m.arch_id == ARCH_ID_LFM2_MOE {
                     // LFM2.5-MoE (11): Liquid's model card recommends specific
                     // sampling — temperature=0.2, top_p=0.80 (+ repetition_penalty
                     // 1.05, set below). Use those exact values, not the generic
@@ -4354,11 +4363,24 @@ fn main() {
                 } else {
                     (0.3_f64, 0.8_f64)
                 };
-                let temp = protocol_generate
+                let mut default_top_k = 20_usize;
+                if let Some(sampler) = m
+                    .registered_backend
                     .as_ref()
-                    .map(|req| req.sampling.temperature)
-                    .or_else(|| msg.get("temperature").and_then(|v| v.as_f64()))
-                    .unwrap_or(default_temp) as f32;
+                    .map(|loaded| &loaded.profile.sampler)
+                {
+                    default_temp = sampler.temperature.map(f64::from).unwrap_or(default_temp);
+                    default_top_p = sampler.top_p.map(f64::from).unwrap_or(default_top_p);
+                    default_top_k = sampler.top_k.unwrap_or(default_top_k);
+                }
+                let temp_override = match protocol_generate.as_ref() {
+                    Some(req) if !req.sampling.temperature_is_default => {
+                        Some(req.sampling.temperature)
+                    }
+                    Some(_) => None,
+                    None => msg.get("temperature").and_then(|v| v.as_f64()),
+                };
+                let temp = temp_override.unwrap_or(default_temp) as f32;
                 let max_tokens = protocol_generate
                     .as_ref()
                     .map(|req| req.sampling.max_tokens as usize)
@@ -4368,11 +4390,21 @@ fn main() {
                             .map(|v| v as usize)
                     })
                     .unwrap_or(512);
-                let top_p = protocol_generate
+                let top_p_override = match protocol_generate.as_ref() {
+                    Some(req) if !req.sampling.top_p_is_default => req.sampling.top_p,
+                    Some(_) => None,
+                    None => msg.get("top_p").and_then(|v| v.as_f64()),
+                };
+                let top_p = top_p_override.unwrap_or(default_top_p) as f32;
+                let top_k = protocol_generate
                     .as_ref()
-                    .and_then(|req| req.sampling.top_p)
-                    .or_else(|| msg.get("top_p").and_then(|v| v.as_f64()))
-                    .unwrap_or(default_top_p) as f32;
+                    .and_then(|req| req.sampling.top_k)
+                    .or_else(|| {
+                        msg.get("top_k")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                    })
+                    .unwrap_or(default_top_k);
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
                 // defaults. The prior 1.3 default suppressed legitimately
@@ -4729,6 +4761,7 @@ fn main() {
                         system,
                         temp,
                         top_p,
+                        top_k,
                         max_tokens,
                         repeat_penalty,
                         repeat_window,
@@ -5467,6 +5500,9 @@ fn main() {
                     if let Some(ref mut b) = m.gemma3_vl {
                         b.state.reset();
                     }
+                    if let Some(ref mut loaded) = m.registered_backend {
+                        let _ = loaded.backend.reset_session(&mut gpu, "default");
+                    }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -5864,8 +5900,10 @@ fn main() {
                     if let Some(b) = m.gemma3_vl.as_mut() {
                         break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
                     }
-                    if let Some(b) = m.qwen2_backend.as_mut() {
-                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    if let Some(loaded) = m.registered_backend.as_mut() {
+                        if let Some(forward) = loaded.backend.kld_forward() {
+                            break 'pick Some(Box::new(forward));
+                        }
                     }
                     if let Some(b) = m.nemotron_backend.as_mut() {
                         break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));

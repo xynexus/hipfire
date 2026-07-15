@@ -1,0 +1,10 @@
+[package]
+name = "hipfire-arch-gemma4-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline Gemma 4 spec (arch_id 24): identity, ingest policy, and structurally distinct deterministic toy fixtures."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+serde_json = "1"

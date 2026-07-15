@@ -27,6 +27,7 @@ use hipfire_arch_embeddinggemma_spec as _;
 use hipfire_arch_flux2_spec as _;
 use hipfire_arch_gemma3_spec as _;
 use hipfire_arch_gemma3_vl_spec as _;
+use hipfire_arch_gemma4_spec as _;
 use hipfire_arch_krea2_spec as _;
 use hipfire_arch_lfm2moe_spec as _;
 use hipfire_arch_llama_spec as _;
@@ -39,7 +40,7 @@ use hipfire_arch_zaya_spec as _;
 
 #[cfg(test)]
 mod tests {
-    use hipfire_arch_api::{ArchId, ArchRegistry};
+    use hipfire_arch_api::{ArchId, ArchRegistry, ExpertLayout};
 
     #[test]
     fn all_specs_present_and_declare_ingest() {
@@ -47,7 +48,7 @@ mod tests {
         // Every migrated arch id must be reachable with an Ingest policy through the
         // bundle (the path the quantizer uses).
         for id in [
-            0u16, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23,
+            0u16, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24,
         ] {
             let a = reg
                 .get(ArchId(id))
@@ -56,6 +57,32 @@ mod tests {
                 a.caps.ingest.is_some(),
                 "arch id {id} ({}) declares no Ingest",
                 a.family
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4_spec_is_force_linked_with_identity_ingest_and_named_toys() {
+        let reg = ArchRegistry::build();
+        let arch = reg.get(ArchId(24)).expect("Gemma 4 arch id 24");
+        assert_eq!(arch.family, "gemma4");
+        assert_eq!(
+            arch.caps.ingest.expect("Gemma 4 ingest").expert_layout(),
+            ExpertLayout::StackedGateUpDown
+        );
+        let toy = arch.caps.toy_model.expect("Gemma 4 named toy models");
+        assert_eq!(toy.fixture_names(), &["dense", "ple-sharing", "dense-moe"]);
+        for model_type in [
+            "gemma4",
+            "gemma4_text",
+            "gemma4_unified",
+            "gemma4_unified_text",
+        ] {
+            assert_eq!(
+                reg.find_by_model_type(model_type)
+                    .unwrap_or_else(|| panic!("missing model type {model_type}"))
+                    .id,
+                ArchId(24)
             );
         }
     }

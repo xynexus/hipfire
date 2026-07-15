@@ -36,6 +36,7 @@ pub mod host_profile;
 pub mod kld_eval;
 pub mod kv;
 pub mod kv_hier;
+pub mod layered_kv;
 pub mod llama;
 pub mod llama_spec;
 pub mod load_progress;
@@ -55,6 +56,7 @@ pub mod tokenizer;
 pub mod tool_call;
 pub mod tp_shard;
 pub mod transformer;
+pub mod transformer_loader;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 #[cfg(feature = "deltanet")]

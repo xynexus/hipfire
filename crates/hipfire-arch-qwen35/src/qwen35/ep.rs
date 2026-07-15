@@ -964,6 +964,7 @@ fn forward_scratch_layers_multi(
                         config.n_kv_heads,
                         config.head_dim,
                         n_rot,
+                        n_rot,
                         config.rope_theta,
                     )?;
                     if kv_cache.compact_offset > 0 {
@@ -1783,6 +1784,7 @@ fn forward_scratch_layers_multi(
                         config.n_heads,
                         config.n_kv_heads,
                         config.head_dim,
+                        n_rot,
                         n_rot,
                         config.rope_theta,
                     )?;
