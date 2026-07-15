@@ -399,7 +399,7 @@ pub fn usage() -> String {
        --dry-run                plan only: resolve models/batteries/cache/artifacts and report (no tests run, nothing fetched/generated)\n\
        --status                 print cache/dataset/hardware status and exit\n\
        --fetch                  ensure datasets are present (HF fetch), then exit\n\
-       --battery <a,b>          smoke,coherence,quality,retrieval,speed,dflash,pflash,agentic,runtime,prompt_shape,structured,barrage,longctx,vision,cask,profile,perplexity,calibrate,embedding_quality\n\
+       --battery <a,b>          smoke,coherence,quality,retrieval,speed,dflash,pflash,agentic,runtime,prompt_shape,structured,barrage,longctx,vision,cask,profile,perplexity,calibrate,embedding_quality,diffusion\n\
        --suite <a,b>            gpqa,lm_eval_micro,humaneval,deep_swe,swe_bench,ruler,nolima,needle_chain,niah,sequential_niah\n\
        --compare <model>        model to compare against the candidate\n\
        --baseline <model>       deprecated alias for --compare\n\

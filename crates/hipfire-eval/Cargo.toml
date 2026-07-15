@@ -15,6 +15,7 @@ hipfire-config = { path = "../hipfire-config" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-evidence = { path = "../hipfire-evidence" }
+hipfire-diffusion = { path = "../hipfire-diffusion" }
 # Host-profile collection (relocated out of this crate's lib.rs).
 hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-generate = { path = "../hipfire-generate" }
@@ -22,6 +23,7 @@ hipfire-hash = { path = "../hipfire-hash" }
 hipfire-model = { path = "../hipfire-model" }
 anyhow.workspace = true
 base64.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
 csv.workspace = true
 libc.workspace = true
 serde.workspace = true

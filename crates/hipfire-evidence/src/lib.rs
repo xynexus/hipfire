@@ -1445,6 +1445,12 @@ pub fn required_admission_evidence_requirements(
             batteries: vec!["barrage"],
         });
     }
+    if selected.iter().any(|battery| battery == "diffusion") {
+        required.push(AdmissionEvidenceRequirement {
+            kind: "diffusion",
+            batteries: vec!["diffusion"],
+        });
+    }
     required
 }
 
@@ -2380,6 +2386,15 @@ mod tests {
         assert_eq!(with_barrage.len(), 2);
         assert_eq!(with_barrage[1].kind, "barrage");
         assert_eq!(with_barrage[1].batteries, vec!["barrage"]);
+
+        let diffusion = required_admission_evidence_requirements(["diffusion"]);
+        assert_eq!(
+            diffusion,
+            vec![AdmissionEvidenceRequirement {
+                kind: "diffusion",
+                batteries: vec!["diffusion"],
+            }]
+        );
     }
 
     #[test]
