@@ -91,30 +91,41 @@ this is the *pure* KV-quant effect, not weight quant):
 Reproduce: `perplexity MODEL corpus.txt --ctx 4096 --kv-mode f32 --dump-ref
 ref.pkld`, then `--kv-mode kvarn --kld-ref ref.pkld` at `HIPFIRE_KVARN_BITS`=4/8.
 
-## Verdict (2026-07-14): don't swap the hot ring — use single-tier 8-bit kvarn
+## Verdict (2026-07-15, REVISED): convert the hot tier to 8-bit — it IS worth it at scale
 
-Investigated the swap; it's the wrong move. Two reasons:
+Earlier I called this "not worth ~8 MB." **Wrong — that reasoning was
+single-session.** hipfire is built to host **thousands of concurrent sessions**
+batched on one Strix Halo (throughput comes from multi-session batching). The hot
+tier is ~16 MB **per session** → ~1000 sessions ≈ **16 GB** of hot KV; halving it
+frees ~8 GB on a 128 GB box = more concurrent sessions / longer contexts. The
+per-session absolute is irrelevant; the session multiplier is the point.
 
-1. **Structural mismatch.** The hot ring is a **per-token** f16 ring
-   (`hot_budget × HD`, written per token via `cast_f32_to_f16`, read via
-   `attention_cold_slots` layout-2). kvarn is **128-token-block** quantized — it
-   can't quantize a per-token ring without re-quantizing the whole window each
-   step. f16-per-token is the *right* fit for the exact tier; that's why the
-   design uses it.
-2. **The goal is already met.** For "near-lossless KV, smaller than f16, no f16
-   tier," just use **single-tier 8-bit kvarn** (`--kv-mode kvarn` +
-   `HIPFIRE_KVARN_BITS=8`, no `--kv-hierarchical`): model KLD **1.1e-5** (§Model-
-   level KLD), 2× smaller than f16, with only a one-block fp16 window. No code
-   change. The 512-token f16 hot ring only exists to protect recent tokens when
-   the **cold tier is aggressively lossy (4-bit + merge)** for very long context —
-   there, per-token f16 is correct and the ~16 MB tier isn't worth a read-path
-   rework (halving it saves ~8 MB).
+8-bit KV is near-lossless (model KLD 1.1e-5, §Model-level KLD), so the exactness
+lost by dropping f16 is negligible.
 
-**So:** near-lossless long-context → single-tier 8-bit kvarn (done).
-Aggressive compression → hierarchical (f16 hot + 4-bit merged cold), keep f16 hot.
-If a smaller *hierarchical* hot ring is ever wanted, the fit is a **per-token
-8-bit affine** ring (like the existing Q8 V tier), NOT block-kvarn — and that
-needs a new K read layout for ~8 MB, so it's not worth it now.
+**Approach (reuses existing kernels — no new attention kernel):** give the
+hierarchical hot tier the same structure single-tier kvarn already uses —
+**8-bit kvarn blocks (completed 128-token blocks) + a small fp16 window for the
+current partial block** — instead of a 512-token f16 ring:
+- Write: accumulate into the fp16 window; when a 128-block completes, quantize it
+  with the existing `kvarn_quantize_tile` (bits=8) into the hot tier (fold_m=1 /
+  unmerged — i.e. exact-ish, no merge). This is `compact_cold_kv(fold_m=1, bits=8)`.
+- Read: merge two `attention_cold_slots` reads — the hot kvarn blocks (**layout 0**,
+  the existing cold kvarn dequant path) + the fp16 partial window (**layout 2**),
+  via `flash_tier_merge` (already used for hot+cold). No new K read layout.
+- Migrate: move whole completed hot kvarn blocks into the cold (merged) tier;
+  they're already the right record type, so migration is cheaper (no re-quantize).
+- Bonus: unifies the read path onto kvarn (hot + cold both kvarn), and 8-bit hot
+  blocks are still far above the 4-bit merged cold floor.
+
+Alternative considered: a per-token 8-bit **affine** (Q8) ring keeps the ring
+structure but needs a NEW Q8-K attention layout; the block-kvarn path above
+reuses layout-0, so it's preferred.
+
+**Change surface:** `kv_hier.rs` hot-tier representation + write/read/migrate
+(the FA-output write, the two-tier read, `migrate_n`). Gate:
+`coherence-gate-dflash.sh` + a hierarchical parity re-check
+(`parity_kv_hier`, `parity_two_tier_e2e`). Sizable runtime refactor, no new kernel.
 
 ## Live guidance
 
