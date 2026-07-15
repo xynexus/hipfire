@@ -174,6 +174,19 @@ pub struct HierKvState {
     /// `HIPFIRE_KV_TRIATTN_SIDECAR`). `None` unless that mode is active with a sidecar.
     /// Read at `migrate_n` to rank the cold merge by calibrated query-energy alignment.
     centers: Option<TriAttnCenters>,
+    /// Phase 0 rotated-frame probe (`HIPFIRE_KV_HOT_ROTATE=1`, default off): FWHT-
+    /// rotate the hot K on write AND the query on read with the same orthonormal
+    /// `rotate_x_mq`, so `q_rot·K_rot = q·K` and the whole cache lives in one
+    /// rotated frame — the cold tier inherits it via migrate (`rotate=false` on
+    /// already-rotated K, no double-rotate). K-only; V stays un-rotated so the
+    /// attention output needs no inverse. Groundwork for the 8-bit hot ring
+    /// (docs/plans/2026-07-15-8bit-hot-ring-kv-hier.md Phase 0). Norm-based
+    /// importance is rotation-invariant, so migrate/importance are unaffected.
+    pub hot_rotate: bool,
+    /// f32 [n_kv_heads × HD] scratch: rotated hot K before the f16 cast. Some when hot_rotate.
+    rot_k: Option<GpuTensor>,
+    /// f32 [n_heads × HD] scratch: rotated query for the two-tier read. Some when hot_rotate.
+    q_rot: Option<GpuTensor>,
 }
 
 impl HierKvState {
@@ -276,10 +289,17 @@ impl HierKvState {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.5f32);
+        // Phase 0 rotated-frame probe: rotate hot K on write + query on read (see
+        // the `hot_rotate` field doc). Opt-in, default off — must be proven neutral
+        // (parity + KLD-vs-bf16 A/B) before it can become the default.
+        let hot_rotate =
+            enabled && std::env::var("HIPFIRE_KV_HOT_ROTATE").ok().as_deref() == Some("1");
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
         let mut attn_mass = Vec::with_capacity(n_layers);
         let mut hot_cast = None;
+        let mut rot_k = None;
+        let mut q_rot = None;
         if enabled {
             // Hot ring is f16 (halves hot VRAM → a larger exact window fits the same
             // budget; f16 is far above the cold 2-bit floor, so it is near-lossless
@@ -291,6 +311,11 @@ impl HierKvState {
                 attn_mass.push(gpu.zeros(&[hot_budget], DType::F32)?);
             }
             hot_cast = Some(gpu.zeros(&[n_kv_heads * HD], DType::F16)?);
+            if hot_rotate {
+                // f32 scratch for the FWHT-rotated K (before f16 cast) and query.
+                rot_k = Some(gpu.zeros(&[n_kv_heads * HD], DType::F32)?);
+                q_rot = Some(gpu.zeros(&[n_heads * HD], DType::F32)?);
+            }
         }
         Ok(Self {
             enabled,
@@ -320,6 +345,9 @@ impl HierKvState {
             scr: None,
             hot_cast,
             centers,
+            hot_rotate,
+            rot_k,
+            q_rot,
         })
     }
 
@@ -389,8 +417,22 @@ impl HierKvState {
             .hot_cast
             .as_ref()
             .expect("hot_cast present when enabled");
-        for (fa, ring) in [(fa_k, &self.hot_k[layer]), (fa_v, &self.hot_v[layer])] {
-            gpu.cast_f32_to_f16(fa, cast)?;
+        for (fa, ring, rotate) in [
+            (fa_k, &self.hot_k[layer], self.hot_rotate),
+            (fa_v, &self.hot_v[layer], false),
+        ] {
+            // Phase 0 (rotated frame): FWHT-rotate K into `rot_k` before the f16
+            // cast so the hot tier is stored rotated; the query is rotated to match
+            // on read, and the cold tier inherits the rotation via migrate
+            // (rotate=false on already-rotated K). V is never rotated.
+            let input = if rotate {
+                let rk = self.rot_k.as_ref().expect("rot_k present when hot_rotate");
+                gpu.rotate_x_mq(fa, rk, self.n_kv_heads * HD)?;
+                rk
+            } else {
+                fa
+            };
+            gpu.cast_f32_to_f16(input, cast)?;
             for kv in 0..self.n_kv_heads {
                 let dst = ((kv * hb + slot) * HD) * 2;
                 let src = (kv * HD) * 2;
@@ -854,6 +896,18 @@ impl HierKvState {
         // Take the scratch out to satisfy the borrow checker, then restore.
         let scr = self.scr.take().unwrap();
 
+        // Phase 0 (rotated frame): hot K — and, via migrate, cold K — are stored
+        // FWHT-rotated. Rotate the query once with the same orthonormal transform
+        // and read BOTH tiers with it (q_rot·K_rot = q·K). V stays un-rotated, so
+        // the attention output needs no inverse rotation.
+        let q_read = if self.hot_rotate {
+            let qr = self.q_rot.as_ref().expect("q_rot present when hot_rotate");
+            gpu.rotate_x_mq(q, qr, nh * HD)?;
+            qr
+        } else {
+            q
+        };
+
         // Hot tier → accumulator (out/acc_m/acc_l). Slot-major f32, stride =
         // hot_budget so the live count reads from a fixed-width ring. When using
         // attention-mass importance, accumulate this query's per-token weight.
@@ -863,7 +917,7 @@ impl HierKvState {
             None
         };
         gpu.attention_cold_slots(
-            q,
+            q_read,
             &self.hot_k[layer],
             &self.hot_v[layer],
             out,
@@ -908,7 +962,7 @@ impl HierKvState {
                 seg.v_bits,
             )?;
             gpu.attention_cold_slots(
-                q,
+                q_read,
                 &scr.deq_k,
                 &scr.deq_v,
                 &scr.out_c,

@@ -119,6 +119,19 @@ fn main() {
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&out).unwrap();
 
+    // Oracle query. With `HIPFIRE_KV_HOT_ROTATE=1` the hot ring — and the cold
+    // segments it migrates into — store K in the FWHT-rotated frame, and the GPU
+    // read rotates the query to match (q_rot·K_rot = q·K). The CPU oracle scores
+    // the raw stored (rotated) K, so it must use the SAME rotated query; rotate via
+    // the same GPU kernel to guarantee identical signs. V is un-rotated either way.
+    let q_ref = if hier.hot_rotate {
+        let qr = gpu.zeros(&[NH * HD], DType::F32).unwrap();
+        gpu.rotate_x_mq(&qd, &qr, NH * HD).unwrap();
+        gpu.download_f32(&qr).unwrap()
+    } else {
+        q.clone()
+    };
+
     // Defrag preservation: the read after folding must match the read before, up to
     // one extra quant round on the repacked slots.
     if let Some(before) = &out_before {
@@ -213,7 +226,7 @@ fn main() {
     let mut oracle = vec![0.0f32; NH * HD];
     for hq in 0..NH {
         let kvh = hq / (NH / NKV);
-        let qh = &q[hq * HD..hq * HD + HD];
+        let qh = &q_ref[hq * HD..hq * HD + HD];
         let ks = &k_slots[kvh];
         let vs = &v_slots[kvh];
         let n = ks.len();

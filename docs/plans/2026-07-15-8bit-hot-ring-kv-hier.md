@@ -108,7 +108,8 @@ before flipping it — it changes stored bytes' meaning (query must now be rotat
 The rotation lives at the **hot write**; the cold tier inherits it through migrate
 (no double-rotate, no separate cold-rotate flip). One `q_rot` for the whole read.
 
-0. **Prove the rotated frame first (lowest-risk, no new codec).** Flip the *hot
+0. **[DONE 2026-07-15 — rotated frame proven neutral]** Prove the rotated frame
+   first (lowest-risk, no new codec). Flip the *hot
    write path to rotate* by making `append_token` FWHT-rotate each token's K
    before the existing f16 store (V un-rotated), and keep `migrate_n` at
    `compact_cold_kv(rotate=false)` (K already rotated → cold inherits it). Rotate
@@ -118,6 +119,22 @@ The rotation lives at the **hot write**; the cold tier inherits it through migra
    must still pass, and a KLD-vs-bf16 A/B must be neutral. Migrate math check:
    `q_rot·(H·K_merged) = q·K_merged` since H is orthogonal and linear commutes
    with the merge average.
+
+   **Implemented:** `HIPFIRE_KV_HOT_ROTATE=1` (opt-in, default off) on
+   `HierKvState` (`kv_hier.rs`): `append_token` rotates K via `rotate_x_mq`
+   (orthonormal FWHT-256, `R=D2·(H/16)·D1`, `RᵀR=I`) into an f32 scratch before
+   the f16 cast (V un-rotated); `two_tier_read` rotates the query once into
+   `q_rot` and reads BOTH tiers with it; `migrate_n` unchanged (cold inherits the
+   rotation, `rotate=false`). **Validated on nix2/gfx1103:**
+   - `parity_kv_hier` (oracle made rotation-aware — rotates its query with the
+     same GPU kernel): PASS at 0.0 (hot-only n=8), 5e-5 (n=40, 3 cold segs), 5e-5
+     (n=100, 11 cold segs), 6.7e-5 (n=40 + defrag). rotate-OFF baseline unchanged
+     (5.2e-5). `parity_two_tier_e2e` (kernel oracle) unaffected: PASS 0.0.
+   - End-to-end PPL A/B (qwen3.5-0.8b-mq4+, kvarn-8 hier, ctx=2048, migrations
+     active): rotate-OFF 17.1595 vs rotate-ON 17.1590 — neutral (3e-5 rel).
+   Dot-preservation of `rotate_x_mq` confirmed directly on GPU (1e-5). The
+   rotated frame is exactly neutral, so Phase 1 (8-bit affine codec on the
+   already-rotated K) can build on it.
 1. **Hot codec = per-token 8-bit affine (on the already-rotated K).** Add a GPU
    per-token/slot 8-bit affine quant + dequant for the ring (V too). Close to the
    `q8_0` slot path; the rotation is already done in step 0, so the codec is just
