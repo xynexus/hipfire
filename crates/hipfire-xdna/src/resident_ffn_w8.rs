@@ -66,6 +66,12 @@ pub struct NpuResidentFfnDenseW8 {
     kernel: NpuKernel,
     io_mode: NpuResidentFfnDenseW8IoMode,
     reuse_gate_activation: bool,
+    // Number of 256-row documents packed into one dispatch (M = 256 * batch).
+    // batch == 1 is the original M256 kernel. The FFN is per-row independent, so
+    // batching concatenates documents' rows; every macro slot gets identical
+    // weights, buffers scale by `batch`, and the block-index formulas are
+    // batch-agnostic (linear in the macro index).
+    batch: usize,
     input: DeviceBuffer,
     scratch: DeviceBuffer,
     output: DeviceBuffer,
@@ -104,26 +110,35 @@ impl NpuResidentFfnDenseW8 {
                 "resident dense-W8 gate reuse requires the direct-X BF16x2 ABI",
             ));
         }
-        for required in [
-            "op=resident_ffn",
-            "m=256",
-            "k=768",
-            "intermediate=1152",
-            "out=768",
-        ] {
+        for required in ["op=resident_ffn", "k=768", "intermediate=1152", "out=768"] {
             if !manifest.lines().any(|line| line == required) {
                 return Err(invalid(format!(
                     "resident dense-W8 FFN cache missing shape field {required}"
                 )));
             }
         }
-        let input = kernel.alloc_arg(input_bytes_for(io_mode))?;
-        let scratch = kernel.alloc_arg(scratch_bytes_for(io_mode))?;
-        let output = kernel.alloc_arg(output_bytes_for(io_mode))?;
+        // Row count M = 256 * batch. Accept any positive multiple of 256 so a
+        // cache built with r26_gen.py --batch=N (m=256*N) drives the batched path;
+        // m=256 is the original single-document kernel (batch == 1).
+        let m_value = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("m="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| invalid("resident dense-W8 FFN cache missing shape field m="))?;
+        if m_value == 0 || m_value % M != 0 {
+            return Err(invalid(format!(
+                "resident dense-W8 FFN cache m={m_value} must be a positive multiple of {M}"
+            )));
+        }
+        let batch = m_value / M;
+        let input = kernel.alloc_arg(input_bytes_for(io_mode) * batch)?;
+        let scratch = kernel.alloc_arg(scratch_bytes_for(io_mode) * batch)?;
+        let output = kernel.alloc_arg(output_bytes_for(io_mode) * batch)?;
         Ok(Self {
             kernel,
             io_mode,
             reuse_gate_activation,
+            batch,
             input,
             scratch,
             output,
@@ -188,15 +203,15 @@ impl NpuResidentFfnDenseW8 {
     }
 
     pub const fn loaded_input_bytes(&self) -> usize {
-        input_bytes_for(self.io_mode)
+        input_bytes_for(self.io_mode) * self.batch
     }
 
     pub const fn loaded_scratch_bytes(&self) -> usize {
-        scratch_bytes_for(self.io_mode)
+        scratch_bytes_for(self.io_mode) * self.batch
     }
 
     pub const fn loaded_output_bytes(&self) -> usize {
-        output_bytes_for(self.io_mode)
+        output_bytes_for(self.io_mode) * self.batch
     }
 
     pub fn attach_shared_io(
@@ -321,14 +336,16 @@ impl NpuResidentFfnDenseW8 {
         let down_awq = padded_awq(down.awq_scale(), DOWN_GROUPS * GROUP);
         let signs1 = gen_fwht_signs(42, GROUP);
         let signs2 = gen_fwht_signs(1042, GROUP);
-        let weight_blocks = if self.reuse_gate_activation {
-            REUSE_WEIGHT_BLOCKS
-        } else {
-            WEIGHT_BLOCKS
-        };
+        let weight_blocks = self.batch
+            * if self.reuse_gate_activation {
+                REUSE_WEIGHT_BLOCKS
+            } else {
+                WEIGHT_BLOCKS
+            };
+        let macros = 3 * self.batch;
         let mut packed = vec![0u8; COLS * weight_blocks * W_BLOCK];
         for stripe in 0..COLS {
-            for mblock in 0..3 {
+            for mblock in 0..macros {
                 if self.reuse_gate_activation {
                     for group in 0..GATE_GROUPS {
                         let block = gate_param_block_index(mblock, group);
@@ -371,7 +388,7 @@ impl NpuResidentFfnDenseW8 {
                     }
                 }
             }
-            for mblock in 0..3 {
+            for mblock in 0..macros {
                 for group in 0..DOWN_GROUPS {
                     for nmacro in 0..2 {
                         let block = down_block_index(
@@ -380,6 +397,7 @@ impl NpuResidentFfnDenseW8 {
                             mblock,
                             group,
                             nmacro,
+                            self.batch,
                         );
                         let start = (stripe * weight_blocks + block) * W_BLOCK;
                         pack_down_block(
@@ -417,15 +435,16 @@ impl NpuResidentFfnDenseW8 {
                 "resident dense-W8 FFN cache does not accept canonical BF16 input",
             ));
         }
-        if input.len() != M * K {
+        let rows = M * self.batch;
+        if input.len() != rows * K {
             return Err(invalid(format!(
                 "resident dense-W8 FFN canonical input wants {} BF16 values, got {}",
-                M * K,
+                rows * K,
                 input.len()
             )));
         }
         self.input.as_mut_slice().fill(0);
-        for (destination, value) in self.input.as_mut_slice()[..M * K * size_of::<u16>()]
+        for (destination, value) in self.input.as_mut_slice()[..rows * K * size_of::<u16>()]
             .chunks_exact_mut(size_of::<u16>())
             .zip(input.iter().copied())
         {
@@ -439,11 +458,11 @@ impl NpuResidentFfnDenseW8 {
     pub fn read_canonical_output_f32(&self) -> Result<Vec<f32>, XdnaError> {
         match self.io_mode {
             NpuResidentFfnDenseW8IoMode::CanonicalBf16 => {
-                decode_canonical_bf16_rows(self.output.as_slice(), M, OUTPUT)
+                decode_canonical_bf16_rows(self.output.as_slice(), M * self.batch, OUTPUT)
             }
             NpuResidentFfnDenseW8IoMode::CanonicalBf16Bf16x2Output
             | NpuResidentFfnDenseW8IoMode::DirectXBf16Bf16x2Output => {
-                decode_canonical_bf16x2_rows(self.output.as_slice(), M, OUTPUT)
+                decode_canonical_bf16x2_rows(self.output.as_slice(), M * self.batch, OUTPUT)
             }
             NpuResidentFfnDenseW8IoMode::PackedF32 => Err(invalid(
                 "resident dense-W8 FFN cache does not use canonical row-major output",
@@ -465,18 +484,19 @@ impl NpuResidentFfnDenseW8 {
         self.kernel.sync_output(&self.scratch)?;
         decode_canonical_bf16_rows_strided(
             self.scratch.as_slice(),
-            M,
+            M * self.batch,
             INTERMEDIATE,
             PAD_INTERMEDIATE,
         )
     }
 
     pub fn run_shared(&mut self, weights: &NpuResidentFfnDenseW8Weights) -> Result<(), XdnaError> {
-        let weight_blocks = if self.reuse_gate_activation {
-            REUSE_WEIGHT_BLOCKS
-        } else {
-            WEIGHT_BLOCKS
-        };
+        let weight_blocks = self.batch
+            * if self.reuse_gate_activation {
+                REUSE_WEIGHT_BLOCKS
+            } else {
+                WEIGHT_BLOCKS
+            };
         if weights.buffer.len() != COLS * weight_blocks * W_BLOCK {
             return Err(invalid("resident dense-W8 FFN packed weight size mismatch"));
         }
@@ -660,12 +680,16 @@ const fn down_block_index(
     mblock: usize,
     group: usize,
     nmacro: usize,
+    batch: usize,
 ) -> usize {
-    let gate_blocks = if reuse_gate_activation {
-        GATE_REUSE_PARAM_BLOCKS + GATE_BLOCKS
-    } else {
-        GATE_BLOCKS
-    };
+    // Down blocks follow every macro's gate blocks; the gate-block count scales
+    // with batch (3*batch macros), so does this offset.
+    let gate_blocks = batch
+        * if reuse_gate_activation {
+            GATE_REUSE_PARAM_BLOCKS + GATE_BLOCKS
+        } else {
+            GATE_BLOCKS
+        };
     gate_blocks
         + match mode {
             NpuResidentFfnDenseW8IoMode::PackedF32 => (mblock * DOWN_GROUPS + group) * 2 + nmacro,
@@ -920,15 +944,29 @@ mod tests {
     #[test]
     fn canonical_down_weights_follow_nmacro_before_group() {
         assert_eq!(
-            down_block_index(NpuResidentFfnDenseW8IoMode::PackedF32, false, 1, 3, 0),
+            down_block_index(NpuResidentFfnDenseW8IoMode::PackedF32, false, 1, 3, 0, 1),
             GATE_BLOCKS + 16
         );
         assert_eq!(
-            down_block_index(NpuResidentFfnDenseW8IoMode::CanonicalBf16, false, 1, 3, 0),
+            down_block_index(
+                NpuResidentFfnDenseW8IoMode::CanonicalBf16,
+                false,
+                1,
+                3,
+                0,
+                1
+            ),
             GATE_BLOCKS + 13
         );
         assert_eq!(
-            down_block_index(NpuResidentFfnDenseW8IoMode::CanonicalBf16, false, 1, 3, 1),
+            down_block_index(
+                NpuResidentFfnDenseW8IoMode::CanonicalBf16,
+                false,
+                1,
+                3,
+                1,
+                1
+            ),
             GATE_BLOCKS + 18
         );
         assert_eq!(
@@ -937,6 +975,7 @@ mod tests {
                 false,
                 1,
                 3,
+                1,
                 1
             ),
             GATE_BLOCKS + 18
@@ -950,7 +989,8 @@ mod tests {
                 true,
                 0,
                 0,
-                0
+                0,
+                1
             ),
             63
         );

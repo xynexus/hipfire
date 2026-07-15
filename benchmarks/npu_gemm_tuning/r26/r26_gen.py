@@ -17,8 +17,24 @@ if DIRECT_X_PRE_NORM and not (CANONICAL_BF16 and CANONICAL_BF16X2_OUTPUT):
 if REUSE_GATE_ACTIVATION and not DIRECT_X_PRE_NORM:
     raise SystemExit("--reuse-gate-activation requires --direct-x-pre-norm")
 
+
+def _int_flag(flag, default):
+    for a in sys.argv[1:]:
+        if a.startswith(flag + "="):
+            return int(a.split("=", 1)[1])
+    return default
+
+
+# Batch: number of 256-row documents packed into one dispatch. BATCH=1 is the
+# original M256 kernel (value-preserving). Larger BATCH scales M by concatenating
+# documents' rows; the FFN is per-row independent, so no cross-doc masking. Only
+# the DMA/BD schedule length and the T/O/D buffer sizes grow linearly — the AIE
+# core program (r26_w8_resident_ffn.cc) is unchanged (fixed 24-row tiles).
+BATCH = _int_flag("--batch", 1)
+REAL_M = 256 * BATCH
+
 COLS, CORE_ROWS = 8, 4
-M_MACROS, GATE_N_MACROS = 3, 6
+M_MACROS, GATE_N_MACROS = 3 * BATCH, 6
 GATE_GROUPS, DOWN_GROUPS = 3, 5
 GATE_OUTBLOCKS = M_MACROS * GATE_N_MACROS
 DOWN_MBLOCKS = M_MACROS
@@ -35,13 +51,13 @@ GATE_ACC = 1152
 GATE_DATA_BLOCKS = GATE_OUTBLOCKS * GATE_GROUPS
 GATE_PARAM_BLOCKS = M_MACROS * GATE_GROUPS if REUSE_GATE_ACTIVATION else 0
 WEIGHT_BLOCKS = GATE_PARAM_BLOCKS + GATE_DATA_BLOCKS + DOWN_MBLOCKS * DOWN_GROUPS * 2
-T_ROWS, T_STRIDE, INTERMEDIATE, PAD_INTERMEDIATE, OUTPUT = 296, 5376, 1152, 1280, 768
-PAD_M = 288
+T_ROWS, T_STRIDE, INTERMEDIATE, PAD_INTERMEDIATE, OUTPUT = 96 * M_MACROS + 8, 5376, 1152, 1280, 768
+PAD_M = 96 * M_MACROS
 O_ELEMS = PAD_M * OUTPUT
 CANONICAL_INPUT_BYTES = PAD_M * 768 * 2
-DIRECT_X_INPUT_BYTES = 2 * 256 * 768 * 2
+DIRECT_X_INPUT_BYTES = 2 * REAL_M * 768 * 2
 RUNTIME_INPUT_BYTES = DIRECT_X_INPUT_BYTES if DIRECT_X_PRE_NORM else CANONICAL_INPUT_BYTES
-PRE_INVERSE_BASE = 256 * 768 * 2
+PRE_INVERSE_BASE = REAL_M * 768 * 2
 PRE_INVERSE_RECORD_BYTES = 12288
 INVERSE_TABLE = 32 * 8 * 4
 CANONICAL_T_BYTES = PAD_M * PAD_INTERMEDIATE * 2
@@ -532,7 +548,7 @@ else:
         ]
 if DIRECT_X_PRE_NORM:
     inverse_dims = (
-        f"[<size = {COLS * CORE_ROWS}, stride = {PRE_INVERSE_RECORD_BYTES}>, "
+        f"[<size = {PRE_INVERSE_BASE // PRE_INVERSE_RECORD_BYTES}, stride = {PRE_INVERSE_RECORD_BYTES}>, "
         "<size = 512, stride = 1>]"
     )
     for col in range(COLS):
