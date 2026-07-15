@@ -179,6 +179,9 @@ pub struct NativeVaeEncoder {
     // RMSNorm, a distinct encode path. When present the SD body is unused.
     wan_encoder: Option<WanImageEncoder>,
     latent_norm: VaeLatentNorm,
+    // FLUX.2 (`AutoencoderKLFlux2`): patchify + BatchNorm the encoder output into
+    // the packed latent the DiT consumes. Symmetric to the decoder's patch norm.
+    flux2_patch_norm: Option<Flux2VaePatchNorm>,
 }
 
 impl NativeVaeEncoder {
@@ -198,6 +201,7 @@ impl NativeVaeEncoder {
                 quant_conv: None,
                 wan_encoder: Some(wan),
                 latent_norm: VaeLatentNorm::from_config(config)?,
+                flux2_patch_norm: None,
             });
         }
         let block_count = config
@@ -285,6 +289,7 @@ impl NativeVaeEncoder {
             quant_conv,
             wan_encoder: None,
             latent_norm: VaeLatentNorm::from_config(config)?,
+            flux2_patch_norm: Flux2VaePatchNorm::from_hfq(hfq, config)?,
         })
     }
 
@@ -345,9 +350,48 @@ impl NativeVaeEncoder {
         Ok(hidden)
     }
 
+    /// FLUX.2 encode: take the distribution mode (mean = first half of the moment
+    /// channels), patchify + BatchNorm-normalize into the packed latent the DiT
+    /// consumes. Mirrors the reference `mean = chunk(moments)[0]; rearrange(...);
+    /// bn.normalize`, and is the inverse of the decoder's `inverse_and_unpatchify`.
+    /// Returns `None` when this is not a FLUX.2 VAE (caller falls back to SD).
+    fn flux2_moments_to_latents(
+        &self,
+        moments: &CpuTensor,
+    ) -> DiffusionResult<Option<LatentBatch>> {
+        let Some(patch_norm) = &self.flux2_patch_norm else {
+            return Ok(None);
+        };
+        let [batch, channels, height, width] = shape4(moments)?;
+        let z = channels / 2; // mean occupies the first half
+        let mut mean = CpuTensor::zeros(&[batch, z, height, width]);
+        for b in 0..batch {
+            for c in 0..z {
+                for y in 0..height {
+                    for x in 0..width {
+                        mean.data[((b * z + c) * height + y) * width + x] =
+                            moments.data[nchw_idx(b, c, y, x, channels, height, width)];
+                    }
+                }
+            }
+        }
+        let packed = patch_norm.patchify_and_normalize(&mean)?;
+        let [pb, pc, ph, pw] = shape4(&packed)?;
+        Ok(Some(LatentBatch {
+            batch: pb,
+            channels: pc,
+            height: ph,
+            width: pw,
+            data: packed.data,
+        }))
+    }
+
     pub fn encode_to_latents(&self, image: &RgbImageBatch) -> DiffusionResult<LatentBatch> {
         let image = rgb_batch_to_vae_tensor(image)?;
         let moments = self.encode_tensor_moments(&image)?;
+        if let Some(latents) = self.flux2_moments_to_latents(&moments)? {
+            return Ok(latents);
+        }
         vae_moments_to_latents(&moments, &self.latent_norm)
     }
 
@@ -369,6 +413,9 @@ impl NativeVaeEncoder {
         let image_tensor = rgb_batch_to_vae_tensor_with_runtime_context(image, runtime_context)?;
         let moments =
             self.encode_tensor_moments_with_runtime_context(&image_tensor, runtime_context)?;
+        if let Some(latents) = self.flux2_moments_to_latents(&moments)? {
+            return Ok(latents);
+        }
         vae_moments_to_latents_with_runtime_context(&moments, &self.latent_norm, runtime_context)
     }
 
@@ -383,6 +430,12 @@ impl NativeVaeEncoder {
         let image_tensor = rgb_batch_to_vae_tensor_with_runtime_context(image, runtime_context)?;
         let moments =
             self.encode_tensor_moments_with_runtime_context(&image_tensor, runtime_context)?;
+        // FLUX.2 uses the distribution mode (mean) + patch-norm; the stochastic
+        // path does not apply to its BatchNorm-packed latent.
+        if let Some(latents) = self.flux2_moments_to_latents(&moments)? {
+            let _ = seeds;
+            return Ok(latents);
+        }
         vae_moments_to_latents_sampled(&moments, &self.latent_norm, seeds)
     }
 }
@@ -636,6 +689,151 @@ pub struct NativeVaeDecoder {
     // decode when present.
     wan_decoder: Option<WanImageDecoder>,
     latent_norm: VaeLatentNorm,
+    flux2_patch_norm: Option<Flux2VaePatchNorm>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Flux2VaePatchNorm {
+    running_mean: Vec<f32>,
+    running_var: Vec<f32>,
+    patch_height: usize,
+    patch_width: usize,
+    eps: f32,
+}
+
+impl Flux2VaePatchNorm {
+    pub(crate) fn from_hfq(hfq: &HfqFile, config: &VaeConfig) -> DiffusionResult<Option<Self>> {
+        if config.class_name != "AutoencoderKLFlux2" {
+            return Ok(None);
+        }
+        let running_mean = cpu_tensor_from_hfq(hfq, "vae/tensors/bn.running_mean")?.data;
+        let running_var = cpu_tensor_from_hfq(hfq, "vae/tensors/bn.running_var")?.data;
+        if running_mean.len() != running_var.len() {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 VAE BatchNorm mean/var lengths {}/{} disagree",
+                running_mean.len(),
+                running_var.len()
+            )));
+        }
+        let (patch_height, patch_width) = match config.patch_size.as_slice() {
+            [height, width] if *height > 0 && *width > 0 => (*height, *width),
+            _ => {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "FLUX.2 VAE patch_size {:?} must be [height, width]",
+                    config.patch_size
+                )))
+            }
+        };
+        Ok(Some(Self {
+            running_mean,
+            running_var,
+            patch_height,
+            patch_width,
+            eps: config.batch_norm_eps.unwrap_or(1e-4),
+        }))
+    }
+
+    /// Forward: patchify the `[b, channels, H, W]` VAE-encoder output into the
+    /// `[b, channels*patch_area, H/ph, W/pw]` packed latent, then BatchNorm-
+    /// normalize it — the exact inverse of [`Self::inverse_and_unpatchify`], and
+    /// the encode-side complement the reference applies as
+    /// `rearrange("c (i pi)(j pj) -> (c pi pj) i j")` then `bn.normalize`.
+    pub(crate) fn patchify_and_normalize(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        let [batch, channels, in_height, in_width] = shape4(input)?;
+        let patch_area = self
+            .patch_height
+            .checked_mul(self.patch_width)
+            .ok_or_else(|| DiffusionError::InvalidMetadata("VAE patch area overflow".into()))?;
+        if in_height % self.patch_height != 0 || in_width % self.patch_width != 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 encode latent {in_height}x{in_width} not divisible by patch {}x{}",
+                self.patch_height, self.patch_width
+            )));
+        }
+        let packed_channels = channels.checked_mul(patch_area).ok_or_else(|| {
+            DiffusionError::InvalidMetadata("FLUX.2 packed channel overflow".into())
+        })?;
+        if packed_channels != self.running_mean.len() {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 packed latent channels {packed_channels} do not match BatchNorm {}",
+                self.running_mean.len()
+            )));
+        }
+        let height = in_height / self.patch_height;
+        let width = in_width / self.patch_width;
+        let mut output = CpuTensor::zeros(&[batch, packed_channels, height, width]);
+        for b in 0..batch {
+            for channel in 0..channels {
+                for patch_y in 0..self.patch_height {
+                    for patch_x in 0..self.patch_width {
+                        let packed_channel =
+                            (channel * self.patch_height + patch_y) * self.patch_width + patch_x;
+                        let scale = (self.running_var[packed_channel] + self.eps).sqrt();
+                        let mean = self.running_mean[packed_channel];
+                        for y in 0..height {
+                            for x in 0..width {
+                                let in_y = y * self.patch_height + patch_y;
+                                let in_x = x * self.patch_width + patch_x;
+                                let src = ((b * channels + channel) * in_height + in_y) * in_width
+                                    + in_x;
+                                let dst = ((b * packed_channels + packed_channel) * height + y)
+                                    * width
+                                    + x;
+                                output.data[dst] = (input.data[src] - mean) / scale;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn inverse_and_unpatchify(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        let [batch, packed_channels, height, width] = shape4(input)?;
+        let patch_area = self
+            .patch_height
+            .checked_mul(self.patch_width)
+            .ok_or_else(|| DiffusionError::InvalidMetadata("VAE patch area overflow".into()))?;
+        if packed_channels != self.running_mean.len()
+            || packed_channels % patch_area != 0
+        {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 packed latent channels {packed_channels} do not match BatchNorm {} and patch area {patch_area}",
+                self.running_mean.len()
+            )));
+        }
+        let channels = packed_channels / patch_area;
+        let out_height = height * self.patch_height;
+        let out_width = width * self.patch_width;
+        let mut output = CpuTensor::zeros(&[batch, channels, out_height, out_width]);
+        for b in 0..batch {
+            for channel in 0..channels {
+                for patch_y in 0..self.patch_height {
+                    for patch_x in 0..self.patch_width {
+                        let packed_channel =
+                            (channel * self.patch_height + patch_y) * self.patch_width + patch_x;
+                        let scale = (self.running_var[packed_channel] + self.eps).sqrt();
+                        let mean = self.running_mean[packed_channel];
+                        for y in 0..height {
+                            for x in 0..width {
+                                let src = ((b * packed_channels + packed_channel) * height + y)
+                                    * width
+                                    + x;
+                                let out_y = y * self.patch_height + patch_y;
+                                let out_x = x * self.patch_width + patch_x;
+                                let dst = ((b * channels + channel) * out_height + out_y)
+                                    * out_width
+                                    + out_x;
+                                output.data[dst] = input.data[src] * scale + mean;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
 }
 
 impl NativeVaeDecoder {
@@ -658,6 +856,7 @@ impl NativeVaeDecoder {
                 conv_out: None,
                 wan_decoder: Some(wan),
                 latent_norm: VaeLatentNorm::from_config(config)?,
+                flux2_patch_norm: None,
             });
         }
         let post_quant_conv = if hfq
@@ -747,6 +946,7 @@ impl NativeVaeDecoder {
             )?),
             wan_decoder: None,
             latent_norm: VaeLatentNorm::from_config(config)?,
+            flux2_patch_norm: Flux2VaePatchNorm::from_hfq(hfq, config)?,
         })
     }
 
@@ -772,7 +972,11 @@ impl NativeVaeDecoder {
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
         let mut hidden = latents.as_nchw_tensor();
-        hidden = denormalize_decode_latents(&hidden, &self.latent_norm, runtime_context)?;
+        hidden = if let Some(flux2) = &self.flux2_patch_norm {
+            flux2.inverse_and_unpatchify(&hidden)?
+        } else {
+            denormalize_decode_latents(&hidden, &self.latent_norm, runtime_context)?
+        };
         // Wan / Qwen-Image decoder: 3D-causal CPU path (no resident kernels yet).
         if let Some(wan) = &self.wan_decoder {
             return wan.decode(&hidden);

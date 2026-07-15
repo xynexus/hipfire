@@ -1994,6 +1994,230 @@ fn feed_forward_stream_forward_resident_matches_cpu_reference() {
 }
 
 #[test]
+fn flux2_silu_glu_first_resident_matches_cpu_reference() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for resident SiLU-GLU test: {error}");
+            return;
+        }
+    };
+    let projected = CpuTensor {
+        shape: vec![2, 3, 8],
+        data: (0..48).map(|index| index as f32 / 7.0 - 3.0).collect(),
+    };
+    let expected = silu_glu_first_3d(&projected).unwrap();
+    let projected_gpu = gpu
+        .upload_f32(&projected.data, &projected.shape)
+        .unwrap();
+    let output_gpu = silu_glu_first_3d_resident(&mut gpu, &projected_gpu).unwrap();
+    let actual = download_resident(&mut gpu, &output_gpu).unwrap();
+    free_resident(&mut gpu, output_gpu).unwrap();
+    free_resident(&mut gpu, projected_gpu).unwrap();
+    assert_eq!(actual.shape, expected.shape);
+    for (index, (actual, expected)) in actual.data.iter().zip(&expected.data).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 2e-6,
+            "SiLU-GLU mismatch at {index}: hip={actual} cpu={expected}"
+        );
+    }
+}
+
+#[test]
+fn flux2_resident_sequence_and_width_views_match_cpu_layout() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for resident view test: {error}");
+            return;
+        }
+    };
+    let left = CpuTensor {
+        shape: vec![1, 2, 3],
+        data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    };
+    let right = CpuTensor {
+        shape: vec![1, 1, 3],
+        data: vec![7.0, 8.0, 9.0],
+    };
+    let left_gpu = gpu.upload_f32(&left.data, &left.shape).unwrap();
+    let right_gpu = gpu.upload_f32(&right.data, &right.shape).unwrap();
+    let joint_gpu = concat_sequence_3d_resident(&mut gpu, &left_gpu, &right_gpu).unwrap();
+    let tail_gpu = slice_sequence_3d_resident(&mut gpu, &joint_gpu, 1, 2).unwrap();
+    let first_gpu = slice_last_dim_3d_resident(&mut gpu, &tail_gpu, 0, 1).unwrap();
+    let rest_gpu = slice_last_dim_3d_resident(&mut gpu, &tail_gpu, 1, 2).unwrap();
+    let rebuilt_gpu = concat_last_dim_3d_resident(&mut gpu, &first_gpu, &rest_gpu).unwrap();
+    let joint = download_resident(&mut gpu, &joint_gpu).unwrap();
+    let rebuilt = download_resident(&mut gpu, &rebuilt_gpu).unwrap();
+    assert_eq!(joint.shape, vec![1, 3, 3]);
+    assert_eq!(joint.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+    assert_eq!(rebuilt.shape, vec![1, 2, 3]);
+    assert_eq!(rebuilt.data, vec![4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+    for tensor in [
+        left_gpu,
+        right_gpu,
+        joint_gpu,
+        tail_gpu,
+        first_gpu,
+        rest_gpu,
+        rebuilt_gpu,
+    ] {
+        free_resident(&mut gpu, tensor).unwrap();
+    }
+}
+
+#[test]
+fn flux2_no_affine_layer_norm_resident_matches_cpu_reference() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for resident layer norm test: {error}");
+            return;
+        }
+    };
+    let input = CpuTensor {
+        shape: vec![1, 3, 8],
+        data: (0..24).map(|index| index as f32 / 5.0 - 2.0).collect(),
+    };
+    let mut cpu_context = DiffusionGenerationRuntimeContext::new(
+        DiffusionGenerationRuntimeOptions::default(),
+    );
+    let expected =
+        layer_norm_3d_no_affine_with_runtime_context(&input, 1e-6, &mut cpu_context).unwrap();
+    let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
+    let output_gpu = layer_norm_no_affine_resident(&mut gpu, &input_gpu, 1e-6).unwrap();
+    let actual = download_resident(&mut gpu, &output_gpu).unwrap();
+    let max_abs = actual
+        .data
+        .iter()
+        .zip(expected.data)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    free_resident(&mut gpu, input_gpu).unwrap();
+    free_resident(&mut gpu, output_gpu).unwrap();
+    assert!(max_abs <= 2e-5, "resident layer norm max_abs={max_abs}");
+}
+
+#[test]
+fn qwen3_masked_causal_attention_gpu_matches_cpu_reference() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for masked Qwen3 attention test: {error}");
+            return;
+        }
+    };
+    let (seq, heads, head_dim) = (7usize, 2usize, 4usize);
+    let hidden = heads * head_dim;
+    let make = |offset: f32| CpuTensor {
+        shape: vec![seq, hidden],
+        data: (0..seq * hidden)
+            .map(|index| ((index % 13) as f32 - 6.0) / 7.0 + offset)
+            .collect(),
+    };
+    let q = make(0.0);
+    let k = make(0.15);
+    let v = make(-0.2);
+    let mask = [true, true, true, false, false, false, false];
+    let expected =
+        qwen3_causal_self_attention_with_key_mask(&q, &k, &v, heads, &mask).unwrap();
+    let actual = qwen3_masked_causal_self_attention_hip_on_gpu(
+        &mut gpu,
+        &q,
+        &k,
+        &v,
+        heads,
+        &mask,
+    )
+    .unwrap();
+    assert_eq!(actual.shape, expected.shape);
+    let max_abs = actual
+        .data
+        .iter()
+        .zip(&expected.data)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_abs <= 2e-5, "masked Qwen3 attention max_abs={max_abs}");
+}
+
+#[test]
+fn flux2_tiny_full_resident_stack_matches_bfl_reference() {
+    if hipfire_rdna::Gpu::init_with_device(0).is_err() {
+        eprintln!("skip: ROCm GPU unavailable for FLUX.2 resident stack test");
+        return;
+    }
+    let root = Path::new("/tmp/hipfire-flux2-tiny-reference");
+    let reference_path = root.join("reference.json");
+    let artifact = root.join("FLUX.2-tiny.bf16.hfq");
+    if !reference_path.is_file() || !artifact.is_file() {
+        eprintln!("skip: run the local FLUX.2 tiny reference/import test first");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let values = |name: &str| {
+        reference[name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>()
+    };
+    let x = values("x");
+    let mut nchw = vec![0.0; x.len()];
+    for channel in 0..8 {
+        for token in 0..2 {
+            nchw[channel * 2 + token] = x[token * 8 + channel];
+        }
+    }
+    let latents = LatentBatch {
+        batch: 1,
+        channels: 8,
+        height: 1,
+        width: 2,
+        data: nchw,
+    };
+    let text = CpuTensor {
+        shape: vec![1, 2, 6],
+        data: values("ctx"),
+    };
+    let hfq = HfqFile::open_index_only(&artifact).unwrap();
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+    let topology = transformer_denoiser_weight_topology(&metadata.components["transformer"]);
+    let denoiser = NativeTransformerDenoiser::from_hfq(&hfq, &config, &topology).unwrap();
+    let mut runtime_context = DiffusionGenerationRuntimeContext::new(
+        DiffusionGenerationRuntimeOptions {
+            rocm_device_id: Some(0),
+            ..DiffusionGenerationRuntimeOptions::default()
+        },
+    );
+    let output = denoiser
+        .forward_flux2_with_runtime_context(
+            &latents,
+            &[reference["scheduler_timestep"].as_f64().unwrap() as f32],
+            &text,
+            None,
+            &mut runtime_context,
+        )
+        .unwrap();
+    let mut token_major = vec![0.0; output.data.len()];
+    for channel in 0..8 {
+        for token in 0..2 {
+            token_major[token * 8 + channel] = output.data[channel * 2 + token];
+        }
+    }
+    let expected = values("output");
+    let max_abs = token_major
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("resident FLUX.2 tiny full forward max_abs={max_abs:.8}");
+    assert!(max_abs <= 5e-3, "resident FLUX.2 full forward max_abs={max_abs}");
+}
+
+#[test]
 fn attend_krea_resident_matches_runtime_context_path() {
     // Full resident attention (proj -> sdpa -> out proj, MHA, no gate/rope)
     // vs the existing CpuTensor round-trip path — same weights, so they should

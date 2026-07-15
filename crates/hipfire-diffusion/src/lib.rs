@@ -30,7 +30,12 @@ pub const HFQ_ARCH_DIFFUSION: u32 = hipfire_arch_api::ARCH_ID_DIFFUSION_LEGACY;
 /// generic id for families without a dedicated arch id, so unknown/new pipelines
 /// still write a valid (routable) diffusion container.
 pub fn diffusion_arch_id_for_metadata(metadata_json: &str) -> u32 {
-    if metadata_json.contains("Krea2Transformer2DModel") {
+    if metadata_json.contains("Flux2Transformer2DModel")
+        || metadata_json.contains("Flux2KleinPipeline")
+        || metadata_json.contains("SEFIInferencePipeline")
+    {
+        hipfire_arch_api::ARCH_ID_FLUX2
+    } else if metadata_json.contains("Krea2Transformer2DModel") {
         hipfire_arch_api::ARCH_ID_KREA2
     } else if metadata_json.contains("QwenImageTransformer2DModel") {
         hipfire_arch_api::ARCH_ID_QWEN_IMAGE
@@ -55,6 +60,14 @@ mod diffusion_arch_id_tests {
             diffusion_arch_id_for_metadata(r#"{"class_name":"QwenImageTransformer2DModel"}"#),
             hipfire_arch_api::ARCH_ID_QWEN_IMAGE
         );
+        assert_eq!(
+            diffusion_arch_id_for_metadata(r#"{"class_name":"Flux2Transformer2DModel"}"#),
+            hipfire_arch_api::ARCH_ID_FLUX2
+        );
+        assert_eq!(
+            diffusion_arch_id_for_metadata(r#"{"class_name":"SEFIInferencePipeline"}"#),
+            hipfire_arch_api::ARCH_ID_FLUX2
+        );
         // Unknown/other pipelines fall back to the legacy generic id.
         assert_eq!(
             diffusion_arch_id_for_metadata(r#"{"class_name":"FluxTransformer2DModel"}"#),
@@ -63,6 +76,9 @@ mod diffusion_arch_id_tests {
         // The stamped ids are all recognized as diffusion by the registry predicate.
         assert!(hipfire_archs::is_diffusion_arch(
             hipfire_arch_api::ARCH_ID_KREA2
+        ));
+        assert!(hipfire_archs::is_diffusion_arch(
+            hipfire_arch_api::ARCH_ID_FLUX2
         ));
     }
 }
@@ -93,6 +109,12 @@ pub const QT_DIFFUSION_TENSOR_OQ4_PLAIN: u8 = 11;
 /// mixed-precision (e.g. oq4.25) artifacts — the loader routes each tensor to
 /// its kernel by `quant_type`, so per-layer precision needs no extra plumbing.
 pub const QT_DIFFUSION_TENSOR_OQ8_PLAIN: u8 = 12;
+/// Plain (unrotated) unsigned **fold** codes for the mixed-precision GEMM
+/// (`gemm_opus_tiled_wmma_u`): dense LSB-first codes at the named bit width +
+/// per-group (256) f32 scales, `[packed | scales]`. Optionally clip-calibrated.
+pub const QT_DIFFUSION_TENSOR_OQF_W4: u8 = 13;
+pub const QT_DIFFUSION_TENSOR_OQF_W2: u8 = 14;
+pub const QT_DIFFUSION_TENSOR_OQF_W1: u8 = 15;
 pub const QT_DIFFUSION_TENSOR_BF16: u8 = 16;
 
 mod metadata;
@@ -247,6 +269,13 @@ struct RocmWeightCache {
     /// GEMM. Quarter the bf16 footprint; the int8 activation keeps precision.
     named_w4a8:
         std::collections::HashMap<String, (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
+    /// Mixed-precision unsigned load-time quant, keyed by (HFQ tensor **name**,
+    /// bits ∈ {1,2,4,8}): the (dense-packed unsigned codes [M*K*bits/8], per-group
+    /// f32 scales [M*K/256]) pair for the fold GEMM (`gemm_opus_tiled_wmma_u`).
+    /// Codes are unsigned (u = q + 2^(bits-1)); the zero-point is folded out at
+    /// GEMM time via the activation group sum.
+    named_wu:
+        std::collections::HashMap<(String, u32), (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
     /// Active activation precision for the resident linear path this step (the
     /// per-STEP schedule). Used directly unless the per-LAYER policy overrides.
     linear_precision: LinearPrecision,
@@ -375,6 +404,80 @@ where
             }
         });
     (packed, scales)
+}
+
+/// Per-group symmetric **unsigned** quant + dense LSB-first pack for bits ∈
+/// {1,2,4,8}, fanned over rows with rayon. Codes are `u = q + Z` (Z = 2^(bits-1)),
+/// so `q ∈ [-Z, Z-1]` — the standard signed grid stored unsigned. Row stride is
+/// `k*bits/8` bytes. Mirrors `hipfire_quantize::opus_lowbit` (which unit-tests the
+/// fold identity `Σ u·x − Z·Σx == Σ (u−Z)·x`). The zero-point is cancelled at
+/// GEMM time by `gemm_opus_tiled_wmma_u` using the activation group sum.
+pub(crate) fn quantize_wua8_rows<F>(
+    m: usize,
+    k: usize,
+    ng: usize,
+    bits: u32,
+    elem_stride: usize,
+    val: F,
+) -> (Vec<u8>, Vec<f32>)
+where
+    F: Fn(usize, usize) -> f32 + Sync,
+{
+    use rayon::prelude::*;
+    const GROUP: usize = 256;
+    let z = 1i32 << (bits - 1);
+    let (qmin, qmax) = (-z, z - 1);
+    let per_byte = (8 / bits) as usize;
+    let mask = ((1u32 << bits) - 1) as u8;
+    let row_stride = k * bits as usize / 8;
+    let mut packed = vec![0u8; m * row_stride];
+    let mut scales = vec![0f32; m * ng];
+    packed
+        .par_chunks_mut(row_stride)
+        .zip(scales.par_chunks_mut(ng))
+        .enumerate()
+        .for_each(|(row, (prow, srow))| {
+            let row_base = row * k * elem_stride;
+            for g in 0..ng {
+                let goff = g * GROUP;
+                let mut amax = 0f32;
+                for i in 0..GROUP {
+                    amax = amax.max(val(row_base, goff + i).abs());
+                }
+                let scale = if amax > 0.0 { amax / z as f32 } else { 1.0 };
+                srow[g] = scale;
+                let inv = 1.0 / scale;
+                for i in 0..GROUP {
+                    let q = (val(row_base, goff + i) * inv).round() as i32;
+                    let u = (q.clamp(qmin, qmax) + z) as u8; // unsigned code
+                    let idx = goff + i;
+                    prow[idx / per_byte] |= (u & mask) << ((idx % per_byte) as u32 * bits);
+                }
+            }
+        });
+    (packed, scales)
+}
+
+#[cfg(test)]
+mod quantize_wua8_tests {
+    use super::*;
+
+    #[test]
+    fn pack_and_scales_match_opus_lowbit_reference() {
+        use hipfire_quantize::opus_lowbit;
+        let (m, k, ng) = (3usize, 256usize, 1usize);
+        let w: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.017).sin()).collect();
+        for bits in [1u32, 2, 4, 8] {
+            let (packed, scales) = quantize_wua8_rows(m, k, ng, bits, 1, |rb, e| w[rb + e]);
+            let (ref_codes, ref_scales) = opus_lowbit::quantize_symmetric(&w, 256, bits);
+            assert_eq!(scales, ref_scales, "scales mismatch bits={bits}");
+            let stride = k * bits as usize / 8;
+            for row in 0..m {
+                let decoded = opus_lowbit::unpack_dense(&packed[row * stride..(row + 1) * stride], k, bits);
+                assert_eq!(&decoded[..], &ref_codes[row * k..(row + 1) * k], "codes row={row} bits={bits}");
+            }
+        }
+    }
 }
 
 impl RocmWeightCache {
@@ -716,6 +819,109 @@ impl RocmWeightCache {
             .get(&weight.name)
             .expect("named w4a8 weight just inserted");
         Ok((w_i4.buf.as_ptr(), w_scales.buf.as_ptr(), ng))
+    }
+
+    /// Mixed-precision load-time quant: return `(unsigned-packed weight ptr, f32
+    /// scale ptr, n_groups)` for a resident linear `[out, in]` (`in % 256 == 0`)
+    /// at `bits` ∈ {1,2,4,8}, built once by decoding the bf16/source weight and
+    /// per-group symmetric quantizing it to dense unsigned codes. Consumed by
+    /// [`hipfire_rdna::Gpu::gemm_opus_tiled_wmma_u`] with the activation group sum.
+    // Foundation for the mixed-precision consume path; wired into `gpu_ops` linear
+    // dispatch in the follow-up (guarded by the coherence gate).
+    #[allow(dead_code)]
+    fn resident_wua8(
+        &mut self,
+        gpu: &mut hipfire_rdna::Gpu,
+        weight: &ResidentWeight,
+        bits: u32,
+    ) -> DiffusionResult<(*mut std::ffi::c_void, *mut std::ffi::c_void, usize)> {
+        const GROUP: usize = 256;
+        assert!(matches!(bits, 1 | 2 | 4 | 8), "resident_wua8: bits must be ∈ {{1,2,4,8}}");
+        let (m, k) = match weight.shape.as_slice() {
+            [out, inf] => (*out, *inf),
+            other => {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "resident_wua8 needs a 2-D [out, in] weight, got {other:?}"
+                )))
+            }
+        };
+        if k % GROUP != 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "resident_wua8: in_features {k} must be a multiple of {GROUP}"
+            )));
+        }
+        let ng = k / GROUP;
+        let key = (weight.name.clone(), bits);
+        let ondisk_fold = matches!(
+            (weight.quant_type, bits),
+            (QT_DIFFUSION_TENSOR_OQF_W4, 4)
+                | (QT_DIFFUSION_TENSOR_OQF_W2, 2)
+                | (QT_DIFFUSION_TENSOR_OQF_W1, 1)
+        );
+        if !self.named_wu.contains_key(&key) {
+            // Already-calibrated on disk: blob is [dense codes | f32 scales].
+            // Upload directly — no requant, no read-of-bf16 (the load-time win).
+            if ondisk_fold {
+                let blob = weight.read_bytes()?;
+                let packed_len = m * k * bits as usize / 8;
+                if blob.len() != packed_len + m * ng * 4 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "resident_wua8: fold blob {:?} has {} bytes, expected {}",
+                        weight.name,
+                        blob.len(),
+                        packed_len + m * ng * 4
+                    )));
+                }
+                let scales: Vec<f32> = blob[packed_len..]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let w_u = gpu
+                    .upload_raw(&blob[..packed_len], &[packed_len])
+                    .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+                let w_scales = gpu
+                    .upload_f32(&scales, &[m * ng])
+                    .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+                self.named_wu.insert(key.clone(), (w_u, w_scales));
+                let (w_u, w_scales) = self.named_wu.get(&key).unwrap();
+                return Ok((w_u.buf.as_ptr(), w_scales.buf.as_ptr(), ng));
+            }
+            let (packed, scales) = if weight.quant_type == QT_DIFFUSION_TENSOR_BF16 {
+                let bytes = weight.read_bytes()?;
+                if bytes.len() != m * k * 2 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "resident_wua8: weight {:?} has {} bytes, expected {}",
+                        weight.name,
+                        bytes.len(),
+                        m * k * 2
+                    )));
+                }
+                quantize_wua8_rows(m, k, ng, bits, 2, |row_base, elem| {
+                    let b = row_base + elem * 2;
+                    bf16_byte_to_f32(bytes[b], bytes[b + 1])
+                })
+            } else {
+                let cpu = weight.decode()?;
+                if cpu.data.len() != m * k {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "resident_wua8: weight {:?} decoded to {} elems, expected {}",
+                        weight.name,
+                        cpu.data.len(),
+                        m * k
+                    )));
+                }
+                quantize_wua8_rows(m, k, ng, bits, 1, |row_base, elem| cpu.data[row_base + elem])
+            };
+            let w_u = gpu
+                .upload_raw(&packed, &[m * k * bits as usize / 8])
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let w_scales = gpu
+                .upload_f32(&scales, &[m * ng])
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            self.named_wu.insert(key.clone(), (w_u, w_scales));
+        }
+        let (w_u, w_scales) = self.named_wu.get(&key).expect("named wu weight just inserted");
+        Ok((w_u.buf.as_ptr(), w_scales.buf.as_ptr(), ng))
     }
 
     /// Return the raw device pointer to an F16 copy of `tensor`, converting the
@@ -1076,6 +1282,9 @@ pub(crate) fn decode_tensor_payload(
         QT_DIFFUSION_TENSOR_HFQ6_G256 => decode_hfq6_g256_slice(name, bytes, elem_count)?,
         QT_DIFFUSION_TENSOR_OQ4_G256 => decode_oq4g256_slice(name, bytes, elem_count)?,
         QT_DIFFUSION_TENSOR_OQ8_G256 => decode_oq8g256_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_OQF_W4 => decode_oqf_slice(name, bytes, elem_count, 4)?,
+        QT_DIFFUSION_TENSOR_OQF_W2 => decode_oqf_slice(name, bytes, elem_count, 2)?,
+        QT_DIFFUSION_TENSOR_OQF_W1 => decode_oqf_slice(name, bytes, elem_count, 1)?,
         other => {
             return Err(DiffusionError::InvalidMetadata(format!(
                 "tensor {name:?} has unsupported quant_type {other}; native diffusion tensor decoding currently supports Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G256, HFQ4G128, HFQ6G256, OQ4G256, and OQ8G256 tensor payloads. Other packed or quantized payloads require a diffusion dequantizer/runtime implementation"
@@ -1124,6 +1333,10 @@ impl ResidentWeight {
 
     pub(crate) fn shape(&self) -> &[usize] {
         &self.shape
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     /// `pread` the packed payload from the HFQ. Transient: the caller uploads or
@@ -1228,9 +1441,10 @@ use quant_decode::*;
 
 mod quant_encode;
 pub use quant_encode::{
-    open_calib_sidecar, opus_quant_token, oq4_arch_combined_len, pack_oq4_arch_combined,
-    quantize_diffusion_hfq, quantize_diffusion_hfq_plain, DiffusionQuantFormat,
-    DiffusionQuantizeSummary, HessianSidecar, PlainOpusPolicy, PlainQuantizeSummary,
+    diff_quantized_transformer_tensors, eval_fold_calibration, open_calib_sidecar,
+    oq4_arch_combined_len, pack_oq4_arch_combined, quantize_diffusion_hfq, opus_quant_token,
+    quantize_diffusion_hfq_plain, DiffusionQuantFormat, DiffusionQuantizeSummary, FoldCalibRow,
+    HessianSidecar, PlainOpusPolicy, PlainQuantizeSummary, TensorQuantDiff,
 };
 
 mod quant_calib;
@@ -1422,6 +1636,25 @@ trait DiffusionNoiseBackend: Send + Sync {
         runtime_context: &mut DiffusionGenerationRuntimeContext,
         progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
     ) -> DiffusionResult<DenoiseLatentsOutput>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_sefi_latents_with_runtime_context(
+        &self,
+        _latents: LatentBatch,
+        _schedule: &SeFiDualSchedule,
+        _semantic_channels: usize,
+        _cfg_scale: f32,
+        _positive_embeddings: &CpuTensor,
+        _negative_embeddings: &CpuTensor,
+        _positive_attention_mask: Option<&CpuTensor>,
+        _negative_attention_mask: Option<&CpuTensor>,
+        _runtime_context: &mut DiffusionGenerationRuntimeContext,
+        _progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
+    ) -> DiffusionResult<DenoiseLatentsOutput> {
+        Err(DiffusionError::InvalidRequest(
+            "SeFi dual-stream denoising requires a FLUX.2 transformer backend".to_string(),
+        ))
+    }
 }
 
 impl DiffusionNoiseBackend for NativeUnet2DConditionModel {
@@ -1628,8 +1861,13 @@ struct NativeDiffusionRuntime {
     // Krea2 text conditioning (Qwen3-VL encoder + text_fusion). Present only for
     // `Krea2Pipeline`; the pipeline drives it to build the DiT conditioning.
     text_conditioner: Option<Krea2TextConditioner>,
+    // FLUX.2 uses the same Qwen3 text tower without Krea's fusion stack: the
+    // selected hidden states are concatenated directly into DiT conditioning.
+    flux2_text_conditioner: Option<Flux2TextConditioner>,
     // Qwen2 byte-level BPE tokenizer for the Krea2 prompt (from `tokenizer.json`).
     krea2_tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
+    flux2_tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
+    flux2_text_max_length: usize,
 }
 
 impl NativeDiffusionRuntime {
@@ -1651,6 +1889,7 @@ impl NativeDiffusionRuntime {
                 Box::new(NativeUnet2DConditionModel::from_hfq(hfq, &config.unet)?)
             };
         let is_krea2 = matches!(transformer_family, Some(TransformerDenoiserFamily::Krea2));
+        let is_flux2 = matches!(transformer_family, Some(TransformerDenoiserFamily::Flux2));
         let text_conditioner = if is_krea2 {
             Self::load_krea2_conditioner(hfq, metadata, config)?
         } else {
@@ -1663,13 +1902,32 @@ impl NativeDiffusionRuntime {
         } else {
             None
         };
+        let flux2_text_conditioner = if is_flux2 {
+            Self::load_flux2_conditioner(hfq, metadata)?
+        } else {
+            None
+        };
+        let flux2_tokenizer = if is_flux2 {
+            hfq.tensor_data_vec("tokenizer/tokenizer.json")
+                .and_then(|(_, bytes)| String::from_utf8(bytes).ok())
+                .and_then(|json| hipfire_model::tokenizer::Tokenizer::from_hf_json(&json).ok())
+        } else {
+            None
+        };
+        // The tokenizer's own model_max_length is the generic Qwen context
+        // window, not the FLUX image-conditioning contract. Enforce the BFL /
+        // SeFi caps even when loading an older artifact with stale metadata.
+        let flux2_text_max_length = if metadata.pipeline.sefi { 1024 } else { 512 };
         Ok(Self {
             kind: DiffusionRuntimeKind::CpuSourceReference,
             noise,
             encoder: NativeVaeEncoder::from_hfq(hfq, &config.vae).ok(),
             decoder: Box::new(NativeVaeDecoder::from_hfq(hfq, &config.vae)?),
             text_conditioner,
+            flux2_text_conditioner,
             krea2_tokenizer,
+            flux2_tokenizer,
+            flux2_text_max_length,
         })
     }
 
@@ -1761,6 +2019,68 @@ impl NativeDiffusionRuntime {
             rope_theta,
             fusion_heads,
             select_layers,
+        )
+    }
+
+    fn flux2_conditioning_from_prompt(
+        &self,
+        prompt: &str,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Option<(CpuTensor, Vec<u32>, Vec<bool>)>> {
+        let (Some(tokenizer), Some(conditioner)) =
+            (&self.flux2_tokenizer, &self.flux2_text_conditioner)
+        else {
+            return Ok(None);
+        };
+        // Qwen3/Qwen3-VL share this chat template for both Klein and SeFi.
+        // Both references request an assistant generation prefix with thinking
+        // disabled, which emits an empty think block before padding.
+        let text = format!(
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        let mut token_ids = tokenizer.encode(&text);
+        token_ids.truncate(self.flux2_text_max_length);
+        let real_tokens = token_ids.len();
+        // Qwen3's tokenizer declares <|endoftext|> as the padding token.
+        const QWEN3_PAD_TOKEN_ID: u32 = 151_643;
+        token_ids.resize(self.flux2_text_max_length, QWEN3_PAD_TOKEN_ID);
+        let attention_mask = (0..self.flux2_text_max_length)
+            .map(|index| index < real_tokens)
+            .collect::<Vec<_>>();
+        let conditioning = conditioner.conditioning_from_token_ids(
+            &token_ids,
+            &attention_mask,
+            runtime_context,
+        )?;
+        Ok(Some((conditioning, token_ids, attention_mask)))
+    }
+
+    fn load_flux2_conditioner(
+        hfq: &HfqFile,
+        metadata: &DiffusionHfqMetadata,
+    ) -> DiffusionResult<Option<Flux2TextConditioner>> {
+        let text_encoder =
+            component_json(hfq, metadata, "text_encoder")?.unwrap_or_else(|| json!({}));
+        let text_config = text_encoder
+            .get("text_config")
+            .cloned()
+            .unwrap_or_else(|| text_encoder.clone());
+        let heads = json_usize(&text_config, "num_attention_heads").unwrap_or(32);
+        let kv_heads = json_usize(&text_config, "num_key_value_heads").unwrap_or(8);
+        let head_dim = json_usize(&text_config, "head_dim").unwrap_or(128);
+        let rope_theta = text_config
+            .get("rope_parameters")
+            .and_then(|params| json_f32(params, "rope_theta"))
+            .or_else(|| json_f32(&text_config, "rope_theta"))
+            .unwrap_or(1_000_000.0);
+        Flux2TextConditioner::from_hfq(
+            hfq,
+            "text_encoder/tensors/language_model",
+            heads,
+            kv_heads,
+            head_dim,
+            rope_theta,
+            vec![9, 18, 27],
         )
     }
 }
@@ -1923,6 +2243,8 @@ impl StableDiffusionConfig {
             up_block_types: json_string_vec(&vae_json, "up_block_types"),
             norm_num_groups: json_usize(&vae_json, "norm_num_groups"),
             norm_eps: json_f32(&vae_json, "norm_eps"),
+            patch_size: json_usize_vec(&vae_json, "patch_size"),
+            batch_norm_eps: json_f32(&vae_json, "batch_norm_eps"),
         };
         let scheduler = SchedulerConfig {
             class_name: json_string(&scheduler_json, "_class_name"),
@@ -1970,12 +2292,25 @@ impl StableDiffusionConfig {
             .latent_width
             .map(|value| value as usize)
             .or(unet.sample_size);
-        let vae_scale_factor = vae
+        let decoder_scale_factor = vae
             .block_out_channels
             .len()
             .checked_sub(1)
             .map(|power| 1usize << power)
             .unwrap_or(8);
+        let vae_scale_factor = if vae.class_name == "AutoencoderKLFlux2" {
+            let patch_height = vae.patch_size.first().copied().unwrap_or(1);
+            let patch_width = vae.patch_size.get(1).copied().unwrap_or(patch_height);
+            if patch_height != patch_width {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "FLUX.2 VAE requires square patch_size, got {:?}",
+                    vae.patch_size
+                )));
+            }
+            decoder_scale_factor * patch_height
+        } else {
+            decoder_scale_factor
+        };
         Ok(Self {
             pipeline_class: metadata.pipeline.class_name.clone(),
             text_encoder,
@@ -2377,6 +2712,10 @@ use superres::*;
 /// pipeline/inpaint encode sites via [`vae_encode_seeds`].
 const VAE_INIT_ENCODE_SEED_SALT: u64 = 0x7661_655f_696e_6974; // "vae_init"
 const VAE_MASKED_ENCODE_SEED_SALT: u64 = 0x7661_655f_6d61_736b; // "vae_mask"
+/// Seed salt for the draft-mode Stage-2 refine noise. Decorrelates the refine
+/// injection noise from Stage-1's sampling noise so the refine adds detail
+/// rather than replaying the same perturbation. Consumed via [`vae_encode_seeds`].
+const DRAFT_REFINE_NOISE_SEED_SALT: u64 = 0x6472_6166_745f_726e; // "draft_rn"
 
 pub fn rgb_tensor_to_u8(tensor: &CpuTensor) -> DiffusionResult<RgbImageBatch> {
     let [batch, channels, height, width] = shape4(tensor)?;
@@ -3439,6 +3778,7 @@ fn transformer_denoiser_weight_topology(
 ) -> TransformerDenoiserWeightTopology {
     let class_name = component.class_name.as_deref().unwrap_or_default();
     let mut blocks = BTreeSet::new();
+    let mut single_blocks = BTreeSet::new();
     let mut has_input_projection = false;
     let mut has_output_projection = false;
     let mut has_text_modulation = false;
@@ -3448,7 +3788,10 @@ fn transformer_denoiser_weight_topology(
         let name = entry
             .strip_prefix("transformer/tensors/")
             .unwrap_or(entry.as_str());
-        has_input_projection |= matches!(name, "img_in.weight" | "img_in.bias");
+        has_input_projection |= matches!(
+            name,
+            "img_in.weight" | "img_in.bias" | "x_embedder.weight" | "x_embedder.bias"
+        );
         has_output_projection |= matches!(
             name,
             "proj_out.weight"
@@ -3471,11 +3814,19 @@ fn transformer_denoiser_weight_topology(
                 }
             }
         }
+        if let Some(rest) = name.strip_prefix("single_transformer_blocks.") {
+            if let Some((idx, _)) = rest.split_once('.') {
+                if let Ok(idx) = idx.parse::<usize>() {
+                    single_blocks.insert(idx);
+                }
+            }
+        }
     }
 
     let family = match class_name {
         "QwenImageTransformer2DModel" => TransformerDenoiserFamily::QwenImage,
         "Krea2Transformer2DModel" => TransformerDenoiserFamily::Krea2,
+        "Flux2Transformer2DModel" => TransformerDenoiserFamily::Flux2,
         _ if has_text_fusion => TransformerDenoiserFamily::Krea2,
         _ if has_text_modulation => TransformerDenoiserFamily::QwenImage,
         _ => TransformerDenoiserFamily::Unknown,
@@ -3484,6 +3835,7 @@ fn transformer_denoiser_weight_topology(
     TransformerDenoiserWeightTopology {
         family,
         block_count: blocks.len(),
+        single_block_count: single_blocks.len(),
         has_input_projection,
         has_output_projection,
         has_text_modulation,
@@ -4389,6 +4741,100 @@ fn resize_latent_batch_nearest(
     })
 }
 
+/// Bilinear latent upscale for the draft-mode Stage-2 refine.
+///
+/// Nearest-neighbour upscaling ([`resize_latent_batch_nearest`]) replicates each
+/// source latent cell into a `k×k` block; the VAE decoder amplifies those
+/// identical blocks into a woven/tiled artifact that a light refine (few steps,
+/// low sigma) cannot erase. Bilinear interpolation produces a continuous latent
+/// field close to the true high-res latent, so the refine only has to add
+/// detail. Channel-agnostic (SeFi's semantic+texture stack is interpolated
+/// per-channel, same as any other latent).
+fn resize_latent_batch_bilinear(
+    latents: &LatentBatch,
+    target_height: usize,
+    target_width: usize,
+) -> DiffusionResult<LatentBatch> {
+    if target_width == 0 || target_height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "target latent dimensions must be positive".to_string(),
+        ));
+    }
+    if latents.width == 0 || latents.height == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "source latent dimensions must be positive".to_string(),
+        ));
+    }
+    let source_values = latents
+        .batch
+        .checked_mul(latents.channels)
+        .and_then(|values| values.checked_mul(latents.height))
+        .and_then(|values| values.checked_mul(latents.width))
+        .ok_or_else(|| DiffusionError::InvalidRequest("latent dimensions overflow".to_string()))?;
+    if latents.data.len() != source_values {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "latent batch has {} values, expected {source_values}",
+            latents.data.len()
+        )));
+    }
+    if latents.width == target_width && latents.height == target_height {
+        return Ok(latents.clone());
+    }
+    let target_values = latents
+        .batch
+        .checked_mul(latents.channels)
+        .and_then(|values| values.checked_mul(target_height))
+        .and_then(|values| values.checked_mul(target_width))
+        .ok_or_else(|| {
+            DiffusionError::InvalidRequest("target latent dimensions overflow".to_string())
+        })?;
+    let mut data = vec![0.0f32; target_values];
+    let source_image_values = latents.channels * latents.height * latents.width;
+    let target_image_values = latents.channels * target_height * target_width;
+    // half-pixel-center mapping (align_corners = false): src = (dst + 0.5)*scale - 0.5.
+    let scale_y = latents.height as f32 / target_height as f32;
+    let scale_x = latents.width as f32 / target_width as f32;
+    let max_y = latents.height.saturating_sub(1);
+    let max_x = latents.width.saturating_sub(1);
+    for batch_idx in 0..latents.batch {
+        let source_batch_offset = batch_idx * source_image_values;
+        let target_batch_offset = batch_idx * target_image_values;
+        for channel in 0..latents.channels {
+            let source_channel_offset =
+                source_batch_offset + channel * latents.height * latents.width;
+            let target_channel_offset =
+                target_batch_offset + channel * target_height * target_width;
+            for y in 0..target_height {
+                let src_y = ((y as f32 + 0.5) * scale_y - 0.5).max(0.0);
+                let y0 = (src_y.floor() as usize).min(max_y);
+                let y1 = (y0 + 1).min(max_y);
+                let wy = src_y - y0 as f32;
+                for x in 0..target_width {
+                    let src_x = ((x as f32 + 0.5) * scale_x - 0.5).max(0.0);
+                    let x0 = (src_x.floor() as usize).min(max_x);
+                    let x1 = (x0 + 1).min(max_x);
+                    let wx = src_x - x0 as f32;
+                    let row = latents.width;
+                    let v00 = latents.data[source_channel_offset + y0 * row + x0];
+                    let v01 = latents.data[source_channel_offset + y0 * row + x1];
+                    let v10 = latents.data[source_channel_offset + y1 * row + x0];
+                    let v11 = latents.data[source_channel_offset + y1 * row + x1];
+                    let top = v00 + (v01 - v00) * wx;
+                    let bottom = v10 + (v11 - v10) * wx;
+                    data[target_channel_offset + y * target_width + x] = top + (bottom - top) * wy;
+                }
+            }
+        }
+    }
+    Ok(LatentBatch {
+        batch: latents.batch,
+        channels: latents.channels,
+        height: target_height,
+        width: target_width,
+        data,
+    })
+}
+
 pub fn resize_rgb_batch_to_cover_nearest(
     image: &RgbImageBatch,
     target_width: u32,
@@ -4614,7 +5060,9 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
     let uses_supported_transformer = transformer_topology.as_ref().is_some_and(|topology| {
         matches!(
             topology.family,
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Krea2
+            TransformerDenoiserFamily::QwenImage
+                | TransformerDenoiserFamily::Krea2
+                | TransformerDenoiserFamily::Flux2
         )
     });
     if !is_native_unet_pipeline_class(&metadata.pipeline.class_name) && !uses_supported_transformer
@@ -4637,12 +5085,14 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
                 _ => topology.has_text_modulation,
             };
             if topology.block_count == 0
+                || (matches!(topology.family, TransformerDenoiserFamily::Flux2)
+                    && topology.single_block_count == 0)
                 || !topology.has_input_projection
                 || !topology.has_output_projection
                 || !text_conditioning_ok
             {
                 return Some(format!(
-                    "native transformer runtime requires complete Qwen image / Krea2 transformer weights; artifact has {}",
+                    "native transformer runtime requires complete Qwen Image / Krea2 / FLUX.2 transformer weights; artifact has {}",
                     topology.diagnostic_label()
                 ));
             }
@@ -4665,7 +5115,10 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
         .get("vae")
         .and_then(|component| component.class_name.as_deref())
     {
-        if vae != "AutoencoderKL" && vae != "AutoencoderKLQwenImage" {
+        if vae != "AutoencoderKL"
+            && vae != "AutoencoderKLQwenImage"
+            && vae != "AutoencoderKLFlux2"
+        {
             return Some(format!(
                 "native diffusion runtime supports AutoencoderKL-family VAEs only; artifact vae class {vae:?} is unsupported"
             ));

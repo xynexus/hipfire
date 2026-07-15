@@ -233,6 +233,41 @@ pub(crate) fn decode_oq4g256_slice(
     ))
 }
 
+/// Decode the plain unsigned **fold** format `[dense codes | f32 per-group
+/// scales]` at `bits` ∈ {1,2,4}: `f32 = (u − 2^(bits-1)) · scale[i/256]`. Mirrors
+/// `hipfire_quantize::opus_lowbit` (dense LSB-first codes, 256-group scales). The
+/// flat 256-group index equals the (row, group) scale index because K % 256 == 0.
+pub(crate) fn decode_oqf_slice(
+    name: &str,
+    bytes: &[u8],
+    elem_count: usize,
+    bits: u32,
+) -> DiffusionResult<Vec<f32>> {
+    const GROUP: usize = 256;
+    let ng = elem_count / GROUP;
+    let packed_len = elem_count * bits as usize / 8;
+    let expected = packed_len + ng * 4;
+    if bytes.len() < expected {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "OQF_W{bits} tensor {name:?} has {} bytes but shape requires at least {expected}",
+            bytes.len()
+        )));
+    }
+    let scales: Vec<f32> = bytes[packed_len..packed_len + ng * 4]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let per_byte = (8 / bits) as usize;
+    let mask = ((1u32 << bits) - 1) as u8;
+    let z = 1i32 << (bits - 1);
+    let mut data = vec![0.0f32; elem_count];
+    for (i, out) in data.iter_mut().enumerate() {
+        let u = (bytes[i / per_byte] >> ((i % per_byte) as u32 * bits)) & mask;
+        *out = (u as i32 - z) as f32 * scales[i / GROUP];
+    }
+    Ok(data)
+}
+
 /// Decode the FWHT-rotated oq8g256 format (258 B / 256-block).
 pub(crate) fn decode_oq8g256_slice(
     name: &str,

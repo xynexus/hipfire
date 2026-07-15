@@ -224,11 +224,26 @@ pub(crate) fn linear_optional_bias_with_runtime_context(
         calib_observe_linear(weight, input);
         return linear_optional_bias(input, weight, bias).map_err(Into::into);
     };
-    {
-        runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
-            linear_optional_bias_hip_on_gpu(gpu, cache, input, weight, bias)
-        })
+    calib_observe_linear(weight, input);
+    runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+        linear_optional_bias_hip_on_gpu(gpu, cache, input, weight, bias)
+    })
+}
+
+pub(crate) fn linear_optional_bias_f32_with_runtime_context(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: Option<&CpuTensor>,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    if runtime_context.rocm_device_id().is_none() {
+        calib_observe_linear(weight, input);
+        return linear_optional_bias(input, weight, bias).map_err(Into::into);
     }
+    calib_observe_linear(weight, input);
+    runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+        linear_optional_bias_f32_hip_on_gpu(gpu, cache, input, weight, bias)
+    })
 }
 
 /// Fold a linear layer's input activations into the calibration accumulators
@@ -507,6 +522,36 @@ pub(crate) fn linear_3d_with_runtime_context(
     if rows != batch * seq {
         return Err(DiffusionError::InvalidMetadata(format!(
             "linear_3d row count {rows} != batch*seq {}",
+            batch * seq
+        )));
+    }
+    Ok(CpuTensor {
+        shape: vec![batch, seq, out_features],
+        data: out.data,
+    })
+}
+
+pub(crate) fn linear_3d_f32_with_runtime_context(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: Option<&CpuTensor>,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, seq, in_features] = shape3(input)?;
+    let flat = CpuTensor {
+        shape: vec![batch * seq, in_features],
+        data: input.data.clone(),
+    };
+    let out = linear_optional_bias_f32_with_runtime_context(
+        &flat,
+        weight,
+        bias,
+        runtime_context,
+    )?;
+    let [rows, out_features] = shape2(&out)?;
+    if rows != batch * seq {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "f32 linear_3d row count {rows} != batch*seq {}",
             batch * seq
         )));
     }

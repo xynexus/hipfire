@@ -88,6 +88,7 @@ pub struct TransformerDenoiserConfig {
 pub(crate) enum TransformerDenoiserFamily {
     QwenImage,
     Krea2,
+    Flux2,
     Unknown,
 }
 
@@ -96,6 +97,7 @@ impl TransformerDenoiserFamily {
         match self {
             Self::QwenImage => "qwen-image-mmdit",
             Self::Krea2 => "krea2-mmdit",
+            Self::Flux2 => "flux2-mmdit",
             Self::Unknown => "unknown-transformer",
         }
     }
@@ -105,6 +107,7 @@ impl TransformerDenoiserFamily {
 pub(crate) struct TransformerDenoiserWeightTopology {
     pub(crate) family: TransformerDenoiserFamily,
     pub(crate) block_count: usize,
+    pub(crate) single_block_count: usize,
     pub(crate) has_input_projection: bool,
     pub(crate) has_output_projection: bool,
     pub(crate) has_text_modulation: bool,
@@ -132,9 +135,10 @@ impl TransformerDenoiserWeightTopology {
             features.join(",")
         };
         format!(
-            "{} blocks={} features={feature_label}",
+            "{} blocks={} single_blocks={} features={feature_label}",
             self.family.as_str(),
-            self.block_count
+            self.block_count,
+            self.single_block_count
         )
     }
 }
@@ -153,6 +157,8 @@ pub struct VaeConfig {
     pub up_block_types: Vec<String>,
     pub norm_num_groups: Option<usize>,
     pub norm_eps: Option<f32>,
+    pub patch_size: Vec<usize>,
+    pub batch_norm_eps: Option<f32>,
 }
 
 /// Latent-space normalization for a VAE.

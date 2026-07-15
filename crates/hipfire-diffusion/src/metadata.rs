@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiffusionHfqMetadata {
     pub artifact_kind: String,
     pub schema_version: u32,
@@ -27,10 +27,12 @@ pub struct DiffusionHfqMetadata {
     pub components: BTreeMap<String, DiffusionComponentMetadata>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DiffusionPipelineMetadata {
     pub class_name: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
     #[serde(default)]
     pub model_name: String,
     #[serde(default)]
@@ -43,6 +45,16 @@ pub struct DiffusionPipelineMetadata {
     pub supported_widths: Vec<u32>,
     #[serde(default)]
     pub supported_heights: Vec<u32>,
+    /// Semantic-first FLUX.2 pipeline marker. The transformer family and arch id
+    /// remain FLUX.2; this selects the dual-time driver within that family.
+    #[serde(default)]
+    pub sefi: bool,
+    #[serde(default)]
+    pub semantic_channels: Option<u32>,
+    #[serde(default)]
+    pub texture_channels: Option<u32>,
+    #[serde(default)]
+    pub delta_t: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
