@@ -24,4 +24,5 @@ hipfire-arch-nemotron-spec = { path = "../hipfire-arch-nemotron-spec" }
 hipfire-arch-zaya-spec = { path = "../hipfire-arch-zaya-spec" }
 hipfire-arch-krea2-spec = { path = "../hipfire-arch-krea2-spec" }
 hipfire-arch-qwenimage-spec = { path = "../hipfire-arch-qwenimage-spec" }
+hipfire-arch-flux2-spec = { path = "../hipfire-arch-flux2-spec" }
 hipfire-arch-embeddinggemma-spec = { path = "../hipfire-arch-embeddinggemma-spec" }
