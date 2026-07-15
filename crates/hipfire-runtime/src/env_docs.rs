@@ -283,7 +283,7 @@ pub const ENV_HIPFIRE_BATCHES_STATE_MAX: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_BENCH_QWEN35_SPEED_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BENCH_QWEN35_SPEED_BIN",
     description: "Runtime variable controlling bench qwen35 speed bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1175",
+    source: "crates/hipfire-eval/src/lib.rs:1180",
 };
 
 /// `HIPFIRE_BF16_DENSE_M128` — Enabled by default; set to 0 to disable
@@ -361,7 +361,7 @@ pub const ENV_HIPFIRE_CHAT_TEMPLATE_FILE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_COLLECT_ARTIFACTS_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_COLLECT_ARTIFACTS_BIN",
     description: "Runtime variable controlling collect artifacts bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1222",
+    source: "crates/hipfire-eval/src/lib.rs:1227",
 };
 
 /// `HIPFIRE_COMP_DUMP` — Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each
@@ -487,14 +487,14 @@ pub const ENV_HIPFIRE_DEBUG_PREFIX_BOUNDARIES: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEBUG_VAE_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEBUG_VAE_DUMP",
     description: "Runtime variable controlling debug vae dump in hipfire",
-    source: "crates/hipfire-diffusion/src/vae.rs:1388",
+    source: "crates/hipfire-diffusion/src/vae.rs:1483",
 };
 
 /// `HIPFIRE_DEBUG_VAE_STAGES` — Runtime variable controlling debug vae stages in hipfire
 pub const ENV_HIPFIRE_DEBUG_VAE_STAGES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEBUG_VAE_STAGES",
     description: "Runtime variable controlling debug vae stages in hipfire",
-    source: "crates/hipfire-diffusion/src/vae.rs:1319",
+    source: "crates/hipfire-diffusion/src/vae.rs:1414",
 };
 
 /// `HIPFIRE_DEEPSEEK4_ATTN` — main model's final_norm_and_head head-HC reduction. Without
@@ -1062,7 +1062,7 @@ pub const ENV_HIPFIRE_DFLASH_SERIAL_TAPE_X_IN_COMPARE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DFLASH_SPEC_DEMO_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_SPEC_DEMO_BIN",
     description: "Runtime variable controlling dflash spec demo bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1160",
+    source: "crates/hipfire-eval/src/lib.rs:1165",
 };
 
 /// `HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN` — Runtime variable controlling dflash trace expected token in hipfire
@@ -1097,49 +1097,49 @@ pub const ENV_HIPFIRE_DIAG: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIFFUSION_ATTN_QTILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_ATTN_QTILE",
     description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:3957",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:4058",
 };
 
 /// `HIPFIRE_DIFFUSION_CPU_REFERENCE` — Runtime variable controlling diffusion cpu reference in hipfire
 pub const ENV_HIPFIRE_DIFFUSION_CPU_REFERENCE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_CPU_REFERENCE",
     description: "Runtime variable controlling diffusion cpu reference in hipfire",
-    source: "crates/hipfire-diffusion/src/lib.rs:181",
+    source: "crates/hipfire-diffusion/src/lib.rs:197",
 };
 
 /// `HIPFIRE_DIFFUSION_DUMP_DIR` — Runtime variable controlling diffusion dump dir in hipfire
 pub const ENV_HIPFIRE_DIFFUSION_DUMP_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_DUMP_DIR",
     description: "Runtime variable controlling diffusion dump dir in hipfire",
-    source: "crates/hipfire-diffusion/src/lib.rs:1011",
+    source: "crates/hipfire-diffusion/src/lib.rs:1027",
 };
 
-/// `HIPFIRE_DIFFUSION_LAYER_RUNG` — Selects behavior from recognized values
+/// `HIPFIRE_DIFFUSION_LAYER_RUNG` — Runtime variable controlling diffusion layer rung in hipfire
 pub const ENV_HIPFIRE_DIFFUSION_LAYER_RUNG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_LAYER_RUNG",
-    description: "Selects behavior from recognized values",
-    source: "crates/hipfire-diffusion/src/denoise.rs:327",
+    description: "Runtime variable controlling diffusion layer rung in hipfire",
+    source: "crates/hipfire-diffusion/src/denoise.rs:363",
 };
 
 /// `HIPFIRE_DIFFUSION_OQ8` — Enabled when set to 1
 pub const ENV_HIPFIRE_DIFFUSION_OQ8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_OQ8",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2208",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2309",
 };
 
 /// `HIPFIRE_DIFFUSION_TILED_GEMM` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_DIFFUSION_TILED_GEMM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_TILED_GEMM",
     description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2340",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2441",
 };
 
 /// `HIPFIRE_DIFFUSION_W4A8` — W8A8 (oq8) path: int8 weight (½ bf16 footprint) × dynamic-int8 activation,
 pub const ENV_HIPFIRE_DIFFUSION_W4A8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_W4A8",
     description: "W8A8 (oq8) path: int8 weight (½ bf16 footprint) × dynamic-int8 activation,",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2203",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2304",
 };
 
 /// `HIPFIRE_DIR` — Runtime variable controlling dir in hipfire
@@ -1286,14 +1286,21 @@ pub const ENV_HIPFIRE_DUMMY_PREFILL_DELAY_MS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DUMP_COND: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_COND",
     description: "Debug hook: HIPFIRE_DUMP_COND prints stats for the text conditioning",
-    source: "crates/hipfire-diffusion/src/pipeline_generate.rs:290",
+    source: "crates/hipfire-diffusion/src/pipeline_generate.rs:311",
+};
+
+/// `HIPFIRE_DUMP_DENOISE_TRACE` — Runtime variable controlling dump denoise trace in hipfire
+pub const ENV_HIPFIRE_DUMP_DENOISE_TRACE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DUMP_DENOISE_TRACE",
+    description: "Runtime variable controlling dump denoise trace in hipfire",
+    source: "crates/hipfire-diffusion/src/denoise.rs:47",
 };
 
 /// `HIPFIRE_DUMP_GATE` — Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate
 pub const ENV_HIPFIRE_DUMP_GATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_GATE",
     description: "Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate",
-    source: "crates/hipfire-diffusion/src/transformer.rs:1556",
+    source: "crates/hipfire-diffusion/src/transformer.rs:2030",
 };
 
 /// `HIPFIRE_DUMP_HIDDEN` — DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
@@ -1335,7 +1342,7 @@ pub const ENV_HIPFIRE_DUMP_HIDDEN_POS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DUMP_LATENT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_LATENT",
     description: "Debug hook: when HIPFIRE_DUMP_LATENT names a path, write the final latent",
-    source: "crates/hipfire-diffusion/src/lib.rs:1496",
+    source: "crates/hipfire-diffusion/src/lib.rs:1535",
 };
 
 /// `HIPFIRE_DUMP_REQUEST` — Environment toggle value controls runtime behavior
@@ -1349,7 +1356,7 @@ pub const ENV_HIPFIRE_DUMP_REQUEST: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DUMP_VELOCITY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_VELOCITY",
     description: "Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model",
-    source: "crates/hipfire-diffusion/src/denoise.rs:498",
+    source: "crates/hipfire-diffusion/src/denoise.rs:554",
 };
 
 /// `HIPFIRE_EMBEDDING_CALIB_LAYERS_PER_PASS` — Runtime variable controlling embedding calib layers per pass in hipfire
@@ -1916,7 +1923,7 @@ pub const ENV_HIPFIRE_HIP_WAIT: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_HOST_PROFILE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HOST_PROFILE_BIN",
     description: "Runtime variable controlling host profile bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1267",
+    source: "crates/hipfire-eval/src/lib.rs:1272",
 };
 
 /// `HIPFIRE_HOST_TIMING` — HIPFIRE_HOST_TIMING=1: dump per-cycle host-side wall-clock breakdown
@@ -2869,7 +2876,7 @@ pub const ENV_HIPFIRE_PERF_BASELINE_DIR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PERPLEXITY_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERPLEXITY_BIN",
     description: "Runtime variable controlling perplexity bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1237",
+    source: "crates/hipfire-eval/src/lib.rs:1242",
 };
 
 /// `HIPFIRE_PFLASH_DAEMON_LABELS` — ONE loader, shared with the daemon train_drafter op
@@ -2911,7 +2918,7 @@ pub const ENV_HIPFIRE_PFLASH_FRESH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PFLASH_NIAH_BENCH_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_NIAH_BENCH_BIN",
     description: "Runtime variable controlling pflash niah bench bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1192",
+    source: "crates/hipfire-eval/src/lib.rs:1197",
 };
 
 /// `HIPFIRE_PFLASH_REPORT_TRAIN` — Runtime variable controlling pflash report train in hipfire
@@ -3264,10 +3271,10 @@ pub const ENV_HIPFIRE_QTIP_EVAL_ST: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-quantize/src/qtip.rs:894",
 };
 
-/// `HIPFIRE_QTIP_HESSIAN` — Runtime variable controlling qtip hessian in hipfire
+/// `HIPFIRE_QTIP_HESSIAN` — Stamp the QTIP calib signature into the output metadata, same
 pub const ENV_HIPFIRE_QTIP_HESSIAN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_HESSIAN",
-    description: "Runtime variable controlling qtip hessian in hipfire",
+    description: "Stamp the QTIP calib signature into the output metadata, same",
     source: "crates/hipfire-quantize/src/main.rs:5273",
 };
 
@@ -3275,7 +3282,7 @@ pub const ENV_HIPFIRE_QTIP_HESSIAN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QUALITY_COMPARE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUALITY_COMPARE_BIN",
     description: "Runtime variable controlling quality compare bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1252",
+    source: "crates/hipfire-eval/src/lib.rs:1257",
 };
 
 /// `HIPFIRE_QUANTIZE_BIN` — Runtime variable controlling quantize bin in hipfire
@@ -3915,7 +3922,7 @@ pub const ENV_HIPFIRE_RQ_PROTECT_FRAC: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RUN_EXAMPLE_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RUN_EXAMPLE_BIN",
     description: "Runtime variable controlling run example bin in hipfire",
-    source: "crates/hipfire-eval/src/lib.rs:1207",
+    source: "crates/hipfire-eval/src/lib.rs:1212",
 };
 
 /// `HIPFIRE_SAMPLE_COMPARE` — Enabled when set to 1
@@ -4034,7 +4041,7 @@ pub const ENV_HIPFIRE_TARGET_ARCH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TEST_LATENT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TEST_LATENT",
     description: "Debug: HIPFIRE_TEST_LATENT=<path> loads a real [4xu32 hdr + f32] latent dump",
-    source: "crates/hipfire-diffusion/src/tests/vae.rs:216",
+    source: "crates/hipfire-diffusion/src/tests/vae.rs:367",
 };
 
 /// `HIPFIRE_TIER_RATIO` — Runtime variable controlling tier ratio in hipfire
@@ -4593,6 +4600,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DUMMY_GENERATE_DELAY_MS,
     ENV_HIPFIRE_DUMMY_PREFILL_DELAY_MS,
     ENV_HIPFIRE_DUMP_COND,
+    ENV_HIPFIRE_DUMP_DENOISE_TRACE,
     ENV_HIPFIRE_DUMP_GATE,
     ENV_HIPFIRE_DUMP_HIDDEN,
     ENV_HIPFIRE_DUMP_HIDDEN_ALL,
