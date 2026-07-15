@@ -114,6 +114,49 @@ fn attn_kld(orig: &[f32], recon: &[f32], r_dim: usize, c_dim: usize, rng: &mut R
     (total / nq as f64) as f32
 }
 
+/// Plain per-token (per-column) affine min/max quant → dequant, no Sinkhorn, no
+/// rotation. tile is [r=head_dim × c=tokens]; each token (column) gets its own
+/// min/max over the head_dim rows — the natural codec for a per-token hot ring.
+/// This is the "does K need treatment at 8-bit?" candidate.
+fn affine_per_token(tile: &[f32], r: usize, c: usize, qmax: f32) -> Vec<f32> {
+    let mut recon = vec![0f32; r * c];
+    for t in 0..c {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for row in 0..r {
+            let v = tile[row * c + t];
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let scale = ((hi - lo) / qmax).max(1e-8);
+        for row in 0..r {
+            let v = tile[row * c + t];
+            let q = (((v - lo) / scale).round()).clamp(0.0, qmax);
+            recon[row * c + t] = q * scale + lo;
+        }
+    }
+    recon
+}
+
+/// Per-token FWHT/Hadamard rotation of a `[head_dim × tokens]` tile (rotate each
+/// token's head_dim column). `signed_fwht` is orthonormal, so rotating both K and
+/// the query preserves q·K — we measure the affine error in this rotated frame
+/// (random queries are rotation-invariant), no inverse needed. Rotation spreads
+/// the outlier-channel energy so a per-token min/max wastes fewer bits.
+fn fwht_tile(tile: &[f32], r: usize, c: usize) -> Vec<f32> {
+    use hipfire_primitives::fwht::{gen_fwht_signs, signed_fwht};
+    let s1 = gen_fwht_signs(42, r);
+    let s2 = gen_fwht_signs(1042, r);
+    let mut rot = vec![0f32; r * c];
+    for t in 0..c {
+        let mut col: Vec<f32> = (0..r).map(|row| tile[row * c + t]).collect();
+        signed_fwht(&mut col, &s1, &s2);
+        for row in 0..r {
+            rot[row * c + t] = col[row];
+        }
+    }
+    rot
+}
+
 fn main() {
     let (r, c) = (256usize, 128usize); // head_dim × 128-token block
     let mut rng = Rng(0x5407_1234_5678);
@@ -154,4 +197,34 @@ fn main() {
          (8-bit kvarn ≈ f16);\nplateau above the floor ⇒ structural (Sinkhorn/min-max \
          ceiling — more bits won't fix it)."
     );
+
+    // Per-token hot-ring codecs: does plain 8-bit affine on K need a treatment
+    // (FWHT rotation) to handle the outlier channels, or is it already ~kvarn?
+    println!("\nPer-token hot-ring codecs (does K need treatment?):");
+    println!("  (FWHT rows measured in the rotated frame: q·K preserved, so the");
+    println!("   rotated-frame quant error is what attention sees.)\n");
+    println!(
+        "{:>5}  {:>16}  {:>10}  {:>12}",
+        "bits", "codec", "rel_rmse", "attn_KLD"
+    );
+    println!("{}", "-".repeat(50));
+    // Precompute the rotated tile once (FWHT candidates quantize + score here).
+    let rot = fwht_tile(&tile, r, c);
+    for &(bits, qmax) in &[(4u32, 15.0f32), (8, 255.0)] {
+        // kvarn (Sinkhorn) and plain affine: original frame.
+        for (name, recon, refr) in [
+            (
+                "kvarn(Sinkhorn)",
+                dequantize_tile(&quantize_tile_qmax(&tile, r, c, qmax)),
+                &tile,
+            ),
+            ("affine plain", affine_per_token(&tile, r, c, qmax), &tile),
+            // affine + FWHT: quantize the rotated tile, score vs the rotated ref.
+            ("affine+FWHT", affine_per_token(&rot, r, c, qmax), &rot),
+        ] {
+            let (rel, _) = recon_metrics(refr, &recon);
+            let kld = attn_kld(refr, &recon, r, c, &mut Rng(0xABCD));
+            println!("{bits:>5}  {name:>16}  {rel:>10.2e}  {kld:>12.3e}");
+        }
+    }
 }

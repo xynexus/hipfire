@@ -103,24 +103,33 @@ per-session absolute is irrelevant; the session multiplier is the point.
 8-bit KV is near-lossless (model KLD 1.1e-5, §Model-level KLD), so the exactness
 lost by dropping f16 is negligible.
 
-**Approach (reuses existing kernels — no new attention kernel):** give the
-hierarchical hot tier the same structure single-tier kvarn already uses —
-**8-bit kvarn blocks (completed 128-token blocks) + a small fp16 window for the
-current partial block** — instead of a 512-token f16 ring:
-- Write: accumulate into the fp16 window; when a 128-block completes, quantize it
-  with the existing `kvarn_quantize_tile` (bits=8) into the hot tier (fold_m=1 /
-  unmerged — i.e. exact-ish, no merge). This is `compact_cold_kv(fold_m=1, bits=8)`.
-- Read: merge two `attention_cold_slots` reads — the hot kvarn blocks (**layout 0**,
-  the existing cold kvarn dequant path) + the fp16 partial window (**layout 2**),
-  via `flash_tier_merge` (already used for hot+cold). No new K read layout.
-- Migrate: move whole completed hot kvarn blocks into the cold (merged) tier;
-  they're already the right record type, so migration is cheaper (no re-quantize).
-- Bonus: unifies the read path onto kvarn (hot + cold both kvarn), and 8-bit hot
-  blocks are still far above the 4-bit merged cold floor.
+**Codec (resolved by the probe — `kvarn_precision_sweep`):** the per-token ring
+wants a **per-token** codec, and K needs a rotation. Measured on the realistic K
+tile at 8-bit:
 
-Alternative considered: a per-token 8-bit **affine** (Q8) ring keeps the ring
-structure but needs a NEW Q8-K attention layout; the block-kvarn path above
-reuses layout-0, so it's preferred.
+| 8-bit codec | rel_rmse | attn_KLD |
+|---|---|---|
+| kvarn (Sinkhorn, block) | 7.5e-3 | 3.8e-4 |
+| per-token affine **plain** | 1.8e-2 | 8.1e-3 |
+| per-token affine **+ FWHT** | 5.2e-3 | 5.5e-4 |
+
+Plain per-token affine is ~21× worse than kvarn (outlier channels dominate the
+per-token min/max). A **per-token FWHT/Hadamard rotation recovers kvarn quality**
+(KLD 5.5e-4 ≈ kvarn 3.8e-4). So the hot codec is:
+- **K:** per-token 8-bit affine on **FWHT-rotated** K. `signed_fwht` is
+  orthonormal → q·K is preserved by rotating K (store) and the query (read); the
+  runtime already rotates the query for the kvarn K path (`HIPFIRE_KVARN_ROTATE`),
+  so the hot ring reuses the **same rotation** (query rotated once for both tiers).
+- **V:** per-token 8-bit affine, no rotation (V has no outlier-channel pathology —
+  same as the cold per-slot Q8 V).
+
+This fits the per-token ring exactly (no block/window overhead → ~47% savings vs
+block-kvarn's ~34%), and reuses existing FWHT + affine machinery.
+
+Change surface in `append_token` (rotate+affine-quant per token), the hot read
+(dequant → f16 scratch → existing layout-2 read; query already rotated), and
+`migrate_n` (dequant instead of widen-f16). A **transient shared f16 scratch**
+(one session's hot tier) is dequanted per read; per-session *storage* is 8-bit.
 
 **Change surface:** `kv_hier.rs` hot-tier representation + write/read/migrate
 (the FA-output write, the two-tier read, `migrate_n`). Gate:
