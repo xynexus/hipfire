@@ -8402,6 +8402,7 @@ mod tests {
                 latent_width: Some(2),
                 supported_widths: vec![2],
                 supported_heights: vec![2],
+                ..DiffusionPipelineMetadata::default()
             },
             tokenizer: DiffusionTokenizerMetadata::default(),
             tokenizer_2: None,
