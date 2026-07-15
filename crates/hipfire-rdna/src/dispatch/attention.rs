@@ -5023,13 +5023,20 @@ impl Gpu {
         slot_stride: usize,
         // Optional per-slot attention-mass accumulator [n_slots] (CASK importance).
         mass_out: Option<&GpuTensor>,
+        // head_dim: 256 (default CHD kernel) or 128 (the _128 variant). The kernel
+        // reads head_dim from its compile-time CHD, so this only selects the variant.
+        head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_cold_slots",
-            kernels::ATTENTION_COLD_SLOTS_SRC,
-            "attention_cold_slots",
-        )?;
+        let (kname, ksrc): (&str, &str) = if head_dim == 128 {
+            (
+                "attention_cold_slots_128",
+                kernels::ATTENTION_COLD_SLOTS_128_SRC,
+            )
+        } else {
+            ("attention_cold_slots", kernels::ATTENTION_COLD_SLOTS_SRC)
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
         let vp = v.buf.as_ptr();
@@ -5063,7 +5070,7 @@ impl Gpu {
             &mut sstride as *mut _ as *mut c_void,
             &massp as *const _ as *mut c_void,
         ];
-        let func = &self.functions["attention_cold_slots"];
+        let func = &self.functions[kname];
         unsafe {
             self.hip.launch_kernel(
                 func,
@@ -5092,13 +5099,15 @@ impl Gpu {
         m_out: &GpuTensor,
         l_out: &GpuTensor,
         n_heads: usize,
+        head_dim: usize, // 256 (default) or 128 → selects the CHD variant
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "flash_tier_merge",
-            kernels::FLASH_TIER_MERGE_SRC,
-            "flash_tier_merge",
-        )?;
+        let (kname, ksrc): (&str, &str) = if head_dim == 128 {
+            ("flash_tier_merge_128", kernels::FLASH_TIER_MERGE_128_SRC)
+        } else {
+            ("flash_tier_merge", kernels::FLASH_TIER_MERGE_SRC)
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
         let oap = out_a.buf.as_ptr();
         let map = m_a.buf.as_ptr();
         let lap = l_a.buf.as_ptr();
@@ -5121,7 +5130,7 @@ impl Gpu {
             &lop as *const _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
         ];
-        let func = &self.functions["flash_tier_merge"];
+        let func = &self.functions[kname];
         unsafe {
             self.hip.launch_kernel(
                 func,

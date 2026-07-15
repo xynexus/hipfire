@@ -156,7 +156,7 @@ fn main() {
     let mm_d = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     let lm_d = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     gpu.flash_tier_merge(
-        &oa_d, &ma_d, &la_d, &ob_d, &mb_d, &lb_d, &om_d, &mm_d, &lm_d, NH,
+        &oa_d, &ma_d, &la_d, &ob_d, &mb_d, &lb_d, &om_d, &mm_d, &lm_d, NH, 256,
     )
     .unwrap();
 

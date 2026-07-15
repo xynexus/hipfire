@@ -118,10 +118,21 @@ Low.
    (256-only still; gate is now the literal `head_dim == 256`). Pure refactor,
    ~40 sites; `parity_kv_hier` byte-identical (q8 4.3e-5 / 5.1e-5, f16 5.2e-5,
    +defrag 5.1e-5 — same as pre-refactor). `Q8Ring::alloc` gained a `head_dim` arg.
-2. **K1 + K2**: `attention_cold_slots_128` + `flash_tier_merge_128` kernels + SRC
-   consts + dispatch-by-head_dim. Parity: extend `parity_kv_hier` to run HD=128.
-3. **C1 + Q1**: cold-compaction sign parametrization + relax the qwen35 gates
-   (incl. `rotate_x_mq_128_batched` if the single-tier path is in scope).
+2. **[DONE 2026-07-15]** K1 + K2 + C1: `attention_cold_slots_128` +
+   `flash_tier_merge_128` kernels (CHD=128/CPL=4 clones) + SRC consts +
+   dispatch-by-head_dim (the two dispatch fns gained a `head_dim` arg selecting the
+   variant). `kv_hier` gate relaxed to `{256,128}`; a `rotate_hd` helper routes the
+   3 rotation calls to `rotate_x_mq` (256) or `rotate_x_mq_128` (128). C1 folded in
+   (needed for cold-segment migrations at 128): `compact_cold_kv` assert relaxed to
+   `{128,256}` + `gen_fwht_signs(seed, head_dim)`; `dequant_head` too. `parity_kv_hier`
+   parametrized (`PARITY_HEAD_DIM`, arrays → `Vec`, oracle query rotates via the
+   matching FWHT variant). **Validated on gfx1103:** HD=256 unchanged; **HD=128
+   PASS** — q8 hot-only 0.0 / cold(40) 3.9e-5 / heavy(100) 4.1e-5, f16 4.9e-5,
+   +defrag 6.1e-5. The 6 rdna parity examples pass `head_dim=256` explicitly.
+3. **Q1 (remaining)**: relax the qwen35 single-tier KVarN rotate guard
+   (`mod.rs:3124 head_dim==256`) + add `rotate_x_mq_128_batched` — ONLY needed for
+   the NON-hier single-tier kvarn path at 128 (hier returns before it). Not required
+   for hier-at-128, which is now fully functional.
 4. **End-to-end**: HD=128 decode on Qwen3.5-122B-A10B (halo/medusa) if available;
    else document parity-only coverage. Coherence gate.
 

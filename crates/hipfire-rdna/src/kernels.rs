@@ -4158,9 +4158,19 @@ pub const KVARN_DEQUANT_TILE_SRC: &str =
 pub const ATTENTION_COLD_SLOTS_SRC: &str =
     include_str!("../../../kernels/src/attention_cold_slots.hip");
 
+/// head_dim=128 variant of `attention_cold_slots` (CHD=128/CPL=4). Selected by the
+/// runtime when head_dim==128. See kernels/src/attention_cold_slots_128.hip.
+pub const ATTENTION_COLD_SLOTS_128_SRC: &str =
+    include_str!("../../../kernels/src/attention_cold_slots_128.hip");
+
 /// Phase 2b hot+cold tier merge: fold two flash-attention tiers' (out,m,l)
 /// partials into one via online softmax. See flash_tier_merge.hip.
 pub const FLASH_TIER_MERGE_SRC: &str = include_str!("../../../kernels/src/flash_tier_merge.hip");
+
+/// head_dim=128 variant of `flash_tier_merge` (CHD=128/CPL=4). See
+/// kernels/src/flash_tier_merge_128.hip.
+pub const FLASH_TIER_MERGE_128_SRC: &str =
+    include_str!("../../../kernels/src/flash_tier_merge_128.hip");
 
 /// Phase 2b hot-tier (m,l) extract: re-read the KVarN/asym flash's per-tile
 /// partials and emit the final softmax (max, denom) so the hot tier can feed

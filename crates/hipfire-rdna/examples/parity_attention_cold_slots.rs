@@ -73,7 +73,7 @@ fn main() {
     let md = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
     let ld = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
     gpu.attention_cold_slots(
-        &qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale, 0, 0, 0, None,
+        &qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale, 0, 0, 0, None, 256,
     )
     .unwrap();
     gpu.device_synchronize().unwrap();

@@ -249,9 +249,10 @@ impl HierKvState {
         // preserved. `is_kv_layer` = base-cache mask (layer_types == FullAttention).
         let n_layers = is_kv_layer.len();
         let n_kv_layers = is_kv_layer.iter().filter(|b| **b).count();
-        // FWHT-256 kernels only for now; the head_dim=128 port relaxes this.
+        // FWHT-256 and FWHT-128 both supported (attention_cold_slots + _128,
+        // rotate_x_mq + _128); other head_dims fall back to non-hier KVarN.
         let enabled = std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() == Some("1")
-            && head_dim == 256;
+            && (head_dim == 256 || head_dim == 128);
         // Default 512: the knee sweep showed hot=512 clearly beats 256 (PPL 27.5 vs
         // 29.0 at fold=4/2-bit), and the f16 ring makes 512 cost the same VRAM the old
         // f32-256 default did. Hot budget is the primary quality dial now that the
@@ -486,6 +487,24 @@ impl HierKvState {
         self.n_kv_heads * hd
     }
 
+    /// FWHT-rotate `k` floats of `x` into `x_rot` with the head_dim-matched
+    /// orthonormal kernel: FWHT-256 (`rotate_x_mq`) or the FWHT-128 variant
+    /// (`rotate_x_mq_128`). `head_dim ∈ {128, 256}`. Same transform for K (write)
+    /// and the query (read), so `q_rot·K_rot = q·K` in either dimension.
+    fn rotate_hd(
+        &self,
+        gpu: &mut Gpu,
+        x: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        if self.head_dim == 128 {
+            gpu.rotate_x_mq_128(x, x_rot, k)
+        } else {
+            gpu.rotate_x_mq(x, x_rot, k)
+        }
+    }
+
     /// Per-layer (fold_m, core_frac) under the PyramidKV schedule. Budget scale s(l) is
     /// `1+amp` at the bottom (l=0), `1−amp` at the top: lower layers get less fold + more
     /// core, upper layers more fold + less core. Identity when pyramid is off. (The
@@ -550,7 +569,7 @@ impl HierKvState {
             // quantized un-rotated. No f16 cast / memcpy — the quant kernel writes the
             // slot directly.
             let rk = self.rot_k.as_ref().expect("rot_k present when hot_q8");
-            gpu.rotate_x_mq(fa_k, rk, nkv * hd)?;
+            self.rotate_hd(gpu, fa_k, rk, nkv * hd)?;
             let kq = &self.hot_kq[layer];
             gpu.kv_hot_quant_q8(&kq.codes, &kq.scale, rk, slot, hb, nkv, hd)?;
             let vq = &self.hot_vq[layer];
@@ -572,7 +591,7 @@ impl HierKvState {
                 // (rotate=false on already-rotated K). V is never rotated.
                 let input = if rotate {
                     let rk = self.rot_k.as_ref().expect("rot_k present when hot_rotate");
-                    gpu.rotate_x_mq(fa, rk, nkv * hd)?;
+                    self.rotate_hd(gpu, fa, rk, nkv * hd)?;
                     rk
                 } else {
                     fa
@@ -1188,7 +1207,7 @@ impl HierKvState {
         // the attention output needs no inverse rotation.
         let q_read = if self.hot_rotate {
             let qr = self.q_rot.as_ref().expect("q_rot present when hot_rotate");
-            gpu.rotate_x_mq(q, qr, nh * hd)?;
+            self.rotate_hd(gpu, q, qr, nh * hd)?;
             qr
         } else {
             q
@@ -1251,6 +1270,7 @@ impl HierKvState {
             2, // v_layout: hot ring is slot-major f16 (dequant scratch when q8)
             self.hot_budget,
             mass,
+            hd,
         )?;
 
         // Fold each cold segment: dequant 4-bit → f16, channel-major attend, merge.
@@ -1296,11 +1316,12 @@ impl HierKvState {
                 if seg.v_perslot { 2 } else { 1 }, // v_layout: 2=slot-major f16 (per-slot V)
                 seg.n_slots,
                 None, // cold tier: no mass accumulation
+                hd,
             )?;
             // Merge cold segment into the accumulator (in place — safe, see kernel).
             gpu.flash_tier_merge(
                 out, &scr.acc_m, &scr.acc_l, &scr.out_c, &scr.m_c, &scr.l_c, out, &scr.acc_m,
-                &scr.acc_l, nh,
+                &scr.acc_l, nh, hd,
             )?;
         }
         self.scr = Some(scr);

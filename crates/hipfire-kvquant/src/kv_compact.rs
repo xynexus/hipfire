@@ -95,7 +95,8 @@ fn similarity_groups(k: &[f32], scratch: &[usize], kv_dim: usize, fold_m: usize)
 /// post-RoPE (the cold tokens, contiguous). `importance[t]` is a shared (head-
 /// aggregated) score; higher = keep exact. `core_frac` of tokens stay singleton
 /// (exact), the rest fold `fold_m:1` by importance-weighted average. `rotate` =
-/// FWHT-256 incoherence per head before quantize. head_dim must be 256 (KVarN v1).
+/// FWHT incoherence per head before quantize. head_dim ∈ {128, 256} (the FWHT is
+/// length-general; signs are generated at head_dim).
 ///
 /// Grouping of the non-core tokens (which fold together):
 /// - `similarity_merge` (CASK): cluster near-DUPLICATE keys by K-cosine → averaging
@@ -127,7 +128,10 @@ pub fn compact_cold_kv(
     // natural quant axis (~15-20% lower output error at the same bits).
     v_perslot: bool,
 ) -> ColdTier {
-    assert_eq!(head_dim, 256, "KVarN v1 FWHT is 256-wide");
+    assert!(
+        head_dim == 256 || head_dim == 128,
+        "KVarN FWHT supports head_dim 128 or 256 (got {head_dim})"
+    );
     assert!(fold_m >= 1);
     assert_eq!(k.len(), n_tok * n_kv_heads * head_dim);
     let kv_dim = n_kv_heads * head_dim;
@@ -182,8 +186,8 @@ pub fn compact_cold_kv(
         .collect();
 
     // 2/3. Per head: build [head_dim × n_slots] tile of (rotated) merged K/V, quantize.
-    let s1 = gen_fwht_signs(42, 256);
-    let s2 = gen_fwht_signs(1042, 256);
+    let s1 = gen_fwht_signs(42, head_dim);
+    let s2 = gen_fwht_signs(1042, head_dim);
     let mut k_tiles = Vec::with_capacity(n_kv_heads);
     let mut v_tiles = Vec::with_capacity(n_kv_heads);
     for h in 0..n_kv_heads {
@@ -254,8 +258,8 @@ impl ColdTier {
     /// Dequantize head `h` back to (K, V) as `[n_valid × head_dim]` row-major in the
     /// ORIGINAL (un-rotated) basis — what a cold-tier attention read consumes.
     pub fn dequant_head(&self, h: usize) -> (Vec<f32>, Vec<f32>) {
-        let s1 = gen_fwht_signs(42, 256);
-        let s2 = gen_fwht_signs(1042, 256);
+        let s1 = gen_fwht_signs(42, self.head_dim);
+        let s2 = gen_fwht_signs(1042, self.head_dim);
         let kt = kvarn::dequantize_tile(&self.k_tiles[h]); // [head_dim × n_slots]
         let vt = kvarn::dequantize_tile(&self.v_tiles[h]);
         let (ns, d, nv) = (self.n_slots, self.head_dim, self.n_valid);
