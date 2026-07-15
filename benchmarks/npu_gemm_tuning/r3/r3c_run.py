@@ -22,10 +22,10 @@ W_NB = KFULL * SZ_Wb              # one N-block's weights
 MACS = N_NBLOCKS * KFULL * NACC * 1024
 STREAMED_W = N_NBLOCKS * W_NB
 
-a_ty = np.ndarray[(A_RES,), np.dtype[np.int8]]
-wnb_ty = np.ndarray[(W_NB,), np.dtype[np.int8]]
-c_ty = np.ndarray[(NACC * SZ_C,), np.dtype[np.int32]]
-inw_ty = np.ndarray[(N_NBLOCKS * W_NB,), np.dtype[np.int8]]
+a_ty: object = np.ndarray[(A_RES,), np.dtype[np.int8]]
+wnb_ty: object = np.ndarray[(W_NB,), np.dtype[np.int8]]
+c_ty: object = np.ndarray[(NACC * SZ_C,), np.dtype[np.int32]]
+inw_ty: object = np.ndarray[(N_NBLOCKS * W_NB,), np.dtype[np.int8]]
 
 flags = ["-std=c++20", "-O2", f"-DKFULL={KFULL}", f"-DNACC={NACC}"]
 kern = ExternalFunction("r3c_mac", source_file="r3c_gemm.cc",

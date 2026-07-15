@@ -52,9 +52,9 @@ CORE_EVENTS = [PortEvent(CoreEvent.PORT_RUNNING_0, port=WireBundle.DMA, channel=
                PortEvent(CoreEvent.PORT_STALLED_0, port=WireBundle.DMA, channel=0, master=True),
                PortEvent(CoreEvent.PORT_IDLE_0, port=WireBundle.DMA, channel=0, master=True)]
 
-in_ty = np.ndarray[(IN_ELEMS,), np.dtype[np.int8]]
-tile_ty = np.ndarray[(TILE_N,), np.dtype[np.int8]]
-acc_ty = np.ndarray[(64,), np.dtype[np.int32]]
+in_ty: object = np.ndarray[(IN_ELEMS,), np.dtype[np.int8]]
+tile_ty: object = np.ndarray[(TILE_N,), np.dtype[np.int8]]
+acc_ty: object = np.ndarray[(64,), np.dtype[np.int32]]
 
 flags = ["-std=c++20", "-O2", f"-DTILE_N={TILE_N}"]
 feed = ExternalFunction("feed_sum", source_file="r1b_feed.cc",
@@ -128,7 +128,7 @@ with open(TRACE_TXT) as f:
     n_pkts = sum(1 for ln in f if ln.strip() and ln.strip() != "00000000")
 p = subprocess.run([sys.executable, "-m", "aie.utils.trace.parse",
                     "--input", TRACE_TXT, "--mlir", mlir, "--output", TRACE_JSON],
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, check=False)
 if p.returncode != 0 or not os.path.exists(TRACE_JSON):
     sys.exit(f"ERROR: trace parse failed rc={p.returncode}\n{p.stderr[-800:]}")
 

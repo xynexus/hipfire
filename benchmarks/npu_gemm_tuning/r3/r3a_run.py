@@ -24,11 +24,11 @@ K_BLOCKS = N_SUPER * KCHUNK
 MACS = K_BLOCKS * 1024                          # 4x16x16 per k-block
 STREAMED_W = N_SUPER * W_SUPER
 
-asuper_ty = np.ndarray[(A_SUPER,), np.dtype[np.int8]]
-wsuper_ty = np.ndarray[(W_SUPER,), np.dtype[np.int8]]
-c_ty = np.ndarray[(SZ_C,), np.dtype[np.int32]]
-ina_ty = np.ndarray[(N_SUPER * A_SUPER,), np.dtype[np.int8]]
-inw_ty = np.ndarray[(N_SUPER * W_SUPER,), np.dtype[np.int8]]
+asuper_ty: object = np.ndarray[(A_SUPER,), np.dtype[np.int8]]
+wsuper_ty: object = np.ndarray[(W_SUPER,), np.dtype[np.int8]]
+c_ty: object = np.ndarray[(SZ_C,), np.dtype[np.int32]]
+ina_ty: object = np.ndarray[(N_SUPER * A_SUPER,), np.dtype[np.int8]]
+inw_ty: object = np.ndarray[(N_SUPER * W_SUPER,), np.dtype[np.int8]]
 
 flags = ["-std=c++20", "-O2", f"-DKCHUNK={KCHUNK}"]
 # The kernels share r3a_gemv_common.h, which lives next to this script (mlir-aie

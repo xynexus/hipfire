@@ -30,9 +30,9 @@ TOTAL = TILE_N * N_TILES                               # total int8 bytes fed
 DEPTH = int(os.environ.get("DEPTH", 4))
 MINIMAL = bool(os.environ.get("MINIMAL"))
 
-in_ty = np.ndarray[(TOTAL,), np.dtype[np.int8]]
-tile_ty = np.ndarray[(TILE_N,), np.dtype[np.int8]]
-acc_ty = np.ndarray[(64,), np.dtype[np.int32]]
+in_ty: object = np.ndarray[(TOTAL,), np.dtype[np.int8]]
+tile_ty: object = np.ndarray[(TILE_N,), np.dtype[np.int8]]
+acc_ty: object = np.ndarray[(64,), np.dtype[np.int32]]
 
 flags = ["-std=c++20", "-O2", f"-DTILE_N={TILE_N}"] + (["-DMINIMAL"] if MINIMAL else [])
 feed = ExternalFunction("feed_sum", source_file="r1b_feed.cc",

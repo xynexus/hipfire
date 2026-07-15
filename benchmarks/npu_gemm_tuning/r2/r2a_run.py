@@ -28,10 +28,10 @@ MACS_PER_MAC = 512 if INT8W else 1024
 MACS_PER_TILE = (INNER + 1) * NACC * MACS_PER_MAC
 STREAMED_B = N_BTILES * SZ_Bb                       # weight bytes fed
 
-a_ty = np.ndarray[(NACC * SZ_A,), np.dtype[np.int8]]
-w_ty = np.ndarray[(SZ_Bb,), np.dtype[np.int8]]        # one weight tile, packed int4
-in_ty = np.ndarray[(N_BTILES * SZ_Bb,), np.dtype[np.int8]]
-c_ty = np.ndarray[(NACC * SZ_C,), np.dtype[np.int32]]
+a_ty: object = np.ndarray[(NACC * SZ_A,), np.dtype[np.int8]]
+w_ty: object = np.ndarray[(SZ_Bb,), np.dtype[np.int8]]        # one weight tile, packed int4
+in_ty: object = np.ndarray[(N_BTILES * SZ_Bb,), np.dtype[np.int8]]
+c_ty: object = np.ndarray[(NACC * SZ_C,), np.dtype[np.int32]]
 
 flags = ["-std=c++20", "-O2", f"-DNACC={NACC}", f"-DINNER={INNER}"] + (["-DINT8W"] if INT8W else [])
 kern = ExternalFunction("r2a_mac", source_file="r2a_gemm.cc",
