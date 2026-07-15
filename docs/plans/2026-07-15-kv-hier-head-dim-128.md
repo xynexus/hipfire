@@ -114,8 +114,10 @@ Low.
 
 0. **[DONE]** Resolve RQ — traced: no double-rotation (hier `return`s before the
    single-tier rotate; the two are mutually exclusive). Clears the gate.
-1. **R1**: `HD` const → field (256-only still; pure refactor, `parity_kv_hier` +
-   `infer_qwen35` unchanged). Land first, separately validatable.
+1. **[DONE 2026-07-15]** R1: `HD` const → runtime `head_dim` field on `HierKvState`
+   (256-only still; gate is now the literal `head_dim == 256`). Pure refactor,
+   ~40 sites; `parity_kv_hier` byte-identical (q8 4.3e-5 / 5.1e-5, f16 5.2e-5,
+   +defrag 5.1e-5 — same as pre-refactor). `Q8Ring::alloc` gained a `head_dim` arg.
 2. **K1 + K2**: `attention_cold_slots_128` + `flash_tier_merge_128` kernels + SRC
    consts + dispatch-by-head_dim. Parity: extend `parity_kv_hier` to run HD=128.
 3. **C1 + Q1**: cold-compaction sign parametrization + relax the qwen35 gates

@@ -2092,14 +2092,14 @@ pub const ENV_HIPFIRE_KVNOISE_LR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KV_CAPTURE_K: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_CAPTURE_K",
     description: "change when unset: append the post-RoPE K about to be merged, token-major",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:735",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:741",
 };
 
 /// `HIPFIRE_KV_CAPTURE_V` — Parallel V capture ("HIPFIRE_KV_CAPTURE_V", same record format) for the
 pub const ENV_HIPFIRE_KV_CAPTURE_V: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_CAPTURE_V",
     description: "Parallel V capture (\"HIPFIRE_KV_CAPTURE_V\", same record format) for the",
-    source: "crates/hipfire-runtime/src/kv_hier.rs:755",
+    source: "crates/hipfire-runtime/src/kv_hier.rs:761",
 };
 
 /// `HIPFIRE_KV_COLD_BITS` — Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,
