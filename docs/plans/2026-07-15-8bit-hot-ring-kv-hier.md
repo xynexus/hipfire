@@ -72,34 +72,70 @@ how much they reuse the cold path.
   N=128 → ~34% savings; N=32 → ~42% (smaller window, more scale overhead).
 - Quality = kvarn (3.8e-4). Migrate moves whole blocks (no re-quantize).
 
-### Recommendation
-**Approach B**, block size 32–64. Rationale: it reuses the *exact* cold read path
-and the un-rotated query, so it adds the least new surface to the most
-coherence-sensitive code (no new kernel, no `q_rot` plumbing, no rotation/tier
-mismatch). It conceptually unifies hot+cold into kvarn segments (merged vs
-unmerged). Approach A saves ~5% more but adds a kernel + a rotated-query path +
-the hot/cold rotation split — more risk for modest extra memory. Revisit A only if
-the block/window overhead proves too costly at the target block size.
+### Key simplification — pre-rotate the cold tier (collapses the fork toward A)
 
-## Implementation phases (Approach B)
+Approach A's only real downside was the **rotation mismatch**: the cold tier is
+un-rotated (Sinkhorn only, `rotate=false`), so an FWHT hot tier needed its own
+`q_rot` separate from the cold read's `q`. **Fix: also FWHT-rotate the cold tier**
+(`compact_cold_kv(rotate=true)` in `migrate_n`/defrag). Verified this is sound:
+- The codec pipeline is **merge → FWHT(K) → Sinkhorn → affine** (kv_compact.rs
+  ~L213 rotates `kvec` *before* `quantize_tile`, which runs `variance_normalize`).
+  So FWHT does **not** stop Sinkhorn — Sinkhorn balances the rotated tile
+  (standard incoherence stack). `rotate=false` today is "Sinkhorn alone suffices",
+  not "rotation breaks it"; expect neutral-to-slightly-better cold quality.
+- **V stays un-rotated** (per-slot Q8, as now). Only K is rotated, so
+  `q_rot·K_rot = q·K` and the attention output (Σ w·V over un-rotated V) needs
+  **no inverse rotation**.
 
-1. **Hot-tier representation.** Replace the per-layer f16 ring with: (a) a small
-   fp16 partial-block window `[nkv × N × HD]`, and (b) a `Vec<ColdSegmentGpu>` of
-   unmerged hot blocks (reuse `ColdSegmentGpu`). Keep counts per layer.
-2. **Write (`append_token`).** Append to the fp16 window; when it reaches N,
-   `compact_cold_kv(fold_m=1, rotate=false, bits=8)` the window into a hot block,
-   reset the window. (Reuses the migrate quantize path.)
-3. **Read (`two_tier`).** Fold the fp16 window (`attention_cold_slots` layout 2,
-   its live count) + each unmerged hot block (the existing cold-segment read) +
-   each merged cold segment, all via `flash_tier_merge`. Un-rotated `q` throughout.
-4. **Migrate.** Move whole unmerged hot blocks into the cold list and merge them
-   (`fold_m>1`) — they're already the right record type, so this is cheaper than
-   the current widen-f16 → re-quantize.
-5. **Knobs + default.** `HIPFIRE_KV_HOT_BITS` (default 8; 4/8) and hot block size;
-   keep the f16 path selectable for A/B. Wire into the default policy per
-   `project-kv-default-kvarn-hier`.
-6. **Bit accounting.** Log the per-session hot-tier bytes so the multi-session win
-   is visible in `hipfire doctor`/telemetry.
+With both tiers rotated, the two-tier read rotates the query **once** → `q_rot`
+and uses it for both K reads — one unified rotated path, no `q`/`q_rot` split.
+
+### Recommendation (updated)
+**Approach A with a pre-rotated cold tier.** The per-token FWHT-affine hot ring
+(~47% savings, fits the ring) plus `compact_cold_kv(rotate=true)` unifies the
+rotation: one `q_rot`, one read path, K-only rotation, V un-rotated. This is both
+the smaller hot tier *and* the simpler kernels the whole exercise was after.
+Approach B (unmerged kvarn blocks + fp16 window) remains the fallback if the
+per-token affine+FWHT ring kernel proves harder than expected; it reuses the cold
+read but keeps the block/window overhead (~34–42%).
+
+**New verification step:** A/B the cold tier at `rotate=true` vs `rotate=false`
+(KLD vs bf16 + `parity_cold_4bit_read`) to confirm quality is neutral/better
+before flipping it — it changes stored bytes' meaning (query must now be rotated).
+
+## Implementation phases (Approach A, rotated frame)
+
+The rotation lives at the **hot write**; the cold tier inherits it through migrate
+(no double-rotate, no separate cold-rotate flip). One `q_rot` for the whole read.
+
+0. **Prove the rotated frame first (lowest-risk, no new codec).** Flip the *hot
+   write path to rotate* by making `append_token` FWHT-rotate each token's K
+   before the existing f16 store (V un-rotated), and keep `migrate_n` at
+   `compact_cold_kv(rotate=false)` (K already rotated → cold inherits it). Rotate
+   the query once (`mq_rotate_x` → `q_rot`) and use it for BOTH the hot and cold
+   K reads in `two_tier`. This changes *only* the frame (still f16 hot), so it is
+   a clean, separately-validatable step: `parity_kv_hier` / `parity_two_tier_e2e`
+   must still pass, and a KLD-vs-bf16 A/B must be neutral. Migrate math check:
+   `q_rot·(H·K_merged) = q·K_merged` since H is orthogonal and linear commutes
+   with the merge average.
+1. **Hot codec = per-token 8-bit affine (on the already-rotated K).** Add a GPU
+   per-token/slot 8-bit affine quant + dequant for the ring (V too). Close to the
+   `q8_0` slot path; the rotation is already done in step 0, so the codec is just
+   affine. Store slot-major 8-bit instead of f16.
+2. **Hot read.** dequant 8-bit hot → transient shared f16 scratch → the existing
+   `attention_cold_slots` layout-2 read with `q_rot`.
+3. **Migrate.** dequant 8-bit hot → f32 (instead of `widen` f16) → the existing
+   `compact_cold_kv(rotate=false, bits=8)` (K already rotated).
+4. **Knobs + default.** `HIPFIRE_KV_HOT_BITS` (default 8; 4/8), keep f16 hot
+   selectable for A/B. Wire into the default policy (`project-kv-default-kvarn-hier`).
+5. **Bit accounting.** Log per-session hot-tier bytes so the multi-session win is
+   visible in `hipfire doctor`/telemetry.
+
+Invariant throughout: **only K is rotated; V stays per-slot un-rotated**, so the
+attention output needs no inverse rotation.
+
+Fallback = Approach B (unmerged kvarn blocks + fp16 window) if the per-token 8-bit
+affine ring proves harder than the rotate-in-place step 0 suggests.
 
 ## Reuse (do not re-invent)
 
