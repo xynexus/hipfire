@@ -418,6 +418,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         config.n_kv_heads,
                         config.head_dim,
                         n_rot,
+                        n_rot,
                         config.rope_theta,
                     )?;
                 }

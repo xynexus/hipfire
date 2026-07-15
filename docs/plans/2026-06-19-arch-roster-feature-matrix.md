@@ -15,17 +15,19 @@ diversity, not against transformers alone. This doc is the shared picture.
 | family | model_type | mixer layers | FFN | generation | new infra forced |
 |---|---|---|---|---|---|
 | gemma3 *(WIP)* | gemma3_text | SWA + full attn, dual-θ (5:1) | GeGLU | AR | GeGLU, (1+w) norm, dual-θ SWA |
-| gemma4 | gemma4_text | SWA+full via `layer_types` list | GeGLU **or MoE** (A4B, 128 exp) | AR | MoE-on-gemma |
+| gemma4 | gemma4_text / gemma4_unified_text | heterogeneous SWA+global attention via explicit `layer_types` | dense GeGLU, PLE/KV-sharing, or dense-plus-routed MoE depending on variant | AR | layered geometry/cache, proportional RoPE, PLE/sharing, dense-plus-MoE |
 | diffusion_gemma | diffusion_gemma_text | SWA+full attn (`layer_types`) | MoE (128 exp, A4B) | **block diffusion** | block-diffusion loop |
 | nemotron_h | nemotron_h | **Mamba2 + attn** interleaved (`hybrid_override_pattern`) | dense **or MoE** (128–512 exp) | AR | **Mamba2 SSM+conv kernels** |
 | mamba2 | ssm_cfg.layer=Mamba2 | **pure Mamba2** (no attn/KV) | — | AR | **Mamba2 SSM+conv kernels** |
 | LFM2 *(WIP, arch_id 11)* | lfm2 / lfm2_moe | **short-conv** + attn | dense or MoE (32 exp) | AR | short-conv state |
 
 Key per-config specifics:
-- **gemma4**: head_dim 256, gelu_pytorch_tanh, sliding_window 512/1024, layer
-  types as an explicit `layer_types: [sliding_attention|full_attention]` list
-  (vs gemma3's `sliding_window_pattern` int). Dense 31B ≈ gemma3-31B; 26B-A4B
-  + E2B/E4B are MoE. `Gemma4ForConditionalGeneration` (multimodal wrapper).
+- **gemma4**: this old roster summary is superseded by the canonical
+  [Gemma 4 support plan](2026-07-15-gemma4-support.md). Gemma 4 is a distinct
+  family, not Gemma 3 plus MoE. E2B/E4B are dense PLE models with cross-layer KV
+  sharing; 31B and 12B unified are dense; only 26B-A4B combines a dense GeGLU
+  branch with routed experts. Local and global layers have different geometry
+  and RoPE policy, and unified/multimodal wrappers are separate capability work.
 - **diffusion_gemma** (`DiffusionGemmaForBlockDiffusion`, 26B-A4B): gemma-shaped
   transformer layers (head_dim 256, GeGLU, SWA, MoE 128) but **block-diffusion**
   generation. Forward is reusable from gemma4; the loop is the novelty.
@@ -65,7 +67,10 @@ Key per-config specifics:
 2. **seam wiring** — route qwen2 + gemma3 through it.
 3. **mamba2 (pure)** — land SSM+conv kernels in isolation; validate `SimpleAr`
    on a no-KV recurrent arch.
-4. **gemma4** — gemma3 + MoE (reuse qwen35-MoE) + `layer_types` form; cheap.
+4. **gemma4** — follow the phased canonical plan: dense 31B BF16 first, then
+   prompt/tool correctness, E4B/E2B PLE+KV sharing, and 26B-A4B dense-plus-MoE.
+   This is a substantial layered-cache and transformer-seam bring-up, not a
+   cheap Gemma 3 variant.
 5. **nemotron_h** — Mamba2(3) + attn + MoE(4) + per-layer hybrid dispatch.
 6. **diffusion_gemma** — gemma4 forward(4) + block-diffusion `ServingBackend`.
 7. **LFM2** finish + shared-loader / Option-soup cleanup folded across.

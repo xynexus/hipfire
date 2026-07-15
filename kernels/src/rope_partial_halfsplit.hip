@@ -27,16 +27,20 @@ extern "C" __global__ void rope_partial_halfsplit_f32(
     int n_heads_k,
     int head_dim,
     int n_rot,
+    int basis_dim,
     float freq_base
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int half = n_rot / 2;
-    if (i >= half) return;
+    int n_pairs = n_rot / 2;
+    int half = basis_dim / 2;
+    if (i >= n_pairs) return;
 
     int pos = *pos_buf;
-    // Frequency for dim i — same indexing as HF's compute_default_rope_parameters,
-    // restricted to the partial-rotary region (n_rot = head_dim * partial_rotary_factor).
-    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)n_rot);
+    // `n_rot` chooses how many pairs participate; `basis_dim` chooses both the
+    // exponent denominator and the half-split partner stride. They are equal
+    // for conventional RoPE. Proportional RoPE retains full-head rotate_half
+    // pairing while activating only the leading fraction of those pairs.
+    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)basis_dim);
     float angle = (float)pos * freq;
     float cos_a = cosf(angle);
     float sin_a = sinf(angle);

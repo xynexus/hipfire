@@ -1,0 +1,12 @@
+{
+  "gemma-4-edge-it.jinja": {
+    "repository": "google/gemma-4-E2B-it",
+    "revision": "70af34e20bd4b7a91f0de6b22675850c43922a03",
+    "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"
+  },
+  "gemma-4-large-it.jinja": {
+    "repository": "google/gemma-4-31B-it",
+    "revision": "3548789868c5356dbf307c98e6f609007b82b3eb",
+    "sha256": "36e3a42e5cf14cd0020e72d92e1fdd9970f59b82170e421f0cbe1bb42bead3f0"
+  }
+}

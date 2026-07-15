@@ -2511,6 +2511,9 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
 
+/// Generic pointwise `cap * tanh(x / cap)` over an arbitrary F32 vector.
+pub const VECTOR_SOFTCAP_SRC: &str = include_str!("../../../kernels/src/vector_softcap.hip");
+
 /// TriAttention sidecar calibration: GPU band-statistics accumulator.
 /// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).
 pub const TRIATTN_ACCUMULATE_SRC: &str =
@@ -2953,6 +2956,13 @@ pub const QKV_SPLIT_INTERLEAVED_SRC: &str =
 /// block `[32]`. See `kernels/src/attention_dflash_wmma.hip`.
 pub const ATTENTION_DFLASH_WMMA_SRC: &str =
     include_str!("../../../kernels/src/attention_dflash_wmma.hip");
+
+/// BF16 causal prefill parity sibling of `ATTENTION_DFLASH_WMMA_SRC`.
+/// F32 Q/K/V are rounded to BF16 in-register, both matrix products use BF16
+/// wave32 WMMA, and the F32 output is rounded through BF16 on store. See
+/// `kernels/src/attention_dflash_wmma_bf16.hip`.
+pub const ATTENTION_DFLASH_WMMA_BF16_SRC: &str =
+    include_str!("../../../kernels/src/attention_dflash_wmma_bf16.hip");
 
 /// gfx12/RDNA4 sister of `ATTENTION_DFLASH_WMMA_SRC`. Same algorithm; the
 /// WMMA fragments use `half8_t` operands + the `_w32_gfx12` intrinsic (the

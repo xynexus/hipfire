@@ -11,14 +11,18 @@
 
 /// Sampler policy knobs for a single token sample.
 ///
-/// `temperature == 0.0` is the greedy path. `top_p == 1.0` disables nucleus
-/// truncation. `repeat_penalty == 1.0` is a no-op.
+/// `temperature == 0.0` is the greedy path. `top_k == 0` disables the explicit
+/// top-k cutoff, `top_p == 1.0` disables nucleus truncation, and
+/// `repeat_penalty == 1.0` is a no-op.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SamplerConfig {
     /// 0.0 = greedy.
     pub temperature: f32,
     /// 1.0 = no nucleus truncation.
     pub top_p: f32,
+    /// Maximum candidates retained before nucleus sampling. `0` means the
+    /// execution backend's full supported candidate set.
+    pub top_k: usize,
     /// 1.0 = repeat-penalty disabled.
     pub repeat_penalty: f32,
     /// Tokens of recent history visible to repeat/frequency penalties.
@@ -39,6 +43,7 @@ impl SamplerConfig {
         Self {
             temperature: 0.0,
             top_p: 1.0,
+            top_k: 0,
             repeat_penalty: 1.0,
             repeat_window: 0,
             presence_penalty: 0.0,
@@ -56,6 +61,7 @@ impl Default for SamplerConfig {
         Self {
             temperature: 0.3,
             top_p: 0.95,
+            top_k: 20,
             repeat_penalty: 1.05,
             repeat_window: 128,
             presence_penalty: 0.0,

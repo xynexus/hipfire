@@ -11,6 +11,7 @@ extern "C" __global__ void rope_partial_interleaved_f32(
     int n_heads_k,
     int head_dim,
     int n_rot,        // number of dims to rotate (64 for Qwen3.5)
+    int basis_dim,    // exponent denominator (n_rot for legacy callers)
     float freq_base
 ) {
     int pair = blockIdx.x * blockDim.x + threadIdx.x;
@@ -23,7 +24,7 @@ extern "C" __global__ void rope_partial_interleaved_f32(
 
     int pos = *pos_buf;
     // Frequency for this pair (same formula as standard RoPE but indexed by pair)
-    float freq = 1.0f / powf(freq_base, (float)(2 * pair) / (float)n_rot);
+    float freq = 1.0f / powf(freq_base, (float)(2 * pair) / (float)basis_dim);
     float angle = (float)pos * freq;
     float cos_a = cosf(angle);
     float sin_a = sinf(angle);

@@ -1,0 +1,192 @@
+{
+  "assistant_continuation": {
+    "add_generation_prompt": false,
+    "messages": [
+      {
+        "content": "What is the weather in Paris?",
+        "role": "user"
+      },
+      {
+        "content": "",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": {
+                "city": "Paris",
+                "unit": "celsius"
+              },
+              "name": "get_weather"
+            },
+            "id": "call_weather_1",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "{\"condition\":\"clear\",\"temperature\":18}",
+        "role": "tool",
+        "tool_call_id": "call_weather_1"
+      },
+      {
+        "content": "It is 18 C and clear in Paris.",
+        "role": "assistant"
+      }
+    ]
+  },
+  "multi_turn": {
+    "add_generation_prompt": true,
+    "messages": [
+      {
+        "content": "My favorite color is amber.",
+        "role": "user"
+      },
+      {
+        "content": "I will remember that.",
+        "role": "assistant"
+      },
+      {
+        "content": "What color did I name?",
+        "role": "user"
+      }
+    ]
+  },
+  "plain": {
+    "add_generation_prompt": true,
+    "messages": [
+      {
+        "content": "Explain why the sky is blue.",
+        "role": "user"
+      }
+    ]
+  },
+  "system": {
+    "add_generation_prompt": true,
+    "messages": [
+      {
+        "content": "Answer in one short sentence.",
+        "role": "system"
+      },
+      {
+        "content": "What is two plus two?",
+        "role": "user"
+      }
+    ]
+  },
+  "thinking_off": {
+    "add_generation_prompt": true,
+    "enable_thinking": false,
+    "messages": [
+      {
+        "content": "Count the letters in banana.",
+        "role": "user"
+      }
+    ]
+  },
+  "thinking_on": {
+    "add_generation_prompt": true,
+    "enable_thinking": true,
+    "messages": [
+      {
+        "content": "Count the letters in banana.",
+        "role": "user"
+      }
+    ]
+  },
+  "tool_call": {
+    "add_generation_prompt": false,
+    "messages": [
+      {
+        "content": "What is the weather in Paris?",
+        "role": "user"
+      },
+      {
+        "content": "",
+        "reasoning_content": "I should query the weather tool.",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": {
+                "city": "Paris",
+                "unit": "celsius"
+              },
+              "name": "get_weather"
+            },
+            "id": "call_weather_1",
+            "type": "function"
+          }
+        ]
+      }
+    ]
+  },
+  "tool_declaration": {
+    "add_generation_prompt": true,
+    "messages": [
+      {
+        "content": "What is the weather in Paris?",
+        "role": "user"
+      }
+    ],
+    "tools": [
+      {
+        "function": {
+          "description": "Read the current weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "description": "City name.",
+                "type": "string"
+              },
+              "unit": {
+                "description": "Temperature unit.",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  },
+  "tool_response": {
+    "add_generation_prompt": true,
+    "messages": [
+      {
+        "content": "What is the weather in Paris?",
+        "role": "user"
+      },
+      {
+        "content": "",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": {
+                "city": "Paris",
+                "unit": "celsius"
+              },
+              "name": "get_weather"
+            },
+            "id": "call_weather_1",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "{\"condition\":\"clear\",\"temperature\":18}",
+        "role": "tool",
+        "tool_call_id": "call_weather_1"
+      }
+    ]
+  }
+}

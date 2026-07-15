@@ -8,9 +8,8 @@
 //!
 //! Each generation loop in `crates/hipfire-daemon/src/main.rs` decodes
 //! every newly-committed token to bytes and ships those bytes out the
-//! wire. Per-arch quirks (Gemma 4's literal `<end_of_turn>` marker that
-//! sometimes resolves to the compact-EOT special token id, Qwen-style
-//! `<think>` blocks, and Qwen3's `<|im_end|>` ChatML terminator) used
+//! wire. Per-arch quirks (Qwen-style `<think>` blocks and Qwen3's
+//! `<|im_end|>` ChatML terminator) used
 //! to be inlined in `daemon.rs` and had to be edited per arch port.
 //! `EosFilter` consumes raw decoded bytes and emits one of:
 //!
@@ -55,8 +54,7 @@ pub struct EosFilterConfig {
     /// `</think>`) are never emitted in this mode.
     pub strip_think: bool,
     /// Byte sequences that signal end of turn. Generation stops at
-    /// any match. Examples: `b"<|im_end|>"`, `b"<end_of_turn>"`, the
-    /// compact-EOT marker that some Gemma 4 GGUFs decode to.
+    /// any match. Example: `b"<|im_end|>"`.
     pub stop_at: Vec<Vec<u8>>,
     /// Byte prefixes that are ambiguous — buffer until disambiguated.
     /// Use for partial markers that may or may not be a stop token.
@@ -440,15 +438,11 @@ mod tests {
         }
     }
 
-    fn cfg_gemma4_eot() -> EosFilterConfig {
-        // Mirrors the Gemma 4 daemon path: literal '<end_of_turn>' is
-        // a stop marker, and any prefix of it must be held back so
-        // false-prefix bytes (e.g. '<en' followed by something else)
-        // can flush correctly.
+    fn cfg_marker_holdback() -> EosFilterConfig {
         EosFilterConfig {
             strip_think: false,
-            stop_at: vec![b"<end_of_turn>".to_vec()],
-            holdback_prefixes: vec![b"<end_of_turn>".to_vec()],
+            stop_at: vec![b"<stop>".to_vec()],
+            holdback_prefixes: vec![b"<stop>".to_vec()],
         }
     }
 
@@ -529,27 +523,24 @@ mod tests {
 
     #[test]
     fn partial_holdback_prefix_holds_then_flushes_on_false_match() {
-        // Gemma 4 false-prefix case from commit 7f37b99: bytes that
-        // *look* like the start of '<end_of_turn>' must be held until
-        // the next token confirms or denies the match.
-        let mut f = EosFilter::new(cfg_gemma4_eot());
-        // Feed a partial prefix '<en' — must hold.
-        assert_eq!(f.observe(b"<en"), FilterAction::Hold);
-        // Next token is something else: 'glish'. The held '<en' is
-        // now disambiguated as not-a-stop-marker, so the combined
-        // 'english' must flush in this observe.
-        match f.observe(b"glish") {
-            FilterAction::Emit(bytes) => assert_eq!(bytes, b"<english"),
-            other => panic!("expected Emit('<english'), got {:?}", other),
+        // Bytes that look like the start of a configured marker must be held
+        // until the next token confirms or denies the match.
+        let mut f = EosFilter::new(cfg_marker_holdback());
+        assert_eq!(f.observe(b"<st"), FilterAction::Hold);
+        // The held prefix is now disambiguated as not-a-stop-marker, so the
+        // combined bytes must flush in this observe.
+        match f.observe(b"ring") {
+            FilterAction::Emit(bytes) => assert_eq!(bytes, b"<string"),
+            other => panic!("expected Emit('<string'), got {:?}", other),
         }
     }
 
     #[test]
     fn partial_holdback_prefix_then_full_match_stops() {
-        let mut f = EosFilter::new(cfg_gemma4_eot());
-        assert_eq!(f.observe(b"<en"), FilterAction::Hold);
+        let mut f = EosFilter::new(cfg_marker_holdback());
+        assert_eq!(f.observe(b"<st"), FilterAction::Hold);
         // The continuation completes the marker — Stop.
-        assert_eq!(f.observe(b"d_of_turn>"), FilterAction::Stop);
+        assert_eq!(f.observe(b"op>"), FilterAction::Stop);
     }
 
     #[test]

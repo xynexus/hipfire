@@ -33,7 +33,7 @@ use hipfire_model::{
     arch_features, is_qwen35_dense_arch_id, is_qwen35_family_arch_id, FeatureSupport,
     ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_TEXT,
     ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
-    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
+    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
 };
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
@@ -690,6 +690,7 @@ pub fn load_model(
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -710,7 +711,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -759,39 +759,38 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == ARCH_ID_QWEN2 {
-        // Qwen2 dense (hipfire-arch-qwen2). Standalone bring-up — no
-        // eviction, no DFlash, no PFlash, no VL. The Architecture
-        // trait surface gives us config + weights + state in three
-        // calls; forward is direct `qwen2::forward_step` below.
+    // Force-link serving-heavy architecture registrations through the aggregate,
+    // then resolve by data rather than growing the central arch-id ladder.
+    let _ = hipfire_archs::registry();
+    if let Some(factory) = hipfire_runtime::arch::serving_factory(hfq.arch_id)? {
         if draft_path.is_some() {
-            return Err(
-                "DFlash not supported on arch_id=7 (hipfire-arch-qwen2 bring-up). \
-                       Reload without a draft."
-                    .to_string(),
-            );
+            return Err(format!(
+                "DFlash is not supported by the registered {} backend; reload without a draft",
+                factory.family()
+            ));
         }
         if cask.sidecar.is_some() {
-            return Err(
-                "CASK eviction not supported on arch_id=7 (hipfire-arch-qwen2 bring-up). \
-                       Reload without --cask-sidecar."
-                    .to_string(),
-            );
+            return Err(format!(
+                "CASK eviction is not supported by the registered {} backend; reload without --cask-sidecar",
+                factory.family()
+            ));
         }
-        let _ = kv_mode;
         let _ = state_quant_override;
-        use hipfire_arch_qwen2::Qwen2;
-        use hipfire_runtime::arch::Architecture;
-        let config = <Qwen2 as Architecture>::config_from_hfq(&hfq)?;
-        let weights = <Qwen2 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
-        let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config, max_seq)
-            .map_err(|e| format!("qwen2: Qwen2State::new_with_max_seq failed: {e:?}"))?;
-        let qwen2_backend = hipfire_arch_qwen2::Qwen2Backend::new(config, weights, state);
+        let registered_backend = factory.load(
+            &mut hfq,
+            gpu,
+            &hipfire_runtime::arch::ServingFactoryOptions {
+                max_seq,
+                kv_mode: &kv_mode,
+            },
+        )?;
+        let physical_cap = registered_backend.physical_cap;
         let chat_template = resolve_chat_template(&hfq, path);
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: Some(registered_backend),
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -812,7 +811,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: Some(qwen2_backend),
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -842,8 +840,8 @@ pub fn load_model(
             embeddinggemma: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
-            max_seq,
-            physical_cap: max_seq,
+            max_seq: physical_cap,
+            physical_cap,
             eviction: None,
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
@@ -884,6 +882,7 @@ pub fn load_model(
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -904,7 +903,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -1011,6 +1009,7 @@ pub fn load_model(
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -1031,7 +1030,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -1110,6 +1108,7 @@ pub fn load_model(
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -1130,7 +1129,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -1222,6 +1220,7 @@ pub fn load_model(
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -1242,7 +1241,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -1321,6 +1319,7 @@ pub fn load_model(
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -1341,7 +1340,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: Some(state),
-            qwen2_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -1441,6 +1439,7 @@ pub fn load_model(
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -1461,7 +1460,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             deepseek4_config: Some(config),
             deepseek4_weights: Some(weights),
             deepseek4_state: Some(state),
@@ -1567,6 +1565,7 @@ pub fn load_model(
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -1587,7 +1586,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -1798,6 +1796,7 @@ pub fn load_model(
                 profile_chat_template(chat_template, Some(&tokenizer));
             return Ok(LoadedModel {
                 arch_id: hfq.arch_id,
+                registered_backend: None,
                 pp: 1,
                 pp_gpus: None,
                 pp_scratch_set: None,
@@ -1818,7 +1817,6 @@ pub fn load_model(
                 qwen2_config: None,
                 qwen2_weights: None,
                 qwen2_state: None,
-                qwen2_backend: None,
                 deepseek4_config: None,
                 deepseek4_weights: None,
                 deepseek4_state: None,
@@ -2149,6 +2147,7 @@ pub fn load_model(
         ));
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -2173,7 +2172,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -2283,6 +2281,7 @@ pub fn load_model(
             profile_chat_template(chat_template, Some(&tokenizer));
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -2303,7 +2302,6 @@ pub fn load_model(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -2474,6 +2472,7 @@ pub fn load_model_safetensors(
 
         return Ok(LoadedModel {
             arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -2484,7 +2483,6 @@ pub fn load_model_safetensors(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             dots_ocr_config: None,
             dots_ocr_weights: None,
             q35_kv_mode: None,
@@ -2590,6 +2588,7 @@ pub fn load_model_safetensors(
 
         return Ok(LoadedModel {
             arch_id,
+            registered_backend: None,
             pp: 1,
             pp_gpus: None,
             pp_scratch_set: None,
@@ -2600,7 +2599,6 @@ pub fn load_model_safetensors(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
-            qwen2_backend: None,
             dots_ocr_config: None,
             dots_ocr_weights: None,
             q35_kv_mode: None,
@@ -2725,6 +2723,7 @@ pub fn load_model_safetensors(
     ));
     Ok(LoadedModel {
         arch_id,
+        registered_backend: None,
         pp: 1,
         pp_gpus: None,
         pp_scratch_set: None,
@@ -2735,7 +2734,6 @@ pub fn load_model_safetensors(
         qwen2_config: None,
         qwen2_weights: None,
         qwen2_state: None,
-        qwen2_backend: None,
         dots_ocr_config: None,
         dots_ocr_weights: None,
         q35_kv_mode: Some(kv_mode.to_string()),
@@ -3025,6 +3023,7 @@ pub fn load_model_pp(
     ));
     Ok(LoadedModel {
         arch_id: hfq.arch_id,
+        registered_backend: None,
         pp,
         pp_gpus: Some(gpus),
         pp_scratch_set: Some(scratch_set),
@@ -3045,7 +3044,6 @@ pub fn load_model_pp(
         qwen2_config: None,
         qwen2_weights: None,
         qwen2_state: None,
-        qwen2_backend: None,
         deepseek4_config: None,
         deepseek4_weights: None,
         deepseek4_state: None,
@@ -3338,8 +3336,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut hipfire_rdna::Gpu) {
         if let Some(b) = m.nemotron_backend {
             Box::new(b).unload(gpu);
         }
-        if let Some(b) = m.qwen2_backend {
-            Box::new(b).unload(gpu);
+        if let Some(loaded) = m.registered_backend {
+            loaded.backend.unload(gpu);
         }
         if let Some(b) = m.llama_backend {
             Box::new(b).unload(gpu);

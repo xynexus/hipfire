@@ -10,6 +10,48 @@ use hip_bridge::HipResult;
 use std::ffi::c_void;
 
 impl Gpu {
+    /// Generic vector softcap: `out[i] = cap * tanh(x[i] / cap)`.
+    /// Supports in-place operation and uses no LDS.
+    pub fn vector_softcap_f32(
+        &mut self,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        cap: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !cap.is_finite() || cap <= 0.0 || n == 0 || n > x.numel() || n > out.numel() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "vector_softcap_f32 requires finite cap > 0 and in-bounds length",
+            ));
+        }
+        self.ensure_kernel(
+            "vector_softcap",
+            kernels::VECTOR_SOFTCAP_SRC,
+            "vector_softcap_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n as i32;
+        let block = 256u32;
+        let grid = (n as u32).div_ceil(block);
+        let bytes = crate::profile::elementwise_bytes(n);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "vector_softcap_f32", bytes);
+        let result = self.launch_kernargs(
+            "vector_softcap_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &kernargs![ptr x_ptr, ptr out_ptr, i32 n_val, f32 cap],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// c = a + b (element-wise)
     pub fn add_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;

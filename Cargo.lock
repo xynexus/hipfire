@@ -1405,6 +1405,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-gemma4"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-gemma4-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-krea2-spec"
 version = "0.3.0"
 dependencies = [
@@ -1571,6 +1590,7 @@ dependencies = [
  "hipfire-arch-flux2-spec",
  "hipfire-arch-gemma3-spec",
  "hipfire-arch-gemma3-vl-spec",
+ "hipfire-arch-gemma4-spec",
  "hipfire-arch-krea2-spec",
  "hipfire-arch-lfm2moe-spec",
  "hipfire-arch-llama-spec",
@@ -1626,9 +1646,12 @@ name = "hipfire-archs"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "hipfire-arch-gemma4",
+ "hipfire-arch-qwen2",
  "hipfire-arch-specs",
  "hipfire-arch-template",
  "hipfire-arch-template-spec",
+ "hipfire-runtime",
 ]
 
 [[package]]
@@ -2150,6 +2173,7 @@ dependencies = [
  "hipfire-state",
  "hipfire-sysinfo",
  "hipfire-xdna",
+ "inventory",
  "libc",
  "memmap2",
  "minijinja",
@@ -2221,6 +2245,7 @@ dependencies = [
  "hipfire-arch-embeddinggemma",
  "hipfire-arch-gemma3",
  "hipfire-arch-gemma3-vl",
+ "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
@@ -2229,6 +2254,7 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-zaya",
+ "hipfire-archs",
  "hipfire-evidence",
  "hipfire-generate",
  "hipfire-media",

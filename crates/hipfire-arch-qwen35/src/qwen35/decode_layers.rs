@@ -1355,6 +1355,7 @@ pub(crate) fn forward_scratch_layers(
                         config.n_kv_heads,
                         config.head_dim,
                         n_rot,
+                        n_rot,
                         config.rope_theta,
                     )?;
                 }
@@ -2620,6 +2621,7 @@ pub(crate) fn forward_scratch_layers(
                         config.n_heads,
                         config.n_kv_heads,
                         config.head_dim,
+                        n_rot,
                         n_rot,
                         config.rope_theta,
                     )?;

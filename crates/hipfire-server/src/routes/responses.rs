@@ -51,6 +51,7 @@ pub struct ResponsesRequest {
     pub previous_response_id: Option<String>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<usize>,
     pub repeat_penalty: Option<f64>,
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
@@ -157,6 +158,7 @@ async fn execute_responses_owned(
         stream: false,
         temperature: body.temperature,
         top_p: body.top_p,
+        top_k: body.top_k,
         repeat_penalty: body.repeat_penalty,
         presence_penalty: body.presence_penalty,
         frequency_penalty: body.frequency_penalty,
@@ -400,6 +402,7 @@ async fn stream_responses(
                     cfg.max_tokens,
                     body.temperature,
                     body.top_p,
+                    body.top_k,
                     body.repeat_penalty,
                     Some(request_max_tokens),
                 ),
@@ -728,6 +731,7 @@ fn response_item_to_message(item: &Value) -> Result<Message, String> {
         .unwrap_or_default();
     let role = match role {
         "system" => Role::System,
+        "developer" => Role::Developer,
         "user" => Role::User,
         "assistant" => Role::Assistant,
         "tool" => Role::Tool,
@@ -787,6 +791,7 @@ fn user_message(content: String) -> Message {
 fn prompt_message_to_chat_message(message: &Message) -> ChatMessage {
     let role = match message.role {
         Role::System => "system",
+        Role::Developer => "developer",
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",

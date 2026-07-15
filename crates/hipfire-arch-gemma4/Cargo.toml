@@ -1,0 +1,13 @@
+[package]
+name = "hipfire-arch-gemma4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Gemma 4 text architecture runtime (arch id 24)."
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-rdna = { path = "../hipfire-rdna" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+hip-bridge = { path = "../hip-bridge" }
+serde_json = "1"

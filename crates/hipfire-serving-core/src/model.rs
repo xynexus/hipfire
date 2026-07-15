@@ -28,6 +28,7 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_prompt as prompt_frame;
+use hipfire_runtime::arch::FactoryLoadedBackend;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::kv;
@@ -212,6 +213,11 @@ thread_local! {
 pub fn effective_raw(m: &LoadedModel) -> bool {
     RAW_OVERRIDE
         .with(|c| c.get())
+        .or_else(|| {
+            m.registered_backend
+                .as_ref()
+                .and_then(|loaded| loaded.profile.prompt.raw)
+        })
         .unwrap_or(m.chat_template.is_none())
 }
 
@@ -260,6 +266,9 @@ pub struct ResidentSession {
 /// will eventually collapse this Option-soup into one boxed backend.
 pub struct LoadedModel {
     pub arch_id: u32,
+    /// Factory-loaded text backends share this one coarse-grained slot together
+    /// with their prompt/generation policy and host-only shape metadata.
+    pub registered_backend: Option<FactoryLoadedBackend>,
     /// Pipeline-parallel degree. 1 = single-GPU (all existing fields below in
     /// use, q35_scratch populated). >1 = multi-GPU (pp_gpus + pp_scratch_set
     /// populated; q35_scratch stays None; kv_cache + dn_state still hold the
@@ -313,12 +322,8 @@ pub struct LoadedModel {
     pub qwen2_config: Option<qwen2::Qwen2Config>,
     pub qwen2_weights: Option<qwen2::Qwen2Weights>,
     pub qwen2_state: Option<qwen2::Qwen2State>,
-    /// Assembled Qwen2 serving backend (arch_id=7), driven through the shared
-    /// `ServingBackend::serve` seam — mirrors `gemma3_text`. Owns its own
-    /// config/weights/state; the separate `qwen2_*` fields above stay `None` on
-    /// the arch-7 path and are retained only for dots-ocr's reuse of
-    /// `qwen2_state`. P3.1.
-    pub qwen2_backend: Option<hipfire_arch_qwen2::Qwen2Backend>,
+    // The separate qwen2 fields above remain only for dots-ocr's text tower.
+    // Standalone Qwen2 is factory-loaded into `registered_backend`.
     // DeepSeek V4 Flash state (arch_id=9 — hipfire-arch-deepseek4).
     // Hyper-Connections + compressed-KV indexer + tail-only RoPE + raw
     // SWA cache. KV cache lives inside DeepseekV4State; no separate

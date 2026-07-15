@@ -1070,6 +1070,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             let cfg = SamplerConfig {
                 temperature: 0.0,
                 top_p: 1.0,
+                top_k: 20,
                 repeat_window: 0,
                 repeat_penalty: 1.0,
                 presence_penalty: 0.0,
@@ -1504,6 +1505,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
             let cfg = SamplerConfig {
                 temperature: 0.0,
                 top_p: 1.0,
+                top_k: 20,
                 repeat_window: 0,
                 repeat_penalty: 1.0,
                 presence_penalty: 0.0,
@@ -1655,6 +1657,7 @@ pub fn qwen35_prefill_suffix_batch_serial_reference(
             let cfg = SamplerConfig {
                 temperature: 0.0,
                 top_p: 1.0,
+                top_k: 20,
                 repeat_window: 0,
                 repeat_penalty: 1.0,
                 presence_penalty: 0.0,

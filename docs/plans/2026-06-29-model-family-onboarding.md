@@ -198,6 +198,26 @@ Adding a dense text family is exactly:
 
 The CI completeness gate refuses a half-wired family; no other file changes.
 
+## Current registered-family checklist
+
+For families using the capability registry, onboarding is now split cleanly:
+
+1. Reserve the numeric container id only in `hipfire-arch-api` and document it
+   in `docs/architecture-ids.md`; re-export it from `hipfire-model`.
+2. Add one lean `hipfire-arch-<family>-spec` that registers canonical
+   `model_type` aliases, `Ingest`, and `ToyModel`; force-link it from
+   `hipfire-arch-specs`.
+3. Declare routed-expert source layout through `Ingest::expert_layout`; do not
+   add a family arm to the quantizer's model-type or stacked-expert ladders.
+4. Add an honest `docs/model-support.toml` row. Identity/ingest-only families
+   remain `none` until runtime evidence passes.
+5. Add the serving crate/factory only when the family crosses the boxed-backend
+   gate. Do not add a typed `LoadedModel` field or central generate branch.
+
+Gemma 4 is the first family required to follow this tightened checklist. Gemma 3
+and Qwen3.5/Zaya are the migration anchors for name detection and stacked-expert
+layout respectively, so neither registry hook is Gemma-4-only.
+
 ## Risks / open questions
 
 - **Sequencing vs seam-finish.** Pillar A's `load → Box<dyn ServingBackend>` is

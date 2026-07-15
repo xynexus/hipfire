@@ -82,6 +82,32 @@ pub enum RopeFlavor {
     Interleaved {
         theta: f32,
     },
+    /// Half-split partial RoPE where the rotated coordinate count and exponent
+    /// denominator are independent. Conventional partial RoPE sets them equal;
+    /// Gemma 4 proportional RoPE keeps the full head width as `basis_dim`.
+    PartialHalfRotate {
+        theta: f32,
+        rotary_dim: u32,
+        basis_dim: u32,
+    },
+}
+
+/// Per-layer attention geometry frozen by architecture lowering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttentionGeometry {
+    pub q_heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+}
+
+/// Physical layered-cache target frozen by architecture lowering. A sharing
+/// consumer points at its resolved producer rather than allocating another
+/// logical-layer cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttentionCacheBinding {
+    pub physical_group: u32,
+    pub physical_slot: u32,
+    pub producer_layer: u32,
 }
 
 /// Attention-block flavor — everything that distinguishes one arch's attention
@@ -90,6 +116,8 @@ pub enum RopeFlavor {
 /// the k_eq_v weightless-V-RMSNorm prelude, logit softcap).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AttnFlavor {
+    pub geometry: AttentionGeometry,
+    pub cache: AttentionCacheBinding,
     /// Sliding-window size; 0 = full (global) attention. Gemma alternates
     /// Sliding(1024)/Full per layer.
     pub window: u32,
@@ -110,6 +138,11 @@ pub enum OpFlavor {
     None,
     Attn(AttnFlavor),
     Act(ActFlavor),
+    /// Immediate scalar used by a regular `Scale` super-op. A learned scalar
+    /// can instead be supplied through `OpBinding.weights`.
+    Scale(f32),
+    /// Generic final-vector softcap value.
+    Softcap(f32),
 }
 
 /// Irregular/stateful ops that don't map onto a single fused kernel. Each is a
@@ -123,8 +156,6 @@ pub enum EscapeKind {
     Deepseek4IndexerTopK,
     /// deepseek4 sparse SWA over the gathered top-K KV.
     Deepseek4SwaTopK,
-    /// Gemma final logit softcap (output stage).
-    GemmaLogitSoftcap,
 }
 
 /// One coarse super-op. For `Proj`/`ResidualGemv`/`Moe` the `key` is the
@@ -154,6 +185,16 @@ pub enum SuperOpKind {
     Recurrent,
     /// Depthwise causal short-conv mixer with advancing conv state (LFM2).
     Conv,
+    /// Regular activation/product operation (e.g. GeGLU).
+    Act,
+    /// Standalone residual add not fused into a projection.
+    Residual,
+    /// Regular scalar multiply (immediate or bound learned scalar).
+    Scale,
+    /// Generic final-vector softcap.
+    Softcap,
+    /// First-class per-layer-input operation, populated by PLE-capable arches.
+    Ple,
     /// Bespoke irregular/stateful op.
     Escape(EscapeKind),
 }
@@ -185,6 +226,8 @@ pub type LayerProgram = Vec<SuperOp>;
 #[derive(Clone, Debug)]
 pub struct LoweredForward {
     pub layers: Vec<LayerProgram>,
+    /// Optional final norm/head/post-processing program.
+    pub final_program: LayerProgram,
     pub weight_gen: u64,
 }
 
@@ -192,6 +235,7 @@ impl LoweredForward {
     pub fn new(weight_gen: u64) -> Self {
         Self {
             layers: Vec::new(),
+            final_program: Vec::new(),
             weight_gen,
         }
     }
@@ -323,6 +367,71 @@ pub trait ForwardBindings {
         ctx: &DispatchCtx,
         op: &OpBinding,
     ) -> Result<(), DispatchError>;
+    fn run_act(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "superop",
+            variant: "act-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+    fn run_residual(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "superop",
+            variant: "residual-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+    fn run_scale(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "superop",
+            variant: "scale-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+    fn run_softcap(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "superop",
+            variant: "softcap-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+    fn run_ple(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "superop",
+            variant: "ple-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
     fn run_escape(
         &mut self,
         gpu: &mut Gpu,
@@ -394,6 +503,11 @@ pub fn dispatch_super_op<B: ForwardBindings>(
         SuperOpKind::Moe => bindings.run_moe(gpu, ctx, &op.binding)?,
         SuperOpKind::Recurrent => bindings.run_recurrent(gpu, ctx, &op.binding)?,
         SuperOpKind::Conv => bindings.run_conv(gpu, ctx, &op.binding)?,
+        SuperOpKind::Act => bindings.run_act(gpu, ctx, &op.binding)?,
+        SuperOpKind::Residual => bindings.run_residual(gpu, ctx, &op.binding)?,
+        SuperOpKind::Scale => bindings.run_scale(gpu, ctx, &op.binding)?,
+        SuperOpKind::Softcap => bindings.run_softcap(gpu, ctx, &op.binding)?,
+        SuperOpKind::Ple => bindings.run_ple(gpu, ctx, &op.binding)?,
         SuperOpKind::Escape(k) => bindings.run_escape(gpu, ctx, &op.binding, k)?,
     }
     Ok(())

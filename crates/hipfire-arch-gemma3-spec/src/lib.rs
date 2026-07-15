@@ -29,6 +29,9 @@ impl Arch for Gemma3Spec {
     fn family(&self) -> &'static str {
         "gemma3"
     }
+    fn model_types(&self) -> &'static [&'static str] {
+        &["gemma3", "gemma3_text"]
+    }
 }
 
 impl Ingest for Gemma3Spec {

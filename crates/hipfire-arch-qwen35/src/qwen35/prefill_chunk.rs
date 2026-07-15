@@ -4090,6 +4090,7 @@ pub(crate) fn forward_prefill_chunk(
                     config.n_kv_heads,
                     config.head_dim,
                     n_rot,
+                    n_rot,
                     config.rope_theta,
                     n,
                     kv_cache.compact_offset as i32,
@@ -6560,6 +6561,7 @@ pub(crate) fn forward_prefill_chunk(
                     config.n_kv_heads,
                     config.head_dim,
                     n_rot,
+                    n_rot,
                     config.rope_theta,
                     n,
                     kv_cache.compact_offset as i32,
@@ -7469,6 +7471,7 @@ fn run_fa_layer_body(
             config.n_heads,
             config.n_kv_heads,
             config.head_dim,
+            n_rot,
             n_rot,
             config.rope_theta,
         )?;

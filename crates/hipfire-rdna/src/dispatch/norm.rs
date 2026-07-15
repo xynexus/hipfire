@@ -10,6 +10,52 @@ use hip_bridge::HipResult;
 use std::ffi::c_void;
 
 impl Gpu {
+    /// `out = x / sqrt(mean(x^2) + eps)` for each row of `x`.
+    ///
+    /// Unlike [`Self::rmsnorm_f32`], this API has no learned weight operand and
+    /// does not allocate or imply an all-ones tensor.
+    pub fn rmsnorm_weightless_f32(
+        &mut self,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rmsnorm_weightless",
+            kernels::RMSNORM_SRC,
+            "rmsnorm_weightless_f32",
+        )?;
+
+        let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
+        let n = x.shape.last().copied().unwrap_or(0);
+        if n == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rmsnorm_weightless_f32 requires a non-empty final dimension",
+            ));
+        }
+        let x_ptr = x.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n as i32;
+        let block = 256u32.min(n as u32).next_power_of_two();
+        let shared_mem = block * 4;
+        let bytes = crate::profile::rmsnorm_bytes(batch * n);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_weightless_f32", bytes);
+        let result = self.launch_kernargs(
+            "rmsnorm_weightless_f32",
+            [batch as u32, 1, 1],
+            [block, 1, 1],
+            shared_mem,
+            &kernargs![ptr x_ptr, ptr out_ptr, i32 n_val, f32 eps],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
         &mut self,

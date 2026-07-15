@@ -45,6 +45,7 @@ and 4 are historically retired and must not be reused.
 | 16 | `ARCH_ID_ZAYA`             | zaya         | `hipfire-arch-zaya`     | `zaya` |
 | 19 | `ARCH_ID_EMBEDDINGGEMMA`   | embeddinggemma | `hipfire-arch-embeddinggemma` | `gemma3_text`/`gemma3` bidirectional encoder w/ ST pooling+Dense modules (embeddinggemma) |
 | 23 | `ARCH_ID_FLUX2`             | flux2        | `hipfire-diffusion` | `Flux2Transformer2DModel` / `Flux2KleinPipeline` / `SEFIInferencePipeline` |
+| 24 | `ARCH_ID_GEMMA4`            | gemma4       | `hipfire-arch-gemma4` | `gemma4`, `gemma4_text`, `gemma4_unified`, `gemma4_unified_text` (one text-core id; wrappers remain typed config distinctions) |
 
 The per-arch capability matrix (prefill / dflash / mtp / kv / vision support)
 lives in `docs/model-support.toml`, keyed by these same ids.

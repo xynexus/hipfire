@@ -42,7 +42,8 @@
 pub mod ingest;
 pub use ingest::{
     allocate, default_importance, default_precision_class, default_requires, mmdit_role,
-    target_bits, transformer_role, CapReq, CodecCaps, Ingest, PrecisionClass, TensorRole,
+    target_bits, transformer_role, CapReq, CodecCaps, ExpertLayout, Ingest, PrecisionClass,
+    TensorRole,
 };
 
 pub mod toy;
@@ -96,6 +97,9 @@ pub const ARCH_ID_DSPARK_DRAFT: u32 = 22;
 /// FLUX.2 MMDiT image denoisers, including Klein and the SeFi semantic-first
 /// variant. Pipeline metadata distinguishes the vanilla and dual-time drivers.
 pub const ARCH_ID_FLUX2: u32 = 23;
+/// Gemma 4 text core. Standard, text-only, and unified wrappers share one base
+/// identity; modality and MTP artifacts are roles/capabilities, not base ids.
+pub const ARCH_ID_GEMMA4: u32 = 24;
 
 impl core::fmt::Display for ArchId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -110,6 +114,14 @@ pub trait Arch: Sync + 'static {
     fn id(&self) -> ArchId;
     /// Human family name for logs/errors, e.g. `"llama"`, `"nemotron-h"`.
     fn family(&self) -> &'static str;
+
+    /// Canonical Hugging Face `model_type` aliases that resolve to this base id.
+    /// Wrapper distinctions remain in config; this list only owns offline
+    /// identity. Empty by default for families not yet migrated to name-based
+    /// detection.
+    fn model_types(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// Config JSON keys that belong to a sidecar `role` (e.g. `"vl"`, `"mtp"`)
     /// rather than the base model. When a bundle is split (`hipfire model
@@ -154,6 +166,17 @@ pub trait ToyModel: Sync + 'static {
     /// quantizer renders it into a loadable HF model dir (safetensors + config +
     /// shared tokenizer) and then quantizes it on the normal `--input` path.
     fn fixture(&self, seed: u64) -> ToyFixture;
+
+    /// Named fixture variants. Most architectures expose only `default`; a
+    /// family may keep multiple structurally distinct tinies local to its spec.
+    fn fixture_names(&self) -> &'static [&'static str] {
+        &["default"]
+    }
+
+    /// Resolve a named variant without growing a quantizer family match arm.
+    fn fixture_named(&self, name: &str, seed: u64) -> Option<ToyFixture> {
+        (name == "default").then(|| self.fixture(seed))
+    }
 }
 
 /// The arch is a diffusion (image/video) denoiser rather than a text LM. Presence
@@ -232,6 +255,7 @@ pub use inventory;
 pub struct RegisteredArch {
     pub id: ArchId,
     pub family: &'static str,
+    pub model_types: Vec<&'static str>,
     pub base: &'static dyn Arch,
     pub caps: Caps,
 }
@@ -255,13 +279,32 @@ impl ArchRegistry {
             // unioning their capability tables. Conflicting claims panic.
             if let Some(existing) = archs.iter_mut().find(|a| a.id == id) {
                 existing.caps.merge_from(caps, id);
+                for &model_type in entry.base.model_types() {
+                    if !existing.model_types.contains(&model_type) {
+                        existing.model_types.push(model_type);
+                    }
+                }
             } else {
                 archs.push(RegisteredArch {
                     id,
                     family: entry.base.family(),
+                    model_types: entry.base.model_types().to_vec(),
                     base: entry.base,
                     caps,
                 });
+            }
+        }
+        for arch in &archs {
+            for &model_type in &arch.model_types {
+                if let Some(other) = archs
+                    .iter()
+                    .find(|other| other.id != arch.id && other.model_types.contains(&model_type))
+                {
+                    panic!(
+                        "model_type `{model_type}` registered for both {} and {}",
+                        arch.id, other.id
+                    );
+                }
             }
         }
         ArchRegistry { archs }
@@ -270,6 +313,13 @@ impl ArchRegistry {
     /// The registered arch for `id`, if any is linked in.
     pub fn get(&self, id: ArchId) -> Option<&RegisteredArch> {
         self.archs.iter().find(|a| a.id == id)
+    }
+
+    /// Resolve a canonical Hugging Face `model_type` through linked arch specs.
+    pub fn find_by_model_type(&self, model_type: &str) -> Option<&RegisteredArch> {
+        self.archs
+            .iter()
+            .find(|arch| arch.model_types.contains(&model_type))
     }
 
     /// True if `id` is a registered diffusion denoiser arch (declares the

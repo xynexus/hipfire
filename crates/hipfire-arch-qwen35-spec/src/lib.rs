@@ -9,7 +9,7 @@
 
 use hipfire_arch_api::{
     default_importance, default_requires, register_arch, transformer_role, Arch, ArchId, CapReq,
-    Ingest, Init, TensorRole, TensorSpec, ToyFixture, ToyModel,
+    ExpertLayout, Ingest, Init, TensorRole, TensorSpec, ToyFixture, ToyModel,
 };
 
 /// Qwen3.5 dense header id.
@@ -59,6 +59,9 @@ impl Arch for Qwen35Spec {
     fn family(&self) -> &'static str {
         "qwen3.5"
     }
+    fn model_types(&self) -> &'static [&'static str] {
+        &["qwen3_5", "qwen3_5_text"]
+    }
     fn sidecar_config_keys(&self, role: &str) -> &'static [&'static str] {
         qwen35_sidecar_config_keys(role)
     }
@@ -84,6 +87,9 @@ impl Arch for Qwen35MoeSpec {
     fn family(&self) -> &'static str {
         "qwen3.5-moe"
     }
+    fn model_types(&self) -> &'static [&'static str] {
+        &["qwen3_5_moe", "qwen3_5_moe_text"]
+    }
     fn sidecar_config_keys(&self, role: &str) -> &'static [&'static str] {
         qwen35_sidecar_config_keys(role)
     }
@@ -97,6 +103,9 @@ impl Ingest for Qwen35MoeSpec {
     }
     fn requires(&self, tensor: &str) -> CapReq {
         qwen35_requires(tensor)
+    }
+    fn expert_layout(&self) -> ExpertLayout {
+        ExpertLayout::StackedGateUpDown
     }
 }
 

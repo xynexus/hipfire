@@ -376,6 +376,7 @@ pub fn generate_vl(
     let vl_cfg_first = SamplerConfig {
         temperature: temp,
         top_p,
+        top_k: 20,
         repeat_penalty: 1.0,
         repeat_window: 0,
         presence_penalty: 0.0,
@@ -385,6 +386,7 @@ pub fn generate_vl(
     let vl_cfg = SamplerConfig {
         temperature: temp,
         top_p,
+        top_k: 20,
         repeat_penalty,
         repeat_window,
         presence_penalty: 0.0,
@@ -1182,6 +1184,7 @@ pub fn generate_vl_gemma3(
         prompt: &framed,
         temperature: params.temp,
         top_p: params.top_p,
+        top_k: 20,
         max_tokens: params.max_tokens,
         repeat_penalty: params.repeat_penalty,
         repeat_window: params.repeat_window,
@@ -1189,6 +1192,9 @@ pub fn generate_vl_gemma3(
         frequency_penalty: 0.0,
         max_think_tokens: params.max_think_tokens,
         stop_sequences: &[],
+        output_holdback_prefixes: &[],
+        strip_think: false,
+        output_protocol: hipfire_runtime::arch::OutputProtocol::Plain,
         images: &no_images,
         sink: stdout,
     };

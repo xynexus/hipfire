@@ -62,6 +62,18 @@ pub enum PrecisionClass {
     SourcePrecision,
 }
 
+/// Physical checkpoint layout for routed-expert weights. This is source-layout
+/// metadata, not a runtime MoE policy: dense variants use [`None`](Self::None),
+/// while an arch whose checkpoints stack experts along rank 3 declares the
+/// stacked form so offline ingest can split it generically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertLayout {
+    None,
+    /// `experts.gate_up_proj`: `[experts, 2 * intermediate, hidden]` and
+    /// `experts.down_proj`: `[experts, hidden, intermediate]`.
+    StackedGateUpDown,
+}
+
 /// Format-AGNOSTIC representability requirements a tensor places on its codec. A
 /// requirement is a *need* ("I must be randomly accessible"), never a solution
 /// ("store me with some specific codec").
@@ -102,6 +114,10 @@ pub trait Ingest: Sync + 'static {
     /// `ArchId`, a class an arch does not declare can never leak onto another family.
     fn precision_class(&self, tensor: &str) -> PrecisionClass {
         default_precision_class(self.role(tensor))
+    }
+    /// Source layout for routed experts, when this architecture has them.
+    fn expert_layout(&self) -> ExpertLayout {
+        ExpertLayout::None
     }
 }
 

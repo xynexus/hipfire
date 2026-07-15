@@ -228,6 +228,7 @@ pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
             args.temperature,
             None,
             None,
+            None,
             args.max_tokens,
         ),
         engine.worker_key_id.clone(),

@@ -53,6 +53,7 @@ This per-arch chart is the **`family × feature` projection** of the 5-axis capa
 | gemma3 (12) | ✅ | ❌ | ❌ | fp32+q8 | ❌ |
 | gemma3-vl (13) | ✅ | ❌ | ❌ | fp32+q8 | ✅ |
 | embeddinggemma (19) | ✅ | ❌ | ❌ | none | ❌ |
+| gemma4 (24) | ❌ | ❌ | ❌ | none | ❌ |
 | qwen2 (7) | ✅ | ❌ | ❌ | fp32 | ❌ |
 | dots-ocr (8) | ✅ | ❌ | ❌ | fp32 | ✅ |
 | llama (0, 1) | 🟡 | ❌ | ❌ | fp32 | ❌ |
@@ -133,6 +134,7 @@ Projection of the dflash axis over **family × gfx-class**: the per-family `[[ar
 | gemma3 (12) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | gemma3-vl (13) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | embeddinggemma (19) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| gemma4 (24) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | qwen2 (7) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | dots-ocr (8) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | llama (0, 1) | ❌ | ❌ | ❌ | ❌ | ❌ |

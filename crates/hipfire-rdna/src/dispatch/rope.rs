@@ -384,6 +384,7 @@ impl Gpu {
         n_heads_k: usize,
         head_dim: usize,
         n_rot: usize,
+        basis_dim: usize,
         freq_base: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
@@ -428,6 +429,7 @@ impl Gpu {
         let nhk = n_heads_k as i32;
         let hd = head_dim as i32;
         let nr = n_rot as i32;
+        let bd = basis_dim as i32;
         let fb = freq_base;
         let n_pairs = (n_rot / 2) as u32;
         let block = 32u32.min(n_pairs);
@@ -439,7 +441,9 @@ impl Gpu {
             grid,
             [block, 1, 1],
             0,
-            &kernargs![ptr qp, ptr kp, ptr pp, i32 nhq, i32 nhk, i32 hd, i32 nr, f32 fb],
+            &kernargs![
+                ptr qp, ptr kp, ptr pp, i32 nhq, i32 nhk, i32 hd, i32 nr, i32 bd, f32 fb
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -461,6 +465,7 @@ impl Gpu {
         n_heads_k: usize,
         head_dim: usize,
         n_rot: usize,
+        basis_dim: usize,
         freq_base: f32,
         batch_size: usize,
         pos_offset: i32,
@@ -493,6 +498,7 @@ impl Gpu {
         let nhk = n_heads_k as i32;
         let hd = head_dim as i32;
         let nr = n_rot as i32;
+        let bd = basis_dim as i32;
         let fb = freq_base;
         let bs = batch_size as i32;
         let po = pos_offset;
@@ -507,7 +513,7 @@ impl Gpu {
             [block, 1, 1],
             0,
             &kernargs![
-                ptr qp, ptr kp, ptr pp, i32 nhq, i32 nhk, i32 hd, i32 nr, f32 fb, i32 bs, i32 po
+                ptr qp, ptr kp, ptr pp, i32 nhq, i32 nhk, i32 hd, i32 nr, i32 bd, f32 fb, i32 bs, i32 po
             ],
         );
         if let Some(t) = timer {
