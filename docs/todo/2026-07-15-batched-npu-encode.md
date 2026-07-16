@@ -258,6 +258,33 @@ but channel-neutral. Code left env-gated + a STATUS:BLOCKED comment; off == veri
 3. `npu_opus.rs` `rows()==256` gate + M-sized GTT buffers → full batched encode;
    benchmark B∈{1,32,128,256}.
 
+## R123 correction — object-FIFO replay rejected; core-stationary path correct but slower
+
+The earlier “iter_count memtile replay CONFIRMED” claim was compile/lowering
+evidence, not a hardware correctness result. The full one-FIFO implementation
+showed that the memtile MM2S repeat re-acquires the source consumer lock for
+every sequence, while shim→memtile S2MM produces that lock only once. With the
+normal prime dispatch the measured command returned all zeros. Skipping prime
+as a discriminator delivered only the first M macro (parity cosine 0.61336109;
+later rows zero). Seven 64 KiB source buffers behaved the same as one 448 KiB
+buffer, ruling out bank span. The alternate object-FIFO `repeat_count` attribute
+expanded BDs and exhausted the memtile's 24-BD limit.
+
+R123 then implemented real core-stationary reuse: each 15,552-byte weight record
+is acquired once while every M96 row macro passes through it, with one f32
+accumulator per macro. M512 required two three-macro accumulator buffers and a
+rolling three-output DMA-task window; queuing all six gate / twelve down outputs
+returned zeros. The final kernel passes the absolute M256 oracle (cosine
+0.99984681) and M512 `[X;X]` is bit-exact against M256 for both documents.
+
+The performance gate rejects it: stationary M256/M512 measured **20.111 / 33.500
+ms** (1.20x row throughput), versus **10.520 / 19.929 ms** for the existing
+replicated-weight path. Weight-major accumulation and routing cost more than the
+saved DMA. Do not admit R123 as the runtime default. Preserve it as the bounded
+negative result and move to next-prep/tail context consolidation before further
+FFN redesign. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r123-weight-stationary-m-scaling-20260715.csv`.
+
 ## Bounded component characterization (2026-07-15)
 
 Before un-pinning more stages, the active M256 resident route was instrumented
@@ -317,3 +344,118 @@ Stop the characterization campaign here unless a candidate changes one of
 these boundaries. For each candidate, require a fresh-process correctness run,
 a primed timing run, and an M-scaling row in the durable CSV rather than trying
 to reverse-engineer every inactive NPU path.
+
+## R124 — direct-X resident FFN batch contract admitted (2026-07-15)
+
+The real resident handoff is now unpinned through M512. Direct-X cannot pack
+two documents as 512 contiguous physical rows: the inverse selector maps only
+one M256 record set, so physical rows 256-287 would alias rows 32-63. Each
+document instead occupies one M288 slot (256 logical rows plus 32 padding
+rows), followed by its own 32-record inverse-RMS plane. The host now packs and
+decodes that document-padded layout; canonical M512 input allocation was also
+corrected from one M288 buffer to two.
+
+Both r55 direct-X/gate-reuse images compile, and the hardware verifier gates
+against both an absolute canonical BF16x2 reference and duplicated-document
+self-consistency. M256 reaches cosine `0.99988810`, maximum absolute error
+`0.0147171`, and mean absolute error `0.00238566` against canonical. M512
+`[X;X]` is bit-exact against direct M256 for both documents and between
+documents. Timing is `8.366 ms` at M256 and `16.489 ms` at M512, only `1.01x`
+row-throughput scaling, so this admits the ABI/correctness seam rather than an
+FFN batching performance win.
+
+The next implementation boundary is the paired post-FFN tail and next-layer
+activation preparation. Unpin or consolidate that transition before segmented
+attention. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r124-direct-x-batched-ffn-20260715.csv`.
+
+## R125 — post-FFN tail and next-prep unpinned through M512 (2026-07-15)
+
+Both sides of the cross-layer boundary now accept document-padded batches. The
+tail initially exhausted shim BD IDs when M512 doubled its phase tasks. The
+admitted schedule retains the original four tasks and adds a document DMA
+dimension plus `repeat_count`, so descriptor count stays fixed while each core
+consumes eight phase objects. M512 preserves the absolute tail oracle (cosine
+`0.99999861`, maximum absolute error `0.0039062`) and the two documents are
+bit-exact. Timing improves from `0.381335 ms` to `0.600561 ms`, a `1.27x`
+row-throughput gain.
+
+R111 next-prep repeats its fixed eight-row local transaction per document in
+the same runtime sequence and places each document's R34 prefixes in a separate
+2,949,120-byte output region. M512 produces byte-identical document outputs;
+the known rounding envelope doubles from five to ten one-code differences,
+with maximum Q delta 1 and scale error `7e-9`. Timing is `5.0606/10.0303 ms`,
+only `1.01x` row-throughput scaling. The prep math, not its dispatch floor,
+dominates this standalone boundary.
+
+This closes the M512 tail/prep ABI but does not yet wire a full batched layer;
+the next dependency is segmented/block-diagonal attention. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r125-batched-tail-next-prep-20260715.csv`.
+
+## R126 — block-diagonal BF16 attention seam admitted (2026-07-15)
+
+The standalone R27 attention graph now processes multiple 256-token documents
+in one dispatch while resetting online-softmax state for every four-query group
+and replaying only that document's sixteen K/V blocks. The first M512 layout
+concatenated already-packed Q buffers behind one row descriptor. That was
+wrong: R27 physical Q is row-major outside the query-group dimension, so the
+second six groups came from another row rather than the second document. Both
+document cosines fell to about 0.99867 and the layout was rejected.
+
+The admitted schedule uses explicit Q, K/V, and output descriptors for each
+document. Two deliberately different documents independently match their CPU
+bidirectional-attention oracles: doc0 cosine `0.99999410`, maximum error
+`0.0002527`; doc1 cosine `0.99999464`, maximum error `0.0002543`. Aggregate
+cosine is `0.99999435`, proving that no cross-document scores enter either
+softmax. M256/M512 timing is `1.4303/2.8932 ms`, essentially row-linear
+(`0.99x` row-throughput scaling).
+
+This proves the segmentation rule and descriptor topology, not yet the full
+resident layer. The next step is to apply the same per-document Q/K/V schedule
+inside the fused QKV/projection/norm attention image, then expose runtime batch
+rows and segment offsets. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r126-segmented-bf16-attention-20260715.csv`.
+
+## R127/R128 — fused segmented attention and full M512 encode admitted (2026-07-15)
+
+R108 now accepts `--batch=N` by replaying its complete B1 descriptor schedule
+inside one runtime command. The core program stays M-agnostic, Q/K/V scratch is
+private per document, and each online-softmax pass consumes only that
+document's sixteen K/V blocks. B1 generated MLIR remains byte-identical.
+
+The first fused M512 layout made each document own a complete 5.1 MB R34 scratch
+image. Its attention output was correct in isolation, but the next direct-X FFN
+expects a compact shared prefix: all padded X documents followed by one inverse
+plane per document. Full-model parity exposed this ABI mismatch. The admitted
+layout keeps per-document scratch after the handoff prefix and scatters only the
+final X/inverse records into the established direct-X format.
+
+Two deliberately different documents are bit-exact against separate fused M256
+hardware runs for both X and inverse metadata. Fused attention measures
+`6.405/11.615 ms` at M256/M512, a `1.10x` row-throughput gain.
+
+The architecture runtime now selects matching M-sized attention, dense-W8 FFN,
+tail, and next-prep caches with `HIPFIRE_EMBED_NPU_BATCH`; rejects mismatched
+component geometry; accepts explicit `[0,256,...]` segment offsets; and pools
+each segment independently. Unsupported projectors or segment shapes retain
+the existing sequential-document path. Since final norm/mean is still M256,
+batched final state is materialized once and final-normed/pooled per segment on
+the GPU.
+
+End-to-end oq8 results for two distinct 256-token documents:
+
+- separate M256 hardware references versus one M512 command: mean cosine
+  `0.99999845`, minimum cosine `0.99999797`, maximum absolute error `0.00025596`;
+- ten reused M512 commands retain exactly the same final parity;
+- three-run timing is `774.491 ms/document` at M256 versus
+  `633.625 ms/document` at M512 (`1267.250 ms` per two-document command), a
+  `1.22x` row-throughput gain, not the originally estimated 60x.
+
+The implementation proves useful whole-encoder batching and a modest measured
+win. It also rejects the original fixed-floor model: projection, FFN,
+next-prep, and attention remain substantially row-linear because weights and
+activation schedules are replayed per document. Larger-B promotion should be
+driven by weight/dataflow reuse, not descriptor replication alone. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r127-fused-segmented-attention-20260715.csv`
+and
+`benchmarks/npu_gemm_tuning/results/r128-full-batched-encode-20260715.csv`.

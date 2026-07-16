@@ -1,0 +1,7 @@
+variant,m,batch,weight_block_bytes,weight_blocks_per_column,weight_bytes_total,absolute_cosine,doc0_vs_m256_cosine,doc1_vs_m256_cosine,doc0_vs_doc1_cosine,ms,rows_per_ms,throughput_gain_vs_own_m256,status,notes
+replicated_weights,256,1,16384,84,11010048,0.99984681,,,,10.520,24.335,,baseline,"existing canonical resident FFN"
+replicated_weights,512,2,16384,168,22020096,,1.00000000,1.00000000,1.00000000,19.929,25.691,1.056,admitted_correctness,"naive duplicated weights; bit-exact"
+iter_count_one_fifo,256,1,16384,28,3670016,,,,,,,,rejected,"all-zero output after normal prime; no-prime probe delivered only first macro and cosine 0.61336109"
+repeat_count_one_fifo,256,1,16384,28,3670016,,,,,,,,rejected_compile,"allocator exhausted 24 memtile BD IDs"
+core_weight_stationary,256,1,15552,28,3483648,0.99984681,,,,20.111,12.729,1.000,rejected_perf,"absolute reference pass"
+core_weight_stationary,512,2,15552,28,3483648,,1.00000000,1.00000000,1.00000000,33.500,15.284,1.201,rejected_perf,"bit-exact after rolling three-output task window"

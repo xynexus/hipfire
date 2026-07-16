@@ -1,0 +1,5 @@
+component,m,batch,absolute_cosine,max_abs,q_mismatches,max_q_delta,max_scale_abs,ms,rows_per_ms,throughput_gain_vs_m256,status,notes
+post_ffn_tail,256,1,0.99999861,0.0039062,,,,0.381335,671.327,1.000,admitted_correctness,"R100 interleaved BF16x2 split-X"
+post_ffn_tail,512,2,0.99999861,0.0039062,,,,0.600561,852.536,1.270,admitted_correctness,"documents bit-exact; four descriptors use document dimension plus repeat_count"
+next_layer_prep,256,1,,,5,1,0.000000007,5.0606,50.587,1.000,admitted_correctness,"R111 one-pass in-place completed state"
+next_layer_prep,512,2,,,10,1,0.000000007,10.0303,51.045,1.009,admitted_correctness,"documents byte-identical; fixed eight-row core transaction repeated in one dispatch"

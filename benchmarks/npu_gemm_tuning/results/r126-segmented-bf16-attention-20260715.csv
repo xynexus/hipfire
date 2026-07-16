@@ -1,0 +1,4 @@
+variant,m,batch,segment_rows,doc0_cosine,doc0_max_abs,doc1_cosine,doc1_max_abs,aggregate_cosine,aggregate_max_abs,ms,rows_per_ms,throughput_gain_vs_m256,status,notes
+bidirectional_bf16,256,1,256,0.99999410,0.0002527,,,0.99999410,0.0002527,1.4303,178.983,1.000,admitted_correctness,"R27 baseline"
+naive_concatenated_q_dma,512,2,256,0.99869340,0.0026014,0.99865441,0.0024911,0.99867145,0.0026014,2.6902,190.320,1.063,rejected_layout,"row-major physical Q layout crossed document boundaries"
+block_diagonal_documents,512,2,256,0.99999410,0.0002527,0.99999464,0.0002543,0.99999435,0.0002543,2.8932,176.966,0.989,admitted_correctness,"explicit Q/KV/output descriptors per document; distinct document inputs"

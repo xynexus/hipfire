@@ -1,0 +1,3 @@
+variant,m,batch,input_layout,input_bytes,absolute_cosine,absolute_max_abs,doc0_vs_m256_cosine,doc1_vs_m256_cosine,doc0_vs_doc1_cosine,ms,rows_per_ms,throughput_gain_vs_m256,status,notes
+direct_x_gate_reuse,256,1,m256_x_plus_one_inverse_plane,786432,0.99988810,0.0147171,,,,8.366,30.600,1.000,admitted_correctness,"canonical BF16x2 absolute reference; mean_abs 0.00238566"
+direct_x_gate_reuse,512,2,two_m288_document_slots_plus_two_inverse_planes,1671168,,,1.00000000,1.00000000,1.00000000,16.489,31.051,1.013,admitted_correctness,"both M256 documents bit-exact; padding rows isolate physical inverse selectors"

@@ -1077,3 +1077,87 @@ arbitrary mixed OQ, OQ8, and +/++ metadata) through this topology and measure
 the complete resident layer. The added kernel parameter remains the platform
 workaround; LDS placement, output repetition, and payload encoding remain
 separate. Durable rows: `results/r121-staged-fullk-n1280-20260713.csv`.
+## 2026-07-15 R123 core-stationary FFN rejection
+
+Object-FIFO `iter_count` compile/lowering evidence did not survive hardware:
+the repeated memtile MM2S chain consumed a source lock that shim S2MM produced
+only once. Normal priming returned zeros; bypassing prime exposed exactly one
+valid macro. `repeat_count` exhausted 24 memtile BDs.
+
+A core-stationary replacement is correct. M512 `[X;X]` is bit-exact with M256,
+using one 28-record weight sequence per column and a rolling three-output task
+window. It is not faster: 20.111 ms at M256 and 33.500 ms at M512 versus the
+replicated-weight 10.520/19.929 ms path. The saved weight DMA does not repay the
+weight-major routing/accumulation overhead. See
+`results/r123-weight-stationary-m-scaling-20260715.csv`.
+
+## 2026-07-15 R124 direct-X M512 contract
+
+Direct-X batching needs document-padded physical rows, not a contiguous M512
+buffer. Each M256 document now occupies one M288 slot and has its own physical
+inverse-RMS record plane, eliminating selector aliasing at rows 256-287. The
+host also scales the canonical input allocation, which previously remained one
+M288 buffer at batch two.
+
+The r55 M256/M512 images compile and pass the combined absolute/self-consistency
+gate. Direct M256 versus canonical measures cosine 0.99988810 and maximum
+absolute error 0.0147171; both M512 documents are bit-exact with direct M256.
+Timing is 8.366/16.489 ms, only 1.01x row-throughput gain. This admits the
+direct-X ABI seam but confirms that replicated-weight FFN batching remains
+row-linear. Continue with tail/next-prep consolidation. See
+`results/r124-direct-x-batched-ffn-20260715.csv`.
+
+## 2026-07-15 R125 unpins the tail/next-prep boundary
+
+Doubling the R100 tail's phase tasks exhausted shim BD IDs. Keeping the four
+M256 descriptors and adding a document dimension plus `repeat_count` compiles
+and is correct: M512 retains cosine 0.99999861, maximum absolute error
+0.0039062, and bit-exact duplicated documents. Timing is 0.381335/0.600561 ms,
+a 1.27x row-throughput gain.
+
+R111 next-prep repeats its eight-row transaction for each padded document and
+writes separate canonical R34 prefix regions. Duplicated outputs are
+byte-identical; M512 has ten one-code Q differences, maximum Q delta 1, and
+`7e-9` scale error. Its 5.0606/10.0303 ms timing is row-linear. The ABI seam is
+admitted, while performance says future work should avoid materializing the
+replicated R34 activation surface. See
+`results/r125-batched-tail-next-prep-20260715.csv`.
+
+## 2026-07-15 R126 proves block-diagonal attention scheduling
+
+R27 can process multiple independent M256 documents in one command by
+resetting online-softmax state per query group and feeding each group only its
+document's sixteen K/V blocks. Concatenating packed Q buffers behind one row
+descriptor is invalid because the physical layout is row-major outside query
+groups; that attempt produced about 0.99867 cosine in both documents.
+
+Explicit Q, K/V, and output tasks per document pass with distinct inputs.
+Doc0/doc1 reach 0.99999410/0.99999464 cosine and 0.0002527/0.0002543 maximum
+error, ruling out cross-document attention. Timing is 1.4303 ms at M256 and
+2.8932 ms at M512, so the math remains row-linear. Apply this descriptor
+topology to the fused resident attention image next. See
+`results/r126-segmented-bf16-attention-20260715.csv`.
+
+## 2026-07-15 R127/R128 fused and end-to-end M512 batching
+
+R108 now repeats its complete B1 task schedule inside one runtime command, with
+private Q/K/V and scratch regions per document. A first per-document R34 image
+passed the local attention oracle but failed the downstream direct-X handoff.
+The corrected form scatters final padded X rows and inverse metadata into the
+compact multi-document prefix consumed by r55 and r46, while keeping transient
+R34 scratch disjoint.
+
+Distinct fused documents are bit-exact against their separate M256 hardware
+oracles. Fused M256/M512 timing is 6.405/11.615 ms (1.10x row throughput).
+The full oq8 encoder now accepts `[0,256,512]` segment offsets, checks matching
+batch geometry across every resident component, and pools the two final states
+independently. One M512 encode matches separate M256 embeddings at mean/minimum
+cosine 0.99999845/0.99999797 and maximum error 0.00025596. Ten reused commands
+retain those values.
+
+Matched three-run timing is 774.491 ms per M256 document versus 633.625 ms per
+M512 document (1267.250 ms per command), a 1.22x throughput gain. The full path
+is admitted, but descriptor replication does not realize the original
+fixed-floor estimate; further scaling needs actual weight/dataflow reuse. See
+`results/r127-fused-segmented-attention-20260715.csv` and
+`results/r128-full-batched-encode-20260715.csv`.
