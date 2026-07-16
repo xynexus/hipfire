@@ -1,7 +1,7 @@
 # Gemma 4 Phase 5 dense-31B admission
 
 Date: 2026-07-15. Status updated: 2026-07-16. Historical BF16 gate blocked;
-canonical OQ8 and OQ8+ candidates rejected at SWA-1.
+canonical OQ8, OQ8+, and BF16-`down_proj` anchor candidates rejected at SWA-1.
 
 ## OQ8 contract revision
 
@@ -115,6 +115,60 @@ fail, so SWA, SWA+1, IT, and OQ8++ were not run. Durable evidence is under
 `~/.hipfire/evidence/gemma4/phase5-oq8plus-admission-v1`; the SWA-1 comparison
 SHA256 is `205c52bb8c7ebf9f8dad1f99e614e8e46ed1173346b7fca0140fc1e5b14cf9e5`.
 The broad thresholds and final OQ8++ narrowing thresholds remain unchanged.
+
+## BF16 down-projection anchor rejection
+
+The next bounded diagnostic tests whether precision at the largest FFN residual
+writer can interrupt cumulative propagation. A lossless BF16 HFQ intermediary
+is requantized to OQ8 with exactly these overrides:
+
+- all 60 `model.language_model.layers.*.mlp.down_proj.weight` tensors remain
+  BF16;
+- all 350 other language-model projection tensors are OQ8G256;
+- all small norm and scalar tensors retain their source precision.
+
+The resulting `Gemma-4-31B-downbf16.oq8.hfq` is 38,586,917,272 bytes with
+1,188 tensors, 31,273,088,876 source parameters, 24,311,703,552 rewritten
+parameters, and quantization hash `cb8eb6e621917c3d`. Its embedded tokenizer is
+the pinned Gemma 4 tokenizer, SHA256
+`12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6`.
+HFQ-to-HFQ rewriting used a bounded spill file; anonymous producer memory
+remained near the 2 GiB spill threshold rather than retaining the 38.55 GB
+output in RAM.
+
+The candidate passes base-short and lifecycle:
+
+- minimum hidden cosine `0.9963057427527575`;
+- maximum hidden NRMSE `0.08614873066273741`;
+- final-logit cosine `0.9994882960196833`;
+- final-logit maximum absolute error `1.0222406387329102`;
+- final argmax `7001`, top-5 overlap `5/5`, and exact eight-token greedy output;
+- reset and full unload/reload reruns are bit-exact.
+
+The base-short comparison SHA256 is
+`d18f7d3c579ea5286d97c7d227142e42fccb0de2220c4033e0e48cabb5616447`.
+The 38.6 GB candidate also fits the 45.1 GB gfx1103 allocation together with
+both 1,024-token F32 layered KV pools.
+
+The exact 1,023-token SWA-1 capture took 44 minutes 20 seconds, reflecting the
+substantial performance cost of BF16 down projections, and still fails:
+
+- layer 58 cosine `0.9693396841748947`, NRMSE `0.25272996220496396`;
+- layer 59 cosine `0.99197309255537`, NRMSE `0.18601964761028233`;
+- final-logit cosine `0.8938572882264477`;
+- final-logit maximum absolute error `5.484806060791016`.
+
+All values are finite; final argmax, first greedy token `7001`, and top-5
+overlap `5/5` still agree. The final-logit result is worse than both plain OQ8
+and activation-calibrated OQ8+, so retaining FFN `down_proj` in BF16 is rejected
+as an error-control basis. SWA, SWA+1, IT, and OQ8++ were not run. Durable
+evidence is under
+`~/.hipfire/evidence/gemma4/phase5-oq8-downbf16-admission-v1`; the SWA-1
+comparison SHA256 is
+`d9b6d4783b868405e4fa11149332ba7ea564acc2b9a9c427c33fbe4a216fd3ae`.
+The next remediation must use a materially different basis rather than another
+FFN down-projection precision anchor. The broad OQ8 and final OQ8++ thresholds
+remain frozen.
 
 ## Historical BF16 base-short result
 
@@ -510,5 +564,6 @@ summaries, and non-finite counts.
 The original BF16 base-short verdict is therefore unchanged: final-logit maximum
 error is `0.5618224143981934`; hidden thresholds fail at layers 39, 52, 56, 57,
 and 58. The BF16 candidate path stopped here. Under the explicit OQ8 revision,
-current Phase 5 advances from the valid OQ8 base-short baseline to the
-SWA-crossing, multi-global, reload/sequential, and instruction-checkpoint gates.
+current Phase 5 advanced through base-short, multi-global, and
+reload/sequential gates, then stopped at SWA-1 for all three tested OQ8-family
+candidates before the SWA, SWA+1, or instruction-checkpoint gates.

@@ -2462,12 +2462,24 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     }
     for t in tensors.iter_mut() {
         if t.spilled_len == 0 && !t.data.is_empty() {
-            let len = spill.spill(&t.data).unwrap_or(0);
-            t.spilled_len = len;
-            t.data = Vec::new(); // free the memory
+            match spill.spill(&t.data) {
+                Ok(len) => {
+                    t.spilled_len = len;
+                    t.data = Vec::new(); // free the memory
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: could not spill tensor {}: {error}; retaining it in memory",
+                        t.name
+                    );
+                    break;
+                }
+            }
         }
     }
-    let _ = spill.flush();
+    if let Err(error) = spill.flush() {
+        eprintln!("warning: could not flush tensor spill: {error}");
+    }
 }
 
 // ─── Model Discovery ────────────────────────────────────────────────────────
@@ -3980,6 +3992,19 @@ fn run_hfq_source_pipeline(
     }
 
     let mut hfq_tensors = Vec::with_capacity(hfq.tensors.len());
+    // HFQ-to-HFQ rewrites can be just as large as direct safetensors ingest.
+    // Keep completed output tensors bounded instead of retaining an entire
+    // mixed-precision model in RAM. Real QTIP is a post-pass over the staged
+    // tensors and therefore still requires them to remain resident.
+    let spill_dir = output.parent().unwrap_or(Path::new("."));
+    let mut spill = if matches!(format, HfqInputFormat::Qtip3 | HfqInputFormat::Qtip4) {
+        None
+    } else {
+        Some(
+            TensorSpill::new(spill_dir)
+                .map_err(|error| format!("create HFQ rewrite spill file: {error}"))?,
+        )
+    };
     let mut total_params = 0u64;
     let mut quantized_params = 0u64;
     for t in &hfq.tensors {
@@ -4040,6 +4065,9 @@ fn run_hfq_source_pipeline(
                 spilled_len: 0,
             });
         }
+        if let Some(ref mut output_spill) = spill {
+            maybe_spill(&mut hfq_tensors, output_spill, 2 * 1024 * 1024 * 1024);
+        }
     }
 
     // Real QTIP-3 is a post-pass over the BF16-staged 2D weights, shared with
@@ -4080,7 +4108,16 @@ fn run_hfq_source_pipeline(
             .sum();
     }
 
-    let total_bytes: usize = hfq_tensors.iter().map(|t| t.data.len()).sum();
+    let total_bytes: usize = hfq_tensors
+        .iter()
+        .map(|tensor| {
+            if tensor.spilled_len > 0 {
+                tensor.spilled_len as usize
+            } else {
+                tensor.data.len()
+            }
+        })
+        .sum();
     eprintln!("\n=== HFQ Input Quantization Summary ===");
     eprintln!("  Total params:     {total_params}");
     eprintln!(
@@ -4109,10 +4146,22 @@ fn run_hfq_source_pipeline(
             obj.insert("calibration".to_string(), prov.clone());
         }
     }
-    let metadata_json =
-        metadata_with_quantization_hash(metadata, &hfq_tensors, None).map_err(|e| e.to_string())?;
-    write_hfq(output, hfq.arch_id, &metadata_json, &hfq_tensors, None)
-        .map_err(|e| format!("write HFQ output: {e}"))?;
+    if let Some(ref mut output_spill) = spill {
+        maybe_spill(&mut hfq_tensors, output_spill, 0);
+    }
+    let metadata_json = metadata_with_quantization_hash(metadata, &hfq_tensors, spill.as_ref())
+        .map_err(|e| e.to_string())?;
+    write_hfq(
+        output,
+        hfq.arch_id,
+        &metadata_json,
+        &hfq_tensors,
+        spill.as_mut(),
+    )
+    .map_err(|e| format!("write HFQ output: {e}"))?;
+    if let Some(output_spill) = spill {
+        output_spill.cleanup();
+    }
     let file_size = std::fs::metadata(output)
         .map_err(|e| format!("stat HFQ output: {e}"))?
         .len();
@@ -10405,6 +10454,58 @@ mod xxh64_provenance_tests {
         assert!(hash["producer"].get("git_branch").is_some());
         assert!(hash["producer"].get("git_describe").is_some());
         assert!(hash["producer"].get("git_dirty").is_some());
+    }
+
+    #[test]
+    fn spilled_hfq_payload_round_trips() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "hipfire-quantize-spill-roundtrip-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temp directory");
+        let output = temp_dir.join("roundtrip.hfq");
+        let expected_payloads = [vec![1, 2, 3, 4], vec![5, 6, 7, 8, 9, 10]];
+        let mut tensors = vec![
+            HfqTensor {
+                name: "model.layers.0.self_attn.q_proj.weight".to_string(),
+                quant_type: QuantType::BF16,
+                shape: vec![2, 1],
+                group_size: 0,
+                data: expected_payloads[0].clone(),
+                spilled_len: 0,
+            },
+            HfqTensor {
+                name: "model.layers.0.mlp.down_proj.weight".to_string(),
+                quant_type: QuantType::BF16,
+                shape: vec![3, 1],
+                group_size: 0,
+                data: expected_payloads[1].clone(),
+                spilled_len: 0,
+            },
+        ];
+        let mut spill = TensorSpill::new(&temp_dir).expect("create spill");
+
+        maybe_spill(&mut tensors, &mut spill, 0);
+        assert!(tensors.iter().all(|tensor| tensor.data.is_empty()));
+        assert_eq!(tensors[0].spilled_len, expected_payloads[0].len() as u64);
+        assert_eq!(tensors[1].spilled_len, expected_payloads[1].len() as u64);
+
+        let metadata = serde_json::json!({ "architecture": "test" });
+        let metadata_json =
+            metadata_with_quantization_hash(metadata, &tensors, Some(&spill)).expect("metadata");
+        write_hfq(&output, 24, &metadata_json, &tensors, Some(&mut spill))
+            .expect("write spilled HFQ");
+
+        let hfq = HfqInputFile::open(&output).expect("open round-trip HFQ");
+        assert_eq!(hfq.arch_id, 24);
+        assert_eq!(hfq.tensors.len(), expected_payloads.len());
+        for (tensor, expected) in hfq.tensors.iter().zip(expected_payloads.iter()) {
+            assert_eq!(hfq.tensor_data(tensor), expected);
+        }
+
+        drop(hfq);
+        spill.cleanup();
+        std::fs::remove_dir_all(&temp_dir).expect("remove temp directory");
     }
 
     #[test]
