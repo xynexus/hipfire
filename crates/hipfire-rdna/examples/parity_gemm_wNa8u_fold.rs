@@ -80,7 +80,10 @@ fn main() {
 
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
-        println!("SKIP parity_gemm_wNa8u_fold: {} lacks wave32 WMMA", gpu.arch);
+        println!(
+            "SKIP parity_gemm_wNa8u_fold: {} lacks wave32 WMMA",
+            gpu.arch
+        );
         return;
     }
     let ng = k / group;
@@ -94,10 +97,16 @@ fn main() {
     let xq_dev = gpu.upload_raw(&vec![0u8; b * k], &[b, k]).unwrap();
     let xs_dev = gpu.alloc_tensor(&[b * ng], DType::F32).unwrap();
     let xsum_dev = gpu.upload_raw(&vec![0u8; b * ng * 4], &[b * ng]).unwrap();
-    gpu.quantize_act_oq8_sum(&x_dev, &xq_dev, &xs_dev, &xsum_dev, b, k, group).unwrap();
+    gpu.quantize_act_oq8_sum(&x_dev, &xq_dev, &xs_dev, &xsum_dev, b, k, group)
+        .unwrap();
     gpu.device_synchronize().unwrap();
 
-    let xq: Vec<i8> = gpu.download_raw(&xq_dev, b * k).unwrap().iter().map(|&v| v as i8).collect();
+    let xq: Vec<i8> = gpu
+        .download_raw(&xq_dev, b * k)
+        .unwrap()
+        .iter()
+        .map(|&v| v as i8)
+        .collect();
     let xs = gpu.download_f32(&xs_dev).unwrap();
     let xsum: Vec<i32> = gpu
         .download_raw(&xsum_dev, b * ng * 4)
@@ -118,7 +127,11 @@ fn main() {
     println!(
         "quantize_act_oq8_sum on {}: Xsum vs CPU recompute -> {} ({} mismatch)",
         gpu.arch,
-        if xsum_mismatch == 0 { "EXACT" } else { "BROKEN" },
+        if xsum_mismatch == 0 {
+            "EXACT"
+        } else {
+            "BROKEN"
+        },
         xsum_mismatch
     );
     if xsum_mismatch != 0 {
@@ -141,8 +154,19 @@ fn main() {
         let yf_dev = gpu.alloc_tensor(&[b * m], DType::F32).unwrap();
 
         gpu.gemm_opus_tiled_wmma_u(
-            bits as usize, &wp_dev, &ws_dev, &xq_dev, &xs_dev, &xsum_dev, &yf_dev, m, k, b, group,
-            2, 2,
+            bits as usize,
+            &wp_dev,
+            &ws_dev,
+            &xq_dev,
+            &xs_dev,
+            &xsum_dev,
+            &yf_dev,
+            m,
+            k,
+            b,
+            group,
+            2,
+            2,
         )
         .unwrap();
         gpu.device_synchronize().unwrap();

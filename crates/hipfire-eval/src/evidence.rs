@@ -713,7 +713,11 @@ pub(crate) fn build_admission_artifact(
                 } else {
                     EvalStatus::Skip
                 },
-                rows: if pass_rows > 0 { pass_rows } else { failed_rows },
+                rows: if pass_rows > 0 {
+                    pass_rows
+                } else {
+                    failed_rows
+                },
                 reason: if pass_rows > 0 {
                     None
                 } else if *kind == "diffusion" && failed_rows > 0 {
@@ -730,7 +734,11 @@ pub(crate) fn build_admission_artifact(
         .iter()
         .filter(|e| e.status != EvalStatus::Pass)
         .count();
-    if config.batteries.iter().all(|battery| *battery == BatteryId::Diffusion) {
+    if config
+        .batteries
+        .iter()
+        .all(|battery| *battery == BatteryId::Diffusion)
+    {
         let failed = rows
             .iter()
             .filter(|row| row.battery == BatteryId::Diffusion && row.status == EvalStatus::Fail)
@@ -762,7 +770,11 @@ pub(crate) fn build_admission_artifact(
             findings: Vec::new(),
         };
     }
-    if config.batteries.iter().all(|battery| *battery == BatteryId::Diffusion) {
+    if config
+        .batteries
+        .iter()
+        .all(|battery| *battery == BatteryId::Diffusion)
+    {
         return AdmissionArtifact {
             schema: 1,
             provenance: run_provenance(ctx),

@@ -297,9 +297,7 @@ impl DiffusionSchedule {
                 "SeFi timestep_shift_alpha {timestep_shift_alpha} must be finite and positive"
             )));
         }
-        let shift = |u: f32| {
-            timestep_shift_alpha * u / (1.0 + (timestep_shift_alpha - 1.0) * u)
-        };
+        let shift = |u: f32| timestep_shift_alpha * u / (1.0 + (timestep_shift_alpha - 1.0) * u);
         // The SeFi reference indexes the scheduler immediately after
         // construction. For its 1000-step FlowMatchEuler config those arrays
         // are timesteps 1000..1 and sigmas 1.0..0.001. Match the reference's
@@ -382,8 +380,7 @@ impl DiffusionSchedule {
                 "SeFi timestep_shift_alpha {timestep_shift_alpha} must be finite and positive"
             )));
         }
-        let shift =
-            |u: f32| timestep_shift_alpha * u / (1.0 + (timestep_shift_alpha - 1.0) * u);
+        let shift = |u: f32| timestep_shift_alpha * u / (1.0 + (timestep_shift_alpha - 1.0) * u);
         let lookup = |u: f32| {
             let index = (u.clamp(0.0, 1.0) * 999.0).floor() as usize;
             let timestep = (1000 - index) as f32;
@@ -392,8 +389,8 @@ impl DiffusionSchedule {
         // base_sigma(u) = lookup(shift(u)) ≈ 1 - shift(u); pick u_start so its base
         // sigma is first_sigma, then resume the trajectory over [u_start, 1].
         let s = (1.0 - first_sigma).clamp(0.0, 1.0);
-        let u_start = (s / (timestep_shift_alpha - s * (timestep_shift_alpha - 1.0)))
-            .clamp(0.0, 1.0);
+        let u_start =
+            (s / (timestep_shift_alpha - s * (timestep_shift_alpha - 1.0))).clamp(0.0, 1.0);
         let u_at = |index: usize| u_start + (1.0 - u_start) * index as f32 / steps as f32;
         let coordinates = (0..=steps)
             .map(|index| {
@@ -406,7 +403,9 @@ impl DiffusionSchedule {
                 (timestep_sem, timestep_tex, sigma_sem, sigma_tex)
             })
             .collect::<Vec<_>>();
-        let base_sigmas = (0..=steps).map(|index| lookup(shift(u_at(index))).1).collect();
+        let base_sigmas = (0..=steps)
+            .map(|index| lookup(shift(u_at(index))).1)
+            .collect();
         let mut schedule_steps = Vec::with_capacity(steps);
         for index in 0..steps {
             let (timestep_sem, timestep_tex, sigma_sem, sigma_tex) = coordinates[index];
@@ -461,10 +460,7 @@ impl DiffusionSchedule {
                 }
             })
             .collect::<Vec<_>>();
-        let timesteps = sigmas[..steps]
-            .iter()
-            .map(|sigma| sigma * 1000.0)
-            .collect();
+        let timesteps = sigmas[..steps].iter().map(|sigma| sigma * 1000.0).collect();
         Ok(Self {
             timesteps,
             sigmas,

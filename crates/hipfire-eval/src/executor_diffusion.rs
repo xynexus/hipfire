@@ -73,7 +73,10 @@ pub(crate) fn diffusion_battery_rows(config: &EvalConfig, ctx: &EvalContext) -> 
     }
 }
 
-fn run_diffusion_battery(config: &EvalConfig, ctx: &EvalContext) -> Result<Vec<EvalResult>, String> {
+fn run_diffusion_battery(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+) -> Result<Vec<EvalResult>, String> {
     let baseline_path = config
         .baseline
         .as_deref()
@@ -96,7 +99,11 @@ fn run_diffusion_battery(config: &EvalConfig, ctx: &EvalContext) -> Result<Vec<E
         "HIPFIRE_DIFFUSION_EVAL_EARLY_RMSE",
         "HIPFIRE_DIFFUSION_EVAL_SSIM_MIN",
     ];
-    if config.fail_on_admission && OVERRIDES.iter().any(|name| std::env::var_os(name).is_some()) {
+    if config.fail_on_admission
+        && OVERRIDES
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+    {
         return Err(
             "diffusion diagnostic overrides are forbidden with --fail-on-admission".to_string(),
         );
@@ -129,7 +136,10 @@ fn run_diffusion_battery(config: &EvalConfig, ctx: &EvalContext) -> Result<Vec<E
     let height = eval_u32("HIPFIRE_DIFFUSION_EVAL_HEIGHT", 64)?;
     let steps = eval_u32("HIPFIRE_DIFFUSION_EVAL_STEPS", 4)?;
     let device_id = eval_i32("HIPFIRE_DIFFUSION_EVAL_DEVICE", 0)?;
-    let early_rmse_limit = eval_f64("HIPFIRE_DIFFUSION_EVAL_EARLY_RMSE", EARLY_LATENT_REL_RMSE_LIMIT)?;
+    let early_rmse_limit = eval_f64(
+        "HIPFIRE_DIFFUSION_EVAL_EARLY_RMSE",
+        EARLY_LATENT_REL_RMSE_LIMIT,
+    )?;
     let ssim_min = eval_f64("HIPFIRE_DIFFUSION_EVAL_SSIM_MIN", SSIM_MIN)?;
     let cfg_scale = if sefi { 1.0 } else { 4.0 };
     let request = DiffusionBatchRequest {
@@ -172,8 +182,14 @@ fn run_diffusion_battery(config: &EvalConfig, ctx: &EvalContext) -> Result<Vec<E
                 actual.dimensions, reference.dimensions
             ));
         }
-        let _ = save_png(&baseline_run.images[index], &image_dir.join(format!("case{index}_seed{seed}_baseline.png")));
-        let _ = save_png(&candidate_run.images[index], &image_dir.join(format!("case{index}_seed{seed}_candidate.png")));
+        let _ = save_png(
+            &baseline_run.images[index],
+            &image_dir.join(format!("case{index}_seed{seed}_baseline.png")),
+        );
+        let _ = save_png(
+            &candidate_run.images[index],
+            &image_dir.join(format!("case{index}_seed{seed}_candidate.png")),
+        );
 
         // --- telemetry: exact pixel drift (non-gating) ---
         let mut abs_sum = 0u64;
@@ -189,7 +205,10 @@ fn run_diffusion_battery(config: &EvalConfig, ctx: &EvalContext) -> Result<Vec<E
         let coherence = image_coherence(&actual);
 
         // --- gate 2: early-latent fidelity (hard) ---
-        let early = match (baseline_run.early.get(index), candidate_run.early.get(index)) {
+        let early = match (
+            baseline_run.early.get(index),
+            candidate_run.early.get(index),
+        ) {
             (Some(b), Some(c)) if !b.is_empty() && b.len() == c.len() => Some(rel_rmse(b, c)),
             _ => None,
         };
@@ -222,12 +241,18 @@ fn run_diffusion_battery(config: &EvalConfig, ctx: &EvalContext) -> Result<Vec<E
         let mut metrics = BTreeMap::from([
             ("implemented".to_string(), json!(true)),
             ("early_latent_rel_rmse".to_string(), json!(early)),
-            ("early_latent_rel_rmse_limit".to_string(), json!(early_rmse_limit)),
+            (
+                "early_latent_rel_rmse_limit".to_string(),
+                json!(early_rmse_limit),
+            ),
             ("early_latent_step".to_string(), json!(EARLY_LATENT_STEP)),
             ("ssim".to_string(), json!(ssim)),
             ("ssim_min".to_string(), json!(ssim_min)),
             ("candidate_image_std".to_string(), json!(coherence.std)),
-            ("candidate_image_finite".to_string(), json!(coherence.finite)),
+            (
+                "candidate_image_finite".to_string(),
+                json!(coherence.finite),
+            ),
             // telemetry (non-gating): kept for continuity / dashboards.
             ("rgb_mae_u8".to_string(), json!(mae_u8)),
             ("rgb_max_error_u8".to_string(), json!(max_error)),
@@ -236,18 +261,38 @@ fn run_diffusion_battery(config: &EvalConfig, ctx: &EvalContext) -> Result<Vec<E
             ("steps".to_string(), json!(steps)),
             ("cfg_scale".to_string(), json!(cfg_scale)),
             ("seed".to_string(), json!(seed)),
-            ("baseline_elapsed_ms".to_string(), json!(baseline_run.elapsed_ms)),
-            ("candidate_elapsed_ms".to_string(), json!(candidate_run.elapsed_ms)),
+            (
+                "baseline_elapsed_ms".to_string(),
+                json!(baseline_run.elapsed_ms),
+            ),
+            (
+                "candidate_elapsed_ms".to_string(),
+                json!(candidate_run.elapsed_ms),
+            ),
         ]);
-        metrics.insert("candidate_png".to_string(), json!(format!("artifacts/diffusion/case{index}_seed{seed}_candidate.png")));
-        metrics.insert("baseline_png".to_string(), json!(format!("artifacts/diffusion/case{index}_seed{seed}_baseline.png")));
+        metrics.insert(
+            "candidate_png".to_string(),
+            json!(format!(
+                "artifacts/diffusion/case{index}_seed{seed}_candidate.png"
+            )),
+        );
+        metrics.insert(
+            "baseline_png".to_string(),
+            json!(format!(
+                "artifacts/diffusion/case{index}_seed{seed}_baseline.png"
+            )),
+        );
 
         rows.push(row(
             BatteryId::Diffusion,
             None,
             &format!("rgb_baseline_{index}"),
             Some(format!("seed-{seed}")),
-            if passed { EvalStatus::Pass } else { EvalStatus::Fail },
+            if passed {
+                EvalStatus::Pass
+            } else {
+                EvalStatus::Fail
+            },
             (!passed).then(|| format!("diffusion admission failed: {}", fail_reasons.join("; "))),
             metrics,
             config,
@@ -300,7 +345,11 @@ fn generate_images(
             Ok(())
         };
         let images = pipeline
-            .generate_batch_with_progress_and_runtime_options(request.clone(), runtime, &mut progress)
+            .generate_batch_with_progress_and_runtime_options(
+                request.clone(),
+                runtime,
+                &mut progress,
+            )
             .map_err(|error| format!("generate diffusion {label}: {error}"))?
             .images;
         let early = captured
@@ -346,7 +395,12 @@ fn generate_images(
             early.push(
                 captured
                     .into_inner()
-                    .map(|l| split_latent_items(&l).into_iter().next().unwrap_or_default())
+                    .map(|l| {
+                        split_latent_items(&l)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default()
+                    })
                     .unwrap_or_default(),
             );
         }
@@ -384,12 +438,21 @@ struct Coherence {
 fn image_coherence(img: &DecodedRgb) -> Coherence {
     let n = img.rgb.len().max(1) as f64;
     let mean = img.rgb.iter().map(|&v| v as f64).sum::<f64>() / n;
-    let var = img.rgb.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+    let var = img
+        .rgb
+        .iter()
+        .map(|&v| (v as f64 - mean).powi(2))
+        .sum::<f64>()
+        / n;
     let std = var.sqrt();
     let finite = std.is_finite();
     // u8 pixels are always finite; the std floor (≈ <1 LSB spread) is the real
     // degenerate-image guard.
-    Coherence { ok: finite && std > 1.0, std, finite }
+    Coherence {
+        ok: finite && std > 1.0,
+        std,
+        finite,
+    }
 }
 
 fn rel_rmse(a: &[f32], b: &[f32]) -> f64 {
@@ -525,19 +588,28 @@ fn save_png(encoded: &str, path: &std::path::Path) -> Result<(), String> {
 
 fn eval_u32(name: &str, default: u32) -> Result<u32, String> {
     std::env::var(name)
-        .map(|raw| raw.parse().map_err(|error| format!("{name}={raw:?}: {error}")))
+        .map(|raw| {
+            raw.parse()
+                .map_err(|error| format!("{name}={raw:?}: {error}"))
+        })
         .unwrap_or(Ok(default))
 }
 
 fn eval_i32(name: &str, default: i32) -> Result<i32, String> {
     std::env::var(name)
-        .map(|raw| raw.parse().map_err(|error| format!("{name}={raw:?}: {error}")))
+        .map(|raw| {
+            raw.parse()
+                .map_err(|error| format!("{name}={raw:?}: {error}"))
+        })
         .unwrap_or(Ok(default))
 }
 
 fn eval_f64(name: &str, default: f64) -> Result<f64, String> {
     std::env::var(name)
-        .map(|raw| raw.parse().map_err(|error| format!("{name}={raw:?}: {error}")))
+        .map(|raw| {
+            raw.parse()
+                .map_err(|error| format!("{name}={raw:?}: {error}"))
+        })
         .unwrap_or(Ok(default))
 }
 
@@ -546,7 +618,10 @@ mod tests {
     use super::*;
 
     fn img(w: u32, h: u32, rgb: Vec<u8>) -> DecodedRgb {
-        DecodedRgb { dimensions: (w, h), rgb }
+        DecodedRgb {
+            dimensions: (w, h),
+            rgb,
+        }
     }
 
     fn checkerboard(w: usize, h: usize, invert: bool) -> DecodedRgb {
@@ -572,7 +647,11 @@ mod tests {
         let a = checkerboard(32, 32, false);
         let b = checkerboard(32, 32, true);
         // Anti-correlated structure => SSIM well below the garbage floor.
-        assert!(ssim_luma(&a, &b) < SSIM_MIN, "inverted ssim = {}", ssim_luma(&a, &b));
+        assert!(
+            ssim_luma(&a, &b) < SSIM_MIN,
+            "inverted ssim = {}",
+            ssim_luma(&a, &b)
+        );
     }
 
     #[test]

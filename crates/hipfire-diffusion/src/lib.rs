@@ -274,8 +274,10 @@ struct RocmWeightCache {
     /// f32 scales [M*K/256]) pair for the fold GEMM (`gemm_opus_tiled_wmma_u`).
     /// Codes are unsigned (u = q + 2^(bits-1)); the zero-point is folded out at
     /// GEMM time via the activation group sum.
-    named_wu:
-        std::collections::HashMap<(String, u32), (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
+    named_wu: std::collections::HashMap<
+        (String, u32),
+        (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor),
+    >,
     /// Active activation precision for the resident linear path this step (the
     /// per-STEP schedule). Used directly unless the per-LAYER policy overrides.
     linear_precision: LinearPrecision,
@@ -473,8 +475,13 @@ mod quantize_wua8_tests {
             assert_eq!(scales, ref_scales, "scales mismatch bits={bits}");
             let stride = k * bits as usize / 8;
             for row in 0..m {
-                let decoded = opus_lowbit::unpack_dense(&packed[row * stride..(row + 1) * stride], k, bits);
-                assert_eq!(&decoded[..], &ref_codes[row * k..(row + 1) * k], "codes row={row} bits={bits}");
+                let decoded =
+                    opus_lowbit::unpack_dense(&packed[row * stride..(row + 1) * stride], k, bits);
+                assert_eq!(
+                    &decoded[..],
+                    &ref_codes[row * k..(row + 1) * k],
+                    "codes row={row} bits={bits}"
+                );
             }
         }
     }
@@ -836,7 +843,10 @@ impl RocmWeightCache {
         bits: u32,
     ) -> DiffusionResult<(*mut std::ffi::c_void, *mut std::ffi::c_void, usize)> {
         const GROUP: usize = 256;
-        assert!(matches!(bits, 1 | 2 | 4 | 8), "resident_wua8: bits must be ∈ {{1,2,4,8}}");
+        assert!(
+            matches!(bits, 1 | 2 | 4 | 8),
+            "resident_wua8: bits must be ∈ {{1,2,4,8}}"
+        );
         let (m, k) = match weight.shape.as_slice() {
             [out, inf] => (*out, *inf),
             other => {
@@ -910,7 +920,9 @@ impl RocmWeightCache {
                         m * k
                     )));
                 }
-                quantize_wua8_rows(m, k, ng, bits, 1, |row_base, elem| cpu.data[row_base + elem])
+                quantize_wua8_rows(m, k, ng, bits, 1, |row_base, elem| {
+                    cpu.data[row_base + elem]
+                })
             };
             let w_u = gpu
                 .upload_raw(&packed, &[m * k * bits as usize / 8])
@@ -920,7 +932,10 @@ impl RocmWeightCache {
                 .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
             self.named_wu.insert(key.clone(), (w_u, w_scales));
         }
-        let (w_u, w_scales) = self.named_wu.get(&key).expect("named wu weight just inserted");
+        let (w_u, w_scales) = self
+            .named_wu
+            .get(&key)
+            .expect("named wu weight just inserted");
         Ok((w_u.buf.as_ptr(), w_scales.buf.as_ptr(), ng))
     }
 
@@ -1442,7 +1457,7 @@ use quant_decode::*;
 mod quant_encode;
 pub use quant_encode::{
     diff_quantized_transformer_tensors, eval_fold_calibration, open_calib_sidecar,
-    oq4_arch_combined_len, pack_oq4_arch_combined, quantize_diffusion_hfq, opus_quant_token,
+    opus_quant_token, oq4_arch_combined_len, pack_oq4_arch_combined, quantize_diffusion_hfq,
     quantize_diffusion_hfq_plain, DiffusionQuantFormat, DiffusionQuantizeSummary, FoldCalibRow,
     HessianSidecar, PlainOpusPolicy, PlainQuantizeSummary, TensorQuantDiff,
 };
@@ -5115,9 +5130,7 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
         .get("vae")
         .and_then(|component| component.class_name.as_deref())
     {
-        if vae != "AutoencoderKL"
-            && vae != "AutoencoderKLQwenImage"
-            && vae != "AutoencoderKLFlux2"
+        if vae != "AutoencoderKL" && vae != "AutoencoderKLQwenImage" && vae != "AutoencoderKLFlux2"
         {
             return Some(format!(
                 "native diffusion runtime supports AutoencoderKL-family VAEs only; artifact vae class {vae:?} is unsupported"

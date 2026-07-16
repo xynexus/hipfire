@@ -413,7 +413,12 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
     let total_steps = schedule.timesteps.len();
     dump_denoise_trace_tensor(
         "latent_000",
-        &[latents.batch, latents.channels, latents.height, latents.width],
+        &[
+            latents.batch,
+            latents.channels,
+            latents.height,
+            latents.width,
+        ],
         &latents.data,
     );
     dump_denoise_trace_tensor(
@@ -543,7 +548,12 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
         };
         dump_denoise_trace_tensor(
             &format!("velocity_{:03}", step + 1),
-            &[latents.batch, latents.channels, latents.height, latents.width],
+            &[
+                latents.batch,
+                latents.channels,
+                latents.height,
+                latents.width,
+            ],
             &guided.data,
         );
         // Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model
@@ -583,7 +593,12 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
         runtime_kind = merge_runtime_kind(runtime_kind, step_runtime_kind);
         dump_denoise_trace_tensor(
             &format!("latent_{:03}", step + 1),
-            &[latents.batch, latents.channels, latents.height, latents.width],
+            &[
+                latents.batch,
+                latents.channels,
+                latents.height,
+                latents.width,
+            ],
             &latents.data,
         );
         if let Some(masked_reference) = masked_reference {

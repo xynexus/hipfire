@@ -29,8 +29,6 @@ use hipfire_arch_specs as _;
 
 pub mod codecs;
 pub mod gguf_import;
-/// Opus mixed-precision low-bit weight codec (unsigned codes + offset fold).
-pub mod opus_lowbit;
 pub mod gptq;
 pub mod hessian_io;
 #[allow(dead_code)]
@@ -38,6 +36,8 @@ pub mod hfhs_diag;
 pub mod hfq_out;
 #[allow(dead_code)]
 pub mod ldlq;
+/// Opus mixed-precision low-bit weight codec (unsigned codes + offset fold).
+pub mod opus_lowbit;
 pub mod quant_plan;
 // QTIP encoder core: some helpers are not yet wired into the dispatch.
 pub mod fixture;

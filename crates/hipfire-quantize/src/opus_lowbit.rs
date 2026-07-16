@@ -48,7 +48,10 @@ pub const fn is_dense_width(bits: u32) -> bool {
 /// contract: dequant value ≈ `(code - Z) * scale`.
 pub fn quantize_symmetric(weights: &[f32], group: usize, bits: u32) -> (Vec<u8>, Vec<f32>) {
     assert!((1..=8).contains(&bits), "bits must be 1..=8");
-    assert!(group > 0 && weights.len() % group == 0, "len must be a multiple of group");
+    assert!(
+        group > 0 && weights.len() % group == 0,
+        "len must be a multiple of group"
+    );
     let z = zero_point(bits);
     let qmin = -z;
     let qmax = z - 1;
@@ -58,7 +61,11 @@ pub fn quantize_symmetric(weights: &[f32], group: usize, bits: u32) -> (Vec<u8>,
         let max_abs = chunk.iter().fold(0.0f32, |acc, &w| acc.max(w.abs()));
         // Map the largest magnitude onto the negative rail (Z levels), matching a
         // symmetric signed grid; guard the all-zero group.
-        let scale = if max_abs > 0.0 { max_abs / z as f32 } else { 1.0 };
+        let scale = if max_abs > 0.0 {
+            max_abs / z as f32
+        } else {
+            1.0
+        };
         scales.push(scale);
         for &w in chunk {
             let q = (w / scale).round() as i32;
@@ -91,13 +98,19 @@ pub fn quantize_symmetric_clip(
     min_clip: f32,
 ) -> (Vec<u8>, Vec<f32>) {
     assert!((1..=8).contains(&bits), "bits must be 1..=8");
-    assert!(group > 0 && weights.len() % group == 0, "len must be a multiple of group");
+    assert!(
+        group > 0 && weights.len() % group == 0,
+        "len must be a multiple of group"
+    );
     let n_steps = n_steps.max(1);
     let z = zero_point(bits);
     let (qmin, qmax) = (-z, z - 1);
     // Per-tensor channel count (for imatrix indexing) inferred from importance.
     let n_groups = importance.map(|im| {
-        assert!(im.len() % group == 0 && weights.len() % im.len() == 0, "importance must be [K], K%group==0");
+        assert!(
+            im.len() % group == 0 && weights.len() % im.len() == 0,
+            "importance must be [K], K%group==0"
+        );
         im.len() / group
     });
     let mut codes = vec![0u8; weights.len()];
@@ -182,7 +195,10 @@ pub fn weighted_quant_error(
 /// occupies bits `[ (j*bits) % 8 .. +bits ]` of byte `j*bits/8`, low code = low
 /// bits — matching the kernel's "low nibble = even k" convention.
 pub fn pack_dense(codes: &[u8], bits: u32) -> Vec<u8> {
-    assert!(is_dense_width(bits), "pack_dense only supports bits ∈ {{1,2,4,8}}");
+    assert!(
+        is_dense_width(bits),
+        "pack_dense only supports bits ∈ {{1,2,4,8}}"
+    );
     let per_byte = (8 / bits) as usize;
     let mask = code_max(bits) as u8;
     let mut out = vec![0u8; codes.len().div_ceil(per_byte)];
@@ -197,7 +213,10 @@ pub fn pack_dense(codes: &[u8], bits: u32) -> Vec<u8> {
 /// Inverse of [`pack_dense`]: recover `count` unsigned codes. Branch-free per
 /// code (mask + shift) — the exact operation the device unpacker performs.
 pub fn unpack_dense(packed: &[u8], count: usize, bits: u32) -> Vec<u8> {
-    assert!(is_dense_width(bits), "unpack_dense only supports bits ∈ {{1,2,4,8}}");
+    assert!(
+        is_dense_width(bits),
+        "unpack_dense only supports bits ∈ {{1,2,4,8}}"
+    );
     let per_byte = (8 / bits) as usize;
     let mask = code_max(bits) as u8;
     (0..count)
@@ -256,9 +275,9 @@ pub mod plane {
 /// per-group activation sum the quantizer precomputes.
 #[allow(clippy::too_many_arguments)]
 pub fn dot_offset_fold(
-    codes_row: &[u8], // unsigned weight codes for one output row m, length K
+    codes_row: &[u8],     // unsigned weight codes for one output row m, length K
     w_scales_row: &[f32], // one per group
-    x_row: &[i8],     // int8 activations for one batch b, length K
+    x_row: &[i8],         // int8 activations for one batch b, length K
     x_scales_row: &[f32],
     x_sum_row: &[i32], // Σ_{k∈g} x_row[k], one per group
     group: usize,
@@ -360,8 +379,12 @@ mod tests {
         for bits in [1, 2, 4, 8] {
             let z = zero_point(bits) as i32;
             let cmax = code_max(bits) as i32;
-            let codes: Vec<u8> = (0..k).map(|i| ((i as i32 * 7 + 3) % (cmax + 1)) as u8).collect();
-            let x: Vec<i8> = (0..k).map(|i| ((i as i32 * 5 - 40) % 100 - 50) as i8).collect();
+            let codes: Vec<u8> = (0..k)
+                .map(|i| ((i as i32 * 7 + 3) % (cmax + 1)) as u8)
+                .collect();
+            let x: Vec<i8> = (0..k)
+                .map(|i| ((i as i32 * 5 - 40) % 100 - 50) as i8)
+                .collect();
             let ws: Vec<f32> = (0..k / group).map(|g| 0.01 * (g as f32 + 1.0)).collect();
             let xs: Vec<f32> = (0..k / group).map(|g| 0.02 * (g as f32 + 1.0)).collect();
             let xsum = group_sums_i8(&x, group);
@@ -369,7 +392,11 @@ mod tests {
             let _ = z;
             let folded = dot_offset_fold(&codes, &ws, &x, &xs, &xsum, group, bits);
             let signed = dot_signed(&codes, &ws, &x, &xs, group, bits);
-            assert_eq!(folded.to_bits(), signed.to_bits(), "fold != signed at bits={bits}");
+            assert_eq!(
+                folded.to_bits(),
+                signed.to_bits(),
+                "fold != signed at bits={bits}"
+            );
         }
     }
 
@@ -415,7 +442,10 @@ mod tests {
         let (clip_codes, clip_scales) = quantize_symmetric_clip(&w, group, bits, None, 12, 0.2);
         let rtn = weighted_quant_error(&w, &rtn_codes, &rtn_scales, group, bits, None);
         let clip = weighted_quant_error(&w, &clip_codes, &clip_scales, group, bits, None);
-        assert!(clip <= rtn + 1e-9, "unweighted clip {clip:.4} should be <= rtn {rtn:.4}");
+        assert!(
+            clip <= rtn + 1e-9,
+            "unweighted clip {clip:.4} should be <= rtn {rtn:.4}"
+        );
     }
 
     #[test]
@@ -437,9 +467,16 @@ mod tests {
         let xs = vec![0.05f32; k / group];
         let xsum = group_sums_i8(&x, group);
         // dequantized activations
-        let x_f32: Vec<f32> = x.iter().enumerate().map(|(i, &q)| q as f32 * xs[i / group]).collect();
+        let x_f32: Vec<f32> = x
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| q as f32 * xs[i / group])
+            .collect();
         let truth: f32 = w_hat.iter().zip(&x_f32).map(|(a, b)| a * b).sum();
         let folded = dot_offset_fold(&codes, &wscale, &x, &xs, &xsum, group, bits);
-        assert!((folded - truth).abs() < 1e-3, "folded={folded} truth={truth}");
+        assert!(
+            (folded - truth).abs() < 1e-3,
+            "folded={folded} truth={truth}"
+        );
     }
 }

@@ -1771,8 +1771,7 @@ fn add_component_from_dir(
                 match parse_safetensors_state_dict(&weight_path) {
                     Ok(tensors) if !tensors.is_empty() => {
                         let split_flux2_norm_out = component == "transformer"
-                            && metadata.class_name.as_deref()
-                                == Some("Flux2Transformer2DModel");
+                            && metadata.class_name.as_deref() == Some("Flux2Transformer2DModel");
                         for tensor in canonicalize_filtered_safetensors(
                             tensors,
                             tensor_name_filter,

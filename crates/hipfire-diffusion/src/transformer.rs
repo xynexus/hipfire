@@ -224,9 +224,7 @@ impl NativeTransformerDenoiserIo {
         } else {
             None
         };
-        if is_flux2
-            && (output_norm_shift_weight.is_none() || output_norm_scale_weight.is_none())
-        {
+        if is_flux2 && (output_norm_shift_weight.is_none() || output_norm_scale_weight.is_none()) {
             return Err(DiffusionError::InvalidMetadata(
                 "FLUX.2 requires canonical norm_out.shift.weight and norm_out.scale.weight tensors"
                     .to_string(),
@@ -580,8 +578,7 @@ impl NativeTransformerDenoiserIo {
         for b in 0..batch {
             let src = b * projected_width;
             let dst = b * width;
-            scale.data[dst..dst + width]
-                .copy_from_slice(&projected.data[src..src + width]);
+            scale.data[dst..dst + width].copy_from_slice(&projected.data[src..src + width]);
             shift.data[dst..dst + width]
                 .copy_from_slice(&projected.data[src + width..src + projected_width]);
         }
@@ -621,13 +618,13 @@ impl NativeTransformerTimestepEmbedding {
             dual_semantic_prefix
         } else {
             match family {
-            TransformerDenoiserFamily::Krea2 => "transformer/tensors/time_embed",
-            TransformerDenoiserFamily::Flux2 => {
-                "transformer/tensors/time_guidance_embed.timestep_embedder"
-            }
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
-                "transformer/tensors/time_text_embed.timestep_embedder"
-            }
+                TransformerDenoiserFamily::Krea2 => "transformer/tensors/time_embed",
+                TransformerDenoiserFamily::Flux2 => {
+                    "transformer/tensors/time_guidance_embed.timestep_embedder"
+                }
+                TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
+                    "transformer/tensors/time_text_embed.timestep_embedder"
+                }
             }
         };
         let modulation_weight = optional_tensor(hfq, "transformer/tensors/time_mod_proj.weight")?;
@@ -647,10 +644,7 @@ impl NativeTransformerTimestepEmbedding {
             linear_2_bias: optional_tensor(hfq, &format!("{prefix}.linear_2.bias"))?,
             texture_linear_1_weight: is_sefi
                 .then(|| {
-                    cpu_tensor_from_hfq(
-                        hfq,
-                        &format!("{dual_texture_prefix}.linear_1.weight"),
-                    )
+                    cpu_tensor_from_hfq(hfq, &format!("{dual_texture_prefix}.linear_1.weight"))
                 })
                 .transpose()?,
             texture_linear_1_bias: if is_sefi {
@@ -660,10 +654,7 @@ impl NativeTransformerTimestepEmbedding {
             },
             texture_linear_2_weight: is_sefi
                 .then(|| {
-                    cpu_tensor_from_hfq(
-                        hfq,
-                        &format!("{dual_texture_prefix}.linear_2.weight"),
-                    )
+                    cpu_tensor_from_hfq(hfq, &format!("{dual_texture_prefix}.linear_2.weight"))
                 })
                 .transpose()?,
             texture_linear_2_bias: if is_sefi {
@@ -935,14 +926,10 @@ impl ResidentFlux2SingleModulationChunks {
 impl NativeFlux2Modulation {
     pub(crate) fn from_hfq(hfq: &HfqFile) -> DiffusionResult<Self> {
         let load = |name: &str| {
-            cpu_tensor_from_hfq(
-                hfq,
-                &format!("transformer/tensors/{name}.linear.weight"),
-            )
+            cpu_tensor_from_hfq(hfq, &format!("transformer/tensors/{name}.linear.weight"))
         };
-        let bias = |name: &str| {
-            optional_tensor(hfq, &format!("transformer/tensors/{name}.linear.bias"))
-        };
+        let bias =
+            |name: &str| optional_tensor(hfq, &format!("transformer/tensors/{name}.linear.bias"));
         Ok(Self {
             image_weight: load("double_stream_modulation_img")?,
             image_bias: bias("double_stream_modulation_img")?,
@@ -964,12 +951,7 @@ impl NativeFlux2Modulation {
             shape: timestep_embedding.shape.clone(),
             data: timestep_embedding.data.iter().copied().map(silu).collect(),
         };
-        linear_optional_bias_f32_with_runtime_context(
-            &activated,
-            weight,
-            bias,
-            runtime_context,
-        )
+        linear_optional_bias_f32_with_runtime_context(&activated, weight, bias, runtime_context)
     }
 
     pub(crate) fn double_chunks(
@@ -2145,20 +2127,11 @@ impl NativeTransformerAttentionProjection {
                 "FLUX.2 resident attention is missing the text projection".into(),
             )
         })?;
-        let (image_q, image_k, image_v) = self.image.project_qkv_resident(
-            image_hidden,
-            self.heads,
-            self.head_dim,
-            gpu,
-            cache,
-        )?;
-        let (text_q, text_k, text_v) = text.project_qkv_resident(
-            text_hidden,
-            self.heads,
-            self.head_dim,
-            gpu,
-            cache,
-        )?;
+        let (image_q, image_k, image_v) =
+            self.image
+                .project_qkv_resident(image_hidden, self.heads, self.head_dim, gpu, cache)?;
+        let (text_q, text_k, text_v) =
+            text.project_qkv_resident(text_hidden, self.heads, self.head_dim, gpu, cache)?;
         let image_q_rot = rope_qwen_resident(
             gpu,
             cache,
@@ -2220,7 +2193,9 @@ impl NativeTransformerAttentionProjection {
         for tensor in [image_q_rot, text_q_rot, joint_k, joint_v] {
             free_resident(gpu, tensor)?;
         }
-        let image_output = self.image.project_output_resident(&image_attention, gpu, cache)?;
+        let image_output = self
+            .image
+            .project_output_resident(&image_attention, gpu, cache)?;
         let text_output = text.project_output_resident(&text_attention, gpu, cache)?;
         free_resident(gpu, image_attention)?;
         free_resident(gpu, text_attention)?;
@@ -2462,7 +2437,12 @@ impl TransformerFeedForwardStream {
             )));
         }
         let inner_width = projected_width / 2;
-        validate_attention_bias_shape(stream_label, "ff.linear_in", proj_bias.as_ref(), projected_width)?;
+        validate_attention_bias_shape(
+            stream_label,
+            "ff.linear_in",
+            proj_bias.as_ref(),
+            projected_width,
+        )?;
         validate_transformer_ff_down_shape(
             stream_label,
             down_weight.shape(),
@@ -2970,9 +2950,7 @@ impl NativeTransformerBlock {
             ),
             TransformerDenoiserFamily::QwenImage
             | TransformerDenoiserFamily::Flux2
-            | TransformerDenoiserFamily::Unknown => {
-                (None, None)
-            }
+            | TransformerDenoiserFamily::Unknown => (None, None),
         };
         Ok(Self {
             family,
@@ -3270,8 +3248,7 @@ impl NativeTransformerBlock {
                 rotary,
                 runtime_context,
             )?;
-        let image_hidden =
-            gated_residual_3d(image_hidden, &image_attention, &image_mod.gate_msa)?;
+        let image_hidden = gated_residual_3d(image_hidden, &image_attention, &image_mod.gate_msa)?;
         let text_hidden = gated_residual_3d(
             text_hidden,
             &text_attention.ok_or_else(|| {
@@ -3326,15 +3303,13 @@ impl NativeTransformerBlock {
         let text_attention_input =
             modulate_3d_resident(gpu, &text_norm, &text_mod.shift_msa, &text_mod.scale_msa)?;
         free_resident(gpu, text_norm)?;
-        let (image_attention, text_attention) = self
-            .attention
-            .attend_flux2_image_text_resident(
-                &image_attention_input,
-                &text_attention_input,
-                rotary,
-                gpu,
-                cache,
-            )?;
+        let (image_attention, text_attention) = self.attention.attend_flux2_image_text_resident(
+            &image_attention_input,
+            &text_attention_input,
+            rotary,
+            gpu,
+            cache,
+        )?;
         free_resident(gpu, image_attention_input)?;
         free_resident(gpu, text_attention_input)?;
         let image_after_attention =
@@ -3371,13 +3346,14 @@ impl NativeTransformerBlock {
             &image_mlp,
             &image_mod.gate_mlp,
         )?;
-        let text_out = gated_residual_3d_resident(
-            gpu,
-            &text_after_attention,
-            &text_mlp,
-            &text_mod.gate_mlp,
-        )?;
-        for tensor in [image_after_attention, text_after_attention, image_mlp, text_mlp] {
+        let text_out =
+            gated_residual_3d_resident(gpu, &text_after_attention, &text_mlp, &text_mod.gate_mlp)?;
+        for tensor in [
+            image_after_attention,
+            text_after_attention,
+            image_mlp,
+            text_mlp,
+        ] {
             free_resident(gpu, tensor)?;
         }
         Ok((image_out, text_out))
@@ -3404,9 +3380,7 @@ impl NativeFlux2SingleBlock {
         block_index: usize,
         heads: usize,
     ) -> DiffusionResult<Self> {
-        let prefix = format!(
-            "transformer/tensors/single_transformer_blocks.{block_index}.attn"
-        );
+        let prefix = format!("transformer/tensors/single_transformer_blocks.{block_index}.attn");
         let linear1_weight =
             ResidentWeight::from_hfq(hfq, &format!("{prefix}.to_qkv_mlp_proj.weight"))?;
         let linear1_bias = optional_tensor(hfq, &format!("{prefix}.to_qkv_mlp_proj.bias"))?;
@@ -3465,20 +3439,10 @@ impl NativeFlux2SingleBlock {
         let k = slice_width_3d(&projected, self.hidden_width, self.hidden_width)?;
         let v = slice_width_3d(&projected, self.hidden_width * 2, self.hidden_width)?;
         let mlp = slice_width_3d(&projected, self.hidden_width * 3, self.hidden_width * 6)?;
-        let mut q = rms_norm_attention_heads_3d(
-            &q,
-            &self.norm_q_weight,
-            self.heads,
-            self.head_dim,
-            1e-6,
-        )?;
-        let mut k = rms_norm_attention_heads_3d(
-            &k,
-            &self.norm_k_weight,
-            self.heads,
-            self.head_dim,
-            1e-6,
-        )?;
+        let mut q =
+            rms_norm_attention_heads_3d(&q, &self.norm_q_weight, self.heads, self.head_dim, 1e-6)?;
+        let mut k =
+            rms_norm_attention_heads_3d(&k, &self.norm_k_weight, self.heads, self.head_dim, 1e-6)?;
         if let Some(rotary) = rotary {
             q = apply_qwen_rotary_embedding(&q, rotary, self.heads, self.head_dim)?;
             k = apply_qwen_rotary_embedding(&k, rotary, self.heads, self.head_dim)?;
@@ -3510,8 +3474,7 @@ impl NativeFlux2SingleBlock {
         cache: &mut RocmWeightCache,
     ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         let normalized = layer_norm_no_affine_resident(gpu, hidden, 1e-6)?;
-        let input =
-            modulate_3d_resident(gpu, &normalized, &modulation.shift, &modulation.scale)?;
+        let input = modulate_3d_resident(gpu, &normalized, &modulation.shift, &modulation.scale)?;
         free_resident(gpu, normalized)?;
         let projected = linear_resident_weight_resident(
             gpu,
@@ -3522,18 +3485,9 @@ impl NativeFlux2SingleBlock {
         )?;
         free_resident(gpu, input)?;
         let q = slice_last_dim_3d_resident(gpu, &projected, 0, self.hidden_width)?;
-        let k = slice_last_dim_3d_resident(
-            gpu,
-            &projected,
-            self.hidden_width,
-            self.hidden_width,
-        )?;
-        let v = slice_last_dim_3d_resident(
-            gpu,
-            &projected,
-            self.hidden_width * 2,
-            self.hidden_width,
-        )?;
+        let k = slice_last_dim_3d_resident(gpu, &projected, self.hidden_width, self.hidden_width)?;
+        let v =
+            slice_last_dim_3d_resident(gpu, &projected, self.hidden_width * 2, self.hidden_width)?;
         let mlp_projected = slice_last_dim_3d_resident(
             gpu,
             &projected,
@@ -3579,8 +3533,7 @@ impl NativeFlux2SingleBlock {
         )?;
         free_resident(gpu, q)?;
         free_resident(gpu, k)?;
-        let attention =
-            scaled_dot_product_attention_resident(gpu, &q_rot, &k_rot, &v, self.heads)?;
+        let attention = scaled_dot_product_attention_resident(gpu, &q_rot, &k_rot, &v, self.heads)?;
         for tensor in [q_rot, k_rot, v] {
             free_resident(gpu, tensor)?;
         }
@@ -3597,8 +3550,7 @@ impl NativeFlux2SingleBlock {
             self.linear2_bias.as_ref(),
         )?;
         free_resident(gpu, combined)?;
-        let result =
-            gated_residual_3d_resident(gpu, hidden, &output, &modulation.gate)?;
+        let result = gated_residual_3d_resident(gpu, hidden, &output, &modulation.gate)?;
         free_resident(gpu, output)?;
         Ok(result)
     }
@@ -3606,9 +3558,9 @@ impl NativeFlux2SingleBlock {
 
 fn slice_width_3d(input: &CpuTensor, start: usize, len: usize) -> DiffusionResult<CpuTensor> {
     let [batch, seq, width] = shape3(input)?;
-    let end = start.checked_add(len).ok_or_else(|| {
-        DiffusionError::InvalidMetadata("3-D width slice overflow".to_string())
-    })?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| DiffusionError::InvalidMetadata("3-D width slice overflow".to_string()))?;
     if end > width {
         return Err(DiffusionError::InvalidMetadata(format!(
             "3-D width slice [{start}..{end}] exceeds width {width}"
@@ -4436,16 +4388,8 @@ impl NativeTransformerDenoiser {
         let text_hidden = self
             .io
             .project_text_to_hidden_with_runtime_context(text_hidden, runtime_context)?;
-        dump_denoise_trace_tensor(
-            "flux2_input_image",
-            &image_hidden.shape,
-            &image_hidden.data,
-        );
-        dump_denoise_trace_tensor(
-            "flux2_input_text",
-            &text_hidden.shape,
-            &text_hidden.data,
-        );
+        dump_denoise_trace_tensor("flux2_input_image", &image_hidden.shape, &image_hidden.data);
+        dump_denoise_trace_tensor("flux2_input_text", &text_hidden.shape, &text_hidden.data);
         let [text_batch, text_seq, _] = shape3(&text_hidden)?;
         if text_batch != latents.batch {
             return Err(DiffusionError::InvalidRequest(format!(
@@ -4504,13 +4448,7 @@ impl NativeTransformerDenoiser {
             let text_mod = ResidentTransformerModulationChunks::upload(gpu, &text_mod)?;
             for (index, block) in self.blocks.iter().enumerate() {
                 let (next_image, next_text) = block.forward_flux2_double_resident(
-                    &image,
-                    &text,
-                    &image_mod,
-                    &text_mod,
-                    &rotary,
-                    gpu,
-                    cache,
+                    &image, &text, &image_mod, &text_mod, &rotary, gpu, cache,
                 )?;
                 free_resident(gpu, image)?;
                 free_resident(gpu, text)?;
@@ -4538,13 +4476,8 @@ impl NativeTransformerDenoiser {
             text_mod.free(gpu)?;
             let single_mod = ResidentFlux2SingleModulationChunks::upload(gpu, &single_mod)?;
             for (index, block) in self.flux2_single_blocks.iter().enumerate() {
-                let next = block.forward_resident(
-                    &joint,
-                    &single_mod,
-                    &joint_rotary,
-                    gpu,
-                    cache,
-                )?;
+                let next =
+                    block.forward_resident(&joint, &single_mod, &joint_rotary, gpu, cache)?;
                 free_resident(gpu, joint)?;
                 joint = next;
                 if denoise_trace_enabled() {
@@ -4729,7 +4662,12 @@ impl DiffusionNoiseBackend for NativeTransformerDenoiser {
         let cfg_is_identity = classifier_free_guidance_is_identity(cfg_scale);
         dump_denoise_trace_tensor(
             "latent_000",
-            &[latents.batch, latents.channels, latents.height, latents.width],
+            &[
+                latents.batch,
+                latents.channels,
+                latents.height,
+                latents.width,
+            ],
             &latents.data,
         );
         dump_denoise_trace_tensor(
@@ -4753,12 +4691,19 @@ impl DiffusionNoiseBackend for NativeTransformerDenoiser {
                     runtime_context,
                 )
             };
-            let positive = predict(positive_embeddings, positive_attention_mask, runtime_context)?;
+            let positive = predict(
+                positive_embeddings,
+                positive_attention_mask,
+                runtime_context,
+            )?;
             let velocity = if cfg_is_identity {
                 positive.data
             } else {
-                let negative =
-                    predict(negative_embeddings, negative_attention_mask, runtime_context)?;
+                let negative = predict(
+                    negative_embeddings,
+                    negative_attention_mask,
+                    runtime_context,
+                )?;
                 negative
                     .data
                     .iter()
@@ -4768,13 +4713,23 @@ impl DiffusionNoiseBackend for NativeTransformerDenoiser {
             };
             dump_denoise_trace_tensor(
                 &format!("velocity_{:03}", index + 1),
-                &[latents.batch, latents.channels, latents.height, latents.width],
+                &[
+                    latents.batch,
+                    latents.channels,
+                    latents.height,
+                    latents.width,
+                ],
                 &velocity,
             );
             sefi_dual_euler_step(&mut latents, &velocity, semantic_channels, step)?;
             dump_denoise_trace_tensor(
                 &format!("latent_{:03}", index + 1),
-                &[latents.batch, latents.channels, latents.height, latents.width],
+                &[
+                    latents.batch,
+                    latents.channels,
+                    latents.height,
+                    latents.width,
+                ],
                 &latents.data,
             );
             if let Some(progress) = progress.as_deref_mut() {
@@ -5833,21 +5788,13 @@ impl Qwen3EncoderLayer {
             let mask = attention_mask.unwrap();
             if runtime_context.rocm_device_id().is_some() {
                 runtime_context.with_rocm_gpu(|gpu| {
-                    qwen3_masked_causal_self_attention_hip_on_gpu(
-                        gpu, &q, &k, &v, heads, mask,
-                    )
+                    qwen3_masked_causal_self_attention_hip_on_gpu(gpu, &q, &k, &v, heads, mask)
                 })?
             } else {
                 qwen3_causal_self_attention_with_key_mask(&q, &k, &v, heads, mask)?
             }
         } else {
-            clip_causal_self_attention_with_runtime_context(
-                &q,
-                &k,
-                &v,
-                heads,
-                runtime_context,
-            )?
+            clip_causal_self_attention_with_runtime_context(&q, &k, &v, heads, runtime_context)?
         };
         let attention = CpuTensor {
             shape: vec![1, seq, inner],
