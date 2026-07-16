@@ -45,6 +45,7 @@ pub struct NpuEmbeddingPostFfnDirectTailBf16x2Params {
 
 pub struct NpuEmbeddingPostFfnDirectTailBf16x2 {
     kernel: NpuKernel,
+    batch: usize,
     combined: DeviceBuffer,
     residual: Option<DeviceBuffer>,
     output: DeviceBuffer,
@@ -62,7 +63,6 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
         for field in [
             "op=embeddinggemma-post-ffn-direct-tail",
             "mode=bf16x2-resident",
-            "m=256",
             "k=768",
         ] {
             if !manifest.lines().any(|line| line == field) {
@@ -71,6 +71,17 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
                 )));
             }
         }
+        let rows = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("m="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| invalid("compensated post-FFN tail cache missing m="))?;
+        if rows == 0 || rows % M != 0 {
+            return Err(invalid(format!(
+                "compensated post-FFN tail m={rows} must be a positive multiple of {M}"
+            )));
+        }
+        let batch = rows / M;
         let row_state_residual = manifest
             .lines()
             .any(|line| line == "input=shared-y-interleaved-bf16x2-and-split-x-bf16-row-state")
@@ -122,18 +133,19 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
             &std::fs::read(format!("{cache}/insts.bin")).map_err(XdnaError::Open)?,
         )?;
         Ok(Self {
-            combined: kernel.alloc_arg(COMBINED_BYTES)?,
+            combined: kernel.alloc_arg(batch * COMBINED_BYTES)?,
             residual: split_residual
                 .then(|| {
                     kernel.alloc_arg(if row_state_residual {
-                        ROW_STATE_RESIDUAL_BYTES
+                        batch * ROW_STATE_RESIDUAL_BYTES
                     } else {
-                        RESIDUAL_BYTES
+                        batch * RESIDUAL_BYTES
                     })
                 })
                 .transpose()?,
-            output: kernel.alloc_arg(output_encoding.bytes())?,
+            output: kernel.alloc_arg(batch * output_encoding.bytes())?,
             kernel,
+            batch,
             output_encoding,
             split_residual,
             residual_bytes: if row_state_residual {
@@ -163,7 +175,7 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
     }
 
     pub const fn output_bytes(&self) -> usize {
-        self.output_encoding.bytes()
+        self.batch * self.output_encoding.bytes()
     }
 
     pub const fn combined_bytes() -> usize {
@@ -179,7 +191,15 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
     }
 
     pub const fn split_x_input_bytes(&self) -> usize {
-        self.residual_bytes
+        self.batch * self.residual_bytes
+    }
+
+    pub const fn batch(&self) -> usize {
+        self.batch
+    }
+
+    pub const fn loaded_combined_bytes(&self) -> usize {
+        self.batch * COMBINED_BYTES
     }
 
     pub fn attach_shared_state(
@@ -194,7 +214,7 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
                 "split-X post-FFN tail requires a separate residual dma-buf",
             ));
         }
-        if combined_bytes != COMBINED_BYTES || output_bytes != self.output_bytes() {
+        if combined_bytes != self.loaded_combined_bytes() || output_bytes != self.output_bytes() {
             return Err(invalid(
                 "compensated post-FFN tail shared dma-buf size mismatch",
             ));
@@ -217,8 +237,8 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
         output_bytes: usize,
     ) -> Result<(), XdnaError> {
         if !self.split_residual
-            || combined_bytes != COMBINED_BYTES
-            || residual_bytes < self.residual_bytes
+            || combined_bytes != self.loaded_combined_bytes()
+            || residual_bytes < self.split_x_input_bytes()
             || output_bytes != self.output_bytes()
         {
             return Err(invalid(
@@ -318,8 +338,12 @@ impl NpuEmbeddingPostFfnDirectTailBf16x2 {
     pub fn read_output_f32(&self) -> Result<Vec<f32>, XdnaError> {
         let output = self.output.as_slice();
         match self.output_encoding {
-            CompletedOutputEncoding::Bf16 => Ok(decode_bf16(output, M * HIDDEN)),
-            CompletedOutputEncoding::Bf16x2 => Ok(decode_token_major_bf16x2(output, M, HIDDEN)),
+            CompletedOutputEncoding::Bf16 => {
+                Ok(decode_padded_bf16_documents(output, self.batch, HIDDEN))
+            }
+            CompletedOutputEncoding::Bf16x2 => Ok(decode_padded_token_major_bf16x2_documents(
+                output, self.batch, HIDDEN,
+            )),
         }
     }
 }
@@ -345,6 +369,37 @@ fn decode_token_major_bf16x2(bytes: &[u8], rows: usize, width: usize) -> Vec<f32
                 .zip(&words[base + width..base + 2 * width])
                 .map(|(&high, &low)| high + low),
         );
+    }
+    output
+}
+
+fn decode_padded_bf16_documents(bytes: &[u8], batch: usize, width: usize) -> Vec<f32> {
+    let mut output = Vec::with_capacity(batch * M * width);
+    let document_bytes = PAD_M * width * size_of::<u16>();
+    for document in 0..batch {
+        let start = document * document_bytes;
+        output.extend(decode_bf16(
+            &bytes[start..start + document_bytes],
+            M * width,
+        ));
+    }
+    output
+}
+
+fn decode_padded_token_major_bf16x2_documents(
+    bytes: &[u8],
+    batch: usize,
+    width: usize,
+) -> Vec<f32> {
+    let mut output = Vec::with_capacity(batch * M * width);
+    let document_bytes = PAD_M * 2 * width * size_of::<u16>();
+    for document in 0..batch {
+        let start = document * document_bytes;
+        output.extend(decode_token_major_bf16x2(
+            &bytes[start..start + document_bytes],
+            M,
+            width,
+        ));
     }
     output
 }
@@ -390,5 +445,25 @@ mod tests {
             decode_token_major_bf16x2(&bytes, 2, 2),
             vec![1.25, -2.5, 3.75, -5.0]
         );
+    }
+
+    #[test]
+    fn decodes_document_padded_completed_bf16x2() {
+        let width = 2;
+        let mut bytes = vec![0u8; 2 * PAD_M * 2 * width * size_of::<u16>()];
+        for document in 0..2 {
+            for row in 0..M {
+                let base = (document * PAD_M + row) * 2 * width * size_of::<u16>();
+                let value = (document * M + row) as f32;
+                for column in 0..width {
+                    let bits = ((value + column as f32).to_bits() >> 16) as u16;
+                    bytes[base + column * 2..base + column * 2 + 2]
+                        .copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+        }
+        let decoded = decode_padded_token_major_bf16x2_documents(&bytes, 2, width);
+        assert_eq!(decoded.len(), 2 * M * width);
+        assert_eq!(decoded[M * width], 256.0);
     }
 }

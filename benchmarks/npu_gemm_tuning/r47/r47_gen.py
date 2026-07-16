@@ -2,13 +2,25 @@
 """R47 compensated completed-state to resident R34 activation preparation."""
 
 import os
+import sys
+
+
+def _int_flag(flag, default):
+    for argument in sys.argv[1:]:
+        if argument.startswith(flag + "="):
+            return int(argument.split("=", 1)[1])
+    return default
 
 COLS, CORE_ROWS = 8, 4
+BATCH = _int_flag("--batch", 1)
+if BATCH < 1:
+    raise SystemExit("--batch must be positive")
 ROWS_PER_CORE, GROUPS, HIDDEN = 8, 3, 768
 GROUP = 256
 PAD_M = 288
+DOCUMENT_COMPLETED_BYTES = PAD_M * 2 * HIDDEN * 2
 COMPLETED_ROW = 2 * HIDDEN * 2
-COMPLETED_BYTES = PAD_M * COMPLETED_ROW
+COMPLETED_BYTES = BATCH * DOCUMENT_COMPLETED_BYTES
 X_ROW_BYTES = COMPLETED_ROW
 X_JOIN_BYTES = CORE_ROWS * X_ROW_BYTES
 PARAM_BYTES = 2 * GROUP * 4 + 2 * GROUP * 2
@@ -26,7 +38,9 @@ IN_PLACE = os.environ.get("HIPFIRE_R47_IN_PLACE", "0") != "0"
 ONE_PASS_COMPLETED = os.environ.get("HIPFIRE_R47_ONE_PASS_COMPLETED", "0") != "0"
 if IN_PLACE and OUTPUT_BASE == 0:
     raise SystemExit("HIPFIRE_R47_IN_PLACE requires a non-zero output base")
-OUTPUT_BYTES = OUTPUT_BASE + R34_INPUT_BYTES + (RESIDUAL_BYTES if FUSED_RESIDUAL else 0)
+if BATCH > 1 and (not ONE_PASS_COMPLETED or not IN_PLACE or FUSED_RESIDUAL):
+    raise SystemExit("batched next-layer prep requires one-pass in-place mode")
+OUTPUT_BYTES = OUTPUT_BASE + BATCH * R34_INPUT_BYTES + (RESIDUAL_BYTES if FUSED_RESIDUAL else 0)
 INF = 9223372036854775807
 
 
@@ -153,6 +167,11 @@ for col, row in cores:
         f"      %inf = arith.constant {INF} : index",
         "      %one = arith.constant 1 : index",
         f"      %rows = arith.constant {ROWS_PER_CORE} : index",
+        *(
+            [f"      %documents = arith.constant {BATCH} : index"]
+            if BATCH > 1
+            else []
+        ),
         "      scf.for %outer = %z to %inf step %one {",
     ]
     if FUSED_RESIDUAL:
@@ -169,6 +188,8 @@ for col, row in cores:
             f"        aie.objectfifo.release @xc{col}_{row}(Consume, 1)",
         ]
     if ONE_PASS_COMPLETED:
+        if BATCH > 1:
+            out.append("        scf.for %document = %z to %documents step %one {")
         out += [
             "        scf.for %row = %z to %rows step %one {",
             f"          %x = aie.objectfifo.acquire @xc{col}_{row}(Consume, 1) : !aie.objectfifosubview<memref<{X_ROW_BYTES}xi8>>",
@@ -241,6 +262,8 @@ for col, row in cores:
             ]
     if FUSED_RESIDUAL:
         out.append(f"        aie.objectfifo.release @rc{col}_{row}(Produce, 1)")
+    if BATCH > 1:
+        out.append("        }")
     out += [
         "      }",
         "      aie.end",
@@ -266,20 +289,25 @@ if FUSED_RESIDUAL:
             f"      aiex.dma_start_task(%{name})",
         ]
 
-for col, row in packers:
-    block, _, _ = roles[(col, row)]
-    token_base = block * 24
-    m_macro = token_base // 96
-    stripe = (token_base % 96) // 24
-    offset = OUTPUT_BASE + (stripe * 45 + m_macro * 15) * R34_BLOCK
-    name = f"to{col}_{row}"
-    out += [
-        f"      %{name} = aiex.dma_configure_task_for @osh{col}_{row} {{",
-        f"        aie.dma_bd(%{'A' if IN_PLACE else 'O'} : memref<{OUTPUT_BYTES}xi8>, {offset}, {5 * BLOCK_PREFIX}, [<size = 3, stride = {R34_BLOCK}>, <size = 5, stride = {3 * R34_BLOCK}>, <size = {BLOCK_PREFIX // 32}, stride = 32>, <size = 32, stride = 1>]) {{burst_length = 0 : i32}}",
-        "        aie.end",
-        "      } {issue_token = true, repeat_count = 2 : i32}",
-        f"      aiex.dma_start_task(%{name})",
-    ]
+for document in range(BATCH):
+    for col, row in packers:
+        block, _, _ = roles[(col, row)]
+        token_base = block * 24
+        m_macro = token_base // 96
+        stripe = (token_base % 96) // 24
+        offset = (
+            OUTPUT_BASE
+            + document * R34_INPUT_BYTES
+            + (stripe * 45 + m_macro * 15) * R34_BLOCK
+        )
+        name = f"to{col}_{row}" if BATCH == 1 else f"to{document}_{col}_{row}"
+        out += [
+            f"      %{name} = aiex.dma_configure_task_for @osh{col}_{row} {{",
+            f"        aie.dma_bd(%{'A' if IN_PLACE else 'O'} : memref<{OUTPUT_BYTES}xi8>, {offset}, {5 * BLOCK_PREFIX}, [<size = 3, stride = {R34_BLOCK}>, <size = 5, stride = {3 * R34_BLOCK}>, <size = {BLOCK_PREFIX // 32}, stride = 32>, <size = 32, stride = 1>]) {{burst_length = 0 : i32}}",
+            "        aie.end",
+            "      } {issue_token = true, repeat_count = 2 : i32}",
+            f"      aiex.dma_start_task(%{name})",
+        ]
 
 for col in range(COLS):
     name = f"tp{col}"
@@ -293,26 +321,40 @@ for col in range(COLS):
 for col in range(COLS):
     out += [f"      aiex.dma_await_task(%tp{col})", f"      aiex.dma_free_task(%tp{col})"]
 
-for pass_index in range(1 if ONE_PASS_COMPLETED else 1 + GROUPS):
-    for col in range(COLS):
-        name = f"tx{pass_index}_{col}"
-        offset = col * CORE_ROWS * ROWS_PER_CORE * COMPLETED_ROW
-        out += [
-            f"      %{name} = aiex.dma_configure_task_for @xsh{col} {{",
-            f"        aie.dma_bd(%{'A' if IN_PLACE else 'X'} : memref<{OUTPUT_BYTES if IN_PLACE else COMPLETED_BYTES}xi8>, {offset}, {X_JOIN_BYTES}, {x_dims()}) {{burst_length = 0 : i32}}",
-            "        aie.end",
-            f"      }} {{issue_token = true, repeat_count = {ROWS_PER_CORE - 1} : i32}}",
-            f"      aiex.dma_start_task(%{name})",
-        ]
-    for col in range(COLS):
-        out += [
-            f"      aiex.dma_await_task(%tx{pass_index}_{col})",
-            f"      aiex.dma_free_task(%tx{pass_index}_{col})",
-        ]
+for document in range(BATCH):
+    for pass_index in range(1 if ONE_PASS_COMPLETED else 1 + GROUPS):
+        for col in range(COLS):
+            name = (
+                f"tx{pass_index}_{col}"
+                if BATCH == 1
+                else f"tx{document}_{pass_index}_{col}"
+            )
+            offset = (
+                document * DOCUMENT_COMPLETED_BYTES
+                + col * CORE_ROWS * ROWS_PER_CORE * COMPLETED_ROW
+            )
+            out += [
+                f"      %{name} = aiex.dma_configure_task_for @xsh{col} {{",
+                f"        aie.dma_bd(%{'A' if IN_PLACE else 'X'} : memref<{OUTPUT_BYTES if IN_PLACE else COMPLETED_BYTES}xi8>, {offset}, {X_JOIN_BYTES}, {x_dims()}) {{burst_length = 0 : i32}}",
+                "        aie.end",
+                f"      }} {{issue_token = true, repeat_count = {ROWS_PER_CORE - 1} : i32}}",
+                f"      aiex.dma_start_task(%{name})",
+            ]
+        for col in range(COLS):
+            name = (
+                f"tx{pass_index}_{col}"
+                if BATCH == 1
+                else f"tx{document}_{pass_index}_{col}"
+            )
+            out += [
+                f"      aiex.dma_await_task(%{name})",
+                f"      aiex.dma_free_task(%{name})",
+            ]
 
-for col, row in packers:
-    name = f"to{col}_{row}"
-    out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
+for document in range(BATCH):
+    for col, row in packers:
+        name = f"to{col}_{row}" if BATCH == 1 else f"to{document}_{col}_{row}"
+        out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
 if FUSED_RESIDUAL:
     for col in range(COLS):
         out += [f"      aiex.dma_await_task(%tr{col})", f"      aiex.dma_free_task(%tr{col})"]

@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """Generate resident W8 QKV packing, optionally followed by R27 attention."""
 
+import re
 import sys
+
+
+def _int_flag(flag, default):
+    for argument in sys.argv[1:]:
+        if argument.startswith(flag + "="):
+            return int(argument.split("=", 1)[1])
+    return default
+
+
+BATCH = _int_flag("--batch", 1)
+if BATCH < 1:
+    raise SystemExit("--batch must be positive")
 
 ATTENTION = "--attention" in sys.argv[1:]
 OUTPUT_PROJECTION = "--output-projection" in sys.argv[1:]
@@ -75,6 +88,11 @@ NORM_ROW_BYTES = 1664 if ROW_STATE_OUTPUT else 768 * 2
 R_BYTES = R_STAGE_BYTES + (ATT_BYTES if ATTENTION else 0) + (
     O_BYTES if OUTPUT_PROJECTION else 0
 )
+DIRECT_X_DOCUMENT_BYTES = 288 * 768 * 2
+PRE_INVERSE_BASE = 256 * 768 * 2
+PRE_INVERSE_PLANE_BYTES = COLS * ROWS * 12288
+BATCH_HANDOFF_BYTES = BATCH * (DIRECT_X_DOCUMENT_BYTES + PRE_INVERSE_PLANE_BYTES)
+BATCH_R_BYTES = BATCH_HANDOFF_BYTES + BATCH * R_BYTES
 TOTAL_W_BYTES = (
     W_BYTES
     + (O_W_BYTES if OUTPUT_PROJECTION else 0)
@@ -1219,4 +1237,95 @@ if OUTPUT_EXECUTION and not DIRECT_OUTPUT:
         out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
 
 out += ["    }", "  }", "}"]
+
+
+def _batch_runtime_sequence(lines):
+    """Replay the complete B1 schedule per document in one NPU command.
+
+    The core program is already an infinite command loop.  Keeping each B1
+    schedule contiguous makes its Q/K/V attention phase a segment boundary;
+    only the external buffer descriptors need document relocation.
+    """
+    if BATCH == 1:
+        return lines
+
+    sequence = next(
+        index for index, line in enumerate(lines) if "aie.runtime_sequence(" in line
+    )
+    close = len(lines) - 3
+    signature = lines[sequence]
+    for name, size in (
+        ("A", A_BYTES),
+        ("R", R_BYTES),
+        ("Q", Q_BYTES),
+        ("KV", KV_BYTES),
+    ):
+        signature = signature.replace(
+            f"%{name}: memref<{size}xi8>",
+            f"%{name}: memref<{BATCH_R_BYTES if name == 'R' else BATCH * size}xi8>",
+        )
+
+    descriptor = re.compile(
+        r"(aie\.dma_bd\(%(A|R|Q|KV) : memref<)(\d+)(xi8>, )(\d+)(,.*)"
+    )
+    task = re.compile(r"%(t[A-Za-z0-9_]*)")
+
+    def relocate(line, document, current_task):
+        line = task.sub(lambda match: f"%{match.group(1)}_d{document}", line)
+        match = descriptor.search(line)
+        if match is None:
+            return line
+        name = match.group(2)
+        old_size = int(match.group(3))
+        offset = int(match.group(5))
+        if name == "A" and DIRECT_EXTERNAL_RESIDUAL:
+            if offset < A_ACTIVATION_BASE:
+                relocated = document * COMPLETED_BYTES + offset
+            else:
+                relocated = (
+                    BATCH * COMPLETED_BYTES
+                    + document * A_BASE_BYTES
+                    + offset
+                    - A_ACTIVATION_BASE
+                )
+        elif name == "R":
+            if current_task.startswith("trno"):
+                relocated = document * DIRECT_X_DOCUMENT_BYTES + offset
+            elif current_task.startswith("trnm"):
+                relocated = (
+                    BATCH * DIRECT_X_DOCUMENT_BYTES
+                    + document * PRE_INVERSE_PLANE_BYTES
+                    + offset
+                    - PRE_INVERSE_BASE
+                )
+            else:
+                relocated = BATCH_HANDOFF_BYTES + document * R_BYTES + offset
+        else:
+            stride = {"A": A_BYTES, "R": R_BYTES, "Q": Q_BYTES, "KV": KV_BYTES}[
+                name
+            ]
+            relocated = document * stride + offset
+        replacement = (
+            match.group(1)
+            + str(BATCH_R_BYTES if name == "R" else BATCH * old_size)
+            + match.group(4)
+            + str(relocated)
+            + match.group(6)
+        )
+        return line[: match.start()] + replacement + line[match.end() :]
+
+    body = lines[sequence + 1 : close]
+    batched_body = []
+    configure = re.compile(r"%(t[A-Za-z0-9_]*) = aiex\.dma_configure_task_for")
+    for document in range(BATCH):
+        current_task = ""
+        for line in body:
+            configured = configure.search(line)
+            if configured is not None:
+                current_task = configured.group(1)
+            batched_body.append(relocate(line, document, current_task))
+    return lines[:sequence] + [signature] + batched_body + lines[close:]
+
+
+out = _batch_runtime_sequence(out)
 print("\n".join(out))

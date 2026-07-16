@@ -3,7 +3,13 @@ set -euo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$HERE/.." && pwd)
-OUT=${R108_CACHE_DIR:-$HOME/.hipfire/npu/embgemma_r108_resident_w8_qkv_attention_direct_completed_residual_m256_k768_n1280}
+BATCH="${1:-1}"
+if ! [[ "$BATCH" =~ ^[1-9][0-9]*$ ]]; then
+  echo "usage: $0 [positive-batch-count]" >&2
+  exit 2
+fi
+M=$((256 * BATCH))
+OUT=${R108_CACHE_DIR:-$HOME/.hipfire/npu/embgemma_r108_resident_w8_qkv_attention_direct_completed_residual_m${M}_k768_n1280}
 rm -rf -- "$OUT"
 mkdir -p -- "$OUT"
 : "${HIPFIRE_NPU_VENV:=$HOME/.venv}"
@@ -24,14 +30,15 @@ COMMON=(
 "$PEANO/bin/clang++" "$ROOT/r34/r34_residual_norm.cc" -c -o "$OUT/r34norm.o" \
   "${COMMON[@]}" -O1 -DR44_DIRECT_X_OUTPUT -DR48_EXTERNAL_RESIDUAL \
   -DR108_DIRECT_COMPLETED_RESIDUAL
-python "$ROOT/r29/r29_gen.py" --residual-norm --external-residual-direct > "$OUT/aie.mlir"
+python "$ROOT/r29/r29_gen.py" --residual-norm --external-residual-direct \
+  --batch="$BATCH" > "$OUT/aie.mlir"
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge --peano="$PEANO" \
   --aie-generate-npu-insts --npu-insts-name="$OUT/insts.bin" \
   --aie-generate-xclbin --xclbin-name="$OUT/final.xclbin" --tmpdir="$OUT" >/dev/null
 printf '%s\n' \
   'op=resident-qkv-paired-attention-output-norm' \
   'mode=w8-scaled' \
-  'm=256' \
+  "m=$M" \
   'k=768' \
   'n=1280' \
   'roles=q0,q1,q2,k,v,o' \
@@ -41,6 +48,8 @@ printf '%s\n' \
   'activation-offset-bytes=884736' \
   'residual-row-stride-bytes=3072' \
   'residual-transfer-row-bytes=2048' \
+  'attention=block-diagonal-documents' \
+  'segment-rows=256' \
   'output=canonical-token-major-x-bf16' \
   'handoff=staging-prefix-dmabuf' \
   'state=pre-ffn-inverse-f32' \

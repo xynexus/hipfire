@@ -2,7 +2,13 @@
 set -euo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-OUT="${R100_CACHE_DIR:-$HOME/.hipfire/npu/embgemma_r100_post_ffn_interleaved_bf16x2_split_x_completed_bf16x2_m256_k768}"
+BATCH="${1:-1}"
+if ! [[ "$BATCH" =~ ^[1-9][0-9]*$ ]]; then
+  echo "usage: $0 [positive-batch-count]" >&2
+  exit 2
+fi
+M=$((256 * BATCH))
+OUT="${R100_CACHE_DIR:-$HOME/.hipfire/npu/embgemma_r100_post_ffn_interleaved_bf16x2_split_x_completed_bf16x2_m${M}_k768}"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 : "${HIPFIRE_NPU_VENV:=$HOME/.venv}"
@@ -16,7 +22,7 @@ export PATH="/opt/xilinx/xrt/bin:$PEANO/bin:$MA_ROOT/bin:$PATH"
   -DR46_SPLIT_RESIDUAL -DR100_INTERLEAVED_FFN \
   -Wno-parentheses -Wno-attributes -Wno-macro-redefined \
   -Wno-empty-body -Wno-deprecated-declarations --target=aie2p-none-unknown-elf
-python "$HERE/../r43/r43_tail_gen.py" --split-residual > "$OUT/aie.mlir"
+python "$HERE/../r43/r43_tail_gen.py" --split-residual --batch="$BATCH" > "$OUT/aie.mlir"
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge \
   --peano="$PEANO" --aie-generate-npu-insts \
   --npu-insts-name="$OUT/insts.bin" --aie-generate-xclbin \
@@ -24,7 +30,7 @@ aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge \
 printf '%s\n' \
   'op=embeddinggemma-post-ffn-direct-tail' \
   'mode=bf16x2-resident' \
-  'm=256' \
+  "m=$M" \
   'k=768' \
   'input=shared-y-interleaved-bf16x2-and-split-x-bf16' \
   'output=shared-completed-bf16x2' > "$OUT/shape.txt"

@@ -28,6 +28,7 @@ pub struct NpuEmbeddingNextLayerPrepW8Params {
 
 pub struct NpuEmbeddingNextLayerPrepW8 {
     kernel: NpuKernel,
+    batch: usize,
     completed: Option<DeviceBuffer>,
     output: DeviceBuffer,
     output_prefix_offset: usize,
@@ -41,7 +42,6 @@ impl NpuEmbeddingNextLayerPrepW8 {
         for field in [
             "op=embeddinggemma-next-layer-prep",
             "mode=w8-scaled",
-            "m=256",
             "k=768",
             "input=shared-completed-bf16x2",
             "output=shared-r34-activation-prefix",
@@ -51,6 +51,17 @@ impl NpuEmbeddingNextLayerPrepW8 {
                 return Err(invalid(format!("next-layer prep cache missing {field}")));
             }
         }
+        let rows = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("m="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| invalid("next-layer prep cache missing m="))?;
+        if rows == 0 || rows % M != 0 {
+            return Err(invalid(format!(
+                "next-layer prep m={rows} must be a positive multiple of {M}"
+            )));
+        }
+        let batch = rows / M;
         let kernel = NpuKernel::load(
             &std::fs::read(format!("{cache}/final.xclbin")).map_err(XdnaError::Open)?,
             &std::fs::read(format!("{cache}/insts.bin")).map_err(XdnaError::Open)?,
@@ -65,15 +76,16 @@ impl NpuEmbeddingNextLayerPrepW8 {
         let in_place = manifest
             .lines()
             .any(|line| line == "buffer-mode=in-place-disjoint-prefix-suffix");
-        let output_bytes = output_prefix_offset + R34_INPUT_BYTES;
+        let output_bytes = output_prefix_offset + batch * R34_INPUT_BYTES;
         let output = kernel.alloc_arg(output_bytes)?;
         Ok(Self {
             completed: (!in_place)
-                .then(|| kernel.alloc_arg(COMPLETED_BYTES))
+                .then(|| kernel.alloc_arg(batch * COMPLETED_BYTES))
                 .transpose()?,
             output,
             output_prefix_offset,
             in_place,
+            batch,
             kernel,
         })
     }
@@ -87,7 +99,19 @@ impl NpuEmbeddingNextLayerPrepW8 {
     }
 
     pub fn output_bytes(&self) -> usize {
-        self.output_prefix_offset + R34_INPUT_BYTES
+        self.output_prefix_offset + self.batch * R34_INPUT_BYTES
+    }
+
+    pub const fn batch(&self) -> usize {
+        self.batch
+    }
+
+    pub const fn loaded_completed_bytes(&self) -> usize {
+        self.batch * COMPLETED_BYTES
+    }
+
+    pub const fn loaded_canonical_output_bytes(&self) -> usize {
+        self.batch * R34_INPUT_BYTES
     }
 
     pub const fn canonical_output_bytes() -> usize {
@@ -101,7 +125,7 @@ impl NpuEmbeddingNextLayerPrepW8 {
         output_fd: i32,
         output_bytes: usize,
     ) -> Result<(), XdnaError> {
-        if completed_bytes != COMPLETED_BYTES || output_bytes != self.output_bytes() {
+        if completed_bytes != self.loaded_completed_bytes() || output_bytes != self.output_bytes() {
             return Err(invalid("next-layer prep shared dma-buf size mismatch"));
         }
         if self.in_place {
@@ -207,11 +231,12 @@ impl NpuEmbeddingNextLayerPrepW8 {
     }
 
     pub fn write_completed_bf16x2(&mut self, bytes: &[u8]) -> Result<(), XdnaError> {
-        if bytes.len() != COMPLETED_BYTES {
+        if bytes.len() != self.loaded_completed_bytes() {
             return Err(invalid("next-layer completed-state size mismatch"));
         }
         if self.in_place {
-            self.output.as_mut_slice()[..COMPLETED_BYTES].copy_from_slice(bytes);
+            let completed_bytes = self.loaded_completed_bytes();
+            self.output.as_mut_slice()[..completed_bytes].copy_from_slice(bytes);
             self.kernel.sync_to_device(&self.output)
         } else {
             let completed = self
@@ -224,8 +249,8 @@ impl NpuEmbeddingNextLayerPrepW8 {
     }
 
     pub fn output_prefixes(&self) -> &[u8] {
-        &self.output.as_slice()
-            [self.output_prefix_offset..self.output_prefix_offset + R34_INPUT_BYTES]
+        &self.output.as_slice()[self.output_prefix_offset
+            ..self.output_prefix_offset + self.loaded_canonical_output_bytes()]
     }
 }
 
@@ -247,5 +272,11 @@ mod tests {
         );
         assert_eq!(PARAM_BYTES, 3_072);
         assert_eq!(PARAM_TOTAL_BYTES, 36_864);
+    }
+
+    #[test]
+    fn batched_geometry_scales_completed_and_prefix_buffers() {
+        assert_eq!(2 * COMPLETED_BYTES, 1_769_472);
+        assert_eq!(2 * R34_INPUT_BYTES, 5_898_240);
     }
 }

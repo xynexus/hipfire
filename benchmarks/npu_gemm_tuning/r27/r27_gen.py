@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 """Generate the 32-core R27 M256 bidirectional attention graph."""
 
+import sys
+
+
+def _int_flag(flag, default):
+    for argument in sys.argv[1:]:
+        if argument.startswith(flag + "="):
+            return int(argument.split("=", 1)[1])
+    return default
+
+
+BATCH = _int_flag("--batch", 1)
+if BATCH < 1:
+    raise SystemExit("--batch must be positive")
+
 COLS, ROWS = 8, 4
-QUERY_GROUPS, KEY_BLOCKS = 6, 16
+QUERY_GROUPS_PER_DOCUMENT, KEY_BLOCKS = 6, 16
+QUERY_GROUPS = BATCH * QUERY_GROUPS_PER_DOCUMENT
 Q_TILE = 4 * 256 * 2
 Q_PAIR = 2 * Q_TILE
 Q_JOIN = COLS * Q_TILE
@@ -11,9 +26,12 @@ OUT_TILE = Q_TILE
 OUT_JOIN = ROWS * OUT_TILE
 ACC = 4 * 256
 STATS = 8
-Q_BYTES = ROWS * QUERY_GROUPS * Q_JOIN
-KV_BYTES = KEY_BLOCKS * KV_TILE
-O_BYTES = COLS * QUERY_GROUPS * OUT_JOIN
+Q_DOCUMENT_BYTES = ROWS * QUERY_GROUPS_PER_DOCUMENT * Q_JOIN
+Q_BYTES = BATCH * Q_DOCUMENT_BYTES
+KV_DOCUMENT_BYTES = KEY_BLOCKS * KV_TILE
+KV_BYTES = BATCH * KV_DOCUMENT_BYTES
+O_DOCUMENT_BYTES = COLS * QUERY_GROUPS_PER_DOCUMENT * OUT_JOIN
+O_BYTES = BATCH * O_DOCUMENT_BYTES
 INF = 9223372036854775807
 
 
@@ -108,30 +126,47 @@ out.append(
     f"    aie.runtime_sequence(%Q: memref<{Q_BYTES}xi8>, %KV: memref<{KV_BYTES}xi8>, %O: memref<{O_BYTES}xi8>) {{"
 )
 for row in range(ROWS):
-    out += [
-        f"      %tq{row} = aiex.dma_configure_task_for @qsh{row} {{",
-        f"        aie.dma_bd(%Q : memref<{Q_BYTES}xi8>, {row * QUERY_GROUPS * Q_JOIN}, {QUERY_GROUPS * Q_JOIN}, {blocks(QUERY_GROUPS, Q_JOIN)}) {{burst_length = 0 : i32}}",
-        "        aie.end",
-        "      } {issue_token = true}",
-        f"      aiex.dma_start_task(%tq{row})",
-        f"      %tkv{row} = aiex.dma_configure_task_for @kvsh{row} {{",
-        f"        aie.dma_bd(%KV : memref<{KV_BYTES}xi8>, 0, {KV_BYTES}, {blocks(KEY_BLOCKS, KV_TILE)}) {{burst_length = 0 : i32}}",
-        "        aie.end",
-        f"      }} {{issue_token = true, repeat_count = {QUERY_GROUPS - 1} : i32}}",
-        f"      aiex.dma_start_task(%tkv{row})",
-    ]
+    for document in range(BATCH):
+        name = f"tq{row}" if BATCH == 1 else f"tq{row}_{document}"
+        out += [
+            f"      %{name} = aiex.dma_configure_task_for @qsh{row} {{",
+            f"        aie.dma_bd(%Q : memref<{Q_BYTES}xi8>, {document * Q_DOCUMENT_BYTES + row * QUERY_GROUPS_PER_DOCUMENT * Q_JOIN}, {QUERY_GROUPS_PER_DOCUMENT * Q_JOIN}, {blocks(QUERY_GROUPS_PER_DOCUMENT, Q_JOIN)}) {{burst_length = 0 : i32}}",
+            "        aie.end",
+            "      } {issue_token = true}",
+            f"      aiex.dma_start_task(%{name})",
+        ]
+    for document in range(BATCH):
+        name = f"tkv{row}" if BATCH == 1 else f"tkv{row}_{document}"
+        out += [
+            f"      %{name} = aiex.dma_configure_task_for @kvsh{row} {{",
+            f"        aie.dma_bd(%KV : memref<{KV_BYTES}xi8>, {document * KV_DOCUMENT_BYTES}, {KV_DOCUMENT_BYTES}, {blocks(KEY_BLOCKS, KV_TILE)}) {{burst_length = 0 : i32}}",
+            "        aie.end",
+            f"      }} {{issue_token = true, repeat_count = {QUERY_GROUPS_PER_DOCUMENT - 1} : i32}}",
+            f"      aiex.dma_start_task(%{name})",
+        ]
 for col in range(COLS):
-    out += [
-        f"      %to{col} = aiex.dma_configure_task_for @osh{col} {{",
-        f"        aie.dma_bd(%O : memref<{O_BYTES}xi8>, {col * QUERY_GROUPS * OUT_JOIN}, {QUERY_GROUPS * OUT_JOIN}, {blocks(QUERY_GROUPS, OUT_JOIN)}) {{burst_length = 0 : i32}}",
-        "        aie.end",
-        "      } {issue_token = true}",
-        f"      aiex.dma_start_task(%to{col})",
-    ]
+    for document in range(BATCH):
+        name = f"to{col}" if BATCH == 1 else f"to{col}_{document}"
+        out += [
+            f"      %{name} = aiex.dma_configure_task_for @osh{col} {{",
+            f"        aie.dma_bd(%O : memref<{O_BYTES}xi8>, {document * O_DOCUMENT_BYTES + col * QUERY_GROUPS_PER_DOCUMENT * OUT_JOIN}, {QUERY_GROUPS_PER_DOCUMENT * OUT_JOIN}, {blocks(QUERY_GROUPS_PER_DOCUMENT, OUT_JOIN)}) {{burst_length = 0 : i32}}",
+            "        aie.end",
+            "      } {issue_token = true}",
+            f"      aiex.dma_start_task(%{name})",
+        ]
 for row in range(ROWS):
-    for task in (f"tq{row}", f"tkv{row}"):
+    tasks = [
+        f"tq{row}" if BATCH == 1 else f"tq{row}_{document}"
+        for document in range(BATCH)
+    ] + [
+        f"tkv{row}" if BATCH == 1 else f"tkv{row}_{document}"
+        for document in range(BATCH)
+    ]
+    for task in tasks:
         out += [f"      aiex.dma_await_task(%{task})", f"      aiex.dma_free_task(%{task})"]
 for col in range(COLS):
-    out += [f"      aiex.dma_await_task(%to{col})", f"      aiex.dma_free_task(%to{col})"]
+    for document in range(BATCH):
+        name = f"to{col}" if BATCH == 1 else f"to{col}_{document}"
+        out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
 out += ["    }", "  }", "}"]
 print("\n".join(out))

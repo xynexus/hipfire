@@ -27,13 +27,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let post_norm = (0..HIDDEN)
         .map(|hidden| f32_to_bf16_bits(0.87 + (hidden % 31) as f32 * 0.0018))
         .collect::<Vec<_>>();
-    let residual = (0..M * HIDDEN)
+    let residual_document = (0..M * HIDDEN)
         .map(|index| f32_to_bf16_bits(((index * 37 % 257) as f32 - 128.0) * 0.0017))
         .collect::<Vec<_>>();
-    let exact_ffn = (0..M * HIDDEN)
+    let exact_ffn_document = (0..M * HIDDEN)
         .map(|index| ((index * 23 % 193) as f32 - 96.0) * 0.0911 + 0.00317)
         .collect::<Vec<_>>();
-    let (high, low): (Vec<_>, Vec<_>) = exact_ffn
+    let (high_document, low_document): (Vec<_>, Vec<_>) = exact_ffn_document
         .iter()
         .map(|&value| {
             let high = f32_to_bf16_bits(value);
@@ -41,44 +41,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (high, low)
         })
         .unzip();
-    let compensated = high
+    let compensated_document = high_document
         .iter()
-        .zip(&low)
+        .zip(&low_document)
         .map(|(&high, &low)| bf16_bits_to_f32(high) + bf16_bits_to_f32(low))
         .collect::<Vec<_>>();
-    let mut expected = vec![0.0f32; M * HIDDEN];
+    let mut expected_document = vec![0.0f32; M * HIDDEN];
     for token in 0..M {
         let base = token * HIDDEN;
-        let sum = compensated[base..base + HIDDEN]
+        let sum = compensated_document[base..base + HIDDEN]
             .iter()
             .map(|value| value.powi(2))
             .sum::<f32>();
         let inverse = (sum / HIDDEN as f32 + EPSILON).sqrt().recip();
         for hidden in 0..HIDDEN {
             let index = base + hidden;
-            expected[index] = bf16_bits_to_f32(f32_to_bf16_bits(
-                bf16_bits_to_f32(residual[index])
-                    + compensated[index] * bf16_bits_to_f32(post_norm[hidden]) * inverse,
+            expected_document[index] = bf16_bits_to_f32(f32_to_bf16_bits(
+                bf16_bits_to_f32(residual_document[index])
+                    + compensated_document[index] * bf16_bits_to_f32(post_norm[hidden]) * inverse,
             ));
         }
     }
 
     let gpu = hipfire_rdna::Gpu::init()?;
     let mut tail = NpuEmbeddingPostFfnDirectTailBf16x2::load_cached(&cache)?;
+    let batch = tail.batch();
+    let high = high_document.repeat(batch);
+    let low = low_document.repeat(batch);
+    let residual = residual_document.repeat(batch);
+    let expected = expected_document.repeat(batch);
     let mut output_shared = gpu.alloc_shared_gtt(tail.output_bytes())?;
-    let mut combined_shared =
-        gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::combined_bytes())?;
+    let mut combined_shared = gpu.alloc_shared_gtt(tail.loaded_combined_bytes())?;
     output_shared.as_mut_slice().fill(0);
     combined_shared.as_mut_slice().fill(0);
     if interleaved_ffn {
         if split_residual {
-            write_interleaved_rows(combined_shared.as_mut_slice(), &high, &low, M, HIDDEN);
+            write_interleaved_rows(
+                combined_shared.as_mut_slice(),
+                &high,
+                &low,
+                batch,
+                M,
+                HIDDEN,
+            );
         } else {
             write_interleaved_combined_rows(
                 combined_shared.as_mut_slice(),
                 &high,
                 &low,
                 &residual,
+                batch,
                 M,
                 HIDDEN,
             );
@@ -89,14 +101,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &high,
             &low,
             &residual,
+            batch,
             M,
             HIDDEN,
         );
     }
     let residual_shared = if split_residual {
-        let mut buffer =
-            gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::residual_bytes())?;
-        write_bf16(buffer.as_mut_slice(), &residual);
+        let mut buffer = gpu.alloc_shared_gtt(tail.split_x_input_bytes())?;
+        write_bf16_padded_documents(buffer.as_mut_slice(), &residual, batch, M, HIDDEN);
         tail.attach_shared_split_state(
             combined_shared.dmabuf_fd(),
             combined_shared.len(),
@@ -141,8 +153,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     println!(
-        "embeddinggemma-post-ffn-direct-tail-bf16x2 M=256 K=768: cosine={cosine:.8} max_abs={max_abs:.7}"
+        "embeddinggemma-post-ffn-direct-tail-bf16x2 M={} K=768: cosine={cosine:.8} max_abs={max_abs:.7}",
+        M * batch
     );
+    if batch > 1 {
+        let (doc0_cosine, doc0_max) = metrics(&got[..M * HIDDEN], &got[M * HIDDEN..2 * M * HIDDEN]);
+        if doc0_cosine < 0.999999 || doc0_max != 0.0 {
+            return Err(format!(
+                "duplicated tail documents differ: cosine={doc0_cosine:.8} max_abs={doc0_max:.7}"
+            )
+            .into());
+        }
+        println!("duplicated_documents_cosine={doc0_cosine:.8} max_abs={doc0_max:.7}");
+    }
     if iterations > 0 {
         let started = std::time::Instant::now();
         for _ in 0..iterations {
@@ -167,23 +190,29 @@ fn write_interleaved_combined_rows(
     high: &[u16],
     low: &[u16],
     residual: &[u16],
+    batch: usize,
     rows: usize,
     hidden: usize,
 ) {
     let row_bytes = 3 * hidden * size_of::<u16>();
-    for row in 0..rows {
-        let destination = &mut destination[row * row_bytes..(row + 1) * row_bytes];
-        let source = row * hidden;
-        for column in 0..hidden {
-            let offset = 2 * column * size_of::<u16>();
-            destination[offset..offset + 2].copy_from_slice(&high[source + column].to_le_bytes());
-            destination[offset + 2..offset + 4]
-                .copy_from_slice(&low[source + column].to_le_bytes());
+    for document in 0..batch {
+        for row in 0..rows {
+            let physical_row = document * 288 + row;
+            let destination =
+                &mut destination[physical_row * row_bytes..(physical_row + 1) * row_bytes];
+            let source = (document * rows + row) * hidden;
+            for column in 0..hidden {
+                let offset = 2 * column * size_of::<u16>();
+                destination[offset..offset + 2]
+                    .copy_from_slice(&high[source + column].to_le_bytes());
+                destination[offset + 2..offset + 4]
+                    .copy_from_slice(&low[source + column].to_le_bytes());
+            }
+            write_bf16(
+                &mut destination[2 * hidden * 2..],
+                &residual[source..source + hidden],
+            );
         }
-        write_bf16(
-            &mut destination[2 * hidden * 2..],
-            &residual[source..source + hidden],
-        );
     }
 }
 
@@ -193,24 +222,27 @@ fn write_combined_rows(
     high: &[u16],
     low: &[u16],
     residual: &[u16],
+    batch: usize,
     rows: usize,
     columns: usize,
 ) {
-    for row in 0..rows {
-        let source = row * columns;
-        let target = row * columns * 6;
-        write_bf16(
-            &mut destination[target..target + columns * 2],
-            &high[source..source + columns],
-        );
-        write_bf16(
-            &mut destination[target + columns * 2..target + columns * 4],
-            &low[source..source + columns],
-        );
-        write_bf16(
-            &mut destination[target + columns * 4..target + columns * 6],
-            &residual[source..source + columns],
-        );
+    for document in 0..batch {
+        for row in 0..rows {
+            let source = (document * rows + row) * columns;
+            let target = (document * 288 + row) * columns * 6;
+            write_bf16(
+                &mut destination[target..target + columns * 2],
+                &high[source..source + columns],
+            );
+            write_bf16(
+                &mut destination[target + columns * 2..target + columns * 4],
+                &low[source..source + columns],
+            );
+            write_bf16(
+                &mut destination[target + columns * 4..target + columns * 6],
+                &residual[source..source + columns],
+            );
+        }
     }
 }
 
@@ -219,15 +251,38 @@ fn write_interleaved_rows(
     destination: &mut [u8],
     high: &[u16],
     low: &[u16],
+    batch: usize,
     rows: usize,
     columns: usize,
 ) {
-    for row in 0..rows {
-        for column in 0..columns {
-            let source = row * columns + column;
-            let target = row * columns * 6 + column * 4;
-            destination[target..target + 2].copy_from_slice(&high[source].to_le_bytes());
-            destination[target + 2..target + 4].copy_from_slice(&low[source].to_le_bytes());
+    for document in 0..batch {
+        for row in 0..rows {
+            for column in 0..columns {
+                let source = (document * rows + row) * columns + column;
+                let target = (document * 288 + row) * columns * 6 + column * 4;
+                destination[target..target + 2].copy_from_slice(&high[source].to_le_bytes());
+                destination[target + 2..target + 4].copy_from_slice(&low[source].to_le_bytes());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_bf16_padded_documents(
+    destination: &mut [u8],
+    values: &[u16],
+    batch: usize,
+    rows: usize,
+    columns: usize,
+) {
+    for document in 0..batch {
+        for row in 0..rows {
+            let source = (document * rows + row) * columns;
+            let target = (document * 288 + row) * columns * size_of::<u16>();
+            write_bf16(
+                &mut destination[target..target + columns * size_of::<u16>()],
+                &values[source..source + columns],
+            );
         }
     }
 }

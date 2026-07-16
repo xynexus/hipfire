@@ -3,6 +3,13 @@
 
 import sys
 
+
+def _int_flag(flag, default):
+    for argument in sys.argv[1:]:
+        if argument.startswith(flag + "="):
+            return int(argument.split("=", 1)[1])
+    return default
+
 SPLIT_RESIDUAL = "--split-residual" in sys.argv[1:]
 FUSION_READY = "--fusion-ready" in sys.argv[1:]
 FUSED_R34_PACK = "--fused-r34-pack" in sys.argv[1:]
@@ -11,6 +18,11 @@ if FUSION_READY and SPLIT_RESIDUAL:
     raise SystemExit("--fusion-ready uses the joined FFN/X row-state input")
 if FUSED_NEXT_PACK and not FUSION_READY:
     raise SystemExit("--fused-next-pack requires --fusion-ready")
+BATCH = _int_flag("--batch", 1)
+if BATCH < 1:
+    raise SystemExit("--batch must be positive")
+if BATCH > 1 and (FUSION_READY or FUSED_NEXT_PACK or FUSED_R34_PACK):
+    raise SystemExit("batched tail currently supports the non-fused split/joined ABI")
 X_ROW = next(
     (
         int(arg.split("=", 1)[1])
@@ -21,7 +33,9 @@ X_ROW = next(
 )
 
 COLS, CORE_ROWS, HALVES = 8, 4, 2
-PHASES, TOKENS_PER_CORE, HIDDEN = 4, 2, 768
+PHASES_PER_DOCUMENT, TOKENS_PER_CORE, HIDDEN = 4, 2, 768
+PHASES = PHASES_PER_DOCUMENT * BATCH
+RUNTIME_PHASES = PHASES_PER_DOCUMENT
 BF16_ROW = HIDDEN * 2
 COMPLETED_ROW = 2 * BF16_ROW  # completed high/low, token-major
 COMBINED_ROW = HIDDEN * 3 * 2  # FFN high/low, residual
@@ -32,9 +46,10 @@ OUTPUT_TILE = TOKENS_PER_CORE * COMPLETED_ROW
 INPUT_JOIN = (COLS // HALVES) * INPUT_TILE
 X_JOIN = (COLS // HALVES) * X_TILE
 OUTPUT_JOIN = (COLS // HALVES) * OUTPUT_TILE
-INPUT_BYTES = 288 * COMBINED_ROW
-X_BYTES = 288 * X_ROW
-OUTPUT_BYTES = 288 * COMPLETED_ROW
+DOCUMENT_ROWS = 288
+INPUT_BYTES = BATCH * DOCUMENT_ROWS * COMBINED_ROW
+X_BYTES = BATCH * DOCUMENT_ROWS * X_ROW
+OUTPUT_BYTES = BATCH * DOCUMENT_ROWS * COMPLETED_ROW
 PARAM_RECORD = INPUT_TILE
 PARAM_BYTES_TOTAL = COLS * CORE_ROWS * PARAM_RECORD
 PARAM_BYTES = HIDDEN * 2 + 4
@@ -94,6 +109,22 @@ assert len(r34_compact_mts) == R34_COMPACT_MTS
 
 def linear_dims(size):
     return f"[<size = {size // 512}, stride = 512>, <size = 512, stride = 1>]"
+
+
+def document_dims(dimensions, document_stride):
+    if BATCH == 1:
+        return dimensions
+    return (
+        f"[<size = {BATCH}, stride = {document_stride}>, "
+        "<size = 1, stride = 4>, "
+        + dimensions.removeprefix("[")
+    )
+
+
+def repeated_task_attrs():
+    if BATCH == 1:
+        return " {issue_token = true}"
+    return f" {{issue_token = true, repeat_count = {BATCH - 1} : i32}}"
 
 
 def r34_core_lines(col, row):
@@ -449,7 +480,7 @@ for row in range(CORE_ROWS):
                 "      } {issue_token = true}",
                 f"      aiex.dma_start_task(%{nname})",
             ]
-        for phase in range(PHASES):
+        for phase in range(RUNTIME_PHASES):
             phase_token = token_base + phase * (
                 TOKENS_PER_CORE
                 if FUSION_READY
@@ -472,16 +503,21 @@ for row in range(CORE_ROWS):
                 if FUSION_READY
                 else linear_dims(OUTPUT_JOIN)
             )
+            y_dims = document_dims(y_dims, DOCUMENT_ROWS * COMBINED_ROW)
+            output_dims = document_dims(
+                output_dims, DOCUMENT_ROWS * COMPLETED_ROW
+            )
+            task_attrs = repeated_task_attrs()
             out += [
                 f"      %{iname} = aiex.dma_configure_task_for @dsh{half}_{row} {{",
                 f"        aie.dma_bd(%{'Y' if SPLIT_RESIDUAL else 'D'} : memref<{INPUT_BYTES}xi8>, {phase_token * COMBINED_ROW}, {INPUT_JOIN}, {y_dims}) {{burst_length = 0 : i32}}",
                 "        aie.end",
-                "      } {issue_token = true}",
+                f"      }}{task_attrs}",
                 f"      aiex.dma_start_task(%{iname})",
                 f"      %{oname} = aiex.dma_configure_task_for @osh{half}_{row} {{",
                 f"        aie.dma_bd(%O : memref<{OUTPUT_BYTES}xi8>, {phase_token * COMPLETED_ROW}, {OUTPUT_JOIN}, {output_dims}) {{burst_length = 0 : i32}}",
                 "        aie.end",
-                "      } {issue_token = true}",
+                f"      }}{task_attrs}",
                 f"      aiex.dma_start_task(%{oname})",
             ]
             if SPLIT_RESIDUAL:
@@ -495,11 +531,12 @@ for row in range(CORE_ROWS):
                     if X_ROW == BF16_ROW
                     else f"[<size = {COLS // HALVES * TOKENS_PER_CORE}, stride = {X_ROW}>, <size = {BF16_ROW}, stride = 1>]"
                 )
+                x_dims = document_dims(x_dims, DOCUMENT_ROWS * X_ROW)
                 out[-5:-5] = [
                     f"      %{xname} = aiex.dma_configure_task_for @xsc{half}_{row} {{",
                     f"        aie.dma_bd(%X : memref<{X_BYTES}xi8>, {phase_token * X_ROW}, {X_JOIN}, {x_dims}) {{burst_length = 0 : i32}}",
                     "        aie.end",
-                    "      } {issue_token = true}",
+                    f"      }}{task_attrs}",
                     f"      aiex.dma_start_task(%{xname})",
                 ]
         if FUSED_NEXT_PACK and not FUSED_R34_PACK:
@@ -536,7 +573,7 @@ if FUSED_R34_PACK:
         # plane plus one compact scale plane. The next resident GEMM reuses
         # these bytes across its five N-macros instead of materializing five
         # 16 KiB activation replicas.
-        for phase in range(PHASES):
+        for phase in range(RUNTIME_PHASES):
             completed = f"to{half}_{row}_{phase}"
             out += [
                 f"      aiex.dma_await_task(%{completed})",
@@ -561,7 +598,7 @@ for row in range(CORE_ROWS):
         names = [f"tp{half}_{row}"]
         if FUSED_NEXT_PACK:
             names += [f"tn{half}_{row}"]
-        for phase in range(PHASES):
+        for phase in range(RUNTIME_PHASES):
             names += [f"td{half}_{row}_{phase}"]
             if SPLIT_RESIDUAL:
                 names += [f"tx{half}_{row}_{phase}"]

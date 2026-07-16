@@ -52,6 +52,8 @@ const PRE_NORM_OFFSET: usize = POST_NORM_OFFSET + K * size_of::<u16>();
 const EPSILON_OFFSET: usize = PRE_NORM_OFFSET + K * size_of::<u16>();
 const PRE_INVERSE_BASE: usize = M * K * size_of::<u16>();
 const PRE_INVERSE_RECORD_BYTES: usize = ROWS_PER_CORE * K * size_of::<u16>();
+const PRE_INVERSE_PLANE_BYTES: usize = COLS * CORE_ROWS * PRE_INVERSE_RECORD_BYTES;
+const DIRECT_X_DOCUMENT_BYTES: usize = 288 * K * size_of::<u16>();
 const PRE_EXCEPTION_OFFSET: usize = ROWS_PER_CORE * size_of::<f32>();
 const ROW_STATE_BYTES: usize = 1_664;
 const ROW_STATE_OFFSET: usize = K * size_of::<u16>();
@@ -102,6 +104,7 @@ pub struct NpuEmbeddingLayerAttentionDenseW8 {
     direct_completed_residual: bool,
     activation_offset: usize,
     input_bytes: usize,
+    batch: usize,
     primed: bool,
     context_commands: usize,
 }
@@ -127,7 +130,6 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         for field in [
             "op=resident-qkv-paired-attention-output-norm",
             "mode=w8-scaled",
-            "m=256",
             "k=768",
             "n=1280",
             "roles=q0,q1,q2,k,v,o",
@@ -139,7 +141,29 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
                 )));
             }
         }
+        let rows = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("m="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| invalid("resident layer attention cache missing m="))?;
+        if rows == 0 || rows % M != 0 {
+            return Err(invalid(format!(
+                "resident layer attention cache m={rows} must be a positive multiple of {M}"
+            )));
+        }
+        let batch = rows / M;
         let direct_completed_residual = manifest_uses_direct_completed_residual(&manifest);
+        if batch > 1
+            && (!direct_completed_residual
+                || !manifest
+                    .lines()
+                    .any(|line| line == "attention=block-diagonal-documents")
+                || !manifest.lines().any(|line| line == "segment-rows=256"))
+        {
+            return Err(invalid(
+                "batched resident attention requires direct completed residual and 256-row segmentation",
+            ));
+        }
         let external_residual = direct_completed_residual
             || manifest
                 .lines()
@@ -209,22 +233,22 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             &std::fs::read(format!("{cache}/insts.bin")).map_err(XdnaError::Open)?,
         )?;
         let activation_offset = if direct_completed_residual {
-            COMPLETED_BF16X2_BYTES
+            batch * COMPLETED_BF16X2_BYTES
         } else {
             0
         };
         let input_bytes = activation_offset
-            + INPUT_BYTES
+            + batch * INPUT_BYTES
             + if external_residual && !direct_completed_residual {
-                EXTERNAL_RESIDUAL_BYTES
+                batch * EXTERNAL_RESIDUAL_BYTES
             } else {
                 0
             };
         Ok(Self {
             input: kernel.alloc_arg(input_bytes)?,
-            hidden: kernel.alloc_arg(HIDDEN_BACKING_BYTES)?,
-            queries: kernel.alloc_arg(Q_BYTES)?,
-            key_values: kernel.alloc_arg(KV_BYTES)?,
+            hidden: kernel.alloc_arg(hidden_backing_bytes_for(batch))?,
+            queries: kernel.alloc_arg(batch * Q_BYTES)?,
+            key_values: kernel.alloc_arg(batch * KV_BYTES)?,
             kernel,
             exception_column,
             outputs_direct_x,
@@ -238,6 +262,7 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             direct_completed_residual,
             activation_offset,
             input_bytes,
+            batch,
             primed: false,
             context_commands: 0,
         })
@@ -247,12 +272,20 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         M
     }
 
+    pub const fn loaded_rows(&self) -> usize {
+        M * self.batch
+    }
+
     pub fn input_bytes(&self) -> usize {
         self.input_bytes
     }
 
     pub const fn activation_bytes() -> usize {
         INPUT_BYTES
+    }
+
+    pub const fn loaded_activation_bytes(&self) -> usize {
+        INPUT_BYTES * self.batch
     }
 
     pub const fn external_input_bytes() -> usize {
@@ -273,6 +306,10 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
 
     pub const fn hidden_backing_bytes() -> usize {
         HIDDEN_BACKING_BYTES
+    }
+
+    pub const fn loaded_hidden_backing_bytes(&self) -> usize {
+        hidden_backing_bytes_for(self.batch)
     }
 
     pub const fn outputs_direct_x(&self) -> bool {
@@ -299,7 +336,7 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
     }
 
     pub fn attach_shared_hidden(&mut self, fd: i32, bytes: usize) -> Result<(), XdnaError> {
-        if bytes < HIDDEN_BACKING_BYTES {
+        if bytes < self.loaded_hidden_backing_bytes() {
             return Err(invalid(
                 "resident layer attention shared hidden buffer is too small",
             ));
@@ -314,6 +351,20 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             return Err(invalid("resident layer has no direct completed residual"));
         }
         self.kernel.sync_to_device(&self.input)
+    }
+
+    /// Stage document-padded BF16x2 completed rows ahead of the packed
+    /// activation suffix. Documents use independent 288-row physical slots.
+    pub fn set_completed_bf16x2(&mut self, completed: &[u8]) -> Result<(), XdnaError> {
+        if !self.direct_completed_residual {
+            return Err(invalid("resident layer has no direct completed residual"));
+        }
+        if completed.len() != self.batch * COMPLETED_BF16X2_BYTES {
+            return Err(invalid("resident layer completed BF16x2 size mismatch"));
+        }
+        self.input.as_mut_slice()[..completed.len()].copy_from_slice(completed);
+        self.kernel
+            .sync_to_device_prefix(&self.input, completed.len())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -484,15 +535,17 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         {
             return Err(invalid("resident layer template size mismatch"));
         }
-        copy_paired_weight_scales(
-            &mut self.input.as_mut_slice()
-                [self.activation_offset..self.activation_offset + INPUT_BYTES],
-            &weights.input_template,
-        );
+        for document in 0..self.batch {
+            let start = self.activation_offset + document * INPUT_BYTES;
+            copy_paired_weight_scales(
+                &mut self.input.as_mut_slice()[start..start + INPUT_BYTES],
+                &weights.input_template,
+            );
+        }
         self.restore_hidden(weights)?;
         if self.external_residual {
             self.kernel
-                .sync_to_device_prefix(&self.input, self.activation_offset + INPUT_BYTES)?;
+                .sync_to_device_prefix(&self.input, self.input_bytes)?;
         } else {
             self.kernel.sync_to_device(&self.input)?;
         }
@@ -504,19 +557,21 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         weights: &NpuEmbeddingLayerAttentionDenseW8Weights,
         packed: &[u8],
     ) -> Result<(), XdnaError> {
-        if packed.len() != INPUT_BYTES {
+        if packed.len() != self.loaded_activation_bytes() {
             return Err(invalid("resident layer prepacked input size mismatch"));
         }
-        self.input.as_mut_slice()[self.activation_offset..self.activation_offset + INPUT_BYTES]
+        self.input.as_mut_slice()[self.activation_offset..self.activation_offset + packed.len()]
             .copy_from_slice(packed);
-        copy_paired_weight_scales(
-            &mut self.input.as_mut_slice()
-                [self.activation_offset..self.activation_offset + INPUT_BYTES],
-            &weights.input_template,
-        );
+        for document in 0..self.batch {
+            let start = self.activation_offset + document * INPUT_BYTES;
+            copy_paired_weight_scales(
+                &mut self.input.as_mut_slice()[start..start + INPUT_BYTES],
+                &weights.input_template,
+            );
+        }
         if self.external_residual {
             self.kernel
-                .sync_to_device_prefix(&self.input, self.activation_offset + INPUT_BYTES)
+                .sync_to_device_prefix(&self.input, self.input_bytes)
         } else {
             self.kernel.sync_to_device(&self.input)
         }
@@ -529,7 +584,7 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         weights: &mut NpuEmbeddingLayerAttentionDenseW8Weights,
         residual: &[u16],
     ) -> Result<(), XdnaError> {
-        if residual.len() != M * K || weights.weights.len() != WEIGHT_BYTES {
+        if self.batch != 1 || residual.len() != M * K || weights.weights.len() != WEIGHT_BYTES {
             return Err(invalid("resident layer residual geometry mismatch"));
         }
         let norm_base = QKV_WEIGHT_BYTES + OUTPUT_WEIGHT_BYTES;
@@ -570,14 +625,21 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
     pub fn read_hidden_f32(&self) -> Result<Vec<f32>, XdnaError> {
         self.kernel.sync_output(&self.hidden)?;
         let bytes = self.hidden.as_slice();
-        let mut output = Vec::with_capacity(M * K);
-        for row in 0..M {
-            let start = row * self.output_row_bytes;
-            output.extend(
-                bytes[start..start + K * size_of::<u16>()]
-                    .chunks_exact(size_of::<u16>())
-                    .map(|word| bf16_bits_to_f32(u16::from_le_bytes([word[0], word[1]]))),
-            );
+        let mut output = Vec::with_capacity(self.loaded_rows() * K);
+        for document in 0..self.batch {
+            let document_base = if self.batch == 1 {
+                0
+            } else {
+                document * DIRECT_X_DOCUMENT_BYTES
+            };
+            for row in 0..M {
+                let start = document_base + row * self.output_row_bytes;
+                output.extend(
+                    bytes[start..start + K * size_of::<u16>()]
+                        .chunks_exact(size_of::<u16>())
+                        .map(|word| bf16_bits_to_f32(u16::from_le_bytes([word[0], word[1]]))),
+                );
+            }
         }
         Ok(output)
     }
@@ -595,40 +657,61 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         self.kernel.sync_output(&self.hidden)?;
         let bytes = self.hidden.as_slice();
         if self.row_state_output {
-            let mut inverse = Vec::with_capacity(M);
-            for row in 0..M {
-                let offset = row * ROW_STATE_BYTES + ROW_STATE_OFFSET;
-                inverse.push(f32::from_le_bytes(
-                    bytes[offset..offset + size_of::<f32>()]
-                        .try_into()
-                        .expect("four-byte row-state inverse"),
-                ));
+            let mut inverse = Vec::with_capacity(self.loaded_rows());
+            for document in 0..self.batch {
+                let document_base = if self.batch == 1 {
+                    0
+                } else {
+                    document * DIRECT_X_DOCUMENT_BYTES
+                };
+                for row in 0..M {
+                    let offset = document_base + row * ROW_STATE_BYTES + ROW_STATE_OFFSET;
+                    inverse.push(f32::from_le_bytes(
+                        bytes[offset..offset + size_of::<f32>()]
+                            .try_into()
+                            .expect("four-byte row-state inverse"),
+                    ));
+                }
             }
             return Ok(NpuEmbeddingPreFfnState {
                 inverse,
                 exception: None,
             });
         }
-        let required = PRE_INVERSE_BASE + COLS * CORE_ROWS * PRE_INVERSE_RECORD_BYTES;
+        let required = if self.batch == 1 {
+            PRE_INVERSE_BASE + PRE_INVERSE_PLANE_BYTES
+        } else {
+            self.batch * (DIRECT_X_DOCUMENT_BYTES + PRE_INVERSE_PLANE_BYTES)
+        };
         if bytes.len() < required {
             return Err(invalid("resident layer pre-inverse backing is too small"));
         }
-        let mut inverse = vec![0.0f32; M];
-        let mut exception_x = self.exception_column.map(|_| vec![0u16; M]);
-        for core_row in 0..CORE_ROWS {
-            for column in 0..COLS {
-                let record = core_row * COLS + column;
-                let token_base = (column / 4) * 128 + core_row * 32 + (column % 4) * 8;
-                let start = PRE_INVERSE_BASE + record * PRE_INVERSE_RECORD_BYTES;
-                for row in 0..ROWS_PER_CORE {
-                    let (decoded_inverse, decoded_exception) = decode_pre_ffn_record(
-                        &bytes[start..start + PRE_INVERSE_RECORD_BYTES],
-                        row,
-                        self.exception_column.is_some(),
-                    );
-                    inverse[token_base + row] = decoded_inverse;
-                    if let (Some(x), Some(value)) = (&mut exception_x, decoded_exception) {
-                        x[token_base + row] = value;
+        let mut inverse = vec![0.0f32; self.loaded_rows()];
+        let mut exception_x = self
+            .exception_column
+            .map(|_| vec![0u16; self.loaded_rows()]);
+        for document in 0..self.batch {
+            let inverse_base = if self.batch == 1 {
+                PRE_INVERSE_BASE
+            } else {
+                self.batch * DIRECT_X_DOCUMENT_BYTES + document * PRE_INVERSE_PLANE_BYTES
+            };
+            for core_row in 0..CORE_ROWS {
+                for column in 0..COLS {
+                    let record = core_row * COLS + column;
+                    let token_base =
+                        document * M + (column / 4) * 128 + core_row * 32 + (column % 4) * 8;
+                    let start = inverse_base + record * PRE_INVERSE_RECORD_BYTES;
+                    for row in 0..ROWS_PER_CORE {
+                        let (decoded_inverse, decoded_exception) = decode_pre_ffn_record(
+                            &bytes[start..start + PRE_INVERSE_RECORD_BYTES],
+                            row,
+                            self.exception_column.is_some(),
+                        );
+                        inverse[token_base + row] = decoded_inverse;
+                        if let (Some(x), Some(value)) = (&mut exception_x, decoded_exception) {
+                            x[token_base + row] = value;
+                        }
                     }
                 }
             }
@@ -665,9 +748,19 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         &mut self,
         weights: &NpuEmbeddingLayerAttentionDenseW8Weights,
     ) -> Result<(), XdnaError> {
-        self.hidden
-            .as_mut_slice()
-            .copy_from_slice(&weights.hidden_template);
+        if self.batch == 1 {
+            self.hidden
+                .as_mut_slice()
+                .copy_from_slice(&weights.hidden_template);
+        } else {
+            self.hidden.as_mut_slice().fill(0);
+            let scratch_base = self.batch * (DIRECT_X_DOCUMENT_BYTES + PRE_INVERSE_PLANE_BYTES);
+            for document in 0..self.batch {
+                let start = scratch_base + document * HIDDEN_BACKING_BYTES;
+                self.hidden.as_mut_slice()[start..start + HIDDEN_BACKING_BYTES]
+                    .copy_from_slice(&weights.hidden_template);
+            }
+        }
         self.kernel.sync_to_device(&self.hidden)
     }
 
@@ -876,6 +969,14 @@ fn write_u16(destination: &mut [u8], offset: usize, value: u16) {
     destination[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+const fn hidden_backing_bytes_for(batch: usize) -> usize {
+    if batch == 1 {
+        HIDDEN_BACKING_BYTES
+    } else {
+        batch * (DIRECT_X_DOCUMENT_BYTES + PRE_INVERSE_PLANE_BYTES + HIDDEN_BACKING_BYTES)
+    }
+}
+
 fn invalid(message: impl Into<String>) -> XdnaError {
     XdnaError::InvalidOpus(message.into())
 }
@@ -896,6 +997,9 @@ mod tests {
         );
         assert_eq!(WEIGHT_BYTES, 8_192_000);
         assert_eq!(HIDDEN_BACKING_BYTES, 5_111_808);
+        assert_eq!(hidden_backing_bytes_for(2), 11_894_784);
+        assert_eq!(DIRECT_X_DOCUMENT_BYTES, 442_368);
+        assert_eq!(PRE_INVERSE_PLANE_BYTES, 393_216);
         assert_eq!(NORM_PARAM_BYTES, 524_288);
         assert_eq!(COMPLETED_BF16X2_BYTES, 884_736);
     }

@@ -7,6 +7,7 @@ CANONICAL_BF16 = "--canonical-bf16-input" in sys.argv[1:]
 CANONICAL_BF16X2_OUTPUT = "--canonical-bf16x2-output" in sys.argv[1:]
 DIRECT_X_PRE_NORM = "--direct-x-pre-norm" in sys.argv[1:]
 REUSE_GATE_ACTIVATION = "--reuse-gate-activation" in sys.argv[1:]
+WEIGHT_REUSE = "--weight-reuse-across-macros" in sys.argv[1:]
 if CANONICAL_BF16X2_OUTPUT and not CANONICAL_BF16:
     raise SystemExit("--canonical-bf16x2-output requires --canonical-bf16-input")
 if DIRECT_X_PRE_NORM and not (CANONICAL_BF16 and CANONICAL_BF16X2_OUTPUT):
@@ -16,6 +17,13 @@ if DIRECT_X_PRE_NORM and not (CANONICAL_BF16 and CANONICAL_BF16X2_OUTPUT):
     )
 if REUSE_GATE_ACTIVATION and not DIRECT_X_PRE_NORM:
     raise SystemExit("--reuse-gate-activation requires --direct-x-pre-norm")
+if WEIGHT_REUSE and (
+    not CANONICAL_BF16 or DIRECT_X_PRE_NORM or REUSE_GATE_ACTIVATION
+):
+    raise SystemExit(
+        "--weight-reuse-across-macros currently requires canonical BF16 input "
+        "without direct-X or gate-activation reuse"
+    )
 
 
 def _int_flag(flag, default):
@@ -32,6 +40,7 @@ def _int_flag(flag, default):
 # core program (r26_w8_resident_ffn.cc) is unchanged (fixed 24-row tiles).
 BATCH = _int_flag("--batch", 1)
 REAL_M = 256 * BATCH
+PAIR_DOWN_FINISH = DIRECT_X_PRE_NORM and CANONICAL_BF16X2_OUTPUT and BATCH > 1
 
 COLS, CORE_ROWS = 8, 4
 M_MACROS, GATE_N_MACROS = 3 * BATCH, 6
@@ -41,7 +50,7 @@ DOWN_MBLOCKS = M_MACROS
 DATA_PAIR = 12288 if CANONICAL_BF16 else 9216
 DATA_JOIN = DATA_PAIR if CANONICAL_BF16 else 4 * DATA_PAIR
 APACK = 6240
-WB = 16384
+WB = 15552 if WEIGHT_REUSE else 16384
 GATE_OUTPUT_BYTES = 1536
 OUTPUT_CO = 2304
 FRAGMENT = 784
@@ -50,15 +59,22 @@ SCRATCH = 256
 GATE_ACC = 1152
 GATE_DATA_BLOCKS = GATE_OUTBLOCKS * GATE_GROUPS
 GATE_PARAM_BLOCKS = M_MACROS * GATE_GROUPS if REUSE_GATE_ACTIVATION else 0
-WEIGHT_BLOCKS = GATE_PARAM_BLOCKS + GATE_DATA_BLOCKS + DOWN_MBLOCKS * DOWN_GROUPS * 2
+WEIGHT_SEQUENCE_BLOCKS = GATE_N_MACROS * GATE_GROUPS + DOWN_GROUPS * 2
+WEIGHT_BLOCKS = (
+    WEIGHT_SEQUENCE_BLOCKS
+    if WEIGHT_REUSE
+    else GATE_PARAM_BLOCKS + GATE_DATA_BLOCKS + DOWN_MBLOCKS * DOWN_GROUPS * 2
+)
 T_ROWS, T_STRIDE, INTERMEDIATE, PAD_INTERMEDIATE, OUTPUT = 96 * M_MACROS + 8, 5376, 1152, 1280, 768
 PAD_M = 96 * M_MACROS
 O_ELEMS = PAD_M * OUTPUT
 CANONICAL_INPUT_BYTES = PAD_M * 768 * 2
-DIRECT_X_INPUT_BYTES = 2 * REAL_M * 768 * 2
-RUNTIME_INPUT_BYTES = DIRECT_X_INPUT_BYTES if DIRECT_X_PRE_NORM else CANONICAL_INPUT_BYTES
-PRE_INVERSE_BASE = REAL_M * 768 * 2
 PRE_INVERSE_RECORD_BYTES = 12288
+PRE_INVERSE_PLANE_BYTES = 32 * PRE_INVERSE_RECORD_BYTES
+DIRECT_X_STORAGE_ROWS = REAL_M if BATCH == 1 else PAD_M
+PRE_INVERSE_BASE = DIRECT_X_STORAGE_ROWS * 768 * 2
+DIRECT_X_INPUT_BYTES = PRE_INVERSE_BASE + BATCH * PRE_INVERSE_PLANE_BYTES
+RUNTIME_INPUT_BYTES = DIRECT_X_INPUT_BYTES if DIRECT_X_PRE_NORM else CANONICAL_INPUT_BYTES
 INVERSE_TABLE = 32 * 8 * 4
 CANONICAL_T_BYTES = PAD_M * PAD_INTERMEDIATE * 2
 CANONICAL_OUTPUT_COMPONENTS = 3 if CANONICAL_BF16X2_OUTPUT else 1
@@ -67,10 +83,12 @@ INF = 9223372036854775807
 
 
 def byte_blocks(count, block):
+    transfer_unit = 512 if block % 512 == 0 else 64
+    assert block % transfer_unit == 0
     return (
         f"[<size = {count}, stride = {block}>, "
-        f"<size = {block // 512}, stride = 512>, "
-        "<size = 512, stride = 1>]"
+        f"<size = {block // transfer_unit}, stride = {transfer_unit}>, "
+        f"<size = {transfer_unit}, stride = 1>]"
     )
 
 
@@ -129,14 +147,29 @@ for col in range(COLS):
     for row in range(CORE_ROWS):
         out += [
             f"    %c{col}_{row} = aie.tile({col}, {row + 2})",
-            f"    %gacc{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"gacc{col}_{row}\"}} : memref<{GATE_ACC}xi32>",
+            f"    %gacc{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"gacc{col}_{row}\"}} : memref<{GATE_ACC * 3 if WEIGHT_REUSE else GATE_ACC}xi32>",
+            *(
+                [f"    %gacc_hi{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"gacc_hi{col}_{row}\"}} : memref<{GATE_ACC * (M_MACROS - 3)}xi32>"]
+                if WEIGHT_REUSE and M_MACROS > 3
+                else []
+            ),
             f"    %apack{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"apack{col}_{row}\"}} : memref<{APACK}xi8>",
-            f"    %scratch{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"scratch{col}_{row}\"}} : memref<{SCRATCH}xf32>",
-            f"    %own{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"own{col}_{row}\"}} : memref<{OWN_FRAGMENT}xi8>",
-            f"    %transit{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"transit{col}_{row}\"}} : memref<{OWN_FRAGMENT}xi8>",
+            *(
+                [f"    %scratch{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"scratch{col}_{row}\"}} : memref<{SCRATCH}xf32>"]
+                if not WEIGHT_REUSE
+                else []
+            ),
             *(
                 [
-                    f"    %inv{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"inv{col}_{row}\"}} : memref<9xf32>"
+                    f"    %own{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"own{col}_{row}\"}} : memref<{OWN_FRAGMENT}xi8>",
+                    f"    %transit{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"transit{col}_{row}\"}} : memref<{OWN_FRAGMENT}xi8>",
+                ]
+                if not WEIGHT_REUSE
+                else []
+            ),
+            *(
+                [
+                    f"    %inv{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = \"inv{col}_{row}\"}} : memref<{9 * BATCH}xf32>"
                 ]
                 if DIRECT_X_PRE_NORM
                 else []
@@ -187,7 +220,7 @@ for col in range(COLS):
         offsets = ", ".join(str(row * GATE_OUTPUT_BYTES) for row in range(CORE_ROWS))
         for row in range(CORE_ROWS):
             out.append(
-                f"    aie.objectfifo @oc{col}_{row}(%c{col}_{row}, {{%mt{col}}}, 1 : i32) : !aie.objectfifo<memref<{GATE_OUTPUT_BYTES}xi8>>"
+                f"    aie.objectfifo @oc{col}_{row}(%c{col}_{row}, {{%mt{col}}}, {2 if PAIR_DOWN_FINISH else 1} : i32) : !aie.objectfifo<memref<{GATE_OUTPUT_BYTES}xi8>>"
             )
         out += [
             f"    aie.objectfifo @osh{col}(%mt{col}, {{%shim{col}}}, 1 : i32) : !aie.objectfifo<memref<{CORE_ROWS * GATE_OUTPUT_BYTES}xi8>>",
@@ -211,7 +244,7 @@ decls = [
     (
         "r26_pack3",
         f"memref<{DATA_PAIR}xi8>, "
-        + ("memref<9xf32>, " if DIRECT_X_PRE_NORM else "")
+        + (f"memref<{9 * BATCH}xf32>, " if DIRECT_X_PRE_NORM else "")
         + f"memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{OWN_FRAGMENT}xi8>, i32, i32",
     ),
     (
@@ -229,20 +262,77 @@ decls = [
     ("r26_down1_scaled", f"memref<{APACK}xi8>, memref<{WB}xi8>, memref<{OUTPUT_CO}xi32>, i32"),
 ]
 if DIRECT_X_PRE_NORM:
-    decls.append(
-        ("r45_select_inverses", f"memref<{WB}xi8>, memref<9xf32>, i32, i32")
-    )
+    if BATCH == 1:
+        decls.append(
+            ("r45_select_inverses", f"memref<{WB}xi8>, memref<9xf32>, i32, i32")
+        )
+    else:
+        decls.append(
+            (
+                "r45_select_inverses_batch",
+                f"memref<{WB}xi8>, memref<{9 * BATCH}xf32>, i32, i32, i32",
+            )
+        )
 if REUSE_GATE_ACTIVATION:
     decls += [
         (
             "r55_pack3_cached",
-            f"memref<{DATA_PAIR}xi8>, memref<9xf32>, memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{GATE_GROUPS * FRAGMENT}xi8>, i32, i32, i32",
+            f"memref<{DATA_PAIR}xi8>, memref<{9 * BATCH}xf32>, memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{GATE_GROUPS * FRAGMENT}xi8>, i32, i32, i32",
         ),
     ]
 if CANONICAL_BF16:
     decls.append(
         ("r35_finish_down48_bf16", f"memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32" + (", i32" if CANONICAL_BF16X2_OUTPUT else ""))
     )
+    if PAIR_DOWN_FINISH:
+        decls.append(
+            (
+                "r35_finish_down48_bf16_pair",
+                f"memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, memref<{GATE_OUTPUT_BYTES}xi8>, i32",
+            )
+        )
+    if WEIGHT_REUSE:
+        stationary_acc = GATE_ACC * 3
+        if M_MACROS > 3:
+            stationary_decls = [
+                (
+                    "r26_gate_scaled_split",
+                    f"memref<{APACK}xi8>, memref<{WB}xi8>, memref<{stationary_acc}xi32>, memref<{GATE_ACC * (M_MACROS - 3)}xi32>, i32, i32",
+                ),
+                (
+                    "r26_geglu_padded_split",
+                    f"memref<{stationary_acc}xi32>, memref<{GATE_ACC * (M_MACROS - 3)}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32",
+                ),
+                (
+                    "r35_finish_down48_bf16_split",
+                    f"memref<{stationary_acc}xi32>, memref<{GATE_ACC * (M_MACROS - 3)}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32, i32",
+                ),
+            ]
+        else:
+            stationary_decls = [
+                (
+                    "r26_gate_scaled_at",
+                    f"memref<{APACK}xi8>, memref<{WB}xi8>, memref<{stationary_acc}xi32>, i32, i32",
+                ),
+                (
+                    "r26_geglu_padded_at",
+                    f"memref<{stationary_acc}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32",
+                ),
+                (
+                    "r35_finish_down48_bf16_at",
+                    f"memref<{stationary_acc}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32, i32",
+                ),
+            ]
+        decls += stationary_decls + [
+            (
+                "r123_exchange_fragments",
+                f"memref<{DATA_PAIR}xi8>, memref<{APACK}xi8>, i32",
+            ),
+            (
+                "r123_pack3_owned",
+                f"memref<{DATA_PAIR}xi8>, memref<{WB}xi8>, memref<{APACK}xi8>, i32, i32",
+            ),
+        ]
 for name, args in decls:
     out.append(
         f'    func.func private @{name}({args}) attributes {{link_with = "r26.o"}}'
@@ -312,6 +402,11 @@ for col in range(COLS):
             f"      %inf = arith.constant {INF} : index",
             "      %one = arith.constant 1 : index",
             f"      %gate_outblocks = arith.constant {GATE_OUTBLOCKS} : index",
+            *(
+                [f"      %gate_nmacros = arith.constant {GATE_N_MACROS} : index"]
+                if WEIGHT_REUSE
+                else []
+            ),
             f"      %gate_groups = arith.constant {GATE_GROUPS} : index",
             f"      %down_mblocks = arith.constant {DOWN_MBLOCKS} : index",
             f"      %down_groups = arith.constant {DOWN_GROUPS} : index",
@@ -329,14 +424,33 @@ for col in range(COLS):
                 if DIRECT_X_PRE_NORM
                 else []
             ),
+            *(
+                [f"      %batch = arith.constant {BATCH} : index"]
+                if DIRECT_X_PRE_NORM and BATCH > 1
+                else []
+            ),
             "      scf.for %outer = %z to %inf step %one {",
             *(
-                [
-                    f"        %iw = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
-                    f"        %iwv = aie.objectfifo.subview.access %iw[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
-                    f"        func.call @r45_select_inverses(%iwv, %inv{col}_{row}, %core_row, %owner) : (memref<{WB}xi8>, memref<9xf32>, i32, i32) -> ()",
-                    f"        aie.objectfifo.release @wbc{col}(Consume, 1)",
-                ]
+                (
+                    [
+                        f"        %iw = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
+                        f"        %iwv = aie.objectfifo.subview.access %iw[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
+                        f"        func.call @r45_select_inverses(%iwv, %inv{col}_{row}, %core_row, %owner) : (memref<{WB}xi8>, memref<9xf32>, i32, i32) -> ()",
+                        f"        aie.objectfifo.release @wbc{col}(Consume, 1)",
+                    ]
+                    if BATCH == 1
+                    else [
+                        # Each 16 KiB inverse object describes one document's
+                        # three-macro / M288 physical slot (M256 + 32 padding).
+                        "        scf.for %macro_chunk = %z to %batch step %one {",
+                        f"          %iw = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
+                        f"          %iwv = aie.objectfifo.subview.access %iw[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
+                        "          %macro_chunk_i32 = arith.index_cast %macro_chunk : index to i32",
+                        f"          func.call @r45_select_inverses_batch(%iwv, %inv{col}_{row}, %core_row, %owner, %macro_chunk_i32) : (memref<{WB}xi8>, memref<{9 * BATCH}xf32>, i32, i32, i32) -> ()",
+                        f"          aie.objectfifo.release @wbc{col}(Consume, 1)",
+                        "        }",
+                    ]
+                )
                 if DIRECT_X_PRE_NORM
                 else []
             ),
@@ -346,6 +460,89 @@ for col in range(COLS):
                 else ["        scf.for %outblock = %z to %gate_outblocks step %one {"]
             ),
         ]
+        if WEIGHT_REUSE:
+            if M_MACROS > 3:
+                gate_acc_call = f"@r26_gate_scaled_split(%apack{{col}}_{{row}}, %{{weight}}, %gacc{{col}}_{{row}}, %gacc_hi{{col}}_{{row}}, %{{accumulate}}, %mblock_i32) : (memref<{APACK}xi8>, memref<{WB}xi8>, memref<{stationary_acc}xi32>, memref<{GATE_ACC * (M_MACROS - 3)}xi32>, i32, i32) -> ()"
+                geglu_call = f"@r26_geglu_padded_split(%gacc{{col}}_{{row}}, %gacc_hi{{col}}_{{row}}, %gov, %mblock_i32) : (memref<{stationary_acc}xi32>, memref<{GATE_ACC * (M_MACROS - 3)}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32) -> ()"
+                finish_call = f"@r35_finish_down48_bf16_split(%gacc{{col}}_{{row}}, %gacc_hi{{col}}_{{row}}, %do{{suffix}}v, %lane{{suffix}}, %mblock_i32) : (memref<{stationary_acc}xi32>, memref<{GATE_ACC * (M_MACROS - 3)}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32, i32) -> ()"
+            else:
+                gate_acc_call = f"@r26_gate_scaled_at(%apack{{col}}_{{row}}, %{{weight}}, %gacc{{col}}_{{row}}, %{{accumulate}}, %mblock_i32) : (memref<{APACK}xi8>, memref<{WB}xi8>, memref<{stationary_acc}xi32>, i32, i32) -> ()"
+                geglu_call = f"@r26_geglu_padded_at(%gacc{{col}}_{{row}}, %gov, %mblock_i32) : (memref<{stationary_acc}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32) -> ()"
+                finish_call = f"@r35_finish_down48_bf16_at(%gacc{{col}}_{{row}}, %do{{suffix}}v, %lane{{suffix}}, %mblock_i32) : (memref<{stationary_acc}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32, i32) -> ()"
+            # Weight-stationary M loop: acquire each block once, stream all
+            # row macros through it, and retain one accumulator per macro.
+            # This avoids relying on memtile objectfifo replay semantics.
+            lines.pop()
+            lines += [
+                "        scf.for %nblock = %z to %gate_nmacros step %one {",
+                "          scf.for %group = %z to %gate_groups step %one {",
+                f"            %w = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
+                f"            %wv = aie.objectfifo.subview.access %w[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
+                "            %accumulate = arith.index_cast %group : index to i32",
+                "            scf.for %mblock = %z to %down_mblocks step %one {",
+                f"              %x = aie.objectfifo.acquire @xbc{row}(Consume, 1) : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>>",
+                f"              %xv = aie.objectfifo.subview.access %x[0] : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>> -> memref<{DATA_PAIR}xi8>",
+                "              %mblock_i32 = arith.index_cast %mblock : index to i32",
+                f"              func.call @r123_pack3_owned(%xv, %wv, %apack{col}_{row}, %owner, %accumulate) : (memref<{DATA_PAIR}xi8>, memref<{WB}xi8>, memref<{APACK}xi8>, i32, i32) -> ()",
+            ]
+            lines.append(
+                f"              func.call @r123_exchange_fragments(%xv, %apack{col}_{row}, %owner) : (memref<{DATA_PAIR}xi8>, memref<{APACK}xi8>, i32) -> ()"
+            )
+            lines += [
+                "              func.call " + gate_acc_call.format(col=col, row=row, weight="wv", accumulate="accumulate"),
+                f"              aie.objectfifo.release @xbc{row}(Consume, 1)",
+                "            }",
+                f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
+                "          }",
+                "          scf.for %mblock = %z to %down_mblocks step %one {",
+                f"            %go = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>>",
+                f"            %gov = aie.objectfifo.subview.access %go[0] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
+                "            %mblock_i32 = arith.index_cast %mblock : index to i32",
+                "            func.call " + geglu_call.format(col=col, row=row),
+                f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                "          }",
+                "        }",
+                "        scf.for %nmacro = %z to %down_nmacros step %one {",
+                "          scf.for %group = %z to %down_groups step %one {",
+                f"            %wd = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
+                f"            %wdv = aie.objectfifo.subview.access %wd[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
+                "            %accumulate_down = arith.index_cast %group : index to i32",
+                "            scf.for %mblock = %z to %down_mblocks step %one {",
+                f"              %xd = aie.objectfifo.acquire @xbc{row}(Consume, 1) : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>>",
+                f"              %xdv = aie.objectfifo.subview.access %xd[0] : !aie.objectfifosubview<memref<{DATA_PAIR}xi8>> -> memref<{DATA_PAIR}xi8>",
+                "              %mblock_i32 = arith.index_cast %mblock : index to i32",
+                f"              func.call @r123_pack3_owned(%xdv, %wdv, %apack{col}_{row}, %owner, %accumulate_down) : (memref<{DATA_PAIR}xi8>, memref<{WB}xi8>, memref<{APACK}xi8>, i32, i32) -> ()",
+            ]
+            lines.append(
+                f"              func.call @r123_exchange_fragments(%xdv, %apack{col}_{row}, %owner) : (memref<{DATA_PAIR}xi8>, memref<{APACK}xi8>, i32) -> ()"
+            )
+            lines += [
+                "              func.call " + gate_acc_call.format(col=col, row=row, weight="wdv", accumulate="accumulate_down"),
+                f"              aie.objectfifo.release @xbc{row}(Consume, 1)",
+                "            }",
+                f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
+                "          }",
+            ]
+            for lane in range(2):
+                suffix = f"r{lane}"
+                lines += ["          scf.for %mblock = %z to %down_mblocks step %one {"]
+                lines += [
+                    f"            %do{suffix} = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>>",
+                    f"            %do{suffix}v = aie.objectfifo.subview.access %do{suffix}[0] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
+                    f"            %lane{suffix} = arith.constant {lane} : i32",
+                    "            %mblock_i32 = arith.index_cast %mblock : index to i32",
+                    "            func.call " + finish_call.format(col=col, row=row, suffix=suffix),
+                    f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                    "          }",
+                ]
+            lines += [
+                "        }",
+                "      }",
+                "      aie.end",
+                f"    }} {{stack_size = {2048 if WEIGHT_REUSE else 4096} : i32}}",
+            ]
+            out += lines
+            continue
         if CANONICAL_BF16:
             if REUSE_GATE_ACTIVATION:
                 lines += [
@@ -360,7 +557,7 @@ for col in range(COLS):
                     f"            %pw = aie.objectfifo.acquire @wbc{col}(Consume, 1) : !aie.objectfifosubview<memref<{WB}xi8>>",
                     f"            %pwv = aie.objectfifo.subview.access %pw[0] : !aie.objectfifosubview<memref<{WB}xi8>> -> memref<{WB}xi8>",
                     "            %pre_group_i32 = arith.index_cast %pre_group : index to i32",
-                    f"            func.call @r55_pack3_cached(%pxv, %inv{col}_{row}, %pwv, %apack{col}_{row}, %scratch{col}_{row}, %own{col}_{row}, %owner, %negative_token, %pre_group_i32) : (memref<{DATA_PAIR}xi8>, memref<9xf32>, memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{GATE_GROUPS * FRAGMENT}xi8>, i32, i32, i32) -> ()",
+                    f"            func.call @r55_pack3_cached(%pxv, %inv{col}_{row}, %pwv, %apack{col}_{row}, %scratch{col}_{row}, %own{col}_{row}, %owner, %negative_token, %pre_group_i32) : (memref<{DATA_PAIR}xi8>, memref<{9 * BATCH}xf32>, memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{GATE_GROUPS * FRAGMENT}xi8>, i32, i32, i32) -> ()",
                     f"            aie.objectfifo.release @xbc{row}(Consume, 1)",
                     f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
                     "          }",
@@ -412,7 +609,7 @@ for col in range(COLS):
                     + f"%wv, %apack{col}_{row}, %scratch{col}_{row}, %own{col}_{row}, %owner, "
                     + ("%negative_token" if DIRECT_X_PRE_NORM else "%accumulate")
                     + f") : (memref<{DATA_PAIR}xi8>, "
-                    + ("memref<9xf32>, " if DIRECT_X_PRE_NORM else "")
+                    + (f"memref<{9 * BATCH}xf32>, " if DIRECT_X_PRE_NORM else "")
                     + f"memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{OWN_FRAGMENT}xi8>, i32, i32) -> ()",
                 ]
                 append_ring(lines, col, row, "            ")
@@ -459,7 +656,7 @@ for col in range(COLS):
                 f"              func.call @r26_pack3(%xv, "
                 + (f"%inv{col}_{row}, " if DIRECT_X_PRE_NORM else "")
                 + f"%w0v, %apack{col}_{row}, %scratch{col}_{row}, %own{col}_{row}, %owner, %group_i32) : (memref<{DATA_PAIR}xi8>, "
-                + ("memref<9xf32>, " if DIRECT_X_PRE_NORM else "")
+                + (f"memref<{9 * BATCH}xf32>, " if DIRECT_X_PRE_NORM else "")
                 + f"memref<{WB}xi8>, memref<{APACK}xi8>, memref<{SCRATCH}xf32>, memref<{OWN_FRAGMENT}xi8>, i32, i32) -> ()",
                 f"              aie.objectfifo.release @xbc{row}(Consume, 1)",
             ]
@@ -470,26 +667,38 @@ for col in range(COLS):
                 f"              aie.objectfifo.release @wbc{col}(Consume, 1)",
                 "            }",
             ]
-            for component in range(2 if CANONICAL_BF16X2_OUTPUT else 1):
-                for lane in range(2):
-                    suffix = f"{component}_{lane}"
-                    call_args = f"%gacc{col}_{row}, %do{suffix}v, %lane{suffix}"
-                    call_types = f"memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32"
+            if PAIR_DOWN_FINISH:
+                for component in range(2):
+                    suffix = f"{component}"
                     lines += [
-                        f"            %do{suffix} = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>>",
-                        f"            %do{suffix}v = aie.objectfifo.subview.access %do{suffix}[0] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
-                        f"            %lane{suffix} = arith.constant {lane} : i32",
+                        f"            %do{suffix} = aie.objectfifo.acquire @oc{col}_{row}(Produce, 2) : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>>",
+                        f"            %do{suffix}v0 = aie.objectfifo.subview.access %do{suffix}[0] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
+                        f"            %do{suffix}v1 = aie.objectfifo.subview.access %do{suffix}[1] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
+                        f"            %component{suffix} = arith.constant {component} : i32",
+                        f"            func.call @r35_finish_down48_bf16_pair(%gacc{col}_{row}, %do{suffix}v0, %do{suffix}v1, %component{suffix}) : (memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, memref<{GATE_OUTPUT_BYTES}xi8>, i32) -> ()",
+                        f"            aie.objectfifo.release @oc{col}_{row}(Produce, 2)",
                     ]
-                    if CANONICAL_BF16X2_OUTPUT:
+            else:
+                for component in range(2 if CANONICAL_BF16X2_OUTPUT else 1):
+                    for lane in range(2):
+                        suffix = f"{component}_{lane}"
+                        call_args = f"%gacc{col}_{row}, %do{suffix}v, %lane{suffix}"
+                        call_types = f"memref<{GATE_ACC}xi32>, memref<{GATE_OUTPUT_BYTES}xi8>, i32"
                         lines += [
-                            f"            %component{suffix} = arith.constant {component} : i32",
-                            f"            func.call @r35_finish_down48_bf16({call_args}, %component{suffix}) : ({call_types}, i32) -> ()",
+                            f"            %do{suffix} = aie.objectfifo.acquire @oc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>>",
+                            f"            %do{suffix}v = aie.objectfifo.subview.access %do{suffix}[0] : !aie.objectfifosubview<memref<{GATE_OUTPUT_BYTES}xi8>> -> memref<{GATE_OUTPUT_BYTES}xi8>",
+                            f"            %lane{suffix} = arith.constant {lane} : i32",
                         ]
-                    else:
-                        lines.append(
-                            f"            func.call @r35_finish_down48_bf16({call_args}) : ({call_types}) -> ()"
-                        )
-                    lines.append(f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)")
+                        if CANONICAL_BF16X2_OUTPUT:
+                            lines += [
+                                f"            %component{suffix} = arith.constant {component} : i32",
+                                f"            func.call @r35_finish_down48_bf16({call_args}, %component{suffix}) : ({call_types}, i32) -> ()",
+                            ]
+                        else:
+                            lines.append(
+                                f"            func.call @r35_finish_down48_bf16({call_args}) : ({call_types}) -> ()"
+                            )
+                        lines.append(f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)")
             lines += ["          }", "        }"]
         else:
             input_fifo = f"xpair{col // 2}_{row}"
@@ -548,13 +757,14 @@ else:
         ]
 if DIRECT_X_PRE_NORM:
     inverse_dims = (
-        f"[<size = {PRE_INVERSE_BASE // PRE_INVERSE_RECORD_BYTES}, stride = {PRE_INVERSE_RECORD_BYTES}>, "
-        "<size = 512, stride = 1>]"
+        f"[<size = {PRE_INVERSE_BASE // PRE_INVERSE_RECORD_BYTES}, stride = {PRE_INVERSE_RECORD_BYTES}>, <size = 512, stride = 1>]"
+        if BATCH == 1
+        else f"[<size = {BATCH}, stride = {32 * PRE_INVERSE_RECORD_BYTES}>, <size = 32, stride = {PRE_INVERSE_RECORD_BYTES}>, <size = 512, stride = 1>]"
     )
     for col in range(COLS):
         out += [
             f"      %ti{col} = aiex.dma_configure_task_for @wsh{col} {{",
-            f"        aie.dma_bd(%D : memref<{RUNTIME_INPUT_BYTES}xi8>, {PRE_INVERSE_BASE}, {WB}, {inverse_dims}) {{burst_length = 0 : i32}}",
+            f"        aie.dma_bd(%D : memref<{RUNTIME_INPUT_BYTES}xi8>, {PRE_INVERSE_BASE}, {BATCH * WB}, {inverse_dims}) {{burst_length = 0 : i32}}",
             "        aie.end",
             "      } {issue_token = true}",
             f"      aiex.dma_start_task(%ti{col})",
@@ -571,7 +781,196 @@ for col in range(COLS):
         f"      aiex.dma_start_task(%tw{col})",
     ]
 
-for outblock in range(GATE_OUTBLOCKS):
+
+def append_canonical_down_runtime(output_lines, mblock):
+    """Schedule one canonical down macro after its six gate blocks."""
+    for nmacro in range(2):
+        for component in range(2 if CANONICAL_BF16X2_OUTPUT else 1):
+            for lane in range(2):
+                for col in range(COLS):
+                    name = f"do{col}_{mblock}_{nmacro}_{component}_{lane}"
+                    offset = (
+                        (mblock * 96) * OUTPUT * CANONICAL_OUTPUT_COMPONENTS
+                        + component * OUTPUT
+                        + nmacro * 384
+                        + col * 48
+                        + lane * 24
+                    ) * 2
+                    output_lines.extend(
+                        [
+                            f"      %{name} = aiex.dma_configure_task_for @osh{col} {{",
+                            f"        aie.dma_bd(%O : memref<{CANONICAL_OUTPUT_BYTES}xi8>, {offset}, {CORE_ROWS * GATE_OUTPUT_BYTES}, {canonical_down_output_dims()}) {{burst_length = 0 : i32}}",
+                            "        aie.end",
+                            "      } {issue_token = true}",
+                            f"      aiex.dma_start_task(%{name})",
+                        ]
+                    )
+        for group in range(DOWN_GROUPS):
+            for row in range(CORE_ROWS):
+                name = f"dx{row}_{mblock}_{nmacro}_{group}"
+                offset = (
+                    (mblock * 96 + row * 24) * PAD_INTERMEDIATE + group * 256
+                ) * 2
+                output_lines.extend(
+                    [
+                        f"      %{name} = aiex.dma_configure_task_for @xsh{row} {{",
+                        f"        aie.dma_bd(%T : memref<{CANONICAL_T_BYTES}xi8>, {offset}, {DATA_PAIR}, {canonical_down_input_dims()}) {{burst_length = 0 : i32}}",
+                        "        aie.end",
+                        "      } {issue_token = true}",
+                        f"      aiex.dma_start_task(%{name})",
+                    ]
+                )
+            for row in range(CORE_ROWS):
+                name = f"dx{row}_{mblock}_{nmacro}_{group}"
+                output_lines.extend(
+                    [
+                        f"      aiex.dma_await_task(%{name})",
+                        f"      aiex.dma_free_task(%{name})",
+                    ]
+                )
+        for component in range(2 if CANONICAL_BF16X2_OUTPUT else 1):
+            for lane in range(2):
+                for col in range(COLS):
+                    name = f"do{col}_{mblock}_{nmacro}_{component}_{lane}"
+                    output_lines.extend(
+                        [
+                            f"      aiex.dma_await_task(%{name})",
+                            f"      aiex.dma_free_task(%{name})",
+                        ]
+                    )
+
+
+def append_weight_stationary_runtime(output_lines):
+    """Match the core's weight-major schedule without replaying weight DMA."""
+    output_window = min(3, M_MACROS)
+
+    def start_gate_output(nblock, mblock):
+        for col in range(COLS):
+            name = f"sgt{col}_{nblock}_{mblock}"
+            offset = (
+                mblock * 96 * PAD_INTERMEDIATE + nblock * 192 + col * 24
+            ) * 2
+            output_lines.extend(
+                [
+                    f"      %{name} = aiex.dma_configure_task_for @osh{col} {{",
+                    f"        aie.dma_bd(%T : memref<{CANONICAL_T_BYTES}xi8>, {offset}, {CORE_ROWS * GATE_OUTPUT_BYTES}, {canonical_gate_output_dims()}) {{burst_length = 0 : i32}}",
+                    "        aie.end",
+                    "      } {issue_token = true}",
+                    f"      aiex.dma_start_task(%{name})",
+                ]
+            )
+
+    def finish_gate_output(nblock, mblock):
+        for col in range(COLS):
+            name = f"sgt{col}_{nblock}_{mblock}"
+            output_lines.extend(
+                [
+                    f"      aiex.dma_await_task(%{name})",
+                    f"      aiex.dma_free_task(%{name})",
+                ]
+            )
+
+    for nblock in range(GATE_N_MACROS):
+        for mblock in range(output_window):
+            start_gate_output(nblock, mblock)
+        for group in range(GATE_GROUPS):
+            for mblock in range(M_MACROS):
+                for row in range(CORE_ROWS):
+                    name = f"sgx{row}_{nblock}_{group}_{mblock}"
+                    offset = ((mblock * 96 + row * 24) * 768 + group * 256) * 2
+                    output_lines.extend(
+                        [
+                            f"      %{name} = aiex.dma_configure_task_for @xsh{row} {{",
+                            f"        aie.dma_bd(%D : memref<{RUNTIME_INPUT_BYTES}xi8>, {offset}, {DATA_PAIR}, {canonical_input_dims()}) {{burst_length = 0 : i32}}",
+                            "        aie.end",
+                            "      } {issue_token = true}",
+                            f"      aiex.dma_start_task(%{name})",
+                        ]
+                    )
+                for row in range(CORE_ROWS):
+                    name = f"sgx{row}_{nblock}_{group}_{mblock}"
+                    output_lines.extend(
+                        [
+                            f"      aiex.dma_await_task(%{name})",
+                            f"      aiex.dma_free_task(%{name})",
+                        ]
+                    )
+        for mblock in range(M_MACROS):
+            finish_gate_output(nblock, mblock)
+            if mblock + output_window < M_MACROS:
+                start_gate_output(nblock, mblock + output_window)
+
+    def start_down_output(nmacro, lane, mblock):
+        for col in range(COLS):
+            name = f"sdo{col}_{nmacro}_{lane}_{mblock}"
+            offset = (
+                mblock * 96 * OUTPUT
+                + nmacro * 384
+                + col * 48
+                + lane * 24
+            ) * 2
+            output_lines.extend(
+                [
+                    f"      %{name} = aiex.dma_configure_task_for @osh{col} {{",
+                    f"        aie.dma_bd(%O : memref<{CANONICAL_OUTPUT_BYTES}xi8>, {offset}, {CORE_ROWS * GATE_OUTPUT_BYTES}, {canonical_down_output_dims()}) {{burst_length = 0 : i32}}",
+                    "        aie.end",
+                    "      } {issue_token = true}",
+                    f"      aiex.dma_start_task(%{name})",
+                ]
+            )
+
+    def finish_down_output(nmacro, lane, mblock):
+        for col in range(COLS):
+            name = f"sdo{col}_{nmacro}_{lane}_{mblock}"
+            output_lines.extend(
+                [
+                    f"      aiex.dma_await_task(%{name})",
+                    f"      aiex.dma_free_task(%{name})",
+                ]
+            )
+
+    for nmacro in range(2):
+        down_outputs = [
+            (lane, mblock) for lane in range(2) for mblock in range(M_MACROS)
+        ]
+        for lane, mblock in down_outputs[:output_window]:
+            start_down_output(nmacro, lane, mblock)
+        for group in range(DOWN_GROUPS):
+            for mblock in range(M_MACROS):
+                for row in range(CORE_ROWS):
+                    name = f"sdx{row}_{nmacro}_{group}_{mblock}"
+                    offset = (
+                        (mblock * 96 + row * 24) * PAD_INTERMEDIATE + group * 256
+                    ) * 2
+                    output_lines.extend(
+                        [
+                            f"      %{name} = aiex.dma_configure_task_for @xsh{row} {{",
+                            f"        aie.dma_bd(%T : memref<{CANONICAL_T_BYTES}xi8>, {offset}, {DATA_PAIR}, {canonical_down_input_dims()}) {{burst_length = 0 : i32}}",
+                            "        aie.end",
+                            "      } {issue_token = true}",
+                            f"      aiex.dma_start_task(%{name})",
+                        ]
+                    )
+                for row in range(CORE_ROWS):
+                    name = f"sdx{row}_{nmacro}_{group}_{mblock}"
+                    output_lines.extend(
+                        [
+                            f"      aiex.dma_await_task(%{name})",
+                            f"      aiex.dma_free_task(%{name})",
+                        ]
+                    )
+        for index, (lane, mblock) in enumerate(down_outputs):
+            finish_down_output(nmacro, lane, mblock)
+            next_index = index + output_window
+            if next_index < len(down_outputs):
+                next_lane, next_mblock = down_outputs[next_index]
+                start_down_output(nmacro, next_lane, next_mblock)
+
+
+if WEIGHT_REUSE:
+    append_weight_stationary_runtime(out)
+
+for outblock in ([] if WEIGHT_REUSE else range(GATE_OUTBLOCKS)):
     mblock, nblock = divmod(outblock, GATE_N_MACROS)
     for col in range(COLS):
         name = f"gt{col}_{outblock}"
@@ -614,12 +1013,14 @@ for outblock in range(GATE_OUTBLOCKS):
     for col in range(COLS):
         name = f"gt{col}_{outblock}"
         out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
+    if WEIGHT_REUSE and nblock == GATE_N_MACROS - 1:
+        append_canonical_down_runtime(out, mblock)
 
 if not CANONICAL_BF16:
     for row in range(CORE_ROWS):
         out += [f"      aiex.dma_await_task(%tg{row})", f"      aiex.dma_free_task(%tg{row})"]
 
-if CANONICAL_BF16:
+if CANONICAL_BF16 and not WEIGHT_REUSE:
     for mblock in range(DOWN_MBLOCKS):
         for nmacro in range(2):
             for component in range(2 if CANONICAL_BF16X2_OUTPUT else 1):
@@ -665,7 +1066,7 @@ if CANONICAL_BF16:
                             f"      aiex.dma_await_task(%{name})",
                             f"      aiex.dma_free_task(%{name})",
                         ]
-else:
+elif not CANONICAL_BF16:
     for mblock in range(DOWN_MBLOCKS):
         for col in range(COLS):
             offset = mblock * 96 * OUTPUT + col * 48
