@@ -256,6 +256,7 @@ HFQ_QUANT_TYPE_NAMES = {
     13: "MQ4G256",
     14: "MQ8G256",
     15: "MQ6G256",
+    16: "BF16",
     17: "MQ3G256",
     18: "MQ2G256",
     19: "MQ2G256_LLOYD",
@@ -265,10 +266,20 @@ HFQ_QUANT_TYPE_NAMES = {
     28: "PARO4G128",
     29: "PARO4G128T",
     30: "MQ4G256_LLOYD",
+    31: "QTIP3G256",
+    33: "OQ_PLUS_G256",
+    34: "OQ4G256",
+    35: "OQ8G256",
+    36: "OQ_PLUS_COMPACT",
+    37: "OQ4G256_ARCH_PACKED",
+    38: "OQ3G256",
+    39: "OQ2G256",
+    40: "OQ6G256",
 }
 
 HFQ_QUANT_TYPE_FORMATS = {
     "F16": "f16",
+    "BF16": "bf16",
     "Q8F16": "q8",
     "Q8HFQ": "q8",
     "MQ8G256": "q8",
@@ -284,6 +295,15 @@ HFQ_QUANT_TYPE_FORMATS = {
     "MQ4G256_LLOYD": "mq4",
     "HFP4G32": "hfp4",
     "MFP4G32": "mfp4",
+    "QTIP3G256": "qtip3",
+    "OQ_PLUS_G256": "oq4+",
+    "OQ4G256": "oq4",
+    "OQ8G256": "oq8",
+    "OQ_PLUS_COMPACT": "oq4+",
+    "OQ4G256_ARCH_PACKED": "oq4",
+    "OQ3G256": "oq3",
+    "OQ2G256": "oq2",
+    "OQ6G256": "oq6",
 }
 
 
