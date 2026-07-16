@@ -1,11 +1,12 @@
 .PHONY: all install link dev-unlink ui serve daemon quant eval tui monitor priv-helper help
 
 HIPFIRE_DIR ?= $(HOME)/.hipfire
+LOCAL_BIN ?= $(HOME)/.local/bin
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 TARGET_DIR ?= $(REPO_ROOT)/target/release
 # Binaries symlinked into ~/.hipfire/bin (and that `hipfire serve` resolves the
 # daemon from). Override DEV_BINS to link a different set.
-DEV_BINS ?= hipfire hipfire-daemon hipfire-quantize hipfire-eval hipfire-tui hipfire-monitor hipfire-priv-helper hipfire-host-profile
+DEV_BINS ?= hipfire hipfire-daemon hipfire-quantize hipfire-eval hipfire-monitor hipfire-priv-helper hipfire-host-profile
 
 # Embedded browser UIs (Leptos/WASM) baked into the `hipfire` CLI. They require
 # `trunk` + the wasm32-unknown-unknown target; when trunk is absent we build
@@ -91,6 +92,8 @@ link:
 			echo "skip $$b (no $(TARGET_DIR)/$$b)"; \
 		fi; \
 	done
+	@HIPFIRE_DIR="$(HIPFIRE_DIR)" LOCAL_BIN="$(LOCAL_BIN)" \
+		bash "$(REPO_ROOT)/scripts/sync-install-links.sh"
 
 # Remove the dev symlinks (leaves real installed binaries from `make install`
 # untouched; only unlinks entries that are symlinks).
@@ -110,5 +113,5 @@ help:
 	@echo "make tui        rebuild hipfire-tui, relink"
 	@echo "make monitor    rebuild hipfire-monitor, relink"
 	@echo "make priv-helper rebuild hipfire-priv-helper, relink"
-	@echo "make link       (re)create the dev symlinks in ~/.hipfire/bin"
+	@echo "make link       refresh private dev links and public ~/.local/bin commands"
 	@echo "make dev-unlink remove the dev symlinks"

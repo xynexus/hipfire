@@ -31,6 +31,9 @@ echo "== Eval harness no-GPU smoke =="
 cargo build -p hipfire-eval
 HIPFIRE_EVAL_BIN="$ROOT/target/debug/hipfire-eval" bash tests/smoke/eval-harness-nogpu-smoke.sh
 
+echo "== Installer link layout =="
+bash tests/install-links.sh
+
 echo "== Python CPU tests =="
 "$PYTHON" -m ruff check .
 "$PYTHON" -m mypy tests scripts benchmarks tools --config-file pyproject.toml
