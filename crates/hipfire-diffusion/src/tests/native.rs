@@ -91,7 +91,12 @@ fn native_runtime_metadata_supports_complete_flux2_klein_topology() {
 
     assert!(native_runtime_metadata_support_error(&metadata).is_none());
 
-    metadata.components.get_mut("transformer").unwrap().weight_entries.pop();
+    metadata
+        .components
+        .get_mut("transformer")
+        .unwrap()
+        .weight_entries
+        .pop();
     let error = native_runtime_metadata_support_error(&metadata).unwrap();
     assert!(error.contains("requires complete"));
     assert!(error.contains("single_blocks=0"));
@@ -507,8 +512,7 @@ fn sefi_dual_euler_updates_semantic_and_texture_channels_independently() {
         sigma_sem_next: 0.5,
         sigma_tex_next: 0.8,
     };
-    sefi_dual_euler_step(&mut latents, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 1, &step)
-        .unwrap();
+    sefi_dual_euler_step(&mut latents, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 1, &step).unwrap();
     assert_f32_close(&latents.data, &[-0.5, -1.0, -0.6, -0.8, -1.0, -1.2], 1e-6);
     let texture = slice_latent_channels(&latents, 1).unwrap();
     assert_eq!(texture.channels, 2);
@@ -1219,20 +1223,23 @@ fn krea2_rope_grid_uses_flux_zero_based_coordinates() {
 
 #[test]
 fn flux2_rope_uses_spatial_image_axes_and_text_sequence_axis() {
-    let rotary =
-        flux2_rotary_embeddings_for_grid(&[2, 2, 2, 2], 2000.0, 8, 2, 2, 3).unwrap();
+    let rotary = flux2_rotary_embeddings_for_grid(&[2, 2, 2, 2], 2000.0, 8, 2, 2, 3).unwrap();
     let freq_width = 4;
     let image_sin = rotary.image.sin_data();
     let text_sin = rotary.text.sin_data();
 
-    assert!(image_sin[..freq_width].iter().all(|value| value.abs() < 1e-6));
+    assert!(image_sin[..freq_width]
+        .iter()
+        .all(|value| value.abs() < 1e-6));
     assert!(image_sin[freq_width..2 * freq_width][1..3]
         .iter()
         .any(|value| value.abs() > 1e-6));
     assert!(image_sin
         .chunks_exact(freq_width)
         .all(|row| row[3].abs() < 1e-6));
-    assert!(text_sin[..freq_width].iter().all(|value| value.abs() < 1e-6));
+    assert!(text_sin[..freq_width]
+        .iter()
+        .all(|value| value.abs() < 1e-6));
     assert!(text_sin[freq_width..2 * freq_width][..3]
         .iter()
         .all(|value| value.abs() < 1e-6));
@@ -1268,14 +1275,8 @@ fn qwen3_masked_causal_attention_ignores_padded_keys_for_all_queries() {
         shape: vec![3, 1],
         data: vec![2.0, 6.0, 100.0],
     };
-    let output = qwen3_causal_self_attention_with_key_mask(
-        &q,
-        &k,
-        &v,
-        1,
-        &[true, true, false],
-    )
-    .unwrap();
+    let output =
+        qwen3_causal_self_attention_with_key_mask(&q, &k, &v, 1, &[true, true, false]).unwrap();
     assert_eq!(output.shape, vec![3, 1]);
     assert_f32_close(&output.data, &[2.0, 14.0 / 3.0, 14.0 / 3.0], 1e-6);
 }
@@ -1355,11 +1356,26 @@ fn local_flux2_tiny_full_forward_matches_vendored_bfl_reference() {
             max_rel = max_rel.max(absolute / expected.abs().max(1e-6));
         }
         eprintln!("FLUX.2 tiny {label}: max_abs={max_abs:.8} max_rel={max_rel:.8}");
-        assert!(max_abs <= 5e-5, "{label} max_abs={max_abs} max_rel={max_rel}");
+        assert!(
+            max_abs <= 5e-5,
+            "{label} max_abs={max_abs} max_rel={max_rel}"
+        );
     };
-    compare("double_image", &trace.double_image.data, values("double_image"));
-    compare("double_text", &trace.double_text.data, values("double_text"));
-    compare("single_joint", &trace.single_joint.data, values("single_joint"));
+    compare(
+        "double_image",
+        &trace.double_image.data,
+        values("double_image"),
+    );
+    compare(
+        "double_text",
+        &trace.double_text.data,
+        values("double_text"),
+    );
+    compare(
+        "single_joint",
+        &trace.single_joint.data,
+        values("single_joint"),
+    );
     let mut token_major = vec![0.0; trace.output.data.len()];
     for channel in 0..8 {
         for token in 0..2 {
@@ -1424,12 +1440,11 @@ fn local_flux2_actual_one_step_velocity_matches_vendored_bfl_reference() {
     let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
     let topology = transformer_denoiser_weight_topology(&metadata.components["transformer"]);
     let denoiser = NativeTransformerDenoiser::from_hfq(&hfq, &config, &topology).unwrap();
-    let mut runtime_context = DiffusionGenerationRuntimeContext::new(
-        DiffusionGenerationRuntimeOptions {
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions {
             rocm_device_id: Some(0),
             ..DiffusionGenerationRuntimeOptions::default()
-        },
-    );
+        });
     let actual = denoiser
         .forward_flux2_with_runtime_context(
             &latents,
@@ -1455,11 +1470,8 @@ fn local_flux2_actual_one_step_velocity_matches_vendored_bfl_reference() {
     let mut latent_max_abs = 0.0f32;
     let mut latent_squared_error = 0.0f32;
     let mut latent_squared_reference = 0.0f32;
-    for ((&initial, &velocity), expected) in latents
-        .data
-        .iter()
-        .zip(&actual.data)
-        .zip(expected_latent)
+    for ((&initial, &velocity), expected) in
+        latents.data.iter().zip(&actual.data).zip(expected_latent)
     {
         let updated = initial + dt * velocity;
         let delta = updated - expected;
@@ -1467,11 +1479,8 @@ fn local_flux2_actual_one_step_velocity_matches_vendored_bfl_reference() {
         latent_squared_error += delta * delta;
         latent_squared_reference += expected * expected;
     }
-    let latent_nrmse =
-        (latent_squared_error / latent_squared_reference.max(1e-12)).sqrt();
-    eprintln!(
-        "FLUX.2 actual updated latent: max_abs={latent_max_abs:.8} nrmse={latent_nrmse:.8}"
-    );
+    let latent_nrmse = (latent_squared_error / latent_squared_reference.max(1e-12)).sqrt();
+    eprintln!("FLUX.2 actual updated latent: max_abs={latent_max_abs:.8} nrmse={latent_nrmse:.8}");
     assert!(latent_max_abs <= 0.5 && latent_nrmse <= 0.02);
 }
 
@@ -1547,7 +1556,10 @@ fn local_qwen3_selected_hidden_states_match_transformers_reference() {
             max_rel = max_rel.max(absolute / expected.abs().max(1e-6));
         }
         eprintln!("Qwen3 tiny {label}: max_abs={max_abs:.8} max_rel={max_rel:.8}");
-        assert!(max_abs <= 5e-5, "{label} max_abs={max_abs} max_rel={max_rel}");
+        assert!(
+            max_abs <= 5e-5,
+            "{label} max_abs={max_abs} max_rel={max_rel}"
+        );
     };
     for (layer, selected) in layers.iter().zip([9, 18, 27]) {
         compare(
@@ -1692,9 +1704,7 @@ fn assert_local_actual_qwen3_hidden_states(
     let mut actual_concatenated = vec![0.0f32; tokens * hidden * layers.len()];
     let mut expected_concatenated = vec![0.0f32; actual_concatenated.len()];
     for (layer_index, (layer, selected)) in layers.iter().zip([9, 18, 27]).enumerate() {
-        let expected = reference[format!("layer_{selected}")]
-            .as_array()
-            .unwrap();
+        let expected = reference[format!("layer_{selected}")].as_array().unwrap();
         for token in 0..tokens {
             let destination = token * hidden * layers.len() + layer_index * hidden;
             let source = token * hidden;
@@ -1712,7 +1722,10 @@ fn assert_local_actual_qwen3_hidden_states(
         .map(|(actual, expected)| (actual - expected).abs())
         .fold(0.0f32, f32::max);
     eprintln!("{label} Qwen3 actual concatenated: max_abs={concat_max_abs:.8}");
-    assert!(concat_max_abs <= 3e-2, "concatenated max_abs={concat_max_abs}");
+    assert!(
+        concat_max_abs <= 3e-2,
+        "concatenated max_abs={concat_max_abs}"
+    );
 }
 
 #[test]
@@ -1978,8 +1991,7 @@ fn native_transformer_feed_forward_runs_flux2_first_half_silu_glu() {
     write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
     let hfq = HfqFile::open_index_only(&path).unwrap();
     let ff =
-        NativeTransformerFeedForward::from_hfq(&hfq, TransformerDenoiserFamily::Flux2, 0)
-            .unwrap();
+        NativeTransformerFeedForward::from_hfq(&hfq, TransformerDenoiserFamily::Flux2, 0).unwrap();
     let hidden = CpuTensor {
         shape: vec![1, 1, 2],
         data: vec![1.0, 2.0],

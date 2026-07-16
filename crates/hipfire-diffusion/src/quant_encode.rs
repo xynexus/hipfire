@@ -627,8 +627,8 @@ pub fn diff_quantized_transformer_tensors(
     reference: &Path,
     candidate: &Path,
 ) -> anyhow::Result<(Vec<TensorQuantDiff>, Vec<String>)> {
-    let ref_hfq =
-        HfqFile::open(reference).map_err(|e| anyhow::anyhow!("open reference {reference:?}: {e}"))?;
+    let ref_hfq = HfqFile::open(reference)
+        .map_err(|e| anyhow::anyhow!("open reference {reference:?}: {e}"))?;
     let cand_hfq = HfqFile::open(candidate)
         .map_err(|e| anyhow::anyhow!("open candidate {candidate:?}: {e}"))?;
     let cand_types: std::collections::HashMap<&str, u8> = cand_hfq
@@ -785,9 +785,7 @@ fn fold_should_quantize(arch_id: u32, name: &str, shape: &[u32]) -> bool {
     // static map protects but the ablation showed are tolerant). Unset ⇒ the
     // conservative default: only tensors the arch spec marks below `High`.
     match std::env::var("HIPFIRE_DIFFUSION_FOLD_ROLES") {
-        Ok(roles) if !roles.trim().is_empty() => {
-            roles.split_whitespace().any(|s| name.contains(s))
-        }
+        Ok(roles) if !roles.trim().is_empty() => roles.split_whitespace().any(|s| name.contains(s)),
         _ => opus_precision_class(arch_id, name) < hipfire_arch_api::PrecisionClass::High,
     }
 }
@@ -830,9 +828,12 @@ mod fold_tests {
         let blob = encode_fold_tensor(bits, "t.weight", &data, None);
 
         // Blob length matches the header estimate.
-        let expected =
-            encoded_payload_len(DiffusionQuantFormat::OqFold4, m * k, QT_DIFFUSION_TENSOR_OQF_W4)
-                .unwrap();
+        let expected = encoded_payload_len(
+            DiffusionQuantFormat::OqFold4,
+            m * k,
+            QT_DIFFUSION_TENSOR_OQF_W4,
+        )
+        .unwrap();
         assert_eq!(blob.len() as u64, expected);
 
         // decode_oqf_slice reconstructs the RTN dequant bit-for-bit.
@@ -849,12 +850,28 @@ mod fold_tests {
     fn fold_only_quantizes_tolerant_256_aligned_transformer_linears() {
         let arch = hipfire_arch_api::ARCH_ID_FLUX2;
         // Tolerant (Compressed) FF up-projection, K%256==0: yes.
-        assert!(fold_should_quantize(arch, "transformer/tensors/transformer_blocks.0.ff.linear_in.weight", &[9216, 3072]));
+        assert!(fold_should_quantize(
+            arch,
+            "transformer/tensors/transformer_blocks.0.ff.linear_in.weight",
+            &[9216, 3072]
+        ));
         // Sensitive (High) attention out-projection: no — stays bf16.
-        assert!(!fold_should_quantize(arch, "transformer/tensors/transformer_blocks.0.attn.to_out.0.weight", &[3072, 3072]));
+        assert!(!fold_should_quantize(
+            arch,
+            "transformer/tensors/transformer_blocks.0.attn.to_out.0.weight",
+            &[3072, 3072]
+        ));
         // x_embedder (K=128): no. Non-transformer: no.
-        assert!(!fold_should_quantize(arch, "transformer/tensors/x_embedder.weight", &[3072, 128]));
-        assert!(!fold_should_quantize(arch, "text_encoder/tensors/foo.weight", &[512, 512]));
+        assert!(!fold_should_quantize(
+            arch,
+            "transformer/tensors/x_embedder.weight",
+            &[3072, 128]
+        ));
+        assert!(!fold_should_quantize(
+            arch,
+            "text_encoder/tensors/foo.weight",
+            &[512, 512]
+        ));
     }
 }
 
@@ -879,7 +896,9 @@ fn encoded_payload_len(
             };
             elements.div_ceil(256).checked_mul(block_bytes)
         }
-        DiffusionQuantFormat::OqFold4 | DiffusionQuantFormat::OqFold2 | DiffusionQuantFormat::OqFold1 => {
+        DiffusionQuantFormat::OqFold4
+        | DiffusionQuantFormat::OqFold2
+        | DiffusionQuantFormat::OqFold1 => {
             // [dense packed codes (elements*bits/8) | f32 per-group scales (ng*4)]
             let bits = format.fold_bits().unwrap() as usize;
             elements

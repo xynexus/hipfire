@@ -297,7 +297,13 @@ fn imports_flux2_native_single_file_into_diffusers_canonical_roles() {
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    for component in ["text_encoder", "transformer", "vae", "scheduler", "tokenizer"] {
+    for component in [
+        "text_encoder",
+        "transformer",
+        "vae",
+        "scheduler",
+        "tokenizer",
+    ] {
         fs::create_dir_all(dir.join(component)).unwrap();
     }
     fs::write(
@@ -336,8 +342,18 @@ fn imports_flux2_native_single_file_into_diffusers_canonical_roles() {
             ("img_in.weight", "F32", &[1, 1], &[0, 0, 0, 0]),
             ("double_blocks.0.img_attn.qkv.weight", "F32", &[3, 1], &qkv),
             ("double_blocks.0.txt_attn.qkv.weight", "F32", &[3, 1], &qkv),
-            ("double_blocks.0.img_attn.proj.weight", "F32", &[1, 1], &[0; 4]),
-            ("double_blocks.0.txt_attn.proj.weight", "F32", &[1, 1], &[0; 4]),
+            (
+                "double_blocks.0.img_attn.proj.weight",
+                "F32",
+                &[1, 1],
+                &[0; 4],
+            ),
+            (
+                "double_blocks.0.txt_attn.proj.weight",
+                "F32",
+                &[1, 1],
+                &[0; 4],
+            ),
             ("double_blocks.0.img_mlp.0.weight", "F32", &[1, 1], &[0; 4]),
             ("double_blocks.0.img_mlp.2.weight", "F32", &[1, 1], &[0; 4]),
             ("single_blocks.0.linear1.weight", "F32", &[1, 1], &[0; 4]),
@@ -419,9 +435,15 @@ fn local_flux2_native_and_diffusers_artifacts_have_identical_canonical_roles() {
     let diffusers_metadata = parse_diffusion_metadata(&diffusers_hfq.metadata_json).unwrap();
     let revision = Some("a3b4f4849157f664bdbc776fd7453c2783562f4d".to_string());
     assert_eq!(native_metadata.pipeline.source_revision, revision);
-    assert_eq!(native_metadata.pipeline.source_revision, diffusers_metadata.pipeline.source_revision);
+    assert_eq!(
+        native_metadata.pipeline.source_revision,
+        diffusers_metadata.pipeline.source_revision
+    );
     assert_eq!(native_metadata.pipeline.latent_channels, Some(128));
-    assert_eq!(native_metadata.pipeline.latent_channels, diffusers_metadata.pipeline.latent_channels);
+    assert_eq!(
+        native_metadata.pipeline.latent_channels,
+        diffusers_metadata.pipeline.latent_channels
+    );
     for component in ["transformer", "text_encoder", "vae"] {
         let roles = |metadata: &DiffusionHfqMetadata| {
             metadata.components[component]
@@ -430,8 +452,15 @@ fn local_flux2_native_and_diffusers_artifacts_have_identical_canonical_roles() {
                 .map(|role| role.role.clone())
                 .collect::<std::collections::BTreeSet<_>>()
         };
-        assert_eq!(roles(&native_metadata), roles(&diffusers_metadata), "{component}");
-        assert!(!roles(&native_metadata).is_empty(), "{component} roles are empty");
+        assert_eq!(
+            roles(&native_metadata),
+            roles(&diffusers_metadata),
+            "{component}"
+        );
+        assert!(
+            !roles(&native_metadata).is_empty(),
+            "{component} roles are empty"
+        );
     }
 }
 

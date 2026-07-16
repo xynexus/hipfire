@@ -542,12 +542,7 @@ pub(crate) fn linear_3d_f32_with_runtime_context(
         shape: vec![batch * seq, in_features],
         data: input.data.clone(),
     };
-    let out = linear_optional_bias_f32_with_runtime_context(
-        &flat,
-        weight,
-        bias,
-        runtime_context,
-    )?;
+    let out = linear_optional_bias_f32_with_runtime_context(&flat, weight, bias, runtime_context)?;
     let [rows, out_features] = shape2(&out)?;
     if rows != batch * seq {
         return Err(DiffusionError::InvalidMetadata(format!(

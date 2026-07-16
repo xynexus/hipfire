@@ -2007,9 +2007,7 @@ fn flux2_silu_glu_first_resident_matches_cpu_reference() {
         data: (0..48).map(|index| index as f32 / 7.0 - 3.0).collect(),
     };
     let expected = silu_glu_first_3d(&projected).unwrap();
-    let projected_gpu = gpu
-        .upload_f32(&projected.data, &projected.shape)
-        .unwrap();
+    let projected_gpu = gpu.upload_f32(&projected.data, &projected.shape).unwrap();
     let output_gpu = silu_glu_first_3d_resident(&mut gpu, &projected_gpu).unwrap();
     let actual = download_resident(&mut gpu, &output_gpu).unwrap();
     free_resident(&mut gpu, output_gpu).unwrap();
@@ -2050,7 +2048,10 @@ fn flux2_resident_sequence_and_width_views_match_cpu_layout() {
     let joint = download_resident(&mut gpu, &joint_gpu).unwrap();
     let rebuilt = download_resident(&mut gpu, &rebuilt_gpu).unwrap();
     assert_eq!(joint.shape, vec![1, 3, 3]);
-    assert_eq!(joint.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+    assert_eq!(
+        joint.data,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    );
     assert_eq!(rebuilt.shape, vec![1, 2, 3]);
     assert_eq!(rebuilt.data, vec![4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
     for tensor in [
@@ -2079,9 +2080,8 @@ fn flux2_no_affine_layer_norm_resident_matches_cpu_reference() {
         shape: vec![1, 3, 8],
         data: (0..24).map(|index| index as f32 / 5.0 - 2.0).collect(),
     };
-    let mut cpu_context = DiffusionGenerationRuntimeContext::new(
-        DiffusionGenerationRuntimeOptions::default(),
-    );
+    let mut cpu_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
     let expected =
         layer_norm_3d_no_affine_with_runtime_context(&input, 1e-6, &mut cpu_context).unwrap();
     let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
@@ -2119,17 +2119,9 @@ fn qwen3_masked_causal_attention_gpu_matches_cpu_reference() {
     let k = make(0.15);
     let v = make(-0.2);
     let mask = [true, true, true, false, false, false, false];
-    let expected =
-        qwen3_causal_self_attention_with_key_mask(&q, &k, &v, heads, &mask).unwrap();
-    let actual = qwen3_masked_causal_self_attention_hip_on_gpu(
-        &mut gpu,
-        &q,
-        &k,
-        &v,
-        heads,
-        &mask,
-    )
-    .unwrap();
+    let expected = qwen3_causal_self_attention_with_key_mask(&q, &k, &v, heads, &mask).unwrap();
+    let actual =
+        qwen3_masked_causal_self_attention_hip_on_gpu(&mut gpu, &q, &k, &v, heads, &mask).unwrap();
     assert_eq!(actual.shape, expected.shape);
     let max_abs = actual
         .data
@@ -2186,12 +2178,11 @@ fn flux2_tiny_full_resident_stack_matches_bfl_reference() {
     let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
     let topology = transformer_denoiser_weight_topology(&metadata.components["transformer"]);
     let denoiser = NativeTransformerDenoiser::from_hfq(&hfq, &config, &topology).unwrap();
-    let mut runtime_context = DiffusionGenerationRuntimeContext::new(
-        DiffusionGenerationRuntimeOptions {
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions {
             rocm_device_id: Some(0),
             ..DiffusionGenerationRuntimeOptions::default()
-        },
-    );
+        });
     let output = denoiser
         .forward_flux2_with_runtime_context(
             &latents,
@@ -2214,7 +2205,10 @@ fn flux2_tiny_full_resident_stack_matches_bfl_reference() {
         .map(|(actual, expected)| (actual - expected).abs())
         .fold(0.0f32, f32::max);
     eprintln!("resident FLUX.2 tiny full forward max_abs={max_abs:.8}");
-    assert!(max_abs <= 5e-3, "resident FLUX.2 full forward max_abs={max_abs}");
+    assert!(
+        max_abs <= 5e-3,
+        "resident FLUX.2 full forward max_abs={max_abs}"
+    );
 }
 
 #[test]

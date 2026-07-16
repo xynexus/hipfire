@@ -774,8 +774,8 @@ impl Flux2VaePatchNorm {
                             for x in 0..width {
                                 let in_y = y * self.patch_height + patch_y;
                                 let in_x = x * self.patch_width + patch_x;
-                                let src = ((b * channels + channel) * in_height + in_y) * in_width
-                                    + in_x;
+                                let src =
+                                    ((b * channels + channel) * in_height + in_y) * in_width + in_x;
                                 let dst = ((b * packed_channels + packed_channel) * height + y)
                                     * width
                                     + x;
@@ -795,9 +795,7 @@ impl Flux2VaePatchNorm {
             .patch_height
             .checked_mul(self.patch_width)
             .ok_or_else(|| DiffusionError::InvalidMetadata("VAE patch area overflow".into()))?;
-        if packed_channels != self.running_mean.len()
-            || packed_channels % patch_area != 0
-        {
+        if packed_channels != self.running_mean.len() || packed_channels % patch_area != 0 {
             return Err(DiffusionError::InvalidMetadata(format!(
                 "FLUX.2 packed latent channels {packed_channels} do not match BatchNorm {} and patch area {patch_area}",
                 self.running_mean.len()

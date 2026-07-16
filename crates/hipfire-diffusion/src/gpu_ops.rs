@@ -2104,7 +2104,10 @@ pub(crate) fn linear_optional_bias_f32_hip_on_gpu(
     kernargs.push_ptr(weight_ptr);
     kernargs.push_ptr(bias_ptr);
     kernargs.push_ptr(output_gpu.as_ptr());
-    kernargs.push_i32(i32_kernel_dim("f32 linear output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim(
+        "f32 linear output elements",
+        output_elements,
+    )?);
     kernargs.push_i32(i32_kernel_dim("f32 linear input features", in_features)?);
     kernargs.push_i32(i32_kernel_dim("f32 linear output features", out_features)?);
     kernargs.push_i32(i32::from(bias.is_some()));
@@ -2162,12 +2165,7 @@ pub(crate) fn linear_resident_weight_hip_on_gpu(
         )));
     }
     if crate::quant_calib::calib_active() {
-        crate::quant_calib::calib_observe_named(
-            weight.name(),
-            &input.data,
-            rows,
-            in_features,
-        );
+        crate::quant_calib::calib_observe_named(weight.name(), &input.data, rows, in_features);
     }
     // Non-eligible dims / archs: decode once and use the CpuTensor linear.
     if !(gpu.arch_caps.has_wmma_w32() && in_features % 16 == 0) {
@@ -2280,12 +2278,7 @@ pub(crate) fn linear_resident_weight_resident(
     let rows = total / in_features;
     if crate::quant_calib::calib_active() {
         let observed = download_resident(gpu, input)?;
-        crate::quant_calib::calib_observe_named(
-            weight.name(),
-            &observed.data,
-            rows,
-            in_features,
-        );
+        crate::quant_calib::calib_observe_named(weight.name(), &observed.data, rows, in_features);
     }
     let mut output_shape = input.shape.clone();
     *output_shape.last_mut().expect("input has a last dim") = out_features;
@@ -2340,7 +2333,11 @@ pub(crate) fn linear_resident_weight_resident(
         // Fold path: unsigned codes + dynamic-int8 activation (with per-group sum)
         // + register-tiled fold GEMM that cancels the weight zero-point.
         const GROUP: usize = 256;
-        let prep_start = if prof { Some(std::time::Instant::now()) } else { None };
+        let prep_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let (w_ptr, w_scales_ptr, ng) = cache.resident_wua8(gpu, weight, fold_bits)?;
         let w_bytes = out_features
             .checked_mul(in_features)
@@ -2375,10 +2372,25 @@ pub(crate) fn linear_resident_weight_resident(
             .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
         gpu.quantize_act_oq8_sum(input, &xq, &xs, &xsum, rows, in_features, GROUP)
             .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
-        let gemm_start = if prof { Some(std::time::Instant::now()) } else { None };
+        let gemm_start = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         gpu.gemm_opus_tiled_wmma_u(
-            fold_bits as usize, &w_view, &w_scales_view, &xq, &xs, &xsum, &output, out_features,
-            in_features, rows, GROUP, 2, 4,
+            fold_bits as usize,
+            &w_view,
+            &w_scales_view,
+            &xq,
+            &xs,
+            &xsum,
+            &output,
+            out_features,
+            in_features,
+            rows,
+            GROUP,
+            2,
+            4,
         )
         .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
         if let Some(start) = gemm_start {
@@ -4380,7 +4392,11 @@ pub(crate) fn layer_norm_no_affine_resident(
         "diffusion_layer_norm_no_affine_rows_f32",
         DIFFUSION_LAYER_NORM_ROWS_HIP_SRC,
         "diffusion_layer_norm_no_affine_rows_f32",
-        [i32_kernel_dim("no-affine layer_norm grid", blocks)? as u32, 1, 1],
+        [
+            i32_kernel_dim("no-affine layer_norm grid", blocks)? as u32,
+            1,
+            1,
+        ],
         [(WAVES_PER_BLOCK * 32) as u32, 1, 1],
         0,
         &mut kernargs,
@@ -5180,11 +5196,26 @@ pub(crate) fn qwen3_masked_causal_self_attention_resident(
         "Qwen3 masked causal attention output elements",
         output_elements,
     )?);
-    kernargs.push_i32(i32_kernel_dim("Qwen3 masked causal attention sequence", seq)?);
-    kernargs.push_i32(i32_kernel_dim("Qwen3 masked causal attention hidden", hidden)?);
-    kernargs.push_i32(i32_kernel_dim("Qwen3 masked causal attention heads", n_heads)?);
-    kernargs.push_i32(i32_kernel_dim("Qwen3 masked causal attention head dim", head_dim)?);
-    kernargs.push_i32(i32_kernel_dim("Qwen3 masked causal attention valid keys", valid_keys)?);
+    kernargs.push_i32(i32_kernel_dim(
+        "Qwen3 masked causal attention sequence",
+        seq,
+    )?);
+    kernargs.push_i32(i32_kernel_dim(
+        "Qwen3 masked causal attention hidden",
+        hidden,
+    )?);
+    kernargs.push_i32(i32_kernel_dim(
+        "Qwen3 masked causal attention heads",
+        n_heads,
+    )?);
+    kernargs.push_i32(i32_kernel_dim(
+        "Qwen3 masked causal attention head dim",
+        head_dim,
+    )?);
+    kernargs.push_i32(i32_kernel_dim(
+        "Qwen3 masked causal attention valid keys",
+        valid_keys,
+    )?);
     kernargs.pad_to(16);
     let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
     ensure_and_launch_diffusion_kernel(
@@ -5231,12 +5262,7 @@ pub(crate) fn qwen3_masked_causal_self_attention_hip_on_gpu(
         .upload_f32(&v.data, &v.shape)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
     let output_gpu = qwen3_masked_causal_self_attention_resident(
-        gpu,
-        &q_gpu,
-        &k_gpu,
-        &v_gpu,
-        n_heads,
-        valid_keys,
+        gpu, &q_gpu, &k_gpu, &v_gpu, n_heads, valid_keys,
     )?;
     let output = download_resident(gpu, &output_gpu)?;
     for tensor in [q_gpu, k_gpu, v_gpu, output_gpu] {

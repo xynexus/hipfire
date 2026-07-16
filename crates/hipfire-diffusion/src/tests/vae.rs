@@ -97,9 +97,7 @@ fn flux2_vae_inverse_batch_norm_unpatchifies_channel_major_tiles() {
         batch_norm_eps: Some(1e-4),
         ..VaeConfig::default()
     };
-    let norm = Flux2VaePatchNorm::from_hfq(&hfq, &config)
-        .unwrap()
-        .unwrap();
+    let norm = Flux2VaePatchNorm::from_hfq(&hfq, &config).unwrap().unwrap();
     let input = CpuTensor {
         shape: vec![1, 8, 1, 1],
         data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
@@ -154,9 +152,7 @@ fn local_flux2_full_vae_matches_vendored_bfl_reference() {
     let artifact = Path::new("/srv/huggingface/FLUX.2-klein-base-4B.diffusers.p0.hfq");
     let reference_path = Path::new("/tmp/hipfire-flux2-vae-reference.json");
     if !artifact.is_file() || !reference_path.is_file() {
-        eprintln!(
-            "skip: generate the local reference with scripts/flux2_vae_reference.py"
-        );
+        eprintln!("skip: generate the local reference with scripts/flux2_vae_reference.py");
         return;
     }
     let reference: serde_json::Value =

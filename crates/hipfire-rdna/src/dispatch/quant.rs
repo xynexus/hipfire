@@ -236,8 +236,16 @@ impl Gpu {
         nb: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(k % group, 0, "gemm_opus_tiled_wmma_u: K must be a multiple of group");
-        assert_eq!(group % 16, 0, "gemm_opus_tiled_wmma_u: group must be a multiple of 16");
+        assert_eq!(
+            k % group,
+            0,
+            "gemm_opus_tiled_wmma_u: K must be a multiple of group"
+        );
+        assert_eq!(
+            group % 16,
+            0,
+            "gemm_opus_tiled_wmma_u: group must be a multiple of 16"
+        );
         let kname = match (w_bits, mb, nb) {
             (8, 2, 2) => "gemm_opus_w8a8u_tiled_wmma_2x2",
             (8, 2, 4) => "gemm_opus_w8a8u_tiled_wmma_2x4",
@@ -358,8 +366,16 @@ impl Gpu {
         group: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(group % 32, 0, "quantize_act_oq8_sum: group must be a multiple of 32");
-        assert_eq!(k % group, 0, "quantize_act_oq8_sum: K must be a multiple of group");
+        assert_eq!(
+            group % 32,
+            0,
+            "quantize_act_oq8_sum: group must be a multiple of 32"
+        );
+        assert_eq!(
+            k % group,
+            0,
+            "quantize_act_oq8_sum: K must be a multiple of group"
+        );
         self.ensure_kernel(
             "quantize_act_oq8_sum",
             kernels::QUANTIZE_ACT_OQ8_SRC,

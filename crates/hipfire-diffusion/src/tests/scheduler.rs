@@ -54,9 +54,21 @@ fn sefi_turbo_dual_schedule_matches_pinned_diffusers_reference() {
         sigma_sem.push(schedule.steps.last().unwrap().sigma_sem_next);
         sigma_tex.push(schedule.steps.last().unwrap().sigma_tex_next);
         for (label, actual, expected) in [
-            ("base_sigmas", schedule.base_sigmas, values(step_count, "base_sigmas")),
-            ("timestep_sem", timestep_sem, values(step_count, "timestep_sem")),
-            ("timestep_tex", timestep_tex, values(step_count, "timestep_tex")),
+            (
+                "base_sigmas",
+                schedule.base_sigmas,
+                values(step_count, "base_sigmas"),
+            ),
+            (
+                "timestep_sem",
+                timestep_sem,
+                values(step_count, "timestep_sem"),
+            ),
+            (
+                "timestep_tex",
+                timestep_tex,
+                values(step_count, "timestep_tex"),
+            ),
             ("sigma_sem", sigma_sem, values(step_count, "sigma_sem")),
             ("sigma_tex", sigma_tex, values(step_count, "sigma_tex")),
         ] {
@@ -82,9 +94,7 @@ fn sefi_turbo_dual_schedule_matches_pinned_diffusers_reference() {
         let trace = reference[step_count.to_string()]["integration_trace"]
             .as_array()
             .unwrap();
-        for (index, (step, expected_step)) in
-            schedule.steps.iter().zip(trace.iter()).enumerate()
-        {
+        for (index, (step, expected_step)) in schedule.steps.iter().zip(trace.iter()).enumerate() {
             let mut velocity = vec![0.0f32; latents.data.len()];
             for channel in 0..latents.channels {
                 let timestep = if channel == 0 {

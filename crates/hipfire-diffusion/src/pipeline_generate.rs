@@ -230,31 +230,31 @@ impl DiffusionPipeline {
                 } else {
                     source.clone()
                 };
-            let images = if request.send_images {
-                let (rgb, image_runtime_kind) = decode_to_rgb8_with_runtime_context(
-                    runtime.decoder.as_ref(),
-                    &decode_latents,
-                    &mut runtime_context,
-                )?;
-                generation_runtime_kind =
-                    merge_runtime_kind(generation_runtime_kind, image_runtime_kind);
-                encode_rgb_batch_png_base64(&rgb)?
-            } else {
-                Vec::new()
-            };
-            let mut info = diffusion_generation_info(
-                self.summary(),
-                generation_runtime_kind,
-                &request,
-                &plan.latent_shape,
-            );
-            if let Value::Object(map) = &mut info {
-                map.insert(
-                    "mode".to_string(),
-                    Value::String("draft-upscaled-nodenoise".to_string()),
+                let images = if request.send_images {
+                    let (rgb, image_runtime_kind) = decode_to_rgb8_with_runtime_context(
+                        runtime.decoder.as_ref(),
+                        &decode_latents,
+                        &mut runtime_context,
+                    )?;
+                    generation_runtime_kind =
+                        merge_runtime_kind(generation_runtime_kind, image_runtime_kind);
+                    encode_rgb_batch_png_base64(&rgb)?
+                } else {
+                    Vec::new()
+                };
+                let mut info = diffusion_generation_info(
+                    self.summary(),
+                    generation_runtime_kind,
+                    &request,
+                    &plan.latent_shape,
                 );
-            }
-            return Ok(DiffusionBatchOutput { images, info });
+                if let Value::Object(map) = &mut info {
+                    map.insert(
+                        "mode".to_string(),
+                        Value::String("draft-upscaled-nodenoise".to_string()),
+                    );
+                }
+                return Ok(DiffusionBatchOutput { images, info });
             }
         }
         let denoise_output = if is_sefi {
@@ -285,9 +285,9 @@ impl DiffusionPipeline {
                 progress,
             )?
         } else {
-            let schedule =
-                plan.schedule
-                    .refine_direct_sigma(first_sigma, refine_steps, shifted)?;
+            let schedule = plan
+                .schedule
+                .refine_direct_sigma(first_sigma, refine_steps, shifted)?;
             schedule.add_flow_match_refine_noise(&mut latents, &noise.data)?;
             runtime.noise.denoise_latents_with_runtime_context(
                 latents,
@@ -332,7 +332,10 @@ impl DiffusionPipeline {
             &plan.latent_shape,
         );
         if let Value::Object(map) = &mut info {
-            map.insert("mode".to_string(), Value::String("draft-refine".to_string()));
+            map.insert(
+                "mode".to_string(),
+                Value::String("draft-refine".to_string()),
+            );
             map.insert("refine_first_sigma".to_string(), json!(first_sigma));
             map.insert("refine_steps".to_string(), json!(refine_steps));
             map.insert("sefi_dual_refine".to_string(), json!(is_sefi));

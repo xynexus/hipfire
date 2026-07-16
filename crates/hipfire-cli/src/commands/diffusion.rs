@@ -17,11 +17,10 @@ use hipfire_diffusion::DiffusionHipRuntimeOptions;
 use hipfire_diffusion::{
     calibrate_diffusion_hfq, diff_quantized_transformer_tensors, eval_fold_calibration,
     inspect_hfq_with_runtime_support, quantize_diffusion_hfq, resize_rgb_batch_to_cover_nearest,
-    DiffusionBatchRequest,
-    DiffusionError, DiffusionGenerationRuntimeOptions, DiffusionHfqInspection,
-    DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress, DiffusionPrompt,
-    DiffusionQuantFormat, DiffusionResult, RefineSigmaSchedule, RgbImageBatch, TensorQuantDiff,
-    QT_DIFFUSION_TENSOR_BF16, QT_DIFFUSION_TENSOR_F16, QT_DIFFUSION_TENSOR_F32,
+    DiffusionBatchRequest, DiffusionError, DiffusionGenerationRuntimeOptions,
+    DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress,
+    DiffusionPrompt, DiffusionQuantFormat, DiffusionResult, RefineSigmaSchedule, RgbImageBatch,
+    TensorQuantDiff, QT_DIFFUSION_TENSOR_BF16, QT_DIFFUSION_TENSOR_F16, QT_DIFFUSION_TENSOR_F32,
     QT_DIFFUSION_TENSOR_OQ4_G256, QT_DIFFUSION_TENSOR_OQ4_PLAIN, QT_DIFFUSION_TENSOR_OQ8_G256,
     QT_DIFFUSION_TENSOR_OQ8_PLAIN, QT_DIFFUSION_TENSOR_Q8F16,
 };
@@ -656,7 +655,10 @@ fn run_calib_eval(args: DiffusionCalibEvalArgs) -> anyhow::Result<()> {
     }
     let mut rows = eval_fold_calibration(&args.source, &args.calib, args.bits)?;
     if rows.is_empty() {
-        println!("no fold-eligible transformer linears in {}", args.source.display());
+        println!(
+            "no fold-eligible transformer linears in {}",
+            args.source.display()
+        );
         return Ok(());
     }
     if args.json {
@@ -680,14 +682,27 @@ fn run_calib_eval(args: DiffusionCalibEvalArgs) -> anyhow::Result<()> {
     }
     // Rank by weighted improvement (best-calibrated first).
     rows.sort_by(|a, b| {
-        let ra = if a.rtn_weighted > 0.0 { a.clip_weighted / a.rtn_weighted } else { 1.0 };
-        let rb = if b.rtn_weighted > 0.0 { b.clip_weighted / b.rtn_weighted } else { 1.0 };
+        let ra = if a.rtn_weighted > 0.0 {
+            a.clip_weighted / a.rtn_weighted
+        } else {
+            1.0
+        };
+        let rb = if b.rtn_weighted > 0.0 {
+            b.clip_weighted / b.rtn_weighted
+        } else {
+            1.0
+        };
         ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
     });
     let with_im = rows.iter().filter(|r| r.has_imatrix).count();
     println!("source: {}", args.source.display());
     println!("calib:  {}", args.calib.display());
-    println!("bits:   {}   fold tensors: {} ({} with imatrix)", args.bits, rows.len(), with_im);
+    println!(
+        "bits:   {}   fold tensors: {} ({} with imatrix)",
+        args.bits,
+        rows.len(),
+        with_im
+    );
     println!();
     println!(
         "{:>12} {:>12} {:>8}  {:>12} {:>12}  {:>3}  {}",
@@ -713,9 +728,15 @@ fn run_calib_eval(args: DiffusionCalibEvalArgs) -> anyhow::Result<()> {
     let n = rows.len() as f64;
     let mean_rtn = rows.iter().map(|r| r.rtn_weighted).sum::<f64>() / n;
     let mean_clip = rows.iter().map(|r| r.clip_weighted).sum::<f64>() / n;
-    let redux = if mean_rtn > 0.0 { 100.0 * (1.0 - mean_clip / mean_rtn) } else { 0.0 };
+    let redux = if mean_rtn > 0.0 {
+        100.0 * (1.0 - mean_clip / mean_rtn)
+    } else {
+        0.0
+    };
     println!();
-    println!("mean weighted rel-RMSE: RTN={mean_rtn:.6}  clip={mean_clip:.6}  ({redux:.1}% reduction)");
+    println!(
+        "mean weighted rel-RMSE: RTN={mean_rtn:.6}  clip={mean_clip:.6}  ({redux:.1}% reduction)"
+    );
     Ok(())
 }
 
@@ -816,11 +837,7 @@ fn run_quant_diff(args: DiffusionQuantDiffArgs) -> anyhow::Result<()> {
     // Element-weighted global MAE over every compared tensor.
     let total_elems: u128 = diffs.iter().map(|d| d.elements as u128).sum();
     let global_mae = if total_elems > 0 {
-        diffs
-            .iter()
-            .map(|d| d.mae * d.elements as f64)
-            .sum::<f64>()
-            / total_elems as f64
+        diffs.iter().map(|d| d.mae * d.elements as f64).sum::<f64>() / total_elems as f64
     } else {
         0.0
     };
@@ -861,9 +878,7 @@ fn run_quant_diff(args: DiffusionQuantDiffArgs) -> anyhow::Result<()> {
             "VERDICT: quantization is faithful in weight space (worst rel-L2 {worst_rel:.4} <= {:.4}).",
             args.rel_rms_threshold
         );
-        println!(
-            "         Any rendered-image drift vs the reference is trajectory divergence"
-        );
+        println!("         Any rendered-image drift vs the reference is trajectory divergence");
         println!(
             "         (sampler chaos), NOT weight corruption. Gate on perceptual/early-latent"
         );
@@ -871,7 +886,10 @@ fn run_quant_diff(args: DiffusionQuantDiffArgs) -> anyhow::Result<()> {
     } else {
         println!(
             "VERDICT: {} tensor(s) exceed rel-L2 {:.4} (worst {worst_rel:.4}) — real quant",
-            changed.iter().filter(|d| d.rel_rms > args.rel_rms_threshold).count(),
+            changed
+                .iter()
+                .filter(|d| d.rel_rms > args.rel_rms_threshold)
+                .count(),
             args.rel_rms_threshold
         );
         println!("         corruption. Investigate the encode path for the top-ranked tensor(s).");
