@@ -1,7 +1,8 @@
 # Gemma 4 Phase 5 dense-31B admission
 
 Date: 2026-07-15. Status updated: 2026-07-16. Historical BF16 gate blocked;
-canonical OQ8, OQ8+, and BF16-`down_proj` anchor candidates rejected at SWA-1.
+canonical OQ8, OQ8+, BF16-`down_proj`, and BF16-attention-`o_proj` anchor
+candidates rejected at SWA-1.
 
 ## OQ8 contract revision
 
@@ -169,6 +170,47 @@ comparison SHA256 is
 The next remediation must use a materially different basis rather than another
 FFN down-projection precision anchor. The broad OQ8 and final OQ8++ thresholds
 remain frozen.
+
+## BF16 attention-output anchor rejection
+
+The next bounded residual-write diagnostic instead retains all 60
+`model.language_model.layers.*.self_attn.o_proj.weight` tensors in BF16. The
+other 350 language-model projections are OQ8G256, while norms and small scalar
+tensors retain their source precision. The resulting
+`Gemma-4-31B-attnoutbf16.oq8.hfq` is 34,763,506,072 bytes with 1,188 tensors,
+31,273,088,876 source parameters, 28,165,220,352 rewritten parameters, and
+quantization hash `b6a3631e816fe472`. Its embedded tokenizer is the pinned
+Gemma 4 tokenizer, SHA256
+`12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6`.
+
+The candidate passes base-short and lifecycle:
+
+- minimum hidden cosine `0.9964441132639994`;
+- maximum hidden NRMSE `0.08440288999942645`;
+- final-logit cosine `0.999495890727652`;
+- final-logit maximum absolute error `1.0559558868408203`;
+- final argmax `7001`, top-5 overlap `5/5`, and exact eight-token greedy output;
+- reset and full unload/reload reruns are bit-exact.
+
+The base-short comparison SHA256 is
+`6ba95b1338d9ab4ac4a22c92769b6fdc641705cbf4207b63def60c7990f8cb2d`.
+The exact 1,023-token SWA-1 comparison nevertheless fails six frozen
+conditions:
+
+- layer 58 cosine `0.9760537257134996`, NRMSE `0.2201338302938732`;
+- layer 59 cosine `0.9962948364897145`, NRMSE `0.12558831987964805`;
+- final-logit cosine `0.9792321613089784`;
+- final-logit maximum absolute error `3.2151159048080444`;
+- final top-5 overlap `4/5`.
+
+All values are finite, and final argmax plus the first greedy token remain
+`7001`. This is the best tested SWA-1 final-logit result but still fails the
+broad OQ8 contract, so attention-output precision anchoring is rejected. SWA,
+SWA+1, IT, and OQ8++ were not run. Durable evidence is under
+`~/.hipfire/evidence/gemma4/phase5-oq8-attnoutbf16-admission-v1`; the SWA-1
+comparison SHA256 is
+`8eec19a6b56c128710c4f3bbe0c443ba44a7f8934b186bd9f41c94260a15ba4a`.
+The broad OQ8 and final OQ8++ thresholds remain frozen.
 
 ## Historical BF16 base-short result
 
@@ -565,5 +607,5 @@ The original BF16 base-short verdict is therefore unchanged: final-logit maximum
 error is `0.5618224143981934`; hidden thresholds fail at layers 39, 52, 56, 57,
 and 58. The BF16 candidate path stopped here. Under the explicit OQ8 revision,
 current Phase 5 advanced through base-short, multi-global, and
-reload/sequential gates, then stopped at SWA-1 for all three tested OQ8-family
+reload/sequential gates, then stopped at SWA-1 for all four tested OQ8-family
 candidates before the SWA, SWA+1, or instruction-checkpoint gates.
