@@ -53,6 +53,7 @@ pub enum AttentionBoundary {
 
 pub enum FinalizedEncoder {
     Pooled(Vec<f32>),
+    PooledBatch(Vec<Vec<f32>>),
     Embedding(Vec<f32>),
 }
 
@@ -86,6 +87,12 @@ pub trait LinearProjector {
     /// Whether `project_layer` already owns the normalized/packed input for
     /// this layer. The canonical GPU RMSNorm can be skipped when true.
     fn has_prepared_layer_input(&self, _layer_idx: usize, _rows: usize) -> bool {
+        false
+    }
+
+    /// Whether one flattened encoder command can preserve the supplied
+    /// document boundaries through every resident layer.
+    fn supports_segmented_batch(&self, _segment_offsets: &[usize]) -> bool {
         false
     }
 
@@ -257,13 +264,57 @@ pub fn embed_forward_with_projector<P: LinearProjector>(
     if tokens.is_empty() {
         return Err("embeddinggemma: empty token sequence".to_string());
     }
-    let hidden = encode_pooled_hidden_with_projector(gpu, weights, cfg, tokens, projector)
+    let hidden = encode_pooled_hidden_with_projector(gpu, weights, cfg, tokens, projector, None)
         .map_err(|e| format!("embeddinggemma: encode failed: {e:?}"))?;
     match hidden {
         FinalizedEncoder::Pooled(hidden) => {
             project_dense_with_capture(&weights.dense_heads, hidden, |_, _| Ok(()))
         }
+        FinalizedEncoder::PooledBatch(_) => {
+            Err("embeddinggemma: single encode returned a pooled batch".to_string())
+        }
         FinalizedEncoder::Embedding(embedding) => Ok(embedding),
+    }
+}
+
+/// Encode several fixed segments in one resident command when the projector
+/// advertises a matching block-diagonal batch. Other projectors retain the
+/// established one-document-at-a-time behavior.
+pub fn embed_batch_forward_with_projector<P: LinearProjector>(
+    gpu: &mut Gpu,
+    weights: &EmbeddingGemmaWeights,
+    cfg: &EmbeddingGemmaConfig,
+    tokenized: &[Vec<u32>],
+    projector: &mut P,
+) -> Result<Vec<Vec<f32>>, String> {
+    if tokenized.is_empty() || tokenized.iter().any(Vec::is_empty) {
+        return Err("embeddinggemma: batch contains no documents or an empty document".into());
+    }
+    let mut offsets = Vec::with_capacity(tokenized.len() + 1);
+    offsets.push(0);
+    for tokens in tokenized {
+        offsets.push(offsets.last().copied().unwrap() + tokens.len());
+    }
+    if !projector.supports_segmented_batch(&offsets) {
+        return tokenized
+            .iter()
+            .map(|tokens| embed_forward_with_projector(gpu, weights, cfg, tokens, projector))
+            .collect();
+    }
+    let flat = tokenized
+        .iter()
+        .flat_map(|tokens| tokens.iter().copied())
+        .collect::<Vec<_>>();
+    match encode_pooled_hidden_with_projector(gpu, weights, cfg, &flat, projector, Some(&offsets))
+        .map_err(|error| format!("embeddinggemma: batched encode failed: {error:?}"))?
+    {
+        FinalizedEncoder::PooledBatch(pooled) => pooled
+            .into_iter()
+            .map(|hidden| project_dense_with_capture(&weights.dense_heads, hidden, |_, _| Ok(())))
+            .collect(),
+        FinalizedEncoder::Pooled(_) | FinalizedEncoder::Embedding(_) => {
+            Err("embeddinggemma: segmented encode returned one document".into())
+        }
     }
 }
 
@@ -295,8 +346,12 @@ pub(crate) fn encode_pooled_hidden(
     tokens: &[u32],
 ) -> HipResult<Vec<f32>> {
     let mut projector = GpuLinearProjector;
-    match encode_pooled_hidden_with_projector(gpu, weights, cfg, tokens, &mut projector)? {
+    match encode_pooled_hidden_with_projector(gpu, weights, cfg, tokens, &mut projector, None)? {
         FinalizedEncoder::Pooled(hidden) => Ok(hidden),
+        FinalizedEncoder::PooledBatch(_) => Err(hip_bridge::HipError::new(
+            0,
+            "GPU pooled-hidden path unexpectedly returned a batch",
+        )),
         FinalizedEncoder::Embedding(_) => Err(hip_bridge::HipError::new(
             0,
             "GPU pooled-hidden path unexpectedly returned a final embedding",
@@ -310,6 +365,7 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     cfg: &EmbeddingGemmaConfig,
     tokens: &[u32],
     projector: &mut P,
+    segment_offsets: Option<&[usize]>,
 ) -> HipResult<FinalizedEncoder> {
     let trace_phases = std::env::var("HIPFIRE_EMBED_TRACE_PHASES").is_ok_and(|value| value != "0");
     let compare_resident_layer =
@@ -666,12 +722,37 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     }
     gpu.reclaim_pending();
 
-    Ok(FinalizedEncoder::Pooled(pool(
-        &hidden_flat,
-        m,
-        dim,
-        cfg.pooling_mode,
-    )))
+    if let Some(offsets) = segment_offsets {
+        Ok(FinalizedEncoder::PooledBatch(pool_segments(
+            &hidden_flat,
+            offsets,
+            dim,
+            cfg.pooling_mode,
+        )))
+    } else {
+        Ok(FinalizedEncoder::Pooled(pool(
+            &hidden_flat,
+            m,
+            dim,
+            cfg.pooling_mode,
+        )))
+    }
+}
+
+fn pool_segments(
+    hidden: &[f32],
+    offsets: &[usize],
+    dim: usize,
+    mode: PoolingMode,
+) -> Vec<Vec<f32>> {
+    offsets
+        .windows(2)
+        .map(|segment| {
+            let start = segment[0];
+            let end = segment[1];
+            pool(&hidden[start * dim..end * dim], end - start, dim, mode)
+        })
+        .collect()
 }
 
 fn tensor_metrics(left: &[f32], right: &[f32]) -> (f64, f32) {
@@ -771,6 +852,15 @@ mod tests {
     fn last_token_pool_takes_final_row() {
         let h = [1.0, 2.0, 3.0, 3.0, 4.0, 5.0];
         assert_eq!(pool(&h, 2, 3, PoolingMode::LastToken), vec![3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn segmented_pooling_never_mixes_documents() {
+        let hidden = [1.0, 3.0, 5.0, 7.0, 100.0, 200.0, 300.0, 400.0];
+        assert_eq!(
+            pool_segments(&hidden, &[0, 2, 4], 2, PoolingMode::Mean),
+            vec![vec![3.0, 5.0], vec![200.0, 300.0]]
+        );
     }
 
     #[test]

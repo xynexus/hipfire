@@ -50,6 +50,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_FFN").is_ok_and(|value| value != "0");
     let compare_resident_attention =
         std::env::var("HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION").is_ok_and(|value| value != "0");
+    let resident_batch = std::env::var("HIPFIRE_EMBED_NPU_BATCH")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(1);
+    if resident_batch == 0 {
+        return Err("HIPFIRE_EMBED_NPU_BATCH must be positive".into());
+    }
 
     let mut hfq = HfqFile::open(Path::new(&args[0]))?;
     let config = embeddinggemma::config_from_metadata_json(&hfq.metadata_json)
@@ -73,14 +81,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if target_tokens == 0 {
             return Err("HIPFIRE_EMBED_E2E_TOKENS must be non-zero".into());
         }
-        let mut document = String::new();
-        let mut tokens = Vec::new();
-        while tokens.len() < target_tokens {
-            document.push_str(" The cat rested by the sunny window while cloud revenue grew.");
-            tokens = tokenizer.encode(&format!("{}{document}", config.document_prompt));
-        }
-        tokens.truncate(target_tokens);
-        token_batches = vec![tokens];
+        token_batches = (0..resident_batch)
+            .map(|document_index| {
+                let mut document = format!(" Batch document {document_index}.");
+                let mut tokens = Vec::new();
+                while tokens.len() < target_tokens {
+                    document
+                        .push_str(" The cat rested by the sunny window while cloud revenue grew.");
+                    tokens = tokenizer.encode(&format!("{}{document}", config.document_prompt));
+                }
+                tokens.truncate(target_tokens);
+                tokens
+            })
+            .collect();
     }
 
     let mut gpu = Gpu::init()?;
@@ -100,6 +113,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         embeddinggemma::EmbeddingGemmaWeights::load_resident_npu(&mut hfq, &config, &mut gpu)?
     } else {
         embeddinggemma::EmbeddingGemmaWeights::load(&mut hfq, &config, &mut gpu)?
+    };
+    let batch_reference_embeddings = if resident_batch > 1
+        && std::env::var("HIPFIRE_EMBED_COMPARE_BATCH").is_ok_and(|value| value != "0")
+    {
+        let mut reference_projector = embeddinggemma::NpuOpusProjector::load_cached_for_batch(
+            &hfq,
+            &config,
+            Path::new(&cache_root),
+            1,
+        )?;
+        let mut reference = Vec::with_capacity(token_batches.len());
+        for tokens in &token_batches {
+            reference.push(embeddinggemma::embed_forward_with_projector(
+                &mut gpu,
+                &weights,
+                &config,
+                tokens,
+                &mut reference_projector,
+            )?);
+        }
+        Some(reference)
+    } else {
+        None
     };
     let mut projector =
         embeddinggemma::NpuOpusProjector::load_cached(&hfq, &config, Path::new(&cache_root))?;
@@ -188,16 +224,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut npu_power = Vec::new();
     for _ in 0..iterations {
         npu_embeddings.clear();
-        for tokens in &token_batches {
-            npu_embeddings.push(embeddinggemma::embed_forward_with_projector(
+        if resident_batch > 1 {
+            npu_embeddings = embeddinggemma::embed_batch_forward_with_projector(
                 &mut gpu,
                 &weights,
                 &config,
-                tokens,
+                &token_batches,
                 &mut projector,
-            )?);
-            npu_power.extend(package_watts(power_path.as_deref()));
+            )?;
+        } else {
+            for tokens in &token_batches {
+                npu_embeddings.push(embeddinggemma::embed_forward_with_projector(
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    tokens,
+                    &mut projector,
+                )?);
+            }
         }
+        npu_power.extend(package_watts(power_path.as_deref()));
     }
     let npu_ms = npu_started.elapsed().as_secs_f64() * 1e3 / encodes as f64;
     if profile_hybrid {
@@ -215,10 +261,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let (mean_cosine, min_cosine, max_abs) = if gpu_embeddings.is_empty() {
+    let comparison_embeddings = if gpu_embeddings.is_empty() {
+        batch_reference_embeddings.as_deref().unwrap_or(&[])
+    } else {
+        &gpu_embeddings
+    };
+    let (mean_cosine, min_cosine, max_abs) = if comparison_embeddings.is_empty() {
         (f32::NAN, f32::NAN, f32::NAN)
     } else {
-        embedding_metrics(&gpu_embeddings, &npu_embeddings)
+        embedding_metrics(comparison_embeddings, &npu_embeddings)
     };
     if let (Some(fallback), Some(fallback_ms)) = (&fallback_embeddings, fallback_ms) {
         let (mean, min, max_abs) = embedding_metrics(fallback, &npu_embeddings);

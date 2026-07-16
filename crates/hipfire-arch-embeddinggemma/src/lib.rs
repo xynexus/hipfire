@@ -33,7 +33,8 @@ pub mod weights;
 
 pub use config::{config_from_metadata_json, DenseHead, EmbeddingGemmaConfig, PoolingMode};
 pub use forward::{
-    embed_forward, embed_forward_with_projector, GpuLinearProjector, LinearProjector, Projection,
+    embed_batch_forward_with_projector, embed_forward, embed_forward_with_projector,
+    GpuLinearProjector, LinearProjector, Projection,
 };
 #[cfg(target_os = "linux")]
 pub use npu_opus::NpuOpusProjector;

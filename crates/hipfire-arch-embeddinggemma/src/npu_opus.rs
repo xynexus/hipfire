@@ -144,6 +144,20 @@ enum ResidentLayerFfn {
 }
 
 impl ResidentLayerFfn {
+    fn loaded_rows(&self) -> usize {
+        match self {
+            Self::W4 { .. } => NpuResidentFfnW4::rows(),
+            Self::DenseW8 { executor, .. } => executor.loaded_rows(),
+        }
+    }
+
+    fn loaded_output_bytes(&self) -> usize {
+        match self {
+            Self::W4 { .. } => NpuResidentFfnW4::output_bytes(),
+            Self::DenseW8 { executor, .. } => executor.loaded_output_bytes(),
+        }
+    }
+
     fn consumes_direct_x(&self) -> bool {
         match self {
             Self::W4 { executor, .. } => executor.consumes_direct_x(),
@@ -258,6 +272,18 @@ impl ResidentLayerAttentionWeights {
 }
 
 impl ResidentLayerAttentionExecutors {
+    fn loaded_rows(&self) -> usize {
+        self.standard.loaded_rows()
+    }
+
+    fn loaded_activation_bytes(&self) -> usize {
+        self.standard.loaded_activation_bytes()
+    }
+
+    fn loaded_hidden_backing_bytes(&self) -> usize {
+        self.standard.loaded_hidden_backing_bytes()
+    }
+
     fn input_bytes(&self) -> usize {
         self.standard.input_bytes()
     }
@@ -507,6 +533,25 @@ impl NpuOpusProjector {
         cfg: &EmbeddingGemmaConfig,
         cache_root: &Path,
     ) -> Result<Self, String> {
+        let resident_batch = std::env::var("HIPFIRE_EMBED_NPU_BATCH")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .map_err(|_| "embeddinggemma NPU: HIPFIRE_EMBED_NPU_BATCH must be positive")?
+            .unwrap_or(1);
+        Self::load_cached_for_batch(hfq, cfg, cache_root, resident_batch)
+    }
+
+    pub fn load_cached_for_batch(
+        hfq: &HfqFile,
+        cfg: &EmbeddingGemmaConfig,
+        cache_root: &Path,
+        resident_batch: usize,
+    ) -> Result<Self, String> {
+        if resident_batch == 0 {
+            return Err("embeddinggemma NPU: resident batch must be positive".into());
+        }
+        let resident_rows = 256 * resident_batch;
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
         let requirements = fullk_requirements(hfq, cfg)?;
@@ -906,13 +951,15 @@ impl NpuOpusProjector {
             cache_root.join("embgemma_aie2p_resident_ffn_w4_m256_k768_i1152_o768");
         let resident_ffn_dense_w8_path =
             cache_root.join("embgemma_aie2p_resident_ffn_dense_w8_m256_k768_i1152_o768");
-        let resident_layer_ffn_direct_x_path = cache_root
-            .join("embgemma_aie2p_resident_ffn_dense_w8_direct_x_bf16x2_m256_k768_i1152_o768");
-        let resident_layer_ffn_gate_reuse_path = cache_root.join(
-            "embgemma_aie2p_resident_ffn_dense_w8_direct_x_gate_reuse_bf16x2_m256_k768_i1152_o768",
-        );
-        let resident_layer_ffn_canonical_path = cache_root
-            .join("embgemma_aie2p_resident_ffn_dense_w8_canonical_bf16x2_m256_k768_i1152_o768");
+        let resident_layer_ffn_direct_x_path = cache_root.join(format!(
+            "embgemma_aie2p_resident_ffn_dense_w8_direct_x_bf16x2_m{resident_rows}_k768_i1152_o768"
+        ));
+        let resident_layer_ffn_gate_reuse_path = cache_root.join(format!(
+            "embgemma_aie2p_resident_ffn_dense_w8_direct_x_gate_reuse_bf16x2_m{resident_rows}_k768_i1152_o768",
+        ));
+        let resident_layer_ffn_canonical_path = cache_root.join(format!(
+            "embgemma_aie2p_resident_ffn_dense_w8_canonical_bf16x2_m{resident_rows}_k768_i1152_o768"
+        ));
         let resident_layer_ffn_w4_canonical_path = cache_root.join(
             "embgemma_r99_canonical_bf16_w4_resident_ffn_combined_bf16x2_m256_k768_i1152_o768",
         );
@@ -1074,9 +1121,9 @@ impl NpuOpusProjector {
             }
             Err(_) => None,
         };
-        let resident_layer_attention_direct_residual_path = cache_root.join(
-            "embgemma_r108_resident_w8_qkv_attention_direct_completed_residual_m256_k768_n1280",
-        );
+        let resident_layer_attention_direct_residual_path = cache_root.join(format!(
+            "embgemma_r108_resident_w8_qkv_attention_direct_completed_residual_m{resident_rows}_k768_n1280",
+        ));
         let resident_layer_attention_external_path = cache_root.join(
             "embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_external_x_bf16x2_m256_k768_n1280",
         );
@@ -1125,15 +1172,16 @@ impl NpuOpusProjector {
         let resident_layer_exception_731_path = cache_root.join(
             "embgemma_aie2p_resident_w8_qkv_paired_attention_o_norm_x_exception_c731_m256_k768_n1280",
         );
-        let resident_layer_tail_split_x_path = cache_root
-            .join("embgemma_aie2p_post_ffn_direct_tail_bf16x2_split_x_completed_bf16x2_m256_k768");
+        let resident_layer_tail_split_x_path = cache_root.join(format!(
+            "embgemma_aie2p_post_ffn_direct_tail_bf16x2_split_x_completed_bf16x2_m{resident_rows}_k768"
+        ));
         let resident_layer_tail_interleaved_path = cache_root
             .join("embgemma_r100_post_ffn_interleaved_bf16x2_split_x_completed_bf16x2_m256_k768");
         let resident_layer_tail_bf16x2_path = cache_root
             .join("embgemma_aie2p_post_ffn_direct_tail_bf16x2_completed_bf16x2_m256_k768");
         let resident_layer_tail_bf16_path =
             cache_root.join("embgemma_aie2p_post_ffn_direct_tail_bf16x2_m256_k768");
-        let resident_layer_tail_path = if resident_layer_mode == Some(OpusResidentMode::W4)
+        let resident_layer_tail_default = if resident_layer_mode == Some(OpusResidentMode::W4)
             && resident_layer_tail_interleaved_path
                 .join("final.xclbin")
                 .is_file()
@@ -1157,8 +1205,12 @@ impl NpuOpusProjector {
         } else {
             resident_layer_tail_bf16_path
         };
-        let resident_next_prep_r111_path =
-            cache_root.join("embgemma_r111_next_layer_prep_w8_bf16x2_one_pass_m256_k768");
+        let resident_layer_tail_path = std::env::var_os("HIPFIRE_EMBED_RESIDENT_TAIL_CACHE")
+            .map(PathBuf::from)
+            .unwrap_or(resident_layer_tail_default);
+        let resident_next_prep_r111_path = cache_root.join(format!(
+            "embgemma_r111_next_layer_prep_w8_bf16x2_one_pass_m{resident_rows}_k768"
+        ));
         let resident_next_prep_r109_path =
             cache_root.join("embgemma_r109_next_layer_prep_w8_bf16x2_inplace_m256_k768");
         let resident_next_prep_r111_ready =
@@ -1259,18 +1311,14 @@ impl NpuOpusProjector {
             };
             let next_prep = if resident_next_prep_path.join("final.xclbin").is_file()
                 && resident_next_prep_path.join("insts.bin").is_file()
-                && tail.output_bytes() == NpuEmbeddingNextLayerPrepW8::completed_bytes()
             {
-                Some(
-                    NpuEmbeddingNextLayerPrepW8::load_cached(
-                        resident_next_prep_path
-                            .to_str()
-                            .expect("UTF-8 next-layer prep cache path"),
-                    )
-                    .map_err(|error| {
-                        format!("embeddinggemma NPU: load next-layer prep: {error}")
-                    })?,
+                let prep = NpuEmbeddingNextLayerPrepW8::load_cached(
+                    resident_next_prep_path
+                        .to_str()
+                        .expect("UTF-8 next-layer prep cache path"),
                 )
+                .map_err(|error| format!("embeddinggemma NPU: load next-layer prep: {error}"))?;
+                (tail.output_bytes() == prep.loaded_completed_bytes()).then_some(prep)
             } else {
                 None
             };
@@ -1878,9 +1926,15 @@ impl LinearProjector for NpuOpusProjector {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(usize::MAX);
-        if rows != NpuEmbeddingLayerAttentionDenseW8::rows()
-            || self.resident_layer.is_none()
-            || !self.resident_ffn_selected
+        if self.resident_layer.as_ref().is_none_or(|state| {
+            rows != state.attention.loaded_rows()
+                || rows != state.ffn.loaded_rows()
+                || rows != state.tail.batch() * NpuEmbeddingLayerAttentionDenseW8::rows()
+                || state
+                    .next_prep
+                    .as_ref()
+                    .is_none_or(|prep| rows != prep.batch() * NpuEmbeddingNextLayerPrepW8::rows())
+        }) || !self.resident_ffn_selected
             || layer_idx >= resident_layer_limit
         {
             return Ok(false);
@@ -1910,8 +1964,13 @@ impl LinearProjector for NpuOpusProjector {
                 .attention
                 .input_bytes();
             let mut input = gpu.alloc_shared_gtt(input_bytes)?;
-            let mut hidden =
-                gpu.alloc_shared_gtt(NpuEmbeddingLayerAttentionDenseW8::hidden_backing_bytes())?;
+            let hidden_bytes = self
+                .resident_layer
+                .as_ref()
+                .expect("checked resident layer")
+                .attention
+                .loaded_hidden_backing_bytes();
+            let mut hidden = gpu.alloc_shared_gtt(hidden_bytes)?;
             let tail_output_bytes = self
                 .resident_layer
                 .as_ref()
@@ -1919,8 +1978,13 @@ impl LinearProjector for NpuOpusProjector {
                 .tail
                 .output_bytes();
             let mut residual = gpu.alloc_shared_gtt(tail_output_bytes)?;
-            let mut ffn =
-                gpu.alloc_shared_gtt(NpuEmbeddingPostFfnDirectTailBf16x2::combined_bytes())?;
+            let ffn_bytes = self
+                .resident_layer
+                .as_ref()
+                .expect("checked resident layer")
+                .ffn
+                .loaded_output_bytes();
+            let mut ffn = gpu.alloc_shared_gtt(ffn_bytes)?;
             let uses_unit_rms = self
                 .resident_layer
                 .as_ref()
@@ -1944,8 +2008,13 @@ impl LinearProjector for NpuOpusProjector {
                 .is_some_and(|state| state.dense_l2.is_some())
                 .then(|| gpu.alloc_shared_gtt(NpuEmbeddingDenseL2::input_and_w0_bytes()))
                 .transpose()?;
-            let activation_bytes = NpuEmbeddingLayerAttentionDenseW8::activation_bytes();
-            input.as_mut_slice()[..activation_bytes].fill(0);
+            let activation_bytes = self
+                .resident_layer
+                .as_ref()
+                .expect("checked resident layer")
+                .attention
+                .loaded_activation_bytes();
+            input.as_mut_slice().fill(0);
             hidden.as_mut_slice().fill(0);
             residual.as_mut_slice().fill(0);
             ffn.as_mut_slice().fill(0);
@@ -2024,7 +2093,7 @@ impl LinearProjector for NpuOpusProjector {
                         tail_x_buffer.dmabuf_fd(),
                         tail_x_buffer.len(),
                         tail_output.dmabuf_fd(),
-                        NpuEmbeddingPostFfnDirectTailBf16x2::completed_bf16x2_bytes(),
+                        state.tail.output_bytes(),
                     )
                     .map_err(|error| {
                         hip_error(format!("attach split-X completed-layer tail: {error}"))
@@ -2048,7 +2117,7 @@ impl LinearProjector for NpuOpusProjector {
                 };
                 prep.attach_shared(
                     completed.dmabuf_fd(),
-                    NpuEmbeddingNextLayerPrepW8::completed_bytes(),
+                    prep.loaded_completed_bytes(),
                     input.dmabuf_fd(),
                     prep.output_bytes(),
                 )
@@ -2577,7 +2646,8 @@ impl LinearProjector for NpuOpusProjector {
             }
         }
         let compare_layer = compare_this_layer_enabled(layer_idx);
-        let final_norm_mean_ready = next_layer == state.attention_weights.len()
+        let final_norm_mean_ready = rows == NpuEmbeddingFinalNormMean::rows()
+            && next_layer == state.attention_weights.len()
             && state.final_norm_mean.is_some()
             && state.final_norm_mean_params.is_some();
         if should_materialize_completed_output(
@@ -2709,11 +2779,39 @@ impl LinearProjector for NpuOpusProjector {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(usize::MAX);
-        rows == NpuEmbeddingNextLayerPrepW8::rows()
-            && layer_idx < resident_layer_limit
+        layer_idx < resident_layer_limit
             && self.resident_layer.as_ref().is_some_and(|state| {
-                state.next_prep.is_some() && state.prepared_input_layer == Some(layer_idx)
+                rows == state.attention.loaded_rows()
+                    && state.next_prep.as_ref().is_some_and(|prep| {
+                        rows == prep.batch() * NpuEmbeddingNextLayerPrepW8::rows()
+                    })
+                    && state.prepared_input_layer == Some(layer_idx)
             })
+    }
+
+    fn supports_segmented_batch(&self, segment_offsets: &[usize]) -> bool {
+        let Some(state) = self.resident_layer.as_ref() else {
+            return false;
+        };
+        let rows = state.attention.loaded_rows();
+        segment_offsets.len() > 2
+            && segment_offsets.first() == Some(&0)
+            && segment_offsets.last() == Some(&rows)
+            && segment_offsets
+                .windows(2)
+                .all(|segment| segment[1] - segment[0] == 256)
+            && self.resident_ffn_selected
+            && state.ffn.loaded_rows() == rows
+            && state.tail.batch() * 256 == rows
+            && state
+                .next_prep
+                .as_ref()
+                .is_some_and(|prep| prep.batch() * 256 == rows)
+            && state.attention_weights.len() == self.layers.len()
+            && state
+                .attention_weights
+                .iter()
+                .all(ResidentLayerAttentionWeights::is_available)
     }
 
     fn take_layer_debug_hidden(&mut self) -> Option<Vec<f32>> {
@@ -3601,20 +3699,30 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
 }
 
 fn completed_high_bf16x2(residual: &[u16], rows: usize, hidden: usize) -> HipResult<Vec<u8>> {
+    const DOCUMENT_ROWS: usize = 256;
     const PAD_ROWS: usize = 288;
-    if rows != 256 || hidden != 768 || residual.len() != rows * hidden {
+    if rows == 0
+        || !rows.is_multiple_of(DOCUMENT_ROWS)
+        || hidden != 768
+        || residual.len() != rows * hidden
+    {
         return Err(hip_error(
             "initial completed-state BF16x2 geometry mismatch",
         ));
     }
-    let mut output = vec![0u8; PAD_ROWS * 2 * hidden * size_of::<u16>()];
-    for row in 0..rows {
-        let target = row * 2 * hidden * size_of::<u16>();
-        for (word, &bits) in output[target..target + hidden * 2]
-            .chunks_exact_mut(2)
-            .zip(&residual[row * hidden..(row + 1) * hidden])
-        {
-            word.copy_from_slice(&bits.to_le_bytes());
+    let batch = rows / DOCUMENT_ROWS;
+    let document_bytes = PAD_ROWS * 2 * hidden * size_of::<u16>();
+    let mut output = vec![0u8; batch * document_bytes];
+    for document in 0..batch {
+        for row in 0..DOCUMENT_ROWS {
+            let target = document * document_bytes + row * 2 * hidden * size_of::<u16>();
+            let source = (document * DOCUMENT_ROWS + row) * hidden;
+            for (word, &bits) in output[target..target + hidden * 2]
+                .chunks_exact_mut(2)
+                .zip(&residual[source..source + hidden])
+            {
+                word.copy_from_slice(&bits.to_le_bytes());
+            }
         }
     }
     Ok(output)
