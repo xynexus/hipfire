@@ -289,6 +289,11 @@ fi
 # hipfire: the CLI (serve / run / list)
 cargo install "${INSTALL_OPTS[@]}" "${UI_FEATURES[@]}" --path crates/hipfire-cli --root "$HIPFIRE_DIR"
 
+# hipfire-quantize: public offline model quantizer
+cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-quantize \
+    --bin hipfire-quantize \
+    --root "$HIPFIRE_DIR"
+
 # hipfire-monitor: standalone terminal hardware telemetry view
 cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-monitor --root "$HIPFIRE_DIR"
 
@@ -335,14 +340,8 @@ ls -1 "$BIN_DIR"/
 
 # ─── Symlinks in ~/.local/bin ────────────────────────────
 echo ""
-echo "Creating symlinks in $LOCAL_BIN..."
-mkdir -p "$LOCAL_BIN"
-for bin in hipfire hipfire-daemon hipfire-monitor hipfire-priv-helper hipfire-eval hipfire-host-profile; do
-    if [ -f "$BIN_DIR/$bin" ]; then
-        ln -sf "$BIN_DIR/$bin" "$LOCAL_BIN/$bin"
-        echo "  $LOCAL_BIN/$bin -> $BIN_DIR/$bin ✓"
-    fi
-done
+HIPFIRE_DIR="$HIPFIRE_DIR" LOCAL_BIN="$LOCAL_BIN" \
+    bash scripts/sync-install-links.sh
 
 # ─── Kernels ─────────────────────────────────────────────
 echo ""
