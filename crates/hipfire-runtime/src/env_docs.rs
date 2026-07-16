@@ -1412,14 +1412,14 @@ pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_FFN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER",
     description: "Runtime variable controlling embed compare resident layer in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3610",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3653",
 };
 
 /// `HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX` — Parses "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX" with fallback defaults
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX",
     description: "Parses \"HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX\" with fallback defaults",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3611",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3654",
 };
 
 /// `HIPFIRE_EMBED_E2E_TOKENS` — Runtime variable controlling embed e2e tokens in hipfire
@@ -1468,7 +1468,7 @@ pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT",
     description: "Parses \"HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT\" with fallback defaults",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2665",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2708",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_NEXT_PREP_CACHE` — Runtime variable controlling embed resident next prep cache in hipfire
@@ -1489,7 +1489,7 @@ pub const ENV_HIPFIRE_EMBED_TRACE_PHASES: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_TRACE_RESIDENT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_TRACE_RESIDENT",
     description: "Runtime variable controlling embed trace resident in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1875",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2697",
 };
 
 /// `HIPFIRE_EMBED_UNIT_RMS_BRIDGE` — Runtime variable controlling embed unit rms bridge in hipfire
@@ -4458,6 +4458,13 @@ pub const ENV_HIPFIRE_XDNA1_LIB: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-npu/src/lib.rs:69",
 };
 
+/// `HIPFIRE_XDNA_TRACE` — Runtime variable controlling xdna trace in hipfire
+pub const ENV_HIPFIRE_XDNA_TRACE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_XDNA_TRACE",
+    description: "Runtime variable controlling xdna trace in hipfire",
+    source: "crates/hipfire-xdna/src/kernel.rs:35",
+};
+
 /// `HIP_PATH` — fails with "file not found". Add well-known candidates as -I flags;
 pub const ENV_HIP_PATH: EnvVarDoc = EnvVarDoc {
     name: "HIP_PATH",
@@ -5254,6 +5261,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_WO_MMQ,
     ENV_HIPFIRE_WO_WMMA_VARIANT,
     ENV_HIPFIRE_XDNA1_LIB,
+    ENV_HIPFIRE_XDNA_TRACE,
     ENV_HIP_PATH,
     ENV_HIP_VISIBLE_DEVICES,
     ENV_HOME,
